@@ -528,6 +528,11 @@ impl UnlockEvents {
         })
     }
 
+    /// Whether `path` is watched (it existed when this was made).
+    pub(crate) fn watches(&self, path: &std::path::Path) -> bool {
+        self.files.iter().any(|(_, watched)| watched == path)
+    }
+
     /// Waits (on a blocking thread, woken when this is dropped) for unlock
     /// events, and returns the paths that were unlocked.
     pub(crate) async fn next(&self) -> std::io::Result<Vec<PathBuf>> {

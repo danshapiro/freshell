@@ -220,19 +220,45 @@ fn p95(samples: &mut [Duration]) -> Duration {
     samples[(samples.len() * 95).div_ceil(100) - 1]
 }
 
-#[test]
-fn system_integrity_protection_is_enabled() {
+/// R12, as the runners are: whether the environment is withheld is decided
+/// by the program's code-signing flags (`CS_RESTRICT`), which do not depend
+/// on System Integrity Protection. With SIP on, the kernel trims a
+/// restricted program's environment; with it off (the macOS 26 arm64 runner
+/// image, run 38024127146) the kernel shows it, and `environ_read` still
+/// reports it withheld. So no environment test passes falsely on a SIP-off
+/// runner. Apple's own programs, `/bin/sleep` among them, are restricted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restricted_programs_environment_is_withheld_whatever_the_sip_state() {
     let out = Command::new("csrutil").arg("status").output().unwrap();
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+    let sip = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let id = UnitId::mint();
+    let kid = Kid::spawn(
+        Command::new("/bin/sleep")
+            .arg("60")
+            .env(UNIT_ENV, id.as_str())
+            .stdout(Stdio::null()),
     );
-    report!("csrutil status: {}", text.trim());
-    assert!(
-        text.contains("status: enabled"),
-        "System Integrity Protection is off here: the kernel then returns every \
-         process's environment, so the withheld-environment tests would pass falsely: {text}"
+    wait_for_name(kid.id(), "sleep").await;
+    let flags = cs_flags(kid.id());
+    let ps = Command::new("ps")
+        .args(["-E", "-ww", "-o", "command=", "-p", &kid.id().to_string()])
+        .output()
+        .unwrap();
+    let kernel_shows_it = String::from_utf8_lossy(&ps.stdout).contains(id.as_str());
+    report!(
+        "SIP: {sip}; /bin/sleep csops {}; the kernel shows its environment: {kernel_shows_it}",
+        describe_flags(flags)
+    );
+    let restricted = flags.is_some_and(|f| f & CS_RESTRICT != 0);
+    let expected = if restricted {
+        EnvRead::Withheld
+    } else {
+        EnvRead::Value(id.as_str().to_string())
+    };
+    assert_eq!(
+        process::environ_read(kid.id(), UNIT_ENV),
+        expected,
+        "withheld exactly when the program is restricted (SIP: {sip})"
     );
 }
 
@@ -343,9 +369,10 @@ waitpid($p, 0);"#;
         .unwrap();
 }
 
-/// V6 T3: the unit tag of an ordinary process reads back; an entitled
-/// binary's environment reads back or is reported withheld, never absent;
-/// argv is exactly the arguments, never the environment that follows them.
+/// V6 T3, as the runners are: a process's unit tag reads back unless the
+/// program is restricted (`CS_RESTRICT`: Apple's own programs and entitled
+/// ones), whose environment is reported withheld, never absent; argv is
+/// exactly the arguments, never the environment that follows them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_unit_tag_is_read_or_reported_withheld() {
     let codex = std::env::var("FRESHELL_TEST_CODEX_NATIVE").expect(
@@ -353,53 +380,45 @@ async fn the_unit_tag_is_read_or_reported_withheld() {
     );
     let id = UnitId::mint();
     let codex_home = tempfile::tempdir().unwrap();
-    // (what, command, process name after exec, argv after exec, may be withheld)
-    type Case = (&'static str, Vec<String>, &'static str, Vec<String>, bool);
+    let node = |args: &[&str]| -> Vec<String> {
+        std::iter::once("node")
+            .chain(args.iter().copied())
+            .map(str::to_string)
+            .collect()
+    };
+    let sleep: Vec<String> = vec!["/bin/sleep".into(), "60".into()];
+    // (what, command, process name after exec, argv after exec)
+    type Case = (&'static str, Vec<String>, &'static str, Vec<String>);
     let cases: Vec<Case> = vec![
-        (
-            "sleep",
-            vec!["/bin/sleep".into(), "60".into()],
-            "sleep",
-            vec!["/bin/sleep".into(), "60".into()],
-            false,
-        ),
+        ("sleep", sleep.clone(), "sleep", sleep.clone()),
         (
             "sandbox-exec",
-            vec![
-                "/usr/bin/sandbox-exec".into(),
-                "-p".into(),
-                "(version 1)(allow default)".into(),
-                "/bin/sleep".into(),
-                "60".into(),
-            ],
+            [
+                "/usr/bin/sandbox-exec",
+                "-p",
+                "(version 1)(allow default)",
+                "/bin/sleep",
+                "60",
+            ]
+            .map(str::to_string)
+            .to_vec(),
             "sleep",
-            vec!["/bin/sleep".into(), "60".into()],
-            false,
+            sleep.clone(),
         ),
         (
             "node",
-            vec![
-                "node".into(),
-                "-e".into(),
-                "setTimeout(()=>{},60000)".into(),
-            ],
+            node(&["-e", "setTimeout(()=>{},60000)"]),
             "node",
-            vec![
-                "node".into(),
-                "-e".into(),
-                "setTimeout(()=>{},60000)".into(),
-            ],
-            true,
+            node(&["-e", "setTimeout(()=>{},60000)"]),
         ),
         (
             "codex",
             vec![codex.clone(), "app-server".into()],
             "codex",
             vec![codex.clone(), "app-server".into()],
-            true,
         ),
     ];
-    for (what, command, name, argv, may_withhold) in cases {
+    for (what, command, name, argv) in cases {
         // stdin is held open (Codex's app-server serves stdio until EOF).
         let kid = Kid::spawn(
             Command::new(&command[0])
@@ -419,9 +438,13 @@ async fn the_unit_tag_is_read_or_reported_withheld() {
             kid.id(),
             describe_flags(flags)
         );
+        let restricted = flags.is_some_and(|f| f & CS_RESTRICT != 0);
         match &read {
-            EnvRead::Value(v) => assert_eq!(v, id.as_str(), "{what}"),
-            EnvRead::Withheld => assert!(may_withhold, "{what}: its environment must be readable"),
+            EnvRead::Value(v) => {
+                assert_eq!(v, id.as_str(), "{what}");
+                assert!(!restricted, "{what}: a restricted program read back");
+            }
+            EnvRead::Withheld => assert!(restricted, "{what}: its environment must be readable"),
             EnvRead::Absent => panic!("{what}: a withheld environment was reported as untagged"),
         }
         assert_eq!(seen_argv, argv, "{what}: argv is exactly the arguments");
@@ -475,12 +498,15 @@ async fn libproc_lookups_fit_the_gone_window() {
     });
 }
 
-/// Plan review R1-F2: decides how detached jobs stay members. A root started
-/// through the shim's `--disclaim` is its own responsible process, and the
-/// kernel keeps that responsible pid on every descendant through `nohup`,
-/// `setsid` and reparenting to launchd.
+/// Plan review R1-F2, Branch B's record of why fork tracking is used: a
+/// root started through the shim's `--disclaim` is its own responsible
+/// process, but a detached official `node` (via `nohup`, or a `setsid`
+/// double fork) is its own responsible process too, so responsibility
+/// cannot carry membership to detached jobs (run 38024127146). Fails if
+/// macOS ever carries it through, when the responsible process could
+/// replace the fork tracker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responsibility_follows_detached_descendants() {
+async fn responsibility_does_not_follow_detached_descendants() {
     for symbol in [
         c"responsibility_spawnattrs_setdisclaim",
         c"responsibility_get_pid_responsible_for_pid",
@@ -491,7 +517,7 @@ async fn responsibility_follows_detached_descendants() {
     }
     const SCRIPT: &str = r#"echo "root $$"
 N1=$(sh -c 'nohup node -e "setInterval(()=>{},1000)" >/dev/null 2>&1 & echo $!')
-N2=$(perl -e 'use POSIX; my $p = fork() // die; if ($p == 0) { POSIX::setsid() or die; my $q = fork() // die; if ($q == 0) { open(STDOUT, ">", "/dev/null"); exec "node", "-e", "setInterval(()=>{},1000)"; } print "$q\n"; exit 0; } waitpid($p, 0);')
+N2=$(perl -e 'use POSIX; my $p = fork() // die; if ($p == 0) { POSIX::setsid() or die; my $q = fork() // die; if ($q == 0) { open(STDOUT, ">", "/dev/null"); open(STDERR, ">", "/dev/null"); exec "node", "-e", "setInterval(()=>{},1000)"; } print "$q\n"; exit 0; } waitpid($p, 0);')
 echo "nodes $N1 $N2"
 exec sleep 600"#;
     let mut root = Kid::spawn(
@@ -528,24 +554,21 @@ exec sleep 600"#;
         );
     }
     let stranger = OwnChild::sleep();
-    let stranger_responsible = process::responsible_pid(stranger.id());
-    report!(
-        "T5: an unwrapped sleep's responsible pid {stranger_responsible:?} (the test runs as pid {})",
-        std::process::id()
-    );
-    assert_ne!(stranger_responsible, Some(root.id()));
+    assert_ne!(process::responsible_pid(stranger.id()), Some(root.id()));
     for pid in &nodes {
-        assert_eq!(
+        assert_ne!(
             process::responsible_pid(*pid),
             Some(root.id()),
-            "detached node {pid} keeps the root as its responsible process"
+            "detached node {pid} now keeps the root as its responsible process: \
+             the responsible process could carry membership"
         );
     }
     drop(pins);
 }
 
-/// The planned selection test: the tag backend is selected and a member's
-/// unit tag reads back; a Force stop reaches Gone.
+/// The planned selection test: the tag backend is selected, a member's unit
+/// tag reads back (the official `node`, an unrestricted program; Apple's
+/// own `sleep` is restricted), and a Force stop reaches Gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn macos_selects_the_tag_backend_and_reads_the_unit_tag() {
     let state = tempfile::tempdir().unwrap();
@@ -557,18 +580,26 @@ async fn macos_selects_the_tag_backend_and_reads_the_unit_tag() {
     assert!(!c.capability().full);
     let unit = c.create_unit(UnitId::mint(), label()).unwrap();
     let mut cmd = unit
-        .tokio_command("sleep", &["600".to_string()], MemberRole::Agent)
+        .tokio_command(
+            "node",
+            &["-e".to_string(), "setInterval(()=>{},1000)".to_string()],
+            MemberRole::Agent,
+        )
         .unwrap();
     cmd.kill_on_drop(true).stdin(Stdio::null());
     let mut child = cmd.spawn().unwrap();
     let pid = child.id().unwrap();
     let watch = ProcWatch::open(pid).unwrap();
     unit.set_main(watch.clone());
-    wait_for_name(pid, "sleep").await;
-    assert_eq!(
-        process::environ_read(pid, UNIT_ENV),
+    wait_for_name(pid, "node").await;
+    let flags = cs_flags(pid);
+    report!("selection: node csops {}", describe_flags(flags));
+    let expected = if flags.is_some_and(|f| f & CS_RESTRICT != 0) {
+        EnvRead::Withheld
+    } else {
         EnvRead::Value(unit.id().as_str().to_string())
-    );
+    };
+    assert_eq!(process::environ_read(pid, UNIT_ENV), expected);
     let report = tokio::time::timeout(
         Duration::from_secs(10),
         unit.stop(StopRequest::new(
@@ -588,103 +619,154 @@ async fn macos_selects_the_tag_backend_and_reads_the_unit_tag() {
     child.wait().await.unwrap();
 }
 
-/// R12: an entitled main whose environment may be withheld is still a
-/// member (the pinned root), and so is its child (a descendant); the stop
-/// logs that it met withheld environments, and ends both.
+/// R12: a main whose environment may be withheld is still a member (the
+/// pinned root), and so is its child (a descendant); a stop that met
+/// withheld environments logs it, and ends both. Run with the official
+/// `node` (the plan's program, readable on the runners) and with Apple's
+/// `/bin/sh` and `sleep` (restricted, so the fallback is always exercised).
 #[tokio::test(flavor = "current_thread")]
 async fn a_withheld_environment_falls_back_to_roots_and_descendants() {
-    let (cap, _guard) = capture::install();
-    let state = tempfile::tempdir().unwrap();
-    let c = Containment::select(SelectOptions {
-        shim: Some(test_shim()),
-        state_root: state.path().to_path_buf(),
-    });
-    let unit = c.create_unit(UnitId::mint(), label()).unwrap();
-    let script = "const c = require('child_process').spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' }); console.log('ready ' + c.pid); setInterval(()=>{}, 1000);";
-    let mut cmd = unit
-        .tokio_command(
-            "node",
-            &["-e".to_string(), script.to_string()],
-            MemberRole::Agent,
-        )
-        .unwrap();
-    cmd.kill_on_drop(false)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped());
-    let mut main = cmd.spawn().unwrap();
-    let main_watch = ProcWatch::open(main.id().unwrap()).unwrap();
-    let _main_cleanup = KillOnDrop(main_watch.clone());
-    unit.set_main(main_watch.clone());
-    let child_pid: u32 = line_after_async(main.stdout.take().unwrap(), "ready")
-        .await
-        .parse()
-        .unwrap();
-    let child_watch = ProcWatch::open(child_pid).unwrap();
-    let _child_cleanup = KillOnDrop(child_watch.clone());
-    let reads = [
-        process::environ_read(main_watch.pid(), UNIT_ENV),
-        process::environ_read(child_pid, UNIT_ENV),
+    let node_main = "const c = require('child_process').spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' }); console.log('ready ' + c.pid); setInterval(()=>{}, 1000);";
+    let cases = [
+        ("node", ["-e", node_main]),
+        ("/bin/sh", ["-c", "sleep 600 & echo \"ready $!\"; wait"]),
     ];
-    report!(
-        "R12: main node environ {:?} csops {}, child node environ {:?} csops {}",
-        reads[0],
-        describe_flags(cs_flags(main_watch.pid())),
-        reads[1],
-        describe_flags(cs_flags(child_pid))
-    );
-    let members: Vec<u32> = {
-        let unit = unit.clone();
-        tokio::task::spawn_blocking(move || unit.members().unwrap())
-            .await
-            .unwrap()
-            .iter()
-            .map(|m| m.pid)
-            .collect()
-    };
-    assert!(members.contains(&main_watch.pid()), "{members:?}");
-    assert!(members.contains(&child_pid), "{members:?}");
-    unit.stop(StopRequest::new(
-        StopMode::Force,
-        StopReason::ShiftX,
-        "test",
-    ))
-    .wait_swept()
-    .await;
-    for (what, watch) in [("main", &main_watch), ("child", &child_watch)] {
-        tokio::time::timeout(Duration::from_secs(5), watch.exited())
-            .await
-            .unwrap_or_else(|_| panic!("the {what} node survived the stop"))
+    for (program, args) in cases {
+        let (cap, guard) = capture::install();
+        let state = tempfile::tempdir().unwrap();
+        let c = Containment::select(SelectOptions {
+            shim: Some(test_shim()),
+            state_root: state.path().to_path_buf(),
+        });
+        let unit = c.create_unit(UnitId::mint(), label()).unwrap();
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let mut cmd = unit
+            .tokio_command(program, &args, MemberRole::Agent)
             .unwrap();
-    }
-    if reads.contains(&EnvRead::Withheld) {
+        cmd.kill_on_drop(false)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped());
+        let mut main = cmd.spawn().unwrap();
+        let main_watch = ProcWatch::open(main.id().unwrap()).unwrap();
+        let _main_cleanup = KillOnDrop(main_watch.clone());
+        unit.set_main(main_watch.clone());
+        let child_pid: u32 = line_after_async(main.stdout.take().unwrap(), "ready")
+            .await
+            .parse()
+            .unwrap();
+        let child_watch = ProcWatch::open(child_pid).unwrap();
+        let _child_cleanup = KillOnDrop(child_watch.clone());
+        let mut reads = Vec::new();
+        for pid in [main_watch.pid(), child_pid] {
+            let flags = cs_flags(pid);
+            let read = process::environ_read(pid, UNIT_ENV);
+            report!(
+                "R12 {program}: pid {pid} environ {read:?} csops {}",
+                describe_flags(flags)
+            );
+            if flags.is_some_and(|f| f & CS_RESTRICT != 0) {
+                assert_eq!(read, EnvRead::Withheld, "{program}: pid {pid}");
+            }
+            reads.push(read);
+        }
+        let members: Vec<u32> = {
+            let unit = unit.clone();
+            tokio::task::spawn_blocking(move || unit.members().unwrap())
+                .await
+                .unwrap()
+                .iter()
+                .map(|m| m.pid)
+                .collect()
+        };
         assert!(
-            cap.has(tracing::Level::INFO, "unit.members.environ_withheld"),
-            "a stop that met withheld environments logs it"
+            members.contains(&main_watch.pid()),
+            "{program}: {members:?}"
         );
+        assert!(members.contains(&child_pid), "{program}: {members:?}");
+        unit.stop(StopRequest::new(
+            StopMode::Force,
+            StopReason::ShiftX,
+            "test",
+        ))
+        .wait_swept()
+        .await;
+        for (what, watch) in [("main", &main_watch), ("child", &child_watch)] {
+            tokio::time::timeout(Duration::from_secs(5), watch.exited())
+                .await
+                .unwrap_or_else(|_| panic!("{program}: the {what} survived the stop"))
+                .unwrap();
+        }
+        if reads.contains(&EnvRead::Withheld) {
+            assert!(
+                cap.has(tracing::Level::INFO, "unit.members.environ_withheld"),
+                "{program}: a stop that met withheld environments logs it"
+            );
+        }
+        let _ = main.wait().await;
+        drop(guard);
     }
-    let _ = main.wait().await;
 }
 
 /// Plan review R1-F2: jobs the agent detached (`nohup`, `setsid`) running
-/// the official, entitled `node` are reparented to launchd and still killed
-/// by a stop.
+/// the official `node` are reparented to launchd and still killed by a
+/// stop. Branch B (the fork tracker): the `nohup` job stays in the root's
+/// session; the `setsid` job's session leader (a perl intermediate) waits
+/// at a gate until it is a member, then starts the job and exits at once,
+/// so the job is found through its session. A session leader whose parent
+/// exited before the tracker handled the fork is the tracker's stated
+/// residual, which no test claims.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_detached_entitled_job_is_killed_by_a_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = dir.path().join("gate");
+    let fifo = std::ffi::CString::new(gate.to_str().unwrap()).unwrap();
+    // SAFETY: a NUL-terminated path of the test's own temp directory.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let main_js = dir.path().join("main.js");
+    std::fs::write(
+        &main_js,
+        r#"const { execFileSync } = require('child_process');
+const dir = process.argv[2];
+const a = execFileSync('/bin/sh', ['-c', 'nohup node -e "setInterval(()=>{},1000)" >/dev/null 2>&1 & echo $!']).toString().trim();
+execFileSync('perl', [dir + '/job.pl', dir], { stdio: 'ignore' });
+console.log('jobs ' + a);
+setInterval(() => {}, 1000);
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("job.pl"),
+        r#"use POSIX;
+my $dir = $ARGV[0];
+my $p = fork() // die "fork: $!";
+if ($p == 0) {
+    POSIX::setsid() or die "setsid: $!";
+    open(my $o, ">", "$dir/leader.tmp") or die; print $o $$; close $o;
+    rename("$dir/leader.tmp", "$dir/leader") or die;
+    open(my $g, "<", "$dir/gate") or die; my $go = <$g>; close $g;
+    my $q = fork() // die "fork: $!";
+    if ($q == 0) { exec "node", "-e", "setInterval(()=>{},1000)"; }
+    open($o, ">", "$dir/job.tmp") or die; print $o $q; close $o;
+    rename("$dir/job.tmp", "$dir/job") or die;
+    exit 0;
+}
+waitpid($p, 0);
+"#,
+    )
+    .unwrap();
     let state = tempfile::tempdir().unwrap();
     let c = Containment::select(SelectOptions {
         shim: Some(test_shim()),
         state_root: state.path().to_path_buf(),
     });
     let unit = c.create_unit(UnitId::mint(), label()).unwrap();
-    let script = r#"const { execFileSync } = require('child_process');
-const a = execFileSync('/bin/sh', ['-c', 'nohup node -e "setInterval(()=>{},1000)" >/dev/null 2>&1 & echo $!']).toString().trim();
-const b = execFileSync('perl', ['-e', 'use POSIX; my $p = fork() // die; if ($p == 0) { POSIX::setsid() or die; my $q = fork() // die; if ($q == 0) { open(STDOUT, ">", "/dev/null"); exec "node", "-e", "setInterval(()=>{},1000)"; } print "$q\n"; exit 0; } waitpid($p, 0);']).toString().trim();
-console.log('jobs ' + a + ' ' + b);
-setInterval(() => {}, 1000);"#;
     let mut cmd = unit
         .tokio_command(
             "node",
-            &["-e".to_string(), script.to_string()],
+            &[
+                main_js.display().to_string(),
+                dir.path().display().to_string(),
+            ],
             MemberRole::Agent,
         )
         .unwrap();
@@ -695,11 +777,44 @@ setInterval(() => {}, 1000);"#;
     let main_watch = ProcWatch::open(main.id().unwrap()).unwrap();
     let _main_cleanup = KillOnDrop(main_watch.clone());
     unit.set_main(main_watch.clone());
-    let jobs: Vec<u32> = line_after_async(main.stdout.take().unwrap(), "jobs")
+    let read_pid = |name: &str| {
+        std::fs::read_to_string(dir.path().join(name))
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u32>().ok())
+    };
+    eventually(
+        Duration::from_secs(10),
+        "the session leader started",
+        || read_pid("leader").is_some(),
+    )
+    .await;
+    let leader = read_pid("leader").unwrap();
+    let _leader_cleanup = KillOnDrop(ProcWatch::open(leader).unwrap());
+    eventually(
+        Duration::from_secs(5),
+        "the session leader is a member before it starts the job",
+        || unit.members().unwrap().iter().any(|m| m.pid == leader),
+    )
+    .await;
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut open_gate = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&gate)
+            .expect("the session leader waits at the gate");
+        open_gate.write_all(b"go\n").unwrap();
+    }
+    eventually(Duration::from_secs(10), "the job started", || {
+        read_pid("job").is_some()
+    })
+    .await;
+    let setsid_job = read_pid("job").unwrap();
+    let nohup_job: u32 = line_after_async(main.stdout.take().unwrap(), "jobs")
         .await
-        .split_whitespace()
-        .map(|p| p.parse().unwrap())
-        .collect();
+        .parse()
+        .unwrap();
+    let jobs = [nohup_job, setsid_job];
     let watches: Vec<ProcWatch> = jobs
         .iter()
         .map(|pid| ProcWatch::open(*pid).unwrap())
@@ -729,6 +844,70 @@ setInterval(() => {}, 1000);"#;
             .unwrap_or_else(|_| panic!("detached job {pid} survived the stop"))
             .unwrap();
     }
+    let _ = main.wait().await;
+}
+
+/// Branch B: every process the fork tracker follows is recorded as a root
+/// in the unit record while it runs, so a restarted server reaches it by
+/// identity even if the server crashed mid-stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_followed_process_is_recorded_as_a_root() {
+    let state = tempfile::tempdir().unwrap();
+    let c = Containment::select(SelectOptions {
+        shim: Some(test_shim()),
+        state_root: state.path().to_path_buf(),
+    });
+    let unit = c.create_unit(UnitId::mint(), label()).unwrap();
+    let mut cmd = unit
+        .tokio_command(
+            "/bin/sh",
+            &[
+                "-c".to_string(),
+                "nohup sleep 600 >/dev/null 2>&1 & echo \"job $!\"; exec sleep 600".to_string(),
+            ],
+            MemberRole::Agent,
+        )
+        .unwrap();
+    cmd.kill_on_drop(false)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped());
+    let mut main = cmd.spawn().unwrap();
+    let main_watch = ProcWatch::open(main.id().unwrap()).unwrap();
+    let _main_cleanup = KillOnDrop(main_watch.clone());
+    unit.set_main(main_watch.clone());
+    let job: u32 = line_after_async(main.stdout.take().unwrap(), "job")
+        .await
+        .parse()
+        .unwrap();
+    let job_watch = ProcWatch::open(job).unwrap();
+    let _job_cleanup = KillOnDrop(job_watch.clone());
+    let identity = (job, job_watch.identity().start);
+    let record = state
+        .path()
+        .join("units")
+        .join(format!("{}.json", unit.id().as_str()));
+    eventually(
+        Duration::from_secs(10),
+        "the job is a recorded root",
+        || {
+            std::fs::read(&record)
+                .ok()
+                .and_then(|raw| serde_json::from_slice::<UnitRecord>(&raw).ok())
+                .is_some_and(|r| r.roots.contains(&identity))
+        },
+    )
+    .await;
+    unit.stop(StopRequest::new(
+        StopMode::Force,
+        StopReason::ShiftX,
+        "test",
+    ))
+    .wait_swept()
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), job_watch.exited())
+        .await
+        .expect("the followed job was stopped")
+        .unwrap();
     let _ = main.wait().await;
 }
 

@@ -760,12 +760,6 @@ pub fn all_pids() -> Vec<u32> {
     crate::darwin::all_pids()
 }
 
-/// macOS: the real uid of `pid` (`pbi_ruid`).
-#[cfg(target_os = "macos")]
-pub(crate) fn real_uid(pid: u32) -> Option<u32> {
-    crate::darwin::bsdinfo(pid).ok().map(|info| info.pbi_ruid)
-}
-
 /// macOS: the process the system holds responsible for `pid`: itself after
 /// a disclaimed spawn (the `--disclaim` shim), otherwise copied from its
 /// parent at fork and kept through `setsid`, exec and reparenting. Read

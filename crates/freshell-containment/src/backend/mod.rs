@@ -12,6 +12,8 @@ use crate::{BoxFuture, UnitId};
 
 #[cfg(target_os = "linux")]
 pub(crate) mod inotify;
+#[cfg(target_os = "macos")]
+pub(crate) mod macos_forks;
 #[cfg(target_os = "linux")]
 pub(crate) mod systemd;
 #[cfg(unix)]
@@ -116,9 +118,10 @@ pub(crate) struct MemberList {
 
 /// What a backend reports back to its unit, which owns the unit record. A
 /// backend whose container no longer ends its members when the server dies
-/// (Windows: kill-on-close cleared) has each member recorded as a root, so a
-/// restarted server can reach it by identity.
-#[cfg_attr(not(windows), allow(dead_code))] // only the Windows backend records today
+/// (Windows: kill-on-close cleared; macOS: there is no container, so every
+/// process the fork tracker follows) has each member recorded as a root, so
+/// a restarted server can reach it by identity.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 pub(crate) trait UnitObserver: Send + Sync {
     /// Adds `(pid, start)` to the record's roots (nothing when present).
     fn record_root(&self, pid: u32, start: u64);
@@ -166,4 +169,9 @@ pub(crate) trait UnitBackend: Send + Sync {
     /// The unit's observer, given once when the unit is built. Backends that
     /// never record members ignore it.
     fn set_observer(&self, _observer: Arc<dyn UnitObserver>) {}
+    /// A process the unit pinned as a root, or a root its record names at a
+    /// restart (which may have exited already). A backend that follows what
+    /// its roots start (macOS: the fork tracker) starts following it; the
+    /// others ignore it.
+    fn root_pinned(&self, _pid: u32, _start: u64) {}
 }

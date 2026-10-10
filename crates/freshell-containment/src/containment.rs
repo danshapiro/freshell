@@ -25,8 +25,8 @@ pub struct ShimCommand {
 #[derive(Debug, Clone, Default)]
 pub struct SelectOptions {
     /// The member exec shim (the Linux fallback's `--reaper`, Windows job
-    /// self-placement): the server passes its own exe + `__unit-exec`; tests
-    /// pass the `freshell-unit-exec` bin.
+    /// self-placement, macOS `--setsid`): the server passes its own exe +
+    /// `__unit-exec`; tests pass the `freshell-unit-exec` bin.
     pub shim: Option<ShimCommand>,
     /// The server's state directory (`<FRESHELL_HOME or HOME>/.freshell`);
     /// unit records live in `<state_root>/units/`. Empty: records are kept
@@ -263,9 +263,7 @@ impl Containment {
 
 #[cfg(unix)]
 fn legacy_backend(tag_key: &str, tag_value: &str, id: &UnitId) -> Arc<dyn UnitBackend> {
-    Arc::new(crate::backend::tag::TagUnit::new(
-        tag_key, tag_value, id, None,
-    ))
+    Arc::new(crate::backend::tag::TagUnit::legacy(tag_key, tag_value, id))
 }
 
 /// Windows never retains a sidecar across a restart, so a legacy unit has

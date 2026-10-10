@@ -13,14 +13,21 @@
 //! - `--reaper` (Linux): run the command under the child-subreaper shim
 //!   (`crate::reaper`), the Linux fallback backend's member root. Other OSes
 //!   ignore it (no backend there places with it).
+//! - `--setsid` (macOS): make this process its own session leader (it
+//!   already is one under a PTY), then exec the command in place, so the pid
+//!   the spawner saw is the command's and everything it starts that never
+//!   calls `setsid` stays in its session: the macOS backend's root
+//!   placement, which its fork tracker follows. Exit 127 when the command
+//!   cannot be started. Other OSes ignore it.
 //! - `--disclaim` (macOS): exec the command in place (`posix_spawn` with
-//!   `POSIX_SPAWN_SETEXEC`, so the pid the spawner saw is the command's)
-//!   after `responsibility_spawnattrs_setdisclaim`, so the command is its
-//!   own responsible process and every process it starts, however detached,
-//!   keeps it as theirs: the macOS backend's kernel-tracked membership. Exit
-//!   127 when the command cannot be started. Where the private function is
-//!   missing, the command is exec'd without disclaiming (with a one-line
-//!   note on stderr). Other OSes ignore it.
+//!   `POSIX_SPAWN_SETEXEC`) after `responsibility_spawnattrs_setdisclaim`,
+//!   so the command is its own responsible process. No backend places with
+//!   it: the macOS suite uses it to record that the official `node`
+//!   resets its responsible process, so responsibility cannot follow a
+//!   detached job (the reason for the fork tracker). Exit 127 when the
+//!   command cannot be started; where the private function is missing, the
+//!   command is exec'd without disclaiming (with a one-line note on
+//!   stderr). Other OSes ignore it.
 //! - `--nofile-soft=<n>` (Linux): lower this shim's own open-file soft limit
 //!   to `n` (capped at the hard limit) before it starts the command, so the
 //!   command starts with the server's original limit instead of the server's
@@ -43,6 +50,7 @@ const START_FAILED_EXIT: i32 = 127;
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Options {
     reaper: bool,
+    setsid: bool,
     disclaim: bool,
     nofile_soft: Option<u64>,
     job: Option<OsString>,
@@ -61,6 +69,8 @@ fn parse_options(options: &[OsString]) -> Options {
         };
         if option == "--reaper" {
             parsed.reaper = true;
+        } else if option == "--setsid" {
+            parsed.setsid = true;
         } else if option == "--disclaim" {
             parsed.disclaim = true;
         } else if let Some(n) = option.strip_prefix("--nofile-soft=") {
@@ -103,21 +113,48 @@ pub fn unit_exec_main(args: Vec<OsString>) -> i32 {
     #[cfg(not(target_os = "linux"))]
     let _ = options.reaper; // no backend places with it off Linux
     #[cfg(target_os = "macos")]
-    if options.disclaim {
-        return macos::exec_disclaimed(program, rest);
+    {
+        if options.setsid {
+            macos::become_session_leader();
+        }
+        if options.disclaim {
+            return macos::exec_disclaimed(program, rest);
+        }
+        if options.setsid {
+            return macos::exec_in_place(program, rest);
+        }
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = options.disclaim; // only the macOS backend places with it
+    let _ = (options.setsid, options.disclaim); // macOS options
     run_plain(program, rest)
 }
 
-/// macOS: the disclaimed in-place exec.
+/// macOS: the session-leader and disclaimed in-place execs.
 #[cfg(target_os = "macos")]
 mod macos {
     use std::ffi::{CString, OsStr, OsString};
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::process::CommandExt;
 
     use super::START_FAILED_EXIT;
+
+    /// `setsid()`; it fails (EPERM) only when this process already leads a
+    /// process group, as a PTY child leads its own session: nothing to do.
+    pub(super) fn become_session_leader() {
+        // SAFETY: plain setsid(2) on this single-threaded process.
+        unsafe { libc::setsid() };
+    }
+
+    /// Replaces this process with `program rest...` (searched on `PATH`).
+    /// Returns only when that fails.
+    pub(super) fn exec_in_place(program: &OsStr, rest: &[OsString]) -> i32 {
+        let err = std::process::Command::new(program).args(rest).exec();
+        eprintln!(
+            "freshell-unit-exec: cannot start {}: {err}",
+            program.to_string_lossy()
+        );
+        START_FAILED_EXIT
+    }
 
     /// Replaces this process with `program rest...` (searched on `PATH`),
     /// disclaimed. Returns only when that fails.
@@ -355,6 +392,13 @@ mod tests {
             parse_options(&args(&["--disclaim"])),
             Options {
                 disclaim: true,
+                ..Options::default()
+            }
+        );
+        assert_eq!(
+            parse_options(&args(&["--setsid"])),
+            Options {
+                setsid: true,
                 ..Options::default()
             }
         );

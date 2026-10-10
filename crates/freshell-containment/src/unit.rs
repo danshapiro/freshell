@@ -451,6 +451,7 @@ impl AgentUnit {
         }
         watch.watch_lock_paths(&lock(&self.inner.lock_paths));
         let new = identity_of(watch);
+        self.inner.backend.root_pinned(new.0, new.1);
         let dropped = previous
             .map(|w| identity_of(&w))
             .filter(|old| *old != new && other_role.as_ref().map(identity_of) != Some(*old));
@@ -571,6 +572,9 @@ impl AgentUnit {
     /// root that cannot be pinned is never signalled (Stage 2: LB-02).
     pub(crate) fn pin_recorded_roots(&self, roots: &[(u32, u64)]) {
         for (pid, start) in roots {
+            // Told to the backend even when it has exited (it then ignores
+            // it).
+            self.inner.backend.root_pinned(*pid, *start);
             match ProcWatch::open_expecting(*pid, *start) {
                 Ok(watch) => {
                     watch.watch_lock_paths(&lock(&self.inner.lock_paths));
@@ -587,6 +591,10 @@ impl AgentUnit {
     /// (`Containment::adopt_legacy`).
     pub(crate) fn adopt_record(&self, record: UnitRecord, roots: Vec<ProcWatch>) {
         *lock(&self.inner.record) = Some(record);
+        for root in &roots {
+            let (pid, start) = identity_of(root);
+            self.inner.backend.root_pinned(pid, start);
+        }
         lock(&self.inner.members).roots.extend(roots);
     }
 
@@ -1087,10 +1095,14 @@ impl AgentUnit {
             match watch_of(who) {
                 Some(watch) => awaited.push(watch),
                 None => {
+                    // Pinned only to deliver the kill: its exit proves
+                    // nothing here, the unlock does.
                     if let Ok(watch) = ProcWatch::open_expecting(who.pid, who.start) {
                         let _ = watch.signal(Sig::Kill);
                     }
-                    if !pending.contains(path) {
+                    // A file created after the watch began has no unlock
+                    // event to wait for; the final scan decides for it.
+                    if unlocks.watches(path) && !pending.contains(path) {
                         pending.push(path.clone());
                     }
                 }
@@ -1307,7 +1319,7 @@ impl AgentUnit {
 /// The unit's side of [`UnitObserver`]: members a backend reports are kept
 /// as roots in the unit record. It holds the unit weakly, so a backend never
 /// keeps its unit alive.
-#[cfg_attr(not(windows), allow(dead_code))] // only the Windows backend records today
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 struct RecordRoots(Weak<Inner>);
 
 impl UnitObserver for RecordRoots {

@@ -1,15 +1,25 @@
-//! Tag backend (Linux without a user systemd manager; macOS until Task 7
-//! fills in its facts). A unit's members are the processes carrying its
-//! environment tag, the live pinned roots (each admitted only while its pid
-//! still names the incarnation that started at its recorded start time), and
-//! every descendant of those, computed fresh at each call from one-shot
-//! `/proc` reads, never by polling.
+//! Tag backend (Linux without a user systemd manager; macOS). A unit's
+//! members are the processes carrying its environment tag, the live pinned
+//! roots (each admitted only while its pid still names the incarnation that
+//! started at its recorded start time), every descendant of those, and on
+//! macOS the processes its fork tracker follows, computed fresh at each call
+//! from one-shot reads (`/proc` on Linux, libproc on macOS), never by
+//! polling. A process whose environment the kernel withholds is neither
+//! tagged nor untagged: it is a member only through those other routes, and
+//! the scan counts it.
 //!
 //! On Linux every member the unit spawns starts under the `__unit-exec
 //! --reaper` shim (`crate::reaper`), a child subreaper: the kernel reparents
 //! every orphaned descendant (a `setsid` or double-forked job, whatever it
 //! does to its environment) to it, so the shim's tree holds everything the
 //! pane started and the tag only matters for a shim killed from outside.
+//!
+//! On macOS every member starts under the `__unit-exec --setsid` shim (its
+//! own session leader, exec'd in place), and the unit's fork tracker
+//! (`super::macos_forks`) follows every process the unit's roots start,
+//! however it detaches: the kernel withholds the tag of restricted
+//! programs, Apple's own among them, and keeps no parent link to a job
+//! reparented to launchd.
 //!
 //! Kill is a stop-the-world sweep that never signals a bare pid: each new
 //! candidate is pinned with a `ProcWatch`, re-verified as a member, and
@@ -36,8 +46,9 @@ const MAX_ANCESTRY: usize = 4096;
 pub(crate) struct TagBackend {
     kind: BackendKind,
     reason: String,
-    /// `[<shim exe>, <shim leading args...>, "--reaper", "--"]` on Linux
-    /// when the backend has a shim; `None` otherwise.
+    /// `[<shim exe>, <shim leading args...>, "--reaper", "--"]` on Linux,
+    /// `[.., "--setsid", "--"]` on macOS, when the backend has a shim;
+    /// `None` otherwise.
     wrapper: Option<Vec<String>>,
 }
 
@@ -47,10 +58,14 @@ impl TagBackend {
         reason: &str,
         shim: Option<&crate::containment::ShimCommand>,
     ) -> Self {
-        let wrapper = reaper_wrapper(shim);
+        let wrapper = member_wrapper(shim);
         let mut reason = reason.to_string();
-        if cfg!(target_os = "linux") && wrapper.is_none() {
-            reason.push_str("; no reaper shim");
+        if wrapper.is_none() {
+            if cfg!(target_os = "linux") {
+                reason.push_str("; no reaper shim");
+            } else if cfg!(target_os = "macos") {
+                reason.push_str("; no session shim");
+            }
         }
         Self {
             kind,
@@ -60,19 +75,22 @@ impl TagBackend {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn reaper_wrapper(shim: Option<&crate::containment::ShimCommand>) -> Option<Vec<String>> {
+/// The shim every member starts under: `--reaper` on Linux (a child
+/// subreaper), `--setsid` on macOS (its own session leader, exec'd in
+/// place).
+fn member_wrapper(shim: Option<&crate::containment::ShimCommand>) -> Option<Vec<String>> {
+    let mode = if cfg!(target_os = "linux") {
+        "--reaper"
+    } else if cfg!(target_os = "macos") {
+        "--setsid"
+    } else {
+        return None;
+    };
     let shim = shim?;
     let mut wrapper = vec![shim.exe.to_string_lossy().into_owned()];
     wrapper.extend(shim.leading_args.iter().cloned());
-    wrapper.extend(["--reaper".to_string(), "--".to_string()]);
+    wrapper.extend([mode.to_string(), "--".to_string()]);
     Some(wrapper)
-}
-
-/// macOS placement is Task 7's.
-#[cfg(not(target_os = "linux"))]
-fn reaper_wrapper(_shim: Option<&crate::containment::ShimCommand>) -> Option<Vec<String>> {
-    None
 }
 
 impl Backend for TagBackend {
@@ -90,7 +108,7 @@ impl Backend for TagBackend {
             id.as_str(),
             id,
             self.wrapper.clone(),
-        )))
+        )?))
     }
 
     fn reopen(&self, id: &UnitId) -> io::Result<Arc<dyn UnitBackend>> {
@@ -109,6 +127,10 @@ pub(crate) struct TagUnit {
     /// The unit id its errors name (a legacy unit's minted id).
     unit_id: String,
     wrapper: Option<Vec<String>>,
+    /// macOS: the processes the unit's roots started, followed by their
+    /// fork events (none for a legacy unit).
+    #[cfg(target_os = "macos")]
+    forks: Option<super::macos_forks::ForkTracker>,
 }
 
 /// One one-shot reading of a unit's processes.
@@ -122,22 +144,93 @@ struct Scan {
 }
 
 impl TagUnit {
+    /// A unit of this server. Fails only when the macOS fork tracker cannot
+    /// start (no kqueue or thread).
     pub(crate) fn new(
         key: &str,
         value: &str,
         unit_id: &UnitId,
         wrapper: Option<Vec<String>>,
-    ) -> Self {
+    ) -> io::Result<Self> {
+        Ok(Self {
+            wrapper,
+            #[cfg(target_os = "macos")]
+            forks: Some(super::macos_forks::ForkTracker::new(unit_id.as_str())?),
+            ..Self::legacy(key, value, unit_id)
+        })
+    }
+
+    /// A pre-containment sidecar found by its legacy tag, its roots and
+    /// their descendants (it was started without a shim; macOS never
+    /// retains one, so it follows no forks).
+    pub(crate) fn legacy(key: &str, value: &str, unit_id: &UnitId) -> Self {
         Self {
             key: key.to_string(),
             value: value.to_string(),
             unit_id: unit_id.as_str().to_string(),
-            wrapper,
+            wrapper: None,
+            #[cfg(target_os = "macos")]
+            forks: None,
         }
     }
 
     fn carries_tag(&self, pid: u32) -> bool {
         matches!(process::environ_read(pid, &self.key), EnvRead::Value(v) if v == self.value)
+    }
+
+    /// Whether `pid` is a member by its tag, and whether its environment
+    /// was withheld from the tag read (counted only for this server's uid).
+    #[cfg(not(target_os = "macos"))]
+    fn classify(&self, pid: u32, my_uid: u32) -> Seen {
+        let read = process::environ_read(pid, &self.key);
+        Seen {
+            tagged: matches!(&read, EnvRead::Value(v) if *v == self.value),
+            withheld: read == EnvRead::Withheld && process::real_uid(pid) == Some(my_uid),
+        }
+    }
+
+    /// macOS: the same for a process of this server's uid; another user's
+    /// process is never a member, and its environment is never read.
+    #[cfg(target_os = "macos")]
+    fn classify(&self, pid: u32, my_uid: u32) -> Seen {
+        if !crate::darwin::bsdinfo(pid).is_ok_and(|info| info.pbi_ruid == my_uid) {
+            return Seen::default();
+        }
+        let read = process::environ_read(pid, &self.key);
+        Seen {
+            tagged: matches!(&read, EnvRead::Value(v) if *v == self.value),
+            withheld: read == EnvRead::Withheld,
+        }
+    }
+
+    /// Whether the incarnation `(pid, start)` is followed by the unit's
+    /// kernel-tracked membership (macOS: its fork tracker).
+    fn kernel_tracked(&self, pid: u32, start: u64) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.forks.as_ref().is_some_and(|f| f.tracks(pid, start))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (pid, start);
+            false
+        }
+    }
+
+    /// The live processes the kernel-tracked membership follows.
+    fn kernel_tracked_pids(&self) -> Vec<u32> {
+        #[cfg(target_os = "macos")]
+        {
+            self.forks
+                .iter()
+                .flat_map(|f| f.tracked())
+                .map(|(pid, _)| pid)
+                .collect()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Vec::new()
+        }
     }
 
     /// One reading of the unit. `count_withheld` also counts the same-uid
@@ -153,18 +246,14 @@ impl TagUnit {
             if pid == me {
                 continue;
             }
-            match process::environ_read(pid, &self.key) {
-                EnvRead::Value(v) if v == self.value => {
-                    candidates.insert(pid);
-                }
-                EnvRead::Value(_) | EnvRead::Absent => {}
-                // Neither tagged nor untagged: such a process is a member
-                // only through the roots (and their descendants).
-                EnvRead::Withheld => {
-                    if count_withheld && process::real_uid(pid) == Some(my_uid) {
-                        withheld += 1;
-                    }
-                }
+            let seen = self.classify(pid, my_uid);
+            if seen.tagged {
+                candidates.insert(pid);
+            }
+            // A withheld environment is neither tagged nor untagged: such a
+            // process is a member only through the other routes.
+            if seen.withheld && count_withheld {
+                withheld += 1;
             }
         }
         candidates.extend(
@@ -172,6 +261,11 @@ impl TagUnit {
                 .iter()
                 .filter(|(pid, start)| *pid != me && is_live_root(*pid, *start))
                 .map(|(pid, _)| *pid),
+        );
+        candidates.extend(
+            self.kernel_tracked_pids()
+                .into_iter()
+                .filter(|pid| *pid != me),
         );
         let mut candidates = with_descendants(candidates, me);
         // A zombie can be neither signalled nor a parent any more.
@@ -194,8 +288,10 @@ impl TagUnit {
             },
             |watch, candidates| {
                 let pid = watch.pid();
+                let start = watch.identity().start;
                 self.carries_tag(pid)
-                    || roots.contains(&(pid, watch.identity().start))
+                    || roots.contains(&(pid, start))
+                    || self.kernel_tracked(pid, start)
                     || process::parent(pid).is_some_and(|pp| candidates.contains(&pp))
             },
         )?;
@@ -249,7 +345,9 @@ impl UnitBackend for TagUnit {
                 .iter()
                 .any(|(root, start)| *root == pid && is_live_root(pid, *start))
         };
-        if self.carries_tag(pid) || is_root(pid) {
+        let tracked =
+            || process::start_time(pid).is_ok_and(|start| self.kernel_tracked(pid, start));
+        if self.carries_tag(pid) || is_root(pid) || tracked() {
             return Ok(());
         }
         let mut at = pid;
@@ -277,6 +375,35 @@ impl UnitBackend for TagUnit {
     fn remove(&self, _emptied: bool) -> io::Result<()> {
         Ok(())
     }
+
+    /// macOS: the fork tracker records each process it follows as a root.
+    fn set_observer(&self, observer: Arc<dyn super::UnitObserver>) {
+        #[cfg(target_os = "macos")]
+        if let Some(forks) = &self.forks {
+            forks.set_observer(observer);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = observer;
+    }
+
+    /// macOS: a root the unit pinned is followed by the fork tracker (a
+    /// root that has exited is not: what it started was followed while it
+    /// ran, and recorded).
+    fn root_pinned(&self, pid: u32, start: u64) {
+        #[cfg(target_os = "macos")]
+        if let Some(forks) = &self.forks {
+            forks.track_root(pid, start);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (pid, start);
+    }
+}
+
+/// What one scan learned about one process.
+#[derive(Debug, Default)]
+struct Seen {
+    tagged: bool,
+    withheld: bool,
 }
 
 /// Whether `pid` is running and is still the incarnation that started at
@@ -674,7 +801,7 @@ sleep 600;"#,
 
     fn fresh_unit() -> TagUnit {
         let id = UnitId::mint();
-        TagUnit::new(UNIT_ENV, id.as_str(), &id, None)
+        TagUnit::new(UNIT_ENV, id.as_str(), &id, None).unwrap()
     }
 
     /// A root whose pid now names another process (the root exited and its
