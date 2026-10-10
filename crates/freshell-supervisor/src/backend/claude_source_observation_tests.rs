@@ -879,7 +879,7 @@ async fn qualify_transport(mode: &'static str) {
     assert_eq!(
         result.is_ok(),
         mode == "success" || matches!(mode, "retained-success" | "retained-terminal-success"),
-        "{mode}: unavailable, contradictory or unjoined evidence cannot be accepted"
+        "{mode}: unavailable, contradictory or unjoined evidence cannot be accepted: {result:?}"
     );
     if let Ok(reply) = result {
         let raw = freshell_runtime_protocol::bounded_json_bytes(

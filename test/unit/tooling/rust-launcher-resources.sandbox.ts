@@ -22,14 +22,18 @@ it('removes its temporary artifacts when an interrupted child ignores terminatio
   })
   const joined = new Promise(resolve => child.once('close', resolve))
   let ownedTmp: string | undefined
+  let ownedExecutableTmp: string | undefined
   try {
     await expect.poll(() => existsSync(marker), { timeout: 5_000 }).toBe(true)
     const running = JSON.parse(readFileSync(marker, 'utf8'))
     ownedTmp = running.tmp
-    console.info(JSON.stringify({ severity: 'info', event: 'rust_interruption_fixture_started', pid: child.pid, childPid: running.pid, temporaryDirectory: ownedTmp }))
+    ownedExecutableTmp = running.executableTmp
+    console.info(JSON.stringify({ severity: 'info', event: 'rust_interruption_fixture_started', pid: child.pid, childPid: running.pid, temporaryDirectory: ownedTmp, executableTemporaryDirectory: ownedExecutableTmp }))
     expect(existsSync(running.tmp)).toBe(true)
+    expect(existsSync(running.executableTmp)).toBe(true)
     child.kill('SIGTERM')
     await expect.poll(() => existsSync(running.tmp), { timeout: 2_000 }).toBe(false)
+    await expect.poll(() => existsSync(running.executableTmp), { timeout: 2_000 }).toBe(false)
     expect(readFileSync(sentinel, 'utf8')).toBe('keep')
   } finally {
     // This regression lives only in the disposable PID namespace. It owns
@@ -42,6 +46,7 @@ it('removes its temporary artifacts when an interrupted child ignores terminatio
     }
     await joined
     if (ownedTmp) rmSync(ownedTmp, { recursive: true, force: true })
+    if (ownedExecutableTmp) rmSync(ownedExecutableTmp, { recursive: true, force: true })
     f.cleanup()
   }
 })
@@ -95,4 +100,60 @@ fn case_${index}() {
     expect(result.status, result.stderr + result.stdout).toBe(0)
     expect(result.stdout).toContain('12 passed; 0 failed; 0 ignored')
   } finally { f.cleanup() }
+})
+
+function assertRustProbe(sourceText: string, env: NodeJS.ProcessEnv = {}): void {
+  const f = fixture()
+  try {
+    const source = path.join(f.artifacts, 'probe.rs')
+    const binary = path.join(f.artifacts, 'probe')
+    writeFileSync(source, sourceText)
+    const build = spawnSync('rustc', [source, '-o', binary], { encoding: 'utf8', timeout: 30_000 })
+    expect(build.status, build.stderr).toBe(0)
+    const result = f.run({ FRESHELL_RUST_TEST_SANDBOX: '1', RUNTIME_PROBE: binary, ...env })
+    expect(result.status, result.stderr + result.stdout).toBe(0)
+  } finally { f.cleanup() }
+}
+
+it('exchanges native-auth and incarnation socket messages', () => {
+  assertRustProbe(`use std::{io::{Read, Write}, os::unix::net::{UnixListener, UnixStream}, path::Path};
+fn exchange(path: &Path) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let listener = UnixListener::bind(path).unwrap();
+    let mut client = UnixStream::connect(path).unwrap();
+    client.write_all(b"private-ipc").unwrap();
+    let (mut server, _) = listener.accept().unwrap();
+    let mut message = [0; 11];
+    server.read_exact(&mut message).unwrap();
+    assert_eq!(&message, b"private-ipc");
+    std::fs::remove_file(path).unwrap();
+}
+fn main() {
+    let root = std::env::temp_dir();
+    let uuid = "00000000-0000-0000-0000-000000000000";
+    exchange(&root.join(format!("freshell-inputs-{uuid}/reply.sock")));
+    exchange(&root.join(format!(".tmpXXXXXX/runtime/incarnation-{uuid}/host.sock")));
+}
+`)
+})
+
+it.each(['native', 'script'])('executes ordinary temporary %s fixtures', kind => {
+  assertRustProbe(`use std::{os::unix::fs::PermissionsExt, process::Command};
+fn main() {
+    if std::env::args().nth(1).as_deref() == Some("copied") { return; }
+    let root = std::env::temp_dir();
+    if std::env::var("EXECUTION_KIND").unwrap() == "native" {
+        let executable = root.join("copied-native");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        assert!(Command::new(executable).arg("copied").status().unwrap().success());
+    } else {
+        let script = root.join("fixture.sh");
+        std::fs::write(&script, "#!/bin/sh\\nprintf ordinary-script").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let result = Command::new(script).output().unwrap();
+        assert!(result.status.success());
+        assert_eq!(result.stdout, b"ordinary-script");
+    }
+}
+`, { EXECUTION_KIND: kind })
 })

@@ -57,9 +57,8 @@ describe('Rust test launcher children', () => {
       expect(result.events[1].jobs).toBe('3')
       expect(result.events[2].args).toEqual(['test', '--workspace', '--locked', ...args.slice(1)])
       expect(result.events[2].binary).toBe(path.join(f.root, 'target/debug/freshell-server'))
-      expect(result.events[2].tmp).toBe(result.events[2].executableTmp)
-      expect(result.events[2].tmp).toMatch(new RegExp(`^${f.artifacts}/\\.freshell-rust-tests-[^/]+$`))
       expect(existsSync(result.events[2].tmp)).toBe(false)
+      expect(existsSync(result.events[2].executableTmp)).toBe(false)
     } finally { f.cleanup() }
   })
 
@@ -82,6 +81,7 @@ describe('Rust test launcher children', () => {
       expect(readFileSync(sentinel, 'utf8')).toBe('keep')
       expect(result.events[2].tmp).toBeTruthy()
       expect(existsSync(result.events[2].tmp)).toBe(false)
+      expect(existsSync(result.events[2].executableTmp)).toBe(false)
     } finally { f.cleanup() }
   })
 })

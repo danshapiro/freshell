@@ -15,6 +15,9 @@ export function fixture() {
   mkdirSync(path.join(root, 'target'))
   mkdirSync(path.join(root, 'bin'))
   const artifacts = mkdtempSync(path.join(temporaryRoot, 'rust-artifacts-'))
+  const runtimeTemplate = process.env.FRESHELL_SANDBOX_MODE === 'runtime-suite'
+    ? '/freshell-test-artifacts/XXX'
+    : path.join(os.tmpdir(), 'XXX')
   copyFileSync(launcher, path.join(root, 'scripts/testing/run-rust-tests.ts'))
   writeFileSync(path.join(root, 'package.json'), '{"type":"module"}')
   symlinkSync(path.resolve('node_modules'), path.join(root, 'node_modules'), 'dir')
@@ -35,7 +38,7 @@ export function fixture() {
     }
     if (args[0] === 'test' && process.env.COMMONJS_PROBE) {
       const cp = await import('node:child_process');
-      const file = process.env.TMPDIR+'/fixture.js';
+      const file = process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR+'/fixture.js';
       fs.writeFileSync(file, "const fs = require('node:fs'); fs.writeFileSync(process.env.COMMONJS_PROBE, 'executed');");
       const result = cp.spawnSync(process.execPath, [file], {env:process.env, stdio:'inherit'});
       process.exit(result.status ?? 1);
@@ -45,7 +48,8 @@ export function fixture() {
       tmp:process.env.TMPDIR, executableTmp:process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR})+'\\n');
     if (args[0] === 'test' && process.env.HOLD_TEST) {
       process.on('SIGTERM', () => {});
-      fs.writeFileSync(process.env.HOLD_TEST, JSON.stringify({pid:process.pid, tmp:process.env.TMPDIR}));
+      fs.writeFileSync(process.env.HOLD_TEST, JSON.stringify({pid:process.pid, tmp:process.env.TMPDIR,
+        executableTmp:process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR}));
       setInterval(() => {}, 10000);
       await new Promise(() => {});
     }
@@ -58,7 +62,8 @@ export function fixture() {
     fs.appendFileSync(process.env.RECEIPT, JSON.stringify({kind:'sandbox', args})+'\\n');
     if (process.env.SANDBOX_EXIT) process.exit(Number(process.env.SANDBOX_EXIT));
     const command = args[1]
-      .replaceAll('/freshell-test-artifacts', ${JSON.stringify(artifacts)})
+      .replace('mktemp -d /freshell-test-artifacts/.freshell-rust-tests-', 'mktemp -d ' + ${JSON.stringify(artifacts)} + '/.freshell-rust-tests-')
+      .replace('mktemp -d /freshell-test-artifacts/XXX', 'mktemp -d ' + ${JSON.stringify(runtimeTemplate)})
       .replace('mktemp -d /workspace/target/', 'mktemp -d ' + ${JSON.stringify(root)} + '/target/')
       .replace('node --import tsx /workspace/scripts/testing/run-rust-tests.ts', 'node --import tsx ' + ${JSON.stringify(root)} + '/scripts/testing/run-rust-tests.ts');
     const result = cp.spawnSync('bash', ['-c', command], {env:process.env, stdio:'inherit'});

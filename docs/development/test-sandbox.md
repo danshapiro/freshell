@@ -53,13 +53,15 @@ FRESHELL_RUST_TEST_SANDBOX=1 pnpm run test:rust <filter> -- --exact
 Only the exact value `1` enables routing; other test backend settings do not.
 The Rust launcher runs its unchanged locked server build and workspace tests
 inside the strict sandbox, selects the container's server binary, and gives
-both temporary-directory variables a newly owned executable directory under
-the sandbox Cargo target volume's `/freshell-test-artifacts` alias, outside
-the checkout's Node package lookup scope. Cargo uses three parallel build jobs;
+ordinary temporary files a short owned directory under `/freshell-test-artifacts`
+so nested Unix socket paths fit the operating system's limit and temporary
+executables can run. Explicit executable fixtures use a separate
+owned directory under the sandbox Cargo target volume's `/freshell-test-artifacts`
+alias, outside the checkout's Node package lookup scope. Cargo uses three parallel build jobs;
 libtest runs four cases at once and default Tokio runtimes use two workers
 within the existing container resource limits. Explicit test worker counts
 and the complete test workload remain unchanged. The launcher logs its owned
-temporary directory and removes it on exit or before awaiting an interrupted
+temporary directories and removes both on exit or before awaiting an interrupted
 child that might ignore termination. Sandbox,
 dependency, and inner-runner failures return failure without host Cargo fallback.
 The same exact opt-in routes the source-runtime process suite through the strict
