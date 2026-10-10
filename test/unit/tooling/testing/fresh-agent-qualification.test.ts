@@ -1,3 +1,6 @@
+// @vitest-environment node
+import { createHash } from 'node:crypto'
+import { DatabaseSync } from 'node:sqlite'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -52,8 +55,9 @@ function row(mode: FreshAgentQualificationRow['mode'] = 'freshclaude'): FreshAge
     nativeSessionId: `native-${mode}`,
     providerStoreId: `store-${mode}`,
     completedNativeTurns: [
-      { turnId: `turn-${mode}-1`, assistantMessageId: `assistant-${mode}-1`, completionKind: 'provider_native_completed' },
-      { turnId: `turn-${mode}-2`, assistantMessageId: `assistant-${mode}-2`, completionKind: 'provider_native_completed' },
+      { turnId: `${mode === 'freshopencode' ? 'assistant' : 'turn'}-${mode}-1`, assistantMessageId: `assistant-${mode}-1`, completionKind: 'provider_native_completed' },
+      { turnId: `${mode === 'freshopencode' ? 'assistant' : 'turn'}-${mode}-2`, assistantMessageId: `assistant-${mode}-2`, completionKind: 'provider_native_completed' },
+      { turnId: `${mode === 'freshopencode' ? 'assistant' : 'turn'}-${mode}-3`, assistantMessageId: `assistant-${mode}-3`, completionKind: 'provider_native_completed' },
     ],
     noToolRecall: true,
     crashes: {
@@ -133,6 +137,47 @@ function fixture(
     errors: [],
     unsafeBrokerAttempts: [],
   }))
+  const original = (name: string, value: unknown) => {
+    const filename = path.join(evidenceDir, name); fs.mkdirSync(path.dirname(filename), { recursive: true })
+    fs.writeFileSync(filename, typeof value === 'string' ? value : JSON.stringify({ execution: { candidateSha, runId: receiptRunId, runtimeImage }, ...value as Record<string, unknown> }), { mode: 0o600 })
+    return { path: name, sha256: createHash('sha256').update(fs.readFileSync(filename)).digest('hex') }
+  }
+  const conversations = rows.map((currentRow, rowIndex) => {
+    const nonce = `owned-memory-${currentRow.mode}-1234567890`, nativeSessionId = currentRow.nativeSessionId || 'invalid-root'
+    const nativeRows: unknown[] = []
+    const stages = ['initial', 'after_session_host_crash', 'after_provider_process_crash'].map((stage, index) => {
+      const base = 1_780_000_000_000 + index * 10_000, prompt = index ? 'Recall the saved marker. Do not use tools.' : `Remember ${nonce}. Reply stored. Do not use tools.`
+      const turnId = `turn-${currentRow.mode}-${index + 1}`, messageId = `assistant-${currentRow.mode}-${index + 1}`, userId = `user-${index}`
+      const response = index ? nonce : 'stored', prefix = `originals-${rowIndex}/stage-${index}`
+      let nativeFile: { path: string; sha256: string }
+      if (currentRow.provider === 'opencode') {
+        const filename = path.join(evidenceDir, prefix, 'opencode.db'); fs.mkdirSync(path.dirname(filename), { recursive: true })
+        const db = new DatabaseSync(filename)
+        db.exec('CREATE TABLE session(id TEXT PRIMARY KEY); CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE part(id TEXT PRIMARY KEY,session_id TEXT,message_id TEXT,time_created INTEGER,data TEXT);')
+        db.prepare('INSERT INTO session VALUES (?)').run(nativeSessionId)
+        nativeRows.push({ id: userId, at: base + 2_000, data: { role: 'user' }, text: prompt }, { id: messageId, at: base + 3_000, data: { role: 'assistant', parentID: userId, providerID: 'opencode', modelID: 'big-pickle', time: { completed: base + 3_000 } }, text: response })
+        for (const value of nativeRows as any[]) {
+          db.prepare('INSERT INTO message VALUES (?,?,?,?)').run(value.id, nativeSessionId, value.at, JSON.stringify(value.data))
+          db.prepare('INSERT INTO part VALUES (?,?,?,?,?)').run('part-' + value.id, nativeSessionId, value.id, value.at, JSON.stringify({ type: 'text', text: value.text }))
+        }
+        db.close(); nativeFile = { path: `${prefix}/opencode.db`, sha256: createHash('sha256').update(fs.readFileSync(filename)).digest('hex') }
+      } else {
+        if (currentRow.provider === 'codex') nativeRows.push({ type: 'turn_context', payload: { turn_id: turnId, model: 'gpt-5.6-luna', effort: 'low' } }, { type: 'event_msg', payload: { type: 'user_message', message: prompt } }, { type: 'response_item', payload: { type: 'message', role: 'assistant', id: messageId, content: [{ type: 'output_text', text: response }] } }, { type: 'event_msg', timestamp: new Date(base + 3_000).toISOString(), payload: { type: 'task_complete', turn_id: turnId, last_agent_message: response } })
+        else nativeRows.push({ type: 'user', uuid: userId, sessionId: nativeSessionId, message: { role: 'user', content: prompt } }, { type: 'assistant', uuid: messageId, parentUuid: userId, sessionId: nativeSessionId, timestamp: new Date(base + 3_000).toISOString(), effort: 'low', message: { id: turnId, role: 'assistant', model: 'claude-haiku-4-5-20251001', stop_reason: 'end_turn', content: [{ type: 'text', text: response }] } })
+        const sourceRows = currentRow.provider === 'codex' ? [{ type: 'session_meta', payload: { id: nativeSessionId, model_provider: 'openai' } }, ...nativeRows] : nativeRows
+        nativeFile = original(`${prefix}/${currentRow.provider === 'codex' ? 'rollout-' : ''}${nativeSessionId}.jsonl`, sourceRows.map(value => JSON.stringify(value)).join('\n') + '\n')
+      }
+      const launch = original(`${prefix}/launch.json`, { capturedAt: base + 1_000, response: { data: { view: { soulId: currentRow.soulId, providerStoreId: currentRow.providerStoreId, nativeSessionId, incarnationId: `inc-${index}`, containerId: `container-${index}`, executionGeneration: index + 1, launchState: 'running', recoveryState: 'live', nativeIdentityObservation: { nativeSessionId, incarnationId: `inc-${index}`, launchNonce: `launch-${index}`, evidenceRevision: index, evidenceDigest: 'c'.repeat(64) } } } } })
+      const request = original(`${prefix}/request.json`, { requestId: `request-${index}`, sentAt: base + 2_000, request: { method: 'fresh_agent_send', params: { soulId: currentRow.soulId, text: prompt } }, reply: { data: {} } })
+      const crash = index ? original(`${prefix}/crash.json`, { kind: index === 1 ? 'session_host_exit' : 'provider_process_exit', containerId: `container-${index - 1}`, incarnationId: `inc-${index - 1}`, requestedAt: base - 2_000, exitedAt: base - 1_000 }) : undefined
+      const namespace = original(`${prefix}/namespace.json`, { uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true, httpsStatus: 200, tlsVerifyMode: 2, tlsCheckHostname: true, nativeRoot: nativeSessionId, nativeCwd: '/owned/workspace', executableSha256: 'd'.repeat(64), profileSha256: 'e'.repeat(64) })
+      const bytes = fs.readFileSync(path.join(evidenceDir, nativeFile.path))
+      const store = original(`${prefix}/store.json`, { containerId: `container-${index}`, providerVolumeName: 'owned-volume', snapshot: { path: '/owned/native-store', identity: ['1', '2'], completeEof: true, bytesBase64: bytes.toString('base64'), sha256: createHash('sha256').update(bytes).digest('hex') } })
+      return { stage, launch, request, nativeFile, namespace, store, ...(crash ? { crash } : {}) }
+    })
+    return { mode: currentRow.mode, provider: currentRow.provider, soulId: currentRow.soulId, providerStoreId: currentRow.providerStoreId, nativeSessionId, nonce, stages }
+  })
+  original('native-recovery-originals.json', { schemaVersion: 1, candidateSha, runId: receiptRunId, runtimeImage, selected: rows.map(current => current.mode), conversations })
   const receipt = buildFreshAgentQualificationReceipt({
     repoRoot,
     evidenceDir,
