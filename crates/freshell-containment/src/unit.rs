@@ -1063,23 +1063,27 @@ impl AgentUnit {
     }
 
     /// macOS: a process that has begun exiting no longer shows its
-    /// descriptors, though they (and its lock) may still be open, and a
-    /// watch opened on it then proves nothing until it is a zombie. So a
-    /// member lock holder is confirmed released only through an exit watch
+    /// descriptors, though they (and its lock) may still be open. So a
+    /// member lock holder is confirmed released through an exit watch
     /// registered before its exit (the pinned roots and the snapshot taken
     /// before the soft signal; Codex's holder is normally its native main,
     /// a pinned root), awaited also for such members whose descriptors can
-    /// no longer be read. A holder found after the kill with no such watch
-    /// is killed, and its lock file's unlock (`NOTE_FUNLOCK`, registered
-    /// before the scan that found it) is awaited. Then the holders are
-    /// checked once more.
+    /// no longer be read. An unreadable member with no such watch gets one
+    /// now, which proves its exit only from the zombie or reaped state
+    /// (never while it may still hold the lock), and is awaited too. A
+    /// holder found after the kill with no such watch is killed, and its
+    /// lock file's unlock (`NOTE_FUNLOCK`, registered before the scan that
+    /// found it) is awaited. Then the holders are checked once more.
     #[cfg(target_os = "macos")]
     async fn check_locks(&self, snapshot: &[ProcWatch]) -> io::Result<bool> {
         let paths = lock(&self.inner.lock_paths).clone();
         if paths.is_empty() {
             return Ok(true);
         }
-        let unlocks = locks::UnlockEvents::watch(&paths)?;
+        let unlocks = {
+            let paths = paths.clone();
+            blocking(move || locks::UnlockEvents::watch(&paths)).await??
+        };
         let mut watched = self.pinned_watches();
         watched.extend(snapshot.iter().cloned());
         let watch_of = |who: &ProcIdentity| {
@@ -1108,9 +1112,28 @@ impl AgentUnit {
                 }
             }
         }
-        awaited.extend(scan.unreadable.iter().filter_map(watch_of));
+        for who in &scan.unreadable {
+            match watch_of(who) {
+                Some(watch) => awaited.push(watch),
+                None => match ProcWatch::open_expecting(who.pid, who.start) {
+                    Ok(watch) => awaited.push(watch),
+                    // Reaped (or its pid names a later process): its
+                    // descriptors are closed.
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err),
+                },
+            }
+        }
+        {
+            let (awaited, paths) = (awaited.clone(), paths.clone());
+            blocking(move || {
+                for watch in &awaited {
+                    watch.watch_lock_paths(&paths);
+                }
+            })
+            .await?;
+        }
         for watch in &awaited {
-            watch.watch_lock_paths(&paths);
             let _ = watch.signal(Sig::Kill);
             watch.exited().await?;
         }
