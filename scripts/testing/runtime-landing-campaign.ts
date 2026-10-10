@@ -20,6 +20,8 @@ import {
   resolveCampaignOutcome,
   validateGateSummary,
   validateProducerEvidence,
+  validateProductionCampaignCoverage,
+  type CompletedCampaignStep,
   type CampaignGateExpectation,
   type CampaignStepDescriptor,
 } from './runtime-campaign-policy.js'
@@ -48,7 +50,7 @@ type ProducerStep = CampaignStepDescriptor & {
   explicitLiveOnly?: boolean
   requiredLiveEnv?: string
   runner: ProducerRunner
-  run: (env: NodeJS.ProcessEnv, logPath: string) => Promise<number>
+  run: (env: NodeJS.ProcessEnv, logPath: string, execute: typeof runLogged) => Promise<number>
 }
 
 type GateStep = CampaignStepDescriptor & {
@@ -79,6 +81,9 @@ type ReceiptProvenance = {
 }
 
 type StepResult = {
+  kind: 'producer' | 'gate'
+  runner?: ProducerRunner
+  logDigest: string
   id: string
   title: string
   outcome: 'PASS' | 'BLOCKED' | 'FAIL'
@@ -92,6 +97,7 @@ type StepResult = {
   gate?: {
     expected: CampaignGateExpectation
     summaryPath: string
+    digestSha256: string
     runId: string
     status?: unknown
     blockedReason?: unknown
@@ -99,7 +105,7 @@ type StepResult = {
 }
 
 export function playwright(spec: string, extraEnv: Record<string, string>, execute = runLogged) {
-  return (env: NodeJS.ProcessEnv, logPath: string): Promise<number> => execute(
+  return (env: NodeJS.ProcessEnv, logPath: string, childExecute = execute): Promise<number> => childExecute(
     'pnpm',
     ['exec', 'tsx', 'scripts/testing/runtime-external-browser.ts', '--spec', spec],
     { ...env, ...extraEnv },
@@ -124,7 +130,7 @@ const STEPS: Step[] = [
     title: 'Deterministic direct and managed provider parity',
     produces: ['FRESHELL_RUNTIME_PROVIDER_PARITY_LOCAL_RECEIPT'],
     runner: 'receipt',
-    run: (env: NodeJS.ProcessEnv, logPath: string) => runLogged(
+    run: (env: NodeJS.ProcessEnv, logPath: string, execute: typeof runLogged) => execute(
       mise,
       ['exec', 'node@22', '--', 'node_modules/.bin/tsx', 'scripts/testing/run-provider-parity-local.ts'],
       env,
@@ -219,7 +225,7 @@ const STEPS: Step[] = [
     title: '>=30 minute, >=50 soul CPU/memory/PID pressure soak',
     produces: ['FRESHELL_RUNTIME_PHASE5_SOAK_RECEIPT'],
     runner: 'receipt',
-    run: (env: NodeJS.ProcessEnv, logPath: string) => runLogged(
+    run: (env: NodeJS.ProcessEnv, logPath: string, execute: typeof runLogged) => execute(
       mise,
       ['exec', 'node@22', '--', 'node_modules/.bin/tsx', 'scripts/testing/runtime-phase5-soak.ts'],
       env,
@@ -258,7 +264,7 @@ const STEPS: Step[] = [
 async function runLogged(command: string, args: string[], env: NodeJS.ProcessEnv, logPath: string): Promise<number> {
   fs.mkdirSync(path.dirname(logPath), { recursive: true })
   const header = Buffer.from(`startedAt=${new Date().toISOString()}\ncommand=${JSON.stringify([command, ...args])}\n`)
-  const descriptor = fs.openSync(logPath, 'wx')
+  const descriptor = fs.openSync(logPath, 'wx', 0o600)
   let written = 0
   let truncated = false
   const write = (chunk: Buffer | string) => {
@@ -355,8 +361,8 @@ function receiptSnapshot(file: string): ReceiptSnapshot {
   }
 }
 
-function relativeEvidencePath(target: string): string {
-  const relative = path.relative(repoRoot, target)
+function relativeEvidencePath(target: string, root = repoRoot): string {
+  const relative = path.relative(root, target)
   if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
     throw new Error(`evidence escaped repository root: ${target}`)
   }
@@ -370,7 +376,7 @@ function currentReceiptTargets(step: ProducerStep, campaignRoot: string): Record
   ]))
 }
 
-function verifiedPriorReceipts(candidateSha: string, campaignsRoot: string): Record<string, ReceiptProvenance> {
+function verifiedPriorReceipts(candidateSha: string, campaignsRoot: string, root = repoRoot): Record<string, ReceiptProvenance> {
   if (!fs.existsSync(campaignsRoot)) return {}
   const manifests = fs.readdirSync(campaignsRoot, { withFileTypes: true })
     .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
@@ -385,7 +391,7 @@ function verifiedPriorReceipts(candidateSha: string, campaignsRoot: string): Rec
       || !['PASS', 'PARTIAL'].includes(manifest.status)) continue
     for (const [envName, provenance] of Object.entries(manifest.receipts ?? {}) as Array<[string, ReceiptProvenance]>) {
       if (found[envName] || provenance.candidateSha !== candidateSha || provenance.campaignRunId !== manifest.runId) continue
-      const absolute = path.resolve(repoRoot, provenance.path)
+      const absolute = path.resolve(root, provenance.path)
       const allowedRoot = `${path.resolve(campaignsRoot)}${path.sep}`
       if (!absolute.startsWith(allowedRoot)) continue
       const snapshot = receiptSnapshot(absolute)
@@ -402,7 +408,7 @@ function writeCampaign(campaignRoot: string, campaign: unknown): void {
   fs.mkdirSync(campaignRoot, { recursive: true })
   const target = path.join(campaignRoot, 'campaign.json')
   if (fs.existsSync(target)) throw new Error(`refusing to overwrite campaign evidence: ${target}`)
-  fs.writeFileSync(target, JSON.stringify(campaign, null, 2))
+  fs.writeFileSync(target, JSON.stringify(campaign, null, 2), { mode: 0o600 })
 }
 
 function blockedPreflight(
@@ -433,16 +439,29 @@ function blockedPreflight(
     productionApproval: false,
   }
   writeCampaign(campaignRoot, campaign)
-  console.error(`BLOCKED: ${reason}`)
+  console.error(JSON.stringify({ severity: 'warn', event: 'runtime_campaign_preflight_refused', runId, candidateSha: candidate.sha, reason }))
   console.error(JSON.stringify(campaign, null, 2))
   return 2
 }
 
-async function main(): Promise<number> {
+export type CampaignRunnerOptions = {
+  repoRoot?: string
+  environment?: NodeJS.ProcessEnv
+  captureCandidate?: typeof captureRuntimeCandidate
+  execute?: typeof runLogged
+}
+
+/** The CLI and focused integration tests share the same filesystem/child loop. */
+export async function runCampaign(args: readonly string[], options: CampaignRunnerOptions = {}): Promise<number> {
+  const root = options.repoRoot ?? repoRoot
+  const environment = options.environment ?? process.env
+  const captureCandidate = options.captureCandidate ?? captureRuntimeCandidate
+  const execute = options.execute ?? runLogged
+  const evidencePath = (target: string) => relativeEvidencePath(target, root)
   const startedAt = new Date().toISOString()
   let parsed
   try {
-    parsed = parseCampaignArguments(process.argv.slice(2), STEPS)
+    parsed = parseCampaignArguments(args, STEPS)
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error))
     console.error(`valid step ids: ${STEPS.map((step) => step.id).join(', ')}`)
@@ -453,13 +472,13 @@ async function main(): Promise<number> {
     return 0
   }
 
-  const selectedSteps = parsed.only === null
-    ? STEPS.filter((step) => step.kind !== 'producer' || !step.explicitLiveOnly)
-    : parsed.only.map((id) => STEPS.find((step) => step.id === id)!)
-  const candidateBefore = captureRuntimeCandidate(repoRoot)
+  const selectedSteps = parsed.scope === 'production' ? STEPS
+    : parsed.only === null ? STEPS.filter((step) => step.kind !== 'producer' || !step.explicitLiveOnly)
+      : parsed.only.map((id) => STEPS.find((step) => step.id === id)!)
+  const candidateBefore = captureCandidate(root)
   const candidateSha = candidateBefore.sha
   const runId = randomUUID()
-  const campaignsRoot = path.join(repoRoot, '.runtime-evidence', candidateSha, 'campaigns')
+  const campaignsRoot = path.join(root, '.runtime-evidence', candidateSha, 'campaigns')
   const campaignRoot = path.join(campaignsRoot, runId)
   const logDir = path.join(campaignRoot, 'logs')
   const unresolvedRoot = path.join(campaignRoot, 'unproduced')
@@ -485,21 +504,27 @@ async function main(): Promise<number> {
       'candidate contains tracked or untracked modifications; commit before qualification or use --allow-dirty for a non-qualifying rehearsal',
     )
   }
+  if (parsed.scope === 'production') {
+    const missing = STEPS.filter((step): step is ProducerStep => step.kind === 'producer' && Boolean(step.requiredLiveEnv))
+      .filter((step) => environment[step.requiredLiveEnv!] !== '1')
+    if (missing.length) return blockedPreflight(startedAt, runId, campaignRoot, candidateBefore, selectedSteps,
+      `production scope requires ${missing.map((step) => `${step.requiredLiveEnv}=1`).join(' and ')} before dispatch`)
+  }
   const dirtyRehearsal = candidateBefore.dirty
-  const prior = dirtyRehearsal ? {} : verifiedPriorReceipts(candidateSha, campaignsRoot)
+  const prior = dirtyRehearsal ? {} : verifiedPriorReceipts(candidateSha, campaignsRoot, root)
   const catalogue: Record<string, ReceiptProvenance> = { ...prior }
   const results: StepResult[] = []
 
   for (const step of selectedSteps) {
     const stepStartedAt = new Date().toISOString()
     const logPath = path.join(logDir, `${step.id}.log`)
-    console.log(`\n### ${step.id}: ${step.title}\nlog: ${relativeEvidencePath(logPath)}`)
-    const priorPaths = Object.fromEntries(Object.entries(catalogue).map(([name, row]) => [name, path.resolve(repoRoot, row.path)]))
+    console.log(`\n### ${step.id}: ${step.title}\nlog: ${evidencePath(logPath)}`)
+    const priorPaths = Object.fromEntries(Object.entries(catalogue).map(([name, row]) => [name, path.resolve(root, row.path)]))
 
     if (step.kind === 'producer') {
       const targets = currentReceiptTargets(step, campaignRoot)
       const before = Object.fromEntries(Object.entries(targets).map(([name, target]) => [name, receiptSnapshot(target)]))
-      const environment = buildReceiptEnvironment({
+      const receiptEnvironment = buildReceiptEnvironment({
         steps: STEPS,
         currentTargets: targets,
         priorReceipts: priorPaths,
@@ -507,23 +532,24 @@ async function main(): Promise<number> {
       })
       let exitCode = 2
       const failures: string[] = []
-      if (step.requiredLiveEnv && process.env[step.requiredLiveEnv] !== '1') {
+      if (step.requiredLiveEnv && environment[step.requiredLiveEnv] !== '1') {
         const message = `step ${step.id} requires ${step.requiredLiveEnv}=1; a skipped live qualification is never a pass`
         fs.mkdirSync(path.dirname(logPath), { recursive: true })
-        fs.writeFileSync(logPath, `${message}\n`)
+        fs.writeFileSync(logPath, `${message}\n`, { mode: 0o600 })
         failures.push(message)
       } else if (Object.values(before).some((snapshot) => snapshot.exists)) {
         failures.push('one or more isolated receipt targets already existed before the producer')
         fs.mkdirSync(path.dirname(logPath), { recursive: true })
-        fs.writeFileSync(logPath, `${failures[0]}\n`)
+        fs.writeFileSync(logPath, `${failures[0]}\n`, { mode: 0o600 })
         exitCode = 1
       } else {
-        exitCode = await step.run({ ...process.env, ...environment }, logPath)
+        exitCode = await step.run({ ...environment, ...receiptEnvironment }, logPath, execute)
       }
       const after = Object.fromEntries(Object.entries(targets).map(([name, target]) => [name, receiptSnapshot(target)]))
       failures.push(...validateProducerEvidence({
         candidateSha,
         runner: step.runner,
+        ...(step.runner === 'playwright' ? { execution: 'managed-external-browser' as const } : {}),
         log: readBoundedLog(logPath),
         receipts: step.produces.map((envName) => ({ envName, before: before[envName], after: after[envName] })),
       }))
@@ -533,7 +559,7 @@ async function main(): Promise<number> {
       if (outcome === 'PASS') {
         for (const [envName, target] of Object.entries(targets)) {
           const provenance: ReceiptProvenance = {
-            path: relativeEvidencePath(target),
+            path: evidencePath(target),
             digestSha256: after[envName].digestSha256!,
             candidateSha,
             campaignRunId: runId,
@@ -546,10 +572,13 @@ async function main(): Promise<number> {
       }
       results.push({
         id: step.id,
+        kind: 'producer',
+        runner: step.runner,
+        logDigest: createHash('sha256').update(fs.readFileSync(logPath)).digest('hex'),
         title: step.title,
         outcome,
         exitCode,
-        log: relativeEvidencePath(logPath),
+        log: evidencePath(logPath),
         startedAt: stepStartedAt,
         finishedAt: new Date().toISOString(),
         failures,
@@ -562,8 +591,8 @@ async function main(): Promise<number> {
 
     const expectation = step.expectation()
     const gateRunId = randomUUID()
-    const summaryPath = path.join(repoRoot, '.runtime-evidence', candidateSha, gateRunId, 'summary.json')
-    const environment = buildReceiptEnvironment({
+    const summaryPath = path.join(root, '.runtime-evidence', candidateSha, gateRunId, 'summary.json')
+    const receiptEnvironment = buildReceiptEnvironment({
       steps: STEPS,
       currentTargets: {},
       priorReceipts: priorPaths,
@@ -574,18 +603,19 @@ async function main(): Promise<number> {
     if (fs.existsSync(path.dirname(summaryPath))) {
       failures.push('isolated gate evidence target existed before this step')
       fs.mkdirSync(path.dirname(logPath), { recursive: true })
-      fs.writeFileSync(logPath, `${failures[0]}\n`)
+      fs.writeFileSync(logPath, `${failures[0]}\n`, { mode: 0o600 })
     } else {
       exitCode = await campaignGate(
         step.gateArgs,
         {
-          ...process.env,
           ...environment,
+          ...receiptEnvironment,
           FRESHELL_RUNTIME_GATE_RUN_ID: gateRunId,
           FRESHELL_RUNTIME_CAMPAIGN_RUN_ID: runId,
           FRESHELL_RUNTIME_CAMPAIGN_STEP_ID: step.id,
         },
         logPath,
+        execute,
       )
     }
     let summary: unknown
@@ -606,16 +636,19 @@ async function main(): Promise<number> {
     const outcome = failures.length === 0 ? 'PASS' : 'FAIL'
     results.push({
       id: step.id,
+      kind: 'gate',
+      logDigest: createHash('sha256').update(fs.readFileSync(logPath)).digest('hex'),
       title: step.title,
       outcome,
       exitCode,
-      log: relativeEvidencePath(logPath),
+      log: evidencePath(logPath),
       startedAt: stepStartedAt,
       finishedAt: new Date().toISOString(),
       failures,
       gate: {
         expected: expectation,
-        summaryPath: relativeEvidencePath(summaryPath),
+        summaryPath: evidencePath(summaryPath),
+        digestSha256: receiptSnapshot(summaryPath).digestSha256 ?? '',
         runId: gateRunId,
         status: (summary as any)?.status,
         blockedReason: (summary as any)?.blockedReason,
@@ -627,7 +660,7 @@ async function main(): Promise<number> {
   let candidateAfter: RuntimeCandidate | null = null
   let integrityFailures: string[]
   try {
-    candidateAfter = captureRuntimeCandidate(repoRoot)
+    candidateAfter = captureCandidate(root)
     integrityFailures = candidateIntegrityFailures(candidateSha, candidateBefore, candidateAfter)
   } catch (error) {
     integrityFailures = [`could not capture the final candidate: ${error instanceof Error ? error.message : String(error)}`]
@@ -636,8 +669,26 @@ async function main(): Promise<number> {
   const candidateOk = integrityFailures.length === 0
   const productionGatePassed = results.some((step) => step.id === 'production-gate'
     && step.outcome === 'PASS' && step.gate?.status === 'PASS')
+  const gateOriginal = results.find(step => step.id === 'production-gate')?.gate
+  const gateSummary = gateOriginal ? receiptSnapshot(path.join(root, gateOriginal.summaryPath)).value as any : undefined
+  let browserImage = ''
+  for (const step of results) {
+    if (step.runner !== 'playwright') continue
+    try {
+      const event = JSON.parse(readBoundedLog(path.join(root, step.log)).split(/\r?\n/).find(line => line.includes('managed_external_browser_passed'))!)
+      browserImage = event.originals?.[0]?.browserImage ?? ''
+      if (browserImage) break
+    } catch { /* Missing originals are reported by coverage, never inferred. */ }
+  }
+  const coverage = parsed.scope === 'production' ? validateProductionCampaignCoverage({
+    selectedIds: selectedSteps.map(step => step.id), completedSteps: results as CompletedCampaignStep[],
+    originals: { repoRoot: root, campaignRunId: runId }, candidate: { before: candidateBefore, after: candidateAfter },
+    images: { runtimeImage: gateSummary?.imageRef ?? '', browserImage },
+  }) : null
+  if (coverage && !coverage.complete) console.error(JSON.stringify({ severity: 'warn', event: 'runtime_campaign_readiness_refused', runId, candidateSha, failures: coverage.failures }))
   const outcome = resolveCampaignOutcome({
-    full: parsed.only === null,
+    full: parsed.scope === 'production' && coverage?.complete === true,
+    coverageFailures: coverage?.failures,
     dirtyRehearsal,
     stepsOk,
     candidateOk,
@@ -649,8 +700,9 @@ async function main(): Promise<number> {
     candidateSha,
     startedAt,
     finishedAt: new Date().toISOString(),
-    selection: parsed.only === null ? 'full' : 'partial',
+    selection: parsed.scope ?? 'partial',
     selectedSteps: selectedSteps.map((step) => step.id),
+    coverage,
     candidateBefore,
     candidateAfter,
     candidateIntegrityFailures: integrityFailures,
@@ -661,10 +713,10 @@ async function main(): Promise<number> {
     ...outcome,
   }
   writeCampaign(campaignRoot, campaign)
-  console.log(JSON.stringify({ ...campaign, evidenceDir: relativeEvidencePath(campaignRoot) }, null, 2))
+  console.log(JSON.stringify({ ...campaign, evidenceDir: evidencePath(campaignRoot) }, null, 2))
   return outcome.exitCode
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  process.exitCode = await main()
+  process.exitCode = await runCampaign(process.argv.slice(2))
 }
