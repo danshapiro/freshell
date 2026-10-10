@@ -31,6 +31,17 @@ struct WithdrawalFileContext {
     lifecycle_log: PathBuf,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoppedRepairWithdrawalStatus {
+    Complete,
+    FilesPending,
+}
+
+enum WithdrawalAttempt {
+    Complete(RestoreLostSoulsResult),
+    FilesPending(IoError),
+}
+
 impl Registry {
     pub(crate) async fn repair_scope_members(
         &self,
@@ -164,9 +175,28 @@ impl Registry {
         incident_root: PathBuf,
         lifecycle_log: PathBuf,
     ) -> Result<(), RegistryError> {
+        match self
+            .resume_pending_stopped_repair_withdrawal_status(incident_root, lifecycle_log)
+            .await?
+        {
+            StoppedRepairWithdrawalStatus::Complete => Ok(()),
+            StoppedRepairWithdrawalStatus::FilesPending => Err(RegistryError::Io(IoError::other(
+                "a stopped-repair incident withdrawal remains pending",
+            ))),
+        }
+    }
+
+    pub(crate) async fn resume_pending_stopped_repair_withdrawal_status(
+        &self,
+        incident_root: PathBuf,
+        lifecycle_log: PathBuf,
+    ) -> Result<StoppedRepairWithdrawalStatus, RegistryError> {
         let db_path = self.database_path().to_path_buf();
-        self.run_blocking(move |mut conn| {
+        let event_log = lifecycle_log.clone();
+        let (status, deferred_events) = self.run_blocking(move |mut conn| {
             let _file_coordinator = incident_file_coordinator();
+            let mut status = StoppedRepairWithdrawalStatus::Complete;
+            let mut deferred_events = Vec::new();
             let pending = {
                 let mut statement = conn.prepare(
                     "SELECT operation_id FROM stopped_repair_operations WHERE status='withdraw_pending' ORDER BY operation_id",
@@ -189,7 +219,7 @@ impl Registry {
                         "pending stopped-repair withdrawal does not have seven verified roots".into(),
                     ));
                 }
-                finish_pending_withdrawal(
+                match try_finish_pending_withdrawal(
                     &mut conn,
                     &operation_id,
                     &marker,
@@ -200,11 +230,37 @@ impl Registry {
                         incident_root: incident_root.clone(),
                         lifecycle_log: lifecycle_log.clone(),
                     },
-                )?;
+                )? {
+                    WithdrawalAttempt::Complete(_) => {}
+                    WithdrawalAttempt::FilesPending(error) => {
+                        status = StoppedRepairWithdrawalStatus::FilesPending;
+                        deferred_events.push(serde_json::json!({"severity":"warn", "operationId":operation_id,
+                                "generation":marker.generation, "reason":"withdrawal_files_pending",
+                                "targets":targets,
+                                "roots":roots.iter().map(|root| serde_json::json!({
+                                    "soulId":root.canonical_soul_id,
+                                    "incarnationId":root.incarnation_id,
+                                    "intentRevision":root.captured_intent_revision,
+                                    "executionGeneration":root.execution_generation,
+                                })).collect::<Vec<_>>(),
+                                "retryPending":true, "cleanupContinued":false, "error":error.to_string()}),
+                        );
+                    }
+                }
             }
-            Ok(())
+            Ok((status, deferred_events))
         })
-        .await
+        .await?;
+        // append_event takes the same file coordinator as withdrawal. Publish
+        // diagnostics only after the coordinated file transaction releases it.
+        for data in deferred_events {
+            crate::service::append_event(
+                &event_log,
+                "supervisor.stopped_repair_withdrawal_deferred",
+                data,
+            );
+        }
+        Ok(status)
     }
 }
 
@@ -1252,6 +1308,20 @@ fn finish_pending_withdrawal(
     roots: &[StoppedRepairRootReceipt],
     file_context: WithdrawalFileContext,
 ) -> Result<RestoreLostSoulsResult, RegistryError> {
+    match try_finish_pending_withdrawal(conn, operation_id, marker, targets, roots, file_context)? {
+        WithdrawalAttempt::Complete(result) => Ok(result),
+        WithdrawalAttempt::FilesPending(error) => Err(RegistryError::Io(error)),
+    }
+}
+
+fn try_finish_pending_withdrawal(
+    conn: &mut Connection,
+    operation_id: &RequestId,
+    marker: &WithdrawalMarker,
+    targets: &[LostSoulRepairTarget],
+    roots: &[StoppedRepairRootReceipt],
+    file_context: WithdrawalFileContext,
+) -> Result<WithdrawalAttempt, RegistryError> {
     let operation = load_operation(conn, operation_id)?;
     validate_withdrawal(&operation, marker, targets)?;
     if marker.generation != withdrawal_generation(operation_id, targets, roots)? {
@@ -1259,6 +1329,7 @@ fn finish_pending_withdrawal(
             "stopped-repair withdrawal generation does not match its exact receipts".into(),
         ));
     }
+    validate_scope_receipts(&operation.scope, &operation.owner_choices, roots)?;
     let incident_ids = serde_json::from_str::<Vec<String>>(&marker.incident_ids_json)?
         .into_iter()
         .collect::<BTreeSet<_>>();
@@ -1268,10 +1339,12 @@ fn finish_pending_withdrawal(
     let expected_incident_ids_json = marker.incident_ids_json.clone();
     let expected_operation_id = operation_id.clone();
     let check_path = file_context.db_path;
+    let generation_check_failed = std::cell::Cell::new(false);
     let mut check_generation = || {
-        let check_conn =
-            open_connection(&check_path).map_err(|error| IoError::other(error.to_string()))?;
-        let current: Option<(String, String, String, String, String)> = check_conn
+        let result = (|| {
+            let check_conn =
+                open_connection(&check_path).map_err(|error| IoError::other(error.to_string()))?;
+            let current: Option<(String, String, String, String, String)> = check_conn
             .query_row(
                 "SELECT o.status,w.generation,w.targets_json,w.incident_ids_json,w.status \
                  FROM stopped_repair_operations o JOIN stopped_repair_withdrawals w ON w.operation_id=o.operation_id \
@@ -1281,32 +1354,45 @@ fn finish_pending_withdrawal(
             )
             .optional()
             .map_err(|error| IoError::other(error.to_string()))?;
-        match current {
-            Some((
-                operation_status,
-                generation,
-                targets_json,
-                incident_ids_json,
-                marker_status,
-            )) if operation_status == "withdraw_pending"
-                && marker_status == "files_pending"
-                && generation == expected_generation
-                && targets_json == expected_targets_json
-                && incident_ids_json == expected_incident_ids_json =>
-            {
-                Ok(())
+            match current {
+                Some((
+                    operation_status,
+                    generation,
+                    targets_json,
+                    incident_ids_json,
+                    marker_status,
+                )) if operation_status == "withdraw_pending"
+                    && marker_status == "files_pending"
+                    && generation == expected_generation
+                    && targets_json == expected_targets_json
+                    && incident_ids_json == expected_incident_ids_json =>
+                {
+                    Ok(())
+                }
+                _ => Err(IoError::other(
+                    "stopped-repair withdrawal generation changed before file effect",
+                )),
             }
-            _ => Err(IoError::other(
-                "stopped-repair withdrawal generation changed before file effect",
-            )),
+        })();
+        if result.is_err() {
+            generation_check_failed.set(true);
         }
+        result
     };
     check_generation()?;
-    exporter.retract_false_incidents_coordinated_checked(
+    if let Err(error) = exporter.retract_false_incidents_coordinated_checked(
         &incident_ids,
         &file_context.lifecycle_log,
         &mut check_generation,
-    )?;
+    ) {
+        // Only file classification/rewrite/sync failures are retryable at
+        // startup. A failed registry/generation fence remains fatal.
+        return if generation_check_failed.get() {
+            Err(RegistryError::Io(error))
+        } else {
+            Ok(WithdrawalAttempt::FilesPending(error))
+        };
+    }
     check_generation()?;
 
     crate::recovery::stopped_repair_crash_boundary("stopped_repair_during_withdrawal_before_ack");
@@ -1343,7 +1429,7 @@ fn finish_pending_withdrawal(
         return Err(RegistryError::RequestConflict);
     }
     tx.commit()?;
-    Ok(result)
+    Ok(WithdrawalAttempt::Complete(result))
 }
 
 fn complete_result(
@@ -1840,6 +1926,74 @@ mod tests {
             .unwrap(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn pending_withdrawal_startup_keeps_nonwithdrawal_persistence_failures_fatal() {
+        for fault in ["generation", "receipt", "export_artifact", "export_queue"] {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = Registry::open(dir.path(), None).unwrap();
+            let operation = RequestId::new();
+            let targets = test_targets();
+            let roots = test_roots(&targets);
+            seed_pending_operation(&registry, &operation, &targets, &roots);
+            let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+            // Genuine file pending work must never conceal an unrelated failure.
+            std::fs::create_dir(dir.path().join("lifecycle.jsonl.1")).unwrap();
+            let conn = Connection::open(registry.database_path()).unwrap();
+            match fault {
+                "generation" => {
+                    conn.execute(
+                        "UPDATE stopped_repair_withdrawals SET generation='stale'",
+                        [],
+                    )
+                    .unwrap();
+                }
+                "receipt" => {
+                    conn.execute(
+                        "UPDATE stopped_repair_root_receipts SET import_receipt_json='{broken'",
+                        [],
+                    )
+                    .unwrap();
+                }
+                "export_artifact" => {
+                    std::fs::write(dir.path().join("incidents"), b"owned obstruction").unwrap();
+                    conn.execute("INSERT INTO outbox(event_id,event_kind,payload,created_at) VALUES ('failed-export','loss_incident.final',?1,1)", [json!({"incidentId":"unrelated","cleanupState":"closed"}).to_string()]).unwrap();
+                }
+                "export_queue" => {
+                    conn.execute("ALTER TABLE outbox RENAME TO unavailable_outbox", [])
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                supervisor.reconcile_pending_loss_cleanup().await.is_err(),
+                "{fault} must still refuse startup"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT status FROM stopped_repair_operations WHERE operation_id=?1",
+                    [operation.as_str()],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+                "withdraw_pending"
+            );
+            if fault == "export_artifact" {
+                assert_eq!(
+                    std::fs::read(dir.path().join("incidents")).unwrap(),
+                    b"owned obstruction"
+                );
+                let delivered: Option<i64> = conn
+                    .query_row(
+                        "SELECT delivered_at FROM outbox WHERE event_id='failed-export'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(delivered.is_none());
+            }
+        }
     }
 
     #[tokio::test]

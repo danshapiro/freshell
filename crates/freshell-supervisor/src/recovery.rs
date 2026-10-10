@@ -4473,7 +4473,13 @@ impl Supervisor {
     /// Resume the incident-before-cleanup pipeline only after a current census
     /// of the exact retained volume; a historical certificate is insufficient.
     pub async fn reconcile_pending_loss_cleanup(&self) -> Result<(), RuntimeError> {
-        self.export_pending_incidents().await?;
+        if self.drain_pending_incident_exports().await?
+            == crate::stopped_repair_cas::StoppedRepairWithdrawalStatus::FilesPending
+        {
+            // Keep repair control available while durable withdrawal is
+            // retryable, without proceeding to destructive loss cleanup.
+            return Ok(());
+        }
         let incidents = self
             .registry
             .unresolved_loss_incident_ids()
@@ -4564,23 +4570,35 @@ impl Supervisor {
                 tracing::warn!(incident_id=%incident_id, error=%error, "supervisor.loss.startup_cleanup_event_failed");
             }
         }
-        self.export_pending_incidents().await?;
+        self.drain_pending_incident_exports().await?;
         Ok(())
     }
 
     pub(crate) async fn export_pending_incidents(&self) -> Result<(), RuntimeError> {
-        let withdrawal_still_pending = match self.resume_pending_stopped_repair_withdrawals().await
-        {
-            Ok(()) => false,
-            Err(error) => {
-                crate::service::append_event(
-                    &self.config.lifecycle_log,
-                    "supervisor.stopped_repair_withdrawal_deferred",
-                    serde_json::json!({"error": error.message}),
-                );
-                true
+        match self.drain_pending_incident_exports().await? {
+            crate::stopped_repair_cas::StoppedRepairWithdrawalStatus::Complete => Ok(()),
+            crate::stopped_repair_cas::StoppedRepairWithdrawalStatus::FilesPending => {
+                Err(RuntimeError::new(
+                    RuntimeErrorCode::IncidentPersistenceFailed,
+                    "a stopped-repair incident withdrawal remains pending",
+                ))
             }
-        };
+        }
+    }
+
+    async fn drain_pending_incident_exports(
+        &self,
+    ) -> Result<crate::stopped_repair_cas::StoppedRepairWithdrawalStatus, RuntimeError> {
+        // Drain unrelated durable exports even if withdrawal failed. Return
+        // that typed result only after all eligible artifacts are persisted.
+        let withdrawal = self
+            .registry
+            .resume_pending_stopped_repair_withdrawal_status(
+                self.registry.registry_root().join("incidents"),
+                self.config.lifecycle_log.clone(),
+            )
+            .await
+            .map_err(map_registry);
         let exports = match self.registry.pending_incident_exports(100).await {
             Ok(exports) => exports,
             Err(error) => {
@@ -4649,13 +4667,7 @@ impl Supervisor {
                 }
             }
         }
-        if withdrawal_still_pending {
-            return Err(RuntimeError::new(
-                RuntimeErrorCode::IncidentPersistenceFailed,
-                "a stopped-repair incident withdrawal remains pending",
-            ));
-        }
-        Ok(())
+        withdrawal
     }
 
     pub(crate) async fn resume_pending_stopped_repair_withdrawals(
