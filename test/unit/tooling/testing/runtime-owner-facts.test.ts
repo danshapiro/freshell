@@ -1529,7 +1529,7 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
       const database = path.join(batch.registryRoot, 'runtime.sqlite3')
       const db = new DatabaseSync(database)
       db.exec(`CREATE TABLE installation(singleton INTEGER,control_epoch INTEGER); INSERT INTO installation VALUES(1,12);
-        CREATE TABLE stopped_repair_operations(operation_id TEXT,status TEXT,targets_json TEXT,scope_json TEXT,owner_choices_json TEXT);
+        CREATE TABLE stopped_repair_operations(operation_id TEXT,status TEXT,targets_json TEXT,scope_json TEXT,owner_choices_json TEXT,result_json TEXT);
         CREATE TABLE stopped_repair_withdrawals(operation_id TEXT,status TEXT);
         CREATE TABLE stopped_repair_root_receipts(operation_id TEXT,root_session_id TEXT,canonical_soul_id TEXT,source_generation TEXT,transfer_id TEXT,import_receipt_json TEXT,readable_receipt_json TEXT,source_store_id TEXT,identity_revision INTEGER,intent_revision INTEGER,native_import_revision INTEGER);
         CREATE TABLE souls(soul_id TEXT,provider_store_id TEXT,native_session_id TEXT,desired_state TEXT,recovery_state TEXT,identity_revision INTEGER,intent_revision INTEGER,native_import_revision INTEGER);
@@ -1553,10 +1553,15 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
       capturedManifest.generation = createHash('sha256').update(JSON.stringify(capturedManifest)).digest('hex')
       const capturedManifestJson = JSON.stringify(capturedManifest)
       scope.roots[0].graphDigest = capturedManifest.generation
-      const insertOperation = db.prepare('INSERT INTO stopped_repair_operations VALUES(?,?,?,?,?)')
-      insertOperation.run('repair-current', 'complete', JSON.stringify(targets), JSON.stringify(scope), JSON.stringify(batch.output.canonicalChoices))
-      insertOperation.run('repair-foreign', 'complete', '[]', JSON.stringify(scope), JSON.stringify(batch.output.canonicalChoices))
-      db.prepare('INSERT INTO stopped_repair_withdrawals VALUES(?,?)').run('repair-current', 'files_complete')
+      const savedComplete = { operationId: 'repair-current', scopeId: scope.scopeId, status: 'complete',
+        repairedTargetCount: targets.length, totalTargetCount: targets.length,
+        roots: scope.roots.map(captured => ({ rootSessionId: captured.rootSessionId,
+          canonicalSoulId: captured.canonicalSoulId ?? batch.output.canonicalChoices.find(choice => choice.rootSessionId === captured.rootSessionId)!.soulId,
+          importStatus: 'complete', intentRevision: 1, nativeImportRevision: 2 })) }
+      const insertOperation = db.prepare('INSERT INTO stopped_repair_operations VALUES(?,?,?,?,?,?)')
+      insertOperation.run('repair-current', 'complete', JSON.stringify(targets), JSON.stringify(scope), JSON.stringify(batch.output.canonicalChoices), JSON.stringify(savedComplete))
+      insertOperation.run('repair-foreign', 'complete', '[]', JSON.stringify(scope), JSON.stringify(batch.output.canonicalChoices), JSON.stringify(savedComplete))
+      // Production atomically saves Complete and removes the files_pending work marker.
       for (const target of batch.output.targets) db.prepare('INSERT INTO souls VALUES(?,?,?,?,?,?,?,?)').run(target.soulId, target.providerStoreId, target.rootSessionId, 'stopped', 'data_repair_complete', 2, 1, 2)
       db.prepare('INSERT INTO loss_incidents VALUES(?)').run('incident-9')
       db.prepare('INSERT INTO view_intents VALUES(?)').run(batch.output.unrelated.viewId)
@@ -1584,7 +1589,91 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
         capturedManifest.generation, descriptor.transferId, JSON.stringify({ ...imported, adoption_baseline: {
           manifestSha256: createHash('sha256').update(capturedManifestJson).digest('hex'), descriptor,
         } }), JSON.stringify(readable), facts.sourceStoreId, 1, 1, 1)
+      // Complete requires all seven qualified receipts. The owner/transport
+      // cases below intentionally retain just one installed root while pending.
+      for (const resultRoot of savedComplete.roots.filter(result => result.rootSessionId !== root.rootSessionId)) {
+        const target = batch.output.targets.find(target => target.soulId === resultRoot.canonicalSoulId)!
+        const manifest = { ...capturedManifest, root_session_id: target.rootSessionId, generation: '' }
+        manifest.generation = createHash('sha256').update(JSON.stringify(manifest)).digest('hex')
+        scope.roots.find(captured => captured.rootSessionId === target.rootSessionId)!.graphDigest = manifest.generation
+        const rootDescriptor = { ...descriptor, rootSessionId: target.rootSessionId, destinationStoreId: target.providerStoreId,
+          sourceGeneration: manifest.generation, manifestJson: JSON.stringify(manifest) }
+        const rootReadable = { ...readable, destinationStoreId: target.providerStoreId }
+        const receipt = { ...imported, root_session_id: target.rootSessionId, canonical_soul_id: target.soulId,
+          destination_store_id: target.providerStoreId, source_generation: manifest.generation,
+          adoption_baseline: { descriptor: rootDescriptor,
+            manifestSha256: createHash('sha256').update(rootDescriptor.manifestJson).digest('hex') } }
+        db.prepare('INSERT INTO stopped_repair_root_receipts VALUES(?,?,?,?,?,?,?,?,?,?,?)').run('repair-current', target.rootSessionId,
+          target.soulId, manifest.generation, rootDescriptor.transferId, JSON.stringify(receipt), JSON.stringify(rootReadable), facts.sourceStoreId, 1, 1, 1)
+      }
+      db.prepare('UPDATE stopped_repair_operations SET scope_json=? WHERE operation_id=?').run(JSON.stringify(scope), 'repair-current')
       db.close()
+      const queryRecords = (script = owner.TASK007_STOPPED_REPAIR_OBSERVATION) => JSON.parse(execFileSync('python3', ['-I', '-c', script,
+        database, batch.metadataFile, 'repair-current', batch.registryRoot, facts.sourceStoreId],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000 })) as { status: string, withdrawalStatus: string | null, roots: unknown[] }
+      expect(queryRecords()).toMatchObject({ status: 'complete', withdrawalStatus: 'files_complete' })
+      expect(queryRecords().roots).toHaveLength(7)
+      expect(queryRecords(owner.TASK007_STOPPED_REGISTRY_OBSERVATION)).toMatchObject({ status: 'complete', withdrawalStatus: 'files_complete' })
+      const updateOperation = (status: string, result: string | null) => {
+        const changed = new DatabaseSync(database)
+        changed.prepare('UPDATE stopped_repair_operations SET status=?,result_json=? WHERE operation_id=?').run(status, result, 'repair-current')
+        changed.close()
+      }
+      const marker = (status?: string) => {
+        const changed = new DatabaseSync(database)
+        changed.exec('DELETE FROM stopped_repair_withdrawals')
+        if (status) changed.prepare('INSERT INTO stopped_repair_withdrawals VALUES(?,?)').run('repair-current', status)
+        changed.close()
+      }
+      if (attempt === 'running') {
+        for (const invalid of [null, '{', 'null', '[]',
+          ...[
+            { ...savedComplete, operationId: 'repair-foreign' }, { ...savedComplete, scopeId: 'wrong-scope' },
+            { ...savedComplete, status: 'pending' }, { ...savedComplete, repairedTargetCount: 8 },
+            { ...savedComplete, totalTargetCount: 8 }, { ...savedComplete, roots: undefined },
+            { ...savedComplete, roots: savedComplete.roots.slice(1) },
+            { ...savedComplete, roots: [...savedComplete.roots.slice(1), savedComplete.roots[1]] },
+            ...['rootSessionId', 'canonicalSoulId', 'importStatus', 'intentRevision', 'nativeImportRevision'].map(key => ({
+              ...savedComplete, roots: savedComplete.roots.map((result, index) => index === 0 ? { ...result, [key]: 'wrong-binding' } : result),
+            })),
+          ].map(result => JSON.stringify(result)),
+        ]) {
+          updateOperation('complete', invalid)
+          expect(queryRecords).toThrow()
+        }
+        updateOperation('complete', JSON.stringify(savedComplete))
+        for (const contradictory of ['files_pending', 'files_complete']) {
+          marker(contradictory)
+          expect(queryRecords).toThrow(/contradictory/)
+        }
+        marker()
+        const missingReceipt = new DatabaseSync(database)
+        const retainedReceipt = missingReceipt.prepare('SELECT * FROM stopped_repair_root_receipts WHERE root_session_id=?').get(root.rootSessionId)!
+        missingReceipt.prepare('DELETE FROM stopped_repair_root_receipts WHERE root_session_id=?').run(root.rootSessionId)
+        missingReceipt.close()
+        expect(queryRecords).toThrow(/receipts/)
+        const restoredReceipt = new DatabaseSync(database)
+        restoredReceipt.prepare('INSERT INTO stopped_repair_root_receipts VALUES(?,?,?,?,?,?,?,?,?,?,?)').run(...Object.values(retainedReceipt))
+        restoredReceipt.close()
+        updateOperation('importing', null)
+        expect(queryRecords()).toMatchObject({ status: 'importing', withdrawalStatus: null })
+        marker('files_pending')
+        expect(queryRecords).toThrow(/contradictory/)
+        marker()
+        updateOperation('withdraw_pending', null)
+        expect(queryRecords).toThrow(/missing/)
+        marker('files_complete')
+        expect(queryRecords).toThrow(/contradictory/)
+        marker('files_pending')
+        updateOperation('withdraw_pending', JSON.stringify(savedComplete))
+        expect(queryRecords).toThrow(/contradictory/)
+      }
+      updateOperation('withdraw_pending', null)
+      marker('files_pending')
+      expect(queryRecords()).toMatchObject({ status: 'withdraw_pending', withdrawalStatus: 'files_pending' })
+      const pendingReceipts = new DatabaseSync(database)
+      pendingReceipts.prepare('DELETE FROM stopped_repair_root_receipts WHERE root_session_id<>?').run(root.rootSessionId)
+      pendingReceipts.close()
       await fsp.mkdir(path.join(batch.registryRoot, 'incidents'))
       await fsp.writeFile(path.join(batch.registryRoot, 'incidents/incident-9.closed.json'), 'unchanged unrelated artifact')
       await fsp.mkdir(path.join(batch.outputDir, 'incidents'))
@@ -1627,7 +1716,8 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
       const observed = await rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')
       expect(observed).toHaveProperty('faultMarkers', { preset: 'none', supervisorContainerId: rig.supervisor.containerId,
         crash: null, firstResumeObservationFailures: [] })
-      expect(observed.status).toBe('complete')
+      expect(observed.status).toBe('withdraw_pending')
+      expect(observed.withdrawalStatus).toBe('files_pending')
       expect(observed.souls).toHaveLength(9)
       expect(observed.souls.every(soul => soul.activeWriters === 0 && !soul.incidentPresent)).toBe(true)
       expect(observed.roots[0]).toMatchObject({ rootSessionId: root.rootSessionId, providerUid: 65534, rowCount: 318,
@@ -1691,7 +1781,7 @@ c.execute("UPDATE stopped_repair_operations SET status='before-current' WHERE op
 c.execute('UPDATE installation SET control_epoch=1')
 c.commit()
 c.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-c.execute("UPDATE stopped_repair_operations SET status='complete' WHERE operation_id='repair-current'")
+c.execute("UPDATE stopped_repair_operations SET status='withdraw_pending' WHERE operation_id='repair-current'")
 c.execute('UPDATE installation SET control_epoch=12')
 c.commit()
 os._exit(0)
@@ -1767,7 +1857,8 @@ os._exit(0)
         const originalRegistry = await fsp.readFile(database)
         const stoppedObserved = await rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')
         expect(stoppedObserved.operationId).toBe('repair-current')
-        expect(stoppedObserved.status).toBe('complete')
+        expect(stoppedObserved.status).toBe('withdraw_pending')
+        expect(stoppedObserved.withdrawalStatus).toBe('files_pending')
         expect(stoppedObserved.controlEpoch).toBe(12)
         expect(stoppedObserved.faultMarkers.crash).toEqual({ point: 'stopped_repair_after_import_publication', running: false, exitCode: 134 })
         expect(stoppedObserved.unrelated).toEqual(observed.unrelated)

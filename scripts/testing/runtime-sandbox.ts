@@ -2068,7 +2068,7 @@ c=sqlite3.connect('file:'+database+'?mode=ro',uri=True)
 c.row_factory=sqlite3.Row
 c.execute('PRAGMA query_only=ON')
 c.execute('BEGIN')
-op=c.execute('SELECT status,targets_json,scope_json,owner_choices_json FROM stopped_repair_operations WHERE operation_id=?',(operation,)).fetchone()
+op=c.execute('SELECT status,targets_json,scope_json,owner_choices_json,result_json FROM stopped_repair_operations WHERE operation_id=?',(operation,)).fetchone()
 if op is None: raise RuntimeError('registered repair operation is absent')
 expected={t['soulId']:t for t in fixture['targets']}
 targets=json.loads(op['targets_json']);scope=json.loads(op['scope_json']);choices=json.loads(op['owner_choices_json'])
@@ -2105,7 +2105,7 @@ for target in fixture['targets']:
     souls.append(dict(soulId=row['soul_id'],providerStoreId=row['provider_store_id'],nativeSessionId=row['native_session_id'],desiredState=row['desired_state'],recoveryState=row['recovery_state'],identityRevision=row['identity_revision'],intentRevision=row['intent_revision'],nativeImportRevision=row['native_import_revision'],activeWriters=len(writers),writerClaims=writers,incidentPresent=present('loss_incidents','incident_id',target['incidentId']),exportPresent=[os.path.isfile(os.path.join(export_root,'incidents',target['incidentId']+'.'+suffix+'.json')) for suffix in ['open','closed']]))
     current=c.execute("SELECT * FROM incarnations WHERE soul_id=? ORDER BY CASE WHEN launch_state IN ('prepared','created','starting','running','stopping') THEN 0 ELSE 1 END,created_at DESC,rowid DESC LIMIT 1",(row['soul_id'],)).fetchone()
     if current: current_incarnations.append(dict(soulId=row['soul_id'],incarnationId=current['incarnation_id'],launchNonce=current['launch_nonce'],containerId=current['container_id'],hostBootId=current['host_boot_id'],launchState=current['launch_state'],executionGeneration=current['execution_generation']))
-roots=[]
+roots=[];completed_roots=[]
 for row in c.execute('SELECT root_session_id,canonical_soul_id,source_store_id,source_generation,identity_revision,intent_revision,native_import_revision,transfer_id,import_receipt_json,readable_receipt_json FROM stopped_repair_root_receipts WHERE operation_id=? ORDER BY root_session_id',(operation,)):
     imported=json.loads(row['import_receipt_json']);readable=json.loads(row['readable_receipt_json'])
     if row['root_session_id'] not in canonicals or row['canonical_soul_id']!=canonicals[row['root_session_id']]: raise RuntimeError('installed canonical differs from selected operation')
@@ -2128,10 +2128,35 @@ for row in c.execute('SELECT root_session_id,canonical_soul_id,source_store_id,s
     manifest=json.loads(descriptor['manifestJson'])
     if manifest['source_store_id']!=row['source_store_id'] or manifest['root_session_id']!=row['root_session_id']: raise RuntimeError('immutable manifest differs from source/root')
     roots.append(dict(rootSessionId=row['root_session_id'],canonicalSoulId=row['canonical_soul_id'],destinationStoreId=readable['destinationStoreId'],descriptor=descriptor,readable=readable,sourceGeneration=row['source_generation'],transferId=row['transfer_id'],rowCount=readable['rowCount'],assetCount=readable['assetCount'],structuralSha256=readable['structuralSha256'],providerUid=readable['providerUid'],providerGid=readable['providerGid'],readerEnvironmentSha256=readable['readerEnvironmentSha256'],adoptionBaselineSha256=digest(json.dumps(imported['adoption_baseline'],sort_keys=True,separators=(',',':')).encode())))
+    completed_roots.append(dict(rootSessionId=row['root_session_id'],canonicalSoulId=row['canonical_soul_id'],importStatus='complete',intentRevision=row['intent_revision'],nativeImportRevision=row['native_import_revision']+1))
 withdrawal=c.execute('SELECT status FROM stopped_repair_withdrawals WHERE operation_id=?',(operation,)).fetchone()
+# Completion atomically removes the work marker and saves the qualified result.
+# An absent marker by itself says nothing about whether withdrawal completed.
+withdrawal_status=None
+if op['status']=='complete':
+    if withdrawal is not None or op['result_json'] is None: raise RuntimeError('completed repair has contradictory withdrawal state or missing saved result')
+    saved=json.loads(op['result_json'])
+    if (not isinstance(saved,dict) or saved.get('operationId')!=operation
+        or saved.get('scopeId')!=scope['scopeId'] or saved.get('status')!='complete'
+        or saved.get('repairedTargetCount')!=len(targets) or saved.get('totalTargetCount')!=len(targets)):
+        raise RuntimeError('saved completed repair differs from current operation/scope/targets')
+    saved_roots=saved.get('roots')
+    if not isinstance(saved_roots,list) or any(not isinstance(root,dict) for root in saved_roots): raise RuntimeError('saved completed repair roots are invalid')
+    fields=['rootSessionId','canonicalSoulId','importStatus','intentRevision','nativeImportRevision']
+    saved_roots=[{key:root.get(key) for key in fields} for root in saved_roots]
+    if (len(completed_roots)!=len(roots_by_id)
+        or {root['rootSessionId'] for root in completed_roots}!=set(roots_by_id)
+        or sorted(saved_roots,key=lambda root:str(root['rootSessionId']))!=completed_roots):
+        raise RuntimeError('saved completed repair roots differ from current captured receipts')
+    withdrawal_status='files_complete'
+elif op['status']=='withdraw_pending':
+    if withdrawal is None or withdrawal['status']!='files_pending' or op['result_json'] is not None: raise RuntimeError('pending repair has missing or contradictory withdrawal authority')
+    withdrawal_status='files_pending'
+elif op['status']!='importing' or withdrawal is not None or op['result_json'] is not None:
+    raise RuntimeError('repair operation has contradictory withdrawal state')
 unrelated=fixture['unrelated']
 epoch=c.execute('SELECT control_epoch FROM installation WHERE singleton=1').fetchone()[0]
-result=dict(fixtureId=fixture['fixtureId'],operationId=operation,controlEpoch=epoch,scope=scope,canonicalChoices=choices,status=op['status'],withdrawalStatus=withdrawal['status'] if withdrawal else None,souls=souls,roots=roots,currentIncarnations=current_incarnations,unrelated=dict(incidentPresent=present('loss_incidents','incident_id',unrelated['incidentId']),viewPresent=present('view_intents','view_id',unrelated['viewId']),noticeIds=[id for id in unrelated['noticeIds'] if present('runtime_notices','notice_id',id)],outboxEventIds=[id for id in unrelated['outboxEventIds'] if present('outbox','event_id',id)],exportSha256=[file_hash(artifact['file']) for artifact in unrelated['exports']]))
+result=dict(fixtureId=fixture['fixtureId'],operationId=operation,controlEpoch=epoch,scope=scope,canonicalChoices=choices,status=op['status'],withdrawalStatus=withdrawal_status,souls=souls,roots=roots,currentIncarnations=current_incarnations,unrelated=dict(incidentPresent=present('loss_incidents','incident_id',unrelated['incidentId']),viewPresent=present('view_intents','view_id',unrelated['viewId']),noticeIds=[id for id in unrelated['noticeIds'] if present('runtime_notices','notice_id',id)],outboxEventIds=[id for id in unrelated['outboxEventIds'] if present('outbox','event_id',id)],exportSha256=[file_hash(artifact['file']) for artifact in unrelated['exports']]))
 c.close()
 print(json.dumps(result))
 `
