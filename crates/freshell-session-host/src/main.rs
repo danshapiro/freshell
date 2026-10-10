@@ -8791,6 +8791,99 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
     }
 
     #[tokio::test]
+    async fn baseline_only_unavailable_saved_undo_preserves_native_reference() {
+        use freshell_sessions::opencode_transfer::{
+            saved_snapshot_summary, OpenCodeTransferManifest, SavedSnapshotAvailability,
+            SavedSnapshotSummary,
+        };
+
+        let fixture =
+            stage_synthetic_opencode_transfer_history(SyntheticTransferHistory::UnavailableUndo)
+                .unwrap();
+        let manifest: OpenCodeTransferManifest =
+            serde_json::from_str(&fixture.descriptor.manifest_json).unwrap();
+        assert_eq!(manifest.saved_snapshots.len(), 1);
+        let reference = &manifest.saved_snapshots[0];
+        assert_eq!(
+            reference.availability,
+            SavedSnapshotAvailability::UnavailableInQualifiedLocations
+        );
+        assert!(reference.objects.is_empty());
+        assert_eq!(
+            saved_snapshot_summary(&manifest),
+            SavedSnapshotSummary::QualifiedReferences {
+                retained_closure_count: 0,
+                unavailable_reference_count: 1,
+            }
+        );
+        let imported = run_joined_synthetic_transfer_from_stage(fixture, None)
+            .await
+            .unwrap();
+        assert!(imported.result.is_ok(), "{:?}", imported.result);
+        let root = imported.root.path();
+        let database = root.join("provider-home/.local/share/opencode/opencode.db");
+        let preserved = [
+            root.join("source.sqlite"),
+            root.join("opencode-transfer-descriptor.json"),
+            root.join("host-state/opencode-synthetic-transfer-import.json"),
+            root.join("host-state/opencode-synthetic-transfer-readable.json"),
+            database.clone(),
+        ]
+        .map(|path| {
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        });
+        let resumed = run_synthetic_exact_resume(&imported, None, true)
+            .await
+            .unwrap();
+        assert!(resumed.result.is_ok(), "{:?}", resumed.result);
+        assert_eq!(*resumed.events.lock().unwrap(), ["current", "pty"]);
+        let original = imported
+            .adoption_expectation
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        let current = resumed
+            .adoption_expectation
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert_eq!(current.baseline, original.baseline);
+        assert_ne!(current.launch_nonce, original.launch_nonce);
+        assert_eq!(
+            current.root_tail,
+            OpenCodeVerifiedRootTail::Message {
+                message_id: "msg_undo_before".into()
+            }
+        );
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let saved: String = connection
+            .query_row(
+                "SELECT revert FROM session WHERE id=?1",
+                [&reference.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&saved).unwrap(),
+            serde_json::json!({"messageID":"msg_undo_boundary","snapshot":reference.tree})
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM message", [], |row| row
+                    .get::<_, u32>(0))
+                .unwrap(),
+            2
+        );
+        assert!(!database.parent().unwrap().join("snapshot").exists());
+        for (path, bytes) in preserved {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+    }
+
+    #[tokio::test]
     async fn baseline_only_unreadable_store_asset_and_interrupted_gate_retry() {
         for case in ["store", "asset", "pre_pty_log"] {
             let missing_asset = case == "asset";
@@ -9093,10 +9186,21 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
                         format!("open synthetic provider database at PTY boundary: {error}"),
                     )
                 })?;
+            let (message_id, expected_message) = if adoption.root_tail
+                == (OpenCodeVerifiedRootTail::Message {
+                    message_id: "msg_undo_before".into(),
+                }) {
+                ("msg_undo_before", synthetic_undo_message(2).to_string())
+            } else {
+                (
+                    "synthetic-message",
+                    r#"{"text":"synthetic message body is test-only"}"#.to_string(),
+                )
+            };
             let message = database
                 .query_row(
                     "SELECT data FROM message WHERE id = ?1",
-                    ["synthetic-message"],
+                    [message_id],
                     |row| row.get::<_, String>(0),
                 )
                 .map_err(|error| {
@@ -9105,7 +9209,7 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
                         format!("read synthetic history at PTY boundary: {error}"),
                     )
                 })?;
-            if message != r#"{"text":"synthetic message body is test-only"}"# {
+            if message != expected_message {
                 return Err(RuntimeError::new(
                     RuntimeErrorCode::HostUnreachable,
                     "PTY callback did not receive the synthetic conversation history",
@@ -9245,6 +9349,31 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
     fn stage_synthetic_opencode_transfer_with_asset(
         referenced_asset: bool,
     ) -> Result<SyntheticOpencodeStage, String> {
+        stage_synthetic_opencode_transfer_history(if referenced_asset {
+            SyntheticTransferHistory::Asset
+        } else {
+            SyntheticTransferHistory::Default
+        })
+    }
+
+    enum SyntheticTransferHistory {
+        Default,
+        Asset,
+        UnavailableUndo,
+    }
+
+    fn synthetic_undo_message(created: i64) -> serde_json::Value {
+        serde_json::json!({
+            "role": "user",
+            "agent": "build",
+            "model": {"providerID":"provider-one", "modelID":"model-one"},
+            "time": {"created": created},
+        })
+    }
+
+    fn stage_synthetic_opencode_transfer_history(
+        history: SyntheticTransferHistory,
+    ) -> Result<SyntheticOpencodeStage, String> {
         use freshell_runtime_protocol::{
             opencode_target_build_receipt, opencode_transfer_bundle_digest, OpenCodeTransferChunk,
             OpenCodeTransferFile, MAX_OPENCODE_TRANSFER_CHUNK_BYTES,
@@ -9304,7 +9433,22 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
                 ],
             )
             .map_err(|error| error.to_string())?;
-        if referenced_asset {
+        if matches!(history, SyntheticTransferHistory::UnavailableUndo) {
+            source
+                .execute("DELETE FROM message", [])
+                .map_err(|error| error.to_string())?;
+            for (id, created) in [("msg_undo_before", 2), ("msg_undo_boundary", 3)] {
+                source.execute(
+                    "INSERT INTO message (id,session_id,time_created,time_updated,data) VALUES (?1,'ses_synthetictransfersession',?2,?2,?3)",
+                    rusqlite::params![id, created, synthetic_undo_message(created).to_string()],
+                ).map_err(|error| error.to_string())?;
+            }
+            source.execute(
+                "UPDATE session SET revert=?1 WHERE id='ses_synthetictransfersession'",
+                [serde_json::json!({"messageID":"msg_undo_boundary","snapshot":"1234567890abcdef1234567890abcdef12345678"}).to_string()],
+            ).map_err(|error| error.to_string())?;
+        }
+        if matches!(history, SyntheticTransferHistory::Asset) {
             let asset = workspace.join("saved-prompt.txt");
             std::fs::write(&asset, b"fictional saved prompt asset")
                 .map_err(|error| error.to_string())?;
