@@ -212,7 +212,7 @@ async fn task007_publish_fixture(
             image_ref: input.image_ref.clone(),
             host_binary_path: input.host_binary_path.clone(),
             runtime_dir: runtime_dir.clone(),
-            limits: limits(),
+            limits: task007_native_limits(),
             test_run_id: input.run_id.clone(),
             terminal: Some(terminal),
             fresh_agent: None,
@@ -597,7 +597,7 @@ fn task007_launch(
         creation_seed_ref: "task007-historical-setup".into(),
         request_id: freshell_runtime_protocol::RequestId::new(),
         payload_digest: "task007-historical-setup".into(),
-        requested_limits: limits(),
+        requested_limits: task007_native_limits(),
         profile: RuntimeProfile::Custom,
         project_key: "task007-fictional".into(),
         fixture: None,
@@ -608,12 +608,27 @@ fn task007_launch(
     }
 }
 
+fn task007_native_limits() -> RuntimeLimits {
+    // These stopped historical enclosures later resume the pinned native TUI.
+    // The small lifecycle-fixture budget OOM-kills OpenCode during startup.
+    RuntimeLimits {
+        cpu_milli: 500,
+        memory_bytes: 1024 * 1024 * 1024,
+        swap_bytes: 0,
+        pids_max: 128,
+    }
+}
+
 async fn task007_historical_loss(
     registry: &Registry,
     prepared: &crate::registry::PreparedLaunch,
 ) -> Result<freshell_runtime_protocol::LostSoulRepairTarget, String> {
     let grant = registry
-        .commit_execution_grant(prepared.incarnation_id.clone(), HostBootId::new(), limits())
+        .commit_execution_grant(
+            prepared.incarnation_id.clone(),
+            HostBootId::new(),
+            task007_native_limits(),
+        )
         .await
         .map_err(|e| e.to_string())?;
     let context = registry
@@ -1057,7 +1072,37 @@ async fn task007_private_fixture_publishes_actual_create_only_schema_seven() {
     assert_eq!(metadata["evidenceKind"], "historical-fixture-setup");
     let targets = metadata["targets"].as_array().unwrap();
     assert_eq!(targets.len(), 9);
+    let published = Connection::open(output.join("runtime.sqlite3")).unwrap();
     for (index, target) in targets.iter().enumerate() {
+        let (requested, effective): (String, String) = published
+            .query_row(
+                "SELECT requested_limits,effective_limits FROM incarnations WHERE incarnation_id=?1",
+                [target["incarnationId"].as_str().unwrap()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let requested: RuntimeLimits = serde_json::from_str(&requested).unwrap();
+        let effective: RuntimeLimits = serde_json::from_str(&effective).unwrap();
+        let enforced = &created[index]["HostConfig"];
+        assert_eq!(
+            requested, effective,
+            "historical grant must retain its budget"
+        );
+        assert_eq!(enforced["Memory"], requested.memory_bytes);
+        assert_eq!(
+            enforced["MemorySwap"],
+            requested.memory_bytes + requested.swap_bytes
+        );
+        assert_eq!(enforced["PidsLimit"], requested.pids_max);
+        assert_eq!(enforced["NanoCpus"], requested.cpu_milli * 1_000_000);
+        // Publish the generated envelope so the offline native startup check
+        // can enforce the same limits as these historical enclosures.
+        println!(
+            "{}",
+            serde_json::json!({"severity":"info",
+            "event":"task007.fixture_native_startup_envelope",
+            "incarnationId":target["incarnationId"], "limits":requested})
+        );
         assert_eq!(target["containerId"], format!("{:064x}", index + 1));
         assert_eq!(
             target["rootSessionId"],
@@ -1084,6 +1129,7 @@ async fn task007_private_fixture_publishes_actual_create_only_schema_seven() {
             "Docker body hashes are not immutable config identities"
         );
     }
+    drop(published);
     assert!(!metadata["unrelated"]["noticeIds"]
         .as_array()
         .unwrap()
