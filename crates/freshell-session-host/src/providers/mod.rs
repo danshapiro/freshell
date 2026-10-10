@@ -307,22 +307,124 @@ fn finish_provider_feature_worker(
     gid: u32,
     output: std::process::Output,
 ) -> Result<Option<String>, String> {
+    finish_provider_feature_worker_at_phase(operation, uid, gid, "feature_worker", output)
+}
+
+#[derive(Default)]
+struct AmplifierProfileFailureContext {
+    phase: Option<String>,
+    exception: Option<String>,
+    native_exit_code: Option<i64>,
+    native_signal: Option<i64>,
+}
+
+fn amplifier_profile_failure_context(stderr: &[u8]) -> AmplifierProfileFailureContext {
+    let mut result = AmplifierProfileFailureContext::default();
+    for line in stderr.split(|byte| *byte == b'\n') {
+        let Ok(event) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        let helper = event["event"] == "amplifier.selected_profile.failed";
+        let native_process = event["event"] == "provider.feature_preparation.failed"
+            && event["operation"] == "amplifier-profile"
+            && event["phase"] == "native_profile_process";
+        if !helper && !native_process {
+            continue;
+        }
+        let phase = event[if helper { "phase" } else { "profile_phase" }].as_str();
+        if let Some(
+            phase @ ("load_native_settings"
+            | "validate_bundle"
+            | "read_bundle"
+            | "validate_providers"
+            | "write_native_settings"
+            | "verify_native_settings"),
+        ) = phase
+        {
+            result.phase = Some(phase.to_owned());
+        }
+        if let Some(exception) = event[if helper {
+            "exception_type"
+        } else {
+            "profile_exception"
+        }]
+        .as_str()
+        {
+            if !exception.is_empty()
+                && exception.len() <= 64
+                && exception
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                result.exception = Some(exception.to_owned());
+            }
+        }
+        if native_process {
+            result.native_exit_code = event["exit_code"].as_i64();
+            result.native_signal = event["signal"].as_i64();
+        }
+    }
+    result
+}
+
+fn finish_provider_feature_worker_at_phase(
+    operation: &str,
+    uid: u32,
+    gid: u32,
+    phase: &str,
+    output: std::process::Output,
+) -> Result<Option<String>, String> {
     if !output.status.success() {
         #[cfg(unix)]
         let signal = std::os::unix::process::ExitStatusExt::signal(&output.status);
         #[cfg(not(unix))]
         let signal: Option<i32> = None;
+        let profile = if operation == "amplifier-profile" {
+            amplifier_profile_failure_context(&output.stderr)
+        } else {
+            AmplifierProfileFailureContext::default()
+        };
         crate::emit_environment_event(serde_json::json!({
             "event": "provider.feature_preparation.failed",
             "severity": "error",
             "operation": operation,
+            "phase": phase,
             "exit_code": output.status.code(),
             "signal": signal,
             "uid": uid,
             "gid": gid,
             "stdout_bytes": output.stdout.len(),
             "stderr_bytes": output.stderr.len(),
+            "profile_phase": profile.phase,
+            "profile_exception": profile.exception,
+            "native_exit_code": profile.native_exit_code,
+            "native_signal": profile.native_signal,
         }));
+        if operation == "amplifier-profile" {
+            let mut detail = format!(
+                "phase={phase}, exit_code={}, signal={}",
+                output
+                    .status
+                    .code()
+                    .map_or_else(|| "none".into(), |code| code.to_string()),
+                signal.map_or_else(|| "none".into(), |signal| signal.to_string())
+            );
+            if let Some(code) = profile.native_exit_code {
+                detail.push_str(&format!(", native_exit_code={code}"));
+            }
+            if let Some(signal) = profile.native_signal {
+                detail.push_str(&format!(", native_signal={signal}"));
+            }
+            if let Some(phase) = profile.phase {
+                detail.push_str(&format!(", profile_phase={phase}"));
+            }
+            if let Some(exception) = profile.exception {
+                detail.push_str(&format!(", profile_exception={exception}"));
+            }
+            return Err(format!(
+                "prepare provider features failed: {operation} ({detail})"
+            ));
+        }
         let _ = std::io::Write::write_all(&mut std::io::stderr(), &output.stderr);
         return Err(format!("prepare provider features failed: {operation}"));
     }
@@ -465,11 +567,14 @@ fn run_provider_features_worker_at(
                 .current_dir(provider_home)
                 .output()
                 .map_err(|_| "native Amplifier profile preparation did not start")?;
-            let _ = std::io::Write::write_all(&mut std::io::stderr(), &output.stderr);
-            if !output.status.success() {
-                return Err("native Amplifier selected profile preparation failed".into());
-            }
-            Ok(None)
+            finish_provider_feature_worker_at_phase(
+                "amplifier-profile",
+                unsafe { libc::geteuid() },
+                unsafe { libc::getegid() },
+                "native_profile_process",
+                output,
+            )
+            .map(|_| None)
         }
         [operation] if operation == "claude-mcp" => {
             use std::os::unix::fs::OpenOptionsExt;
@@ -731,7 +836,7 @@ mod provider_secret_context_tests {
         let result = finish_provider_feature_worker("amplifier-profile", uid, gid, output);
         assert_eq!(
             result.unwrap_err(),
-            "prepare provider features failed: amplifier-profile"
+            "prepare provider features failed: amplifier-profile (phase=feature_worker, exit_code=23, signal=none)"
         );
         let output = run_owned("printf '/owned/selector.json\\n'");
         assert_eq!(
@@ -774,6 +879,91 @@ mod provider_secret_context_tests {
             .unwrap()
             .contains("private-fixture"));
         assert!(!serde_json::to_string(&events).unwrap().contains("/owned"));
+    }
+
+    #[test]
+    fn amplifier_profile_failure_reaches_caller_without_private_output() {
+        let owned = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", "printf '%s\\n' '{\"event\":\"amplifier.selected_profile.failed\",\"severity\":\"error\",\"phase\":\"read_bundle\",\"exception_type\":\"FileNotFoundError\"}' >&2; printf private-fixture-details >&2; exit 19"])
+            .current_dir(owned.path())
+            .output()
+            .unwrap();
+        let error = finish_provider_feature_worker(
+            "amplifier-profile",
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+            output,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("exit_code=19"),
+            "actual worker exit must reach caller: {error}"
+        );
+        assert!(
+            error.contains("profile_phase=read_bundle"),
+            "native phase must reach caller: {error}"
+        );
+        assert!(
+            error.contains("profile_exception=FileNotFoundError"),
+            "native exception class must reach caller: {error}"
+        );
+        assert!(!error.contains("private-fixture"));
+    }
+
+    #[test]
+    fn native_profile_failure_survives_both_worker_boundaries() {
+        const CHILD: &str = "FRESHELL_TEST_NATIVE_PROFILE_FAILURE_CHILD";
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        if std::env::var_os(CHILD).is_some() {
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", "printf '%s\\n' '{\"event\":\"amplifier.selected_profile.failed\",\"phase\":\"write_native_settings\",\"exception_type\":\"PermissionError\"}' >&2; printf private-fixture-details >&2; exit 17"])
+                .output()
+                .unwrap();
+            let error = finish_provider_feature_worker_at_phase(
+                "amplifier-profile",
+                uid,
+                gid,
+                "native_profile_process",
+                output,
+            )
+            .unwrap_err();
+            assert!(error.contains("exit_code=17"));
+            std::process::exit(1);
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "providers::provider_secret_context_tests::native_profile_failure_survives_both_worker_boundaries", "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("private-fixture"));
+        let error =
+            finish_provider_feature_worker("amplifier-profile", uid, gid, output).unwrap_err();
+        assert!(error.contains("exit_code=1"));
+        assert!(error.contains("native_exit_code=17"));
+        assert!(error.contains("profile_phase=write_native_settings"));
+        assert!(error.contains("profile_exception=PermissionError"));
+    }
+
+    #[test]
+    fn amplifier_profile_failure_does_not_copy_unrecognized_diagnostics() {
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", "printf '%s\\n' '{\"event\":\"amplifier.selected_profile.failed\",\"phase\":\"private-fixture-phase\",\"exception_type\":\"private-fixture-error\"}' >&2; exit 11"])
+            .output()
+            .unwrap();
+        let error = finish_provider_feature_worker(
+            "amplifier-profile",
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+            output,
+        )
+        .unwrap_err();
+        assert!(error.contains("exit_code=11"));
+        assert!(!error.contains("private-fixture"));
+        assert!(!error.contains("profile_phase="));
+        assert!(!error.contains("profile_exception="));
     }
 
     #[test]
@@ -851,6 +1041,18 @@ mod provider_secret_context_tests {
             "selected profile must be prepared under provider identity"
         );
         assert_eq!(prepared.terminal.args, ["run", "--mode", "chat"]);
+        let refusal = "prepare provider features failed: amplifier-profile (phase=feature_worker, exit_code=1, signal=none, profile_phase=read_bundle, profile_exception=FileNotFoundError)";
+        let result = prepare_terminal_with_provider_feature_runner(
+            prepared.terminal,
+            &std::collections::BTreeMap::new(),
+            |_, _, _| Err(refusal.into()),
+        )
+        .await;
+        assert_eq!(
+            result.err().unwrap(),
+            refusal,
+            "preparation refusal must reach the existing launch caller"
+        );
     }
 
     #[tokio::test]
