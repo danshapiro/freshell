@@ -60,6 +60,7 @@ import type { FreshAgentQualificationRow } from './fresh-agent-qualification-rec
 import { RetainedFixtureBrowserSession, runTask2RetainedFixture, Task2RetainedBrowserStageSchema,
   type Task2RetainedBrowserStage } from './task002-retained-fixture.js'
 import { requireAmplifierOnecliBootstrap, readAmplifierQualificationProfile, stageAmplifierQualificationProfile } from './runtime-amplifier-onecli.js'
+import { ownedClaudeStartupPreferences } from './runtime-native-feasibility.js'
 
 type OwnedProcessIdentity = { pid: number; startTicks: string; executable: string; cwd: string }
 
@@ -2397,6 +2398,8 @@ export function createExternalManagedWebFactory(selection: ExternalBrowserSelect
     FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION: 'ask', FRESHELL_MANAGED_RECOVERY_TEST_DELAY_MS: '7000',
   } : {}
   const spec = path.basename(selection.spec)
+  const claudeStartup = !retainedArtifacts && spec === 'runtime-managed-provider-qualification-rust.spec.ts'
+    && selection.provider === 'claude'
   const amplifierProfile = !retainedArtifacts && spec === 'runtime-managed-provider-qualification-rust.spec.ts'
     && selection.provider === 'amplifier'
     ? readAmplifierQualificationProfile(environment) : undefined
@@ -2411,9 +2414,14 @@ export function createExternalManagedWebFactory(selection: ExternalBrowserSelect
       FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: bootstrap.caFile })
   }
   return options => webFactory({ ...options, env: { ...options.env, ...preset },
-    ...(amplifierProfile ? { setupHome: async (home: string) => {
+    ...(amplifierProfile || claudeStartup ? { setupHome: async (home: string) => {
       await options.setupHome?.(home)
-      stageAmplifierQualificationProfile(amplifierProfile, home)
+      if (amplifierProfile) stageAmplifierQualificationProfile(amplifierProfile, home)
+      if (claudeStartup) {
+        const directory = path.join(home, '.claude')
+        await fsp.mkdir(directory, { recursive: true, mode: 0o700 })
+        await fsp.writeFile(path.join(directory, '.claude.json'), ownedClaudeStartupPreferences([options.repoRoot]), { mode: 0o600 })
+      }
     } } : {}),
   })
 }
