@@ -9,7 +9,8 @@
 //!   lock's handle is not inheritable, so the child never holds it). Prints
 //!   one line `locked <pid>` and exits normally when its stdin reaches end of
 //!   file.
-//! - `idle [args...]`: sleeps until killed and ignores its arguments, so
+//! - `idle [args...]`: prints `idle <pid>` and sleeps until killed; it
+//!   ignores its arguments, so
 //!   `freshell-test-helper idle app-server --managed-daemon` is shaped like a
 //!   Codex daemon-family process (`is_codex_daemon_family` judges argv).
 //! - `breakaway-daemon` (Windows only): starts a copy of itself as
@@ -117,6 +118,12 @@ fn hold_lock(args: &[String]) -> i32 {
 }
 
 fn idle() -> i32 {
+    println!("idle {}", std::process::id());
+    let _ = std::io::stdout().flush();
+    park_forever()
+}
+
+fn park_forever() -> i32 {
     loop {
         std::thread::park();
     }
@@ -141,7 +148,7 @@ fn breakaway_daemon() -> i32 {
         Err(err) => println!("spawn-error {}", err.raw_os_error().unwrap_or(-1)),
     }
     let _ = std::io::stdout().flush();
-    idle()
+    park_forever()
 }
 
 #[cfg(not(windows))]

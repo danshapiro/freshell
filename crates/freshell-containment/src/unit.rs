@@ -510,6 +510,11 @@ impl AgentUnit {
         Ok(list.members)
     }
 
+    /// The backend's "unit is empty" event (see `testing::unit_empty_wait`).
+    pub(crate) fn empty_wait(&self) -> Option<BoxFuture<'static, io::Result<()>>> {
+        self.inner.backend.wait_empty()
+    }
+
     pub fn stop_in_flight(&self) -> Option<StopHandle> {
         lock(&self.inner.stop).as_ref().map(|s| s.handle.clone())
     }

@@ -2,7 +2,7 @@
 //! process runs with FRESHELL_TEST_HOOKS=1). One hook holds the Gone
 //! CONFIRMATION (not the kill) so the unconfirmed path is testable end to
 //! end; the other slows the write of the Stopping record, which every signal
-//! waits for.
+//! waits for. Plus one read-only view for tests: the unit's emptiness wait.
 
 /// The delay to hold Gone confirmation for, from
 /// `FRESHELL_TEST_UNIT_GONE_DELAY_MS` (only with `FRESHELL_TEST_HOOKS=1`).
@@ -15,6 +15,15 @@ pub fn gone_delay() -> Option<std::time::Duration> {
 /// `FRESHELL_TEST_HOOKS=1`).
 pub fn persist_delay() -> Option<std::time::Duration> {
     hook_delay("FRESHELL_TEST_UNIT_PERSIST_DELAY_MS")
+}
+
+/// Test support: the "unit is empty" wait the post-Gone sweep uses, when
+/// the unit's backend has one (`None` otherwise). Read-only: it never
+/// changes the unit.
+pub fn unit_empty_wait(
+    unit: &crate::AgentUnit,
+) -> Option<crate::BoxFuture<'static, std::io::Result<()>>> {
+    unit.empty_wait()
 }
 
 fn hook_delay(var: &str) -> Option<std::time::Duration> {
