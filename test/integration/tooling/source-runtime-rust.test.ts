@@ -2,7 +2,7 @@
 
 import { spawn, type ChildProcess } from 'node:child_process'
 import { once } from 'node:events'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
@@ -24,6 +24,10 @@ const PROJECT_ROOT = path.resolve(TEST_DIR, '../../..')
 let child: ChildProcess | undefined
 let homeDir: string | undefined
 let ownedRustPid: number | undefined
+
+function recordFixture(event: string, fields: Record<string, unknown>): void {
+  process.stdout.write(`${JSON.stringify({ severity: 'info', event, ...fields })}\n`)
+}
 
 async function findFreePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -102,7 +106,10 @@ afterEach(async () => {
   }
   child = undefined
   ownedRustPid = undefined
-  if (homeDir) await rm(homeDir, { recursive: true, force: true })
+  if (homeDir) {
+    await rm(homeDir, { recursive: true, force: true })
+    recordFixture('source_runtime_fixture_home_removed', { homeDir })
+  }
   homeDir = undefined
 })
 
@@ -110,11 +117,13 @@ describe('source runtime', () => {
   it('recognizes an owned child that exited by signal before the wait began', async () => {
     const signaledChild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
     await once(signaledChild, 'spawn')
+    recordFixture('source_runtime_signal_fixture_started', { pid: signaledChild.pid })
     signaledChild.kill('SIGTERM')
     await once(signaledChild, 'exit')
     expect(signaledChild.signalCode).toBe('SIGTERM')
 
     await waitForExit(signaledChild, 100)
+    recordFixture('source_runtime_signal_fixture_joined', { pid: signaledChild.pid, signal: signaledChild.signalCode })
   })
 
   it.each([
@@ -142,6 +151,7 @@ describe('source runtime', () => {
       ensureAuthTokenFile({ env, envPath, generateToken: () => token })
       child = spawn(binary, [], { cwd: homeDir, env, stdio: 'ignore' })
       ownedRustPid = child.pid
+      recordFixture('source_runtime_auth_fixture_started', { pid: child.pid, port, homeDir, launch })
 
       await waitForHealth(`http://127.0.0.1:${port}`, 5_000)
       const response = await fetch(`http://127.0.0.1:${port}/api/server-info`, {
@@ -152,17 +162,32 @@ describe('source runtime', () => {
       expect(child.kill('SIGTERM')).toBe(true)
       await waitForExit(child)
       expect(child.exitCode).toBe(0)
+      recordFixture('source_runtime_auth_fixture_joined', { pid: child.pid, exit: child.exitCode, launch })
       child = undefined
       ownedRustPid = undefined
     }
   })
 
   it('starts the release Rust binary through the detected package manager start script and serves the built SPA', async () => {
-    homeDir = await mkdtemp(path.join(os.tmpdir(), 'freshell-source-runtime-'))
+    homeDir = await mkdtemp(path.join(
+      process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR ?? os.tmpdir(), 'freshell-source-runtime-',
+    ))
     const port = await findFreePort()
     const token = `source-runtime-${process.pid}`
     const manager = detectProjectManager(PROJECT_ROOT).manager
     const startCommand = resolveManagerCommand({ manager, args: ['start'], env: process.env })
+    // The resolved manager is already available. An isolated runtime HOME
+    // must not require another manager bootstrap through a PATH shim (for
+    // example Corepack, whose cache belongs to the original HOME).
+    const shimDir = path.join(homeDir, 'bin')
+    await mkdir(shimDir)
+    const shimPath = path.join(shimDir, process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm')
+    const shimSource =
+      process.platform === 'win32'
+        ? '@echo off\r\necho Unexpected nested package-manager bootstrap 1>&2\r\nexit /b 1\r\n'
+        : '#!/bin/sh\nprintf "%s\\n" "Unexpected nested package-manager bootstrap" >&2\nexit 1\n'
+    await writeFile(shimPath, shimSource, { mode: 0o755 })
+    let startupOutput = ''
     child = spawn(startCommand.command, startCommand.args, {
       cwd: PROJECT_ROOT,
       env: {
@@ -175,14 +200,29 @@ describe('source runtime', () => {
         FRESHELL_HOME: homeDir,
         FRESHELL_BIND_HOST: '127.0.0.1',
         FRESHELL_CLIENT_DIR: path.join(PROJECT_ROOT, 'dist', 'client'),
+        PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ''}`,
       },
-      stdio: 'ignore',
+      stdio: ['ignore', 'pipe', 'pipe'],
       shell: startCommand.viaShell ?? false,
     })
+    recordFixture('source_runtime_start_fixture_started', { pid: child.pid, port, homeDir })
+    for (const stream of [child.stdout, child.stderr]) {
+      stream?.on('data', (data: Buffer) => {
+        // Keep synthetic startup diagnostics bounded while still draining
+        // both pipes so diagnostics cannot block the owned server.
+        startupOutput += data.toString().slice(0, Math.max(0, 64 * 1024 - startupOutput.length))
+      })
+    }
 
-    await waitForHealth(`http://127.0.0.1:${port}`)
+    try {
+      await waitForHealth(`http://127.0.0.1:${port}`)
+    } catch (error) {
+      throw new Error(`${error instanceof Error ? error.message : String(error)}; ` +
+        `owned child pid=${child.pid} exit=${child.exitCode} signal=${child.signalCode}; ${startupOutput}`)
+    }
     const rustPid = await waitForRustChild(child.pid!)
     ownedRustPid = rustPid
+    recordFixture('source_runtime_release_child_identified', { pid: rustPid, parentPid: child.pid })
     const response = await fetch(`http://127.0.0.1:${port}/api/server-info`, {
       headers: { 'x-auth-token': token },
     })
@@ -197,6 +237,7 @@ describe('source runtime', () => {
 
     process.kill(rustPid, 'SIGTERM')
     await waitForExit(child)
+    recordFixture('source_runtime_start_fixture_joined', { pid: child.pid, rustPid, exit: child.exitCode, signal: child.signalCode })
     ownedRustPid = undefined
     child = undefined
   })
