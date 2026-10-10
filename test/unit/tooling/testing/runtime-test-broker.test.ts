@@ -366,7 +366,8 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
       res.end(JSON.stringify({ Id: body.Entrypoint ? helperAckId : ownedId }))
       return
     }
-    if (options.delayHelperWait && req.url?.includes('/wait?')) {
+    const isHelperWait = /\/wait(?:\?|$)/.test(req.url ?? '')
+    if (options.delayHelperWait && isHelperWait) {
       waitingResponse = res
       return
     }
@@ -382,7 +383,7 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
       return
     }
     res.statusCode = 200
-    res.end(req.url?.includes('/wait?') ? '{"StatusCode":0}'
+    res.end(isHelperWait ? '{"StatusCode":0}'
       : req.url?.includes('/logs?') ? '{"threadId":"native-owned"}' : JSON.stringify({ Name: providerVolume }))
   })
   const instance = new RestrictedDockerBroker({
@@ -635,6 +636,111 @@ describe('receipt-owned stopped OpenCode repair HTTP routes', () => {
 })
 
 describe('receipt-owned read-only history HTTP routes', () => {
+  it.each([
+    ['retained reader', helperName, dockerCliRetainedStoreHelperBody],
+    ['Node graph reader', helperName, batchStoreHelperBody],
+    ['native history reader', helperName, historyHelperBody],
+    ['stopped repair', repairName, stoppedRepairBody],
+    ['stopped transfer', repairName, () => stoppedRepairBody(path.join(repairStageRoot, 'opencode-transfer-one.ready'))],
+  ] as const)('forwards the captured CLI lifecycle for the already admitted %s', async (_family, name, helperBody) => {
+    await withHttpBroker(async ({ request, forwarded }) => {
+      const body = helperBody()
+      const owner = JSON.parse(createBody(ordinaryBinds).toString())
+      owner.Image = body.Image
+      owner.Env = []
+      expect((await request('POST', '/v1.47/containers/create?name=owned-runtime', owner)).status).toBe(201)
+      expect((await request('POST', `/v1.47/containers/create?name=${name}`, body)).status).toBe(201)
+      expect(forwarded.at(-1)?.body).toEqual(body)
+      const before = forwarded.length
+      for (const [method, url, status] of [
+        ['POST', `/v1.47/containers/${helperId}/start`, 204],
+        ['POST', `/v1.47/containers/${helperId}/wait`, 200],
+        ['GET', `/v1.47/containers/${helperId}/json`, 200],
+        ['GET', `/v1.47/containers/${helperId}/logs?stderr=1&stdout=1`, 200],
+        ['DELETE', `/v1.47/containers/${name}?force=1`, 204],
+      ] as const) {
+        expect((await request(method, url)).status).toBe(status)
+        expect(forwarded.at(-1)).toEqual({ method, url, body: undefined })
+      }
+      expect(forwarded).toHaveLength(before + 5)
+    })
+  })
+
+  it('admits the captured Docker CLI logs query order without accepting extra log controls', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker }) => {
+      await registerRepairOwner(request)
+      expect((await request('POST', `/v1.47/containers/create?name=${helperName}`, dockerCliRetainedStoreHelperBody())).status).toBe(201)
+      expect((await request('GET', `/v1.47/containers/${helperId}/logs?stderr=1&stdout=1`)).status).toBe(200)
+      expect(forwarded.at(-1)?.url).toBe(`/v1.47/containers/${helperId}/logs?stderr=1&stdout=1`)
+      expect(broker.eventsSnapshot().at(-1)).toMatchObject({
+        decision: 'forward', destructive: false, helperName, ownerContainerId: ownedId, providerVolumeName: providerVolume,
+      })
+      const before = forwarded.length
+      for (const [method, url] of [
+        ['POST', `/v1.47/containers/${helperId}/logs?stderr=1&stdout=1`],
+        ['GET', `/v1.47/containers/${helperName}/logs?stderr=1&stdout=1`],
+        ['GET', `/v1.47/containers/${'f'.repeat(64)}/logs?stderr=1&stdout=1`],
+        ['GET', `/v1.47/containers/${helperId.slice(0, 12)}/logs?stderr=1&stdout=1`],
+        ...['follow=1', 'tail=all', 'extra=1', 'stdout=1', 'stderr=1'].map(query =>
+          ['GET', `/v1.47/containers/${helperId}/logs?stderr=1&stdout=1&${query}`]),
+        ['GET', `/v1.47/containers/${helperId}/logs?stderr=1&stdout=0`],
+        ['DELETE', `/v1.47/containers/${helperName}?force=1&v=1`],
+        ['DELETE', `/v1.47/containers/${helperName}`],
+      ]) expect((await request(method, url)).status).toBe(403)
+      expect(forwarded).toHaveLength(before)
+      expect((await request('DELETE', `/v1.47/containers/${helperName}?force=1`)).status).toBe(204)
+    })
+  })
+
+  it('admits the captured Docker CLI log inspection only for an acknowledged exact helper ID', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker }) => {
+      await registerRepairOwner(request)
+      expect((await request('POST', `/v1.47/containers/create?name=${helperName}`, dockerCliRetainedStoreHelperBody())).status).toBe(201)
+      expect((await request('GET', `/v1.47/containers/${helperId}/json`)).status).toBe(200)
+      expect(forwarded.at(-1)?.url).toBe(`/v1.47/containers/${helperId}/json`)
+      expect(broker.eventsSnapshot().at(-1)).toMatchObject({
+        decision: 'forward', destructive: false, helperName, ownerContainerId: ownedId, providerVolumeName: providerVolume,
+      })
+      const before = forwarded.length
+      for (const [method, url] of [
+        ['POST', `/v1.47/containers/${helperId}/json`],
+        ['GET', `/v1.47/containers/${helperName}/json`],
+        ['GET', `/v1.47/containers/${'f'.repeat(64)}/json`],
+        ['GET', `/v1.47/containers/${helperId.slice(0, 12)}/json`],
+        ['GET', `/v1.47/containers/${helperId}/json?size=1`],
+        ['GET', `/v1.47/containers/${helperId}/json?extra=1`],
+      ]) expect((await request(method, url)).status).toBe(403)
+      expect(forwarded).toHaveLength(before)
+      expect((await request('DELETE', `/v1.47/containers/${helperName}?force=1`)).status).toBe(204)
+    })
+  })
+
+  it('admits the captured Docker CLI default wait only for an acknowledged exact helper ID', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker }) => {
+      await registerRepairOwner(request)
+      expect((await request('POST', `/v1.47/containers/create?name=${helperName}`, dockerCliRetainedStoreHelperBody())).status).toBe(201)
+      expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(204)
+      expect(await request('POST', `/v1.47/containers/${helperId}/wait`)).toEqual({ status: 200, body: '{"StatusCode":0}' })
+      expect(forwarded.at(-1)?.url).toBe(`/v1.47/containers/${helperId}/wait`)
+      expect(broker.eventsSnapshot().at(-1)).toMatchObject({
+        decision: 'forward', helperName, ownerContainerId: ownedId, providerVolumeName: providerVolume,
+      })
+      expect((await request('POST', `/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
+      const before = forwarded.length
+      for (const [method, url] of [
+        ['GET', `/v1.47/containers/${helperId}/wait`],
+        ['POST', `/v1.47/containers/${helperName}/wait`],
+        ['POST', `/v1.47/containers/${'f'.repeat(64)}/wait`],
+        ['POST', `/v1.47/containers/${helperId.slice(0, 12)}/wait`],
+        ...['condition=', 'condition=next-exit', 'condition=removed', 'condition=not-running&condition=not-running',
+          'condition=not-running&extra=1', 'extra=1'].map(query => ['POST', `/v1.47/containers/${helperId}/wait?${query}`]),
+        ['POST', `/v1.47/containers/${helperId}/wait/`],
+      ]) expect((await request(method, url)).status).toBe(403)
+      expect(forwarded).toHaveLength(before)
+      expect((await request('DELETE', `/v1.47/containers/${helperName}?force=1`)).status).toBe(204)
+    })
+  })
+
   it('admits the captured Docker CLI retained-reader environment order without changing its authority', async () => {
     await withHttpBroker(async ({ request, forwarded, broker }) => {
       await registerRepairOwner(request)
@@ -722,6 +828,9 @@ describe('receipt-owned read-only history HTTP routes', () => {
       expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(204)
       expect((await request('POST', `/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
       expect((await request('GET', `/v1.47/containers/${helperId}/logs?stdout=1&stderr=0`)).body).toContain('native-owned')
+      expect((await request('POST', `/v1.47/containers/${helperId}/wait`)).status).toBe(200)
+      expect((await request('GET', `/v1.47/containers/${helperId}/json`)).status).toBe(200)
+      expect((await request('GET', `/v1.47/containers/${helperId}/logs?stderr=1&stdout=1`)).body).toContain('native-owned')
       expect((await request('POST', `/v1.47/containers/${helperId}/kill`)).status).toBe(403)
       expect((await request('DELETE', `/v1.47/containers/${helperName}?force=1`)).status).toBe(204)
     })
@@ -832,6 +941,9 @@ describe('receipt-owned read-only history HTTP routes', () => {
       const before = forwarded.length
       expect((await request('DELETE', '/v1.47/containers/freshell-history-22222222-2222-4222-8222-222222222222?force=1')).status).toBe(403)
       expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(403)
+      expect((await request('POST', `/v1.47/containers/${helperId}/wait`)).status).toBe(403)
+      expect((await request('GET', `/v1.47/containers/${helperId}/json`)).status).toBe(403)
+      expect((await request('GET', `/v1.47/containers/${helperId}/logs?stderr=1&stdout=1`)).status).toBe(403)
       expect(forwarded).toHaveLength(before)
       expect((await request('DELETE', `/v1.47/containers/${helperName}?force=1`)).status).toBe(204)
       expect(forwarded.at(-1)?.url).toBe(`/v1.47/containers/${helperName}?force=1`)
@@ -845,6 +957,9 @@ describe('receipt-owned read-only history HTTP routes', () => {
       expect([...broker.receiptIds()]).toEqual([ownedId])
       const before = forwarded.length
       expect((await request('POST', '/v1.47/containers/short-id/start')).status).toBe(403)
+      expect((await request('POST', '/v1.47/containers/short-id/wait')).status).toBe(403)
+      expect((await request('GET', '/v1.47/containers/short-id/json')).status).toBe(403)
+      expect((await request('GET', '/v1.47/containers/short-id/logs?stderr=1&stdout=1')).status).toBe(403)
       expect(forwarded).toHaveLength(before)
       expect((await request('DELETE', `/v1.47/containers/${helperName}?force=1`)).status).toBe(204)
     })
