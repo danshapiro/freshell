@@ -217,13 +217,17 @@ impl TagUnit {
         }
     }
 
-    /// The live processes the kernel-tracked membership follows.
+    /// The live processes the kernel-tracked membership follows, each only
+    /// while its pid still names the incarnation that was tracked (after a
+    /// tracker failure its list is never updated again, and a pid can be
+    /// reused).
     fn kernel_tracked_pids(&self) -> Vec<u32> {
         #[cfg(target_os = "macos")]
         {
             self.forks
                 .iter()
                 .flat_map(|f| f.tracked())
+                .filter(|(pid, start)| is_live_root(*pid, *start))
                 .map(|(pid, _)| pid)
                 .collect()
         }
