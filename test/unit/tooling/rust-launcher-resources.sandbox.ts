@@ -1,13 +1,50 @@
 // @vitest-environment node
-import { spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { spawn, spawnSync } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { expect, it } from 'vitest'
 import { fixture } from './run-rust-tests-fixture.js'
+import { sandboxCommand } from '../../../scripts/testing/run-rust-tests.js'
+import { descendantPids, readProcessSnapshot } from '../../../scripts/testing/process-tree.js'
 
 if (process.env.FRESHELL_SANDBOX_MODE !== 'runtime-suite') {
   throw new Error('Rust resource regression requires the disposable runtime sandbox')
 }
+
+it('removes its temporary artifacts when an interrupted child ignores termination', async () => {
+  const f = fixture()
+  const marker = path.join(f.root, 'held')
+  const sentinel = path.join(f.artifacts, 'foreign')
+  writeFileSync(sentinel, 'keep')
+  const child = spawn('bash', ['-c', sandboxCommand([])], {
+    env: { ...process.env, PATH: `${f.root}/bin:${process.env.PATH}`, HOLD_TEST: marker, RECEIPT: path.join(f.root, 'receipt.jsonl') },
+    stdio: 'ignore',
+  })
+  const joined = new Promise(resolve => child.once('close', resolve))
+  let ownedTmp: string | undefined
+  try {
+    await expect.poll(() => existsSync(marker), { timeout: 5_000 }).toBe(true)
+    const running = JSON.parse(readFileSync(marker, 'utf8'))
+    ownedTmp = running.tmp
+    console.info(JSON.stringify({ severity: 'info', event: 'rust_interruption_fixture_started', pid: child.pid, childPid: running.pid, temporaryDirectory: ownedTmp }))
+    expect(existsSync(running.tmp)).toBe(true)
+    child.kill('SIGTERM')
+    await expect.poll(() => existsSync(running.tmp), { timeout: 2_000 }).toBe(false)
+    expect(readFileSync(sentinel, 'utf8')).toBe('keep')
+  } finally {
+    // This regression lives only in the disposable PID namespace. It owns
+    // the exact shell tree and joins it even when the expected RED fails.
+    if (child.pid !== undefined && child.exitCode === null) {
+      const snapshot = readProcessSnapshot(process.platform)
+      for (const pid of [child.pid, ...descendantPids(child.pid, snapshot)]) {
+        try { process.kill(pid, 'SIGKILL') } catch { /* already settled */ }
+      }
+    }
+    await joined
+    if (ownedTmp) rmSync(ownedTmp, { recursive: true, force: true })
+    f.cleanup()
+  }
+})
 
 it('starts concurrent default Tokio runtimes within the unchanged sandbox PID budget', () => {
   const probe = mkdtempSync('/freshell-test-artifacts/.rust-runtime-probe-')

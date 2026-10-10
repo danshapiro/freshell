@@ -78,62 +78,75 @@ if [ "${1:-}" = "--native-tools" ]; then
     --output "${NATIVE_RECEIPT_DIR%/}/native-session-names.json"
 fi
 
-MOUNT_CORPUS=0
-RUNTIME_SUITE=0
-while [ "$#" -gt 0 ]; do
-  case "${1}" in
-    --corpus)
-      MOUNT_CORPUS=1
-      shift
-      ;;
-    --runtime-suite)
-      RUNTIME_SUITE=1
-      shift
-      ;;
-    --)
-      shift
-      break
-      ;;
-    *)
-      break
-      ;;
-  esac
-done
-
-if [ "${MOUNT_CORPUS}" -eq 1 ] && [ "${RUNTIME_SUITE}" -eq 1 ]; then
-  echo "[sandbox] --runtime-suite may not mount the real --corpus provider data" >&2
-  exit 2
-fi
-
-if [ "$#" -lt 1 ]; then
-  echo "usage: $0 [--corpus | --runtime-suite] \"<command to run inside the sandbox>\"" >&2
-  exit 2
-fi
-CMD="$1"
-
-if ! docker image inspect "${IMAGE_TAG}" >/dev/null 2>&1; then
-  echo "[sandbox] image ${IMAGE_TAG} not found, building it first..." >&2
-  "${REPO_ROOT}/scripts/sandbox-build.sh"
-fi
-
-# Ordinary destructive tests keep the established dedicated bridge network.
-# Managed-runtime lifecycle tests are stricter: no network at all. Neither mode
-# ever uses the host network.
-NETWORK_ARGS=()
-if [ "${RUNTIME_SUITE}" -eq 1 ]; then
-  NETWORK_ARGS=(--network none)
-else
-  NETWORK_NAME="freshell-sandbox"
-  if ! docker network inspect "${NETWORK_NAME}" >/dev/null 2>&1; then
-    docker network create --driver bridge "${NETWORK_NAME}" >/dev/null
+SETTLE_ONLY=0
+if [ "${1:-}" = "--settle-owned" ]; then
+  SETTLE_ONLY=1
+  OWNED_CONTROL_DIR="${2:?owned control directory is required}"
+  OWNED_CONTAINER_NAME="$(basename "${OWNED_CONTROL_DIR}")"
+  if ! [[ "${OWNED_CONTAINER_NAME}" =~ ^freshell-sandbox-[[:alnum:]]{8}$ ]] \
+    || [ "$(cat "${OWNED_CONTROL_DIR}/container.name")" != "${OWNED_CONTAINER_NAME}" ]; then
+    echo '[sandbox] invalid owned settlement control directory' >&2
+    exit 1
   fi
-  NETWORK_ARGS=(--network "${NETWORK_NAME}")
-fi
+else
+  MOUNT_CORPUS=0
+  RUNTIME_SUITE=0
+  while [ "$#" -gt 0 ]; do
+    case "${1}" in
+      --corpus)
+        MOUNT_CORPUS=1
+        shift
+        ;;
+      --runtime-suite)
+        RUNTIME_SUITE=1
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
 
-OWNED_CONTROL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/freshell-sandbox-XXXXXXXX")"
-OWNED_CONTAINER_NAME="$(basename "${OWNED_CONTROL_DIR}")"
+  if [ "${MOUNT_CORPUS}" -eq 1 ] && [ "${RUNTIME_SUITE}" -eq 1 ]; then
+    echo "[sandbox] --runtime-suite may not mount the real --corpus provider data" >&2
+    exit 2
+  fi
+
+  if [ "$#" -lt 1 ]; then
+    echo "usage: $0 [--corpus | --runtime-suite] \"<command to run inside the sandbox>\"" >&2
+    exit 2
+  fi
+  CMD="$1"
+
+  if ! docker image inspect "${IMAGE_TAG}" >/dev/null 2>&1; then
+    echo "[sandbox] image ${IMAGE_TAG} not found, building it first..." >&2
+    "${REPO_ROOT}/scripts/sandbox-build.sh"
+  fi
+
+  # Ordinary destructive tests keep the established dedicated bridge network.
+  # Managed-runtime lifecycle tests are stricter: no network at all. Neither mode
+  # ever uses the host network.
+  NETWORK_ARGS=()
+  if [ "${RUNTIME_SUITE}" -eq 1 ]; then
+    NETWORK_ARGS=(--network none)
+  else
+    NETWORK_NAME="freshell-sandbox"
+    if ! docker network inspect "${NETWORK_NAME}" >/dev/null 2>&1; then
+      docker network create --driver bridge "${NETWORK_NAME}" >/dev/null
+    fi
+    NETWORK_ARGS=(--network "${NETWORK_NAME}")
+  fi
+
+  OWNED_CONTROL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/freshell-sandbox-XXXXXXXX")"
+  OWNED_CONTAINER_NAME="$(basename "${OWNED_CONTROL_DIR}")"
+  printf '%s\n' "${OWNED_CONTAINER_NAME}" > "${OWNED_CONTROL_DIR}/container.name"
+fi
 OWNED_CID_FILE="${OWNED_CONTROL_DIR}/container.id"
-printf '%s\n' "${OWNED_CONTAINER_NAME}" > "${OWNED_CONTROL_DIR}/container.name"
+OWNER_GUARD_PID=""
 DOCKER_CLIENT_PID=""
 REQUESTED_SIGNAL=""
 
@@ -206,6 +219,14 @@ cleanup_owned_container() {
   return "${cleanup_status}"
 }
 
+# The independent owner guard uses this same exact-ID/name settlement path.
+# It runs after a SIGKILL, when the ordinary wrapper cannot execute its traps.
+if [ "${SETTLE_ONLY}" -eq 1 ]; then
+  REQUESTED_SIGNAL="SIGTERM"
+  cleanup_owned_container
+  exit $?
+fi
+
 # shellcheck disable=SC2317 # Invoked by the installed EXIT trap.
 finish_owned_sandbox() {
   local result=$?
@@ -234,6 +255,16 @@ finish_owned_sandbox() {
       kill -TERM "${DOCKER_CLIENT_PID}" 2>/dev/null || true
     fi
     wait "${DOCKER_CLIENT_PID}" 2>/dev/null || true
+  fi
+  # The owner completed its cleanup attempt even when daemon state is
+  # unknown. Join the guard, preserve that failure and retain its evidence.
+  if [ -n "${OWNER_GUARD_PID}" ]; then
+    touch "${OWNED_CONTROL_DIR}/owner.released"
+    if ! python3 "${REPO_ROOT}/scripts/testing/sandbox-owner-guard.py" --join "${OWNED_CONTROL_DIR}"; then
+      sandbox_log error sandbox_owner_guard_unsettled 1
+      result=1
+      container_settled=0
+    fi
   fi
   if [ "${container_settled}" -eq 1 ]; then
     rm -rf -- "${OWNED_CONTROL_DIR}" || result=1
@@ -276,6 +307,14 @@ trap 'finish_owned_sandbox' EXIT
 trap 'interrupt_owned_sandbox 130 SIGINT' INT
 trap 'interrupt_owned_sandbox 143 SIGTERM' TERM
 trap 'interrupt_owned_sandbox 129 SIGHUP' HUP
+
+# Only the strict Rust route opts in. A detached owner guard survives the
+# unchanged coordinator's SIGKILL tree and settles this preallocated object.
+if [ "${RUNTIME_SUITE}" -eq 1 ] && [ "${FRESHELL_SANDBOX_OWNER_GUARD:-}" = "1" ]; then
+  OWNER_GUARD_PID="$(python3 "${REPO_ROOT}/scripts/testing/sandbox-owner-guard.py" "${OWNED_CONTROL_DIR}" "$$" "${BASH_SOURCE[0]}")"
+  printf '{"severity":"info","event":"sandbox_owner_guard_started","container":"%s","pid":%s}\n' \
+    "${OWNED_CONTAINER_NAME}" "${OWNER_GUARD_PID}" >&2
+fi
 
 DOCKER_ARGS=(
   # Reap orphaned test children so zombies cannot exhaust the PID limit.

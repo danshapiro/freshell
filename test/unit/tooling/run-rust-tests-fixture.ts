@@ -43,6 +43,12 @@ export function fixture() {
     fs.appendFileSync(process.env.RECEIPT, JSON.stringify({kind:'cargo', args,
       binary:process.env.FRESHELL_SERVER_BIN, route:process.env.FRESHELL_RUST_TEST_SANDBOX, jobs:process.env.CARGO_BUILD_JOBS,
       tmp:process.env.TMPDIR, executableTmp:process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR})+'\\n');
+    if (args[0] === 'test' && process.env.HOLD_TEST) {
+      process.on('SIGTERM', () => {});
+      fs.writeFileSync(process.env.HOLD_TEST, JSON.stringify({pid:process.pid, tmp:process.env.TMPDIR}));
+      setInterval(() => {}, 10000);
+      await new Promise(() => {});
+    }
     process.exit(Number(args[0]==='build' ? process.env.BUILD_EXIT || 0 : process.env.TEST_EXIT || 0));
   `)
   executable(path.join(root, 'scripts/sandbox-test.sh'), `

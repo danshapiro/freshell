@@ -54,9 +54,13 @@ Only the exact value `1` enables routing; other test backend settings do not.
 The Rust launcher runs its unchanged locked server build and workspace tests
 inside the strict sandbox, selects the container's server binary, and gives
 both temporary-directory variables a newly owned executable directory under
-the sandbox Cargo target volume. Cargo uses three parallel build jobs within
-the existing container resource limits. The launcher removes its temporary
-directory on exit. Sandbox,
+the sandbox Cargo target volume's `/freshell-test-artifacts` alias, outside
+the checkout's Node package lookup scope. Cargo uses three parallel build jobs;
+libtest runs four cases at once and default Tokio runtimes use two workers
+within the existing container resource limits. Explicit test worker counts
+and the complete test workload remain unchanged. The launcher logs its owned
+temporary directory and removes it on exit or before awaiting an interrupted
+child that might ignore termination. Sandbox,
 dependency, and inner-runner failures return failure without host Cargo fallback.
 The same exact opt-in routes the source-runtime process suite through the strict
 sandbox. Its prebuild guard, client build, tools build, and locked release Rust
@@ -73,6 +77,12 @@ FRESHELL_RUST_TEST_SANDBOX=1 pnpm run test:source-runtime
 The client and Electron phases keep their configured backends and coordinator.
 The wrapper records its owned container and settles it before returning a
 signal failure; stopping the attached Docker client alone is insufficient.
+The strict Rust route also starts an independent guard for its exact owned
+container. If the phase watchdog kills the launcher, the guard reuses the
+wrapper's CID/name settlement checks; unknown daemon state retains the
+control directory and an error receipt. Ordinary completion joins the guard
+before returning. The coordinator's watchdog limits and kill behavior remain
+unchanged.
 Warm dependency caches through the documented ordinary sandbox preparation
 before a strict run if needed; strict mode keeps its read-only home and no network.
 

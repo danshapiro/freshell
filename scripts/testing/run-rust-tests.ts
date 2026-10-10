@@ -77,11 +77,12 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`
 }
 
-function sandboxCommand(argv: string[]): string {
+export function sandboxCommand(argv: string[]): string {
   // Fixed wrapper text owns only its newly allocated target subdirectory.
   // Arguments remain separately quoted words; none becomes shell code.
   return `set -e
 owned_tmp="$(mktemp -d /freshell-test-artifacts/.freshell-rust-tests-XXXXXXXX)"
+printf '{"severity":"info","event":"rust_test_temp_created","directory":"%s"}\\n' "$owned_tmp"
 runner_pid=
 cleanup() {
   status=$?
@@ -93,6 +94,9 @@ interrupt() {
   trap '' INT TERM HUP
   if [ -n "$runner_pid" ]; then
     kill -s "$1" "$runner_pid" 2>/dev/null || true
+    # A child may ignore termination. Remove our artifacts before waiting;
+    # the sandbox owner separately settles all remaining container work.
+    rm -rf -- "$owned_tmp"
     wait "$runner_pid" || true
   fi
   exit "$2"
@@ -119,7 +123,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     // Do not inherit a host binary selection. The unchanged inner runner
     // selects its own freshly built /workspace/target/debug server.
     const { FRESHELL_SERVER_BIN: _hostBinary, ...env } = process.env
-    return runChild(path.join(PROJECT_ROOT, 'scripts/sandbox-test.sh'), ['--runtime-suite', sandboxCommand(argv)], env, true)
+    return runChild(path.join(PROJECT_ROOT, 'scripts/sandbox-test.sh'), ['--runtime-suite', sandboxCommand(argv)], { ...env, FRESHELL_SANDBOX_OWNER_GUARD: '1' }, true)
   }
   const binary = path.join(PROJECT_ROOT, 'target', 'debug', `freshell-server${process.platform === 'win32' ? '.exe' : ''}`)
   const cargo = process.platform === 'win32' ? 'cargo.exe' : 'cargo'
