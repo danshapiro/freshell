@@ -9324,6 +9324,8 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
         workspace: PathBuf,
         descriptor: OpenCodeTransferDescriptor,
         ready: PathBuf,
+        source_database: PathBuf,
+        rich_roots: Vec<String>,
     }
 
     impl SyntheticOpencodeStage {
@@ -9360,6 +9362,12 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
         Default,
         Asset,
         UnavailableUndo,
+        Rich,
+        ExistingRich {
+            database: PathBuf,
+            workspace: PathBuf,
+            session_id: String,
+        },
     }
 
     fn synthetic_undo_message(created: i64) -> serde_json::Value {
@@ -9388,29 +9396,60 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
             .prefix("task007-stage-envelope-")
             .tempdir()
             .map_err(|error| error.to_string())?;
-        let workspace = root.path().join("workspace");
+        let mut workspace = root.path().join("workspace");
         std::fs::create_dir_all(&workspace).map_err(|error| error.to_string())?;
-        let source_database = root.path().join("source.sqlite");
-        let source =
-            rusqlite::Connection::open(&source_database).map_err(|error| error.to_string())?;
-        source
-            .execute_batch(freshell_sessions::opencode_transfer::pinned_destination_schema_sql())
-            .map_err(|error| error.to_string())?;
-        for migration in freshell_sessions::opencode_transfer::pinned_destination_migration_ids() {
+        let mut source_database = root.path().join("source.sqlite");
+        let mut rich_roots = Vec::new();
+        let session_id = if let SyntheticTransferHistory::ExistingRich {
+            database,
+            workspace: source_workspace,
+            session_id,
+        } = &history
+        {
+            source_database = database.clone();
+            workspace = source_workspace.clone();
+            session_id.clone()
+        } else if matches!(history, SyntheticTransferHistory::Rich) {
+            let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let seeded = std::process::Command::new("node")
+                .current_dir(&repo)
+                .args(["--import", "tsx", "--input-type=module", "-e", r#"
+import {seedManagedOpenCodeSource} from './scripts/testing/runtime-sandbox.ts';
+const source=seedManagedOpenCodeSource({repoRoot:process.cwd(),databasePath:process.argv[1],workspace:process.argv[2],nonce:'fictional-rich-task007',batch:'stopped-repair-seven-roots'});
+process.stdout.write(JSON.stringify(source.families.map(f=>f.rootId)));
+"#])
+                .arg(&source_database).arg(&workspace).output().map_err(|e|e.to_string())?;
+            if !seeded.status.success() {
+                return Err(String::from_utf8_lossy(&seeded.stderr).into());
+            }
+            rich_roots =
+                serde_json::from_slice::<Vec<String>>(&seeded.stdout).map_err(|e| e.to_string())?;
+            rich_roots[0].clone()
+        } else {
+            let source =
+                rusqlite::Connection::open(&source_database).map_err(|error| error.to_string())?;
             source
-                .execute(
-                    "INSERT INTO migration (id,time_completed) VALUES (?1,0)",
-                    [migration],
+                .execute_batch(
+                    freshell_sessions::opencode_transfer::pinned_destination_schema_sql(),
                 )
                 .map_err(|error| error.to_string())?;
-        }
-        source
+            for migration in
+                freshell_sessions::opencode_transfer::pinned_destination_migration_ids()
+            {
+                source
+                    .execute(
+                        "INSERT INTO migration (id,time_completed) VALUES (?1,0)",
+                        [migration],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            source
             .execute(
                 "INSERT INTO project (id,worktree,time_created,time_updated,sandboxes) VALUES (?1,?2,1,1,'{}')",
                 rusqlite::params!["synthetic-project", workspace.to_string_lossy()],
             )
             .map_err(|error| error.to_string())?;
-        source
+            source
             .execute(
                 "INSERT INTO session (id,project_id,slug,directory,title,version,time_created,time_updated) VALUES (?1,?2,?3,?4,?5,?6,1,1)",
                 rusqlite::params![
@@ -9423,7 +9462,7 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
                 ],
             )
             .map_err(|error| error.to_string())?;
-        source
+            source
             .execute(
                 "INSERT INTO message (id,session_id,time_created,time_updated,data) VALUES (?1,?2,1,1,?3)",
                 rusqlite::params![
@@ -9433,36 +9472,39 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
                 ],
             )
             .map_err(|error| error.to_string())?;
-        if matches!(history, SyntheticTransferHistory::UnavailableUndo) {
-            source
-                .execute("DELETE FROM message", [])
-                .map_err(|error| error.to_string())?;
-            for (id, created) in [("msg_undo_before", 2), ("msg_undo_boundary", 3)] {
-                source.execute(
+            if matches!(history, SyntheticTransferHistory::UnavailableUndo) {
+                source
+                    .execute("DELETE FROM message", [])
+                    .map_err(|error| error.to_string())?;
+                for (id, created) in [("msg_undo_before", 2), ("msg_undo_boundary", 3)] {
+                    source.execute(
                     "INSERT INTO message (id,session_id,time_created,time_updated,data) VALUES (?1,'ses_synthetictransfersession',?2,?2,?3)",
                     rusqlite::params![id, created, synthetic_undo_message(created).to_string()],
                 ).map_err(|error| error.to_string())?;
-            }
-            source.execute(
+                }
+                source.execute(
                 "UPDATE session SET revert=?1 WHERE id='ses_synthetictransfersession'",
                 [serde_json::json!({"messageID":"msg_undo_boundary","snapshot":"1234567890abcdef1234567890abcdef12345678"}).to_string()],
             ).map_err(|error| error.to_string())?;
-        }
-        if matches!(history, SyntheticTransferHistory::Asset) {
-            let asset = workspace.join("saved-prompt.txt");
-            std::fs::write(&asset, b"fictional saved prompt asset")
-                .map_err(|error| error.to_string())?;
-            source.execute(
+            }
+            if matches!(history, SyntheticTransferHistory::Asset) {
+                let asset = workspace.join("saved-prompt.txt");
+                std::fs::write(&asset, b"fictional saved prompt asset")
+                    .map_err(|error| error.to_string())?;
+                source.execute(
                 "INSERT INTO part (id,message_id,session_id,time_created,time_updated,data) VALUES ('synthetic-file-part','synthetic-message','ses_synthetictransfersession',1,1,?1)",
                 [serde_json::json!({"type":"file","mime":"text/plain","url":format!("file://{}",asset.display())}).to_string()],
             ).map_err(|error| error.to_string())?;
-        }
-        drop(source);
+            }
+            drop(source);
+
+            "ses_synthetictransfersession".to_string()
+        };
 
         let snapshot = export_exact_session(
-            &HostOpenCodeInventory::new(source_database)
+            &HostOpenCodeInventory::new(source_database.clone())
                 .with_trusted_mount_for_selected_session(workspace.clone()),
-            "ses_synthetictransfersession",
+            &session_id,
             ExportOptions::new(root.path().join("extraction")),
         )
         .map_err(|error| error.to_string())?;
@@ -9485,7 +9527,7 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
             transfer_id: "synthetic-transfer".into(),
             provider: "opencode".into(),
             source_store_id: snapshot.manifest().source_store_id.clone(),
-            root_session_id: "ses_synthetictransfersession".into(),
+            root_session_id: session_id,
             source_generation: snapshot.manifest().generation.clone(),
             provider_schema: snapshot.manifest().provider_schema.clone(),
             source_schema_fingerprint: snapshot.manifest().source_schema_fingerprint.clone(),
@@ -9543,6 +9585,8 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
             workspace,
             descriptor,
             ready,
+            source_database,
+            rich_roots,
         })
     }
 
@@ -9562,6 +9606,243 @@ sys.exit(0 if os.environ.get('OPENCODE_DISABLE_AUTOUPDATE')=='true' else 7)
         );
         drop(fixture);
         assert!(!root_path.exists(), "owned stage must be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopped_repair_installed_generation_uses_actual_export_import_and_node_comparison() {
+        use freshell_agent_runtime::opencode_transfer::{
+            import_bundle_payload, verify_installed_store, InstalledStoreReaderContext,
+        };
+        use freshell_sessions::opencode_transfer::{
+            export_exact_session, ExportOptions, HostOpenCodeInventory,
+        };
+        let rich =
+            stage_synthetic_opencode_transfer_history(SyntheticTransferHistory::Rich).unwrap();
+        let roots = &rich.rich_roots;
+        assert_eq!(roots.len(), 7);
+        // All seven families use one source store, followed by the original
+        // pinned-schema compatibility fixture. Each gets its own staged bundle/HOME.
+        for index in 0..8 {
+            let fixture = stage_synthetic_opencode_transfer_history(if index == 7 {
+                SyntheticTransferHistory::Default
+            } else {
+                SyntheticTransferHistory::ExistingRich {
+                    database: rich.source_database.clone(),
+                    workspace: rich.workspace.clone(),
+                    session_id: roots[index].clone(),
+                }
+            })
+            .unwrap();
+            let descriptor = &fixture.descriptor;
+            let home = fixture.root.path().join("destination-home");
+            let data = home.join(".local/share");
+            let config = home.join(".config");
+            std::fs::create_dir_all(&config).unwrap();
+            let database = data.join("opencode/opencode.db");
+            let imported = import_bundle_payload(
+                descriptor,
+                std::fs::File::open(fixture.ready.join("entry-0000.bin")).unwrap(),
+                &database,
+                &fixture.workspace,
+            )
+            .unwrap();
+            let reader = InstalledStoreReaderContext {
+                database_path: &database,
+                workspace_root: &fixture.workspace,
+                provider_uid: unsafe { libc::geteuid() },
+                provider_gid: unsafe { libc::getegid() },
+                home: &home,
+                xdg_data_home: &data,
+                xdg_config_home: &config,
+                cwd: &fixture.workspace,
+            };
+            let readable = verify_installed_store(descriptor, &reader).unwrap();
+            assert_eq!(readable.source_generation, descriptor.source_generation);
+            assert_eq!(readable.structural_sha256, imported.structural_sha256);
+            let source_database = fixture.source_database.clone();
+            let export = |database: &Path, name: &str| {
+                export_exact_session(
+                    &HostOpenCodeInventory::new(database.to_path_buf())
+                        .with_trusted_mount_for_selected_session(fixture.workspace.clone()),
+                    &descriptor.root_session_id,
+                    ExportOptions::new(fixture.root.path().join(name)),
+                )
+                .unwrap()
+                .manifest()
+                .clone()
+            };
+            let installed = export(&database, "installed-extraction");
+            assert_ne!(installed.generation, descriptor.source_generation);
+            assert_eq!(installed.row_count as u64, readable.row_count);
+            if index != 7 {
+                assert_eq!(readable.row_count, 332);
+                assert_ne!(
+                    installed.source_schema_fingerprint,
+                    descriptor.source_schema_fingerprint
+                );
+                assert_ne!(
+                    installed.migration_journal_fingerprint,
+                    descriptor.migration_journal_fingerprint
+                );
+            }
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            for (table, column, predicate) in [
+                ("session", "title", "id"),
+                ("message", "data", "session_id"),
+                ("todo", "content", "session_id"),
+            ] {
+                if index == 7 && table == "todo" {
+                    continue;
+                }
+                let original: String = connection
+                    .query_row(
+                        &format!("SELECT {column} FROM {table} WHERE {predicate}=?1 LIMIT 1"),
+                        [&descriptor.root_session_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                // Update just one selected row and retain exactly the same counts.
+                let change = format!("UPDATE {table} SET {column}=?1 WHERE rowid=(SELECT rowid FROM {table} WHERE {predicate}=?2 LIMIT 1)");
+                let changed = if table == "message" {
+                    let mut value: serde_json::Value = serde_json::from_str(&original).unwrap();
+                    value["fictionalMutation"] = serde_json::json!(true);
+                    value.to_string()
+                } else {
+                    "fictional changed row".to_string()
+                };
+                connection
+                    .execute(
+                        &change,
+                        rusqlite::params![changed, descriptor.root_session_id],
+                    )
+                    .unwrap();
+                assert!(
+                    verify_installed_store(descriptor, &reader).is_err(),
+                    "{table} full row mutation must be refused"
+                );
+                assert_eq!(
+                    export(&database, &format!("{table}-changed")).row_count,
+                    installed.row_count
+                );
+                connection
+                    .execute(
+                        &change,
+                        rusqlite::params![original, descriptor.root_session_id],
+                    )
+                    .unwrap();
+                assert!(verify_installed_store(descriptor, &reader).is_ok());
+            }
+            if index != 7 {
+                let child: String = connection
+                    .query_row(
+                        "SELECT id FROM session WHERE parent_id=?1 LIMIT 1",
+                        [&descriptor.root_session_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                connection
+                    .execute("UPDATE session SET parent_id=NULL WHERE id=?1", [&child])
+                    .unwrap();
+                assert!(verify_installed_store(descriptor, &reader).is_err());
+                connection
+                    .execute(
+                        "UPDATE session SET parent_id=?1 WHERE id=?2",
+                        rusqlite::params![descriptor.root_session_id, child],
+                    )
+                    .unwrap();
+                assert!(verify_installed_store(descriptor, &reader).is_ok());
+                connection.execute("INSERT INTO todo(session_id,position,content,status,priority,time_created,time_updated) VALUES(?1,999,'unreceipted','pending','low',1,1)", [&descriptor.root_session_id]).unwrap();
+                assert!(
+                    verify_installed_store(descriptor, &reader).is_err(),
+                    "extra selected closure row must be refused"
+                );
+                connection
+                    .execute(
+                        "DELETE FROM todo WHERE session_id=?1 AND position=999",
+                        [&descriptor.root_session_id],
+                    )
+                    .unwrap();
+                assert!(verify_installed_store(descriptor, &reader).is_ok());
+            }
+            drop(connection);
+            let source = rusqlite::Connection::open(&source_database).unwrap();
+            let title: String = source
+                .query_row(
+                    "SELECT title FROM session WHERE id=?1",
+                    [&descriptor.root_session_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            source
+                .execute(
+                    "UPDATE session SET title='changed source title' WHERE id=?1",
+                    [&descriptor.root_session_id],
+                )
+                .unwrap();
+            let changed_source = export(&source_database, "source-changed");
+            assert_ne!(changed_source.generation, descriptor.source_generation);
+            assert_eq!(changed_source.row_count, installed.row_count);
+            source
+                .execute(
+                    "UPDATE session SET title=?1 WHERE id=?2",
+                    rusqlite::params![title, descriptor.root_session_id],
+                )
+                .unwrap();
+            drop(source);
+            assert_eq!(
+                export(&source_database, "source-restored").generation,
+                descriptor.source_generation
+            );
+            assert_eq!(
+                export(&database, "installed-restored").generation,
+                installed.generation
+            );
+            let environment = serde_json::json!({"providerUid":readable.provider_uid,"providerGid":readable.provider_gid,
+                "home":readable.home,"xdgDataHome":readable.xdg_data_home,"xdgConfigHome":readable.xdg_config_home,
+                "opencodeDb":readable.opencode_db,"cwd":readable.cwd});
+            let baseline = serde_json::json!({"destinationStoreId":imported.destination_store_id,
+                "bundleSha256":imported.bundle_sha256,"structuralSha256":imported.structural_sha256,
+                "rowCount":imported.row_count,"assetCount":imported.asset_count,"providerUid":readable.provider_uid,
+                "providerGid":readable.provider_gid,"readerEnvironmentSha256":hex::encode(Sha256::digest(serde_json::to_vec(&environment).unwrap()))});
+            let facts = fixture.root.path().join("generation-facts.json");
+            std::fs::write(&facts, serde_json::to_vec(&serde_json::json!({
+                "descriptor":descriptor,"baseline":baseline,"readable":readable,
+                "sourceDatabase":source_database,"destinationDatabase":database,"rich":index != 7,
+                "originalManifestJson":descriptor.manifest_json,"installedManifestJson":serde_json::to_string(&installed).unwrap(),
+            })).unwrap()).unwrap();
+            let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let result = std::process::Command::new("node").current_dir(&repo)
+                .args(["--import", "tsx", "--input-type=module", "-e", r#"
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import {execFileSync} from 'node:child_process';
+import {task007ValidateInstalledRead, TASK007_BATCH_STORE_PROBE} from './scripts/testing/runtime-sandbox.ts';
+const f=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));
+const original=JSON.parse(f.originalManifestJson), installed=JSON.parse(f.installedManifestJson);
+assert.notEqual(original.generation,installed.generation);
+if(f.rich){
+  assert.notEqual(original.source_schema_fingerprint,installed.source_schema_fingerprint);
+  assert.notEqual(original.migration_journal_fingerprint,installed.migration_journal_fingerprint);
+}
+assert.deepEqual(task007ValidateInstalledRead(f.descriptor,f.baseline,f.readable),f.readable);
+const graph=database=>JSON.parse(execFileSync(process.execPath,['--no-warnings','-e',TASK007_BATCH_STORE_PROBE,database,f.descriptor.rootSessionId],{encoding:'utf8'}));
+const source=graph(f.sourceDatabase),destination=graph(f.destinationDatabase);
+assert.deepEqual(destination.history,source.history);
+assert.deepEqual(destination.parents,source.parents);
+assert.deepEqual(destination.excludedSourceSentinels,[]);
+if(f.rich) assert.equal(source.excludedSourceSentinels.length,7);
+for(const [key,value] of Object.entries({sourceGeneration:'f'.repeat(64),rootSessionId:'ses_foreign',destinationStoreId:'foreign',structuralSha256:'0'.repeat(64),cwd:'/foreign'})){
+  assert.throws(()=>task007ValidateInstalledRead(f.descriptor,f.baseline,{...f.readable,[key]:value}));
+}
+console.log('actual library export/import/full-row reader and Node semantic binding passed');
+"#]).arg(&facts).output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
     }
 
     #[test]

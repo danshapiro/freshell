@@ -640,18 +640,22 @@ export class RestrictedDockerBroker {
   }
 
   private validateNodeHistoryHelper(parsed: Record<string, any>): BrokerReceipt | undefined {
+    const same = (actual: unknown, expected: unknown) => JSON.stringify(actual) === JSON.stringify(expected)
     const host = parsed.HostConfig ?? {}
     const cmd = parsed.Cmd
-    const workspace = parsed.WorkingDir
+    const semantic = Array.isArray(cmd) && cmd.length === 7 && cmd[2] === TASK007_BATCH_STORE_PROBE
+    const workspace = semantic ? cmd[6] : parsed.WorkingDir
+    if (typeof workspace !== 'string' || path.normalize(workspace) !== workspace || !this.isAllowedWorkspacePath(workspace)) return
     const sources: Record<string, string> = {
       claude: '/home/freshell/provider/.claude/projects', codex: '/home/freshell/provider/.codex/sessions',
       opencode: '/home/freshell/provider/.local/share/opencode/opencode.db', amplifier: '/home/freshell/provider/.amplifier/projects',
     }
     // Read the owner binding only when handling a request, after both ESM
     // modules initialize; the helper admits no caller-selected script.
-    const batch = Array.isArray(cmd) && cmd.length === 5 && cmd[0] === '--no-warnings' && cmd[1] === '-e'
+    const batch = Array.isArray(cmd) && (cmd.length === 5 || semantic) && cmd[0] === '--no-warnings' && cmd[1] === '-e'
       && cmd[2] === TASK007_BATCH_STORE_PROBE && cmd[3] === sources.opencode
       && typeof cmd[4] === 'string' && /^ses_[A-Za-z0-9_-]{1,252}$/.test(cmd[4])
+      && (!semantic || cmd[5] === '/run/freshell-opencode-reader.frame')
       && typeof parsed.Image === 'string' && /^sha256:[a-f0-9]{64}$/.test(parsed.Image)
     const native = typeof workspace === 'string' && Array.isArray(cmd) && cmd.length === 7
       && cmd[0] === '--no-warnings' && cmd[1] === '--import'
@@ -660,16 +664,22 @@ export class RestrictedDockerBroker {
       && typeof cmd[4] === 'string' && Object.hasOwn(sources, cmd[4]) && cmd[5] === sources[cmd[4]]
       && typeof cmd[6] === 'string' && cmd[6].length > 0
     if ((!batch && !native) || parsed.User !== '65534:0' || parsed.Tty !== !batch || !this.validHistoryHelperHost(host, false)
-      || JSON.stringify(parsed.Env) !== JSON.stringify(['HOME=/home/freshell/provider'])
-      || typeof workspace !== 'string' || path.normalize(workspace) !== workspace || !this.isAllowedWorkspacePath(workspace)
+      || !Array.isArray(parsed.Env) || !same([...parsed.Env].sort(), semantic ? ['HOME=/home/freshell/provider', 'OPENCODE_DB=/home/freshell/provider/.local/share/opencode/opencode.db', 'XDG_CONFIG_HOME=/home/freshell/provider/.config', 'XDG_DATA_HOME=/home/freshell/provider/.local/share'] : ['HOME=/home/freshell/provider'])
+      || (semantic && (typeof parsed.WorkingDir !== 'string' || path.normalize(parsed.WorkingDir) !== parsed.WorkingDir
+        || !(parsed.WorkingDir === workspace || isStrictDescendant(parsed.WorkingDir, workspace))))
       || !this.policy.allowedImageRefs.has(parsed.Image)) return
     const mounts = host.Mounts
-    if (!Array.isArray(mounts) || mounts.length !== 2) return
+    if (!Array.isArray(mounts) || mounts.length !== (semantic ? 4 : 2) || new Set(mounts.map(mount => mount.Target)).size !== mounts.length) return
     const volume = mounts.find(mount => mount.Type === 'volume' && mount.Target === '/home/freshell/provider' && mount.ReadOnly === true)
     const source = mounts.find(mount => mount.Type === 'bind' && mount.Source === workspace && mount.Target === workspace && mount.ReadOnly === true)
     if (!volume || !source) return
+    const binary = semantic && mounts.find(mount => mount.Type === 'bind' && mount.Target === '/runtime/freshell-session-host' && mount.ReadOnly === true)
+    const descriptor = semantic && mounts.find(mount => mount.Type === 'bind' && mount.Target === '/run/freshell-opencode-reader.frame' && mount.ReadOnly === true)
+    if (semantic && (!binary || !descriptor || !this.policy.allowedHostBinaryPaths.has(binary.Source))) return
     return this.receipts().find(receipt => receipt.providerVolumeName === volume.Source
-      && receipt.workspacePath === workspace && receipt.imageRef === parsed.Image)
+      && receipt.workspacePath === workspace && receipt.imageRef === parsed.Image
+      && (!semantic || (binary.Source === receipt.hostBinaryPath
+        && descriptor.Source === path.join(receipt.runtimeDir, 'task007-reader-descriptor.frame'))))
   }
 
   private isAllowedWorkspacePath(candidate: string): boolean {

@@ -4503,6 +4503,15 @@ async fn stopped_repair_resume_failure_retry_preserves_baseline() {
     if run_task007_owned_case_child(Task007OwnedCase::BaselineRetry).await {
         return;
     }
+    stopped_repair_baseline_case(false).await;
+}
+
+#[tokio::test]
+async fn pending_stopped_repair_withdrawal_allows_startup_without_losing_baseline() {
+    stopped_repair_baseline_case(true).await;
+}
+
+async fn stopped_repair_baseline_case(pending_startup: bool) {
     use freshell_runtime_protocol::{
         CanonicalOwnerChoice, DesiredState, PreflightLostSoulsRequest, RecoverRequest,
         RecoveryOutcome, RecoveryState, RecoveryTrigger, RepairBatchSourceSelection, RequestId,
@@ -4513,7 +4522,7 @@ async fn stopped_repair_resume_failure_retry_preserves_baseline() {
     };
     use sha2::{Digest, Sha256};
     let dir = tempfile::tempdir().unwrap();
-    let registry = Registry::open(dir.path(), None).unwrap();
+    let mut registry = Registry::open(dir.path(), None).unwrap();
     let workspace = dir.path().join("workspace");
     fs::create_dir(&workspace).unwrap();
     let database = dir.path().join("source.sqlite");
@@ -4565,7 +4574,7 @@ async fn stopped_repair_resume_failure_retry_preserves_baseline() {
             .unwrap();
         targets.push(target);
     }
-    let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+    let mut supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
     let scope = supervisor
         .preflight_lost_souls_from_inventory(
             PreflightLostSoulsRequest {
@@ -4659,6 +4668,191 @@ async fn stopped_repair_resume_failure_retry_preserves_baseline() {
     }
     // Actual export/import/reader receipts exercise baseline persistence here;
     // the authenticated Docker/helper/UI path is the stopped browser runbook.
+    if pending_startup {
+        let obstruction = dir.path().join("lifecycle.jsonl.1");
+        fs::create_dir(&obstruction).unwrap();
+        let unrelated = freshell_runtime_protocol::IncidentId::new();
+        Connection::open(registry.database_path()).unwrap().execute(
+            "INSERT INTO outbox(event_id,event_kind,payload,created_at) VALUES ('startup-unrelated','loss_incident.final',?1,1)",
+            [serde_json::json!({"incidentId":unrelated,"cleanupState":"closed","event":"unrelated"}).to_string()],
+        ).unwrap();
+        assert!(registry
+            .finalize_stopped_repair_batch(
+                operation.clone(),
+                targets.clone(),
+                receipts.clone(),
+                dir.path().join("incidents"),
+                dir.path().join("lifecycle.jsonl"),
+            )
+            .await
+            .is_err());
+        drop(supervisor);
+        drop(registry);
+        registry = Registry::open(dir.path(), None).unwrap();
+        supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+        // These are the actual calls before main binds the control socket.
+        supervisor
+            .reconcile_pending_loss_cleanup()
+            .await
+            .expect("pending withdrawal must leave startup and repair control available");
+        assert_eq!(supervisor.reconcile_startup().await.unwrap().scanned, 0);
+        let conn = Connection::open(registry.database_path()).unwrap();
+        let pending: (String, String) = conn.query_row(
+            "SELECT o.status,w.status FROM stopped_repair_operations o JOIN stopped_repair_withdrawals w USING(operation_id) WHERE operation_id=?1",
+            [operation.as_str()], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(pending, ("withdraw_pending".into(), "files_pending".into()));
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM writer_claims", [], |row| row
+                .get::<_, u32>(0))
+                .unwrap(),
+            0
+        );
+        assert!(
+            supervisor.export_pending_incidents().await.is_err(),
+            "destructive cleanup remains blocked"
+        );
+        for target in &targets {
+            assert_eq!(
+                registry
+                    .recovery_context(target.soul_id.clone())
+                    .await
+                    .unwrap()
+                    .desired_state,
+                DesiredState::Stopped
+            );
+        }
+        for (receipt, (store, bytes)) in receipts.iter().zip(&stores) {
+            assert_eq!(
+                registry
+                    .recovery_context(receipt.canonical_soul_id.clone())
+                    .await
+                    .unwrap()
+                    .opencode_adoption_baseline,
+                Some(receipt.adoption_baseline.clone())
+            );
+            assert_eq!(fs::read(store).unwrap(), *bytes);
+        }
+        let unrelated_path = dir
+            .path()
+            .join("incidents")
+            .join(format!("{unrelated}.closed.json"));
+        let unrelated_bytes = fs::read(&unrelated_path).unwrap();
+        let delivered: Option<i64> = conn
+            .query_row(
+                "SELECT delivered_at FROM outbox WHERE event_id='startup-unrelated'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(delivered.is_some());
+        drop(conn);
+        let true_context = prepared_context_in_registry(&registry, dir.path()).await;
+        let true_loss = registry
+            .prepare_loss(decision_for(&registry, &true_context).unwrap())
+            .await
+            .unwrap();
+        let true_incident = true_loss.certificate.incident_id.clone();
+        supervisor.reconcile_pending_loss_cleanup().await.unwrap();
+        let conn = Connection::open(registry.database_path()).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT cleanup_state FROM loss_incidents WHERE incident_id=?1",
+                [true_incident.as_str()],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "cleanup_pending",
+            "pending withdrawal must gate actual certified loss cleanup"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM writer_claims WHERE soul_id=?1",
+                [true_context.soul_id.as_str()],
+                |row| row.get::<_, u32>(0)
+            )
+            .unwrap(),
+            1,
+            "retain the unrelated certified writer until cleanup is allowed"
+        );
+        let true_certificate: String = conn
+            .query_row(
+                "SELECT certificate_json FROM loss_incidents WHERE incident_id=?1",
+                [true_incident.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        fs::remove_dir(&obstruction).unwrap();
+        supervisor.reconcile_pending_loss_cleanup().await.unwrap();
+        let conn = Connection::open(registry.database_path()).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT cleanup_state FROM loss_incidents WHERE incident_id=?1",
+                [true_incident.as_str()],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "closed"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT certificate_json FROM loss_incidents WHERE incident_id=?1",
+                [true_incident.as_str()],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            true_certificate
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM writer_claims", [], |row| row
+                .get::<_, u32>(0))
+                .unwrap(),
+            0
+        );
+        drop(conn);
+        let first = registry
+            .finalize_stopped_repair_batch(
+                operation.clone(),
+                targets.clone(),
+                receipts.clone(),
+                dir.path().join("incidents"),
+                dir.path().join("lifecycle.jsonl"),
+            )
+            .await
+            .unwrap();
+        let again = registry
+            .finalize_stopped_repair_batch(
+                operation.clone(),
+                targets.clone(),
+                receipts.clone(),
+                dir.path().join("incidents"),
+                dir.path().join("lifecycle.jsonl"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first, again);
+        assert_eq!(fs::read(unrelated_path).unwrap(), unrelated_bytes);
+        let conn = Connection::open(registry.database_path()).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT status FROM stopped_repair_operations WHERE operation_id=?1",
+                [operation.as_str()],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "complete"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM stopped_repair_withdrawals WHERE operation_id=?1",
+                [operation.as_str()],
+                |row| row.get::<_, u32>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
     let result = registry
         .finalize_stopped_repair_batch(
             operation,

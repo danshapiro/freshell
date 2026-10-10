@@ -1,3 +1,4 @@
+import { runInNewContext } from 'node:vm'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as owner from '../../../../scripts/testing/runtime-sandbox.js'
 import * as external from '../../../../scripts/testing/runtime-external-browser.js'
@@ -180,6 +181,170 @@ try{await runTask007DestructiveSandbox(${JSON.stringify(fixtureRepoRoot)})}catch
         if (control) await fsp.rm(control.testRoot, { recursive: true, force: true })
       }
   }, 90_000)
+})
+
+describe('Task7 exclusive descriptor file cleanup', () => {
+  it.each(['partial write', 'partial write and close', 'close', 'pre-existing', 'restrictive umask'] as const)(
+    'preserves descriptor ownership and read-only handoff for %s', async (fault) => {
+      const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused descriptor writer web') }, fixtureRepoRoot, 3,
+        {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
+      const runtimeDir = path.join(fixtureRepoRoot, 'owned-runtime')
+      await fsp.mkdir(runtimeDir, { mode: 0o700 })
+      const descriptorFile = path.join(runtimeDir, 'task007-reader-descriptor.frame')
+      const imageRef = `sha256:${'a'.repeat(64)}`
+      const descriptor = { targetImageRef: imageRef, rootSessionId: 'ses_current' }
+      const batch = { input: { hostBinaryPath: '/owned/host', workspacePath: fixtureRepoRoot, cwd: fixtureRepoRoot, fixtureId: 'fixture-current' } }
+      const target = { rootSessionId: 'ses_current', soulId: 'soul-current' }
+      const receipt = { runtimeDir, imageRef, containerId: 'b'.repeat(64), providerVolumeName: 'owned-volume' }
+      rig.runtime.imageRef = imageRef
+      const readerFailure = new Error('controlled reader failure after frame handoff')
+      const docker = vi.spyOn(Object.getPrototypeOf(rig), 'trackedDockerProbe').mockImplementation(async (_containerId: string, args: string[]) => {
+        if (fault === 'restrictive umask') {
+          if (args[0] === 'rm') return ''
+          if (args[0] === 'create') {
+            expect(args.slice(args.indexOf('--user'), args.indexOf('--user') + 2)).toEqual(['--user', '65534:0'])
+            expect(args).toContain(`type=bind,source=${descriptorFile},target=/run/freshell-opencode-reader.frame,readonly`)
+            expect((await fsp.stat(descriptorFile)).mode & 0o777).toBe(0o444)
+            const frame = await fsp.readFile(descriptorFile)
+            expect(frame.readUInt32BE(0)).toBe(frame.length - 4)
+            expect(JSON.parse(frame.subarray(4).toString())).toEqual(descriptor)
+            throw readerFailure
+          }
+        }
+        throw new Error('unexpected Docker probe')
+      })
+      const writeFailure = Object.assign(new Error('controlled partial frame write'), { code: 'ENOSPC' })
+      const closeFailure = Object.assign(new Error('controlled descriptor close'), { code: 'EIO' })
+      const originalWrite = fsp.writeFile.bind(fsp), originalOpen = fsp.open.bind(fsp)
+      let handle: Awaited<ReturnType<typeof fsp.open>> | undefined
+      let closed = false, partialObserved = false
+      let descriptorMode: number | undefined
+      const foreign = Buffer.from('pre-existing different owned-by-someone-else frame')
+      if (fault === 'pre-existing') await originalWrite(descriptorFile, foreign, { mode: 0o400 })
+      // Inject failure after real bytes reach the temporary file, for either
+      // path-based or fd-based writers.
+      vi.spyOn(fsp, 'writeFile').mockImplementation(async (...args) => {
+        if (args[0] === descriptorFile && fault.startsWith('partial')) {
+          await originalWrite(descriptorFile, Buffer.from(args[1] as Uint8Array).subarray(0, 5), args[2])
+          partialObserved = (await fsp.readFile(descriptorFile)).length === 5
+          throw writeFailure
+        }
+        return originalWrite(...args)
+      })
+      vi.spyOn(fsp, 'open').mockImplementation(async (...args) => {
+        const opened = await originalOpen(...args)
+        if (args[0] !== descriptorFile) return opened
+        handle = opened
+        // Model the actual 0400 file produced by a restrictive creator umask.
+        await opened.chmod(0o400)
+        const originalClose = opened.close.bind(opened)
+        vi.spyOn(opened, 'close').mockImplementation(async () => {
+          descriptorMode = (await opened.stat()).mode & 0o777
+          await originalClose(); closed = true
+          if (fault === 'close' || fault === 'partial write and close') throw closeFailure
+        })
+        if (fault.startsWith('partial')) vi.spyOn(opened, 'writeFile').mockImplementation(async bytes => {
+          await opened.write(Buffer.from(bytes as Uint8Array).subarray(0, 5))
+          partialObserved = (await fsp.readFile(descriptorFile)).length === 5
+          throw writeFailure
+        })
+        return opened
+      })
+      try {
+        const read = Reflect.apply(Object.getPrototypeOf(rig).readTask007InstalledGraph, rig, [batch, target, receipt, { descriptor }])
+        if (fault === 'pre-existing') {
+          await expect(read).rejects.toMatchObject({ code: 'EEXIST' })
+          expect((await fsp.readFile(descriptorFile)).equals(foreign)).toBe(true)
+          expect(handle).toBeUndefined()
+          expect((await fsp.stat(descriptorFile)).mode & 0o777).toBe(0o400)
+        } else {
+          const expectedFailure = fault === 'close' ? closeFailure : fault === 'restrictive umask' ? readerFailure : writeFailure
+          await expect(read).rejects.toBe(expectedFailure)
+          if (fault.startsWith('partial')) expect(partialObserved).toBe(true)
+          expect(fs.existsSync(descriptorFile)).toBe(false)
+          expect(closed).toBe(true)
+          expect(descriptorMode).toBe(0o444)
+          await expect(handle!.stat()).rejects.toMatchObject({ code: 'EBADF' })
+        }
+        if (fault === 'restrictive umask') expect(docker.mock.calls.map(([, args]) => args[0])).toEqual(['create', 'rm'])
+        else expect(docker).not.toHaveBeenCalled()
+      } finally {
+        try { if (handle && !closed) await handle.close() }
+        finally { vi.restoreAllMocks() }
+      }
+    })
+})
+
+describe('Task7 existing native reader baseline binding', () => {
+  it('hands the original bounded frame to the exact native reader before publishing a real SQLite graph', async () => {
+    const database = path.join(fixtureRepoRoot, 'semantic-source.db')
+    const source = owner.seedManagedOpenCodeSource({ repoRoot: fixtureRepoRoot, databasePath: database,
+      workspace: fixtureRepoRoot, nonce: 'fictional-semantic-transport' })
+    const frameFile = path.join(fixtureRepoRoot, 'reader.frame')
+    const descriptor = { rootSessionId: source.rootId, manifestJson: 'fictional immutable descriptor metadata' }
+    const bytes = Buffer.from(JSON.stringify(descriptor)), frame = Buffer.alloc(bytes.length + 4)
+    frame.writeUInt32BE(bytes.length); bytes.copy(frame, 4)
+    await fsp.writeFile(frameFile, frame)
+    const native = vi.fn((file: string, args: string[], options: { input: Buffer }) => {
+      expect(file).toBe('/runtime/freshell-session-host')
+      expect(args).toEqual(['opencode-reader-probe', '--workspace-root', fixtureRepoRoot,
+        '--expected-cwd', fixtureRepoRoot, '--provider-uid', '65534', '--provider-gid', '0'])
+      expect(options.input.equals(frame)).toBe(true)
+      return JSON.stringify({ rootSessionId: source.rootId, sourceGeneration: 'original' })
+    })
+    const execute = (root = source.rootId) => {
+      let output = ''
+      runInNewContext(owner.TASK007_BATCH_STORE_PROBE, { Buffer,
+        process: { execPath: process.execPath, argv: ['node', database, root, frameFile, fixtureRepoRoot],
+          cwd: () => fixtureRepoRoot, stdout: { write: (bytes: string) => { output += bytes } } },
+        require: (name: string) => name === 'node:child_process' ? {
+          execFileSync: (file: string, args: string[], options: { input: Buffer }) => file === '/runtime/freshell-session-host'
+            ? native(file, args, options) : execFileSync(file, args, options),
+        } : createRequire(import.meta.url)(name),
+      })
+      return JSON.parse(output)
+    }
+    const actual = execute()
+    expect(native).toHaveBeenCalledOnce()
+    expect(actual.readable.rootSessionId).toBe(source.rootId)
+    expect(actual.history.messages).toEqual(Object.fromEntries(source.baselineMessages))
+    expect(actual.parents).toEqual({ [source.rootId]: null, [source.childId]: source.rootId, [source.grandchildId]: source.childId })
+    expect(() => execute('ses_foreign')).toThrow(/root differs/)
+    for (const invalid of [frame.subarray(0, 3), Buffer.concat([frame, Buffer.from([0])])]) {
+      await fsp.writeFile(frameFile, invalid)
+      expect(() => execute()).toThrow(/frame/)
+    }
+    expect(native).toHaveBeenCalledOnce()
+  })
+
+  const descriptor = { transferId: 'transfer-current', sourceStoreId: 'a'.repeat(64), sourceGeneration: 'b'.repeat(64),
+    rootSessionId: 'ses_current', destinationStoreId: 'store-current', destinationDatabasePath: '.local/share/opencode/opencode.db',
+    targetImageRef: `sha256:${'c'.repeat(64)}`, targetBuildReceipt: 'd'.repeat(64), bundleSha256: 'e'.repeat(64),
+    sourceSchemaFingerprint: '1'.repeat(64), migrationJournalFingerprint: '2'.repeat(64), manifestJson: '{}' }
+  const environment = { providerUid: 65534, providerGid: 0, home: '/home/freshell/provider',
+    xdgDataHome: '/home/freshell/provider/.local/share', xdgConfigHome: '/home/freshell/provider/.config',
+    opencodeDb: '/home/freshell/provider/.local/share/opencode/opencode.db', cwd: '/workspace' }
+  const readable = { version: 1, transferId: descriptor.transferId, destinationStoreId: descriptor.destinationStoreId,
+    rootSessionId: descriptor.rootSessionId, sourceGeneration: descriptor.sourceGeneration, targetImageRef: descriptor.targetImageRef,
+    targetBuildReceipt: descriptor.targetBuildReceipt, ...environment, rowCount: 332, assetCount: 0, structuralSha256: 'f'.repeat(64) }
+  const baseline = { destinationStoreId: readable.destinationStoreId, providerUid: readable.providerUid, providerGid: readable.providerGid,
+    rowCount: readable.rowCount, assetCount: readable.assetCount, structuralSha256: readable.structuralSha256,
+    bundleSha256: descriptor.bundleSha256, readerEnvironmentSha256: createHash('sha256').update(JSON.stringify(environment)).digest('hex') }
+  it('accepts a fresh reader of the original baseline and refuses foreign, stale or absent evidence', () => {
+    expect(owner.task007ValidateInstalledRead(descriptor, baseline, readable)).toEqual(readable)
+    for (const [key, value] of Object.entries({ transferId: 'foreign', destinationStoreId: 'foreign', rootSessionId: 'ses_foreign',
+      sourceGeneration: '0'.repeat(64), targetImageRef: `sha256:${'0'.repeat(64)}`, targetBuildReceipt: '0'.repeat(64),
+      providerUid: 0, providerGid: 1, rowCount: 331, assetCount: 1, structuralSha256: '0'.repeat(64), cwd: '/foreign',
+      home: '/foreign', xdgDataHome: '/foreign', xdgConfigHome: '/foreign', opencodeDb: '/foreign' })) {
+      expect(() => owner.task007ValidateInstalledRead(descriptor, baseline, { ...readable, [key]: value })).toThrow()
+    }
+    for (const missing of [undefined, {}]) {
+      expect(() => owner.task007ValidateInstalledRead(missing, baseline, readable)).toThrow()
+      expect(() => owner.task007ValidateInstalledRead(descriptor, missing, readable)).toThrow()
+      expect(() => owner.task007ValidateInstalledRead(descriptor, baseline, missing)).toThrow()
+    }
+    expect(() => owner.task007ValidateInstalledRead(descriptor, { ...baseline, bundleSha256: '0'.repeat(64) }, readable)).toThrow()
+  })
 })
 
 describe('Task7 exact library test artifact packaging', () => {
@@ -1333,6 +1498,12 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
             canonicalSoulId: eligibleOwners.length === 1 ? eligibleOwners[0] : null } }) }
       // Production scopes use a SHA256 generation, independently of the selection ID.
       scope.roots.forEach(root => { root.graphDigest = 'f'.repeat(64) })
+      const capturedManifest = { version: 1, root_session_id: batch.output.targets[0].rootSessionId,
+        source_store_id: facts.sourceStoreId, source_schema_fingerprint: '1'.repeat(64),
+        migration_journal_fingerprint: '2'.repeat(64), rows: [], generation: '' }
+      capturedManifest.generation = createHash('sha256').update(JSON.stringify(capturedManifest)).digest('hex')
+      const capturedManifestJson = JSON.stringify(capturedManifest)
+      scope.roots[0].graphDigest = capturedManifest.generation
       const insertOperation = db.prepare('INSERT INTO stopped_repair_operations VALUES(?,?,?,?,?)')
       insertOperation.run('repair-current', 'complete', JSON.stringify(targets), JSON.stringify(scope), JSON.stringify(batch.output.canonicalChoices))
       insertOperation.run('repair-foreign', 'complete', '[]', JSON.stringify(scope), JSON.stringify(batch.output.canonicalChoices))
@@ -1343,10 +1514,27 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
       db.prepare('INSERT INTO runtime_notices VALUES(?)').run('notice-unrelated')
       db.prepare('INSERT INTO outbox VALUES(?)').run('event-unrelated')
       const root = batch.output.targets[0]
+      const descriptor = { transferId: 'transfer-current', sourceStoreId: facts.sourceStoreId,
+        sourceGeneration: capturedManifest.generation, rootSessionId: root.rootSessionId, destinationStoreId: root.providerStoreId,
+        destinationDatabasePath: '.local/share/opencode/opencode.db', manifestJson: capturedManifestJson,
+        targetImageRef: batch.input.imageRef, targetBuildReceipt: 'c'.repeat(64), bundleSha256: 'd'.repeat(64),
+        sourceSchemaFingerprint: capturedManifest.source_schema_fingerprint, migrationJournalFingerprint: capturedManifest.migration_journal_fingerprint }
+      const environment = { providerUid: 65534, providerGid: 0, home: '/home/freshell/provider',
+        xdgDataHome: '/home/freshell/provider/.local/share', xdgConfigHome: '/home/freshell/provider/.config',
+        opencodeDb: '/home/freshell/provider/.local/share/opencode/opencode.db', cwd: batch.input.cwd }
+      const readable = { destinationStoreId: root.providerStoreId, rowCount: 318, assetCount: 0, structuralSha256: 'a'.repeat(64),
+        providerUid: 65534, providerGid: 0, bundleSha256: descriptor.bundleSha256,
+        readerEnvironmentSha256: createHash('sha256').update(JSON.stringify(environment)).digest('hex') }
+      const fresh = { version: 1, transferId: descriptor.transferId, destinationStoreId: descriptor.destinationStoreId,
+        rootSessionId: descriptor.rootSessionId, sourceGeneration: descriptor.sourceGeneration, targetImageRef: descriptor.targetImageRef,
+        targetBuildReceipt: descriptor.targetBuildReceipt, ...environment, rowCount: 318, assetCount: 0, structuralSha256: readable.structuralSha256 }
+      const imported = { canonical_soul_id: root.soulId, captured_identity_revision: 1, captured_intent_revision: 1,
+        captured_native_import_revision: 1, ...Object.fromEntries(Object.entries({ ...descriptor, ...readable }).filter(([key]) => key !== 'manifestJson')
+        .map(([key, value]) => [key.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`), value])) }
       db.prepare('INSERT INTO stopped_repair_root_receipts VALUES(?,?,?,?,?,?,?,?,?,?,?)').run('repair-current', root.rootSessionId, root.soulId,
-        'f'.repeat(64), 'transfer-current', JSON.stringify({ adoption_baseline: { manifestSha256: 'f'.repeat(64) } }),
-        JSON.stringify({ destinationStoreId: root.providerStoreId, rowCount: 318, assetCount: 0, structuralSha256: 'a'.repeat(64),
-          providerUid: 65534, providerGid: 0, readerEnvironmentSha256: 'b'.repeat(64) }), facts.sourceStoreId, 1, 1, 1)
+        capturedManifest.generation, descriptor.transferId, JSON.stringify({ ...imported, adoption_baseline: {
+          manifestSha256: createHash('sha256').update(capturedManifestJson).digest('hex'), descriptor,
+        } }), JSON.stringify(readable), facts.sourceStoreId, 1, 1, 1)
       db.close()
       await fsp.mkdir(path.join(batch.registryRoot, 'incidents'))
       await fsp.writeFile(path.join(batch.registryRoot, 'incidents/incident-9.closed.json'), 'unchanged unrelated artifact')
@@ -1380,7 +1568,10 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
       await fsp.writeFile(inspection, JSON.stringify([{ Id: root.containerId, State: { Running: false } }]))
       const installedDatabase = path.join(batch.outputDir, 'installed.db')
       await fsp.copyFile(batch.sourceDatabaseFile, installedDatabase)
-      await fsp.writeFile(probeScript, `const fs=require('node:fs'),args=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');if(args[0]==='inspect')process.stdout.write(fs.readFileSync(${JSON.stringify(inspection)}));else if(args[0]==='create'){fs.writeFileSync(${JSON.stringify(selected)},JSON.stringify(args));process.stdout.write('${'d'.repeat(64)}')}else if(args[0]==='wait')process.stdout.write('0');else if(args[0]==='logs'){const saved=JSON.parse(fs.readFileSync(${JSON.stringify(selected)}));if(saved[saved.indexOf('--entrypoint')+1]==='node')process.stdout.write(require('node:child_process').execFileSync(process.execPath,['--no-warnings','-e',saved.at(-3),${JSON.stringify(installedDatabase)},saved.at(-1)],{encoding:'utf8'}));else process.stdout.write(JSON.stringify({request:JSON.parse(saved.at(-1)),providerVersion:'1.18.21',sourceSchemaFingerprint:'schema-current',migrationJournalFingerprint:'migration-current',generation:'generation-current',rowCount:318}));}else if(!['start','rm'].includes(args[0]))process.exit(4);\n`)
+      await fsp.mkdir(root.runtimeDir, { recursive: true })
+      const freshFile = path.join(batch.outputDir, 'fresh-reader.json')
+      await fsp.writeFile(freshFile, JSON.stringify(fresh))
+      await fsp.writeFile(probeScript, `const fs=require('node:fs'),args=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');if(args[0]==='inspect')process.stdout.write(fs.readFileSync(${JSON.stringify(inspection)}));else if(args[0]==='create'){fs.writeFileSync(${JSON.stringify(selected)},JSON.stringify(args));process.stdout.write('${'d'.repeat(64)}')}else if(args[0]==='wait')process.stdout.write('0');else if(args[0]==='logs'){const saved=JSON.parse(fs.readFileSync(${JSON.stringify(selected)}));if(saved[saved.indexOf('--entrypoint')+1]==='node'){const frame=fs.readFileSync(${JSON.stringify(path.join(root.runtimeDir, 'task007-reader-descriptor.frame'))});if(frame.readUInt32BE(0)!==frame.length-4||JSON.parse(frame.subarray(4)).rootSessionId!==saved.at(-3))throw Error('wrong frame');const graph=JSON.parse(require('node:child_process').execFileSync(process.execPath,['--no-warnings','-e',saved.at(-5),${JSON.stringify(installedDatabase)},saved.at(-3)],{encoding:'utf8'}));process.stdout.write(JSON.stringify({...graph,readable:JSON.parse(fs.readFileSync(${JSON.stringify(freshFile)}))}));}else process.stdout.write(JSON.stringify({request:JSON.parse(saved.at(-1)),providerVersion:'1.18.21',sourceSchemaFingerprint:'schema-current',migrationJournalFingerprint:'migration-current',generation:'generation-current',rowCount:318}));}else if(!['start','rm'].includes(args[0]))process.exit(4);\n`)
       const read = vi.spyOn(Object.getPrototypeOf(rig), 'trackedDockerProbe').mockImplementation(async (_container: string, args: string[]) => new Promise<string>((resolve, reject) => {
         execFile(process.execPath, [probeScript, ...args], { encoding: 'utf8' }, (error, stdout) => error ? reject(error) : resolve(stdout))
       }))
@@ -1390,10 +1581,17 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
       expect(observed.status).toBe('complete')
       expect(observed.souls).toHaveLength(9)
       expect(observed.souls.every(soul => soul.activeWriters === 0 && !soul.incidentPresent)).toBe(true)
-      expect(observed.roots[0]).toMatchObject({ rootSessionId: root.rootSessionId, providerUid: 65534, rowCount: 318 })
+      expect(observed.roots[0]).toMatchObject({ rootSessionId: root.rootSessionId, providerUid: 65534, rowCount: 318,
+        sourceGeneration: capturedManifest.generation,
+        sourceSchemaFingerprint: capturedManifest.source_schema_fingerprint,
+        migrationJournalFingerprint: capturedManifest.migration_journal_fingerprint })
+      expect(observed.roots[0]).not.toHaveProperty('sourceManifestJson')
+      expect(observed.roots[0]).not.toHaveProperty('descriptor')
+      expect(observed.roots[0]).not.toHaveProperty('readable')
+      expect(observed.roots[0]).not.toHaveProperty('destinationDatabasePath')
       expect(observed.installedStores.map(({ parents, history, excludedSourceSentinels, ...measured }) => measured)).toEqual([{ rootSessionId: root.rootSessionId, providerStoreId: root.providerStoreId,
         providerUid: 65534, providerGid: 0, providerVersion: '1.18.21', sourceSchemaFingerprint: 'schema-current',
-        migrationJournalFingerprint: 'migration-current', generation: 'generation-current', rowCount: 318 }])
+        migrationJournalFingerprint: 'migration-current', generation: 'generation-current', rowCount: 318, readable: fresh }])
       expect(observed.installedStores[0]).toHaveProperty('parents', {
         [batch.source.families[0].rootId]: null,
         [batch.source.families[0].childId]: batch.source.families[0].rootId,
@@ -1408,6 +1606,26 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
       expect(actual[1]).toContain('retained-opencode-store-worker')
       expect(actual[1]).toContain(`type=volume,source=${root.providerVolumeName},target=/home/freshell/provider,readonly`)
       expect(actual.at(-1)?.slice(0, 2)).toEqual(['rm', '--force'])
+      expect(fs.existsSync(path.join(root.runtimeDir, 'task007-reader-descriptor.frame'))).toBe(false)
+      await fsp.writeFile(freshFile, JSON.stringify({ ...fresh, sourceGeneration: '0'.repeat(64) }))
+      await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/original descriptor/)
+      expect(fs.existsSync(path.join(root.runtimeDir, 'task007-reader-descriptor.frame'))).toBe(false)
+      await fsp.writeFile(freshFile, JSON.stringify(fresh))
+      const originalImport = JSON.stringify({ ...imported, adoption_baseline: {
+        manifestSha256: createHash('sha256').update(capturedManifestJson).digest('hex'), descriptor } })
+      for (const badDescriptor of [undefined, { ...descriptor, sourceGeneration: '0'.repeat(64) },
+        { ...descriptor, rootSessionId: 'ses_foreign' }, { ...descriptor, destinationStoreId: 'foreign' },
+        { ...descriptor, targetImageRef: `sha256:${'0'.repeat(64)}` }]) {
+        const changed = new DatabaseSync(database)
+        changed.prepare('UPDATE stopped_repair_root_receipts SET import_receipt_json=? WHERE operation_id=?')
+          .run(JSON.stringify({ ...imported, adoption_baseline: { descriptor: badDescriptor,
+            manifestSha256: createHash('sha256').update(capturedManifestJson).digest('hex') } }), 'repair-current')
+        changed.close()
+        await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow()
+      }
+      const restored = new DatabaseSync(database)
+      restored.prepare('UPDATE stopped_repair_root_receipts SET import_receipt_json=? WHERE operation_id=?').run(originalImport, 'repair-current')
+      restored.close()
       expect(observed.unrelated).toEqual({ incidentPresent: true, viewPresent: true, noticeIds: ['notice-unrelated'],
         outboxEventIds: ['event-unrelated'], exportSha256: [createHash('sha256').update('unchanged unrelated artifact').digest('hex')] })
       if (attempt === 'blocked stopped' || attempt === 'stopped readonly WAL') {
@@ -1954,6 +2172,166 @@ describe('fixed observations of an owned prior enclosure', () => {
       await expect(rig.ownedContainerState({ ...address, runId: 'foreign' })).rejects.toThrow(/owned|address/)
       expect(await fsp.readFile(calls, 'utf8')).toBe(before)
     } finally { vi.unstubAllEnvs(); await fsp.rm(root, { recursive: true, force: true }) }
+  })
+})
+
+describe('current running fresh-session lookup', () => {
+  it('resolves presentation and materialized native IDs to the same current running row', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', {
+      enabledProviders: [], freshAgentModes: [],
+    })
+    const row = { ...handle, freshAgentSessionId: 'presentation-owned', launchState: 'running', intentRevision: 1 }
+    const prior = { ...row, incarnationId: 'prior-incarnation', launchState: 'stopped' }
+    vi.spyOn(rig, 'inventory').mockResolvedValue([prior, row])
+    await expect(rig.runningViewForFreshSession(row.freshAgentSessionId)).resolves.toEqual(row)
+    await expect(rig.runningViewForFreshSession(row.nativeSessionId)).resolves.toEqual(row)
+    await expect(rig.runningViewForFreshSession('unrelated-session')).resolves.toBeNull()
+  })
+
+  it.each(['prepared', 'created', 'starting', 'stopped', 'failed'])('refuses %s rows and unrelated session identities', async launchState => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', {
+      enabledProviders: [], freshAgentModes: [],
+    })
+    const row = { ...handle, freshAgentSessionId: 'presentation-owned', launchState, intentRevision: 1 }
+    vi.spyOn(rig, 'inventory').mockResolvedValue([row])
+    await expect(rig.runningViewForFreshSession(row.freshAgentSessionId)).resolves.toBeNull()
+    await expect(rig.runningViewForFreshSession(row.nativeSessionId)).resolves.toBeNull()
+    await expect(rig.runningViewForFreshSession('unrelated-session')).resolves.toBeNull()
+  })
+})
+
+describe('startup replacement fixture observes bounded automatic recovery', () => {
+  it.each(['scheduled', 'blocked', 'unrelated-live', 'late-live', 'deadline-live', 'pending', 'near-deadline'] as const)('observes %s inventory without forcing or rearming recovery', async scenario => {
+    const { exercisePhase3StartupReplacementCrash } = await import('../../../runtime/gates/phase-3.test.js')
+    const h = new owner.RuntimeHarness(fixtureRepoRoot, 'startup-backoff-unit', 3, { bootstrapProviders: [] })
+    let starts = 0
+    let soulId = ''
+    const row = () => ({ soulId, incarnationId: 'original-incarnation', containerId: 'original-container',
+      nativeSessionId: 'native-root', launchState: 'running', recoveryState: 'live',
+      durabilityState: 'resume_captured', allocationState: 'verified_durable' })
+    h.broker = { receiptIds: () => new Set<string>() } as unknown as RestrictedDockerBroker
+    vi.spyOn(h, 'startSupervisor').mockImplementation(async () => ({
+      containerId: `supervisor-${++starts}`, volumeName: 'owned-volume',
+    }) as owner.SupervisorInstance)
+    vi.spyOn(h, 'stopSupervisorExact').mockImplementation(() => undefined)
+    vi.spyOn(h, 'removeContainerExact').mockImplementation(() => undefined)
+    vi.spyOn(h, 'killOwnedRuntimeExact').mockImplementation(() => undefined)
+    const waitForFault = vi.spyOn(h, 'waitForContainerExit').mockResolvedValue(undefined)
+    vi.spyOn(h, 'containerLogs').mockReturnValue(JSON.stringify({ event: 'supervisor.test_crash', point: 'after_docker_create' }))
+    vi.spyOn(h, 'brokerReceiptsSince').mockReturnValue([{ containerId: 'quarantined-container' }] as ReturnType<owner.RuntimeHarness['brokerReceiptsSince']>)
+    vi.spyOn(h, 'inspectContainer').mockReturnValue({ State: { Running: false } })
+    vi.spyOn(h, 'nativeFixtureCall').mockImplementation(async (_instance, _incarnation, request) =>
+      request.method === 'create' ? { ok: true, sessionId: 'native-root' }
+        : { ok: true, sessionId: 'native-root', history: ['create', 'automatic_resume'] })
+    const recoveryTimes: number[] = []
+    const inventoryTimes: number[] = []
+    const readTimeouts: Array<number | undefined> = []
+    let pendingReads = 0
+    vi.spyOn(h, 'adminOk').mockImplementation(async (_instance, body, options) => {
+      const elapsed = Date.now()
+      switch (body.method) {
+        case 'health': return { kind: 'health', data: { controlEpoch: 1 } }
+        case 'launch':
+          soulId = body.params.soulId
+          return { kind: 'launch', data: { view: row(), workerPid: 42, workerLaunchCount: 1 } }
+        case 'probe_recovery': return { kind: 'recovery_probe', data: { kind: 'reattach_ready' } }
+        case 'inventory': {
+          if (starts < 3) return { kind: 'inventory', data: [row()] }
+          inventoryTimes.push(elapsed)
+          readTimeouts.push(options?.timeoutMs)
+          if (scenario === 'pending') {
+            pendingReads++
+            const timeout = options?.timeoutMs ?? owner.CONTROL_ROUND_TRIP_TIMEOUT_MS
+            return await new Promise((_resolve, reject) => setTimeout(() => {
+              pendingReads--
+              reject(new Error(`control round trip exceeded ${timeout}ms`))
+            }, timeout))
+          }
+          if (scenario === 'late-live' || scenario === 'deadline-live') {
+            vi.setSystemTime(scenario === 'late-live' ? 9_001 : 8_000)
+            return { kind: 'inventory', data: [{ ...row(), incarnationId: 'replacement-incarnation' }] }
+          }
+          if (scenario === 'near-deadline') {
+            vi.setSystemTime(7_990)
+            return { kind: 'inventory', data: [{ ...row(), launchState: 'stopped', recoveryState: 'blocked' }] }
+          }
+          const recovered = elapsed >= 2_000 && scenario !== 'blocked'
+          return { kind: 'inventory', data: recovered
+            ? [{ ...row(), soulId: scenario === 'unrelated-live' ? 'other-soul' : soulId, incarnationId: 'replacement-incarnation' }]
+            : [{ ...row(), launchState: 'stopped', recoveryState: 'blocked' }] }
+        }
+        case 'recover':
+          expect(body.params.trigger).toBe('startup_reconcile')
+          recoveryTimes.push(elapsed)
+          return { kind: 'recovery', data: { outcome: elapsed >= 2_000 ? 'reattached' : 'blocked' } }
+        case 'stop': return { kind: 'stop', data: { outcome: 'verified_empty' } }
+        default: throw new Error(`unadmitted controlled request ${body.method}`)
+      }
+    })
+    vi.useFakeTimers({ now: 0 })
+    try {
+      const execution = exercisePhase3StartupReplacementCrash(h)
+      // Attach the assertion before advancing timers so a genuine driver
+      // failure is observed without creating an unhandled rejection.
+      const checked = scenario === 'scheduled'
+        ? expect(execution).resolves.toMatchObject({ recoveryOutcome: 'reattached', nativeSessionStable: true, stopOutcome: 'verified_empty' })
+        : expect(execution).rejects.toThrow(/within 8000ms|control round trip exceeded 8000ms/)
+      await Promise.all([vi.runAllTimersAsync(), checked])
+      expect(waitForFault).toHaveBeenCalledExactlyOnceWith('supervisor-2', 8_000)
+      expect(recoveryTimes).toEqual(scenario === 'scheduled' ? [2_000] : [])
+      expect(inventoryTimes.at(-1)).toBe(scenario === 'scheduled' ? 2_000 : scenario === 'blocked' || scenario === 'unrelated-live' ? 7_900 : 0)
+      expect(readTimeouts[0]).toBe(8_000)
+      if (scenario === 'scheduled') {
+        expect(readTimeouts.at(-2)).toBe(6_000)
+        expect(readTimeouts.at(-1)).toBeUndefined() // existing post-recovery inventory keeps its default
+      }
+      if (scenario === 'pending' || scenario === 'near-deadline') expect(Date.now()).toBe(8_000)
+      expect(pendingReads).toBe(0)
+      expect(vi.getTimerCount()).toBe(0)
+    } finally { vi.useRealTimers() }
+  })
+})
+
+describe('owned inventory control read timeout', () => {
+  it.each(['adminRaw', 'adminOk', 'adminEnvelopeRaw'] as const)('settles %s and destroys its owned socket within the requested read budget', async method => {
+    const h = new owner.RuntimeHarness(fixtureRepoRoot, 'control-timeout-unit', 3, { bootstrapProviders: [] })
+    const socketPath = path.join(fixtureRepoRoot, 'control.sock')
+    const sockets = new Set<net.Socket>()
+    const timers = new Set<NodeJS.Timeout>()
+    let requests = 0
+    let closed = 0
+    const server = net.createServer(socket => {
+      sockets.add(socket)
+      socket.once('data', () => {
+        requests++
+        // A bounded fallback makes the pre-fix RED settle too, instead of
+        // waiting the unchanged default two-minute control timeout.
+        const timer = setTimeout(() => {
+          timers.delete(timer)
+          const payload = Buffer.from(JSON.stringify({ result: { Ok: { kind: 'inventory', data: [] } } }))
+          const frame = Buffer.alloc(4 + payload.length)
+          frame.writeUInt32BE(payload.length)
+          payload.copy(frame, 4)
+          socket.end(frame)
+        }, 100)
+        timers.add(timer)
+        socket.once('close', () => { clearTimeout(timer); timers.delete(timer) })
+      })
+      socket.once('close', () => { sockets.delete(socket); closed++ })
+    })
+    await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(socketPath, resolve) })
+    const instance = { controlSocket: socketPath, controlSecret: 'controlled-secret' } as owner.SupervisorInstance
+    try {
+      const read = method === 'adminEnvelopeRaw'
+        ? h.adminEnvelopeRaw(instance, { body: h.inventoryBody() }, { timeoutMs: 25 })
+        : h[method](instance, h.inventoryBody(), { timeoutMs: 25 })
+      await expect(read).rejects.toThrow(/control round trip exceeded 25ms/)
+      await vi.waitFor(() => { expect(requests).toBe(1); expect(closed).toBe(1); expect(sockets.size).toBe(0); expect(timers.size).toBe(0) })
+    } finally {
+      for (const timer of timers) clearTimeout(timer)
+      for (const socket of sockets) socket.destroy()
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+    }
   })
 })
 
