@@ -430,6 +430,20 @@ describe('Amplifier native history proof', () => {
       reasoningEffortProvenance: 'unsupported-native-telemetry', nativeEvidence: { kind: 'append_only_record', recordIndex: 1, completionEventOrdinal: 1 } })
   })
 
+  it.each(['missing-full', 'conflicting-preview', 'conflicting-length', 'empty-sole-data'] as const)(
+    'refuses an incomplete observed Amplifier callback sequence (%s)', fault => {
+      const root = tempRoot('amplifier-preview-only'), sessionDir = path.join(root, 'project', 'sessions', sessionId), source: any = observedSession()
+      writeJsonl(path.join(sessionDir, 'events.jsonl'), source.events); writeJsonl(path.join(sessionDir, 'transcript.jsonl'), source.transcript)
+      expect(readAmplifierNativeHistory(root, sessionId).turns).toHaveLength(1)
+      source.events.splice(3, 1)
+      if (fault === 'conflicting-preview') source.events[2].data.response_preview = 'unrelated'
+      if (fault === 'conflicting-length') source.events[2].data.length = 100
+      if (fault === 'empty-sole-data') source.events[2].data = {}
+      writeJsonl(path.join(sessionDir, 'events.jsonl'), source.events)
+      expect(() => readAmplifierNativeHistory(root, sessionId)).toThrow(/completion|callback|response/i)
+    },
+  )
+
   it('joins each observed profile to its own persisted prompt instead of using the first response or configuration', () => {
     const root = tempRoot('amplifier-per-prompt'), sessionDir = path.join(root, 'project', 'sessions', sessionId), source: any = observedSession()
     const second = observedSession()

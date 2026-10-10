@@ -273,6 +273,26 @@ describe('qualification from private native originals', () => {
     conversation.stages[1].observedReasoningEffort = 'low'; write('native-recovery-originals.json', original)
     expect(derive).toThrow(/observed effort/i)
   })
+
+  it.each(['missing-full', 'conflicting-preview', 'conflicting-length', 'empty-sole-data'] as const)(
+    'refuses incomplete Amplifier callbacks through native recovery derivation (%s)', fault => {
+      const { input, stages, original, write, derive } = amplifierFixture(true)
+      expect(derive()).toHaveLength(1)
+      const stage = stages[1]!, events = fs.readFileSync(path.join(input.evidenceDir, (stage as any).nativeEvents.path), 'utf8').trim().split('\n').map(line => JSON.parse(line))
+      const full = events.findLastIndex(event => event.event === 'prompt:complete' && typeof event.data.response === 'string')
+      events.splice(full, 1)
+      const preview = events.findLast(event => event.event === 'prompt:complete')!
+      if (fault === 'conflicting-preview') preview.data.response_preview = 'unrelated'
+      if (fault === 'conflicting-length') preview.data.length = 100
+      if (fault === 'empty-sole-data') preview.data = {}
+      const bytes = Buffer.from(events.map(event => JSON.stringify(event)).join('\n') + '\n')
+      Object.assign(stage, { nativeEvents: write((stage as any).nativeEvents.path, bytes.toString('utf8')) })
+      const store = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.store.path), 'utf8'))
+      store.eventsSnapshot.bytesBase64 = bytes.toString('base64'); store.eventsSnapshot.sha256 = digest(bytes)
+      stage.store = write(stage.store.path, store); write('native-recovery-originals.json', original)
+      expect(derive).toThrow(/completion|callback|response/i)
+    },
+  )
   it('refuses missing originals through the actual settled owner finalizer without publishing assertions or a receipt', async () => {
     const { input } = fixture()
     const owner = new ManagedRuntimeOwner(() => { throw new Error('unused native original fixture web') }, path.resolve(import.meta.dirname, '../../../..'), 5,

@@ -51,7 +51,7 @@ type Completion = {
   ordinal: number
   eventSha256: string
   profile: AmplifierProfile
-  observed?: { prompt: string; response: string | null; submittedAt: number; responseAt: number; requestId: string | null; responseEventSha256s: string[] }
+  observed?: { prompt: string; response: string; submittedAt: number; responseAt: number; requestId: string | null; responseEventSha256s: string[] }
 }
 
 /** The pinned CLI emits an orchestrator preview and a final CLI callback for
@@ -85,19 +85,20 @@ function observedCompletions(records: PositionedJsonlRecord[]): Completion[] {
       current.callbacks.push(object(event.data, 'Amplifier completion callback data'))
       continue
     }
-    if (!current.responses.length || !current.callbacks.length || current.callbacks.length > 2) throw new Error('Amplifier stored prompt lacks unambiguous native response/completion evidence')
+    if (!current.responses.length || current.callbacks.length !== 2) throw new Error('Amplifier stored prompt lacks its native response and preview/full completion callbacks')
     const profiles = current.responses.map(response => {
       const data = object(response.value.data, 'Amplifier llm:response data')
       return { provider: requiredString(data.provider, 'Amplifier observed response provider'), model: requiredString(data.model, 'Amplifier observed response model'),
         effort: data.reasoning_effort === undefined || data.reasoning_effort === null ? 'unknown' : requiredString(data.reasoning_effort, 'Amplifier observed response effort') }
     })
     if (profiles.some(profile => JSON.stringify(profile) !== JSON.stringify(profiles[0]))) throw new Error('Amplifier native responses have conflicting per-prompt profile evidence')
-    const [first, second] = current.callbacks
-    if (second && (typeof first!.response_preview !== 'string' || !Number.isSafeInteger(first!.length) || typeof second.prompt !== 'string' || typeof second.response !== 'string'
-      || second.response.length !== first!.length || !second.response.startsWith(first!.response_preview))) throw new Error('Amplifier native completion callbacks are duplicated or conflicting')
-    const full = second ?? first!
-    if (full.prompt !== undefined && full.prompt !== current.prompt) throw new Error('Amplifier completion callback conflicts with the submitted native prompt')
-    const response = full.response === undefined ? null : requiredString(full.response, 'Amplifier completed response')
+    // The pinned producer establishes this pair; a preview alone cannot prove
+    // the complete response or its exact submitted prompt.
+    const [preview, full] = current.callbacks as [Record<string, any>, Record<string, any>]
+    if (typeof preview.response_preview !== 'string' || !Number.isSafeInteger(preview.length) || typeof full.prompt !== 'string' || typeof full.response !== 'string'
+      || full.response.length !== preview.length || !full.response.startsWith(preview.response_preview)) throw new Error('Amplifier native completion callbacks are duplicated or conflicting')
+    if (full.prompt !== current.prompt) throw new Error('Amplifier completion callback conflicts with the submitted native prompt')
+    const response = requiredString(full.response, 'Amplifier completed response')
     completions.push({ completedAt: event.ts, ordinal: completions.length + 1, eventSha256: record.recordSha256, profile: profiles[0]!,
       observed: { prompt: current.prompt, response, submittedAt: current.submittedAt, responseAt: Date.parse(current.responses.at(-1)!.value.ts), requestId: current.requestId, responseEventSha256s: current.responses.map(row => row.recordSha256) } })
     current = undefined
@@ -209,7 +210,7 @@ export function readAmplifierNativeHistory(projectsRoot: string, exactSessionId:
     if (completion.observed) {
       const observed = completion.observed, prior = transcript.find(prior => prior.recordIndex === record.recordIndex - 1)?.value
       if (prior?.role !== 'user' || prior.content !== observed.prompt) throw new Error('Amplifier native response does not map to the exact preceding transcript prompt')
-      if (observed.response !== null && materialized.text !== observed.response) throw new Error('Amplifier native response does not match the stored assistant content')
+      if (materialized.text !== observed.response) throw new Error('Amplifier native response does not match the stored assistant content')
       const transcriptId = optionalString(message.metadata?.request_id ?? message.request_id)
       if (transcriptId && observed.requestId && transcriptId !== observed.requestId) throw new Error('Amplifier transcript conflicts with the provider-supplied prompt identity')
       const assistantAt = Date.parse(validTimestamp(message.metadata?.timestamp ?? message.timestamp, 'Amplifier stored assistant timestamp'))
