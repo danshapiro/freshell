@@ -169,6 +169,7 @@ pub(crate) fn unit_record(unit_id: &str, running: bool) -> freshell_containment:
                 since_ms: 1,
             }
         },
+        legacy_tag: None,
     }
 }
 

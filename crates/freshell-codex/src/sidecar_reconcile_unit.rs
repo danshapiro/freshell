@@ -4,7 +4,9 @@
 //! LB-02, LB-25, LB-32). The unit is reopened from the boot unit record
 //! (each recorded root re-pinned only while its pid still has its recorded
 //! start time), or, for a legacy (v1) record without a unit, the sidecar is
-//! adopted into a fresh unit by its pinned launcher. The native main is
+//! adopted into a fresh unit by its pinned launcher (that unit's record
+//! keeps the legacy tag, so the next restart reopens it with the same
+//! members, and the rewritten sidecar record names it). The native main is
 //! pinned (by its recorded pid and start time, or for a legacy record as the
 //! listener among the unit's members), the recorded ws URL is probed once,
 //! and the listener must be that pinned main. An unusable survivor's unit is

@@ -29,6 +29,13 @@ pub struct UnitRecord {
     /// signals only processes whose pid AND start time still match.
     pub roots: Vec<(u32, u64)>,
     pub state: UnitRecordState,
+    /// A pre-containment (v1) Codex sidecar adopted by
+    /// `Containment::adopt_legacy`: the environment tag `(key, value)` its
+    /// processes carry. A reopen finds the unit's members by this tag, its
+    /// live roots and their descendants, as the adoption did. `None` for
+    /// every unit this server created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_tag: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -375,6 +382,7 @@ mod tests {
             conversation_keys: vec![("codex".into(), "s1".into())],
             roots: vec![(10, 1000)],
             state,
+            legacy_tag: None,
         }
     }
 

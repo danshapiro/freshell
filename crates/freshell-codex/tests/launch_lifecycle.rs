@@ -2810,6 +2810,204 @@ mod unit_sidecar {
         );
     }
 
+    /// SIGKILLs, when dropped, every process this test started that is still
+    /// that process: the launcher (pinned at spawn) and everything the
+    /// native manifests in `manifests` pin. A failed assertion leaves
+    /// nothing running.
+    struct KillOwnOnDrop {
+        launcher: (u32, u64),
+        manifests: PathBuf,
+    }
+
+    impl Drop for KillOwnOnDrop {
+        fn drop(&mut self) {
+            for entry in std::fs::read_dir(&self.manifests)
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let is_native = entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("native-") && n.ends_with(".json"));
+                let manifest = std::fs::read_to_string(entry.path())
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<fake_codex::NativeManifest>(&raw).ok());
+                if let (true, Some(manifest)) = (is_native, manifest) {
+                    manifest.kill_all();
+                }
+            }
+            fake_codex::signal_own_child(self.launcher.0, self.launcher.1, libc::SIGKILL);
+        }
+    }
+
+    /// A legacy (v1) sidecar adopted inside a unit at the first restart after
+    /// the upgrade, and retained again, is reattached at the NEXT restart
+    /// through its recorded unit: the unit still finds its members by the
+    /// legacy tag, nothing is killed, and a later stop reaches the native and
+    /// everything it started, including a detached job found only by that
+    /// tag (review I1).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_legacy_sidecar_adopted_at_one_restart_is_reattached_at_the_next() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(CodexSidecarStore::new(home.path().join("records")));
+        let root = UnitStateRoot::new();
+        let options = || SelectOptions {
+            shim: None,
+            state_root: root.path().to_path_buf(),
+        };
+        let manifests = home.path().join("manifests");
+
+        // Before the upgrade: a unit-less sidecar with a v1-shaped record,
+        // retained across the restart.
+        let legacy = SpawnedCodexAppServerRuntime::with_command_store_and_context(
+            fake_codex::launcher_command(),
+            store.clone(),
+            fake_context(
+                json!({"threadStartThreadId": "t-leg", "turnCompleteDelayMs": 60000,
+                    "spawnHelperProcess": true, "turnSpawnsShellCommand": true,
+                    "detachedJobOnTurn": true}),
+                home.path(),
+            ),
+        );
+        let ready = legacy.ensure_ready(None).await.expect("legacy ready");
+        legacy
+            .note_session_id("t-leg".to_string())
+            .await
+            .expect("session id");
+        let launcher = legacy.child_pid().await.expect("launcher pid");
+        let _cleanup = KillOwnOnDrop {
+            launcher: (
+                launcher,
+                fake_codex::proc_starttime(launcher).expect("launcher start"),
+            ),
+            manifests: manifests.clone(),
+        };
+        legacy
+            .prepare_retention("server-shutdown".to_string())
+            .await
+            .expect("retain");
+        drop(legacy);
+        let v1 = store.load_all().pop().expect("the legacy record");
+        assert!(
+            v1.unit_id.is_none() && v1.main_pid.is_none(),
+            "a legacy record names no unit: {v1:?}"
+        );
+        let native = native_manifest_in(&manifests);
+        let native_start = native.start_time(native.pid);
+
+        // The upgrade restart: the legacy sidecar is adopted inside a fresh
+        // unit, then retained again at the next shutdown.
+        let unit_id = {
+            let server = Containment::select(options());
+            let units = server.recorded_units().expect("records");
+            let (reconciler, report) =
+                SidecarReconciler::boot_reconcile_with_units(store.clone(), &units);
+            assert_eq!(report.held, 1, "the legacy sidecar is held: {report:?}");
+            let record = reconciler.claim_for_session("t-leg").await.expect("claim");
+            let adopted = ReattachedCodexAppServerRuntime::with_unit(
+                record,
+                None,
+                store.clone(),
+                seed_over(server.clone(), "t-leg"),
+            );
+            let adopted_ready = adopted.ensure_ready(None).await.expect("legacy adoption");
+            assert_eq!(adopted_ready.ws_url, ready.ws_url);
+            let unit = adopted.unit().expect("adopted inside a unit");
+            let main = unit.main().expect("the native main is pinned");
+            assert_eq!(
+                (main.pid(), main.identity().start),
+                (native.pid, native_start),
+                "the main is the native, found as the listener among the legacy members"
+            );
+            let rewritten = store.load_all().pop().expect("record");
+            assert_eq!(rewritten.unit_id.as_deref(), Some(unit.id().as_str()));
+            assert_eq!(rewritten.main_pid, Some(native.pid));
+            assert_eq!(rewritten.main_starttime, Some(native_start));
+            adopted
+                .prepare_retention("server-shutdown".to_string())
+                .await
+                .expect("retain again");
+            // The second restart: this server, its unit and the runtime go
+            // without a signal.
+            unit.id().to_string()
+        };
+        assert!(fake_codex::pid_alive(native.pid) && fake_codex::pid_alive(launcher));
+
+        // The next server reattaches through the recorded unit.
+        let server = Containment::select(options());
+        let units = server.recorded_units().expect("records");
+        let (reconciler, report) =
+            SidecarReconciler::boot_reconcile_with_units(store.clone(), &units);
+        assert_eq!(report.held, 1, "the adopted sidecar is held: {report:?}");
+        let record = reconciler.claim_for_session("t-leg").await.expect("claim");
+        let seed = seed_over(server.clone(), "t-leg");
+        let reattached = ReattachedCodexAppServerRuntime::with_unit(
+            record,
+            reconciler.unit_record(&unit_id),
+            store.clone(),
+            seed.clone(),
+        );
+        let reattached_ready = reattached
+            .ensure_ready(None)
+            .await
+            .expect("the second restart reattaches");
+        assert_eq!(reattached_ready.ws_url, ready.ws_url);
+        let unit = reattached.unit().expect("reattached inside its unit");
+        assert_eq!(unit.id().as_str(), unit_id);
+        assert_eq!(unit.main().map(|m| m.pid()), Some(native.pid));
+        assert!(
+            fake_codex::pid_alive(native.pid) && fake_codex::pid_alive(launcher),
+            "nothing is killed"
+        );
+        assert_eq!(store.load_all().len(), 1, "the record stays");
+
+        // A turn: the native starts a shell command and a detached job (a
+        // member only through the legacy tag it inherited).
+        let mut rpc = fake_codex::Rpc::connect(port_of(&ready.ws_url)).await;
+        rpc.initialize().await;
+        rpc.call("thread/start", json!({})).await.unwrap();
+        rpc.call("turn/start", json!({"threadId": "t-leg", "input": []}))
+            .await
+            .unwrap();
+        let started = manifests.clone();
+        fake_codex::wait_until(
+            "the turn's shell command and detached job",
+            LIMIT,
+            move || {
+                let c = native_manifest_in(&started).children;
+                c.helper.is_some() && !c.shell.is_empty() && !c.detached.is_empty()
+            },
+        )
+        .await;
+        let native = native_manifest_in(&manifests);
+        let c = native.children.clone();
+
+        let stop = seed.stop(&unit, StopMode::Force, StopReason::ShiftX, "test");
+        stop.wait().await;
+        stop.wait_swept().await;
+        for pid in [native.pid, launcher, c.helper.unwrap()]
+            .into_iter()
+            .chain(c.shell)
+            .chain(c.detached)
+        {
+            assert!(!fake_codex::pid_alive(pid), "{pid} survived the stop");
+        }
+        assert!(
+            server
+                .recorded_units()
+                .expect("records")
+                .iter()
+                .all(|u| u.unit_id.as_str() != unit_id),
+            "the unit's record is deleted at Gone"
+        );
+        reattached.finish_after_gone().await;
+        assert!(
+            store.load_all().is_empty(),
+            "the sidecar record goes after Gone"
+        );
+    }
+
     /// A probe answered by ANOTHER pane's app-server on a reused port fails
     /// the attempt (no launcher-as-main fallback) and the retry starts on a
     /// new port in a new unit (Stage 2: LB-30, LB-17).

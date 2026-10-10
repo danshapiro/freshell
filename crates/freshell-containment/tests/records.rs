@@ -263,6 +263,7 @@ async fn boot_never_signals_a_recorded_root_whose_start_time_differs() {
             conversation_keys: Vec::new(),
             roots,
             state: UnitRecordState::Running,
+            legacy_tag: None,
         };
 
         let unit = c
@@ -322,6 +323,73 @@ async fn boot_never_signals_a_recorded_root_whose_start_time_differs() {
             Some(libc::SIGKILL),
             "{name}: the matching root is stopped"
         );
+    }
+}
+
+/// A legacy (v1) Codex sidecar adopted by `adopt_legacy` is found the same
+/// way after the next restart: the reopened unit's members still include
+/// every process carrying the legacy tag, not only its pinned roots, so a
+/// later stop (or a boot finish) reaches what the old app-server started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reopened_legacy_unit_still_finds_its_members_by_the_legacy_tag() {
+    let root = StateRoot::new();
+    for (name, c) in backends_with_state(root.path()) {
+        let tag_value = format!("codex-sidecar-{}", UnitId::mint().as_str());
+        // A pinned root, and a job that left its tree: a member only
+        // through the legacy tag it carries.
+        let launcher = OwnChild::sleep();
+        let launcher_start = process::start_time(launcher.id()).unwrap();
+        let job = OwnChild::spawn(
+            std::process::Command::new("sleep")
+                .arg("600")
+                .env(LEGACY_CODEX_TAG_ENV, &tag_value),
+        );
+        let pids = |unit: &AgentUnit| -> Vec<u32> {
+            unit.members().unwrap().iter().map(|m| m.pid).collect()
+        };
+        let adopted = c.adopt_legacy(
+            LEGACY_CODEX_TAG_ENV,
+            &tag_value,
+            &[(launcher.id(), launcher_start)],
+            label(),
+        );
+        assert!(
+            pids(&adopted).contains(&job.id()),
+            "{name}: the adoption finds the tagged job"
+        );
+        let unit_id = adopted.id().clone();
+
+        // The restart: the unit and its containment go away without a stop.
+        drop(adopted);
+        drop(c);
+        let c = rebuild(name, root.path());
+        let records = c.recorded_units().unwrap();
+        let record = records
+            .iter()
+            .find(|r| r.unit_id == unit_id)
+            .expect("the adopted unit's record");
+        let unit = c.reopen_unit(record, label()).unwrap();
+        let members = pids(&unit);
+        assert!(
+            members.contains(&launcher.id()),
+            "{name}: the pinned root is a member: {members:?}"
+        );
+        assert!(
+            members.contains(&job.id()),
+            "{name}: the tagged job is still a member: {members:?}"
+        );
+
+        unit.stop(StopRequest::new(
+            StopMode::Force,
+            StopReason::BootFinish,
+            "boot",
+        ))
+        .wait()
+        .await;
+        unit.stop_in_flight().unwrap().wait_swept().await;
+        assert!(!alive(launcher.id()), "{name}: the root is stopped");
+        assert!(!alive(job.id()), "{name}: the tagged job is stopped");
+        assert!(c.recorded_units().unwrap().is_empty(), "{name}");
     }
 }
 

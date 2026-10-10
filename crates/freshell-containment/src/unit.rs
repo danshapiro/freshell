@@ -1633,6 +1633,7 @@ mod tests {
             conversation_keys: Vec::new(),
             roots: vec![(10, 100)],
             state: UnitRecordState::Running,
+            legacy_tag: None,
         };
         let unit = AgentUnit::new(
             id,
@@ -1773,6 +1774,7 @@ mod tests {
             conversation_keys: Vec::new(),
             roots: Vec::new(),
             state: UnitRecordState::Running,
+            legacy_tag: None,
         };
         let unit = AgentUnit::new(
             id,

@@ -1427,6 +1427,20 @@ impl SpawnedCodexAppServerRuntime {
         }
     }
 
+    /// Tests: explicit command, store AND context, with no unit seed (the
+    /// unit-less spawn, whose record names no unit: a legacy sidecar).
+    pub fn with_command_store_and_context(
+        command: impl Into<String>,
+        store: Arc<CodexSidecarStore>,
+        sidecar_context: CodexSidecarLaunchContext,
+    ) -> Self {
+        Self {
+            codex_command: Some(command.into()),
+            store,
+            ..Self::with_context(sidecar_context)
+        }
+    }
+
     /// Tests: explicit command, store, context AND unit seed.
     pub fn with_command_store_context_and_seed(
         command: impl Into<String>,

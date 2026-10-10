@@ -165,6 +165,7 @@ impl Containment {
                 .collect(),
             roots: Vec::new(),
             state: UnitRecordState::Running,
+            legacy_tag: None,
         };
         self.store.write(&record)?;
         Ok(AgentUnit::new(
@@ -187,9 +188,13 @@ impl Containment {
     /// A unit continuing `record` (not rewritten), logging with `label`'s
     /// keys. Every recorded root still alive with its recorded start time is
     /// pinned; any other is never signalled and is logged at WARN
-    /// `unit.root.not_pinned`.
+    /// `unit.root.not_pinned`. A legacy unit (`record.legacy_tag`) finds its
+    /// members by that tag again, as its adoption did.
     pub fn reopen_unit(&self, record: &UnitRecord, label: UnitLabel) -> std::io::Result<AgentUnit> {
-        let backend = self.backend.reopen(&record.unit_id)?;
+        let backend = match &record.legacy_tag {
+            Some((key, value)) => legacy_backend(key, value, &record.unit_id),
+            None => self.backend.reopen(&record.unit_id)?,
+        };
         let unit = AgentUnit::new(
             record.unit_id.clone(),
             backend,
@@ -205,7 +210,8 @@ impl Containment {
     /// A pre-containment (v1 record) Codex sidecar: members are found by its
     /// legacy tag, its pinned roots and their descendants (it was started
     /// without a reaper shim). It gets a freshly minted unit id with a
-    /// Running record holding the roots that could be pinned.
+    /// Running record holding the roots that could be pinned and the legacy
+    /// tag, so a later reopen finds the same members.
     pub fn adopt_legacy(
         &self,
         tag_key: &str,
@@ -228,6 +234,7 @@ impl Containment {
                 .collect(),
             roots: Vec::new(),
             state: UnitRecordState::Running,
+            legacy_tag: Some((tag_key.to_string(), tag_value.to_string())),
         };
         let unit = AgentUnit::new(
             id,

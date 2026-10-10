@@ -668,6 +668,7 @@ async fn a_reopened_unit_stops_its_recorded_roots_and_their_descendants() {
             operation_id: None,
             since_ms: 0,
         },
+        legacy_tag: None,
     };
     let unit = containment.reopen_unit(&record, label()).unwrap();
     assert!(
