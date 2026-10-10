@@ -177,18 +177,47 @@ function fixture(missingHostCompletion = false) {
   return { input: { ...input, selectedModes: [...input.selectedModes] }, write, stages }
 }
 
-function amplifierFixture() {
+function claudeFixture() {
+  const built = fixture(), { input, write, stages } = built
+  const original = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, 'native-recovery-originals.json'), 'utf8'))
+  const conversation = original.conversations[0], transcript: unknown[] = []
+  for (const [index, stage] of stages.entries()) {
+    const request = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.request.path), 'utf8'))
+    const base = 1_780_000_000_000 + index * 10_000
+    transcript.push({ type: 'user', sessionId: conversation.nativeSessionId, uuid: `user-${index}`, message: { role: 'user', content: request.request.params.text } },
+      { type: 'attachment', sessionId: conversation.nativeSessionId, uuid: `attachment-${index}`, parentUuid: `user-${index}` },
+      { type: 'assistant', sessionId: conversation.nativeSessionId, uuid: `thinking-${index}`, parentUuid: `attachment-${index}`, timestamp: new Date(base + 2_500).toISOString(),
+        message: { id: `turn-${index}`, role: 'assistant', model: 'claude-haiku-4-5-20251001', stop_reason: 'end_turn', content: [{ type: 'thinking', thinking: 'private', signature: 'signed' }] } },
+      { type: 'assistant', sessionId: conversation.nativeSessionId, uuid: `assistant-${index}`, parentUuid: `thinking-${index}`, timestamp: new Date(base + 3_000).toISOString(),
+        message: { id: `turn-${index}`, role: 'assistant', model: 'claude-haiku-4-5-20251001', stop_reason: 'end_turn', content: [{ type: 'text', text: index ? conversation.nonce : 'stored' }] } })
+    stage.nativeFile = write(`claude-stage-${index}/${conversation.nativeSessionId}.jsonl`, transcript.map(row => JSON.stringify(row)).join('\n') + '\n')
+    const store = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.store.path), 'utf8')), bytes = fs.readFileSync(path.join(input.evidenceDir, stage.nativeFile.path))
+    store.snapshot.bytesBase64 = bytes.toString('base64'); store.snapshot.sha256 = digest(bytes); stage.store = write(stage.store.path, store)
+  }
+  original.selected = ['freshclaude']; conversation.mode = 'freshclaude'; conversation.provider = 'claude'; conversation.stages = stages
+  write('native-recovery-originals.json', original)
+  const derive = () => deriveNativeRecoveryOriginals({ evidenceDir: input.evidenceDir, candidateSha, runId: receiptRunId, runtimeImage, selected: ['freshclaude'] })
+  return { ...built, original, conversation, derive }
+}
+
+function amplifierFixture(observed = false) {
   const built = fixture(), { input, write, stages } = built
   const original = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, 'native-recovery-originals.json'), 'utf8'))
   const conversation = original.conversations[0], transcript: unknown[] = [], events: unknown[] = []
   const event = (name: string, at: number, data: unknown = {}) => ({ event: name, ts: new Date(at).toISOString(), session_id: conversation.nativeSessionId, schema: { name: 'amplifier.log', ver: '1.0.0' }, data })
-  events.push(event('session:config', 1_780_000_000_000, { raw: { providers: [{ id: 'lunaroute', config: { default_model: 'glm-5.3', reasoning_effort: 'low' } }] } }))
+  events.push(event('session:config', 1_780_000_000_000, { raw: { providers: [{ id: 'lunaroute', config: { default_model: observed ? 'configured-only-model' : 'glm-5.3', reasoning_effort: 'low' } }] } }))
   for (const [index, stage] of stages.entries()) {
     const base = 1_780_000_000_000 + index * 10_000
     const request = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.request.path), 'utf8'))
     const prompt = request.request.params.text
-    transcript.push({ role: 'user', content: prompt }, { role: 'assistant', content: index ? conversation.nonce : 'stored' })
-    events.push(event('prompt:complete', base + 2_000), event('cleanup:store_end', base + 3_000))
+    const response = index ? conversation.nonce : 'stored'
+    transcript.push({ role: 'user', content: prompt, metadata: { timestamp: new Date(base + 2_000).toISOString() } }, { role: 'assistant', content: response, metadata: { timestamp: new Date(base + 2_800).toISOString() } })
+    if (observed) events.push(event('prompt:submit', base + 2_000, { prompt, parent_id: null }),
+      event('llm:response', base + 2_500, { model: 'glm-5.3', provider: 'vllm', parent_id: null }),
+      event('prompt:complete', base + 2_800, { length: response.length, response_preview: response, parent_id: null }),
+      event('prompt:complete', base + 2_900, { prompt, response, parent_id: null }))
+    else events.push(event('prompt:complete', base + 2_800))
+    events.push(event('cleanup:store_end', base + 3_000))
     const prefix = `amplifier-stage-${index}/sessions/${conversation.nativeSessionId}`
     stage.nativeFile = write(`${prefix}/transcript.jsonl`, transcript.map(row => JSON.stringify(row)).join('\n') + '\n')
     Object.assign(stage, { nativeEvents: write(`${prefix}/events.jsonl`, events.map(row => JSON.stringify(row)).join('\n') + '\n') })
@@ -207,6 +236,43 @@ function amplifierFixture() {
 }
 
 describe('qualification from private native originals', () => {
+  it('derives one assembled Claude reply per request at every recovery stage from actual split rows', () => {
+    const { derive } = claudeFixture()
+    const stages = derive()[0]!.stages
+    expect(stages.map(stage => [stage.stage, stage.recalledNonce, stage.profile.observedModel, stage.profile.effort])).toEqual([
+      ['initial', false, 'claude-haiku-4-5-20251001', null], ['after_session_host_crash', true, 'claude-haiku-4-5-20251001', null], ['after_provider_process_crash', true, 'claude-haiku-4-5-20251001', null],
+    ])
+    expect(stages.every(stage => stage.nativeEvidence.kind === 'identified_message' && stage.nativeEvidence.turnId.startsWith('turn-'))).toBe(true)
+  })
+
+  it.each(['missing-nonce', 'tool', 'parent', 'duplicate-provider-id', 'changed-prior-component', 'root', 'cross-run'] as const)(
+    'refuses mutated assembled Claude recovery originals (%s)', fault => {
+      const { input, stages, original, write, derive } = claudeFixture()
+      expect(derive()).toHaveLength(1)
+      const stage = stages[1]!, rows = fs.readFileSync(path.join(input.evidenceDir, stage.nativeFile.path), 'utf8').trim().split('\n').map(line => JSON.parse(line))
+      if (fault === 'missing-nonce') rows.at(-1).message.content[0].text = 'not recalled'
+      if (fault === 'tool') rows.at(-1).message.content.push({ type: 'tool_use', id: 'tool', name: 'Read', input: {} })
+      if (fault === 'parent') rows.at(-1).parentUuid = 'unrelated'
+      if (fault === 'duplicate-provider-id') for (const row of rows.slice(4)) if (row.type === 'assistant') row.message.id = 'turn-0'
+      if (fault === 'changed-prior-component') rows[2].message.content[0].thinking = 'changed prior native component'
+      if (fault === 'root') rows.at(-1).sessionId = 'other-root'
+      stage.nativeFile = write(stage.nativeFile.path, rows.map(row => JSON.stringify(row)).join('\n') + '\n')
+      const store = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.store.path), 'utf8')), bytes = fs.readFileSync(path.join(input.evidenceDir, stage.nativeFile.path))
+      store.snapshot.bytesBase64 = bytes.toString('base64'); store.snapshot.sha256 = digest(bytes)
+      if (fault === 'cross-run') store.execution.runId = 'other-run'
+      stage.store = write(stage.store.path, store); write('native-recovery-originals.json', original)
+      expect(derive).toThrow()
+    },
+  )
+
+  it('derives Amplifier observed response model separately from configured profile and unknown optional effort', () => {
+    const { derive, original, conversation, write } = amplifierFixture(true)
+    expect(derive()[0]!.stages.map(stage => stage.profile)).toEqual([0, 1, 2].map(() => ({
+      provider: 'vllm', model: 'glm-5.3', observedModel: 'glm-5.3', modelProvenance: 'amplifier-llm:response.model', effort: null, effortProvenance: 'unsupported-native-telemetry',
+    })))
+    conversation.stages[1].observedReasoningEffort = 'low'; write('native-recovery-originals.json', original)
+    expect(derive).toThrow(/observed effort/i)
+  })
   it('refuses missing originals through the actual settled owner finalizer without publishing assertions or a receipt', async () => {
     const { input } = fixture()
     const owner = new ManagedRuntimeOwner(() => { throw new Error('unused native original fixture web') }, path.resolve(import.meta.dirname, '../../../..'), 5,

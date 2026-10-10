@@ -12,6 +12,7 @@ import { readClaudeNativeHistory } from '../../../e2e-browser/helpers/provider-n
 import { readCodexNativeHistory, readCodexNativeObservation } from '../../../e2e-browser/helpers/provider-native-history/codex.js'
 import { readOpenCodeNativeHistory, readOpenCodeNativeObservation } from '../../../e2e-browser/helpers/provider-native-history/opencode.js'
 import { nativeTurnProof } from '../../../e2e-browser/helpers/provider-native-history/proof.js'
+import { selectNativeAssistantTurn } from '../../../../scripts/testing/provider-native-history.js'
 import { OPENCODE_NATIVE_HISTORY_SCRIPT } from '../../../e2e-browser/helpers/opencode-native-history.js'
 import { captureNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/probe-cli.js'
 
@@ -34,6 +35,72 @@ function writeJsonl(filePath: string, rows: unknown[]): void {
 
 describe('Claude native history proof', () => {
   const sessionId = '11111111-1111-4111-8111-111111111111'
+
+  function splitReply() {
+    return [
+      { type: 'user', uuid: 'user', sessionId, message: { role: 'user', content: 'remember the marker' } },
+      { type: 'attachment', uuid: 'context', parentUuid: 'user', sessionId },
+      { type: 'assistant', uuid: 'thinking', parentUuid: 'context', sessionId, requestId: 'request', apiBlockIndex: 0,
+        timestamp: '2026-09-01T00:00:01.000Z', message: { id: 'msg', role: 'assistant', model: 'haiku', stop_reason: 'end_turn', content: [{ type: 'thinking', thinking: 'private reasoning', signature: 'signature' }] } },
+      { type: 'assistant', uuid: 'text', parentUuid: 'thinking', sessionId, requestId: 'request', apiBlockIndex: 1,
+        timestamp: '2026-09-01T00:00:01.100Z', message: { id: 'msg', role: 'assistant', model: 'haiku', stop_reason: 'end_turn', content: [{ type: 'text', text: 'remembered-marker' }] } },
+    ]
+  }
+
+  it('assembles the native thinking/text rows into one selectable reply and retains both original components', () => {
+    const root = tempRoot('claude-split')
+    writeJsonl(path.join(root, `${sessionId}.jsonl`), splitReply())
+    const history = readClaudeNativeHistory(root, sessionId)
+    expect(history.turns).toHaveLength(1)
+    expect(history.turns[0]).toMatchObject({ turnId: 'msg', messageId: 'text', parentMessageId: 'user', text: 'remembered-marker',
+      completedAt: '2026-09-01T00:00:01.100Z', resolvedReasoningEffort: 'unknown',
+      nativeEvidence: { components: [{ messageId: 'thinking', parentMessageId: 'context', recordIndex: 2 }, { messageId: 'text', parentMessageId: 'thinking', recordIndex: 3 }] } })
+    expect(selectNativeAssistantTurn(history.turns, new Set(), 'remembered-marker')).toBe(history.turns[0])
+    expect(selectNativeAssistantTurn(history.turns, new Set(['text']), 'remembered-marker')).toBeNull()
+    expect(nativeTurnProof('initial', sessionId, history.turns[0]!, 'remembered-marker').toolCallCount).toBe(0)
+  })
+
+  it('preserves text and tool blocks in later same-provider-ID components', () => {
+    const root = tempRoot('claude-split-tool'), rows = splitReply()
+    rows[3]!.message!.content.push({ type: 'tool_use', id: 'tool-1', name: 'Read', input: {} } as any)
+    writeJsonl(path.join(root, `${sessionId}.jsonl`), rows)
+    const history = readClaudeNativeHistory(root, sessionId)
+    expect(history.turns).toHaveLength(1)
+    expect(history.turns[0]!.toolCalls).toEqual([{ type: 'tool_use', name: 'Read' }])
+    expect(selectNativeAssistantTurn(history.turns, new Set(), 'remembered-marker')).toBeNull()
+  })
+
+  it('assembles component rows that each contain multiple native content blocks in block order', () => {
+    const root = tempRoot('claude-multi-block'), rows = splitReply()
+    rows[2]!.message!.content.push({ type: 'text', text: 'prefix ' } as any)
+    rows[3]!.apiBlockIndex = 2
+    writeJsonl(path.join(root, `${sessionId}.jsonl`), rows)
+    const history = readClaudeNativeHistory(root, sessionId)
+    expect(history.turns).toHaveLength(1)
+    expect(history.turns[0]!.text).toBe('prefix remembered-marker')
+  })
+
+  it.each(['model', 'missing-model', 'missing-id', 'root', 'alternate-root', 'parent', 'duplicate-uuid', 'reused-id', 'partial', 'unknown-block', 'request', 'block-order', 'effort', 'invalid-effort'] as const)(
+    'refuses ambiguous split Claude evidence (%s)', fault => {
+      const root = tempRoot('claude-split-conflict'), rows: any[] = splitReply()
+      if (fault === 'model') rows[3].message.model = 'other-model'
+      if (fault === 'missing-model') delete rows[3].message.model
+      if (fault === 'missing-id') delete rows[3].message.id
+      if (fault === 'root') rows[3].sessionId = 'other-root'
+      if (fault === 'alternate-root') rows[3].session_id = 'other-root'
+      if (fault === 'parent') rows[3].parentUuid = 'other-parent'
+      if (fault === 'duplicate-uuid') rows[3].uuid = 'thinking'
+      if (fault === 'reused-id') rows.push({ ...rows[0], uuid: 'another-user' }, { ...rows[3], uuid: 'another-reply', parentUuid: 'another-user' })
+      if (fault === 'partial') rows[3].message.stop_reason = null
+      if (fault === 'unknown-block') rows[3].message.content.push({ type: 'unknown' })
+      if (fault === 'request') rows[3].requestId = 'other-request'
+      if (fault === 'block-order') rows[3].apiBlockIndex = 0
+      if (fault === 'effort') { rows[2].effort = 'low'; rows[3].effort = 'high' }
+      if (fault === 'invalid-effort') rows[3].message.effort = 42
+      writeJsonl(path.join(root, `${sessionId}.jsonl`), rows)
+      expect(() => readClaudeNativeHistory(root, sessionId)).toThrow()
+    },
+  )
 
   it('reads only the exact session and requires a completed assistant response with native profile metadata', () => {
     const root = tempRoot('claude-native')
@@ -338,6 +405,67 @@ describe('OpenCode native history proof', () => {
 
 describe('Amplifier native history proof', () => {
   const sessionId = '44444444-4444-4444-8444-444444444444'
+
+  function observedSession() {
+    const event = (name: string, millisecond: number, data: any = {}) => ({ event: name, session_id: sessionId,
+      schema: { name: 'amplifier.log', ver: '1.0.0' }, ts: new Date(Date.parse('2026-09-01T00:00:00Z') + millisecond).toISOString(), data })
+    return {
+      events: [event('prompt:submit', 0, { prompt: 'remember', parent_id: null }),
+        event('llm:response', 100, { model: 'glm-5.3', provider: 'vllm', continuation_count: null, parent_id: null }),
+        event('prompt:complete', 200, { length: 6, response_preview: 'marker', parent_id: null }),
+        event('prompt:complete', 300, { prompt: 'remember', response: 'marker', parent_id: null }),
+        event('cleanup:store_end', 400, { parent_id: null })],
+      transcript: [{ role: 'user', content: 'remember', metadata: { timestamp: '2026-09-01T00:00:00.000Z' } },
+        { role: 'assistant', content: [{ type: 'thinking', thinking: 'private' }, { type: 'text', text: 'marker' }], metadata: { timestamp: '2026-09-01T00:00:00.200Z' } }],
+    }
+  }
+
+  it('reads actual llm:response model/provider with two completion callbacks and no session:config', () => {
+    const root = tempRoot('amplifier-observed'), sessionDir = path.join(root, 'project', 'sessions', sessionId), source = observedSession()
+    writeJsonl(path.join(sessionDir, 'events.jsonl'), source.events); writeJsonl(path.join(sessionDir, 'transcript.jsonl'), source.transcript)
+    const history = readAmplifierNativeHistory(root, sessionId)
+    expect(history.turns).toHaveLength(1)
+    expect(history.turns[0]).toMatchObject({ text: 'marker', resolvedProvider: 'vllm', resolvedModel: 'glm-5.3',
+      resolvedReasoningEffort: 'unknown', providerProvenance: 'amplifier-llm:response.provider', modelProvenance: 'amplifier-llm:response.model',
+      reasoningEffortProvenance: 'unsupported-native-telemetry', nativeEvidence: { kind: 'append_only_record', recordIndex: 1, completionEventOrdinal: 1 } })
+  })
+
+  it('joins each observed profile to its own persisted prompt instead of using the first response or configuration', () => {
+    const root = tempRoot('amplifier-per-prompt'), sessionDir = path.join(root, 'project', 'sessions', sessionId), source: any = observedSession()
+    const second = observedSession()
+    for (const event of second.events) event.ts = new Date(Date.parse(event.ts) + 1_000).toISOString()
+    second.events[1]!.data.model = 'next-native-model'
+    for (const row of second.transcript) row.metadata.timestamp = new Date(Date.parse(row.metadata.timestamp) + 1_000).toISOString()
+    source.events.push(...second.events); source.transcript.push(...second.transcript)
+    writeJsonl(path.join(sessionDir, 'events.jsonl'), source.events); writeJsonl(path.join(sessionDir, 'transcript.jsonl'), source.transcript)
+    expect(readAmplifierNativeHistory(root, sessionId).turns.map(turn => turn.resolvedModel)).toEqual(['glm-5.3', 'next-native-model'])
+  })
+
+  it.each(['missing-response', 'missing-model', 'missing-provider', 'conflicting-model', 'conflicting-provider', 'foreign-root', 'late-response', 'no-submit', 'duplicate-submit', 'duplicate-completion', 'wrong-prompt', 'wrong-response', 'wrong-request', 'wrong-transcript-request', 'assistant-before-response', 'user-after-response', 'missing-store', 'unpersisted-next-prompt'] as const)(
+    'refuses uncorrelated native Amplifier response evidence (%s)', fault => {
+      const root = tempRoot('amplifier-observed-fault'), sessionDir = path.join(root, 'project', 'sessions', sessionId), source: any = observedSession()
+      if (fault === 'missing-response') source.events.splice(1, 1)
+      if (fault === 'missing-model') delete source.events[1].data.model
+      if (fault === 'missing-provider') delete source.events[1].data.provider
+      if (fault === 'conflicting-model') source.events.splice(2, 0, { ...source.events[1], data: { ...source.events[1].data, model: 'other-model' } })
+      if (fault === 'conflicting-provider') source.events.splice(2, 0, { ...source.events[1], data: { ...source.events[1].data, provider: 'other-provider' } })
+      if (fault === 'foreign-root') source.events[1].session_id = 'other-root'
+      if (fault === 'late-response') source.events[1].ts = '2026-09-01T00:00:01Z'
+      if (fault === 'no-submit') source.events.shift()
+      if (fault === 'duplicate-submit') source.events.splice(1, 0, structuredClone(source.events[0]))
+      if (fault === 'duplicate-completion') source.events.splice(3, 0, structuredClone(source.events[2]))
+      if (fault === 'wrong-prompt') source.events[3].data.prompt = 'unrelated'
+      if (fault === 'wrong-response') source.events[3].data.response = 'unrelated'
+      if (fault === 'wrong-request') { source.events[0].request_id = 'one'; source.events[1].request_id = 'two' }
+      if (fault === 'wrong-transcript-request') { for (const row of source.events) row.request_id = 'one'; source.transcript[1].metadata.request_id = 'two' }
+      if (fault === 'assistant-before-response') source.transcript[1].metadata.timestamp = '2026-09-01T00:00:00.050Z'
+      if (fault === 'user-after-response') source.transcript[0].metadata.timestamp = '2026-09-01T00:00:00.150Z'
+      if (fault === 'missing-store') source.events.pop()
+      if (fault === 'unpersisted-next-prompt') source.events.push({ ...source.events[0], ts: '2026-09-01T00:00:01Z' })
+      writeJsonl(path.join(sessionDir, 'events.jsonl'), source.events); writeJsonl(path.join(sessionDir, 'transcript.jsonl'), source.transcript)
+      expect(() => readAmplifierNativeHistory(root, sessionId)).toThrow()
+    },
+  )
 
   it('binds an exact session directory, stored assistant IDs, completion events, tools, and session:config', () => {
     const root = tempRoot('amplifier-native')
