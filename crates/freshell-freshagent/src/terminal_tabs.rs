@@ -1110,9 +1110,16 @@ impl RestUnitStart {
         self.lifecycle.current()
     }
 
+    /// Whether the start must be given up: its entry is gone, a stop
+    /// cancelled it, or its unit's stop began. The last is checked on its
+    /// own because this lane's start settles as soon as its screen's
+    /// placement is confirmed, which can come before the create commits,
+    /// and a stop never marks a settled start cancelled.
     fn cancelled(&self) -> bool {
         let unit = self.unit();
-        self.units.get(unit.id()).is_none() || self.units.start_cancelled(unit.id())
+        self.units.get(unit.id()).is_none()
+            || self.units.start_cancelled(unit.id())
+            || unit.stop_in_flight().is_some()
     }
 
     /// The screen `screen_pid` of `terminal_id` started in the unit: it is

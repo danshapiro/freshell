@@ -345,11 +345,13 @@ impl freshell_terminal::registry::PaneIdentityBinder for RegistrationHook {
 type StoppedAtRegistration =
     Arc<std::sync::Mutex<Option<(String, freshell_containment::StopHandle)>>>;
 
-/// Arms `registration` so that, after a REST create's bind, `before` runs
-/// and then the start's unit is stopped as a failed placement (an ending
-/// that keeps the pane's row as a failed start); with `until_gone` the
-/// create continues only once that stop reached Gone. Yields the terminal
-/// and the stop's handle once the hook ran.
+/// Arms `registration` so that, after a REST create's bind and once its
+/// start has settled (its screen's placement confirmed, which for the REST
+/// lane can come before the create commits), `before` runs and then the
+/// start's unit is stopped as a failed placement (an ending that keeps the
+/// pane's row as a failed start); with `until_gone` the create continues
+/// only once that stop reached Gone. Yields the terminal and the stop's
+/// handle once the hook ran.
 fn stop_at_registration(
     h: &UnitHarness,
     registration: &RegistrationHook,
@@ -361,10 +363,18 @@ fn stop_at_registration(
         let units = h.state.units.directory.clone();
         let stop = stop.clone();
         move |terminal_id: &str| {
-            before();
             let entry = units
                 .by_terminal(terminal_id)
                 .expect("the bound start's entry names its terminal");
+            // The identity registration runs on a blocking thread.
+            let runtime = tokio::runtime::Handle::current();
+            runtime
+                .block_on(tokio::time::timeout(
+                    LIMIT,
+                    units.start_settled(entry.unit.id()),
+                ))
+                .expect("the start settles once its screen is placed");
+            before();
             let handle = units
                 .stop_unit(
                     entry.unit.id(),
@@ -374,8 +384,7 @@ fn stop_at_registration(
                 )
                 .expect("the start's unit stops through the lifecycle");
             if until_gone {
-                // The identity registration runs on a blocking thread.
-                tokio::runtime::Handle::current()
+                runtime
                     .block_on(handle.wait_for(LIMIT))
                     .expect("the unit reaches Gone");
             }
