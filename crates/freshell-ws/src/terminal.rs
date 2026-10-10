@@ -10536,6 +10536,19 @@ pub(crate) fn stale_kill_refusal(
     }
 }
 
+/// The observed `(epoch, generation)` pair the kill itself carries, if any.
+/// A half-sent pair is the typed invalid-fence refusal.
+pub(crate) fn kill_wire_fence(
+    kill: &TerminalKill,
+) -> Result<Option<freshell_ownership::ObservedFence>, KillRefusal> {
+    freshell_freshagent::ownership_lane::wire_fence(kill.observed_epoch, kill.observed_generation)
+        .map_err(|err| KillRefusal {
+            reason: err.message().to_string(),
+            invalid_fence: true,
+            owner: None,
+        })
+}
+
 /// The observed `(epoch, generation)` a kill is fenced with: the pair the
 /// wire carried, else the retained claim's stamp (legacy-unfenced). A
 /// half-sent pair is the typed invalid-fence refusal — never silently
@@ -10545,21 +10558,12 @@ pub(crate) fn kill_observed_fence(
     ownership: &freshell_ownership::RuntimeOwnershipRegistry,
     retained: &freshell_terminal::registry::RetainedSessionRefOwnership,
 ) -> Result<freshell_ownership::ObservedFence, KillRefusal> {
-    match freshell_freshagent::ownership_lane::wire_fence(
-        kill.observed_epoch,
-        kill.observed_generation,
-    ) {
-        Ok(Some(fence)) => Ok(fence),
-        Ok(None) => Ok(freshell_ownership::ObservedFence {
+    Ok(
+        kill_wire_fence(kill)?.unwrap_or(freshell_ownership::ObservedFence {
             epoch: ownership.boot_epoch(),
             generation: retained.generation,
         }),
-        Err(err) => Err(KillRefusal {
-            reason: err.message().to_string(),
-            invalid_fence: true,
-            owner: None,
-        }),
-    }
+    )
 }
 
 /// Where one `terminal.kill` is answered: the connection's outbox (inline

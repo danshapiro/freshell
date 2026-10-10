@@ -1328,15 +1328,17 @@ pub(crate) async fn kill_unit(
 }
 
 /// Step 1 of [`kill_unit`]: `Some(refusal)` when the kill's observed fence
-/// (or the retained stamp) no longer names the pane's current Live owner.
+/// (or the retained stamp) no longer names the pane's current owner. A unit
+/// with a key Stopping is never fenced (the kill joins). Once the pane's row
+/// holds a retained claim, the fence is checked against the main key's Live
+/// pair and owner; before that (the pane, or its replacement, is still
+/// starting), by [`starting_unit_kill_fence`].
 fn unit_kill_fence(
     state: &WsState,
     kill: &freshell_protocol::TerminalKill,
     entry: &UnitEntry,
 ) -> Option<crate::terminal::KillRefusal> {
     let ownership = state.ownership.as_ref()?;
-    let terminal_id = entry.terminal_id.as_deref()?;
-    let retained = state.registry.retained_ownership_claim(terminal_id)?;
     let stopping = ownership
         .keys_for_unit(entry.unit.id().as_str())
         .iter()
@@ -1349,6 +1351,13 @@ fn unit_kill_fence(
     if stopping {
         return None;
     }
+    let Some(retained) = entry
+        .terminal_id
+        .as_deref()
+        .and_then(|terminal_id| state.registry.retained_ownership_claim(terminal_id))
+    else {
+        return starting_unit_kill_fence(ownership, kill, entry);
+    };
     let observed = match crate::terminal::kill_observed_fence(kill, ownership, &retained) {
         Ok(observed) => observed,
         Err(refusal) => return Some(refusal),
@@ -1366,6 +1375,44 @@ fn unit_kill_fence(
                     &current.state,
                     ownership.boot_epoch(),
                     *generation,
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The fence of a kill reaching a unit that is still starting (its row holds
+/// no retained claim yet), as for a Live pane (Task 13 review M3): an
+/// observed pair the kill carries must be the current pair of the
+/// conversation the unit is starting, while that conversation is Starting
+/// or Live; otherwise the kill is refused as stale and cancels nothing (a
+/// delayed kill from another device cannot cancel the start of an
+/// auto-resumed or stuck-restart replacement). A kill carrying no pair has
+/// no retained stamp to fall back to and is not fenced; nor is a start of a
+/// fresh conversation (no session id yet).
+fn starting_unit_kill_fence(
+    ownership: &freshell_ownership::RuntimeOwnershipRegistry,
+    kill: &freshell_protocol::TerminalKill,
+    entry: &UnitEntry,
+) -> Option<crate::terminal::KillRefusal> {
+    let observed = match crate::terminal::kill_wire_fence(kill) {
+        Ok(Some(observed)) => observed,
+        Ok(None) => return None,
+        Err(refusal) => return Some(refusal),
+    };
+    let session_id = entry.unit.label().session_id?;
+    let current = ownership.observe(&entry.provider, &session_id);
+    match &current.state {
+        freshell_ownership::OwnershipState::Starting { .. }
+        | freshell_ownership::OwnershipState::Live { .. } => {
+            let stale =
+                observed.epoch != current.epoch || observed.generation != current.generation;
+            stale.then(|| {
+                crate::terminal::stale_kill_refusal(
+                    &current.state,
+                    current.epoch,
+                    current.generation,
                 )
             })
         }

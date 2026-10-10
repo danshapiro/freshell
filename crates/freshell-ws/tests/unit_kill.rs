@@ -330,6 +330,118 @@ async fn a_delayed_kill_from_another_device_cannot_stop_the_auto_resumed_replace
     assert_eq!(live_pair("after the delayed kill"), p1);
 }
 
+/// Stage 2: LB-34 while the replacement is still starting (Task 13 review
+/// M3): the same delayed kill, arriving while the stuck restart's respawn
+/// still waits for its app-server to listen, is refused as stale too and
+/// cancels nothing: the replacement's start completes and it keeps running.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delayed_kill_from_another_device_cannot_cancel_the_replacements_start() {
+    let h = UnitHarness::start(HarnessOpts::default()).await;
+    let mut ws = h.connect().await;
+    let ownership = h.state.ownership.clone().expect("an owner registry");
+    let first = h.create_codex(&mut ws, "crq-fs", Some("t-fence-s")).await;
+    let p0 = match ownership.observe("codex", "t-fence-s") {
+        freshell_ownership::OwnershipSnapshot {
+            epoch,
+            state: freshell_ownership::OwnershipState::Live { generation, .. },
+            ..
+        } => (epoch, generation),
+        other => panic!("the pane holds its conversation Live: {other:?}"),
+    };
+    let first_unit = h.unit_for(&first).id().clone();
+
+    let mut stuck = kill(Some(&first), "crq-fs", "rk-stuck-s");
+    stuck["reason"] = json!("stuck-recovery");
+    h.send(&mut ws, stuck).await;
+    let killed = h
+        .next_matching(&mut ws, Duration::from_secs(10), |f| {
+            f["type"] == "terminal.killed" && f["requestId"] == "rk-stuck-s"
+        })
+        .await
+        .expect("the stuck restart's kill is answered");
+    assert_eq!(killed["success"], true);
+
+    // The respawn's app-server waits before it listens, so the replacement
+    // stays starting while the delayed kill arrives.
+    std::env::set_var(
+        "FAKE_CODEX_APP_SERVER_BEHAVIOR",
+        json!({"listenDelayMs": 4000}).to_string(),
+    );
+    h.send(
+        &mut ws,
+        json!({"type": "terminal.create", "requestId": "crq-fs", "mode": "codex", "shell": "system",
+            "cwd": h.home.path().display().to_string(),
+            "sessionRef": {"provider": "codex", "sessionId": "t-fence-s"}, "restore": true}),
+    )
+    .await;
+    let starting = {
+        let state = h.state.clone();
+        let ownership = ownership.clone();
+        let first_unit = first_unit.clone();
+        move || {
+            state
+                .units
+                .by_create_request("crq-fs")
+                .is_some_and(|entry| entry.unit.id() != &first_unit)
+                && matches!(
+                    ownership.observe("codex", "t-fence-s").state,
+                    freshell_ownership::OwnershipState::Starting { .. }
+                )
+        }
+    };
+    fake_codex::wait_until(
+        "the replacement is starting",
+        Duration::from_secs(10),
+        starting.clone(),
+    )
+    .await;
+    let starting_generation = ownership.observe("codex", "t-fence-s").generation;
+    assert_ne!(starting_generation, p0.1);
+
+    let mut delayed = kill(Some(&first), "crq-fs", "rk-late-s");
+    delayed["observedEpoch"] = json!(p0.0);
+    delayed["observedGeneration"] = json!(p0.1);
+    h.send(&mut ws, delayed).await;
+    let refused = h
+        .next_matching(&mut ws, Duration::from_secs(10), |f| {
+            f["type"] == "terminal.killed" && f["requestId"] == "rk-late-s"
+        })
+        .await
+        .expect("the delayed kill is answered");
+    assert_eq!(refused["success"], false, "{refused}");
+    assert_eq!(refused["ownerGeneration"], starting_generation, "{refused}");
+    assert!(
+        starting(),
+        "the replacement is still starting after the refusal"
+    );
+
+    let created = h
+        .next_matching(&mut ws, Duration::from_secs(20), |f| {
+            f["requestId"] == "crq-fs" && (f["type"] == "terminal.created" || f["type"] == "error")
+        })
+        .await
+        .expect("the replacement's create is answered");
+    assert_eq!(created["type"], "terminal.created", "{created}");
+    let replacement = created["terminalId"]
+        .as_str()
+        .expect("a terminal")
+        .to_string();
+    assert_ne!(replacement, first);
+    let native = h.native_pid(&replacement);
+    match ownership.observe("codex", "t-fence-s") {
+        freshell_ownership::OwnershipSnapshot {
+            state: freshell_ownership::OwnershipState::Live { generation, .. },
+            ..
+        } => assert_eq!(generation, starting_generation),
+        other => panic!("the replacement holds its conversation Live: {other:?}"),
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        fake_codex::pid_alive(native),
+        "the replacement's app-server still runs"
+    );
+}
+
 /// Stage 2: LB-34. "Stopping…" is derived from server state: an inventory
 /// taken while a pane's stop is in flight reports the row `stopping` (with
 /// when the stop began), and one taken after Gone no longer lists it.
