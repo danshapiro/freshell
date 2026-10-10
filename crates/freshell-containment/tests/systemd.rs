@@ -8,6 +8,7 @@
 //! Runtimes get two workers each (the Docker sandbox's 512-task cap).
 mod support;
 
+use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
@@ -28,6 +29,14 @@ fn label() -> UnitLabel {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn selection_matches_the_host() {
     let c = Containment::select(SelectOptions::default());
+    // Written past the test harness's output capture, so every run's log
+    // (CI included, where nothing requires a backend) names the selection.
+    let _ = writeln!(
+        std::io::stderr(),
+        "containment backend selected: {} (reason: {})",
+        c.capability().kind.as_str(),
+        c.capability().reason.as_deref().unwrap_or("none")
+    );
     if require() {
         assert_eq!(c.capability().kind, BackendKind::SystemdScope);
         assert!(c.capability().full);
