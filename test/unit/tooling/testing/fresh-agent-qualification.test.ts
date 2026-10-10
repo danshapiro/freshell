@@ -170,7 +170,7 @@ function fixture(
         const sourceRows = currentRow.provider === 'codex' ? [{ type: 'session_meta', payload: { id: nativeSessionId, model_provider: 'openai' } }, ...nativeRows] : nativeRows
         nativeFile = original(`${prefix}/${currentRow.provider === 'codex' ? 'rollout-' : ''}${nativeSessionId}.jsonl`, sourceRows.map(value => JSON.stringify(value)).join('\n') + '\n')
       }
-      const launch = original(`${prefix}/launch.json`, { capturedAt: base + 1_000, response: { data: { view: { soulId: currentRow.soulId, providerStoreId: currentRow.providerStoreId, nativeSessionId, incarnationId: `inc-${index}`, containerId: `container-${index}`, executionGeneration: index + 1, launchState: 'running', recoveryState: 'live', nativeIdentityObservation: { nativeSessionId, incarnationId: `inc-${index}`, launchNonce: `launch-${index}`, evidenceRevision: index, evidenceDigest: 'c'.repeat(64) } } } } })
+      const launch = original(`${prefix}/launch.json`, { capturedAt: base + 1_000, response: { data: { view: { soulId: currentRow.soulId, providerStoreId: currentRow.providerStoreId, nativeSessionId, incarnationId: `inc-${index}`, containerId: `container-${index}`, hostBootId: `boot-${index}`, executionGeneration: index + 1, launchState: 'running', recoveryState: 'live', nativeIdentityObservation: { nativeSessionId, incarnationId: `inc-${index}`, launchNonce: `launch-${index}`, evidenceRevision: index, evidenceDigest: 'c'.repeat(64) } } } } })
       const request = original(`${prefix}/request.json`, { requestId: `request-${index}`, sentAt: base + 2_000, request: { method: 'fresh_agent_send', params: { soulId: currentRow.soulId, text: prompt } }, reply: { data: {} } })
       const crash = index ? original(`${prefix}/crash.json`, { kind: index === 1 ? 'session_host_exit' : 'provider_process_exit', containerId: `container-${index - 1}`, incarnationId: `inc-${index - 1}`, requestedAt: base - 2_000, exitedAt: base - 1_000 }) : undefined
       const namespace = original(`${prefix}/namespace.json`, { uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true, httpsStatus: 200, tlsVerifyMode: 2, tlsCheckHostname: true, nativeRoot: nativeSessionId, nativeCwd: '/owned/workspace', nativePid: 55 + index, ownedProbe: { containerId: `container-${index}`, nativePid: 55 + index, capturedAt: base + 1_500 }, executableSha256: 'd'.repeat(64), profileSha256: 'e'.repeat(64) })
@@ -188,7 +188,13 @@ function fixture(
       return { stage, launch, request, nativeFile, namespace, store, profile, ...(crash ? { crash } : {}) }
     })
     const last = stages.at(-1)!
-    const stopped = original(`originals-${rowIndex}/stopped.json`, { nativeFile: last.nativeFile, store: last.store })
+    const stoppedView = { soulId: currentRow.soulId, nativeSessionId, incarnationId: 'inc-2', containerId: 'container-2', hostBootId: 'boot-2', executionGeneration: 3,
+      provider: currentRow.mode === 'kilroy' ? 'kilroy' : currentRow.provider, launchState: 'stopped', desiredState: 'stopped', cleanupState: 'verified_empty' }
+    const stopped = original(`originals-${rowIndex}/stopped.json`, { nativeFile: last.nativeFile, store: last.store,
+      stopResult: { outcome: 'verified_empty', view: stoppedView }, stoppedView,
+      writer: { provider: stoppedView.provider, soulId: currentRow.soulId, incarnationId: stoppedView.incarnationId, providerStoreId: currentRow.providerStoreId, nativeSessionId, activeClaimCount: 0, globalConflictingClaimCount: 0 },
+      stopCompletedAt: 1_780_000_024_000, stoppedObservedAt: 1_780_000_024_100, writerObservedAt: 1_780_000_024_200,
+      readStartedAt: 1_780_000_024_300, readCompletedAt: 1_780_000_024_400, completedTurnCount: 3 })
     return { mode: currentRow.mode, provider: currentRow.provider, soulId: currentRow.soulId, providerStoreId: currentRow.providerStoreId, nativeSessionId, nonce, stages, stopped }
   })
   original('native-recovery-originals.json', { schemaVersion: 1, candidateSha, runId: receiptRunId, runtimeImage, selected: rows.map(current => current.mode), conversations })
@@ -430,6 +436,44 @@ describe('fresh-agent qualification receipt v1', () => {
     expect(() => buildFreshAgentQualificationReceipt({ repoRoot: built.repoRoot, evidenceDir: built.evidenceDir, candidateSha,
       receiptRunId, runtimeImage, selectedModes: ['freshclaude'], rows: [row()] })).toThrow(/stopped/)
   })
+
+  it.each(['missing-stop', 'blocked-stop', 'missing-stopped-view', 'live-stop-view', 'live-inventory', 'missing-writer',
+    'active-writer', 'conflicting-writer', 'wrong-store', 'wrong-writer-soul', 'wrong-writer-root', 'wrong-writer-incarnation', 'wrong-writer-provider',
+    'wrong-stop-soul', 'wrong-stop-root', 'wrong-stop-container', 'wrong-stop-boot', 'wrong-inventory-incarnation', 'wrong-inventory-generation',
+    'missing-read-order', 'read-before-stop', 'writer-after-read', 'stop-before-completion'] as const)(
+    'refuses valid-hash final stopped association %s in both builder and validator', mutation => {
+      const built = fixture(), manifestFile = path.join(built.evidenceDir, 'native-recovery-originals.json')
+      const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8')), reference = manifest.conversations[0].stopped
+      const filename = path.join(built.evidenceDir, reference.path), stopped = JSON.parse(fs.readFileSync(filename, 'utf8'))
+      if (mutation === 'missing-stop') delete stopped.stopResult
+      if (mutation === 'blocked-stop') stopped.stopResult.outcome = 'blocked_ownership'
+      if (mutation === 'missing-stopped-view') delete stopped.stoppedView
+      if (mutation === 'live-stop-view') stopped.stopResult.view.launchState = 'running'
+      if (mutation === 'live-inventory') stopped.stoppedView.desiredState = 'running'
+      if (mutation === 'missing-writer') delete stopped.writer
+      if (mutation === 'active-writer') stopped.writer.activeClaimCount = 1
+      if (mutation === 'conflicting-writer') stopped.writer.globalConflictingClaimCount = 1
+      const writerFields: Partial<Record<typeof mutation, string>> = { 'wrong-store': 'providerStoreId', 'wrong-writer-soul': 'soulId', 'wrong-writer-root': 'nativeSessionId', 'wrong-writer-incarnation': 'incarnationId', 'wrong-writer-provider': 'provider' }
+      const writerField = writerFields[mutation]
+      if (writerField) stopped.writer[writerField] = 'another-writer'
+      const stopFields: Partial<Record<typeof mutation, string>> = { 'wrong-stop-soul': 'soulId', 'wrong-stop-root': 'nativeSessionId', 'wrong-stop-container': 'containerId', 'wrong-stop-boot': 'hostBootId' }
+      const stopField = stopFields[mutation]
+      if (stopField) stopped.stopResult.view[stopField] = 'another-stopped-source'
+      if (mutation === 'wrong-inventory-incarnation') stopped.stoppedView.incarnationId = 'previous-incarnation'
+      if (mutation === 'wrong-inventory-generation') stopped.stoppedView.executionGeneration = 2
+      if (mutation === 'missing-read-order') delete stopped.readStartedAt
+      if (mutation === 'read-before-stop') stopped.readStartedAt = stopped.stopCompletedAt - 1
+      if (mutation === 'writer-after-read') stopped.writerObservedAt = stopped.readCompletedAt + 1
+      if (mutation === 'stop-before-completion') stopped.stopCompletedAt = 1_780_000_022_999
+      fs.writeFileSync(filename, JSON.stringify(stopped)); reference.sha256 = createHash('sha256').update(fs.readFileSync(filename)).digest('hex')
+      fs.writeFileSync(manifestFile, JSON.stringify(manifest)); built.receipt.artifacts.nativeOriginals.sha256 = createHash('sha256').update(fs.readFileSync(manifestFile)).digest('hex')
+      const refusal = [() => buildFreshAgentQualificationReceipt({ repoRoot: built.repoRoot, evidenceDir: built.evidenceDir, candidateSha,
+        receiptRunId, runtimeImage, selectedModes: ['freshclaude'], rows: [row()] }),
+      () => validateFreshAgentQualificationReceipt({ repoRoot: built.repoRoot, candidateSha, expectedRuntimeImage: runtimeImage, receipt: built.receipt })]
+        .map(operation => { try { operation(); return 'accepted' } catch (error) { return (error as Error).message } })
+      expect(refusal).toEqual([expect.stringMatching(/stopped|Stop|writer|read order/), expect.stringMatching(/stopped|Stop|writer|read order/)])
+    },
+  )
 
   it('keeps Kilroy distinct from FreshClaude by provider runtime variant', () => {
     expect(() => fixture([{ ...row('kilroy'), runtimeVariant: 'claude-agent-sdk' }])).toThrow(/kilroy.*runtimeVariant/i)

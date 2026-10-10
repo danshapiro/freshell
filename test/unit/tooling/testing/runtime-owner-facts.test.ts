@@ -4171,6 +4171,7 @@ describe('finite retained fresh native collection', () => {
     vi.spyOn(rig.runtime, 'recordLifecycle').mockImplementation(() => undefined)
     vi.spyOn(rig, 'stopSoul').mockImplementation(async () => { stopped = true; return { outcome: 'verified_empty', view: current() } })
     Object.assign(rig, { readStoppedNativeHistory: async () => {
+      expect(stopped).toBe(true)
       const { captureNativeHistory } = await import('../../../e2e-browser/helpers/provider-native-history/probe-cli.js')
       return captureNativeHistory('claude', projects, nativeRoot)
     } })
@@ -4185,6 +4186,13 @@ describe('finite retained fresh native collection', () => {
         if (index < 2) { generation++; previousExited = false }
       }
       await expect(rig.finishFreshNativeCollection({ ...rig.runtimeEnclosureHandle(current()), nativeSessionId: nativeRoot }, registered.collectionId)).resolves.toMatchObject({ completedStages: 3, closed: true })
+      const manifest = JSON.parse(await fsp.readFile(path.join(rig.runtime.evidenceDir, 'native-recovery-originals.json'), 'utf8'))
+      const stoppedRead = JSON.parse(await fsp.readFile(path.join(rig.runtime.evidenceDir, manifest.conversations[0].stopped.path), 'utf8'))
+      expect(stoppedRead).toMatchObject({ stopResult: { outcome: 'verified_empty', view: { soulId: handle.soulId, incarnationId: 'inc-3', launchState: 'stopped' } },
+        stoppedView: { soulId: handle.soulId, incarnationId: 'inc-3', containerId: '3'.repeat(64), hostBootId: 'boot-3', nativeSessionId: nativeRoot, desiredState: 'stopped', cleanupState: 'verified_empty' },
+        writer: { providerStoreId: 'owned-native-store', incarnationId: 'inc-3', activeClaimCount: 0, globalConflictingClaimCount: 0 } })
+      const readOrder = ['stopCompletedAt', 'stoppedObservedAt', 'writerObservedAt', 'readStartedAt', 'readCompletedAt'].map(field => stoppedRead[field])
+      expect(readOrder.every((at, index) => Number.isSafeInteger(at) && at > 0 && (index === 0 || at >= readOrder[index - 1]))).toBe(true)
       await rig.stop()
       expect(fs.existsSync(projects)).toBe(false)
       const { deriveNativeRecoveryOriginals } = await import('../../../../scripts/testing/qualification-observations.js')

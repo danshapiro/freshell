@@ -5891,18 +5891,23 @@ export class ManagedRuntimeOwner {
       try {
         if (collection.stages.length !== 3 || collection.crash) throw new Error('all three native recovery stages must settle before Stop')
         const result = await this.stopSoul(handle.soulId)
+        const stopCompletedAt = Date.now()
         if (result.outcome !== 'verified_empty') throw new Error('fresh native Stop did not verify empty')
         const row = (await this.inventory()).filter(view => view.soulId === handle.soulId)
           .find(view => view.incarnationId === handle.incarnationId)
+        const stoppedObservedAt = Date.now()
         if (!row || row.launchState !== 'stopped' || row.desiredState !== 'stopped' || row.cleanupState !== 'verified_empty'
           || row.nativeSessionId !== handle.nativeSessionId || row.containerId !== handle.containerId || row.hostBootId !== handle.hostBootId) throw new Error('exact stopped fresh native source is absent')
         const writer = await this.writerClaimFacts(handle)
+        const writerObservedAt = Date.now()
         if (writer.providerStoreId !== collection.providerStoreId || writer.activeClaimCount !== 0 || writer.globalConflictingClaimCount !== 0) throw new Error('fresh native stopped source still has a writer')
         const receipts = this.runtime.broker.receipts().filter(receipt => receipt.containerId === handle.containerId && receipt.incarnationId === handle.incarnationId && receipt.soulId === handle.soulId)
         if (receipts.length !== 1 || !receipts[0]!.providerVolumeName || receipts[0]!.workspacePath !== this.repoRoot
           || receipts[0]!.imageRef !== this.runtime.imageRef) throw new Error('exact stopped fresh provider receipt is absent')
         if ((await this.ownedContainerState(this.runtimeEnclosureHandle(handle))).running) throw new Error('stopped fresh provider is running')
+        const readStartedAt = Date.now()
         const captured = await this.readStoppedNativeHistory(handle, collection.provider, receipts[0]!)
+        const readCompletedAt = Date.now()
         const prefix = `fresh-native-${collectionId}/stopped`
         const nativeFile = await this.materializeNativeSource(`${prefix}/completed`, captured)
         const store = await this.retainNativeOriginal(`${prefix}/store.json`, { containerId: handle.containerId,
@@ -5915,7 +5920,8 @@ export class ManagedRuntimeOwner {
         const lastHistory = captureNativeHistory(collection.provider, collection.provider === 'opencode' ? lastFilename : path.dirname(lastFilename), collection.nativeSessionId)
         if (JSON.stringify(captured.turns) !== JSON.stringify(lastHistory.turns)) throw new Error('stopped native completions differ from the retained current source')
         if (collection.provider !== 'opencode' && !finalBytes.subarray(0, lastBytes.length).equals(lastBytes)) throw new Error('stopped native retained prefix changed')
-        collection.stopped = await this.retainNativeOriginal(`${prefix}/read.json`, { nativeFile, store, stopResult: result, writer, completedTurnCount: captured.turns.length })
+        collection.stopped = await this.retainNativeOriginal(`${prefix}/read.json`, { nativeFile, store, stopResult: result, stoppedView: row, writer,
+          stopCompletedAt, stoppedObservedAt, writerObservedAt, readStartedAt, readCompletedAt, completedTurnCount: captured.turns.length })
         collection.closed = true
         if ([...this.freshNativeCollections.values()].every(value => value.closed && !value.failed)
           && this.freshAgentModes.every(mode => [...this.freshNativeCollections.values()].some(value => value.mode === mode))) {

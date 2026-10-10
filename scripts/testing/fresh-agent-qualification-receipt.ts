@@ -280,6 +280,31 @@ export function validateFreshAgentQualificationReceipt(
   }
 }
 
+function validateStoppedNativeRead(stopped: Record<string, any>, row: FreshAgentQualificationRow,
+  lastView: Record<string, any>, lastCompletedAt: number): void {
+  const stopResult = object(stopped.stopResult, 'stopped Stop result'), writer = object(stopped.writer, 'stopped writer observation')
+  stringEqual(stopResult.outcome, 'verified_empty', 'stopped Stop outcome')
+  for (const view of [object(stopResult.view, 'stopped Stop view'), object(stopped.stoppedView, 'stopped inventory view')]) {
+    for (const [field, expected] of Object.entries({ soulId: row.soulId, nativeSessionId: row.nativeSessionId,
+      incarnationId: lastView.incarnationId, containerId: lastView.containerId, hostBootId: lastView.hostBootId,
+      provider: row.mode === 'kilroy' ? 'kilroy' : row.provider, launchState: 'stopped', desiredState: 'stopped', cleanupState: 'verified_empty' })) {
+      stringEqual(view[field], expected, `stopped view ${field}`)
+    }
+    if (view.executionGeneration !== lastView.executionGeneration) throw new Error('stopped execution generation differs')
+  }
+  for (const [field, expected] of Object.entries({ provider: row.mode === 'kilroy' ? 'kilroy' : row.provider,
+    soulId: row.soulId, providerStoreId: row.providerStoreId, nativeSessionId: row.nativeSessionId, incarnationId: lastView.incarnationId })) {
+    stringEqual(writer[field], expected, `stopped writer ${field}`)
+  }
+  if (writer.activeClaimCount !== 0 || writer.globalConflictingClaimCount !== 0) throw new Error('stopped writer is active or conflicting')
+  let previousObservation = lastCompletedAt
+  for (const field of ['stopCompletedAt', 'stoppedObservedAt', 'writerObservedAt', 'readStartedAt', 'readCompletedAt']) {
+    const at = stopped[field]
+    if (!Number.isSafeInteger(at) || at <= 0 || at < previousObservation) throw new Error('stopped native read order differs')
+    previousObservation = at
+  }
+}
+
 /** Profile configuration and optional native effort are separate observations. */
 function validateNativeProfiles(repoRoot: string, evidenceDir: string, rows: FreshAgentQualificationRow[], candidateSha: string, runId: string, runtimeImage: string, observed: ObservedNativeConversation[]): void {
   const manifest = parseJsonObject(readRegularFile(path.join(evidenceDir, NATIVE_RECOVERY_ORIGINALS_FILE), 'native profiles manifest'), 'native profiles manifest')
@@ -339,6 +364,7 @@ function validateNativeProfiles(repoRoot: string, evidenceDir: string, rows: Fre
     const stopped = source(conversation.stopped, 'stopped raw read'), stoppedStore = source(stopped.store, 'stopped store')
     const lastStore = source(last.store, 'last current store'), lastLaunch = source(last.launch, 'last launch')
     const lastView = lastLaunch.response?.data?.view ?? lastLaunch.response?.result?.Ok?.data?.view
+    validateStoppedNativeRead(stopped, row, lastView, observed[index]!.stages.at(-1)!.completedAt)
     const finalSource = readNativeOriginalReference(evidenceDir, stopped.nativeFile)
     const captured = Buffer.from(stoppedStore.snapshot.querySnapshotBase64 ?? stoppedStore.snapshot.bytesBase64, 'base64')
     if (!finalSource.bytes.equals(captured) || createHash('sha256').update(captured).digest('hex') !== (stoppedStore.snapshot.querySnapshotSha256 ?? stoppedStore.snapshot.sha256)
