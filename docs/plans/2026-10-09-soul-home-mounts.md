@@ -71,7 +71,8 @@ The load-bearing stage falsified the request's proposed mechanism and replaced i
 - Consumes: `TerminalMounts` (docker.rs:34-42), `workload_mounts` (docker.rs:68-198), `runtime_host_environment` (backend.rs:402-497), `runtime_tmpfs(runtime_mode)` (backend.rs:629), `docker_create_body` (backend.rs:640), `verify_inspect_config` (backend.rs:993-1030).
 - Produces:
   - `pub struct OperatorHomeMount { pub home: PathBuf, pub mask_rel_paths: Vec<String> }` (new field `pub operator_home: Option<OperatorHomeMount>` on `TerminalMounts`).
-  - `fn operator_home_mount(home_env: Option<&std::ffi::OsStr>, supervisor_euid: u32) -> Option<OperatorHomeMount>` in docker.rs — canonicalize HOME, require the home directory to exist and its `st_uid` to equal `supervisor_euid` (the home-owner guard); masks are fixed: `[".freshell", ".amplifier/onecli", ".config/gcloud"]`.
+  - `fn operator_home_mount(home_env: Option<&std::ffi::OsStr>, supervisor_euid: u32) -> Option<OperatorHomeMount>` in docker.rs — canonicalize HOME, require the home directory to exist and its `st_uid` to equal `supervisor_euid` (the home-owner guard); masks are fixed `[".freshell", ".amplifier/onecli", ".config/gcloud"]` FILTERED to destinations that already exist as directories under the home (runc must never have to create a missing mountpoint inside the read-only bind — a home missing one target must still launch).
+  - Contract: `workload_mounts` sets `operator_home` to `None` when the workspace equals the operator home (that is the pre-existing workspace shape; no marker env, no masks, no verification applies to it), so `operator_home: Some(_)` always means: workspace differs from home, the `:ro` bind and all masks are emitted, and the marker env is set. Implemented as `fn effective_operator_mount(mount: Option<OperatorHomeMount>, workspace: &Path) -> Option<OperatorHomeMount>` in docker.rs (pure, testable), called from `workload_mounts`.
   - `fn assemble_workload_binds(...) -> (Vec<String>, std::collections::BTreeMap<String, String>)` in backend.rs — extracted from `create_stopped` inline assembly; returns binds plus tmpfs destinations (`"<destination>": ""` merged with `runtime_tmpfs` output; additive keys win, existing tmpfs destinations must never be dropped).
   - Container env set by `runtime_host_environment` when the spec's mounts include `operator_home`: marker `FRESHELL_OPERATOR_HOME_MOUNT=1` plus `FRESHELL_OPERATOR_HOME=<canonical home path>` (consumed by Task 2).
 
@@ -84,7 +85,9 @@ In `crates/freshell-supervisor/src/backend/docker.rs` tests module (beside the e
 fn operator_home_mount_derives_masks_and_requires_operator_ownership() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
-    std::fs::create_dir_all(&home).unwrap();
+    for rel in [".freshell", ".amplifier/onecli", ".config/gcloud"] {
+        std::fs::create_dir_all(home.join(rel)).unwrap();
+    }
     use std::os::unix::fs::MetadataExt;
     let owner = std::fs::metadata(&home).unwrap().uid() as u32;
     let mount = operator_home_mount(Some(home.as_os_str()), owner).expect("owned home mounts");
@@ -95,6 +98,41 @@ fn operator_home_mount_derives_masks_and_requires_operator_ownership() {
     );
     // A home owned by a different uid (e.g. root's /) must never mount.
     assert!(operator_home_mount(Some(std::path::Path::new("/").as_os_str()), owner).is_none());
+}
+
+#[test]
+fn operator_home_mount_filters_masks_to_existing_destinations() {
+    // runc cannot create missing mountpoints inside a read-only bind, so a
+    // home lacking some mask targets still mounts, with the existing masks.
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(home.join(".freshell")).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    let owner = std::fs::metadata(&home).unwrap().uid() as u32;
+    let mount = operator_home_mount(Some(home.as_os_str()), owner).expect("owned home mounts");
+    assert_eq!(mount.mask_rel_paths, vec![".freshell"]);
+}
+
+#[test]
+fn operator_home_mount_is_dropped_when_workspace_equals_home() {
+    // workload_mounts nulls the mount for the pre-existing home-as-workspace
+    // soul shape: no ro bind, no masks, no marker env, no verification.
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(home.join(".freshell")).unwrap();
+    let home = home.canonicalize().unwrap();
+    use std::os::unix::fs::MetadataExt;
+    let owner = std::fs::metadata(&home).unwrap().uid() as u32;
+    let mount = operator_home_mount(Some(home.as_os_str()), owner).unwrap();
+    assert!(mount.home == home);
+    // The contract under test: workload_mounts applies
+    //   .filter(|mount| mount.home != workspace)
+    // — assert the resulting TerminalMounts.field is None for the equal case
+    //   by exercising the same predicate the wiring uses.
+    assert_eq!(effective_operator_mount(Some(mount), &home), None);
+    let workspace = home.join("code").join("repo");
+    std::fs::create_dir_all(&workspace).unwrap();
+    assert!(effective_operator_mount(Some(mount), &workspace).is_some());
 }
 
 #[test]
@@ -141,10 +179,14 @@ fn workload_binds_include_read_only_home_and_mask_tmpfs() {
 }
 
 #[test]
-fn workload_binds_skip_home_bind_when_workspace_equals_home() {
+fn workload_binds_emit_home_bind_and_masks_whenever_operator_home_is_some() {
+    // The workspace-equals-home shape is filtered out upstream (see the
+    // operator_home_mount_is_dropped_when_workspace_equals_home test), so
+    // assembly may rely on Some(_) meaning both the ro bind and the masks
+    // are present — otherwise verify_inspect_config and reality diverge.
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
-    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(home.join(".freshell")).unwrap();
     let home = home.canonicalize().unwrap();
     let (binds, tmpfs) = assemble_workload_binds(
         &tmp.path().join("binary"),
@@ -152,7 +194,7 @@ fn workload_binds_skip_home_bind_when_workspace_equals_home() {
         "provider-vol",
         None,
         Some(&TerminalMounts {
-            workspace: home.clone(),
+            workspace: home.join("code").join("repo"),
             git_common_dir: None,
             provider_bootstrap_files: vec![],
             provider_secret_files: vec![],
@@ -165,7 +207,7 @@ fn workload_binds_skip_home_bind_when_workspace_equals_home() {
         }),
     )
     .unwrap();
-    assert!(!binds.iter().any(|b| b == &format!("{}:{}:ro", home.display(), home.display())));
+    assert!(binds.iter().any(|b| b == &format!("{}:{}:ro", home.display(), home.display())));
     assert_eq!(tmpfs.get(&format!("{}/.freshell", home.display())).map(String::as_str), Some(""));
 }
 
@@ -227,22 +269,34 @@ pub fn operator_home_mount(
         // Never mount a home the supervisor user does not own (e.g. /root).
         return None;
     }
-    Some(OperatorHomeMount {
-        home,
-        mask_rel_paths: OPERATOR_HOME_MASK_REL_PATHS.iter().map(|s| s.to_string()).collect(),
-    })
+    // runc cannot create missing mountpoints inside a read-only bind, so
+    // only mask destinations that already exist are emitted; a home missing
+    // some targets still mounts and launches.
+    let mask_rel_paths: Vec<String> = OPERATOR_HOME_MASK_REL_PATHS
+        .iter()
+        .filter(|rel| home.join(rel).is_dir())
+        .map(|s| s.to_string())
+        .collect();
+    Some(OperatorHomeMount { home, mask_rel_paths })
+}
+
+/// The pre-existing home-as-workspace soul shape keeps its legacy behavior:
+/// no operator-home mount at all (no ro bind, no masks, no marker env).
+fn effective_operator_mount(
+    mount: Option<OperatorHomeMount>,
+    workspace: &Path,
+) -> Option<OperatorHomeMount> {
+    mount.filter(|mount| mount.home != workspace)
 }
 ```
 
-Wire it in `workload_mounts` (docker.rs:68-198): read `let supervisor_home = std::env::var_os("HOME");` once at the top (the user-root branch at line 141 reuses the same value) and set `operator_home: operator_home_mount(supervisor_home.as_deref(), unsafe { libc::geteuid() })` on the returned `TerminalMounts` (add `libc` to the crate if absent).
+Wire it in `workload_mounts` (docker.rs:68-198): read `let supervisor_home = std::env::var_os("HOME");` once at the top (the user-root branch at line 141 reuses the same value) and set `operator_home: effective_operator_mount(operator_home_mount(supervisor_home.as_deref(), unsafe { libc::geteuid() }), &workspace)` on the returned `TerminalMounts` — `workspace` is the canonical workspace computed at the top of `workload_mounts` (docker.rs:77). `Some(_)` now guarantees workspace differs from home.
 
 In backend.rs, extract the inline binds assembly at lines 572-618 into `assemble_workload_binds` exactly as sketched in the tests, adding after the existing mounts block:
 
 ```rust
 if let Some(home) = &mounts.operator_home {
-    if home.home != mounts.workspace {
-        binds.push(format!("{}:{}:ro", home.home.display(), home.home.display()));
-    }
+    binds.push(format!("{}:{}:ro", home.home.display(), home.home.display()));
     for rel in &home.mask_rel_paths {
         tmpfs.insert(format!("{}/{}", home.home.display(), rel), String::new());
     }
@@ -272,7 +326,7 @@ Expected: PASS
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add crates/freshell-supervisor/src/backend.rs crates/freshell-supervisor/src/backend/docker.rs crates/freshell-supervisor/Cargo.toml
+git add crates/freshell-supervisor/src/backend.rs crates/freshell-supervisor/src/backend/docker.rs
 git commit -m "feat(supervisor): mount operator home read-only in souls with tmpfs control-plane masks"
 ```
 
@@ -308,8 +362,11 @@ fn child_can_traverse_evaluates_dac_classes() {
     // No group bits (0700 operator dir, child not the owner) — the incident's
     // failure surface under the rootless mapping.
     assert!(!child_can_traverse(0o700, 0, 0, 65_534, 0));
-    // Other execute always passes.
-    assert!(child_can_traverse(0o701, 0, 0, 65_534, 65_534));
+    // POSIX selects the FIRST matching class: a matching group with no
+    // execute bit cannot fall through to the other class's execute bit.
+    assert!(!child_can_traverse(0o701, 0, 0, 65_534, 0));
+    // Other execute applies when neither uid nor gid matches.
+    assert!(child_can_traverse(0o701, 1000, 1000, 65_534, 65_534));
 }
 
 #[test]
@@ -334,12 +391,15 @@ Expected: FAIL to compile — `child_can_traverse` and the emission do not exist
 
 ```rust
 fn child_can_traverse(mode_bits: u32, owner_uid: u32, owner_gid: u32, child_uid: u32, child_gid: u32) -> bool {
-    let owner_exec = mode_bits & 0o100 != 0;
-    let group_exec = mode_bits & 0o010 != 0;
-    let other_exec = mode_bits & 0o001 != 0;
-    (child_uid == owner_uid && owner_exec)
-        || (child_gid == owner_gid && group_exec)
-        || other_exec
+    // POSIX permission classes select the FIRST match; a matched class with no
+    // execute bit denies even when a later class carries it.
+    if child_uid == owner_uid {
+        mode_bits & 0o100 != 0
+    } else if child_gid == owner_gid {
+        mode_bits & 0o010 != 0
+    } else {
+        mode_bits & 0o001 != 0
+    }
 }
 ```
 
@@ -398,6 +458,9 @@ Build the spec by mirroring the fresh-agent qualification spec's real imports/ri
 //        "provider": { "openai": { "name": "OpenAI",
 //          "options": { "apiKey": "{file:<home>/.amplifier/ms-runpod.key}" } } },
 //        "model": "openai/gpt-5.6-luna" }   // native provider id: validates offline
+//    - Empty dirs for EVERY mask destination (they must pre-exist in the home;
+//      create all three to exercise the full mask set):
+//      <home>/.freshell/, <home>/.amplifier/onecli/, <home>/.config/gcloud/
 //    - chmod 0750 on <testRoot> and /tmp/f<uid> ancestors (harness creates them
 //      0700; under the rootless daemon the 65534:0 child needs group traversal).
 // 4. Launch a freshopencode fresh-agent pane (the qualification spec's
@@ -406,8 +469,14 @@ Build the spec by mirroring the fresh-agent qualification spec's real imports/ri
 test('freshopencode soul resolves {file:} API key references under the operator home', async () => {
   const info = await rig.start()
   // ...create home fixtures per steps 3 above, using info's testRoot...
-  await rig.launchFreshAgentPane('opencode') // exact helper per the qualification spec
-  await expect(page.getByText('Ask anything')).toBeVisible({ timeout: 120_000 })
+  const sessionId = await rig.launchFreshAgentPane('opencode') // exact helper per the qualification spec
+  // Positive proof the opencode child actually started (the incident's child
+  // died instantly): the qualification running view carries a native session id.
+  const view = await rig.runningViewForFreshSession(sessionId)
+  expect(view?.nativeSessionId).toBeTruthy()
+  // The fresh-agent composer renders "Send a message…" when the pane is ready
+  // (the current UI has no "Ask anything" text — see FreshAgentComposer.tsx).
+  await expect(page.getByText('Send a message')).toBeVisible({ timeout: 120_000 })
   const paneText = await rig.capturePaneText()
   expect(paneText).not.toContain('Configuration is invalid')
   expect(paneText).not.toContain('bad file reference')
@@ -430,7 +499,7 @@ No production change: this task is the system-level proof. The broker/sandbox al
 
 Run: `pnpm run test:e2e:local test/e2e-browser/specs/runtime-opencode-home-file-reference-rust.spec.ts --project=chromium`
 
-Expected: PASS — the freshopencode fresh-agent pane boots to the opencode prompt, proving the `{file:}` reference resolved in-soul through the mounted, group-readable home.
+Expected: PASS — the freshopencode fresh-agent child starts (running view with a native session id), the composer reaches its ready state, and no "Configuration is invalid" text appears — proving the `{file:}` reference resolved in-soul through the mounted, group-readable home.
 
 - [ ] **Step 5: Refactor while green**
 
@@ -492,7 +561,7 @@ git commit -m "docs(managed-runtime): operator home mounts, masks, and group-rea
 
 ## Verification (user-visible outcome)
 
-1. The incident scenario end-to-end: covered by Task 3's spec on the real rootless daemon — a freshopencode fresh-agent pane (fresh-agent launch path) with a `{file:}`-referencing global config boots to its prompt with no "Configuration is invalid" text.
+1. The incident scenario end-to-end: covered by Task 3's spec on the real rootless daemon — a freshopencode fresh-agent pane (fresh-agent launch path) with a `{file:}`-referencing global config starts its child (native session id), reaches the composer's ready state, and shows no "Configuration is invalid" text.
 2. Production, after user-approved deploy and the one-time host prep from Task 4: a freshopencode pane in `/home/dan/code/shapiroserver2` with the real global `~/.config/opencode/opencode.json` boots opencode.
 3. Pre-upgrade running souls: untouched by construction — no identity, record, digest, or volume changes; replaced incarnations naturally gain the home mount.
 4. Control-plane safety: `~/.freshell`, `~/.amplifier/onecli`, and `~/.config/gcloud` are tmpfs-masked in-soul; all other operator secrets remain protected by their owner-only modes.
