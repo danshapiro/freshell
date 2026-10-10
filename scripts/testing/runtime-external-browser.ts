@@ -233,12 +233,22 @@ async function freeOwnerPort(): Promise<number> {
   return address.port
 }
 
-export function validateManagedWebProvenance(observed: unknown, candidateSha: string, buildDirty: boolean): void {
-  if (!observed || typeof observed !== 'object' || Array.isArray(observed)) throw new Error('owned managed web provenance is missing')
-  const body = observed as Record<string, unknown>
-  if (body.runtime !== 'rust' || body.commit !== candidateSha || body.buildDirty !== buildDirty) {
-    throw new Error('owned managed web provenance differs from the exact artifact candidate and cleanliness')
+class ManagedWebProvenanceError extends Error {
+  constructor(readonly fields: Record<string, string | boolean>) {
+    super('owned managed web provenance differs from the exact artifact candidate and cleanliness')
   }
+}
+
+export function validateManagedWebProvenance(observed: unknown, candidateSha: string, buildDirty: boolean): void {
+  const body = observed && typeof observed === 'object' && !Array.isArray(observed)
+    ? observed as Record<string, unknown> : undefined
+  const reason = !body || typeof body.buildDirty !== 'boolean' ? 'unreadable_provenance'
+    : body.runtime !== 'rust' ? 'runtime_mismatch' : body.commit !== candidateSha ? 'candidate_mismatch'
+      : body.buildDirty !== buildDirty ? 'cleanliness_mismatch' : undefined
+  if (!reason) return
+  const safeCommit = (value: unknown): string => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value) ? value : 'unknown'
+  throw new ManagedWebProvenanceError({ reason, expectedCommit: safeCommit(candidateSha), observedCommit: safeCommit(body?.commit),
+    expectedBuildDirty: buildDirty, ...(typeof body?.buildDirty === 'boolean' ? { observedBuildDirty: body.buildDirty } : {}) })
 }
 
 export type OwnedWebDiagnosticRecord = {
@@ -289,6 +299,7 @@ export class ManagedRuntimeWebServer implements RuntimeWebHandle {
   private homeConfigured = false
   private lastOutput = { stdout: '', stderr: '' }
   private logsDir?: string
+  private admissionFailure?: OwnedWebDiagnosticRecord['facts'][number]
 
   constructor(private readonly options: RuntimeWebConstructOptions,
     private readonly diagnostics?: (record: OwnedWebDiagnosticRecord) => void | Promise<void>) {
@@ -312,6 +323,7 @@ export class ManagedRuntimeWebServer implements RuntimeWebHandle {
   }
 
   private async boot(port: number): Promise<RuntimeWebInfo> {
+    this.admissionFailure = undefined
     const token = this.token
     const home = this.homeDir!
     const configDir = path.join(home, '.freshell')
@@ -367,6 +379,9 @@ export class ManagedRuntimeWebServer implements RuntimeWebHandle {
       }
       return this.current
     } catch (error) {
+      if (error instanceof ManagedWebProvenanceError) {
+        this.admissionFailure = { severity: 'error', event: 'managed_runtime.web_admission_refused', fields: error.fields }
+      }
       await this.process.stop()
       throw error
     }
@@ -388,10 +403,12 @@ export class ManagedRuntimeWebServer implements RuntimeWebHandle {
       this.lastOutput = this.process.output()
       const log = await this.readOwnedRustLogs()
       if (!this.homeDir) throw new Error('owned web HOME reference is unavailable')
+      const outputFacts = ownedWebDiagnosticFacts(this.lastOutput, { text: log.text, pid: this.process.identity.pid })
+      if (this.admissionFailure) outputFacts.facts.push(this.admissionFailure)
       await this.diagnostics?.({ pid: this.process.identity.pid, bootAttemptCount: this.bootCount,
         homeReference: this.homeDir,
         logReadState: log.files.length ? 'read' : 'missing', logFiles: log.files,
-        ...ownedWebDiagnosticFacts(this.lastOutput, { text: log.text, pid: this.process.identity.pid }) })
+        ...outputFacts })
     }
     this.process = undefined
   }

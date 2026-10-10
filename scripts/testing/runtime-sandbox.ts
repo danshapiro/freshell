@@ -7719,12 +7719,13 @@ export class ManagedRuntimeOwner {
   private buildManagedServer(): string {
     const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
     const qualification = this.pendingQualificationProviders()
+    const sourceState = `${git(this.repoRoot, ['rev-parse', 'HEAD']).trim()}:${git(this.repoRoot, ['status', '--porcelain']).trim() ? 'dirty' : 'clean'}`
     execFileSync(mise, [
       'exec', 'rust@1.96', '--', 'cargo', 'build', '--release', '-p', 'freshell-server',
       '--features', this.fixtureFreshAgentModes.length > 0
         ? 'managed-fresh-agent-fixtures'
         : qualification.length ? 'managed-provider-qualification' : 'managed-runtime-v1',
-    ], { cwd: this.repoRoot, stdio: 'inherit' })
+    ], { cwd: this.repoRoot, stdio: 'inherit', env: { ...process.env, FRESHELL_BUILD_SOURCE_STATE: sourceState } })
     const source = path.join(this.repoRoot, 'target', 'release', 'freshell-server')
     const target = path.join(this.runtime.buildDir, 'freshell-server-managed')
     fs.copyFileSync(source, target)

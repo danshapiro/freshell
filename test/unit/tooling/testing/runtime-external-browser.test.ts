@@ -1328,6 +1328,25 @@ describe('owned web process lifetime (Node process fixture only)', () => {
       await expect(fsp.stat(`/proc/${pid}`)).rejects.toThrow()
     } finally { await server.stop(); await fsp.rm(directory, { recursive: true }) }
   })
+  it('records an authenticated cleanliness refusal before exact owned web cleanup', async () => {
+    const { fixture: directory, entry, setup } = await fixture()
+    await fsp.writeFile(entry, `require('node:http').createServer((req,res)=>{res.setHeader('content-type','application/json');res.end(JSON.stringify({runtime:'rust',commit:'${'a'.repeat(40)}',buildDirty:true,authToken:'private-admission-secret',transcript:'private-admission-body'}))}).listen(Number(process.env.PORT),'127.0.0.1')`)
+    const diagnostics = vi.fn()
+    const server = new runner.ManagedRuntimeWebServer({ binary: process.execPath, repoRoot: process.cwd(),
+      candidateSha: 'a'.repeat(40), buildDirty: false, setupHome: setup, preserveHomeOnStop: false,
+      env: { NODE_OPTIONS: `--require=${entry}` } }, diagnostics)
+    try {
+      await expect(server.start()).rejects.toThrow(/provenance/)
+      await server.stop()
+      const record = diagnostics.mock.calls[0][0]
+      expect(record.facts).toContainEqual({ severity: 'error', event: 'managed_runtime.web_admission_refused',
+        fields: { reason: 'cleanliness_mismatch', expectedCommit: 'a'.repeat(40), observedCommit: 'a'.repeat(40),
+          expectedBuildDirty: false, observedBuildDirty: true } })
+      expect(JSON.stringify(record)).not.toContain('private-admission-')
+      await expect(fsp.stat(`/proc/${record.pid}`)).rejects.toThrow()
+      await expect(fsp.stat(record.homeReference)).rejects.toThrow()
+    } finally { await server.stop(); await fsp.rm(directory, { recursive: true }) }
+  })
   it('captures the actual Rust JSONL msg and bound server PID before removing owned HOME', async () => {
     const { fixture: directory, entry, setup } = await fixture()
     const logging = `const fs=require('node:fs'),path=require('node:path');fs.writeFileSync(path.join(process.env.FRESHELL_LOG_DIR,'rust-server.jsonl'),JSON.stringify({level:'WARN',msg:'fresh_agent.hosted_snapshot_unavailable',server_pid:process.pid,code:'CAPABILITY_PENDING',soul_id:'owned-file-soul',transcript:'file-body-must-not-persist'})+'\\n'+JSON.stringify({level:'WARN',msg:'fresh_agent.hosted_snapshot_unavailable',server_pid:process.pid-1,code:'FOREIGN_PID'})+'\\n');\n`
