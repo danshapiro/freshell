@@ -1210,7 +1210,7 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
     } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
   })
 
-  it.each(['running', 'blocked stopped', 'retained failed Retry'] as const)(
+  it.each(['running', 'blocked stopped', 'stopped readonly WAL', 'retained failed Retry'] as const)(
     'projects actual current repair SQLite records for %s and refuses absent or foreign operations', async (attempt) => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused batch reader web') }, fixtureRepoRoot, 3,
       {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
@@ -1321,7 +1321,30 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
       expect(actual.at(-1)?.slice(0, 2)).toEqual(['rm', '--force'])
       expect(observed.unrelated).toEqual({ incidentPresent: true, viewPresent: true, noticeIds: ['notice-unrelated'],
         outboxEventIds: ['event-unrelated'], exportSha256: [createHash('sha256').update('unchanged unrelated artifact').digest('hex')] })
-      if (attempt === 'blocked stopped') {
+      if (attempt === 'blocked stopped' || attempt === 'stopped readonly WAL') {
+        let originalWal: Buffer | undefined
+        if (attempt === 'stopped readonly WAL') {
+          // A stopped WAL writer can leave committed rows outside the main DB and
+          // no shared-memory index. The source directory must remain read-only.
+          await new Promise<void>((resolve, reject) => execFile('python3', ['-I', '-c', String.raw`
+import os,sqlite3,sys
+c=sqlite3.connect(sys.argv[1])
+c.execute('PRAGMA journal_mode=WAL')
+c.execute('PRAGMA wal_autocheckpoint=0')
+c.execute("UPDATE stopped_repair_operations SET status='before-current' WHERE operation_id='repair-current'")
+c.execute('UPDATE installation SET control_epoch=1')
+c.commit()
+c.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+c.execute("UPDATE stopped_repair_operations SET status='complete' WHERE operation_id='repair-current'")
+c.execute('UPDATE installation SET control_epoch=12')
+c.commit()
+os._exit(0)
+`, database], { encoding: 'utf8' }, error => error ? reject(error) : resolve()))
+          await fsp.unlink(`${database}-shm`)
+          originalWal = await fsp.readFile(`${database}-wal`)
+          expect(originalWal.length).toBeGreaterThan(32)
+          await fsp.chmod(batch.registryRoot, 0o500)
+        }
         Object.assign(rig.runtime, { task007Fixtures: new Map([['browser', batch]]),
           trackedSupervisorContainers: new Set([rig.supervisor.containerId]), trackedVolumes: new Set([batch.volumeName]) })
         const running = vi.spyOn(rig.runtime, 'isContainerRunning').mockReturnValue(false)
@@ -1388,9 +1411,15 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
         const originalRegistry = await fsp.readFile(database)
         const stoppedObserved = await rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')
         expect(stoppedObserved.operationId).toBe('repair-current')
+        expect(stoppedObserved.status).toBe('complete')
+        expect(stoppedObserved.controlEpoch).toBe(12)
         expect(stoppedObserved.faultMarkers.crash).toEqual({ point: 'stopped_repair_after_import_publication', running: false, exitCode: 134 })
         expect(stoppedObserved.unrelated).toEqual(observed.unrelated)
         expect((await fsp.readFile(database)).equals(originalRegistry)).toBe(true)
+        if (originalWal) {
+          expect((await fsp.readFile(`${database}-wal`)).equals(originalWal)).toBe(true)
+          await expect(fsp.stat(`${database}-shm`)).rejects.toMatchObject({ code: 'ENOENT' })
+        }
         expect(registryCommands.filter(args => args[0] === 'create')).toHaveLength(2)
         expect(registryCommands.filter(args => args[0] === 'rm')).toHaveLength(2)
         expect(rig.runtime.transferOwnedIds().containers).not.toContain(helperId)
@@ -1421,6 +1450,11 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
         expect((await rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).faultMarkers.crash).toBeNull()
         await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')
         running.mockReturnValue(true)
+        if (originalWal) {
+          expect((await fsp.readFile(database)).equals(originalRegistry)).toBe(true)
+          expect((await fsp.readFile(`${database}-wal`)).equals(originalWal)).toBe(true)
+          await fsp.chmod(batch.registryRoot, 0o700)
+        }
       }
       const alteredGraph = new DatabaseSync(installedDatabase)
       alteredGraph.prepare('UPDATE session SET parent_id = ? WHERE id = ?').run(root.rootSessionId, batch.source.families[0].grandchildId)
@@ -1665,6 +1699,7 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
       await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/canonical/)
     } finally {
       if (hostServer) await new Promise<void>(resolve => hostServer!.close(() => resolve()))
+      if (attempt === 'stopped readonly WAL') await fsp.chmod(batch.registryRoot, 0o700)
       vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true })
       expect(fs.existsSync(path.join(hostRuntimeDir, 'host.sock'))).toBe(false)
       expect(fs.existsSync(rig.runtime.testRoot)).toBe(false)

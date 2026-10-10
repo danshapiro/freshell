@@ -1880,6 +1880,20 @@ c.close()
 print(json.dumps(result))
 `
 
+// Only the known-stopped reader takes a snapshot. Committed SQLite state can
+// still live in the WAL; a private writable directory lets SQLite rebuild its
+// derived SHM index without writing to the read-only Registry volume.
+export const TASK007_STOPPED_REGISTRY_OBSERVATION = String.raw`
+import os,shutil,sys,tempfile
+with tempfile.TemporaryDirectory(prefix='freshell-registry-read-') as snapshot:
+    source_database=sys.argv[1]
+    snapshot_database=os.path.join(snapshot,'runtime.sqlite3')
+    shutil.copyfile(source_database,snapshot_database)
+    if os.path.isfile(source_database+'-wal'):
+        shutil.copyfile(source_database+'-wal',snapshot_database+'-wal')
+    sys.argv[1]=snapshot_database
+` + TASK007_STOPPED_REPAIR_OBSERVATION.split('\n').map(line => `    ${line}`).join('\n')
+
 const TASK007_PROVIDER_HOME_INITIALIZER = `import json, os, stat
 fd = os.open("/home/freshell/provider", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 try:
@@ -2558,7 +2572,7 @@ export class RuntimeHarness {
         '--label', `com.freshell.runtime-test-run-id=${this.runId}`, '--label', `com.freshell.runtime-test-candidate=${this.candidateSha}`,
         '--label', 'com.freshell.task007-setup=registry-observation', '--label', `com.freshell.task007-fixture-id=${fixtureId}`,
         '--label', `com.freshell.task007-supervisor-id=${supervisor.containerId}`,
-        '--entrypoint', 'python3', this.imageRef, '-I', '-c', TASK007_STOPPED_REPAIR_OBSERVATION,
+        '--entrypoint', 'python3', this.imageRef, '-I', '-c', TASK007_STOPPED_REGISTRY_OBSERVATION,
         '/registry/runtime.sqlite3', '/fixture/metadata.json', operationId, '/registry', sourceStoreId])).trim()
       Task007Hex.parse(returnedId)
       if (this.trackedContainers.has(returnedId) || this.trackedSupervisorContainers.has(returnedId)
