@@ -9,8 +9,8 @@
 //!
 //! This crate is **serialization only, no logic** (ADR Decision 1/5). It is the
 //! shared seam consumed by the future Rust server and the equivalence oracle.
-//! Changing the wire is out of scope; the contract is pinned at
-//! `WS_PROTOCOL_VERSION = 10`.
+//! Changing the wire is out of scope; the contract is pinned at the version
+//! `WS_PROTOCOL_VERSION` names.
 //!
 //! ## Modeling notes
 //!
