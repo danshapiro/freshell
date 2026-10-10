@@ -406,6 +406,18 @@ export class ManagedRuntimeWebServer implements RuntimeWebHandle {
 const PINNED_CLOUDFLARED_SHA256 = 'd33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db'
 const PINNED_CLOUDFLARED_PATH = '/home/dan/code/freshell/.worktrees/.the-usual-logs/managed-provider-environment/reports/transport-preflight/cloudflared'
 
+// A diagnostic write must not replace an operation result or interrupt cleanup.
+function emitExternalDiagnostic(site: 'relay' | 'client' | 'retained' | 'tunnel', emit: () => void): void {
+  try { emit() } catch {
+    try {
+      // Use the stderr descriptor so a fallback error stays inside this catch.
+      fs.writeSync(2, `${JSON.stringify({ severity: 'warn', event: 'managed_external_diagnostic_write_failed', site })}\n`)
+    } catch {
+      // Both sinks may be unavailable; the original response/cleanup still settles.
+    }
+  }
+}
+
 // Error messages and arbitrary error codes can contain credentials or bodies.
 function safeExternalFailure(error: unknown): { errorClass: string; errorCode: string } {
   const errorClass = error instanceof TypeError ? 'TypeError' : error instanceof SyntaxError ? 'SyntaxError'
@@ -488,9 +500,10 @@ export class OwnedManagedRuntimeTunnel {
     }
   }
   async stop(): Promise<void> {
-    if (this.process) {
-      try { await this.process.stop() } finally {
-        const { stdout, stderr } = this.process.output()
+    const owned = this.process
+    if (owned) {
+      try { await owned.stop() } finally {
+        const { stdout, stderr } = owned.output()
         const counts = { originUnreachable: 0, connectionRefused: 0, edgeConnectionClosed: 0, timeout: 0, otherErrorLines: 0 }
         for (const line of `${stdout}\n${stderr}`.split('\n')) {
           if (!/\bERR\b/.test(line)) continue
@@ -500,7 +513,8 @@ export class OwnedManagedRuntimeTunnel {
           else if (line.includes('timeout') || line.includes('deadline exceeded')) counts.timeout++
           else counts.otherErrorLines++
         }
-        this.diagnostics?.({ severity: 'info', pid: this.process.identity.pid, startTicks: this.process.identity.startTicks, ...counts })
+        emitExternalDiagnostic('tunnel', () => this.diagnostics?.({ severity: 'info', pid: owned.identity.pid,
+          startTicks: owned.identity.startTicks, ...counts }))
       }
     }
     this.process = undefined
@@ -599,9 +613,9 @@ export class OwnedManagedRuntimeRelay {
       diagnostic.phase = 'body_read'
       response.setHeader('server', OWNED_RELAY_SERVER)
       response.setHeader(OWNED_RELAY_REQUEST_HEADER, diagnostic.diagnosticId)
-      const record = (event: string, severity: string, extra: Record<string, unknown> = {}) => this.options.diagnostics?.recordLifecycle(event, {
+      const record = (event: string, severity: string, extra: Record<string, unknown> = {}) => emitExternalDiagnostic('relay', () => this.options.diagnostics?.recordLifecycle(event, {
         severity, runId: this.options.diagnostics.runId, candidateSha: this.options.diagnostics.candidateSha, ...diagnostic, ...extra,
-      })
+      }))
       record('external.relay_owner_received', 'info')
       response.once('finish', () => record('external.relay_owner_completed', response.statusCode >= 500 ? 'error' : 'info', { status: response.statusCode }))
       const body = await this.readOwnerRequest(request)
@@ -677,10 +691,10 @@ export class OwnedManagedRuntimeRelay {
     this.server = http.createServer((request, response) => {
       const diagnostic: Parameters<OwnedManagedRuntimeRelay['handle']>[2] = { phase: 'admission' }
       this.handle(request, response, diagnostic).catch(error => {
-        if (diagnostic.diagnosticId) this.options.diagnostics?.recordLifecycle('external.relay_owner_failed', {
+        if (diagnostic.diagnosticId) emitExternalDiagnostic('relay', () => this.options.diagnostics?.recordLifecycle('external.relay_owner_failed', {
           severity: 'error', runId: this.options.diagnostics.runId, candidateSha: this.options.diagnostics.candidateSha,
           ...diagnostic, status: response.headersSent ? response.statusCode : 502, ...safeExternalFailure(error),
-        })
+        }))
         if (!response.headersSent) response.writeHead(502)
         response.end()
       })
@@ -830,14 +844,14 @@ export class ExternalManagedRuntimeRig {
       const contentType = response.headers.get('content-type')?.split(';')[0].trim().toLowerCase()
       const server = response.headers.get('server')?.trim().toLowerCase()
       const ray = response.headers.get('cf-ray'), relayRequest = response.headers.get(OWNED_RELAY_REQUEST_HEADER)
-      process.stderr.write(`${JSON.stringify({ severity: 'error', event: 'managed_external_owner_http_failed',
+      emitExternalDiagnostic('client', () => process.stderr.write(`${JSON.stringify({ severity: 'error', event: 'managed_external_owner_http_failed',
         runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha, operationId, action, status: response.status,
         server: server === OWNED_RELAY_SERVER ? 'owned_relay' : server === 'cloudflare' ? 'cloudflare' : 'unknown',
         contentType: !contentType ? 'absent' : contentType === 'application/json' ? 'json'
           : contentType === 'text/html' ? 'html' : contentType === 'text/plain' ? 'text' : 'other',
         cloudflareRay: ray && /^[a-f0-9]{16}-[A-Z]{3}$/.test(ray) ? ray : null,
         relayRequestId: relayRequest && z.string().uuid().safeParse(relayRequest).success ? relayRequest : null,
-      })}\n`)
+      })}\n`))
       throw new Error(`closed owner operation refused: ${response.status}`)
     }
     let body: unknown
@@ -1321,8 +1335,9 @@ export class OwnedRetainedBrowserFixtures implements ExternalRetainedFixtureCont
         const stage = retainedStageDiagnostic(this.session!.status())
         if (stage?.kind !== 'observe' && stage?.kind !== 'retry') return
         lastStage = stage
-        h.recordLifecycle('external.retained_stage_published', { severity: 'info', parentRunId: this.owner.runtime.runId,
-          runId: h.runId, candidateSha: h.candidateSha, fixtureId, stage: lastStage })
+        emitExternalDiagnostic('retained', () => h.recordLifecycle('external.retained_stage_published', {
+          severity: 'info', parentRunId: this.owner.runtime.runId, runId: h.runId,
+          candidateSha: h.candidateSha, fixtureId, stage: lastStage }))
       }
       const observe: typeof hooks.observe = (context, phase) => {
         const pending = hooks.observe(context, phase)
@@ -1343,9 +1358,9 @@ export class OwnedRetainedBrowserFixtures implements ExternalRetainedFixtureCont
       } catch (error) {
         original = error
         const cancelled = error instanceof Error && error.message === 'owned retained browser session cancelled'
-        h.recordLifecycle('external.retained_driver_failed', { severity: cancelled ? 'info' : 'error',
+        emitExternalDiagnostic('retained', () => h.recordLifecycle('external.retained_driver_failed', { severity: cancelled ? 'info' : 'error',
           parentRunId: this.owner.runtime.runId, runId: h.runId, candidateSha: h.candidateSha, fixtureId,
-          reason: cancelled ? 'cancelled' : 'driver_failure', stage: lastStage, ...safeExternalFailure(error) })
+          reason: cancelled ? 'cancelled' : 'driver_failure', stage: lastStage, ...safeExternalFailure(error) }))
       }
       let cleanupFailure: unknown
       try {

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { z } from 'zod'
 import http from 'node:http'
 import type { AddressInfo } from 'node:net'
+import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -874,6 +875,131 @@ describe('owner HTTP failure observability', () => {
       expect(JSON.stringify(log.mock.calls)).not.toContain('private-')
     } finally { driver.mockRestore(); vi.restoreAllMocks() }
   })
+})
+
+describe('diagnostic sink failure isolation', () => {
+  it.each([
+    ['external.relay_owner_received', 200],
+    ['external.relay_owner_completed', 409],
+    ['external.relay_owner_failed', 502],
+  ] as const)('settles the original HTTP %s path with status %i when its sink throws', async (failedEvent, status) => {
+    const bound = runner.resolveManagedExternalDescriptor(descriptor)!
+    const unexpected: unknown[] = []
+    const capture = (error: unknown) => { unexpected.push(error) }
+    const sinkError = Object.assign(new Error('private-sink-error-sentinel'), { code: 'ENOSPC' })
+    const recordLifecycle = vi.fn((event: string) => { if (event === failedEvent) throw sinkError })
+    const control = vi.fn(async () => {
+      if (status === 409) throw new Error('private-control-error-sentinel')
+      return { runId: bound.runId, candidateSha: bound.candidateSha, operationId: '550e8400-e29b-41d4-a716-446655440000', result: { kind: 'preparing', sequence: 0 } }
+    })
+    const relay = new runner.OwnedManagedRuntimeRelay({ token: bound.token, backend: () => 'http://127.0.0.1:1', control,
+      diagnostics: { runId: bound.runId, candidateSha: bound.candidateSha, recordLifecycle } })
+    const write = vi.spyOn(fs, 'writeSync').mockReturnValue(0)
+    process.on('uncaughtException', capture)
+    process.on('unhandledRejection', capture)
+    try {
+      await relay.start()
+      const body = status === 502 ? 'x'.repeat(2 * 1024 * 1024 + 1) : JSON.stringify({
+        runId: bound.runId, candidateSha: bound.candidateSha, operationId: '550e8400-e29b-41d4-a716-446655440000',
+        scenarioId: 'browser-managed-runtime', action: 'retained-status' })
+      const response = await fetch(`${relay.localUrl}/__managed_runtime`, { method: 'POST',
+        headers: { 'x-auth-token': bound.token }, body, signal: AbortSignal.timeout(1000) })
+      expect(response.status).toBe(status)
+      if (status === 409) expect(await response.json()).toEqual({ reason: 'owner_operation_refused' })
+      else await response.text()
+      await new Promise<void>(resolve => setImmediate(resolve))
+      expect(unexpected).toEqual([])
+      expect(recordLifecycle.mock.calls.some(([event]) => event === failedEvent)).toBe(true)
+      expect(control).toHaveBeenCalledTimes(status === 502 ? 0 : 1)
+      expect(write).toHaveBeenCalledWith(2, expect.stringContaining('managed_external_diagnostic_write_failed'))
+      expect(JSON.stringify(write.mock.calls)).not.toContain('private-')
+    } finally {
+      await relay.stop()
+      process.removeListener('uncaughtException', capture)
+      process.removeListener('unhandledRejection', capture)
+      write.mockRestore()
+    }
+  })
+  it('keeps the client HTTP error and single dispatch when both stderr writes throw', async () => {
+    const bound = runner.resolveManagedExternalDescriptor(descriptor)!
+    const transport = vi.fn(async () => new Response(null, { status: 502 }))
+    const write = vi.spyOn(process.stderr, 'write').mockImplementation(() => { throw new Error('private-stderr-error-sentinel') })
+    const fallback = vi.spyOn(fs, 'writeSync').mockImplementation(() => { throw new Error('private-stderr-descriptor-sentinel') })
+    try {
+      const rig = new runner.ExternalManagedRuntimeRig(bound, transport)
+      await expect(rig.retainedFixtureStage()).rejects.toThrow('closed owner operation refused: 502')
+      expect(transport).toHaveBeenCalledOnce()
+      expect(write).toHaveBeenCalled()
+      expect(fallback).toHaveBeenCalled()
+    } finally { write.mockRestore(); fallback.mockRestore() }
+  })
+  it.each([false, true])('removes the exact tunnel HOME and settles fields with a throwing sink (stderr failure=%s)', async stderrFails => {
+    const home = await fsp.mkdtemp(path.join(fixtureRepoRoot, 'owned-tunnel-home-'))
+    await fsp.chmod(home, 0o700)
+    const stop = vi.fn(async () => {})
+    const diagnostics = vi.fn(() => { throw new Error('private-tunnel-sink-sentinel') })
+    const tunnel = new runner.OwnedManagedRuntimeTunnel(fixtureRepoRoot, '/unused-pinned-binary', diagnostics)
+    Object.assign(tunnel, { home, origin: 'https://owned.trycloudflare.com', process: {
+      identity: { pid: 1234, startTicks: '9876', executable: '/owned/cloudflared', cwd: fixtureRepoRoot },
+      stop, output: () => ({ stdout: '', stderr: 'ERR private-captured-sentinel' }),
+    } })
+    const write = vi.spyOn(fs, 'writeSync').mockImplementation(() => {
+      if (stderrFails) throw new Error('private-stderr-error-sentinel')
+      return 0
+    })
+    try {
+      await expect(tunnel.stop()).resolves.toBeUndefined()
+      await expect(fsp.stat(home)).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(tunnel).toMatchObject({ process: undefined, home: undefined, origin: undefined })
+      expect(() => tunnel.baseUrl).toThrow('owned tunnel has not published its origin')
+      await tunnel.stop()
+      expect(stop).toHaveBeenCalledOnce()
+      expect(diagnostics).toHaveBeenCalledOnce()
+      expect(JSON.stringify(write.mock.calls)).not.toContain('private-')
+    } finally { write.mockRestore() }
+  })
+  it.each(['external.retained_stage_published', 'external.retained_driver_failed'])(
+    'cleans and verifies the retained harness and preserves the driver error when %s throws', async failedEvent => {
+      const owner = new ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot)
+      vi.spyOn(owner, 'info', 'get').mockReturnValue({ baseUrl: 'http://127.0.0.1:1', wsUrl: 'ws://127.0.0.1:1/ws', token: 'private-token',
+        port: 1, pid: 42, homeDir: fixtureRepoRoot, configDir: fixtureRepoRoot, logsDir: fixtureRepoRoot,
+        debugLogPath: path.join(fixtureRepoRoot, 'unused-web.jsonl'), runtimeRoot: fixtureRepoRoot })
+      vi.spyOn(RuntimeHarness.prototype, 'prepareTask2FixtureArtifacts').mockResolvedValue(undefined)
+      const cleanup = vi.spyOn(RuntimeHarness.prototype, 'cleanup').mockResolvedValue({ ok: true, errors: [] })
+      const verify = vi.spyOn(RuntimeHarness.prototype, 'verifyTransferCleanup').mockImplementation(() => undefined)
+      vi.spyOn(RuntimeHarness.prototype, 'writeArtifact').mockImplementation(() => undefined)
+      const log = vi.spyOn(RuntimeHarness.prototype, 'recordLifecycle').mockImplementation(event => {
+        if (event === failedEvent) throw Object.assign(new Error('private-retained-sink-sentinel'), { code: 'EIO' })
+      })
+      const write = vi.spyOn(fs, 'writeSync').mockReturnValue(0)
+      const configFile = path.join(fixtureRepoRoot, 'retained-config.json')
+      await fsp.writeFile(configFile, '{}')
+      const original = new TypeError('private-original-driver-sentinel')
+      vi.spyOn(retainedDriver, 'runTask2RetainedFixture').mockImplementation(async (h, _legacy, _factory, hooks) => {
+        if (!hooks) throw new Error('test hooks required')
+        await hooks.observe({ h, configFile, web: { info: owner.info }, title: 'private-context-sentinel',
+          soulId: 'owned', rootSessionId: 'owned-root', childSessionId: 'owned-child', oldContainerId: 'b'.repeat(64),
+          oldIncarnationId: 'owned-incarnation', providerVolumeName: 'owned-volume', preferredTabId: 'owned-tab',
+          preferredPaneId: 'owned-pane' } as retainedDriver.Task2RetainedBrowserContext, 'store_blocked')
+        throw original
+      })
+      const fixtures = new runner.OwnedRetainedBrowserFixtures(owner, {} as any, ['config'])
+      try {
+        fixtures.start('config')
+        await expect.poll(() => ['observe', 'failed'].includes(fixtures.status().kind)).toBe(true)
+        if (fixtures.status().kind === 'observe') fixtures.advance(1)
+        const session = (fixtures as unknown as { session: RetainedFixtureBrowserSession }).session
+        await expect(session.settled()).rejects.toBe(original)
+        expect(cleanup).toHaveBeenCalledOnce()
+        expect(verify).toHaveBeenCalledOnce()
+        expect(log.mock.calls.some(([event]) => event === failedEvent)).toBe(true)
+        expect(write).toHaveBeenCalledWith(2, expect.stringContaining('managed_external_diagnostic_write_failed'))
+        expect(JSON.stringify(write.mock.calls)).not.toContain('private-')
+        await fixtures.cancel()
+        expect(cleanup).toHaveBeenCalledOnce()
+      } finally { vi.restoreAllMocks() }
+    },
+  )
 })
 
 describe('owned pinned Quick Tunnel endpoint', () => {
