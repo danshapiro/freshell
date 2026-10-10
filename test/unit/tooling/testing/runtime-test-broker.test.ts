@@ -322,6 +322,16 @@ function retainedStoreHelperBody() {
   }
 }
 
+function dockerCliRetainedStoreHelperBody() {
+  const body = retainedStoreHelperBody()
+  // Captured from the actual installed-store producer and Docker 29.7.2
+  // create request. This Node HTTP fixture protects admission semantics;
+  // the separate private diagnostic exercises Docker serialization.
+  body.Env = [body.Env[3], body.Env[0], body.Env[1], body.Env[2]]
+  Object.assign(body.HostConfig, { CapAdd: null, Binds: null })
+  return body
+}
+
 type ForwardedRequest = { method: string; url: string; body: any }
 type BrokerHttpFixture = {
   request(method: string, url: string, body?: unknown, timeoutMs?: number): Promise<{ status: number; body: string }>
@@ -625,6 +635,56 @@ describe('receipt-owned stopped OpenCode repair HTTP routes', () => {
 })
 
 describe('receipt-owned read-only history HTTP routes', () => {
+  it('admits the captured Docker CLI retained-reader environment order without changing its authority', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker }) => {
+      await registerRepairOwner(request)
+      const body = dockerCliRetainedStoreHelperBody()
+      expect((await request('POST', `/v1.47/containers/create?name=${helperName}`, body)).status).toBe(201)
+      expect(forwarded.at(-1)?.body).toEqual(body)
+      expect(broker.eventsSnapshot().at(-1)).toMatchObject({
+        decision: 'forward', helperName, ownerContainerId: ownedId, providerVolumeName: providerVolume,
+      })
+      expect((await request('DELETE', `/v1.47/containers/${helperName}?force=1`)).status).toBe(204)
+    })
+  })
+
+  it('refuses changed retained-reader environment entries and ownership before forwarding or reserving a name', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker }) => {
+      await registerRepairOwner(request)
+      const mutations = [
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.Env.splice(0, 1) },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.Env[3] = body.Env[0] },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.Env.push('EXTRA=unexpected') },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.Env[1] = 'HOME=/foreign' },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.Env[0] = 'OPENCODE_DB=/foreign.db' },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.Env[2] = 'XDG_DATA_HOME=/foreign' },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.Env[3] = 'XDG_CONFIG_HOME=/foreign' },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { Object.assign(body, { Env: null }) },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.User = '0:0' },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.User = '65534:1' },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { Object.assign(body.HostConfig, { CapAdd: ['CHOWN'] }) },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.HostConfig.Mounts[1].Source = 'foreign-volume' },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.HostConfig.Mounts[1].ReadOnly = false },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.HostConfig.Mounts[0].Source = '/foreign-host' },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.HostConfig.Mounts[2].ReadOnly = false },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.WorkingDir = '/foreign' },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.HostConfig.Memory++ },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.HostConfig.NetworkMode = 'bridge' },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { body.Cmd[0] = 'foreign-worker' },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { const selected = JSON.parse(body.Cmd[1]); selected.providerUid = 0; body.Cmd[1] = JSON.stringify(selected) },
+        (body: ReturnType<typeof retainedStoreHelperBody>) => { const selected = JSON.parse(body.Cmd[1]); selected.providerGid = 1; body.Cmd[1] = JSON.stringify(selected) },
+      ]
+      for (const mutate of mutations) {
+        const body = dockerCliRetainedStoreHelperBody()
+        mutate(body)
+        const count = forwarded.length
+        expect((await request('POST', `/v1.47/containers/create?name=${helperName}`, body)).status).toBe(403)
+        expect(forwarded).toHaveLength(count)
+        expect(broker.historyHelperNames()).not.toContain(helperName)
+      }
+    })
+  })
+
   it('admits only the fixed Node native reader on the exact receipt workspace and read-only provider source', async () => {
     await withHttpBroker(async ({ request, forwarded, broker }) => {
       await request('POST', '/v1.47/containers/create?name=owned-runtime', createBody([...ordinaryBinds, actorBind]))

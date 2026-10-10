@@ -593,7 +593,10 @@ export class RestrictedDockerBroker {
         || typeof selected.cwd !== 'string' || path.normalize(selected.cwd) !== selected.cwd
         || !(selected.cwd === selected.workspacePath || isStrictDescendant(selected.cwd, selected.workspacePath))
         || parsed.WorkingDir !== selected.cwd
-        || !same(parsed.Env, ['HOME=/home/freshell/provider', 'XDG_DATA_HOME=/home/freshell/provider/.local/share', 'XDG_CONFIG_HOME=/home/freshell/provider/.config', 'OPENCODE_DB=/home/freshell/provider/.local/share/opencode/opencode.db'])) return
+        // Docker CLI serializes its environment map in arbitrary order.
+        // Sorting keeps the exact four entries, including duplicate rejection.
+        || !Array.isArray(parsed.Env)
+        || !same([...parsed.Env].sort(), ['HOME=/home/freshell/provider', 'OPENCODE_DB=/home/freshell/provider/.local/share/opencode/opencode.db', 'XDG_CONFIG_HOME=/home/freshell/provider/.config', 'XDG_DATA_HOME=/home/freshell/provider/.local/share'])) return
     } else if (!Array.isArray(cmd) || cmd.length !== 7 || cmd[0] !== 'native-history-only'
       || cmd[1] !== '--provider' || !['claude', 'kilroy', 'codex', 'opencode'].includes(cmd[2])
       || cmd[3] !== '--session-id' || typeof cmd[4] !== 'string' || !cmd[4]
