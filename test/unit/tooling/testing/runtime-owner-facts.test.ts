@@ -2801,6 +2801,353 @@ describe('owner-side synthetic OpenCode source preparation', () => {
   })
 })
 
+describe('retained fixture pinned native seed SQL', () => {
+  const root = 'ses_providercreatedroot123', child = 'ses_task002syntheticchild'
+  function database() {
+    const file = path.join(fixtureRepoRoot, 'native.db')
+    const db = new DatabaseSync(file)
+    db.exec(fs.readFileSync(path.join(fixtureRepoRoot, 'crates/freshell-sessions/src/opencode_schema_v1_18_21.sql'), 'utf8'))
+    db.prepare(`INSERT INTO project(id,worktree,name,time_created,time_updated,sandboxes,commands)
+      VALUES ('native-project', '/native-worktree', 'native name', 123, 456, '["native-sandbox"]', '{"native":true}')`).run()
+    db.prepare(`INSERT INTO project_directory(project_id,directory,type,strategy,time_created)
+      VALUES ('native-project', ?, 'native-type', 'native-strategy', 321)`).run(fixtureRepoRoot)
+    db.prepare(`INSERT INTO session(id,project_id,parent_id,slug,directory,title,version,time_created,time_updated,metadata)
+      VALUES (?, 'native-project', NULL, 'native-slug', ?, 'native title', '1.18.21', 123, 456, '{"native":true}')`).run(root, fixtureRepoRoot)
+    db.prepare(`INSERT INTO event_sequence(aggregate_id,seq,owner_id) VALUES (?,7,'native-owner')`).run(root)
+    db.prepare(`INSERT INTO event(id,aggregate_id,seq,type,data) VALUES ('evt_native',?,7,'session.created.1','{"native":true}')`).run(root)
+    db.close()
+    return file
+  }
+  function rows(file: string) {
+    const db = new DatabaseSync(file, { readOnly: true })
+    try {
+      return Object.fromEntries(['session', 'project', 'project_directory', 'message', 'part', 'event', 'event_sequence',
+        'session_input', 'session_message'].map(table => [table, db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()]))
+    } finally { db.close() }
+  }
+  function seed(file: string, nativeRoot = root, preserveNativeRoot = true) {
+    execFileSync('python3', ['-c', `import sqlite3,json,sys
+c=sqlite3.connect(sys.argv[1]); c.execute('PRAGMA foreign_keys=ON')
+workspace,root,child=sys.argv[2:5]
+preserve_native_root=sys.argv[5]=='current'
+try:
+ exec(${JSON.stringify(retained.TASK2_RETAINED_SEED_SQL)})
+ c.commit()
+finally:c.close()
+`, file, fixtureRepoRoot, nativeRoot, child, preserveNativeRoot ? 'current' : 'legacy'],
+    { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'] })
+  }
+
+  it('preserves the exact native parentless root/project/directory/events while adding the same child and attachments', () => {
+    const file = database(), before = rows(file)
+    seed(file)
+    const after = rows(file)
+    expect(after.session[0]).toEqual(before.session[0])
+    expect(after.project).toEqual(before.project)
+    expect(after.project_directory).toEqual(before.project_directory)
+    expect(after.event[0]).toEqual(before.event[0])
+    expect(after.event_sequence[0]).toEqual(before.event_sequence[0])
+    expect(after.session).toHaveLength(2)
+    expect(after.session[1]).toMatchObject({ id: child, parent_id: root, project_id: 'native-project', directory: fixtureRepoRoot })
+    expect(after.message).toHaveLength(2)
+    expect(after.part).toHaveLength(2)
+    for (const sessionId of [root, child]) {
+      const message = after.message.find(row => row.session_id === sessionId)!
+      const part = after.part.find(row => row.session_id === sessionId)!
+      expect(message.id).toBe(`msg_${sessionId}`)
+      expect(JSON.parse(String(message.data))).toMatchObject({ role: 'user' })
+      expect(part.message_id).toBe(message.id)
+      expect(JSON.parse(String(part.data))).toEqual({ type: 'file', mime: 'text/plain', filename: 'asset.txt',
+        url: `file://${fixtureRepoRoot}/asset.txt` })
+    }
+    expect(after.event).toHaveLength(2)
+    expect(JSON.parse(String(after.event[1].data))).toMatchObject({ sessionID: child,
+      info: { projectID: 'native-project', parentID: root, directory: fixtureRepoRoot } })
+  })
+
+  it.each(['missing-root', 'parented-root', 'wrong-directory', 'missing-project', 'messages', 'orphan-parts',
+    'pending-input', 'session-history', 'existing-child', 'existing-descendant'] as const)
+    ('refuses %s atomically before appending a retained graph', fault => {
+      const file = database(), db = new DatabaseSync(file)
+      try {
+        if (fault === 'parented-root') db.prepare('UPDATE session SET parent_id=? WHERE id=?').run('ses_parent', root)
+        if (fault === 'wrong-directory') db.prepare('UPDATE session SET directory=? WHERE id=?').run('/other-workspace', root)
+        if (fault === 'missing-project') { db.exec('PRAGMA foreign_keys=OFF'); db.exec("DELETE FROM project WHERE id='native-project'") }
+        if (fault === 'messages') db.prepare("INSERT INTO message VALUES ('msg_existing',?,1,1,'{}')").run(root)
+        if (fault === 'orphan-parts') { db.exec('PRAGMA foreign_keys=OFF'); db.prepare("INSERT INTO part VALUES ('prt_existing','msg_missing',?,1,1,'{}')").run(root) }
+        if (fault === 'pending-input') db.prepare("INSERT INTO session_input VALUES ('input_existing',?,'private synthetic','pending',1,NULL,1)").run(root)
+        if (fault === 'session-history') db.prepare("INSERT INTO session_message VALUES ('history_existing',?,'synthetic',1,1,1,'{}')").run(root)
+        if (fault === 'existing-child' || fault === 'existing-descendant') db.prepare(`INSERT INTO session
+          (id,project_id,parent_id,slug,directory,title,version,time_created,time_updated)
+          VALUES (?,'native-project',?,'existing',?,'existing','1.18.21',1,1)`)
+          .run(fault === 'existing-child' ? child : 'ses_existingdescendant', fault === 'existing-child' ? null : root, fixtureRepoRoot)
+      } finally { db.close() }
+      const before = rows(file)
+      expect(() => seed(file, fault === 'missing-root' ? 'ses_missing' : root)).toThrow(/retained native root/)
+      expect(rows(file)).toEqual(before)
+    })
+
+  it('keeps the historical legacy seed as two new fixture sessions and fixture project/events', () => {
+    const file = database()
+    seed(file, 'ses_task002syntheticroot', false)
+    const after = rows(file)
+    expect(after.session.slice(1)).toMatchObject([{ id: 'ses_task002syntheticroot', parent_id: null, project_id: 'task002_project' },
+      { id: child, parent_id: 'ses_task002syntheticroot', project_id: 'task002_project' }])
+    expect(after.message).toHaveLength(2)
+    expect(after.part).toHaveLength(2)
+    expect(after.project).toHaveLength(2)
+    expect(after.event).toHaveLength(3)
+    expect(after.event_sequence).toHaveLength(3)
+  })
+})
+
+describe('current retained fixture native root binding', () => {
+  async function fixture(options: { complete?: boolean; legacy?: boolean; fault?: string; tuiFormat?: 'json' | 'jsonc' } = {}) {
+    const h = new owner.RuntimeHarness(fixtureRepoRoot, undefined, 3)
+    await fsp.mkdir(h.testRoot, { recursive: true, mode: 0o700 })
+    const control = path.join(h.testRoot, 'control')
+    await fsp.mkdir(control)
+    const supervisor: owner.SupervisorInstance = { scenarioId: 'task2-config-jsonc', containerId: 'c'.repeat(64),
+      controlSocket: path.join(control, 'supervisor.sock'), controlSecret: 'owned-unit-secret',
+      controlSecretFile: path.join(control, 'secret'), runtimeRoot: path.join(control, 'runtime'),
+      volumeName: 'owned-unit-volume', binaryKind: 'test' }
+    let workspace = ''
+    const preparation = net.createServer(socket => {
+      let request = ''
+      socket.on('data', chunk => { request += chunk.toString() })
+      socket.on('end', () => {
+        const selected = JSON.parse(request)
+        expect(selected.soulId).toMatch(/^soul-/)
+        workspace = selected.workspace
+        socket.end(JSON.stringify({ context: { workspace: selected.workspace }, secretReferences: [] }))
+      })
+    })
+    await new Promise<void>(resolve => preparation.listen(path.join(control, 'mcp.sock'), resolve))
+    const stop = vi.fn(async () => {})
+    const info = { baseUrl: 'https://owned.example.invalid', wsUrl: 'wss://owned.example.invalid/ws',
+      token: 'unit-token', port: 443, configDir: h.testRoot, homeDir: h.testRoot, logsDir: h.testRoot,
+      debugLogPath: path.join(h.testRoot, 'web.jsonl'), pid: 1, runtimeRoot: h.repoRoot }
+    const web: owner.RuntimeWebHandle = { start: async () => info, stop, info }
+    let controlEpoch = 0
+    vi.spyOn(h, 'startSupervisor').mockImplementation(async () => { controlEpoch++; return supervisor })
+    vi.spyOn(h, 'waitForFile').mockResolvedValue(undefined)
+    vi.spyOn(h, 'assert').mockImplementation((_caseId, passed, message) => { expect(passed, message).toBe(true) })
+    vi.spyOn(h, 'recordLifecycle').mockImplementation(() => {})
+    const provider = vi.spyOn(h, 'execOwnedContainerAsExact')
+    const input = vi.spyOn(h, 'terminalInputBody')
+    let release!: () => void
+    let entered!: () => void
+    const launchEntered = new Promise<void>(resolve => { entered = resolve })
+    const nativeReady = new Promise<void>(resolve => { release = resolve })
+    const nativeRoot = 'ses_providercreatedroot123'
+    let created = 0, navigated = 0, hydrated = 0
+    let view: Record<string, any>, oldRunning = true, replaced = false
+    const oldContainer = 'a'.repeat(64), replacement = 'b'.repeat(64)
+    const incarnation = 'incarnation-current-unit'
+    const observation = { nativeSessionId: nativeRoot, incarnationId: incarnation, launchNonce: 'launch-current-unit',
+      evidenceRevision: 0, source: 'opencode_tui', evidenceDigest: 'd'.repeat(64) }
+    const launch = async (body: any) => {
+      workspace = body.params.terminal.cwd
+      entered()
+      await nativeReady
+      // The current native plugin creates/navigates only without a requested root.
+      // An assigned missing root cannot publish a loaded observation or complete launch.
+      if (body.params.nativeSessionId && !options.legacy) throw new Error('missing requested native root remains unobserved')
+      expect(body.params.terminal.args).toEqual([])
+      if (options.legacy) expect(body.params.nativeSessionId).toBe('ses_task002syntheticroot')
+      else { created++; navigated++; hydrated++ }
+      if (!options.complete) throw new Error(`observed fresh root ${nativeRoot}`)
+      view = { soulId: body.params.soulId, incarnationId: incarnation, nativeSessionId: nativeRoot,
+        containerId: oldContainer, hostBootId: 'boot-current-unit', provider: 'opencode', launchState: 'running',
+        evidenceRevision: 0, nativeIdentityObservation: observation }
+      const result = { ...view, nativeIdentityObservation: { ...observation } }
+      if (options.fault === 'missing-root') delete result.nativeSessionId
+      if (options.fault === 'empty-root') result.nativeSessionId = ''
+      if (options.fault === 'invalid-root') result.nativeSessionId = 'ses_invalid_root'
+      if (options.fault === 'placeholder-root') result.nativeSessionId = 'ses_task002syntheticroot'
+      if (options.fault === 'wrong-soul') result.soulId = 'soul-foreign'
+      if (options.fault === 'wrong-observation-root') result.nativeIdentityObservation.nativeSessionId = 'ses_foreign'
+      if (options.fault === 'wrong-observation-incarnation') result.nativeIdentityObservation.incarnationId = 'incarnation-foreign'
+      if (options.fault === 'stale-incarnation') view.incarnationId = 'incarnation-newer'
+      if (options.fault === 'wrong-current-observation') view.nativeIdentityObservation = { ...observation, nativeSessionId: 'ses_foreign' }
+      return { kind: 'launch', data: { view: result, hostBootId: 'boot-current-unit' } }
+    }
+    vi.spyOn(h, 'adminOk').mockImplementation(async (_supervisor, body) => {
+      if (body.method === 'health') return { kind: 'health', data: { controlEpoch } }
+      if (body.method === 'launch') return launch(body)
+      if (body.method === 'inventory') return { kind: 'inventory', data: [view] }
+      if (body.method === 'upsert_view_intent') return { kind: 'view_intent', data: {} }
+      if (body.method === 'probe_recovery') return { kind: 'recovery_probe', data: { kind: 'resume_ready' } }
+      if (body.method === 'recover') {
+        await fsp.mkdir(control, { recursive: true })
+        await fsp.writeFile(path.join(control, 'evidence/lifecycle.jsonl'), JSON.stringify({ event: 'supervisor.recovery.preflight',
+          data: { severity: 'warn', soulId: view.soulId, incarnationId: incarnation, controlEpoch: 2,
+            blockReason: 'STORE_UNREADABLE', repair: 'repair owned store', attemptReserved: false } })+'\n')
+        return { kind: 'recovery', data: { outcome: 'blocked', probe: { kind: 'blocked', data: { reason: 'STORE_UNREADABLE' } } } }
+      }
+      throw new Error(`unexpected adapter operation ${body.method}`)
+    })
+    vi.spyOn(h, 'adminEnvelopeRaw').mockImplementation(async (s, envelope) => ({ requestId: envelope.requestId,
+      result: { Ok: await h.adminOk(s, envelope.body) } }))
+    const roots: string[] = [], probeRoots: string[][] = []
+    let host: net.Server | undefined
+    if (options.complete) {
+      h.imageRef = 'sha256:'+ 'f'.repeat(64)
+      await fsp.mkdir(path.join(control, 'evidence'))
+      const hostDir = path.join(h.testRoot, 'host')
+      await fsp.mkdir(hostDir)
+      await fsp.writeFile(path.join(hostDir, 'secret'), 'synthetic-host-secret')
+      vi.spyOn(h, 'runtimeDir').mockReturnValue(hostDir)
+      host = net.createServer(socket => {
+        const chunks: Buffer[] = []
+        socket.on('data', chunk => { chunks.push(chunk) })
+        socket.on('end', () => {
+          const frame = Buffer.concat(chunks)
+          expect(frame.readUInt32BE(0)).toBe(frame.length-4)
+          const request = JSON.parse(frame.subarray(4).toString())
+          expect(request.body.params.incarnation_id).toBe(incarnation)
+          const reply = Buffer.from(JSON.stringify({ requestId: request.requestId,
+            result: { Ok: { kind: 'status', data: { exited: false } } } }))
+          const header = Buffer.alloc(4); header.writeUInt32BE(reply.length)
+          socket.end(Buffer.concat([header, reply]))
+        })
+      })
+      await new Promise<void>(resolve => host!.listen(path.join(hostDir, 'host.sock'), resolve))
+      vi.spyOn(h, 'stopSupervisorExact').mockImplementation(() => {})
+      vi.spyOn(h, 'removeContainerExact').mockImplementation(() => {})
+      vi.spyOn(h, 'inspectContainer').mockImplementation(id => ({ Id: id, Image: h.imageRef,
+        HostConfig: { Tmpfs: { '/tmp': 'owned', '/run/opencode-tmp': 'owned' } },
+        Mounts: [{ Destination: '/home/freshell/provider', Name: 'owned-provider-volume' }],
+        State: { Running: id === oldContainer ? oldRunning : true } }))
+      vi.spyOn(h, 'execOwnedContainerExact').mockImplementation(() => JSON.stringify({ attemptCount: replaced ? 1 : 0,
+        writerClaims: replaced ? 1 : 0, incarnation: { soul_id: view.soulId, incarnation_id: incarnation,
+          container_id: replaced ? replacement : oldContainer, immutable_config_digest: 'owned-digest', ...(!options.legacy ? { launch_policy: 'current' } : {}) } }))
+      const dbFile = path.join(h.testRoot, 'probe.db'), db = new DatabaseSync(dbFile)
+      db.exec('CREATE TABLE session(id TEXT PRIMARY KEY)')
+      db.prepare('INSERT INTO session VALUES (?)').run(nativeRoot)
+      db.prepare('INSERT INTO session VALUES (?)').run('ses_task002syntheticchild')
+      db.close()
+      provider.mockImplementation((_id, user, args) => {
+        expect(user).toBe('65534:0')
+        if (args[0] === 'cat') return fs.readFileSync(path.join(workspace, `selected-tui.${options.tuiFormat ?? 'jsonc'}`), 'utf8')
+        if (args[0] === 'chmod') return ''
+        if (args[0] !== 'python3') throw new Error('unexpected provider mutation')
+        if (args.length >= 6) {
+          roots.push(args[4])
+          if (options.legacy) {
+            expect(args.slice(3)).toEqual([workspace, 'ses_task002syntheticroot', 'ses_task002syntheticchild'])
+            throw new Error('original legacy seed entered')
+          }
+          expect(args[6]).toBe('preserve_native_root')
+          return JSON.stringify({ root: args[4], child: args[5], providerUid: 65534, providerGid: 0 })
+        }
+        probeRoots.push(args.slice(3))
+        // Execute the driver's actual read query against an owned SQLite store.
+        return execFileSync('python3', ['-c', `import sqlite3
+connect=sqlite3.connect
+sqlite3.connect=lambda *args,**kwargs:connect(${JSON.stringify(dbFile)})
+` + args[2], ...args.slice(3)], { encoding: 'utf8', timeout: 10_000 })
+      })
+      h.broker = { receiptIds: () => [], receipts: () => [] } as unknown as RestrictedDockerBroker
+      vi.spyOn(h, 'brokerReceiptsSince').mockImplementation(() => replaced ? [{ containerId: replacement,
+        providerVolumeName: 'owned-provider-volume' } as any] : [])
+      let retries = 0
+      vi.spyOn(h, 'adminRaw').mockImplementation(async () => {
+        const failed = retries++ === 0
+        if (!failed) { replaced = true; oldRunning = false }
+        return { requestId: 'owned-retry', result: { Ok: { kind: 'recovery', data: failed
+          ? { outcome: 'blocked', probe: { data: { reason: 'CAPABILITY_PENDING', retry_hint: { repair: 'provider configuration publication' } } } }
+          : { outcome: 'replaced', view } } } }
+      })
+      vi.spyOn(h, 'writeArtifact').mockImplementation(() => {})
+    }
+    return { h, provider, input, stop, release, launchEntered, nativeRoot,
+      observations: () => ({ created, navigated, hydrated }),
+      roots, probeRoots,
+      run: (browser?: retained.Task2RetainedBrowserHooks) => retained.runTask2RetainedFixture(h, !!options.legacy, () => web, browser, options.tuiFormat),
+      close: async () => {
+        if (host) await new Promise<void>((resolve, reject) => host!.close(error => error ? reject(error) : resolve()))
+        await new Promise<void>((resolve, reject) => preparation.close(error => error ? reject(error) : resolve()))
+        await fsp.rm(h.testRoot, { recursive: true, force: true })
+      } }
+  }
+
+  it('waits for actual fresh create/navigation/hydration before seeding rather than resuming a missing root', async () => {
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    const f = await fixture()
+    const operation = f.run()
+    const settled = operation.catch(error => error as Error)
+    try {
+      await f.launchEntered
+      expect(f.provider).not.toHaveBeenCalled()
+      expect(f.input).not.toHaveBeenCalled()
+      expect(f.observations()).toEqual({ created: 0, navigated: 0, hydrated: 0 })
+      f.release()
+      expect(await settled).toMatchObject({ message: `observed fresh root ${f.nativeRoot}` })
+      expect(f.observations()).toEqual({ created: 1, navigated: 1, hydrated: 1 })
+      expect(f.provider).not.toHaveBeenCalled()
+      expect(f.input).not.toHaveBeenCalled()
+      expect(f.stop).toHaveBeenCalledOnce()
+    } finally { f.release(); await settled; await f.close(); vi.unstubAllEnvs() }
+  })
+
+  it.each(['json', 'jsonc'] as const)('binds the observed current root through seeding/public context and actual retained SQL probes (%s)', async tuiFormat => {
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    const f = await fixture({ complete: true, tuiFormat })
+    const contexts: retained.Task2RetainedPublicContext[] = []
+    const operation = f.run({ observe: async (context, phase) => {
+      contexts.push(retained.task2RetainedPublicContext(context))
+      expect(context.rootSessionId).toBe(f.nativeRoot)
+      expect(context.soulId).toMatch(/^soul-/)
+      if (phase === 'store_blocked') expect(context.oldIncarnationId).toBe('incarnation-current-unit')
+    }, retry: async (context) => {
+      contexts.push(retained.task2RetainedPublicContext(context))
+      return f.h.adminRaw(context.supervisor, f.h.recoverBody(context.soulId, 'manual_retry', 3))
+    } })
+    const settled = operation.catch(error => error as Error)
+    try {
+      await f.launchEntered; f.release()
+      expect(await settled).toBeUndefined()
+      expect(f.roots).toEqual([f.nativeRoot])
+      expect(f.probeRoots).toEqual([[f.nativeRoot, 'ses_task002syntheticchild']])
+      expect(contexts).toHaveLength(5)
+      expect(contexts.every(context => context.rootSessionId === f.nativeRoot)).toBe(true)
+      expect(f.input).not.toHaveBeenCalled()
+      expect(f.stop).toHaveBeenCalledOnce()
+    } finally { f.release(); await settled; await f.close(); vi.unstubAllEnvs() }
+  })
+
+  it.each(['missing-root', 'empty-root', 'invalid-root', 'placeholder-root', 'wrong-soul',
+    'wrong-observation-root', 'wrong-observation-incarnation', 'stale-incarnation', 'wrong-current-observation'])
+    ('refuses %s before any provider seed/config/store mutation', async fault => {
+      vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+      const f = await fixture({ complete: true, fault })
+      const operation = f.run(), settled = operation.catch(error => error as Error)
+      try {
+        await f.launchEntered; f.release()
+        expect(await settled).toMatchObject({ message: expect.stringMatching(/observed retained native root/) })
+        expect(f.provider).not.toHaveBeenCalled()
+        expect(f.input).not.toHaveBeenCalled()
+        expect(f.stop).toHaveBeenCalledOnce()
+      } finally { f.release(); await settled; await f.close(); vi.unstubAllEnvs() }
+    })
+
+  it('keeps the genuine protocol1 launch/root and original legacy seed without requiring current observation', async () => {
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    const f = await fixture({ complete: true, legacy: true })
+    const operation = f.run(), settled = operation.catch(error => error as Error)
+    try {
+      await f.launchEntered; f.release()
+      expect(await settled).toMatchObject({ message: 'original legacy seed entered' })
+      expect(f.roots).toEqual(['ses_task002syntheticroot'])
+      expect(f.observations()).toEqual({ created: 0, navigated: 0, hydrated: 0 })
+      expect(f.h.adminEnvelopeRaw).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ protocolVersion: 1,
+        body: expect.objectContaining({ method: 'launch', params: expect.objectContaining({ nativeSessionId: 'ses_task002syntheticroot' }) }) }))
+      expect(f.input).not.toHaveBeenCalled()
+    } finally { f.release(); await settled; await f.close(); vi.unstubAllEnvs() }
+  })
+})
+
 describe('retained fixture owner web injection', () => {
   it('uses the injected owner factory rather than launching its browser fixture dependency', async () => {
     const h = new owner.RuntimeHarness(fixtureRepoRoot, undefined, 3)

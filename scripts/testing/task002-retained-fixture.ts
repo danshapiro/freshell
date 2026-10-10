@@ -163,9 +163,36 @@ async function legacyNegativeMounts(
     nativeQualified: false, selectedCount: faults.length, executedCount: results.length,
     savedDigest: digest, imageDigest: source.Image, results })
 }
+// Shared by the provider-bound wrapper and source-only pinned-schema SQL tests.
+export const TASK2_RETAINED_SEED_SQL = String.raw`
+project='task002_project'
+if preserve_native_root:
+ c.execute('BEGIN IMMEDIATE')
+ existing=c.execute('SELECT project_id,parent_id,directory FROM session WHERE id=?',(root,)).fetchone()
+ if existing is None or existing[1] is not None or existing[2]!=workspace:raise RuntimeError('retained native root missing or not the exact parentless workspace root')
+ project=existing[0]
+ if c.execute('SELECT id FROM project WHERE id=?',(project,)).fetchone() is None:raise RuntimeError('retained native root project missing')
+ if c.execute('SELECT id FROM session WHERE id=? OR parent_id=?',(child,root)).fetchone() is not None:raise RuntimeError('retained native root already has a child or descendant')
+ for table in ('message','part','session_input','session_message'):
+  if c.execute('SELECT 1 FROM '+table+' WHERE session_id=? LIMIT 1',(root,)).fetchone() is not None:raise RuntimeError('retained native root is nonempty')
+else:
+ c.execute("INSERT INTO project (id,worktree,time_created,time_updated,sandboxes) VALUES (?,?,?,?,?)",(project,workspace,1,1,'[]'))
+ c.execute('INSERT INTO project_directory (project_id,directory,time_created) VALUES (?,?,?)',(project,workspace,1))
+for ident,parent in [(root,None),(child,root)]:
+ if ident!=root or not preserve_native_root:
+  c.execute('INSERT INTO session (id,project_id,parent_id,slug,directory,title,version,time_created,time_updated) VALUES (?,?,?,?,?,?,?,?,?)',(ident,project,parent,'fixture',workspace,'synthetic fixture','1.18.21',1,1))
+ c.execute('INSERT INTO message (id,session_id,time_created,time_updated,data) VALUES (?,?,?,?,?)',('msg_'+ident,ident,1,1,json.dumps({'role':'user','agent':'build','model':{'providerID':'openai','modelID':'gpt-5.6-luna'},'time':{'created':1}})))
+ c.execute('INSERT INTO part (id,message_id,session_id,time_created,time_updated,data) VALUES (?,?,?,?,?,?)',('prt_'+ident,'msg_'+ident,ident,1,1,json.dumps({'type':'file','mime':'text/plain','filename':'asset.txt','url':'file://'+workspace+'/asset.txt'})))
+ if ident!=root or not preserve_native_root:
+  info={'id':ident,'slug':'fixture','projectID':project,'directory':workspace,'title':'synthetic fixture','version':'1.18.21','time':{'created':1,'updated':1}}
+  if parent:info['parentID']=parent
+  c.execute('INSERT INTO event_sequence (aggregate_id,seq,owner_id) VALUES (?,1,?)',(ident,'task002_fixture'))
+  c.execute('INSERT INTO event (id,aggregate_id,seq,type,data) VALUES (?,?,1,?,?)',('evt_'+ident,ident,'session.created.1',json.dumps({'sessionID':ident,'info':info})))
+`
 const SEED = String.raw`
 import sqlite3,os,sys,json,time
-workspace,root,child=sys.argv[1:]
+workspace,root,child=sys.argv[1:4]
+preserve_native_root=len(sys.argv)==5 and sys.argv[4]=='preserve_native_root'
 status=open('/proc/self/status').read()
 if os.geteuid()!=65534 or os.getegid()!=0 or not any(line.startswith('CapEff:') and int(line.split()[1],16)==0 for line in status.splitlines()) or 'NoNewPrivs:\t1' not in status:raise RuntimeError('provider identity/capability boundary differs')
 database='/home/freshell/provider/.local/share/opencode/opencode.db'
@@ -176,16 +203,7 @@ for _ in range(100):
   c.close()
  time.sleep(.1)
 else:raise RuntimeError('native initialization did not create pinned store')
-c.execute("INSERT INTO project (id,worktree,time_created,time_updated,sandboxes) VALUES (?,?,?,?,?)",('task002_project',workspace,1,1,'[]'))
-c.execute('INSERT INTO project_directory (project_id,directory,time_created) VALUES (?,?,?)',('task002_project',workspace,1))
-for ident,parent in [(root,None),(child,root)]:
- c.execute('INSERT INTO session (id,project_id,parent_id,slug,directory,title,version,time_created,time_updated) VALUES (?,?,?,?,?,?,?,?,?)',(ident,'task002_project',parent,'fixture',workspace,'synthetic fixture','1.18.21',1,1))
- c.execute('INSERT INTO message (id,session_id,time_created,time_updated,data) VALUES (?,?,?,?,?)',('msg_'+ident,ident,1,1,json.dumps({'role':'user','agent':'build','model':{'providerID':'openai','modelID':'gpt-5.6-luna'},'time':{'created':1}})))
- c.execute('INSERT INTO part (id,message_id,session_id,time_created,time_updated,data) VALUES (?,?,?,?,?,?)',('prt_'+ident,'msg_'+ident,ident,1,1,json.dumps({'type':'file','mime':'text/plain','filename':'asset.txt','url':'file://'+workspace+'/asset.txt'})))
- info={'id':ident,'slug':'fixture','projectID':'task002_project','directory':workspace,'title':'synthetic fixture','version':'1.18.21','time':{'created':1,'updated':1}}
- if parent:info['parentID']=parent
- c.execute('INSERT INTO event_sequence (aggregate_id,seq,owner_id) VALUES (?,1,?)',(ident,'task002_fixture'))
- c.execute('INSERT INTO event (id,aggregate_id,seq,type,data) VALUES (?,?,1,?,?)',('evt_'+ident,ident,'session.created.1',json.dumps({'sessionID':ident,'info':info})))
+` + TASK2_RETAINED_SEED_SQL + String.raw`
 c.commit(); c.close()
 print(json.dumps({'root':root,'child':child,'providerUid':os.geteuid(),'providerGid':os.getegid(),'capEff':'0','noNewPrivileges':1}))
 `
@@ -251,6 +269,38 @@ export type Task2RetainedBrowserHooks = {
   retry(context: Task2RetainedBrowserContext, phase: 'config_fault' | 'repaired'): Promise<AdminReply>
 }
 
+async function observedRetainedRoot(h: RuntimeHarness, supervisor: SupervisorInstance, soulId: string, launch: any): Promise<string> {
+  const refuse = (reasonCode: string): never => {
+    h.recordLifecycle('task2.retained_native_root.refused', { severity: 'error', soulId, reasonCode })
+    throw new Error(`observed retained native root ${reasonCode}`)
+  }
+  const schema = z.object({
+    soulId: z.literal(soulId), incarnationId: z.string().min(1), provider: z.literal('opencode'),
+    launchState: z.literal('running'), containerId: z.string().regex(/^[a-f0-9]{64}$/),
+    nativeSessionId: z.string().regex(/^ses_[A-Za-z0-9]+$/).refine(root => root !== ROOT && root !== CHILD),
+    evidenceRevision: z.number().int().nonnegative(),
+    nativeIdentityObservation: z.object({ nativeSessionId: z.string(), incarnationId: z.string(),
+      launchNonce: z.string().min(1), evidenceRevision: z.number().int().nonnegative(),
+      source: z.literal('opencode_tui'), evidenceDigest: z.string().regex(/^[a-f0-9]{64}$/) }),
+  }).refine(view => view.nativeIdentityObservation.nativeSessionId === view.nativeSessionId
+    && view.nativeIdentityObservation.incarnationId === view.incarnationId
+    && view.nativeIdentityObservation.evidenceRevision === view.evidenceRevision)
+  const parsed = schema.safeParse(launch?.view)
+  if (!parsed.success) return refuse('launch_binding_mismatch')
+  const view = parsed.data, observation = view.nativeIdentityObservation
+  const current = (await inventory(h, supervisor)).filter(row => row.soulId === soulId)
+  if (current.length !== 1 || !schema.safeParse(current[0]).success
+    || current[0].incarnationId !== view.incarnationId || current[0].containerId !== view.containerId
+    || current[0].nativeSessionId !== view.nativeSessionId || current[0].evidenceRevision !== view.evidenceRevision
+    || current[0].nativeIdentityObservation.launchNonce !== observation.launchNonce
+    || current[0].nativeIdentityObservation.evidenceDigest !== observation.evidenceDigest) {
+    return refuse('current_incarnation_mismatch')
+  }
+  h.recordLifecycle('task2.retained_native_root.bound', { severity: 'info', soulId,
+    incarnationId: view.incarnationId, nativeSessionId: view.nativeSessionId, evidenceRevision: view.evidenceRevision })
+  return view.nativeSessionId
+}
+
 export async function runTask2RetainedFixture(
   h: RuntimeHarness, legacy: boolean, webFactory: RuntimeWebFactory, browser?: Task2RetainedBrowserHooks, tuiFormat: 'json' | 'jsonc' = 'jsonc',
 ): Promise<void> {
@@ -288,9 +338,12 @@ export async function runTask2RetainedFixture(
       OPENCODE_DB: DATABASE, OPENCODE_DISABLE_DEFAULT_PLUGINS: '1', OPENCODE_DISABLE_MODELS_FETCH: '1', OPENCODE_DISABLE_AUTOUPDATE: '1' },
     ...(!legacy ? { providerLaunchContext: preparation.context, providerSecretReferences: preparation.secretReferences } : {}),
   }
-  const body = h.launchBody({ soulId, provider: 'opencode', providerStoreId: `store-${scenarioId}-${h.runId}`, nativeSessionId: ROOT,
+  const body = h.launchBody({ soulId, provider: 'opencode', providerStoreId: `store-${scenarioId}-${h.runId}`, ...(legacy ? { nativeSessionId: ROOT } : {}),
     terminal, limits: {cpuMilli:2000,memoryBytes:4*1024*1024*1024,swapBytes:0,pidsMax:512}, profile: 'default_agent', expectedControlEpoch: 1 })
   const launch = data(await (legacy ? oldOk(h, first, body) : h.adminOk(first, body)), 'launch')
+  // Current launch completes only after provider-observed native creation. The
+  // historical protocol1 fixture retains its original preassigned seed identity.
+  const rootSessionId = legacy ? ROOT : await observedRetainedRoot(h, first, soulId, launch)
   const containerId = launch.view.containerId
   const readPublishedTui = (id: string) => h.execOwnedContainerAsExact(id, '65534:0', ['cat', `${HOME}/.freshell/opencode/user-tui.${tuiFormat}`])
   if (!legacy) h.assert(caseId, readPublishedTui(containerId) === initialTui, `${tuiFormat} actual callback recipe publishes selected TUI bytes under provider identity`)
@@ -298,8 +351,9 @@ export async function runTask2RetainedFixture(
   h.assert(caseId, /^[a-f0-9]{64}$/.test(containerId) && inspected.Id === containerId, 'saved enclosure uses full exact container identity')
   h.assert(caseId, inspected.Image === h.imageRef, 'saved enclosure uses exact immutable image')
   if (legacy) h.assert(caseId, JSON.stringify(Object.keys(inspected.HostConfig.Tmpfs).sort()) === JSON.stringify(['/run/opencode-tmp', '/tmp']), 'actual historical creator emitted only known legacy tmpfs')
-  const seeded = JSON.parse(h.execOwnedContainerAsExact(containerId, '65534:0', ['python3', '-c', SEED, workspace, ROOT, CHILD]))
-  h.assert(caseId, seeded.root === ROOT && seeded.child === CHILD && seeded.providerUid === 65534 && seeded.providerGid === 0, 'actual synthetic retained graph is seeded by provider identity')
+  const seeded = JSON.parse(h.execOwnedContainerAsExact(containerId, '65534:0', ['python3', '-c', SEED, workspace, rootSessionId, CHILD,
+    ...(!legacy ? ['preserve_native_root'] : [])]))
+  h.assert(caseId, seeded.root === rootSessionId && seeded.child === CHILD && seeded.providerUid === 65534 && seeded.providerGid === 0, 'actual synthetic retained graph is seeded by provider identity')
   h.assert(caseId,(await retainedHostStatus(h,first,launch,legacy)).exited===false,'the actual retained provider remains alive after native initialization')
   const before = ownedRecord(h, first, soulId)
   if (legacy) h.assert(caseId, !('launch_policy' in before.incarnation), 'actual historical registry predates policy column')
@@ -322,7 +376,7 @@ export async function runTask2RetainedFixture(
     }))
   }
   const browserContext = (result?: AdminReply): Task2RetainedBrowserContext => ({
-    h, web: web!, supervisor: current, soulId, rootSessionId: ROOT, childSessionId: CHILD,
+    h, web: web!, supervisor: current, soulId, rootSessionId, childSessionId: CHILD,
     oldContainerId: containerId, oldIncarnationId: launch.view.incarnationId,
     providerVolumeName: inspected.Mounts.find((m: any) => m.Destination === HOME)?.Name,
     configFile, preferredTabId, preferredPaneId, title: caseId, result,
@@ -378,7 +432,7 @@ export async function runTask2RetainedFixture(
   h.assert(caseId, created.every(receipt => receipt.providerVolumeName === inspected.Mounts.find((m: any) => m.Destination === HOME)?.Name), 'every attempted replacement keeps exact provider volume')
   h.assert(caseId, h.inspectContainer(containerId).State.Running === false, 'old enclosure is empty before current writer runs')
   const actual = h.execOwnedContainerAsExact(live[0]!.containerId, '65534:0', ['python3', '-c',
-    "import sqlite3,json,os; c=sqlite3.connect('file:/home/freshell/provider/.local/share/opencode/opencode.db?mode=ro',uri=True); print(json.dumps([r[0] for r in c.execute('SELECT id FROM session WHERE id IN (?,?)',('ses_task002syntheticroot','ses_task002syntheticchild'))]))"])
+    "import sqlite3,json,sys; c=sqlite3.connect('file:/home/freshell/provider/.local/share/opencode/opencode.db?mode=ro',uri=True); print(json.dumps([r[0] for r in c.execute('SELECT id FROM session WHERE id IN (?,?)',tuple(sys.argv[1:]))]))", rootSessionId, CHILD])
   h.assert(caseId, JSON.parse(actual).length === 2, 'replacement retained exact synthetic root and descendant')
   await browser?.observe(browserContext(result), 'replaced')
   h.writeArtifact(`${scenarioId}-result.json`, { kind: 'synthetic-task2', nativeQualified: false, browserExecuted: false, result, before, blockedProbe: blocked.probe, blockedRecord, after, fullOldContainerId: containerId, imageDigest: h.imageRef })
