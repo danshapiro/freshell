@@ -10,8 +10,9 @@ import { createHash, randomUUID } from 'node:crypto'
 import { RuntimeHarness } from './runtime-sandbox.js'
 import { seedManagedOpenCodeSource } from '../../test/e2e-browser/fixtures/managed-opencode-source.js'
 import { ManagedRuntimeSoulSchema } from '../../shared/managed-runtime.js'
-import { readCodexNativeHistory } from '../../test/e2e-browser/helpers/provider-native-history/codex.js'
-import { readOpenCodeNativeHistory } from '../../test/e2e-browser/helpers/provider-native-history/opencode.js'
+import { readCodexNativeHistory, readCodexNativeObservation } from '../../test/e2e-browser/helpers/provider-native-history/codex.js'
+import { readOpenCodeNativeHistory, readOpenCodeNativeObservation } from '../../test/e2e-browser/helpers/provider-native-history/opencode.js'
+import { deriveNativeRecoveryOriginals, type NativeOriginalReference } from './qualification-observations.js'
 import type { NativeHistory } from '../../test/e2e-browser/helpers/provider-native-history/types.js'
 
 export type NativeProvider = 'claude' | 'codex' | 'opencode' | 'amplifier'
@@ -27,6 +28,7 @@ export type NativeExperimentOriginal = {
   executableSha256: string
   profileSha256: string
   artifactReferences: string[]
+  nativeOriginals?: { evidenceDir: string; reference: NativeOriginalReference }
   assertions: { name: string; pass: boolean }[]
 }
 
@@ -507,7 +509,7 @@ export function nativeFeasibilityCases(selection: NativeSelection): readonly str
 export function prepareOwnedOpenCodeTuiSource(repoRoot: string, ownedRoot: string, caseId: string, nonce: string) {
   if (!/^\/tmp\/f[a-z0-9]+\/[a-f0-9]{8}-[a-f0-9]{3}$/.test(ownedRoot)
     || fs.realpathSync(ownedRoot) !== ownedRoot || !nonce
-    || !nativeFeasibilityCases({ provider: 'opencode', case: 'startup' }).includes(caseId)) {
+    || !(caseId === 'current-native-turn' || nativeFeasibilityCases({ provider: 'opencode', case: 'startup' }).includes(caseId))) {
     throw new Error('finite owned OpenCode source preparation required')
   }
   const workspace = path.join(ownedRoot, `opencode-${caseId}-workspace`)
@@ -651,6 +653,10 @@ export async function dispatchNativeFeasibility(input: {
           || requiredAssertions.some((name) => !original.assertions.some((assertion) => assertion.name === name && assertion.pass))) {
           failures.push(caseId)
         }
+        if (input.selection.case === 'native-turn') {
+          if (!original.nativeOriginals) throw new Error('native-turn original references missing')
+          deriveNativeRecoveryOriginals({ evidenceDir: original.nativeOriginals.evidenceDir, originalReference: original.nativeOriginals.reference, candidateSha: input.candidateSha, runId: input.ownerId, runtimeImage: input.imageDigest, selected: [input.selection.mode ?? input.selection.provider!], requiredStages: ['initial', 'after_provider_process_crash'] })
+        }
       } catch {
         failures.push(caseId)
       }
@@ -755,13 +761,13 @@ export async function executeManagedNativeCase(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], selection: NativeSelection,
   caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
-  if (selection.provider === 'opencode' && selection.case === 'startup') {
+  if (selection.provider === 'opencode' && (selection.case === 'startup' || caseId === 'current-native-turn')) {
     return executeManagedOpenCodeTui(harness, sources, caseId, serverPath, servers)
   }
-  if (selection.provider === 'codex' && ['create', 'exact-resume', 'wrong-root', 'cancellation'].includes(caseId)) {
+  if (selection.provider === 'codex' && ['create', 'exact-resume', 'wrong-root', 'cancellation', 'current-native-turn'].includes(caseId)) {
     return executeManagedReceiverNative(harness, sources, 'codex', caseId, serverPath, servers)
   }
-  if (['freshcodex', 'freshopencode'].includes(selection.mode ?? '') && ['create', 'exact-resume', 'wrong-root', 'cancellation'].includes(caseId)) {
+  if (['freshcodex', 'freshopencode'].includes(selection.mode ?? '') && ['create', 'exact-resume', 'wrong-root', 'cancellation', 'current-native-turn'].includes(caseId)) {
     return executeManagedReceiverNative(harness, sources, selection.mode as 'freshcodex' | 'freshopencode', caseId)
   }
   if (selection.provider === 'claude' && ['create', 'wrong-root', 'fork-root', 'stale-shared-signal', 'disabled-hooks', 'trust-refusal', 'unwritable-signal', 'timeout', 'provider-exit', 'stop-cancellation', 'exact-resume', 'restoration-failure-after-hook', 'current-native-turn'].includes(caseId)) {
@@ -898,6 +904,7 @@ print(json.dumps({'patchedPublisherSha256':hashlib.sha256((base/'index.mjs').rea
   const inspect = async (containerId: string, label: string, requireTranscript: boolean) => {
     const metadata = JSON.parse(await harness.execOwnedContainerAsExact(containerId, '65534:0',
       ['python3', '-c', claudeNativeInspection, view.nativeSessionId, String(requireTranscript), 'fresh', 'ordinary', ...(sdkForkImage ? ['sdk-fork-image'] : [])]))
+    if (caseId === 'current-native-turn') retainOwnedNativeProbe(metadata, containerId)
     harness.writeArtifact(`${scenario}-${label}-native-private.json`, metadata)
     if (metadata.uid !== 65534 || metadata.gid !== 0 || metadata.caps !== '0000000000000000'
       || !metadata.readOnlyRoot || metadata.httpsStatus !== 200 || metadata.tlsVerifyMode !== 2
@@ -911,11 +918,15 @@ print(json.dumps({'patchedPublisherSha256':hashlib.sha256((base/'index.mjs').rea
   if (namespace.uid !== 65534 || namespace.gid !== 0 || !namespace.version.includes('2.1.237')) {
     throw new Error('actual selected native child/UID differs')
   }
+  let nativeOriginals: NativeExperimentOriginal['nativeOriginals']
   if (caseId === 'current-native-turn' || caseId === 'exact-resume' || wrongId || restorationFailure) {
-    const marker = 'owned-memory-' + randomUUID()
+    const marker = 'owned-memory-' + randomUUID(), initialObservedAt = Date.now()
+    const nativeRequests = new Map<string, NativeOriginalReference>()
     let cursor = 0
     const nativeTurn = async (text: string, label: string): Promise<any[]> => {
-      const receipt = await harness.adminOk(supervisor, { method: 'fresh_agent_send', params: { soulId, text } })
+      const requestId = 'request-' + randomUUID(), sentAt = Date.now(), body = { method: 'fresh_agent_send', params: { soulId, text } }
+      const receipt = await harness.adminOk(supervisor, body, { requestId })
+      if (caseId === 'current-native-turn') nativeRequests.set(label, writeNativeOriginal(harness, `${scenario}-${label}-request-original.json`, { requestId, sentAt, request: body, reply: receipt }))
       harness.writeArtifact(`${scenario}-${label}-dispatch.json`, receipt)
       const events: any[] = []
       const batches: unknown[] = []
@@ -955,10 +966,13 @@ print(json.dumps({'patchedPublisherSha256':hashlib.sha256((base/'index.mjs').rea
         seedSha256: before.transcript.sha256, ...(restorationFailure ? { identity: before.transcript.identity.slice(0, 2) } : {}) }), { mode: 0o660 })
       fs.chmodSync(control, 0o660)
     }
+    const requestedAt = Date.now()
     await harness.killOwnedRuntimeExact(view.containerId)
     await harness.waitForContainerExit(view.containerId)
+    const exitedAt = Date.now()
     const recovery = wrongId || restorationFailure ? await harness.adminRaw(supervisor, harness.recoverBody(soulId, 'host_unreachable'))
       : await harness.adminOk(supervisor, harness.recoverBody(soulId, 'host_unreachable'))
+    const replacementObservedAt = Date.now()
     harness.writeArtifact(`${scenario}-recovery.json`, recovery)
     if (wrongId) {
       const observedPath = path.join(workspace, 'native-fork-fault-observation.json')
@@ -1031,6 +1045,8 @@ print(json.dumps({'patchedPublisherSha256':hashlib.sha256((base/'index.mjs').rea
         const text = recalled.flatMap((event) => event.content ?? []).filter((part) => part.type === 'text').map((part) => part.text).join('').trim()
         if (text !== marker) throw new Error('native restored context did not recall the private marker')
         if (recalled.some((event) => (event.content ?? []).some((part: any) => part.type === 'tool_use'))) throw new Error('native recall unexpectedly requested a tool')
+        const recalledStore = await inspect(recovery.data.view.containerId, 'recall-completed', true)
+        nativeOriginals = retainFamilyNativeTurnOriginals(harness, { scenario, mode: mode as 'freshclaude' | 'kilroy', provider: 'claude', launchRequest: request, nonce: marker, requestedAt, exitedAt, initial: { view, namespace, capture: before, observedAt: initialObservedAt, request: nativeRequests.get('seed')!, snapshotPath: before.hook.native.transcript_path }, replacement: { view: recovery.data.view, namespace: recalledStore, capture: recalledStore, observedAt: replacementObservedAt, request: nativeRequests.get('recall')!, snapshotPath: recalledStore.hook.native.transcript_path } })
         assertions.push({ name: 'actual-restored-context-private-marker-recall', pass: text === marker },
           { name: 'native-turns-requested-no-tools', pass: ![...seedEvents, ...recalled].some((event) =>
             (event.content ?? []).some((part: any) => part.type === 'tool_use')) })
@@ -1048,7 +1064,7 @@ print(json.dumps({'patchedPublisherSha256':hashlib.sha256((base/'index.mjs').rea
   const profileSha256 = createHash('sha256').update(JSON.stringify({ settings, nativeProfile: namespace.profileFiles })).digest('hex')
   const original = { caseId, ownerId: harness.runId, candidateSha: harness.candidateSha,
     imageDigest: harness.imageRef, nativeVersion: namespace.version, executableSha256: namespace.executableSha256,
-    profileSha256, artifactReferences: [`${scenario}-launch.json`, `${scenario}-namespace.json`],
+    profileSha256, artifactReferences: [`${scenario}-launch.json`, `${scenario}-namespace.json`, ...(nativeOriginals ? [nativeOriginals.reference.path] : [])], nativeOriginals,
     assertions }
   harness.writeArtifact(`${scenario}-original.json`, original)
   return original
@@ -1064,10 +1080,11 @@ async function executeManagedOpenCodeTui(harness: RuntimeHarness,
   sources: { name: string; path: string; sha256: string }[], caseId: string, serverPath?: string,
   servers: { server: import('../../test/e2e-browser/helpers/rust-server.js').RustServer; scope: string; pid?: number }[] = []): Promise<NativeExperimentOriginal> {
   const replacementFault = caseId === 'baseline-only-resume' || caseId === 'stale-observation'
-  if (replacementFault && !serverPath) throw new Error('actual native OpenCode replacement requires the owned real server artifact')
+  const requiresController = replacementFault || caseId === 'current-native-turn'
+  if (requiresController && !serverPath) throw new Error('actual native OpenCode replacement requires the owned real server artifact')
   const stageSource = sources.find(file => file.name === 'opencode/native-preparation/transfer-stage.bin')
   if (!stageSource) throw new Error('selected OpenCode native transfer stage required')
-  if (!['null-slot', 'v1-empty', 'v2-empty-is-not-v1-empty', 'full-revert', 'part-revert', 'disposal', 'cancellation', 'root-load-error', 'history-load-error', 'baseline-only-resume', 'stale-observation'].includes(caseId)) {
+  if (!['null-slot', 'v1-empty', 'v2-empty-is-not-v1-empty', 'full-revert', 'part-revert', 'disposal', 'cancellation', 'root-load-error', 'history-load-error', 'baseline-only-resume', 'stale-observation', 'current-native-turn'].includes(caseId)) {
     throw new Error(`actual native OpenCode TUI case has no qualified execution path: ${caseId}`)
   }
   const scenario = `opencode-${caseId}`
@@ -1137,7 +1154,7 @@ async function executeManagedOpenCodeTui(harness: RuntimeHarness,
     return { sourcePath: selected.path, profile: 'opencode_onecli_' + (suffix === 'env_file' ? 'environment' : suffix) }
   })
   let managedPreparation: any
-  if (replacementFault && serverPath) {
+  if (requiresController && serverPath) {
     const { RustServer } = await import('../../test/e2e-browser/helpers/rust-server.js')
     const server = new RustServer({ homeDir: sourceHome, preserveHomeOnStop: true,
       env: { FRESHELL_BIND_HOST: '0.0.0.0', FRESHELL_MANAGED_RUNTIME_V1: '1',
@@ -1214,6 +1231,7 @@ async function executeManagedOpenCodeTui(harness: RuntimeHarness,
   }
   const namespace = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
     ['python3', '-c', openCodeTuiNativeNamespace, 'opencode', source.rootId, source.workspace]))
+  if (caseId === 'current-native-turn') retainOwnedNativeProbe(namespace, view.containerId)
   harness.writeArtifact(`${scenario}-namespace-native-private.json`, namespace)
   if (!receiverNativeNamespaceMatches(namespace, 'opencode', source.workspace, source.rootId)
     || namespace.nativeVersion !== '1.18.21'
@@ -1248,6 +1266,9 @@ print(json.dumps(records))
   }
   if (caseId === 'baseline-only-resume' || caseId === 'stale-observation') {
     return executeManagedOpenCodeTuiReplacementFault(harness, supervisor, request, source, view, namespace, caseId)
+  }
+  if (caseId === 'current-native-turn') {
+    return executeReceiverNativeTurn(harness, supervisor, { mode: 'opencode', provider: 'opencode', terminal: true, scenario, soulId, storeId: soulId, workspace: source.workspace, view, namespace, launchRequest: request, namespaceScript: openCodeTuiNativeNamespace })
   }
   const publication: any = Object.values(signals).find((row: any) => row.stage === 'publication_succeeded')
   const assertion = (name: string, pass: boolean) => ({ name, pass })
@@ -1606,7 +1627,7 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
       throw new Error('owned native receiver load-fault image binding differs')
     }
   }
-  const requiresController = terminal && caseId === 'exact-resume'
+  const requiresController = terminal && ['exact-resume', 'current-native-turn'].includes(caseId)
   if (requiresController && !serverPath) throw new Error('actual terminal recovery requires the owned real server artifact')
   const provider = mode === 'freshcodex' || terminal ? 'codex' : 'opencode', scenario = `${mode}-${caseId}`
   const observationSource = terminal ? 'codex_app_server' : 'fresh_provider_handshake'
@@ -1937,10 +1958,14 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
   }
   const namespace = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
     ['python3', '-c', receiverNativeNamespace, provider, view.nativeSessionId, workspace]))
+  if (caseId === 'current-native-turn') retainOwnedNativeProbe(namespace, view.containerId)
   harness.writeArtifact(`${scenario}-namespace-private.json`, namespace)
   if (!receiverNativeNamespaceMatches(namespace, provider, workspace, view.nativeSessionId)
     || (provider === 'opencode' && namespace.nativeMessageCount !== 0)) {
     throw new Error('actual native receiver namespace/profile/pin/TLS differs')
+  }
+  if (caseId === 'current-native-turn') {
+    return executeReceiverNativeTurn(harness, supervisor, { mode, provider, terminal, scenario, soulId, storeId, workspace, view, namespace, launchRequest: selectedRequest, namespaceScript: receiverNativeNamespace })
   }
   const assertions = [{ name: 'actual-native-receiver-current-observation-before-input', pass: true },
     { name: 'actual-selected-native-process-profile-uid-and-tls', pass: true }]
@@ -2027,6 +2052,143 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
   return original
 }
 
+function nativeOriginalReference(evidenceDir: string, filename: string): NativeOriginalReference {
+  return { path: path.relative(evidenceDir, filename), sha256: createHash('sha256').update(fs.readFileSync(filename)).digest('hex') }
+}
+
+function writeNativeOriginal(harness: RuntimeHarness, name: string, value: unknown): NativeOriginalReference {
+  harness.writeArtifact(name, { ...value as Record<string, unknown>, execution: { candidateSha: harness.candidateSha, runId: harness.runId, runtimeImage: harness.imageRef } })
+  return nativeOriginalReference(harness.evidenceDir, path.join(harness.evidenceDir, name))
+}
+
+/** Capture association comes from the exact owned invocation and its actual process probe. */
+function retainOwnedNativeProbe(namespace: any, containerId: string): void {
+  if (!containerId || !Number.isSafeInteger(namespace.nativePid) || namespace.nativePid < 1) throw new Error('owned native namespace probe lacks its actual container/process')
+  namespace.ownedProbe = { containerId, nativePid: namespace.nativePid, capturedAt: Date.now() }
+}
+
+type FamilyNativeStage = { view: any; namespace: any; capture: any; observedAt: number; request: NativeOriginalReference; snapshotPath: string }
+
+function retainFamilyNativeTurnOriginals(harness: RuntimeHarness, input: {
+  scenario: string; mode: 'claude' | 'amplifier' | 'freshclaude' | 'kilroy'; provider: 'claude' | 'amplifier'
+  launchRequest: any; nonce: string; initial: FamilyNativeStage; replacement: FamilyNativeStage; requestedAt: number; exitedAt: number
+}): NonNullable<NativeExperimentOriginal['nativeOriginals']> {
+  const { scenario, provider, mode, nonce } = input, root = input.initial.view.nativeSessionId
+  const materialize = (label: string, stage: FamilyNativeStage) => {
+    const directory = provider === 'amplifier' ? path.join(harness.evidenceDir, `${scenario}-${label}-native-originals`, 'sessions', root) : path.join(harness.evidenceDir, `${scenario}-${label}-native-originals`)
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 })
+    const filename = path.join(directory, provider === 'claude' ? `${root}.jsonl` : 'transcript.jsonl')
+    const bytes = Buffer.from(stage.capture.transcript.bytesBase64, 'base64')
+    if (!bytes.length || bytes.at(-1) !== 10 || createHash('sha256').update(bytes).digest('hex') !== stage.capture.transcript.sha256) throw new Error('native family transcript capture digest/EOF differs')
+    fs.writeFileSync(filename, bytes, { mode: 0o600, flag: 'wx' })
+    const nativeFile = nativeOriginalReference(harness.evidenceDir, filename)
+    let nativeEvents: NativeOriginalReference | undefined
+    if (provider === 'amplifier') {
+      const events = Buffer.from(stage.capture.eventsBytesBase64, 'base64'), eventsPath = path.join(directory, 'events.jsonl')
+      if (!events.length || events.at(-1) !== 10) throw new Error('native Amplifier events capture lacks complete originals')
+      fs.writeFileSync(eventsPath, events, { mode: 0o600, flag: 'wx' }); nativeEvents = nativeOriginalReference(harness.evidenceDir, eventsPath)
+    }
+    // Amplifier's version/UID and TLS probes are separate actual calls in the
+    // same current container/process. Preserve the checked TLS response when
+    // the transcript-only poll did not issue another models request.
+    const namespaceProbe = stage.namespace.ownedProbe
+    if (provider === 'amplifier' && (!namespaceProbe || namespaceProbe.containerId !== stage.view.containerId || namespaceProbe.nativePid !== stage.capture.nativePid)) throw new Error('native family namespace probe belongs to a different current process')
+    const namespace = { ...stage.namespace, ...stage.capture, httpsStatus: stage.capture.httpsStatus ?? stage.namespace.httpsStatus,
+      profileSha256: stage.capture.nativeSettingsSha256 ?? createHash('sha256').update(JSON.stringify(stage.capture.profileFiles.slice(0, 3))).digest('hex') }
+    // Completion/tool authority comes exclusively from this stage's captured
+    // store events, never an older namespace object's embedded event bytes.
+    delete namespace.eventsBytesBase64
+    const volume = harness.broker.receipts().find(receipt => receipt.containerId === stage.view.containerId)?.providerVolumeName
+    if (!volume) throw new Error('native family original owned volume is missing')
+    return { stage: label === 'initial' ? 'initial' : 'after_provider_process_crash', nativeFile, ...(nativeEvents ? { nativeEvents } : {}), request: stage.request,
+      launch: writeNativeOriginal(harness, `${scenario}-${label}-launch-original.json`, { capturedAt: stage.observedAt, request: input.launchRequest, response: { data: { view: stage.view } } }),
+      namespace: writeNativeOriginal(harness, `${scenario}-${label}-namespace-original.json`, namespace),
+      store: writeNativeOriginal(harness, `${scenario}-${label}-store-original.json`, { containerId: stage.view.containerId, providerVolumeName: volume, snapshot: { ...stage.capture.transcript, path: stage.snapshotPath }, ...(provider === 'amplifier' ? { eventsSnapshot: { bytesBase64: stage.capture.eventsBytesBase64, sha256: createHash('sha256').update(Buffer.from(stage.capture.eventsBytesBase64, 'base64')).digest('hex') } } : {}) }),
+      ...(label === 'initial' ? {} : { crash: writeNativeOriginal(harness, `${scenario}-owned-crash-original.json`, { kind: 'provider_process_exit', containerId: input.initial.view.containerId, incarnationId: input.initial.view.incarnationId, requestedAt: input.requestedAt, exitedAt: input.exitedAt }) }) }
+  }
+  const reference = writeNativeOriginal(harness, `${scenario}-native-recovery-originals.json`, { schemaVersion: 1, candidateSha: harness.candidateSha, runId: harness.runId, runtimeImage: harness.imageRef, selected: [mode], conversations: [{ mode, provider, soulId: input.launchRequest.params.soulId, providerStoreId: input.launchRequest.params.providerStoreId, nativeSessionId: root, nonce, stages: [materialize('initial', input.initial), materialize('replacement', input.replacement)] }] })
+  deriveNativeRecoveryOriginals({ evidenceDir: harness.evidenceDir, originalReference: reference, candidateSha: harness.candidateSha, runId: harness.runId, runtimeImage: harness.imageRef, selected: [mode], requiredStages: ['initial', 'after_provider_process_crash'] })
+  return { evidenceDir: harness.evidenceDir, reference }
+}
+
+/** One serialized native seed and one actual recall after the owned enclosure exits. */
+async function executeReceiverNativeTurn(harness: RuntimeHarness, supervisor: any, input: {
+  mode: 'codex' | 'opencode' | 'freshcodex' | 'freshopencode'; provider: 'codex' | 'opencode'; terminal: boolean
+  scenario: string; soulId: string; storeId: string; workspace: string; view: any; namespace: any; launchRequest: any; namespaceScript: string
+}): Promise<NativeExperimentOriginal> {
+  const { mode, provider, terminal, scenario, soulId, storeId, workspace, view, namespace, namespaceScript } = input
+  const root = view.nativeSessionId, nonce = 'owned-memory-' + randomUUID()
+  const initialObservedAt = Date.now()
+  const before = await captureReceiverStore(harness, view.containerId, provider, root, scenario, 'before-seed', true)
+  const send = async (text: string, label: string) => {
+    const requests: any[] = []
+    const gesture = async (request: any) => {
+      const requestId = 'request-' + randomUUID(), sentAt = Date.now()
+      const reply = await harness.adminOk(supervisor, request, { requestId })
+      requests.push({ requestId, sentAt, request, reply })
+    }
+    if (terminal) {
+      await harness.adminOk(supervisor, harness.terminalReadOutputBody(soulId))
+      await gesture(harness.terminalInputBody(soulId, '\x1b[200~' + text + '\x1b[201~'))
+      await new Promise(resolve => setTimeout(resolve, 100))
+      await gesture(harness.terminalInputBody(soulId, '\r'))
+    } else await gesture({ method: 'fresh_agent_send', params: { soulId, text } })
+    return writeNativeOriginal(harness, `${scenario}-${label}-request-private.json`, { requests })
+  }
+  const complete = async (container: string, boundary: Awaited<ReturnType<typeof captureReceiverStore>>, label: string, expectedText?: string) => {
+    const prior = new Set(boundary.history.turns.map(turn => JSON.stringify(turn.nativeEvidence))), deadline = Date.now() + 90_000
+    let attempt = 0
+    while (Date.now() < deadline) {
+      let captured: Awaited<ReturnType<typeof captureReceiverStore>> | undefined
+      try { captured = await captureReceiverStore(harness, container, provider, root, scenario, `${label}-${++attempt}`) }
+      catch (error) { harness.writeArtifact(`${scenario}-${label}-${attempt}-diagnostic.json`, { severity: 'debug', event: 'runtime.native_feasibility.native_completion_pending', reason: error instanceof Error ? error.message : 'native store incomplete' }) }
+      if (captured) {
+        const turns = captured.history.turns.filter(turn => !prior.has(JSON.stringify(turn.nativeEvidence)))
+        if (turns.length > 1) throw new Error('native serialized prompt produced duplicate completions')
+        if (turns.length === 1) {
+          const turn = turns[0]!
+          if (turn.toolCalls.length || turn.resolvedProvider !== 'openai' || turn.resolvedModel !== 'gpt-5.6-luna' || (expectedText && !turn.text.includes(expectedText))) throw new Error('native no-tool completion/profile/recall differs')
+          return captured
+        }
+      }
+      await new Promise(resolve => setTimeout(resolve, 200))
+    }
+    throw new Error('bounded current native turn did not complete')
+  }
+  const seedRequest = await send(`Remember this private marker: ${nonce}. Reply stored. Do not use tools.`, 'seed')
+  const seed = await complete(view.containerId, before, 'seed')
+  const probe = await harness.adminOk(supervisor, harness.probeRecoveryBody(soulId))
+  harness.writeArtifact(`${scenario}-before-death-store-probe.json`, probe)
+  if (probe.data.kind !== 'reattach_ready') throw new Error('completed native store is not readable before owned death')
+  const originalVolume = harness.broker.receipts().find(receipt => receipt.containerId === view.containerId)?.providerVolumeName
+  if (!originalVolume) throw new Error('original owned native volume missing')
+  const requestedAt = Date.now()
+  await harness.killOwnedRuntimeExact(view.containerId)
+  await harness.waitForContainerExit(view.containerId)
+  const exitedAt = Date.now()
+  const recovery = await harness.adminOk(supervisor, harness.recoverBody(soulId, 'host_unreachable')), observedAt = Date.now()
+  harness.writeArtifact(`${scenario}-recovery.json`, recovery)
+  const current = recovery.data.view, observed = current?.nativeIdentityObservation
+  if (recovery.data.outcome !== 'replaced' || current.launchState !== 'running' || current.recoveryState !== 'live' || current.containerId === view.containerId || current.incarnationId === view.incarnationId || current.nativeSessionId !== root || observed?.nativeSessionId !== root || observed.incarnationId !== current.incarnationId || observed.source !== view.nativeIdentityObservation.source || !observed.launchNonce || observed.launchNonce === view.nativeIdentityObservation.launchNonce || observed.evidenceRevision <= view.nativeIdentityObservation.evidenceRevision || harness.broker.receipts().find(receipt => receipt.containerId === current.containerId)?.providerVolumeName !== originalVolume) throw new Error('native replacement differs from current root/incarnation/original volume')
+  const currentNamespace = JSON.parse(await harness.execOwnedContainerAsExact(current.containerId, '65534:0', ['python3', '-c', namespaceScript, provider, root, workspace]))
+  retainOwnedNativeProbe(currentNamespace, current.containerId)
+  harness.writeArtifact(`${scenario}-replacement-namespace-private.json`, currentNamespace)
+  if (!receiverNativeNamespaceMatches(currentNamespace, provider, workspace, root) || currentNamespace.executableSha256 !== namespace.executableSha256 || currentNamespace.profileSha256 !== namespace.profileSha256) throw new Error('native replacement namespace/profile differs')
+  const restored = await captureReceiverStore(harness, current.containerId, provider, root, scenario, 'restored-before-input')
+  if (seed.snapshot.path !== restored.snapshot.path || JSON.stringify(seed.snapshot.identity.slice(0, 2)) !== JSON.stringify(restored.snapshot.identity.slice(0, 2)) || JSON.stringify(seed.history) !== JSON.stringify(restored.history) || (provider === 'codex' && !Buffer.from(restored.snapshot.bytesBase64, 'base64').subarray(0, Buffer.from(seed.snapshot.bytesBase64, 'base64').length).equals(Buffer.from(seed.snapshot.bytesBase64, 'base64')))) throw new Error('native original completed store changed before replacement input')
+  const recallRequest = await send('Reply with only the private marker from before. Do not use tools.', 'recall')
+  const recall = await complete(current.containerId, restored, 'recall', nonce)
+  const launch = (label: string, capturedAt: number, actualView: any) => writeNativeOriginal(harness, `${scenario}-${label}-current-launch-private.json`, { capturedAt, request: input.launchRequest, response: { data: { view: actualView } } })
+  const reference = writeNativeOriginal(harness, `${scenario}-native-recovery-originals.json`, { schemaVersion: 1, candidateSha: harness.candidateSha, runId: harness.runId, runtimeImage: harness.imageRef, selected: [mode], conversations: [{ mode, provider, soulId, providerStoreId: storeId, nativeSessionId: root, nonce, stages: [
+    { stage: 'initial', launch: launch('initial', initialObservedAt, view), request: seedRequest, nativeFile: seed.nativeFile, boundaryFile: before.nativeFile, namespace: writeNativeOriginal(harness, `${scenario}-initial-namespace-original.json`, namespace), store: writeNativeOriginal(harness, `${scenario}-initial-store-original.json`, { containerId: view.containerId, providerVolumeName: originalVolume, snapshot: seed.snapshot }) },
+    { stage: 'after_provider_process_crash', launch: launch('replacement', observedAt, current), request: recallRequest, nativeFile: recall.nativeFile, boundaryFile: restored.nativeFile, namespace: writeNativeOriginal(harness, `${scenario}-replacement-namespace-original.json`, currentNamespace), store: writeNativeOriginal(harness, `${scenario}-replacement-store-original.json`, { containerId: current.containerId, providerVolumeName: originalVolume, snapshot: recall.snapshot }), crash: writeNativeOriginal(harness, `${scenario}-owned-crash-private.json`, { kind: 'provider_process_exit', containerId: view.containerId, incarnationId: view.incarnationId, requestedAt, exitedAt }) },
+  ] }] })
+  deriveNativeRecoveryOriginals({ evidenceDir: harness.evidenceDir, originalReference: reference, candidateSha: harness.candidateSha, runId: harness.runId, runtimeImage: harness.imageRef, selected: [mode], requiredStages: ['initial', 'after_provider_process_crash'] })
+  const original: NativeExperimentOriginal = { caseId: 'current-native-turn', ownerId: harness.runId, candidateSha: harness.candidateSha, imageDigest: harness.imageRef, nativeVersion: namespace.nativeVersion, executableSha256: namespace.executableSha256, profileSha256: namespace.profileSha256, artifactReferences: [reference.path], nativeOriginals: { evidenceDir: harness.evidenceDir, reference }, assertions: ['readable-completed-native-store-before-death', 'replacement-new-incarnation-same-native-root', 'original-owned-volume-transcript-continuity', 'same-workspace-selected-native-profile', 'actual-restored-context-private-marker-recall', 'native-turns-requested-no-tools'].map(name => ({ name, pass: true })) }
+  harness.writeArtifact(`${scenario}-original.json`, original)
+  return original
+}
+
 function readCurrentCodexReceipt(file: string): Buffer {
   const stat = fs.lstatSync(file)
   if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 65_536 || fs.realpathSync(file) !== file) {
@@ -2045,33 +2207,35 @@ function receiverNativeNamespaceMatches(namespace: any, provider: 'codex' | 'ope
 }
 
 async function captureReceiverStore(harness: RuntimeHarness, containerId: string, provider: 'codex' | 'opencode',
-  root: string, scenario: string, label: string): Promise<{ snapshot: any; history: NativeHistory }> {
+  root: string, scenario: string, label: string, allowEmpty = false): Promise<{ snapshot: any; history: NativeHistory; nativeFile: NativeOriginalReference }> {
   const snapshot = JSON.parse(await harness.execOwnedContainerAsExact(containerId, '65534:0',
     ['python3', '-c', receiverStoreSnapshot, provider, root]))
   harness.writeArtifact(`${scenario}-${label}-store-private.json`, snapshot)
   if ((provider === 'codex' && snapshot.nativeRoot !== root) || !Array.isArray(snapshot.identity) || snapshot.identity.length < 2
     || !snapshot.completeEof || !/^[a-f0-9]{64}$/.test(snapshot.sha256 ?? '')) throw new Error('actual native store capture invalid')
   let history: NativeHistory
+  let copy: string
   if (provider === 'codex') {
     const bytes = Buffer.from(snapshot.bytesBase64, 'base64')
     if (createHash('sha256').update(bytes).digest('hex') !== snapshot.sha256 || bytes.at(-1) !== 10) throw new Error('native rollout capture digest/EOF differs')
     const directory = path.join(harness.evidenceDir, `${scenario}-${label}-native-copy`)
     fs.mkdirSync(directory, { mode: 0o700 })
-    fs.writeFileSync(path.join(directory, `rollout-${root}.jsonl`), bytes, { mode: 0o600 })
-    history = readCodexNativeHistory(directory, root)
+    copy = path.join(directory, `rollout-${root}.jsonl`)
+    fs.writeFileSync(copy, bytes, { mode: 0o600 })
+    history = allowEmpty ? readCodexNativeObservation(directory, root).history : readCodexNativeHistory(directory, root)
   } else {
     const bytes = Buffer.from(snapshot.querySnapshotBase64, 'base64')
     if (createHash('sha256').update(bytes).digest('hex') !== snapshot.querySnapshotSha256) throw new Error('actual native SQLite snapshot digest differs')
-    const copy = path.join(harness.evidenceDir, `${scenario}-${label}-native-copy.db`)
+    copy = path.join(harness.evidenceDir, `${scenario}-${label}-native-copy.db`)
     fs.writeFileSync(copy, bytes, { mode: 0o600, flag: 'wx' })
-    history = readOpenCodeNativeHistory(copy, root)
+    history = allowEmpty ? readOpenCodeNativeObservation(copy, root).history : readOpenCodeNativeHistory(copy, root)
   }
   if (history.schemaVersion !== 1 || history.provider !== provider || history.nativeSessionId !== root
     || !Array.isArray(history.turns) || history.turns.some(turn => !turn.nativeEvidence || !Array.isArray(turn.toolCalls))) {
     throw new Error('actual native history reader returned a different root or schema')
   }
   harness.writeArtifact(`${scenario}-${label}-history-private.json`, history)
-  return { snapshot, history }
+  return { snapshot, history, nativeFile: nativeOriginalReference(harness.evidenceDir, copy) }
 }
 
 export const receiverStoreSnapshot = String.raw`
@@ -2903,10 +3067,13 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
       assertions.push({ name: providerExit ? 'exact-owned-native-pid-exited' : 'ordinary-stop-verified-empty-and-stopped-intent', pass: closed })
     }
   }
+  let nativeOriginals: NativeExperimentOriginal['nativeOriginals']
   if (resumes) {
+    const nativeRequests = new Map<string, NativeOriginalReference>(), initialObservedAt = Date.now()
     const inspect = async (containerId: string, label: string) => {
       const current = JSON.parse(await harness.execOwnedContainerAsExact(containerId, '65534:0',
         ['python3', '-c', claudeNativeInspection, actualRoot, 'false', 'terminal']))
+      if (caseId === 'current-native-turn') retainOwnedNativeProbe(current, containerId)
       harness.writeArtifact(`${scenario}-${label}-native-private.json`, current)
       return current
     }
@@ -2915,11 +3082,16 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
       const before = await inspect(containerId, label + '-before-input')
       // Keep paste content and the submit key as distinct ordinary gestures;
       // a bulk text/CR packet can remain in the native TUI's paste buffer.
-      harness.writeArtifact(`${scenario}-${label}-paste-dispatch.json`, await harness.adminOk(supervisor,
-        harness.terminalInputBody(soulId, '\x1b[200~' + text + '\x1b[201~')))
+      const requests: any[] = []
+      const gesture = async (body: any, name: string) => {
+        const requestId = 'request-' + randomUUID(), sentAt = Date.now()
+        const reply = await harness.adminOk(supervisor, body, { requestId })
+        requests.push({ requestId, sentAt, request: body, reply }); harness.writeArtifact(name, reply)
+      }
+      await gesture(harness.terminalInputBody(soulId, '\x1b[200~' + text + '\x1b[201~'), `${scenario}-${label}-paste-dispatch.json`)
       await new Promise((resolve) => setTimeout(resolve, 100))
-      harness.writeArtifact(`${scenario}-${label}-dispatch.json`, await harness.adminOk(supervisor,
-        harness.terminalInputBody(soulId, '\r')))
+      await gesture(harness.terminalInputBody(soulId, '\r'), `${scenario}-${label}-dispatch.json`)
+      if (caseId === 'current-native-turn') nativeRequests.set(label, writeNativeOriginal(harness, `${scenario}-${label}-request-original.json`, { requests }))
       const deadline = Date.now() + 90_000
       while (Date.now() < deadline) {
         const current = await inspect(containerId, label)
@@ -2953,10 +3125,13 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
       const controlPath = path.join(workspace, 'native-restoration-fault-control.json')
       fs.writeFileSync(controlPath, JSON.stringify(mutation), { mode: 0o660 }); fs.chmodSync(controlPath, 0o660)
     }
+    const requestedAt = Date.now()
     await harness.killOwnedRuntimeExact(view.containerId)
     await harness.waitForContainerExit(view.containerId)
+    const exitedAt = Date.now()
     const recovery = restorationFailure || forkRoot ? await harness.adminRaw(supervisor, harness.recoverBody(soulId, 'host_unreachable'))
       : await harness.adminOk(supervisor, harness.recoverBody(soulId, 'host_unreachable'))
+    const replacementObservedAt = Date.now()
     harness.writeArtifact(`${scenario}-recovery.json`, recovery)
     if (forkRoot) {
       const faultPath = path.join(workspace, 'native-fork-fault-observation.json')
@@ -3043,6 +3218,7 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
     if (caseId === 'current-native-turn') {
       const recalled = await turn(replacement.containerId, 'Reply with only the private marker from before. Do not use tools.', 'recall')
       if (recalled.lastAssistantText.trim() !== marker || recalled.toolEvents !== 0) throw new Error('terminal Claude native restored context/tool-free recall differs')
+      nativeOriginals = retainFamilyNativeTurnOriginals(harness, { scenario, mode: 'claude', provider: 'claude', launchRequest: request, nonce: marker, requestedAt, exitedAt, initial: { view, namespace, capture: seed, observedAt: initialObservedAt, request: nativeRequests.get('seed')!, snapshotPath: seed.hook.native.transcript_path }, replacement: { view: replacement, namespace: recalled, capture: recalled, observedAt: replacementObservedAt, request: nativeRequests.get('recall')!, snapshotPath: recalled.hook.native.transcript_path } })
       assertions.push({ name: 'actual-restored-context-private-marker-recall', pass: recalled.lastAssistantText.trim() === marker },
         { name: 'native-turns-requested-no-tools', pass: seed.toolEvents === 0 && recalled.toolEvents === 0 })
     }
@@ -3052,7 +3228,7 @@ print(json.dumps({'readerUid':os.getuid(),'readerGid':os.getgid(),'processes':pr
     nativeVersion: namespace.version, executableSha256: namespace.executableSha256,
     profileSha256: createHash('sha256').update(JSON.stringify({ preferences: preferences.sha256, profileFiles: namespace.profileFiles,
       model: selectedModel, workspace })).digest('hex'),
-    artifactReferences: [`${scenario}-launch.json`, `${scenario}-namespace-native-private.json`],
+    artifactReferences: [`${scenario}-launch.json`, `${scenario}-namespace-native-private.json`, ...(nativeOriginals ? [nativeOriginals.reference.path] : [])], nativeOriginals,
     assertions: [...assertions,
     { name: 'actual-terminal-global-pin-distinct-from-sdk-child', pass: namespace.version.startsWith('2.1.263')
       && (noCallbacks || namespace.loaded.native.version === '2.1.263') },
@@ -3447,12 +3623,13 @@ async function executeManagedAmplifier(harness: RuntimeHarness,
         config: profile.map((file) => ({ root: 'user_provider', relativePath: file.relative,
           providerRelativePath: '.amplifier/' + file.relative, format: 'yaml' })) } } } }
   harness.writeArtifact(`${scenario}-request.json`, request)
+  let nativeOriginals: NativeExperimentOriginal['nativeOriginals']
   const finish = (namespace: any, artifactReferences: string[], assertions: { name: string; pass: boolean }[]) => {
     const original = { caseId, ownerId: harness.runId, candidateSha: harness.candidateSha, imageDigest: harness.imageRef,
       nativeVersion: `amplifier-app-cli ${namespace.cliVersion}; amplifier-core ${namespace.coreVersion}`,
       executableSha256: namespace.executableSha256,
       profileSha256: createHash('sha256').update(JSON.stringify(profile.map(file => ({ relative: file.relative, sha256: file.sha256 })))).digest('hex'),
-      artifactReferences, assertions }
+      artifactReferences: [...artifactReferences, ...(nativeOriginals ? [nativeOriginals.reference.path] : [])], nativeOriginals, assertions }
     harness.writeArtifact(`${scenario}-original.json`, original)
     return original
   }
@@ -3693,9 +3870,9 @@ print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] f
     || observation.nativeSessionId !== view.nativeSessionId || observation.incarnationId !== view.incarnationId
     || observation.source !== 'amplifier_native_loaded_context') throw new Error('current managed Amplifier no-input acknowledgement missing')
   await captureNativeSignal()
-  const namespace = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
-    ['/opt/amplifier-src/.venv/bin/python', '-c',
-      "import os,json,pathlib,hashlib,importlib.metadata as m; p=pathlib.Path('/opt/amplifier-src/.venv/bin/amplifier'); producer=pathlib.Path('/opt/amplifier-src/amplifier_app_cli/freshell_native_resume.py'); print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] for x in pathlib.Path('/proc/self/status').read_text().splitlines() if x.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'executableSha256':hashlib.sha256(p.read_bytes()).hexdigest(),'producerSha256':hashlib.sha256(producer.read_bytes()).hexdigest(),'cliVersion':m.version('amplifier-app-cli'),'coreVersion':m.version('amplifier-core')}))"]))
+  const namespaceScript = "import os,json,pathlib,hashlib,importlib.metadata as m; p=pathlib.Path('/opt/amplifier-src/.venv/bin/amplifier'); producer=pathlib.Path('/opt/amplifier-src/amplifier_app_cli/freshell_native_resume.py'); print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] for x in pathlib.Path('/proc/self/status').read_text().splitlines() if x.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'executableSha256':hashlib.sha256(p.read_bytes()).hexdigest(),'producerSha256':hashlib.sha256(producer.read_bytes()).hexdigest(),'cliVersion':m.version('amplifier-app-cli'),'coreVersion':m.version('amplifier-core')}))"
+  const captureNamespace = async (containerId: string) => JSON.parse(await harness.execOwnedContainerAsExact(containerId, '65534:0', ['/opt/amplifier-src/.venv/bin/python', '-c', namespaceScript]))
+  const namespace = await captureNamespace(view.containerId)
   harness.writeArtifact(`${scenario}-namespace.json`, namespace)
   if (namespace.uid !== 65534 || namespace.gid !== 0 || namespace.caps !== '0000000000000000'
     || !namespace.readOnlyRoot || namespace.cliVersion !== '0.1.1' || namespace.coreVersion !== '1.6.0') {
@@ -3706,6 +3883,7 @@ print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] f
   const inspectNative = async (transcriptPath: string, containerId: string, label: string, checkTls: boolean) => {
     const snapshot = JSON.parse(await harness.execOwnedContainerAsExact(containerId, '65534:0',
       ['/opt/amplifier-src/.venv/bin/python', '-c', amplifierNativeInspection, transcriptPath, nativeRoot, String(checkTls)]))
+    if (caseId === 'current-native-turn') retainOwnedNativeProbe(snapshot, containerId)
     harness.writeArtifact(`${scenario}-${label}-native-private.json`, snapshot)
     return snapshot
   }
@@ -3768,7 +3946,8 @@ print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] f
     if (startup.httpsStatus !== 200 || startup.tlsVerifyMode !== 2 || !startup.tlsCheckHostname) {
       throw new Error('current native Amplifier selected grant/TLS check failed')
     }
-    const marker = 'owned-memory-' + randomUUID()
+    const marker = 'owned-memory-' + randomUUID(), initialObservedAt = Date.now()
+    const nativeRequests = new Map<string, NativeOriginalReference>()
     const turn = async (containerId: string, text: string, label: string) => {
       let before = await inspect(containerId, label + '-before-input')
       const readyDeadline = Date.now() + 15_000
@@ -3779,7 +3958,9 @@ print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] f
         before = await inspect(containerId, label + '-before-input')
       }
       if (!inputReady()) throw new Error('ordinary Amplifier REPL not ready after native gate')
-      const receipt = await harness.adminOk(supervisor, harness.terminalInputBody(soulId, text + '\r'))
+      const requestId = 'request-' + randomUUID(), sentAt = Date.now(), body = harness.terminalInputBody(soulId, text + '\r')
+      const receipt = await harness.adminOk(supervisor, body, { requestId })
+      if (caseId === 'current-native-turn') nativeRequests.set(label, writeNativeOriginal(harness, `${scenario}-${label}-request-original.json`, { requestId, sentAt, request: body, reply: receipt }))
       harness.writeArtifact(`${scenario}-${label}-dispatch.json`, receipt)
       const deadline = Date.now() + 90_000
       while (Date.now() < deadline) {
@@ -3804,10 +3985,13 @@ print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] f
       const file = path.join(workspace, 'prior-native-signal.json')
       fs.writeFileSync(file, fs.readFileSync(nativeSignalFile), { flag: 'wx', mode: 0o660 }); fs.chmodSync(file, 0o660)
     }
+    const requestedAt = Date.now()
     await harness.killOwnedRuntimeExact(view.containerId)
     await harness.waitForContainerExit(view.containerId)
+    const exitedAt = Date.now()
     const recovery = staleWriter ? await harness.adminRaw(supervisor, harness.recoverBody(soulId, 'host_unreachable'))
       : await harness.adminOk(supervisor, harness.recoverBody(soulId, 'host_unreachable'))
+    const replacementObservedAt = Date.now()
     harness.writeArtifact(`${scenario}-turn-recovery.json`, recovery)
     if (staleWriter) {
       assertions.push({ name: 'readable-completed-native-store-before-death', pass: probe.data.kind === 'reattach_ready' },
@@ -3837,6 +4021,11 @@ print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] f
         'Reply with only the private marker from before. Do not use tools.', 'recall')
       if (recalled.lastAssistantText.trim() !== marker || recalled.metadata.model !== 'glm-5.3') {
         throw new Error('native Amplifier restored context or selected model differs')
+      }
+      if (caseId === 'current-native-turn') {
+        const currentNamespace = await captureNamespace(replacement.containerId)
+        const qualified = await inspectNative(transcriptPath, replacement.containerId, 'recall-qualified', true)
+        nativeOriginals = retainFamilyNativeTurnOriginals(harness, { scenario, mode: 'amplifier', provider: 'amplifier', launchRequest: request, nonce: marker, requestedAt, exitedAt, initial: { view, namespace: { ...namespace, ...startup }, capture: seed, observedAt: initialObservedAt, request: nativeRequests.get('seed')!, snapshotPath: transcriptPath }, replacement: { view: replacement, namespace: { ...currentNamespace, ...qualified }, capture: qualified, observedAt: replacementObservedAt, request: nativeRequests.get('recall')!, snapshotPath: transcriptPath } })
       }
       assertions.push({ name: 'actual-restored-context-private-marker-recall', pass: recalled.lastAssistantText.trim() === marker },
         { name: 'native-turns-requested-no-tools', pass: seed.toolEvents === 0 && recalled.toolEvents === 0 })

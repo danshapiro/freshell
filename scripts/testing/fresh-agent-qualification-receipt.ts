@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 
+import { deriveNativeRecoveryOriginals, NATIVE_RECOVERY_ORIGINALS_FILE, type ObservedNativeConversation } from './qualification-observations.js'
+
 import {
   QUALIFIABLE_FRESH_AGENT_MODES,
   type QualifiableFreshAgentMode,
@@ -136,6 +138,7 @@ export type FreshAgentQualificationReceiptV1 = {
     assertions: FreshQualificationArtifactReference
     broker: FreshQualificationArtifactReference
     cleanup: FreshQualificationArtifactReference
+    nativeOriginals: FreshQualificationArtifactReference
   }
 }
 
@@ -172,6 +175,8 @@ export function buildFreshAgentQualificationReceipt(
   assertBrokerSafe(readRegularFile(path.join(expectedDir, FRESH_AGENT_QUALIFICATION_BROKER_FILE), 'broker artifact'))
   assertCleanupSafe(readRegularFile(path.join(expectedDir, FRESH_AGENT_QUALIFICATION_CLEANUP_FILE), 'cleanup artifact'))
 
+  validateDerivedNativeRows(input.rows, deriveNativeRecoveryOriginals({ evidenceDir: expectedDir, candidateSha: input.candidateSha, runId: input.receiptRunId, runtimeImage: input.runtimeImage, selected: input.selectedModes }))
+
   const assertionPath = path.join(expectedDir, FRESH_AGENT_QUALIFICATION_ASSERTIONS_FILE)
   fs.writeFileSync(assertionPath, JSON.stringify({
     schemaVersion: 1,
@@ -202,6 +207,7 @@ export function buildFreshAgentQualificationReceipt(
       assertions: artifact(FRESH_AGENT_QUALIFICATION_ASSERTIONS_FILE),
       broker: artifact(FRESH_AGENT_QUALIFICATION_BROKER_FILE),
       cleanup: artifact(FRESH_AGENT_QUALIFICATION_CLEANUP_FILE),
+      nativeOriginals: artifact(NATIVE_RECOVERY_ORIGINALS_FILE),
     },
   }
   validateFreshAgentQualificationReceipt({
@@ -260,9 +266,24 @@ export function validateFreshAgentQualificationReceipt(
   rejectSensitiveFields(assertion.rows)
   assertBrokerSafe(brokerBytes)
   assertCleanupSafe(cleanupBytes)
+  validateArtifact(evidenceDir, evidenceRun, NATIVE_RECOVERY_ORIGINALS_FILE, artifacts.nativeOriginals)
+  const nativeReference = object(artifacts.nativeOriginals, 'native originals reference')
+  validateDerivedNativeRows(assertion.rows, deriveNativeRecoveryOriginals({ evidenceDir, candidateSha: input.candidateSha, runId: receipt.receiptRunId, runtimeImage: input.expectedRuntimeImage, selected: receipt.selectedModes, originalReference: { path: NATIVE_RECOVERY_ORIGINALS_FILE, sha256: nativeReference.sha256 } }))
   return {
     receipt: receipt as FreshAgentQualificationReceiptV1,
     rows: assertion.rows,
+  }
+}
+
+function validateDerivedNativeRows(rows: FreshAgentQualificationRow[], observed: ObservedNativeConversation[]): void {
+  for (const [index, row] of rows.entries()) {
+    const conversation = observed[index]!
+    for (const field of ['mode', 'soulId', 'providerStoreId', 'nativeSessionId'] as const) stringEqual(conversation[field], row[field], `native ${field}`)
+    const derived = conversation.stages.map(stage => {
+      if (stage.nativeEvidence.kind !== 'identified_message') throw new Error('fresh native completion requires actual native message IDs')
+      return { turnId: stage.nativeEvidence.turnId, assistantMessageId: stage.nativeEvidence.messageId, completionKind: 'provider_native_completed' }
+    })
+    if (stableJson(derived) !== stableJson(row.completedNativeTurns)) throw new Error('native completed turns differ from declared receipt turns')
   }
 }
 

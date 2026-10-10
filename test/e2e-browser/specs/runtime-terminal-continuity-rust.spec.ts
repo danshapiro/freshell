@@ -15,7 +15,7 @@ import { waitForOpenCodeTerminalCondition } from '../helpers/opencode-native-his
 import { TestHarness } from '../helpers/test-harness.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
-import { reportInterruptedOrdinaryStopAckFailure } from '../helpers/runtime-chaos-evidence.js'
+import { bindInterruptedOrdinaryStopFailedAck, reportInterruptedOrdinaryStopAckFailure } from '../helpers/runtime-chaos-evidence.js'
 
 function findTerminalLeaves(node: any, out: any[] = []): any[] {
   if (!node) return out
@@ -507,6 +507,8 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       expect(before.writers).toBe(1)
       const receiptCount = (await rig.ownershipFacts()).receiptCount
       const workerLaunchCount = beforeFacts.workerLaunchCount
+      const closeState = await harness.getState()
+      const closePane = closeState.panes.layouts[created.tabId]
       const sentAtStop = sent.length
       const receivedAtStop = received.length
       const stopSocketAtMs = Date.now() - socketStartedAt
@@ -519,10 +521,12 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       expect(crash.crashPoint).toBe('ordinary_stop_after_intent')
       expect(crash.exitCode).toBe(134)
       try {
-        await expect.poll(() => received.slice(receivedAtStop).some((message) => {
-          const event = message.type === 'freshAgent.event' ? message.event : message
-          return message.sessionId === original.sessionId && event.type === 'freshAgent.killed' && event.success === false
-        }), { timeout: 30_000 }).toBe(true)
+        const hasFailedAck = bindInterruptedOrdinaryStopFailedAck(sent, sentAtStop, {
+          pane: closePane, paneId: created.paneId, createRequestId: canonical.createRequestId,
+          soulId: view.soulId, nativeSessionId: nativeId, provider: 'codex', sessionType: 'freshcodex',
+          pendingCreate: closeState.freshAgent.pendingCreates[canonical.createRequestId],
+        })
+        await expect.poll(() => hasFailedAck(received, receivedAtStop), { timeout: 30_000 }).toBe(true)
       } catch (failure) {
         await reportInterruptedOrdinaryStopAckFailure(failure, testInfo, {
           expected: { presentationSessionId: original.sessionId ?? null, nativeSessionId: nativeId, soulId: view.soulId },
@@ -571,6 +575,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       expect(afterFacts.workerLaunchCount).toBe(workerLaunchCount)
       expect((await rig.ownershipFacts()).receiptCount).toBe(receiptCount)
       expect(sent.slice(sentAtStop).filter((frame) => ['freshAgent.create', 'terminal.create'].includes(frame.type))).toEqual([])
+      expect(sent.slice(sentAtStop).filter((frame) => ['freshAgent.send', 'freshAgent.recovery.stop'].includes(frame.type))).toEqual([])
       const lifecycle = afterFacts.lifecycle
       expect(lifecycle.filter((event) => event.event === 'supervisor.stop_committed').map((event) => event.data.intentRevision))
         .toEqual([stopped.intentRevision])

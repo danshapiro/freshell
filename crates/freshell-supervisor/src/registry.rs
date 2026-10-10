@@ -3463,6 +3463,13 @@ impl Registry {
                         retryable: transient.is_some(),
                         reason: transient.map(TransientRecoveryFailure::as_str).unwrap_or(&reason),
                     })?;
+            } else if reason == recovery_block_reason_name(RecoveryBlockReason::StoreUnreadable) {
+                // Discovery can refuse a due retry before reserving it. Keep
+                // its counted history while removing the obsolete deadline.
+                tx.execute(
+                    "UPDATE recovery_retries SET next_due_at_ms=NULL,last_reason=?1 WHERE soul_id=?2 AND intent_revision=?3 AND reserved_attempt_id IS NULL",
+                    params![reason, soul_id.as_str(), fence.intent_revision],
+                )?;
             }
             tx.commit()?;
             Ok(())

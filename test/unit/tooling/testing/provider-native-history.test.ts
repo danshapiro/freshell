@@ -9,8 +9,8 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { readAmplifierNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/amplifier.js'
 import { readClaudeNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/claude.js'
-import { readCodexNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/codex.js'
-import { readOpenCodeNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/opencode.js'
+import { readCodexNativeHistory, readCodexNativeObservation } from '../../../e2e-browser/helpers/provider-native-history/codex.js'
+import { readOpenCodeNativeHistory, readOpenCodeNativeObservation } from '../../../e2e-browser/helpers/provider-native-history/opencode.js'
 import { nativeTurnProof } from '../../../e2e-browser/helpers/provider-native-history/proof.js'
 import { OPENCODE_NATIVE_HISTORY_SCRIPT } from '../../../e2e-browser/helpers/opencode-native-history.js'
 
@@ -137,6 +137,24 @@ describe('Claude native history proof', () => {
 describe('Codex native history proof', () => {
   const threadId = '22222222-2222-4222-8222-222222222222'
 
+  it.each(['valid', 'duplicate-input', 'duplicate-completion', 'wrong-completion', 'missing-model'])(
+    'retains native input/completion association and truthful absent effort (%s)', (fault) => {
+      const root = tempRoot('codex-input'), prompt = { type: 'event_msg', payload: { type: 'user_message', message: 'remember the nonce' } }
+      const completion = { type: 'event_msg', timestamp: '2026-09-01T00:00:01Z', payload: { type: 'task_complete', turn_id: fault === 'wrong-completion' ? 'other-turn' : 'turn-1', last_agent_message: 'stored' } }
+      writeJsonl(path.join(root, `rollout-${threadId}.jsonl`), [
+        { type: 'session_meta', payload: { id: threadId, model_provider: 'openai' } },
+        { type: 'turn_context', payload: { turn_id: 'turn-1', ...(fault === 'missing-model' ? {} : { model: 'gpt-5.6-luna' }) } },
+        prompt, ...(fault === 'duplicate-input' ? [prompt] : []),
+        { type: 'response_item', payload: { type: 'message', role: 'assistant', id: 'assistant-1', content: [{ type: 'output_text', text: 'stored' }] } },
+        completion, ...(fault === 'duplicate-completion' ? [completion] : []),
+      ])
+      if (fault !== 'valid') { expect(() => readCodexNativeObservation(root, threadId)).toThrow(); return }
+      const observed = readCodexNativeObservation(root, threadId)
+      expect(observed.inputs).toEqual([{ turnId: 'turn-1', text: 'remember the nonce' }])
+      expect(observed.history.turns[0]).toMatchObject({ turnId: 'turn-1', resolvedReasoningEffort: 'unknown', reasoningEffortProvenance: 'unsupported-native-telemetry' })
+    },
+  )
+
   it('correlates a task_complete turn to its assistant response and turn_context profile', () => {
     const root = tempRoot('codex-native')
     writeJsonl(path.join(root, '2026', '09', '01', `rollout-test-${threadId}.jsonl`), [
@@ -213,7 +231,7 @@ describe('OpenCode native history proof', () => {
     expect(readOpenCodeNativeHistory(dbPath, 'ses_exact').turns).toEqual([expect.objectContaining({
       turnId: 'msg-1', messageId: 'msg-1', parentMessageId: 'user-1', completedAt: 2,
       toolCalls: [], resolvedProvider: 'opencode', resolvedModel: 'big-pickle',
-      resolvedReasoningEffort: 'provider-default',
+      resolvedReasoningEffort: 'unknown', reasoningEffortProvenance: 'unsupported-native-telemetry',
     })])
     const inEnclosure = JSON.parse(execFileSync(
       process.execPath,
@@ -231,6 +249,13 @@ describe('OpenCode native history proof', () => {
         resolvedModel: 'big-pickle',
       })],
     })
+    const nativeInput = new DatabaseSync(dbPath)
+    nativeInput.prepare('INSERT INTO message VALUES (?,?,?,?)').run('user-1', 'ses_exact', 0, JSON.stringify({ role: 'user' }))
+    nativeInput.prepare('INSERT INTO part VALUES (?,?,?,?,?)').run('user-part', 'ses_exact', 'user-1', 0, JSON.stringify({ type: 'text', text: 'remember the nonce' }))
+    nativeInput.close()
+    const observed = readOpenCodeNativeObservation(dbPath, 'ses_exact')
+    expect(observed.inputs).toEqual([{ messageId: 'user-1', text: 'remember the nonce' }])
+    expect(observed.history.turns[0]!.parentMessageId).toBe(observed.inputs[0]!.messageId)
   })
 
   it('fails closed for a symlinked database and an absent exact session row', () => {

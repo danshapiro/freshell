@@ -20,7 +20,7 @@ import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibili
   executeManagedOpenCodeTuiReplacementFault,
   openCodeTuiOwnedStoreFault,
   runNativeFeasibility, executeManagedNativeCase, nativeSdkResumeForkWrapper, nativeReceiverLoadFaultWrapper, nativeReceiverLoadFaultEntry, writeOwnedNativeReceiverControl, nativeResumeRootInArgv, stageSdkInitFieldFault, nativeSdkInitFieldFaultMatches, staleNativeSignalBindingMatches, claudeNativeRestorationFault, terminalRestorationFaultHook, sdkRestorationFaultHook, terminalForkFaultHook, executeManagedNativeApproval, nativeCheckpointTranscriptRetained, nativeTwoToolBatchMatches, amplifierNativeProfileRetained, amplifierWrongRootInspection, nativeAmplifierStartupFaultWrapper,
-  amplifierNativeAckFileFault, amplifierNativeHostStatus, completeAmplifierStaleWriter, receiverNativeNamespace, receiverWrongRootEvidence, type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
+  amplifierNativeAckFileFault, amplifierNativeHostStatus, completeAmplifierStaleWriter, receiverNativeNamespace, receiverStoreSnapshot, receiverWrongRootEvidence, type NativeExperimentOriginal, type NativeSelection } from '../../../../scripts/testing/runtime-native-feasibility.js'
 
 const imageDigest = `sha256:${'a'.repeat(64)}`
 const candidateSha = 'b'.repeat(40)
@@ -51,6 +51,94 @@ function createFixtureCheckout(directory: string): string {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
+  it.each(['codex', 'opencode', 'freshcodex', 'freshopencode'] as const)('routes actual current native turns through seed, replacement, recall and original capture (%s; controlled fixtures)', async mode => {
+    const terminal = mode === 'codex' || mode === 'opencode', provider = mode === 'codex' || mode === 'freshcodex' ? 'codex' : 'opencode'
+    const directory = path.join('/tmp/frs', randomUUID().slice(0, 12)), evidenceDir = path.join(directory, 'evidence')
+    fs.mkdirSync(evidenceDir, { recursive: true, mode: 0o700 })
+    const serverPath = path.join(directory, 'controlled-server'); fs.writeFileSync(serverPath, 'fixture server only')
+    let root = provider === 'codex' ? randomUUID() : 'ses_ownedNative', launchRequest: any, sourceDatabase: string | undefined, sourceHome = ''
+    let recovered = false, pasted = '', turnNumber = 0, sourceIds: string[] = []
+    const commands: string[] = [], rollout: any[] = [], submitted: string[] = []
+    const database = path.join(directory, 'controlled-store.db')
+    const initialInc = 'incarnation-' + randomUUID(), nextInc = 'incarnation-' + randomUUID()
+    const runtimeRoot = path.join(directory, 'r/openco-12345678/x')
+    const view = () => ({ soulId: launchRequest.params.soulId, incarnationId: recovered ? nextInc : initialInc, containerId: recovered ? 'owned-replacement' : 'owned-initial', launchState: 'running', recoveryState: 'live', desiredState: 'running', cleanupState: 'none', allocationState: 'allocated', durabilityState: 'unknown', intentRevision: 1, executionGeneration: recovered ? 2 : 1, evidenceRevision: recovered ? 2 : 1, successfulRecoveriesInWindow: recovered ? 1 : 0, nativeSessionId: root,
+      nativeIdentityObservation: { nativeSessionId: root, incarnationId: recovered ? nextInc : initialInc, launchNonce: recovered ? 'new-launch' : 'old-launch', evidenceRevision: recovered ? 2 : 1, evidenceDigest: 'c'.repeat(64), source: terminal ? provider === 'codex' ? 'codex_app_server' : 'opencode_tui' : 'fresh_provider_handshake' } })
+    const appendTurn = (prompt: string) => {
+      commands.push(recovered ? 'recall' : 'seed'); submitted.push(prompt); turnNumber++
+      const nonce = submitted[0]!.match(/owned-memory-[A-Za-z0-9-]+/)?.[0]
+      const response = recovered ? nonce! : 'stored', turnId = `turn-${turnNumber}`, messageId = `assistant-${turnNumber}`, completedAt = Date.now()
+      if (provider === 'codex') rollout.push({ type: 'turn_context', payload: { turn_id: turnId, model: 'gpt-5.6-luna' } }, { type: 'event_msg', payload: { type: 'user_message', message: prompt } }, { type: 'response_item', payload: { type: 'message', role: 'assistant', id: messageId, content: [{ type: 'output_text', text: response }] } }, { type: 'event_msg', timestamp: new Date(completedAt).toISOString(), payload: { type: 'task_complete', turn_id: turnId, last_agent_message: response } })
+      else {
+        const db = new DatabaseSync(database), user = `user-${turnNumber}`
+        db.prepare('INSERT INTO message(id,session_id,time_created,time_updated,data) VALUES (?,?,?,?,?)').run(user, root, completedAt, completedAt, JSON.stringify({ role: 'user' }))
+        db.prepare('INSERT INTO message(id,session_id,time_created,time_updated,data) VALUES (?,?,?,?,?)').run(messageId, root, completedAt + 1, completedAt + 1, JSON.stringify({ role: 'assistant', parentID: user, providerID: 'openai', modelID: 'gpt-5.6-luna', time: { completed: completedAt } }))
+        for (const [id, content] of [[user, prompt], [messageId, response]]) db.prepare('INSERT INTO part(id,session_id,message_id,time_created,time_updated,data) VALUES (?,?,?,?,?,?)').run('part-' + id, root, id, completedAt, completedAt, JSON.stringify({ type: 'text', text: content }))
+        db.close()
+      }
+      return { data: { ...(provider === 'codex' ? { submittedTurnId: turnId } : {}) } }
+    }
+    const controller = terminal ? createServer(socket => {
+      const chunks: Buffer[] = []; socket.on('data', chunk => chunks.push(chunk)); socket.on('end', () => {
+        const issue = JSON.parse(Buffer.concat(chunks).toString()); expect(issue.provider).toBe(provider); commands.push('prepare-controller')
+        socket.end(JSON.stringify({ context: { preparation: provider === 'codex' ? { codex: { tui_args: [], sidecar_args: [] } } : { opencode: { project_config: [], tui_config: null, inline_config: false } }, config: [], mcpCapability: { grantId: 'owned-fixture' } }, secretReferences: ['environment', 'auth_file', 'ca_file'].map(suffix => ({ sourcePath: '/owned/' + suffix, profile: `${provider}_onecli_${suffix}` })) }))
+      })
+    }) : undefined
+    if (controller) await new Promise<void>(resolve => controller.listen(path.join(directory, 'mcp.sock'), resolve))
+    const start = terminal ? vi.spyOn(RustServer.prototype, 'start').mockResolvedValue({} as any) : undefined
+    const serverEvidence = terminal ? vi.spyOn(RustServer.prototype, 'processEvidence').mockReturnValue({} as any) : undefined
+    const originalExec = childProcess.execFileSync
+    childProcess.execFileSync = ((program: any, args: any, options: any) => {
+      if (program === 'python3' && args?.[2] === runtimeRoot) return JSON.stringify({ opencodeAdoption: { state: 'observed', data: { observation: { rootSessionId: root, incarnationId: initialInc, hydrated: true, tailMessageId: sourceIds.at(-1), messagesRead: 'success' } } } })
+      return originalExec(program, args, options)
+    }) as typeof childProcess.execFileSync; syncBuiltinESMExports()
+    const harness = {
+      repoRoot: process.cwd(), testRoot: directory, evidenceDir, runId: ownerId, candidateSha, imageRef: imageDigest,
+      writeArtifact: (name: string, value: unknown) => { fs.writeFileSync(path.join(evidenceDir, name), JSON.stringify(value), { mode: 0o600 }); return path.join(evidenceDir, name) },
+      startTransferProvider: () => ({ containerId: 'owned-exporter' }), copyTransferFileExact: async (_: string, file: string) => { sourceDatabase = file },
+      writeTransferRequest: (_: string, _name: string, value: any) => { root = value.rootSessionId }, execTransferProviderExact: () => JSON.stringify({ fixtureOnly: true }),
+      captureTransferFileExact: async (_: string, name: string, destination: string) => {
+        if (name.includes('descriptor')) fs.writeFileSync(destination, JSON.stringify({ rootSessionId: root }))
+        else { fs.copyFileSync(sourceDatabase!, destination); fs.copyFileSync(sourceDatabase!, database); const db = new DatabaseSync(database, { readOnly: true }); sourceIds = (db.prepare('SELECT id FROM message WHERE session_id=? ORDER BY time_created,id').all(root) as { id: string }[]).map(row => row.id); db.close() }
+      },
+      startSupervisor: async (options: any) => { sourceHome = options.env.HOME; return { runtimeRoot, controlSocket: path.join(directory, 'supervisor.sock'), controlSecret: 'controlled-only', controlSecretFile: path.join(directory, 'secret') } },
+      launchBody: (params: unknown) => ({ method: 'launch', params }), inventoryBody: () => ({ method: 'inventory' }), probeRecoveryBody: (soulId: string) => ({ method: 'probe_recovery', params: { soulId } }), recoverBody: (soulId: string) => ({ method: 'recover', params: { soulId } }), terminalInputBody: (soulId: string, data: string) => ({ method: 'terminal_input', params: { soulId, data } }), terminalReadOutputBody: (soulId: string) => ({ method: 'terminal_read_output', params: { soulId } }),
+      broker: { receipts: () => [{ containerId: 'owned-initial', providerVolumeName: 'owned-volume' }, { containerId: 'owned-replacement', providerVolumeName: 'owned-volume' }] },
+      killOwnedRuntimeExact: async () => { expect(turnNumber).toBe(1); commands.push('kill'); await new Promise(resolve => setTimeout(resolve, 2)) }, waitForContainerExit: async () => { commands.push('exit') },
+      adminRaw: async (_: unknown, request: any) => { launchRequest = request; commands.push('launch'); return { result: { Ok: { data: { view: view() } } } } },
+      adminOk: async (_: unknown, request: any) => {
+        if (request.method === 'open_code_transfer') return { data: {} }
+        if (request.method === 'launch') { launchRequest = request; commands.push('launch'); if (provider === 'opencode') { const db = new DatabaseSync(database); db.exec('CREATE TABLE session(id TEXT PRIMARY KEY); CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,time_updated INTEGER,data TEXT); CREATE TABLE part(id TEXT PRIMARY KEY,session_id TEXT,message_id TEXT,time_created INTEGER,time_updated INTEGER,data TEXT);'); db.prepare('INSERT INTO session VALUES (?)').run(root); db.close() }; return { data: { view: view() } } }
+        if (request.method === 'inventory') return { data: [view()] }
+        if (request.method === 'terminal_read_output') return { data: { frames: [] } }
+        if (request.method === 'terminal_input') { if (request.params.data === '\r') return appendTurn(pasted); pasted = request.params.data.replace(/^\x1b\[200~/, '').replace(/\x1b\[201~$/, ''); return { data: {} } }
+        if (request.method === 'fresh_agent_send') return appendTurn(request.params.text)
+        if (request.method === 'probe_recovery') { commands.push('probe'); return { data: { kind: 'reattach_ready' } } }
+        if (request.method === 'recover') { expect(commands.at(-1)).toBe('exit'); recovered = true; commands.push('recover'); return { data: { outcome: 'replaced', view: view() } } }
+        throw new Error('unexpected controlled native operation')
+      },
+      execOwnedContainerAsExact: async (_container: string, _uid: string, args: string[]) => {
+        if (args[2] === receiverStoreSnapshot) {
+          commands.push('capture')
+          const bytes = provider === 'codex' ? Buffer.from([{ type: 'session_meta', payload: { id: root, model_provider: 'openai' } }, ...rollout].map(row => JSON.stringify(row)).join('\n') + '\n') : fs.readFileSync(database)
+          return JSON.stringify({ nativeRoot: provider === 'codex' ? root : null, path: '/home/freshell/provider/owned-native-store', identity: ['1', '2', String(bytes.length)], sha256: createHash('sha256').update(bytes).digest('hex'), completeEof: true, bytesBase64: provider === 'codex' ? bytes.toString('base64') : null, querySnapshotBase64: provider === 'opencode' ? bytes.toString('base64') : null, querySnapshotSha256: createHash('sha256').update(bytes).digest('hex') })
+        }
+        if (args[2]?.includes('opencode-adoption-diagnostics')) return JSON.stringify({ current: { stage: 'publication_succeeded', registeredSlotCount: 2 } })
+        return JSON.stringify({ uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true, httpsStatus: 200, tlsVerifyMode: 2, tlsCheckHostname: true, nativeCwd: launchRequest.params.terminal?.cwd ?? launchRequest.params.freshAgent.cwd, nativePid: 55, nativeProcessCwd: launchRequest.params.terminal?.cwd, nativeVersion: provider === 'codex' ? 'codex-cli 0.147.0' : '1.18.21', nativeRoot: provider === 'codex' ? null : root, nativeMessageCount: sourceIds.length + turnNumber * 2, activeMessageIds: sourceIds, activeNativeProcesses: 1, executableSha256: provider === 'opencode' ? 'c9485f62576606dbde6404647405df2401fada964b7f669f799dc125dbbeff99' : 'e'.repeat(64), profileSha256: 'd'.repeat(64), nativeLaunch: { incarnationId: view().incarnationId, launchNonce: view().nativeIdentityObservation.launchNonce, evidenceRevision: view().nativeIdentityObservation.evidenceRevision, executionGeneration: view().executionGeneration } })
+      },
+    } as unknown as RuntimeHarness
+    try {
+      const sources = ['env_file', 'auth_file', 'ca_file'].map(suffix => ({ name: `${provider}/grants/${suffix}`, path: serverPath, sha256: 'd'.repeat(64) }))
+      if (mode === 'opencode') sources.push({ name: 'opencode/native-preparation/transfer-stage.bin', path: serverPath, sha256: 'd'.repeat(64) })
+      const result = await executeManagedNativeCase(harness, sources, terminal ? { provider, case: 'native-turn' } : { mode, case: 'native-turn' }, 'current-native-turn', terminal ? serverPath : undefined)
+      expect(commands.filter(command => command !== 'capture' && command !== 'prepare-controller')).toEqual(['launch', 'seed', 'probe', 'kill', 'exit', 'recover', 'recall'])
+      expect(result.assertions.every(assertion => assertion.pass)).toBe(true)
+      expect(submitted).toHaveLength(2); expect(submitted[1]).not.toContain(submitted[0]!.match(/owned-memory-[A-Za-z0-9-]+/)![0])
+      expect(result.artifactReferences.some(reference => reference.includes('native-recovery-originals'))).toBe(true)
+      expect(commands.at(-1)).toBe('capture')
+      expect(fs.statSync(sourceHome).isDirectory()).toBe(true)
+    } finally { childProcess.execFileSync = originalExec; syncBuiltinESMExports(); start?.mockRestore(); serverEvidence?.mockRestore(); if (controller) await new Promise<void>(resolve => controller.close(() => resolve())); fs.rmSync(directory, { recursive: true, force: true }) }
+  })
   it.each([undefined, 'stopped-repair-seven-roots'] as const)('canonical source seeds complete disjoint native Git families in one store (%s)', batch => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'task007-seed-'))
     try {
