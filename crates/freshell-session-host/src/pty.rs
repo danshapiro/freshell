@@ -431,11 +431,14 @@ impl HostedPty {
         }
         batch.exited = self.exited();
         batch.exit_code = self.exited().then(|| self.exit_code());
-        batch.native_session_id = self
-            .native_session_id
-            .lock()
-            .ok()
-            .and_then(|session| session.clone());
+        batch.native_session_id = if self.native_identity_launch.is_some() {
+            // Output is the supervisor's durable identity boundary. Re-read
+            // qualified native proof so withdrawn evidence cannot use a cache.
+            self.native_identity_observation()
+                .map(|observation| observation.native_session_id)
+        } else {
+            self.native_session_id()
+        };
         Ok(batch)
     }
 
@@ -1208,10 +1211,59 @@ mod native_startup_source_tests {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    #[test]
-    fn claude_actual_launch_intent_accepts_only_matching_native_hook_source() {
+    fn publish_claude(
+        home: &std::path::Path,
+        signal_dir: &std::path::Path,
+        launch: &freshell_runtime_protocol::NativeIdentityLaunch,
+        root: &str,
+        source: &str,
+    ) {
         let module = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../freshell-claude-sidecar/native-session-channel.mjs");
+        let transcript = home.join("native.jsonl");
+        let cwd = home.to_string_lossy();
+        let hook = serde_json::json!({"hook_event_name":"SessionStart", "session_id":root,
+            "source":source, "cwd":cwd, "transcript_path":transcript});
+        let status = serde_json::json!({"session_id":root,"transcript_path":transcript,
+            "version":"2.1.263","model":{"id":"controlled-model"},
+            "workspace":{"current_dir":cwd},
+            "context_window":{"context_window_size":200000,"current_usage":null}});
+        for (option, payload) in [(None, hook), (Some("--status-line"), status)] {
+            let mut command = Command::new("node");
+            command.arg(&module);
+            if let Some(option) = option {
+                command.arg(option);
+            }
+            let mut child = command
+                .env("HOME", home)
+                .current_dir(home)
+                .env(
+                    "FRESHELL_NATIVE_IDENTITY_LAUNCH",
+                    serde_json::to_string(launch).unwrap(),
+                )
+                .env("FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR", signal_dir)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(payload.to_string().as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn claude_actual_launch_intent_accepts_only_matching_native_hook_source() {
         let root = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
         for (flag, emitted_source, accepted) in [
             ("--session-id", "startup", true),
@@ -1228,46 +1280,7 @@ mod native_startup_source_tests {
                 execution_generation: 1,
                 requested_native_session_id: Some(root.into()),
             };
-            let transcript = owned.path().join("native.jsonl");
-            let cwd = owned.path().to_string_lossy();
-            let hook = serde_json::json!({"hook_event_name":"SessionStart", "session_id":root,
-                "source":emitted_source, "cwd":cwd, "transcript_path":transcript});
-            let status = serde_json::json!({"session_id":root,"transcript_path":transcript,
-                "version":"2.1.263","model":{"id":"controlled-model"},
-                "workspace":{"current_dir":cwd},
-                "context_window":{"context_window_size":200000,"current_usage":null}});
-            for (option, payload) in [(None, hook), (Some("--status-line"), status)] {
-                let mut command = Command::new("node");
-                command.arg(&module);
-                if let Some(option) = option {
-                    command.arg(option);
-                }
-                let mut child = command
-                    .env("HOME", owned.path())
-                    .current_dir(owned.path())
-                    .env(
-                        "FRESHELL_NATIVE_IDENTITY_LAUNCH",
-                        serde_json::to_string(&launch).unwrap(),
-                    )
-                    .env("FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR", &signal_dir)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap();
-                child
-                    .stdin
-                    .take()
-                    .unwrap()
-                    .write_all(payload.to_string().as_bytes())
-                    .unwrap();
-                let output = child.wait_with_output().unwrap();
-                assert!(
-                    output.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
+            publish_claude(owned.path(), &signal_dir, &launch, root, emitted_source);
             let args = vec![flag.into(), root.into()];
             let observed = crate::providers::native_identity::read_claude_observation(
                 &signal_dir.join("session-start.json"),
@@ -1280,6 +1293,106 @@ mod native_startup_source_tests {
             .unwrap();
             assert_eq!(observed.is_some(), accepted, "{flag} with {emitted_source}");
         }
+    }
+
+    #[tokio::test]
+    async fn native_output_reads_current_producer_without_legacy_cache_fallback() {
+        use crate::providers::native_identity::{signal_directory, LAUNCH_ENV};
+        let owned = tempfile::tempdir().unwrap();
+        let incarnation = freshell_runtime_protocol::IncarnationId::new();
+        let root = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let binding = freshell_runtime_protocol::NativeIdentityLaunch {
+            incarnation_id: incarnation.clone(),
+            launch_nonce: "owned-output-launch".into(),
+            evidence_revision: 0,
+            execution_generation: 1,
+            requested_native_session_id: Some(root.into()),
+        };
+        let launch = serde_json::from_value(serde_json::json!({
+            "terminalId":"owned-output", "streamId":"owned-output", "mode":"claude",
+            "program":"/usr/bin/cat", "args":[], "cwd":owned.path(), "workspacePath":owned.path(),
+            "projectKey":"owned-output", "cols":80, "rows":24,
+            "runAsUid":unsafe {libc::geteuid()}, "runAsGid":unsafe {libc::getegid()},
+            "env":{"HOME":owned.path(),"PATH":"/usr/bin:/bin"}
+        }))
+        .unwrap();
+        let mut pty = super::HostedPty::spawn(
+            &owned.path().join("state"),
+            incarnation.clone(),
+            &launch,
+            std::collections::BTreeMap::from([(
+                LAUNCH_ENV.into(),
+                serde_json::to_string(&binding).unwrap(),
+            )]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let signal_dir = signal_directory(owned.path(), &binding).unwrap();
+        let output_identity = |pty: &super::HostedPty| {
+            pty.read_output(incarnation.clone(), 0, 65536, None)
+                .unwrap()
+                .native_session_id
+        };
+        assert_eq!(
+            output_identity(&pty),
+            None,
+            "no producer acknowledgement yet"
+        );
+        publish_claude(owned.path(), &signal_dir, &binding, root, "startup");
+        assert_eq!(
+            pty.native_identity_observation().unwrap().native_session_id,
+            root
+        );
+        assert_eq!(
+            output_identity(&pty).as_deref(),
+            Some(root),
+            "qualified producer reaches output"
+        );
+        *pty.native_session_id.lock().unwrap() = Some("stale-legacy-root".into());
+        std::fs::remove_file(signal_dir.join("session-start.json")).unwrap();
+        assert_eq!(
+            output_identity(&pty),
+            None,
+            "withdrawn proof cannot use stale cache"
+        );
+        let mut foreign = binding.clone();
+        foreign.launch_nonce = "foreign-launch".into();
+        publish_claude(owned.path(), &signal_dir, &foreign, root, "startup");
+        assert_eq!(
+            output_identity(&pty),
+            None,
+            "another launch cannot use stale cache"
+        );
+        publish_claude(owned.path(), &signal_dir, &binding, root, "resume");
+        assert_eq!(
+            output_identity(&pty),
+            None,
+            "wrong hook source cannot use stale cache"
+        );
+        publish_claude(owned.path(), &signal_dir, &binding, root, "startup");
+        assert_eq!(output_identity(&pty).as_deref(), Some(root));
+        pty.native_identity_launch = None;
+        assert_eq!(
+            output_identity(&pty).as_deref(),
+            Some("stale-legacy-root"),
+            "ordinary cache behavior preserved"
+        );
+        pty.native_identity_launch = Some(binding);
+        pty.stop().await;
+        for _ in 0..100 {
+            if pty.exited() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(pty.exited(), "owned PTY stopped");
+        assert_eq!(
+            output_identity(&pty),
+            None,
+            "exited native producer cannot use stale cache"
+        );
     }
 }
 
