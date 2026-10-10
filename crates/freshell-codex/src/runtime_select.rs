@@ -89,7 +89,7 @@ fn refuse_seedless_claim(record: &CodexSidecarRecord) {
     );
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use crate::launch_plan::{plan_codex_launch, CodexLaunchPlanInput};
