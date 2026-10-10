@@ -342,6 +342,9 @@ fn cleanup(h: &Harness) {
 /// exactly as the plugin would, via the pub drain (no sweep-timer race).
 #[tokio::test(flavor = "multi_thread")]
 async fn rest_created_opencode_pane_binds_identity_row_and_ledger() {
+    if common::run_with_opencode_home("rest_created_opencode_pane_binds_identity_row_and_ledger") {
+        return;
+    }
     let h = spawn_merged_server(vec![common::sleeper_cli_spec("opencode")], None).await;
     let (tid, _pane_id) = rest_create(&h, "opencode").await;
 

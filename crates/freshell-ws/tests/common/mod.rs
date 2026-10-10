@@ -17,6 +17,9 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use freshell_ws::WsState;
 
+mod opencode_home;
+pub use opencode_home::run_with_opencode_home;
+
 pub const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
 
 /// Frame-receive / poll budget for the WS e2e suites. DEFLAKE (the-usual
@@ -1755,6 +1758,16 @@ pub async fn next_frame_of_type(ws: &mut TestWs, wanted: &str) -> serde_json::Va
             .expect("no ws error");
         if let WsMessage::Text(text) = &msg {
             let value: serde_json::Value = serde_json::from_str(text).expect("json frame");
+            if wanted == "terminal.created" && value["type"] == "error" {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "severity": "error", "event": "test_terminal_create_error",
+                        "requestId": value["requestId"], "code": value["code"],
+                        "message": value["message"],
+                    })
+                );
+            }
             if value["type"] == serde_json::json!(wanted) {
                 return value;
             }

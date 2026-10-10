@@ -554,6 +554,11 @@ async fn wait_for_is_subagent(
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn tui_switch_signal_reclassifies_is_subagent_in_both_directions() {
+    if common::run_with_opencode_home(
+        "tui_switch_signal_reclassifies_is_subagent_in_both_directions",
+    ) {
+        return;
+    }
     const ROOT: &str = "ses_switchroot";
     const CHILD: &str = "ses_switchchild";
 
@@ -663,6 +668,11 @@ fn opencode_session_ref(session_id: &str) -> SessionNameRef {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_db_association_transfers_pending_and_switch_surfaces_own_record() {
+    if common::run_with_opencode_home(
+        "cli_db_association_transfers_pending_and_switch_surfaces_own_record",
+    ) {
+        return;
+    }
     const ASSOC: &str = "ses_assoc000000000000000000000a";
     const SWITCH: &str = "ses_switch00000000000000000000b";
 
@@ -860,6 +870,9 @@ async fn cli_db_association_transfers_pending_and_switch_surfaces_own_record() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn tui_switch_signal_rebinds_and_restart_resumes_the_new_id() {
+    if common::run_with_opencode_home("tui_switch_signal_rebinds_and_restart_resumes_the_new_id") {
+        return;
+    }
     // ---- env setup (single test fn: this binary owns process env) ----
     let capture_for = |phase: &str| {
         std::env::temp_dir().join(format!(
