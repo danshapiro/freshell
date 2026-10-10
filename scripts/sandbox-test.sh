@@ -133,6 +133,7 @@ fi
 OWNED_CONTROL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/freshell-sandbox-XXXXXXXX")"
 OWNED_CONTAINER_NAME="$(basename "${OWNED_CONTROL_DIR}")"
 OWNED_CID_FILE="${OWNED_CONTROL_DIR}/container.id"
+printf '%s\n' "${OWNED_CONTAINER_NAME}" > "${OWNED_CONTROL_DIR}/container.name"
 DOCKER_CLIENT_PID=""
 REQUESTED_SIGNAL=""
 
@@ -154,9 +155,16 @@ owned_docker_client_running() {
 # shellcheck disable=SC2317 # Reached by the installed EXIT trap handler.
 cleanup_owned_container() {
   local cleanup_status=0
+  local owned_cid=""
   if [ -s "${OWNED_CID_FILE}" ]; then
-    local owned_cid
     owned_cid="$(cat "${OWNED_CID_FILE}")"
+  else
+    # Creation may reach the daemon before the attached client publishes its
+    # CID. The preallocated exact name is still ours; missing publication is
+    # unknown state, not evidence that no container was created.
+    owned_cid="$(docker ps -aq --no-trunc --filter "name=^/${OWNED_CONTAINER_NAME}$")" || return 1
+  fi
+  if [ -n "${owned_cid}" ]; then
     if ! [[ "${owned_cid}" =~ ^[a-f0-9]{64}$ ]]; then
       sandbox_log error sandbox_invalid_owned_identity 1
       return 1
@@ -190,24 +198,50 @@ cleanup_owned_container() {
     remaining="$(docker ps -aq --no-trunc --filter "id=${owned_cid}")" || cleanup_status=1
     [ -z "${remaining}" ] || cleanup_status=1
   fi
+  # Always query the exact name, including failures before CID publication.
+  # Only a successful daemon response establishes absence.
+  local remaining_by_name
+  remaining_by_name="$(docker ps -aq --no-trunc --filter "name=^/${OWNED_CONTAINER_NAME}$")" || cleanup_status=1
+  [ -z "${remaining_by_name}" ] || cleanup_status=1
   return "${cleanup_status}"
 }
 
 # shellcheck disable=SC2317 # Invoked by the installed EXIT trap.
 finish_owned_sandbox() {
   local result=$?
+  local container_settled=0
   trap - EXIT
   trap '' INT TERM HUP
-  cleanup_owned_container || result=1
+  if [ ! -s "${OWNED_CID_FILE}" ] && [ -n "${DOCKER_CLIENT_PID}" ]; then
+    # Join creation before looking up the name: querying first could observe
+    # absence while this client is still creating the owned object.
+    if owned_docker_client_running; then
+      kill -TERM "${DOCKER_CLIENT_PID}" 2>/dev/null || true
+    fi
+    wait "${DOCKER_CLIENT_PID}" 2>/dev/null || true
+    DOCKER_CLIENT_PID=""
+  fi
+  if cleanup_owned_container; then
+    container_settled=1
+  else
+    result=1
+  fi
   if [ -n "${DOCKER_CLIENT_PID}" ]; then
-    # The container is already settled; terminate a lingering attached client
-    # rather than leaving this wrapper waiting on a transport after cleanup.
+    # Cleanup has been attempted; join a lingering attached client instead of
+    # leaving this wrapper waiting on its transport. Unknown daemon state
+    # retains the control directory below.
     if owned_docker_client_running; then
       kill -TERM "${DOCKER_CLIENT_PID}" 2>/dev/null || true
     fi
     wait "${DOCKER_CLIENT_PID}" 2>/dev/null || true
   fi
-  rm -rf -- "${OWNED_CONTROL_DIR}" || result=1
+  if [ "${container_settled}" -eq 1 ]; then
+    rm -rf -- "${OWNED_CONTROL_DIR}" || result=1
+  else
+    sandbox_log error sandbox_owned_container_unsettled 1
+    printf '[sandbox] owned container %s could not be settled; control evidence retained at %q\n' \
+      "${OWNED_CONTAINER_NAME}" "${OWNED_CONTROL_DIR}" >&2
+  fi
   if [ "${result}" -eq 0 ]; then
     sandbox_log info sandbox_workload_finished "${result}"
   else
