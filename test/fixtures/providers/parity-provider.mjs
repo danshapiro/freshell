@@ -242,6 +242,44 @@ if (provider === 'claude') {
   try { await configuredClaudeStartup() }
   catch (error) { append({ kind: 'native-startup', result: 'refused', errorKind: error?.name ?? 'Error' }); process.exitCode = 1 }
 }
+async function configuredAmplifierStartup() {
+  if (!nativeId || !process.env.FRESHELL_NATIVE_IDENTITY_LAUNCH) return
+  // Load the actual installed CLI store and restore the controlled context.
+  // Its unchanged producer captures the native files and publishes the ACK.
+  const code = `
+import asyncio, sys
+from types import SimpleNamespace
+from amplifier_app_cli.session_store import SessionStore
+from amplifier_app_cli.freshell_native_resume import publish_initialized
+
+class ControlledContext:
+    async def set_messages(self, messages):
+        self.messages = list(messages)
+    async def get_messages(self):
+        return self.messages
+
+async def main():
+    loaded, metadata = SessionStore().load(sys.argv[1])
+    context = ControlledContext()
+    await context.set_messages(loaded)
+    async def cleanup():
+        pass
+    session = SimpleNamespace(session_id=sys.argv[1], parent_id=metadata.get('parent_id'),
+                              coordinator={'context': context}, cleanup=cleanup)
+    config = SimpleNamespace(is_resume=True, initial_transcript=loaded)
+    await publish_initialized(session, config)
+
+asyncio.run(main())
+`
+  await new Promise((resolve, reject) => {
+    const child = spawn('/opt/amplifier-src/.venv/bin/python', ['-c', code, nativeId],
+      { env: process.env, cwd, stdio: ['ignore', 'inherit', 'inherit'] })
+    child.once('error', reject)
+    child.once('exit', code => code === 0 ? resolve() : reject(new Error('installed Amplifier startup producer refused')))
+  })
+}
+
+if (provider === 'amplifier') await configuredAmplifierStartup()
 if (provider === 'codex' || provider === 'opencode') {
   // Keep ordinary fake transcripts Enter-bound. Only this managed Codex
   // parity wrapper requests the current proxy handshake before input.
