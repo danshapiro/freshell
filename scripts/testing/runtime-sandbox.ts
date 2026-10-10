@@ -4837,15 +4837,35 @@ export class ManagedRuntimeOwner {
       || !info.isFile() || info.uid !== process.getuid?.() || info.nlink !== 1 || (info.mode & 0o777) !== 0o600) {
       throw new Error('registered fictional source custody changed')
     }
-    for (const suffix of ['-wal', '-shm', '-journal']) {
-      let present = false
-      try { fs.lstatSync(`${file}${suffix}`); present = true }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
-      if (present) throw new Error('registered fictional source has an unsettled sidecar')
+    const sidecars = ['-wal', '-shm', '-journal'].map(suffix => {
+      try { return { suffix, info: fs.lstatSync(`${file}${suffix}`) } }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; return undefined }
+    }).filter((entry): entry is { suffix: string; info: fs.Stats } => entry !== undefined)
+    // A completed read-only SQLite consumer can leave an empty WAL/SHM pair.
+    // Only that private, quiesced shape is eligible for SQLite's own cleanup.
+    if (sidecars.length && (sidecars.length !== 2 || sidecars.some(({ suffix, info }) =>
+      !info.isFile() || info.uid !== process.getuid?.() || info.nlink !== 1 || (info.mode & 0o777) !== 0o600
+      || (suffix === '-wal' ? info.size !== 0 : suffix !== '-shm' || info.size !== 32_768)))) {
+      throw new Error('registered fictional source has an unsettled sidecar')
     }
     const current = fs.readFileSync(file), digest = createHash('sha256').update(current).digest('hex')
     const recorded = this.stoppedRepairSourceFault
     if (digest !== (recorded?.expectedSha256 ?? identity.sha256)) throw new Error('registered fictional source bytes changed unexpectedly')
+    if (sidecars.length) {
+      const db = new DatabaseSync(file)
+      try {
+        // Refuse a still-active writer. Checkpoint and close settle the empty
+        // sidecars without applying data or changing the captured main file.
+        db.exec('BEGIN IMMEDIATE; COMMIT')
+        if (db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get()?.busy !== 0) {
+          throw new Error('registered fictional source has an unsettled sidecar')
+        }
+      } finally { db.close() }
+      for (const suffix of ['-wal', '-shm', '-journal']) {
+        if (fs.existsSync(`${file}${suffix}`)) throw new Error('registered fictional source has an unsettled sidecar')
+      }
+      if (task007FileHash(file) !== digest) throw new Error('registered fictional source bytes changed unexpectedly')
+    }
     if (activate) {
       if (recorded) {
         if (!recorded.active) throw new Error('registered fictional source requires completion of owned restoration')

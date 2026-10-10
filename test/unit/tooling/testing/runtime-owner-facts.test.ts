@@ -652,6 +652,94 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
     } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
   })
 
+  // A completed read-only SQLite consumer leaves the empty WAL and SHM pair
+  // seen by the stopped runbook. Do not fabricate their bytes or kill a reader.
+  function readSourceSessions(databaseFile: string): { id: string; title: string }[] {
+    return JSON.parse(execFileSync(process.execPath, ['--no-warnings', '-e', `
+      const {DatabaseSync}=require('node:sqlite'),db=new DatabaseSync(process.argv[1],{readOnly:true});
+      try { process.stdout.write(JSON.stringify(db.prepare('SELECT id,title FROM session ORDER BY id').all())) }
+      finally { db.close() }
+    `, databaseFile], { encoding: 'utf8', timeout: 10_000 }))
+  }
+
+  it('settles quiesced SQLite WAL sidecars before changing and restoring the registered fictional source', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused source sidecar web') }, fixtureRepoRoot, 3,
+      {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
+    const batch = await browserFixture(rig)
+    vi.spyOn(rig.runtime, 'prepareTask007StoppedFixture').mockResolvedValue(batch)
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    const previous: owner.SupervisorInstance = { scenarioId: batch.scenarioId, containerId: 'a'.repeat(64), volumeName: batch.volumeName!,
+      runtimeRoot: batch.input.runtimeRoot, controlSocket: '/controlled/socket', controlSecret: 'controlled-secret',
+      controlSecretFile: '/controlled/secret', binaryKind: 'test' }
+    vi.spyOn(rig.runtime, 'stopSupervisorExact').mockImplementation(() => undefined)
+    vi.spyOn(rig.runtime, 'removeContainerExact').mockImplementation(() => undefined)
+    vi.spyOn(rig.runtime, 'waitForSupervisorHealth').mockResolvedValue({})
+    const launch = vi.spyOn(rig.runtime, 'startSupervisor').mockResolvedValue(previous)
+    vi.spyOn(rig, 'controlEpoch').mockResolvedValue(12)
+    const readSource = () => readSourceSessions(batch.sourceDatabaseFile)
+    const sidecars = () => ['-wal', '-shm'].map(suffix => fs.lstatSync(`${batch.sourceDatabaseFile}${suffix}`))
+    try {
+      await rig.prepareSyntheticStoppedRepairBatch(); rig.supervisor = previous
+      const original = await fsp.readFile(batch.sourceDatabaseFile)
+      const originalRows = readSource()
+      expect(sidecars().map(info => info.size)).toEqual([0, 32_768])
+      expect(sidecars().every(info => info.isFile() && info.uid === process.getuid?.() && info.nlink === 1
+        && (info.mode & 0o777) === 0o600)).toBe(true)
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'source_generation_change')).resolves.toEqual({ controlEpoch: 12 })
+      const changed = await fsp.readFile(batch.sourceDatabaseFile)
+      expect(createHash('sha256').update(changed).digest('hex')).not.toEqual(createHash('sha256').update(original).digest('hex'))
+      for (const suffix of ['-wal', '-shm', '-journal']) expect(fs.existsSync(`${batch.sourceDatabaseFile}${suffix}`)).toBe(false)
+      expect(readSource()).toEqual(originalRows.map(row => row.id === batch.source.families[0].rootId
+        ? { ...row, title: `${row.title} [fictional stopped-repair generation fault]` } : row))
+      expect(sidecars().map(info => info.size)).toEqual([0, 32_768])
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')).resolves.toEqual({ controlEpoch: 12 })
+      expect((await fsp.readFile(batch.sourceDatabaseFile)).equals(original)).toBe(true)
+      for (const suffix of ['-wal', '-shm', '-journal']) expect(fs.existsSync(`${batch.sourceDatabaseFile}${suffix}`)).toBe(false)
+      expect(readSource()).toEqual(originalRows)
+      expect(launch).toHaveBeenCalledTimes(2)
+    } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
+  })
+
+  it.each(['active-writer', 'shared-sidecar', 'public-sidecar'] as const)(
+    'refuses source fault settlement with a real WAL pair and %s', async mode => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused unsafe source web') }, fixtureRepoRoot, 3,
+      {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
+    const batch = await browserFixture(rig)
+    vi.spyOn(rig.runtime, 'prepareTask007StoppedFixture').mockResolvedValue(batch)
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    const previous: owner.SupervisorInstance = { scenarioId: batch.scenarioId, containerId: 'a'.repeat(64), volumeName: batch.volumeName!,
+      runtimeRoot: batch.input.runtimeRoot, controlSocket: '/controlled/socket', controlSecret: 'controlled-secret',
+      controlSecretFile: '/controlled/secret', binaryKind: 'test' }
+    vi.spyOn(rig.runtime, 'stopSupervisorExact').mockImplementation(() => undefined)
+    const launch = vi.spyOn(rig.runtime, 'startSupervisor')
+    let writer: InstanceType<typeof DatabaseSync> | undefined
+    try {
+      await rig.prepareSyntheticStoppedRepairBatch(); rig.supervisor = previous
+      const original = await fsp.readFile(batch.sourceDatabaseFile)
+      if (mode === 'active-writer') {
+        writer = new DatabaseSync(batch.sourceDatabaseFile)
+        writer.exec('BEGIN IMMEDIATE')
+      } else {
+        readSourceSessions(batch.sourceDatabaseFile)
+        if (mode === 'shared-sidecar') await fsp.link(`${batch.sourceDatabaseFile}-shm`, path.join(batch.outputDir, 'unrelated-shm'))
+        else await fsp.chmod(`${batch.sourceDatabaseFile}-shm`, 0o644)
+      }
+      expect(fs.statSync(`${batch.sourceDatabaseFile}-wal`).size).toBe(0)
+      expect(fs.statSync(`${batch.sourceDatabaseFile}-shm`).size).toBe(32_768)
+      const wal = await fsp.readFile(`${batch.sourceDatabaseFile}-wal`)
+      const shm = await fsp.readFile(`${batch.sourceDatabaseFile}-shm`)
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'source_generation_change'))
+        .rejects.toThrow(mode === 'active-writer' ? /locked/ : /sidecar/)
+      expect((await fsp.readFile(batch.sourceDatabaseFile)).equals(original)).toBe(true)
+      expect((await fsp.readFile(`${batch.sourceDatabaseFile}-wal`)).equals(wal)).toBe(true)
+      expect((await fsp.readFile(`${batch.sourceDatabaseFile}-shm`)).equals(shm)).toBe(true)
+      expect(launch).not.toHaveBeenCalled()
+    } finally {
+      if (writer) { writer.exec('ROLLBACK'); writer.close() }
+      vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true })
+    }
+  })
+
   it('changes only the registered fictional source generation and restores its exact original bytes', async () => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused fault web') }, fixtureRepoRoot, 3,
       {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
