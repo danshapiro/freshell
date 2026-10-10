@@ -2,7 +2,8 @@
 //! process runs with FRESHELL_TEST_HOOKS=1). One hook holds the Gone
 //! CONFIRMATION (not the kill) so the unconfirmed path is testable end to
 //! end; the other slows the write of the Stopping record, which every signal
-//! waits for. Plus one read-only view for tests: the unit's emptiness wait.
+//! waits for. Plus one read-only view for tests (the unit's emptiness wait)
+//! and the cleanup of a test state root's systemd namespace slice.
 
 /// The delay to hold Gone confirmation for, from
 /// `FRESHELL_TEST_UNIT_GONE_DELAY_MS` (only with `FRESHELL_TEST_HOOKS=1`).
@@ -24,6 +25,36 @@ pub fn unit_empty_wait(
     unit: &crate::AgentUnit,
 ) -> Option<crate::BoxFuture<'static, std::io::Result<()>>> {
     unit.empty_wait()
+}
+
+/// Test support: the systemd namespace slice of the containment over
+/// `state_root` (`freshell-n<ns>.slice`, the parent of every unit slice it
+/// creates), named by the backend's own rule.
+#[cfg(target_os = "linux")]
+pub fn namespace_slice(state_root: &std::path::Path) -> String {
+    format!(
+        "freshell-n{}.slice",
+        crate::backend::systemd::namespace(state_root)
+    )
+}
+
+/// Test support: stops the systemd namespace slice of a test's own state
+/// root (with every unit slice still in it), within the backend's command
+/// deadline, ignoring failures. A no-op where there is no systemd user
+/// manager. Only for a state root the test created: it stops whatever runs
+/// under that root's units.
+pub fn stop_namespace_slice(state_root: &std::path::Path) {
+    #[cfg(target_os = "linux")]
+    {
+        let mut stop = std::process::Command::new("systemctl");
+        stop.args(["--user", "stop", &namespace_slice(state_root)]);
+        let _ = crate::process::run_capture_with_deadline(
+            &mut stop,
+            crate::backend::systemd::COMMAND_DEADLINE,
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = state_root;
 }
 
 fn hook_delay(var: &str) -> Option<std::time::Duration> {

@@ -74,10 +74,9 @@ fn a_probe_slice_that_cannot_be_stopped_is_logged_as_a_warning() {
     for warning in &warnings {
         assert_eq!(warning.level, tracing::Level::WARN);
         let slice = &warning.fields["slice"];
+        // Outside every server's namespace (`freshell-n<ns>`).
         assert!(
-            slice.starts_with("freshell-n")
-                && slice.contains("-probe")
-                && slice.ends_with(".slice"),
+            slice.starts_with("freshell-probe") && slice.ends_with(".slice"),
             "{slice}"
         );
         assert!(

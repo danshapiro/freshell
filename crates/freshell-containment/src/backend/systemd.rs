@@ -50,7 +50,7 @@ use crate::{BoxFuture, UnitId, UNIT_ENV};
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// The deadline of every systemd command this backend runs (a stalled user
 /// bus blocks a command for 90 s otherwise; Stage 2: LB-27(d)).
-const COMMAND_DEADLINE: Duration = Duration::from_secs(10);
+pub(crate) const COMMAND_DEADLINE: Duration = Duration::from_secs(10);
 /// How long the kill waits for the slice to report `frozen 1`.
 const FREEZE_DEADLINE: Duration = Duration::from_secs(1);
 /// The first systemd version whose `systemd-run` expands `$VAR` in command
@@ -73,7 +73,7 @@ fn procs_recursive(dir: &Path, out: &mut Vec<u32>) {
 /// The per-server namespace: the first 16 lowercase hex digits of the
 /// SHA-256 of the canonicalized state root (an empty root hashes the empty
 /// string; a root that cannot be canonicalized hashes as given).
-fn namespace(state_root: &Path) -> String {
+pub(crate) fn namespace(state_root: &Path) -> String {
     use sha2::{Digest, Sha256};
     let canonical = std::fs::canonicalize(state_root).unwrap_or_else(|_| state_root.to_path_buf());
     Sha256::digest(canonical.as_os_str().as_encoded_bytes())
@@ -236,8 +236,12 @@ impl SystemdBackend {
         }
 
         // A throwaway scope in a probe slice of our own (named with this
-        // probe's nonce, so concurrent probes never stop each other's).
-        let probe_slice = format!("freshell-n{}-probe{}.slice", shared.ns, shared.boot);
+        // probe's nonce, so concurrent probes never stop each other's). It
+        // lies outside every server's namespace: a namespace slice is
+        // created (implicitly, as the parent of a unit slice) only when a
+        // unit is, so a server that never creates a unit leaves nothing
+        // behind (implicit slices are never collected).
+        let probe_slice = format!("freshell-probe{}.slice", shared.boot);
         let mut place = std::process::Command::new(&shared.systemd_run);
         place
             .args(&shared.scope_args(&probe_slice, None)[1..])
@@ -245,7 +249,10 @@ impl SystemdBackend {
             .envs(shared.bus_env.iter().cloned());
         let placed = run_capture_with_deadline(&mut place, COMMAND_DEADLINE)
             .map_err(|e| step("systemd-run --user --scope", e))?;
-        let expected = format!("{}/", shared.slice_cgroup(&probe_slice));
+        let expected = format!(
+            "{}/freshell.slice/{probe_slice}/",
+            shared.manager_cgroup.trim_end_matches('/')
+        );
         let slice_dir = Path::new(CGROUP_ROOT).join(expected.trim_start_matches('/'));
         let landed = checked(placed)
             .map_err(|e| step("systemd-run --user --scope", e))

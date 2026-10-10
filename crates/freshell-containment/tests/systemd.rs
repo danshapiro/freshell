@@ -85,6 +85,47 @@ fn stop_force(unit: &AgentUnit, reason: StopReason) -> StopHandle {
     unit.stop(StopRequest::new(StopMode::Force, reason, "test"))
 }
 
+/// The user manager's view of `slice` (`active`, `inactive`, ...).
+fn active_state(slice: &str) -> String {
+    let out = std::process::Command::new("systemctl")
+        .args(["--user", "show", "-p", "ActiveState", "--value", slice])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("systemctl --user show");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A containment that never creates a unit leaves no slice of its own: the
+/// selection probe runs in a slice outside every namespace, so a namespace
+/// slice (implicit, never collected) exists only once a unit's member was
+/// placed (Task 12 review M6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selection_alone_leaves_no_namespace_slice() {
+    let root = tempfile::tempdir().unwrap();
+    let Some(c) = systemd_on(root.path()) else {
+        assert!(!require(), "systemd containment required on this host");
+        return;
+    };
+    let slice = testing::namespace_slice(root.path());
+    let after_selection = active_state(&slice);
+
+    // Positive control: placing a member creates the namespace slice.
+    let unit = c.create_unit(UnitId::mint(), label()).unwrap();
+    let mut cmd = unit.tokio_command("true", &[], MemberRole::Agent).unwrap();
+    cmd.stdin(std::process::Stdio::null());
+    let placed = cmd.status().await.unwrap();
+    let after_unit = active_state(&slice);
+    stop_force(&unit, StopReason::ShiftX).wait().await;
+    testing::stop_namespace_slice(root.path());
+
+    assert!(placed.success(), "{placed:?}");
+    assert_ne!(
+        after_selection, "active",
+        "the selection probe left {slice} behind"
+    );
+    assert_eq!(after_unit, "active", "a unit's slice lives under {slice}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn members_land_in_the_unit_slice_with_their_pid_preserved_outside_our_cgroup() {
     let Some(c) = systemd_or_skip_reason() else {
