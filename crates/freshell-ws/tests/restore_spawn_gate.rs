@@ -657,15 +657,56 @@ async fn restore_storm_drains_bounded_with_per_terminal_ordering() {
     // requestId, exactly once, with no duplicate PTYs; and no terminal may
     // emit output before the client attaches (the A21 causal invariant —
     // create never auto-attaches, registry.rs:548).
+    //
+    // DEFLAKE: the queueing proof used to be `queued_total() >= N - 2` after
+    // the drain, which assumed the server would read all N create frames
+    // before the first two creates settled and freed their permits. Under
+    // CPU load a settle could win that race, a later create then took the
+    // freed permit on the fast path without queueing, and the count came up
+    // short (observed 9 < 10; 24 of 1,360 runs under CPU load). The same
+    // rework as restore_creates_queue_behind_held_permit_and_both_settle:
+    // the TEST holds both of the gate's permits while the storm arrives, so
+    // "every create had to queue" is structural (now == N, strictly stronger
+    // than the old >= N - 2), then releases them and the storm drains through
+    // the gate's 2 permits.
     let cfg = CreateProtectConfig::default();
     let (ws_url, registry, _shutdown, gate, _shutdown_started) =
         spawn_server(cfg, SpawnGate::new(2, 64)).await;
     let mut client = connect_and_hello(&ws_url).await;
 
+    // Hold both permits so every storm create MUST queue.
+    let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+    let held_permits = [
+        gate.acquire(FRAME_BUDGET, &mut cancel_rx)
+            .await
+            .expect("test acquires the gate's first permit"),
+        gate.acquire(FRAME_BUDGET, &mut cancel_rx)
+            .await
+            .expect("test acquires the gate's second permit"),
+    ];
+
     const N: usize = 12; // > gate limit 2: forces real FIFO queueing
     for i in 0..N {
         send_text(&mut client, &create_frame(&format!("storm-{i}"), true)).await;
     }
+
+    // Bounded poll (suite idiom): every storm create observably queued
+    // behind the held permits.
+    let deadline = std::time::Instant::now() + FRAME_BUDGET;
+    while std::time::Instant::now() < deadline {
+        if gate.queued_total() >= N as u64 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        gate.queued_total(),
+        N as u64,
+        "with 2 permits the storm must actually queue FIFO behind the gate"
+    );
+
+    // Release: the storm now drains through the gate's 2 permits.
+    drop(held_permits);
 
     // Drain N terminal.created frames. While draining, FAIL on any
     // terminal.output / terminal.outputBatch frame — nothing is attached
@@ -691,10 +732,6 @@ async fn restore_storm_drains_bounded_with_per_terminal_ordering() {
     assert!(
         seen.keys().all(|k| k.starts_with("storm-")),
         "only the storm requestIds replied"
-    );
-    assert!(
-        gate.queued_total() >= (N as u64) - 2,
-        "with 2 permits the storm must actually queue FIFO behind the gate"
     );
 
     // Per-terminal created -> attach -> output: attach ONE storm terminal
