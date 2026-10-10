@@ -14,7 +14,7 @@ import path from 'node:path'
 
 import { expect, type Page, type Browser } from '@playwright/test'
 
-import type { ProviderQualificationRow } from '../../../scripts/testing/provider-qualification-receipt.js'
+import { providerNativeProfileMatches, type ProviderQualificationRow } from '../../../scripts/testing/provider-qualification-receipt.js'
 import { requireAmplifierOnecliBootstrap } from '../../../scripts/testing/runtime-amplifier-onecli.js'
 import {
   QUALIFICATION_PROVIDER_SELECTION_ENV,
@@ -391,17 +391,7 @@ async function qualifyProvider(
     swapMaxVerified: exactLimits.swapMax === '0',
     limitEvidence: exactLimits,
     automaticResume: true,
-    profileVerified: nativeTurnProofs.every((proof) => (
-      proof.resolvedReasoningEffort === definition.reasoningEffort
-      && (definition.provider !== 'codex' || proof.resolvedModel === definition.model)
-      && (definition.provider !== 'amplifier' || (
-        proof.resolvedProvider === 'lunaroute'
-        && proof.resolvedModel === definition.model
-      ))
-      && (definition.provider !== 'claude' || proof.resolvedModel.toLowerCase().includes('haiku'))
-      && (definition.provider !== 'opencode'
-        || `${proof.resolvedProvider}/${proof.resolvedModel}` === definition.model)
-    )),
+    profileVerified: nativeTurnProofs.every((proof) => providerNativeProfileMatches(definition, proof)),
     releaseBinary: (await rig.ownershipFacts()).supervisorBinaryKind === 'release',
     nativeRecovery: true,
     exactNativeRecovery: afterHostLoss.nativeSessionId === nativeSessionId

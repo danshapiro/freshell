@@ -70,14 +70,15 @@ function jsonReference(evidenceDir: string, reference: unknown): JsonObject {
   return object(JSON.parse(bytes.toString('utf8')), 'native original')
 }
 
-function verifyCapturedNativeCopy(evidenceDir: string, reference: unknown, bytesBase64: string, digest: string, label: string): void {
+function verifyCapturedNativeCopy(evidenceDir: string, reference: unknown, bytesBase64: string, digest: string, label: string): Buffer {
   const copied = readNativeOriginalReference(evidenceDir, reference).bytes
   const captured = Buffer.from(bytesBase64, 'base64')
   if (!copied.equals(captured)) throw new Error(`${label} differs from the captured native original`)
   equal(sha256(captured), digest, `${label} capture digest`)
+  return copied
 }
 
-function nativeMaterial(evidenceDir: string, stage: JsonObject, provider: string, root: string): { history: NativeHistory; inputs: NativeInput[] } {
+export function nativeMaterial(evidenceDir: string, stage: JsonObject, provider: string, root: string): { history: NativeHistory; inputs: NativeInput[] } {
   const { filename } = readNativeOriginalReference(evidenceDir, stage.nativeFile)
   if (provider === 'codex') {
     const basename = path.basename(filename), [meta] = readBoundedJsonl(filename, 'Codex referenced native rollout')
@@ -161,6 +162,7 @@ export function deriveNativeRecoveryOriginals(input: {
     const stages: NativeRecoveryStageEvidence[] = []
     const requestIds: string[] = [], incarnationIds: string[] = [], launchNonces: string[] = []
     let previousView: JsonObject | undefined, previousCompletion = 0, previousNamespace: JsonObject | undefined, previousStore: JsonObject | undefined
+    let previousTranscript: Buffer | undefined
     let priorTurns = new Map<string, NativeAssistantTurn>(), priorInputs = new Map<string, string>()
     const key = (turn: NativeAssistantTurn) => JSON.stringify(turn.nativeEvidence)
     for (const stageValue of conversation.stages) {
@@ -198,7 +200,7 @@ export function deriveNativeRecoveryOriginals(input: {
       text(store.providerVolumeName, 'native original volume')
       const snapshot = object(store.snapshot, 'native store snapshot')
       if (!snapshot.completeEof || !Array.isArray(snapshot.identity) || snapshot.identity.length < 2) throw new Error('native original store is truncated or lacks file identity')
-      verifyCapturedNativeCopy(input.evidenceDir, stage.nativeFile, snapshot.querySnapshotBase64 ?? snapshot.bytesBase64, snapshot.querySnapshotSha256 ?? snapshot.sha256, 'native transcript copy')
+      const transcript = verifyCapturedNativeCopy(input.evidenceDir, stage.nativeFile, snapshot.querySnapshotBase64 ?? snapshot.bytesBase64, snapshot.querySnapshotSha256 ?? snapshot.sha256, 'native transcript copy')
       if (provider === 'amplifier') {
         const events = object(store.eventsSnapshot, 'Amplifier captured native events')
         verifyCapturedNativeCopy(input.evidenceDir, stage.nativeEvents, events.bytesBase64, events.sha256, 'Amplifier event copy')
@@ -206,7 +208,15 @@ export function deriveNativeRecoveryOriginals(input: {
       if (previousStore && previousNamespace) {
         equal(store.providerVolumeName, previousStore.providerVolumeName, 'native original volume')
         equal(snapshot.path, previousStore.snapshot.path, 'native original store path')
-        equal(JSON.stringify(snapshot.identity.slice(0, 2)), JSON.stringify(previousStore.snapshot.identity.slice(0, 2)), 'native original store identity')
+        if (provider === 'amplifier') {
+          // The pinned SessionStore atomically replaces its complete transcript
+          // on save. Durable continuity binds the same device and all prior
+          // bytes, while the capture producer requires a stable descriptor.
+          equal(snapshot.identity[0], previousStore.snapshot.identity[0], 'native original store device')
+          if (!previousTranscript || !transcript.subarray(0, previousTranscript.length).equals(previousTranscript)) throw new Error('Amplifier native transcript prefix changed or disappeared')
+        } else {
+          equal(JSON.stringify(snapshot.identity.slice(0, 2)), JSON.stringify(previousStore.snapshot.identity.slice(0, 2)), 'native original store identity')
+        }
         for (const field of ['nativeCwd', 'executableSha256', 'profileSha256']) equal(namespace[field], previousNamespace[field], `native replacement ${field}`)
       }
       if (previousView) {
@@ -215,7 +225,9 @@ export function deriveNativeRecoveryOriginals(input: {
         equal(crash.containerId, previousView.containerId, 'native old container'); equal(crash.incarnationId, previousView.incarnationId, 'native old incarnation')
         const requestedAt = timestamp(crash.requestedAt, 'native crash request'), exitedAt = timestamp(crash.exitedAt, 'native owned exit')
         if (namespaceAt < exitedAt || timestamp(previousNamespace!.ownedProbe.capturedAt, 'previous native namespace capture') > requestedAt) throw new Error('native namespace probe precedes replacement or follows owned death')
-        if (!(previousCompletion <= requestedAt && requestedAt <= exitedAt && exitedAt <= launchAt) || view.containerId === previousView.containerId || view.executionGeneration <= previousView.executionGeneration || observation.evidenceRevision <= previousView.nativeIdentityObservation.evidenceRevision) throw new Error('native crash/exit/replacement order is invalid')
+        // Execution grants increment an incarnation-local counter. Recovery
+        // requires a new incarnation, whose committed generation may restart at 1.
+        if (!(previousCompletion <= requestedAt && requestedAt <= exitedAt && exitedAt <= launchAt) || view.containerId === previousView.containerId || incarnationId === previousView.incarnationId || observation.evidenceRevision <= previousView.nativeIdentityObservation.evidenceRevision) throw new Error('native crash/exit/replacement order is invalid')
       } else if (stage.crash !== undefined) throw new Error('initial native stage must precede recovery')
       const request = source(stage.request)
       const gestures: JsonObject[] = Array.isArray(request.requests) ? request.requests : [request]
@@ -280,6 +292,7 @@ export function deriveNativeRecoveryOriginals(input: {
       })
       incarnationIds.push(incarnationId); launchNonces.push(launchNonce)
       previousView = view; previousCompletion = completedAt; previousNamespace = namespace; previousStore = store
+      previousTranscript = transcript
       priorTurns = new Map(material.history.turns.map(nativeTurn => [key(nativeTurn), nativeTurn])); priorInputs = new Map(material.inputs.map(nativeInput => [nativeInput.id, nativeInput.text]))
     }
     unique(requestIds, 'native request'); unique(incarnationIds, 'native incarnation'); unique(launchNonces, 'native launch')

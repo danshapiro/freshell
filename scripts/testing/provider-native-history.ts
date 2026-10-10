@@ -21,6 +21,19 @@ export type IdentifiedMessageEvidence = {
   turnId: string
   messageId: string
   parentMessageId: string | null
+  /** Actual persisted components of a provider message, in source order. */
+  components?: NativeMessageComponentEvidence[]
+  /** Native attachment ancestry between the first component and its user. */
+  parentChain?: NativeMessageComponentEvidence[]
+}
+
+export type NativeMessageComponentEvidence = {
+  messageId: string
+  parentMessageId: string | null
+  recordIndex: number
+  byteStart: number
+  byteEnd: number
+  recordSha256: string
 }
 
 export type AppendOnlyRecordEvidence = {
@@ -32,6 +45,8 @@ export type AppendOnlyRecordEvidence = {
   prefixSha256Before: string
   completionEventOrdinal: number
   completionEventSha256: string
+  /** Native response rows that supplied the observed per-turn profile. */
+  responseEventSha256s?: string[]
 }
 
 export type NativeTurnEvidence = IdentifiedMessageEvidence | AppendOnlyRecordEvidence

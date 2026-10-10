@@ -26,6 +26,26 @@ const imageDigest = `sha256:${'a'.repeat(64)}`
 const candidateSha = 'b'.repeat(40)
 const ownerId = 'unit-finite-child'
 const selection: NativeSelection = { mode: 'freshclaude', case: 'startup' }
+
+describe('shared observed native solo Bash outcome', () => {
+  it.each([true, false])('derives the actual result and effect after a browser decision (allow=%s)', async allowed => {
+    const module = await import('../../../../scripts/testing/runtime-native-feasibility.js')
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'browser-native-approval-'))
+    const effectFile = path.join(directory, 'effect.jsonl')
+    if (allowed) fs.writeFileSync(effectFile, 'effect\n')
+    const toolUseID = 'toolu_actual_original'
+    const events = [{ kind: 'provider', data: { payload: { event: { type: 'freshAgent.tool.result',
+      content: [{ tool_use_id: toolUseID, is_error: !allowed }] } } } },
+    { kind: 'provider', data: { payload: { event: { type: 'freshAgent.result', nativeSessionId: 'owned-native-root', isError: false } } } }]
+    try {
+      const result = (module as any).observeNativeSoloBashOutcome({ nativeRoot: 'owned-native-root', toolUseID, allowed, observed: events,
+        effectCount: fs.existsSync(effectFile) ? fs.readFileSync(effectFile, 'utf8').split('\n').length - 1 : 0 })
+      expect(result).toMatchObject({ toolUseID, nativeSessionId: 'owned-native-root', effectCount: allowed ? 1 : 0,
+        nativeToolResultIsError: !allowed, completionCount: 1 })
+    } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+  })
+})
+
 function child(caseId: string, failure = false): NativeExperimentOriginal {
   const code = `const [caseId,ownerId,imageDigest,candidateSha,failure]=process.argv.slice(1);
     const original={caseId,ownerId,imageDigest,candidateSha,nativeVersion:'fixture-only',
