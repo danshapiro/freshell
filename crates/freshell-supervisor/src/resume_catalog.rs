@@ -84,6 +84,10 @@ pub fn exact_resume_candidate(
         .insert("XDG_DATA_HOME".into(), data_home.clone());
     spec.environment
         .insert("XDG_CONFIG_HOME".into(), format!("{PROVIDER_HOME}/.config"));
+    // Legacy repaired launches need the same native-library staging directory
+    // as new managed OpenCode launches; the global /tmp mount remains noexec.
+    spec.environment
+        .insert("TMPDIR".into(), "/run/opencode-tmp".into());
     spec.environment.insert(
         "OPENCODE_DB".into(),
         format!("{data_home}/opencode/opencode.db"),
@@ -927,6 +931,72 @@ mod tests {
         assert_eq!(
             resume_spec.provider_session.native_session_id,
             "ses_recovery_exact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repaired_opencode_resume_and_blocked_retry_select_executable_native_temp_directory() {
+        for legacy_tmpdir in [None, Some("/tmp")] {
+            let mut context = completed_import_context();
+            let terminal = context.terminal.as_mut().unwrap();
+            terminal.opencode_transfer_attempt_id = Some("a".repeat(32));
+            if let Some(tmpdir) = legacy_tmpdir {
+                terminal.env.insert("TMPDIR".into(), tmpdir.into());
+            }
+            let original = context.terminal.clone().unwrap();
+            let resume = exact_resume_candidate(&context, None).unwrap().unwrap();
+            let baseline = resume.opencode_adoption_baseline.clone().unwrap();
+            let launch =
+                freshell_agent_runtime::prepare_terminal_for_resume(&original, &resume).unwrap();
+            assert_native_temp_directory(&launch);
+            assert_eq!(context.terminal, Some(original.clone()));
+
+            // A persisted legacy candidate must be upgraded on Retry as well,
+            // even after the transient transfer descriptor has been cleared.
+            let mut saved = resume.clone();
+            saved.environment.remove("TMPDIR");
+            if let Some(tmpdir) = legacy_tmpdir {
+                saved.environment.insert("TMPDIR".into(), tmpdir.into());
+            }
+            context.resume_spec = Some(saved.clone());
+            context.recovery_state = RecoveryState::Blocked;
+            context.opencode_adoption_baseline = None;
+            let terminal = context.terminal.as_mut().unwrap();
+            terminal.opencode_transfer = None;
+            terminal.opencode_transfer_attempt_id = None;
+            context.evidence_revision += 1;
+
+            let retry = exact_resume_candidate(&context, None).unwrap().unwrap();
+            let launch = freshell_agent_runtime::prepare_terminal_for_resume(
+                context.terminal.as_ref().unwrap(),
+                &retry,
+            )
+            .unwrap();
+            assert_native_temp_directory(&launch);
+            assert_eq!(retry.opencode_adoption_baseline, Some(baseline));
+            assert_eq!(retry.provider_session, resume.provider_session);
+            assert_eq!(retry.evidence_revision, context.evidence_revision);
+            assert_eq!(context.resume_spec, Some(saved));
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_native_temp_directory(launch: &TerminalLaunchSpec) {
+        // Run the child process's native temporary-directory resolver with the
+        // actual resume adapter environment, without ambient host fallbacks.
+        let child = std::process::Command::new("node")
+            .args(["-e", "process.stdout.write(require('node:os').tmpdir())"])
+            .env_clear()
+            .envs(&launch.env)
+            .output()
+            .expect("run the native temporary-directory resolver");
+        assert!(child.status.success());
+        let selected = String::from_utf8(child.stdout).unwrap();
+        println!("OpenCode native temporary directory: {selected}");
+        assert_eq!(
+            selected, "/run/opencode-tmp",
+            "OpenCode must load its native render library from the dedicated executable tmpfs"
         );
     }
 
