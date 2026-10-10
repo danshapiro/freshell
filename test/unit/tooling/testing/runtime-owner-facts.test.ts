@@ -2902,7 +2902,7 @@ finally:c.close()
 })
 
 describe('current retained fixture native root binding', () => {
-  async function fixture(options: { complete?: boolean; legacy?: boolean; fault?: string; tuiFormat?: 'json' | 'jsonc' } = {}) {
+  async function fixture(options: { complete?: boolean; legacy?: boolean; fault?: string; tuiFormat?: 'json' | 'jsonc'; observationRevision?: number } = {}) {
     const h = new owner.RuntimeHarness(fixtureRepoRoot, undefined, 3)
     await fsp.mkdir(h.testRoot, { recursive: true, mode: 0o700 })
     const control = path.join(h.testRoot, 'control')
@@ -2949,7 +2949,7 @@ describe('current retained fixture native root binding', () => {
     const oldContainer = 'a'.repeat(64), replacement = 'b'.repeat(64)
     const incarnation = 'incarnation-current-unit'
     const observation = { nativeSessionId: nativeRoot, incarnationId: incarnation, launchNonce: 'launch-current-unit',
-      evidenceRevision: 0, source: 'opencode_tui', evidenceDigest: 'd'.repeat(64) }
+      evidenceRevision: options.observationRevision ?? 0, source: 'opencode_tui', evidenceDigest: 'd'.repeat(64) }
     const launch = async (body: any) => {
       workspace = body.params.terminal.cwd
       entered()
@@ -2963,7 +2963,8 @@ describe('current retained fixture native root binding', () => {
       if (!options.complete) throw new Error(`observed fresh root ${nativeRoot}`)
       view = { soulId: body.params.soulId, incarnationId: incarnation, nativeSessionId: nativeRoot,
         containerId: oldContainer, hostBootId: 'boot-current-unit', provider: 'opencode', launchState: 'running',
-        evidenceRevision: 0, nativeIdentityObservation: observation }
+        // First native identity recording advances the soul, not the launch observation.
+        evidenceRevision: options.legacy ? 0 : observation.evidenceRevision + 1, nativeIdentityObservation: observation }
       const result: Record<string, any> = { ...view, nativeIdentityObservation: { ...observation } }
       if (options.legacy) { result.nativeSessionId = 'ses_task002syntheticroot'; delete result.nativeIdentityObservation }
       if (options.fault === 'missing-root') delete result.nativeSessionId
@@ -2975,6 +2976,10 @@ describe('current retained fixture native root binding', () => {
       if (options.fault === 'wrong-observation-incarnation') result.nativeIdentityObservation.incarnationId = 'incarnation-foreign'
       if (options.fault === 'stale-incarnation') view.incarnationId = 'incarnation-newer'
       if (options.fault === 'wrong-current-observation') view.nativeIdentityObservation = { ...observation, nativeSessionId: 'ses_foreign' }
+      if (options.fault === 'stale-launch-soul-revision') result.evidenceRevision = observation.evidenceRevision
+      if (options.fault === 'stale-current-soul-revision') view.evidenceRevision = observation.evidenceRevision
+      if (options.fault === 'wrong-launch-observation-revision') result.nativeIdentityObservation.evidenceRevision++
+      if (options.fault === 'wrong-current-observation-revision') view.nativeIdentityObservation = { ...observation, evidenceRevision: observation.evidenceRevision - 1 }
       return { kind: 'launch', data: { view: result, hostBootId: 'boot-current-unit' } }
     }
     vi.spyOn(h, 'adminOk').mockImplementation(async (_supervisor, body) => {
@@ -3099,9 +3104,11 @@ sqlite3.connect=lambda *args,**kwargs:connect(${JSON.stringify(dbFile)})
     } finally { f.release(); await settled; await f.close(); vi.unstubAllEnvs() }
   })
 
-  it.each(['json', 'jsonc'] as const)('binds the observed current root through seeding/public context and actual retained SQL probes (%s)', async tuiFormat => {
+  it.each([{ tuiFormat: 'json', observationRevision: 0 }, { tuiFormat: 'jsonc', observationRevision: 0 },
+    { tuiFormat: 'json', observationRevision: 7 }, { tuiFormat: 'jsonc', observationRevision: 7 }] as const)
+    ('binds the observed current root through seeding/public context and actual retained SQL probes ($tuiFormat, observation revision $observationRevision)', async ({ tuiFormat, observationRevision }) => {
     vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
-    const f = await fixture({ complete: true, tuiFormat })
+    const f = await fixture({ complete: true, tuiFormat, observationRevision })
     const contexts: retained.Task2RetainedPublicContext[] = []
     const operation = f.run({ observe: async (context, phase) => {
       contexts.push(retained.task2RetainedPublicContext(context))
@@ -3126,10 +3133,11 @@ sqlite3.connect=lambda *args,**kwargs:connect(${JSON.stringify(dbFile)})
   })
 
   it.each(['missing-root', 'empty-root', 'invalid-root', 'placeholder-root', 'wrong-soul',
-    'wrong-observation-root', 'wrong-observation-incarnation', 'stale-incarnation', 'wrong-current-observation'])
+    'wrong-observation-root', 'wrong-observation-incarnation', 'stale-incarnation', 'wrong-current-observation',
+    'stale-launch-soul-revision', 'stale-current-soul-revision', 'wrong-launch-observation-revision', 'wrong-current-observation-revision'])
     ('refuses %s before any provider seed/config/store mutation', async fault => {
       vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
-      const f = await fixture({ complete: true, fault })
+      const f = await fixture({ complete: true, fault, observationRevision: 7 })
       const operation = f.run(), settled = operation.catch(error => error as Error)
       try {
         await f.launchEntered; f.release()

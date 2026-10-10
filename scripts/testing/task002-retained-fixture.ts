@@ -283,17 +283,21 @@ async function observedRetainedRoot(h: RuntimeHarness, supervisor: SupervisorIns
       launchNonce: z.string().min(1), evidenceRevision: z.number().int().nonnegative(),
       source: z.literal('opencode_tui'), evidenceDigest: z.string().regex(/^[a-f0-9]{64}$/) }),
   }).refine(view => view.nativeIdentityObservation.nativeSessionId === view.nativeSessionId
-    && view.nativeIdentityObservation.incarnationId === view.incarnationId
-    && view.nativeIdentityObservation.evidenceRevision === view.evidenceRevision)
+    && view.nativeIdentityObservation.incarnationId === view.incarnationId)
   const parsed = schema.safeParse(launch?.view)
   if (!parsed.success) return refuse('launch_binding_mismatch')
   const view = parsed.data, observation = view.nativeIdentityObservation
-  const current = (await inventory(h, supervisor)).filter(row => row.soulId === soulId)
-  if (current.length !== 1 || !schema.safeParse(current[0]).success
-    || current[0].incarnationId !== view.incarnationId || current[0].containerId !== view.containerId
-    || current[0].nativeSessionId !== view.nativeSessionId || current[0].evidenceRevision !== view.evidenceRevision
-    || current[0].nativeIdentityObservation.launchNonce !== observation.launchNonce
-    || current[0].nativeIdentityObservation.evidenceDigest !== observation.evidenceDigest) {
+  const currentRows = (await inventory(h, supervisor)).filter(row => row.soulId === soulId)
+  const current = schema.safeParse(currentRows[0])
+  if (currentRows.length !== 1 || !current.success) return refuse('current_incarnation_mismatch')
+  const currentView = current.data, currentObservation = currentView.nativeIdentityObservation
+  // First identity recording advances the soul revision; the observation keeps
+  // its launch revision. Correlate each domain against the current inventory.
+  if (currentView.incarnationId !== view.incarnationId || currentView.containerId !== view.containerId
+    || currentView.nativeSessionId !== view.nativeSessionId || currentView.evidenceRevision !== view.evidenceRevision
+    || currentObservation.evidenceRevision !== observation.evidenceRevision
+    || currentObservation.launchNonce !== observation.launchNonce
+    || currentObservation.evidenceDigest !== observation.evidenceDigest) {
     return refuse('current_incarnation_mismatch')
   }
   h.recordLifecycle('task2.retained_native_root.bound', { severity: 'info', soulId,
