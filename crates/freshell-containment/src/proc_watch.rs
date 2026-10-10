@@ -5,9 +5,18 @@
 //! different process the pidfd never names), it becomes readable exactly when
 //! the process exits (zombies count), and `pidfd_send_signal` through it can
 //! never reach a recycled pid. No polling anywhere: `exited` waits on the
-//! pidfd's readiness in the tokio reactor. Windows and macOS bodies land in
-//! later tasks behind the same API (until then `open` answers
-//! `ErrorKind::Unsupported`).
+//! pidfd's readiness in the tokio reactor.
+//!
+//! Windows uses a process handle: Windows never reuses a pid while a handle
+//! to its process is open, the handle is signalled exactly when the process
+//! exits, and `TerminateProcess` through it reaches only that process.
+//! `exited` registers one thread-pool wait on the handle
+//! (`RegisterWaitForSingleObject`), so nothing polls and no thread is held
+//! per watch. Only `Sig::Kill` exists there (`TerminateProcess`); the soft
+//! signals answer `ErrorKind::Unsupported`.
+//!
+//! The macOS body lands in a later task behind the same API (until then
+//! `open` answers `ErrorKind::Unsupported`).
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,6 +46,17 @@ struct Inner {
     /// is returned to that caller and never cached.
     #[cfg(target_os = "linux")]
     registered: tokio::sync::OnceCell<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>,
+    /// The process handle that pins this incarnation.
+    #[cfg(windows)]
+    handle: std::os::windows::io::OwnedHandle,
+    /// Set to `true` by the thread-pool wait when the handle is signalled.
+    #[cfg(windows)]
+    exit_tx: tokio::sync::watch::Sender<bool>,
+    /// The thread-pool wait, registered by the first `exited` await and
+    /// unregistered (waiting for a running callback) before the rest of
+    /// `Inner` drops. A failed registration is returned and never cached.
+    #[cfg(windows)]
+    wait: std::sync::Mutex<Option<WaitRegistration>>,
 }
 
 impl std::fmt::Debug for ProcWatch {
@@ -231,7 +251,184 @@ fn pidfd_readable(fd: &std::os::fd::OwnedFd) -> bool {
     ready > 0 && (pfd.revents & libc::POLLIN) != 0
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+impl ProcWatch {
+    fn open_inner(pid: u32, expect_start: Option<u64>) -> io::Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Threading::{
+            PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        };
+        let handle = crate::process::open_process(
+            pid,
+            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+        )?;
+        // Read from the handle itself, which pins the incarnation.
+        let start = crate::process::start_time_of(handle.as_raw_handle())
+            .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "process gone"))?;
+        if expect_start.is_some_and(|s| s != start) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "different incarnation",
+            ));
+        }
+        let identity = ProcIdentity {
+            pid,
+            start,
+            name: crate::process::name(pid).unwrap_or_default(),
+        };
+        Ok(Self {
+            inner: Arc::new(Inner {
+                identity,
+                exited: AtomicBool::new(false),
+                handle,
+                exit_tx: tokio::sync::watch::channel(false).0,
+                wait: std::sync::Mutex::new(None),
+            }),
+        })
+    }
+
+    /// Non-blocking: has the process exited?
+    pub fn has_exited(&self) -> bool {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        if self.inner.exited.load(Ordering::SeqCst) {
+            return true;
+        }
+        // SAFETY: a live handle with SYNCHRONIZE; zero timeout.
+        let signalled =
+            unsafe { WaitForSingleObject(self.inner.handle.as_raw_handle(), 0) } == WAIT_OBJECT_0;
+        if signalled {
+            self.inner.exited.store(true, Ordering::SeqCst);
+        }
+        signalled
+    }
+
+    /// Resolves when the process exits: one thread-pool wait on the process
+    /// handle, registered by the first call and shared by every later one.
+    /// A wait that cannot be registered answers `Err`, and a later call
+    /// tries again. Needs no particular runtime.
+    pub async fn exited(&self) -> io::Result<()> {
+        if self.has_exited() {
+            return Ok(());
+        }
+        let mut rx = self.inner.exit_tx.subscribe();
+        self.register_wait()?;
+        // The sender lives in `Inner`, which `self` keeps alive.
+        let _ = rx.wait_for(|exited| *exited).await;
+        self.inner.exited.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn register_wait(&self) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Threading::{
+            RegisterWaitForSingleObject, INFINITE, WT_EXECUTEONLYONCE,
+        };
+        let mut slot = self
+            .inner
+            .wait
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_some() {
+            return Ok(());
+        }
+        let mut wait: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+        let context: *const tokio::sync::watch::Sender<bool> = &self.inner.exit_tx;
+        // SAFETY: `context` points into `Inner`, which outlives the wait:
+        // `Inner`'s drop unregisters it (waiting for a running callback)
+        // before the sender is dropped.
+        let ok = unsafe {
+            RegisterWaitForSingleObject(
+                &mut wait,
+                self.inner.handle.as_raw_handle(),
+                Some(on_process_exit),
+                context.cast(),
+                INFINITE,
+                WT_EXECUTEONLYONCE,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        *slot = Some(WaitRegistration(wait));
+        Ok(())
+    }
+
+    /// End THIS incarnation: `Sig::Kill` is `TerminateProcess` (an
+    /// already-exited process is Ok(())); the soft signals do not exist for
+    /// a Windows process and answer `ErrorKind::Unsupported`.
+    pub fn signal(&self, sig: Sig) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Threading::TerminateProcess;
+        match sig {
+            Sig::Kill => {
+                // SAFETY: a live handle with PROCESS_TERMINATE.
+                if unsafe { TerminateProcess(self.inner.handle.as_raw_handle(), 1) } != 0 {
+                    return Ok(());
+                }
+                let err = io::Error::last_os_error();
+                // Terminating a process that already exited is refused.
+                if self.has_exited() {
+                    Ok(())
+                } else {
+                    Err(err)
+                }
+            }
+            Sig::Interrupt | Sig::Terminate => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Windows processes take no soft signal",
+            )),
+        }
+    }
+}
+
+/// One registered thread-pool wait; unregistering waits for a callback
+/// that is already running.
+#[cfg(windows)]
+struct WaitRegistration(windows_sys::Win32::Foundation::HANDLE);
+
+// SAFETY: a wait handle is a plain kernel handle, usable from any thread.
+#[cfg(windows)]
+unsafe impl Send for WaitRegistration {}
+
+#[cfg(windows)]
+impl Drop for WaitRegistration {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Threading::UnregisterWaitEx;
+        // SAFETY: our registration, unregistered once; INVALID_HANDLE_VALUE
+        // waits for a callback in progress to finish.
+        unsafe { UnregisterWaitEx(self.0, INVALID_HANDLE_VALUE) };
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // Before `exit_tx` (the callback's context) is dropped.
+        drop(
+            self.wait
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+    }
+}
+
+/// The thread-pool callback: the process handle is signalled.
+#[cfg(windows)]
+unsafe extern "system" fn on_process_exit(
+    context: *mut std::ffi::c_void,
+    _timed_out: windows_sys::Win32::Foundation::BOOLEAN,
+) {
+    // SAFETY: `context` is the `exit_tx` of a live `Inner` (see
+    // `register_wait`).
+    let tx = unsafe { &*context.cast::<tokio::sync::watch::Sender<bool>>() };
+    tx.send_replace(true);
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 impl ProcWatch {
     fn open_inner(_pid: u32, _expect_start: Option<u64>) -> io::Result<Self> {
         Err(io::Error::new(

@@ -2,6 +2,14 @@
 //! through: `[options] -- <command> [args...]`.
 //!
 //! Options (before `--`):
+//! - `--job <name>` (Windows): first register a console control handler
+//!   that keeps the shim alive through Ctrl-C and Ctrl-Break (the command
+//!   still gets them), then put THIS process into the named unit job, before
+//!   anything is started, so the command and everything it starts inherit
+//!   the job (the Windows backend's race-free placement). Exit 3 when the
+//!   job cannot be opened, 4 when the shim cannot join it, 5 when the
+//!   handler cannot be registered; nothing is started then. Other OSes
+//!   ignore it.
 //! - `--reaper` (Linux): run the command under the child-subreaper shim
 //!   (`crate::reaper`), the Linux fallback backend's member root. Other OSes
 //!   ignore it (no backend there places with it).
@@ -28,11 +36,20 @@ const START_FAILED_EXIT: i32 = 127;
 struct Options {
     reaper: bool,
     nofile_soft: Option<u64>,
+    job: Option<OsString>,
 }
 
 fn parse_options(options: &[OsString]) -> Options {
     let mut parsed = Options::default();
-    for option in options.iter().filter_map(|o| o.to_str()) {
+    let mut it = options.iter();
+    while let Some(raw) = it.next() {
+        if raw == "--job" {
+            parsed.job = it.next().cloned();
+            continue;
+        }
+        let Some(option) = raw.to_str() else {
+            continue;
+        };
         if option == "--reaper" {
             parsed.reaper = true;
         } else if let Some(n) = option.strip_prefix("--nofile-soft=") {
@@ -62,6 +79,12 @@ pub fn unit_exec_main(args: Vec<OsString>) -> i32 {
     if let Some(soft) = options.nofile_soft {
         lower_nofile_soft_limit(soft);
     }
+    #[cfg(windows)]
+    if let Err(code) = windows::prepare(options.job.as_deref()) {
+        return code;
+    }
+    #[cfg(not(windows))]
+    let _ = options.job; // only the Windows backend places with a job
     #[cfg(target_os = "linux")]
     if options.reaper {
         return crate::reaper::run(program, rest);
@@ -114,6 +137,81 @@ fn lower_nofile_soft_limit(soft: u64) {
 #[cfg(not(target_os = "linux"))]
 fn lower_nofile_soft_limit(_soft: u64) {}
 
+/// Windows: the console control handler and the job self-assignment.
+#[cfg(windows)]
+mod windows {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, BOOL, FALSE, TRUE};
+    use windows_sys::Win32::System::Console::{
+        SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT,
+    };
+    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, OpenJobObjectW};
+    use windows_sys::Win32::System::SystemServices::JOB_OBJECT_ASSIGN_PROCESS;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    /// The job named by `--job` cannot be opened.
+    const JOB_OPEN_FAILED_EXIT: i32 = 3;
+    /// The shim cannot join the job.
+    const JOB_ASSIGN_FAILED_EXIT: i32 = 4;
+    /// The console control handler cannot be registered.
+    const HANDLER_FAILED_EXIT: i32 = 5;
+
+    /// Ctrl-C and Ctrl-Break reach every process attached to the console;
+    /// the default handler would end the shim (`ExitProcess`) while the
+    /// command runs on, so the shim handles both and stays. Other events
+    /// (console close, logoff, shutdown) go to the default handler.
+    unsafe extern "system" fn keep_running(ctrl_type: u32) -> BOOL {
+        if ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT {
+            TRUE
+        } else {
+            FALSE
+        }
+    }
+
+    /// Registers the handler (never `SetConsoleCtrlHandler(NULL, TRUE)`:
+    /// that "ignore Ctrl-C" attribute is inherited and would disable Ctrl-C
+    /// in the command), then joins `job` when one is named.
+    pub(super) fn prepare(job: Option<&OsStr>) -> Result<(), i32> {
+        // SAFETY: registers a handler routine that lives for the process.
+        if unsafe { SetConsoleCtrlHandler(Some(keep_running), TRUE) } == 0 {
+            eprintln!(
+                "freshell-unit-exec: cannot register the console control handler: {}",
+                std::io::Error::last_os_error()
+            );
+            return Err(HANDLER_FAILED_EXIT);
+        }
+        let Some(name) = job else {
+            return Ok(());
+        };
+        let wide: Vec<u16> = name.encode_wide().chain(std::iter::once(0)).collect();
+        // SAFETY: a NUL-terminated name; the handle is checked and closed.
+        let handle = unsafe { OpenJobObjectW(JOB_OBJECT_ASSIGN_PROCESS, FALSE, wide.as_ptr()) };
+        if handle.is_null() {
+            eprintln!(
+                "freshell-unit-exec: cannot open job {}: {}",
+                name.to_string_lossy(),
+                std::io::Error::last_os_error()
+            );
+            return Err(JOB_OPEN_FAILED_EXIT);
+        }
+        // SAFETY: a live job handle and this process's pseudo-handle.
+        let joined = unsafe { AssignProcessToJobObject(handle, GetCurrentProcess()) } != 0;
+        let err = std::io::Error::last_os_error();
+        // SAFETY: the handle is ours and closed once.
+        unsafe { CloseHandle(handle) };
+        if !joined {
+            eprintln!(
+                "freshell-unit-exec: cannot join job {}: {err}",
+                name.to_string_lossy()
+            );
+            return Err(JOB_ASSIGN_FAILED_EXIT);
+        }
+        Ok(())
+    }
+}
+
 fn exit_code(status: ExitStatus) -> i32 {
     if let Some(code) = status.code() {
         return code;
@@ -142,7 +240,16 @@ mod tests {
             parse_options(&args(&["--reaper", "--nofile-soft=1024", "--other"])),
             Options {
                 reaper: true,
-                nofile_soft: Some(1024)
+                nofile_soft: Some(1024),
+                job: None,
+            }
+        );
+        assert_eq!(
+            parse_options(&args(&["--job", "Local\\freshell-unit-u1", "--reaper"])),
+            Options {
+                reaper: true,
+                nofile_soft: None,
+                job: Some("Local\\freshell-unit-u1".into()),
             }
         );
         assert_eq!(

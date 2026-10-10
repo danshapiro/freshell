@@ -775,8 +775,36 @@ fn runtime_ownership_for_ledger(
     }))
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    // `__unit-exec`: the per-member exec shim of agent-pane containment
+    // (Windows job self-placement, the Linux reaper). It runs before the
+    // tokio runtime exists: a shim lives as long as its pane, and the Linux
+    // reaper installs signal handlers and reaps with `waitpid(-1)`, so it
+    // must not carry a runtime's worker threads. It also runs before the
+    // server strips an inherited unit tag, so the tag its placement set
+    // reaches the command.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|a| a == "__unit-exec")
+    {
+        std::process::exit(freshell_containment::exec_shim::unit_exec_main(
+            std::env::args_os().skip(2).collect(),
+        ));
+    }
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("freshell-server: cannot start the async runtime: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> ExitCode {
     // Legacy parity: `import 'dotenv/config'` (`server/index.ts:2-3`) loads
     // `.env` from cwd before the module reads ANY process env — including the
     // AUTH_TOKEN check immediately below. A cwd we can't resolve, or a cwd with
