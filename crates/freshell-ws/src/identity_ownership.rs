@@ -834,6 +834,29 @@ pub(crate) fn broadcast_owner_frame(
     generation: u64,
     transition: &str,
 ) {
+    broadcast_terminal_owner_frame(
+        state,
+        provider,
+        session_id,
+        Some(terminal_id),
+        operation_id,
+        generation,
+        transition,
+    );
+}
+
+/// [`broadcast_owner_frame`] for an owner whose terminal may not be known
+/// yet (a unit stop that began before its start spawned a row): the frame
+/// then carries no `terminalId`.
+pub(crate) fn broadcast_terminal_owner_frame(
+    state: &WsState,
+    provider: &str,
+    session_id: &str,
+    terminal_id: Option<&str>,
+    operation_id: &str,
+    generation: u64,
+    transition: &str,
+) {
     let Some(ownership) = state.ownership.as_ref() else {
         return;
     };
@@ -845,7 +868,7 @@ pub(crate) fn broadcast_owner_frame(
             generation,
             owner_kind: "terminal".into(),
             previous_kind: None,
-            terminal_id: Some(terminal_id.to_string()),
+            terminal_id: terminal_id.map(str::to_string),
             operation_id: operation_id.to_string(),
             transition: transition.to_string(),
             reason: None,

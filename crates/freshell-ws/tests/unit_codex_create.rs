@@ -8,10 +8,11 @@
 #[path = "support/unit_harness.rs"]
 mod unit_harness;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::json;
-use unit_harness::{fake_codex, AutoResumeMode, HarnessOpts, UnitHarness};
+use unit_harness::{fake_codex, AutoResumeMode, GoneDelay, HarnessOpts, UnitHarness};
 
 const LIMIT: Duration = Duration::from_secs(15);
 
@@ -196,4 +197,177 @@ async fn the_start_settles_once_the_screen_is_placed() {
 
 fn unit_harness_placement_deadline() -> Duration {
     freshell_ws::unit_lifecycle::PLACEMENT_DEADLINE
+}
+
+fn is_vacant(h: &UnitHarness, session_id: &str) -> bool {
+    matches!(
+        h.state
+            .ownership
+            .as_ref()
+            .expect("an owner registry")
+            .observe("codex", session_id)
+            .state,
+        freshell_ownership::OwnershipState::Vacant
+    )
+}
+
+async fn eventually(what: &str, f: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + LIMIT;
+    while !f() {
+        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A restore-class Codex create plans its launch (its app-server resumes the
+/// conversation in the pane's unit) before it claims the conversation. When
+/// it then gives up early (here another create holds the conversation's
+/// sessionRef lease), the conversation is released only at that unit's
+/// Gone, never when the create answers (Task 12 review M1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_create_that_gives_up_early_releases_its_conversation_only_at_gone() {
+    let h = UnitHarness::start(HarnessOpts::default()).await;
+    let locator = freshell_protocol::SessionLocator {
+        provider: "codex".into(),
+        session_id: "t-early".into(),
+    };
+    assert!(matches!(
+        h.state
+            .registry
+            .claim_session_ref(&locator, "crq-other-holder", 0, 1_000),
+        freshell_terminal::registry::SessionRefClaim::Acquired
+    ));
+    // Gone is confirmed 1.5 s after the kill, so the release order shows.
+    let _gone_delay = GoneDelay::set(1500);
+    let mut ws = h.connect().await;
+    h.send(
+        &mut ws,
+        json!({
+            "type": "terminal.create",
+            "requestId": "crq-early",
+            "mode": "codex",
+            "shell": "system",
+            "cwd": h.home.path().display().to_string(),
+            "restore": true,
+            "sessionRef": { "provider": "codex", "sessionId": "t-early" },
+        }),
+    )
+    .await;
+    let answer = h
+        .next_matching(&mut ws, LIMIT, |f| {
+            f["requestId"] == "crq-early"
+                && (f["type"] == "terminal.created" || f["type"] == "error")
+        })
+        .await
+        .expect("an answer to the create");
+    assert_eq!(answer["type"], "error", "{answer}");
+    let natives = h.native_manifests();
+    assert_eq!(natives.len(), 1, "the restore planned its app-server first");
+    let entry = h
+        .state
+        .units
+        .all()
+        .into_iter()
+        .next()
+        .expect("the given-up start's entry lives until its unit is Gone");
+
+    // The create has returned and dropped its holds.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !is_vacant(&h, "t-early"),
+        "the conversation is not released before the unit's Gone"
+    );
+    entry
+        .unit
+        .stop_in_flight()
+        .expect("the given-up start stopped its unit")
+        .wait_for(LIMIT)
+        .await
+        .expect("the unit reaches Gone");
+    assert!(
+        !fake_codex::pid_alive(natives[0].pid),
+        "the app-server is dead"
+    );
+    eventually("the conversation is released at Gone", || {
+        is_vacant(&h, "t-early")
+    })
+    .await;
+    eventually("the entry is removed", || h.state.units.all().is_empty()).await;
+    h.state
+        .registry
+        .fail_session_ref_claim(&locator, "crq-other-holder");
+}
+
+/// An auto-resume whose replacement start is given up inside its unit (here
+/// the replacement's plan resumed the conversation in a new app-server, then
+/// it found no spawn permit in time) releases the conversation only at that
+/// unit's Gone, never when the hub settles the failure (Task 12 review M1,
+/// the respawn path).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_auto_resume_releases_its_conversation_only_at_its_units_gone() {
+    let gate = Arc::new(freshell_freshagent::spawn_gate::SpawnGate::new(1, 8));
+    let h = UnitHarness::start(HarnessOpts {
+        spawn_gate: Some((Arc::clone(&gate), Duration::from_secs(30))),
+        create_protect: freshell_ws::create_limit::CreateProtectConfig {
+            spawn_timeout_ms: 1500,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await;
+    let mut ws = h.connect().await;
+    let tid = h.create_codex(&mut ws, "crq-auto", Some("t-auto")).await;
+    h.next_matching(&mut ws, LIMIT, |f| {
+        f["type"] == "terminal.output"
+            && f["data"]
+                .as_str()
+                .is_some_and(|d| d.contains("FAKE_TUI_READY"))
+    })
+    .await
+    .expect("tui ready");
+    tokio::time::timeout(LIMIT, h.state.units.start_settled(h.unit_for(&tid).id()))
+        .await
+        .expect("the start settled");
+    // The replacement will find no spawn permit.
+    let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+    let held = gate
+        .acquire(Duration::from_secs(1), &mut cancel_rx)
+        .await
+        .expect("hold the only spawn permit");
+    let _gone_delay = GoneDelay::set(1500);
+
+    h.send(
+        &mut ws,
+        json!({"type": "terminal.input", "terminalId": tid, "data": "crash\r"}),
+    )
+    .await;
+    let settled = h
+        .next_matching(&mut ws, Duration::from_secs(30), |f| {
+            f["type"] == "terminal.status" && f["terminalId"] == tid && f["status"] == "exited"
+        })
+        .await
+        .expect("the hub settles the auto-resume");
+    assert_eq!(settled["reason"], "respawn_failed", "{settled}");
+    let natives = h.native_manifests();
+    assert_eq!(
+        natives.len(),
+        2,
+        "the replacement planned its own app-server"
+    );
+    assert!(
+        !is_vacant(&h, "t-auto"),
+        "the conversation is not released before the replacement's unit is Gone"
+    );
+    eventually("the conversation is released at Gone", || {
+        is_vacant(&h, "t-auto")
+    })
+    .await;
+    for native in &natives {
+        assert!(
+            !fake_codex::pid_alive(native.pid),
+            "every app-server is dead"
+        );
+    }
+    eventually("no unit entry is left", || h.state.units.all().is_empty()).await;
+    drop(held);
 }

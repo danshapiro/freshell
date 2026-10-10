@@ -4,7 +4,9 @@
 //! Built from `codex_managed_launch_e2e.rs::spawn_server`, with an enabled
 //! owner registry, the pane-unit services (units on the selected backend,
 //! records under `<home>/.freshell/units/`) and the unit lifecycle wired as
-//! `freshell-server` wires it. Shared by every ws unit test file via
+//! `freshell-server` wires it, including the REST lane (`/api/tabs`) over
+//! the same unit directory and containment (`FreshAgentState::with_units`,
+//! as `main.rs` builds it). Shared by every ws unit test file via
 //! `#[path = "support/unit_harness.rs"] mod unit_harness;`.
 #![allow(dead_code)]
 #[path = "../../../freshell-codex/tests/support/fake_codex.rs"]
@@ -36,6 +38,14 @@ pub struct HarnessOpts {
     pub behavior: serde_json::Value,
     pub containment: Option<freshell_containment::Containment>,
     pub auto_resume: AutoResumeMode,
+    /// The server-wide spawn gate both doors share (as at boot), and the
+    /// REST door's permit wait. Default: an ungated REST door.
+    pub spawn_gate: Option<(Arc<freshell_freshagent::spawn_gate::SpawnGate>, Duration)>,
+    /// The REST lane's Codex TUI command (its CLI spec's default command,
+    /// read instead of `CODEX_CMD`); the sidecar still runs `CODEX_CMD`.
+    pub rest_codex_tui_cmd: Option<String>,
+    /// The WebSocket doors' create protection (spawn permit wait included).
+    pub create_protect: freshell_ws::create_limit::CreateProtectConfig,
 }
 
 impl Default for HarnessOpts {
@@ -44,12 +54,17 @@ impl Default for HarnessOpts {
             behavior: json!({}),
             containment: None,
             auto_resume: AutoResumeMode::Hub,
+            spawn_gate: None,
+            rest_codex_tui_cmd: None,
+            create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
         }
     }
 }
 
 pub struct UnitHarness {
     pub url: String,
+    /// `http://<addr>` of the same server (the REST lane).
+    pub base_url: String,
     pub state: freshell_ws::WsState,
     pub codex_home: PathBuf,
     pub manifests: PathBuf,
@@ -133,17 +148,6 @@ fn test_settings_value() -> serde_json::Value {
         },
         "terminal": { "scrollback": 10000 }
     })
-}
-
-/// The systemd namespace slice of a state root (`freshell-n<ns>.slice`: the
-/// first 8 bytes of the SHA-256 of the canonical root, in hex). Implicit
-/// slices are never collected, so the harness stops its own.
-fn namespace_slice(root: &Path) -> String {
-    use sha2::{Digest, Sha256};
-    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
-    let ns: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
-    format!("freshell-n{ns}.slice")
 }
 
 impl UnitHarness {
@@ -233,8 +237,12 @@ impl UnitHarness {
             allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: freshell_ws::backpressure::Term09Config::default(),
-            create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
-            spawn_gate: Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
+            create_protect: opts.create_protect,
+            spawn_gate: opts
+                .spawn_gate
+                .as_ref()
+                .map(|(gate, _)| Arc::clone(gate))
+                .unwrap_or_else(|| Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64))),
             shutdown_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             create_dedupe: Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
             config_fallback: None,
@@ -251,21 +259,33 @@ impl UnitHarness {
                 containment,
             },
         };
-        // As `freshell-server` wires them (Stage 2: LB-01, LB-25).
-        registry.set_unit_screen_exit_hook(freshell_ws::unit_lifecycle::screen_exit_hook(
-            state.clone(),
-            tokio::runtime::Handle::current(),
-        ));
-        registry.set_unit_kill_hook(freshell_ws::unit_lifecycle::kill_hook(
-            state.clone(),
-            tokio::runtime::Handle::current(),
-        ));
-        state
-            .units
-            .set_lifecycle(freshell_ws::unit_lifecycle::lifecycle(
-                state.clone(),
-                tokio::runtime::Handle::current(),
-            ));
+        // As `freshell-server` wires it (Stage 2: LB-01, LB-25).
+        freshell_ws::unit_lifecycle::wire(&state, &tokio::runtime::Handle::current());
+
+        // The REST lane over the same registry, owner registry and units
+        // (`main.rs`'s `with_units(..)`).
+        let rest_codex_spec = match opts.rest_codex_tui_cmd.as_deref() {
+            Some(cmd) => freshell_platform::CliCommandSpec {
+                env_var: None,
+                default_cmd: cmd.to_string(),
+                ..codex_cli_spec()
+            },
+            None => codex_cli_spec(),
+        };
+        let fresh_agent_state = freshell_freshagent::FreshAgentState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+        )
+        .with_terminal_registry(registry.clone())
+        .with_ownership(state.ownership.clone().expect("an owner registry"))
+        .with_cli_commands(Arc::new(vec![rest_codex_spec]))
+        .with_units(
+            state.units.directory.clone(),
+            state.units.containment.clone(),
+        );
+        if let Some((gate, timeout)) = opts.spawn_gate.as_ref() {
+            fresh_agent_state.set_spawn_gate(Arc::clone(gate), *timeout);
+        }
 
         // The managed launches' proxy events (identity adoption) reach this
         // state's router, as at boot.
@@ -286,7 +306,24 @@ impl UnitHarness {
             AutoResumeMode::Capture => Some(auto_resume_rx),
         };
 
-        let router = freshell_ws::router(state.clone());
+        // The session handoff (`POST /api/sessions/handoff`), as `main.rs`
+        // builds it over the same states.
+        let handoff_runner = Arc::new(freshell_freshagent::SessionHandoffRunner::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            state.ownership.clone().expect("an owner registry"),
+            registry.clone(),
+            state.fresh_codex.clone(),
+            state.fresh_claude.clone(),
+            state.fresh_opencode.clone(),
+            fresh_agent_state.clone(),
+            Arc::clone(&state.cli_commands),
+        ));
+        let router = freshell_ws::router(state.clone())
+            .merge(freshell_freshagent::router(fresh_agent_state))
+            .merge(freshell_freshagent::session_handoff::handoff_router(
+                handoff_runner,
+            ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral loopback port");
@@ -297,6 +334,7 @@ impl UnitHarness {
 
         Self {
             url: format!("ws://{addr}/ws"),
+            base_url: format!("http://{addr}"),
             state,
             codex_home,
             manifests,
@@ -420,6 +458,102 @@ impl UnitHarness {
         }
     }
 
+    /// POSTs `body` to the REST lane; returns the status and the JSON body
+    /// (`Null` when it is not JSON). A hand-rolled HTTP/1.1 request (this
+    /// crate has no HTTP client), as `rest_ws_shared_gate.rs` does.
+    pub async fn post(&self, path: &str, body: serde_json::Value) -> (u16, serde_json::Value) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let host = self
+            .base_url
+            .strip_prefix("http://")
+            .expect("base_url is http://{addr}");
+        let body = body.to_string();
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {host}\r\nx-auth-token: {AUTH_TOKEN}\r\n\
+             Content-Type: application/json\r\nContent-Length: {len}\r\n\
+             Connection: close\r\n\r\n{body}",
+            len = body.len(),
+        );
+        let mut stream = tokio::net::TcpStream::connect(host)
+            .await
+            .expect("connect to the harness");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write the request");
+        let mut raw = Vec::new();
+        tokio::time::timeout(Duration::from_secs(60), stream.read_to_end(&mut raw))
+            .await
+            .expect("an HTTP response within 60 s")
+            .expect("read the response");
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        let (head, body) = text
+            .split_once("\r\n\r\n")
+            .expect("an HTTP header/body separator");
+        let status = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .expect("an HTTP status code");
+        (
+            status,
+            serde_json::from_str(body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// Creates a Codex pane through the REST lane (`POST /api/tabs`; a
+    /// restore of `resume` when given); returns the status and body.
+    pub async fn rest_create_codex(&self, resume: Option<&str>) -> (u16, serde_json::Value) {
+        let mut body = json!({
+            "mode": "codex",
+            "cwd": self.home.path().display().to_string(),
+        });
+        if let Some(session_id) = resume {
+            body["sessionRef"] = json!({ "provider": "codex", "sessionId": session_id });
+        }
+        self.post("/api/tabs", body).await
+    }
+
+    /// Attaches `ws` to `terminal_id` (so its output and `terminal.exit`
+    /// reach the socket).
+    pub async fn attach(&self, ws: &mut TestWs, terminal_id: &str) {
+        let attach_request_id = format!("attach-{terminal_id}");
+        self.send(
+            ws,
+            json!({
+                "type": "terminal.attach",
+                "terminalId": terminal_id,
+                "intent": "viewport_hydrate",
+                "cols": 120,
+                "rows": 30,
+                "attachRequestId": attach_request_id,
+            }),
+        )
+        .await;
+        self.next_matching(ws, FRAME_LIMIT, |f| {
+            f["type"] == "terminal.attach.ready" && f["attachRequestId"] == attach_request_id
+        })
+        .await
+        .expect("attached");
+    }
+
+    /// Every native app-server manifest the fake wrote.
+    pub fn native_manifests(&self) -> Vec<fake_codex::NativeManifest> {
+        std::fs::read_dir(&self.manifests)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("native-") && name.ends_with(".json"))
+            })
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .filter_map(|raw| serde_json::from_str(&raw).ok())
+            .collect()
+    }
+
     pub fn unit_for(&self, terminal_id: &str) -> freshell_containment::AgentUnit {
         self.state
             .units
@@ -473,12 +607,28 @@ impl Drop for UnitHarness {
             }
         }
         if let Some(root) = self.state_root.as_deref() {
-            let _ = std::process::Command::new("systemctl")
-                .args(["--user", "stop", &namespace_slice(root)])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+            freshell_containment::testing::stop_namespace_slice(root);
         }
+    }
+}
+
+/// Holds Gone confirmation for `ms` after every unit kill in this process
+/// (the containment's test hook) while alive, so a test can see what is
+/// published before Gone. Tests that use a harness run one at a time (the
+/// harness holds its environment lock); create this after the harness.
+pub struct GoneDelay;
+
+impl GoneDelay {
+    pub fn set(ms: u64) -> Self {
+        std::env::set_var("FRESHELL_TEST_HOOKS", "1");
+        std::env::set_var("FRESHELL_TEST_UNIT_GONE_DELAY_MS", ms.to_string());
+        GoneDelay
+    }
+}
+
+impl Drop for GoneDelay {
+    fn drop(&mut self) {
+        std::env::remove_var("FRESHELL_TEST_UNIT_GONE_DELAY_MS");
+        std::env::remove_var("FRESHELL_TEST_HOOKS");
     }
 }

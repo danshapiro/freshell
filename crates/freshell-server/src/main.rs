@@ -2393,23 +2393,11 @@ async fn async_main() -> ExitCode {
 
     // The pane-unit lifecycle (Task 12), installed before any connection or
     // REST request can create a pane: a unit row's unrequested screen exit
-    // goes to the lifecycle (never published as an ordinary exit), and every
-    // stop — including those of REST-created panes and of the Codex seed —
-    // runs through `stop_terminal_unit`.
-    registry.set_unit_screen_exit_hook(freshell_ws::unit_lifecycle::screen_exit_hook(
-        ws_state.clone(),
-        tokio::runtime::Handle::current(),
-    ));
-    registry.set_unit_kill_hook(freshell_ws::unit_lifecycle::kill_hook(
-        ws_state.clone(),
-        tokio::runtime::Handle::current(),
-    ));
-    ws_state
-        .units
-        .set_lifecycle(freshell_ws::unit_lifecycle::lifecycle(
-            ws_state.clone(),
-            tokio::runtime::Handle::current(),
-        ));
+    // goes to the lifecycle (never published as an ordinary exit), a unit
+    // row's screen is pinned by pid and start time, and every stop —
+    // including those of REST-created panes and of the Codex seed — runs
+    // through `stop_terminal_unit`.
+    freshell_ws::unit_lifecycle::wire(&ws_state, &tokio::runtime::Handle::current());
 
     // Lane D1 (Task 5): the auto-resume hub — consumes the crash events the
     // PTY exit hook sends and drives bounded respawns. A boot-time background

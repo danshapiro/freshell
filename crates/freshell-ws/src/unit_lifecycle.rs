@@ -25,8 +25,9 @@ use std::time::Duration;
 use freshell_codex::launch_plan::{CodexUnitServices, DirectoryUnitLifecycle, UnitSeed};
 use freshell_containment::events::{self, UnitLogKeys};
 use freshell_containment::{
-    AgentUnit, Containment, ProcWatch, Sig, StopHandle, StopMode, StopReason, StopReport,
-    StopRequest, UnitDirectory, UnitEntry, UnitId, UnitLabel, UnitLifecycle, UNCONFIRMED_AFTER,
+    AbandonedStart, AgentUnit, Containment, ProcWatch, Sig, StopHandle, StopMode, StopReason,
+    StopReport, StopRequest, UnitDirectory, UnitEntry, UnitId, UnitLabel, UnitLifecycle,
+    UNCONFIRMED_AFTER,
 };
 use freshell_terminal::{UnitEnding, UnitScreenExit};
 use tokio::sync::watch;
@@ -75,6 +76,12 @@ fn now_ms() -> u64 {
 /// `StopReason::AgentExited`'s report reason: a stop that stayed an agent
 /// exit (no user kill took it over).
 const AGENT_EXITED: &str = "agent-exited";
+
+/// Whether a stop report's reason is a user's kill (Shift-X or a kill
+/// command).
+fn is_user_kill(reason: &str) -> bool {
+    reason == StopReason::ShiftX.as_str() || reason == StopReason::KillCommand.as_str()
+}
 
 fn fresh_operation(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4())
@@ -174,11 +181,12 @@ pub fn stop_terminal_unit(state: &WsState, entry: &UnitEntry, cmd: UnitStopComma
     if let Some(ownership) = state.ownership.as_ref() {
         let moved = ownership.begin_unit_stop(&unit_id, &operation_id, &cmd.initiator, now_ms());
         for key in moved.iter().filter(|key| !key.joined) {
-            crate::identity_ownership::broadcast_owner_frame(
+            // A start whose terminal is not known yet names none.
+            crate::identity_ownership::broadcast_terminal_owner_frame(
                 state,
                 &key.key.provider,
                 &key.key.session_id,
-                terminal_id.as_deref().unwrap_or(""),
+                terminal_id.as_deref(),
                 &operation_id,
                 key.generation,
                 "stopping",
@@ -262,10 +270,17 @@ pub(crate) async fn publish_gone(
         .get(&unit_id)
         .and_then(|e| e.terminal_id)
         .or_else(|| entry.terminal_id.clone());
-    let ending = terminal_id
+    let ending = match terminal_id
         .as_deref()
         .and_then(|tid| state.registry.ending(tid))
-        .unwrap_or_else(|| cmd.ending());
+        .unwrap_or_else(|| cmd.ending())
+    {
+        // A user kill that joined an agent exit took the stop over (its
+        // reason is the report's): the row ends as a requested stop,
+        // removed like every kill, never kept as a crashed-looking row.
+        UnitEnding::AgentExited { .. } if is_user_kill(&report.reason) => UnitEnding::Requested,
+        ending => ending,
+    };
     let (crash, main_key) = match terminal_id.as_deref() {
         Some(tid) => {
             let crash = match ending {
@@ -368,6 +383,26 @@ fn on_screen_exit(state: &WsState, exit: UnitScreenExit) {
         terminal_id: Some(exit.terminal_id.clone()),
         ..entry
     };
+    if entry.unit.stop_in_flight().is_some() {
+        // The unit's own stop ended the screen (it signals the screen it
+        // pinned): the exit is part of that stop, never a start failure or
+        // a crash. A row whose ending that stop could not mark yet (it began
+        // before the row was known) ends as the requested stop it is.
+        state
+            .registry
+            .mark_ending(&exit.terminal_id, UnitEnding::Requested);
+        let keys = unit_keys(&entry.unit, None);
+        tracing::debug!(target: "freshell_unit",
+            event = "unit.screen_exit_in_stop",
+            unit_id = %keys.unit_id,
+            provider = %keys.provider,
+            session_id = %keys.session_id.as_deref().unwrap_or(""),
+            terminal_id = %exit.terminal_id,
+            operation_id = "",
+            exit_code = exit.exit_code,
+            "a unit row's screen exited during its unit's stop");
+        return;
+    }
     if !state.units.start_is_settled(&unit_id) {
         let operation_id = fresh_operation("unit-placement");
         let pid = entry.unit.screen().map(|w| w.pid()).unwrap_or(0);
@@ -434,12 +469,36 @@ pub fn kill_hook(state: WsState, rt: tokio::runtime::Handle) -> freshell_termina
                 mode: StopMode::Force,
                 reason,
                 initiator: format!("registry-kill-{by}"),
-                operation_id: fresh_operation("term-kill"),
+                operation_id: registry_kill_operation(&state, unit_id),
                 record_stopped_pane: false,
             },
         );
         true
     })
+}
+
+/// The operation a registry kill stops a unit under. A key of the unit in
+/// `Handoff` with this unit as its prior belongs to that handoff, which is
+/// stopping its prior through this very kill: the stop runs under the
+/// handoff's own operation, so the unit's stop leaves that key to the
+/// handoff (it commits it to its target) instead of moving it to Stopping
+/// under a new operation, which would make the handoff's commit stale.
+/// Otherwise a fresh kill operation.
+fn registry_kill_operation(state: &WsState, unit_id: &str) -> String {
+    state
+        .ownership
+        .as_ref()
+        .and_then(|ownership| {
+            ownership.keys_for_unit(unit_id).into_iter().find_map(
+                |(_, key_state)| match key_state {
+                    freshell_ownership::OwnershipState::Handoff { operation_id, .. } => {
+                        Some(operation_id)
+                    }
+                    _ => None,
+                },
+            )
+        })
+        .unwrap_or_else(|| fresh_operation("term-kill"))
 }
 
 /// The WebSocket implementation of the directory's [`UnitLifecycle`]: the
@@ -485,6 +544,47 @@ impl UnitLifecycle for WsUnitLifecycle {
         ));
     }
 
+    /// The REST lane's start given up: the same abandonment as a
+    /// [`StartScope`]'s (the row it names is ended even when the unit's stop
+    /// reached Gone before the row was known).
+    fn abandon_start(&self, start: AbandonedStart) {
+        let AbandonedStart {
+            entry,
+            base,
+            initiator,
+            claim,
+        } = start;
+        let spawned_terminal = entry.terminal_id.clone();
+        let entry = match self.state.units.get(entry.unit.id()) {
+            Some(current) => UnitEntry {
+                terminal_id: current.terminal_id.or(spawned_terminal.clone()),
+                ..current
+            },
+            None => entry,
+        };
+        let base = base
+            .filter(|base| base.id() != entry.unit.id())
+            .map(|base| UnitEntry {
+                unit: base,
+                provider: entry.provider.clone(),
+                mode: entry.mode.clone(),
+                create_request_id: None,
+                terminal_id: None,
+            });
+        abandon_now(
+            &self.state,
+            &self.rt,
+            Abandonment {
+                entry,
+                base,
+                spawned_terminal,
+                initiator,
+                claim,
+                claim_relay: None,
+            },
+        );
+    }
+
     /// A stop has begun when the unit's own stop is in flight or the owner
     /// registry holds any of its keys Stopping. Synchronous and never
     /// blocking: the Codex launch manager asks while holding its own lock.
@@ -502,13 +602,18 @@ impl UnitLifecycle for WsUnitLifecycle {
 }
 
 /// Installs the unit lifecycle on a state's registry (the screen-exit and
-/// kill hooks) and directory (the single stop path). `freshell-server` does this at boot;
-/// a start does it for a state built without it (tests), so a unit row's
-/// screen exit is never lost. Idempotent.
+/// kill hooks, and the process start-time reader that lets a start pin its
+/// screen by pid and start time) and directory (the single stop path).
+/// `freshell-server` does this at boot; a start does it for a state built
+/// without it (tests), so a unit row's screen exit is never lost.
+/// Idempotent.
 pub fn wire(state: &WsState, rt: &tokio::runtime::Handle) {
     if state.units.lifecycle().is_some() {
         return;
     }
+    state.registry.set_process_start_reader(Arc::new(|pid| {
+        freshell_containment::process::start_time(pid).ok()
+    }));
     state
         .registry
         .set_unit_screen_exit_hook(screen_exit_hook(state.clone(), rt.clone()));
@@ -605,9 +710,30 @@ async fn settle_placement(
 pub enum Spawned {
     /// The screen runs in a live unit: bind and continue.
     Running,
-    /// The unit's stop already reached Gone: the screen was killed and its
-    /// row ended; abandon the start.
+    /// The unit's stop already reached Gone before the start's row was
+    /// known to it: abandon the start (its abandonment kills the screen
+    /// through its pin and ends the row).
     AlreadyStopped,
+}
+
+/// A claim a start does not hold itself (the auto-resume hub's): if the
+/// start is given up, the holder sends it here, and the start drops it once
+/// its unit is Gone, before it settles. A relay closed without a claim is
+/// not waited for.
+pub type ClaimRelay = tokio::sync::oneshot::Receiver<Box<dyn std::any::Any + Send>>;
+
+/// The screen `pid` the registry spawned for `terminal_id`, pinned by pid
+/// AND the start time its row recorded at the spawn, before anything could
+/// reap it (a pid alone could name a later process once the screen was
+/// reaped). `Err` says why it could not be pinned.
+fn pin_screen(state: &WsState, terminal_id: &str, pid: u32) -> Result<ProcWatch, String> {
+    let start = state
+        .registry
+        .screen_start_time(terminal_id)
+        .ok_or_else(|| {
+            "no start time is recorded for the screen (it already exited)".to_string()
+        })?;
+    ProcWatch::open_expecting(pid, start).map_err(|error| error.to_string())
 }
 
 /// One start of a coding-agent terminal pane inside its unit (see the module
@@ -625,6 +751,7 @@ pub struct StartScope {
     seed: OnceLock<Arc<DirectoryUnitLifecycle>>,
     spawned_terminal: Option<String>,
     screen_pid: Option<u32>,
+    claim_relay: Option<ClaimRelay>,
     phase: watch::Sender<ScopePhase>,
     done: bool,
 }
@@ -675,6 +802,7 @@ impl StartScope {
             seed: OnceLock::new(),
             spawned_terminal: None,
             screen_pid: None,
+            claim_relay: None,
             phase: watch::channel(ScopePhase::Open).0,
             done: false,
         })
@@ -718,6 +846,14 @@ impl StartScope {
         self.seed_lifecycle().finish_planning(launch_unit);
     }
 
+    /// The conversation claim of this start is held elsewhere (the
+    /// auto-resume hub holds a respawn's): if the start is given up, the
+    /// holder hands it over through `relay`, and it is dropped once the unit
+    /// is Gone, before the start settles.
+    pub fn release_claim_after_gone(&mut self, relay: ClaimRelay) {
+        self.claim_relay = Some(relay);
+    }
+
     /// Whether a stop cancelled this start.
     pub fn cancelled(&self) -> bool {
         let unit = self.unit();
@@ -734,23 +870,18 @@ impl StartScope {
     }
 
     /// The screen `screen_pid` of `terminal_id` was spawned into the unit:
-    /// it is pinned as the unit's screen (every later stop signals it
-    /// directly) and the terminal is noted. When the unit's stop already
-    /// reached Gone, the screen is killed through its pin, its row is ended,
-    /// and the start must be abandoned.
-    pub async fn spawned(&mut self, terminal_id: &str, screen_pid: u32) -> Spawned {
+    /// it is pinned as the unit's screen by pid and start time (every later
+    /// stop signals it directly) and the terminal is noted. Never waits:
+    /// when the unit's stop already reached Gone it answers
+    /// [`Spawned::AlreadyStopped`], and the start's abandonment (which the
+    /// caller then runs) kills the screen through its pin and ends the row.
+    pub fn spawned(&mut self, terminal_id: &str, screen_pid: u32) -> Spawned {
         let unit = self.unit();
-        match ProcWatch::open(screen_pid) {
+        match pin_screen(&self.state, terminal_id, screen_pid) {
             Ok(watch) => unit.set_screen(watch),
-            // The screen already exited: its exit reaches the screen-exit
-            // hook as a start failure.
-            Err(error) => tracing::debug!(target: "freshell_unit",
-                event = "unit.screen_unpinned",
-                unit_id = %unit.id(),
-                terminal_id,
-                pid = screen_pid,
-                error = %error,
-                "the screen could not be pinned (it already exited)"),
+            // An exit the screen already took reaches the screen-exit hook
+            // as a start failure.
+            Err(reason) => events::screen_unpinned(&unit_keys(&unit, None), screen_pid, &reason),
         }
         self.state.units.note_terminal(unit.id(), terminal_id);
         self.spawned_terminal = Some(terminal_id.to_string());
@@ -758,11 +889,11 @@ impl StartScope {
         let gone = unit
             .stop_in_flight()
             .is_some_and(|handle| handle.try_report().is_some());
-        if !gone {
-            return Spawned::Running;
+        if gone {
+            Spawned::AlreadyStopped
+        } else {
+            Spawned::Running
         }
-        end_row_of_gone_unit(&self.state, &unit, terminal_id).await;
-        Spawned::AlreadyStopped
     }
 
     /// Binds the unit to its terminal (the bind hook fires) and starts the
@@ -804,11 +935,11 @@ impl StartScope {
         self.phase.send_replace(ScopePhase::Committed);
     }
 
-    /// The create gives the start up. Not async: a spawned task stops the
-    /// unit (Force, `StartCancelled`; it joins a kill already in flight),
-    /// waits for Gone, drops `claim` (the create's ownership claim, so the
-    /// Starting key is released before the start settles), then settles the
-    /// start and removes its entry.
+    /// The create gives the start up. Not async: the unit's stop (Force,
+    /// `StartCancelled`; it joins a kill already in flight) begins now, and
+    /// a spawned task waits for Gone, drops `claim` (the create's ownership
+    /// claim, so the Starting key is released after Gone and before the
+    /// start settles), then settles the start and removes its entry.
     pub fn abandon(mut self, claim: Option<Box<dyn std::any::Any + Send>>) {
         self.abandon_inner(claim);
     }
@@ -819,60 +950,40 @@ impl StartScope {
         }
         self.done = true;
         self.phase.send_replace(ScopePhase::Abandoned);
-        let state = self.state.clone();
         let current = self.unit();
-        let base = self.base.clone();
-        let entry = state.units.get(current.id()).unwrap_or_else(|| UnitEntry {
-            unit: current.clone(),
-            provider: self.provider.clone(),
-            mode: self.mode.clone(),
-            create_request_id: Some(self.create_request_id.clone()),
-            terminal_id: self.spawned_terminal.clone(),
-        });
-        let detached_base = UnitEntry {
-            unit: base.clone(),
+        let entry = self
+            .state
+            .units
+            .get(current.id())
+            .unwrap_or_else(|| UnitEntry {
+                unit: current.clone(),
+                provider: self.provider.clone(),
+                mode: self.mode.clone(),
+                create_request_id: Some(self.create_request_id.clone()),
+                terminal_id: self.spawned_terminal.clone(),
+            });
+        let base = (self.base.id() != current.id()).then(|| UnitEntry {
+            unit: self.base.clone(),
             provider: self.provider.clone(),
             mode: self.mode.clone(),
             create_request_id: None,
             terminal_id: None,
-        };
-        let spawned_terminal = self.spawned_terminal.clone();
-        let unit_id = current.id().clone();
-        let task = async move {
-            let command = || UnitStopCommand {
-                mode: StopMode::Force,
-                reason: StopReason::StartCancelled,
-                initiator: "start-cancelled".to_string(),
-                operation_id: fresh_operation("unit-start-cancel"),
-                record_stopped_pane: false,
-            };
-            let stop = stop_terminal_unit(&state, &entry, command());
-            let base_stop = (base.id() != current.id())
-                .then(|| stop_terminal_unit(&state, &detached_base, command()));
-            stop.wait().await;
-            if let Some(base_stop) = base_stop {
-                base_stop.wait().await;
-            }
-            if let Some(terminal_id) = spawned_terminal.as_deref() {
-                end_row_of_gone_unit(&state, &current, terminal_id).await;
-            }
-            drop(claim);
-            state.units.mark_start_settled(current.id());
-            state.units.remove(current.id());
+        });
+        let abandonment = Abandonment {
+            entry,
+            base,
+            spawned_terminal: self.spawned_terminal.clone(),
+            initiator: "start-cancelled".to_string(),
+            claim,
+            claim_relay: self.claim_relay.take(),
         };
         match self
             .rt
             .clone()
             .or_else(|| tokio::runtime::Handle::try_current().ok())
         {
-            Some(rt) => {
-                rt.spawn(task);
-            }
-            None => tracing::error!(target: "freshell_unit",
-                event = "unit.start_abandon_unscheduled",
-                unit_id = %unit_id,
-                "an abandoned start could not be stopped (no runtime); its unit record \
-                 stays for the next boot"),
+            Some(rt) => abandon_now(&self.state, &rt, abandonment),
+            None => events::start_abandon_unscheduled(&unit_keys(&current, None)),
         }
     }
 }
@@ -883,11 +994,73 @@ impl Drop for StartScope {
     }
 }
 
+/// A start given up: its unit (and a differing base unit), the row it
+/// spawned, and what it holds on its conversation.
+struct Abandonment {
+    entry: UnitEntry,
+    base: Option<UnitEntry>,
+    spawned_terminal: Option<String>,
+    initiator: String,
+    claim: Option<Box<dyn std::any::Any + Send>>,
+    claim_relay: Option<ClaimRelay>,
+}
+
+/// Gives a start up ([`StartScope::abandon`], and the directory's
+/// `abandon_start` for the REST lane). The unit's stop (Force,
+/// `StartCancelled`) begins NOW, before the caller's other holds drop: a
+/// key stamped with the unit moves to Stopping first, so no claim dropped
+/// after this call can vacate it before Gone. A spawned task (nothing here
+/// waits) then waits for Gone, ends a row that stop could not end (a screen
+/// spawned after Gone is killed through its pin), drops the claim (and a
+/// relayed one), and only then settles the start and removes its entry.
+fn abandon_now(state: &WsState, rt: &tokio::runtime::Handle, abandonment: Abandonment) {
+    let Abandonment {
+        entry,
+        base,
+        spawned_terminal,
+        initiator,
+        claim,
+        claim_relay,
+    } = abandonment;
+    let command = || UnitStopCommand {
+        mode: StopMode::Force,
+        reason: StopReason::StartCancelled,
+        initiator: initiator.clone(),
+        operation_id: fresh_operation("unit-start-cancel"),
+        record_stopped_pane: false,
+    };
+    let _runtime = rt.enter();
+    let stop = stop_terminal_unit(state, &entry, command());
+    let base_stop = base
+        .as_ref()
+        .map(|base| stop_terminal_unit(state, base, command()));
+    let state = state.clone();
+    let unit = entry.unit;
+    rt.spawn(async move {
+        stop.wait().await;
+        if let Some(base_stop) = base_stop {
+            base_stop.wait().await;
+        }
+        if let Some(terminal_id) = spawned_terminal.as_deref() {
+            end_row_of_gone_unit(&state, &unit, terminal_id).await;
+        }
+        drop(claim);
+        if let Some(relay) = claim_relay {
+            if let Ok(relayed) = relay.await {
+                drop(relayed);
+            }
+        }
+        state.units.mark_start_settled(unit.id());
+        state.units.remove(unit.id());
+    });
+}
+
 /// A unit whose stop reached Gone before its row was known to the stop: the
 /// screen is killed through its pin (when it still runs) and the row, if it
 /// is still this unit's and still running, is ended and retired as a
 /// requested stop. A row the stop's own Gone already ended (removed, or kept
-/// `Exited` after a failed start) is left as it is.
+/// `Exited` after a failed start) is left as it is. Runs only in an
+/// abandonment's spawned task.
 async fn end_row_of_gone_unit(state: &WsState, unit: &AgentUnit, terminal_id: &str) {
     if state.registry.unit_id_for(terminal_id).as_deref() != Some(unit.id().as_str())
         || !state.registry.is_pty_running(terminal_id)

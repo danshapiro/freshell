@@ -1036,12 +1036,17 @@ async fn teardown_unowned_spawn(
 /// and the Codex seed's lifecycle over that entry (each start attempt's unit
 /// takes the entry over). Every stop goes through the directory's installed
 /// lifecycle — the WebSocket layer's single stop path — which ends the row
-/// and the unit at Gone; nothing here waits for Gone.
+/// and the unit at Gone; nothing here waits for Gone. A start dropped
+/// without [`Self::commit`] or [`Self::give_up`] is given up (with no
+/// claim), so no early return leaves its unit running.
 struct RestUnitStart {
     units: std::sync::Arc<freshell_containment::UnitDirectory>,
     containment: freshell_containment::Containment,
     label: freshell_containment::UnitLabel,
     lifecycle: std::sync::Arc<freshell_codex::launch_plan::DirectoryUnitLifecycle>,
+    /// The terminal the start spawned, once noted.
+    spawned_terminal: Option<String>,
+    done: bool,
 }
 
 impl RestUnitStart {
@@ -1084,6 +1089,8 @@ impl RestUnitStart {
             units: state.units.clone(),
             containment: state.containment.clone(),
             label,
+            spawned_terminal: None,
+            done: false,
         }))
     }
 
@@ -1109,14 +1116,41 @@ impl RestUnitStart {
     }
 
     /// The screen `screen_pid` of `terminal_id` started in the unit: it is
-    /// pinned (pin before any placement check, as macOS requires) and its
-    /// terminal noted, so every stop from now on ends this row.
-    fn spawned(&self, terminal_id: &str, screen_pid: u32) {
+    /// pinned by pid AND the start time its row recorded at the spawn (pin
+    /// before any placement check, as macOS requires) and its terminal
+    /// noted, so every stop from now on ends this row. `false` when the
+    /// start must be given up: a stop cancelled it, or already reached Gone
+    /// before the row was known to it (the give-up then ends the row).
+    fn spawned(
+        &mut self,
+        registry: &freshell_terminal::TerminalRegistry,
+        terminal_id: &str,
+        screen_pid: u32,
+    ) -> bool {
         let unit = self.unit();
-        if let Ok(watch) = freshell_containment::ProcWatch::open(screen_pid) {
-            unit.set_screen(watch);
+        let pinned = registry
+            .screen_start_time(terminal_id)
+            .ok_or_else(|| {
+                "no start time is recorded for the screen (it already exited)".to_string()
+            })
+            .and_then(|start| {
+                freshell_containment::ProcWatch::open_expecting(screen_pid, start)
+                    .map_err(|error| error.to_string())
+            });
+        match pinned {
+            Ok(watch) => unit.set_screen(watch),
+            Err(reason) => freshell_containment::events::screen_unpinned(
+                &self.log_keys(&unit),
+                screen_pid,
+                &reason,
+            ),
         }
         self.units.note_terminal(unit.id(), terminal_id);
+        self.spawned_terminal = Some(terminal_id.to_string());
+        let gone = unit
+            .stop_in_flight()
+            .is_some_and(|handle| handle.try_report().is_some());
+        !gone && !self.cancelled()
     }
 
     /// Binds the unit to its terminal and hands the screen to the
@@ -1127,54 +1161,104 @@ impl RestUnitStart {
         self.units.settle_start(unit.id(), screen_pid);
     }
 
-    /// The create gives the start up: its unit (and the unused base unit)
-    /// is stopped through the single stop path; once Gone, `after_gone`
-    /// runs (a lease release) and the start is settled and its entry
-    /// removed. Nothing waits here.
-    fn give_up(self, initiator: &'static str, after_gone: Option<Box<dyn FnOnce() + Send>>) {
-        use freshell_codex::launch_plan::CodexUnitLifecycle as _;
+    /// The create succeeded: the placement settlement settles the start.
+    fn commit(mut self) {
+        self.done = true;
+    }
+
+    /// The create gives the start up (`initiator` names why): the unit (and
+    /// the unused base unit) is stopped through the single stop path, a row
+    /// spawned after that stop's Gone is ended, and once the unit is Gone
+    /// `claim` — the create's holds on its conversation — is dropped, then
+    /// the start is settled and its entry removed. Nothing waits here.
+    fn give_up(mut self, initiator: &str, claim: Option<Box<dyn std::any::Any + Send>>) {
+        self.give_up_inner(initiator, claim);
+    }
+
+    fn give_up_inner(&mut self, initiator: &str, claim: Option<Box<dyn std::any::Any + Send>>) {
+        if self.done {
+            return;
+        }
+        self.done = true;
         let unit = self.unit();
         let base = self.lifecycle.base();
-        let stop = self.lifecycle.stop(
-            &unit,
-            freshell_containment::StopMode::Force,
-            freshell_containment::StopReason::StartCancelled,
-            initiator,
-        );
-        let base_stop = (base.id() != unit.id()).then(|| {
-            self.lifecycle.stop(
-                &base,
-                freshell_containment::StopMode::Force,
-                freshell_containment::StopReason::StartCancelled,
-                initiator,
-            )
-        });
-        let units = self.units.clone();
-        tokio::spawn(async move {
-            stop.wait().await;
-            if let Some(base_stop) = base_stop {
-                base_stop.wait().await;
+        let start = freshell_containment::AbandonedStart {
+            entry: freshell_containment::UnitEntry {
+                unit: unit.clone(),
+                provider: self.label.provider.clone(),
+                mode: self.label.mode.clone(),
+                create_request_id: self.label.create_request_id.clone(),
+                terminal_id: self.spawned_terminal.clone(),
+            },
+            base: (base.id() != unit.id()).then_some(base),
+            initiator: initiator.to_string(),
+            claim,
+        };
+        if let Err(start) = self.units.abandon_start(start) {
+            // `begin` requires an installed lifecycle; should it have gone,
+            // the units are still stopped (their rows end with their PTYs).
+            let start = *start;
+            for unit in std::iter::once(start.entry.unit).chain(start.base) {
+                let _ = unit.stop(freshell_containment::StopRequest::new(
+                    freshell_containment::StopMode::Force,
+                    freshell_containment::StopReason::StartCancelled,
+                    initiator,
+                ));
             }
-            if let Some(after_gone) = after_gone {
-                after_gone();
-            }
-            units.mark_start_settled(unit.id());
-            units.remove(unit.id());
-        });
+        }
+    }
+
+    /// The unit's log keys (provider, conversation, terminal; no operation).
+    fn log_keys(
+        &self,
+        unit: &freshell_containment::AgentUnit,
+    ) -> freshell_containment::events::UnitLogKeys {
+        freshell_containment::events::UnitLogKeys {
+            unit_id: unit.id().to_string(),
+            provider: self.label.provider.clone(),
+            session_id: self.label.session_id.clone(),
+            terminal_id: self.label.terminal_id.clone(),
+            operation_id: None,
+        }
     }
 }
 
-/// The lease release a given-up REST start runs once its unit is Gone (the
-/// confirmed death `force_release_after_confirmed_kill` requires).
-fn release_lease_after_gone(
-    registry: &freshell_terminal::TerminalRegistry,
-    locator: &SessionLocator,
-) -> Option<Box<dyn FnOnce() + Send>> {
-    let registry = registry.clone();
-    let locator = locator.clone();
-    Some(Box::new(move || {
-        registry.force_release_after_confirmed_kill(&locator)
-    }))
+impl Drop for RestUnitStart {
+    fn drop(&mut self) {
+        self.give_up_inner("rest-start-dropped", None);
+    }
+}
+
+/// The REST create's holds on its conversation — its coordinator claim, its
+/// sessionRef lease and its start-cancellation witness — handed to a
+/// given-up start, which drops them only once its unit is Gone (so the
+/// conversation is never released while its Codex may still hold it).
+fn take_rest_claims(
+    ownership_claim: &mut Option<RestOwnershipClaim>,
+    session_ref_lease: &mut Option<RestSessionRefLease>,
+    start_cancellation: &mut Option<crate::ownership_lane::StartCancellationGuard>,
+) -> Box<dyn std::any::Any + Send> {
+    Box::new((
+        ownership_claim.take(),
+        session_ref_lease.take(),
+        start_cancellation.take(),
+    ))
+}
+
+/// Releases a disarmed sessionRef lease (and its retained coordinator
+/// claim) when dropped: carried by a given-up start, it runs after the
+/// unit's Gone — the confirmed death `force_release_after_confirmed_kill`
+/// requires.
+struct ReleaseLeaseAfterGone {
+    registry: freshell_terminal::TerminalRegistry,
+    locator: SessionLocator,
+}
+
+impl Drop for ReleaseLeaseAfterGone {
+    fn drop(&mut self) {
+        self.registry
+            .force_release_after_confirmed_kill(&self.locator);
+    }
 }
 
 /// Poll `kill(pid, 0)` for ESRCH for up to 500ms (the PTY's dedicated waiter
@@ -2403,6 +2487,7 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
         adopt_attach_window_op: _rest_adopt_guard
             .as_ref()
             .map(|guard| guard.operation_id().to_string()),
+        start_cancellation: _rest_start_cancellation.take(),
     };
     let settle = {
         // Round-3 review I-1: the settle marks settlement (success or
@@ -2507,6 +2592,10 @@ struct GatedSettleInputs {
     /// coordinator's deferred-acquisition block exempts THIS create
     /// (continuous authority) while competitors answer Blocked.
     adopt_attach_window_op: Option<String>,
+    /// b8ke ext r20 F1: the claim's settlement witness, held by the settle
+    /// to its end (its Drop fires the settle the watchdog awaits); a
+    /// given-up unit start drops it only at its unit's Gone.
+    start_cancellation: Option<crate::ownership_lane::StartCancellationGuard>,
 }
 
 /// The spawn-to-settled tail of [`spawn_terminal_pane`], run on a detached
@@ -2549,6 +2638,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         amplifier_stub,
         ownership_start_terminal_id,
         adopt_attach_window_op,
+        mut start_cancellation,
     } = inputs;
 
     // b8ke ext r20 F1: the DOOR claim pre-minted the terminal id when it
@@ -2727,7 +2817,14 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                         freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
                             .discard_sync(launch);
                         if let Some(start) = rest_unit.take() {
-                            start.give_up("rest-start-cancelled", None);
+                            start.give_up(
+                                "rest-start-cancelled",
+                                Some(take_rest_claims(
+                                    &mut ownership_claim,
+                                    &mut session_ref_lease,
+                                    &mut start_cancellation,
+                                )),
+                            );
                         }
                         return Err(codex_launch_error_response(
                             freshell_codex::launch_lifecycle::CodexLaunchError::Cancelled,
@@ -2737,7 +2834,14 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                 }
                 Err(error) => {
                     if let Some(start) = rest_unit.take() {
-                        start.give_up("rest-start-cancelled", None);
+                        start.give_up(
+                            "rest-start-plan-failed",
+                            Some(take_rest_claims(
+                                &mut ownership_claim,
+                                &mut session_ref_lease,
+                                &mut start_cancellation,
+                            )),
+                        );
                     }
                     return Err(codex_launch_error_response(error));
                 }
@@ -2761,6 +2865,20 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         let (mcp_injection, overrides) = match codex_setup {
             Some(setup) => {
                 if setup.terminal_id.as_str() != terminal_id.as_str() {
+                    if let Some(launch) = codex_launch.take() {
+                        freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+                            .discard_sync(launch);
+                    }
+                    if let Some(start) = rest_unit.take() {
+                        start.give_up(
+                            "rest-start-setup-mismatch",
+                            Some(take_rest_claims(
+                                &mut ownership_claim,
+                                &mut session_ref_lease,
+                                &mut start_cancellation,
+                            )),
+                        );
+                    }
                     return Err(fail_json(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "managed Codex terminal setup did not match its spawn id".to_string(),
@@ -2869,7 +2987,25 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         };
         let launch = match resolve_coding_cli_command(&state.cli_commands, &inputs, &RealEnv) {
             Ok(l) => l,
-            Err(e) => return Err(fail_json(StatusCode::BAD_REQUEST, e.message())),
+            Err(e) => {
+                // A planned Codex launch dies with the failed create; its
+                // unit's start is given up (the claims go at its Gone).
+                if let Some(launch) = codex_launch.take() {
+                    freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+                        .discard_sync(launch);
+                }
+                if let Some(start) = rest_unit.take() {
+                    start.give_up(
+                        "rest-start-launch-unresolved",
+                        Some(take_rest_claims(
+                            &mut ownership_claim,
+                            &mut session_ref_lease,
+                            &mut start_cancellation,
+                        )),
+                    );
+                }
+                return Err(fail_json(StatusCode::BAD_REQUEST, e.message()));
+            }
         };
 
         let effective_shell = resolve_shell(shell_type, host_os, is_wsl);
@@ -3024,7 +3160,14 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                     match rest_unit.take() {
                         Some(start) => {
                             manager.discard_sync(launch);
-                            start.give_up("rest-start-cancelled", None);
+                            start.give_up(
+                                "rest-start-gate-refused",
+                                Some(take_rest_claims(
+                                    &mut ownership_claim,
+                                    &mut session_ref_lease,
+                                    &mut start_cancellation,
+                                )),
+                            );
                         }
                         None => manager.discard(launch).await,
                     }
@@ -3130,7 +3273,14 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                                 .discard_sync(launch);
                         }
                         if let Some(start) = rest_unit.take() {
-                            start.give_up("rest-start-cancelled", None);
+                            start.give_up(
+                                "rest-start-cancelled",
+                                Some(take_rest_claims(
+                                    &mut ownership_claim,
+                                    &mut session_ref_lease,
+                                    &mut start_cancellation,
+                                )),
+                            );
                         }
                         cleanup_mcp_config(
                             &RealMcpRuntime,
@@ -3256,7 +3406,14 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             match rest_unit.take() {
                 Some(start) => {
                     manager.discard_sync(launch);
-                    start.give_up("rest-start-cancelled", None);
+                    start.give_up(
+                        "rest-start-spawn-failed",
+                        Some(take_rest_claims(
+                            &mut ownership_claim,
+                            &mut session_ref_lease,
+                            &mut start_cancellation,
+                        )),
+                    );
                 }
                 None => manager.discard(launch).await,
             }
@@ -3304,19 +3461,50 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
     // given up; otherwise the unit is bound and its placement settlement
     // begins (the start settles once the screen is confirmed placed).
     let mut rest_unit_bound: Option<RestUnitStart> = None;
-    if let (Some(start), Some(screen_pid)) = (rest_unit.take(), unit_screen_pid) {
-        start.spawned(&terminal_id, screen_pid);
-        if start.cancelled() {
+    if let (Some(mut start), Some(screen_pid)) = (rest_unit.take(), unit_screen_pid) {
+        if !start.spawned(&registry, &terminal_id, screen_pid) {
+            // A stop cancelled the start, or reached Gone before it knew
+            // this row: the give-up ends the row and the unit (and the
+            // claims go at its Gone).
             if let Some(launch) = codex_launch.take() {
                 freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
                     .discard_sync(launch);
             }
-            start.give_up("rest-start-cancelled", None);
+            start.give_up(
+                "rest-start-cancelled",
+                Some(take_rest_claims(
+                    &mut ownership_claim,
+                    &mut session_ref_lease,
+                    &mut start_cancellation,
+                )),
+            );
             return Err(codex_launch_error_response(
                 freshell_codex::launch_lifecycle::CodexLaunchError::Cancelled,
             ));
         }
         start.bind(&terminal_id, screen_pid);
+        // The create's Starting key is stamped with the unit (as the WS
+        // create's is): a stop of the unit before the create commits moves
+        // it to Stopping and releases it at Gone, and the create's commit
+        // then answers stale.
+        if let (Some(ownership), Some(claim)) = (state.ownership.as_ref(), ownership_claim.as_ref())
+        {
+            ownership.register_partial_runtime(
+                &claim.locator.provider,
+                &claim.locator.session_id,
+                claim.ticket.operation_id(),
+                claim.ticket.generation(),
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                    terminal_id: Some(terminal_id.clone()),
+                    live_session_key: None,
+                    pid: registry.pid_of(&terminal_id),
+                    ownership_id: None,
+                    unit_id: registry.unit_id_for(&terminal_id),
+                    hold: freshell_ownership::HoldKind::Main,
+                },
+            );
+        }
         // Kept for the failure arms below (they stop the unit).
         rest_unit_bound = Some(start);
     }
@@ -3326,7 +3514,14 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             .await
         {
             match rest_unit_bound.take() {
-                Some(start) => start.give_up("rest-adopt-failed", None),
+                Some(start) => start.give_up(
+                    "rest-adopt-failed",
+                    Some(take_rest_claims(
+                        &mut ownership_claim,
+                        &mut session_ref_lease,
+                        &mut start_cancellation,
+                    )),
+                ),
                 None => {
                     registry.kill(&terminal_id);
                 }
@@ -3396,7 +3591,14 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                     "handoff_target_registration_failed: the terminal target's                      durable identity registration failed — the spawned terminal                      is reaped and the handoff fails typed (kata b8ke ext r27 F3)"
                 );
                 if let Some(start) = rest_unit_bound.take() {
-                    start.give_up("rest-handoff-registration-failed", None);
+                    start.give_up(
+                        "rest-handoff-registration-failed",
+                        Some(take_rest_claims(
+                            &mut ownership_claim,
+                            &mut session_ref_lease,
+                            &mut start_cancellation,
+                        )),
+                    );
                 } else {
                     let pid = registry.pid_of(&terminal_id);
                     registry.kill(&terminal_id);
@@ -3471,7 +3673,17 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                 Some(start) => {
                     start.give_up(
                         "rest-lease-revoked",
-                        release_lease_after_gone(&registry, &locator),
+                        Some(Box::new((
+                            take_rest_claims(
+                                &mut ownership_claim,
+                                &mut session_ref_lease,
+                                &mut start_cancellation,
+                            ),
+                            ReleaseLeaseAfterGone {
+                                registry: registry.clone(),
+                                locator: locator.clone(),
+                            },
+                        ))),
                     );
                     true
                 }
@@ -3590,7 +3802,17 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                 match rest_unit_bound.take() {
                     Some(start) => start.give_up(
                         "rest-ownership-lost",
-                        release_lease_after_gone(&registry, &locator),
+                        Some(Box::new((
+                            take_rest_claims(
+                                &mut ownership_claim,
+                                &mut session_ref_lease,
+                                &mut start_cancellation,
+                            ),
+                            ReleaseLeaseAfterGone {
+                                registry: registry.clone(),
+                                locator: locator.clone(),
+                            },
+                        ))),
                     ),
                     None => teardown_unowned_spawn(&registry, &locator, &terminal_id).await,
                 }
@@ -3696,7 +3918,17 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                     match rest_unit_bound.take() {
                         Some(start) => start.give_up(
                             "rest-ownership-lost",
-                            release_lease_after_gone(&registry, &locator),
+                            Some(Box::new((
+                                take_rest_claims(
+                                    &mut ownership_claim,
+                                    &mut session_ref_lease,
+                                    &mut start_cancellation,
+                                ),
+                                ReleaseLeaseAfterGone {
+                                    registry: registry.clone(),
+                                    locator: locator.clone(),
+                                },
+                            ))),
                         ),
                         None => teardown_unowned_spawn(&registry, &locator, &terminal_id).await,
                     }
@@ -3711,6 +3943,11 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                 }
             }
         }
+    }
+
+    // The create succeeded: the placement settlement settles its start.
+    if let Some(start) = rest_unit_bound.take() {
+        start.commit();
     }
 
     let mut pane_content = json!({
@@ -10006,3 +10243,7 @@ if (args.includes('app-server')) {{
         registry.kill(&terminal_id);
     }
 }
+
+#[cfg(test)]
+#[path = "terminal_tabs_unit_tests.rs"]
+mod unit_tests;

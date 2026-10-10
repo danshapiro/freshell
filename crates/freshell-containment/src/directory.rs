@@ -46,6 +46,23 @@ impl std::fmt::Debug for UnitEntry {
     }
 }
 
+/// A start its owner gives up (its create failed or was cancelled), handed
+/// to the installed lifecycle by a lane that cannot depend on the WebSocket
+/// layer ([`UnitDirectory::abandon_start`]).
+pub struct AbandonedStart {
+    /// The start as its owner knows it: the unit it runs in now, and the
+    /// terminal it spawned, if any.
+    pub entry: UnitEntry,
+    /// The start's own base unit when it differs from `entry.unit` (stopped
+    /// too).
+    pub base: Option<AgentUnit>,
+    /// Why the start is given up (the stop's initiator, for its log lines).
+    pub initiator: String,
+    /// What the start holds on its conversation (its ownership claim, its
+    /// lease): dropped once the unit is Gone, before the start settles.
+    pub claim: Option<Box<dyn std::any::Any + Send>>,
+}
+
 /// The single stop path and the start settlement, installed by the
 /// WebSocket layer ([`UnitDirectory::set_lifecycle`]).
 pub trait UnitLifecycle: Send + Sync {
@@ -62,6 +79,13 @@ pub trait UnitLifecycle: Send + Sync {
     /// Confirms the placement of a start's screen (`screen_pid`) and settles
     /// the start (or fails it), without waiting.
     fn settle_start(&self, entry: &UnitEntry, screen_pid: u32);
+
+    /// Gives a start up without waiting: its unit (and a differing base
+    /// unit) is stopped through the single stop path, a row that stop could
+    /// not end (spawned after its Gone) is ended, and once the unit is Gone
+    /// the start's claim is dropped, then the start is settled and its
+    /// entry removed.
+    fn abandon_start(&self, start: AbandonedStart);
 
     /// Whether a stop of `unit` has begun, as the owner registry sees it.
     /// The default reads the unit's own stop latch.
@@ -321,6 +345,19 @@ impl UnitDirectory {
         let entry = self.get(unit_id)?;
         let lifecycle = self.lifecycle()?;
         Some(lifecycle.stop(&entry, mode, reason, initiator))
+    }
+
+    /// Gives a start up through the installed lifecycle
+    /// ([`UnitLifecycle::abandon_start`]); `Err` hands the start back when
+    /// no lifecycle is installed.
+    pub fn abandon_start(&self, start: AbandonedStart) -> Result<(), Box<AbandonedStart>> {
+        match self.lifecycle() {
+            Some(lifecycle) => {
+                lifecycle.abandon_start(start);
+                Ok(())
+            }
+            None => Err(Box::new(start)),
+        }
     }
 
     /// Hands a registered start's screen to the installed lifecycle's

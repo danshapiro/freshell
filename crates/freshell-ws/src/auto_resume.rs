@@ -779,6 +779,30 @@ pub(crate) struct WsAutoResumeDriver {
     /// While held, a handoff or stop begin on the key answers the typed
     /// Blocked outcome.
     pending_attach_guard: std::sync::Arc<std::sync::Mutex<Option<freshell_ownership::AttachGuard>>>,
+    /// A failed respawn whose replacement start was given up inside its
+    /// unit: `fail_claim` hands the claim (ticket, attach guard, lease
+    /// release) through this relay to that start, which drops it only once
+    /// the unit is Gone, so the conversation is never released while the
+    /// replacement's Codex may still hold it. The hub never waits for it.
+    pending_claim_relay: std::sync::Arc<std::sync::Mutex<Option<ClaimRelaySender>>>,
+}
+
+/// The sending half of a respawn start's [`crate::unit_lifecycle::ClaimRelay`].
+type ClaimRelaySender = tokio::sync::oneshot::Sender<Box<dyn std::any::Any + Send>>;
+
+/// Releases a respawn's sessionRef lease when dropped (the headless
+/// driver's failure-path release, carried to a given-up start's Gone).
+struct FailSessionRefClaim {
+    registry: freshell_terminal::TerminalRegistry,
+    locator: freshell_protocol::SessionLocator,
+    create_request_id: String,
+}
+
+impl Drop for FailSessionRefClaim {
+    fn drop(&mut self) {
+        self.registry
+            .fail_session_ref_claim(&self.locator, &self.create_request_id);
+    }
 }
 
 /// The coordinator claim a respawn holds between `claim_session` and
@@ -1324,23 +1348,39 @@ impl AutoResumeDriver for WsAutoResumeDriver {
     /// failure-path release. kata b8ke Task 4: the parked coordinator
     /// ticket drops here too (RAII typed fail — no orphan `Starting`).
     fn fail_claim(&self, provider: &str, session_id: &str, create_request_id: &str) {
-        drop(
+        // b8ke ext r13 F2: the Adopt path's held window closes on failure
+        // too (with the ticket and the lease below).
+        let claim: Box<dyn std::any::Any + Send> = Box::new((
             self.pending_ownership
                 .lock()
                 .expect("pending ownership lock")
                 .take(),
-        );
-        // b8ke ext r13 F2: the Adopt path's held window closes on failure
-        // too.
-        drop(
             self.pending_attach_guard
                 .lock()
                 .expect("pending attach guard lock")
                 .take(),
-        );
-        self.state
-            .registry
-            .fail_session_ref_claim(&session_locator(provider, session_id), create_request_id);
+            FailSessionRefClaim {
+                registry: self.state.registry.clone(),
+                locator: session_locator(provider, session_id),
+                create_request_id: create_request_id.to_string(),
+            },
+        ));
+        // A replacement given up inside its unit takes the claim and drops
+        // it at the unit's Gone; otherwise (nothing was started, or the
+        // start already let its relay go) it is released now.
+        let relay = self
+            .pending_claim_relay
+            .lock()
+            .expect("pending claim relay lock")
+            .take();
+        match relay {
+            Some(relay) => {
+                if let Err(claim) = relay.send(claim) {
+                    drop(claim);
+                }
+            }
+            None => drop(claim),
+        }
     }
 
     fn respawn(
@@ -1355,13 +1395,25 @@ impl AutoResumeDriver for WsAutoResumeDriver {
             create_request_id: req.create_request_id.clone(),
             cwd: req.cwd.clone(),
         };
+        // This respawn's claim relay (a stale one from an earlier respawn
+        // is dropped, so its start stops waiting for it).
+        let (relay_tx, relay_rx) = tokio::sync::oneshot::channel();
+        let relay_slot = std::sync::Arc::clone(&self.pending_claim_relay);
+        drop(relay_slot.lock().expect("pending claim relay lock").take());
         async move {
-            crate::terminal::respawn_agent_terminal(&state, &req)
-                .await
-                .map_err(|err| match err {
-                    crate::terminal::RespawnError::LaunchUnresolvable(msg) => msg,
-                    crate::terminal::RespawnError::Spawn(io) => io.to_string(),
-                })
+            let respawned = crate::terminal::respawn_agent_terminal_relaying_claim(
+                &state,
+                &req,
+                Some(relay_rx),
+            )
+            .await;
+            if respawned.is_err() {
+                *relay_slot.lock().expect("pending claim relay lock") = Some(relay_tx);
+            }
+            respawned.map_err(|err| match err {
+                crate::terminal::RespawnError::LaunchUnresolvable(msg) => msg,
+                crate::terminal::RespawnError::Spawn(io) => io.to_string(),
+            })
         }
     }
 
@@ -1481,6 +1533,7 @@ pub fn spawn_auto_resume_hub(
             state,
             pending_ownership: Default::default(),
             pending_attach_guard: Default::default(),
+            pending_claim_relay: Default::default(),
         },
         rx,
         HubConfig::from_env(),
@@ -1501,6 +1554,7 @@ pub fn spawn_auto_resume_hub_with_schedules(
             state,
             pending_ownership: Default::default(),
             pending_attach_guard: Default::default(),
+            pending_claim_relay: Default::default(),
         },
         rx,
         HubConfig::with_schedules(delays, identity_grace_delays),
@@ -3137,6 +3191,82 @@ mod tests {
             .expect("spawn a real shell row for the test PTY");
     }
 
+    /// A failed respawn whose replacement start was given up inside its
+    /// unit receives the hub's claim through the start's relay:
+    /// `fail_claim` hands the coordinator ticket and the sessionRef lease
+    /// over instead of releasing them, so the conversation stays held until
+    /// that start drops them (at its unit's Gone). With no start waiting,
+    /// `fail_claim` releases at once (Task 12 review M1, the respawn path).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fail_claim_hands_the_claim_to_a_given_up_respawn_start() {
+        let (state, ownership) = ownership_state();
+        let driver = WsAutoResumeDriver {
+            state: state.clone(),
+            pending_ownership: Default::default(),
+            pending_attach_guard: Default::default(),
+            pending_claim_relay: Default::default(),
+        };
+        let locator = freshell_protocol::SessionLocator {
+            provider: "codex".to_string(),
+            session_id: "ses-relay".to_string(),
+        };
+        let lease_free = || match state
+            .registry
+            .claim_session_ref(&locator, "crq-probe", 0, 1_000)
+        {
+            freshell_terminal::registry::SessionRefClaim::Acquired => {
+                state.registry.fail_session_ref_claim(&locator, "crq-probe");
+                true
+            }
+            _ => false,
+        };
+        let starting = || {
+            matches!(
+                ownership.observe("codex", "ses-relay").state,
+                freshell_ownership::OwnershipState::Starting { .. }
+            )
+        };
+
+        // A start given up inside its unit waits on the relay.
+        assert!(
+            driver
+                .claim_session("codex", "ses-relay", "crq-relay", None)
+                .await
+        );
+        assert!(starting() && !lease_free(), "the hub holds the claim");
+        let (relay_tx, relay_rx) = tokio::sync::oneshot::channel();
+        *driver.pending_claim_relay.lock().unwrap() = Some(relay_tx);
+        driver.fail_claim("codex", "ses-relay", "crq-relay");
+        assert!(
+            starting() && !lease_free(),
+            "handed to the given-up start, the claim is still held"
+        );
+        let claim = relay_rx.await.expect("the claim reached the start");
+        drop(claim); // the start's unit is Gone
+        assert!(
+            matches!(
+                ownership.observe("codex", "ses-relay").state,
+                freshell_ownership::OwnershipState::Vacant
+            ),
+            "released when the start drops it"
+        );
+        assert!(lease_free(), "the lease is released with it");
+
+        // Nothing waits: released at once.
+        assert!(
+            driver
+                .claim_session("codex", "ses-relay", "crq-relay-2", None)
+                .await
+        );
+        assert!(starting());
+        driver.fail_claim("codex", "ses-relay", "crq-relay-2");
+        assert!(matches!(
+            ownership.observe("codex", "ses-relay").state,
+            freshell_ownership::OwnershipState::Vacant
+        ));
+        assert!(lease_free());
+    }
+
     /// b8ke ext r13 F2: the crash-recovery Adopt path retains authority
     /// through spawn/commit. The claim Adopts a live same-kind incumbent
     /// whose ROW IS DEAD (the crash shape — the watcher's ownership
@@ -3154,6 +3284,7 @@ mod tests {
             state: state.clone(),
             pending_ownership: Default::default(),
             pending_attach_guard: Default::default(),
+            pending_claim_relay: Default::default(),
         };
         let sid = "ses-r13-f2-adopt".to_string();
         spawn_real_shell_row(&state, "t-incumbent", "claude");
@@ -3260,6 +3391,7 @@ mod tests {
             state: state.clone(),
             pending_ownership: Default::default(),
             pending_attach_guard: Default::default(),
+            pending_claim_relay: Default::default(),
         };
         let sid = "ses-fenceheal-t3-respawn".to_string();
         // The broadcast receiver subscribed BEFORE the commit (the shared
@@ -3327,6 +3459,7 @@ mod tests {
             state: state.clone(),
             pending_ownership: Default::default(),
             pending_attach_guard: Default::default(),
+            pending_claim_relay: Default::default(),
         };
         let sid = "ses-r13-f2-adopt-live".to_string();
         spawn_real_shell_row(&state, "t-incumbent-live", "claude");
@@ -3391,6 +3524,7 @@ mod tests {
             state: state.clone(),
             pending_ownership: Default::default(),
             pending_attach_guard: Default::default(),
+            pending_claim_relay: Default::default(),
         });
         let sid = "ses-r14-f4-stale-retry".to_string();
         spawn_real_shell_row(&state, "t-crashed", "claude");

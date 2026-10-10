@@ -3003,13 +3003,13 @@ fn codex_screen_placement(
 /// The Codex TUI `screen_pid` of `terminal_id` started: it is pinned as the
 /// unit's screen and its row noted, and the unit is bound unless a stop
 /// reached Gone or cancelled the start meanwhile (`false`: give the start
-/// up).
-async fn codex_screen_spawned(
+/// up). Never waits.
+fn codex_screen_spawned(
     scope: &mut crate::unit_lifecycle::StartScope,
     terminal_id: &str,
     screen_pid: u32,
 ) -> bool {
-    let spawned = scope.spawned(terminal_id, screen_pid).await;
+    let spawned = scope.spawned(terminal_id, screen_pid);
     if spawned == crate::unit_lifecycle::Spawned::AlreadyStopped || scope.cancelled() {
         return false;
     }
@@ -4226,6 +4226,13 @@ impl PreparedCodexLaunch {
         Self(Some((setup, launch, scope)))
     }
 
+    /// The unit the planned launch runs in (its app-server's).
+    fn unit_id(&self) -> Option<String> {
+        self.0
+            .as_ref()
+            .map(|(_, _, scope)| scope.unit().id().to_string())
+    }
+
     /// The ID was reserved before off-permit planning. Reuse it in
     /// `handle_create`; do not mint or render a second terminal context.
     fn terminal_id(&self) -> Option<&str> {
@@ -4786,7 +4793,7 @@ pub(crate) async fn handle_create(
     // the TOP so `prepared_codex`'s Drop guard is alive across EVERY
     // pre-plan early return below (keyed-create adopt, D8 lease, rate
     // limit, unknown mode, claude ladder, D7 guard, opencode port).
-    let (prep, mut prepared_codex, prepared_resume_gate) = match prepared {
+    let (prep, prepared_codex, prepared_resume_gate) = match prepared {
         // p.codex_launch is None for non-codex modes AND for the A4
         // fresh-plan exclusion (no derived resume session id) — the None
         // arm of the plan site below then plans on-permit, byte-identical
@@ -4965,6 +4972,15 @@ pub(crate) async fn handle_create(
     let mut _terminal_start_cancellation: Option<
         freshell_freshagent::ownership_lane::StartCancellationGuard,
     > = None;
+    // A restore-class Codex create planned its launch (its unit runs its
+    // app-server) before this create claimed anything. DROP ORDER IS
+    // LOAD-BEARING: rebound here, after the claim guards above, so every
+    // early return below drops the prepared launch BEFORE those claims. Its
+    // abandonment begins the unit's stop at once, which moves the Starting
+    // key (stamped with that unit when it is claimed below) to Stopping;
+    // the claims dropped right after can then no longer vacate it, and the
+    // key is released only at the unit's Gone (`publish_gone`).
+    let mut prepared_codex = prepared_codex;
     if let Some(locator) = create_session_locator(&create) {
         if state.ownership.is_some() {
             wire_claim_locator_key = Some((locator.provider.clone(), locator.session_id.clone()));
@@ -5056,7 +5072,12 @@ pub(crate) async fn handle_create(
                                 live_session_key: None,
                                 pid: None,
                                 ownership_id: None,
-                                unit_id: None,
+                                // A prepared Codex launch's unit already
+                                // runs: a stop of it moves this Starting
+                                // key to Stopping and releases it at Gone.
+                                unit_id: prepared_codex
+                                    .as_ref()
+                                    .and_then(PreparedCodexLaunch::unit_id),
                                 hold: freshell_ownership::HoldKind::Main,
                             },
                         );
@@ -6019,7 +6040,12 @@ pub(crate) async fn handle_create(
                                 live_session_key: None,
                                 pid: None,
                                 ownership_id: None,
-                                unit_id: None,
+                                // A prepared Codex launch's unit already
+                                // runs: a stop of it moves this Starting
+                                // key to Stopping and releases it at Gone.
+                                unit_id: prepared_codex
+                                    .as_ref()
+                                    .and_then(PreparedCodexLaunch::unit_id),
                                 hold: freshell_ownership::HoldKind::Main,
                             },
                         );
@@ -7022,7 +7048,7 @@ pub(crate) async fn handle_create(
     // stop from now on ends this row. A stop that already reached Gone (or
     // cancelled the start meanwhile) gives the start up.
     if let (Some(scope), Some(screen_pid)) = (codex_scope.as_mut(), unit_screen_pid) {
-        if !codex_screen_spawned(scope, &terminal_id, screen_pid).await {
+        if !codex_screen_spawned(scope, &terminal_id, screen_pid) {
             if let Some(launch) = codex_launch.take() {
                 freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
                     .discard_sync(launch);
@@ -7765,6 +7791,18 @@ pub async fn respawn_agent_terminal(
     state: &WsState,
     req: &AgentRespawnRequest,
 ) -> Result<String, RespawnError> {
+    respawn_agent_terminal_relaying_claim(state, req, None).await
+}
+
+/// [`respawn_agent_terminal`] for a caller that holds the conversation's
+/// claim itself (the auto-resume hub): when the replacement's start is
+/// given up inside its unit, the caller hands the claim over through
+/// `claim_relay` and the start drops it at the unit's Gone, never before.
+pub(crate) async fn respawn_agent_terminal_relaying_claim(
+    state: &WsState,
+    req: &AgentRespawnRequest,
+    mut claim_relay: Option<crate::unit_lifecycle::ClaimRelay>,
+) -> Result<String, RespawnError> {
     let host_os = host_os_live();
     let is_wsl = is_wsl_env_live();
     // Headless respawn: no wire `shell` field — the system shell, exactly
@@ -7922,6 +7960,9 @@ pub async fn respawn_agent_terminal(
                     "codex unit could not be recorded: {error}"
                 ))
             })?;
+            if let Some(relay) = claim_relay.take() {
+                scope.release_claim_after_gone(relay);
+            }
             let planned = plan_codex_launch_in_unit(
                 state,
                 setup,
@@ -8228,7 +8269,7 @@ pub async fn respawn_agent_terminal(
     // The TUI is the unit's screen (pinned; its row noted); a stop that
     // reached Gone or cancelled the start meanwhile gives the start up.
     if let (Some(scope), Some(screen_pid)) = (codex_scope.as_mut(), unit_screen_pid) {
-        if !codex_screen_spawned(scope, &terminal_id, screen_pid).await {
+        if !codex_screen_spawned(scope, &terminal_id, screen_pid) {
             discard_respawn_launch(codex_launch.take(), codex_scope.take()).await;
             return Err(RespawnError::LaunchUnresolvable(
                 freshell_codex::launch_plan::CODEX_START_CANCELLED_MESSAGE.to_string(),

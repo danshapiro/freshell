@@ -182,6 +182,21 @@ pub fn placement_failed(
         reason = %reason, "unit member placement failed");
 }
 
+/// A start's screen could not be pinned as the process the start spawned
+/// (it already exited, or its pid now names another process); it is never
+/// signalled directly, and its exit reaches the unit lifecycle as usual.
+pub fn screen_unpinned(k: &UnitLogKeys, pid: u32, reason: &str) {
+    keyed!(debug, k, "unit.screen_unpinned", pid, reason = %reason,
+        "the start's screen could not be pinned");
+}
+
+/// A start was given up where no runtime could run its stop: its unit
+/// record stays for the next boot to finish.
+pub fn start_abandon_unscheduled(k: &UnitLogKeys) {
+    keyed!(error, k, "unit.start_abandon_unscheduled",
+        "an abandoned start could not be stopped (no runtime); its unit record stays for the next boot");
+}
+
 /// The unit record could not be written (`op`: create, update, stopping or
 /// remove).
 pub fn record_write_failed(k: &UnitLogKeys, op: &str, error: &str) {
@@ -290,6 +305,38 @@ mod tests {
         assert_eq!(events[6].str("holder_name"), "");
         assert_eq!(events[7].u64("port"), 41000);
         assert_eq!(events[7].u64("launcher_pid"), 4242);
+    }
+
+    #[test]
+    fn the_start_events_carry_the_unit_keys() {
+        let k = UnitLogKeys {
+            terminal_id: Some("T-1".into()),
+            operation_id: Some("unit-start-cancel-1".into()),
+            ..keys()
+        };
+        let events = capture(|| {
+            screen_unpinned(&k, 77, "different incarnation");
+            start_abandon_unscheduled(&k);
+        });
+        use tracing::Level;
+        let got: Vec<(Level, &str)> = events.iter().map(|e| (e.level, e.str("event"))).collect();
+        assert_eq!(
+            got,
+            [
+                (Level::DEBUG, "unit.screen_unpinned"),
+                (Level::ERROR, "unit.start_abandon_unscheduled"),
+            ]
+        );
+        for event in &events {
+            assert_eq!(event.target, "freshell_unit");
+            assert_eq!(event.str("unit_id"), "u0123456789abcdef0123456789abcdef");
+            assert_eq!(event.str("provider"), "codex");
+            assert_eq!(event.str("session_id"), "t-1");
+            assert_eq!(event.str("terminal_id"), "T-1");
+            assert_eq!(event.str("operation_id"), "unit-start-cancel-1");
+        }
+        assert_eq!(events[0].u64("pid"), 77);
+        assert_eq!(events[0].str("reason"), "different incarnation");
     }
 
     #[test]

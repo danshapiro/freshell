@@ -190,10 +190,17 @@ async fn killed_starts_are_remembered_after_the_unit_is_gone() {
 
 /// Records every call it receives; its `stop` stops the entry's unit for
 /// real (the tag backend), so the returned handle is a genuine one.
+/// An abandoned start as recorded: (unit id, base unit id, terminal id).
+type Abandoned = (String, Option<String>, Option<String>);
+
 #[derive(Default)]
 struct RecordingLifecycle {
     stops: Mutex<Vec<(String, StopMode, String)>>,
     settles: Mutex<Vec<(String, u32)>>,
+    /// Each abandoned start: (unit id, base unit id, terminal id), and its
+    /// claim, kept so the test can see it was handed over (not dropped).
+    abandons: Mutex<Vec<Abandoned>>,
+    claims: Mutex<Vec<Box<dyn std::any::Any + Send>>>,
 }
 
 impl UnitLifecycle for RecordingLifecycle {
@@ -218,6 +225,71 @@ impl UnitLifecycle for RecordingLifecycle {
             .unwrap()
             .push((entry.unit.id().to_string(), screen_pid));
     }
+
+    fn abandon_start(&self, start: AbandonedStart) {
+        self.abandons.lock().unwrap().push((
+            start.entry.unit.id().to_string(),
+            start.base.as_ref().map(|base| base.id().to_string()),
+            start.entry.terminal_id.clone(),
+        ));
+        if let Some(claim) = start.claim {
+            self.claims.lock().unwrap().push(claim);
+        }
+    }
+}
+
+/// A claim that records when it is dropped.
+struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A lane that cannot depend on the WebSocket layer gives its start up
+/// through the installed lifecycle, which receives the start's unit, base
+/// unit, terminal and claim (the claim is the lifecycle's to drop at Gone);
+/// without a lifecycle the start is handed back.
+#[tokio::test]
+async fn abandon_start_routes_through_the_installed_lifecycle() {
+    let dir = UnitDirectory::new();
+    let (current, base) = (unit(), unit());
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let start = |claim: Option<Box<dyn std::any::Any + Send>>| AbandonedStart {
+        entry: UnitEntry {
+            terminal_id: Some("T-abandon".into()),
+            ..starting_entry(&current, "crq-abandon")
+        },
+        base: Some(base.clone()),
+        initiator: "rest-start-cancelled".into(),
+        claim,
+    };
+
+    let returned = dir
+        .abandon_start(start(None))
+        .expect_err("no lifecycle: the start is handed back");
+    assert_eq!(returned.entry.unit.id(), current.id());
+
+    let recorder = Arc::new(RecordingLifecycle::default());
+    dir.set_lifecycle(recorder.clone());
+    assert!(dir
+        .abandon_start(start(Some(Box::new(DropFlag(dropped.clone())))))
+        .is_ok());
+    assert_eq!(
+        *recorder.abandons.lock().unwrap(),
+        vec![(
+            current.id().to_string(),
+            Some(base.id().to_string()),
+            Some("T-abandon".to_string())
+        )]
+    );
+    assert!(
+        !dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "the claim went to the lifecycle, not dropped on the way"
+    );
+    recorder.claims.lock().unwrap().clear();
+    assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
 }
 
 #[tokio::test]
