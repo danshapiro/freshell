@@ -5402,8 +5402,8 @@ export class ManagedRuntimeOwner {
   }
 
   async runningViewForFreshSession(sessionId: string): Promise<ManagedRuntimeView | null> {
-    return (await this.inventory()).find((row: any) => (
-      row.freshAgentSessionId === sessionId && row.launchState === 'running'
+    return (await this.inventory()).find((row) => (
+      (row.freshAgentSessionId === sessionId || row.nativeSessionId === sessionId) && row.launchState === 'running'
     )) ?? null
   }
 

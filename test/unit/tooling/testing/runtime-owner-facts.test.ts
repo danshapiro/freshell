@@ -1957,6 +1957,31 @@ describe('fixed observations of an owned prior enclosure', () => {
   })
 })
 
+describe('current running fresh-session lookup', () => {
+  it('resolves presentation and materialized native IDs to the same current running row', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', {
+      enabledProviders: [], freshAgentModes: [],
+    })
+    const row = { ...handle, freshAgentSessionId: 'presentation-owned', launchState: 'running', intentRevision: 1 }
+    const prior = { ...row, incarnationId: 'prior-incarnation', launchState: 'stopped' }
+    vi.spyOn(rig, 'inventory').mockResolvedValue([prior, row])
+    await expect(rig.runningViewForFreshSession(row.freshAgentSessionId)).resolves.toEqual(row)
+    await expect(rig.runningViewForFreshSession(row.nativeSessionId)).resolves.toEqual(row)
+    await expect(rig.runningViewForFreshSession('unrelated-session')).resolves.toBeNull()
+  })
+
+  it.each(['prepared', 'created', 'starting', 'stopped', 'failed'])('refuses %s rows and unrelated session identities', async launchState => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', {
+      enabledProviders: [], freshAgentModes: [],
+    })
+    const row = { ...handle, freshAgentSessionId: 'presentation-owned', launchState, intentRevision: 1 }
+    vi.spyOn(rig, 'inventory').mockResolvedValue([row])
+    await expect(rig.runningViewForFreshSession(row.freshAgentSessionId)).resolves.toBeNull()
+    await expect(rig.runningViewForFreshSession(row.nativeSessionId)).resolves.toBeNull()
+    await expect(rig.runningViewForFreshSession('unrelated-session')).resolves.toBeNull()
+  })
+})
+
 describe('fixed fresh-agent launch observations', () => {
   it('crashes the matching fresh provider child rather than its adapter PID', async () => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', {
