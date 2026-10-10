@@ -86,14 +86,17 @@ fn boot_nonce() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
 }
 
-/// The number on `systemd-run --version`'s first line (`systemd 255 (…)`).
+/// The number on `systemd-run --version`'s first line (`systemd 255 (…)`;
+/// a pre-release `systemd 256~rc3 (…)` counts as 256).
 fn systemd_version(first_line: &str) -> Option<u32> {
-    first_line
+    let token = first_line
         .strip_prefix("systemd ")?
         .split_whitespace()
-        .next()?
-        .parse()
-        .ok()
+        .next()?;
+    let digits = token
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(token.len());
+    token[..digits].parse().ok()
 }
 
 /// What the backend learned at its probe; shared by every unit.
@@ -1032,7 +1035,11 @@ mod tests {
         assert_eq!(expands("systemd 255 (255.4-1ubuntu8.17)"), Some(true));
         assert_eq!(expands("systemd 254 (254.5-1)"), Some(true));
         assert_eq!(expands("systemd 249 (249.11-0ubuntu3.12)"), Some(false));
+        // A pre-release build is the version it leads up to.
+        assert_eq!(expands("systemd 256~rc3 (256~rc3-1)"), Some(true));
+        assert_eq!(expands("systemd 253~rc1 (253~rc1-2)"), Some(false));
         assert_eq!(expands("systemd-run 255"), None);
+        assert_eq!(expands("systemd ~rc3"), None);
         assert_eq!(expands(""), None);
     }
 }
