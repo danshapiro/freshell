@@ -498,6 +498,12 @@ export async function exercisePhase3StartupReplacementCrash(
     scenarioId: crashScenario,
     volumeName: beforeCrash.volumeName,
   })
+  // Retirement spends the interrupted try and preserves its automatic 2s
+  // backoff. Observe the scheduled retry; do not mint an immediate new try.
+  await waitUntil(async () => {
+    const view = latestSoulView(await inventory(h, reconciled), crashSoul.soulId)
+    return view?.launchState === 'running' && view?.recoveryState === 'live'
+  }, 8_000)
   const final = dataOf(
     await h.adminOk(reconciled, h.recoverBody(crashSoul.soulId, 'startup_reconcile')),
     'recovery',
@@ -918,10 +924,10 @@ function shellRegexEscape(value: string): string {
   return value.replace(/[\\/.*+?[^\]$(){}=!<>|:-]/g, '\\$&')
 }
 
-async function waitUntil(predicate: () => boolean, timeoutMs: number): Promise<void> {
+async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    if (predicate()) return
+    if (await predicate()) return
     await new Promise((resolve) => setTimeout(resolve, 100))
   }
   throw new Error(`condition did not become true within ${timeoutMs}ms`)

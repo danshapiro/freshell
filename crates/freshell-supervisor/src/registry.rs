@@ -2733,6 +2733,7 @@ impl Registry {
         &self,
         soul_id: SoulId,
     ) -> Result<bool, RegistryError> {
+        let now = self.recovery_now_ms();
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let candidate: Option<(String, Option<String>)> = tx
@@ -2748,7 +2749,6 @@ impl Registry {
             };
             let incarnation_id = IncarnationId::parse(incarnation_raw)
                 .map_err(|_| RegistryError::Integrity("invalid incarnation id".into()))?;
-            let now = now_millis();
             let changed = tx.execute(
                 "UPDATE incarnations SET launch_state='failed',cleanup_state='termination_unconfirmed',updated_at=?1                  WHERE incarnation_id=?2 AND launch_state='prepared'                    AND docker_daemon_id IS NULL AND container_id IS NULL",
                 params![now, incarnation_id.as_str()],
@@ -2769,21 +2769,38 @@ impl Registry {
                 "DELETE FROM admission_reservations WHERE incarnation_id=?1",
                 params![incarnation_id.as_str()],
             )?;
-            if let Some(attempt_id) = attempt_raw.as_deref() {
+            if let Some(raw) = attempt_raw {
+                let attempt = RecoveryAttemptId::parse(raw)
+                    .map_err(|_| RegistryError::Integrity("invalid interrupted attempt".into()))?;
+                let revision: u64 = tx.query_row(
+                    "SELECT intent_revision FROM recovery_attempts WHERE attempt_id=?1",
+                    [attempt.as_str()], |row| row.get(0),
+                )?;
+                // An unfinished pre-migration journal already spent one try.
+                // Upgrade only that current reservation before finishing it;
+                // an older intent cannot acquire or overwrite a retry budget.
+                tx.execute(
+                    "INSERT OR IGNORE INTO recovery_retries (soul_id,intent_revision,attempt_count,reserved_attempt_id,last_reason)
+                     SELECT a.soul_id,a.intent_revision,1,a.attempt_id,'reserved'
+                     FROM recovery_attempts a JOIN souls s ON s.soul_id=a.soul_id
+                     WHERE a.attempt_id=?1 AND a.finished_at IS NULL
+                       AND s.intent_revision=a.intent_revision AND s.recovery_attempt_id=a.attempt_id
+                       AND s.desired_state='running' AND s.recovery_state='recovering'",
+                    [attempt.as_str()],
+                )?;
                 tx.execute(
                     "UPDATE recovery_attempts SET verdict='interrupted_before_ownership_commit',evidence_ref='unregistered_stopped_object_quarantined',finished_at=?1                      WHERE attempt_id=?2 AND finished_at IS NULL",
-                    params![now, attempt_id],
+                    params![now, attempt.as_str()],
                 )?;
-            }
-            tx.execute(
-                "UPDATE souls SET recovery_state='blocked',recovery_reason='INTERRUPTED_BEFORE_OWNERSHIP_COMMIT',recovery_attempt_id=NULL,updated_at=?1                  WHERE soul_id=?2 AND recovery_state='recovering'",
-                params![now, soul_id.as_str()],
-            )?;
-            if let Some(raw) = attempt_raw {
-                let attempt=RecoveryAttemptId::parse(raw).map_err(|_|RegistryError::Integrity("invalid interrupted attempt".into()))?;
-                let revision:u64=tx.query_row("SELECT intent_revision FROM recovery_attempts WHERE attempt_id=?1",[attempt.as_str()],|r|r.get(0))?;
+                tx.execute(
+                    "UPDATE souls SET recovery_state='blocked',recovery_reason='INTERRUPTED_BEFORE_OWNERSHIP_COMMIT',recovery_attempt_id=NULL,updated_at=?1
+                     WHERE soul_id=?2 AND recovery_state='recovering' AND recovery_attempt_id=?3 AND intent_revision=?4",
+                    params![now, soul_id.as_str(), attempt.as_str(), revision],
+                )?;
+                // Only the protected try is retryable. Its spent count and
+                // backoff survive; the abandoned object acquires no authority.
                 settle_recovery_retry_tx(&tx, &soul_id, revision, &attempt, now,
-                    RetrySettlement::Blocked { retryable: false, reason: "ownership_not_committed" })?;
+                    RetrySettlement::Blocked { retryable: true, reason: "ownership_not_committed" })?;
             }
             tx.commit()?;
             Ok(true)

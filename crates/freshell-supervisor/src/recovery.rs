@@ -2355,8 +2355,35 @@ impl Supervisor {
             crate::service::append_event(
                 &self.config.lifecycle_log,
                 "supervisor.recovery.interrupted_prepared_retired",
-                serde_json::json!({"soulId": request.soul_id}),
+                serde_json::json!({
+                    "severity":"warn", "soulId":request.soul_id,
+                    "incarnationId":before_retry.prior_handle.incarnation_id(),
+                    "intentRevision":before_retry.intent_revision,
+                    "controlEpoch":self.registry.control_epoch(),
+                    "reason":"unregistered_stopped_object_quarantined",
+                }),
             );
+            if let Some(retry) = self
+                .registry
+                .recovery_retry(request.soul_id.clone(), before_retry.intent_revision)
+                .await
+                .map_err(map_registry)?
+                .filter(|retry| {
+                    retry.next_due_at_ms.is_some() || retry.last_reason == "retry_exhausted"
+                })
+            {
+                self.log_recovery_retry(
+                    if retry.last_reason == "retry_exhausted" {
+                        "exhausted"
+                    } else {
+                        "scheduled"
+                    },
+                    &retry,
+                    &before_retry.recovery_attempt_id,
+                    &before_retry,
+                )
+                .await;
+            }
         }
         if request.trigger == RecoveryTrigger::RetryExhausted {
             let initial_context = self
@@ -9377,6 +9404,397 @@ mod automatic_retry_tests {
             task.abort();
             let _ = task.await;
         }
+    }
+
+    async fn uncommitted_replacement(
+        supervisor: &Supervisor,
+        backend: &RetryBackend,
+        soul: &SoulId,
+    ) -> (IncarnationId, PathBuf, String) {
+        let original = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        supervisor
+            .registry
+            .reserve_due_recovery_retry(
+                soul.clone(),
+                original.intent_revision,
+                supervisor.registry.recovery_now_ms(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let start = supervisor
+            .registry
+            .begin_recovery(
+                soul.clone(),
+                RecoveryTrigger::ProviderExit,
+                RecoveryPath::NativeResume,
+            )
+            .await
+            .unwrap();
+        supervisor
+            .registry
+            .mark_stop_outcome(
+                original.prior_handle.incarnation_id().clone(),
+                StopOutcome::VerifiedEmpty,
+            )
+            .await
+            .unwrap();
+        let replacement = supervisor
+            .registry
+            .prepare_replacement(
+                start,
+                original.terminal,
+                original.fresh_agent,
+                original.resume_spec,
+                RecoveryPath::NativeResume,
+            )
+            .await
+            .unwrap();
+        let incarnation = replacement.prepared.incarnation_id;
+        let runtime = supervisor.config.runtime_root.join(incarnation.as_str());
+        std::fs::create_dir_all(&runtime).unwrap();
+        let created = backend
+            .create_stopped(&CreateRuntimeSpec {
+                installation_id: supervisor.registry.installation_id().clone(),
+                soul_id: soul.clone(),
+                incarnation_id: incarnation.clone(),
+                image_ref: supervisor.config.image_ref.clone(),
+                host_binary_path: supervisor.config.host_binary_path.clone(),
+                runtime_dir: runtime.clone(),
+                limits: original.requested_limits,
+                test_run_id: "retry-uncommitted".into(),
+                terminal: None,
+                fresh_agent: None,
+                opencode_transfer_dir: None,
+                provider_volume_name: "retry-volume".into(),
+            })
+            .await
+            .unwrap();
+        // Model the exact persisted boundary without aborting a host process:
+        // create returned, but ownership was never committed to the registry.
+        (incarnation, runtime, created.container_id)
+    }
+
+    fn assert_uncommitted_object_quarantined(
+        supervisor: &Supervisor,
+        backend: &RetryBackend,
+        incarnation: &IncarnationId,
+        runtime: &Path,
+        container: &str,
+    ) {
+        assert_eq!(
+            std::fs::read_to_string(runtime.join("fixture-object")).unwrap(),
+            container
+        );
+        assert!(!runtime.join("fixture-started").exists());
+        assert!(!runtime.join("fixture-stopped").exists());
+        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+        let facts: (String, String, Option<String>, u64, u64, u64) = conn
+            .query_row(
+                "SELECT launch_state,cleanup_state,container_id,execution_generation,
+             (SELECT count(*) FROM writer_claims WHERE incarnation_id=?1),
+             (SELECT count(*) FROM admission_reservations WHERE incarnation_id=?1)
+             FROM incarnations WHERE incarnation_id=?1",
+                [incarnation.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            facts,
+            (
+                "failed".into(),
+                "termination_unconfirmed".into(),
+                None,
+                0,
+                0,
+                0
+            )
+        );
+        let inspected = std::fs::read_to_string(backend.root.join("inspects")).unwrap_or_default();
+        assert!(!inspected.lines().any(|value| value == incarnation.as_str()));
+    }
+
+    #[tokio::test]
+    async fn retry_uncommitted_replacement_reopens_with_backoff_and_preserves_native_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, backend, _) = open(dir.path(), 0);
+        let soul = seed_native(&supervisor, dir.path()).await;
+        let original = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let (incarnation, runtime, container) =
+            uncommitted_replacement(&supervisor, &backend, &soul).await;
+        let attempt = attempts(dir.path())[0].0.clone();
+        drop(supervisor);
+        drop(backend);
+
+        let (supervisor, backend, _) = open(dir.path(), 1_000);
+        let report = supervisor.reconcile_startup().await.unwrap();
+        assert!(
+            report.results.iter().all(|result| result.error.is_none()),
+            "{report:?}"
+        );
+        assert_eq!(due(dir.path()), Some(3_000));
+        let retry = supervisor
+            .registry
+            .recovery_retry(soul.clone(), original.intent_revision)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.attempt_count, 1);
+        assert!(retry.reserved_attempt_id.is_none());
+        assert_eq!(
+            attempts(dir.path()),
+            vec![(attempt, "interrupted_before_ownership_commit".into())]
+        );
+        assert_eq!(backend.count("creates"), 1);
+        assert_uncommitted_object_quarantined(
+            &supervisor,
+            &backend,
+            &incarnation,
+            &runtime,
+            &container,
+        );
+        let events = std::fs::read_to_string(dir.path().join("lifecycle.jsonl")).unwrap();
+        let scheduled: serde_json::Value = events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["event"] == "supervisor.recovery_retry.scheduled")
+            .unwrap();
+        assert_eq!(scheduled["data"]["attemptCount"], 1);
+        assert_eq!(scheduled["data"]["nextDueAtMs"], 3_000);
+        assert_eq!(scheduled["data"]["reason"], "ownership_not_committed");
+        assert_eq!(scheduled["data"]["severity"], "info");
+        drop(supervisor);
+        drop(backend);
+
+        let (supervisor, backend, clock) = open(dir.path(), 2_000);
+        supervisor.reconcile_startup().await.unwrap();
+        assert_eq!(due(dir.path()), Some(3_000));
+        assert_eq!(backend.count("creates"), 1);
+        clock.store(3_000, Ordering::SeqCst);
+        supervisor.observe_once().await.unwrap();
+        let current = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        assert_eq!(current.recovery_state, RecoveryState::Live);
+        assert_eq!(current.intent_revision, original.intent_revision);
+        assert_ne!(current.prior_handle.incarnation_id(), &incarnation);
+        assert_ne!(current.prior_handle.container_id(), container);
+        assert_eq!(backend.count("creates"), 2);
+        assert_eq!(attempts(dir.path()).len(), 2);
+        assert_eq!(attempts(dir.path())[1].1, "succeeded");
+        assert_eq!(due(dir.path()), None);
+        assert_root_and_successes(&supervisor, &soul, 1).await;
+        assert_uncommitted_object_quarantined(
+            &supervisor,
+            &backend,
+            &incarnation,
+            &runtime,
+            &container,
+        );
+        close_retry_hosts(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn retry_uncommitted_replacements_preserve_three_attempt_exhaustion() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, backend, clock) = open(dir.path(), 0);
+        let soul = seed(&supervisor).await;
+        for (count, now, expected_due) in [
+            (1, 0, Some(2_000)),
+            (2, 2_000, Some(12_000)),
+            (3, 12_000, None),
+        ] {
+            clock.store(now, Ordering::SeqCst);
+            let (incarnation, runtime, container) =
+                uncommitted_replacement(&supervisor, &backend, &soul).await;
+            supervisor.reconcile_startup().await.unwrap();
+            assert_eq!(due(dir.path()), expected_due);
+            assert_eq!(attempts(dir.path()).len(), count);
+            assert_uncommitted_object_quarantined(
+                &supervisor,
+                &backend,
+                &incarnation,
+                &runtime,
+                &container,
+            );
+        }
+        drop(supervisor);
+        drop(backend);
+        let (supervisor, backend, _) = open(dir.path(), 1_000_000);
+        supervisor.reconcile_startup().await.unwrap();
+        supervisor.observe_once().await.unwrap();
+        assert_eq!(attempts(dir.path()).len(), 3);
+        assert_eq!(backend.count("creates"), 3);
+        assert_eq!(due(dir.path()), None);
+        assert!(supervisor
+            .registry
+            .inventory()
+            .await
+            .unwrap()
+            .iter()
+            .any(|view| view.soul_id == soul
+                && view.recovery_reason.as_deref() == Some("RETRY_BUDGET")));
+        assert_root_and_successes(&supervisor, &soul, 0).await;
+    }
+
+    #[tokio::test]
+    async fn retry_uncommitted_legacy_journal_consumes_its_existing_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, backend, _) = open(dir.path(), 0);
+        let soul = seed(&supervisor).await;
+        let (incarnation, runtime, container) =
+            uncommitted_replacement(&supervisor, &backend, &soul).await;
+        // The unfinished pre-migration journal still represents a spent try.
+        Connection::open(supervisor.registry.database_path())
+            .unwrap()
+            .execute("DELETE FROM recovery_retries", [])
+            .unwrap();
+        drop(supervisor);
+        drop(backend);
+        let (supervisor, backend, _) = open(dir.path(), 1_000);
+        supervisor.reconcile_startup().await.unwrap();
+        assert_eq!(backend.count("creates"), 1);
+        assert_eq!(attempts(dir.path()).len(), 1);
+        assert_eq!(due(dir.path()), Some(3_000));
+        assert_uncommitted_object_quarantined(
+            &supervisor,
+            &backend,
+            &incarnation,
+            &runtime,
+            &container,
+        );
+        close_retry_hosts(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn retry_uncommitted_old_intent_cannot_cancel_current_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, backend, clock) = open(dir.path(), 0);
+        let soul = seed(&supervisor).await;
+        let original = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let (incarnation, runtime, container) =
+            uncommitted_replacement(&supervisor, &backend, &soul).await;
+        let revision = supervisor
+            .registry
+            .rearm_recovery_retry(soul.clone(), original.intent_revision)
+            .await
+            .unwrap();
+        clock.store(1_000, Ordering::SeqCst);
+        let reserved = supervisor
+            .registry
+            .reserve_due_recovery_retry(soul.clone(), revision, 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(supervisor
+            .recover(RecoverRequest {
+                soul_id: soul.clone(),
+                trigger: RecoveryTrigger::StartupReconcile,
+                expected_intent_revision: Some(original.intent_revision),
+                expected_control_epoch: Some(supervisor.registry.control_epoch()),
+            })
+            .await
+            .is_err());
+        assert_eq!(backend.count("creates"), 1);
+        let result = supervisor
+            .recover(RecoverRequest {
+                soul_id: soul.clone(),
+                trigger: RecoveryTrigger::StartupReconcile,
+                expected_intent_revision: Some(revision),
+                expected_control_epoch: Some(supervisor.registry.control_epoch()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, RecoveryOutcome::Replaced);
+        assert_eq!(
+            attempts(dir.path())[1],
+            (
+                reserved.reserved_attempt_id.unwrap().to_string(),
+                "succeeded".into()
+            )
+        );
+        assert_eq!(result.view.intent_revision, revision);
+        assert_uncommitted_object_quarantined(
+            &supervisor,
+            &backend,
+            &incarnation,
+            &runtime,
+            &container,
+        );
+        close_retry_hosts(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn retry_uncommitted_replacement_retirement_never_rearms_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, backend, clock) = open(dir.path(), 0);
+        let soul = seed(&supervisor).await;
+        let original = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let (incarnation, runtime, container) =
+            uncommitted_replacement(&supervisor, &backend, &soul).await;
+        supervisor
+            .registry
+            .retire_unowned_prepared_replacement(soul.clone())
+            .await
+            .unwrap();
+        assert_uncommitted_object_quarantined(
+            &supervisor,
+            &backend,
+            &incarnation,
+            &runtime,
+            &container,
+        );
+        // Stop commits its durable intent even when it cannot issue a handle
+        // for the quarantined object's missing ownership record.
+        assert!(supervisor.registry.begin_stop(soul.clone()).await.is_err());
+        clock.store(1_000_000, Ordering::SeqCst);
+        supervisor.reconcile_startup().await.unwrap();
+        supervisor.observe_once().await.unwrap();
+        let context = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        assert_eq!(context.desired_state, DesiredState::Stopped);
+        assert_eq!(context.intent_revision, original.intent_revision + 1);
+        assert_eq!(context.recovery_state, RecoveryState::Stopped);
+        assert_eq!(backend.count("creates"), 1);
+        assert_eq!(attempts(dir.path()).len(), 1);
+        assert_eq!(due(dir.path()), None);
+        assert_eq!(
+            std::fs::read_to_string(runtime.join("fixture-object")).unwrap(),
+            container
+        );
+        assert!(!runtime.join("fixture-started").exists());
+        assert!(!runtime.join("fixture-stopped").exists());
+        close_retry_hosts(&backend).await;
     }
 
     #[tokio::test]

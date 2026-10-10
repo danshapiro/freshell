@@ -1982,6 +1982,71 @@ describe('current running fresh-session lookup', () => {
   })
 })
 
+describe('startup replacement fixture observes bounded automatic recovery', () => {
+  it.each(['scheduled', 'blocked', 'unrelated-live'] as const)('observes %s inventory without forcing or rearming recovery', async scenario => {
+    const { exercisePhase3StartupReplacementCrash } = await import('../../../runtime/gates/phase-3.test.js')
+    const h = new owner.RuntimeHarness(fixtureRepoRoot, 'startup-backoff-unit', 3, { bootstrapProviders: [] })
+    let starts = 0
+    let soulId = ''
+    const row = () => ({ soulId, incarnationId: 'original-incarnation', containerId: 'original-container',
+      nativeSessionId: 'native-root', launchState: 'running', recoveryState: 'live',
+      durabilityState: 'resume_captured', allocationState: 'verified_durable' })
+    h.broker = { receiptIds: () => new Set<string>() } as unknown as RestrictedDockerBroker
+    vi.spyOn(h, 'startSupervisor').mockImplementation(async () => ({
+      containerId: `supervisor-${++starts}`, volumeName: 'owned-volume',
+    }) as owner.SupervisorInstance)
+    vi.spyOn(h, 'stopSupervisorExact').mockImplementation(() => undefined)
+    vi.spyOn(h, 'removeContainerExact').mockImplementation(() => undefined)
+    vi.spyOn(h, 'killOwnedRuntimeExact').mockImplementation(() => undefined)
+    const waitForFault = vi.spyOn(h, 'waitForContainerExit').mockResolvedValue(undefined)
+    vi.spyOn(h, 'containerLogs').mockReturnValue(JSON.stringify({ event: 'supervisor.test_crash', point: 'after_docker_create' }))
+    vi.spyOn(h, 'brokerReceiptsSince').mockReturnValue([{ containerId: 'quarantined-container' }] as ReturnType<owner.RuntimeHarness['brokerReceiptsSince']>)
+    vi.spyOn(h, 'inspectContainer').mockReturnValue({ State: { Running: false } })
+    vi.spyOn(h, 'nativeFixtureCall').mockImplementation(async (_instance, _incarnation, request) =>
+      request.method === 'create' ? { ok: true, sessionId: 'native-root' }
+        : { ok: true, sessionId: 'native-root', history: ['create', 'automatic_resume'] })
+    const recoveryTimes: number[] = []
+    const inventoryTimes: number[] = []
+    vi.spyOn(h, 'adminOk').mockImplementation(async (_instance, body) => {
+      const elapsed = Date.now()
+      switch (body.method) {
+        case 'health': return { kind: 'health', data: { controlEpoch: 1 } }
+        case 'launch':
+          soulId = body.params.soulId
+          return { kind: 'launch', data: { view: row(), workerPid: 42, workerLaunchCount: 1 } }
+        case 'probe_recovery': return { kind: 'recovery_probe', data: { kind: 'reattach_ready' } }
+        case 'inventory': {
+          if (starts < 3) return { kind: 'inventory', data: [row()] }
+          inventoryTimes.push(elapsed)
+          const recovered = elapsed >= 2_000 && scenario !== 'blocked'
+          return { kind: 'inventory', data: recovered
+            ? [{ ...row(), soulId: scenario === 'unrelated-live' ? 'other-soul' : soulId, incarnationId: 'replacement-incarnation' }]
+            : [{ ...row(), launchState: 'stopped', recoveryState: 'blocked' }] }
+        }
+        case 'recover':
+          expect(body.params.trigger).toBe('startup_reconcile')
+          recoveryTimes.push(elapsed)
+          return { kind: 'recovery', data: { outcome: elapsed >= 2_000 ? 'reattached' : 'blocked' } }
+        case 'stop': return { kind: 'stop', data: { outcome: 'verified_empty' } }
+        default: throw new Error(`unadmitted controlled request ${body.method}`)
+      }
+    })
+    vi.useFakeTimers({ now: 0 })
+    try {
+      const execution = exercisePhase3StartupReplacementCrash(h)
+      // Attach the assertion before advancing timers so a genuine driver
+      // failure is observed without creating an unhandled rejection.
+      const checked = scenario === 'scheduled'
+        ? expect(execution).resolves.toMatchObject({ recoveryOutcome: 'reattached', nativeSessionStable: true, stopOutcome: 'verified_empty' })
+        : expect(execution).rejects.toThrow(/within 8000ms/)
+      await Promise.all([vi.runAllTimersAsync(), checked])
+      expect(waitForFault).toHaveBeenCalledExactlyOnceWith('supervisor-2', 8_000)
+      expect(recoveryTimes).toEqual(scenario === 'scheduled' ? [2_000] : [])
+      expect(inventoryTimes.at(-1)).toBe(scenario === 'scheduled' ? 2_000 : 7_900)
+    } finally { vi.useRealTimers() }
+  })
+})
+
 describe('fixed fresh-agent launch observations', () => {
   it('crashes the matching fresh provider child rather than its adapter PID', async () => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', {
