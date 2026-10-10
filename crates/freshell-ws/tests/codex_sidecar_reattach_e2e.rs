@@ -1055,6 +1055,11 @@ fn restore_reattaches_tui_to_surviving_sidecar_preserving_in_flight_turn() {
                 updated_at: 1_700_000_000_001,
                 state: SidecarRecordState::Active,
                 lane: None,
+                held_thread_ids: Vec::new(),
+                unit_id: None,
+                main_pid: None,
+                main_starttime: None,
+                codex_home: None,
             })
             .expect("write survivor record");
         let (reconciler, report) = SidecarReconciler::boot_reconcile(store.clone());

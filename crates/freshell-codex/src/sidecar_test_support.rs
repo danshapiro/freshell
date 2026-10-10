@@ -121,6 +121,54 @@ pub(crate) fn record_for_child(
         updated_at: 1_700_000_000_001,
         state: SidecarRecordState::Active,
         lane: None,
+        held_thread_ids: Vec::new(),
+        unit_id: None,
+        main_pid: None,
+        main_starttime: None,
+        codex_home: None,
+    }
+}
+
+/// Spawn this test's own `sleep 300` (it stands in for the native main) and
+/// a Verified v2 record for it: `session_id`, `unit_id`, and
+/// `main_pid`/`main_starttime` set to the child's own pid and start time.
+/// The ownership id is `codex-sidecar-<unit_id>`. The child is killed and
+/// reaped when the guard drops.
+pub(crate) fn spawn_verified_record(
+    session_id: &str,
+    unit_id: &str,
+) -> (ChildGuard, CodexSidecarRecord) {
+    let child = spawn_own_sleep_child();
+    let pid = child.0.id();
+    let record = CodexSidecarRecord {
+        unit_id: Some(unit_id.to_string()),
+        main_pid: Some(pid),
+        main_starttime: Some(proc_starttime(pid as i32).expect("live child has a starttime")),
+        ..record_for_child(&format!("codex-sidecar-{unit_id}"), pid, Some(session_id))
+    };
+    (child, record)
+}
+
+/// A containment unit record for `unit_id` (provider `codex`): `Running`, or
+/// `Stopping` for a Shift-X under operation `op`.
+pub(crate) fn unit_record(unit_id: &str, running: bool) -> freshell_containment::UnitRecord {
+    freshell_containment::UnitRecord {
+        unit_id: freshell_containment::UnitId::parse(unit_id).expect("a minted unit id"),
+        provider: "codex".to_string(),
+        mode: "codex".to_string(),
+        terminal_id: None,
+        create_request_id: None,
+        conversation_keys: Vec::new(),
+        roots: Vec::new(),
+        state: if running {
+            freshell_containment::UnitRecordState::Running
+        } else {
+            freshell_containment::UnitRecordState::Stopping {
+                reason: "shift-x".to_string(),
+                operation_id: Some("op".to_string()),
+                since_ms: 1,
+            }
+        },
     }
 }
 

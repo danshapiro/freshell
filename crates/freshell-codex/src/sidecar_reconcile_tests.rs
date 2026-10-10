@@ -83,6 +83,8 @@ fn boot_reconcile_prunes_dead_and_mismatched_records() {
             pruned_dead: 1,
             pruned_mismatch: 1,
             held: 1,
+            finishing: Vec::new(),
+            pruned_unit_gone: 0,
         }
     );
     assert_eq!(reconciler.unclaimed_len(), 1, "only the verified row held");
@@ -815,4 +817,172 @@ async fn select_codex_runtime_prefers_a_claimable_survivor() {
         .kill()
         .await
         .expect("cleanup: kill this test's own fixture");
+}
+
+// ---------------------------------------------------------------------------
+// Task 9: record v2 at boot. A row that names a containment unit is held
+// only while that unit's own record is Running; Stopping is the unit
+// record's state (the sidecar record has none), and a missing unit record
+// means the unit already reached Gone.
+// ---------------------------------------------------------------------------
+
+use crate::sidecar_test_support::{spawn_verified_record, unit_record};
+
+#[tokio::test]
+async fn records_of_stopping_or_missing_units_are_never_offered() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = store_in(&dir);
+    let ua = freshell_containment::UnitId::mint();
+    let ub = freshell_containment::UnitId::mint();
+    let uc = freshell_containment::UnitId::mint();
+
+    let (mut child_a, a) = spawn_verified_record("t-a", ua.as_str());
+    let (mut child_b, b) = spawn_verified_record("t-b-root", ub.as_str());
+    let b = CodexSidecarRecord {
+        held_thread_ids: vec!["t-b-helper".into(), "t-b-prefork".into()],
+        ..b
+    };
+    let (mut child_c, c) = spawn_verified_record("t-c", uc.as_str());
+    for record in [&a, &b, &c] {
+        store.write(record).expect("write record");
+    }
+    let ua_record = unit_record(ua.as_str(), false);
+    let ub_record = unit_record(ub.as_str(), true);
+
+    let (reconciler, report) = SidecarReconciler::boot_reconcile_with_units(
+        Arc::clone(&store),
+        &[ua_record, ub_record.clone()],
+    );
+
+    assert_eq!(
+        report,
+        BootReconcileReport {
+            loaded: 3,
+            pruned_dead: 0,
+            pruned_mismatch: 0,
+            held: 1,
+            finishing: vec![a.clone()],
+            pruned_unit_gone: 1,
+        }
+    );
+    assert_eq!(reconciler.unclaimed_len(), 1, "only b is held");
+    let mut on_disk: Vec<String> = store
+        .load_all()
+        .into_iter()
+        .map(|r| r.ownership_id)
+        .collect();
+    on_disk.sort();
+    let mut want = vec![a.ownership_id.clone(), b.ownership_id.clone()];
+    want.sort();
+    assert_eq!(
+        on_disk, want,
+        "c's row is removed (its unit is Gone); a's row stays until its unit's stop finishes"
+    );
+
+    // A dying or finished unit's app-server is never offered for reuse.
+    assert_eq!(reconciler.claim_for_session("t-a").await, None);
+    assert_eq!(reconciler.claim_for_session("t-c").await, None);
+    // Any thread b's app-server holds claims it.
+    assert_eq!(
+        reconciler.claim_for_session("t-b-prefork").await,
+        Some(b.clone())
+    );
+    assert_eq!(
+        reconciler.claim_for_session("t-b-root").await,
+        None,
+        "claimable once, whichever of its threads claimed it"
+    );
+    assert_eq!(reconciler.unit_record(ub.as_str()), Some(ub_record));
+    assert_eq!(
+        reconciler.unit_record(ua.as_str()),
+        None,
+        "a Stopping unit's record is not handed out for reattach"
+    );
+
+    // Nothing was signalled.
+    for child in [&mut child_a, &mut child_b, &mut child_c] {
+        assert_eq!(
+            child.0.try_wait().expect("try_wait own child"),
+            None,
+            "reconcile never signals"
+        );
+    }
+}
+
+#[tokio::test]
+async fn v2_records_are_verified_by_the_native_main() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = store_in(&dir);
+    let ud = freshell_containment::UnitId::mint();
+    let ue = freshell_containment::UnitId::mint();
+
+    // d: the launcher exited (spawned, killed, reaped); the native lives.
+    let mut dead_launcher = spawn_own_sleep_child();
+    let dead_launcher_record = record_for_child(
+        "codex-sidecar-dead-launcher",
+        dead_launcher.0.id(),
+        Some("t-d"),
+    );
+    dead_launcher.0.kill().expect("kill own child");
+    dead_launcher.0.wait().expect("reap own child");
+    let (mut live_main, live_main_record) = spawn_verified_record("t-d", ud.as_str());
+    let d = CodexSidecarRecord {
+        pid: dead_launcher_record.pid,
+        starttime: dead_launcher_record.starttime,
+        cmdline: dead_launcher_record.cmdline,
+        ..live_main_record
+    };
+
+    // e: the launcher lives; the native exited.
+    let (mut dead_main, dead_main_record) = spawn_verified_record("t-e", ue.as_str());
+    dead_main.0.kill().expect("kill own child");
+    dead_main.0.wait().expect("reap own child");
+    let mut live_launcher = spawn_own_sleep_child();
+    let e = CodexSidecarRecord {
+        main_pid: dead_main_record.main_pid,
+        main_starttime: dead_main_record.main_starttime,
+        ..record_for_child(
+            &dead_main_record.ownership_id,
+            live_launcher.0.id(),
+            Some("t-e"),
+        )
+    };
+    let e = CodexSidecarRecord {
+        unit_id: Some(ue.as_str().to_string()),
+        ..e
+    };
+
+    store.write(&d).expect("write d");
+    store.write(&e).expect("write e");
+    let (reconciler, report) = SidecarReconciler::boot_reconcile_with_units(
+        Arc::clone(&store),
+        &[
+            unit_record(ud.as_str(), true),
+            unit_record(ue.as_str(), true),
+        ],
+    );
+
+    assert_eq!(report.held, 1, "d is held: its native main lives");
+    assert_eq!(
+        report.pruned_dead, 1,
+        "e is pruned: its native main is dead"
+    );
+    assert_eq!(
+        store.load_all(),
+        vec![d.clone()],
+        "e's row is gone from the store"
+    );
+    assert_eq!(
+        reconciler.claim_for_session("t-d").await,
+        Some(d),
+        "a dead launcher with a live native is reclaimed, never dropped"
+    );
+    assert_eq!(reconciler.claim_for_session("t-e").await, None);
+    for child in [&mut live_main, &mut live_launcher] {
+        assert_eq!(
+            child.0.try_wait().expect("try_wait own child"),
+            None,
+            "reconcile never signals"
+        );
+    }
 }

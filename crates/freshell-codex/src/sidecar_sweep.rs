@@ -19,10 +19,10 @@ use std::time::Duration;
 use crate::app_server::CodexAppServerClient;
 use crate::events::{normalize_codex_thread_status, CodexStatus};
 use crate::sidecar_reconcile::{
-    remove_pruned, unix_millis, write_record_loudly, SidecarReconciler,
+    index_held, remove_pruned, unindex_held, unix_millis, write_record_loudly, SidecarReconciler,
 };
 #[cfg(target_os = "linux")]
-use crate::sidecar_store::{proc_cmdline, proc_starttime};
+use crate::sidecar_store::{proc_cmdline, proc_starttime, verify_launcher_identity};
 use crate::sidecar_store::{
     verify_sidecar_identity, CodexSidecarRecord, IdentityVerdict, SidecarRecordState,
 };
@@ -290,13 +290,7 @@ impl SidecarReconciler {
         {
             let mut held = self.held.lock().unwrap();
             held.insert(retained.ownership_id.clone(), retained.clone());
-            let mut by_session = self.by_session.lock().unwrap();
-            if let Some(session_id) = &retained.session_id {
-                let ids = by_session.entry(session_id.clone()).or_default();
-                if !ids.iter().any(|id| id == &retained.ownership_id) {
-                    ids.push(retained.ownership_id.clone());
-                }
-            }
+            index_held(&mut self.by_session.lock().unwrap(), &retained);
         }
         write_record_loudly(&self.store, &retained);
     }
@@ -319,15 +313,7 @@ impl SidecarReconciler {
             );
             return false;
         }
-        let mut by_session = self.by_session.lock().unwrap();
-        if let Some(session_id) = &record.session_id {
-            if let Some(ids) = by_session.get_mut(session_id) {
-                ids.retain(|id| id != &record.ownership_id);
-                if ids.is_empty() {
-                    by_session.remove(session_id);
-                }
-            }
-        }
+        unindex_held(&mut self.by_session.lock().unwrap(), record);
         true
     }
 }
@@ -649,15 +635,18 @@ async fn kill_verified_tree_linux(record: &CodexSidecarRecord) -> KillTreeOutcom
     let mut outcomes = Vec::with_capacity(1 + descendants.len());
 
     // The caller's verify dispatched here, but re-verify immediately before
-    // the signal — nothing is ever signalled on a stale pid.
-    let root_outcome = match verify_sidecar_identity(record) {
+    // the signal — nothing is ever signalled on a stale pid. The root is the
+    // LAUNCHER (`record.pid`), so it is checked by its own evidence: a v2
+    // record verifies by its native main, which says nothing about the
+    // launcher's pid.
+    let root_outcome = match verify_launcher_identity(record) {
         IdentityVerdict::Verified => {
             signal_pid(root_pid, libc::SIGTERM);
             if poll_incarnation_gone(root_pid, record.starttime, KILL_DRAIN_BUDGET).await {
                 KillOutcome::ExitedAfterSigterm
             } else {
                 // Re-verify immediately before the escalation too.
-                match verify_sidecar_identity(record) {
+                match verify_launcher_identity(record) {
                     IdentityVerdict::Verified => {
                         signal_pid(root_pid, libc::SIGKILL);
                         if poll_incarnation_gone(

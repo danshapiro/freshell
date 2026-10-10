@@ -1331,6 +1331,11 @@ async fn plan_retry_falls_back_to_fresh_spawn_after_reattach_failure() {
         updated_at: 1_700_000_000_001,
         state: SidecarRecordState::Active,
         lane: None,
+        held_thread_ids: Vec::new(),
+        unit_id: None,
+        main_pid: None,
+        main_starttime: None,
+        codex_home: None,
     };
     store.write(&dead_record).expect("write survivor record");
     let (reconciler, report) = SidecarReconciler::boot_reconcile(store.clone());
@@ -1507,6 +1512,11 @@ async fn plan_retry_spawns_fresh_after_claimed_reattach_ensure_ready_fails() {
         updated_at: 1_700_000_000_001,
         state: SidecarRecordState::Active,
         lane: None,
+        held_thread_ids: Vec::new(),
+        unit_id: None,
+        main_pid: None,
+        main_starttime: None,
+        codex_home: None,
     };
     store
         .write(&survivor_record)

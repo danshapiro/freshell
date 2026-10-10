@@ -34,6 +34,11 @@ fn sample_record(ownership_id: &str) -> CodexSidecarRecord {
         updated_at: 1_700_000_000_001,
         state: SidecarRecordState::Active,
         lane: None,
+        held_thread_ids: Vec::new(),
+        unit_id: None,
+        main_pid: None,
+        main_starttime: None,
+        codex_home: None,
     }
 }
 
@@ -332,4 +337,131 @@ fn verify_identity_reports_dead_for_missing_pid() {
         impossible.pid
     );
     assert_eq!(verify_sidecar_identity(&impossible), IdentityVerdict::Dead);
+}
+
+// ---------------------------------------------------------------------------
+// Record v2 (Task 9): unit id, native main process, every held thread and the
+// sidecar's own Codex home. A v1 row still loads (legacy, no unit).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v1_rows_load_and_v2_rows_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = CodexSidecarStore::new(dir.path().to_path_buf());
+    let v1 = serde_json::json!({
+        "recordVersion": 1, "ownershipId": "codex-sidecar-v1", "pid": 4242, "starttime": 7,
+        "cmdline": ["node", "codex"], "wsUrl": "ws://127.0.0.1:1", "sessionId": "t-root",
+        "serverInstanceId": "srv", "createdAt": 1, "updatedAt": 1, "state": {"kind": "active"}
+    });
+    std::fs::write(dir.path().join("codex-sidecar-v1.json"), v1.to_string()).unwrap();
+    let loaded = store.load_all();
+    assert_eq!(loaded.len(), 1, "a v1 row is not quarantined");
+    assert!(loaded[0].holds_thread("t-root"));
+    assert_eq!(loaded[0].unit_id, None);
+    assert!(loaded[0].held_thread_ids.is_empty());
+    assert_eq!(loaded[0].all_thread_ids(), vec!["t-root"]);
+
+    let mut row = loaded[0].clone();
+    row.record_version = SIDECAR_RECORD_VERSION;
+    row.held_thread_ids = vec!["t-helper".into(), "t-earlier".into()];
+    row.unit_id = Some("u0123456789abcdef0123456789abcdef".into());
+    row.main_pid = Some(4243);
+    row.main_starttime = Some(8);
+    row.codex_home = Some(dir.path().join("codex-a").to_string_lossy().into_owned());
+    store.write(&row).unwrap();
+    let back = store.load_all();
+    assert_eq!(back, vec![row.clone()]);
+    assert_eq!(
+        back[0].all_thread_ids(),
+        vec!["t-root", "t-helper", "t-earlier"]
+    );
+    assert!(back[0].holds_thread("t-helper"));
+    assert!(back[0].holds_thread("t-earlier"));
+    assert!(!back[0].holds_thread("t-other"));
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("codex-sidecar-v1.json")).unwrap())
+            .unwrap();
+    assert_eq!(json["recordVersion"], 2, "a rewritten row is a v2 row");
+    assert_eq!(
+        json["heldThreadIds"],
+        serde_json::json!(["t-helper", "t-earlier"])
+    );
+    assert_eq!(json["unitId"], "u0123456789abcdef0123456789abcdef");
+    assert_eq!(json["mainPid"], 4243);
+    assert_eq!(json["mainStarttime"], 8);
+    assert_eq!(
+        json["codexHome"],
+        dir.path().join("codex-a").to_string_lossy().as_ref()
+    );
+}
+
+#[test]
+fn rows_of_an_unknown_version_are_still_quarantined() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = CodexSidecarStore::new(dir.path().to_path_buf());
+    let future = serde_json::json!({
+        "recordVersion": 3, "ownershipId": "codex-sidecar-v3", "pid": 4242, "starttime": 7,
+        "cmdline": ["node", "codex"], "wsUrl": "ws://127.0.0.1:1",
+        "serverInstanceId": "srv", "createdAt": 1, "updatedAt": 1, "state": {"kind": "active"}
+    });
+    std::fs::write(dir.path().join("codex-sidecar-v3.json"), future.to_string()).unwrap();
+    assert!(
+        store.load_all().is_empty(),
+        "a v3 row is never reinterpreted"
+    );
+    assert!(
+        dir_names(dir.path())
+            .iter()
+            .any(|n| n.starts_with("codex-sidecar-v3.json.quarantined-")),
+        "the v3 row is renamed aside"
+    );
+}
+
+#[test]
+fn all_thread_ids_lists_each_thread_once_root_first() {
+    let row = CodexSidecarRecord {
+        session_id: Some("t-root".into()),
+        held_thread_ids: vec!["t-helper".into(), "t-root".into(), "t-helper".into()],
+        ..sample_record("codex-sidecar-dedupe")
+    };
+    assert_eq!(row.all_thread_ids(), vec!["t-root", "t-helper"]);
+
+    let sessionless = CodexSidecarRecord {
+        session_id: None,
+        held_thread_ids: vec!["t-helper".into()],
+        ..sample_record("codex-sidecar-sessionless")
+    };
+    assert_eq!(sessionless.all_thread_ids(), vec!["t-helper"]);
+    assert!(sessionless.holds_thread("t-helper"));
+}
+
+/// A v2 row carrying the native main is verified by the native alone: the
+/// launcher (`pid`/`starttime`/`cmdline`) may have exited.
+#[cfg(target_os = "linux")]
+#[test]
+fn verify_identity_follows_the_native_main_when_recorded() {
+    let main = spawn_own_sleep_child();
+    let main_start = proc_starttime(main.0.id() as i32).expect("live main starttime");
+    // The launcher evidence names a pid that cannot exist (dead launcher).
+    let with_live_main = CodexSidecarRecord {
+        pid: 999_999_999,
+        main_pid: Some(main.0.id()),
+        main_starttime: Some(main_start),
+        ..sample_record("codex-sidecar-main-live")
+    };
+    assert_eq!(
+        verify_sidecar_identity(&with_live_main),
+        IdentityVerdict::Verified
+    );
+    let reused = CodexSidecarRecord {
+        main_starttime: Some(main_start + 1),
+        ..with_live_main.clone()
+    };
+    assert_eq!(verify_sidecar_identity(&reused), IdentityVerdict::Mismatch);
+    let gone = CodexSidecarRecord {
+        main_pid: Some(999_999_999),
+        ..with_live_main
+    };
+    assert_eq!(verify_sidecar_identity(&gone), IdentityVerdict::Dead);
 }

@@ -1297,6 +1297,11 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
                             updated_at: now,
                             state: SidecarRecordState::Active,
                             lane: None,
+                            held_thread_ids: Vec::new(),
+                            unit_id: None,
+                            main_pid: None,
+                            main_starttime: None,
+                            codex_home: None,
                         };
                         // A detached sidecar without a durable row is an
                         // unrecoverable ownership gap. Fail closed: terminate
@@ -1511,6 +1516,11 @@ mod tests {
             updated_at: unix_millis(),
             state: SidecarRecordState::Active,
             lane: None,
+            held_thread_ids: Vec::new(),
+            unit_id: None,
+            main_pid: None,
+            main_starttime: None,
+            codex_home: None,
         };
         let error = persist_record_or_terminate_exact_child(&store, &row, &mut child)
             .await

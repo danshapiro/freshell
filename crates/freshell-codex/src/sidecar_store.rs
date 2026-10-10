@@ -30,15 +30,24 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-/// Schema version stamped into every record. Rows with a different version
-/// are quarantined loudly at load, never silently reinterpreted (the
-/// `LEDGER_VERSION` policy, `pane_ledger.rs:57`).
-pub const SIDECAR_RECORD_VERSION: u32 = 1;
+/// Schema version stamped into every record this binary writes. Version 2
+/// adds the containment unit id, the native main process, every held thread
+/// and the sidecar's own Codex home, all optional, so a version-1 row decodes
+/// as a version-2 row without a unit (legacy) and is upgraded on load. Rows
+/// of any other version are quarantined loudly at load, never silently
+/// reinterpreted (the `LEDGER_VERSION` policy, `pane_ledger.rs:57`).
+pub const SIDECAR_RECORD_VERSION: u32 = 2;
+
+/// The first schema version, still read (see [`SIDECAR_RECORD_VERSION`]).
+const SIDECAR_RECORD_VERSION_1: u32 = 1;
 
 /// One durable sidecar record — everything a restarted server needs to
-/// re-verify (pid + starttime + cmdline), reattach to (ws_url), or attribute
-/// (ownership/session/terminal ids) a codex app-server it spawned.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+/// re-verify (the native main's pid + starttime, or for a row without one the
+/// launcher's pid + starttime + cmdline), reattach to (ws_url), or attribute
+/// (ownership/unit/session/terminal ids, every held thread) a codex
+/// app-server it spawned. Stop state is NOT part of this record: a stopping
+/// unit is recorded only in its containment unit record.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexSidecarRecord {
     pub record_version: u32,
@@ -67,12 +76,55 @@ pub struct CodexSidecarRecord {
     /// terminal-pane for claim purposes and must keep meaning that.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane: Option<SidecarLane>,
+    /// Every other thread the app-server holds (helper agents, forks,
+    /// earlier conversations opened in the pane), besides `session_id`.
+    /// Any of them claims the record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_thread_ids: Vec<String>,
+    /// The containment unit the sidecar runs in. `None`: a legacy row
+    /// (every v1 row, and rows written by a spawn without a unit), verified
+    /// and claimed as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_id: Option<String>,
+    /// The native `codex app-server` behind the launcher (`pid`). When both
+    /// `main_pid` and `main_starttime` are present the record is verified by
+    /// the native alone; the launcher may have exited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_pid: Option<u32>,
+    /// The native main's start time (`/proc/<pid>/stat` field 22).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_starttime: Option<u64>,
+    /// The Codex home the sidecar reported in its `initialize` answer. Every
+    /// lock path for this sidecar's threads derives from it, never from the
+    /// server's own `CODEX_HOME`/`HOME`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_home: Option<String>,
+}
+
+impl CodexSidecarRecord {
+    /// Whether the app-server holds thread `id`, as its root conversation
+    /// (`session_id`) or as any other held thread.
+    pub fn holds_thread(&self, id: &str) -> bool {
+        self.session_id.as_deref() == Some(id) || self.held_thread_ids.iter().any(|t| t == id)
+    }
+
+    /// Every thread the app-server holds, each once: `session_id` (if any)
+    /// first, then `held_thread_ids` in order.
+    pub fn all_thread_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = Vec::with_capacity(1 + self.held_thread_ids.len());
+        for id in self.session_id.iter().chain(&self.held_thread_ids) {
+            if !ids.contains(id) {
+                ids.push(id.clone());
+            }
+        }
+        ids
+    }
 }
 
 /// Lifecycle state of a recorded sidecar: `Active` (owned by a live server
 /// generation) or `Retained { reason }` (deliberately left running across a
 /// server death, awaiting reconciliation).
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum SidecarRecordState {
     Active,
@@ -251,6 +303,15 @@ impl CodexSidecarStore {
                 Ok(record) if record.record_version == SIDECAR_RECORD_VERSION => {
                     records.push(record);
                 }
+                Ok(record) if record.record_version == SIDECAR_RECORD_VERSION_1 => {
+                    // A v1 row is a v2 row without a unit (its new fields
+                    // decode empty); upgraded here, it is rewritten as v2 by
+                    // its next write.
+                    records.push(CodexSidecarRecord {
+                        record_version: SIDECAR_RECORD_VERSION,
+                        ..record
+                    });
+                }
                 Ok(record) => quarantine_row(
                     &path,
                     &format!("unsupported recordVersion {}", record.record_version),
@@ -323,7 +384,8 @@ pub fn proc_cmdline(_pid: i32) -> Option<Vec<String>> {
 /// — the gate every reattach/reap decision goes through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdentityVerdict {
-    /// (pid, starttime, cmdline) all match the record — this IS our sidecar.
+    /// The recorded evidence matches (the native main's pid + starttime, or
+    /// the launcher's pid + starttime + cmdline) — this IS our sidecar.
     Verified,
     /// pid gone or zombie — the sidecar is dead; the record is stale.
     Dead,
@@ -333,12 +395,43 @@ pub enum IdentityVerdict {
     Unverifiable,
 }
 
-/// Re-verify a record's `(pid, starttime, cmdline)` evidence against live
-/// `/proc`. Read-only — never signals anything. A pid that vanishes between
-/// the two reads yields [`IdentityVerdict::Unverifiable`] (conservative:
-/// never signalled), not a guess.
+/// Is the app-server this record describes still running? A record that
+/// carries its native main (`main_pid` + `main_starttime`) is judged by the
+/// native alone: alive with that start time is [`IdentityVerdict::Verified`]
+/// (also when the launcher has exited), gone is [`IdentityVerdict::Dead`],
+/// another start time is [`IdentityVerdict::Mismatch`]. Any other record is
+/// judged by its launcher ([`verify_launcher_identity`]). Read-only — never
+/// signals anything.
+///
+/// A `Verified` verdict says the SIDECAR runs; it does not vouch for the
+/// launcher pid. Code that signals `record.pid` must check
+/// [`verify_launcher_identity`] immediately before each signal.
 #[cfg(target_os = "linux")]
 pub fn verify_sidecar_identity(record: &CodexSidecarRecord) -> IdentityVerdict {
+    let (Some(main_pid), Some(main_starttime)) = (record.main_pid, record.main_starttime) else {
+        return verify_launcher_identity(record);
+    };
+    // Same pid-width reasoning as `verify_launcher_identity`.
+    match proc_starttime(main_pid as i32) {
+        None => IdentityVerdict::Dead,
+        Some(starttime) if starttime != main_starttime => IdentityVerdict::Mismatch,
+        Some(_) => IdentityVerdict::Verified,
+    }
+}
+
+/// Non-Linux stub: no `/proc` evidence — [`IdentityVerdict::Unverifiable`]
+/// (never verified ⇒ never killed).
+#[cfg(not(target_os = "linux"))]
+pub fn verify_sidecar_identity(_record: &CodexSidecarRecord) -> IdentityVerdict {
+    IdentityVerdict::Unverifiable
+}
+
+/// Re-verify a record's LAUNCHER `(pid, starttime, cmdline)` evidence
+/// against live `/proc`. Read-only — never signals anything. A pid that
+/// vanishes between the two reads yields [`IdentityVerdict::Unverifiable`]
+/// (conservative: never signalled), not a guess.
+#[cfg(target_os = "linux")]
+pub fn verify_launcher_identity(record: &CodexSidecarRecord) -> IdentityVerdict {
     // pid > i32::MAX cannot exist on Linux (PID_MAX_LIMIT = 2^22); the `as`
     // wrap would produce a negative pid whose /proc entry never exists, so
     // the verdict is still the safe `Dead`.
@@ -361,7 +454,7 @@ pub fn verify_sidecar_identity(record: &CodexSidecarRecord) -> IdentityVerdict {
 /// Non-Linux stub: no `/proc` evidence — [`IdentityVerdict::Unverifiable`]
 /// (never verified ⇒ never killed).
 #[cfg(not(target_os = "linux"))]
-pub fn verify_sidecar_identity(_record: &CodexSidecarRecord) -> IdentityVerdict {
+pub fn verify_launcher_identity(_record: &CodexSidecarRecord) -> IdentityVerdict {
     IdentityVerdict::Unverifiable
 }
 

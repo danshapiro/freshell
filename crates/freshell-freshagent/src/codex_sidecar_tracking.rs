@@ -119,6 +119,11 @@ pub(crate) async fn record_spawned_sidecar(ownership_id: &str, pid: u32, ws_url:
         updated_at: now,
         state: SidecarRecordState::Active,
         lane: Some(SidecarLane::FreshAgent),
+        held_thread_ids: Vec::new(),
+        unit_id: None,
+        main_pid: None,
+        main_starttime: None,
+        codex_home: None,
     };
     match store.write(&record) {
         Ok(()) => {

@@ -42,6 +42,9 @@ default = []
 real-transport = ["dep:tokio-tungstenite", "dep:futures-util", "dep:libc", "tokio/net", "tokio/io-util", "tokio/process"]
 
 [dependencies]
+# Containment unit records: boot reconcile holds a sidecar row only while its
+# unit's own record is Running (Stopping lives only in the unit record).
+freshell-containment = { path = "../freshell-containment" }
 # `child_nofile`: the app-server sidecar starts with the server's original
 # open-file soft limit, not the raised one the server runs with.
 freshell-platform = { path = "../freshell-platform" }

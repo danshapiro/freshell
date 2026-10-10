@@ -873,3 +873,83 @@ async fn kill_tree_root_refusal_skips_captured_descendants() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Record v2 (Task 9): a row that carries its native main is VERIFIED by the
+// native, but the tree kill signals the LAUNCHER (`pid`), so every signal to
+// it is gated on the launcher's own (pid, starttime, cmdline) evidence.
+// ---------------------------------------------------------------------------
+
+/// A v2 row whose native main (this test's own `sleep`) lives and whose
+/// launcher evidence no longer matches its pid (the pid-reuse shape, on this
+/// test's own second `sleep`).
+fn v2_record_with_mismatched_launcher(
+    main: &crate::sidecar_test_support::ChildGuard,
+    launcher: &crate::sidecar_test_support::ChildGuard,
+) -> CodexSidecarRecord {
+    CodexSidecarRecord {
+        cmdline: vec!["codex".to_string(), "app-server".to_string()],
+        unit_id: Some("u0123456789abcdef0123456789abcdef".to_string()),
+        main_pid: Some(main.0.id()),
+        main_starttime: proc_starttime(main.0.id() as i32),
+        held_thread_ids: vec!["t-helper".to_string()],
+        ..record_for_child(
+            "codex-sidecar-a9000031-cccc-4ccc-8ccc-cccccccccccc",
+            launcher.0.id(),
+            Some(SESSION),
+        )
+    }
+}
+
+#[tokio::test]
+async fn kill_tree_never_signals_a_launcher_whose_own_evidence_mismatches() {
+    let mut main = spawn_own_sleep_child();
+    let mut launcher = spawn_own_sleep_child();
+    let record = v2_record_with_mismatched_launcher(&main, &launcher);
+    assert_eq!(
+        verify_sidecar_identity(&record),
+        IdentityVerdict::Verified,
+        "the row itself verifies by its live native main"
+    );
+
+    let outcome = kill_verified_sidecar_tree(&record).await;
+    assert_eq!(
+        outcome.outcomes,
+        vec![(record.pid, KillOutcome::SkippedIdentityMismatch)]
+    );
+    tokio::time::sleep(NEVER_SIGNALLED_GRACE).await;
+    assert_eq!(
+        launcher.0.try_wait().expect("try_wait launcher"),
+        None,
+        "a launcher pid whose own evidence mismatches is NEVER signalled"
+    );
+    assert_eq!(main.0.try_wait().expect("try_wait main"), None);
+}
+
+#[tokio::test]
+async fn an_unconfirmed_sweep_kill_keeps_every_held_thread_claimable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = store_in(&dir);
+    let main = spawn_own_sleep_child();
+    let launcher = spawn_own_sleep_child();
+    let record = v2_record_with_mismatched_launcher(&main, &launcher);
+    store.write(&record).expect("write record");
+    let (reconciler, report) = SidecarReconciler::boot_reconcile_with_units(
+        Arc::clone(&store),
+        &[crate::sidecar_test_support::unit_record(
+            record.unit_id.as_deref().expect("unit id"),
+            true,
+        )],
+    );
+    assert_eq!(report.held, 1);
+
+    let outcome = reconciler
+        .commit_sweep_decision(&record, SweepDecision::Kill)
+        .await;
+    assert_eq!(outcome, SweepOutcome::TerminationUnconfirmed);
+    let claimed = reconciler
+        .claim_for_session("t-helper")
+        .await
+        .expect("a helper thread claims the re-held record");
+    assert_eq!(claimed.ownership_id, record.ownership_id);
+}

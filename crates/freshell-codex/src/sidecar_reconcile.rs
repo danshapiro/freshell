@@ -39,7 +39,7 @@ const WRITER_PROBE_BUDGET: Duration = Duration::from_millis(1000);
 /// the 45s spawn budget.
 const REATTACH_PROBE_BUDGET: Duration = Duration::from_secs(3);
 
-/// Boot-log summary returned by [`SidecarReconciler::boot_reconcile`].
+/// Boot-log summary returned by [`SidecarReconciler::boot_reconcile_with_units`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootReconcileReport {
     /// Healthy rows loaded from the store (corrupt rows were quarantined by
@@ -50,8 +50,16 @@ pub struct BootReconcileReport {
     /// Mismatch-verdict rows removed (pid reuse — the pid is NOT ours; the
     /// row is dropped and the process is NEVER signalled).
     pub pruned_mismatch: usize,
-    /// Rows held for claim/sweep (Verified + Unverifiable).
+    /// Rows held for claim/sweep (Verified + Unverifiable whose unit, if
+    /// they name one, is Running).
     pub held: usize,
+    /// Rows whose containment unit record is Stopping: never held, never
+    /// claimable. Their unit's stop is finished from the unit record, which
+    /// removes the row at Gone. Left in the store.
+    pub finishing: Vec<CodexSidecarRecord>,
+    /// Rows whose containment unit has no record (the unit already reached
+    /// Gone): removed, nothing signalled.
+    pub pruned_unit_gone: usize,
 }
 
 /// The boot reconciler: holds every surviving record until a restore claims
@@ -67,8 +75,14 @@ pub struct SidecarReconciler {
     /// Unverifiable records must also be held for the sweep. Keying by
     /// session_id would silently drop records (a fifth-fate ynfn violation).
     pub(crate) held: Mutex<HashMap<String /*ownership_id*/, CodexSidecarRecord>>,
-    /// Secondary index for restore-time claims.
-    pub(crate) by_session: Mutex<HashMap<String /*session_id*/, Vec<String /*ownership_id*/>>>,
+    /// Secondary index for restore-time claims: every thread a held record's
+    /// app-server holds ([`CodexSidecarRecord::all_thread_ids`]) maps to it.
+    /// Maintained only through [`index_held`] / [`unindex_held`].
+    pub(crate) by_session: Mutex<HashMap<String /*thread id*/, Vec<String /*ownership_id*/>>>,
+    /// The boot unit record of every row held at boot that names a unit
+    /// (all `Running`), kept after a claim so the reattach can reopen the
+    /// unit from it.
+    unit_records: HashMap<String /*unit id*/, freshell_containment::UnitRecord>,
 }
 
 /// Outcome of the sync (lock-holding) phase of a claim. The `Claimed` record
@@ -84,18 +98,41 @@ enum FastClaim {
 }
 
 impl SidecarReconciler {
-    /// Boot: load_all(); prune records whose identity verdict is Dead
-    /// (remove) or Mismatch (remove — the pid is NOT ours, never signal);
-    /// hold every remaining record by ownership_id (Verified with session =
-    /// claimable via the index; Verified without session and Unverifiable =
-    /// held for the sweep only). Returns a summary for boot logs.
+    /// [`Self::boot_reconcile_with_units`] with no containment unit records:
+    /// every row naming a unit is then treated as Gone.
     pub fn boot_reconcile(store: Arc<CodexSidecarStore>) -> (Self, BootReconcileReport) {
+        Self::boot_reconcile_with_units(store, &[])
+    }
+
+    /// Boot: load_all(); prune records whose identity verdict is Dead
+    /// (remove) or Mismatch (remove — the pid is NOT ours, never signal).
+    /// A surviving row that names a containment unit follows its unit's own
+    /// record in `unit_records`: `Running` → held as below; `Stopping` →
+    /// reported in `finishing`, not held, never claimable (a dying unit's
+    /// app-server is never offered for reuse); no record → the unit already
+    /// reached Gone (containment writes the unit record before any member
+    /// starts and deletes it only at Gone), so the row is removed and nothing
+    /// is signalled. Every other row is held by ownership_id (Verified with
+    /// a thread = claimable through every thread its app-server holds;
+    /// Verified without one and Unverifiable = held for the sweep only).
+    /// Returns a summary for boot logs.
+    pub fn boot_reconcile_with_units(
+        store: Arc<CodexSidecarStore>,
+        unit_records: &[freshell_containment::UnitRecord],
+    ) -> (Self, BootReconcileReport) {
+        let boot_units: HashMap<&str, &freshell_containment::UnitRecord> = unit_records
+            .iter()
+            .map(|unit| (unit.unit_id.as_str(), unit))
+            .collect();
         let records = store.load_all();
         let loaded = records.len();
         let mut pruned_dead = 0;
         let mut pruned_mismatch = 0;
+        let mut pruned_unit_gone = 0;
+        let mut finishing = Vec::new();
         let mut held: HashMap<String, CodexSidecarRecord> = HashMap::new();
         let mut by_session: HashMap<String, Vec<String>> = HashMap::new();
+        let mut held_units: HashMap<String, freshell_containment::UnitRecord> = HashMap::new();
 
         for record in records {
             let verdict = verify_sidecar_identity(&record);
@@ -122,24 +159,69 @@ impl SidecarReconciler {
                     remove_pruned(&store, &record.ownership_id);
                 }
                 IdentityVerdict::Verified | IdentityVerdict::Unverifiable => {
-                    // Verified with a session id is claimable via the index;
+                    if let Some(unit_id) = record.unit_id.as_deref() {
+                        match boot_units.get(unit_id) {
+                            Some(unit) => match &unit.state {
+                                freshell_containment::UnitRecordState::Running => {
+                                    held_units.insert(unit_id.to_string(), (*unit).clone());
+                                }
+                                freshell_containment::UnitRecordState::Stopping {
+                                    operation_id,
+                                    ..
+                                } => {
+                                    tracing::info!(
+                                        target: "freshell_codex::sidecar_reconcile",
+                                        event = "sidecar_record_finishing",
+                                        unit_id,
+                                        provider = "codex",
+                                        session_id = record.session_id.as_deref().unwrap_or(""),
+                                        terminal_id = record.terminal_id.as_deref().unwrap_or(""),
+                                        operation_id = operation_id.as_deref().unwrap_or(""),
+                                        ownership_id = %record.ownership_id,
+                                        "sidecar_record_finishing: the sidecar's unit is \
+                                         Stopping; never offered for reuse, its stop is \
+                                         finished from the unit record"
+                                    );
+                                    finishing.push(record);
+                                    continue;
+                                }
+                            },
+                            None => {
+                                pruned_unit_gone += 1;
+                                tracing::info!(
+                                    target: "freshell_codex::sidecar_reconcile",
+                                    event = "sidecar_record_pruned",
+                                    reason = "unit-gone",
+                                    unit_id,
+                                    provider = "codex",
+                                    session_id = record.session_id.as_deref().unwrap_or(""),
+                                    terminal_id = record.terminal_id.as_deref().unwrap_or(""),
+                                    ownership_id = %record.ownership_id,
+                                    "sidecar_record_pruned: the sidecar's unit already \
+                                     reached Gone; row removed, nothing signalled"
+                                );
+                                remove_pruned(&store, &record.ownership_id);
+                                continue;
+                            }
+                        }
+                    }
+                    // Verified with a thread is claimable via the index;
                     // Verified without one and Unverifiable are held for the
                     // sweep only. freshagent-lane records are sweep-only:
                     // they are never claimed by terminal-pane restores (wfah).
                     let claimable = verdict == IdentityVerdict::Verified
-                        && record.session_id.is_some()
+                        && !record.all_thread_ids().is_empty()
                         && record.lane != Some(SidecarLane::FreshAgent);
                     if claimable {
-                        by_session
-                            .entry(record.session_id.clone().expect("claimable has a session"))
-                            .or_default()
-                            .push(record.ownership_id.clone());
+                        index_held(&mut by_session, &record);
                     }
                     tracing::info!(
                         target: "freshell_codex::sidecar_reconcile",
                         ownership_id = %record.ownership_id,
                         verdict = ?verdict,
                         session_id = record.session_id.as_deref().unwrap_or("<none>"),
+                        unit_id = record.unit_id.as_deref().unwrap_or(""),
+                        held_threads = record.held_thread_ids.len(),
                         claimable,
                         "sidecar_record_held: survivor held for claim/sweep"
                     );
@@ -153,15 +235,25 @@ impl SidecarReconciler {
             pruned_dead,
             pruned_mismatch,
             held: held.len(),
+            finishing,
+            pruned_unit_gone,
         };
         (
             Self {
                 store,
                 held: Mutex::new(held),
                 by_session: Mutex::new(by_session),
+                unit_records: held_units,
             },
             report,
         )
+    }
+
+    /// The boot unit record of a row held at boot (for Task 10's reattach,
+    /// which reopens the unit from it). `None` for a unit whose row was not
+    /// held (Stopping, Gone, or no such row).
+    pub fn unit_record(&self, unit_id: &str) -> Option<freshell_containment::UnitRecord> {
+        self.unit_records.get(unit_id).cloned()
     }
 
     /// Restore-time claim: re-verify identity at claim time and return ONE
@@ -257,7 +349,9 @@ impl SidecarReconciler {
                         "sidecar_claim_pruned: candidate died since boot; row removed"
                     );
                     remove_pruned(&self.store, &ownership_id);
-                    held.remove(&ownership_id);
+                    if let Some(gone) = held.remove(&ownership_id) {
+                        unindex_held(&mut by_session, &gone);
+                    }
                 }
                 IdentityVerdict::Mismatch => {
                     tracing::warn!(
@@ -269,7 +363,9 @@ impl SidecarReconciler {
                          ours; row removed, process NEVER signalled"
                     );
                     remove_pruned(&self.store, &ownership_id);
-                    held.remove(&ownership_id);
+                    if let Some(gone) = held.remove(&ownership_id) {
+                        unindex_held(&mut by_session, &gone);
+                    }
                 }
                 IdentityVerdict::Unverifiable => {
                     // Not provably ours ⇒ not claimable; not provably stale
@@ -290,6 +386,7 @@ impl SidecarReconciler {
         if candidates.len() == 1 {
             let claimed = candidates.remove(0);
             held.remove(&claimed.ownership_id);
+            unindex_held(&mut by_session, &claimed);
             retained_ids.retain(|id| id != &claimed.ownership_id);
             tracing::info!(
                 target: "freshell_codex::sidecar_reconcile",
@@ -332,12 +429,7 @@ impl SidecarReconciler {
                 );
                 continue;
             };
-            if let Some(ids) = by_session.get_mut(session_id) {
-                ids.retain(|id| id != &record.ownership_id);
-                if ids.is_empty() {
-                    by_session.remove(session_id);
-                }
-            }
+            unindex_held(&mut by_session, &record);
             tracing::info!(
                 target: "freshell_codex::sidecar_reconcile",
                 ownership_id = %record.ownership_id,
@@ -362,6 +454,36 @@ pub(crate) fn remove_pruned(store: &CodexSidecarStore, ownership_id: &str) {
             error = %error,
             "sidecar_record_prune_remove_failed: row removal failed; retried next boot"
         );
+    }
+}
+
+/// Index a held record under every thread its app-server holds (the one
+/// place the claim index is built: boot, and the sweep's re-hold).
+pub(crate) fn index_held(
+    by_session: &mut HashMap<String, Vec<String>>,
+    record: &CodexSidecarRecord,
+) {
+    for thread_id in record.all_thread_ids() {
+        let ids = by_session.entry(thread_id).or_default();
+        if !ids.iter().any(|id| id == &record.ownership_id) {
+            ids.push(record.ownership_id.clone());
+        }
+    }
+}
+
+/// Drop a record from the claim index under every thread it was indexed by
+/// (it left `held`).
+pub(crate) fn unindex_held(
+    by_session: &mut HashMap<String, Vec<String>>,
+    record: &CodexSidecarRecord,
+) {
+    for thread_id in record.all_thread_ids() {
+        if let Some(ids) = by_session.get_mut(&thread_id) {
+            ids.retain(|id| id != &record.ownership_id);
+            if ids.is_empty() {
+                by_session.remove(&thread_id);
+            }
+        }
     }
 }
 

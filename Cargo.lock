@@ -1306,6 +1306,7 @@ dependencies = [
 name = "freshell-codex"
 version = "0.1.0"
 dependencies = [
+ "freshell-containment",
  "freshell-platform",
  "futures-util",
  "libc",
