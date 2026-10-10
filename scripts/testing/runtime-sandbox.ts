@@ -16,7 +16,7 @@ import { ManagedRuntimeInventorySnapshotSchema, ManagedRuntimeMigrationPlanSchem
 import fsp from 'node:fs/promises'
 import { defaultReceiptFileName } from './runtime-receipts.js'
 import { buildProviderQualificationReceipt, type ProviderQualificationReceiptV2, type ProviderQualificationRow } from './provider-qualification-receipt.js'
-import { buildFreshAgentQualificationReceipt, deriveFreshBrowserExecution, validateFreshBrowserAlias, validateFreshApprovalCheckpoint, validateFreshApprovalDispatch, nativeCompletedTurnProofs, type FreshBrowserIngressObservation, type FreshAgentQualificationReceiptV1, type FreshAgentQualificationRow } from './fresh-agent-qualification-receipt.js'
+import { buildFreshAgentQualificationReceipt, deriveFreshBrowserExecution, validateFreshBrowserAlias, validateFreshApprovalCheckpoint, validateFreshApprovalDispatch, validateFreshApprovalRecovery, nativeCompletedTurnProofs, type FreshBrowserIngressObservation, type FreshAgentQualificationReceiptV1, type FreshAgentQualificationRow } from './fresh-agent-qualification-receipt.js'
 import { claudeNativeInspection, nativeCheckpointTranscriptRetained, observeNativeSoloBashOutcome } from './runtime-native-feasibility.js'
 import type { QualifiableTerminalProvider } from './provider-qualification-selection.js'
 import { deriveNativeRecoveryOriginals, NATIVE_RECOVERY_ORIGINALS_FILE, type NativeOriginalReference, type NativeRecoveryStage } from './qualification-observations.js'
@@ -5354,11 +5354,12 @@ export class ManagedRuntimeOwner {
 
   async crashAndRestartWeb(): Promise<RuntimeWebInfo> {
     const before = await this.observeLiveFreshAllocations()
+    const requestedAt = Date.now()
     const info = await this.withManagedBin(() => this.web.restartAbrupt())
     const after = await this.observeLiveFreshAllocations()
     for (const allocation of before) {
       const current = after.find(value => value.view.soulId === allocation.view.soulId)
-      if (current) this.freshWebRestarts.push({ before: allocation, after: current, observedAt: Date.now() })
+      if (current) this.freshWebRestarts.push({ kind: 'web_restart', before: allocation, after: current, requestedAt, completedAt: Date.now(), observedAt: Date.now() })
     }
     return info
   }
@@ -5660,9 +5661,11 @@ export class ManagedRuntimeOwner {
   async crashRuntimeHost(handle: ExactRuntimeHandle): Promise<void> {
     await this.assertCurrentHandle(handle)
     const collection = this.nativeCollectionForCrash(handle, 'session_host_exit')
+    const approval = this.pendingFreshApprovalForCrash(handle)
     const requestedAt = Date.now()
     this.runtime.killOwnedRuntimeExact(handle.containerId)
     if (collection) await this.retainFreshNativeExit(collection, handle, 'session_host_exit', requestedAt)
+    if (approval) await this.retainFreshNativeExit(approval, handle, 'session_host_exit', requestedAt)
   }
 
   runtimeEnclosureHandle(view: Pick<ManagedRuntimeView, 'soulId' | 'incarnationId' | 'containerId' | 'hostBootId'>): RuntimeEnclosureHandle {
@@ -5871,13 +5874,21 @@ export class ManagedRuntimeOwner {
       if (card.payload.tool?.name !== 'Bash' || card.payload.tool.input?.command !== challenge.command
         || card.payload.nativeCheckpoint.nativeSessionId !== challenge.nativeRoot || card.payload.nativeCheckpoint.toolUseID !== card.payload.toolUseID
         || native.nativeLaunch.incarnationId !== handle.incarnationId || effectCount !== 0) throw new Error('actual native solo Bash checkpoint/input differs')
-      if (!challenge.beforeCard) Object.assign(challenge, { beforeCard: card, beforeNative: native, beforeFiles: files, beforeEffectCount: effectCount })
+      if (!challenge.beforeCard) Object.assign(challenge, { beforeCard: card, beforeNative: native, beforeFiles: files, beforeEffectCount: effectCount,
+        beforeAllocation: await this.freshBrowserAllocation(handle), beforeCapturedAt: Date.now(), beforeWebRestartCount: this.freshWebRestarts.length })
       else {
         if (challenge.beforeCard.decision_id !== card.decision_id || !nativeCheckpointTranscriptRetained(challenge.beforeNative, native, card.payload.toolUseID)
           || JSON.stringify(challenge.beforeCard.payload.nativeCheckpoint) !== JSON.stringify(card.payload.nativeCheckpoint)
           || (challenge.recovery === 'web' ? challenge.beforeView.incarnationId !== view.incarnationId
             : challenge.beforeView.incarnationId === view.incarnationId || challenge.beforeCard.payload.nativeRequestId === card.payload.nativeRequestId)) throw new Error('current native callback/checkpoint did not survive recovery')
-        Object.assign(challenge, { currentCard: card, currentNative: native, currentFiles: files, currentEffectCount: effectCount, afterView: view })
+        const after = await this.freshBrowserAllocation(handle)
+        const recoveryObservation = challenge.crash ? { ...challenge.crash, completedAt: Date.now(), before: challenge.beforeAllocation, after,
+          lifecycle: await this.readOwnedLifecycle() }
+          : this.freshWebRestarts.slice(challenge.beforeWebRestartCount).find(value => value.before.view.soulId === challenge.soulId && value.requestedAt >= challenge.beforeCapturedAt)
+        const current = { ...challenge, currentCard: card, currentNative: native, currentFiles: files, currentEffectCount: effectCount, afterView: view,
+          recoveryObservation, currentCapturedAt: Date.now() }
+        validateFreshApprovalRecovery(current, { soulId: challenge.soulId, nativeSessionId: challenge.nativeRoot, providerStoreId: challenge.beforeAllocation.writer.providerStoreId })
+        Object.assign(challenge, current)
       }
       await this.retainNativeOriginal('fresh-approval-' + challengeId + '/' + (challenge.currentCard ? 'current' : 'before') + '.json', { card, native, files, effectCount, view })
       return { challengeId, decisionId: card.decision_id, toolUseID: card.payload.toolUseID, nativeRequestId: card.payload.nativeRequestId }
@@ -6121,6 +6132,13 @@ export class ManagedRuntimeOwner {
     return collection
   }
 
+  private pendingFreshApprovalForCrash(handle: ExactRuntimeHandle): any {
+    const matches = [...this.freshApprovalChallenges.values()].filter(value => value.soulId === handle.soulId && value.nativeRoot === handle.nativeSessionId
+      && value.beforeCard && !value.currentCard && !value.finished)
+    if (matches.length > 1 || matches[0]?.crash || matches[0] && matches[0].beforeView.incarnationId !== handle.incarnationId) throw new Error('one current pending approval recovery required')
+    return matches[0]
+  }
+
   private async retainFreshNativeExit(collection: FreshNativeCollection, handle: ExactRuntimeHandle, kind: string, requestedAt: number): Promise<void> {
     const deadline = Date.now() + 30_000
     const process = this.freshNativeProcesses.get(JSON.stringify(this.runtimeEnclosureHandle(handle)))
@@ -6134,7 +6152,7 @@ export class ManagedRuntimeOwner {
         exited = observation.exited === true
       }
       if (exited) {
-        collection.crash = { kind, containerId: handle.containerId, incarnationId: handle.incarnationId, requestedAt,
+        collection.crash = { kind, soulId: handle.soulId, nativeSessionId: handle.nativeSessionId, containerId: handle.containerId, incarnationId: handle.incarnationId, requestedAt,
           exitedAt: Date.now(), ...(process ? { nativePid: process.native.pid, startTicks: process.native.startTicks } : {}),
           observation: state.running ? 'exact-native-process-exited' : 'exact-owned-container-stopped' }
         return
@@ -6577,6 +6595,7 @@ export class ManagedRuntimeOwner {
     await this.assertCurrentHandle(handle)
     const row = (await this.inventory()).find(view => view.soulId === handle.soulId && view.launchState === 'running')
     const collection = this.nativeCollectionForCrash(handle, 'provider_process_exit')
+    const approval = this.pendingFreshApprovalForCrash(handle)
     const facts = row?.freshAgentSessionType
       ? await this.freshAgentLaunchFacts(this.runtimeEnclosureHandle(handle))
       : await this.chaosHostFacts(handle)
@@ -6585,6 +6604,7 @@ export class ManagedRuntimeOwner {
     const requestedAt = Date.now()
     this.runtime.killOwnedRuntimePidExact(handle.containerId, facts.workerPid)
     if (collection) await this.retainFreshNativeExit(collection, handle, 'provider_process_exit', requestedAt)
+    if (approval) await this.retainFreshNativeExit(approval, handle, 'provider_process_exit', requestedAt)
   }
 
   async registerNativeChallenge(handle: ExactRuntimeHandle, kind: NativeChallengeKind): Promise<{ challengeId: string }> {

@@ -4120,6 +4120,24 @@ describe('finite retained fresh native collection', () => {
     vi.spyOn(rig, 'freshAgentLaunchFacts').mockResolvedValue({ provider: 'claude', version: '2.1.237', workerPid: 42 })
     vi.spyOn(rig as any, 'retainNativeOriginal').mockResolvedValue({ path: 'private-controlled.json', sha256: 'a'.repeat(64) })
     let native: any, card: any, pending: any[] = [], head = 0
+    const allocation = () => ({ view: structuredClone(current), writer: { soulId: address.soulId, incarnationId: current.incarnationId, nativeSessionId: address.nativeSessionId,
+      providerStoreId: 'owned-store', activeClaimCount: 1, globalConflictingClaimCount: 0 }, volume: { providerVolumeName: 'owned-volume' },
+      process: { version: '2.1.237', native: { uid: 65534, pid: native.nativePid, startTicks: current.incarnationId === address.incarnationId ? '100' : '200', executableSha256: native.executableSha256, launch: structuredClone(native.nativeLaunch) } } })
+    vi.spyOn(rig as any, 'freshBrowserAllocation').mockImplementation(async (requested: any) => {
+      const value = allocation(); (rig as any).freshNativeProcesses.set(JSON.stringify(rig.runtimeEnclosureHandle(requested)), value.process); return value
+    })
+    vi.spyOn(rig as any, 'observeLiveFreshAllocations').mockImplementation(async () => [allocation()])
+    ;(rig as any).web = { restartAbrupt: vi.fn(async () => ({ baseUrl: 'http://127.0.0.1:1' })) }
+    vi.spyOn(rig as any, 'withManagedBin').mockImplementation(async (work: any) => work())
+    vi.spyOn(rig, 'inventory').mockImplementation(async () => [current] as any)
+    vi.spyOn(rig.runtime, 'killOwnedRuntimeExact').mockImplementation(() => undefined)
+    vi.spyOn(rig.runtime, 'killOwnedRuntimePidExact').mockImplementation(() => undefined)
+    vi.spyOn(rig, 'ownedContainerState').mockResolvedValue({ present: true, running: false } as any)
+    vi.spyOn(rig as any, 'readOwnedLifecycle').mockImplementation(async () => [
+      { event: 'supervisor.recovery.old_writer_released', data: { soulId: address.soulId, incarnationId: address.incarnationId, containerId: address.containerId, providerStoreId: 'owned-store', outcome: 'verified_empty', writerState: 'released' } },
+      { event: 'supervisor.recovery.replacement_writer_prepared', data: { soulId: address.soulId, priorIncarnationId: address.incarnationId, incarnationId: current.incarnationId, providerStoreId: 'owned-store', nativeSessionId: address.nativeSessionId, writerState: 'prepared' } },
+      { event: 'supervisor.launch_running', data: { soulId: address.soulId, incarnationId: current.incarnationId, containerId: current.containerId } },
+    ])
     vi.spyOn(rig.runtime, 'adminOk').mockImplementation(async (_supervisor, request) => {
       expect(request.method).toBe('fresh_agent_read_events')
       const events = pending; pending = []; head += events.length
@@ -4149,15 +4167,21 @@ describe('finite retained fresh native collection', () => {
       const deferred = { type: 'attachment', uuid: 'actual-checkpoint', version: '2.1.237', sessionId: address.nativeSessionId, attachment: { type: 'hook_deferred_tool', hookEvent: 'PreToolUse', toolUseID, toolName: 'Bash', toolInput: { command: challenge.command } } }
       const bytes = Buffer.from(JSON.stringify(assistant) + '\n' + JSON.stringify(deferred) + '\n')
       Object.assign(card.payload.nativeCheckpoint, { toolName: 'Bash', assistantUuid: assistant.uuid, checkpointUuid: deferred.uuid, nativeVersion: '2.1.237', checkpointDigest: createHash('sha256').update(JSON.stringify(deferred)).digest('hex') })
-      native = { nativeRoot: address.nativeSessionId, nativeLaunch: structuredClone(card.payload.nativeBinding.launch),
+      native = { nativeRoot: address.nativeSessionId, nativePid: 42, executableSha256: 'd'.repeat(64), nativeLaunch: structuredClone(card.payload.nativeBinding.launch),
         transcript: { identity: ['1', '2'], completeEof: true, bytesBase64: bytes.toString('base64'), sha256: createHash('sha256').update(bytes).digest('hex') } }
       pending = [{ kind: 'permission_requested', data: card }]
       await rig.captureFreshApprovalCheckpoint(address, registered.challengeId)
+      if (recovery === 'web') {
+        await expect(rig.captureFreshApprovalCheckpoint(address, registered.challengeId)).rejects.toThrow(/recovery/)
+        await rig.crashAndRestartWeb()
+      }
       if (recovery !== 'web') {
+        if (recovery === 'host') await rig.crashRuntimeHost(address)
+        else await rig.crashProviderWorker(address)
         current = { ...current, incarnationId: 'replacement-inc', containerId: 'd'.repeat(64), hostBootId: 'replacement-boot' }
         card = structuredClone(card); card.payload.nativeRequestId = 'current-native-callback'
         card.payload.nativeBinding = { nativeRequestId: 'current-native-callback', queryGeneration: 1, launch: { incarnationId: current.incarnationId, launchNonce: 'replacement-nonce' } }
-        native = structuredClone(native); native.nativeLaunch = structuredClone(card.payload.nativeBinding.launch)
+        native = structuredClone(native); native.nativePid = 84; native.nativeLaunch = structuredClone(card.payload.nativeBinding.launch)
         pending = [{ kind: 'permission_requested', data: card }]
       }
       const currentAddress = { ...address, incarnationId: current.incarnationId, containerId: current.containerId, hostBootId: current.hostBootId }

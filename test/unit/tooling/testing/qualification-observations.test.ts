@@ -78,16 +78,28 @@ function browserExecutionFixture(current: FreshAgentQualificationRow, stages: an
     const deferred = { type: 'attachment', uuid: 'checkpoint-' + decisionId, version: '2.1.237', sessionId: otherRoot, attachment: { type: 'hook_deferred_tool', hookEvent: 'PreToolUse', toolUseID, toolName: 'Bash', toolInput: { command } } }
     const bytes = Buffer.from(JSON.stringify(assistant) + '\n' + JSON.stringify(deferred) + '\n')
     const checkpoint = { nativeSessionId: otherRoot, toolUseID, inputDigest, profileDigest: 'a'.repeat(64), toolName: 'Bash', checkpointUuid: deferred.uuid, assistantUuid: assistant.uuid, nativeVersion: '2.1.237', checkpointDigest: createHash('sha256').update(JSON.stringify(deferred)).digest('hex') }
-    const beforeNative = { nativeRoot: otherRoot, version: current.providerVersion + ' (Claude Code)', executableSha256: 'd'.repeat(64), nativeCwd: '/owned/workspace', transcript: { identity: ['1', '2'], completeEof: true, bytesBase64: bytes.toString('base64'), sha256: createHash('sha256').update(bytes).digest('hex') } }
+    const beforeNative = { nativeRoot: otherRoot, version: current.providerVersion + ' (Claude Code)', executableSha256: 'd'.repeat(64), nativeCwd: '/owned/workspace', nativePid: other.process.native.pid, transcript: { identity: ['1', '2'], completeEof: true, bytesBase64: bytes.toString('base64'), sha256: createHash('sha256').update(bytes).digest('hex') } }
     const beforeCard = { decision_id: decisionId, payload: { tool: { name: 'Bash', input: { command } }, toolUseID, nativeCheckpoint: checkpoint,
       nativeRequestId: 'old-' + decisionId, nativeBinding: { nativeRequestId: 'old-' + decisionId, queryGeneration: 1, launch: { incarnationId: 'other-inc', launchNonce: 'old-' + decisionId } } } }
-    const currentCard = structuredClone(beforeCard), afterView = { ...other.view, incarnationId: recovery === 'web' ? 'other-inc' : 'recovered-' + decisionId }
+    const currentCard = structuredClone(beforeCard), afterView = { ...structuredClone(other.view), incarnationId: recovery === 'web' ? 'other-inc' : 'recovered-' + decisionId }
     currentCard.payload.nativeBinding.launch.incarnationId = afterView.incarnationId
     if (recovery !== 'web') currentCard.payload.nativeRequestId = 'new-' + decisionId
     currentCard.payload.nativeBinding.nativeRequestId = currentCard.payload.nativeRequestId
     const currentNative = structuredClone(beforeNative)
     Object.assign(beforeNative, { nativeLaunch: beforeCard.payload.nativeBinding.launch })
     Object.assign(currentNative, { nativeLaunch: currentCard.payload.nativeBinding.launch })
+    const afterAllocation = structuredClone(other)
+    afterAllocation.view = afterView
+    afterAllocation.writer.incarnationId = afterView.incarnationId
+    afterAllocation.process.native.launch.incarnationId = afterView.incarnationId
+    if (recovery !== 'web') { afterView.containerId = 'recovered-container-' + decisionId; afterView.hostBootId = 'recovered-boot-' + decisionId; afterAllocation.process.native.pid += 100; afterAllocation.process.native.startTicks = '200' }
+    currentNative.nativePid = afterAllocation.process.native.pid
+    const auxiliaryLifecycle = [{ event: 'supervisor.recovery.old_writer_released', data: { soulId: other.view.soulId, incarnationId: other.view.incarnationId, containerId: other.view.containerId, providerStoreId: other.writer.providerStoreId, outcome: 'verified_empty', writerState: 'released' } },
+      { event: 'supervisor.recovery.replacement_writer_prepared', data: { soulId: other.view.soulId, priorIncarnationId: other.view.incarnationId, incarnationId: afterView.incarnationId, providerStoreId: other.writer.providerStoreId, nativeSessionId: otherRoot, writerState: 'prepared' } },
+      { event: 'supervisor.launch_running', data: { soulId: other.view.soulId, incarnationId: afterView.incarnationId, containerId: afterView.containerId } }]
+    const recoveryObservation = { kind: recovery === 'web' ? 'web_restart' : recovery === 'host' ? 'session_host_exit' : 'provider_process_exit', requestedAt: 11, completedAt: 13, exitedAt: 12,
+      soulId: other.view.soulId, nativeSessionId: otherRoot, incarnationId: other.view.incarnationId, containerId: other.view.containerId, nativePid: other.process.native.pid, startTicks: other.process.native.startTicks,
+      observation: recovery === 'provider' ? 'exact-native-process-exited' : 'exact-owned-container-stopped', before: structuredClone(other), after: afterAllocation, lifecycle: recovery === 'web' ? [] : auxiliaryLifecycle }
     const files = (card: any) => {
       const { profileDigest, ...nativeCheckpoint } = card.payload.nativeCheckpoint
       return [{ path: '/home/freshell/provider/.freshell/native-checkpoints/claude/' + otherRoot + '.json', readerUid: 65534,
@@ -99,7 +111,7 @@ function browserExecutionFixture(current: FreshAgentQualificationRow, stages: an
       { kind: 'provider', data: { payload: { event: { type: 'freshAgent.tool.result', content: [{ tool_use_id: toolUseID, is_error: !allowed }] } } } },
       { kind: 'provider', data: { payload: { event: { type: 'freshAgent.result', nativeSessionId: otherRoot, isError: false } } } }]
     approvals.push({ recovery, allowed, nativeRoot: otherRoot, command, beforeCard, currentCard, beforeView: structuredClone(other.view), beforeNative, currentNative, beforeFiles: files(beforeCard), currentFiles: files(currentCard),
-      beforeEffectCount: 0, currentEffectCount: 0, afterView, effectCount: allowed ? 1 : 0, recheckedEffectCount: allowed ? 1 : 0, events,
+      beforeCapturedAt: 10, currentCapturedAt: 14, recoveryObservation, beforeEffectCount: 0, currentEffectCount: 0, afterView, effectCount: allowed ? 1 : 0, recheckedEffectCount: allowed ? 1 : 0, events,
       browserDecision: { type: 'freshAgent.approval.respond', sessionId: otherRoot, requestId: decisionId, decision: { behavior: allowed ? 'allow' : 'deny' } } })
   }
   const execution = { mode: current.mode, routes, ui, allocations: [allocation, other], stageViews, lifecycle,

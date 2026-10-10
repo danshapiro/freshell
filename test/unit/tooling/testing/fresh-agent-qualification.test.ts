@@ -34,7 +34,7 @@ describe('observed fresh browser execution', () => {
     const module = await import('../../../../scripts/testing/fresh-agent-qualification-receipt.js')
     expect(() => (module as any).deriveFreshBrowserExecution({ mode: 'freshcodex', routes: [], allocations: [], lifecycle: [] }, {})).toThrow(/executed ingress/)
   })
-  it.each(['approval-missing-before-files', 'approval-missing-current-files', 'approval-no-native-operation', 'approval-wrong-native-input', 'approval-wrong-checkpoint', 'approval-stale-actor', 'approval-wrong-dispatch-id', 'approval-wrong-native-dispatch', 'alias-wrong-rest-tab', 'alias-wrong-rest-split', 'alias-wrong-mcp-new-tab', 'alias-wrong-mcp-split', 'alias-wrong-request', 'alias-wrong-store', 'alias-stale-writer', 'missing-route', 'wrong-reply', 'two-writers', 'shared-store', 'shared-container', 'release-after-prepare', 'missing-release', 'missing-running', 'web-process-replaced', 'startup-empty', 'approval-missing-deny', 'approval-old-callback', 'approval-effect-replayed', 'approval-duplicate-dispatch', 'approval-extra-completion', 'approval-changed-native-root', 'approval-changed-native-executable'])('reopens originals and rejects %s', fault => {
+  it.each(['approval-native-already-consumed', 'approval-swapped-recovery', 'approval-web-no-restart', 'approval-web-old-restart', 'approval-missing-aux-release', 'approval-aux-release-after-start', 'approval-wrong-exit-process', 'approval-wrong-recovery-root', 'approval-web-process-changed', 'approval-missing-before-files', 'approval-missing-current-files', 'approval-no-native-operation', 'approval-wrong-native-input', 'approval-wrong-checkpoint', 'approval-stale-actor', 'approval-wrong-dispatch-id', 'approval-wrong-native-dispatch', 'alias-wrong-rest-tab', 'alias-wrong-rest-split', 'alias-wrong-mcp-new-tab', 'alias-wrong-mcp-split', 'alias-wrong-request', 'alias-wrong-store', 'alias-stale-writer', 'missing-route', 'wrong-reply', 'two-writers', 'shared-store', 'shared-container', 'release-after-prepare', 'missing-release', 'missing-running', 'web-process-replaced', 'startup-empty', 'approval-missing-deny', 'approval-old-callback', 'approval-effect-replayed', 'approval-duplicate-dispatch', 'approval-extra-completion', 'approval-changed-native-root', 'approval-changed-native-executable'])('reopens originals and rejects %s', fault => {
     const built = fixture()
     const current = built.receipt.rows[0]!, reference = current.executionOriginal as { path: string; sha256: string }
     const filename = path.join(built.evidenceDir, reference.path), original = JSON.parse(fs.readFileSync(filename, 'utf8'))
@@ -58,6 +58,14 @@ describe('observed fresh browser execution', () => {
     if (fault === 'startup-empty') original.supervisorRestarts[0].lifecycle[0].data.scanned = 0
     if (fault === 'approval-missing-deny') original.approvals.pop()
     const approval = original.approvals[2]
+    if (fault === 'approval-swapped-recovery') for (const value of original.approvals) if (value.recovery !== 'web') value.recovery = value.recovery === 'host' ? 'provider' : 'host'
+    if (fault === 'approval-web-no-restart') delete original.approvals[0].recoveryObservation
+    if (fault === 'approval-web-old-restart') original.approvals[0].recoveryObservation.requestedAt = 9
+    if (fault === 'approval-missing-aux-release') approval.recoveryObservation.lifecycle.shift()
+    if (fault === 'approval-aux-release-after-start') approval.recoveryObservation.lifecycle.reverse()
+    if (fault === 'approval-wrong-exit-process') approval.recoveryObservation.nativePid += 1
+    if (fault === 'approval-wrong-recovery-root') approval.recoveryObservation.after.view.nativeSessionId = 'unrelated-root'
+    if (fault === 'approval-web-process-changed') original.approvals[0].recoveryObservation.after.process.native.pid += 1
     const rewriteNative = (snapshot: any, change: (rows: any[]) => any[]) => {
       const rows = change(Buffer.from(snapshot.transcript.bytesBase64, 'base64').toString().trim().split('\n').map(line => JSON.parse(line)))
       const bytes = Buffer.from(rows.map(row => JSON.stringify(row)).join('\n') + '\n')
@@ -70,6 +78,7 @@ describe('observed fresh browser execution', () => {
     if (fault === 'approval-missing-before-files') delete approval.beforeFiles
     if (fault === 'approval-missing-current-files') delete approval.currentFiles
     if (fault === 'approval-no-native-operation') for (const snapshot of [approval.beforeNative, approval.currentNative]) rewriteNative(snapshot, () => [{ type: 'system', sessionId: approval.nativeRoot }])
+    if (fault === 'approval-native-already-consumed') for (const snapshot of [approval.beforeNative, approval.currentNative]) rewriteNative(snapshot, rows => [...rows, { type: 'user', sessionId: approval.nativeRoot, message: { content: [{ type: 'tool_result', tool_use_id: approval.beforeCard.payload.toolUseID }] } }])
     if (fault === 'approval-wrong-native-input') for (const snapshot of [approval.beforeNative, approval.currentNative]) rewriteNative(snapshot, rows => { rows[0].message.content[0].input.command = 'unrelated operation'; return rows })
     if (fault === 'approval-wrong-checkpoint') rewriteFile(approval.currentFiles[0], value => { value.checkpoint.toolUseID = 'toolu_other' })
     if (fault === 'approval-stale-actor') rewriteFile(approval.currentFiles[1], value => { value.decisions[approval.currentCard.decision_id].payload.nativeBinding.nativeRequestId = 'stale-callback' })
@@ -218,16 +227,28 @@ function browserExecutionFixture(current: FreshAgentQualificationRow, stages: an
     const deferred = { type: 'attachment', uuid: 'checkpoint-' + decisionId, version: '2.1.237', sessionId: otherRoot, attachment: { type: 'hook_deferred_tool', hookEvent: 'PreToolUse', toolUseID, toolName: 'Bash', toolInput: { command } } }
     const bytes = Buffer.from(JSON.stringify(assistant) + '\n' + JSON.stringify(deferred) + '\n')
     const checkpoint = { nativeSessionId: otherRoot, toolUseID, inputDigest, profileDigest: 'a'.repeat(64), toolName: 'Bash', checkpointUuid: deferred.uuid, assistantUuid: assistant.uuid, nativeVersion: '2.1.237', checkpointDigest: createHash('sha256').update(JSON.stringify(deferred)).digest('hex') }
-    const beforeNative = { nativeRoot: otherRoot, version: current.providerVersion + ' (Claude Code)', executableSha256: 'd'.repeat(64), nativeCwd: '/owned/workspace', transcript: { identity: ['1', '2'], completeEof: true, bytesBase64: bytes.toString('base64'), sha256: createHash('sha256').update(bytes).digest('hex') } }
+    const beforeNative = { nativeRoot: otherRoot, version: current.providerVersion + ' (Claude Code)', executableSha256: 'd'.repeat(64), nativeCwd: '/owned/workspace', nativePid: other.process.native.pid, transcript: { identity: ['1', '2'], completeEof: true, bytesBase64: bytes.toString('base64'), sha256: createHash('sha256').update(bytes).digest('hex') } }
     const beforeCard = { decision_id: decisionId, payload: { tool: { name: 'Bash', input: { command } }, toolUseID, nativeCheckpoint: checkpoint,
       nativeRequestId: 'old-' + decisionId, nativeBinding: { nativeRequestId: 'old-' + decisionId, queryGeneration: 1, launch: { incarnationId: 'other-inc', launchNonce: 'old-' + decisionId } } } }
-    const currentCard = structuredClone(beforeCard), afterView = { ...other.view, incarnationId: recovery === 'web' ? 'other-inc' : 'recovered-' + decisionId }
+    const currentCard = structuredClone(beforeCard), afterView = { ...structuredClone(other.view), incarnationId: recovery === 'web' ? 'other-inc' : 'recovered-' + decisionId }
     currentCard.payload.nativeBinding.launch.incarnationId = afterView.incarnationId
     if (recovery !== 'web') currentCard.payload.nativeRequestId = 'new-' + decisionId
     currentCard.payload.nativeBinding.nativeRequestId = currentCard.payload.nativeRequestId
     const currentNative = structuredClone(beforeNative)
     Object.assign(beforeNative, { nativeLaunch: beforeCard.payload.nativeBinding.launch })
     Object.assign(currentNative, { nativeLaunch: currentCard.payload.nativeBinding.launch })
+    const afterAllocation = structuredClone(other)
+    afterAllocation.view = afterView
+    afterAllocation.writer.incarnationId = afterView.incarnationId
+    afterAllocation.process.native.launch.incarnationId = afterView.incarnationId
+    if (recovery !== 'web') { afterView.containerId = 'recovered-container-' + decisionId; afterView.hostBootId = 'recovered-boot-' + decisionId; afterAllocation.process.native.pid += 100; afterAllocation.process.native.startTicks = '200' }
+    currentNative.nativePid = afterAllocation.process.native.pid
+    const auxiliaryLifecycle = [{ event: 'supervisor.recovery.old_writer_released', data: { soulId: other.view.soulId, incarnationId: other.view.incarnationId, containerId: other.view.containerId, providerStoreId: other.writer.providerStoreId, outcome: 'verified_empty', writerState: 'released' } },
+      { event: 'supervisor.recovery.replacement_writer_prepared', data: { soulId: other.view.soulId, priorIncarnationId: other.view.incarnationId, incarnationId: afterView.incarnationId, providerStoreId: other.writer.providerStoreId, nativeSessionId: otherRoot, writerState: 'prepared' } },
+      { event: 'supervisor.launch_running', data: { soulId: other.view.soulId, incarnationId: afterView.incarnationId, containerId: afterView.containerId } }]
+    const recoveryObservation = { kind: recovery === 'web' ? 'web_restart' : recovery === 'host' ? 'session_host_exit' : 'provider_process_exit', requestedAt: 11, completedAt: 13, exitedAt: 12,
+      soulId: other.view.soulId, nativeSessionId: otherRoot, incarnationId: other.view.incarnationId, containerId: other.view.containerId, nativePid: other.process.native.pid, startTicks: other.process.native.startTicks,
+      observation: recovery === 'provider' ? 'exact-native-process-exited' : 'exact-owned-container-stopped', before: structuredClone(other), after: afterAllocation, lifecycle: recovery === 'web' ? [] : auxiliaryLifecycle }
     const files = (card: any) => {
       const { profileDigest, ...nativeCheckpoint } = card.payload.nativeCheckpoint
       return [{ path: '/home/freshell/provider/.freshell/native-checkpoints/claude/' + otherRoot + '.json', readerUid: 65534,
@@ -239,7 +260,7 @@ function browserExecutionFixture(current: FreshAgentQualificationRow, stages: an
       { kind: 'provider', data: { payload: { event: { type: 'freshAgent.tool.result', content: [{ tool_use_id: toolUseID, is_error: !allowed }] } } } },
       { kind: 'provider', data: { payload: { event: { type: 'freshAgent.result', nativeSessionId: otherRoot, isError: false } } } }]
     approvals.push({ recovery, allowed, nativeRoot: otherRoot, command, beforeCard, currentCard, beforeView: structuredClone(other.view), beforeNative, currentNative, beforeFiles: files(beforeCard), currentFiles: files(currentCard),
-      beforeEffectCount: 0, currentEffectCount: 0, afterView, effectCount: allowed ? 1 : 0, recheckedEffectCount: allowed ? 1 : 0, events,
+      beforeCapturedAt: 10, currentCapturedAt: 14, recoveryObservation, beforeEffectCount: 0, currentEffectCount: 0, afterView, effectCount: allowed ? 1 : 0, recheckedEffectCount: allowed ? 1 : 0, events,
       browserDecision: { type: 'freshAgent.approval.respond', sessionId: otherRoot, requestId: decisionId, decision: { behavior: allowed ? 'allow' : 'deny' } } })
   }
   const execution = { mode: current.mode, routes, ui, allocations: [allocation, other], stageViews, lifecycle,

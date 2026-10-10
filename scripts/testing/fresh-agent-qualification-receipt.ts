@@ -102,6 +102,7 @@ export function validateFreshApprovalCheckpoint(card: any, native: any, files: a
     || deferred.attachment?.type !== 'hook_deferred_tool' || deferred.attachment.hookEvent !== 'PreToolUse'
     || deferred.attachment.toolUseID !== payload.toolUseID || deferred.attachment.toolName !== 'Bash'
     || digest(deferred.attachment.toolInput) !== checkpoint.inputDigest
+    || lines.slice(index + 1).some(line => line.includes('"tool_use_id":"' + payload.toolUseID + '"'))
     || createHash('sha256').update(lines[index]!).digest('hex') !== checkpoint.checkpointDigest
     || !binding?.nativeRequestId || binding.nativeRequestId !== payload.nativeRequestId || binding.launch?.incarnationId !== view.incarnationId
     || stableJson(binding.launch) !== stableJson(native.nativeLaunch)) throw new Error('native approval operation/checkpoint/current binding differs')
@@ -129,6 +130,51 @@ export function validateFreshApprovalDispatch(value: any): void {
   if (dispatches.length !== 1 || dispatch.ok !== true || String(dispatch.requestId) !== current.decision_id
     || dispatch.nativeRequestId !== current.payload.nativeRequestId || dispatch.sessionId !== view.freshAgentSessionId
     || value.browserDecision?.sessionId !== view.freshAgentSessionId) throw new Error('native approval current dispatch differs')
+}
+
+function validateFreshWriterReplacement(lifecycle: any[], before: any, after: any, store: string, root: string): void {
+  const release = lifecycle.findIndex(event => event.event === 'supervisor.recovery.old_writer_released' && event.data?.soulId === before.soulId
+    && event.data.incarnationId === before.incarnationId && event.data.containerId === before.containerId && event.data.providerStoreId === store
+    && event.data.outcome === 'verified_empty' && event.data.writerState === 'released')
+  const preparation = lifecycle.findIndex(event => event.event === 'supervisor.recovery.replacement_writer_prepared' && event.data?.soulId === before.soulId
+    && event.data.priorIncarnationId === before.incarnationId && event.data.incarnationId === after.incarnationId && event.data.providerStoreId === store
+    && event.data.nativeSessionId === root && event.data.writerState === 'prepared')
+  const running = lifecycle.findIndex(event => event.event === 'supervisor.launch_running' && event.data?.soulId === before.soulId
+    && event.data.incarnationId === after.incarnationId && event.data.containerId === after.containerId)
+  if (release < 0 || preparation <= release || running <= preparation) throw new Error('committed old writer release/preparation/running order differs')
+}
+
+export function validateFreshApprovalRecovery(value: any, identity: { soulId: string; nativeSessionId: string; providerStoreId: string }): void {
+  const recovery = value.recoveryObservation
+  if (!recovery || !Number.isSafeInteger(value.beforeCapturedAt) || !Number.isSafeInteger(value.currentCapturedAt)
+    || !Number.isSafeInteger(recovery.requestedAt) || !Number.isSafeInteger(recovery.completedAt)
+    || recovery.requestedAt < value.beforeCapturedAt || recovery.completedAt < recovery.requestedAt
+    || value.currentCapturedAt < recovery.completedAt) throw new Error('actual intervening approval recovery is missing')
+  const { before, after } = recovery
+  for (const [allocation, view, native] of [[before, value.beforeView, value.beforeNative], [after, value.afterView, value.currentNative]]) {
+    if (allocation.view.soulId !== identity.soulId || allocation.view.nativeSessionId !== identity.nativeSessionId
+      || ['soulId', 'nativeSessionId', 'incarnationId', 'containerId', 'hostBootId'].some(field => allocation.view[field] !== view[field])
+      || allocation.writer.providerStoreId !== identity.providerStoreId || allocation.writer.soulId !== identity.soulId
+      || allocation.writer.nativeSessionId !== identity.nativeSessionId || allocation.writer.incarnationId !== view.incarnationId
+      || allocation.writer.activeClaimCount !== 1 || allocation.writer.globalConflictingClaimCount !== 0
+      || allocation.process.native.uid !== 65534 || allocation.process.native.launch.incarnationId !== view.incarnationId
+      || allocation.process.native.pid !== native.nativePid || allocation.process.native.executableSha256 !== native.executableSha256) throw new Error('approval recovery current allocation/process/writer differs')
+  }
+  if (before.volume.providerVolumeName !== after.volume.providerVolumeName) throw new Error('approval recovery provider volume differs')
+  if (recovery.kind === 'web_restart') {
+    if (value.recovery !== 'web' || ['incarnationId', 'containerId', 'hostBootId'].some(field => before.view[field] !== after.view[field])
+      || ['pid', 'startTicks', 'executableSha256'].some(field => before.process.native[field] !== after.process.native[field])) throw new Error('approval web recovery did not retain its live native process')
+  } else {
+    const kind = recovery.kind === 'session_host_exit' ? 'host' : recovery.kind === 'provider_process_exit' ? 'provider' : null
+    if (!kind || value.recovery !== kind || recovery.soulId !== identity.soulId || recovery.nativeSessionId !== identity.nativeSessionId
+      || recovery.containerId !== before.view.containerId || recovery.incarnationId !== before.view.incarnationId
+      || recovery.nativePid !== before.process.native.pid || recovery.startTicks !== before.process.native.startTicks
+      || !Number.isSafeInteger(recovery.exitedAt) || recovery.exitedAt < recovery.requestedAt || recovery.exitedAt > recovery.completedAt
+      || (kind === 'host' ? recovery.observation !== 'exact-owned-container-stopped'
+        : !['exact-native-process-exited', 'exact-owned-container-stopped'].includes(recovery.observation))
+      || before.view.incarnationId === after.view.incarnationId || before.view.containerId === after.view.containerId) throw new Error('approval owned recovery action/exit differs')
+    validateFreshWriterReplacement(recovery.lifecycle, before.view, after.view, identity.providerStoreId, identity.nativeSessionId)
+  }
 }
 
 /** Reopens practical browser/owner observations, rather than treating inventory as execution. */
@@ -179,17 +225,9 @@ export function deriveFreshBrowserExecution(original: Record<string, any>, conve
   const target = (event: Record<string, any>, name: string) => event.event === name && event.data?.soulId === conversation.soulId
   const releases = lifecycle.filter(event => target(event, 'supervisor.recovery.old_writer_released'))
   const prepared = lifecycle.filter(event => target(event, 'supervisor.recovery.replacement_writer_prepared'))
-  const running = lifecycle.filter(event => target(event, 'supervisor.launch_running'))
-  for (const [index, stage] of conversation.stages.entries()) {
+  for (const [index] of conversation.stages.entries()) {
     if (index === 0) continue
-    const prior = original.stageViews[index - 1], current = original.stageViews[index]
-    const release = releases.find(event => event.data.incarnationId === prior.incarnationId && event.data.containerId === prior.containerId
-      && event.data.providerStoreId === conversation.providerStoreId && event.data.outcome === 'verified_empty' && event.data.writerState === 'released')
-    const preparation = prepared.find(event => event.data.priorIncarnationId === prior.incarnationId && event.data.incarnationId === current.incarnationId
-      && event.data.providerStoreId === conversation.providerStoreId && event.data.nativeSessionId === conversation.nativeSessionId && event.data.writerState === 'prepared')
-    const launch = running.find(event => event.data.incarnationId === current.incarnationId && event.data.containerId === current.containerId)
-    if (!release || !preparation || !launch || lifecycle.indexOf(release) >= lifecycle.indexOf(preparation)
-      || lifecycle.indexOf(preparation) >= lifecycle.indexOf(launch)) throw new Error(`committed old writer release/preparation/running order differs at ${stage.stage}`)
+    validateFreshWriterReplacement(lifecycle, original.stageViews[index - 1], original.stageViews[index], conversation.providerStoreId, conversation.nativeSessionId)
   }
   if (!lifecycle.some(event => target(event, 'supervisor.runtime_observer.recovery_scheduled'))) throw new Error('automatic recovery was not observed')
   const stable = (before: any, after: any) => ['soulId', 'incarnationId', 'containerId', 'nativeSessionId'].every(field => before.view[field] === after.view[field])
@@ -207,6 +245,7 @@ export function deriveFreshBrowserExecution(original: Record<string, any>, conve
       const cases = approvals.filter((value: any) => value.recovery === recovery && value.allowed === allowed)
       if (cases.length !== 1) throw new Error('native solo Bash allow/deny recovery matrix is incomplete')
       const value = cases[0], old = value.beforeCard, current = value.currentCard
+      validateFreshApprovalRecovery(value, { soulId: other.view.soulId, nativeSessionId: other.view.nativeSessionId, providerStoreId: other.writer.providerStoreId })
       validateFreshApprovalCheckpoint(old, value.beforeNative, value.beforeFiles, value.beforeView, value.command)
       validateFreshApprovalCheckpoint(current, value.currentNative, value.currentFiles, value.afterView, value.command)
       validateFreshApprovalDispatch(value)
