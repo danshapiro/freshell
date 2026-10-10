@@ -347,6 +347,107 @@ fn hosted_created_frame_uses_the_public_request_identity() {
 }
 
 #[tokio::test]
+async fn managed_ordinary_stop_eof_broadcasts_one_failed_ack_to_both_receivers() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("supervisor.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let soul = SoulId::parse("owned-stop-soul").unwrap();
+    let expected_soul = soul.clone();
+    let supervisor = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let health: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+        assert!(matches!(health.body, AdminCommand::Health));
+        assert_eq!(health.role, ControlRole::Web);
+        assert_eq!(health.auth.as_deref(), Some("0123456789abcdef"));
+        write_frame(
+            &mut stream,
+            &AdminReply {
+                request_id: health.request_id.clone(),
+                result: Ok(AdminResult::Health {
+                    control_epoch: 77,
+                    installation_id: InstallationId::new(),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        drop(stream);
+
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+        assert_eq!(request.role, ControlRole::Web);
+        assert_eq!(request.auth.as_deref(), Some("0123456789abcdef"));
+        assert_ne!(request.request_id, health.request_id);
+        let AdminCommand::Stop(stop) = request.body else {
+            panic!("ordinary kill must issue exactly one Stop")
+        };
+        assert_eq!(stop.soul_id, expected_soul);
+        assert_eq!(stop.expected_control_epoch, Some(77));
+        assert_eq!(stop.expected_intent_revision, None);
+        // Model the crashed supervisor's real UDS EOF, not a typed refusal.
+        drop(stream);
+        listener
+    });
+    let (broadcast, mut first) = broadcast::channel(16);
+    let mut second = broadcast.subscribe();
+    let proxy = Arc::new(HostedFreshAgentProxy {
+        client: RuntimeClient::new(&socket, "0123456789abcdef"),
+        broadcast: Arc::new(broadcast),
+        aliases: Mutex::new(HashMap::from([
+            (
+                ("codex".into(), "presentation-stop-session".into()),
+                soul.clone(),
+            ),
+            (
+                ("codex".into(), "different-native-root".into()),
+                soul.clone(),
+            ),
+        ])),
+        presentation_ids: Mutex::new(HashMap::from([(soul, "presentation-stop-session".into())])),
+        pollers: Mutex::new(HashSet::new()),
+        fixture_modes: HashSet::new(),
+        naming: OnceLock::new(),
+    });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        proxy.dispatch(HostedFreshAgentCommand::Kill(
+            freshell_protocol::FreshAgentKill {
+                provider: AgentProvider::Codex,
+                session_id: "presentation-stop-session".into(),
+                session_type: SessionType::Freshcodex,
+                cwd: None,
+                observed_epoch: Some(77),
+                observed_generation: Some(9),
+            },
+        )),
+    )
+    .await
+    .expect("UDS EOF must settle the actual gateway dispatch");
+    let first_frame = first.try_recv().expect("first connected receiver gets ACK");
+    assert_eq!(second.try_recv().unwrap(), first_frame);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&first_frame).unwrap(),
+        serde_json::json!({
+            "type":"freshAgent.killed", "provider":"codex",
+            "sessionId":"presentation-stop-session", "sessionType":"freshcodex",
+            "success":false
+        })
+    );
+    assert!(first.try_recv().is_err());
+    assert!(second.try_recv().is_err());
+    let listener = tokio::time::timeout(Duration::from_secs(5), supervisor)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err(),
+        "EOF must not cause another Stop, retry, or other control effect"
+    );
+}
+
+#[tokio::test]
 async fn managed_recovery_stop_refuses_without_contacting_the_host() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("supervisor.sock");

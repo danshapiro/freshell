@@ -15,6 +15,7 @@ import { waitForOpenCodeTerminalCondition } from '../helpers/opencode-native-his
 import { TestHarness } from '../helpers/test-harness.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { reportInterruptedOrdinaryStopAckFailure } from '../helpers/runtime-chaos-evidence.js'
 
 function findTerminalLeaves(node: any, out: any[] = []): any[] {
   if (!node) return out
@@ -405,7 +406,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
     }
   })
 
-  test('synthetic interrupted ordinary Stop preserves history', async ({ page }) => {
+  test('synthetic interrupted ordinary Stop preserves history', async ({ page }, testInfo) => {
     test.skip(process.env.FRESHELL_RUNTIME_SYNTHETIC_RESUME !== '1', 'requires the explicit synthetic runtime lane')
     test.setTimeout(900_000)
     const supervisorEnv = {
@@ -419,9 +420,30 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
     })
     const sent: any[] = []
     const received: any[] = []
+    const socketStartedAt = Date.now()
+    const socketLifecycle: { socketOrdinal: number; atMs: number; event: string }[] = []
+    const sentSocketFacts: { socketOrdinal: number; atMs: number }[] = []
+    const receivedSocketFacts: { socketOrdinal: number; atMs: number }[] = []
+    let socketCount = 0
     page.on('websocket', (socket) => {
-      socket.on('framesent', (frame) => { sent.push(JSON.parse(String(frame.payload))) })
-      socket.on('framereceived', (frame) => { received.push(JSON.parse(String(frame.payload))) })
+      const socketOrdinal = ++socketCount
+      const socketEvent = (event: string) => socketLifecycle.push({ socketOrdinal, atMs: Date.now() - socketStartedAt, event })
+      socketEvent('created')
+      let observedOpen = false
+      const frameFacts = () => {
+        if (!observedOpen) { socketEvent('open-observed-by-frame'); observedOpen = true }
+        return { socketOrdinal, atMs: Date.now() - socketStartedAt }
+      }
+      socket.on('framesent', (frame) => {
+        sent.push(JSON.parse(String(frame.payload)))
+        sentSocketFacts.push(frameFacts())
+      })
+      socket.on('framereceived', (frame) => {
+        received.push(JSON.parse(String(frame.payload)))
+        receivedSocketFacts.push(frameFacts())
+      })
+      socket.on('close', () => { socketEvent('closed') })
+      socket.on('socketerror', () => { socketEvent('error') })
     })
     try {
       const info = await rig.start()
@@ -487,6 +509,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       const workerLaunchCount = beforeFacts.workerLaunchCount
       const sentAtStop = sent.length
       const receivedAtStop = received.length
+      const stopSocketAtMs = Date.now() - socketStartedAt
 
       // Close pane sends the fenced, acknowledged ordinary Stop. Composer
       // Stop interrupts a turn and does not commit durable stopped intent.
@@ -495,10 +518,17 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       const crash = await rig.interruptedOrdinaryStopCrashFacts(handle)
       expect(crash.crashPoint).toBe('ordinary_stop_after_intent')
       expect(crash.exitCode).toBe(134)
-      await expect.poll(() => received.slice(receivedAtStop).some((message) => {
-        const event = message.type === 'freshAgent.event' ? message.event : message
-        return message.sessionId === original.sessionId && event.type === 'freshAgent.killed' && event.success === false
-      }), { timeout: 30_000 }).toBe(true)
+      try {
+        await expect.poll(() => received.slice(receivedAtStop).some((message) => {
+          const event = message.type === 'freshAgent.event' ? message.event : message
+          return message.sessionId === original.sessionId && event.type === 'freshAgent.killed' && event.success === false
+        }), { timeout: 30_000 }).toBe(true)
+      } catch (failure) {
+        await reportInterruptedOrdinaryStopAckFailure(failure, testInfo, {
+          expected: { presentationSessionId: original.sessionId ?? null, nativeSessionId: nativeId, soulId: view.soulId },
+          sentAtStop, receivedAtStop, stopSocketAtMs, sent, received, sentSocketFacts, receivedSocketFacts, socketLifecycle,
+        })
+      }
       expect(sent.slice(sentAtStop).filter((frame) => frame.type === 'freshAgent.kill')).toHaveLength(1)
       await expect(pane).toBeVisible()
       expect((await harness.getPaneLayout(created.tabId)).content).toMatchObject(canonical)

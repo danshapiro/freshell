@@ -5,6 +5,7 @@ import path from 'node:path'
 
 import type { ManagedRuntimeView, ManagedFixtureRig } from './managed-runtime.js'
 import type { RuntimeChaosLog } from '../../../scripts/testing/runtime-sandbox.js'
+import type { TestInfo } from '@playwright/test'
 export { writePrivateRuntimeChaosJsonl as writePrivateJsonl } from '../../../scripts/testing/runtime-sandbox.js'
 
 
@@ -94,4 +95,44 @@ export function writePrivateJson(filePath: string, value: unknown): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 })
   fs.writeFileSync(filePath, JSON.stringify(value, null, 2), { mode: 0o600 })
   fs.chmodSync(filePath, 0o600)
+}
+
+export async function reportInterruptedOrdinaryStopAckFailure(
+  failure: unknown,
+  testInfo: Pick<TestInfo, 'attach'>,
+  capture: {
+    expected: { presentationSessionId: string | null; nativeSessionId: string; soulId: string }
+    sentAtStop: number
+    receivedAtStop: number
+    stopSocketAtMs: number
+    sent: any[]
+    received: any[]
+    sentSocketFacts: { socketOrdinal: number; atMs: number }[]
+    receivedSocketFacts: { socketOrdinal: number; atMs: number }[]
+    socketLifecycle: { socketOrdinal: number; atMs: number; event: string }[]
+  },
+): Promise<never> {
+  try {
+    const killFrames = (frames: any[], offset: number, socketFacts: typeof capture.sentSocketFacts) => frames.slice(offset).flatMap((message, index) => {
+      const event = message.type === 'freshAgent.event' ? message.event : message
+      if (!['freshAgent.kill', 'freshAgent.killed'].includes(event?.type)) return []
+      return [{ ...socketFacts[offset + index], arrayIndex: offset + index,
+        type: message.type, eventType: event.type, sessionId: message.sessionId, eventSessionId: event.sessionId,
+        provider: message.provider, eventProvider: event.provider,
+        sessionType: message.sessionType, eventSessionType: event.sessionType,
+        observedEpoch: message.observedEpoch, observedGeneration: message.observedGeneration,
+        success: event.success, code: event.code }]
+    })
+    const body = JSON.stringify({ severity: 'error', event: 'interrupted_ordinary_stop_ack_missing', expected: capture.expected,
+      sentAtStop: capture.sentAtStop, receivedAtStop: capture.receivedAtStop, stopSocketAtMs: capture.stopSocketAtMs,
+      sent: killFrames(capture.sent, capture.sentAtStop, capture.sentSocketFacts),
+      received: killFrames(capture.received, capture.receivedAtStop, capture.receivedSocketFacts),
+      socketLifecycle: capture.socketLifecycle })
+    // Cloud's execution-log display collects textPayload; a prefix keeps this
+    // complete record there instead of an unqueried structured JSON payload.
+    process.stdout.write(`[interrupted-ordinary-stop-ack-sockets] ${body}\n`)
+    await testInfo.attach('interrupted-ordinary-stop-ack-sockets', {
+      contentType: 'application/json', body: Buffer.from(body),
+    })
+  } finally { throw failure }
 }
