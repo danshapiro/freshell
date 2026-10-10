@@ -209,8 +209,10 @@ fn fdinfo_has_lock(fdinfo: &str) -> bool {
 /// is named by its image name (falling back to the Restart Manager's
 /// application name), never by its command line. An entry whose pid now
 /// names a different process (started at another time) is dropped. A path
-/// that does not exist, or that the Restart Manager cannot be asked about,
-/// yields nothing.
+/// that does not exist yields nothing. So does one the Restart Manager
+/// cannot be asked about, which is logged as a warning
+/// (`containment.lock_lookup_failed`): that empty answer is not proof that
+/// nobody holds the file.
 #[cfg(windows)]
 pub fn lock_holders(paths: &[PathBuf]) -> Vec<LockHolder> {
     let mut out: Vec<LockHolder> = Vec::new();
@@ -282,14 +284,29 @@ mod restart_manager {
         }
     }
 
+    /// A Restart Manager call that failed: logged, and the lookup answers
+    /// nothing (it could not check).
+    fn failed(call: &'static str, code: u32, path: &Path) -> Vec<(u32, u64, String)> {
+        tracing::warn!(target: "freshell_unit",
+            event = "containment.lock_lookup_failed",
+            call,
+            code,
+            error = %std::io::Error::from_raw_os_error(code as i32),
+            path = %path.display(),
+            "the Restart Manager could not say who has a lock file open; it is reported as having no holder");
+        Vec::new()
+    }
+
     /// `(pid, start time, application name)` of every process that has
-    /// `path` open (empty when the Restart Manager cannot be asked).
+    /// `path` open (empty, after a warning, when the Restart Manager cannot
+    /// be asked).
     pub(super) fn processes_using(path: &Path) -> Vec<(u32, u64, String)> {
         let mut handle = 0u32;
         let mut key = [0u16; CCH_RM_SESSION_KEY as usize + 1];
         // SAFETY: valid out-pointers; the key buffer has room for the key.
-        if unsafe { RmStartSession(&mut handle, 0, key.as_mut_ptr()) } != ERROR_SUCCESS {
-            return Vec::new();
+        let started = unsafe { RmStartSession(&mut handle, 0, key.as_mut_ptr()) };
+        if started != ERROR_SUCCESS {
+            return failed("RmStartSession", started, path);
         }
         let session = Session(handle);
         let wide: Vec<u16> = path
@@ -311,7 +328,7 @@ mod restart_manager {
             )
         };
         if registered != ERROR_SUCCESS {
-            return Vec::new();
+            return failed("RmRegisterResources", registered, path);
         }
         let mut capacity = 16usize;
         for _ in 0..LIST_ATTEMPTS {
@@ -335,7 +352,7 @@ mod restart_manager {
                 continue;
             }
             if rc != ERROR_SUCCESS {
-                return Vec::new();
+                return failed("RmGetList", rc, path);
             }
             list.truncate(count as usize);
             return list
@@ -356,7 +373,8 @@ mod restart_manager {
                 })
                 .collect();
         }
-        Vec::new()
+        // The list kept growing between the size query and the read.
+        failed("RmGetList", ERROR_MORE_DATA, path)
     }
 }
 
