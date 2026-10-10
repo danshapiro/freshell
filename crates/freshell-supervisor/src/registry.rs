@@ -25,6 +25,14 @@ use std::{
 pub const SCHEMA_VERSION: u32 = 16;
 const ACTIVE_STATES: &str = "'prepared','created','starting','running','stopping'";
 
+// Both capture phases validate their complete fence inside the same immediate
+// transaction as the existing resume-spec identity check and persistence.
+#[derive(Clone, Copy)]
+enum ResumeSpecCapturePhase {
+    ActiveIncarnation,
+    RecoveryPrior,
+}
+
 type ExistingSoulLaunchRow = (
     String,
     String,
@@ -2088,12 +2096,49 @@ impl Registry {
     pub async fn store_verified_resume_spec_fenced(
         &self,
         soul_id: SoulId,
+        resume_spec: ResumeSpec,
+        fence: RecoveryWriteFence,
+    ) -> Result<ResumeSpec, RegistryError> {
+        self.store_verified_resume_spec_in_phase(
+            soul_id,
+            resume_spec,
+            fence,
+            ResumeSpecCapturePhase::ActiveIncarnation,
+        )
+        .await
+    }
+
+    /// Recovery may start from the exact latest already-retired prior. Capture
+    /// the positively read owned store before replacement so re-entry retains
+    /// the exact native resume input. This never relaxes the active-only API.
+    pub(crate) async fn store_verified_recovery_resume_spec_fenced(
+        &self,
+        soul_id: SoulId,
+        resume_spec: ResumeSpec,
+        fence: RecoveryWriteFence,
+    ) -> Result<ResumeSpec, RegistryError> {
+        self.store_verified_resume_spec_in_phase(
+            soul_id,
+            resume_spec,
+            fence,
+            ResumeSpecCapturePhase::RecoveryPrior,
+        )
+        .await
+    }
+
+    async fn store_verified_resume_spec_in_phase(
+        &self,
+        soul_id: SoulId,
         mut resume_spec: ResumeSpec,
         fence: RecoveryWriteFence,
+        phase: ResumeSpecCapturePhase,
     ) -> Result<ResumeSpec, RegistryError> {
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            validate_recovery_write_fence(&tx, &soul_id, &fence)?;
+            match phase {
+                ResumeSpecCapturePhase::ActiveIncarnation => validate_recovery_write_fence(&tx, &soul_id, &fence)?,
+                ResumeSpecCapturePhase::RecoveryPrior => validate_recovery_resume_capture_fence(&tx, &soul_id, &fence)?,
+            }
             if let Some(recipe) = &resume_spec.claude_fork {
                 let current: Option<String> = tx.query_row("SELECT claude_fork_recipe FROM souls WHERE soul_id=?1", params![soul_id.as_str()], |row| row.get(0))?;
                 let current: Option<freshell_runtime_protocol::ClaudeForkRecipe> = current.map(|raw| serde_json::from_str(&raw)).transpose()?;
@@ -5309,6 +5354,34 @@ fn validate_recovery_write_fence(
     Ok(())
 }
 
+fn validate_recovery_resume_capture_fence(
+    tx: &rusqlite::Transaction<'_>,
+    soul_id: &SoulId,
+    fence: &RecoveryWriteFence,
+) -> Result<(), RegistryError> {
+    // Latest exact incarnation plus every revision, RUNNING intent and the
+    // current reservation remain mandatory even when no active row exists.
+    validate_recovery_context_fence(tx, soul_id, fence)?;
+    let (state, cleanup): (String, String) = tx.query_row(
+        "SELECT launch_state,cleanup_state FROM incarnations WHERE soul_id=?1 AND incarnation_id=?2",
+        params![soul_id.as_str(), fence.active_incarnation_id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if parse_launch_state(&state)?.is_potentially_active() {
+        return validate_recovery_write_fence(tx, soul_id, fence);
+    }
+    let conflicting_owner: bool = tx.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM incarnations WHERE soul_id=?1 AND launch_state IN ({ACTIVE_STATES})) OR EXISTS(SELECT 1 FROM writer_claims w JOIN souls s ON s.soul_id=?1 WHERE w.soul_id=s.soul_id OR (w.provider=s.provider AND w.provider_store_id=s.provider_store_id AND w.native_session_id=s.native_session_id))"),
+        [soul_id.as_str()], |row| row.get(0),
+    )?;
+    if state != "stopped" || cleanup != "verified_empty" || conflicting_owner {
+        return Err(RegistryError::InvalidState(
+            "resume capture needs the latest verified-empty prior with no pending writer".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_recovery_revision_fence(
     tx: &rusqlite::Transaction<'_>,
     soul_id: &SoulId,
@@ -8382,6 +8455,223 @@ pub(crate) mod tests {
                 .as_deref(),
             Some("ses_B")
         );
+    }
+
+    async fn retired_capture_fixture(registry: &Registry) -> (SoulId, RecoveryContext, ResumeSpec) {
+        let soul = SoulId::new();
+        let prepared = materialize_test_runtime(registry, soul.clone()).await;
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        conn.execute(
+            "UPDATE souls SET provider='native-session-fixture' WHERE soul_id=?1",
+            [soul.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE incarnations SET fixture_kind='native_session' WHERE incarnation_id=?1",
+            [prepared.incarnation_id.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+        registry
+            .record_native_session(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                "retired-root".into(),
+            )
+            .await
+            .unwrap();
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        let spec = crate::resume_catalog::exact_resume_candidate(&context, None)
+            .unwrap()
+            .unwrap();
+        registry
+            .mark_stop_outcome(prepared.incarnation_id, StopOutcome::VerifiedEmpty)
+            .await
+            .unwrap();
+        (soul, context, spec)
+    }
+
+    #[tokio::test]
+    async fn retired_resume_capture_preserves_active_only_api_and_saved_exact_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let (soul, context, spec) = retired_capture_fixture(&registry).await;
+        assert!(
+            registry
+                .store_verified_resume_spec_fenced(
+                    soul.clone(),
+                    spec.clone(),
+                    context.write_fence()
+                )
+                .await
+                .is_err(),
+            "the existing active-only API must still reject a retired prior"
+        );
+        assert!(registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap()
+            .resume_spec
+            .is_none());
+        let saved = registry
+            .store_verified_recovery_resume_spec_fenced(
+                soul.clone(),
+                spec.clone(),
+                context.write_fence(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved.provider_session, spec.provider_session);
+        assert_eq!(saved.evidence_revision, context.evidence_revision + 1);
+        assert_eq!(saved.allocation_state, AllocationState::VerifiedDurable);
+        let before = registry.recovery_context(soul.clone()).await.unwrap();
+        let replay = registry
+            .store_verified_recovery_resume_spec_fenced(
+                soul.clone(),
+                saved.clone(),
+                before.write_fence(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            replay, saved,
+            "idempotent re-entry must not advance evidence"
+        );
+        drop(registry);
+        let reopened = Registry::open(dir.path(), None).unwrap();
+        assert_eq!(
+            reopened.recovery_context(soul).await.unwrap().resume_spec,
+            Some(saved)
+        );
+    }
+
+    #[tokio::test]
+    async fn retired_resume_capture_rejects_stale_or_unverified_prior_without_writing() {
+        for case in [
+            "evidence",
+            "identity",
+            "import",
+            "intent",
+            "control",
+            "attempt",
+            "stop_intent",
+            "failed_prior",
+            "unverified_cleanup",
+            "new_active",
+            "new_stopped",
+            "orphan_writer",
+            "wrong_root",
+            "wrong_store",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = Registry::open(dir.path(), None).unwrap();
+            let (soul, context, mut spec) = retired_capture_fixture(&registry).await;
+            let conn = open_connection(&registry.inner.db_path).unwrap();
+            match case {
+                "evidence" => {
+                    conn.execute(
+                        "UPDATE souls SET evidence_revision=evidence_revision+1 WHERE soul_id=?1",
+                        [soul.as_str()],
+                    )
+                    .unwrap();
+                }
+                "identity" => {
+                    conn.execute(
+                        "UPDATE souls SET identity_revision=identity_revision+1 WHERE soul_id=?1",
+                        [soul.as_str()],
+                    )
+                    .unwrap();
+                }
+                "import" => {
+                    conn.execute("UPDATE souls SET native_import_revision=native_import_revision+1 WHERE soul_id=?1", [soul.as_str()]).unwrap();
+                }
+                "intent" => {
+                    conn.execute(
+                        "UPDATE souls SET intent_revision=intent_revision+1 WHERE soul_id=?1",
+                        [soul.as_str()],
+                    )
+                    .unwrap();
+                }
+                "control" => {
+                    conn.execute("UPDATE installation SET control_epoch=control_epoch+1", [])
+                        .unwrap();
+                }
+                "attempt" => {
+                    conn.execute(
+                        "UPDATE souls SET recovery_attempt_id=?1 WHERE soul_id=?2",
+                        params![RecoveryAttemptId::new().as_str(), soul.as_str()],
+                    )
+                    .unwrap();
+                }
+                "stop_intent" => {
+                    conn.execute(
+                        "UPDATE souls SET desired_state='stopped' WHERE soul_id=?1",
+                        [soul.as_str()],
+                    )
+                    .unwrap();
+                }
+                "failed_prior" => {
+                    conn.execute(
+                        "UPDATE incarnations SET launch_state='failed' WHERE incarnation_id=?1",
+                        [context.prior_handle.incarnation_id().as_str()],
+                    )
+                    .unwrap();
+                }
+                "unverified_cleanup" => {
+                    conn.execute("UPDATE incarnations SET cleanup_state='termination_unconfirmed' WHERE incarnation_id=?1", [context.prior_handle.incarnation_id().as_str()]).unwrap();
+                }
+                "new_active" | "new_stopped" => {
+                    let mut preparation =
+                        prep(soul.clone(), RequestId::new(), "new-retired-capture-owner");
+                    preparation.provider = context.provider.clone();
+                    preparation.native_session_id = context.native_session_id.clone();
+                    preparation.fixture = context.fixture;
+                    let current = registry.prepare_launch(preparation).await.unwrap();
+                    if case == "new_stopped" {
+                        registry
+                            .mark_stop_outcome(current.incarnation_id, StopOutcome::VerifiedEmpty)
+                            .await
+                            .unwrap();
+                    }
+                }
+                "orphan_writer" => {
+                    conn.execute("INSERT INTO writer_claims (provider,provider_store_id,native_session_id,soul_id,incarnation_id,intent_revision) VALUES (?1,?2,?3,?4,?5,?6)", params![context.provider, context.provider_store_id, context.native_session_id, soul.as_str(), context.prior_handle.incarnation_id().as_str(), context.intent_revision]).unwrap();
+                }
+                "wrong_root" => spec.provider_session.native_session_id = "wrong-root".into(),
+                "wrong_store" => spec.provider_session.provider_store_id = "wrong-store".into(),
+                _ => unreachable!(),
+            }
+            let evidence_before: u64 = conn
+                .query_row(
+                    "SELECT evidence_revision FROM souls WHERE soul_id=?1",
+                    [soul.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                registry
+                    .store_verified_recovery_resume_spec_fenced(
+                        soul.clone(),
+                        spec,
+                        context.write_fence()
+                    )
+                    .await
+                    .is_err(),
+                "{case}"
+            );
+            let stored: (Option<String>, u64) = conn
+                .query_row(
+                    "SELECT resume_spec,evidence_revision FROM souls WHERE soul_id=?1",
+                    [soul.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                stored,
+                (None, evidence_before),
+                "{case} must fail before any persistence"
+            );
+        }
     }
 
     #[tokio::test]
