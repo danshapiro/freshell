@@ -4030,6 +4030,18 @@ describe('actual owned runtime cleanup observations', () => {
 })
 
 describe('finite retained fresh native collection', () => {
+  it.each(['rest-tab', 'rest-split', 'mcp-new-tab', 'mcp-split'] as const)('refuses a successful wrong-root %s alias activation', async ingress => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', { enabledProviders: [], freshAgentModes: ['freshclaude'] })
+    const id = randomUUID(), address = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
+    ;(rig as any).freshNativeCollections.set(id, { collectionId: id, soulId: address.soulId, provider: 'claude', mode: 'freshclaude', nativeSessionId: address.nativeSessionId, providerStoreId: 'main-store' })
+    vi.spyOn(rig as any, 'assertCurrentHandle').mockResolvedValue(undefined)
+    vi.spyOn(rig as any, 'currentRuntimeEnclosure').mockResolvedValue({ ...address, soulId: 'unrelated-soul', nativeSessionId: 'unrelated-root', freshAgentSessionId: 'unrelated-session', freshAgentSessionType: 'freshclaude' })
+    vi.spyOn(rig, 'writerClaimFacts').mockResolvedValue({ ...address, soulId: 'unrelated-soul', nativeSessionId: 'unrelated-root', providerStoreId: 'unrelated-store', activeClaimCount: 1, globalConflictingClaimCount: 0 } as any)
+    await expect(rig.observeFreshBrowserIngress(address, id, { ingress,
+      request: { method: 'POST', path: ingress.endsWith('split') ? '/api/panes/pane/split' : '/api/tabs', body: { sessionRef: { provider: 'claude', sessionId: address.nativeSessionId } } },
+      reply: { paneId: 'pane', sessionId: 'unrelated-session' } })).rejects.toThrow(/alias/)
+    expect((rig as any).freshBrowserCollections.get(id).routes).toHaveLength(0)
+  })
   it('retains an empty raw UI boundary without asking the completed-turn decoder to read it', async () => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', { enabledProviders: [], freshAgentModes: ['freshclaude'] })
     const id = randomUUID(), current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }

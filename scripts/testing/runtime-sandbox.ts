@@ -16,7 +16,7 @@ import { ManagedRuntimeInventorySnapshotSchema, ManagedRuntimeMigrationPlanSchem
 import fsp from 'node:fs/promises'
 import { defaultReceiptFileName } from './runtime-receipts.js'
 import { buildProviderQualificationReceipt, type ProviderQualificationReceiptV2, type ProviderQualificationRow } from './provider-qualification-receipt.js'
-import { buildFreshAgentQualificationReceipt, deriveFreshBrowserExecution, nativeCompletedTurnProofs, type FreshBrowserIngressObservation, type FreshAgentQualificationReceiptV1, type FreshAgentQualificationRow } from './fresh-agent-qualification-receipt.js'
+import { buildFreshAgentQualificationReceipt, deriveFreshBrowserExecution, validateFreshBrowserAlias, nativeCompletedTurnProofs, type FreshBrowserIngressObservation, type FreshAgentQualificationReceiptV1, type FreshAgentQualificationRow } from './fresh-agent-qualification-receipt.js'
 import { claudeNativeInspection, nativeCheckpointTranscriptRetained, observeNativeSoloBashOutcome } from './runtime-native-feasibility.js'
 import type { QualifiableTerminalProvider } from './provider-qualification-selection.js'
 import { deriveNativeRecoveryOriginals, NATIVE_RECOVERY_ORIGINALS_FILE, type NativeOriginalReference, type NativeRecoveryStage } from './qualification-observations.js'
@@ -5753,7 +5753,10 @@ export class ManagedRuntimeOwner {
       const view = await this.currentRuntimeEnclosure(handle)
       if (view.freshAgentSessionType !== collection.mode || browser.routes.some(route => route.ingress === observation.ingress)
         || ['startup-restore', 'auto-resume'].includes(observation.ingress)) throw new Error('one executed browser route on the selected mode required')
-      browser.routes.push({ ...FreshBrowserIngressObservationSchema.parse(observation), view, observedAt: Date.now() })
+      const route = { ...FreshBrowserIngressObservationSchema.parse(observation), view, observedAt: Date.now(),
+        ...(/^(rest|mcp)-/.test(observation.ingress) ? { writer: await this.writerClaimFacts(handle) } : {}) }
+      if (/^(rest|mcp)-/.test(observation.ingress)) validateFreshBrowserAlias(route, collection)
+      browser.routes.push(route)
     })
   }
 

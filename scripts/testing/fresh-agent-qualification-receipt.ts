@@ -73,6 +73,15 @@ export type FreshBrowserIngressObservation = {
   reply?: Record<string, any>
 }
 
+export function validateFreshBrowserAlias(route: Record<string, any>, main: { soulId: string; nativeSessionId: string; providerStoreId: string; provider: string }): void {
+  const { view, writer, request, reply } = route
+  if (request?.body?.sessionRef?.provider !== main.provider || request.body.sessionRef.sessionId !== main.nativeSessionId
+    || view?.soulId !== main.soulId || view.nativeSessionId !== main.nativeSessionId
+    || reply?.sessionId !== view.freshAgentSessionId || writer?.providerStoreId !== main.providerStoreId
+    || writer.soulId !== main.soulId || writer.nativeSessionId !== main.nativeSessionId || writer.incarnationId !== view.incarnationId
+    || writer.activeClaimCount !== 1 || writer.globalConflictingClaimCount !== 0) throw new Error('executed alias did not resume the registered main soul/store/root')
+}
+
 /** Reopens practical browser/owner observations, rather than treating inventory as execution. */
 export function deriveFreshBrowserExecution(original: Record<string, any>, conversation: ObservedNativeConversation): Pick<FreshAgentQualificationRow,
   'ingresses' | 'crashes' | 'pendingApproval' | 'writerProof' | 'isolation' | 'limits' | 'oldEnclosure'> {
@@ -95,6 +104,7 @@ export function deriveFreshBrowserExecution(original: Record<string, any>, conve
       // Successful attach has no wire acknowledgment. The exact current activation is the observed outcome.
       if (request?.type !== 'freshAgent.attach' || request.sessionId !== view.freshAgentSessionId) throw new Error('executed ingress ws-attach differs')
     } else {
+      validateFreshBrowserAlias(matching[0]!, { ...conversation, provider: MODE_CONTRACT[conversation.mode as QualifiableFreshAgentMode].provider })
       const split = id.endsWith('split')
       if (request?.method !== 'POST' || (split ? !/^\/api\/panes\/[^/]+\/split$/.test(request.path) : request.path !== '/api/tabs')
         || !reply?.paneId || reply.sessionId !== view.freshAgentSessionId) throw new Error(`executed ingress ${id} request/reply differs`)

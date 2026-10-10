@@ -37,7 +37,7 @@ function browserExecutionFixture(current: FreshAgentQualificationRow, stages: an
       request: { type: 'freshAgent.create', requestId, sessionType: current.mode, ...(ingress === 'history-resume' ? { sessionRef: { provider: current.provider, sessionId: target.nativeSessionId } } : {}) },
       reply: { type: 'freshAgent.created', requestId, sessionId: target.freshAgentSessionId } }
     if (ingress === 'ws-attach') return { ingress, view: target, request: { type: 'freshAgent.attach', sessionId: target.freshAgentSessionId } }
-    return { ingress, view: target, request: { method: 'POST', path: ingress.endsWith('split') ? '/api/panes/actual-pane/split' : '/api/tabs', body: { agent: current.mode, sessionRef: { provider: current.provider, sessionId: target.nativeSessionId } } },
+    return { ingress, view: target, writer: structuredClone(allocation.writer), request: { method: 'POST', path: ingress.endsWith('split') ? '/api/panes/actual-pane/split' : '/api/tabs', body: { agent: current.mode, sessionRef: { provider: current.provider, sessionId: target.nativeSessionId } } },
       reply: { paneId: 'actual-pane', sessionId: target.freshAgentSessionId } }
   })
   const lifecycle: any[] = [{ event: 'supervisor.runtime_observer.recovery_scheduled', data: { soulId: current.soulId } }]

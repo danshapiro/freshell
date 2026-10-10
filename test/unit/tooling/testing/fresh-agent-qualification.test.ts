@@ -34,10 +34,18 @@ describe('observed fresh browser execution', () => {
     const module = await import('../../../../scripts/testing/fresh-agent-qualification-receipt.js')
     expect(() => (module as any).deriveFreshBrowserExecution({ mode: 'freshcodex', routes: [], allocations: [], lifecycle: [] }, {})).toThrow(/executed ingress/)
   })
-  it.each(['missing-route', 'wrong-reply', 'two-writers', 'shared-store', 'shared-container', 'release-after-prepare', 'missing-release', 'missing-running', 'web-process-replaced', 'startup-empty', 'approval-missing-deny', 'approval-old-callback', 'approval-effect-replayed', 'approval-duplicate-dispatch', 'approval-extra-completion', 'approval-changed-native-root', 'approval-changed-native-executable'])('reopens originals and rejects %s', fault => {
+  it.each(['alias-wrong-rest-tab', 'alias-wrong-rest-split', 'alias-wrong-mcp-new-tab', 'alias-wrong-mcp-split', 'alias-wrong-request', 'alias-wrong-store', 'alias-stale-writer', 'missing-route', 'wrong-reply', 'two-writers', 'shared-store', 'shared-container', 'release-after-prepare', 'missing-release', 'missing-running', 'web-process-replaced', 'startup-empty', 'approval-missing-deny', 'approval-old-callback', 'approval-effect-replayed', 'approval-duplicate-dispatch', 'approval-extra-completion', 'approval-changed-native-root', 'approval-changed-native-executable'])('reopens originals and rejects %s', fault => {
     const built = fixture()
     const current = built.receipt.rows[0]!, reference = current.executionOriginal as { path: string; sha256: string }
     const filename = path.join(built.evidenceDir, reference.path), original = JSON.parse(fs.readFileSync(filename, 'utf8'))
+    if (fault.startsWith('alias-wrong-') && !['alias-wrong-request', 'alias-wrong-store'].includes(fault)) {
+      const route = original.routes.find((value: any) => value.ingress === fault.slice('alias-wrong-'.length))
+      route.view = original.allocations[1].view; route.reply.sessionId = route.view.freshAgentSessionId
+    }
+    const alias = original.routes.find((value: any) => value.ingress === 'rest-tab')
+    if (fault === 'alias-wrong-request') alias.request.body.sessionRef.sessionId = original.allocations[1].view.nativeSessionId
+    if (fault === 'alias-wrong-store') alias.writer.providerStoreId = 'unrelated-store'
+    if (fault === 'alias-stale-writer') alias.writer.incarnationId = 'stale-incarnation'
     if (fault === 'missing-route') original.routes.pop()
     if (fault === 'wrong-reply') original.routes[0].reply.requestId = 'another-request'
     if (fault === 'two-writers') original.allocations[0].writer.activeClaimCount = 2
@@ -152,7 +160,7 @@ function browserExecutionFixture(current: FreshAgentQualificationRow, stages: an
       request: { type: 'freshAgent.create', requestId, sessionType: current.mode, ...(ingress === 'history-resume' ? { sessionRef: { provider: current.provider, sessionId: target.nativeSessionId } } : {}) },
       reply: { type: 'freshAgent.created', requestId, sessionId: target.freshAgentSessionId } }
     if (ingress === 'ws-attach') return { ingress, view: target, request: { type: 'freshAgent.attach', sessionId: target.freshAgentSessionId } }
-    return { ingress, view: target, request: { method: 'POST', path: ingress.endsWith('split') ? '/api/panes/actual-pane/split' : '/api/tabs', body: { agent: current.mode, sessionRef: { provider: current.provider, sessionId: target.nativeSessionId } } },
+    return { ingress, view: target, writer: structuredClone(allocation.writer), request: { method: 'POST', path: ingress.endsWith('split') ? '/api/panes/actual-pane/split' : '/api/tabs', body: { agent: current.mode, sessionRef: { provider: current.provider, sessionId: target.nativeSessionId } } },
       reply: { paneId: 'actual-pane', sessionId: target.freshAgentSessionId } }
   })
   const lifecycle: any[] = [{ event: 'supervisor.runtime_observer.recovery_scheduled', data: { soulId: current.soulId } }]
