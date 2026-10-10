@@ -172,8 +172,11 @@ describe('managed browser producers', () => {
         { FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE: file }, web)).toThrow(/private/)
       expect(web).not.toHaveBeenCalled()
       await fsp.chmod(file, 0o600)
+      await fsp.mkdir(path.join(root, 'bundles'))
+      await fsp.writeFile(path.join(root, 'settings.yaml'), 'bundle:\n  active: default\n')
+      await fsp.writeFile(path.join(root, 'bundles/default.yaml'), 'providers:\n  - module: provider-vllm\n')
       const owned = runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, selection,
-        { FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE: file }, web)
+        { FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE: file, FRESHELL_RUNTIME_AMPLIFIER_CONFIG_HOME: root }, web)
       expect(owned.fixtureRegistrationFacts()).toEqual({ phase: 5, enabledProviders: ['amplifier'], freshAgentModes: [], fixtureFreshAgentModes: [] })
       expect(web).not.toHaveBeenCalled()
       const fixture = runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, {
@@ -240,6 +243,50 @@ const descriptor = {
 const smokeSpec = 'test/e2e-browser/specs/runtime-external-target-smoke-rust.spec.ts'
 
 describe('selected production owner registration', () => {
+  it('projects only the selected ordinary Amplifier profile into the owned web home before native preparation', async () => {
+    const selected = path.join(fixtureRepoRoot, 'selected-amplifier')
+    const home = path.join(fixtureRepoRoot, 'owned-web-home')
+    await fsp.mkdir(path.join(selected, 'bundles'), { recursive: true })
+    const settings = JSON.stringify({ bundle: { active: 'default', added: { default: '/home/freshell/provider/.amplifier/bundles/default.yaml' } } })
+    const bundle = JSON.stringify({ providers: [{ module: 'provider-vllm', config: { default_model: 'selected-unit-model' } }] })
+    await fsp.writeFile(path.join(selected, 'settings.yaml'), settings)
+    await fsp.writeFile(path.join(selected, 'bundles/default.yaml'), bundle)
+    await fsp.writeFile(path.join(selected, 'keys.env'), 'PRIVATE_CREDENTIAL_SENTINEL')
+    await fsp.mkdir(path.join(selected, 'projects/native-history'), { recursive: true })
+    let captured!: RuntimeWebConstructOptions
+    const factory = runner.createExternalManagedWebFactory({
+      spec: 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts', provider: 'amplifier',
+    }, { FRESHELL_RUNTIME_AMPLIFIER_CONFIG_HOME: selected }, value => { captured = value; return {} as any })
+    // Profile bytes are selected once; web replacements reuse that selection.
+    await fsp.writeFile(path.join(selected, 'bundles/default.yaml'), 'changed after selection')
+    factory({ binary: process.execPath, repoRoot: fixtureRepoRoot, candidateSha: 'a'.repeat(40), buildDirty: false,
+      preserveHomeOnStop: true, env: {}, setupHome: async ownedHome => {
+        await fsp.mkdir(path.join(ownedHome, '.freshell'), { recursive: true })
+        await fsp.writeFile(path.join(ownedHome, '.freshell/config.json'), '{"version":1}')
+      } })
+    await captured.setupHome!(home)
+    expect(await fsp.readFile(path.join(home, '.amplifier/settings.yaml'), 'utf8')).toBe(settings)
+    expect(await fsp.readFile(path.join(home, '.amplifier/bundles/default.yaml'), 'utf8')).toBe(bundle)
+    expect(await fsp.readdir(path.join(home, '.amplifier'))).toEqual(['bundles', 'settings.yaml'])
+    expect(await fsp.readFile(path.join(home, '.freshell/config.json'), 'utf8')).toBe('{"version":1}')
+    expect(captured.env.FRESHELL_RUNTIME_AMPLIFIER_CONFIG_HOME).toBeUndefined()
+    expect(runner.externalCloudMetadata({ ...descriptor,
+      FRESHELL_RUNTIME_EXTERNAL_SPEC: 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts',
+      FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE: '1',
+      FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_PROVIDERS: 'amplifier',
+      FRESHELL_RUNTIME_AMPLIFIER_CONFIG_HOME: selected }).FRESHELL_RUNTIME_AMPLIFIER_CONFIG_HOME).toBeUndefined()
+  })
+  it('requires an ordinary Amplifier profile only for its selected full native owner', () => {
+    const selection = { spec: 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts', provider: 'amplifier' as const }
+    const web = () => ({} as any)
+    expect(() => runner.createExternalManagedWebFactory(selection, {}, web)).toThrow(/FRESHELL_RUNTIME_AMPLIFIER_CONFIG_HOME/)
+    expect(() => runner.createExternalManagedWebFactory({ ...selection, provider: 'codex' },
+      { FRESHELL_RUNTIME_AMPLIFIER_CONFIG_HOME: '/missing/ordinary-profile' }, web)).not.toThrow()
+    expect(() => runner.createExternalManagedWebFactory({ ...selection,
+      spec: 'test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts' },
+      { FRESHELL_RUNTIME_AMPLIFIER_CONFIG_HOME: '/missing/ordinary-profile' }, web)).not.toThrow()
+    expect(() => runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, selection, {}, web, true)).not.toThrow()
+  })
   it('keeps private bootstrap reads out of the external browser while preserving local setup refusal', () => {
     for (const key of Object.keys(descriptor)) vi.stubEnv(key, undefined)
     vi.stubEnv('FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE', undefined)
