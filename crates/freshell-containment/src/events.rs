@@ -312,6 +312,7 @@ mod tests {
             root_not_pinned(&k, 33, 3003, "different incarnation");
             release_failed(&k, "busy");
             environ_withheld(&k, 4);
+            freeze_timeout(&k, "no frozen event within 1000 ms");
         });
         use tracing::Level;
         let got: Vec<(Level, &str)> = events.iter().map(|e| (e.level, e.str("event"))).collect();
@@ -329,6 +330,7 @@ mod tests {
                 (Level::WARN, "unit.root.not_pinned"),
                 (Level::WARN, "unit.release_failed"),
                 (Level::INFO, "unit.members.environ_withheld"),
+                (Level::WARN, "unit.stop.freeze_timeout"),
             ]
         );
         for event in &events {
@@ -349,6 +351,7 @@ mod tests {
         assert_eq!(events[7].str("op"), "remove");
         assert_eq!(events[8].u64("recorded_start"), 3003);
         assert_eq!(events[10].u64("count"), 4);
+        assert_eq!(events[11].str("detail"), "no frozen event within 1000 ms");
     }
 
     #[test]
