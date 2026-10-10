@@ -117,15 +117,18 @@ describe('hosted fresh-agent provider inputs', () => {
   }, 900_000)
 
   afterAll(async () => {
-    await Promise.allSettled(wires.map(wire => wire.close()))
-    if (rig) {
-      const cleanup = await rig.stop()
-      expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
+    try {
+      await Promise.allSettled(wires.map(wire => wire.close()))
+      if (rig) {
+        const cleanup = await rig.stop()
+        expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
+      }
+    } finally {
+      restoreOnecliEnvironment?.()
+      if (opencodeProject) fs.rmSync(opencodeProject, { recursive: true, force: true })
+      if (homeDir) fs.rmSync(homeDir, { recursive: true, force: true })
+      if (onecli) fs.rmSync(onecli.directory, { recursive: true, force: true })
     }
-    if (opencodeProject) fs.rmSync(opencodeProject, { recursive: true, force: true })
-    if (homeDir) fs.rmSync(homeDir, { recursive: true, force: true })
-    if (onecli) fs.rmSync(onecli.directory, { recursive: true, force: true })
-    restoreOnecliEnvironment?.()
   }, 180_000)
 
   it.each(providers)('$sessionType retains create settings and exact native resume', async row => {

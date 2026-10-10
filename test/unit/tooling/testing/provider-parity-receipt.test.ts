@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { execFileSync } from 'node:child_process'
+import { runInNewContext } from 'node:vm'
+import ts from 'typescript'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -15,6 +17,37 @@ import { validateFreshAgentQualificationReceipt } from '../../../../scripts/test
 import { exposeGrantsToHarness, fakeOnecliGrants } from '../../../integration/server/provider-parity-onecli.js'
 
 describe('fake provider parity grant isolation', () => {
+  it.each(['fresh-agent-parity.test.ts', 'managed-provider-parity.test.ts'].flatMap(file =>
+    ['stop', 'remove'].map(stage => ({ file, stage }))))(
+    'restores ambient references when actual $file cleanup fails during $stage', async ({ file, stage }) => {
+    const filename = `test/integration/server/${file}`
+    // Execute the actual teardown callback without starting provider fixtures.
+    const text = fs.readFileSync(path.resolve(import.meta.dirname, '../../../..', filename), 'utf8')
+    const source = ts.createSourceFile(filename, text, ts.ScriptTarget.Latest, true)
+    let callback: ts.Node | undefined
+    const find = (node: ts.Node): void => {
+      if (ts.isCallExpression(node) && node.expression.getText(source) === 'afterAll') callback = node.arguments[0]
+      ts.forEachChild(node, find)
+    }
+    find(source)
+    if (!callback) throw new Error('actual parity teardown callback is missing')
+    vi.stubEnv('FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE', '/nonexistent/operator/auth.json')
+    const fake = fakeOnecliGrants(['opencode'])
+    const restore = exposeGrantsToHarness(fake.serverEnv)
+    const restoreOnecliEnvironment = vi.fn(restore)
+    const teardown = runInNewContext(`(${callback.getText(source)})`, {
+      rig: { stop: async () => { if (stage === 'stop') throw new Error('controlled cleanup failure'); return { ok: true, errors: [] } } },
+      wires: [], sockets: [], expect, process, inheritedFreshellUrl: process.env.FRESHELL_URL,
+      workspace: undefined, webHome: undefined, homeDir: undefined, opencodeProject: undefined, onecli: fake,
+      restoreOnecliEnvironment, fs: { rmSync: () => { if (stage === 'remove') throw new Error('controlled cleanup failure') } },
+    }) as () => Promise<void>
+    try {
+      await expect(teardown()).rejects.toThrow('controlled cleanup failure')
+      expect(restoreOnecliEnvironment).toHaveBeenCalledOnce()
+      expect(process.env.FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE).toBe('/nonexistent/operator/auth.json')
+    } finally { restore(); vi.unstubAllEnvs(); fs.rmSync(fake.directory, { recursive: true, force: true }) }
+  })
+
   it('exposes only owned fake references to actual child processes and restores ambient references', () => {
     const ambient = {
       FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: '/nonexistent/operator/auth.json',

@@ -346,12 +346,12 @@ describe('ordinary and managed terminal provider parity', () => {
         expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
       }
     } finally {
-      if (workspace) fs.rmSync(workspace, { recursive: true, force: true })
-      if (webHome) fs.rmSync(webHome, { recursive: true, force: true })
-      if (onecli) fs.rmSync(onecli.directory, { recursive: true, force: true })
       restoreOnecliEnvironment?.()
       if (inheritedFreshellUrl === undefined) delete process.env.FRESHELL_URL
       else process.env.FRESHELL_URL = inheritedFreshellUrl
+      if (workspace) fs.rmSync(workspace, { recursive: true, force: true })
+      if (webHome) fs.rmSync(webHome, { recursive: true, force: true })
+      if (onecli) fs.rmSync(onecli.directory, { recursive: true, force: true })
     }
   }, 180_000)
 
