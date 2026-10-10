@@ -25,6 +25,8 @@ windows-sys = { version = "0.59", features = [
   "Win32_Foundation",
   "Win32_Security",
   "Win32_System_Threading",
+  "Win32_System_Console",
+  "Win32_System_SystemServices",
   "Win32_System_JobObjects",
   "Win32_System_IO",
   "Win32_System_Diagnostics_ToolHelp",
@@ -43,7 +45,19 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["r
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 portable-pty = "0.8"
 
+# The Windows shim's Ctrl-C test runs it under a real ConPTY, as Freshell's
+# screens are.
+[target.'cfg(windows)'.dev-dependencies]
+portable-pty = "0.8"
+
 [[bin]]
 name = "freshell-unit-exec"
 path = "src/bin/freshell-unit-exec.rs"
+test = false
+
+# Test support only (never shipped): a real writer-lock holder, an idle
+# process and Codex's breakaway daemon launch, for the containment suites.
+[[bin]]
+name = "freshell-test-helper"
+path = "src/bin/freshell-test-helper.rs"
 test = false

@@ -90,6 +90,14 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Per-pane containment on Windows: Job Object units, the self-placing
+      # exec shim, the process facts, and the design-decision tests that
+      # chose the unit job's flags. The macOS jobs join once the macOS
+      # process facts exist.
+      - name: Test containment (Windows)
+        if: matrix.os == 'windows-2022'
+        run: cargo test --locked -p freshell-containment
+
       # Exercise the native Windows Claude profile lookup and the generated
       # terminal hook behavior. Keep this scoped to the two owning Rust crates.
       - name: Test Windows Claude profile lookup
