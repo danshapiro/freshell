@@ -1811,6 +1811,34 @@ mod tests {
             Self { child, watch }
         }
 
+        /// `perl` holding an exclusive `flock` on `path` until it is killed,
+        /// with `extra` arguments (ignored, as in `perl_sleep`). Returns once
+        /// the lock is held.
+        fn perl_lock(path: &std::path::Path, extra: &[&str]) -> Self {
+            use std::io::{BufRead, BufReader};
+            const HOLD: &str = r#"use Fcntl qw(:flock);
+open(my $f, ">>", $ARGV[0]) or die "open: $!";
+flock($f, LOCK_EX) or die "flock: $!";
+$| = 1;
+print "locked\n";
+sleep 600;"#;
+            let mut child = std::process::Command::new("perl")
+                .args(["-e", HOLD])
+                .arg(path)
+                .args(extra)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            // Our own unreaped child: its pid names it.
+            let watch = ProcWatch::open(child.id()).unwrap();
+            let out = child.stdout.take().unwrap();
+            let spawned = Self { child, watch };
+            let mut line = String::new();
+            BufReader::new(out).read_line(&mut line).unwrap();
+            assert_eq!(line.trim(), "locked", "the holder took its lock");
+            spawned
+        }
+
         fn identity(&self) -> (u32, u64) {
             identity_of(&self.watch)
         }
@@ -1984,6 +2012,39 @@ mod tests {
         assert!(
             daemon.untouched(),
             "the daemon-family process was signalled"
+        );
+    }
+
+    /// The same rule in the Gone lock check, whose holders include the
+    /// live members of the pre-signal snapshot: a snapshot member whose own
+    /// argv is the daemon family by the time of the check (one that exec'd
+    /// into it after the snapshot) is neither signalled nor waited for,
+    /// although it holds a unit lock file, and that lock then counts as
+    /// still held. A plain snapshot member holding the other lock file is
+    /// still killed.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_lock_check_never_signals_a_daemon_family_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon_lock = dir.path().join("daemon.lock");
+        let plain_lock = dir.path().join("plain.lock");
+        let daemon = Spawned::perl_lock(&daemon_lock, &["app-server", "--managed-daemon"]);
+        let plain = Spawned::perl_lock(&plain_lock, &[]);
+        let unit = unit_on(Arc::new(NoProcesses));
+        unit.set_lock_paths(vec![daemon_lock, plain_lock]);
+        let snapshot = [daemon.watch.clone(), plain.watch.clone()];
+        let released = tokio::time::timeout(Duration::from_secs(10), unit.check_locks(&snapshot))
+            .await
+            .expect("the check ended without waiting for the daemon-family holder")
+            .unwrap();
+        assert!(
+            daemon.untouched(),
+            "the lock check signalled the daemon-family holder"
+        );
+        assert!(plain.watch.has_exited(), "the plain holder was killed");
+        assert!(
+            !released,
+            "the daemon-family holder still holds its lock file"
         );
     }
 

@@ -842,6 +842,47 @@ mod mac {
             let _ = self.mac.kq.wake();
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// An exiting watch's state, as its awaiters see it, of the test
+        /// process itself (nothing is signalled).
+        fn exiting_watch() -> Shared {
+            let identity = ProcIdentity {
+                pid: std::process::id(),
+                start: 0,
+                name: String::new(),
+            };
+            Shared::new(Kqueue::new().unwrap(), &identity, Opened::Exiting)
+        }
+
+        /// A waiter giving up at its last deadline never replaces an exit
+        /// that another thread's `has_exited()` proved at the same moment,
+        /// published or about to be: its awaiters see the exit, not an
+        /// error. With no proof, giving up answers the error.
+        #[test]
+        fn a_waiter_giving_up_never_replaces_a_proven_exit() {
+            let published = exiting_watch();
+            published.mark_exited();
+            published.stop_waiting("exit not proven".into());
+            assert_eq!(*published.subscribe().borrow(), Some(Ok(())));
+
+            let proving = exiting_watch();
+            // `mark_exited` sets the flag before it publishes.
+            proving.exited.store(true, Ordering::SeqCst);
+            proving.stop_waiting("exit not proven".into());
+            assert_eq!(*proving.subscribe().borrow(), None);
+
+            let unproven = exiting_watch();
+            unproven.stop_waiting("exit not proven".into());
+            assert_eq!(
+                *unproven.subscribe().borrow(),
+                Some(Err("exit not proven".into()))
+            );
+        }
+    }
 }
 
 /// macOS: the waiting of a watch opened while its process was exiting.

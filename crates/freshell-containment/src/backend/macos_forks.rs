@@ -62,10 +62,87 @@ struct Shared {
     /// registration.
     scan_requested: AtomicBool,
     shutdown: AtomicBool,
+    #[cfg(test)]
+    hold: test_hold::Hold,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Test support: stops the tracker's thread at the top of its loop, before
+/// it collects events, so the events one process raises meanwhile arrive
+/// in one batch (as when the thread is slow to run).
+#[cfg(test)]
+mod test_hold {
+    use std::sync::{Condvar, Mutex, PoisonError};
+
+    #[derive(Default)]
+    struct State {
+        requested: bool,
+        held: bool,
+    }
+
+    #[derive(Default)]
+    pub(super) struct Hold {
+        state: Mutex<State>,
+        changed: Condvar,
+    }
+
+    impl Hold {
+        /// The thread's side: waits here while a hold is requested.
+        pub(super) fn pass(&self) {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if !state.requested {
+                return;
+            }
+            state.held = true;
+            self.changed.notify_all();
+            while state.requested {
+                state = self
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            state.held = false;
+        }
+
+        /// Returns once the thread waits in `pass`; `wake` makes it leave
+        /// a blocked wait for events.
+        pub(super) fn hold(&self, wake: impl FnOnce()) {
+            self.state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .requested = true;
+            wake();
+            let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            drop(
+                self.changed
+                    .wait_while(state, |state| !state.held)
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+        }
+
+        pub(super) fn release(&self) {
+            self.state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .requested = false;
+            self.changed.notify_all();
+        }
+    }
+}
+
+/// Test support: the tracker's thread is held (see `test_hold`) until this
+/// is dropped.
+#[cfg(test)]
+pub(crate) struct HeldForTest<'a>(&'a Shared);
+
+#[cfg(test)]
+impl Drop for HeldForTest<'_> {
+    fn drop(&mut self) {
+        self.0.hold.release();
+    }
 }
 
 /// One process of a scan's snapshot.
@@ -85,6 +162,8 @@ impl ForkTracker {
             observer: Mutex::new(None),
             scan_requested: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
+            #[cfg(test)]
+            hold: test_hold::Hold::default(),
         });
         let thread_shared = shared.clone();
         std::thread::Builder::new()
@@ -132,6 +211,16 @@ impl ForkTracker {
     #[cfg(test)]
     pub(crate) fn insert_for_test(&self, pid: u32, start: u64) {
         lock(&self.shared.tracked).insert(pid, start);
+    }
+
+    /// Test support: holds the tracker's thread before it collects events
+    /// until the result is dropped.
+    #[cfg(test)]
+    pub(crate) fn hold_for_test(&self) -> HeldForTest<'_> {
+        self.shared.hold.hold(|| {
+            let _ = self.shared.kq.wake();
+        });
+        HeldForTest(&self.shared)
     }
 }
 
@@ -208,6 +297,8 @@ impl Shared {
     /// the batch's changes at once.
     fn run(&self) {
         loop {
+            #[cfg(test)]
+            self.hold.pass();
             if self.shutdown.load(Ordering::SeqCst) {
                 return;
             }
@@ -414,6 +505,120 @@ mod tests {
             calls.len(),
             1,
             "the jobs were reported in separate calls: {calls:?}"
+        );
+        drop(tracker);
+    }
+
+    /// Waits (bounded, 10 s) until `done`, failing the test with `what`.
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out: {what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The pid on the next line of `out`, which must be `<prefix> <pid>`.
+    fn pid_after(out: &mut impl BufRead, prefix: &str) -> u32 {
+        let mut line = String::new();
+        out.read_line(&mut line).unwrap();
+        line.trim()
+            .strip_prefix(prefix)
+            .unwrap_or_else(|| panic!("expected {prefix:?}: {line:?}"))
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// A tracked process that execs into Codex's daemon family and starts a
+    /// child before the tracker collects its events (the tracker's thread
+    /// is held meanwhile, so its exec and its fork arrive in one batch):
+    /// the tracker drops it before it looks for new processes, so neither
+    /// it nor the child, which by then runs an ordinary program, is tracked
+    /// or recorded. The child shares the root's session and process group,
+    /// so the scan still links it: only its parent's family keeps it out.
+    #[test]
+    fn a_process_that_execs_into_the_daemon_family_and_forks_in_one_batch_leaves_nothing_tracked() {
+        use std::io::Write;
+        const ROOT: &str = r#"use POSIX ();
+POSIX::setsid() or die "setsid: $!";
+$| = 1;
+my $t = fork() // die "fork: $!";
+if ($t == 0) {
+    my $cue = <STDIN>;
+    exec("/bin/sh", "-c", '/bin/sleep 600 & echo "child $!"; wait', "sh", "app-server", "--managed-daemon") or die "exec: $!";
+}
+print "t $t\n";
+waitpid($t, 0);"#;
+        let mut root = Command::new("perl")
+            .args(["-e", ROOT])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut cue = root.stdin.take().unwrap();
+        let mut out = BufReader::new(root.stdout.take().unwrap());
+        let root_pin = ProcWatch::open(root.id()).unwrap();
+        let mut tree = Tree {
+            root,
+            pins: vec![root_pin.clone()],
+        };
+        let t = pid_after(&mut out, "t");
+        // Pinned while its parent, the root, waits for it.
+        let t_pin = ProcWatch::open(t).unwrap();
+        tree.pins.push(t_pin.clone());
+        let t_start = t_pin.identity().start;
+
+        let reports = Arc::new(Reports::default());
+        let tracker = ForkTracker::new("u-test").unwrap();
+        tracker.set_observer(reports.clone());
+        tracker.track_root(root_pin.pid(), root_pin.identity().start);
+        wait_until("the tracker follows the root's child", || {
+            tracker.tracks(t, t_start)
+        });
+
+        let held = tracker.hold_for_test();
+        writeln!(cue, "go").unwrap();
+        let child = pid_after(&mut out, "child");
+        // Pinned while its parent, the shell, waits for it.
+        tree.pins.push(ProcWatch::open(child).unwrap());
+        wait_until("the child runs /bin/sleep", || {
+            process::argv(child).is_ok_and(|argv| argv == ["/bin/sleep", "600"])
+        });
+        assert!(
+            process::argv(t).is_ok_and(|argv| process::is_codex_daemon_family(&argv)),
+            "the tracked process exec'd into the daemon family"
+        );
+        assert!(
+            tracker.tracks(t, t_start),
+            "the held tracker has not collected the exec yet"
+        );
+        drop(held);
+
+        wait_until("the tracker reports the process it drops", || {
+            reports
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, removed)| removed.contains(&t))
+        });
+        let added: Vec<u32> = reports
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(added, _)| added.iter().map(|(pid, _)| *pid))
+            .collect();
+        assert!(
+            !added.contains(&child),
+            "the daemon-family process's child was recorded: {:?}",
+            reports.0.lock().unwrap()
+        );
+        let tracked: Vec<u32> = tracker.tracked().iter().map(|(pid, _)| *pid).collect();
+        assert!(
+            !tracked.contains(&t) && !tracked.contains(&child),
+            "still tracked: {tracked:?} (the process {t}, its child {child})"
         );
         drop(tracker);
     }
