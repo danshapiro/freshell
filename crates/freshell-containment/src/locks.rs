@@ -583,3 +583,75 @@ mod tests {
         assert!(!fdinfo_has_lock(unlocked));
     }
 }
+
+/// macOS: the unlock events the Gone lock check waits on when it found a
+/// holder with no exit watch registered before its exit.
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    use super::UnlockEvents;
+    use crate::proc_watch::{ProcWatch, Sig};
+
+    /// A perl `flock` holder of `path`, pinned once it holds the lock.
+    fn holder(path: &std::path::Path) -> (std::process::Child, ProcWatch) {
+        let mut child = Command::new("perl")
+            .args([
+                "-e",
+                "use Fcntl qw(:flock); open(my $f, '>>', $ARGV[0]) or die; flock($f, LOCK_EX) or die; $| = 1; print \"locked\\n\"; sleep 600",
+                path.to_str().unwrap(),
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "locked");
+        // Unreaped, so its pid names it.
+        let watch = ProcWatch::open(child.id()).unwrap();
+        (child, watch)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_killed_holders_release_is_an_unlock_event_on_its_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("t.lock");
+        let other = dir.path().join("other.lock");
+        std::fs::write(&other, b"").unwrap();
+        let (mut child, watch) = holder(&lock);
+        // Registered while the lock is held; a missing file is not watched.
+        let events =
+            UnlockEvents::watch(&[lock.clone(), other.clone(), dir.path().join("none")]).unwrap();
+        assert!(events.watches(&lock) && events.watches(&other));
+        assert!(!events.watches(&dir.path().join("none")));
+        watch.signal(Sig::Kill).unwrap();
+        let unlocked = tokio::time::timeout(Duration::from_secs(5), events.next())
+            .await
+            .expect("an unlock event when the holder dies")
+            .unwrap();
+        assert_eq!(unlocked, [lock]);
+        child.wait().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_wait_with_no_unlock_stays_pending_and_dropping_it_ends_the_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("t.lock");
+        let (mut child, watch) = holder(&lock);
+        let events = UnlockEvents::watch(std::slice::from_ref(&lock)).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), events.next())
+                .await
+                .is_err(),
+            "no unlock while the holder runs"
+        );
+        // The blocked wait above returns once the events are dropped.
+        drop(events);
+        watch.signal(Sig::Kill).unwrap();
+        child.wait().unwrap();
+    }
+}
