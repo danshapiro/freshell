@@ -406,6 +406,28 @@ export class ManagedRuntimeWebServer implements RuntimeWebHandle {
 const PINNED_CLOUDFLARED_SHA256 = 'd33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db'
 const PINNED_CLOUDFLARED_PATH = '/home/dan/code/freshell/.worktrees/.the-usual-logs/managed-provider-environment/reports/transport-preflight/cloudflared'
 
+// Error messages and arbitrary error codes can contain credentials or bodies.
+function safeExternalFailure(error: unknown): { errorClass: string; errorCode: string } {
+  const errorClass = error instanceof TypeError ? 'TypeError' : error instanceof SyntaxError ? 'SyntaxError'
+    : error instanceof RangeError ? 'RangeError' : error instanceof AggregateError ? 'AggregateError'
+      : error instanceof Error ? 'Error' : 'unknown'
+  const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined
+  const errorCode = ['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'ENOTFOUND', 'EAI_AGAIN', 'ABORT_ERR']
+    .find(allowed => allowed === code) ?? 'unknown'
+  return { errorClass, errorCode }
+}
+
+function retainedStageDiagnostic(stage: unknown): { kind: string; sequence: number; phase?: string } | undefined {
+  const parsed = z.object({ kind: z.enum(['preparing', 'failed', 'finished', 'observe', 'retry']),
+    sequence: z.number().int().nonnegative(),
+    phase: z.enum(['store_blocked', 'config_blocked', 'replaced', 'config_fault', 'repaired']).optional(),
+  }).safeParse(stage)
+  return parsed.success ? parsed.data : undefined
+}
+
+const OWNED_RELAY_SERVER = 'freshell-managed-runtime-relay'
+const OWNED_RELAY_REQUEST_HEADER = 'x-freshell-relay-request-id'
+
 export function parseOwnedTunnelOrigin(output: string): string | null {
   const origins = new Set(output.match(/https:\/\/[a-z0-9]+(?:-[a-z0-9]+)*\.trycloudflare\.com\b/g) ?? [])
   if (origins.size > 1) throw new Error('owned tunnel published different generated origins')
@@ -417,7 +439,8 @@ export class OwnedManagedRuntimeTunnel {
   private home?: string
   private origin?: string
 
-  constructor(private readonly repoRoot: string, private readonly binary = process.env.FRESHELL_RUNTIME_CLOUDFLARED_BINARY ?? PINNED_CLOUDFLARED_PATH) {}
+  constructor(private readonly repoRoot: string, private readonly binary = process.env.FRESHELL_RUNTIME_CLOUDFLARED_BINARY ?? PINNED_CLOUDFLARED_PATH,
+    private readonly diagnostics?: (record: Record<string, string | number>) => void) {}
 
   get baseUrl(): string {
     if (!this.origin) throw new Error('owned tunnel has not published its origin')
@@ -465,7 +488,21 @@ export class OwnedManagedRuntimeTunnel {
     }
   }
   async stop(): Promise<void> {
-    if (this.process) await this.process.stop()
+    if (this.process) {
+      try { await this.process.stop() } finally {
+        const { stdout, stderr } = this.process.output()
+        const counts = { originUnreachable: 0, connectionRefused: 0, edgeConnectionClosed: 0, timeout: 0, otherErrorLines: 0 }
+        for (const line of `${stdout}\n${stderr}`.split('\n')) {
+          if (!/\bERR\b/.test(line)) continue
+          if (line.includes('Unable to reach the origin service')) counts.originUnreachable++
+          else if (line.includes('connection refused')) counts.connectionRefused++
+          else if (line.includes('connection with edge closed')) counts.edgeConnectionClosed++
+          else if (line.includes('timeout') || line.includes('deadline exceeded')) counts.timeout++
+          else counts.otherErrorLines++
+        }
+        this.diagnostics?.({ severity: 'info', pid: this.process.identity.pid, startTicks: this.process.identity.startTicks, ...counts })
+      }
+    }
     this.process = undefined
     if (this.home) await fsp.rm(this.home, { recursive: true })
     this.home = undefined
@@ -485,6 +522,7 @@ export class OwnedManagedRuntimeRelay {
   constructor(private readonly options: {
     token: string; backend: () => string; control: (request: unknown) => Promise<unknown>
     retryResponse?: (observed: { soulId: string; requestId: string; response: unknown }) => void
+    diagnostics?: { runId: string; candidateSha: string; recordLifecycle: (event: string, data: unknown) => void }
   }) {}
 
   get localUrl(): string {
@@ -548,23 +586,50 @@ export class OwnedManagedRuntimeRelay {
     return Buffer.concat(chunks)
   }
 
-  private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  private async handle(request: IncomingMessage, response: ServerResponse, diagnostic: {
+    diagnosticId?: string; phase: string; operationId?: string; action?: string; stage?: ReturnType<typeof retainedStageDiagnostic>
+  }): Promise<void> {
     const refusal = this.admission(request)
     if (refusal) { response.writeHead(refusal); response.end(); return }
     const pathname = new URL(request.url ?? '/', 'http://owned-relay').pathname
     if (!this.admittedPath(pathname)) { response.writeHead(404); response.end(); return }
     if (pathname === '/__managed_runtime') {
       if (request.method !== 'POST') { response.writeHead(405); response.end(); return }
+      diagnostic.diagnosticId = randomUUID()
+      diagnostic.phase = 'body_read'
+      response.setHeader('server', OWNED_RELAY_SERVER)
+      response.setHeader(OWNED_RELAY_REQUEST_HEADER, diagnostic.diagnosticId)
+      const record = (event: string, severity: string, extra: Record<string, unknown> = {}) => this.options.diagnostics?.recordLifecycle(event, {
+        severity, runId: this.options.diagnostics.runId, candidateSha: this.options.diagnostics.candidateSha, ...diagnostic, ...extra,
+      })
+      record('external.relay_owner_received', 'info')
+      response.once('finish', () => record('external.relay_owner_completed', response.statusCode >= 500 ? 'error' : 'info', { status: response.statusCode }))
       const body = await this.readOwnerRequest(request)
       let result: unknown
-      try { result = await this.options.control(JSON.parse(body.toString('utf8'))) }
+      diagnostic.phase = 'control'
+      try {
+        const input: unknown = JSON.parse(body.toString('utf8'))
+        // This only extracts safe correlation fields; control retains full admission.
+        const metadata = z.object({ runId: z.literal(this.options.diagnostics?.runId),
+          candidateSha: z.literal(this.options.diagnostics?.candidateSha), operationId: z.string().uuid(),
+          action: z.enum(['retained-start', 'retained-status', 'retained-observed', 'retained-finish', 'finish', 'abort']),
+        }).safeParse(input)
+        if (metadata.success) { diagnostic.operationId = metadata.data.operationId; diagnostic.action = metadata.data.action }
+        result = await this.options.control(input)
+      }
       catch {
         response.writeHead(409, { 'content-type': 'application/json' })
         response.end(JSON.stringify({ reason: 'owner_operation_refused' }))
         return
       }
+      if (diagnostic.action === 'retained-status' && result && typeof result === 'object' && 'result' in result) {
+        diagnostic.stage = retainedStageDiagnostic(result.result)
+      }
       response.writeHead(200, { 'content-type': 'application/json' })
-      response.end(JSON.stringify(result))
+      diagnostic.phase = 'response_serialize'
+      const serialized = JSON.stringify(result)
+      diagnostic.phase = 'response_send'
+      response.end(serialized)
       return
     }
     const retryPath = request.method === 'POST' && this.options.retryResponse
@@ -610,7 +675,12 @@ export class OwnedManagedRuntimeRelay {
 
   async start(): Promise<void> {
     this.server = http.createServer((request, response) => {
-      this.handle(request, response).catch(() => {
+      const diagnostic: Parameters<OwnedManagedRuntimeRelay['handle']>[2] = { phase: 'admission' }
+      this.handle(request, response, diagnostic).catch(error => {
+        if (diagnostic.diagnosticId) this.options.diagnostics?.recordLifecycle('external.relay_owner_failed', {
+          severity: 'error', runId: this.options.diagnostics.runId, candidateSha: this.options.diagnostics.candidateSha,
+          ...diagnostic, status: response.headersSent ? response.statusCode : 502, ...safeExternalFailure(error),
+        })
         if (!response.headersSent) response.writeHead(502)
         response.end()
       })
@@ -756,7 +826,20 @@ export class ExternalManagedRuntimeRig {
       }
     }
     if (!response) throw new Error('closed owner transport produced no response')
-    if (!response.ok) throw new Error(`closed owner operation refused: ${response.status}`)
+    if (!response.ok) {
+      const contentType = response.headers.get('content-type')?.split(';')[0].trim().toLowerCase()
+      const server = response.headers.get('server')?.trim().toLowerCase()
+      const ray = response.headers.get('cf-ray'), relayRequest = response.headers.get(OWNED_RELAY_REQUEST_HEADER)
+      process.stderr.write(`${JSON.stringify({ severity: 'error', event: 'managed_external_owner_http_failed',
+        runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha, operationId, action, status: response.status,
+        server: server === OWNED_RELAY_SERVER ? 'owned_relay' : server === 'cloudflare' ? 'cloudflare' : 'unknown',
+        contentType: !contentType ? 'absent' : contentType === 'application/json' ? 'json'
+          : contentType === 'text/html' ? 'html' : contentType === 'text/plain' ? 'text' : 'other',
+        cloudflareRay: ray && /^[a-f0-9]{16}-[A-Z]{3}$/.test(ray) ? ray : null,
+        relayRequestId: relayRequest && z.string().uuid().safeParse(relayRequest).success ? relayRequest : null,
+      })}\n`)
+      throw new Error(`closed owner operation refused: ${response.status}`)
+    }
     let body: unknown
     try { body = await response.json() } catch { throw new Error('closed owner reply is not valid JSON') }
     const reply = z.object({ runId: z.literal(this.descriptor.runId), candidateSha: z.literal(this.descriptor.candidateSha),
@@ -1233,13 +1316,37 @@ export class OwnedRetainedBrowserFixtures implements ExternalRetainedFixtureCont
     }
     this.session.start(async hooks => {
       let original: unknown
+      let lastStage = retainedStageDiagnostic(this.session!.status())
+      const recordStage = () => {
+        const stage = retainedStageDiagnostic(this.session!.status())
+        if (stage?.kind !== 'observe' && stage?.kind !== 'retry') return
+        lastStage = stage
+        h.recordLifecycle('external.retained_stage_published', { severity: 'info', parentRunId: this.owner.runtime.runId,
+          runId: h.runId, candidateSha: h.candidateSha, fixtureId, stage: lastStage })
+      }
+      const observe: typeof hooks.observe = (context, phase) => {
+        const pending = hooks.observe(context, phase)
+        recordStage()
+        return pending
+      }
+      const retry: typeof hooks.retry = (context, phase) => {
+        const pending = hooks.retry(context, phase)
+        recordStage()
+        return pending
+      }
       try {
         await h.prepareTask2FixtureArtifacts(this.artifacts)
         h.recordLifecycle('external.retained_fixture_registered', { severity: 'info',
           parentRunId: this.owner.runtime.runId, candidateSha: h.candidateSha, fixtureId })
-        await runTask2RetainedFixture(h, fixtureId === 'legacy', factory, hooks)
+        await runTask2RetainedFixture(h, fixtureId === 'legacy', factory, { observe, retry })
         h.assert(fixtureId, h.broker.unsafeAttempts().length === 0, 'retained browser fixture performs no unsafe broker operation')
-      } catch (error) { original = error }
+      } catch (error) {
+        original = error
+        const cancelled = error instanceof Error && error.message === 'owned retained browser session cancelled'
+        h.recordLifecycle('external.retained_driver_failed', { severity: cancelled ? 'info' : 'error',
+          parentRunId: this.owner.runtime.runId, runId: h.runId, candidateSha: h.candidateSha, fixtureId,
+          reason: cancelled ? 'cancelled' : 'driver_failure', stage: lastStage, ...safeExternalFailure(error) })
+      }
       let cleanupFailure: unknown
       try {
         const webErrors: unknown[] = []
@@ -2291,6 +2398,8 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
     }
     let control: ((request: unknown) => Promise<unknown>) | undefined
     this.relay = new OwnedManagedRuntimeRelay({ token: this.owner.info.token, backend: () => this.retained?.backend ?? this.owner!.info.baseUrl,
+      diagnostics: { runId: this.owner.runtime.runId, candidateSha: this.owner.runtime.candidateSha,
+        recordLifecycle: (event, data) => this.owner!.runtime.recordLifecycle(event, data) },
       control: async request => {
         if (!control) throw new Error('owned external controller is not admitted yet')
         return control(request)
@@ -2298,7 +2407,9 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
       retryResponse: this.retained ? observed => this.retained!.captureRetry(observed) : undefined,
     })
     await this.relay.start()
-    this.tunnel = new OwnedManagedRuntimeTunnel(root, this.environment.FRESHELL_RUNTIME_CLOUDFLARED_BINARY)
+    this.tunnel = new OwnedManagedRuntimeTunnel(root, this.environment.FRESHELL_RUNTIME_CLOUDFLARED_BINARY,
+      record => this.owner!.runtime.recordLifecycle('external.tunnel_diagnostics', {
+        runId: this.owner!.runtime.runId, candidateSha: this.owner!.runtime.candidateSha, ...record }))
     await this.tunnel.start(this.relay.localUrl)
     this.relay.setOrigin(this.tunnel.baseUrl)
     this.descriptor = { baseUrl: this.tunnel.baseUrl, wsUrl: this.tunnel.wsUrl,
