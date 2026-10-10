@@ -444,6 +444,11 @@ pub(crate) fn scan_among(paths: &[PathBuf], pids: &[u32]) -> LockScan {
         if !seen.insert(pid) {
             continue;
         }
+        #[cfg(test)]
+        if test_unreadable::reports(pid) {
+            scan.unreadable.push(pid);
+            continue;
+        }
         let fds = match darwin::fds(pid) {
             Ok(fds) => fds,
             Err(_) => {
@@ -485,6 +490,34 @@ pub(crate) fn scan_among(paths: &[PathBuf], pids: &[u32]) -> LockScan {
         );
     }
     scan
+}
+
+/// Test support: pids the descriptor scan reports unreadable although they
+/// run, as it does for a process that has begun exiting, so a test can
+/// give the Gone lock check that answer for a live process of its own.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) mod test_unreadable {
+    use std::sync::Mutex;
+
+    static PIDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+    /// Reports `pid` unreadable until the returned guard is dropped.
+    pub(crate) fn report(pid: u32) -> Reported {
+        PIDS.lock().unwrap().push(pid);
+        Reported(pid)
+    }
+
+    pub(crate) struct Reported(u32);
+
+    impl Drop for Reported {
+        fn drop(&mut self) {
+            PIDS.lock().unwrap().retain(|pid| *pid != self.0);
+        }
+    }
+
+    pub(super) fn reports(pid: u32) -> bool {
+        PIDS.lock().unwrap().contains(&pid)
+    }
 }
 
 /// macOS: unlock events on a set of lock files (`EVFILT_VNODE` /

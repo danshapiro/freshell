@@ -2118,6 +2118,47 @@ sleep 600;"#;
             assert!(released, "the lock is released");
         }
 
+        /// A member the descriptor scan reports unreadable (its answer for a
+        /// process that has begun exiting, given here for a live process of
+        /// the test, so the case does not hang on how long a real exit
+        /// takes) and that has no exit watch of the unit's: the check opens
+        /// a watch, kills the member through it and waits for its exit
+        /// before it says the lock is released.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_unreadable_member_with_no_exit_watch_is_killed_and_awaited() {
+            let dir = tempfile::tempdir().unwrap();
+            let lock = dir.path().join("t.lock");
+            std::fs::write(&lock, b"").unwrap();
+            let member = Reaped(
+                Command::new("perl")
+                    .args(["-e", "sleep 600"])
+                    .spawn()
+                    .unwrap(),
+            );
+            // Our own unreaped child: its pid names it.
+            let pin = ProcWatch::open(member.0.id()).unwrap();
+            let _reported = crate::locks::test_unreadable::report(pin.pid());
+            let unit = unit_on(Arc::new(Listed(vec![pin.identity().clone()])));
+            unit.set_lock_paths(vec![lock]);
+            let check = tokio::spawn({
+                let unit = unit.clone();
+                let pin = pin.clone();
+                async move {
+                    let released = unit.check_locks(&[]).await;
+                    (released, pin.has_exited())
+                }
+            });
+            let (released, proven) = tokio::time::timeout(Duration::from_secs(10), check)
+                .await
+                .expect("the check ended")
+                .unwrap();
+            assert!(released.unwrap(), "the lock is released");
+            assert!(
+                proven,
+                "the check ended while the unreadable member still ran"
+            );
+        }
+
         /// A process in the middle of its exit: a session leader whose
         /// terminal output nobody reads, killed while its write is blocked.
         /// On both hosted runners it stays exiting (descriptors closed, no
