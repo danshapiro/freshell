@@ -498,13 +498,38 @@ async fn libproc_lookups_fit_the_gone_window() {
     });
 }
 
+/// The process the system holds responsible for `pid` (itself after a
+/// disclaimed spawn, else copied from its parent at fork), read through the
+/// private libSystem function `responsibility_get_pid_responsible_for_pid`;
+/// `None` when it cannot be read.
+fn responsible_pid(pid: u32) -> Option<u32> {
+    type GetResponsible = unsafe extern "C" fn(libc::pid_t) -> libc::pid_t;
+    // SAFETY: a NUL-terminated name looked up in every loaded image.
+    let symbol = unsafe {
+        libc::dlsym(
+            libc::RTLD_DEFAULT,
+            c"responsibility_get_pid_responsible_for_pid".as_ptr(),
+        )
+    };
+    if symbol.is_null() {
+        return None;
+    }
+    // SAFETY: the libSystem function of this exact signature.
+    let get = unsafe { std::mem::transmute::<usize, GetResponsible>(symbol as usize) };
+    // SAFETY: a plain pid argument.
+    let responsible = unsafe { get(pid as libc::pid_t) };
+    u32::try_from(responsible).ok().filter(|r| *r > 0)
+}
+
 /// Plan review R1-F2, Branch B's record of why fork tracking is used: a
-/// root started through the shim's `--disclaim` is its own responsible
-/// process, but a detached official `node` (via `nohup`, or a `setsid`
-/// double fork) is its own responsible process too, so responsibility
-/// cannot carry membership to detached jobs (run 38024127146). Fails if
-/// macOS ever carries it through, when the responsible process could
-/// replace the fork tracker.
+/// root started through the test helper's `disclaim-exec` is its own
+/// responsible process, but a detached official `node` (via `nohup`, or a
+/// `setsid` double fork) is its own responsible process too, so
+/// responsibility cannot carry membership to detached jobs (decision run
+/// 38024127146). Fails if macOS ever carries it through, when the
+/// responsible process could replace the fork tracker. The disclaimed
+/// spawn and the responsible-process query are test-only code (the helper
+/// and this file); the server never uses them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responsibility_does_not_follow_detached_descendants() {
     for symbol in [
@@ -521,8 +546,8 @@ N2=$(perl -e 'use POSIX; my $p = fork() // die; if ($p == 0) { POSIX::setsid() o
 echo "nodes $N1 $N2"
 exec sleep 600"#;
     let mut root = Kid::spawn(
-        Command::new(test_shim().exe)
-            .args(["--disclaim", "--", "/bin/sh", "-c", SCRIPT])
+        Command::new(HELPER)
+            .args(["disclaim-exec", "--", "/bin/sh", "-c", SCRIPT])
             .stdout(Stdio::piped()),
     );
     let mut out = BufReader::new(root.0.stdout.take().unwrap());
@@ -537,7 +562,7 @@ exec sleep 600"#;
         .collect();
     assert_eq!(shell, root.id(), "the shim execs its command in place");
     assert_eq!(
-        process::responsible_pid(root.id()),
+        responsible_pid(root.id()),
         Some(root.id()),
         "a disclaimed root is its own responsible process"
     );
@@ -548,16 +573,16 @@ exec sleep 600"#;
     for pid in &nodes {
         report!(
             "T5: node {pid} responsible pid {:?} (root {}) csops {}",
-            process::responsible_pid(*pid),
+            responsible_pid(*pid),
             root.id(),
             describe_flags(cs_flags(*pid))
         );
     }
     let stranger = OwnChild::sleep();
-    assert_ne!(process::responsible_pid(stranger.id()), Some(root.id()));
+    assert_ne!(responsible_pid(stranger.id()), Some(root.id()));
     for pid in &nodes {
         assert_ne!(
-            process::responsible_pid(*pid),
+            responsible_pid(*pid),
             Some(root.id()),
             "detached node {pid} now keeps the root as its responsible process: \
              the responsible process could carry membership"

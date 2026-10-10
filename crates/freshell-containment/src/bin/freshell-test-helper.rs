@@ -23,6 +23,15 @@
 //!   nested job is now empty) and sleeps until killed. (On the runner a
 //!   nested job WITHOUT a port of its own posted no zero message to its
 //!   parent job's port.)
+//! - `disclaim-exec -- <command> [args...]` (macOS only): replaces itself
+//!   with the command (`posix_spawn` with `POSIX_SPAWN_SETEXEC`, so the pid
+//!   is unchanged) after the private libSystem function
+//!   `responsibility_spawnattrs_setdisclaim`, so the command is its own
+//!   responsible process. Exits 127 when the command cannot be started,
+//!   the function included. The macOS suite uses it to record that a
+//!   detached official `node` resets its responsible process, so
+//!   responsibility cannot carry unit membership (the reason the macOS
+//!   backend tracks forks).
 //! - `breakaway-daemon` (Windows only): starts a copy of itself as
 //!   `idle app-server --managed-daemon` with
 //!   `DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB` (Codex 0.162's exact
@@ -36,6 +45,9 @@ use std::process::{Command, Stdio};
 const USAGE_EXIT: i32 = 2;
 /// The lock is held elsewhere (Codex's "already has an active writer").
 const WOULD_BLOCK_EXIT: i32 = 3;
+/// The command cannot be started (the shell convention).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const START_FAILED_EXIT: i32 = 127;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -45,9 +57,10 @@ fn main() {
         Some("until-eof") => until_eof(),
         Some("job-child") => job_child(),
         Some("breakaway-daemon") => breakaway_daemon(),
+        Some("disclaim-exec") => disclaim_exec(&args[1..]),
         _ => {
             eprintln!(
-                "usage: freshell-test-helper hold-lock <path> [--threads N] [--child] | idle [args...] | until-eof | job-child | breakaway-daemon"
+                "usage: freshell-test-helper hold-lock <path> [--threads N] [--child] | idle [args...] | until-eof | job-child | breakaway-daemon | disclaim-exec -- <command> [args...]"
             );
             USAGE_EXIT
         }
@@ -285,5 +298,97 @@ fn breakaway_daemon() -> i32 {
 #[cfg(not(windows))]
 fn breakaway_daemon() -> i32 {
     eprintln!("freshell-test-helper breakaway-daemon: Windows only");
+    USAGE_EXIT
+}
+
+#[cfg(target_os = "macos")]
+fn disclaim_exec(args: &[String]) -> i32 {
+    use std::ffi::CString;
+
+    type SetDisclaim =
+        unsafe extern "C" fn(*mut libc::posix_spawnattr_t, libc::c_int) -> libc::c_int;
+
+    let command = match args.split_first() {
+        Some((separator, command)) if separator == "--" && !command.is_empty() => command,
+        _ => {
+            eprintln!("usage: freshell-test-helper disclaim-exec -- <command> [args...]");
+            return USAGE_EXIT;
+        }
+    };
+    let fail = |why: String| {
+        eprintln!(
+            "freshell-test-helper disclaim-exec: cannot start {}: {why}",
+            command[0]
+        );
+        START_FAILED_EXIT
+    };
+    let Ok(args) = command
+        .iter()
+        .map(|arg| CString::new(arg.as_str()))
+        .collect::<Result<Vec<CString>, _>>()
+    else {
+        return fail("an argument holds a NUL byte".into());
+    };
+    let mut argv: Vec<*mut libc::c_char> = args
+        .iter()
+        .map(|arg| arg.as_ptr().cast_mut())
+        .chain(std::iter::once(std::ptr::null_mut()))
+        .collect();
+    // A private libSystem function, resolved at run time (as LLDB and
+    // Chromium resolve it).
+    // SAFETY: a NUL-terminated name looked up in every loaded image.
+    let symbol = unsafe {
+        libc::dlsym(
+            libc::RTLD_DEFAULT,
+            c"responsibility_spawnattrs_setdisclaim".as_ptr(),
+        )
+    };
+    if symbol.is_null() {
+        return fail("this macOS has no responsibility_spawnattrs_setdisclaim".into());
+    }
+    // SAFETY: the libSystem function of this exact signature.
+    let set_disclaim = unsafe { std::mem::transmute::<usize, SetDisclaim>(symbol as usize) };
+    let mut attr: libc::posix_spawnattr_t = std::ptr::null_mut();
+    // SAFETY: initialises the attribute object this function owns.
+    let rc = unsafe { libc::posix_spawnattr_init(&mut attr) };
+    if rc != 0 {
+        return fail(std::io::Error::from_raw_os_error(rc).to_string());
+    }
+    // SAFETY: a live attribute object, SETEXEC (which fits the flags' type)
+    // and the documented disclaim value.
+    let rc = unsafe {
+        match libc::posix_spawnattr_setflags(&mut attr, libc::POSIX_SPAWN_SETEXEC as libc::c_short)
+        {
+            0 => set_disclaim(&mut attr, 1),
+            rc => rc,
+        }
+    };
+    if rc != 0 {
+        // SAFETY: the attribute object initialised above.
+        unsafe { libc::posix_spawnattr_destroy(&mut attr) };
+        return fail(std::io::Error::from_raw_os_error(rc).to_string());
+    }
+    let mut pid: libc::pid_t = 0;
+    // SAFETY: a NUL-terminated program, a null-terminated argv of live
+    // CStrings, the live attribute object and this process's own
+    // environment. With SETEXEC a success never returns.
+    let rc = unsafe {
+        libc::posix_spawnp(
+            &mut pid,
+            args[0].as_ptr(),
+            std::ptr::null(),
+            &attr,
+            argv.as_mut_ptr().cast_const(),
+            (*libc::_NSGetEnviron()).cast_const(),
+        )
+    };
+    // SAFETY: the attribute object initialised above.
+    unsafe { libc::posix_spawnattr_destroy(&mut attr) };
+    fail(std::io::Error::from_raw_os_error(rc).to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn disclaim_exec(_args: &[String]) -> i32 {
+    eprintln!("freshell-test-helper disclaim-exec: macOS only");
     USAGE_EXIT
 }

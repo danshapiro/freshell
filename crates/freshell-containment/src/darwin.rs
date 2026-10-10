@@ -1,6 +1,5 @@
 //! macOS kernel interfaces the crate reads: libproc process and descriptor
-//! facts, `KERN_PROCARGS2`, code-signing status, the responsible process,
-//! and kqueue. Structures and constants that `libc` lacks for this target
+//! facts, `KERN_PROCARGS2`, code-signing status, and kqueue. Structures and constants that `libc` lacks for this target
 //! are declared here exactly as in `<sys/proc_info.h>`, `<sys/event.h>`
 //! and `<sys/codesign.h>`.
 //!
@@ -434,45 +433,6 @@ pub(crate) fn procargs(pid: u32) -> io::Result<Vec<u8>> {
     }
     buf.truncate(size);
     Ok(buf)
-}
-
-/// The responsible-process functions are private libSystem symbols,
-/// resolved at run time (as LLDB and Chromium resolve the disclaim one).
-type GetResponsible = unsafe extern "C" fn(libc::pid_t) -> libc::pid_t;
-pub(crate) type SetDisclaim = unsafe extern "C" fn(*mut libc::posix_spawnattr_t, c_int) -> c_int;
-
-fn symbol(name: &std::ffi::CStr) -> Option<*mut c_void> {
-    // SAFETY: a NUL-terminated name looked up in every loaded image.
-    let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
-    (!found.is_null()).then_some(found)
-}
-
-/// `responsibility_get_pid_responsible_for_pid`, when this macOS has it.
-fn get_responsible() -> Option<GetResponsible> {
-    static FOUND: OnceLock<Option<usize>> = OnceLock::new();
-    let address = (*FOUND.get_or_init(|| {
-        symbol(c"responsibility_get_pid_responsible_for_pid").map(|p| p as usize)
-    }))?;
-    // SAFETY: the libSystem function of this exact signature.
-    Some(unsafe { std::mem::transmute::<usize, GetResponsible>(address) })
-}
-
-/// `responsibility_spawnattrs_setdisclaim`, when this macOS has it.
-pub(crate) fn set_disclaim() -> Option<SetDisclaim> {
-    let address = symbol(c"responsibility_spawnattrs_setdisclaim")? as usize;
-    // SAFETY: the libSystem function of this exact signature.
-    Some(unsafe { std::mem::transmute::<usize, SetDisclaim>(address) })
-}
-
-/// The responsible process of `pid` (the process the system holds
-/// responsible for it: itself after a disclaimed spawn, else inherited from
-/// its parent at fork and kept through `setsid`, exec and reparenting).
-/// `None` when it cannot be read or the function does not exist here.
-pub(crate) fn responsible_pid(pid: u32) -> Option<u32> {
-    let get = get_responsible()?;
-    // SAFETY: a plain pid argument.
-    let responsible = unsafe { get(pid as libc::pid_t) };
-    u32::try_from(responsible).ok().filter(|r| *r > 0)
 }
 
 /// A kqueue (closed on drop, never inherited by a child).

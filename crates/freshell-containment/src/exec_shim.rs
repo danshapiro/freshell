@@ -19,15 +19,6 @@
 //!   calls `setsid` stays in its session: the macOS backend's root
 //!   placement, which its fork tracker follows. Exit 127 when the command
 //!   cannot be started. Other OSes ignore it.
-//! - `--disclaim` (macOS): exec the command in place (`posix_spawn` with
-//!   `POSIX_SPAWN_SETEXEC`) after `responsibility_spawnattrs_setdisclaim`,
-//!   so the command is its own responsible process. No backend places with
-//!   it: the macOS suite uses it to record that the official `node`
-//!   resets its responsible process, so responsibility cannot follow a
-//!   detached job (the reason for the fork tracker). Exit 127 when the
-//!   command cannot be started; where the private function is missing, the
-//!   command is exec'd without disclaiming (with a one-line note on
-//!   stderr). Other OSes ignore it.
 //! - `--nofile-soft=<n>` (Linux): lower this shim's own open-file soft limit
 //!   to `n` (capped at the hard limit) before it starts the command, so the
 //!   command starts with the server's original limit instead of the server's
@@ -51,7 +42,6 @@ const START_FAILED_EXIT: i32 = 127;
 struct Options {
     reaper: bool,
     setsid: bool,
-    disclaim: bool,
     nofile_soft: Option<u64>,
     job: Option<OsString>,
 }
@@ -71,8 +61,6 @@ fn parse_options(options: &[OsString]) -> Options {
             parsed.reaper = true;
         } else if option == "--setsid" {
             parsed.setsid = true;
-        } else if option == "--disclaim" {
-            parsed.disclaim = true;
         } else if let Some(n) = option.strip_prefix("--nofile-soft=") {
             parsed.nofile_soft = n.parse().ok();
             if parsed.nofile_soft.is_none() {
@@ -113,27 +101,19 @@ pub fn unit_exec_main(args: Vec<OsString>) -> i32 {
     #[cfg(not(target_os = "linux"))]
     let _ = options.reaper; // no backend places with it off Linux
     #[cfg(target_os = "macos")]
-    {
-        if options.setsid {
-            macos::become_session_leader();
-        }
-        if options.disclaim {
-            return macos::exec_disclaimed(program, rest);
-        }
-        if options.setsid {
-            return macos::exec_in_place(program, rest);
-        }
+    if options.setsid {
+        macos::become_session_leader();
+        return macos::exec_in_place(program, rest);
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = (options.setsid, options.disclaim); // macOS options
+    let _ = options.setsid; // a macOS option
     run_plain(program, rest)
 }
 
-/// macOS: the session-leader and disclaimed in-place execs.
+/// macOS: the session leader and its in-place exec.
 #[cfg(target_os = "macos")]
 mod macos {
-    use std::ffi::{CString, OsStr, OsString};
-    use std::os::unix::ffi::OsStrExt;
+    use std::ffi::{OsStr, OsString};
     use std::os::unix::process::CommandExt;
 
     use super::START_FAILED_EXIT;
@@ -154,79 +134,6 @@ mod macos {
             program.to_string_lossy()
         );
         START_FAILED_EXIT
-    }
-
-    /// Replaces this process with `program rest...` (searched on `PATH`),
-    /// disclaimed. Returns only when that fails.
-    pub(super) fn exec_disclaimed(program: &OsStr, rest: &[OsString]) -> i32 {
-        let fail = |why: String| {
-            eprintln!(
-                "freshell-unit-exec: cannot start {}: {why}",
-                program.to_string_lossy()
-            );
-            START_FAILED_EXIT
-        };
-        let args: Result<Vec<CString>, _> = std::iter::once(program)
-            .chain(rest.iter().map(OsString::as_os_str))
-            .map(|arg| CString::new(arg.as_bytes()))
-            .collect();
-        let Ok(args) = args else {
-            return fail("an argument holds a NUL byte".into());
-        };
-        let mut argv: Vec<*mut libc::c_char> = args
-            .iter()
-            .map(|arg| arg.as_ptr().cast_mut())
-            .chain(std::iter::once(std::ptr::null_mut()))
-            .collect();
-        let mut attr: libc::posix_spawnattr_t = std::ptr::null_mut();
-        // SAFETY: initialises the attribute object this function owns.
-        let rc = unsafe { libc::posix_spawnattr_init(&mut attr) };
-        if rc != 0 {
-            return fail(std::io::Error::from_raw_os_error(rc).to_string());
-        }
-        // SAFETY: a live attribute object; SETEXEC fits the flags' type.
-        let rc = unsafe {
-            libc::posix_spawnattr_setflags(&mut attr, libc::POSIX_SPAWN_SETEXEC as libc::c_short)
-        };
-        if rc != 0 {
-            // SAFETY: the attribute object initialised above.
-            unsafe { libc::posix_spawnattr_destroy(&mut attr) };
-            return fail(std::io::Error::from_raw_os_error(rc).to_string());
-        }
-        match crate::darwin::set_disclaim() {
-            // SAFETY: a live attribute object and the documented flag value.
-            Some(set_disclaim) => {
-                let rc = unsafe { set_disclaim(&mut attr, 1) };
-                if rc != 0 {
-                    eprintln!(
-                        "freshell-unit-exec: cannot disclaim responsibility ({}); {} runs without it",
-                        std::io::Error::from_raw_os_error(rc),
-                        program.to_string_lossy()
-                    );
-                }
-            }
-            None => eprintln!(
-                "freshell-unit-exec: this macOS has no responsibility_spawnattrs_setdisclaim; {} runs without disclaiming",
-                program.to_string_lossy()
-            ),
-        }
-        let mut pid: libc::pid_t = 0;
-        // SAFETY: NUL-terminated program and argv (null-terminated array of
-        // live CStrings), the live attribute object, and this process's own
-        // environment. With SETEXEC a success never returns.
-        let rc = unsafe {
-            libc::posix_spawnp(
-                &mut pid,
-                args[0].as_ptr(),
-                std::ptr::null(),
-                &attr,
-                argv.as_mut_ptr().cast_const(),
-                (*libc::_NSGetEnviron()).cast_const(),
-            )
-        };
-        // SAFETY: the attribute object initialised above.
-        unsafe { libc::posix_spawnattr_destroy(&mut attr) };
-        fail(std::io::Error::from_raw_os_error(rc).to_string())
     }
 }
 
@@ -385,13 +292,6 @@ mod tests {
             Options {
                 reaper: true,
                 job: Some("Local\\freshell-unit-u1".into()),
-                ..Options::default()
-            }
-        );
-        assert_eq!(
-            parse_options(&args(&["--disclaim"])),
-            Options {
-                disclaim: true,
                 ..Options::default()
             }
         );

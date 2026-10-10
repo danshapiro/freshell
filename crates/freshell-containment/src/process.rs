@@ -803,16 +803,6 @@ pub fn all_pids() -> Vec<u32> {
     crate::darwin::all_pids()
 }
 
-/// macOS: the process the system holds responsible for `pid`: itself after
-/// a disclaimed spawn (the `--disclaim` shim), otherwise copied from its
-/// parent at fork and kept through `setsid`, exec and reparenting. Read
-/// through private libSystem functions resolved at run time; `None` when
-/// they do not exist here or the pid cannot be read.
-#[cfg(target_os = "macos")]
-pub fn responsible_pid(pid: u32) -> Option<u32> {
-    crate::darwin::responsible_pid(pid)
-}
-
 #[cfg(test)]
 mod command_line_tests {
     use super::split_command_line;
