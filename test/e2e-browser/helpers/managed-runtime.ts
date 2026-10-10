@@ -9,6 +9,8 @@ export {
   type ManagedRuntimeView, type ManagedOpenCodeAdoptionStatus,
   type ExactRuntimeHandle, type FixtureNativeState, type RuntimeHostFacts, type NativeToolEvidence,
   type SyntheticOpenCodeSourceFacts,
+  type SyntheticStoppedRepairBatchFacts, type SyntheticStoppedRepairBatchObservation,
+  type SyntheticStoppedRepairFault,
   type Phase3BrowserObservation,
   type RuntimeTerminalContinuityObservation,
   type OpencodeQualificationTurn, type OpencodeQualificationProofStage,
