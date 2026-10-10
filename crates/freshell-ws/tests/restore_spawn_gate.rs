@@ -49,17 +49,12 @@ fn test_settings_value() -> serde_json::Value {
 /// creates genuinely spawn — the same recording-script convention as
 /// `session_identity_frames.rs` (these tests assert on wire frames, not argv).
 ///
-/// Each call writes a **unique** script path (PID + atomic counter) so parallel
-/// tests in the same binary never collide with ETXTBSY ("Text file busy") when
-/// one test writes the script while another is executing a prior copy.
-static SLEEPER_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn sleeper_cli_spec(name: &str) -> freshell_platform::CliCommandSpec {
-    let seq = SLEEPER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let script_path = std::env::temp_dir().join(format!(
-        "freshell-restore-gate-sleeper-{name}-{}-{seq}.sh",
-        std::process::id()
-    ));
+/// The script is written into `dir`, the server's own temporary directory,
+/// so parallel tests in the same binary never share a script path (no
+/// ETXTBSY, "Text file busy", when one test writes its script while another
+/// executes its own copy), and the script is removed with the directory.
+fn sleeper_cli_spec(dir: &std::path::Path, name: &str) -> freshell_platform::CliCommandSpec {
+    let script_path = dir.join(format!("sleeper-{name}.sh"));
     std::fs::write(&script_path, "#!/bin/sh\nexec sleep 30\n").expect("write sleeper script");
     #[cfg(unix)]
     {
@@ -107,6 +102,14 @@ async fn spawn_server(
     let settings =
         Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
     let registry = freshell_terminal::TerminalRegistry::new();
+    // The sleeper scripts live exactly as long as the server: its serving
+    // task owns their directory, and the test's runtime drops that task (and
+    // so removes the directory) when the test ends, whether it passed or
+    // panicked.
+    let scripts = tempfile::Builder::new()
+        .prefix("freshell-restore-gate-")
+        .tempdir()
+        .expect("the sleeper scripts' directory");
 
     let state = WsState {
         layout: Default::default(),
@@ -142,8 +145,8 @@ async fn spawn_server(
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(vec![
-            sleeper_cli_spec("amplifier"),
-            sleeper_cli_spec("claude"),
+            sleeper_cli_spec(scripts.path(), "amplifier"),
+            sleeper_cli_spec(scripts.path(), "claude"),
         ]),
         shutdown: std::sync::Arc::clone(&shutdown),
         ping_interval_ms: 30_000,
@@ -177,6 +180,7 @@ async fn spawn_server(
         .expect("bind ephemeral loopback port");
     let addr = listener.local_addr().expect("local addr");
     tokio::spawn(async move {
+        let _scripts = scripts;
         let _ = axum::serve(listener, router).await;
     });
 
