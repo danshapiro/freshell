@@ -183,6 +183,98 @@ try{await runTask007DestructiveSandbox(${JSON.stringify(fixtureRepoRoot)})}catch
   }, 90_000)
 })
 
+describe('Task7 exclusive descriptor file cleanup', () => {
+  it.each(['partial write', 'partial write and close', 'close', 'pre-existing', 'restrictive umask'] as const)(
+    'preserves descriptor ownership and read-only handoff for %s', async (fault) => {
+      const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused descriptor writer web') }, fixtureRepoRoot, 3,
+        {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
+      const runtimeDir = path.join(fixtureRepoRoot, 'owned-runtime')
+      await fsp.mkdir(runtimeDir, { mode: 0o700 })
+      const descriptorFile = path.join(runtimeDir, 'task007-reader-descriptor.frame')
+      const imageRef = `sha256:${'a'.repeat(64)}`
+      const descriptor = { targetImageRef: imageRef, rootSessionId: 'ses_current' }
+      const batch = { input: { hostBinaryPath: '/owned/host', workspacePath: fixtureRepoRoot, cwd: fixtureRepoRoot, fixtureId: 'fixture-current' } }
+      const target = { rootSessionId: 'ses_current', soulId: 'soul-current' }
+      const receipt = { runtimeDir, imageRef, containerId: 'b'.repeat(64), providerVolumeName: 'owned-volume' }
+      rig.runtime.imageRef = imageRef
+      const readerFailure = new Error('controlled reader failure after frame handoff')
+      const docker = vi.spyOn(Object.getPrototypeOf(rig), 'trackedDockerProbe').mockImplementation(async (_containerId: string, args: string[]) => {
+        if (fault === 'restrictive umask') {
+          if (args[0] === 'rm') return ''
+          if (args[0] === 'create') {
+            expect(args.slice(args.indexOf('--user'), args.indexOf('--user') + 2)).toEqual(['--user', '65534:0'])
+            expect(args).toContain(`type=bind,source=${descriptorFile},target=/run/freshell-opencode-reader.frame,readonly`)
+            expect((await fsp.stat(descriptorFile)).mode & 0o777).toBe(0o444)
+            const frame = await fsp.readFile(descriptorFile)
+            expect(frame.readUInt32BE(0)).toBe(frame.length - 4)
+            expect(JSON.parse(frame.subarray(4).toString())).toEqual(descriptor)
+            throw readerFailure
+          }
+        }
+        throw new Error('unexpected Docker probe')
+      })
+      const writeFailure = Object.assign(new Error('controlled partial frame write'), { code: 'ENOSPC' })
+      const closeFailure = Object.assign(new Error('controlled descriptor close'), { code: 'EIO' })
+      const originalWrite = fsp.writeFile.bind(fsp), originalOpen = fsp.open.bind(fsp)
+      let handle: Awaited<ReturnType<typeof fsp.open>> | undefined
+      let closed = false, partialObserved = false
+      let descriptorMode: number | undefined
+      const foreign = Buffer.from('pre-existing different owned-by-someone-else frame')
+      if (fault === 'pre-existing') await originalWrite(descriptorFile, foreign, { mode: 0o400 })
+      // Inject failure after real bytes reach the temporary file, for either
+      // path-based or fd-based writers.
+      vi.spyOn(fsp, 'writeFile').mockImplementation(async (...args) => {
+        if (args[0] === descriptorFile && fault.startsWith('partial')) {
+          await originalWrite(descriptorFile, Buffer.from(args[1] as Uint8Array).subarray(0, 5), args[2])
+          partialObserved = (await fsp.readFile(descriptorFile)).length === 5
+          throw writeFailure
+        }
+        return originalWrite(...args)
+      })
+      vi.spyOn(fsp, 'open').mockImplementation(async (...args) => {
+        const opened = await originalOpen(...args)
+        if (args[0] !== descriptorFile) return opened
+        handle = opened
+        // Model the actual 0400 file produced by a restrictive creator umask.
+        await opened.chmod(0o400)
+        const originalClose = opened.close.bind(opened)
+        vi.spyOn(opened, 'close').mockImplementation(async () => {
+          descriptorMode = (await opened.stat()).mode & 0o777
+          await originalClose(); closed = true
+          if (fault === 'close' || fault === 'partial write and close') throw closeFailure
+        })
+        if (fault.startsWith('partial')) vi.spyOn(opened, 'writeFile').mockImplementation(async bytes => {
+          await opened.write(Buffer.from(bytes as Uint8Array).subarray(0, 5))
+          partialObserved = (await fsp.readFile(descriptorFile)).length === 5
+          throw writeFailure
+        })
+        return opened
+      })
+      try {
+        const read = Reflect.apply(Object.getPrototypeOf(rig).readTask007InstalledGraph, rig, [batch, target, receipt, { descriptor }])
+        if (fault === 'pre-existing') {
+          await expect(read).rejects.toMatchObject({ code: 'EEXIST' })
+          expect((await fsp.readFile(descriptorFile)).equals(foreign)).toBe(true)
+          expect(handle).toBeUndefined()
+          expect((await fsp.stat(descriptorFile)).mode & 0o777).toBe(0o400)
+        } else {
+          const expectedFailure = fault === 'close' ? closeFailure : fault === 'restrictive umask' ? readerFailure : writeFailure
+          await expect(read).rejects.toBe(expectedFailure)
+          if (fault.startsWith('partial')) expect(partialObserved).toBe(true)
+          expect(fs.existsSync(descriptorFile)).toBe(false)
+          expect(closed).toBe(true)
+          expect(descriptorMode).toBe(0o444)
+          await expect(handle!.stat()).rejects.toMatchObject({ code: 'EBADF' })
+        }
+        if (fault === 'restrictive umask') expect(docker.mock.calls.map(([, args]) => args[0])).toEqual(['create', 'rm'])
+        else expect(docker).not.toHaveBeenCalled()
+      } finally {
+        try { if (handle && !closed) await handle.close() }
+        finally { vi.restoreAllMocks() }
+      }
+    })
+})
+
 describe('Task7 existing native reader baseline binding', () => {
   it('hands the original bounded frame to the exact native reader before publishing a real SQLite graph', async () => {
     const database = path.join(fixtureRepoRoot, 'semantic-source.db')

@@ -4834,46 +4834,59 @@ export class ManagedRuntimeOwner {
     const bytes = Buffer.from(JSON.stringify(root.descriptor))
     if (bytes.length > 512 * 1024 + 16 * 1024) throw new Error('original descriptor exceeds native frame bound')
     const frame = Buffer.alloc(4 + bytes.length); frame.writeUInt32BE(bytes.length); bytes.copy(frame, 4)
-    await fsp.writeFile(descriptorFile, frame, { flag: 'wx', mode: 0o444 })
-    let failure: unknown
+    const descriptorHandle = await fsp.open(descriptorFile, 'wx', 0o444)
     try {
-      const id = (await probe(['create', '--name', name, '--user', '65534:0', '--network', 'none', '--read-only',
-        '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--memory', '256m', '--memory-swap', '256m',
-        '--cpus', '0.5', '--pids-limit', '32', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=16m',
-        '--env', 'HOME=/home/freshell/provider', '--env', 'XDG_DATA_HOME=/home/freshell/provider/.local/share',
-        '--env', 'XDG_CONFIG_HOME=/home/freshell/provider/.config', '--env', 'OPENCODE_DB=/home/freshell/provider/.local/share/opencode/opencode.db',
-        '--mount', `type=bind,source=${batch.input.hostBinaryPath},target=/runtime/freshell-session-host,readonly`,
-        '--mount', `type=bind,source=${descriptorFile},target=/run/freshell-opencode-reader.frame,readonly`,
-        '--mount', `type=volume,source=${receipt.providerVolumeName},target=/home/freshell/provider,readonly`,
-        '--mount', `type=bind,source=${batch.input.workspacePath},target=${batch.input.workspacePath},readonly`,
-        '--workdir', batch.input.cwd, '--entrypoint', 'node', this.runtime.imageRef,
-        '--no-warnings', '-e', TASK007_BATCH_STORE_PROBE,
-        '/home/freshell/provider/.local/share/opencode/opencode.db', target.rootSessionId, '/run/freshell-opencode-reader.frame', batch.input.workspacePath])).trim()
-      if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('batch graph reader returned no exact helper ID')
-      await probe(['start', id])
-      const exit = (await probe(['wait', id])).trim()
-      const output = await probe(['logs', id])
-      this.runtime.writeArtifact(`task007-installed-graph-${target.soulId}.json`, { fixtureId: batch.input.fixtureId, helperId: id, exit, output })
-      if (exit !== '0') throw new Error('batch installed graph reader refused registered root')
-      const { readable: measured, ...graph } = Task007InstalledGraphSchema.extend({ readable: Task007ReaderReceiptSchema }).parse(JSON.parse(output))
-      const readable = task007ValidateInstalledRead(root.descriptor, root.readable, measured)
-      if (readable.cwd !== batch.input.cwd || readable.home !== '/home/freshell/provider'
-        || readable.xdgDataHome !== '/home/freshell/provider/.local/share'
-        || readable.xdgConfigHome !== '/home/freshell/provider/.config'
-        || readable.opencodeDb !== '/home/freshell/provider/.local/share/opencode/opencode.db') throw new Error('fresh reader environment differs from current store')
-      if (graph.parents[target.rootSessionId] !== null || new Set(graph.history.sessions).size !== graph.history.sessions.length
-        || JSON.stringify([...graph.history.sessions].sort()) !== JSON.stringify(Object.keys(graph.parents).sort())) {
-        throw new Error('batch graph/history closure differs from registered root')
+      let writeFailed = false
+      try {
+        await descriptorHandle.chmod(0o444)
+        await descriptorHandle.writeFile(frame)
       }
-      return { ...graph, readable }
-    } catch (error) { failure = error; throw error }
-    finally {
-      try { await probe(['rm', '--force', name]) }
-      catch (cleanupError) {
-        if (failure) throw new AggregateError([failure, cleanupError], 'batch graph reader and cleanup failed')
-        throw cleanupError
-      } finally { await fsp.unlink(descriptorFile) }
-    }
+      catch (error) { writeFailed = true; throw error }
+      finally {
+        try { await descriptorHandle.close() }
+        // Preserve the original write failure if closing the same handle also fails.
+        catch (closeError) { if (!writeFailed) throw closeError }
+      }
+      let failure: unknown
+      try {
+        const id = (await probe(['create', '--name', name, '--user', '65534:0', '--network', 'none', '--read-only',
+          '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--memory', '256m', '--memory-swap', '256m',
+          '--cpus', '0.5', '--pids-limit', '32', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=16m',
+          '--env', 'HOME=/home/freshell/provider', '--env', 'XDG_DATA_HOME=/home/freshell/provider/.local/share',
+          '--env', 'XDG_CONFIG_HOME=/home/freshell/provider/.config', '--env', 'OPENCODE_DB=/home/freshell/provider/.local/share/opencode/opencode.db',
+          '--mount', `type=bind,source=${batch.input.hostBinaryPath},target=/runtime/freshell-session-host,readonly`,
+          '--mount', `type=bind,source=${descriptorFile},target=/run/freshell-opencode-reader.frame,readonly`,
+          '--mount', `type=volume,source=${receipt.providerVolumeName},target=/home/freshell/provider,readonly`,
+          '--mount', `type=bind,source=${batch.input.workspacePath},target=${batch.input.workspacePath},readonly`,
+          '--workdir', batch.input.cwd, '--entrypoint', 'node', this.runtime.imageRef,
+          '--no-warnings', '-e', TASK007_BATCH_STORE_PROBE,
+          '/home/freshell/provider/.local/share/opencode/opencode.db', target.rootSessionId, '/run/freshell-opencode-reader.frame', batch.input.workspacePath])).trim()
+        if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('batch graph reader returned no exact helper ID')
+        await probe(['start', id])
+        const exit = (await probe(['wait', id])).trim()
+        const output = await probe(['logs', id])
+        this.runtime.writeArtifact(`task007-installed-graph-${target.soulId}.json`, { fixtureId: batch.input.fixtureId, helperId: id, exit, output })
+        if (exit !== '0') throw new Error('batch installed graph reader refused registered root')
+        const { readable: measured, ...graph } = Task007InstalledGraphSchema.extend({ readable: Task007ReaderReceiptSchema }).parse(JSON.parse(output))
+        const readable = task007ValidateInstalledRead(root.descriptor, root.readable, measured)
+        if (readable.cwd !== batch.input.cwd || readable.home !== '/home/freshell/provider'
+          || readable.xdgDataHome !== '/home/freshell/provider/.local/share'
+          || readable.xdgConfigHome !== '/home/freshell/provider/.config'
+          || readable.opencodeDb !== '/home/freshell/provider/.local/share/opencode/opencode.db') throw new Error('fresh reader environment differs from current store')
+        if (graph.parents[target.rootSessionId] !== null || new Set(graph.history.sessions).size !== graph.history.sessions.length
+          || JSON.stringify([...graph.history.sessions].sort()) !== JSON.stringify(Object.keys(graph.parents).sort())) {
+          throw new Error('batch graph/history closure differs from registered root')
+        }
+        return { ...graph, readable }
+      } catch (error) { failure = error; throw error }
+      finally {
+        try { await probe(['rm', '--force', name]) }
+        catch (cleanupError) {
+          if (failure) throw new AggregateError([failure, cleanupError], 'batch graph reader and cleanup failed')
+          throw cleanupError
+        }
+      }
+    } finally { await fsp.unlink(descriptorFile) }
   }
 
   async setSyntheticStoppedRepairFault(fixtureId: string, preset: SyntheticStoppedRepairFault): Promise<{ controlEpoch: number | null }> {
