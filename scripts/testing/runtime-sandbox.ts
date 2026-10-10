@@ -626,10 +626,18 @@ const parents = () => {
     return Object.fromEntries(rows.map(row => [row.id, row.parent_id]));
   } finally { db.close(); }
 };
+let readable;
+if (process.argv[3]) {
+  const frame = require('node:fs').readFileSync(process.argv[3]);
+  if (frame.length < 5 || frame.length > 512 * 1024 + 16 * 1024 + 4 || frame.readUInt32BE(0) !== frame.length - 4) throw new Error('invalid original descriptor frame');
+  const descriptor = JSON.parse(frame.subarray(4).toString('utf8'));
+  if (descriptor.rootSessionId !== root) throw new Error('original descriptor root differs from selected graph');
+  readable = JSON.parse(execFileSync('/runtime/freshell-session-host', ['opencode-reader-probe', '--workspace-root', process.argv[4], '--expected-cwd', process.cwd(), '--provider-uid', '65534', '--provider-gid', '0'], { input: frame, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 }));
+}
 const before = parents(), digests = history();
 const exclusions = JSON.parse(execFileSync(process.execPath, ['--no-warnings', '-e', ${JSON.stringify(PROVIDER_SENTINEL_SCAN)}, database, ${JSON.stringify(JSON.stringify(EXCLUDED_SOURCE_SENTINELS))}], { encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 }));
 if (JSON.stringify(before) !== JSON.stringify(parents()) || JSON.stringify(digests) !== JSON.stringify(history()) || JSON.stringify(Object.keys(before).sort()) !== JSON.stringify([...digests.sessions].sort())) throw new Error('installed graph changed during batch read');
-process.stdout.write(JSON.stringify({ parents: before, history: digests, excludedSourceSentinels: exclusions }));
+process.stdout.write(JSON.stringify({ parents: before, history: digests, excludedSourceSentinels: exclusions, ...(readable ? { readable } : {}) }));
 `
 
 export type RuntimeHostFacts = {
@@ -1743,22 +1751,43 @@ export const SyntheticStoppedRepairBatchFactsSchema = z.object({ fixtureId: Task
     noticeIds: z.array(Task007Id), outboxEventIds: z.array(Task007Id), exportSha256: z.array(Task007Hex) }).strict(),
 }).strict()
 export type SyntheticStoppedRepairBatchFacts = z.infer<typeof SyntheticStoppedRepairBatchFactsSchema>
-// A fresh export binds its generation to the database's canonical location.
-// Keep the immutable exporter's JSON bytes: parsing/reserializing can reorder
-// fields or round integers, changing content that this comparison must preserve.
-export function task007ExpectedInstalledGeneration(manifestJson: string, canonicalDestinationDatabase: string): string {
-  if (!path.posix.isAbsolute(canonicalDestinationDatabase)
-    || path.posix.normalize(canonicalDestinationDatabase) !== canonicalDestinationDatabase) {
-    throw new Error('installed export database path is not canonical')
+// These are the existing native reader's bindings, not a second row verifier.
+const Task007ReaderReceiptSchema = z.object({ version: z.literal(1), transferId: Task007Id,
+  destinationStoreId: Task007Id, rootSessionId: Task007Id, sourceGeneration: Task007Hex,
+  targetImageRef: z.string().regex(/^sha256:[a-f0-9]{64}$/), targetBuildReceipt: Task007Hex,
+  providerUid: z.number().int().nonnegative(), providerGid: z.number().int().nonnegative(),
+  home: z.string(), xdgDataHome: z.string(), xdgConfigHome: z.string(), opencodeDb: z.string(), cwd: z.string(),
+  rowCount: z.number().int().nonnegative(), assetCount: z.number().int().nonnegative(), structuralSha256: Task007Hex,
+}).passthrough()
+const Task007DescriptorSchema = z.object({ transferId: Task007Id, sourceStoreId: Task007Hex,
+  rootSessionId: Task007Id, sourceGeneration: Task007Hex, destinationStoreId: Task007Id,
+  destinationDatabasePath: z.literal('.local/share/opencode/opencode.db'), targetImageRef: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+  targetBuildReceipt: Task007Hex, sourceSchemaFingerprint: Task007Hex, migrationJournalFingerprint: Task007Hex,
+  manifestJson: z.string().max(512 * 1024), bundleSha256: Task007Hex,
+}).passthrough()
+const Task007ReadableBaselineSchema = z.object({ destinationStoreId: Task007Id,
+  providerUid: z.number().int().nonnegative(), providerGid: z.number().int().nonnegative(),
+  rowCount: z.number().int().nonnegative(), assetCount: z.number().int().nonnegative(), structuralSha256: Task007Hex,
+  readerEnvironmentSha256: Task007Hex, bundleSha256: Task007Hex,
+}).strict()
+export function task007ValidateInstalledRead(descriptorValue: unknown, baselineValue: unknown, freshValue: unknown) {
+  const descriptor = Task007DescriptorSchema.parse(descriptorValue)
+  const baseline = Task007ReadableBaselineSchema.parse(baselineValue)
+  const fresh = Task007ReaderReceiptSchema.parse(freshValue)
+  if (baseline.destinationStoreId !== descriptor.destinationStoreId || baseline.bundleSha256 !== descriptor.bundleSha256) {
+    throw new Error('reader baseline differs from original descriptor')
   }
-  const manifest = z.object({ source_store_id: Task007Hex, generation: Task007Hex }).parse(JSON.parse(manifestJson))
-  const generationField = `"generation":"${manifest.generation}"`
-  const sourceField = `"source_store_id":"${manifest.source_store_id}"`
-  if (!manifestJson.endsWith(`${generationField}}`)
-    || manifestJson.split(sourceField).length !== 2) throw new Error('captured manifest serialization differs from exporter')
-  const cleared = manifestJson.slice(0, -generationField.length - 1) + '"generation":""}'
-  if (sha256(cleared) !== manifest.generation) throw new Error('captured manifest generation differs from immutable content')
-  return sha256(cleared.replace(sourceField, `"source_store_id":"${sha256(canonicalDestinationDatabase)}"`))
+  for (const key of ['transferId', 'destinationStoreId', 'rootSessionId', 'sourceGeneration', 'targetImageRef', 'targetBuildReceipt'] as const) {
+    if (fresh[key] !== descriptor[key]) throw new Error(`fresh reader differs from original descriptor: ${key}`)
+  }
+  for (const key of ['destinationStoreId', 'providerUid', 'providerGid', 'rowCount', 'assetCount', 'structuralSha256'] as const) {
+    if (fresh[key] !== baseline[key]) throw new Error(`fresh reader differs from original baseline: ${key}`)
+  }
+  // Match the production receipt's explicit field order (serde_json preserve_order).
+  const environment = Object.fromEntries(['providerUid', 'providerGid', 'home', 'xdgDataHome', 'xdgConfigHome', 'opencodeDb', 'cwd']
+    .map(key => [key, fresh[key]]))
+  if (sha256(JSON.stringify(environment)) !== baseline.readerEnvironmentSha256) throw new Error('fresh reader environment differs from original baseline')
+  return fresh
 }
 const Task007RepairSoulSchema = z.object({ soulId: Task007Id, providerStoreId: Task007Id,
   nativeSessionId: Task007Id.nullable(), desiredState: z.string(), recoveryState: z.string(),
@@ -1809,7 +1838,7 @@ const Task007FaultMarkersSchema = z.object({ preset: SyntheticStoppedRepairFault
   firstResumeObservationFailures: z.array(z.object({ soulId: Task007Id, incarnationId: Task007Id,
     executionGeneration: z.number().int().positive() }).strict()).max(9) }).strict()
 const Task007RepairRootSchema = z.object({ rootSessionId: Task007Id, canonicalSoulId: Task007Id, destinationStoreId: Task007Id,
-    expectedInstalledGeneration: Task007Hex, sourceSchemaFingerprint: Task007Hex, migrationJournalFingerprint: Task007Hex,
+    sourceSchemaFingerprint: Task007Hex, migrationJournalFingerprint: Task007Hex,
     sourceGeneration: Task007Id, transferId: Task007Id, rowCount: z.number().int().nonnegative(),
     assetCount: z.number().int().nonnegative(), structuralSha256: Task007Hex,
     providerUid: z.number().int().nonnegative(), providerGid: z.number().int().nonnegative(),
@@ -1827,19 +1856,31 @@ export const SyntheticStoppedRepairBatchObservationSchema = z.object({ fixtureId
   installedStores: z.array(z.object({ rootSessionId: Task007Id, providerStoreId: Task007Id,
     providerUid: z.literal(65534), providerGid: z.literal(0), providerVersion: Task007Id,
     generation: Task007Id, sourceSchemaFingerprint: Task007Id, migrationJournalFingerprint: Task007Id,
-    rowCount: z.number().int().nonnegative() }).extend(Task007InstalledGraphSchema.shape).strict()).max(7),
+    rowCount: z.number().int().nonnegative(), readable: Task007ReaderReceiptSchema }).extend(Task007InstalledGraphSchema.shape).strict()).max(7),
   nativeObservations: z.array(Task007NativeObservationSchema).max(7),
 }).strict()
 const Task007RepairRecordsSchema = SyntheticStoppedRepairBatchObservationSchema.omit({ installedStores: true, nativeObservations: true,
   activity: true, faultMarkers: true })
   .extend({ currentIncarnations: z.array(Task007CurrentIncarnationSchema).max(9),
-    roots: z.array(Task007RepairRootSchema.omit({ expectedInstalledGeneration: true,
+    roots: z.array(Task007RepairRootSchema.omit({
       sourceSchemaFingerprint: true, migrationJournalFingerprint: true }).extend({
-      sourceManifestJson: z.string(), destinationDatabasePath: z.literal('/home/freshell/provider/.local/share/opencode/opencode.db'),
-    }).strict().transform(({ sourceManifestJson, destinationDatabasePath, ...root }) => {
-      const manifest = z.object({ generation: z.literal(root.sourceGeneration),
-        source_schema_fingerprint: Task007Hex, migration_journal_fingerprint: Task007Hex }).parse(JSON.parse(sourceManifestJson))
-      return { ...root, expectedInstalledGeneration: task007ExpectedInstalledGeneration(sourceManifestJson, destinationDatabasePath),
+      descriptor: Task007DescriptorSchema, readable: Task007ReadableBaselineSchema,
+    }).strict().transform(({ descriptor, readable, ...root }) => {
+      const manifest = z.object({ generation: z.literal(root.sourceGeneration), source_store_id: z.literal(descriptor.sourceStoreId),
+        root_session_id: z.literal(root.rootSessionId), source_schema_fingerprint: z.literal(descriptor.sourceSchemaFingerprint),
+        migration_journal_fingerprint: z.literal(descriptor.migrationJournalFingerprint) }).parse(JSON.parse(descriptor.manifestJson))
+      const generationField = `"generation":"${manifest.generation}"`
+      if (!descriptor.manifestJson.endsWith(`${generationField}}`)
+        || sha256(descriptor.manifestJson.slice(0, -generationField.length - 1) + '"generation":""}') !== manifest.generation) {
+        throw new Error('captured source manifest generation differs from immutable content')
+      }
+      if (descriptor.rootSessionId !== root.rootSessionId || descriptor.destinationStoreId !== root.destinationStoreId
+        || descriptor.transferId !== root.transferId || descriptor.sourceGeneration !== root.sourceGeneration
+        || readable.rowCount !== root.rowCount || readable.assetCount !== root.assetCount
+        || readable.structuralSha256 !== root.structuralSha256 || readable.providerUid !== root.providerUid
+        || readable.providerGid !== root.providerGid || readable.readerEnvironmentSha256 !== root.readerEnvironmentSha256
+        || readable.bundleSha256 !== descriptor.bundleSha256) throw new Error('private descriptor/receipt differs from operation root')
+      return { ...root, descriptor, readable,
         sourceSchemaFingerprint: manifest.source_schema_fingerprint, migrationJournalFingerprint: manifest.migration_journal_fingerprint }
     })).max(7),
   }).strict()
@@ -1902,9 +1943,19 @@ for row in c.execute('SELECT root_session_id,canonical_soul_id,source_store_id,s
     if readable['destinationStoreId']!=expected[row['canonical_soul_id']]['providerStoreId']: raise RuntimeError('installed destination differs from selected owner')
     descriptor=imported['adoption_baseline']['descriptor']
     if descriptor['sourceStoreId']!=row['source_store_id'] or descriptor['sourceGeneration']!=row['source_generation'] or descriptor['rootSessionId']!=row['root_session_id'] or descriptor['destinationStoreId']!=readable['destinationStoreId'] or descriptor['destinationDatabasePath']!='.local/share/opencode/opencode.db': raise RuntimeError('immutable adoption descriptor differs from registered source/root/destination')
+    for key in ['transfer_id','root_session_id','destination_store_id','source_store_id','source_generation','source_schema_fingerprint','migration_journal_fingerprint','target_image_ref','target_build_receipt','bundle_sha256']:
+        camel=''.join([key.split('_')[0]]+[word.title() for word in key.split('_')[1:]])
+        if imported[key]!=descriptor[camel]: raise RuntimeError('original import receipt differs from descriptor')
+    for key in ['provider_uid','provider_gid','row_count','asset_count','structural_sha256','reader_environment_sha256','bundle_sha256']:
+        camel=''.join([key.split('_')[0]]+[word.title() for word in key.split('_')[1:]])
+        if imported[key]!=readable[camel]: raise RuntimeError('original import and readability receipts differ')
+    if imported['adoption_baseline']['manifestSha256']!=digest(descriptor['manifestJson'].encode()): raise RuntimeError('immutable baseline manifest digest differs')
+    if imported['canonical_soul_id']!=row['canonical_soul_id']: raise RuntimeError('original import canonical owner differs')
+    for key in ['identity_revision','intent_revision','native_import_revision']:
+        if imported['captured_'+key]!=row[key]: raise RuntimeError('original import captured revisions differ')
     manifest=json.loads(descriptor['manifestJson'])
     if manifest['source_store_id']!=row['source_store_id'] or manifest['root_session_id']!=row['root_session_id']: raise RuntimeError('immutable manifest differs from source/root')
-    roots.append(dict(rootSessionId=row['root_session_id'],canonicalSoulId=row['canonical_soul_id'],destinationStoreId=readable['destinationStoreId'],sourceManifestJson=descriptor['manifestJson'],destinationDatabasePath='/home/freshell/provider/'+descriptor['destinationDatabasePath'],sourceGeneration=row['source_generation'],transferId=row['transfer_id'],rowCount=readable['rowCount'],assetCount=readable['assetCount'],structuralSha256=readable['structuralSha256'],providerUid=readable['providerUid'],providerGid=readable['providerGid'],readerEnvironmentSha256=readable['readerEnvironmentSha256'],adoptionBaselineSha256=digest(json.dumps(imported['adoption_baseline'],sort_keys=True,separators=(',',':')).encode())))
+    roots.append(dict(rootSessionId=row['root_session_id'],canonicalSoulId=row['canonical_soul_id'],destinationStoreId=readable['destinationStoreId'],descriptor=descriptor,readable=readable,sourceGeneration=row['source_generation'],transferId=row['transfer_id'],rowCount=readable['rowCount'],assetCount=readable['assetCount'],structuralSha256=readable['structuralSha256'],providerUid=readable['providerUid'],providerGid=readable['providerGid'],readerEnvironmentSha256=readable['readerEnvironmentSha256'],adoptionBaselineSha256=digest(json.dumps(imported['adoption_baseline'],sort_keys=True,separators=(',',':')).encode())))
 withdrawal=c.execute('SELECT status FROM stopped_repair_withdrawals WHERE operation_id=?',(operation,)).fetchone()
 unrelated=fixture['unrelated']
 epoch=c.execute('SELECT control_epoch FROM installation WHERE singleton=1').fetchone()[0]
@@ -4643,7 +4694,7 @@ export class ManagedRuntimeOwner {
       }
     }
     if (JSON.stringify(await records()) !== JSON.stringify(initial)) throw new Error('current stopped repair records changed during independent store observation')
-    return SyntheticStoppedRepairBatchObservationSchema.parse({ ...observed, installedStores, nativeObservations,
+    return SyntheticStoppedRepairBatchObservationSchema.parse({ ...observed, roots: observed.roots.map(({ descriptor: _descriptor, readable: _readable, ...root }) => root), installedStores, nativeObservations,
       activity: await this.readTask007Activity(batch), faultMarkers: await this.readTask007FaultMarkers(currentIncarnations) })
   }
 
@@ -4718,7 +4769,7 @@ export class ManagedRuntimeOwner {
   }
 
   private async readTask007InstalledStore(batch: Task007PreparedStoppedFixture,
-    root: SyntheticStoppedRepairBatchObservation['roots'][number], view?: ManagedRuntimeView): Promise<SyntheticStoppedRepairBatchObservation['installedStores'][number]> {
+    root: z.infer<typeof Task007RepairRecordsSchema>['roots'][number], view?: ManagedRuntimeView): Promise<SyntheticStoppedRepairBatchObservation['installedStores'][number]> {
     const target = batch.output.targets.find(target => target.soulId === root.canonicalSoulId
       && target.providerStoreId === root.destinationStoreId && target.rootSessionId === root.rootSessionId)
     const receipt = target && this.runtime.broker.receipts().find(receipt => receipt.containerId === (view?.containerId ?? target.containerId)
@@ -4756,11 +4807,11 @@ export class ManagedRuntimeOwner {
         cwd: z.literal(selected.cwd), providerUid: z.literal(65534), providerGid: z.literal(0) }).strict(),
         providerVersion: Task007Id, sourceSchemaFingerprint: Task007Id, migrationJournalFingerprint: Task007Id,
         generation: Task007Id, rowCount: z.number().int().nonnegative() }).strict().parse(JSON.parse(output))
-      const graph = await this.readTask007InstalledGraph(batch, target, receipt)
+      const { readable, ...graph } = await this.readTask007InstalledGraph(batch, target, receipt, root)
       return { rootSessionId: root.rootSessionId, providerStoreId: root.destinationStoreId,
         providerUid: measured.request.providerUid, providerGid: measured.request.providerGid, providerVersion: measured.providerVersion,
         sourceSchemaFingerprint: measured.sourceSchemaFingerprint, migrationJournalFingerprint: measured.migrationJournalFingerprint,
-        generation: measured.generation, rowCount: measured.rowCount, ...graph }
+        generation: measured.generation, rowCount: measured.rowCount, readable, ...graph }
     } catch (error) { failure = error; throw error }
     finally {
       try { await probe(['rm', '--force', name]) }
@@ -4772,39 +4823,56 @@ export class ManagedRuntimeOwner {
   }
 
   private async readTask007InstalledGraph(batch: Task007PreparedStoppedFixture,
-    target: Task007FixtureOutput['targets'][number], receipt: BrokerReceipt): Promise<z.infer<typeof Task007InstalledGraphSchema>> {
+    target: Task007FixtureOutput['targets'][number], receipt: BrokerReceipt,
+    root: z.infer<typeof Task007RepairRecordsSchema>['roots'][number]): Promise<z.infer<typeof Task007InstalledGraphSchema> & { readable: z.infer<typeof Task007ReaderReceiptSchema> }> {
     const name = `freshell-history-${randomUUID()}`
     const probe = (args: string[]) => this.trackedDockerProbe(receipt.containerId, args, true)
+    if (root.descriptor.targetImageRef !== receipt.imageRef) {
+      throw new Error('original reader environment differs from current owned store')
+    }
+    const descriptorFile = path.join(receipt.runtimeDir, 'task007-reader-descriptor.frame')
+    const bytes = Buffer.from(JSON.stringify(root.descriptor))
+    if (bytes.length > 512 * 1024 + 16 * 1024) throw new Error('original descriptor exceeds native frame bound')
+    const frame = Buffer.alloc(4 + bytes.length); frame.writeUInt32BE(bytes.length); bytes.copy(frame, 4)
+    await fsp.writeFile(descriptorFile, frame, { flag: 'wx', mode: 0o444 })
     let failure: unknown
     try {
       const id = (await probe(['create', '--name', name, '--user', '65534:0', '--network', 'none', '--read-only',
         '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--memory', '256m', '--memory-swap', '256m',
         '--cpus', '0.5', '--pids-limit', '32', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=16m',
-        '--env', 'HOME=/home/freshell/provider',
+        '--env', 'HOME=/home/freshell/provider', '--env', 'XDG_DATA_HOME=/home/freshell/provider/.local/share',
+        '--env', 'XDG_CONFIG_HOME=/home/freshell/provider/.config', '--env', 'OPENCODE_DB=/home/freshell/provider/.local/share/opencode/opencode.db',
+        '--mount', `type=bind,source=${batch.input.hostBinaryPath},target=/runtime/freshell-session-host,readonly`,
+        '--mount', `type=bind,source=${descriptorFile},target=/run/freshell-opencode-reader.frame,readonly`,
         '--mount', `type=volume,source=${receipt.providerVolumeName},target=/home/freshell/provider,readonly`,
         '--mount', `type=bind,source=${batch.input.workspacePath},target=${batch.input.workspacePath},readonly`,
-        '--workdir', batch.input.workspacePath, '--entrypoint', 'node', this.runtime.imageRef,
+        '--workdir', batch.input.cwd, '--entrypoint', 'node', this.runtime.imageRef,
         '--no-warnings', '-e', TASK007_BATCH_STORE_PROBE,
-        '/home/freshell/provider/.local/share/opencode/opencode.db', target.rootSessionId])).trim()
+        '/home/freshell/provider/.local/share/opencode/opencode.db', target.rootSessionId, '/run/freshell-opencode-reader.frame', batch.input.workspacePath])).trim()
       if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('batch graph reader returned no exact helper ID')
       await probe(['start', id])
       const exit = (await probe(['wait', id])).trim()
       const output = await probe(['logs', id])
       this.runtime.writeArtifact(`task007-installed-graph-${target.soulId}.json`, { fixtureId: batch.input.fixtureId, helperId: id, exit, output })
       if (exit !== '0') throw new Error('batch installed graph reader refused registered root')
-      const graph = Task007InstalledGraphSchema.parse(JSON.parse(output))
+      const { readable: measured, ...graph } = Task007InstalledGraphSchema.extend({ readable: Task007ReaderReceiptSchema }).parse(JSON.parse(output))
+      const readable = task007ValidateInstalledRead(root.descriptor, root.readable, measured)
+      if (readable.cwd !== batch.input.cwd || readable.home !== '/home/freshell/provider'
+        || readable.xdgDataHome !== '/home/freshell/provider/.local/share'
+        || readable.xdgConfigHome !== '/home/freshell/provider/.config'
+        || readable.opencodeDb !== '/home/freshell/provider/.local/share/opencode/opencode.db') throw new Error('fresh reader environment differs from current store')
       if (graph.parents[target.rootSessionId] !== null || new Set(graph.history.sessions).size !== graph.history.sessions.length
         || JSON.stringify([...graph.history.sessions].sort()) !== JSON.stringify(Object.keys(graph.parents).sort())) {
         throw new Error('batch graph/history closure differs from registered root')
       }
-      return graph
+      return { ...graph, readable }
     } catch (error) { failure = error; throw error }
     finally {
       try { await probe(['rm', '--force', name]) }
       catch (cleanupError) {
         if (failure) throw new AggregateError([failure, cleanupError], 'batch graph reader and cleanup failed')
         throw cleanupError
-      }
+      } finally { await fsp.unlink(descriptorFile) }
     }
   }
 

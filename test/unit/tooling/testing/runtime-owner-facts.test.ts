@@ -1,3 +1,4 @@
+import { runInNewContext } from 'node:vm'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as owner from '../../../../scripts/testing/runtime-sandbox.js'
 import * as external from '../../../../scripts/testing/runtime-external-browser.js'
@@ -182,30 +183,75 @@ try{await runTask007DestructiveSandbox(${JSON.stringify(fixtureRepoRoot)})}catch
   }, 90_000)
 })
 
-describe('Task7 installed export generation comparison', () => {
-  function manifestJson() {
-    // Preserve exporter field ordering and its exact large integer bytes.
-    const empty = '{"version":1,"source_store_id":"' + 'a'.repeat(64)
-      + '","row_count":1,"rows":[{"table":"session","sha256":"' + 'b'.repeat(64)
-      + '"}],"sqlite_version":"3.45.0","payload_bytes":9007199254740993,"generation":""}'
-    return empty.replace('"generation":""', '"generation":"' + createHash('sha256').update(empty).digest('hex') + '"')
-  }
-  it('compares destination exports using captured bytes without changing original source authority', () => {
-    const original = manifestJson()
-    const database = '/home/freshell/provider/.local/share/opencode/opencode.db'
-    const cleared = original.replace(/"generation":"[a-f0-9]{64}"/, '"generation":""')
-    const relocated = cleared.replace('"source_store_id":"' + 'a'.repeat(64) + '"',
-      '"source_store_id":"' + createHash('sha256').update(database).digest('hex') + '"')
-    const expected = createHash('sha256').update(relocated).digest('hex')
-    expect(owner.task007ExpectedInstalledGeneration(original, database)).toBe(expected)
-    expect(original).toBe(manifestJson())
-    expect(owner.task007ExpectedInstalledGeneration(original, database)).not.toBe(JSON.parse(original).generation)
+describe('Task7 existing native reader baseline binding', () => {
+  it('hands the original bounded frame to the exact native reader before publishing a real SQLite graph', async () => {
+    const database = path.join(fixtureRepoRoot, 'semantic-source.db')
+    const source = owner.seedManagedOpenCodeSource({ repoRoot: fixtureRepoRoot, databasePath: database,
+      workspace: fixtureRepoRoot, nonce: 'fictional-semantic-transport' })
+    const frameFile = path.join(fixtureRepoRoot, 'reader.frame')
+    const descriptor = { rootSessionId: source.rootId, manifestJson: 'fictional immutable descriptor metadata' }
+    const bytes = Buffer.from(JSON.stringify(descriptor)), frame = Buffer.alloc(bytes.length + 4)
+    frame.writeUInt32BE(bytes.length); bytes.copy(frame, 4)
+    await fsp.writeFile(frameFile, frame)
+    const native = vi.fn((file: string, args: string[], options: { input: Buffer }) => {
+      expect(file).toBe('/runtime/freshell-session-host')
+      expect(args).toEqual(['opencode-reader-probe', '--workspace-root', fixtureRepoRoot,
+        '--expected-cwd', fixtureRepoRoot, '--provider-uid', '65534', '--provider-gid', '0'])
+      expect(options.input.equals(frame)).toBe(true)
+      return JSON.stringify({ rootSessionId: source.rootId, sourceGeneration: 'original' })
+    })
+    const execute = (root = source.rootId) => {
+      let output = ''
+      runInNewContext(owner.TASK007_BATCH_STORE_PROBE, { Buffer,
+        process: { execPath: process.execPath, argv: ['node', database, root, frameFile, fixtureRepoRoot],
+          cwd: () => fixtureRepoRoot, stdout: { write: (bytes: string) => { output += bytes } } },
+        require: (name: string) => name === 'node:child_process' ? {
+          execFileSync: (file: string, args: string[], options: { input: Buffer }) => file === '/runtime/freshell-session-host'
+            ? native(file, args, options) : execFileSync(file, args, options),
+        } : createRequire(import.meta.url)(name),
+      })
+      return JSON.parse(output)
+    }
+    const actual = execute()
+    expect(native).toHaveBeenCalledOnce()
+    expect(actual.readable.rootSessionId).toBe(source.rootId)
+    expect(actual.history.messages).toEqual(Object.fromEntries(source.baselineMessages))
+    expect(actual.parents).toEqual({ [source.rootId]: null, [source.childId]: source.rootId, [source.grandchildId]: source.childId })
+    expect(() => execute('ses_foreign')).toThrow(/root differs/)
+    for (const invalid of [frame.subarray(0, 3), Buffer.concat([frame, Buffer.from([0])])]) {
+      await fsp.writeFile(frameFile, invalid)
+      expect(() => execute()).toThrow(/frame/)
+    }
+    expect(native).toHaveBeenCalledOnce()
   })
-  it('refuses a changed captured manifest and a noncanonical destination', () => {
-    expect(() => owner.task007ExpectedInstalledGeneration(manifestJson().replace('3.45.0', 'changed'), '/dest.db'))
-      .toThrow(/generation|manifest/)
-    expect(() => owner.task007ExpectedInstalledGeneration(manifestJson(), '/home/provider/../dest.db'))
-      .toThrow(/canonical/)
+
+  const descriptor = { transferId: 'transfer-current', sourceStoreId: 'a'.repeat(64), sourceGeneration: 'b'.repeat(64),
+    rootSessionId: 'ses_current', destinationStoreId: 'store-current', destinationDatabasePath: '.local/share/opencode/opencode.db',
+    targetImageRef: `sha256:${'c'.repeat(64)}`, targetBuildReceipt: 'd'.repeat(64), bundleSha256: 'e'.repeat(64),
+    sourceSchemaFingerprint: '1'.repeat(64), migrationJournalFingerprint: '2'.repeat(64), manifestJson: '{}' }
+  const environment = { providerUid: 65534, providerGid: 0, home: '/home/freshell/provider',
+    xdgDataHome: '/home/freshell/provider/.local/share', xdgConfigHome: '/home/freshell/provider/.config',
+    opencodeDb: '/home/freshell/provider/.local/share/opencode/opencode.db', cwd: '/workspace' }
+  const readable = { version: 1, transferId: descriptor.transferId, destinationStoreId: descriptor.destinationStoreId,
+    rootSessionId: descriptor.rootSessionId, sourceGeneration: descriptor.sourceGeneration, targetImageRef: descriptor.targetImageRef,
+    targetBuildReceipt: descriptor.targetBuildReceipt, ...environment, rowCount: 332, assetCount: 0, structuralSha256: 'f'.repeat(64) }
+  const baseline = { destinationStoreId: readable.destinationStoreId, providerUid: readable.providerUid, providerGid: readable.providerGid,
+    rowCount: readable.rowCount, assetCount: readable.assetCount, structuralSha256: readable.structuralSha256,
+    bundleSha256: descriptor.bundleSha256, readerEnvironmentSha256: createHash('sha256').update(JSON.stringify(environment)).digest('hex') }
+  it('accepts a fresh reader of the original baseline and refuses foreign, stale or absent evidence', () => {
+    expect(owner.task007ValidateInstalledRead(descriptor, baseline, readable)).toEqual(readable)
+    for (const [key, value] of Object.entries({ transferId: 'foreign', destinationStoreId: 'foreign', rootSessionId: 'ses_foreign',
+      sourceGeneration: '0'.repeat(64), targetImageRef: `sha256:${'0'.repeat(64)}`, targetBuildReceipt: '0'.repeat(64),
+      providerUid: 0, providerGid: 1, rowCount: 331, assetCount: 1, structuralSha256: '0'.repeat(64), cwd: '/foreign',
+      home: '/foreign', xdgDataHome: '/foreign', xdgConfigHome: '/foreign', opencodeDb: '/foreign' })) {
+      expect(() => owner.task007ValidateInstalledRead(descriptor, baseline, { ...readable, [key]: value })).toThrow()
+    }
+    for (const missing of [undefined, {}]) {
+      expect(() => owner.task007ValidateInstalledRead(missing, baseline, readable)).toThrow()
+      expect(() => owner.task007ValidateInstalledRead(descriptor, missing, readable)).toThrow()
+      expect(() => owner.task007ValidateInstalledRead(descriptor, baseline, missing)).toThrow()
+    }
+    expect(() => owner.task007ValidateInstalledRead(descriptor, { ...baseline, bundleSha256: '0'.repeat(64) }, readable)).toThrow()
   })
 })
 
@@ -1376,15 +1422,27 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
       db.prepare('INSERT INTO runtime_notices VALUES(?)').run('notice-unrelated')
       db.prepare('INSERT INTO outbox VALUES(?)').run('event-unrelated')
       const root = batch.output.targets[0]
+      const descriptor = { transferId: 'transfer-current', sourceStoreId: facts.sourceStoreId,
+        sourceGeneration: capturedManifest.generation, rootSessionId: root.rootSessionId, destinationStoreId: root.providerStoreId,
+        destinationDatabasePath: '.local/share/opencode/opencode.db', manifestJson: capturedManifestJson,
+        targetImageRef: batch.input.imageRef, targetBuildReceipt: 'c'.repeat(64), bundleSha256: 'd'.repeat(64),
+        sourceSchemaFingerprint: capturedManifest.source_schema_fingerprint, migrationJournalFingerprint: capturedManifest.migration_journal_fingerprint }
+      const environment = { providerUid: 65534, providerGid: 0, home: '/home/freshell/provider',
+        xdgDataHome: '/home/freshell/provider/.local/share', xdgConfigHome: '/home/freshell/provider/.config',
+        opencodeDb: '/home/freshell/provider/.local/share/opencode/opencode.db', cwd: batch.input.cwd }
+      const readable = { destinationStoreId: root.providerStoreId, rowCount: 318, assetCount: 0, structuralSha256: 'a'.repeat(64),
+        providerUid: 65534, providerGid: 0, bundleSha256: descriptor.bundleSha256,
+        readerEnvironmentSha256: createHash('sha256').update(JSON.stringify(environment)).digest('hex') }
+      const fresh = { version: 1, transferId: descriptor.transferId, destinationStoreId: descriptor.destinationStoreId,
+        rootSessionId: descriptor.rootSessionId, sourceGeneration: descriptor.sourceGeneration, targetImageRef: descriptor.targetImageRef,
+        targetBuildReceipt: descriptor.targetBuildReceipt, ...environment, rowCount: 318, assetCount: 0, structuralSha256: readable.structuralSha256 }
+      const imported = { canonical_soul_id: root.soulId, captured_identity_revision: 1, captured_intent_revision: 1,
+        captured_native_import_revision: 1, ...Object.fromEntries(Object.entries({ ...descriptor, ...readable }).filter(([key]) => key !== 'manifestJson')
+        .map(([key, value]) => [key.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`), value])) }
       db.prepare('INSERT INTO stopped_repair_root_receipts VALUES(?,?,?,?,?,?,?,?,?,?,?)').run('repair-current', root.rootSessionId, root.soulId,
-        capturedManifest.generation, 'transfer-current', JSON.stringify({ adoption_baseline: {
-          manifestSha256: createHash('sha256').update(capturedManifestJson).digest('hex'),
-          descriptor: { manifestJson: capturedManifestJson, sourceStoreId: facts.sourceStoreId,
-            sourceGeneration: capturedManifest.generation, rootSessionId: root.rootSessionId,
-            destinationStoreId: root.providerStoreId, destinationDatabasePath: '.local/share/opencode/opencode.db' },
-        } }),
-        JSON.stringify({ destinationStoreId: root.providerStoreId, rowCount: 318, assetCount: 0, structuralSha256: 'a'.repeat(64),
-          providerUid: 65534, providerGid: 0, readerEnvironmentSha256: 'b'.repeat(64) }), facts.sourceStoreId, 1, 1, 1)
+        capturedManifest.generation, descriptor.transferId, JSON.stringify({ ...imported, adoption_baseline: {
+          manifestSha256: createHash('sha256').update(capturedManifestJson).digest('hex'), descriptor,
+        } }), JSON.stringify(readable), facts.sourceStoreId, 1, 1, 1)
       db.close()
       await fsp.mkdir(path.join(batch.registryRoot, 'incidents'))
       await fsp.writeFile(path.join(batch.registryRoot, 'incidents/incident-9.closed.json'), 'unchanged unrelated artifact')
@@ -1418,7 +1476,10 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
       await fsp.writeFile(inspection, JSON.stringify([{ Id: root.containerId, State: { Running: false } }]))
       const installedDatabase = path.join(batch.outputDir, 'installed.db')
       await fsp.copyFile(batch.sourceDatabaseFile, installedDatabase)
-      await fsp.writeFile(probeScript, `const fs=require('node:fs'),args=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');if(args[0]==='inspect')process.stdout.write(fs.readFileSync(${JSON.stringify(inspection)}));else if(args[0]==='create'){fs.writeFileSync(${JSON.stringify(selected)},JSON.stringify(args));process.stdout.write('${'d'.repeat(64)}')}else if(args[0]==='wait')process.stdout.write('0');else if(args[0]==='logs'){const saved=JSON.parse(fs.readFileSync(${JSON.stringify(selected)}));if(saved[saved.indexOf('--entrypoint')+1]==='node')process.stdout.write(require('node:child_process').execFileSync(process.execPath,['--no-warnings','-e',saved.at(-3),${JSON.stringify(installedDatabase)},saved.at(-1)],{encoding:'utf8'}));else process.stdout.write(JSON.stringify({request:JSON.parse(saved.at(-1)),providerVersion:'1.18.21',sourceSchemaFingerprint:'schema-current',migrationJournalFingerprint:'migration-current',generation:'generation-current',rowCount:318}));}else if(!['start','rm'].includes(args[0]))process.exit(4);\n`)
+      await fsp.mkdir(root.runtimeDir, { recursive: true })
+      const freshFile = path.join(batch.outputDir, 'fresh-reader.json')
+      await fsp.writeFile(freshFile, JSON.stringify(fresh))
+      await fsp.writeFile(probeScript, `const fs=require('node:fs'),args=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');if(args[0]==='inspect')process.stdout.write(fs.readFileSync(${JSON.stringify(inspection)}));else if(args[0]==='create'){fs.writeFileSync(${JSON.stringify(selected)},JSON.stringify(args));process.stdout.write('${'d'.repeat(64)}')}else if(args[0]==='wait')process.stdout.write('0');else if(args[0]==='logs'){const saved=JSON.parse(fs.readFileSync(${JSON.stringify(selected)}));if(saved[saved.indexOf('--entrypoint')+1]==='node'){const frame=fs.readFileSync(${JSON.stringify(path.join(root.runtimeDir, 'task007-reader-descriptor.frame'))});if(frame.readUInt32BE(0)!==frame.length-4||JSON.parse(frame.subarray(4)).rootSessionId!==saved.at(-3))throw Error('wrong frame');const graph=JSON.parse(require('node:child_process').execFileSync(process.execPath,['--no-warnings','-e',saved.at(-5),${JSON.stringify(installedDatabase)},saved.at(-3)],{encoding:'utf8'}));process.stdout.write(JSON.stringify({...graph,readable:JSON.parse(fs.readFileSync(${JSON.stringify(freshFile)}))}));}else process.stdout.write(JSON.stringify({request:JSON.parse(saved.at(-1)),providerVersion:'1.18.21',sourceSchemaFingerprint:'schema-current',migrationJournalFingerprint:'migration-current',generation:'generation-current',rowCount:318}));}else if(!['start','rm'].includes(args[0]))process.exit(4);\n`)
       const read = vi.spyOn(Object.getPrototypeOf(rig), 'trackedDockerProbe').mockImplementation(async (_container: string, args: string[]) => new Promise<string>((resolve, reject) => {
         execFile(process.execPath, [probeScript, ...args], { encoding: 'utf8' }, (error, stdout) => error ? reject(error) : resolve(stdout))
       }))
@@ -1430,14 +1491,15 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
       expect(observed.souls.every(soul => soul.activeWriters === 0 && !soul.incidentPresent)).toBe(true)
       expect(observed.roots[0]).toMatchObject({ rootSessionId: root.rootSessionId, providerUid: 65534, rowCount: 318,
         sourceGeneration: capturedManifest.generation,
-        expectedInstalledGeneration: owner.task007ExpectedInstalledGeneration(capturedManifestJson, '/home/freshell/provider/.local/share/opencode/opencode.db'),
         sourceSchemaFingerprint: capturedManifest.source_schema_fingerprint,
         migrationJournalFingerprint: capturedManifest.migration_journal_fingerprint })
       expect(observed.roots[0]).not.toHaveProperty('sourceManifestJson')
+      expect(observed.roots[0]).not.toHaveProperty('descriptor')
+      expect(observed.roots[0]).not.toHaveProperty('readable')
       expect(observed.roots[0]).not.toHaveProperty('destinationDatabasePath')
       expect(observed.installedStores.map(({ parents, history, excludedSourceSentinels, ...measured }) => measured)).toEqual([{ rootSessionId: root.rootSessionId, providerStoreId: root.providerStoreId,
         providerUid: 65534, providerGid: 0, providerVersion: '1.18.21', sourceSchemaFingerprint: 'schema-current',
-        migrationJournalFingerprint: 'migration-current', generation: 'generation-current', rowCount: 318 }])
+        migrationJournalFingerprint: 'migration-current', generation: 'generation-current', rowCount: 318, readable: fresh }])
       expect(observed.installedStores[0]).toHaveProperty('parents', {
         [batch.source.families[0].rootId]: null,
         [batch.source.families[0].childId]: batch.source.families[0].rootId,
@@ -1452,6 +1514,26 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
       expect(actual[1]).toContain('retained-opencode-store-worker')
       expect(actual[1]).toContain(`type=volume,source=${root.providerVolumeName},target=/home/freshell/provider,readonly`)
       expect(actual.at(-1)?.slice(0, 2)).toEqual(['rm', '--force'])
+      expect(fs.existsSync(path.join(root.runtimeDir, 'task007-reader-descriptor.frame'))).toBe(false)
+      await fsp.writeFile(freshFile, JSON.stringify({ ...fresh, sourceGeneration: '0'.repeat(64) }))
+      await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/original descriptor/)
+      expect(fs.existsSync(path.join(root.runtimeDir, 'task007-reader-descriptor.frame'))).toBe(false)
+      await fsp.writeFile(freshFile, JSON.stringify(fresh))
+      const originalImport = JSON.stringify({ ...imported, adoption_baseline: {
+        manifestSha256: createHash('sha256').update(capturedManifestJson).digest('hex'), descriptor } })
+      for (const badDescriptor of [undefined, { ...descriptor, sourceGeneration: '0'.repeat(64) },
+        { ...descriptor, rootSessionId: 'ses_foreign' }, { ...descriptor, destinationStoreId: 'foreign' },
+        { ...descriptor, targetImageRef: `sha256:${'0'.repeat(64)}` }]) {
+        const changed = new DatabaseSync(database)
+        changed.prepare('UPDATE stopped_repair_root_receipts SET import_receipt_json=? WHERE operation_id=?')
+          .run(JSON.stringify({ ...imported, adoption_baseline: { descriptor: badDescriptor,
+            manifestSha256: createHash('sha256').update(capturedManifestJson).digest('hex') } }), 'repair-current')
+        changed.close()
+        await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow()
+      }
+      const restored = new DatabaseSync(database)
+      restored.prepare('UPDATE stopped_repair_root_receipts SET import_receipt_json=? WHERE operation_id=?').run(originalImport, 'repair-current')
+      restored.close()
       expect(observed.unrelated).toEqual({ incidentPresent: true, viewPresent: true, noticeIds: ['notice-unrelated'],
         outboxEventIds: ['event-unrelated'], exportSha256: [createHash('sha256').update('unchanged unrelated artifact').digest('hex')] })
       if (attempt === 'blocked stopped' || attempt === 'stopped readonly WAL') {

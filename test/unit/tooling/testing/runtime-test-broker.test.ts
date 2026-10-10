@@ -242,6 +242,54 @@ function batchStoreHelperBody() {
       { Type: 'bind', Source: '/workspace', Target: '/workspace', ReadOnly: true }] } }
 }
 
+function semanticBatchStoreHelperBody() {
+  const body = batchStoreHelperBody()
+  body.Cmd.push('/run/freshell-opencode-reader.frame', '/workspace')
+  body.Env.push('XDG_DATA_HOME=/home/freshell/provider/.local/share', 'XDG_CONFIG_HOME=/home/freshell/provider/.config',
+    'OPENCODE_DB=/home/freshell/provider/.local/share/opencode/opencode.db')
+  body.HostConfig.Mounts.push(
+    { Type: 'bind', Source: '/tmp/owned/freshell-session-host', Target: '/runtime/freshell-session-host', ReadOnly: true },
+    { Type: 'bind', Source: `${runtimeDir}/task007-reader-descriptor.frame`, Target: '/run/freshell-opencode-reader.frame', ReadOnly: true })
+  return body
+}
+it('routes only the exact owner-bound immutable descriptor reader and refuses wider transport', async () => {
+  await withHttpBroker(async ({ request, forwarded }) => {
+    const original = { ...JSON.parse(createBody([...ordinaryBinds, actorBind]).toString()), Image: `sha256:${'b'.repeat(64)}` }
+    expect((await request('POST', '/v1.47/containers/create?name=owned-runtime', original)).status).toBe(201)
+    const mutations = [
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.Image = 'sha256:other-approved-image' },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.User = '0:0' },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.User = '65534:1' },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.Cmd[4] = '../foreign' },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.Cmd[5] = '/foreign.frame' },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.Cmd.push('extra') },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.Cmd[2] += ';process.exit(0)' },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.HostConfig.Mounts[0].Source = 'foreign-volume' },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.HostConfig.Mounts[0].ReadOnly = false },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.HostConfig.Mounts[2].Source = '/tmp/owned/other-approved-host' },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.HostConfig.Mounts[3].Source = '/tmp/owned/r/foreign/task007-reader-descriptor.frame' },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.HostConfig.Mounts[3].ReadOnly = false },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.HostConfig.Mounts.push({Type:'bind',Source:'/foreign',Target:'/foreign',ReadOnly:true}) },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.Env.push('TOKEN=foreign') },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.WorkingDir = '/foreign' },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { b.Cmd[6] = '/foreign' },
+      (b: ReturnType<typeof semanticBatchStoreHelperBody>) => { Object.assign(b, { Cmd: [...b.Cmd.slice(0, 6), {}] }) },
+    ]
+    for (const mutate of mutations) {
+      const body = semanticBatchStoreHelperBody(); mutate(body)
+      const before = forwarded.length
+      expect((await request('POST', `/v1.47/containers/create?name=${helperName}`, body)).status).toBe(403)
+      expect(forwarded).toHaveLength(before)
+    }
+    expect((await request('POST', `/v1.47/containers/create?name=${helperName}`, semanticBatchStoreHelperBody())).status).toBe(201)
+    expect((await request('POST', `/v1.47/containers/${helperId}/attach?stdin=1&stream=1`)).status).toBe(403)
+    expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(204)
+    expect((await request('POST', `/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
+    expect((await request('GET', `/v1.47/containers/${helperId}/logs?stdout=1&stderr=1`)).status).toBe(200)
+    expect((await request('DELETE', `/v1.47/containers/${helperName}?force=1`)).status).toBe(204)
+  })
+})
+
 it('tracks the fixed batch Node reader and refuses every altered capability before forwarding', async () => {
   await withHttpBroker(async ({ request, forwarded, broker }) => {
     const original = { ...JSON.parse(createBody([...ordinaryBinds, actorBind]).toString()), Image: `sha256:${'b'.repeat(64)}` }
