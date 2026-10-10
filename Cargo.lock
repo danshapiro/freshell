@@ -1393,6 +1393,7 @@ name = "freshell-ownership"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "tokio",
  "tracing",
 ]
 

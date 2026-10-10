@@ -1179,6 +1179,8 @@ mod tests {
                     live_session_key: None,
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 }
             ),
             freshell_ownership::CommitOutcome::Committed
@@ -1557,6 +1559,8 @@ mod tests {
                     live_session_key: None,
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 },
             ),
             freshell_ownership::CommitOutcome::Committed,

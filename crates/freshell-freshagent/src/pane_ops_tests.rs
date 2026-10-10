@@ -1102,6 +1102,8 @@ fn task10_seed_live_owner(
             live_session_key: Some("task10-live-key".to_string()),
             pid: None,
             ownership_id: None,
+            unit_id: None,
+            hold: freshell_ownership::HoldKind::Main,
         },
     );
     generation
@@ -1820,6 +1822,8 @@ async fn attach_pane_against_a_dead_terminal_answers_typed_restore_unavailable()
                 live_session_key: None,
                 pid: None,
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             },
         ),
         freshell_ownership::CommitOutcome::Committed
@@ -1923,6 +1927,8 @@ async fn attach_pane_for_a_rekeyed_session_resolves_the_canonical_owner() {
                 live_session_key: Some("task10-live-key".to_string()),
                 pid: None,
                 ownership_id: Some("op-task10".to_string()),
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             },
             "test-rekey",
             "op-rekey-r7",

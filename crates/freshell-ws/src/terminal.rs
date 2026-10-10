@@ -1507,6 +1507,8 @@ async fn handle_client_text(
                         live_session_key: None,
                         pid: None,
                         ownership_id: None,
+                        unit_id: None,
+                        hold: freshell_ownership::HoldKind::Main,
                     };
                     // The pair: the request's observed pair when fenced;
                     // else the precheck-window observation (the adopt
@@ -4765,6 +4767,8 @@ pub(crate) async fn handle_create(
                                 live_session_key: None,
                                 pid: None,
                                 ownership_id: None,
+                                unit_id: None,
+                                hold: freshell_ownership::HoldKind::Main,
                             },
                         );
                     }
@@ -4807,6 +4811,8 @@ pub(crate) async fn handle_create(
                         live_session_key: None,
                         pid: None,
                         ownership_id: None,
+                        unit_id: None,
+                        hold: freshell_ownership::HoldKind::Main,
                     };
                     let adopt_fence = match observed {
                         Some(fence) => fence,
@@ -5735,6 +5741,8 @@ pub(crate) async fn handle_create(
                                 live_session_key: None,
                                 pid: None,
                                 ownership_id: None,
+                                unit_id: None,
+                                hold: freshell_ownership::HoldKind::Main,
                             },
                         );
                     }
@@ -6619,6 +6627,8 @@ pub(crate) async fn handle_create(
                 live_session_key: None,
                 pid: state.registry.pid_of(&terminal_id),
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             },
         );
     }
@@ -9676,6 +9686,8 @@ async fn handle_kill(
                 live_session_key: None,
                 pid: retained.pid,
                 ownership_id: Some(retained.operation_id.clone()),
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             }),
             observed,
         };
@@ -9735,6 +9747,13 @@ async fn handle_kill(
             } => None,
             freshell_ownership::StopOutcome::NotLive { state } => Some(format!(
                 "a lifecycle operation is in flight for this session ({state:?}); retry after it settles"
+            )),
+            // A stop is already in flight: refused exactly as the in-flight
+            // `NotLive{Stopping}` answer was (terminal units join the
+            // in-flight stop through the unit lifecycle from Task 12 on).
+            freshell_ownership::StopOutcome::AlreadyStopping { operation_id, .. } => Some(format!(
+                "a lifecycle operation is in flight for this session (Stopping under \
+                 {operation_id}); retry after it settles"
             )),
             freshell_ownership::StopOutcome::BlockedHandoff { .. } => Some(
                 "a handoff owns this session's transition; retry after it settles".to_string(),

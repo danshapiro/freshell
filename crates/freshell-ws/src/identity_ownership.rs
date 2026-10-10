@@ -193,6 +193,8 @@ pub(crate) async fn coordinator_begin_identity(
                         live_session_key: None,
                         pid: None,
                         ownership_id: None,
+                        unit_id: None,
+                        hold: freshell_ownership::HoldKind::Main,
                     };
                     match ownership.begin_adopt_guard(
                         provider,
@@ -950,6 +952,8 @@ mod tests {
                     live_session_key: None,
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 },
             ),
             freshell_ownership::CommitOutcome::Committed
@@ -983,6 +987,8 @@ mod tests {
                     live_session_key: Some("k-r39-race".to_string()),
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 },
             ),
             freshell_ownership::CommitOutcome::Committed

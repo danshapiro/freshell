@@ -5684,6 +5684,8 @@ mod stale_start_watchdog_tests {
                 live_session_key: None,
                 pid: Some(dead_pid),
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             },
         );
         // The operation COMPLETES: the guard's Drop fires the settle.
@@ -5772,6 +5774,8 @@ mod stale_start_watchdog_tests {
                 live_session_key: None,
                 pid: Some(live_pid),
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             },
         );
         // The operation COMPLETES (the settle fires) — only the runtime
@@ -5860,6 +5864,8 @@ mod stale_start_watchdog_tests {
                 live_session_key: Some("sid-stale".into()),
                 pid: None,
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             },
         );
         // The r20 contract: the settle must FIRE before the sweep converts
@@ -6047,6 +6053,8 @@ mod stale_start_watchdog_tests {
                 live_session_key: Some("sid-stale".into()),
                 pid: Some(live_pid),
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             },
         );
         let _ = recover_one(&states, std::time::Duration::from_millis(50)).await;
@@ -6106,6 +6114,8 @@ mod stale_start_watchdog_tests {
                 live_session_key: Some("sid-stale".into()),
                 pid: Some(exited_pid),
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             },
         );
         states2
@@ -6175,6 +6185,8 @@ mod stale_start_watchdog_tests {
             live_session_key: Some("rk-map-key".into()),
             pid: Some(4242),
             ownership_id: None,
+            unit_id: None,
+            hold: freshell_ownership::HoldKind::Main,
         };
         assert!(matches!(
             states_rk
@@ -6194,6 +6206,8 @@ mod stale_start_watchdog_tests {
                     live_session_key: Some("rk-map-key".into()),
                     pid: Some(4242),
                     ownership_id: Some("rekey-op-schema".into()),
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 },
                 "test-rekey",
                 "rekey-op-schema",
@@ -6340,6 +6354,8 @@ mod stale_start_watchdog_tests {
                     live_session_key: Some("sid-stale".into()),
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 },
             ),
             freshell_ownership::CommitOutcome::Committed
@@ -6529,6 +6545,8 @@ mod stale_start_watchdog_tests {
                 live_session_key: None,
                 pid: None,
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             },
         );
         // The settle fires BEFORE the sweep (the r20 contract: the flag
@@ -6644,6 +6662,8 @@ mod stale_start_watchdog_tests {
                 live_session_key: None,
                 pid: None,
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             },
         );
         // b8ke r22 follow-up (the r20 F1 contract): the settle must FIRE
@@ -6796,6 +6816,8 @@ mod stale_start_watchdog_tests {
                 live_session_key: None,
                 pid: Some(prior_pid),
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             },
         );
         let recs = states.0.recover_stale_starts(0, 0);
@@ -6934,6 +6956,8 @@ mod stale_start_watchdog_tests {
                 live_session_key: None,
                 pid: None,
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             },
         );
         // The settle fires BEFORE the sweep (the r20 contract).
@@ -7008,6 +7032,8 @@ mod stale_start_watchdog_tests {
                     live_session_key: Some("sid-stale".into()),
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 },
             ),
             freshell_ownership::CommitOutcome::Committed
@@ -7265,6 +7291,8 @@ mod stale_start_watchdog_tests {
                 live_session_key: Some("sid-stale".into()),
                 pid: Some(live_pid),
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             },
         );
         let _ = recover_one(&states, std::time::Duration::from_millis(50)).await;
@@ -7333,6 +7361,8 @@ mod stale_start_watchdog_tests {
                 live_session_key: Some("sid-stale".into()),
                 pid: Some(reaped_pid),
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             },
         );
         drop(guard);
@@ -7455,6 +7485,8 @@ mod stale_start_watchdog_tests {
                 live_session_key: Some("sid-stale-alive".into()),
                 pid: Some(alive_pid),
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             },
         );
         drop(guard);
@@ -7561,6 +7593,8 @@ mod stale_start_watchdog_tests {
                 live_session_key: Some("sid-stale".into()),
                 pid: Some(reaped_pid),
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             },
         );
         states
@@ -7637,6 +7671,8 @@ mod stale_start_watchdog_tests {
                 live_session_key: Some("sid-stale".into()),
                 pid: Some(exited_pid),
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             },
         );
         let recs = states.0.recover_stale_starts(0, 0);
@@ -7691,6 +7727,8 @@ mod stale_start_watchdog_tests {
                 live_session_key: Some("sid-stale".into()),
                 pid: Some(live_pid),
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             },
         );
         let recs2 = states2.0.recover_stale_starts(0, 0);

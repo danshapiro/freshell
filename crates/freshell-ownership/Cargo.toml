@@ -21,3 +21,9 @@ serde = { workspace = true }
 # (crates/freshell-server/src/logging.rs); this crate stays tokio-free (std
 # `sync::Mutex` only) and never installs its own subscriber.
 tracing = "0.1"
+
+[dev-dependencies]
+# `#[tokio::test]` + `tokio::time::timeout` in the unit-scope tests only;
+# the production crate stays tokio-free (wait_settled is a plain Future
+# woken by the registry's own lock scopes).
+tokio = { version = "1", features = ["rt", "macros", "time"] }

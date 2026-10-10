@@ -1196,6 +1196,8 @@ mod tests {
                 live_session_key: None,
                 pid: Some(40_000),
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             }
         }
 
@@ -1206,6 +1208,8 @@ mod tests {
                 live_session_key: Some("fake-claude-session-x".into()),
                 pid: Some(41_000),
                 ownership_id: Some("own-x".into()),
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             }
         }
 

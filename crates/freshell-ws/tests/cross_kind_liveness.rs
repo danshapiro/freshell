@@ -2509,6 +2509,8 @@ async fn ready_frame_replays_a_fenced_key_with_its_typed_reason() {
         live_session_key: None,
         pid: None,
         ownership_id: None,
+        unit_id: None,
+        hold: freshell_ownership::HoldKind::Main,
     };
     assert_eq!(
         ownership.commit_live("claude", &sid, "op-fenced-replay-prior", generation, prior,),
@@ -2624,6 +2626,8 @@ async fn same_kind_adopt_death_acquire_settle_commits_the_surviving_terminal() {
         live_session_key: None,
         pid: None,
         ownership_id: None,
+        unit_id: None,
+        hold: freshell_ownership::HoldKind::Main,
     };
     assert_eq!(
         ownership.commit_live("claude", &sid, phantom_op, generation, phantom.clone()),
@@ -2751,6 +2755,8 @@ async fn a_mid_window_competitor_is_deferred_and_the_guarded_create_completes() 
         live_session_key: None,
         pid: None,
         ownership_id: None,
+        unit_id: None,
+        hold: freshell_ownership::HoldKind::Main,
     };
     assert_eq!(
         ownership.commit_live("claude", &sid, phantom_op, generation, phantom.clone()),
@@ -2924,6 +2930,8 @@ async fn bound_elsewhere_attach_commits_ownership_for_the_unclaimed_holder() {
                 live_session_key: None,
                 pid: retained.pid,
                 ownership_id: Some(retained.operation_id.clone()),
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             }),
         },
         "test/attach-gap",
@@ -5910,6 +5918,8 @@ async fn a_restore_create_against_a_live_foreign_terminal_owner_never_spawns() {
                 live_session_key: None,
                 pid: None,
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             },
         ),
         freshell_ownership::CommitOutcome::Committed
@@ -7304,6 +7314,8 @@ async fn an_attach_while_a_fresh_agent_owns_answers_the_typed_fresh_owner_confli
                 live_session_key: Some(sid.clone()),
                 pid: None,
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             },
         ),
         freshell_ownership::CommitOutcome::Committed

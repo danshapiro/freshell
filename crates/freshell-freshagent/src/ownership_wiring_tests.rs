@@ -23,6 +23,8 @@ fn owner_fresh(key: &str) -> freshell_ownership::OwnerIdentity {
         live_session_key: Some(key.to_string()),
         pid: Some(991),
         ownership_id: Some("own-1".into()),
+        unit_id: None,
+        hold: freshell_ownership::HoldKind::Main,
     }
 }
 
@@ -196,6 +198,8 @@ fn fresh_agent_stop_with_a_stale_claim_is_typed_refused_and_does_not_kill() {
         live_session_key: None,
         pid: None,
         ownership_id: None,
+        unit_id: None,
+        hold: freshell_ownership::HoldKind::Main,
     };
     assert_eq!(
         registry.commit_live("codex", "sid-5", "ho-5", g2, term),
@@ -243,6 +247,8 @@ fn fresh_agent_claim_fails_typed_when_terminal_owns() {
         live_session_key: None,
         pid: None,
         ownership_id: None,
+        unit_id: None,
+        hold: freshell_ownership::HoldKind::Main,
     };
     registry.commit_live("codex", "sid-2", "term-op", generation, t);
     // The fresh-agent lane's claim must see the typed cross-kind conflict.
@@ -399,6 +405,8 @@ async fn start_cancellation_registers_on_the_tickets_canonical_key() {
                 live_session_key: Some("map-key".into()),
                 pid: Some(4321),
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             }
         ),
         CommitOutcome::Committed
@@ -415,6 +423,8 @@ async fn start_cancellation_registers_on_the_tickets_canonical_key() {
                 live_session_key: Some("map-key".into()),
                 pid: Some(4322),
                 ownership_id: Some("rekey-op".into()),
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             },
             "test-rekey",
             "rekey-op",
@@ -438,6 +448,8 @@ async fn start_cancellation_registers_on_the_tickets_canonical_key() {
                     live_session_key: Some("map-key".into()),
                     pid: Some(4322),
                     ownership_id: Some("rekey-op".into()),
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 }),
             },
             "claude-exit",

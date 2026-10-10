@@ -1134,6 +1134,8 @@ impl FreshCodexState {
                 live_session_key: Some(session_id.to_string()),
                 pid,
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             },
         );
     }
@@ -5208,6 +5210,18 @@ impl FreshCodexState {
                             "a lifecycle operation is in flight ({state:?}); retry after it settles"
                         ),
                     )),
+                    // A stop is already in flight: refused exactly as the
+                    // in-flight `NotLive{Stopping}` answer was (Task 23 makes
+                    // this lane join the in-flight stop instead).
+                    freshell_ownership::StopOutcome::AlreadyStopping {
+                        ref operation_id, ..
+                    } => Some((
+                        "LIFECYCLE_IN_FLIGHT",
+                        format!(
+                            "a lifecycle operation is in flight (Stopping under {operation_id}); \
+                             retry after it settles"
+                        ),
+                    )),
                     freshell_ownership::StopOutcome::BlockedHandoff { .. } => Some((
                         "HANDOFF_IN_FLIGHT",
                         "a handoff owns this session's transition; retry after it settles"
@@ -5343,6 +5357,16 @@ impl FreshCodexState {
                                         format!(
                                             "a lifecycle operation is in flight ({state:?}); \
                                              retry after it settles"
+                                        ),
+                                    ),
+                                    freshell_ownership::StopOutcome::AlreadyStopping {
+                                        operation_id,
+                                        ..
+                                    } => (
+                                        "LIFECYCLE_IN_FLIGHT",
+                                        format!(
+                                            "a lifecycle operation is in flight (Stopping \
+                                             under {operation_id}); retry after it settles"
                                         ),
                                     ),
                                     freshell_ownership::StopOutcome::BlockedHandoff { .. } => (
@@ -5925,6 +5949,8 @@ impl FreshCodexState {
                                 live_session_key: None,
                                 pid: None,
                                 ownership_id: None,
+                                unit_id: None,
+                                hold: freshell_ownership::HoldKind::Main,
                             };
                             tracked_attach_guard = match crate::ownership_lane::arm_adopt_guard(
                                 &self.ownership,
@@ -8530,6 +8556,8 @@ impl FreshCodexState {
                 live_session_key: Some(thread_id.to_string()),
                 pid: sidecar_pid,
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             }),
             None => {
                 if let Err(outcome) =
@@ -13689,6 +13717,8 @@ pub(crate) mod tests {
             live_session_key: Some("thread-dead-close".into()),
             pid: Some(pid),
             ownership_id: None,
+            unit_id: None,
+            hold: freshell_ownership::HoldKind::Main,
         };
         assert!(matches!(
             registry.commit_live("codex", "thread-dead-close", "op-live", generation, owner),
@@ -13707,6 +13737,8 @@ pub(crate) mod tests {
                     live_session_key: Some("thread-dead-close".into()),
                     pid: Some(pid),
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 },
             },
         );
@@ -28194,6 +28226,8 @@ pub(crate) mod tests {
                     live_session_key: None,
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 }
             ),
             freshell_ownership::CommitOutcome::Committed
@@ -28359,6 +28393,8 @@ pub(crate) mod tests {
                     live_session_key: None,
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 },
             ),
             freshell_ownership::CommitOutcome::Committed

@@ -495,6 +495,8 @@ mod tests {
                 live_session_key: None,
                 pid: None,
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             }
         }
         // Live same-kind (fresh-agent): respawn still burns (a same-kind rebind).

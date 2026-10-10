@@ -21,13 +21,16 @@
 //!   competing starts); the KILL happens while `Stopping`; `commit_stop`
 //!   moves to `Vacant` only after the caller confirms the reap. A stop
 //!   attempted during another operation's `Handoff` returns the typed
-//!   `BlockedHandoff` — the caller must NOT kill. During `Starting` or
-//!   `Stopping` the typed `NotLive` result carries the in-flight state and
-//!   licenses NO kill: the in-flight operation (or the watchdog) owns the
-//!   transition. A stop abandoned before the kill (runtime confirmed still
-//!   alive) unwinds via `abort_stop` — `Stopping` → `Live` at the owner's
-//!   pre-stop generation (Task 4 review F1: every granted stop reaches
-//!   commit or abort; nothing strands).
+//!   `BlockedHandoff` — the caller must NOT kill. During `Starting` the
+//!   typed `NotLive` result carries the in-flight state and licenses NO
+//!   kill: the in-flight operation (or the watchdog) owns the transition.
+//!   During `Stopping` the typed `AlreadyStopping` names the in-flight stop
+//!   operation: the caller joins it (and, for a forced stop, escalates
+//!   it), never starting a second stop. A stop abandoned before the kill
+//!   (runtime confirmed still alive) unwinds via `abort_stop` —
+//!   `Stopping` → `Live` at the owner's pre-stop generation (Task 4
+//!   review F1: every granted stop reaches commit or abort; nothing
+//!   strands).
 //! - Release fencing (round-1 review): watcher/TTL releases carry
 //!   `(operation_id, generation, runtime identity)` and are no-ops on any
 //!   mismatch — a delayed watcher can never erase a newer owner or an
@@ -63,6 +66,17 @@
 //!   (target-directive filters kill span fields; see
 //!   crates/freshell-server/src/logging.rs:30-44) on the stable target
 //!   `freshell_ownership`. Diagnostic, not audit-grade.
+//! - Units (codex-pane-lifecycle): every coding-agent pane is one contained
+//!   unit, and its Running / Stopping / Gone states ARE this registry's
+//!   Live / Stopping / Vacant — there is no second state machine. Every
+//!   key a unit holds carries its `OwnerIdentity::unit_id` (the pane's own
+//!   conversation as `HoldKind::Main`, threads its agent process holds
+//!   besides it as `HoldKind::Extra`); `begin_unit_stop` /
+//!   `commit_unit_stop` move all of them together, and a persisted
+//!   Stopping unit is seeded back at boot by `restore_stopping`.
+//! - Waiting is event-driven: `wait_settled` registers a waker under the
+//!   records lock; every mutating scope wakes parked waiters when it ends.
+//!   No timers, no polling.
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -269,9 +283,10 @@ pub struct ObservedFence {
     pub generation: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimeOwnerKind {
+    #[default]
     Terminal,
     FreshAgent,
 }
@@ -291,7 +306,7 @@ impl SessionKey {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnerIdentity {
     pub kind: RuntimeOwnerKind,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -302,6 +317,29 @@ pub struct OwnerIdentity {
     pub pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ownership_id: Option<String>,
+    /// The containment unit (freshell-containment) whose processes ARE this
+    /// owner. Every key a unit holds (main conversation and extra threads)
+    /// carries the same unit id; unit stops and commits move them together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_id: Option<String>,
+    /// How the unit holds this key: its pane's own conversation, or an
+    /// extra thread its agent process has loaded besides it.
+    #[serde(default)]
+    pub hold: HoldKind,
+}
+
+/// How a unit holds a conversation key ([`OwnerIdentity::hold`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HoldKind {
+    /// The pane's own conversation.
+    #[default]
+    Main,
+    /// A thread the unit's agent process holds besides its main
+    /// conversation (a helper agent, a fork parent, an earlier
+    /// conversation opened in the same pane). A handoff or reopen on such
+    /// a key adopts the holder; it never stops the holding unit.
+    Extra,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -578,9 +616,10 @@ pub enum StopOutcome {
     /// The key is not Live. When the carried state is `Vacant` the caller
     /// may still kill what it observed (idempotent — a leftover child the
     /// registry never knew) but MUST skip `commit_stop`. When the carried
-    /// state is `Starting` or `Stopping` an operation is in flight and the
-    /// caller MUST NOT kill — the in-flight operation (or the watchdog)
-    /// owns the transition; retry after it settles (round-2 review).
+    /// state is `Starting` (or any other non-Live state) an operation is in
+    /// flight and the caller MUST NOT kill — the in-flight operation (or
+    /// the watchdog) owns the transition; retry after it settles (round-2
+    /// review). A `Stopping` key answers [`StopOutcome::AlreadyStopping`].
     NotLive {
         state: OwnershipState,
     },
@@ -598,6 +637,43 @@ pub enum StopOutcome {
         current_generation: u64,
         state: OwnershipState,
     },
+    /// A stop is already in flight for this key (a unit stop or another
+    /// kill). The caller JOINS it (waits for Gone through the unit's stop
+    /// handle / `wait_settled`) and, for a forced stop, escalates it — it
+    /// never starts a second, competing stop.
+    AlreadyStopping {
+        operation_id: String,
+        generation: u64,
+        owner: Option<OwnerIdentity>,
+    },
+}
+
+/// One key a unit stop moved or joined ([`RuntimeOwnershipRegistry::begin_unit_stop`])
+/// or a unit commit vacated ([`RuntimeOwnershipRegistry::commit_unit_stop`]).
+/// `generation` is the record's generation after the call: for a commit,
+/// the post-commit pair a fenced `begin_start` accepts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitStopKey {
+    pub key: SessionKey,
+    pub generation: u64,
+    /// `true` when the key was already `Stopping` for the unit (the call
+    /// joined the in-flight stop instead of moving the key).
+    pub joined: bool,
+}
+
+/// Outcome of [`RuntimeOwnershipRegistry::hold_extra`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HoldOutcome {
+    /// The vacant key is now `Live`, held by the unit as an extra thread.
+    Held { generation: u64 },
+    /// The same unit already holds the key (as its main conversation or
+    /// as an extra thread).
+    AlreadyHeld,
+    /// Another owner holds the key Live.
+    HeldByOther { owner: OwnerIdentity },
+    /// Nothing changed: the key is in another state, the unit is stopping
+    /// (a stopping unit never gains holds), or the owner names no unit.
+    Skipped { state: OwnershipState },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -932,7 +1008,7 @@ impl AttachGuard {
 impl AttachGuard {
     /// The exactly-once window release (disarm or Drop — never both).
     fn release_window(&self) {
-        let mut inner = self.registry.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.registry.lock_records();
         let key = SessionKey::new(&self.provider, &self.session_id);
         // b8ke ext r15 F3: the release event joins the UNIFORM transition
         // schema — the record's CURRENT owner at release time (the
@@ -944,15 +1020,18 @@ impl AttachGuard {
         let mut released_runtime_id = None;
         let mut released_pid = None;
         if let Some(record) = inner.get_mut(&key) {
-            record.in_flight_attaches = record.in_flight_attaches.saturating_sub(1);
             // b8ke ext r32 F1: the identified window closes with the
-            // count (the holder's exemption list stays in lockstep).
+            // count (the holder's exemption list stays in lockstep). A
+            // window a unit's Gone commit already cleared is not in the
+            // list any more, and its late release must not close a window
+            // armed afterwards by a newer attach.
             if let Some(pos) = record
                 .armed_attach_ops
                 .iter()
                 .position(|op| op == &self.operation_id)
             {
                 record.armed_attach_ops.remove(pos);
+                record.in_flight_attaches = record.in_flight_attaches.saturating_sub(1);
             }
             if let OwnershipState::Live { owner, .. } = &record.state {
                 released_from_kind = Some(owner.kind);
@@ -1106,6 +1185,128 @@ impl Drop for OperationTicket {
 pub struct RuntimeOwnershipRegistry {
     epoch: u64,
     inner: Mutex<HashMap<SessionKey, SessionRecord>>,
+    /// Parked [`SettledWait`] futures. Woken (all of them; each re-checks
+    /// its own key) whenever a mutating lock scope ends. No timers, no
+    /// polling.
+    waiters: Mutex<Vec<std::task::Waker>>,
+}
+
+/// The records lock taken by every MUTATING scope
+/// ([`RuntimeOwnershipRegistry::lock_records`]): when the scope ends it
+/// releases the records lock FIRST and then wakes every parked
+/// [`SettledWait`], so a woken waiter can take the lock at once and sees
+/// the committed state.
+struct RecordsGuard<'a> {
+    guard: Option<std::sync::MutexGuard<'a, HashMap<SessionKey, SessionRecord>>>,
+    waiters: &'a Mutex<Vec<std::task::Waker>>,
+}
+
+impl std::ops::Deref for RecordsGuard<'_> {
+    type Target = HashMap<SessionKey, SessionRecord>;
+    fn deref(&self) -> &Self::Target {
+        self.guard
+            .as_ref()
+            .expect("records guard is live until drop")
+    }
+}
+
+impl std::ops::DerefMut for RecordsGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard
+            .as_mut()
+            .expect("records guard is live until drop")
+    }
+}
+
+impl Drop for RecordsGuard<'_> {
+    fn drop(&mut self) {
+        // Release the records lock BEFORE waking: a woken waiter re-polls
+        // and takes it immediately.
+        drop(self.guard.take());
+        let wakers = std::mem::take(&mut *self.waiters.lock().expect("waiters lock poisoned"));
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+}
+
+/// `true` while a lifecycle operation owns the key (Starting / Handoff /
+/// Stopping); every other state is settled for [`SettledWait`].
+fn in_progress(state: &OwnershipState) -> bool {
+    matches!(
+        state,
+        OwnershipState::Starting { .. }
+            | OwnershipState::Handoff { .. }
+            | OwnershipState::Stopping { .. }
+    )
+}
+
+/// The identity a record is STAMPED with for unit-scoped operations: the
+/// owner of a `Live` or `Stopping` record, the partial runtime a
+/// `Starting` record registered, or the prior a `Handoff` captured. Every
+/// other state (including `Aliased`, which carries no owner) is unstamped.
+fn stamping_owner(record: &SessionRecord) -> Option<&OwnerIdentity> {
+    match &record.state {
+        OwnershipState::Live { owner, .. } => Some(owner),
+        OwnershipState::Stopping { owner, .. } => owner.as_ref(),
+        OwnershipState::Starting { .. } => record.partial_runtime.as_ref(),
+        OwnershipState::Handoff { prior, .. } => prior.as_ref().map(|(owner, _)| owner),
+        _ => None,
+    }
+}
+
+/// The unit a record is stamped with (see [`stamping_owner`]).
+fn stamped_unit(record: &SessionRecord) -> Option<&str> {
+    stamping_owner(record).and_then(|owner| owner.unit_id.as_deref())
+}
+
+/// The order unit-scoped results are reported in: by session id, then
+/// provider.
+fn by_session_id(a: &SessionKey, b: &SessionKey) -> std::cmp::Ordering {
+    (a.session_id.as_str(), a.provider.as_str()).cmp(&(b.session_id.as_str(), b.provider.as_str()))
+}
+
+/// Event-driven wait for a key to settle
+/// ([`RuntimeOwnershipRegistry::wait_settled`]): resolves with the first
+/// snapshot whose state is not Starting / Handoff / Stopping.
+pub struct SettledWait {
+    registry: Arc<RuntimeOwnershipRegistry>,
+    key: SessionKey,
+}
+
+impl std::future::Future for SettledWait {
+    type Output = OwnershipSnapshot;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<OwnershipSnapshot> {
+        // Register the waker WHILE holding the records lock: any later
+        // mutation takes the lock after us and wakes us when it ends.
+        let inner = self.registry.inner.lock().expect("ownership lock poisoned");
+        let snapshot = match inner.get(&self.key) {
+            Some(record) => OwnershipSnapshot {
+                epoch: self.registry.epoch,
+                generation: snapshot_generation(record),
+                state: record.state.clone(),
+            },
+            None => OwnershipSnapshot {
+                epoch: self.registry.epoch,
+                generation: 0,
+                state: OwnershipState::Vacant,
+            },
+        };
+        if in_progress(&snapshot.state) {
+            self.registry
+                .waiters
+                .lock()
+                .expect("waiters lock poisoned")
+                .push(cx.waker().clone());
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(snapshot)
+        }
+    }
 }
 
 impl Default for RuntimeOwnershipRegistry {
@@ -1128,6 +1329,30 @@ impl RuntimeOwnershipRegistry {
         Self {
             epoch,
             inner: Mutex::new(HashMap::new()),
+            waiters: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The records lock for a MUTATING scope: parked [`SettledWait`]s are
+    /// woken when the returned guard drops. Read-only scopes take
+    /// `self.inner.lock()` directly so a read never wakes waiters.
+    fn lock_records(&self) -> RecordsGuard<'_> {
+        RecordsGuard {
+            guard: Some(self.inner.lock().expect("ownership lock poisoned")),
+            waiters: &self.waiters,
+        }
+    }
+
+    /// Event-driven: resolves once the key is not Starting / Handoff /
+    /// Stopping (settled = Vacant, Live, Aliased or Fenced). The future
+    /// parks a waker under the records lock and is woken when a mutating
+    /// scope ends; it never polls on a timer. The caller resolves a stale
+    /// id to its canonical key ([`Self::resolve_canonical`]) before
+    /// waiting.
+    pub fn wait_settled(self: &Arc<Self>, provider: &str, session_id: &str) -> SettledWait {
+        SettledWait {
+            registry: Arc::clone(self),
+            key: SessionKey::new(provider, session_id),
         }
     }
 
@@ -1216,7 +1441,7 @@ impl RuntimeOwnershipRegistry {
         now_ms: u64,
         attach_window_operation_id: Option<&str>,
     ) -> BeginOutcome {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         let key = SessionKey::new(provider, session_id);
         // Fence check BEFORE creating the record: a stale request must not
         // create ownership — not even a Vacant replay entry for a key it
@@ -1426,7 +1651,7 @@ impl RuntimeOwnershipRegistry {
         owner: OwnerIdentity,
         initiator: &str,
     ) -> CommitOutcome {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         let new_key = SessionKey::new(provider, new_session_id);
         // (1) The new key's Starting claim must be ours.
         match inner.get(&new_key).map(|r| r.state.clone()) {
@@ -1513,7 +1738,7 @@ impl RuntimeOwnershipRegistry {
         observed_generation: Option<u64>,
         initiator: &str,
     ) -> AttachGuardOutcome {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         let key = SessionKey::new(provider, session_id);
         let Some(record) = inner.get_mut(&key) else {
             return AttachGuardOutcome::Refused {
@@ -1616,7 +1841,7 @@ impl RuntimeOwnershipRegistry {
         observed: ObservedFence,
         initiator: &str,
     ) -> AttachGuardOutcome {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         let key = SessionKey::new(provider, session_id);
         // (1) THE EPOCH — the pair is one fence; a different boot's pair
         // is stale regardless of the generation.
@@ -1801,7 +2026,7 @@ impl RuntimeOwnershipRegistry {
         initiator: &str,
         now_ms: u64,
     ) -> AcknowledgedStartOutcome {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         let key = SessionKey::new(provider, session_id);
         // The fence check BEFORE the record is read (begin_handoff's
         // discipline): a stale pair refuses without touching anything.
@@ -1909,7 +2134,7 @@ impl RuntimeOwnershipRegistry {
         initiator: &str,
         now_ms: u64,
     ) -> BeginOutcome {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         let key = SessionKey::new(provider, session_id);
         // Fence check BEFORE creating the record (same discipline as
         // begin_start: a stale request creates nothing).
@@ -2007,6 +2232,28 @@ impl RuntimeOwnershipRegistry {
                     generation: record.generation,
                 }
             }
+            // A thread a unit holds as an EXTRA (a helper, fork parent or
+            // earlier conversation its agent process has loaded) is never
+            // switched away: stopping the holder would kill the pane that
+            // displays a different conversation. The caller jumps to the
+            // holder instead (Decision 1); nothing changes here.
+            OwnershipState::Live {
+                owner, generation, ..
+            } if owner.hold == HoldKind::Extra => {
+                tracing::info!(target: "freshell_ownership",
+                    event = "ownership.handoff.extra_hold_adopt",
+                    operation_id, provider, session_id, initiator,
+                    from_kind = ?Some(owner.kind), to_kind = ?Some(to_kind),
+                    runtime_id = ?owner.terminal_id, pid = ?owner.pid,
+                    epoch = self.epoch, generation,
+                    duration_ms = 0u64,
+                    outcome = "adopt-live", failure_reason = "",
+                    unit_id = owner.unit_id.as_deref().unwrap_or(""),
+                    terminal_id = owner.terminal_id.as_deref().unwrap_or(""),
+                    "the key is held as an extra thread by a running unit — the \
+                     switch adopts the holder and never stops it");
+                BeginOutcome::AdoptLive { owner, generation }
+            }
             OwnershipState::Live {
                 owner,
                 generation,
@@ -2086,7 +2333,7 @@ impl RuntimeOwnershipRegistry {
         generation: u64,
         mut owner: OwnerIdentity,
     ) -> CommitOutcome {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         let key = SessionKey::new(provider, session_id);
         let Some(record) = inner.get_mut(&key) else {
             return CommitOutcome::ForeignOperation;
@@ -2180,7 +2427,7 @@ impl RuntimeOwnershipRegistry {
         generation: u64,
         mut owner: OwnerIdentity,
     ) -> CommitOutcome {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         let old_key = SessionKey::new(provider, old_session_id);
         // Validation pass (immutable reads — the mutation below cannot
         // interleave with any of these checks).
@@ -2303,7 +2550,7 @@ impl RuntimeOwnershipRegistry {
         operation_id: &str,
         generation: u64,
     ) -> CommitOutcome {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         let old_key = SessionKey::new(provider, old_session_id);
         // Validation pass (immutable reads — the mutation below cannot
         // interleave with any of these checks).
@@ -2442,7 +2689,7 @@ impl RuntimeOwnershipRegistry {
         // uniform schema's operation_id (the caller's rekey operation).
         operation_id: &str,
     ) -> CommitOutcome {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         let old_key = SessionKey::new(provider, old_session_id);
         // b8ke focused episode-2 post-cap F1: EXPECTED-OWNER VERIFICATION.
         // The move happens ONLY for the lane's own runtime — the old record
@@ -2586,7 +2833,7 @@ impl RuntimeOwnershipRegistry {
         operation_id: &str,
         initiator: &str,
     ) -> CommitOutcome {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         let from_key = SessionKey::new(provider, from_session_id);
         let to_key = SessionKey::new(provider, to_session_id);
         // The FROM key must be truly vacant (no record, or an existing
@@ -2678,7 +2925,7 @@ impl RuntimeOwnershipRegistry {
         generation: u64,
         prior_confirmed_live: bool,
     ) -> FailOutcome {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         let key = SessionKey::new(provider, session_id);
         let Some(record) = inner.get_mut(&key) else {
             return FailOutcome::ForeignOperation;
@@ -2825,7 +3072,7 @@ impl RuntimeOwnershipRegistry {
         reason: FenceReason,
         unconfirmed: Option<(OwnerIdentity, u64)>,
     ) -> FenceOutcome {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         let key = SessionKey::new(provider, session_id);
         let Some(record) = inner.get_mut(&key) else {
             return FenceOutcome::ForeignOperation;
@@ -2890,7 +3137,7 @@ impl RuntimeOwnershipRegistry {
         generation: u64,
         reason: FenceReason,
     ) -> FenceOutcome {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         let key = SessionKey::new(provider, session_id);
         let Some(record) = inner.get_mut(&key) else {
             return FenceOutcome::ForeignOperation;
@@ -2954,7 +3201,7 @@ impl RuntimeOwnershipRegistry {
         expected_runtime: &OwnerIdentity,
         reason: FenceReason,
     ) -> FenceOutcome {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         let key = SessionKey::new(provider, session_id);
         let Some(record) = inner.get_mut(&key) else {
             return FenceOutcome::ForeignOperation;
@@ -3014,7 +3261,7 @@ impl RuntimeOwnershipRegistry {
         operation_id: &str,
         generation: u64,
     ) -> CommitOutcome {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         let key = SessionKey::new(provider, session_id);
         let Some(record) = inner.get_mut(&key) else {
             return CommitOutcome::ForeignOperation;
@@ -3147,7 +3394,7 @@ impl RuntimeOwnershipRegistry {
         observed: ObservedFence,
         initiator: &str,
     ) -> ForceReleaseOutcome {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         let key = SessionKey::new(provider, session_id);
         let Some(record) = inner.get_mut(&key) else {
             return ForceReleaseOutcome::NotPlatformLimited {
@@ -3272,7 +3519,7 @@ impl RuntimeOwnershipRegistry {
         initiator: &str,
         now_ms: u64,
     ) -> StopOutcome {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         let key = SessionKey::new(provider, session_id);
         let Some(record) = inner.get_mut(&key) else {
             return StopOutcome::NotLive {
@@ -3385,6 +3632,16 @@ impl RuntimeOwnershipRegistry {
                 state: record.state.clone(),
                 retry_after_ms: OWNERSHIP_RETRY_AFTER_MS,
             },
+            OwnershipState::Stopping {
+                operation_id,
+                generation,
+                owner,
+                ..
+            } => StopOutcome::AlreadyStopping {
+                operation_id,
+                generation,
+                owner,
+            },
             state => StopOutcome::NotLive { state },
         }
     }
@@ -3399,7 +3656,7 @@ impl RuntimeOwnershipRegistry {
         operation_id: &str,
         generation: u64,
     ) -> CommitOutcome {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         let key = SessionKey::new(provider, session_id);
         let Some(record) = inner.get_mut(&key) else {
             return CommitOutcome::ForeignOperation;
@@ -3460,7 +3717,7 @@ impl RuntimeOwnershipRegistry {
         operation_id: &str,
         generation: u64,
     ) -> AbortStopOutcome {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         let key = SessionKey::new(provider, session_id);
         let Some(record) = inner.get_mut(&key) else {
             return AbortStopOutcome::ForeignOperation;
@@ -3515,7 +3772,7 @@ impl RuntimeOwnershipRegistry {
         claim: &ReleaseClaim,
         initiator: &str,
     ) -> bool {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         let key = SessionKey::new(provider, session_id);
         if let Some(record) = inner.get_mut(&key) {
             if let OwnershipState::Live {
@@ -3590,7 +3847,7 @@ impl RuntimeOwnershipRegistry {
         claim: &ReleaseClaim,
         initiator: &str,
     ) {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         let key = SessionKey::new(provider, session_id);
         let Some(record) = inner.get_mut(&key) else {
             return;
@@ -3652,6 +3909,414 @@ impl RuntimeOwnershipRegistry {
         }
     }
 
+    /// Begin (or join) the stop of a UNIT: every key stamped with the unit
+    /// (see [`stamping_owner`]) moves to `Stopping` (generation + 1),
+    /// whatever its state — a `Live` key keeps its owner
+    /// (`prior_generation: Some(live generation)`), a `Starting` key's
+    /// owner is the partial runtime it registered (`prior_generation:
+    /// None`), a `Handoff` key's owner is the captured prior
+    /// (`prior_generation: Some(prior generation)`). The one exception is a
+    /// `Handoff` whose own operation id is `operation_id`: that handoff is
+    /// stopping its own prior and commits the key itself. Keys already
+    /// `Stopping` for the unit are reported `joined: true`.
+    ///
+    /// A unit has ONE stop operation at a time: when keys of the unit are
+    /// already `Stopping`, every key moved now is moved under that
+    /// in-flight operation (the caller's own `operation_id` when it is one
+    /// of them), so the one [`Self::commit_unit_stop`] at Gone covers the
+    /// whole unit. A kill always wins over an attach guard (logged
+    /// `attach_in_flight=true`). `Aliased` keys carry no owner and are
+    /// never touched. The result is sorted by session id.
+    pub fn begin_unit_stop(
+        &self,
+        unit_id: &str,
+        operation_id: &str,
+        initiator: &str,
+        now_ms: u64,
+    ) -> Vec<UnitStopKey> {
+        let mut inner = self.lock_records();
+        let effective_op = {
+            let mut in_flight: Vec<(&SessionKey, &str)> = inner
+                .iter()
+                .filter(|(_, record)| stamped_unit(record) == Some(unit_id))
+                .filter_map(|(key, record)| match &record.state {
+                    OwnershipState::Stopping {
+                        operation_id: op, ..
+                    } => Some((key, op.as_str())),
+                    _ => None,
+                })
+                .collect();
+            in_flight.sort_by(|a, b| by_session_id(a.0, b.0));
+            if in_flight.iter().any(|(_, op)| *op == operation_id) {
+                operation_id.to_string()
+            } else {
+                in_flight
+                    .first()
+                    .map_or_else(|| operation_id.to_string(), |(_, op)| op.to_string())
+            }
+        };
+        let mut keys = Vec::new();
+        for (key, record) in inner.iter_mut() {
+            if stamped_unit(record) != Some(unit_id) {
+                continue;
+            }
+            let (owner, prior_generation, from_state, prior_since_ms) = match &record.state {
+                OwnershipState::Stopping { .. } => {
+                    keys.push(UnitStopKey {
+                        key: key.clone(),
+                        generation: record.generation,
+                        joined: true,
+                    });
+                    continue;
+                }
+                OwnershipState::Handoff {
+                    operation_id: handoff_op,
+                    ..
+                } if handoff_op == operation_id => continue,
+                OwnershipState::Live {
+                    owner,
+                    generation,
+                    since_ms,
+                } => (owner.clone(), Some(*generation), "live", *since_ms),
+                OwnershipState::Handoff {
+                    prior: Some((prior, prior_generation)),
+                    since_ms,
+                    ..
+                } => (prior.clone(), Some(*prior_generation), "handoff", *since_ms),
+                OwnershipState::Starting { since_ms, .. } => match &record.partial_runtime {
+                    Some(partial) => (partial.clone(), None, "starting", *since_ms),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            record.generation += 1;
+            record.state = OwnershipState::Stopping {
+                owner: Some(owner.clone()),
+                prior_generation,
+                operation_id: effective_op.clone(),
+                generation: record.generation,
+                initiator: initiator.to_string(),
+                since_ms: now_ms,
+            };
+            tracing::info!(target: "freshell_ownership",
+                event = "ownership.stop.begin", operation_id = %effective_op,
+                provider = %key.provider, session_id = %key.session_id, initiator,
+                from_kind = ?owner.kind, to_kind = ?Option::<RuntimeOwnerKind>::None,
+                runtime_id = ?owner.terminal_id, pid = ?owner.pid,
+                epoch = self.epoch, generation = record.generation,
+                duration_ms = now_ms.saturating_sub(prior_since_ms),
+                outcome = "granted", failure_reason = "",
+                unit_id, terminal_id = owner.terminal_id.as_deref().unwrap_or(""),
+                from_state, attach_in_flight = record.in_flight_attaches > 0,
+                requested_operation_id = operation_id,
+                "the unit's stop moved this key to Stopping");
+            keys.push(UnitStopKey {
+                key: key.clone(),
+                generation: record.generation,
+                joined: false,
+            });
+        }
+        keys.sort_by(|a, b| by_session_id(&a.key, &b.key));
+        keys
+    }
+
+    /// Gone for a unit: every key stamped with the unit whose `Stopping`
+    /// operation is `operation_id` moves to `Vacant`. Keys the unit holds
+    /// under any other operation (a boot seed, another stop) are left
+    /// alone. Every armed attach guard on a vacated key is cleared, so no
+    /// Vacant key stays blocked by a window the kill already won. Returns
+    /// the vacated keys, sorted by session id, with their POST-COMMIT
+    /// generation: the pair a fenced `begin_start` accepts (the one a
+    /// crash event built at Gone must carry).
+    pub fn commit_unit_stop(&self, unit_id: &str, operation_id: &str) -> Vec<UnitStopKey> {
+        let mut inner = self.lock_records();
+        let mut keys = Vec::new();
+        for (key, record) in inner.iter_mut() {
+            let OwnershipState::Stopping {
+                owner: Some(owner),
+                operation_id: stop_op,
+                initiator,
+                since_ms,
+                ..
+            } = &record.state
+            else {
+                continue;
+            };
+            if owner.unit_id.as_deref() != Some(unit_id) || stop_op != operation_id {
+                continue;
+            }
+            let owner = owner.clone();
+            let initiator = initiator.clone();
+            let duration_ms = now_epoch_ms().saturating_sub(*since_ms);
+            let attach_guards_cleared = record.in_flight_attaches;
+            // The record generation is already the post-stop generation.
+            record.state = OwnershipState::Vacant;
+            record.in_flight_attaches = 0;
+            record.armed_attach_ops.clear();
+            tracing::info!(target: "freshell_ownership",
+                event = "ownership.stop.commit", operation_id,
+                provider = %key.provider, session_id = %key.session_id,
+                initiator = %initiator,
+                from_kind = ?owner.kind, to_kind = ?Option::<RuntimeOwnerKind>::None,
+                runtime_id = ?owner.terminal_id, pid = ?owner.pid,
+                epoch = self.epoch, generation = record.generation,
+                duration_ms, outcome = "committed", failure_reason = "",
+                unit_id, terminal_id = owner.terminal_id.as_deref().unwrap_or(""),
+                attach_guards_cleared,
+                "the unit is Gone — the key is released");
+            keys.push(UnitStopKey {
+                key: key.clone(),
+                generation: record.generation,
+                joined: false,
+            });
+        }
+        keys.sort_by(|a, b| by_session_id(&a.key, &b.key));
+        keys
+    }
+
+    /// Record that a unit's agent process holds `session_id` as an EXTRA
+    /// thread (a helper agent, a fork parent, an earlier conversation).
+    /// `owner` must carry its `unit_id`; it is stored with
+    /// `hold: HoldKind::Extra`. A `Vacant` key becomes `Live` (`Held`);
+    /// a key the same unit already holds is `AlreadyHeld`; a key another
+    /// owner holds Live is `HeldByOther`; any other state is `Skipped`.
+    /// While any key of the unit is `Stopping`, nothing is held
+    /// (`Skipped` carrying that state): a stopping unit never gains holds.
+    pub fn hold_extra(
+        &self,
+        provider: &str,
+        session_id: &str,
+        owner: OwnerIdentity,
+        initiator: &str,
+        now_ms: u64,
+    ) -> HoldOutcome {
+        let mut inner = self.lock_records();
+        let unit_id = owner.unit_id.clone().unwrap_or_default();
+        let operation_id = owner.ownership_id.clone().unwrap_or_default();
+        let terminal_id = owner.terminal_id.clone().unwrap_or_default();
+        let log_refusal = |outcome: &str, failure_reason: &str, generation: u64| {
+            tracing::info!(target: "freshell_ownership",
+                event = "ownership.extra.hold", operation_id = %operation_id,
+                provider, session_id, initiator,
+                from_kind = ?Option::<RuntimeOwnerKind>::None, to_kind = ?Some(owner.kind),
+                runtime_id = ?owner.terminal_id, pid = ?owner.pid,
+                epoch = self.epoch, generation, duration_ms = 0u64,
+                outcome, failure_reason,
+                unit_id = %unit_id, terminal_id = %terminal_id,
+                "the extra-thread hold was not recorded");
+        };
+        if unit_id.is_empty() {
+            // A caller bug: an extra hold names the unit that holds it.
+            let state = inner
+                .get(&SessionKey::new(provider, session_id))
+                .map_or(OwnershipState::Vacant, |record| record.state.clone());
+            tracing::warn!(target: "freshell_ownership",
+                event = "ownership.extra.hold", operation_id = %operation_id,
+                provider, session_id, initiator,
+                from_kind = ?Option::<RuntimeOwnerKind>::None, to_kind = ?Some(owner.kind),
+                runtime_id = ?owner.terminal_id, pid = ?owner.pid,
+                epoch = self.epoch, generation = 0u64, duration_ms = 0u64,
+                outcome = "skipped-no-unit", failure_reason = "OWNER_HAS_NO_UNIT",
+                unit_id = "", terminal_id = %terminal_id,
+                "an extra-thread hold must name its unit — nothing is recorded");
+            return HoldOutcome::Skipped { state };
+        }
+        if let Some(stopping) = inner
+            .values()
+            .find(|record| {
+                stamped_unit(record) == Some(unit_id.as_str())
+                    && matches!(record.state, OwnershipState::Stopping { .. })
+            })
+            .map(|record| record.state.clone())
+        {
+            log_refusal("skipped-unit-stopping", "UNIT_STOPPING", 0);
+            return HoldOutcome::Skipped { state: stopping };
+        }
+        let record = inner
+            .entry(SessionKey::new(provider, session_id))
+            .or_default();
+        match &record.state {
+            OwnershipState::Vacant => {
+                record.generation += 1;
+                let held = OwnerIdentity {
+                    hold: HoldKind::Extra,
+                    ..owner.clone()
+                };
+                record.state = OwnershipState::Live {
+                    owner: held,
+                    generation: record.generation,
+                    since_ms: now_ms,
+                };
+                tracing::info!(target: "freshell_ownership",
+                    event = "ownership.extra.hold", operation_id = %operation_id,
+                    provider, session_id, initiator,
+                    from_kind = ?Option::<RuntimeOwnerKind>::None, to_kind = ?Some(owner.kind),
+                    runtime_id = ?owner.terminal_id, pid = ?owner.pid,
+                    epoch = self.epoch, generation = record.generation, duration_ms = 0u64,
+                    outcome = "held", failure_reason = "",
+                    unit_id = %unit_id, terminal_id = %terminal_id,
+                    "the unit's agent process holds this thread besides its main \
+                     conversation — the key is Live as an extra hold");
+                HoldOutcome::Held {
+                    generation: record.generation,
+                }
+            }
+            OwnershipState::Live { owner: held, .. }
+                if held.unit_id.as_deref() == Some(unit_id.as_str()) =>
+            {
+                HoldOutcome::AlreadyHeld
+            }
+            OwnershipState::Live {
+                owner: held,
+                generation,
+                ..
+            } => {
+                tracing::warn!(target: "freshell_ownership",
+                    event = "ownership.extra.hold", operation_id = %operation_id,
+                    provider, session_id, initiator,
+                    from_kind = ?Some(held.kind), to_kind = ?Some(owner.kind),
+                    runtime_id = ?held.terminal_id, pid = ?held.pid,
+                    epoch = self.epoch, generation = *generation, duration_ms = 0u64,
+                    outcome = "held-by-other", failure_reason = "HELD_BY_OTHER",
+                    unit_id = %unit_id, terminal_id = %terminal_id,
+                    holder_unit_id = held.unit_id.as_deref().unwrap_or(""),
+                    holder_terminal_id = held.terminal_id.as_deref().unwrap_or(""),
+                    "another owner already holds this thread Live");
+                HoldOutcome::HeldByOther {
+                    owner: held.clone(),
+                }
+            }
+            state => {
+                let state = state.clone();
+                log_refusal("skipped", "KEY_NOT_VACANT", snapshot_generation(record));
+                HoldOutcome::Skipped { state }
+            }
+        }
+    }
+
+    /// Release an EXTRA hold: `Live` (held by `unit_id` as
+    /// [`HoldKind::Extra`]) → `Vacant`. Anything else — another unit's
+    /// key, the unit's main conversation, any other state — is a `false`
+    /// no-op.
+    pub fn release_extra(&self, provider: &str, session_id: &str, unit_id: &str) -> bool {
+        let mut inner = self.lock_records();
+        let Some(record) = inner.get_mut(&SessionKey::new(provider, session_id)) else {
+            return false;
+        };
+        let OwnershipState::Live {
+            owner, since_ms, ..
+        } = &record.state
+        else {
+            return false;
+        };
+        if owner.unit_id.as_deref() != Some(unit_id) || owner.hold != HoldKind::Extra {
+            return false;
+        }
+        let owner = owner.clone();
+        let duration_ms = now_epoch_ms().saturating_sub(*since_ms);
+        record.state = OwnershipState::Vacant;
+        tracing::info!(target: "freshell_ownership",
+            event = "ownership.extra.release",
+            operation_id = owner.ownership_id.as_deref().unwrap_or(""),
+            provider, session_id,
+            from_kind = ?Some(owner.kind), to_kind = ?Option::<RuntimeOwnerKind>::None,
+            runtime_id = ?owner.terminal_id, pid = ?owner.pid,
+            epoch = self.epoch, generation = record.generation, duration_ms,
+            outcome = "released", failure_reason = "",
+            unit_id, terminal_id = owner.terminal_id.as_deref().unwrap_or(""),
+            "the unit no longer holds this extra thread — the key is released");
+        true
+    }
+
+    /// Boot seed for a unit persisted as Stopping: a `Vacant` (never-seen
+    /// this boot) key becomes `Stopping { owner: Some(owner),
+    /// prior_generation: None, .. }` (generation + 1), so it is never
+    /// offered for reuse while the boot finishes the stop. Any other state
+    /// refuses (`false`).
+    pub fn restore_stopping(
+        &self,
+        provider: &str,
+        session_id: &str,
+        owner: OwnerIdentity,
+        operation_id: &str,
+        initiator: &str,
+        now_ms: u64,
+    ) -> bool {
+        let mut inner = self.lock_records();
+        let record = inner
+            .entry(SessionKey::new(provider, session_id))
+            .or_default();
+        let unit_id = owner.unit_id.as_deref().unwrap_or("");
+        let terminal_id = owner.terminal_id.as_deref().unwrap_or("");
+        if record.state != OwnershipState::Vacant {
+            tracing::warn!(target: "freshell_ownership",
+                event = "ownership.stop.restored", operation_id, provider, session_id,
+                initiator,
+                from_kind = ?record.state.kind(), to_kind = ?Option::<RuntimeOwnerKind>::None,
+                runtime_id = ?owner.terminal_id, pid = ?owner.pid,
+                epoch = self.epoch, generation = snapshot_generation(record),
+                duration_ms = 0u64,
+                outcome = "refused", failure_reason = "KEY_NOT_VACANT",
+                unit_id, terminal_id,
+                "a persisted Stopping unit names a key this boot already holds — \
+                 the seed is refused");
+            return false;
+        }
+        record.generation += 1;
+        record.state = OwnershipState::Stopping {
+            owner: Some(owner.clone()),
+            prior_generation: None,
+            operation_id: operation_id.to_string(),
+            generation: record.generation,
+            initiator: initiator.to_string(),
+            since_ms: now_ms,
+        };
+        tracing::info!(target: "freshell_ownership",
+            event = "ownership.stop.restored", operation_id, provider, session_id,
+            initiator,
+            from_kind = ?Some(owner.kind), to_kind = ?Option::<RuntimeOwnerKind>::None,
+            runtime_id = ?owner.terminal_id, pid = ?owner.pid,
+            epoch = self.epoch, generation = record.generation,
+            duration_ms = 0u64,
+            outcome = "stopping", failure_reason = "",
+            unit_id, terminal_id,
+            "a unit persisted as Stopping is seeded Stopping — the boot finishes \
+             its stop before the key is offered again");
+        true
+    }
+
+    /// Every key stamped with the unit (see [`stamping_owner`]), with its
+    /// state, sorted by session id. Read-only.
+    pub fn keys_for_unit(&self, unit_id: &str) -> Vec<(SessionKey, OwnershipState)> {
+        let inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut keys: Vec<(SessionKey, OwnershipState)> = inner
+            .iter()
+            .filter(|(_, record)| stamped_unit(record) == Some(unit_id))
+            .map(|(key, record)| (key.clone(), record.state.clone()))
+            .collect();
+        keys.sort_by(|a, b| by_session_id(&a.0, &b.0));
+        keys
+    }
+
+    /// Every key a terminal holds `Live` or is `Stopping`, with its state,
+    /// sorted by session id. Read-only.
+    pub fn states_for_terminal(&self, terminal_id: &str) -> Vec<(SessionKey, OwnershipState)> {
+        let inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut keys: Vec<(SessionKey, OwnershipState)> = inner
+            .iter()
+            .filter(|(_, record)| match &record.state {
+                OwnershipState::Live { owner, .. }
+                | OwnershipState::Stopping {
+                    owner: Some(owner), ..
+                } => owner.terminal_id.as_deref() == Some(terminal_id),
+                _ => false,
+            })
+            .map(|(key, record)| (key.clone(), record.state.clone()))
+            .collect();
+        keys.sort_by(|a, b| by_session_id(&a.0, &b.0));
+        keys
+    }
+
     /// Register the in-flight `Starting` operation's abort + settle handles
     /// (round-2 review watchdog cancellation): the spawn task registers
     /// `abort` immediately after wrapping its Granted claim in an
@@ -3672,7 +4337,7 @@ impl RuntimeOwnershipRegistry {
         settle: Box<dyn std::future::Future<Output = ()> + Send>,
         settle_fired: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> bool {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         if let Some(record) = inner.get_mut(&SessionKey::new(provider, session_id)) {
             if let OwnershipState::Starting {
                 operation_id: op,
@@ -3707,7 +4372,7 @@ impl RuntimeOwnershipRegistry {
         generation: u64,
         flag: Arc<std::sync::atomic::AtomicBool>,
     ) -> bool {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         if let Some(record) = inner.get_mut(&SessionKey::new(provider, session_id)) {
             if let OwnershipState::Stopping {
                 operation_id: op,
@@ -3734,7 +4399,7 @@ impl RuntimeOwnershipRegistry {
     /// the acknowledged operator force-clear (the prior's death is
     /// UNCONFIRMED — the killing operation vanished mid-flight).
     pub fn recover_stale_stoppings(&self, now_ms: u64, max_age_ms: u64) -> Vec<StaleStopping> {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         let mut out = Vec::new();
         for (key, record) in inner.iter_mut() {
             let snapshot = record.state.clone();
@@ -3748,6 +4413,30 @@ impl RuntimeOwnershipRegistry {
             } = snapshot
             {
                 if now_ms.saturating_sub(since_ms) < max_age_ms {
+                    continue;
+                }
+                // A UNIT's stop is supervised by its lifecycle and, if cut
+                // off, finished on the next boot from its persisted unit
+                // record — never fenced on age. This watchdog stays for
+                // non-unit claims (a panicked handler between claim and
+                // commit).
+                if let Some(unit_owner) = owner.as_ref().filter(|o| o.unit_id.is_some()) {
+                    tracing::info!(target: "freshell_ownership",
+                        event = "ownership.stop.stale_stopping_skipped_unit",
+                        operation_id = %operation_id, provider = %key.provider,
+                        session_id = %key.session_id,
+                        initiator = %initiator,
+                        from_kind = ?Some(unit_owner.kind),
+                        to_kind = ?Option::<RuntimeOwnerKind>::None,
+                        runtime_id = ?unit_owner.terminal_id, pid = ?unit_owner.pid,
+                        epoch = self.epoch, generation,
+                        duration_ms = now_ms.saturating_sub(since_ms),
+                        outcome = "skipped",
+                        failure_reason = "",
+                        unit_id = unit_owner.unit_id.as_deref().unwrap_or(""),
+                        terminal_id = unit_owner.terminal_id.as_deref().unwrap_or(""),
+                        "the over-aged stop belongs to a unit — its lifecycle (or the \
+                         next boot) finishes it; the watchdog never fences it");
                     continue;
                 }
                 // b8ke e3r3 F7: consult the STOP's settlement evidence
@@ -3840,7 +4529,7 @@ impl RuntimeOwnershipRegistry {
         generation: u64,
         owner: OwnerIdentity,
     ) {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         if let Some(record) = inner.get_mut(&SessionKey::new(provider, session_id)) {
             if let OwnershipState::Starting {
                 operation_id: op,
@@ -3883,7 +4572,7 @@ impl RuntimeOwnershipRegistry {
     /// API's vacate semantics are reshaped onto the new contract: the
     /// acknowledged start now carries the prior as the reap target.)
     pub fn recover_stale_starts(&self, now_ms: u64, max_age_ms: u64) -> Vec<RecoveredStart> {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut inner = self.lock_records();
         let mut recovered = Vec::new();
         for (key, record) in inner.iter_mut() {
             if let OwnershipState::Starting {
@@ -4180,6 +4869,9 @@ impl RuntimeOwnershipRegistry {
 }
 
 #[cfg(test)]
+mod unit_scope_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -4227,6 +4919,8 @@ mod tests {
             live_session_key: None,
             pid: Some(4242),
             ownership_id: None,
+            unit_id: None,
+            hold: HoldKind::Main,
         };
         assert_eq!(
             r.commit_live(PROVIDER, "sid", "op-1", generation, owner.clone()),
@@ -4265,6 +4959,8 @@ mod tests {
             live_session_key: Some("freshcodex:sid".into()),
             pid: Some(pid),
             ownership_id: None,
+            unit_id: None,
+            hold: HoldKind::Main,
         }
     }
 
@@ -4628,6 +5324,8 @@ mod tests {
                 live_session_key: None,
                 pid: Some(4242),
                 ownership_id: None,
+                unit_id: None,
+                hold: HoldKind::Main,
             },
             r.boot_epoch(),
             1,
@@ -4838,6 +5536,8 @@ mod tests {
             live_session_key: None,
             pid: Some(555),
             ownership_id: None,
+            unit_id: None,
+            hold: HoldKind::Main,
         };
         r.register_partial_runtime(PROVIDER, "sid", "op-leak", generation, partial.clone());
         let recovered = r.recover_stale_starts(0, 0); // everything is over-aged at now=0
@@ -4929,6 +5629,8 @@ mod tests {
             live_session_key: Some("map-key".into()),
             pid: Some(4321),
             ownership_id: None,
+            unit_id: None,
+            hold: HoldKind::Main,
         };
         assert!(matches!(
             r.commit_live(PROVIDER, "old-live", "op-original", generation, owner),
@@ -4947,6 +5649,8 @@ mod tests {
             live_session_key: Some("map-key".into()),
             pid: Some(9999),
             ownership_id: Some("rekey-op-1".into()),
+            unit_id: None,
+            hold: HoldKind::Main,
         };
         assert!(matches!(
             r.rekey_live(
@@ -5027,6 +5731,8 @@ mod tests {
             live_session_key: Some("map-key-2".into()),
             pid: Some(1111),
             ownership_id: Some("rekey-op-2".into()),
+            unit_id: None,
+            hold: HoldKind::Main,
         };
         let BeginOutcome::Granted { generation: g2 } = r.begin_start(
             PROVIDER,
@@ -5051,6 +5757,8 @@ mod tests {
                     live_session_key: Some("map-key-2".into()),
                     pid: Some(4321),
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 }
             ),
             CommitOutcome::Committed
@@ -5101,6 +5809,8 @@ mod tests {
             live_session_key: Some("map-a".into()),
             pid: None,
             ownership_id: None,
+            unit_id: None,
+            hold: HoldKind::Main,
         };
         assert!(matches!(
             r2.commit_live(PROVIDER, "old-2", "op-a", ga, owner_a),
@@ -5123,6 +5833,8 @@ mod tests {
             live_session_key: None,
             pid: None,
             ownership_id: None,
+            unit_id: None,
+            hold: HoldKind::Main,
         };
         assert!(matches!(
             r2.commit_live(PROVIDER, "target-2", "op-b", gb, owner_b),
@@ -5140,6 +5852,8 @@ mod tests {
                     live_session_key: Some("map-a".into()),
                     pid: Some(7777),
                     ownership_id: Some("rekey-op-x".into()),
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 },
                 "test-rekey",
                 "op-rekey"
@@ -5180,6 +5894,8 @@ mod tests {
                     live_session_key: Some("foreign-map".into()),
                     pid: Some(4),
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 }
             ),
             CommitOutcome::Committed
@@ -5196,6 +5912,8 @@ mod tests {
                     live_session_key: Some("this-lanes-map-key".into()),
                     pid: Some(5),
                     ownership_id: Some("rekey-op-4".into()),
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 },
                 "test-rekey",
                 "op-rekey"
@@ -5228,6 +5946,8 @@ mod tests {
                     live_session_key: None,
                     pid: Some(5),
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 }
             ),
             CommitOutcome::Committed
@@ -5244,6 +5964,8 @@ mod tests {
                     live_session_key: Some("any-map-key".into()),
                     pid: Some(6),
                     ownership_id: Some("rekey-op-5".into()),
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 },
                 "test-rekey",
                 "op-rekey"
@@ -5265,6 +5987,8 @@ mod tests {
                     live_session_key: Some("map-key".into()),
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 },
                 "test-rekey",
                 "op-rekey"
@@ -5291,6 +6015,8 @@ mod tests {
                 live_session_key: Some("map-key".into()),
                 pid: Some(pid),
                 ownership_id: Some("own-1".into()),
+                unit_id: None,
+                hold: HoldKind::Main,
             }
         }
         fn seed_live(r: &RuntimeOwnershipRegistry, id: &str, op: &str) -> u64 {
@@ -5489,6 +6215,8 @@ mod tests {
                     live_session_key: Some("map".into()),
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 }
             ),
             CommitOutcome::Committed
@@ -5609,6 +6337,8 @@ mod tests {
             live_session_key: Some("map".into()),
             pid: Some(4321),
             ownership_id: None,
+            unit_id: None,
+            hold: HoldKind::Main,
         };
         assert!(matches!(
             r.commit_live(PROVIDER, "sid-slow-stop", "op-live", generation, owner),
@@ -5705,6 +6435,8 @@ mod tests {
             live_session_key: Some("map".into()),
             pid: Some(4321),
             ownership_id: None,
+            unit_id: None,
+            hold: HoldKind::Main,
         };
         assert!(matches!(
             r.commit_live(PROVIDER, "sid-stale-stop", "op-live", generation, owner),
@@ -5997,6 +6729,8 @@ mod tests {
                     live_session_key: None,
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 }
             ),
             CommitOutcome::Committed
@@ -6228,6 +6962,8 @@ mod tests {
                     live_session_key: Some("map".into()),
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 },
             ),
             CommitOutcome::Committed
@@ -6310,6 +7046,8 @@ mod tests {
             live_session_key: Some("map-key".into()),
             pid: Some(4242),
             ownership_id: None,
+            unit_id: None,
+            hold: HoldKind::Main,
         };
         assert!(matches!(
             r.commit_live_rekey(
@@ -6395,6 +7133,8 @@ mod tests {
             live_session_key: None,
             pid: None,
             ownership_id: None,
+            unit_id: None,
+            hold: HoldKind::Main,
         };
         assert!(matches!(
             r2.commit_live(PROVIDER, "new-2", "op-foreign", foreign, foreign_owner),
@@ -6686,6 +7426,8 @@ mod tests {
             live_session_key: None,
             pid: None,
             ownership_id: None,
+            unit_id: None,
+            hold: HoldKind::Main,
         };
         // A commit carrying the PRE-handoff generation is refused — the stale
         // caller must tear down its own child.
@@ -7430,6 +8172,8 @@ mod tests {
             live_session_key: None,
             pid: Some(4242),
             ownership_id: None,
+            unit_id: None,
+            hold: HoldKind::Main,
         };
         assert_eq!(
             r3.commit_live(
@@ -7722,8 +8466,9 @@ mod tests {
             "the refused stop must not have transitioned the in-flight start"
         );
 
-        // Stopping: the first stop owns the reap; a second stop is typed
-        // NotLive (no kill license) and the first stop still commits.
+        // Stopping: the first stop owns the reap; a second stop is told to
+        // JOIN it (`AlreadyStopping` names the in-flight operation — no
+        // second, competing stop) and the first stop still commits.
         let (r, owner, live_gen) = registry_with_live_terminal();
         let StopOutcome::Granted { generation } = r.begin_stop(
             PROVIDER,
@@ -7744,7 +8489,7 @@ mod tests {
                 "test",
                 2
             ),
-            StopOutcome::NotLive { .. }
+            StopOutcome::AlreadyStopping { ref operation_id, .. } if operation_id == "kill-1"
         ));
         assert!(matches!(
             r.observe(PROVIDER, "sid").state,
@@ -7804,6 +8549,8 @@ mod tests {
                 live_session_key: None,
                 pid: Some(1111),
                 ownership_id: None,
+                unit_id: None,
+                hold: HoldKind::Main,
             },
         );
         assert_eq!(
@@ -7879,6 +8626,8 @@ mod tests {
             live_session_key: None,
             pid: None,
             ownership_id: None,
+            unit_id: None,
+            hold: HoldKind::Main,
         };
         assert_eq!(
             r.commit_live(PROVIDER, "sid", "op-slow", 1, stale_owner),
@@ -8173,6 +8922,8 @@ mod tests {
             live_session_key: None,
             pid: None,
             ownership_id: None,
+            unit_id: None,
+            hold: HoldKind::Main,
         }
     }
 
@@ -8407,6 +9158,8 @@ mod tests {
                     live_session_key: Some("sid".into()),
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 },
             ),
             CommitOutcome::Committed
@@ -8563,6 +9316,8 @@ mod tests {
                     live_session_key: Some("sid-rekey".into()),
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 },
             ),
             CommitOutcome::Committed
@@ -8579,6 +9334,8 @@ mod tests {
                     live_session_key: Some("sid-rekey".into()),
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 },
                 "test",
                 "op-rekey-move",
@@ -8651,6 +9408,8 @@ mod tests {
                     live_session_key: Some("sid-stale-naming".into()),
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 },
             ),
             CommitOutcome::Committed
@@ -8867,6 +9626,8 @@ mod tests {
                     live_session_key: None,
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 }),
             },
             "test-noop",
@@ -9013,6 +9774,8 @@ mod tests {
                     live_session_key: Some("sid-enum".into()),
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 },
             ),
             CommitOutcome::Committed
@@ -9125,6 +9888,8 @@ mod tests {
                     live_session_key: Some("sid-enum-rekey".into()),
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 },
             ),
             CommitOutcome::Committed
@@ -9141,6 +9906,8 @@ mod tests {
                     live_session_key: Some("sid-enum-rekey".into()),
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 },
                 "test",
                 "op-enum-rekey",
@@ -9173,6 +9940,8 @@ mod tests {
                     live_session_key: Some("sid-enum-crk-new".into()),
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 },
             ),
             CommitOutcome::Committed
@@ -9282,6 +10051,8 @@ mod tests {
                     live_session_key: None,
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 },
             ),
             CommitOutcome::Committed
@@ -9314,6 +10085,8 @@ mod tests {
                     live_session_key: None,
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 },
                 "test",
             ),
@@ -9341,6 +10114,8 @@ mod tests {
             live_session_key: Some("sid-enum-force".into()),
             pid: None,
             ownership_id: None,
+            unit_id: None,
+            hold: HoldKind::Main,
         };
         assert!(matches!(
             r.commit_live(
@@ -9393,6 +10168,8 @@ mod tests {
                     live_session_key: Some("sid-enum-alias-to".into()),
                     pid: Some(6464),
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 },
             ),
             CommitOutcome::Committed
@@ -9440,6 +10217,8 @@ mod tests {
                     live_session_key: None,
                     pid: Some(4242),
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 },
             ),
             CommitOutcome::Committed
@@ -9483,6 +10262,8 @@ mod tests {
                     live_session_key: Some("sid-enum-cleared-unverified".into()),
                     pid: Some(5555),
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 },
             ),
             CommitOutcome::Committed
@@ -9589,6 +10370,8 @@ mod tests {
                     live_session_key: Some("sid-enum-cu-stale-obs".into()),
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 },
             ),
             CommitOutcome::Committed
@@ -9646,6 +10429,11 @@ mod tests {
             AcknowledgedStartOutcome::StaleObservation { .. }
         ));
 
+        // codex-pane-lifecycle Task 8: the unit-scoped transitions (a
+        // separate registry so the earlier keys stay as they are).
+        let r_unit = RuntimeOwnershipRegistry::new();
+        drive_unit_scoped_transitions(&r_unit, "u-enum", "t-enum-unit");
+
         // ── the ENUMERATION: every captured transition event carries the
         // complete stable schema. A missing field anywhere fails.
         let events = capture.events();
@@ -9695,6 +10483,13 @@ mod tests {
             "ownership.live.rekey_from_terminal",
             "ownership.force_released",
             "ownership.key.alias_vacant",
+            // codex-pane-lifecycle Task 8: the unit-scoped transitions
+            // (the unit stop/commit log `ownership.stop.begin` /
+            // `ownership.stop.commit`, listed above).
+            "ownership.extra.hold",
+            "ownership.extra.release",
+            "ownership.stop.restored",
+            "ownership.handoff.extra_hold_adopt",
         ];
         let mut covered: Vec<&str> = Vec::new();
         for event in &events {
@@ -9722,6 +10517,151 @@ mod tests {
                 return Err(format!(
                     "the enumeration must cover {expected} — covered: {covered:?}"
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Drive every unit-scoped transition once for `unit_id` (owner
+    /// terminal `terminal_id`): a Live main key, an extra hold adopted by a
+    /// switch and released, a boot seed, the unit stop (joining the seed),
+    /// the stale-Stopping sweep skipping the unit, and the Gone commit.
+    fn drive_unit_scoped_transitions(
+        r: &RuntimeOwnershipRegistry,
+        unit_id: &str,
+        terminal_id: &str,
+    ) {
+        let unit_owner = OwnerIdentity {
+            terminal_id: Some(terminal_id.into()),
+            unit_id: Some(unit_id.into()),
+            ..OwnerIdentity::default()
+        };
+        let BeginOutcome::Granted { generation } = r.begin_start(
+            PROVIDER,
+            "sid-unit-main",
+            RuntimeOwnerKind::Terminal,
+            "op-unit-start",
+            None,
+            "test",
+            18_000,
+        ) else {
+            panic!("expected Granted")
+        };
+        assert_eq!(
+            r.commit_live(
+                PROVIDER,
+                "sid-unit-main",
+                "op-unit-start",
+                generation,
+                unit_owner.clone()
+            ),
+            CommitOutcome::Committed
+        );
+        assert!(matches!(
+            r.hold_extra(
+                PROVIDER,
+                "sid-unit-extra",
+                unit_owner.clone(),
+                "test",
+                18_100
+            ),
+            HoldOutcome::Held { .. }
+        ));
+        assert!(matches!(
+            r.begin_handoff(
+                PROVIDER,
+                "sid-unit-extra",
+                RuntimeOwnerKind::FreshAgent,
+                "op-unit-switch",
+                None,
+                "test",
+                18_200,
+            ),
+            BeginOutcome::AdoptLive { .. }
+        ));
+        assert!(r.release_extra(PROVIDER, "sid-unit-extra", unit_id));
+        assert!(r.restore_stopping(
+            PROVIDER,
+            "sid-unit-restored",
+            unit_owner,
+            "op-unit-stop",
+            "boot",
+            18_300,
+        ));
+        assert_eq!(
+            r.begin_unit_stop(unit_id, "op-unit-stop", "test", 18_400)
+                .len(),
+            2
+        );
+        assert!(r
+            .recover_stale_stoppings(18_400 + 3_600_000, 30_000)
+            .is_empty());
+        assert_eq!(r.commit_unit_stop(unit_id, "op-unit-stop").len(), 2);
+    }
+
+    /// codex-pane-lifecycle Task 8: every unit-scoped ownership event is
+    /// keyed by the unit and its terminal (plain values), so the registry's
+    /// lines join the `freshell_unit` lifecycle lines of the same unit.
+    #[test]
+    fn unit_scoped_events_carry_the_unit_keys() {
+        let mut last_problem = String::new();
+        for attempt in 0..3 {
+            match run_unit_keys_once() {
+                Ok(()) => return,
+                Err(problem) => {
+                    eprintln!(
+                        "unit-keys attempt {attempt} incomplete ({problem}); retrying with a \
+                         fresh capture"
+                    );
+                    last_problem = problem;
+                }
+            }
+        }
+        panic!("{last_problem}");
+    }
+
+    fn run_unit_keys_once() -> Result<(), String> {
+        let r = RuntimeOwnershipRegistry::new();
+        let capture = EventCapture::default();
+        let _guard = capture.install();
+        drive_unit_scoped_transitions(&r, "u-keys", "t-keys");
+        let events = capture.events();
+        for (name, extra_fields) in [
+            (
+                "ownership.stop.begin",
+                &["from_state", "attach_in_flight"][..],
+            ),
+            ("ownership.stop.commit", &["attach_guards_cleared"][..]),
+            ("ownership.extra.hold", &[][..]),
+            ("ownership.extra.release", &[][..]),
+            ("ownership.stop.restored", &[][..]),
+            ("ownership.handoff.extra_hold_adopt", &[][..]),
+            ("ownership.stop.stale_stopping_skipped_unit", &[][..]),
+        ] {
+            let matching: Vec<&CapturedEvent> = events
+                .iter()
+                .filter(|e| e.event.as_deref() == Some(name))
+                .collect();
+            if matching.is_empty() {
+                return Err(format!("{name} was not logged"));
+            }
+            for event in matching {
+                for (key, expected) in [("unit_id", "u-keys"), ("terminal_id", "t-keys")] {
+                    if event.values.get(key).map(String::as_str) != Some(expected) {
+                        return Err(format!(
+                            "{name} must carry {key}={expected} — got {:?}",
+                            event.values
+                        ));
+                    }
+                }
+                for field in extra_fields {
+                    if !event.fields.contains(&field.to_string()) {
+                        return Err(format!(
+                            "{name} must carry {field} — got {:?}",
+                            event.fields
+                        ));
+                    }
+                }
             }
         }
         Ok(())
@@ -9866,6 +10806,8 @@ mod tests {
                     live_session_key: None,
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 },
             ),
             CommitOutcome::Committed
@@ -9933,6 +10875,8 @@ mod tests {
                     live_session_key: Some(sid.clone()),
                     pid: Some(1111),
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 },
             ),
             CommitOutcome::Committed
@@ -10455,6 +11399,8 @@ mod tests {
                     live_session_key: None,
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 },
             ),
             CommitOutcome::Committed
@@ -10497,6 +11443,8 @@ mod tests {
                             live_session_key: None,
                             pid: None,
                             ownership_id: None,
+                            unit_id: None,
+                            hold: HoldKind::Main,
                         }),
                         observed: ObservedFence {
                             epoch: registry.boot_epoch(),
@@ -10558,6 +11506,8 @@ mod tests {
             live_session_key: Some("live-key-1".into()),
             pid: Some(424_242),
             ownership_id: Some("op-live-r32".into()),
+            unit_id: None,
+            hold: HoldKind::Main,
         };
         let BeginOutcome::Granted { generation } = registry.begin_start(
             "codex",
@@ -10721,6 +11671,8 @@ mod tests {
                     live_session_key: None,
                     pid: None,
                     ownership_id: Some("op-holder-late".into()),
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 },
             ),
             CommitOutcome::Committed,
@@ -10744,6 +11696,8 @@ mod tests {
                     live_session_key: None,
                     pid: None,
                     ownership_id: Some("op-holder-late".into()),
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 }),
             },
             "watcher",
@@ -10803,6 +11757,8 @@ mod tests {
                     live_session_key: None,
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: HoldKind::Main,
                 },
             ),
             CommitOutcome::Committed
@@ -10860,6 +11816,8 @@ mod tests {
             live_session_key: None,
             pid: None,
             ownership_id: None,
+            unit_id: None,
+            hold: HoldKind::Main,
         };
 
         // (1) A Vacant key: Refused typed.
@@ -10963,6 +11921,8 @@ mod tests {
             live_session_key: None,
             pid: None,
             ownership_id: None,
+            unit_id: None,
+            hold: HoldKind::Main,
         };
         match registry.begin_adopt_guard(
             "claude",

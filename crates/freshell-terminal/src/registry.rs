@@ -1153,6 +1153,8 @@ fn retained_runtime_identity(
         live_session_key: None,
         pid: claim.pid,
         ownership_id: Some(claim.operation_id.clone()),
+        unit_id: None,
+        hold: freshell_ownership::HoldKind::Main,
     }
 }
 
@@ -5555,6 +5557,8 @@ impl TerminalRegistry {
             live_session_key: None,
             pid,
             ownership_id: Some(operation_id.to_string()),
+            unit_id: None,
+            hold: freshell_ownership::HoldKind::Main,
         };
         let outcome = ownership.commit_live(
             &locator.provider,
@@ -5604,6 +5608,8 @@ impl TerminalRegistry {
             live_session_key: None,
             pid: None,
             ownership_id: Some(operation_id.to_string()),
+            unit_id: None,
+            hold: freshell_ownership::HoldKind::Main,
         };
         let outcome = ownership.commit_live(
             &locator.provider,
@@ -5697,6 +5703,8 @@ impl TerminalRegistry {
             live_session_key: None,
             pid,
             ownership_id: Some(operation_id.to_string()),
+            unit_id: None,
+            hold: freshell_ownership::HoldKind::Main,
         };
         let outcome = ownership.commit_live_rekey_from_terminal(
             &new_locator.provider,

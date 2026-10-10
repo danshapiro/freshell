@@ -1394,6 +1394,8 @@ impl FreshClaudeState {
                     live_session_key: Some(session_id.to_string()),
                     pid,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 })
             }
             Err(ResumeClaudeError::NotFound) => Err((
@@ -1512,6 +1514,8 @@ impl FreshClaudeState {
                     live_session_key: Some(live_session_key.to_string()),
                     pid,
                     ownership_id: Some(ticket_ref.operation_id().to_string()),
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 };
                 registry.commit_live_rekey(
                     PROVIDER,
@@ -1533,6 +1537,8 @@ impl FreshClaudeState {
                     // sidecar exit/crash release (which claims with the
                     // stamp's identity) matches the live owner.
                     ownership_id: Some(rekey_operation_id.clone()),
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 };
                 registry.rekey_live(
                     PROVIDER,
@@ -1578,6 +1584,8 @@ impl FreshClaudeState {
                         live_session_key: Some(live_session_key.to_string()),
                         pid,
                         ownership_id: Some(stamp_operation_id),
+                        unit_id: None,
+                        hold: freshell_ownership::HoldKind::Main,
                     },
                 };
                 self.ownership_stamps
@@ -3006,6 +3014,18 @@ impl FreshClaudeState {
                             "a lifecycle operation is in flight ({state:?}); retry after it settles"
                         ),
                     )),
+                    // A stop is already in flight: refused exactly as the
+                    // in-flight `NotLive{Stopping}` answer was (Task 23 makes
+                    // this lane join the in-flight stop instead).
+                    freshell_ownership::StopOutcome::AlreadyStopping {
+                        ref operation_id, ..
+                    } => Some((
+                        "LIFECYCLE_IN_FLIGHT",
+                        format!(
+                            "a lifecycle operation is in flight (Stopping under {operation_id}); \
+                             retry after it settles"
+                        ),
+                    )),
                     freshell_ownership::StopOutcome::BlockedHandoff { .. } => Some((
                         "HANDOFF_IN_FLIGHT",
                         "a handoff owns this session's transition; retry after it settles"
@@ -3208,6 +3228,16 @@ impl FreshClaudeState {
                                         format!(
                                             "a lifecycle operation is in flight ({state:?}); \
                                              retry after it settles"
+                                        ),
+                                    ),
+                                    freshell_ownership::StopOutcome::AlreadyStopping {
+                                        operation_id,
+                                        ..
+                                    } => (
+                                        "LIFECYCLE_IN_FLIGHT",
+                                        format!(
+                                            "a lifecycle operation is in flight (Stopping \
+                                             under {operation_id}); retry after it settles"
                                         ),
                                     ),
                                     freshell_ownership::StopOutcome::BlockedHandoff { .. } => (
@@ -5549,6 +5579,8 @@ impl FreshClaudeState {
                 live_session_key: None,
                 pid: None,
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             };
             match crate::ownership_lane::arm_adopt_guard(
                 &self.ownership,
@@ -6623,6 +6655,8 @@ impl FreshClaudeState {
                 live_session_key: None,
                 pid: None,
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             };
             let rebind_guard = match attach_fence {
                 Some(adopt_fence) => {
@@ -12654,6 +12688,96 @@ rl.on('line', (line) => {
         );
     }
 
+    /// codex-pane-lifecycle Task 8: a kill on a key whose stop is already
+    /// in flight (the coordinator now answers `AlreadyStopping`) is refused
+    /// exactly as the in-flight `NotLive{Stopping}` answer was: typed
+    /// LIFECYCLE_IN_FLIGHT naming the in-flight stop, nothing killed and
+    /// nothing durable closed — never misreported as a stale claim. (Task
+    /// 23 makes this lane join the in-flight stop instead.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_during_another_stop_is_refused_as_in_flight() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(sink.clone());
+
+        let mut create = dedup_create_msg("req-t8-in-flight");
+        create.model = Some("opus".into());
+        st.handle_create(create, None).await;
+        let created = await_claude_created(&mut rx, "req-t8-in-flight").await;
+        let placeholder = created["sessionId"].as_str().unwrap().to_string();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let live = loop {
+            let snap = registry.observe(PROVIDER, FRESH_CREATE_DURABLE_ID);
+            if matches!(snap.state, freshell_ownership::OwnershipState::Live { .. }) {
+                break snap;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the create never committed its owner Live"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+
+        // ANOTHER stop owns the key's transition.
+        let freshell_ownership::StopOutcome::Granted { .. } = registry.begin_stop(
+            PROVIDER,
+            FRESH_CREATE_DURABLE_ID,
+            "op-t8-other-stop",
+            &freshell_ownership::StopClaim {
+                expected_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                expected_runtime: None,
+                observed: freshell_ownership::ObservedFence {
+                    epoch: live.epoch,
+                    generation: live.generation,
+                },
+            },
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) else {
+            panic!("the other stop begins on the Live key")
+        };
+
+        st.handle_kill(kill_msg(&placeholder)).await;
+
+        let frame = await_specific_frame(&mut rx, "freshAgent.killed", &placeholder).await;
+        assert_eq!(frame["success"], json!(false));
+        assert_eq!(
+            frame["code"],
+            json!("LIFECYCLE_IN_FLIGHT"),
+            "a kill during another stop is refused as in flight: {frame}"
+        );
+        assert!(
+            frame["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("op-t8-other-stop")),
+            "the refusal names the in-flight stop: {frame}"
+        );
+        assert!(
+            st.has_live_session(FRESH_CREATE_DURABLE_ID).await,
+            "the refused kill left the session live"
+        );
+        assert!(
+            sink.retires
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, id)| id != FRESH_CREATE_DURABLE_ID),
+            "the refused kill closed nothing durable"
+        );
+        assert_eq!(
+            registry
+                .observe(PROVIDER, FRESH_CREATE_DURABLE_ID)
+                .state
+                .operation_id(),
+            Some("op-t8-other-stop"),
+            "the other stop still owns the key"
+        );
+    }
+
     /// b8ke e3r1 F1: a DELAYED kill after a completed handoff NEVER
     /// fabricates a claim against the replacement owner. The handoff
     /// consumed the Fresh Agent stamp and committed a TERMINAL owner; the
@@ -12701,6 +12825,8 @@ rl.on('line', (line) => {
             live_session_key: None,
             pid: None,
             ownership_id: Some("handoff-completed-e3r1".into()),
+            unit_id: None,
+            hold: freshell_ownership::HoldKind::Main,
         };
         assert!(matches!(
             registry.commit_live(
@@ -13112,6 +13238,8 @@ rl.on('line', (line) => {
             live_session_key: None,
             pid: None,
             ownership_id: Some("handoff-in-flight-e3r2".into()),
+            unit_id: None,
+            hold: freshell_ownership::HoldKind::Main,
         };
         assert!(matches!(
             registry.commit_live(
@@ -14301,6 +14429,8 @@ rl.on('line', (line) => {
             live_session_key: None,
             pid: None,
             ownership_id: None,
+            unit_id: None,
+            hold: freshell_ownership::HoldKind::Main,
         };
         let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
             "claude",
@@ -14465,6 +14595,8 @@ rl.on('line', (line) => {
                     live_session_key: Some(placeholder.clone()),
                     pid: Some(4321),
                     ownership_id: Some("rekey-op-fork-e2r4".into()),
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 },
                 "test-rekey",
                 "rekey-op-fork-e2r4",
@@ -14713,6 +14845,8 @@ rl.on('line', (line) => {
                     live_session_key: None,
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 },
             ),
             freshell_ownership::CommitOutcome::Committed,
@@ -15014,6 +15148,8 @@ rl.on('line', (line) => {
                     live_session_key: None,
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 },
             ),
             freshell_ownership::CommitOutcome::Committed
@@ -15045,6 +15181,8 @@ rl.on('line', (line) => {
                     live_session_key: Some("cycle-f3-newer".into()),
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 },
             ),
             freshell_ownership::CommitOutcome::Committed

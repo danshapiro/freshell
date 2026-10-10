@@ -1900,6 +1900,8 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                             live_session_key: None,
                             pid: None,
                             ownership_id: None,
+                            unit_id: None,
+                            hold: freshell_ownership::HoldKind::Main,
                         },
                     );
                 }
@@ -1937,6 +1939,8 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                     live_session_key: None,
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 };
                 let adopt_fence = match observed {
                     Some(fence) => fence,
@@ -3329,6 +3333,8 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                 live_session_key: None,
                 pid: registry.pid_of(&terminal_id),
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             });
         } else {
             let claim_locator = claim.locator.clone();
@@ -8833,6 +8839,8 @@ if (args.includes('app-server')) {{
             live_session_key: None,
             pid: None,
             ownership_id: None,
+            unit_id: None,
+            hold: freshell_ownership::HoldKind::Main,
         };
         assert_eq!(
             ownership.commit_live("claude", &sid, phantom_op, generation, phantom.clone()),
@@ -8985,6 +8993,8 @@ if (args.includes('app-server')) {{
             live_session_key: None,
             pid: None,
             ownership_id: None,
+            unit_id: None,
+            hold: freshell_ownership::HoldKind::Main,
         };
         assert_eq!(
             ownership.commit_live(

@@ -1983,6 +1983,8 @@ async fn a_stale_stop_fence_recovers_through_the_handoff_runner() {
         live_session_key: Some(sid.clone()),
         pid: None,
         ownership_id: None,
+        unit_id: None,
+        hold: freshell_ownership::HoldKind::Main,
     };
     assert!(matches!(
         rig.ownership
@@ -3060,6 +3062,8 @@ async fn the_uncommitted_target_reap_never_confirms_on_a_missing_row() {
         live_session_key: None,
         pid: Some(target_pid),
         ownership_id: None,
+        unit_id: None,
+        hold: freshell_ownership::HoldKind::Main,
     };
 
     // THE WINDOW: kill() answers false (the row is gone) while the pid
@@ -3099,6 +3103,8 @@ async fn the_uncommitted_target_reap_never_confirms_on_a_missing_row() {
         live_session_key: None,
         pid: Some(target_pid),
         ownership_id: None,
+        unit_id: None,
+        hold: freshell_ownership::HoldKind::Main,
     };
     let outcome = rig
         .runner
@@ -4471,6 +4477,8 @@ async fn a_codex_handoff_on_an_old_rebound_reference_resolves_the_permanent_alia
         live_session_key: None,
         pid: None,
         ownership_id: Some("op-r33-codex-live".to_string()),
+        unit_id: None,
+        hold: freshell_ownership::HoldKind::Main,
     };
     let freshell_ownership::BeginOutcome::Granted { generation } = rig.ownership.begin_start(
         "codex",
@@ -4614,6 +4622,8 @@ async fn a_stale_generation_answer_is_retryable_from_the_handler_output() {
                 live_session_key: None,
                 pid: None,
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             },
         ),
         freshell_ownership::CommitOutcome::Committed
@@ -7044,6 +7054,8 @@ async fn a_handoff_on_a_superseded_rekeyed_id_resolves_the_canonical_owner() {
                 live_session_key: Some(rekey_map_key.clone()),
                 pid: sidecar_pid,
                 ownership_id: Some("test-rekey-op".into()),
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             },
             "test-rekey",
             "test-rekey-op",
@@ -8821,6 +8833,8 @@ async fn the_prior_stop_never_confirms_on_a_missing_row() {
         live_session_key: None,
         pid: Some(prior_pid),
         ownership_id: None,
+        unit_id: None,
+        hold: freshell_ownership::HoldKind::Main,
     };
 
     // THE WINDOW: kill() answers false (the row is gone) while the pid
@@ -8857,6 +8871,8 @@ async fn the_prior_stop_never_confirms_on_a_missing_row() {
         live_session_key: None,
         pid: Some(prior_pid),
         ownership_id: None,
+        unit_id: None,
+        hold: freshell_ownership::HoldKind::Main,
     };
     let outcome = rig
         .runner
@@ -8911,6 +8927,8 @@ async fn the_replacement_probe_never_confirms_a_terminal_prior_on_a_missing_row(
         live_session_key: None,
         pid: Some(prior_pid),
         ownership_id: None,
+        unit_id: None,
+        hold: freshell_ownership::HoldKind::Main,
     };
 
     // THE WINDOW: the row is gone while the pid lives — the replacement

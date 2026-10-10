@@ -255,6 +255,8 @@ pub mod ownership_lane {
                 live_session_key: Some(session_id.to_string()),
                 pid,
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             });
             self
         }
@@ -829,6 +831,8 @@ pub mod ownership_lane {
                 live_session_key: Some(live_session_key.to_string()),
                 pid,
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             },
         );
     }
@@ -1079,6 +1083,8 @@ pub mod ownership_lane {
             live_session_key: Some(live_session_key.to_string()),
             pid,
             ownership_id: Some(operation_id.clone()),
+            unit_id: None,
+            hold: freshell_ownership::HoldKind::Main,
         };
         // b8ke ext r30 F1: the stamps lock is the ordering point for the
         // WHOLE publication — held across the liveness check, the
@@ -5251,6 +5257,8 @@ async fn resume_session_ref_tab(
                 live_session_key: None,
                 pid: None,
                 ownership_id: None,
+                unit_id: None,
+                hold: freshell_ownership::HoldKind::Main,
             };
             let adopt_outcome = match resume_fence {
                 Some(adopt_fence) => ownership_lane::arm_adopt_guard(
@@ -7647,6 +7655,8 @@ mod ownership_watch_tests {
             live_session_key: Some(session_id.to_string()),
             pid: Some(101),
             ownership_id: Some("op-old".to_string()),
+            unit_id: None,
+            hold: freshell_ownership::HoldKind::Main,
         };
         let BeginOutcome::Granted { generation } = registry.begin_start(
             "codex",
@@ -7774,6 +7784,8 @@ mod ownership_watch_tests {
             live_session_key: Some(session_id.to_string()),
             pid: Some(303),
             ownership_id: Some("op-fenced".to_string()),
+            unit_id: None,
+            hold: freshell_ownership::HoldKind::Main,
         };
         let BeginOutcome::Granted { generation } = registry.begin_start(
             "codex",
@@ -8104,6 +8116,8 @@ mod tests {
             live_session_key: Some("live-key-r32-f2".into()),
             pid: Some(111_222),
             ownership_id: Some("op-live-r32-f2".into()),
+            unit_id: None,
+            hold: freshell_ownership::HoldKind::Main,
         };
         let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
             "codex",
@@ -8559,7 +8573,9 @@ mod tests {
                     terminal_id: Some("foreign-terminal".into()),
                     live_session_key: None,
                     pid: None,
-                    ownership_id: None
+                    ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 }
             ),
             freshell_ownership::CommitOutcome::Committed
@@ -9395,6 +9411,8 @@ mod tests {
             live_session_key: None,
             pid: None,
             ownership_id: None,
+            unit_id: None,
+            hold: freshell_ownership::HoldKind::Main,
         };
         assert_eq!(
             registry.commit_live(
@@ -9706,6 +9724,8 @@ mod tests {
                     live_session_key: None,
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 }
             ),
             freshell_ownership::CommitOutcome::Committed
@@ -10054,6 +10074,8 @@ mod tests {
                     live_session_key: Some("ses_r26_adopt".to_string()),
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 }
             ),
             freshell_ownership::CommitOutcome::Committed
@@ -12090,6 +12112,8 @@ mod tests {
                     live_session_key: None,
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 },
             ),
             freshell_ownership::CommitOutcome::Committed

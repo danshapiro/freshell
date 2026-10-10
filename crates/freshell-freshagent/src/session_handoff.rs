@@ -2466,6 +2466,8 @@ impl SessionHandoffRunner {
             live_session_key: Some(session_id.clone()),
             pid: None,
             ownership_id: None,
+            unit_id: None,
+            hold: freshell_ownership::HoldKind::Main,
         });
         let target_outcome = self.abort_reap_uncommitted_target(&payload).await;
         let confirmed_live = match prior.as_ref() {
@@ -2796,6 +2798,8 @@ impl SessionHandoffRunner {
             live_session_key: Some(session_id.clone()),
             pid: None,
             ownership_id: None,
+            unit_id: None,
+            hold: freshell_ownership::HoldKind::Main,
         });
         let cleanup_req = self.cleanup_request(provider, session_id, *target_kind);
         // b8ke ext r10 F3: when the abort left a DETACHED TERMINAL SPAWN
@@ -4073,6 +4077,8 @@ impl SessionHandoffRunner {
                     live_session_key: None,
                     pid: self.registry.pid_of(&spawned.terminal_id),
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 });
                 if let Some(hooks) = self.test_hooks.as_ref() {
                     hooks.record("TargetStarted");

@@ -3414,6 +3414,8 @@ impl FreshOpencodeState {
                     // per-session writer — never a kill target, never the pid.
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 },
                 OpencodeSessionHandle::new(session_arc),
             )),
@@ -3648,6 +3650,18 @@ impl FreshOpencodeState {
                             "a lifecycle operation is in flight ({state:?}); retry after it settles"
                         ),
                     )),
+                    // A stop is already in flight: refused exactly as the
+                    // in-flight `NotLive{Stopping}` answer was (Task 23 makes
+                    // this lane join the in-flight stop instead).
+                    freshell_ownership::StopOutcome::AlreadyStopping {
+                        ref operation_id, ..
+                    } => Some((
+                        "LIFECYCLE_IN_FLIGHT",
+                        format!(
+                            "a lifecycle operation is in flight (Stopping under {operation_id}); \
+                             retry after it settles"
+                        ),
+                    )),
                     freshell_ownership::StopOutcome::BlockedHandoff { .. } => Some((
                         "HANDOFF_IN_FLIGHT",
                         "a handoff owns this session's transition; retry after it settles"
@@ -3837,6 +3851,16 @@ impl FreshOpencodeState {
                                         format!(
                                             "a lifecycle operation is in flight ({state:?}); \
                                              retry after it settles"
+                                        ),
+                                    ),
+                                    freshell_ownership::StopOutcome::AlreadyStopping {
+                                        operation_id,
+                                        ..
+                                    } => (
+                                        "LIFECYCLE_IN_FLIGHT",
+                                        format!(
+                                            "a lifecycle operation is in flight (Stopping \
+                                             under {operation_id}); retry after it settles"
                                         ),
                                     ),
                                     freshell_ownership::StopOutcome::BlockedHandoff { .. } => (
@@ -6830,6 +6854,8 @@ impl FreshOpencodeState {
                         live_session_key: None,
                         pid: None,
                         ownership_id: None,
+                        unit_id: None,
+                        hold: freshell_ownership::HoldKind::Main,
                     };
                     existing_session_attach_guard = match crate::ownership_lane::arm_adopt_guard(
                         &self.fresh_agent.ownership,
@@ -8078,6 +8104,8 @@ impl FreshOpencodeState {
                             live_session_key: None,
                             pid: None,
                             ownership_id: None,
+                            unit_id: None,
+                            hold: freshell_ownership::HoldKind::Main,
                         };
                         match crate::ownership_lane::arm_adopt_guard(
                             &self.fresh_agent.ownership,
@@ -8413,6 +8441,8 @@ impl FreshOpencodeState {
                         live_session_key: None,
                         pid: None,
                         ownership_id: None,
+                        unit_id: None,
+                        hold: freshell_ownership::HoldKind::Main,
                     };
                     match crate::ownership_lane::arm_adopt_guard(
                         &self.fresh_agent.ownership,
@@ -10120,6 +10150,8 @@ mod tests {
                     live_session_key: None,
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 },
             ),
             freshell_ownership::CommitOutcome::Committed
@@ -10253,6 +10285,8 @@ mod tests {
                     live_session_key: None,
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 },
             ),
             freshell_ownership::CommitOutcome::Committed
@@ -10772,6 +10806,8 @@ mod tests {
             live_session_key: Some("seed".to_string()),
             pid: None,
             ownership_id: Some("op-r31-seed-prior".to_string()),
+            unit_id: None,
+            hold: freshell_ownership::HoldKind::Main,
         };
         assert!(
             matches!(
@@ -14344,6 +14380,8 @@ mod tests {
                     live_session_key: Some(durable_id.to_string()),
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 },
             ),
             freshell_ownership::CommitOutcome::Committed
@@ -14377,6 +14415,8 @@ mod tests {
                     live_session_key: Some(durable_id.to_string()),
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 },
             ),
             freshell_ownership::CommitOutcome::Committed
@@ -17724,6 +17764,8 @@ mod tests {
                     live_session_key: Some("r5-race-newer".into()),
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 },
             ),
             freshell_ownership::CommitOutcome::Committed
@@ -17823,6 +17865,8 @@ mod tests {
                     live_session_key: None,
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 },
             ),
             freshell_ownership::CommitOutcome::Committed
@@ -17851,6 +17895,8 @@ mod tests {
                     live_session_key: Some("cycle-fresh".into()),
                     pid: None,
                     ownership_id: None,
+                    unit_id: None,
+                    hold: freshell_ownership::HoldKind::Main,
                 },
             ),
             freshell_ownership::CommitOutcome::Committed
@@ -18200,6 +18246,8 @@ mod tests {
                         live_session_key: None,
                         pid: None,
                         ownership_id: None,
+                        unit_id: None,
+                        hold: freshell_ownership::HoldKind::Main,
                     },
                 ),
                 freshell_ownership::CommitOutcome::Committed
@@ -18249,6 +18297,8 @@ mod tests {
                         live_session_key: None,
                         pid: None,
                         ownership_id: None,
+                        unit_id: None,
+                        hold: freshell_ownership::HoldKind::Main,
                     },
                 ),
                 freshell_ownership::CommitOutcome::Committed
@@ -18297,6 +18347,8 @@ mod tests {
                         live_session_key: None,
                         pid: None,
                         ownership_id: None,
+                        unit_id: None,
+                        hold: freshell_ownership::HoldKind::Main,
                     },
                 ),
                 freshell_ownership::CommitOutcome::Committed
@@ -22380,6 +22432,8 @@ mod tests {
                         live_session_key: None,
                         pid: None,
                         ownership_id: None,
+                        unit_id: None,
+                        hold: freshell_ownership::HoldKind::Main,
                     },
                 ),
                 freshell_ownership::CommitOutcome::Committed
