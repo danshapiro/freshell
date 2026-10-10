@@ -97,6 +97,59 @@ export function writePrivateJson(filePath: string, value: unknown): void {
   fs.chmodSync(filePath, 0o600)
 }
 
+type InterruptedOrdinaryStopPane = {
+  id: string
+  type: string
+  content: {
+    kind: string
+    soulId?: string
+    createRequestId: string
+    provider: string
+    sessionType: string
+    sessionId?: string | null
+    sessionRef?: { provider: string; sessionId: string }
+  }
+}
+
+export function bindInterruptedOrdinaryStopFailedAck(
+  sent: any[], sentAtStop: number,
+  owned: {
+    pane: InterruptedOrdinaryStopPane
+    paneId: string; createRequestId: string; soulId: string; nativeSessionId: string
+    provider: string; sessionType: string
+    pendingCreate?: { sessionId?: string; provider?: string; sessionType?: string }
+  },
+): (received: any[], receivedAtStop: number) => boolean {
+  const content = owned.pane?.content
+  if (owned.pane?.type !== 'leaf' || owned.pane.id !== owned.paneId
+    || content?.kind !== 'fresh-agent' || content.createRequestId !== owned.createRequestId
+    || content.soulId !== owned.soulId || content.provider !== owned.provider
+    || content.sessionType !== owned.sessionType || content.sessionRef?.provider !== owned.provider
+    || content.sessionRef.sessionId !== owned.nativeSessionId || !owned.nativeSessionId.trim()) {
+    throw new Error('interrupted ordinary Stop lacks the exact owned pane/native identity')
+  }
+  const pending = owned.pendingCreate
+  if (!content.sessionId && pending?.sessionId && (pending.provider !== owned.provider || pending.sessionType !== owned.sessionType)) {
+    throw new Error('interrupted ordinary Stop pending target lacks matching provider/type evidence')
+  }
+  const expectedTarget = content.sessionId || pending?.sessionId || content.sessionRef.sessionId
+  const requests = sent.slice(sentAtStop).filter((message) => message?.type === 'freshAgent.kill')
+  if (requests.length !== 1) throw new Error('interrupted ordinary Stop requires exactly one post-click kill')
+  const { sessionId, provider, sessionType } = requests[0]
+  if (typeof sessionId !== 'string' || !sessionId.trim() || sessionId !== expectedTarget
+    || provider !== owned.provider || sessionType !== owned.sessionType) {
+    throw new Error('interrupted ordinary Stop kill does not target the owned pane')
+  }
+  // Freeze the validated outbound tuple. This broadcast protocol cannot
+  // distinguish another operation with the identical target/provider/type.
+  return (received, receivedAtStop) => received.slice(receivedAtStop).some((message) => {
+    if (message?.sessionId !== sessionId || message.provider !== provider || message.sessionType !== sessionType) return false
+    const event = message.type === 'freshAgent.event' ? message.event
+      : message.type === 'freshAgent.killed' ? message : undefined
+    return event?.type === 'freshAgent.killed' && event.success === false
+  })
+}
+
 export async function reportInterruptedOrdinaryStopAckFailure(
   failure: unknown,
   testInfo: Pick<TestInfo, 'attach'>,

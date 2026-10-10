@@ -29,7 +29,7 @@ import * as runner from '../../../../scripts/testing/runtime-external-browser.js
 import { ManagedRuntimeOwner, RuntimeHarness, assertExactRuntimeHandle, type SupervisorInstance, type Phase3BrowserObservation, type RuntimeLossAssertions, type RuntimeWebConstructOptions } from '../../../../scripts/testing/runtime-sandbox.js'
 import { runTask2RetainedFixture, RetainedFixtureBrowserSession } from '../../../../scripts/testing/task002-retained-fixture.js'
 import { stopManagedRuntimeSoul, createManagedOpenCodeRuntimeBrowserRig } from '../../../e2e-browser/helpers/managed-runtime.js'
-import { structuredChaosLog, reportInterruptedOrdinaryStopAckFailure } from '../../../e2e-browser/helpers/runtime-chaos-evidence.js'
+import { structuredChaosLog, bindInterruptedOrdinaryStopFailedAck, reportInterruptedOrdinaryStopAckFailure } from '../../../e2e-browser/helpers/runtime-chaos-evidence.js'
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import type { BrokerReceipt } from '../../../../scripts/testing/runtime-test-broker.js'
 import type { ProviderQualificationRow } from '../../../../scripts/testing/provider-qualification-receipt.js'
@@ -1144,6 +1144,107 @@ describe('owned web process lifetime (Node process fixture only)', () => {
       if (nextPid) await expect(fsp.stat(`/proc/${nextPid}`)).rejects.toThrow()
       await fsp.rm(directory, { recursive: true })
     }
+  })
+})
+
+describe('interrupted ordinary Stop request ACK binding', () => {
+  const ownedPane = (sessionId?: string | null) => ({
+    pane: { type: 'leaf', id: 'pane-owned', content: {
+      kind: 'fresh-agent', soulId: 'soul-owned', createRequestId: 'create-owned',
+      provider: 'codex', sessionType: 'freshcodex', sessionId,
+      sessionRef: { provider: 'codex', sessionId: 'native-owned' },
+    } },
+    paneId: 'pane-owned', createRequestId: 'create-owned', soulId: 'soul-owned',
+    nativeSessionId: 'native-owned', provider: 'codex', sessionType: 'freshcodex',
+  })
+  const request = { type: 'freshAgent.kill', sessionId: 'native-owned', provider: 'codex', sessionType: 'freshcodex' }
+  const reply = { ...request, type: 'freshAgent.killed', success: false }
+
+  it.each([undefined, null])('accepts the owned native-target failed ACK with presentation ID %s', (sessionId) => {
+    const owned = ownedPane(sessionId)
+    const hasFailedAck = bindInterruptedOrdinaryStopFailedAck([{ type: 'hello' }, request], 1, owned)
+    expect(hasFailedAck([reply], 0)).toBe(true)
+  })
+
+  it.each([
+    ['none', []],
+    ['empty target', [{ ...request, sessionId: '' }]],
+    ['missing target', [{ ...request, sessionId: undefined }]],
+    ['duplicate', [request, request]],
+    ['foreign target', [{ ...request, sessionId: 'native-foreign' }]],
+    ['foreign provider', [{ ...request, provider: 'claude' }]],
+    ['foreign type', [{ ...request, sessionType: 'freshclaude' }]],
+  ])('refuses %s outbound kill evidence', (_reason, frames) => {
+    expect(() => bindInterruptedOrdinaryStopFailedAck(frames as any[], 0, ownedPane())).toThrow()
+  })
+
+  it.each([
+    ['pane', { paneId: 'pane-foreign' }],
+    ['create', { createRequestId: 'create-foreign' }],
+    ['soul', { soulId: 'soul-foreign' }],
+    ['native root', { nativeSessionId: 'native-foreign' }],
+    ['provider', { provider: 'claude' }],
+    ['type', { sessionType: 'freshclaude' }],
+  ])('refuses foreign owned %s identity even if the reply echoes it', (_reason, change) => {
+    expect(() => bindInterruptedOrdinaryStopFailedAck([request], 0, { ...ownedPane(), ...change })).toThrow()
+  })
+
+  it('refuses a wrong-provider canonical ref and unbound pending target', () => {
+    const owned = ownedPane()
+    owned.pane.content.sessionRef.provider = 'claude'
+    expect(() => bindInterruptedOrdinaryStopFailedAck([request], 0, owned)).toThrow()
+    expect(() => bindInterruptedOrdinaryStopFailedAck([request], 0, {
+      ...ownedPane(), pendingCreate: { sessionId: 'native-owned' },
+    })).toThrow()
+    expect(() => bindInterruptedOrdinaryStopFailedAck([request], 0, {
+      ...ownedPane(), pendingCreate: { sessionId: 'native-owned', provider: 'claude', sessionType: 'freshcodex' },
+    })).toThrow()
+    expect(() => bindInterruptedOrdinaryStopFailedAck([request], 0, {
+      ...ownedPane(), pendingCreate: { sessionId: 'native-owned', provider: 'codex', sessionType: 'freshclaude' },
+    })).toThrow()
+  })
+
+  it.each([
+    ['presentation over pending', 'presentation-owned', 'pending-owned', 'presentation-owned'],
+    ['pending over canonical', undefined, 'pending-owned', 'pending-owned'],
+  ])('preserves %s dispatch precedence and its failed reply', (_reason, presentation, pending, target) => {
+    const owned = { ...ownedPane(presentation), pendingCreate: {
+      sessionId: pending, provider: 'codex', sessionType: 'freshcodex',
+    } }
+    const hasFailedAck = bindInterruptedOrdinaryStopFailedAck([{ ...request, sessionId: target }], 0, owned)
+    expect(hasFailedAck([{ ...reply, sessionId: target }], 0)).toBe(true)
+    expect(hasFailedAck([reply], 0)).toBe(false)
+    expect(() => bindInterruptedOrdinaryStopFailedAck([request], 0, owned)).toThrow()
+  })
+
+  it.each([
+    ['wrong outer ID', { ...reply, sessionId: 'native-foreign' }],
+    ['wrong outer provider', { ...reply, provider: 'claude' }],
+    ['wrong outer type', { ...reply, sessionType: 'freshclaude' }],
+    ['success', { ...reply, success: true }],
+    ['missing success', { ...reply, success: undefined }],
+    ['unrelated event', { ...reply, type: 'freshAgent.event', event: { type: 'freshAgent.created', success: false } }],
+    ['inner-only matching ID', { ...reply, type: 'freshAgent.event', sessionId: 'native-foreign', event: reply }],
+    ['inner-only provider', { ...reply, type: 'freshAgent.event', provider: undefined, event: reply }],
+    ['inner-only type', { ...reply, type: 'freshAgent.event', sessionType: undefined, event: reply }],
+    ['foreign envelope', { ...reply, type: 'unrelated', event: reply }],
+    ['missing wrapped event', { ...reply, type: 'freshAgent.event' }],
+    ['wrapped missing success', { ...reply, type: 'freshAgent.event', event: { ...reply, success: undefined } }],
+    ['wrapped success', { ...reply, type: 'freshAgent.event', event: { ...reply, success: true } }],
+  ])('rejects %s as the required failed ACK', (_reason, message) => {
+    const hasFailedAck = bindInterruptedOrdinaryStopFailedAck([request], 0, ownedPane())
+    expect(hasFailedAck([message], 0)).toBe(false)
+  })
+
+  it('accepts supported wrapped failure, ignores pre-click frames, and freezes the dispatched tuple', () => {
+    const sent = [{ ...request, sessionId: 'old-target' }, { ...request }]
+    const owned = ownedPane()
+    const hasFailedAck = bindInterruptedOrdinaryStopFailedAck(sent, 1, owned)
+    sent[1].sessionId = 'mutated-target'
+    owned.pane.content.sessionId = 'mutated-presentation'
+    expect(hasFailedAck([reply], 1)).toBe(false)
+    expect(hasFailedAck([{ type: 'hello' }, { ...reply, type: 'freshAgent.event', event: reply }], 1)).toBe(true)
+    expect(hasFailedAck([{ ...reply, sessionId: 'mutated-target' }], 0)).toBe(false)
   })
 })
 
