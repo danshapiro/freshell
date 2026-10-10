@@ -15,6 +15,7 @@ import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import * as retained from '../../../../scripts/testing/task002-retained-fixture.js'
 import { RestrictedDockerBroker } from '../../../../scripts/testing/runtime-test-broker.js'
 import type { NativeHistory } from '../../../../scripts/testing/provider-native-history.js'
+import plugin from '../../../../extensions/opencode/freshell-rebind-plugin.js'
 
 const { DatabaseSync }: typeof import('node:sqlite') = createRequire(import.meta.url)('node:sqlite')
 
@@ -2838,6 +2839,113 @@ finally:c.close()
     { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'] })
   }
 
+  function seededFixture(mode: 'current' | 'legacy') {
+    const nativeRoot = mode === 'current' ? root : 'ses_task002syntheticroot'
+    const file = database()
+    seed(file, nativeRoot, mode === 'current')
+    return { file, nativeRoot }
+  }
+
+  function nativeHistory(file: string, nativeRoot: string) {
+    const stored = rows(file)
+    const sessionRow = stored.session.find(row => row.id === nativeRoot)!
+    const session = { id: sessionRow.id, parentID: sessionRow.parent_id, projectID: sessionRow.project_id,
+      directory: sessionRow.directory, title: sessionRow.title, version: sessionRow.version,
+      time: { created: sessionRow.time_created, updated: sessionRow.time_updated }, revert: sessionRow.revert }
+    const messages = stored.message.filter(row => row.session_id === nativeRoot).map(row => ({
+      info: { ...JSON.parse(String(row.data)), id: row.id, sessionID: row.session_id },
+      parts: stored.part.filter(part => part.message_id === row.id).map(part => ({
+        ...JSON.parse(String(part.data)), id: part.id, messageID: part.message_id, sessionID: part.session_id,
+      })),
+    }))
+    return { session, messages }
+  }
+
+  async function loadSeededRoot(file: string, nativeRoot: string) {
+    // Project the stored native IDs and original payloads without normalizing
+    // them. This exercises our producer/loader boundary, not an installed SDK.
+    const { session, messages } = nativeHistory(file, nativeRoot)
+    const home = path.join(fixtureRepoRoot, `native-loader-${randomUUID()}`)
+    const launch = { incarnationId: 'incarnation-retained', launchNonce: 'launch-retained', evidenceRevision: 4,
+      executionGeneration: 2, requestedNativeSessionId: nativeRoot }
+    const directory = path.join(home, '.freshell/native-identity', launch.launchNonce)
+    const abort = new AbortController()
+    const create = vi.fn()
+    const get = vi.fn(async () => ({ data: session }))
+    const readMessages = vi.fn(async () => ({ data: messages }))
+    vi.useFakeTimers()
+    for (const key of Object.keys(process.env).filter(key => key.startsWith('FRESHELL_OPENCODE_ADOPTION_'))) {
+      vi.stubEnv(key, undefined)
+    }
+    vi.stubEnv('HOME', home)
+    vi.stubEnv('FRESHELL_NATIVE_IDENTITY_LAUNCH', JSON.stringify(launch))
+    vi.stubEnv('FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR', directory)
+    try {
+      plugin.tui({
+        state: { ready: true, session: { get: () => session, messages: () => messages.map(row => row.info) },
+          part: (messageId: string) => messages.find(row => row.info.id === messageId)?.parts },
+        client: { session: { create, get, messages: readMessages } },
+        route: { current: { name: 'session', params: { sessionID: nativeRoot } } }, lifecycle: { signal: abort.signal },
+      })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(create).not.toHaveBeenCalled()
+      expect(get).toHaveBeenCalledExactlyOnceWith({ sessionID: nativeRoot }, { throwOnError: true })
+      expect(readMessages).toHaveBeenCalledExactlyOnceWith({ sessionID: nativeRoot }, { throwOnError: true })
+      const read = (name: string) => {
+        const filename = path.join(directory, `${name}.json`)
+        return fs.existsSync(filename) ? JSON.parse(fs.readFileSync(filename, 'utf8')) : null
+      }
+      return { launch, messages, loaded: read('opencode-loaded'), refused: read('opencode-refused') }
+    } finally {
+      try {
+        abort.abort()
+        expect(vi.getTimerCount()).toBe(0)
+      } finally {
+        vi.useRealTimers()
+        vi.unstubAllEnvs()
+        fs.rmSync(home, { recursive: true, force: true })
+      }
+    }
+  }
+
+  it.each(['current', 'legacy'] as const)('hydrates the actual %s SQL seed through the production native TUI loader', async mode => {
+    const { file, nativeRoot } = seededFixture(mode)
+    const before = rows(file)
+    const observed = await loadSeededRoot(file, nativeRoot)
+    expect({ loaded: observed.loaded !== null, refused: observed.refused }).toEqual({ loaded: true, refused: null })
+    expect(observed.loaded).toEqual({ launch: observed.launch, native: {
+      source: 'opencode-tui-native-loader', session_id: nativeRoot, parent_id: null, hydrated: true,
+      messages_read: 'success', active_message_count: 1, tail_message_id: observed.messages[0].info.id,
+    } })
+    expect(observed.messages).toHaveLength(1)
+    expect(observed.messages[0].parts).toHaveLength(1)
+    expect(rows(file)).toEqual(before)
+  })
+
+  it.each((['current', 'legacy'] as const).flatMap(mode => [false, true].map(laterTail => ({ mode, laterTail }))))(
+    'refuses an actual malformed stored message before native publication ($mode, later valid tail: $laterTail)', async ({ mode, laterTail }) => {
+      const { file, nativeRoot } = seededFixture(mode)
+      const db = new DatabaseSync(file)
+      const malformedId = `msg_${nativeRoot}`
+      try {
+        db.exec('PRAGMA foreign_keys=ON; BEGIN; PRAGMA defer_foreign_keys=ON')
+        db.prepare('UPDATE message SET id=? WHERE session_id=?').run(malformedId, nativeRoot)
+        db.prepare('UPDATE part SET message_id=? WHERE session_id=?').run(malformedId, nativeRoot)
+        if (laterTail) db.prepare(`INSERT INTO message(id,session_id,time_created,time_updated,data)
+          SELECT 'msg_latervalidtail',session_id,2,2,data FROM message WHERE id=?`).run(malformedId)
+        db.exec('COMMIT')
+        expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([])
+      } finally { db.close() }
+      const before = rows(file)
+      const observed = await loadSeededRoot(file, nativeRoot)
+      expect(observed.messages.map(row => row.info.id)).toEqual(laterTail ? [malformedId, 'msg_latervalidtail'] : [malformedId])
+      expect(observed.messages[0].parts[0].messageID).toBe(malformedId)
+      expect(observed.loaded).toBeNull()
+      expect(observed.refused).toMatchObject({ nativeSessionId: nativeRoot, reason: 'history_not_hydrated',
+        incarnationId: observed.launch.incarnationId, launchNonce: observed.launch.launchNonce })
+      expect(rows(file)).toEqual(before)
+    })
+
   it('preserves the exact native parentless root/project/directory/events while adding the same child and attachments', () => {
     const file = database(), before = rows(file)
     seed(file)
@@ -2854,8 +2962,10 @@ finally:c.close()
     for (const sessionId of [root, child]) {
       const message = after.message.find(row => row.session_id === sessionId)!
       const part = after.part.find(row => row.session_id === sessionId)!
-      expect(message.id).toBe(`msg_${sessionId}`)
-      expect(JSON.parse(String(message.data))).toMatchObject({ role: 'user' })
+      expect(message.id).toBe(`msg_${sessionId.slice(4)}`)
+      expect(JSON.parse(String(message.data))).toEqual({ role: 'user', agent: 'build',
+        model: { providerID: 'openai', modelID: 'gpt-5.6-luna' }, time: { created: 1 } })
+      expect(part.id).toBe(`prt_${sessionId}`)
       expect(part.message_id).toBe(message.id)
       expect(JSON.parse(String(part.data))).toEqual({ type: 'file', mime: 'text/plain', filename: 'asset.txt',
         url: `file://${fixtureRepoRoot}/asset.txt` })
@@ -2898,6 +3008,16 @@ finally:c.close()
     expect(after.project).toHaveLength(2)
     expect(after.event).toHaveLength(3)
     expect(after.event_sequence).toHaveLength(3)
+    for (const sessionId of ['ses_task002syntheticroot', child]) {
+      const message = after.message.find(row => row.session_id === sessionId)!
+      const part = after.part.find(row => row.session_id === sessionId)!
+      expect(JSON.parse(String(message.data))).toEqual({ role: 'user', agent: 'build',
+        model: { providerID: 'openai', modelID: 'gpt-5.6-luna' }, time: { created: 1 } })
+      expect(part).toMatchObject({ id: `prt_${sessionId}`, message_id: message.id, session_id: sessionId })
+      expect(JSON.parse(String(part.data))).toEqual({ type: 'file', mime: 'text/plain', filename: 'asset.txt',
+        url: `file://${fixtureRepoRoot}/asset.txt` })
+      expect(after.event.find(row => row.aggregate_id === sessionId)).toMatchObject({ id: `evt_${sessionId}` })
+    }
   })
 })
 

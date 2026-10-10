@@ -181,8 +181,9 @@ else:
 for ident,parent in [(root,None),(child,root)]:
  if ident!=root or not preserve_native_root:
   c.execute('INSERT INTO session (id,project_id,parent_id,slug,directory,title,version,time_created,time_updated) VALUES (?,?,?,?,?,?,?,?,?)',(ident,project,parent,'fixture',workspace,'synthetic fixture','1.18.21',1,1))
- c.execute('INSERT INTO message (id,session_id,time_created,time_updated,data) VALUES (?,?,?,?,?)',('msg_'+ident,ident,1,1,json.dumps({'role':'user','agent':'build','model':{'providerID':'openai','modelID':'gpt-5.6-luna'},'time':{'created':1}})))
- c.execute('INSERT INTO part (id,message_id,session_id,time_created,time_updated,data) VALUES (?,?,?,?,?,?)',('prt_'+ident,'msg_'+ident,ident,1,1,json.dumps({'type':'file','mime':'text/plain','filename':'asset.txt','url':'file://'+workspace+'/asset.txt'})))
+ message_id='msg_'+ident[4:]
+ c.execute('INSERT INTO message (id,session_id,time_created,time_updated,data) VALUES (?,?,?,?,?)',(message_id,ident,1,1,json.dumps({'role':'user','agent':'build','model':{'providerID':'openai','modelID':'gpt-5.6-luna'},'time':{'created':1}})))
+ c.execute('INSERT INTO part (id,message_id,session_id,time_created,time_updated,data) VALUES (?,?,?,?,?,?)',('prt_'+ident,message_id,ident,1,1,json.dumps({'type':'file','mime':'text/plain','filename':'asset.txt','url':'file://'+workspace+'/asset.txt'})))
  if ident!=root or not preserve_native_root:
   info={'id':ident,'slug':'fixture','projectID':project,'directory':workspace,'title':'synthetic fixture','version':'1.18.21','time':{'created':1,'updated':1}}
   if parent:info['parentID']=parent
