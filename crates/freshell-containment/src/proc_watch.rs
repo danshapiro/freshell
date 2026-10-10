@@ -518,6 +518,32 @@ impl ProcWatch {
         })
     }
 
+    /// Test support: a watch in the state `open` gives a process whose exit
+    /// had already begun (no exit registration), here on a process that may
+    /// still run, so the exiting state's waiting can be tested on a process
+    /// that never proves its exit.
+    #[cfg(test)]
+    pub(crate) fn open_as_exiting_for_test(pid: u32) -> io::Result<Self> {
+        use crate::darwin::{self, Kqueue};
+        let info = darwin::bsdinfo(pid)?;
+        let identity = ProcIdentity {
+            pid,
+            start: darwin::start_of(&info),
+            name: darwin::name_of(&info),
+        };
+        let shared = Arc::new(mac::Shared::new(
+            Kqueue::new()?,
+            &identity,
+            mac::Opened::Exiting,
+        ));
+        Ok(Self {
+            inner: Arc::new(Inner {
+                identity,
+                mac: shared,
+            }),
+        })
+    }
+
     /// Non-blocking: is the process proven to have exited (zombies count)?
     /// A pending exit event is collected; a watch opened while its process
     /// was already exiting re-reads it (one zombie-aware lookup).
@@ -786,5 +812,70 @@ mod mac {
             self.mac.shutdown.store(true, Ordering::SeqCst);
             let _ = self.mac.kq.wake();
         }
+    }
+}
+
+/// macOS: the waiting of a watch opened while its process was exiting.
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use std::process::{Child, Command};
+    use std::time::{Duration, Instant};
+
+    use super::{ProcWatch, Sig};
+
+    /// A `/bin/sleep 600` child of the test, killed through a watch opened
+    /// while it runs (so its pid names it) and reaped on drop.
+    struct Sleeper {
+        child: Child,
+        pin: ProcWatch,
+    }
+
+    impl Sleeper {
+        fn start() -> Self {
+            let child = Command::new("/bin/sleep").arg("600").spawn().unwrap();
+            let pin = ProcWatch::open(child.id()).unwrap();
+            Self { child, pin }
+        }
+    }
+
+    impl Drop for Sleeper {
+        fn drop(&mut self) {
+            let _ = self.pin.signal(Sig::Kill);
+            let _ = self.child.wait();
+        }
+    }
+
+    /// No event marks the end of an exit that had begun before the watch
+    /// was opened (the kernel refuses the registration then), so such a
+    /// watch re-reads its process only at its deadlines and at unlocks of
+    /// its lock files. When its last deadline passes with no proof of the
+    /// exit, `exited()` answers an error instead of waiting forever, and
+    /// never a false "exited". A later await waits again, and proves the
+    /// exit once the process is a zombie.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_exiting_watch_answers_at_its_last_deadline_instead_of_waiting_forever() {
+        let sleeper = Sleeper::start();
+        let watch = ProcWatch::open_as_exiting_for_test(sleeper.child.id()).unwrap();
+        let started = Instant::now();
+        let answer = tokio::time::timeout(Duration::from_secs(20), watch.exited())
+            .await
+            .expect("a watch on an exiting process waited past its last deadline");
+        assert!(
+            answer.is_err(),
+            "a running process was reported exited after {:?}",
+            started.elapsed()
+        );
+        assert!(!watch.has_exited(), "a running process was reported exited");
+        sleeper.pin.signal(Sig::Kill).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), sleeper.pin.exited())
+            .await
+            .expect("the kill ended the sleeper")
+            .unwrap();
+        // The unreaped child is a zombie now: the exiting watch proves it.
+        tokio::time::timeout(Duration::from_secs(10), watch.exited())
+            .await
+            .expect("a later await proves the exit")
+            .unwrap();
+        assert!(watch.has_exited());
     }
 }

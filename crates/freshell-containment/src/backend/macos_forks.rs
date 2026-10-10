@@ -115,6 +115,13 @@ impl ForkTracker {
     pub(crate) fn tracks(&self, pid: u32, start: u64) -> bool {
         lock(&self.shared.tracked).get(&pid) == Some(&start)
     }
+
+    /// Test support: counts `(pid, start)` as tracked with no registration,
+    /// as an entry left behind once the tracker's thread has stopped.
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&self, pid: u32, start: u64) {
+        lock(&self.shared.tracked).insert(pid, start);
+    }
 }
 
 impl Drop for ForkTracker {
@@ -247,5 +254,121 @@ impl Shared {
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Child, Command, Stdio};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use super::ForkTracker;
+    use crate::backend::UnitObserver;
+    use crate::proc_watch::{ProcWatch, Sig};
+    use crate::process;
+
+    /// Every report the tracker makes, one entry per call: (added, removed).
+    #[derive(Default)]
+    struct Reports(Mutex<Vec<(Vec<(u32, u64)>, Vec<u32>)>>);
+
+    impl UnitObserver for Reports {
+        fn record_root(&self, pid: u32, start: u64) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((vec![(pid, start)], Vec::new()));
+        }
+        fn forget_root(&self, pid: u32) {
+            self.0.lock().unwrap().push((Vec::new(), vec![pid]));
+        }
+        fn roots_changed(&self, added: &[(u32, u64)], removed: &[u32]) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((added.to_vec(), removed.to_vec()));
+        }
+    }
+
+    /// The test's processes: each pin killed, and the root reaped, on drop.
+    struct Tree {
+        root: Child,
+        pins: Vec<ProcWatch>,
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            for pin in &self.pins {
+                let _ = pin.signal(Sig::Kill);
+            }
+            let _ = self.root.wait();
+        }
+    }
+
+    /// The tracker writes the unit record at most once per batch of its
+    /// events: the scan that follows a root's registration finds the three
+    /// jobs the root started before it, and reports all of them in one call
+    /// (one record write).
+    #[test]
+    fn one_batch_reports_every_process_it_starts_following_at_once() {
+        let mut root = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "/bin/sleep 600 & /bin/sleep 600 & /bin/sleep 600 & echo ready; wait",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let out = root.stdout.take().unwrap();
+        let root_pin = ProcWatch::open(root.id()).unwrap();
+        let mut tree = Tree {
+            root,
+            pins: vec![root_pin.clone()],
+        };
+        let mut line = String::new();
+        BufReader::new(out).read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "ready");
+        let jobs = process::children(tree.root.id());
+        assert_eq!(jobs.len(), 3, "{jobs:?}");
+        // Pinned while their parent, the root, waits for them.
+        tree.pins
+            .extend(jobs.iter().map(|pid| ProcWatch::open(*pid).unwrap()));
+
+        let reports = Arc::new(Reports::default());
+        let tracker = ForkTracker::new("u-test").unwrap();
+        tracker.set_observer(reports.clone());
+        tracker.track_root(root_pin.pid(), root_pin.identity().start);
+        let reported = |pid: u32| {
+            reports
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(added, _)| added.iter().any(|(p, _)| *p == pid))
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !jobs.iter().all(|pid| reported(*pid)) {
+            assert!(
+                Instant::now() < deadline,
+                "the tracker never reported every job: {:?}",
+                reports.0.lock().unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let calls: Vec<_> = reports
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(added, _)| added.iter().any(|(p, _)| jobs.contains(p)))
+            .cloned()
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the jobs were reported in separate calls: {calls:?}"
+        );
+        drop(tracker);
     }
 }

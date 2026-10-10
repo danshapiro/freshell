@@ -637,21 +637,46 @@ mod macos_tests {
         child.wait().unwrap();
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_wait_with_no_unlock_stays_pending_and_dropping_it_ends_the_wait() {
+    /// A perl holder, killed (through its pin) and reaped on drop.
+    struct Held(std::process::Child, ProcWatch);
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            let _ = self.1.signal(Sig::Kill);
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A wait with no unlock stays pending, and dropping the events ends a
+    /// wait still blocked on its thread: the runtime that ran it finishes
+    /// its shutdown (which waits for every blocking task) within a bound.
+    #[test]
+    fn a_wait_with_no_unlock_stays_pending_and_dropping_it_ends_the_wait() {
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join("t.lock");
-        let (mut child, watch) = holder(&lock);
-        let events = UnlockEvents::watch(std::slice::from_ref(&lock)).unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(300), events.next())
-                .await
-                .is_err(),
-            "no unlock while the holder runs"
-        );
-        // The blocked wait above returns once the events are dropped.
-        drop(events);
-        watch.signal(Sig::Kill).unwrap();
-        child.wait().unwrap();
+        let (child, watch) = holder(&lock);
+        let _held = Held(child, watch);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let pending = runtime.block_on(async {
+                let events = UnlockEvents::watch(std::slice::from_ref(&lock)).unwrap();
+                let pending = tokio::time::timeout(Duration::from_millis(300), events.next())
+                    .await
+                    .is_err();
+                // The wait started above is still blocked on its thread.
+                drop(events);
+                pending
+            });
+            drop(runtime);
+            let _ = done_tx.send(pending);
+        });
+        let pending = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("dropping the events did not end the blocked wait");
+        assert!(pending, "no unlock while the holder runs");
     }
 }

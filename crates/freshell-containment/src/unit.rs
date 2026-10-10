@@ -1687,4 +1687,263 @@ mod tests {
             assert_unit_keys(event, &unit, event.str("operation_id"));
         }
     }
+
+    /// macOS: the Gone lock check, on a backend whose members are exactly
+    /// the listed processes (while each still runs as listed), so a member
+    /// can lack any exit watch of the unit's.
+    #[cfg(target_os = "macos")]
+    mod macos {
+        use super::*;
+        use std::io::{BufRead, BufReader, Read};
+        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+        use std::process::{Child, Command, Stdio};
+
+        use crate::process;
+
+        struct Listed(Vec<ProcIdentity>);
+
+        impl UnitBackend for Listed {
+            fn placement(&self, role: MemberRole, seq: u32) -> io::Result<Placement> {
+                NoProcesses.placement(role, seq)
+            }
+            fn kill_all(
+                self: Arc<Self>,
+                _roots: Vec<(u32, u64)>,
+            ) -> BoxFuture<'static, io::Result<KillSummary>> {
+                Box::pin(async { Ok(KillSummary::default()) })
+            }
+            fn members(&self, _roots: &[(u32, u64)]) -> io::Result<MemberList> {
+                Ok(MemberList {
+                    members: self
+                        .0
+                        .iter()
+                        .filter(|p| {
+                            process::is_running(p.pid)
+                                && process::start_time(p.pid).ok() == Some(p.start)
+                        })
+                        .cloned()
+                        .collect(),
+                    withheld: 0,
+                })
+            }
+            fn confirm_placement(&self, pid: u32, roots: &[(u32, u64)]) -> io::Result<()> {
+                NoProcesses.confirm_placement(pid, roots)
+            }
+            fn wait_empty(&self) -> Option<BoxFuture<'static, io::Result<()>>> {
+                None
+            }
+            fn remove(&self, emptied: bool) -> io::Result<()> {
+                NoProcesses.remove(emptied)
+            }
+        }
+
+        /// Kills its process through the pin when dropped.
+        struct KillOnDrop(ProcWatch);
+
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.signal(Sig::Kill);
+            }
+        }
+
+        /// The test's own child, killed (if still running) and reaped on
+        /// drop: an unreaped child's pid always names it.
+        struct Reaped(Child);
+
+        impl Drop for Reaped {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        /// A lock holder the member scan finds with no exit watch the unit
+        /// registered before the kill (a member the snapshot missed) is
+        /// killed, and the check then waits for its lock file's unlock
+        /// event. Here the lock outlives the holder, because a process
+        /// outside the unit shares its open file, so the check ends only
+        /// once that one lets go.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_holder_with_no_exit_watch_is_killed_and_its_unlock_awaited() {
+            const SHARED_LOCK: &str = r#"use Fcntl qw(:flock);
+open(my $f, ">>", $ARGV[0]) or die "open: $!";
+flock($f, LOCK_EX) or die "flock: $!";
+my $sharer = fork() // die "fork: $!";
+if ($sharer == 0) { close(STDOUT); sleep 600; exit 0; }
+$| = 1;
+print "locked $sharer\n";
+close(STDOUT);
+sleep 600;"#;
+            let dir = tempfile::tempdir().unwrap();
+            let lock = dir.path().join("t.lock");
+            let mut child = Command::new("perl")
+                .args(["-e", SHARED_LOCK, lock.to_str().unwrap()])
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let out = child.stdout.take().unwrap();
+            let holder = Reaped(child);
+            let mut line = String::new();
+            BufReader::new(out).read_line(&mut line).unwrap();
+            let sharer: u32 = line
+                .trim()
+                .strip_prefix("locked ")
+                .unwrap_or_else(|| panic!("the holder took the lock: {line:?}"))
+                .parse()
+                .unwrap();
+            // The sharer is pinned while its parent, the holder, sleeps.
+            let sharer_pin = KillOnDrop(ProcWatch::open(sharer).unwrap());
+            let holder_pin = ProcWatch::open(holder.0.id()).unwrap();
+            let unit = unit_on(Arc::new(Listed(vec![holder_pin.identity().clone()])));
+            unit.set_lock_paths(vec![lock.clone()]);
+            let check = tokio::spawn({
+                let unit = unit.clone();
+                async move { unit.check_locks(&[]).await }
+            });
+            tokio::time::timeout(Duration::from_secs(5), holder_pin.exited())
+                .await
+                .expect("the check killed the holder")
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(
+                !check.is_finished(),
+                "the check ended while the lock was still held (through the sharer)"
+            );
+            sharer_pin.0.signal(Sig::Kill).unwrap();
+            let released = tokio::time::timeout(Duration::from_secs(10), check)
+                .await
+                .expect("the unlock ended the check")
+                .unwrap()
+                .unwrap();
+            assert!(released, "the lock is released");
+        }
+
+        /// A process stuck in its exit: a session leader whose terminal
+        /// output nobody reads. The kernel drains a session leader's
+        /// controlling terminal before it posts the exit, with no timeout,
+        /// after it closed the process's descriptors; meanwhile the process
+        /// is neither a zombie nor visible to a lookup that skips exiting
+        /// processes. Closing the terminal's master side lets it finish.
+        struct StalledExit {
+            /// Reaped when the fixture is dropped, after the master closed.
+            _child: Reaped,
+            master: Option<OwnedFd>,
+            pin: ProcWatch,
+        }
+
+        impl StalledExit {
+            fn start() -> Self {
+                let (mut master, mut slave) = (-1, -1);
+                // SAFETY: out-pointers to two ints; no name, termios or size.
+                let rc = unsafe {
+                    libc::openpty(
+                        &mut master,
+                        &mut slave,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                assert_eq!(rc, 0, "openpty: {}", io::Error::last_os_error());
+                // SAFETY: the fresh descriptors openpty returned, owned here.
+                let (master, slave) =
+                    unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+                let mut cmd = Command::new("perl");
+                cmd.args(["-e", "$| = 1; print STDOUT 'x' x 4194304; sleep 600"])
+                    .stdin(Stdio::from(slave.try_clone().unwrap()))
+                    .stdout(Stdio::from(slave))
+                    .stderr(Stdio::null());
+                // SAFETY: only async-signal-safe calls between fork and exec.
+                unsafe {
+                    cmd.pre_exec(|| {
+                        if libc::setsid() < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        if libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                let child = Reaped(cmd.spawn().unwrap());
+                let pin = ProcWatch::open(child.0.id()).unwrap();
+                // Built first, so a failure below closes the master before
+                // the child is reaped.
+                let fixture = Self {
+                    _child: child,
+                    master: Some(master),
+                    pin,
+                };
+                // It writes (the first byte arrives), then fills the
+                // terminal's output queue and blocks.
+                let mut first = [0u8; 1];
+                let master = fixture.master.as_ref().unwrap();
+                std::fs::File::from(master.try_clone().unwrap())
+                    .read_exact(&mut first)
+                    .unwrap();
+                std::thread::sleep(Duration::from_millis(500));
+                fixture.pin.signal(Sig::Kill).unwrap();
+                std::thread::sleep(Duration::from_millis(500));
+                let pid = fixture.pin.pid();
+                assert!(
+                    !fixture.pin.has_exited()
+                        && crate::darwin::fds(pid).is_err()
+                        && crate::darwin::bsdinfo(pid).is_ok_and(|i| !crate::darwin::is_zombie(&i)),
+                    "fixture: the killed session leader did not stall in its exit"
+                );
+                fixture
+            }
+
+            /// Closes the terminal's master side: the exit completes.
+            fn release(&mut self) {
+                self.master.take();
+            }
+        }
+
+        /// The master closes first, so the child's exit can complete before
+        /// it is reaped (field drop).
+        impl Drop for StalledExit {
+            fn drop(&mut self) {
+                self.master.take();
+                let _ = self.pin.signal(Sig::Kill);
+            }
+        }
+
+        /// A member that has begun exiting shows no descriptors, so the scan
+        /// cannot tell whether it still holds a lock. With no exit watch of
+        /// the unit's registered before its exit, the check opens one now
+        /// (such a watch proves the exit only from the zombie or reaped
+        /// state) and waits for it before the lock counts as released.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_exiting_member_with_no_exit_watch_is_awaited_before_the_lock_counts_as_released(
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let lock = dir.path().join("t.lock");
+            std::fs::write(&lock, b"").unwrap();
+            let mut stalled = StalledExit::start();
+            let unit = unit_on(Arc::new(Listed(vec![stalled.pin.identity().clone()])));
+            unit.set_lock_paths(vec![lock]);
+            let check = tokio::spawn({
+                let unit = unit.clone();
+                async move { unit.check_locks(&[]).await }
+            });
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            assert!(
+                !check.is_finished(),
+                "the check ended while a member was still exiting"
+            );
+            stalled.release();
+            let released = tokio::time::timeout(Duration::from_secs(15), check)
+                .await
+                .expect("the member's exit was proven")
+                .unwrap()
+                .unwrap();
+            assert!(released, "the lock is released");
+            assert!(
+                stalled.pin.has_exited(),
+                "the check ended before the member had exited"
+            );
+        }
+    }
 }

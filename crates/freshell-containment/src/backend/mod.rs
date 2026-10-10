@@ -127,6 +127,16 @@ pub(crate) trait UnitObserver: Send + Sync {
     fn record_root(&self, pid: u32, start: u64);
     /// Drops every recorded root with `pid` (that process exited).
     fn forget_root(&self, pid: u32);
+    /// One batch of changes: drops every recorded root with a `removed`
+    /// pid, then adds `added` (each unless present).
+    fn roots_changed(&self, added: &[(u32, u64)], removed: &[u32]) {
+        for pid in removed {
+            self.forget_root(*pid);
+        }
+        for (pid, start) in added {
+            self.record_root(*pid, *start);
+        }
+    }
 }
 
 /// One containment mechanism (selected once per server).

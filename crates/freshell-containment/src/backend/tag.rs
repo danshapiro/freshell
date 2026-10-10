@@ -844,3 +844,96 @@ sleep 600;"#,
         assert_eq!(sleep.child.wait().unwrap().signal(), Some(libc::SIGKILL));
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::*;
+    use crate::proc_watch::Sig;
+    use std::io::{BufRead, BufReader};
+    use std::process::{Child, Command, Stdio};
+    use std::time::Duration;
+
+    /// The test's processes: each pin killed, and the root reaped, on drop.
+    struct Tree {
+        root: Child,
+        pins: Vec<ProcWatch>,
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            for pin in &self.pins {
+                let _ = pin.signal(Sig::Kill);
+            }
+            let _ = self.root.wait();
+        }
+    }
+
+    /// Once the fork tracker's thread has stopped (`containment.fork_tracker_failed`)
+    /// its pids are never updated again, so a tracked pid can come to name
+    /// another process. A tracked pid counts only while it still names the
+    /// incarnation that was tracked (pid and start time), as a root does: a
+    /// reused pid, and the children of that process, are never listed or
+    /// signalled.
+    #[test]
+    fn a_tracked_pid_that_now_names_another_process_is_not_a_member() {
+        let mut root = Command::new("/bin/sh")
+            .args(["-c", "/bin/sleep 600 & echo \"child $!\"; wait"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let out = root.stdout.take().unwrap();
+        let root_pin = ProcWatch::open(root.id()).unwrap();
+        let mut tree = Tree {
+            root,
+            pins: vec![root_pin.clone()],
+        };
+        let mut line = String::new();
+        BufReader::new(out).read_line(&mut line).unwrap();
+        let child: u32 = line
+            .trim()
+            .strip_prefix("child ")
+            .unwrap_or_else(|| panic!("the root printed its child: {line:?}"))
+            .parse()
+            .unwrap();
+        // Pinned while its parent, the root, waits for it.
+        tree.pins.push(ProcWatch::open(child).unwrap());
+        let (pid, start) = (root_pin.pid(), root_pin.identity().start);
+
+        let id = UnitId::mint();
+        let unit = TagUnit::new(UNIT_ENV, id.as_str(), &id, None).unwrap();
+        let forks = unit.forks.as_ref().unwrap();
+        forks.insert_for_test(pid, start + 1);
+        let listed: Vec<u32> = unit
+            .members(&[])
+            .unwrap()
+            .members
+            .iter()
+            .map(|m| m.pid)
+            .collect();
+        assert!(
+            !listed.contains(&pid) && !listed.contains(&child),
+            "a stale tracked pid made a stranger a member: {listed:?}"
+        );
+        unit.kill_all_now(&[]).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            tree.pins.iter().all(|pin| !pin.has_exited()),
+            "a stale tracked pid had a stranger killed"
+        );
+
+        // The same pid tracked with its own start time is a member, and so
+        // is its child.
+        forks.insert_for_test(pid, start);
+        let listed: Vec<u32> = unit
+            .members(&[])
+            .unwrap()
+            .members
+            .iter()
+            .map(|m| m.pid)
+            .collect();
+        assert!(
+            listed.contains(&pid) && listed.contains(&child),
+            "{listed:?}"
+        );
+    }
+}

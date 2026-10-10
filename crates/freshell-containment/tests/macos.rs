@@ -707,53 +707,81 @@ async fn a_withheld_environment_falls_back_to_roots_and_descendants() {
     }
 }
 
-/// Plan review R1-F2: jobs the agent detached (`nohup`, `setsid`) running
-/// the official `node` are reparented to launchd and still killed by a
-/// stop. Branch B (the fork tracker): the `nohup` job stays in the root's
-/// session; the `setsid` job's session leader (a perl intermediate) waits
-/// at a gate until it is a member, then starts the job and exits at once,
-/// so the job is found through its session. A session leader whose parent
-/// exited before the tracker handled the fork is the tracker's stated
-/// residual, which no test claims.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_detached_entitled_job_is_killed_by_a_stop() {
-    let dir = tempfile::tempdir().unwrap();
-    let gate = dir.path().join("gate");
-    let fifo = std::ffi::CString::new(gate.to_str().unwrap()).unwrap();
-    // SAFETY: a NUL-terminated path of the test's own temp directory.
-    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-    let main_js = dir.path().join("main.js");
-    std::fs::write(
-        &main_js,
-        r#"const { execFileSync } = require('child_process');
-const dir = process.argv[2];
-const a = execFileSync('/bin/sh', ['-c', 'nohup node -e "setInterval(()=>{},1000)" >/dev/null 2>&1 & echo $!']).toString().trim();
-execFileSync('perl', [dir + '/job.pl', dir], { stdio: 'ignore' });
-console.log('jobs ' + a);
+/// The detached-job test's main (the official `node`): a `nohup` job whose
+/// intermediate shell exits at once, and a job in a `setsid` session (the
+/// perl script below); then it prints `jobs <nohup job> <session leader>
+/// <session job>`.
+const DETACHING_MAIN: &str = r#"const { execFileSync, spawn } = require('child_process');
+const nohup = execFileSync('/bin/sh', ['-c', 'nohup /bin/sleep 600 >/dev/null 2>&1 & echo $!']).toString().trim();
+const session = spawn('perl', [process.argv[2]], { stdio: ['ignore', 'pipe', 'ignore'] });
+let out = '';
+let told = false;
+session.stdout.on('data', (d) => {
+  out += d;
+  if (!told && out.includes('\n')) {
+    told = true;
+    console.log('jobs ' + nohup + ' ' + out.trim());
+  }
+});
 setInterval(() => {}, 1000);
-"#,
-    )
-    .unwrap();
-    std::fs::write(
-        dir.path().join("job.pl"),
-        r#"use POSIX;
-my $dir = $ARGV[0];
-my $p = fork() // die "fork: $!";
-if ($p == 0) {
+"#;
+
+/// A session leader (it stays, as `/bin/sleep`, the child of this script,
+/// which waits for it) whose intermediate child starts the job and exits at
+/// once, so the job's parent link ends with it. Prints `<leader> <job>`.
+const DETACHING_SESSION: &str = r#"use POSIX;
+pipe(my $r, my $w) or die "pipe: $!";
+my $leader = fork() // die "fork: $!";
+if ($leader == 0) {
+    close $r;
     POSIX::setsid() or die "setsid: $!";
-    open(my $o, ">", "$dir/leader.tmp") or die; print $o $$; close $o;
-    rename("$dir/leader.tmp", "$dir/leader") or die;
-    open(my $g, "<", "$dir/gate") or die; my $go = <$g>; close $g;
-    my $q = fork() // die "fork: $!";
-    if ($q == 0) { exec "node", "-e", "setInterval(()=>{},1000)"; }
-    open($o, ">", "$dir/job.tmp") or die; print $o $q; close $o;
-    rename("$dir/job.tmp", "$dir/job") or die;
-    exit 0;
+    my $mid = fork() // die "fork: $!";
+    if ($mid == 0) {
+        my $job = fork() // die "fork: $!";
+        if ($job == 0) {
+            close $w;
+            open(STDIN, "<", "/dev/null"); open(STDOUT, ">", "/dev/null"); open(STDERR, ">", "/dev/null");
+            exec "/bin/sleep", "600" or exit 127;
+        }
+        print $w "$job\n";
+        close $w;
+        exit 0;
+    }
+    close $w;
+    waitpid($mid, 0);
+    open(STDIN, "<", "/dev/null"); open(STDOUT, ">", "/dev/null"); open(STDERR, ">", "/dev/null");
+    exec "/bin/sleep", "600" or exit 127;
 }
-waitpid($p, 0);
-"#,
-    )
-    .unwrap();
+close $w;
+my $job = <$r>;
+chomp $job;
+$| = 1;
+print "$leader $job\n";
+close STDOUT;
+waitpid($leader, 0);
+"#;
+
+/// Plan review R1-F2, R2-F2: jobs the agent detached, a `nohup` job and a
+/// job in a `setsid` session, are still killed by a stop when they run a
+/// restricted program (`/bin/sleep`: its environment, and so its unit tag,
+/// is withheld) and were reparented to launchd. Neither a tag nor a parent
+/// link reaches them, only the fork tracker's session and process-group
+/// links. Both jobs detach before the unit tracks its root (as after a
+/// server restart, when tracking resumes from the recorded roots), so their
+/// parents are gone when the tracker first scans: the `nohup` job is linked
+/// through the root's session and process group, the `setsid` job through
+/// its session leader, which stays a member as the root's descendant. The
+/// test waits for the unit record to list both jobs (only the tracker
+/// writes that), then stops the unit. A session leader that exits before
+/// the tracker scans is the tracker's stated residual, which no test
+/// claims.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_detached_restricted_job_is_killed_by_a_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let main_js = dir.path().join("main.js");
+    std::fs::write(&main_js, DETACHING_MAIN).unwrap();
+    let session_pl = dir.path().join("session.pl");
+    std::fs::write(&session_pl, DETACHING_SESSION).unwrap();
     let state = tempfile::tempdir().unwrap();
     let c = Containment::select(SelectOptions {
         shim: Some(test_shim()),
@@ -765,7 +793,7 @@ waitpid($p, 0);
             "node",
             &[
                 main_js.display().to_string(),
-                dir.path().display().to_string(),
+                session_pl.display().to_string(),
             ],
             MemberRole::Agent,
         )
@@ -776,61 +804,62 @@ waitpid($p, 0);
     let mut main = cmd.spawn().unwrap();
     let main_watch = ProcWatch::open(main.id().unwrap()).unwrap();
     let _main_cleanup = KillOnDrop(main_watch.clone());
-    unit.set_main(main_watch.clone());
-    let read_pid = |name: &str| {
-        std::fs::read_to_string(dir.path().join(name))
-            .ok()
-            .and_then(|raw| raw.trim().parse::<u32>().ok())
-    };
-    eventually(
-        Duration::from_secs(10),
-        "the session leader started",
-        || read_pid("leader").is_some(),
-    )
-    .await;
-    let leader = read_pid("leader").unwrap();
-    let _leader_cleanup = KillOnDrop(ProcWatch::open(leader).unwrap());
-    eventually(
-        Duration::from_secs(5),
-        "the session leader is a member before it starts the job",
-        || unit.members().unwrap().iter().any(|m| m.pid == leader),
-    )
-    .await;
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut open_gate = std::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&gate)
-            .expect("the session leader waits at the gate");
-        open_gate.write_all(b"go\n").unwrap();
-    }
-    eventually(Duration::from_secs(10), "the job started", || {
-        read_pid("job").is_some()
-    })
-    .await;
-    let setsid_job = read_pid("job").unwrap();
-    let nohup_job: u32 = line_after_async(main.stdout.take().unwrap(), "jobs")
+    let pids: Vec<u32> = line_after_async(main.stdout.take().unwrap(), "jobs")
         .await
-        .parse()
-        .unwrap();
-    let jobs = [nohup_job, setsid_job];
+        .split_whitespace()
+        .map(|p| p.parse().unwrap())
+        .collect();
+    let (nohup_job, leader, session_job) = (pids[0], pids[1], pids[2]);
+    let jobs = [nohup_job, session_job];
     let watches: Vec<ProcWatch> = jobs
         .iter()
         .map(|pid| ProcWatch::open(*pid).unwrap())
         .collect();
     let _cleanup: Vec<KillOnDrop> = watches.iter().cloned().map(KillOnDrop).collect();
+    let _leader_cleanup = KillOnDrop(ProcWatch::open(leader).unwrap());
     eventually(Duration::from_secs(10), "both jobs reparented", || {
         jobs.iter().all(|pid| process::parent(*pid) == Some(1))
     })
     .await;
-    for pid in &jobs {
+    for pid in jobs {
+        wait_for_name(pid, "sleep").await;
+        // SAFETY: plain reads of a pid's process group and session.
+        let (pgid, sid) = unsafe {
+            (
+                libc::getpgid(pid as libc::pid_t),
+                libc::getsid(pid as libc::pid_t),
+            )
+        };
         report!(
-            "R1-F2: detached node {pid} environ {:?} csops {}",
-            process::environ_read(*pid, UNIT_ENV),
-            describe_flags(cs_flags(*pid))
+            "R1-F2: detached job {pid} (root {}, session leader {leader}): pgid {pgid} sid {sid} csops {}",
+            main_watch.pid(),
+            describe_flags(cs_flags(pid))
+        );
+        assert_eq!(
+            process::environ_read(pid, UNIT_ENV),
+            EnvRead::Withheld,
+            "a restricted program's tag is withheld"
         );
     }
+    // Tracking starts now, with both jobs' parents gone.
+    unit.set_main(main_watch.clone());
+    let record = state
+        .path()
+        .join("units")
+        .join(format!("{}.json", unit.id().as_str()));
+    let job_roots: Vec<(u32, u64)> = watches
+        .iter()
+        .map(|w| (w.pid(), w.identity().start))
+        .collect();
+    eventually(
+        Duration::from_secs(10),
+        "the fork tracker records both detached jobs as roots",
+        || {
+            recorded_roots(&record)
+                .is_some_and(|roots| job_roots.iter().all(|job| roots.contains(job)))
+        },
+    )
+    .await;
     unit.stop(StopRequest::new(
         StopMode::Force,
         StopReason::ShiftX,
@@ -845,6 +874,238 @@ waitpid($p, 0);
             .unwrap();
     }
     let _ = main.wait().await;
+}
+
+/// The roots of the unit record at `path`, when it can be read.
+fn recorded_roots(path: &Path) -> Option<Vec<(u32, u64)>> {
+    let raw = std::fs::read(path).ok()?;
+    serde_json::from_slice::<UnitRecord>(&raw)
+        .ok()
+        .map(|record| record.roots)
+}
+
+/// The user's rule: Codex's managed daemon is never signalled, and its
+/// family is never a unit root. A member that starts a daemon-family
+/// process (the test helper shaped as `app-server --managed-daemon`,
+/// through a shell's fork and exec, so the tracker can see it before the
+/// exec) does not leave it in the unit record, while a plain job started
+/// after it is recorded; and the stop spares it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_daemon_family_process_is_never_left_in_the_unit_record() {
+    let state = tempfile::tempdir().unwrap();
+    let c = Containment::select(SelectOptions {
+        shim: Some(test_shim()),
+        state_root: state.path().to_path_buf(),
+    });
+    let unit = c.create_unit(UnitId::mint(), label()).unwrap();
+    let script = format!(
+        "'{HELPER}' idle app-server --managed-daemon >/dev/null 2>&1 & echo \"daemon $!\"; /bin/sleep 600 & echo \"job $!\"; exec /bin/sleep 600"
+    );
+    let mut cmd = unit
+        .tokio_command("/bin/sh", &["-c".to_string(), script], MemberRole::Agent)
+        .unwrap();
+    cmd.kill_on_drop(false)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped());
+    let mut main = cmd.spawn().unwrap();
+    let main_watch = ProcWatch::open(main.id().unwrap()).unwrap();
+    let _main_cleanup = KillOnDrop(main_watch.clone());
+    unit.set_main(main_watch.clone());
+    let (daemon, job) = {
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = tokio::io::BufReader::new(main.stdout.take().unwrap()).lines();
+        let mut pids = Vec::new();
+        for prefix in ["daemon", "job"] {
+            let line = lines
+                .next_line()
+                .await
+                .unwrap()
+                .expect("the main printed its children");
+            let pid: u32 = line
+                .strip_prefix(prefix)
+                .unwrap_or_else(|| panic!("expected {prefix:?}: {line:?}"))
+                .trim()
+                .parse()
+                .unwrap();
+            pids.push(pid);
+        }
+        (pids[0], pids[1])
+    };
+    // Both are children of the main, which runs on: their pids name them.
+    let daemon_watch = ProcWatch::open(daemon).unwrap();
+    let _daemon_cleanup = KillOnDrop(daemon_watch.clone());
+    let job_watch = ProcWatch::open(job).unwrap();
+    let _job_cleanup = KillOnDrop(job_watch.clone());
+    eventually(
+        Duration::from_secs(10),
+        "the daemon-family process exec'd",
+        || process::argv(daemon).is_ok_and(|argv| is_codex_daemon_family(&argv)),
+    )
+    .await;
+    let record = state
+        .path()
+        .join("units")
+        .join(format!("{}.json", unit.id().as_str()));
+    let job_root = (job, job_watch.identity().start);
+    eventually(
+        Duration::from_secs(10),
+        "the job is a recorded root and the daemon-family process is not",
+        || {
+            recorded_roots(&record).is_some_and(|roots| {
+                roots.contains(&job_root) && !roots.iter().any(|(pid, _)| *pid == daemon)
+            })
+        },
+    )
+    .await;
+    unit.stop(StopRequest::new(
+        StopMode::Force,
+        StopReason::ShiftX,
+        "test",
+    ))
+    .wait_swept()
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), job_watch.exited())
+        .await
+        .expect("the job was stopped")
+        .unwrap();
+    assert!(
+        !daemon_watch.has_exited(),
+        "the daemon-family process was signalled"
+    );
+    let _ = main.wait().await;
+}
+
+/// The `--setsid` shim makes its command lead its own session (so what the
+/// command starts stays linked to it by session after its parent exits),
+/// also when the spawner made it a process-group leader
+/// (`process_group(0)`), where `setsid()` alone is refused; the command
+/// still leads its own process group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_setsid_shim_leads_a_session_even_when_spawned_as_a_group_leader() {
+    use std::os::unix::process::CommandExt;
+    for group_leader in [false, true] {
+        let mut cmd = Command::new(test_shim().exe);
+        cmd.args(["--setsid", "--", "/bin/sleep", "600"]);
+        if group_leader {
+            cmd.process_group(0);
+        }
+        let child = Kid::spawn(&mut cmd);
+        let pid = child.id();
+        wait_for_name(pid, "sleep").await;
+        // SAFETY: plain reads of a pid's session and process group.
+        let (sid, pgid) = unsafe {
+            (
+                libc::getsid(pid as libc::pid_t),
+                libc::getpgid(pid as libc::pid_t),
+            )
+        };
+        assert_eq!(
+            sid, pid as libc::pid_t,
+            "spawned as a group leader: {group_leader}: the command leads its own session"
+        );
+        assert_eq!(
+            pgid, pid as libc::pid_t,
+            "spawned as a group leader: {group_leader}: the command leads its own process group"
+        );
+    }
+}
+
+/// Why Branch B records every followed process as a root: after a server
+/// crash, the restarted server finishes the unit from its record and
+/// reaches a followed job by identity, though nothing else leads to it any
+/// more (a restricted program, so no readable tag; reparented to launchd;
+/// its session leader, the main, gone).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_followed_job_is_stopped_from_the_unit_record_after_a_crash() {
+    let state = tempfile::tempdir().unwrap();
+    let c = rebuild("selected", state.path());
+    assert_eq!(c.capability().kind, BackendKind::MacosTag);
+    let unit = c.create_unit(UnitId::mint(), label()).unwrap();
+    let mut cmd = unit
+        .tokio_command(
+            "/bin/sh",
+            &[
+                "-c".to_string(),
+                "nohup /bin/sleep 600 >/dev/null 2>&1 & echo \"job $!\"; exec /bin/sleep 600"
+                    .to_string(),
+            ],
+            MemberRole::Agent,
+        )
+        .unwrap();
+    cmd.kill_on_drop(false)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped());
+    let mut main = cmd.spawn().unwrap();
+    let main_watch = ProcWatch::open(main.id().unwrap()).unwrap();
+    let _main_cleanup = KillOnDrop(main_watch.clone());
+    unit.set_main(main_watch.clone());
+    let job: u32 = line_after_async(main.stdout.take().unwrap(), "job")
+        .await
+        .parse()
+        .unwrap();
+    // A child of the main, which runs on: its pid names it.
+    let job_watch = ProcWatch::open(job).unwrap();
+    let _job_cleanup = KillOnDrop(job_watch.clone());
+    let job_root = (job, job_watch.identity().start);
+    wait_for_name(job, "sleep").await;
+    assert_eq!(
+        process::environ_read(job, UNIT_ENV),
+        EnvRead::Withheld,
+        "a restricted program's tag is withheld"
+    );
+    let record = record_path(state.path(), "selected", &unit);
+    eventually(
+        Duration::from_secs(10),
+        "the job is a recorded root",
+        || recorded_roots(&record).is_some_and(|roots| roots.contains(&job_root)),
+    )
+    .await;
+    // The main (the job's parent and session leader) ends; the record
+    // keeps the job.
+    main_watch.signal(Sig::Kill).unwrap();
+    let _ = main.wait().await;
+    eventually(Duration::from_secs(10), "the job is reparented", || {
+        process::parent(job) == Some(1)
+    })
+    .await;
+    let main_pid = main_watch.pid();
+    eventually(
+        Duration::from_secs(10),
+        "the record keeps the job and drops the main",
+        || {
+            recorded_roots(&record).is_some_and(|roots| {
+                roots.contains(&job_root) && !roots.iter().any(|(pid, _)| *pid == main_pid)
+            })
+        },
+    )
+    .await;
+    // The server crashes: its unit and containment go away without a stop.
+    let unit_id = unit.id().clone();
+    drop(unit);
+    drop(c);
+    assert!(!job_watch.has_exited(), "the crash stopped nothing");
+    let c = rebuild("selected", state.path());
+    let records = c.recorded_units().unwrap();
+    let record = records
+        .iter()
+        .find(|r| r.unit_id == unit_id)
+        .expect("the restarted server finds the unit's record");
+    let unit = c.reopen_unit(record, label()).unwrap();
+    unit.stop(StopRequest::new(
+        StopMode::Force,
+        StopReason::BootFinish,
+        "boot",
+    ))
+    .wait_swept()
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), job_watch.exited())
+        .await
+        .expect("the followed job was stopped from the record")
+        .unwrap();
+    assert!(
+        c.recorded_units().unwrap().is_empty(),
+        "Gone deletes the record"
+    );
 }
 
 /// Branch B: every process the fork tracker follows is recorded as a root
