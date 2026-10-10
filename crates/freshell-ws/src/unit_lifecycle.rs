@@ -1253,7 +1253,15 @@ pub(crate) async fn kill_unit(
     state: &WsState,
     initiator: &str,
 ) -> bool {
-    let reply = reply.naming(entry.terminal_id.as_deref());
+    // A pane still starting has no noted terminal yet: the answer names the
+    // terminal its start was allocated.
+    let reply = reply.naming(
+        entry
+            .terminal_id
+            .clone()
+            .or_else(|| entry.unit.label().terminal_id)
+            .as_deref(),
+    );
     let stuck_recovery = kill.reason.as_deref() == Some("stuck-recovery");
 
     // 1.

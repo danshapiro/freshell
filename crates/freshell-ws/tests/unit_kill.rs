@@ -146,6 +146,12 @@ async fn kill_during_start_cancels_the_start() {
         },
     )
     .await;
+    let allocated = h
+        .state
+        .units
+        .by_create_request("crq-start")
+        .and_then(|entry| entry.unit.label().terminal_id)
+        .expect("the start's allocated terminal");
     h.send(&mut ws, kill(None, "crq-start", "rks")).await;
     let killed = h
         .next_matching(&mut ws, Duration::from_secs(5), |f| {
@@ -154,6 +160,11 @@ async fn kill_during_start_cancels_the_start() {
         .await
         .expect("ack");
     assert_eq!(killed["success"], true);
+    assert_eq!(
+        killed["terminalId"],
+        allocated.as_str(),
+        "the answer names the terminal the start was allocated: {killed}"
+    );
     for e in std::fs::read_dir(&h.manifests).unwrap().flatten() {
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(e.path()).unwrap()).unwrap();
