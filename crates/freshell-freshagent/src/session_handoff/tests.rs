@@ -7212,6 +7212,11 @@ async fn a_fresh_created_kilroy_session_adopts_the_canonical_key() {
 /// id is unchanged in every coordinator record and response.
 #[tokio::test]
 async fn opencode_handoff_keeps_shared_serve_alive_and_session_id_stable() {
+    if crate::test_environment::run_with_opencode_home(
+        "session_handoff::tests::opencode_handoff_keeps_shared_serve_alive_and_session_id_stable",
+    ) {
+        return;
+    }
     let _guard = ENV_LOCK.lock().await;
     // The claude-lane env surface this file's tests mutate
     // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
@@ -7341,6 +7346,11 @@ async fn opencode_handoff_keeps_shared_serve_alive_and_session_id_stable() {
 /// failed.
 #[tokio::test]
 async fn an_opencode_placeholder_handoff_resolves_the_durable_owner_and_completes() {
+    if crate::test_environment::run_with_opencode_home(
+        "session_handoff::tests::an_opencode_placeholder_handoff_resolves_the_durable_owner_and_completes",
+    ) {
+        return;
+    }
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
     let env = FakeOpencodeServeEnv::install();
@@ -7452,6 +7462,11 @@ async fn an_opencode_placeholder_handoff_resolves_the_durable_owner_and_complete
 /// killed (OpenCode invariant).
 #[tokio::test]
 async fn opencode_handoff_stop_aborts_the_active_turn_through_the_manager_before_reaping() {
+    if crate::test_environment::run_with_opencode_home(
+        "session_handoff::tests::opencode_handoff_stop_aborts_the_active_turn_through_the_manager_before_reaping",
+    ) {
+        return;
+    }
     let _guard = ENV_LOCK.lock().await;
     // The claude-lane env surface this file's tests mutate
     // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
@@ -7589,6 +7604,11 @@ async fn opencode_handoff_stop_aborts_the_active_turn_through_the_manager_before
 /// daemon-side turn.
 #[tokio::test]
 async fn opencode_handoff_stop_aborts_a_daemon_turn_left_running_by_a_finished_local_task() {
+    if crate::test_environment::run_with_opencode_home(
+        "session_handoff::tests::opencode_handoff_stop_aborts_a_daemon_turn_left_running_by_a_finished_local_task",
+    ) {
+        return;
+    }
     let _guard = ENV_LOCK.lock().await;
     // The claude-lane env surface this file's tests mutate
     // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
@@ -7726,6 +7746,11 @@ async fn opencode_handoff_stop_aborts_a_daemon_turn_left_running_by_a_finished_l
 /// parked) while the abort answers normally.
 #[tokio::test]
 async fn opencode_handoff_during_compaction_aborts_the_daemon_side_summarize() {
+    if crate::test_environment::run_with_opencode_home(
+        "session_handoff::tests::opencode_handoff_during_compaction_aborts_the_daemon_side_summarize",
+    ) {
+        return;
+    }
     let _guard = ENV_LOCK.lock().await;
     // The claude-lane env surface this file's tests mutate
     // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
@@ -7844,6 +7869,11 @@ async fn opencode_handoff_during_compaction_aborts_the_daemon_side_summarize() {
 /// handoff must not complete while the daemon-side abort is unanswered.
 #[tokio::test]
 async fn opencode_handoff_stop_aborts_an_in_flight_rest_driven_turn_before_reaping() {
+    if crate::test_environment::run_with_opencode_home(
+        "session_handoff::tests::opencode_handoff_stop_aborts_an_in_flight_rest_driven_turn_before_reaping",
+    ) {
+        return;
+    }
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
     let env = FakeOpencodeServeEnv::install();
@@ -7975,6 +8005,11 @@ async fn opencode_handoff_stop_aborts_an_in_flight_rest_driven_turn_before_reapi
 /// confirms the daemon-side turn's death BEFORE the reap.
 #[tokio::test]
 async fn opencode_handoff_stop_waits_for_a_mid_dispatch_rest_drive_under_the_gate() {
+    if crate::test_environment::run_with_opencode_home(
+        "session_handoff::tests::opencode_handoff_stop_waits_for_a_mid_dispatch_rest_drive_under_the_gate",
+    ) {
+        return;
+    }
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
     let env = FakeOpencodeServeEnv::install();

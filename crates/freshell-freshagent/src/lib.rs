@@ -59,6 +59,8 @@ pub mod spawn_gate;
 pub(crate) mod summary;
 pub mod target_resolver;
 pub mod terminal_tabs;
+#[cfg(test)]
+mod test_environment;
 
 pub use claude::FreshClaudeState;
 // Kata 09v1 + SYNC-06: the TWO claude_snapshot items visible outside this
