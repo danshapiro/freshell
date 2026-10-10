@@ -7,10 +7,11 @@ import os from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { spawn } = vi.hoisted(() => ({ spawn: vi.fn() }))
+const { spawn, execFileSync } = vi.hoisted(() => ({ spawn: vi.fn(), execFileSync: vi.fn() }))
 vi.mock('node:child_process', async (original) => ({
   ...await original<typeof import('node:child_process')>(),
   spawn,
+  execFileSync,
 }))
 
 import { main as runSourceRuntimeTests } from '../../../scripts/testing/run-source-runtime-tests.js'
@@ -21,6 +22,7 @@ const require = createRequire(import.meta.url)
 const vitestPackagePath = require.resolve('vitest/package.json')
 const vitestManifest = JSON.parse(fs.readFileSync(vitestPackagePath, 'utf8')) as { bin: { vitest: string } }
 const expectedVitestEntrypoint = path.resolve(path.dirname(vitestPackagePath), vitestManifest.bin.vitest)
+const fixtureCommit = 'a'.repeat(40)
 
 interface LaunchFixture {
   root: string
@@ -32,7 +34,8 @@ interface LaunchFixture {
 let fixture: LaunchFixture
 
 function createLaunchFixture(): LaunchFixture {
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-runtime-manager-'))
+  // The strict sandbox supplies executable storage separately from its /tmp.
+  const base = fs.mkdtempSync(path.join(process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR ?? os.tmpdir(), 'freshell-runtime-manager-'))
   // Spaces in the fixture root prove manager argv and entrypoint paths
   // survive child-process spawning without shell re-parsing.
   const root = path.join(base, 'dir with spaces')
@@ -54,12 +57,15 @@ function createLaunchFixture(): LaunchFixture {
 
 beforeEach(() => {
   fixture = createLaunchFixture()
+  // Cloud unit tests have no checkout metadata; commit lookup is a fixture.
+  execFileSync.mockReturnValue(`${fixtureCommit}\n`)
 })
 
 afterEach(() => {
   vi.restoreAllMocks()
   vi.unstubAllEnvs()
   spawn.mockReset()
+  execFileSync.mockReset()
   fs.rmSync(path.dirname(fixture.root), { recursive: true, force: true })
 })
 
@@ -114,6 +120,29 @@ describe('runtime test script manager launches', () => {
     expect(specs).toHaveLength(5)
     expect(specs[4].command).toBe(path.resolve('scripts/sandbox-test.sh'))
     expect((specs[4].args as string[])[0]).toBe('--runtime-suite')
+    expect(execFileSync).toHaveBeenCalledExactlyOnceWith('git', ['rev-parse', 'HEAD'], {
+      cwd: path.resolve('.'), encoding: 'utf8',
+    })
+  })
+
+  it('rejects failed commit lookup before sandbox dispatch', async () => {
+    vi.stubEnv('FRESHELL_RUST_TEST_SANDBOX', '1')
+    vi.stubEnv('npm_execpath', fixture.pnpmCjs)
+    mockSpawnResolvingChildren()
+    execFileSync.mockImplementationOnce(() => { throw new Error('Git metadata unavailable') })
+
+    await expect(runSourceRuntimeTests([])).rejects.toThrow('Git metadata unavailable')
+    expect(spawn).toHaveBeenCalledTimes(4)
+  })
+
+  it('rejects an invalid commit identity before sandbox dispatch', async () => {
+    vi.stubEnv('FRESHELL_RUST_TEST_SANDBOX', '1')
+    vi.stubEnv('npm_execpath', fixture.pnpmCjs)
+    mockSpawnResolvingChildren()
+    execFileSync.mockReturnValueOnce('unknown\n')
+
+    await expect(runSourceRuntimeTests([])).rejects.toThrow('Cannot identify the source-runtime build commit.')
+    expect(spawn).toHaveBeenCalledTimes(4)
   })
 
   it.each(['0', 'true', ''])('keeps direct runtime dispatch for non-opt-in %j even with cloud configured', async value => {
@@ -149,6 +178,7 @@ describe('runtime test script manager launches', () => {
     fs.writeFileSync(helper, `import fs from 'node:fs';
       fs.appendFileSync(process.env.RECEIPT, JSON.stringify({kind:process.argv[2], args:process.argv.slice(3),
         route:process.env.FRESHELL_RUST_TEST_SANDBOX, jobs:process.env.CARGO_BUILD_JOBS,
+        commit:process.env.FRESHELL_BUILD_COMMIT,
         tmp:process.env.TMPDIR, executableTmp:process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR})+'\\n');
       process.exit(process.argv[2]==='node' ? Number(process.env.SUITE_EXIT) : 0);`)
     const quote = (word: string) => `'${word.replaceAll("'", "'\\''")}'`
@@ -185,6 +215,7 @@ describe('runtime test script manager launches', () => {
     expect(events[1].args.slice(5)).toEqual(['--', ...args.slice(1)])
     expect(events[1].route).toBe('0')
     expect(events[1].jobs).toBe('3')
+    expect(events[1].commit).toBe(fixtureCommit)
     expect(events[1].tmp).toBe(events[1].executableTmp)
     expect(fs.existsSync(events[1].tmp)).toBe(false)
     expect(fs.existsSync(path.join(fixture.root, 'SHOULD_NOT_EXIST'))).toBe(false)
