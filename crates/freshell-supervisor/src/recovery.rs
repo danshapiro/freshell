@@ -5454,6 +5454,10 @@ pub(crate) mod tests {
         );
         assert_eq!(staging.verify_ready(&descriptor).unwrap(), ready);
         assert_stopped_payload_bytes(&snapshot, &ready);
+        staging.abort(&descriptor.transfer_id, &reopened).unwrap();
+        drop(staging);
+        drop(snapshot);
+        directory.close().unwrap();
     }
 
     fn assert_stopped_payload_bytes(snapshot: &OpenCodeNativeSnapshot, ready: &Path) {
@@ -5464,7 +5468,10 @@ pub(crate) mod tests {
             .read_to_end(&mut original)
             .unwrap();
         let staged = std::fs::read(ready.join("entry-0000.bin")).unwrap();
-        assert_eq!(staged, original);
+        assert!(
+            staged == original,
+            "staged bytes differ from the exported snapshot"
+        );
         assert_eq!(
             format!("{:x}", Sha256::digest(&staged)),
             snapshot.manifest().payload_sha256
@@ -5508,6 +5515,10 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(staging.verify_ready(&descriptor).unwrap(), ready);
         assert_stopped_payload_bytes(&snapshot, &ready);
+        staging.abort(&descriptor.transfer_id, &reopened).unwrap();
+        drop(staging);
+        drop(snapshot);
+        directory.close().unwrap();
     }
 
     fn write_stopped_payload_first_chunk(
@@ -5571,6 +5582,12 @@ pub(crate) mod tests {
         assert!(
             stage_snapshot_payload(&snapshot, &descriptor, &reopened, &staging, &progress).is_err()
         );
+        drop(writer);
+        drop(payload);
+        staging.abort(&descriptor.transfer_id, &reopened).unwrap();
+        drop(staging);
+        drop(snapshot);
+        directory.close().unwrap();
     }
 
     #[tokio::test]
@@ -5624,6 +5641,12 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(staging.verify_ready(&queued_descriptor).unwrap(), ready);
         assert_stopped_payload_bytes(&snapshot, &ready);
+        staging
+            .abort(&queued_descriptor.transfer_id, &queued_attempt)
+            .unwrap();
+        drop(staging);
+        drop(snapshot);
+        directory.close().unwrap();
     }
 
     #[test]
@@ -5670,6 +5693,10 @@ pub(crate) mod tests {
         let ready = staging.finalize(&descriptor.transfer_id, &attempt).unwrap();
         assert_eq!(staging.verify_ready(&descriptor).unwrap(), ready);
         assert_stopped_payload_bytes(&snapshot, &ready);
+        staging.abort(&descriptor.transfer_id, &attempt).unwrap();
+        drop(staging);
+        drop(snapshot);
+        directory.close().unwrap();
     }
 
     #[tokio::test]
