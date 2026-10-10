@@ -801,10 +801,18 @@ mod mac {
         }
 
         /// Ends this waiter with an error; the next await starts another.
+        /// An exit another thread proved meanwhile (`has_exited()`) wins:
+        /// it is never replaced by the error, published or about to be.
         fn stop_waiting(&self, error: String) {
             let mut running = lock(&self.waiter);
             *running = false;
-            self.state.send_replace(Some(Err(error)));
+            self.state.send_if_modified(|state| {
+                if self.exited.load(Ordering::SeqCst) || matches!(state, Some(Ok(()))) {
+                    return false;
+                }
+                *state = Some(Err(error));
+                true
+            });
         }
 
         /// Registers `NOTE_FUNLOCK` on each lock file, on a watch opened
