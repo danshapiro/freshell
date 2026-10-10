@@ -1299,7 +1299,7 @@ print(json.dumps(dict(soul=soul,incarnations=incarnations,stops=stops,writers=c.
 `
 
 export const SyntheticStoppedRepairFaultSchema = z.enum(['none', 'after_import_publication',
-  'after_repair_cas_before_withdrawal', 'during_withdrawal_before_ack', 'first_resume_observation'])
+  'after_repair_cas_before_withdrawal', 'during_withdrawal_before_ack', 'first_resume_observation', 'source_generation_change', 'pending_withdrawal'])
 export type SyntheticStoppedRepairFault = z.infer<typeof SyntheticStoppedRepairFaultSchema>
 
 const RuntimeOwnerOperationRequestSchema = z.object({
@@ -1730,7 +1730,11 @@ export type Task007PreparedStoppedFixture = {
 
 const Task007FamilyFactsSchema = z.object({ rootId: Task007Id, childId: Task007Id, grandchildId: Task007Id,
   baselineMessages: z.record(z.string(), Task007Hex), baselineParts: z.record(z.string(), Task007Hex) }).strict()
+const Task007ActivitySchema = z.object({ setupHelpersCompleted: z.number().int().nonnegative(),
+  helperStartRequests: z.number().int().nonnegative(), providerContainerStartRequests: z.number().int().nonnegative(),
+  providerLaunchRunningEvents: z.number().int().nonnegative() }).strict()
 export const SyntheticStoppedRepairBatchFactsSchema = z.object({ fixtureId: Task007Id, sourceStoreId: Task007Hex,
+  activity: Task007ActivitySchema,
   families: z.array(Task007FamilyFactsSchema).length(7),
   targets: z.array(z.object({ soulId: Task007Id, providerStoreId: Task007Id, rootSessionId: Task007Id,
     terminalId: Task007Id, streamId: Task007Id, incidentId: Task007Id, viewIds: z.array(Task007Id) }).strict()).length(9),
@@ -1781,7 +1785,14 @@ const Task007CurrentIncarnationSchema = z.object({ soulId: Task007Id, incarnatio
   launchNonce: Task007Id, containerId: Task007Hex.nullable(), hostBootId: Task007Id.nullable(),
   launchState: Task007Id, executionGeneration: z.number().int().nonnegative() }).strict()
 type Task007CurrentIncarnation = z.infer<typeof Task007CurrentIncarnationSchema>
+const Task007CrashPointSchema = z.enum(['stopped_repair_after_import_publication',
+  'stopped_repair_after_repair_cas_before_withdrawal', 'stopped_repair_during_withdrawal_before_ack'])
+const Task007FaultMarkersSchema = z.object({ preset: SyntheticStoppedRepairFaultSchema, supervisorContainerId: Task007Hex,
+  crash: z.object({ point: Task007CrashPointSchema, running: z.boolean(), exitCode: z.number().int() }).strict().nullable(),
+  firstResumeObservationFailures: z.array(z.object({ soulId: Task007Id, incarnationId: Task007Id,
+    executionGeneration: z.number().int().positive() }).strict()).max(9) }).strict()
 export const SyntheticStoppedRepairBatchObservationSchema = z.object({ fixtureId: Task007Id, operationId: Task007Id,
+  activity: Task007ActivitySchema, faultMarkers: Task007FaultMarkersSchema,
   controlEpoch: z.number().int().nonnegative(), scope: ManagedRuntimeRepairBatchScopeSchema,
   canonicalChoices: z.array(z.object({ rootSessionId: Task007Id, soulId: Task007Id,
     expectedIntentRevision: z.number().int().positive() }).strict()).length(2),
@@ -1800,7 +1811,8 @@ export const SyntheticStoppedRepairBatchObservationSchema = z.object({ fixtureId
     rowCount: z.number().int().nonnegative() }).extend(Task007InstalledGraphSchema.shape).strict()).max(7),
   nativeObservations: z.array(Task007NativeObservationSchema).max(7),
 }).strict()
-const Task007RepairRecordsSchema = SyntheticStoppedRepairBatchObservationSchema.omit({ installedStores: true, nativeObservations: true })
+const Task007RepairRecordsSchema = SyntheticStoppedRepairBatchObservationSchema.omit({ installedStores: true, nativeObservations: true,
+  activity: true, faultMarkers: true })
   .extend({ currentIncarnations: z.array(Task007CurrentIncarnationSchema).max(9) }).strict()
 export type SyntheticStoppedRepairBatchObservation = z.infer<typeof SyntheticStoppedRepairBatchObservationSchema>
 
@@ -1812,6 +1824,7 @@ database,metadata,operation,export_root,source_store=sys.argv[1:6]
 fixture=json.load(open(metadata))
 c=sqlite3.connect('file:'+database+'?mode=ro',uri=True)
 c.row_factory=sqlite3.Row
+c.execute('PRAGMA query_only=ON')
 c.execute('BEGIN')
 op=c.execute('SELECT status,targets_json,scope_json,owner_choices_json FROM stopped_repair_operations WHERE operation_id=?',(operation,)).fetchone()
 if op is None: raise RuntimeError('registered repair operation is absent')
@@ -2510,6 +2523,68 @@ export class RuntimeHarness {
     }
   }
 
+  async readTask007StoppedRegistry(supervisor: SupervisorInstance, fixtureId: string, operationId: string): Promise<z.infer<typeof Task007RepairRecordsSchema>> {
+    const batch = this.task007Fixtures.get('browser')
+    Task007Id.parse(operationId)
+    if (!batch || batch.input.fixtureId !== fixtureId || batch.input.runId !== this.runId || batch.input.candidateSha !== this.candidateSha
+      || batch.volumeName !== supervisor.volumeName || batch.input.runtimeRoot !== supervisor.runtimeRoot
+      || batch.scenarioId !== supervisor.scenarioId || !this.trackedSupervisorContainers.has(supervisor.containerId)
+      || !this.trackedVolumes.has(supervisor.volumeName) || this.imageRef !== batch.input.imageRef) {
+      throw new Error('exact registered stopped Registry reader ownership required')
+    }
+    if (this.isContainerRunning(supervisor.containerId)) throw new Error('stopped Registry reader refuses a running supervisor')
+    assertTask007PrivatePath(batch.metadataFile, false, 0o600)
+    if (!batch.metadataFile.startsWith(`${fs.realpathSync(this.testRoot)}${path.sep}`)
+      || fs.lstatSync(batch.metadataFile).nlink !== 1
+      || JSON.stringify(Task007FixtureOutputSchema.parse(JSON.parse(fs.readFileSync(batch.metadataFile, 'utf8'))))
+        !== JSON.stringify(Task007FixtureOutputSchema.parse(batch.output))) {
+      throw new Error('registered stopped Registry metadata custody changed')
+    }
+    const sourceStoreId = createHash('sha256').update(fs.realpathSync(batch.sourceDatabaseFile)).digest('hex')
+    const name = `freshell-task007-registry-read-${randomUUID()}`
+    if ((await this.task007Docker(['ps', '-a', '--format', '{{.Names}}'])).trim().split('\n').includes(name)) {
+      throw new Error('stopped Registry reader name already exists')
+    }
+    this.task007HelperNames.add(name)
+    let containerId: string | undefined, failure: unknown
+    try {
+      const returnedId = (await this.task007Docker(['create', '--name', name, '--user', '0:0', '--network', 'none', '--read-only',
+        '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--memory', '256m', '--memory-swap', '256m', '--cpus', '0.5', '--pids-limit', '32',
+        '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=16m',
+        '--mount', `type=volume,source=${supervisor.volumeName},target=/registry,readonly,volume-nocopy`,
+        '--mount', `type=bind,source=${batch.metadataFile},target=/fixture/metadata.json,readonly`,
+        '--label', `com.freshell.runtime-test-run-id=${this.runId}`, '--label', `com.freshell.runtime-test-candidate=${this.candidateSha}`,
+        '--label', 'com.freshell.task007-setup=registry-observation', '--label', `com.freshell.task007-fixture-id=${fixtureId}`,
+        '--label', `com.freshell.task007-supervisor-id=${supervisor.containerId}`,
+        '--entrypoint', 'python3', this.imageRef, '-I', '-c', TASK007_STOPPED_REPAIR_OBSERVATION,
+        '/registry/runtime.sqlite3', '/fixture/metadata.json', operationId, '/registry', sourceStoreId])).trim()
+      Task007Hex.parse(returnedId)
+      if (this.trackedContainers.has(returnedId) || this.trackedSupervisorContainers.has(returnedId)
+        || this.broker.receiptIds().has(returnedId)) throw new Error('stopped Registry reader returned an already owned container')
+      containerId = returnedId
+      this.trackedContainers.add(containerId)
+      this.recordLifecycle('task007.registry_reader.start_requested', { fixtureId, containerId, supervisorContainerId: supervisor.containerId })
+      await this.task007Docker(['start', containerId])
+      const exit = (await this.task007Docker(['wait', containerId])).trim()
+      const stdout = await this.task007Docker(['logs', containerId])
+      this.writeArtifact(`task007-registry-read-${randomUUID()}.json`, { fixtureId, operationId, containerId, exit, stdout })
+      if (exit !== '0') throw new Error('current stopped Registry reader refused operation')
+      if (this.isContainerRunning(supervisor.containerId)) throw new Error('stopped Registry supervisor restarted during read')
+      return Task007RepairRecordsSchema.parse(JSON.parse(stdout))
+    } catch (error) { failure = error; throw error }
+    finally {
+      try {
+        if (containerId && Task007Hex.safeParse(containerId).success) {
+          await this.task007Docker(['rm', '--force', containerId]); this.trackedContainers.delete(containerId)
+        } else await this.removeTask007Helper(name)
+        this.task007HelperNames.delete(name)
+      } catch (cleanupError) {
+        if (failure) throw new AggregateError([failure, cleanupError], 'stopped Registry read and owned cleanup failed')
+        throw cleanupError
+      }
+    }
+  }
+
   async runTask007StoppedRepairParents(): Promise<{ executedParents: 3; passedParents: 3 }> {
     this.assertTask007Active()
     const kinds = ['after_import_publication', 'after_repair_cas_before_withdrawal', 'during_withdrawal_before_ack'] as const
@@ -2832,9 +2907,16 @@ export class RuntimeHarness {
       && (kind === 'provider-home' ? observed.Mounts.length === 1 && volumes[0].Destination === '/home/freshell/provider'
         : observed.Mounts.length === 2 && volumes[0].Destination === '/registry' && binds.length === 1
           && !!binds[0].Source?.startsWith(`${this.testRoot}${path.sep}`) && binds[0].Destination === '/fixture' && !binds[0].RW)
+    const batch = this.task007Fixtures.get('browser')
+    const registryReaderMounts = kind === 'registry-observation' && name.startsWith('freshell-task007-registry-read-')
+      && !!batch && labels['com.freshell.task007-fixture-id'] === batch.input.fixtureId
+      && this.trackedSupervisorContainers.has(labels['com.freshell.task007-supervisor-id'])
+      && observed.Mounts.length === 2 && volumes.length === 1 && volumes[0].Name === batch.volumeName
+      && !!batch.volumeName && this.trackedVolumes.has(batch.volumeName) && volumes[0].Destination === '/registry' && !volumes[0].RW
+      && binds.length === 1 && binds[0].Source === batch.metadataFile && binds[0].Destination === '/fixture/metadata.json' && !binds[0].RW
     if (observed.Image !== this.imageRef || labels['com.freshell.runtime-test-run-id'] !== this.runId
       || labels['com.freshell.runtime-test-candidate'] !== this.candidateSha
-      || (!parentMounts && !setupMounts)) throw new Error('Task7 partial setup helper ownership is unknown')
+      || (!parentMounts && !setupMounts && !registryReaderMounts)) throw new Error('Task7 partial setup helper ownership is unknown')
     await this.task007Docker(['rm', '--force', observed.Id])
   }
 
@@ -4260,6 +4342,11 @@ export class ManagedRuntimeOwner {
   private readonly providerProbes = new Map<string, { child?: ChildProcess; settlement: Promise<string> }>()
   private syntheticSource?: { source: SyntheticSource; root: string; nonce: string }
   private stoppedRepairBatch?: Task007PreparedStoppedFixture
+  private stoppedRepairSourceIdentity?: { file: string; sha256: string }
+  private stoppedRepairSourceFault?: { original: Buffer; expectedSha256: string; active: boolean }
+  private stoppedRepairWithdrawalFault?: { file: string; sha256: string; dev: number; ino: number; removed: boolean }
+  private stoppedRepairWebStopped = false
+  private stoppedRepairFaultPreset: SyntheticStoppedRepairFault = 'none'
   private runtimePreparation?: Promise<void>
   private receiptCandidateBefore?: RuntimeCandidateIntegrity
   private chaosEvidencePublished = false
@@ -4344,6 +4431,8 @@ export class ManagedRuntimeOwner {
     this.runtimePreparation = preparation.then(() => undefined)
     await this.runtimePreparation
     this.stoppedRepairBatch = await preparation
+    this.stoppedRepairSourceIdentity = { file: fs.realpathSync(this.stoppedRepairBatch.sourceDatabaseFile),
+      sha256: task007FileHash(this.stoppedRepairBatch.sourceDatabaseFile) }
     this.webHomeDir = path.join(this.runtime.testRoot, 'task007-browser-web-home')
     ensurePrivateDirectory(this.webHomeDir)
     this.serverEnv.OPENCODE_DB = this.stoppedRepairBatch.sourceDatabaseFile
@@ -4363,6 +4452,7 @@ export class ManagedRuntimeOwner {
   async syntheticStoppedRepairBatchFacts(): Promise<SyntheticStoppedRepairBatchFacts> {
     const batch = this.registeredStoppedRepairBatch()
     return SyntheticStoppedRepairBatchFactsSchema.parse({ fixtureId: batch.input.fixtureId,
+      activity: await this.readTask007Activity(batch),
       sourceStoreId: createHash('sha256').update(await fsp.realpath(batch.sourceDatabaseFile)).digest('hex'),
       families: batch.source.families.map(family => ({ rootId: family.rootId, childId: family.childId,
         grandchildId: family.grandchildId, baselineMessages: Object.fromEntries(family.baselineMessages),
@@ -4378,14 +4468,44 @@ export class ManagedRuntimeOwner {
     })
   }
 
+  private async readTask007Activity(batch: Task007PreparedStoppedFixture): Promise<z.infer<typeof Task007ActivitySchema>> {
+    const targetIds = new Set(batch.output.targets.map(target => target.containerId))
+    const soulIds = new Set(batch.output.targets.map(target => target.soulId))
+    const providerIds = new Set(this.runtime.broker.receipts().filter(receipt => soulIds.has(receipt.soulId)).map(receipt => receipt.containerId))
+    const ownerEvents = await this.readOwnedLifecycle('owner')
+    const setupHelpersCompleted = ownerEvents.filter(event => {
+      if (event.event !== 'task007.provider_home.initialized') return false
+      const data = z.object({ fixtureId: Task007Id, ownerContainerId: Task007Hex }).parse(event.data)
+      if (data.fixtureId !== batch.input.fixtureId) return false
+      if (!targetIds.has(data.ownerContainerId)) throw new Error('setup completion belongs to an unregistered container')
+      return true
+    }).length
+    let helperStartRequests = 0, providerContainerStartRequests = 0
+    for (const event of this.runtime.broker.eventsSnapshot()) {
+      if (event.decision !== 'forward' || event.method !== 'POST' || !event.url.endsWith('/start')) continue
+      const containerId = Task007Hex.parse(event.containerId)
+      if (event.url !== `/v1.47/containers/${containerId}/start`) throw new Error('forwarded start address differs from recorded container')
+      if (event.helperName) {
+        if (!/^freshell-history-[a-zA-Z0-9-]+$/.test(event.helperName)) throw new Error('unknown registered helper start name')
+        if (providerIds.has(Task007Hex.parse(event.ownerContainerId))) helperStartRequests++
+      } else if (providerIds.has(containerId)) providerContainerStartRequests++
+    }
+    const supervisorEvents = this.supervisor ? await this.readOwnedLifecycle() : []
+    const providerLaunchRunningEvents = supervisorEvents.filter(event => event.event === 'supervisor.launch_running'
+      && soulIds.has(z.object({ soulId: Task007Id }).parse(event.data).soulId)).length
+    return { setupHelpersCompleted, helperStartRequests, providerContainerStartRequests, providerLaunchRunningEvents }
+  }
+
   async syntheticStoppedRepairBatchObservation(fixtureId: string, operationId: string): Promise<SyntheticStoppedRepairBatchObservation> {
     const batch = this.registeredStoppedRepairBatch(fixtureId)
     Task007Id.parse(operationId)
     if (!this.supervisor || this.supervisor.volumeName !== batch.volumeName) throw new Error('registered batch supervisor required')
     const sourceStoreId = (await this.syntheticStoppedRepairBatchFacts()).sourceStoreId
-    const records = async () => Task007RepairRecordsSchema.parse(JSON.parse(await this.ownedDockerProbe(
-      this.supervisor.containerId, ['python3', '-I', '-c', TASK007_STOPPED_REPAIR_OBSERVATION,
-        '/var/lib/freshell-supervisor/runtime.sqlite3', batch.metadataFile, operationId, '/var/lib/freshell-supervisor', sourceStoreId], false)))
+    const records = async () => this.runtime.isContainerRunning(this.supervisor.containerId)
+      ? Task007RepairRecordsSchema.parse(JSON.parse(await this.ownedDockerProbe(
+        this.supervisor.containerId, ['python3', '-I', '-c', TASK007_STOPPED_REPAIR_OBSERVATION,
+          '/var/lib/freshell-supervisor/runtime.sqlite3', batch.metadataFile, operationId, '/var/lib/freshell-supervisor', sourceStoreId], false)))
+      : this.runtime.readTask007StoppedRegistry(this.supervisor, fixtureId, operationId)
     const initial = await records()
     const { currentIncarnations, ...observed } = initial
     if (observed.fixtureId !== fixtureId || observed.operationId !== operationId
@@ -4448,7 +4568,36 @@ export class ManagedRuntimeOwner {
       }
     }
     if (JSON.stringify(await records()) !== JSON.stringify(initial)) throw new Error('current stopped repair records changed during independent store observation')
-    return SyntheticStoppedRepairBatchObservationSchema.parse({ ...observed, installedStores, nativeObservations })
+    return SyntheticStoppedRepairBatchObservationSchema.parse({ ...observed, installedStores, nativeObservations,
+      activity: await this.readTask007Activity(batch), faultMarkers: await this.readTask007FaultMarkers(currentIncarnations) })
+  }
+
+  private async readTask007FaultMarkers(current: Task007CurrentIncarnation[]): Promise<z.infer<typeof Task007FaultMarkersSchema>> {
+    const preset = this.stoppedRepairFaultPreset
+    let crash: z.infer<typeof Task007FaultMarkersSchema>['crash'] = null
+    if (['after_import_publication', 'after_repair_cas_before_withdrawal', 'during_withdrawal_before_ack'].includes(preset)) {
+      for (const line of this.runtime.containerLogs(this.supervisor.containerId).split('\n').filter(Boolean)) {
+        let row: unknown
+        try { row = JSON.parse(line) }
+        catch { if (line.includes('supervisor.test_crash')) throw new Error('current stopped-repair crash marker is malformed'); continue }
+        const candidate = z.object({ event: z.string().optional() }).passthrough().parse(row)
+        if (candidate.event !== 'supervisor.test_crash') continue
+        const marker = z.object({ event: z.literal('supervisor.test_crash'), point: Task007CrashPointSchema }).strict().parse(row)
+        if (marker.point !== `stopped_repair_${preset}` || crash) throw new Error('current stopped-repair crash marker conflicts with selected seam')
+        const state = z.object({ State: z.object({ Running: z.boolean(), ExitCode: z.number().int() }) })
+          .parse(this.runtime.inspectContainer(this.supervisor.containerId)).State
+        crash = { point: marker.point, running: state.Running, exitCode: state.ExitCode }
+      }
+    }
+    const firstResumeObservationFailures: z.infer<typeof Task007FaultMarkersSchema>['firstResumeObservationFailures'] = []
+    if (preset === 'first_resume_observation') {
+      for (const event of await this.readOwnedLifecycle()) {
+        if (event.event !== 'supervisor.stopped_repair_resume_observation_test_failure') continue
+        const marker = z.object({ soulId: Task007Id, incarnationId: Task007Id, executionGeneration: z.number().int().positive() }).parse(event.data)
+        if (current.some(row => row.soulId === marker.soulId && row.incarnationId === marker.incarnationId)) firstResumeObservationFailures.push(marker)
+      }
+    }
+    return { preset, supervisorContainerId: this.supervisor.containerId, crash, firstResumeObservationFailures }
   }
 
   private async readTask007NativeObservation(root: SyntheticStoppedRepairBatchObservation['roots'][number],
@@ -4588,13 +4737,148 @@ export class ManagedRuntimeOwner {
     const batch = this.registeredStoppedRepairBatch(fixtureId)
     const fault = SyntheticStoppedRepairFaultSchema.parse(preset)
     if (this.supervisorBinaryKind !== 'test') throw new Error('stopped repair faults require the feature-built supervisor')
-    if (this.supervisor && this.supervisor.volumeName !== batch.volumeName) throw new Error('registered batch supervisor differs')
-    delete this.supervisorEnv.FRESHELL_RUNTIME_CRASH_POINT
-    delete this.supervisorEnv.FRESHELL_RUNTIME_STOPPED_REPAIR_RESUME_OBSERVATION_FAIL
-    if (fault === 'first_resume_observation') this.supervisorEnv.FRESHELL_RUNTIME_STOPPED_REPAIR_RESUME_OBSERVATION_FAIL = '1'
-    else if (fault !== 'none') this.supervisorEnv.FRESHELL_RUNTIME_CRASH_POINT = `stopped_repair_${fault}`
-    if (this.supervisor) await this.replaceSupervisor('graceful')
+    if (this.supervisor && (this.supervisor.volumeName !== batch.volumeName || this.supervisor.runtimeRoot !== batch.input.runtimeRoot)) {
+      throw new Error('registered batch supervisor differs')
+    }
+    const sourceEffect = fault === 'source_generation_change' || (fault === 'none' && Boolean(this.stoppedRepairSourceFault))
+    const beforeStart = () => {
+      if (sourceEffect) this.applyStoppedRepairSourceFault(batch, fault === 'source_generation_change')
+      if (fault === 'pending_withdrawal' || (fault === 'none' && this.stoppedRepairWithdrawalFault)) {
+        this.applyStoppedRepairWithdrawalFault(batch, fault === 'pending_withdrawal')
+      }
+      delete this.supervisorEnv.FRESHELL_RUNTIME_CRASH_POINT
+      delete this.supervisorEnv.FRESHELL_RUNTIME_STOPPED_REPAIR_RESUME_OBSERVATION_FAIL
+      if (fault === 'first_resume_observation') this.supervisorEnv.FRESHELL_RUNTIME_STOPPED_REPAIR_RESUME_OBSERVATION_FAIL = '1'
+      else if (['after_import_publication', 'after_repair_cas_before_withdrawal', 'during_withdrawal_before_ack'].includes(fault)) {
+        this.supervisorEnv.FRESHELL_RUNTIME_CRASH_POINT = `stopped_repair_${fault}`
+      }
+      this.stoppedRepairFaultPreset = fault
+    }
+    const restartWeb = sourceEffect || this.stoppedRepairWebStopped
+    if (restartWeb) {
+      this.assertStoppedRepairSourceSettled()
+    }
+    try {
+      if (restartWeb && this.web) {
+        this.stoppedRepairWebStopped = true
+        await this.web.stop()
+      }
+      if (this.supervisor) await this.replaceSupervisor('graceful', undefined, beforeStart)
+      else beforeStart()
+      if (restartWeb && this.web) {
+        this.info = await this.withManagedBin(() => this.web.start())
+        this.stoppedRepairWebStopped = false
+      }
+    } catch (error) {
+      if (!restartWeb) throw error
+      const errors = [error]
+      try { await this.web?.stop() } catch (cleanupError) { errors.push(cleanupError) }
+      try { if (this.supervisor) this.runtime.stopSupervisorExact(this.supervisor) }
+      catch (cleanupError) { errors.push(cleanupError) }
+      if (errors.length > 1) throw new AggregateError(errors, 'stopped repair replacement and service settlement failed')
+      throw error
+    }
     return { controlEpoch: this.supervisor ? await this.controlEpoch() : null }
+  }
+
+  private assertStoppedRepairSourceSettled(): void {
+    if (this.providerProbes.size || this.stopSettlement) throw new Error('registered source consumers are not settled')
+  }
+
+  private applyStoppedRepairSourceFault(batch: Task007PreparedStoppedFixture, activate: boolean): void {
+    this.assertStoppedRepairSourceSettled()
+    const identity = this.stoppedRepairSourceIdentity
+    const file = batch.sourceDatabaseFile
+    const info = fs.lstatSync(file)
+    if (!identity || identity.file !== file || fs.realpathSync(file) !== file
+      || !file.startsWith(`${fs.realpathSync(this.runtime.testRoot)}${path.sep}`)
+      || !info.isFile() || info.uid !== process.getuid?.() || info.nlink !== 1 || (info.mode & 0o777) !== 0o600) {
+      throw new Error('registered fictional source custody changed')
+    }
+    for (const suffix of ['-wal', '-shm', '-journal']) {
+      let present = false
+      try { fs.lstatSync(`${file}${suffix}`); present = true }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+      if (present) throw new Error('registered fictional source has an unsettled sidecar')
+    }
+    const current = fs.readFileSync(file), digest = createHash('sha256').update(current).digest('hex')
+    const recorded = this.stoppedRepairSourceFault
+    if (digest !== (recorded?.expectedSha256 ?? identity.sha256)) throw new Error('registered fictional source bytes changed unexpectedly')
+    if (activate) {
+      if (recorded) {
+        if (!recorded.active) throw new Error('registered fictional source requires completion of owned restoration')
+        return
+      }
+      const db = new DatabaseSync(file)
+      const retained = { original: current, expectedSha256: digest, active: false }
+      this.stoppedRepairSourceFault = retained
+      let transactionOpen = false
+      try {
+        db.exec('BEGIN IMMEDIATE')
+        transactionOpen = true
+        const changed = db.prepare("UPDATE session SET title = title || ' [fictional stopped-repair generation fault]' WHERE id = ?")
+          .run(batch.source.families[0].rootId)
+        if (changed.changes !== 1) throw new Error('registered fictional source root is absent')
+        db.exec('COMMIT')
+        transactionOpen = false
+      } catch (error) { if (transactionOpen) db.exec('ROLLBACK'); throw error }
+      finally { db.close() }
+      retained.expectedSha256 = task007FileHash(file)
+      retained.active = true
+    } else if (recorded) {
+      const temporary = `${file}.task007-restore-${randomUUID()}`
+      try {
+        const fd = fs.openSync(temporary, 'wx', 0o600)
+        try { fs.writeFileSync(fd, recorded.original); fs.fsyncSync(fd) } finally { fs.closeSync(fd) }
+        fs.renameSync(temporary, file)
+        if (task007FileHash(file) !== identity.sha256) throw new Error('registered fictional source restoration differs')
+        recorded.expectedSha256 = identity.sha256
+        recorded.active = false
+        const directory = fs.openSync(path.dirname(file), 'r')
+        try { fs.fsyncSync(directory) } finally { fs.closeSync(directory) }
+        this.stoppedRepairSourceFault = undefined
+      } finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary) }
+    }
+  }
+
+  private applyStoppedRepairWithdrawalFault(batch: Task007PreparedStoppedFixture, activate: boolean): void {
+    const directory = path.join(path.dirname(batch.input.runtimeRoot), 'evidence')
+    const file = path.join(directory, 'lifecycle.jsonl.1')
+    if (!file.startsWith(`${fs.realpathSync(this.runtime.testRoot)}${path.sep}`)) throw new Error('withdrawal obstruction is outside registered owner')
+    const parent = path.dirname(directory)
+    if (fs.realpathSync(parent) !== parent) throw new Error('withdrawal obstruction parent custody changed')
+    fs.mkdirSync(directory, { mode: 0o700, recursive: true })
+    if (fs.realpathSync(directory) !== directory) throw new Error('withdrawal obstruction directory custody changed')
+    const recorded = this.stoppedRepairWithdrawalFault
+    if (recorded) {
+      if (recorded.file !== file) throw new Error('owned withdrawal obstruction changed')
+      if (recorded.removed) {
+        let present = false
+        try { fs.lstatSync(file); present = true }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+        if (present) throw new Error('owned withdrawal obstruction changed after removal')
+        if (activate) throw new Error('owned withdrawal obstruction requires completion of removal')
+      } else {
+        const info = fs.lstatSync(file)
+        if (!info.isFile() || info.uid !== process.getuid?.() || info.nlink !== 1 || (info.mode & 0o777) !== 0o600
+          || info.dev !== recorded.dev || info.ino !== recorded.ino || task007FileHash(file) !== recorded.sha256) {
+          throw new Error('owned withdrawal obstruction changed')
+        }
+        if (activate) return
+        fs.unlinkSync(file)
+        recorded.removed = true
+      }
+      const fd = fs.openSync(directory, 'r')
+      try { fs.fsyncSync(fd) } finally { fs.closeSync(fd) }
+      this.stoppedRepairWithdrawalFault = undefined
+    } else if (activate) {
+      if (fs.existsSync(file)) throw new Error('withdrawal obstruction already exists and is not owned')
+      const content = Buffer.from('malformed fictional stopped-repair withdrawal\n')
+      const fd = fs.openSync(file, 'wx', 0o600)
+      try { fs.writeFileSync(fd, content); fs.fsyncSync(fd) } finally { fs.closeSync(fd) }
+      const info = fs.lstatSync(file)
+      this.stoppedRepairWithdrawalFault = { file, sha256: task007FileHash(file), dev: info.dev, ino: info.ino, removed: false }
+    }
   }
 
   async syntheticOpenCodeSourceFacts(): Promise<SyntheticOpenCodeSourceFacts> {
@@ -4832,15 +5116,17 @@ export class ManagedRuntimeOwner {
     return this.replaceSupervisor('abrupt')
   }
 
-  private async replaceSupervisor(mode: 'graceful' | 'abrupt', crashPoint?: 'ordinary_stop_after_intent'): Promise<SupervisorInstance> {
+  private async replaceSupervisor(mode: 'graceful' | 'abrupt', crashPoint?: 'ordinary_stop_after_intent', beforeStart?: () => void): Promise<SupervisorInstance> {
     const previous = this.supervisor
     if (mode === 'abrupt') this.runtime.killTrackedContainerExact(previous.containerId)
     else this.runtime.stopSupervisorExact(previous)
-    this.runtime.removeContainerExact(previous.containerId)
+    beforeStart?.()
+    if (!beforeStart) this.runtime.removeContainerExact(previous.containerId)
     this.supervisor = await this.runtime.startSupervisor({
       scenarioId: previous.scenarioId,
       volumeName: previous.volumeName,
       binaryKind: previous.binaryKind,
+      ...(beforeStart ? { waitForHealth: false } : {}),
       reuseSecret: true,
       env: { ...this.supervisorEnv, ...this.qualificationEnvironment() },
       binaryPath: this.qualificationSupervisorBin,
@@ -4849,6 +5135,10 @@ export class ManagedRuntimeOwner {
         ? { crashPoint: this.supervisorEnv.FRESHELL_RUNTIME_CRASH_POINT } : {}),
       ...(crashPoint ? { crashPoint } : {}),
     })
+    if (beforeStart) {
+      await this.runtime.waitForSupervisorHealth(this.supervisor)
+      this.runtime.removeContainerExact(previous.containerId)
+    }
     return this.supervisor
   }
 

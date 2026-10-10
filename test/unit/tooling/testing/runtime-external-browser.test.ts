@@ -1321,7 +1321,8 @@ describe('closed external owner control', () => {
   }
   it('forwards only registered batch IDs and fixed faults while keeping repair IDs distinct from transport retries', async () => {
     const { owned, context, request } = fixture()
-    const facts = { fixtureId: 'fixture-batch', sourceStoreId: 'a'.repeat(64), families: Array.from({ length: 7 }, (_, index) => ({ rootId: `ses_root_${index}`,
+    const activity = { setupHelpersCompleted: 9, helperStartRequests: 0, providerContainerStartRequests: 0, providerLaunchRunningEvents: 0 }
+    const facts = { fixtureId: 'fixture-batch', sourceStoreId: 'a'.repeat(64), activity, families: Array.from({ length: 7 }, (_, index) => ({ rootId: `ses_root_${index}`,
       childId: `ses_child_${index}`, grandchildId: `ses_grand_${index}`, baselineMessages: {}, baselineParts: {} })),
       targets: Array.from({ length: 9 }, (_, index) => ({ soulId: `soul-${index}`, providerStoreId: `store-${index}`,
         rootSessionId: `ses_root_${index % 7}`, terminalId: `terminal-${index}`, streamId: `stream-${index}`,
@@ -1348,16 +1349,21 @@ describe('closed external owner control', () => {
     await expect(remote.prepareSyntheticStoppedRepairBatch()).resolves.toEqual(facts)
     await expect(remote.setSyntheticStoppedRepairFault('fixture-batch', 'none')).resolves.toEqual({ controlEpoch: 27 })
     expect(fault).toHaveBeenCalledExactlyOnceWith('fixture-batch', 'none')
+    for (const preset of ['source_generation_change', 'pending_withdrawal'] as const) {
+      await expect(remote.setSyntheticStoppedRepairFault('fixture-batch', preset)).resolves.toEqual({ controlEpoch: 27 })
+      expect(fault).toHaveBeenLastCalledWith('fixture-batch', preset)
+    }
     const query = { ...request, action: 'synthetic-stopped-repair-observation', fixtureId: 'fixture-batch', repairOperationId: 'repair-current' }
     await expect(control(query)).rejects.toThrow(/absent/)
     await expect(control(query)).rejects.toThrow(/absent/)
     expect(observation).toHaveBeenCalledExactlyOnceWith('fixture-batch', 'repair-current')
     await expect(control({ ...query, operationId: 'foreign-path', databasePath: '/foreign' })).rejects.toThrow(/operation/)
     await expect(control({ ...request, operationId: 'generic-fault', action: 'synthetic-stopped-repair-fault',
-      fixtureId: 'fixture-batch', stoppedRepairFault: 'source_generation_change' })).rejects.toThrow(/operation/)
+      fixtureId: 'fixture-batch', stoppedRepairFault: 'arbitrary_source_sql' })).rejects.toThrow(/operation/)
     await expect(control({ ...request, operationId: 'missing-id', action: 'synthetic-stopped-repair-observation' })).rejects.toThrow(/fixture|operation/)
     const measured: import('../../../../scripts/testing/runtime-sandbox.js').SyntheticStoppedRepairBatchObservation = {
       fixtureId: facts.fixtureId, operationId: 'repair-current', controlEpoch: 27,
+      activity, faultMarkers: { preset: 'none', supervisorContainerId: 'c'.repeat(64), crash: null, firstResumeObservationFailures: [] },
       scope: { scopeId: 'd'.repeat(64), sourceStoreId: facts.sourceStoreId, sourceFingerprint: 'e'.repeat(64),
         targets: facts.targets.map(target => ({ target: { soulId: target.soulId, incidentId: target.incidentId, expectedIntentRevision: 1 },
           providerStoreId: target.providerStoreId, rootSessionId: target.rootSessionId, incidentRevision: 1, identityRevision: 1,
