@@ -4351,7 +4351,7 @@ export class ManagedRuntimeOwner {
   private stoppedRepairBatch?: Task007PreparedStoppedFixture
   private stoppedRepairSourceIdentity?: { file: string; sha256: string }
   private stoppedRepairSourceFault?: { original: Buffer; expectedSha256: string; active: boolean }
-  private stoppedRepairWithdrawalFault?: { file: string; sha256: string; dev: number; ino: number; removed: boolean }
+  private stoppedRepairWithdrawalFault?: { file: string; sha256: string; dev: number; ino: number; removed: boolean; activationComplete: boolean }
   private stoppedRepairWebStopped = false
   private stoppedRepairFaultPreset: SyntheticStoppedRepairFault = 'none'
   private runtimePreparation?: Promise<void>
@@ -4880,7 +4880,10 @@ export class ManagedRuntimeOwner {
           || info.dev !== recorded.dev || info.ino !== recorded.ino || task007FileHash(file) !== recorded.sha256) {
           throw new Error('owned withdrawal obstruction changed')
         }
-        if (activate) return
+        if (activate) {
+          if (!recorded.activationComplete) throw new Error('owned withdrawal obstruction requires completion of removal after failed activation')
+          return
+        }
         fs.unlinkSync(file)
         recorded.removed = true
       }
@@ -4891,9 +4894,21 @@ export class ManagedRuntimeOwner {
       if (fs.existsSync(file)) throw new Error('withdrawal obstruction already exists and is not owned')
       const content = Buffer.from('malformed fictional stopped-repair withdrawal\n')
       const fd = fs.openSync(file, 'wx', 0o600)
-      try { fs.writeFileSync(fd, content); fs.fsyncSync(fd) } finally { fs.closeSync(fd) }
-      const info = fs.lstatSync(file)
-      this.stoppedRepairWithdrawalFault = { file, sha256: task007FileHash(file), dev: info.dev, ino: info.ino, removed: false }
+      const info = fs.fstatSync(fd)
+      const created = { file, sha256: createHash('sha256').update('').digest('hex'), dev: info.dev, ino: info.ino, removed: false, activationComplete: false }
+      this.stoppedRepairWithdrawalFault = created
+      try { fs.writeFileSync(fd, content); fs.fsyncSync(fd) }
+      finally {
+        try {
+          const current = fs.lstatSync(file)
+          if (!current.isFile() || current.dev !== created.dev || current.ino !== created.ino
+            || current.uid !== process.getuid?.() || current.nlink !== 1 || (current.mode & 0o777) !== 0o600) {
+            throw new Error('owned withdrawal obstruction changed during activation')
+          }
+          created.sha256 = task007FileHash(file)
+        } finally { fs.closeSync(fd) }
+      }
+      created.activationComplete = true
     }
   }
 

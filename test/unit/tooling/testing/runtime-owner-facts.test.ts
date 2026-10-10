@@ -823,6 +823,72 @@ describe('Task7 registered physical stopped fixture preparation', () => {
     } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
   })
 
+  it.each(['write', 'fsync', 'close'] as const)(
+    'retains exclusively created obstruction custody after activation $0 failure until exact none cleanup', async stage => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused activation-failure web') }, fixtureRepoRoot, 3,
+      {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
+    const batch = await browserFixture(rig)
+    vi.spyOn(rig.runtime, 'prepareTask007StoppedFixture').mockResolvedValue(batch)
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    vi.spyOn(rig.runtime, 'stopSupervisorExact').mockImplementation(() => undefined)
+    vi.spyOn(rig.runtime, 'removeContainerExact').mockImplementation(() => undefined)
+    vi.spyOn(rig.runtime, 'waitForSupervisorHealth').mockResolvedValue({})
+    vi.spyOn(rig, 'controlEpoch').mockResolvedValue(12)
+    const obstruction = path.join(path.dirname(batch.input.runtimeRoot), 'evidence/lifecycle.jsonl.1')
+    const supervisor: owner.SupervisorInstance = { scenarioId: batch.scenarioId, containerId: 'a'.repeat(64), volumeName: batch.volumeName!,
+      runtimeRoot: batch.input.runtimeRoot, controlSocket: '/controlled/socket', controlSecret: 'controlled-secret',
+      controlSecretFile: '/controlled/secret', binaryKind: 'test' }
+    vi.spyOn(rig.runtime, 'startSupervisor').mockResolvedValue(supervisor)
+    const unrelated = path.join(path.dirname(obstruction), 'lifecycle.jsonl.2')
+    let failed = false, descriptor: number | undefined
+    const matches = (fd: unknown): fd is number => typeof fd === 'number' && fs.existsSync(obstruction)
+      && fs.fstatSync(fd).ino === fs.lstatSync(obstruction).ino
+    try {
+      await rig.prepareSyntheticStoppedRepairBatch(); rig.supervisor = supervisor
+      await fsp.writeFile(unrelated, 'unrelated rotation bytes', { mode: 0o600 })
+      const write = fs.writeFileSync, sync = fs.fsyncSync, close = fs.closeSync
+      const writeFailure = vi.spyOn(fs, 'writeFileSync').mockImplementation((file, data, options) => {
+        if (matches(file)) descriptor = file
+        if (stage === 'write' && !failed && matches(file)) {
+          failed = true; descriptor = file; write(file, Buffer.from(data as Uint8Array).subarray(0, 7))
+          throw new Error('controlled activation write failure')
+        }
+        write(file, data, options)
+      })
+      const syncFailure = vi.spyOn(fs, 'fsyncSync').mockImplementation(fd => {
+        if (stage === 'fsync' && !failed && matches(fd)) {
+          failed = true; descriptor = fd; throw new Error('controlled activation fsync failure')
+        }
+        sync(fd)
+      })
+      const closeFailure = vi.spyOn(fs, 'closeSync').mockImplementation(fd => {
+        const fail = stage === 'close' && !failed && fd === descriptor
+        close(fd)
+        if (fail) { failed = true; descriptor = fd; throw new Error('controlled activation close failure') }
+      })
+      try {
+        await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'pending_withdrawal')).rejects.toThrow(/controlled activation/)
+      } finally { writeFailure.mockRestore(); syncFailure.mockRestore(); closeFailure.mockRestore() }
+      expect(failed).toBe(true)
+      expect(() => fs.fstatSync(descriptor!)).toThrow()
+      const ownedBytes = await fsp.readFile(obstruction)
+      expect(ownedBytes.length).toBeGreaterThan(0)
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'pending_withdrawal')).rejects.toThrow(/completion.*removal/)
+      const held = `${obstruction}.held-owned`
+      await fsp.rename(obstruction, held)
+      await fsp.writeFile(obstruction, ownedBytes, { mode: 0o600 })
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')).rejects.toThrow(/changed|owned/)
+      expect(await fsp.readFile(obstruction)).toEqual(ownedBytes)
+      await fsp.unlink(obstruction); await fsp.rename(held, obstruction)
+      await expect(rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')).resolves.toEqual({ controlEpoch: 12 })
+      await expect(fsp.stat(obstruction)).rejects.toHaveProperty('code', 'ENOENT')
+      expect(await fsp.readFile(unrelated, 'utf8')).toBe('unrelated rotation bytes')
+      await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'pending_withdrawal')
+      await rig.setSyntheticStoppedRepairFault(batch.input.fixtureId, 'none')
+      await expect(fsp.stat(obstruction)).rejects.toHaveProperty('code', 'ENOENT')
+    } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
+  })
+
   it('owns only the actual exporter rotation obstruction and clears only its recorded bytes', async () => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused obstruction web') }, fixtureRepoRoot, 3,
       {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
