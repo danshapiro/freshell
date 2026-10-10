@@ -4563,6 +4563,39 @@ describe('current handle admission before owner mutation', () => {
 })
 
 describe('run-owned workload image build', () => {
+  it.each([2, 3, 4, 5] as const)('uses only its own tag for default phase %i image build and resolution', async phase => {
+    const runId = '7aab49a4-08ed-4ca7-a4b2-6501f4821a63'
+    const runtime = new owner.RuntimeHarness(fixtureRepoRoot, runId, phase)
+    const directory = path.join(fixtureRepoRoot, 'image-daemon')
+    await fsp.mkdir(directory)
+    await fsp.mkdir(runtime.evidenceDir, { recursive: true })
+    const calls = path.join(directory, 'calls.jsonl')
+    const digest = `sha256:${'c'.repeat(64)}`
+    await fsp.writeFile(path.join(directory, 'docker'), `#!${process.execPath}\nconst fs=require('node:fs'),args=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');if(args[0]==='image'&&args[1]==='inspect')process.stdout.write('${digest}\\n');else if(args[0]!=='build')process.exit(9);\n`, { mode: 0o700 })
+    vi.stubEnv('PATH', `${directory}${path.delimiter}${process.env.PATH}`)
+    try {
+      ;(runtime as unknown as { ensureRuntimeImage(): void }).ensureRuntimeImage()
+      const actual = (await fsp.readFile(calls, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as string[])
+      const build = actual.find(args => args[0] === 'build')!
+      const tag = build[build.indexOf('-t') + 1]
+      expect(tag).toBe(`freshell-managed-runtime:task008-${runtime.candidateSha.slice(0, 12)}-${runId}`)
+      expect(build).toContain(`com.freshell.runtime-test-run-id=${runId}`)
+      expect(build).toContain(`com.freshell.runtime-test-candidate=${runtime.candidateSha}`)
+      expect(actual.filter(args => args[0] === 'image')).toEqual([
+        ['image', 'inspect', tag, '--format', '{{.Id}}'], ['image', 'inspect', digest, '--format', '{{.Id}}'],
+      ])
+      expect(runtime.imageRef).toBe(digest)
+    } finally { vi.unstubAllEnvs() }
+  })
+
+  it('refuses a built tag whose exact digest is not locally addressable', () => {
+    const digest = `sha256:${'c'.repeat(64)}`
+    const child = vi.fn<typeof execFileSync>().mockReturnValue('')
+      .mockReturnValueOnce('').mockReturnValueOnce(digest).mockReturnValueOnce(`sha256:${'d'.repeat(64)}`)
+    expect(() => owner.buildRunOwnedRuntimeImage(process.cwd(), '7aab49a4-08ed-4ca7-a4b2-6501f4821a63',
+      handle.candidateSha, child)).toThrow(/locally addressable/)
+  })
+
   it('builds and resolves only the exact run tag instead of the shared runtime tag', () => {
     const runId = '7aab49a4-08ed-4ca7-a4b2-6501f4821a63'
     const child = vi.fn<typeof execFileSync>().mockReturnValue(`sha256:${'c'.repeat(64)}\n`)

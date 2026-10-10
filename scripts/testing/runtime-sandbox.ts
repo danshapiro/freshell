@@ -331,6 +331,8 @@ export function buildRunOwnedRuntimeImage(
     '-f', 'docker/runtime/Dockerfile', '-t', tag, '.'], { cwd: repoRoot, stdio: 'inherit' })
   const digest = String(execute('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8' })).trim()
   if (!/^sha256:[a-f0-9]{64}$/.test(digest)) throw new Error('run-owned runtime image has no pinned digest')
+  const addressed = String(execute('docker', ['image', 'inspect', digest, '--format', '{{.Id}}'], { encoding: 'utf8' })).trim()
+  if (addressed !== digest) throw new Error('run-owned runtime image digest is not locally addressable')
   return { tag, digest }
 }
 
@@ -4234,7 +4236,7 @@ export class RuntimeHarness {
   }
 
   private ensureRuntimeImage(): void {
-    if (this.ownerIsolation && this.phase >= 2) {
+    if (this.phase >= 2) {
       this.ownedImage = { tag: runOwnedRuntimeImageTag(this.runId, this.candidateSha), runId: this.runId, candidateSha: this.candidateSha }
       const image = buildRunOwnedRuntimeImage(this.repoRoot, this.runId, this.candidateSha)
       this.ownedImage.digest = image.digest
@@ -4242,31 +4244,10 @@ export class RuntimeHarness {
       this.recordLifecycle('runtime.owned_image_built', { tag: image.tag, digest: image.digest })
       return
     }
-    const tag = this.phase === 1 ? PHASE1_RUNTIME_IMAGE_TAG : PHASE2_RUNTIME_IMAGE_TAG
+    const tag = PHASE1_RUNTIME_IMAGE_TAG
     let inspect = spawnSync('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8' })
-    if (this.phase === 1) {
-      if (inspect.status !== 0) {
-        docker(['pull', tag])
-        inspect = spawnSync('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8' })
-      }
-    } else {
-      // Always invoke the Phase 2 build so Docker validates the current
-      // Dockerfile/provider pins. Layer caching keeps unchanged rebuilds cheap.
-      // BuildKit provenance captures the whole context digest, including files
-      // the image never copies, and therefore changes the manifest-list ID for
-      // an otherwise identical workload image. Disable attestations here so
-      // the exact image identity is a reproducible digest of the image itself.
-      execFileSync('docker', [
-        'build',
-        '--pull=false',
-        '--provenance=false',
-        '--sbom=false',
-        '-f',
-        'docker/runtime/Dockerfile',
-        '-t',
-        tag,
-        '.',
-      ], { cwd: this.repoRoot, stdio: 'inherit' })
+    if (inspect.status !== 0) {
+      docker(['pull', tag])
       inspect = spawnSync('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8' })
     }
     this.imageRef = inspect.stdout.trim()
