@@ -1429,10 +1429,10 @@ fn starting_unit_kill_fence(
 }
 
 /// A kill named a terminal nothing runs for: `Ok(())` only when the owner
-/// registry confirms nothing holds a conversation for it. A key held under
-/// the terminal that is still settling (Stopping) is waited for (event
-/// driven, `wait_settled`) and the check repeated; a key still Live under
-/// it answers `Err("OWNER_WITHOUT_RUNTIME")` with ERROR
+/// registry confirms nothing holds a conversation for it. The registry
+/// lists the keys a terminal holds Live or Stopping: a Stopping one is
+/// waited for (event driven, `wait_settled`) and the check repeated; a Live
+/// one answers `Err("OWNER_WITHOUT_RUNTIME")` with ERROR
 /// `unit.kill_inconsistent`. Without an owner registry, `Ok(())`. Only ever
 /// awaited in a kill's spawned task.
 pub async fn confirm_gone_for_unknown(state: &WsState, terminal_id: &str) -> Result<(), String> {
@@ -1454,14 +1454,11 @@ pub async fn confirm_gone_for_unknown(state: &WsState, terminal_id: &str) -> Res
                         "a kill found no runtime for this terminal, but a conversation is still held Live under it");
                     return Err("OWNER_WITHOUT_RUNTIME".to_string());
                 }
-                freshell_ownership::OwnershipState::Stopping { .. }
-                | freshell_ownership::OwnershipState::Starting { .. }
-                | freshell_ownership::OwnershipState::Handoff { .. } => {
+                freshell_ownership::OwnershipState::Stopping { .. } => {
                     settling = Some(key);
                     break;
                 }
-                // Aliased keys hold no runtime; Vacant and Fenced keys are
-                // settled.
+                // `states_for_terminal` lists only Live and Stopping keys.
                 _ => {}
             }
         }
