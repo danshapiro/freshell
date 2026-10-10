@@ -1010,6 +1010,82 @@ describe('default export (TuiPluginModule)', () => {
       } finally { abort.abort(); rmSync(home, { recursive: true, force: true }) }
     })
 
+  it.each([
+    ['get', 'qualified'], ['messages', 'qualified'],
+    ['get', 'rejected'], ['messages', 'rejected'],
+  ] as const)('withdraws a fresh native root before deferred %s settles %s', async (firstRead, outcome) => {
+    const home = mkdtempSync(join(tmpdir(), 'freshell-native-opencode-pending-switch-'))
+    const original = 'ses_originalnative1', selected = 'ses_selectednative1', tail = 'msg_selectednative1'
+    const launch = { incarnationId: 'incarnation-native1', launchNonce: 'launch-native1', evidenceRevision: 4,
+      executionGeneration: 2, requestedNativeSessionId: null }
+    const directory = join(home, '.freshell/native-identity', launch.launchNonce)
+    vi.stubEnv('HOME', home)
+    vi.stubEnv('FRESHELL_NATIVE_IDENTITY_LAUNCH', JSON.stringify(launch))
+    vi.stubEnv('FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR', directory)
+    const route = { current: { name: 'session', params: { sessionID: original } },
+      navigate: (name: string, params: { sessionID: string }) => { route.current = { name, params } } }
+    const session = (id: string) => ({ id, parentID: null })
+    const info = { id: tail, sessionID: selected, role: 'user' }
+    const part = { id: 'prt_selectednative1', messageID: tail, sessionID: selected, type: 'text' }
+    const results = { get: { data: session(selected) }, messages: { data: [{ info, parts: [part] }] } }
+    const deferred = () => {
+      let resolve!: (value: unknown) => void
+      let reject!: (reason: Error) => void
+      const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise
+        reject = rejectPromise
+      })
+      return { promise, resolve, reject }
+    }
+    const reads = { get: deferred(), messages: deferred() }
+    const get = vi.fn(async ({ sessionID }: { sessionID: string }) => sessionID === original
+      ? { data: session(original) } : reads.get.promise)
+    const messages = vi.fn(async ({ sessionID }: { sessionID: string }) => sessionID === original
+      ? { data: [] } : reads.messages.promise)
+    const create = vi.fn(async () => ({ data: session(original) }))
+    const abort = new AbortController()
+    const renderers: Record<string, (context: unknown, props: unknown) => unknown> = {}
+    const file = join(directory, 'opencode-loaded.json')
+    const observation = () => JSON.parse(readFileSync(file, 'utf8'))
+    const expectUnqualified = () => expect(observation()).toMatchObject({ launch,
+      native: { session_id: original, hydrated: false } })
+    try {
+      plugin.tui({ route, lifecycle: { signal: abort.signal },
+        slots: { register: ({ slots }: { slots: typeof renderers }) => { Object.assign(renderers, slots) } },
+        state: { ready: true, part: () => [part], session: {
+          get: session, messages: (id: string) => id === original ? [] : [info],
+        } }, client: { session: { create, get, messages } } })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(observation()).toMatchObject({ launch, native: { session_id: original, hydrated: true } })
+      route.navigate('session', { sessionID: selected })
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(get).toHaveBeenLastCalledWith({ sessionID: selected }, { throwOnError: true })
+      expect(messages).toHaveBeenLastCalledWith({ sessionID: selected }, { throwOnError: true })
+      expectUnqualified()
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(renderers.session_prompt({}, {})).toBeNull()
+      expect(get).toHaveBeenCalledTimes(2)
+      expect(messages).toHaveBeenCalledTimes(2)
+      expectUnqualified()
+      const second = firstRead === 'get' ? 'messages' : 'get'
+      if (outcome === 'rejected') reads[firstRead].reject(new Error('controlled native read failure'))
+      else reads[firstRead].resolve(results[firstRead])
+      await vi.advanceTimersByTimeAsync(0)
+      expectUnqualified()
+      reads[second].resolve(results[second])
+      await vi.advanceTimersByTimeAsync(0)
+      if (outcome === 'qualified') {
+        expect(observation()).toMatchObject({ launch, native: { session_id: selected, parent_id: null,
+          hydrated: true, messages_read: 'success', active_message_count: 1, tail_message_id: tail } })
+      } else {
+        expectUnqualified()
+        expect(JSON.parse(readFileSync(join(directory, 'opencode-refused.json'), 'utf8')).reason)
+          .toBe(firstRead === 'get' ? 'native_root_load_failed' : 'native_history_load_failed')
+      }
+      expect(create).toHaveBeenCalledOnce()
+    } finally { abort.abort(); rmSync(home, { recursive: true, force: true }) }
+  })
+
   it.each(['wrong-root', 'history-error', 'unhydrated-tail', 'unhydrated-parts', 'parent-root', 'malformed-binding'])
     ('keeps managed nonadoption %s unobserved without a legacy fallback', async (fault) => {
       const home = mkdtempSync(join(tmpdir(), 'freshell-native-opencode-refusal-'))

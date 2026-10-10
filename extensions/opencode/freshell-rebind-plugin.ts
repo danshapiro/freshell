@@ -765,6 +765,8 @@ function createNativeObservationEmitter(deps: EmitterDeps): (apiValue: unknown) 
       const selectedRoot = currentRouteSessionId(api.route?.current)
       const candidate = launch.requestedNativeSessionId === null ? selectedRoot : root
       if (candidate === null || selectedRoot !== candidate) return refuse('route_not_selected')
+      // The old root is no longer selected while the candidate's reads wait.
+      if (candidate !== root) withdraw('route_not_selected')
       const get = api.state?.session?.get
       const messages = api.state?.session?.messages
       if (typeof get !== 'function' || typeof messages !== 'function') return refuse('tui_session_api_unavailable')
