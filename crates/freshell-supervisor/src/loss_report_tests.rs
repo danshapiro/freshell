@@ -181,9 +181,7 @@ async fn task007_publish_fixture(
     output_dir: &std::path::Path,
 ) -> Result<serde_json::Value, String> {
     use crate::backend::{CreateRuntimeSpec, DockerEngineBackend, RuntimeBackend};
-    use freshell_runtime_protocol::{
-        RuntimeLaunchPolicy, UpsertViewIntentRequest, ViewIntentKind, ViewIntentRequest,
-    };
+    use freshell_runtime_protocol::{UpsertViewIntentRequest, ViewIntentKind, ViewIntentRequest};
     use std::os::unix::fs::PermissionsExt;
     let input: Task007FixtureInput =
         serde_json::from_slice(&fs::read(input_file).map_err(|e| e.to_string())?)
@@ -207,26 +205,29 @@ async fn task007_publish_fixture(
             .map_err(|e| e.to_string())?;
         let volume =
             crate::registry::stable_provider_volume_name(&input.installation_id, &target.soul_id);
+        let create_spec = CreateRuntimeSpec {
+            installation_id: input.installation_id.clone(),
+            soul_id: target.soul_id.clone(),
+            incarnation_id: prepared.incarnation_id.clone(),
+            image_ref: input.image_ref.clone(),
+            host_binary_path: input.host_binary_path.clone(),
+            runtime_dir: runtime_dir.clone(),
+            limits: limits(),
+            test_run_id: input.run_id.clone(),
+            terminal: Some(terminal),
+            fresh_agent: None,
+            opencode_transfer_dir: None,
+            provider_volume_name: volume.clone(),
+        };
         let created = backend
-            .create_stopped(&CreateRuntimeSpec {
-                installation_id: input.installation_id.clone(),
-                soul_id: target.soul_id.clone(),
-                incarnation_id: prepared.incarnation_id.clone(),
-                image_ref: input.image_ref.clone(),
-                host_binary_path: input.host_binary_path.clone(),
-                runtime_dir: runtime_dir.clone(),
-                limits: limits(),
-                test_run_id: input.run_id.clone(),
-                terminal: Some(terminal),
-                fresh_agent: None,
-                opencode_transfer_dir: None,
-                provider_volume_name: volume.clone(),
-            })
+            .create_stopped(&create_spec)
             .await
             .map_err(|e| e.to_string())?;
         if created.daemon_id != input.docker_daemon_id {
             return Err("private fixture Docker daemon changed".into());
         }
+        let saved_digest =
+            crate::backend::task007_schema_seven_digest(&create_spec).map_err(|e| e.to_string())?;
         registry
             .commit_created(
                 prepared.incarnation_id.clone(),
@@ -236,8 +237,8 @@ async fn task007_publish_fixture(
                     image_ref: input.image_ref.clone(),
                     runtime_dir: runtime_dir.clone(),
                     host_binary_path: input.host_binary_path.clone(),
-                    immutable_config_digest: created.immutable_config_digest.clone(),
-                    launch_policy: Some(RuntimeLaunchPolicy::ProviderVolumeV1),
+                    immutable_config_digest: saved_digest.clone(),
+                    launch_policy: None,
                 },
             )
             .await
@@ -247,7 +248,7 @@ async fn task007_publish_fixture(
             "rootSessionId":native_root,"soulId":target.soul_id,"providerStoreId":target.provider_store_id,
             "incarnationId":prepared.incarnation_id,"launchNonce":prepared.launch_nonce,
             "containerId":created.container_id,"providerVolumeName":volume,"runtimeDir":runtime_dir,
-            "hostBinaryPath":input.host_binary_path,"immutableConfigDigest":created.immutable_config_digest,
+            "hostBinaryPath":input.host_binary_path,"immutableConfigDigest":saved_digest,
             "incidentId":loss.incident_id,"expectedIntentRevision":loss.expected_intent_revision,"viewIds":[],
         }));
     }
@@ -774,6 +775,7 @@ fn task007_private_fixture_environment_is_inert_or_complete() {
 #[cfg(unix)]
 #[tokio::test]
 async fn task007_private_fixture_publishes_actual_create_only_schema_seven() {
+    use crate::backend::{BackendError, BackendRuntimeState, DockerEngineBackend, RuntimeBackend};
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let root = tempfile::tempdir().unwrap();
@@ -794,6 +796,7 @@ async fn task007_private_fixture_publishes_actual_create_only_schema_seven() {
     let (shutdown, mut receiver) = tokio::sync::oneshot::channel();
     let broker = tokio::spawn(async move {
         let mut created = Vec::new();
+        let mut requests = Vec::new();
         loop {
             let (mut stream, _) = tokio::select! {
                 _ = &mut receiver => break,
@@ -804,6 +807,7 @@ async fn task007_private_fixture_publishes_actual_create_only_schema_seven() {
                 raw.push(stream.read_u8().await.unwrap());
             }
             let header = String::from_utf8(raw).unwrap();
+            requests.push(header.lines().next().unwrap().to_owned());
             let length = header
                 .lines()
                 .find_map(|line| line.strip_prefix("Content-Length: "))
@@ -816,6 +820,24 @@ async fn task007_private_fixture_publishes_actual_create_only_schema_seven() {
                 (
                     200,
                     serde_json::json!({"ID":daemon,"SecurityOptions":["name=rootless"]}),
+                )
+            } else if header.starts_with("GET /v1.47/containers/") {
+                let container = header.lines().next().unwrap().split('/').nth(3).unwrap();
+                let index = usize::from_str_radix(container, 16).unwrap() - 1;
+                let body: &serde_json::Value = &created[index];
+                let mounts = body["HostConfig"]["Binds"].as_array().unwrap().iter().map(|bind| {
+                    let fields = bind.as_str().unwrap().split(':').collect::<Vec<_>>();
+                    let key = if fields[1] == "/home/freshell/provider" {"Name"} else {"Source"};
+                    serde_json::json!({key:fields[0],"Destination":fields[1],"RW":fields[2] == "rw"})
+                }).collect::<Vec<_>>();
+                (
+                    200,
+                    serde_json::json!({
+                        "Id":container,"Image":body["Image"],
+                        "State":{"Status":"created","Running":false,"Paused":false,"Restarting":false},
+                        "Config":{"Labels":body["Labels"],"Env":body["Env"]},
+                        "HostConfig":body["HostConfig"],"Mounts":mounts,
+                    }),
                 )
             } else {
                 assert!(
@@ -842,7 +864,7 @@ async fn task007_private_fixture_publishes_actual_create_only_schema_seven() {
             stream.write_all(&bytes).await.unwrap();
             stream.shutdown().await.unwrap();
         }
-        created
+        (created, requests)
     });
     let input = Task007FixtureInput {
         schema_version: 1,
@@ -952,9 +974,85 @@ async fn task007_private_fixture_publishes_actual_create_only_schema_seven() {
     assert!(fs::read_dir(&output).unwrap().next().is_none());
     fs::set_permissions(&input_file, fs::Permissions::from_mode(0o600)).unwrap();
     let result = task007_publish_fixture(&input_file, &output).await;
-    shutdown.send(()).unwrap();
-    let created = broker.await.unwrap();
     let metadata = result.expect("historical producer must create and checkpoint actual bindings");
+    // Install a copy of the closed published snapshot. Migration and full
+    // backend inspection must agree on every saved enclosure binding.
+    let installed = owner_root.join("installed");
+    fs::create_dir(&installed).unwrap();
+    fs::copy(
+        output.join("runtime.sqlite3"),
+        installed.join("runtime.sqlite3"),
+    )
+    .unwrap();
+    let migrated = Registry::open(&installed, Some(input.installation_id.clone())).unwrap();
+    let backend = DockerEngineBackend::new(&input.broker_socket_path);
+    let mut inspections = Vec::new();
+    let mut emptiness = Vec::new();
+    let mut altered = Vec::new();
+    for target in metadata["targets"].as_array().unwrap() {
+        let handle = migrated
+            .owned_handle(serde_json::from_value(target["incarnationId"].clone()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(handle.launch_policy(), None);
+        assert_eq!(
+            handle.immutable_config_digest(),
+            target["immutableConfigDigest"].as_str().unwrap()
+        );
+        inspections.push(backend.inspect(&handle).await);
+        emptiness.push(backend.verify_empty(&handle).await);
+        let connection = Connection::open(migrated.database_path()).unwrap();
+        let mut limits = handle.requested_limits();
+        limits.cpu_milli += 1;
+        connection
+            .execute(
+                "UPDATE incarnations SET requested_limits=?1 WHERE incarnation_id=?2",
+                params![
+                    serde_json::to_string(&limits).unwrap(),
+                    handle.incarnation_id().as_str()
+                ],
+            )
+            .unwrap();
+        let changed = migrated
+            .owned_handle(handle.incarnation_id().clone())
+            .await
+            .unwrap();
+        altered.push(backend.inspect(&changed).await);
+        connection
+            .execute(
+                "UPDATE incarnations SET requested_limits=?1 WHERE incarnation_id=?2",
+                params![
+                    serde_json::to_string(&handle.requested_limits()).unwrap(),
+                    handle.incarnation_id().as_str()
+                ],
+            )
+            .unwrap();
+    }
+    shutdown.send(()).unwrap();
+    let (created, requests) = broker.await.unwrap();
+    for (index, inspection) in inspections.into_iter().enumerate() {
+        assert_eq!(
+            inspection
+                .unwrap_or_else(|error| panic!("schema-7 handle {index}: {error}"))
+                .state,
+            BackendRuntimeState::Created
+        );
+        assert!(
+            emptiness[index].as_ref().is_ok_and(|empty| *empty),
+            "handle {index}: {:?}",
+            emptiness[index]
+        );
+        assert!(
+            matches!(altered[index], Err(BackendError::OwnershipMismatch(_))),
+            "altered handle {index}: {:?}",
+            altered[index]
+        );
+    }
+    assert!(
+        requests.iter().all(|request| request.starts_with("GET ")
+            || request.starts_with("POST /v1.47/containers/create?")),
+        "fixture must never START/stop/kill a provider: {requests:?}"
+    );
     assert_eq!(created.len(), 9);
     assert_eq!(metadata["evidenceKind"], "historical-fixture-setup");
     let targets = metadata["targets"].as_array().unwrap();
@@ -1050,7 +1148,6 @@ async fn task007_private_fixture_publishes_actual_create_only_schema_seven() {
             Sha256::digest(fs::read(output.join("runtime.sqlite3")).unwrap())
         )
     );
-    let migrated = Registry::open(&output, Some(input.installation_id.clone())).unwrap();
     for root in &input.source.root_session_ids[..2] {
         let candidates = migrated
             .stopped_repair_owner_candidates(root.clone())
@@ -4503,15 +4600,20 @@ async fn stopped_repair_resume_failure_retry_preserves_baseline() {
     if run_task007_owned_case_child(Task007OwnedCase::BaselineRetry).await {
         return;
     }
-    stopped_repair_baseline_case(false).await;
+    Box::pin(stopped_repair_baseline_case(false, false)).await;
 }
 
 #[tokio::test]
 async fn pending_stopped_repair_withdrawal_allows_startup_without_losing_baseline() {
-    Box::pin(stopped_repair_baseline_case(true)).await;
+    Box::pin(stopped_repair_baseline_case(true, false)).await;
 }
 
-async fn stopped_repair_baseline_case(pending_startup: bool) {
+#[tokio::test]
+async fn stopped_repair_created_preflight_preserves_baseline() {
+    Box::pin(stopped_repair_baseline_case(false, true)).await;
+}
+
+async fn stopped_repair_baseline_case(pending_startup: bool, created_preflight: bool) {
     use freshell_runtime_protocol::{
         CanonicalOwnerChoice, DesiredState, PreflightLostSoulsRequest, RecoverRequest,
         RecoveryOutcome, RecoveryState, RecoveryTrigger, RepairBatchSourceSelection, RequestId,
@@ -5000,6 +5102,9 @@ async fn stopped_repair_baseline_case(pending_startup: bool) {
     assert_eq!(repaired.desired_state, DesiredState::Stopped);
     assert_eq!(repaired.recovery_state, RecoveryState::DataRepairComplete);
     assert_eq!(repaired.opencode_adoption_baseline, Some(baseline.clone()));
+    if created_preflight {
+        crate::recovery::tests::assert_created_repaired_preflight(&dir, &registry, &soul).await;
+    }
     for _ in 0..2 {
         let context = registry.recovery_context(soul.clone()).await.unwrap();
         let outcome = supervisor

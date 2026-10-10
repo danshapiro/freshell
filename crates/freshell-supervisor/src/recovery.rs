@@ -2068,7 +2068,10 @@ impl Supervisor {
 
         if matches!(
             inspection.state,
-            BackendRuntimeState::Exited | BackendRuntimeState::Dead | BackendRuntimeState::Missing
+            BackendRuntimeState::Created
+                | BackendRuntimeState::Exited
+                | BackendRuntimeState::Dead
+                | BackendRuntimeState::Missing
         ) {
             if context.fixture.is_none()
                 && !deterministic_fresh_fixture(context)
@@ -7040,7 +7043,18 @@ pub(crate) mod tests {
         assert_eq!(events[1]["data"]["abortCategory"], "invalid_state");
     }
 
-    struct ObservedRuntime(BackendRuntimeState);
+    struct ObservedRuntime {
+        state: BackendRuntimeState,
+        repaired: Option<Arc<RepairedPreflightEvidence>>,
+    }
+
+    #[derive(Default)]
+    struct RepairedPreflightEvidence {
+        ownership_mismatch: bool,
+        baseline: Option<OpenCodeAdoptionBaseline>,
+        qualifications: std::sync::atomic::AtomicUsize,
+        empty_checks: std::sync::atomic::AtomicUsize,
+    }
 
     #[async_trait::async_trait]
     impl crate::backend::RuntimeBackend for ObservedRuntime {
@@ -7072,10 +7086,61 @@ pub(crate) mod tests {
             &self,
             handle: &OwnedRuntimeHandle,
         ) -> Result<crate::backend::BackendInspection, BackendError> {
+            if self
+                .repaired
+                .as_ref()
+                .is_some_and(|evidence| evidence.ownership_mismatch)
+            {
+                return Err(BackendError::OwnershipMismatch(
+                    "controlled saved binding mismatch".into(),
+                ));
+            }
             Ok(crate::backend::BackendInspection {
-                state: self.0,
+                state: self.state,
                 configured_limits: handle.requested_limits(),
             })
+        }
+        async fn qualify_retained_opencode(
+            &self,
+            handle: &OwnedRuntimeHandle,
+            request: &freshell_runtime_protocol::RetainedStoreCompatibilityRequest,
+            _: &Path,
+        ) -> Result<freshell_runtime_protocol::RetainedStoreCompatibilityReceipt, BackendError>
+        {
+            let Some(evidence) = &self.repaired else {
+                return Err(BackendError::Unavailable(
+                    "current-image retained-store qualification is unavailable".into(),
+                ));
+            };
+            assert_eq!(request.provider_store_id, handle.provider_store_id());
+            let terminal = handle.terminal().unwrap();
+            assert_eq!(
+                (request.provider_uid, request.provider_gid),
+                (terminal.run_as_uid, terminal.run_as_gid)
+            );
+            assert_eq!(request.workspace_path, terminal.workspace_path);
+            assert_eq!(request.cwd, terminal.cwd);
+            let baseline = &evidence.baseline.as_ref().unwrap().descriptor;
+            assert_eq!(request.native_session_id, baseline.root_session_id);
+            evidence
+                .qualifications
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Controlled backend transition evidence only. The source/import/
+            // readability receipts and baseline come from the real library path
+            // in loss_report_tests; this receipt is never native qualification.
+            Ok(
+                freshell_runtime_protocol::RetainedStoreCompatibilityReceipt {
+                    request: request.clone(),
+                    provider_version: "1.18.21".into(),
+                    source_schema_fingerprint: baseline.source_schema_fingerprint.clone(),
+                    migration_journal_fingerprint: baseline.migration_journal_fingerprint.clone(),
+                    generation: baseline.source_generation.clone(),
+                    row_count: serde_json::from_str::<serde_json::Value>(&baseline.manifest_json)
+                        .unwrap()["row_count"]
+                        .as_u64()
+                        .unwrap() as usize,
+                },
+            )
         }
         async fn create_stopped(
             &self,
@@ -7093,6 +7158,12 @@ pub(crate) mod tests {
             panic!("unexpected stop")
         }
         async fn verify_empty(&self, _: &OwnedRuntimeHandle) -> Result<bool, BackendError> {
+            if let Some(evidence) = &self.repaired {
+                evidence
+                    .empty_checks
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Ok(self.state == BackendRuntimeState::Created);
+            }
             Ok(true)
         }
         async fn list_known(
@@ -7126,7 +7197,10 @@ pub(crate) mod tests {
     ) -> Supervisor {
         Supervisor::new(
             registry,
-            std::sync::Arc::new(ObservedRuntime(state)),
+            std::sync::Arc::new(ObservedRuntime {
+                state,
+                repaired: None,
+            }),
             crate::service::SupervisorConfig {
                 runtime_root: dir.path().join("runtime"),
                 control_socket_path: dir.path().join("control.sock"),
@@ -7139,6 +7213,123 @@ pub(crate) mod tests {
             },
         )
         .unwrap()
+    }
+
+    pub(crate) fn assert_created_repaired_preflight<'a>(
+        dir: &'a tempfile::TempDir,
+        registry: &'a crate::registry::Registry,
+        soul: &'a SoulId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
+        Box::pin(async move {
+            use std::sync::atomic::Ordering;
+            let initial = registry.recovery_context(soul.clone()).await.unwrap();
+            assert!(
+                initial.opencode_adoption_baseline.is_some(),
+                "test must use the published real import baseline"
+            );
+            registry
+                .start_stopped_data_repair(soul.clone(), initial.intent_revision)
+                .await
+                .unwrap();
+            for (state, mismatch) in [
+                (BackendRuntimeState::Paused, false),
+                (BackendRuntimeState::Restarting, false),
+                (BackendRuntimeState::Created, true),
+                (BackendRuntimeState::Created, false),
+            ] {
+                let evidence = Arc::new(RepairedPreflightEvidence {
+                    ownership_mismatch: mismatch,
+                    baseline: initial.opencode_adoption_baseline.clone(),
+                    ..Default::default()
+                });
+                let config = (*missing_supervisor(dir, registry.clone()).config).clone();
+                let supervisor = Supervisor::new(
+                    registry.clone(),
+                    Arc::new(ObservedRuntime {
+                        state,
+                        repaired: Some(evidence.clone()),
+                    }),
+                    config,
+                )
+                .unwrap();
+                let mut current = registry.recovery_context(soul.clone()).await.unwrap();
+                let fence = current.write_fence();
+                let mut transient = None;
+                let probe = supervisor
+                    .probe_recovery_context(&mut current, &mut transient)
+                    .await
+                    .unwrap();
+                let valid_created = state == BackendRuntimeState::Created && !mismatch;
+                assert!(transient.is_none());
+                assert_eq!(
+                    current.write_fence(),
+                    fence,
+                    "preflight cannot advance durable evidence"
+                );
+                if valid_created {
+                    let RecoveryProbe::ResumeReady {
+                        resume_spec,
+                        evidence_revision,
+                    } = probe
+                    else {
+                        panic!("Created must reach retained qualification: {probe:?}")
+                    };
+                    assert_eq!(evidence_revision, current.evidence_revision);
+                    assert_eq!(
+                        resume_spec.provider_session.native_session_id,
+                        current.native_session_id.clone().unwrap()
+                    );
+                    assert_eq!(
+                        resume_spec.provider_session.provider_store_id,
+                        current.provider_store_id
+                    );
+                    assert_eq!(
+                        resume_spec.opencode_adoption_baseline,
+                        initial.opencode_adoption_baseline
+                    );
+                    assert_eq!(evidence.qualifications.load(Ordering::SeqCst), 1);
+                    // This is the actual independent empty-retirement boundary used
+                    // by replacement. No callback, grant, replacement or native
+                    // success is claimed by this transition regression.
+                    assert_eq!(
+                        supervisor
+                            .terminate_owned_for_recovery(&current.prior_handle)
+                            .await
+                            .unwrap(),
+                        StopOutcome::VerifiedEmpty
+                    );
+                    assert_eq!(
+                        evidence.empty_checks.load(Ordering::SeqCst),
+                        1,
+                        "replacement independently proves old enclosure empty"
+                    );
+                } else {
+                    assert!(
+                        matches!(
+                            probe,
+                            RecoveryProbe::Blocked {
+                                reason: RecoveryBlockReason::OldRuntimeNotEmpty,
+                                ..
+                            }
+                        ),
+                        "{state:?}/mismatch={mismatch}: {probe:?}"
+                    );
+                    assert_eq!(evidence.qualifications.load(Ordering::SeqCst), 0);
+                    assert_eq!(evidence.empty_checks.load(Ordering::SeqCst), 0);
+                }
+                let after = registry.recovery_context(soul.clone()).await.unwrap();
+                assert_eq!(
+                    after.prior_handle.incarnation_id(),
+                    initial.prior_handle.incarnation_id()
+                );
+                assert_eq!(after.native_session_id, initial.native_session_id);
+                assert_eq!(after.provider_store_id, initial.provider_store_id);
+                assert_eq!(
+                    after.opencode_adoption_baseline,
+                    initial.opencode_adoption_baseline
+                );
+            }
+        })
     }
 
     pub(crate) fn absent_native_probe() -> RecoveryProbe {

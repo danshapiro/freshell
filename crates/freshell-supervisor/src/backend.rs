@@ -1163,6 +1163,20 @@ impl ExpectedConfig {
     }
 }
 
+// The private historical fixture uses the current physical enclosure profile,
+// while schema 7 represents no launch policy. Bind exactly those saved fields;
+// this is not a production digest override or an authentic old-binary receipt.
+#[cfg(test)]
+pub(super) fn task007_schema_seven_digest(
+    spec: &CreateRuntimeSpec,
+) -> Result<String, BackendError> {
+    let binary = canonical_regular_file(&spec.host_binary_path)?;
+    let runtime_dir = canonical_dir(&spec.runtime_dir)?;
+    let mut expected = ExpectedConfig::new(spec, &binary, &runtime_dir);
+    expected.launch_policy = None;
+    digest_expected(&expected)
+}
+
 fn immutable_digest_from_handle(handle: &OwnedRuntimeHandle) -> Result<String, BackendError> {
     digest_expected(&ExpectedConfig {
         image_ref: handle.image_ref().to_owned(),
