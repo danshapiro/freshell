@@ -1460,6 +1460,9 @@ pub struct TerminalRegistry {
     /// The unit lifecycle's handler for a kill of a unit row
     /// ([`Self::set_unit_kill_hook`]); shared like the screen-exit hook.
     unit_kill_hook: Arc<std::sync::RwLock<Option<UnitKillHook>>>,
+    /// Reads a unit row's screen start time at its spawn
+    /// ([`Self::set_process_start_reader`]); shared like the hooks.
+    process_start_reader: Arc<std::sync::RwLock<Option<crate::pty::ProcessStartReader>>>,
 }
 
 /// The retained coordinator claim for one sessionRef-owning terminal (kata
@@ -1753,6 +1756,7 @@ impl TerminalRegistry {
             paced_exit_stage_hook: Arc::new(Mutex::new(None)),
             unit_screen_exit_hook: Arc::new(std::sync::RwLock::new(None)),
             unit_kill_hook: Arc::new(std::sync::RwLock::new(None)),
+            process_start_reader: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -2654,7 +2658,10 @@ impl TerminalRegistry {
             Some((spec, env)) => (spec, env),
             None => (spec, env),
         };
-        let pty = match PtyTerminal::spawn_with_sink(
+        // A unit row's screen records its start time (pid + start time
+        // name it for the unit lifecycle's pin).
+        let start_reader = placement.as_ref().and_then(|_| self.process_start_reader());
+        let pty = match PtyTerminal::spawn_with_sink_from_seq(
             spawn_spec,
             spawn_env,
             terminal_id.clone(),
@@ -2662,6 +2669,8 @@ impl TerminalRegistry {
             ring_max_bytes,
             Some(sink),
             pty_exit_hook,
+            1,
+            start_reader.as_ref(),
         ) {
             Ok(pty) => pty,
             Err(err) => {
@@ -4383,6 +4392,36 @@ impl TerminalRegistry {
         *self.unit_kill_hook.write().expect("unit kill hook lock") = Some(hook);
     }
 
+    /// Install the reader of a process's OS start time: every unit row's
+    /// screen then records its start time at its spawn, before anything can
+    /// reap it ([`Self::screen_start_time`]), so the unit lifecycle can pin
+    /// the screen by pid AND start time.
+    pub fn set_process_start_reader(&self, reader: crate::pty::ProcessStartReader) {
+        *self
+            .process_start_reader
+            .write()
+            .expect("process start reader lock") = Some(reader);
+    }
+
+    fn process_start_reader(&self) -> Option<crate::pty::ProcessStartReader> {
+        self.process_start_reader
+            .read()
+            .expect("process start reader lock")
+            .clone()
+    }
+
+    /// The OS start time of the row's current screen, as recorded at its
+    /// spawn (a unit row with a start reader installed); `None` otherwise or
+    /// once its exit was taken.
+    pub fn screen_start_time(&self, terminal_id: &str) -> Option<u64> {
+        let inner = self.inner.lock().expect("registry lock");
+        inner
+            .terminals
+            .get(terminal_id)
+            .and_then(|h| h.pty.as_ref())
+            .and_then(|p| p.start_time())
+    }
+
     /// The unit a row's screen belongs to; `None` for a plain or unknown row.
     pub fn unit_id_for(&self, terminal_id: &str) -> Option<String> {
         let shared = self.shared_for(terminal_id)?;
@@ -4598,6 +4637,7 @@ impl TerminalRegistry {
             Some(self.build_output_sink(&shared, terminal_id, &mode)),
             Some(self.unit_row_exit_hook(terminal_id, generation)),
             first_seq,
+            self.process_start_reader().as_ref(),
         );
         #[cfg(test)]
         REPLACE_SCREEN_INTERLOCK.wait_if_targeted(terminal_id);

@@ -123,7 +123,17 @@ pub struct PtyTerminal {
     // comment for why `killer.kill()` alone is not sufficient.
     #[cfg_attr(not(unix), allow(dead_code))]
     pid: Option<u32>,
+    /// The child's OS start time, read (through the spawn's
+    /// [`ProcessStartReader`]) before its waiter thread can reap it, so
+    /// `(pid, start)` names exactly the process this PTY spawned.
+    start: Option<u64>,
 }
+
+/// Reads a process's OS start time (`None` when unreadable). A unit row's
+/// screen is identified by its pid AND start time; the unit lifecycle
+/// installs the containment's reader
+/// ([`crate::TerminalRegistry::set_process_start_reader`]).
+pub type ProcessStartReader = Arc<dyn Fn(u32) -> Option<u64> + Send + Sync>;
 
 impl PtyTerminal {
     /// Spawn `spec` with the given fully-resolved child `env`, at `spec.cols` x
@@ -175,13 +185,16 @@ impl PtyTerminal {
             sink,
             on_exit,
             1,
+            None,
         )
     }
 
     /// As [`spawn_with_sink`](Self::spawn_with_sink), but the first framed
     /// output is numbered `first_seq` instead of 1. A unit row's replacement
     /// screen passes its row's `head_seq + 1`, so the new screen's output
-    /// continues the row's sequence on the same stream.
+    /// continues the row's sequence on the same stream. With a
+    /// `start_reader`, the child's start time is read before anything can
+    /// reap it ([`Self::start_time`]).
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_with_sink_from_seq(
         spec: &SpawnSpec,
@@ -192,6 +205,7 @@ impl PtyTerminal {
         sink: Option<MessageSink>,
         on_exit: Option<ExitHook>,
         first_seq: i64,
+        start_reader: Option<&ProcessStartReader>,
     ) -> io::Result<Self> {
         let terminal_id = terminal_id.into();
         let stream_id = stream_id.into();
@@ -310,6 +324,11 @@ impl PtyTerminal {
         // so `kill()` can additionally signal the whole process GROUP (see
         // `kill`'s doc comment).
         let pid = child.process_id();
+        // The child is unreaped until the waiter thread below starts, so its
+        // pid still names it here (a zombie's pid is never reused).
+        let start = pid
+            .zip(start_reader)
+            .and_then(|(pid, read_start)| read_start(pid));
         let master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>> =
             Arc::new(Mutex::new(Some(pair.master)));
         let waiter_master = Arc::clone(&master);
@@ -345,6 +364,7 @@ impl PtyTerminal {
             stream_id,
             reaped: false,
             pid,
+            start,
         })
     }
 
@@ -372,6 +392,13 @@ impl PtyTerminal {
     /// lifecycle event for process-ownership context.
     pub fn pid(&self) -> Option<u32> {
         self.pid
+    }
+
+    /// The child's OS start time, when the spawn was given a reader and it
+    /// could read it (`None` after
+    /// [`mark_naturally_exited`](Self::mark_naturally_exited), like the pid).
+    pub fn start_time(&self) -> Option<u64> {
+        self.start
     }
 
     pub fn stream_id(&self) -> &str {
@@ -473,6 +500,7 @@ impl PtyTerminal {
     pub(crate) fn mark_naturally_exited(&mut self) {
         self.reaped = true;
         self.pid = None;
+        self.start = None;
     }
 }
 

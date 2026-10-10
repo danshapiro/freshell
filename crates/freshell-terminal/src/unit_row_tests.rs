@@ -1179,3 +1179,84 @@ fn a_unit_rows_kill_goes_to_the_unit_kill_hook() {
     wait("the screen is dead", || !screen.alive());
     assert!(!reg.is_running("TK"));
 }
+
+/// With a start reader installed, a unit row's screen records its start time
+/// at its spawn, read before anything can reap it: a screen that exits at
+/// once is still named by pid AND start time (read while its pid named it).
+/// A plain row records none, and nothing is recorded without a reader.
+#[test]
+fn a_unit_rows_screen_records_its_start_time_at_spawn() {
+    let reg = TerminalRegistry::new();
+    let spawn = |tid: &str, script: &str| {
+        reg.create_in_unit(
+            &bash(script),
+            &env(),
+            tid.into(),
+            format!("S-{tid}"),
+            "codex",
+            None,
+            None,
+            None,
+            None,
+            placement(None),
+        )
+        .unwrap()
+    };
+
+    // No reader installed: nothing recorded.
+    let pid = spawn("T-none", "sleep 30");
+    let _screen = Own::pin(pid);
+    assert_eq!(reg.screen_start_time("T-none"), None);
+
+    // The reader is asked with the screen's pid while that pid still names
+    // the screen (unreaped: running or a zombie), even for a screen that
+    // exits at once.
+    type Asked = Arc<Mutex<Vec<(u32, Option<u64>)>>>;
+    let asked: Asked = Arc::default();
+    reg.set_process_start_reader(Arc::new({
+        let asked = asked.clone();
+        move |pid| {
+            let start = stat(pid).map(|(_, start)| start);
+            asked.lock().unwrap().push((pid, start));
+            start
+        }
+    }));
+    let pid = spawn("T-start", "sleep 30");
+    let screen = Own::pin(pid);
+    assert_eq!(reg.screen_start_time("T-start"), Some(screen.start));
+    assert_eq!(
+        asked.lock().unwrap().last(),
+        Some(&(pid, Some(screen.start)))
+    );
+
+    let quick = spawn("T-quick", "exit 0");
+    let recorded = asked.lock().unwrap().last().copied();
+    assert_eq!(
+        recorded.map(|(pid, _)| pid),
+        Some(quick),
+        "the reader was asked for the quick screen"
+    );
+    assert!(
+        recorded.and_then(|(_, start)| start).is_some(),
+        "its start time was read before it could be reaped"
+    );
+
+    // A plain row never asks.
+    let before = asked.lock().unwrap().len();
+    reg.create(
+        &bash("sleep 30"),
+        &env(),
+        "T-plain".into(),
+        "S-plain".into(),
+        "shell",
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let _plain = reg.pid_of("T-plain").map(Own::pin);
+    assert_eq!(asked.lock().unwrap().len(), before);
+    assert_eq!(reg.screen_start_time("T-plain"), None);
+    reg.kill_all();
+}
