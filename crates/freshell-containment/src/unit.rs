@@ -455,6 +455,14 @@ impl AgentUnit {
         let dropped = previous
             .map(|w| identity_of(&w))
             .filter(|old| *old != new && other_role.as_ref().map(identity_of) != Some(*old));
+        // The backend may have recorded it already (the macOS fork tracker
+        // records every root it follows): then nothing is left to write.
+        let recorded = lock(&self.inner.record).as_ref().is_some_and(|r| {
+            r.roots.contains(&new) && dropped.is_none_or(|old| !r.roots.contains(&old))
+        });
+        if recorded {
+            return;
+        }
         self.update_record(|r| {
             if let Some(old) = dropped {
                 r.roots.retain(|root| *root != old);
@@ -1347,32 +1355,32 @@ struct RecordRoots(Weak<Inner>);
 
 impl UnitObserver for RecordRoots {
     fn record_root(&self, pid: u32, start: u64) {
-        let Some(inner) = self.0.upgrade() else {
-            return;
-        };
-        let unit = AgentUnit { inner };
-        let present = lock(&unit.inner.record)
-            .as_ref()
-            .is_none_or(|r| r.roots.contains(&(pid, start)));
-        if !present {
-            unit.update_record(|r| {
-                if !r.roots.contains(&(pid, start)) {
-                    r.roots.push((pid, start));
-                }
-            });
-        }
+        self.roots_changed(&[(pid, start)], &[]);
     }
 
     fn forget_root(&self, pid: u32) {
+        self.roots_changed(&[], &[pid]);
+    }
+
+    /// One record write for the whole batch (none when it changes nothing).
+    fn roots_changed(&self, added: &[(u32, u64)], removed: &[u32]) {
         let Some(inner) = self.0.upgrade() else {
             return;
         };
         let unit = AgentUnit { inner };
-        let present = lock(&unit.inner.record)
-            .as_ref()
-            .is_some_and(|r| r.roots.iter().any(|(p, _)| *p == pid));
-        if present {
-            unit.update_record(|r| r.roots.retain(|(p, _)| *p != pid));
+        let changes = lock(&unit.inner.record).as_ref().is_some_and(|r| {
+            r.roots.iter().any(|(pid, _)| removed.contains(pid))
+                || added.iter().any(|root| !r.roots.contains(root))
+        });
+        if changes {
+            unit.update_record(|r| {
+                r.roots.retain(|(pid, _)| !removed.contains(pid));
+                for root in added {
+                    if !r.roots.contains(root) {
+                        r.roots.push(*root);
+                    }
+                }
+            });
         }
     }
 }
@@ -1708,6 +1716,153 @@ mod tests {
         for event in withheld {
             assert_eq!(event.level, tracing::Level::INFO);
             assert_unit_keys(event, &unit, event.str("operation_id"));
+        }
+    }
+
+    /// A unit with a Running record (no roots yet) on `backend`, and the
+    /// store its record writes go to.
+    fn unit_with_record(backend: Arc<dyn UnitBackend>) -> (AgentUnit, Arc<RecordStore>) {
+        let id = UnitId::mint();
+        let store = Arc::new(RecordStore::open(std::path::Path::new("")));
+        let record = UnitRecord {
+            unit_id: id.clone(),
+            provider: "codex".into(),
+            mode: "codex".into(),
+            terminal_id: Some("t-1".into()),
+            create_request_id: None,
+            conversation_keys: Vec::new(),
+            roots: Vec::new(),
+            state: UnitRecordState::Running,
+        };
+        let unit = AgentUnit::new(
+            id,
+            backend,
+            Capability {
+                kind: BackendKind::LinuxTag,
+                full: false,
+                reason: None,
+            },
+            store.clone(),
+            UnitLabel::default(),
+            Some(record),
+        );
+        (unit, store)
+    }
+
+    fn recorded_roots(unit: &AgentUnit) -> Vec<(u32, u64)> {
+        lock(&unit.inner.record).as_ref().unwrap().roots.clone()
+    }
+
+    /// The fork tracker reports each batch of its events at once: the unit
+    /// applies a whole batch with one record write, and a batch that changes
+    /// nothing with none.
+    #[test]
+    fn a_batch_of_root_changes_is_one_record_write() {
+        let backend = Arc::new(Observed::default());
+        let (unit, store) = unit_with_record(backend.clone());
+        let observer = lock(&backend.0).clone().unwrap();
+        observer.record_root(10, 100);
+        observer.record_root(11, 110);
+        let before = store.writes();
+        observer.roots_changed(&[(42, 7), (43, 8)], &[10]);
+        assert_eq!(store.writes() - before, 1, "one batch, one write");
+        assert_eq!(recorded_roots(&unit), [(11, 110), (42, 7), (43, 8)]);
+        observer.roots_changed(&[(42, 7)], &[99]);
+        assert_eq!(store.writes() - before, 1, "a batch that changes nothing");
+    }
+
+    /// A process of the test, killed through its pin and reaped on drop.
+    #[cfg(unix)]
+    struct Spawned {
+        child: std::process::Child,
+        watch: ProcWatch,
+    }
+
+    #[cfg(unix)]
+    impl Spawned {
+        /// `perl -e 'sleep 600'` with `extra` arguments (perl ignores them,
+        /// so `app-server --managed-daemon` shapes a Codex daemon-family
+        /// process).
+        fn perl_sleep(extra: &[&str]) -> Self {
+            let child = std::process::Command::new("perl")
+                .args(["-e", "sleep 600"])
+                .args(extra)
+                .spawn()
+                .unwrap();
+            // Our own unreaped child: its pid names it.
+            let watch = ProcWatch::open(child.id()).unwrap();
+            Self { child, watch }
+        }
+
+        fn identity(&self) -> (u32, u64) {
+            identity_of(&self.watch)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Spawned {
+        fn drop(&mut self) {
+            let _ = self.watch.signal(Sig::Kill);
+            let _ = self.child.wait();
+        }
+    }
+
+    /// A backend that records every root it is told about (as the macOS
+    /// fork tracker records each root it follows).
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct RecordsPinnedRoots(Observed);
+
+    #[cfg(unix)]
+    impl UnitBackend for RecordsPinnedRoots {
+        fn placement(&self, role: MemberRole, seq: u32) -> io::Result<Placement> {
+            self.0.placement(role, seq)
+        }
+        fn kill_all(
+            self: Arc<Self>,
+            _roots: Vec<(u32, u64)>,
+        ) -> BoxFuture<'static, io::Result<KillSummary>> {
+            Box::pin(async { Ok(KillSummary::default()) })
+        }
+        fn members(&self, roots: &[(u32, u64)]) -> io::Result<MemberList> {
+            self.0.members(roots)
+        }
+        fn confirm_placement(&self, pid: u32, roots: &[(u32, u64)]) -> io::Result<()> {
+            self.0.confirm_placement(pid, roots)
+        }
+        fn wait_empty(&self) -> Option<BoxFuture<'static, io::Result<()>>> {
+            None
+        }
+        fn remove(&self, emptied: bool) -> io::Result<()> {
+            self.0.remove(emptied)
+        }
+        fn set_observer(&self, observer: Arc<dyn crate::backend::UnitObserver>) {
+            self.0.set_observer(observer);
+        }
+        fn root_pinned(&self, pid: u32, start: u64) {
+            if let Some(observer) = lock(&(self.0).0).clone() {
+                observer.record_root(pid, start);
+            }
+        }
+    }
+
+    /// Pinning a root writes the record once: also when the backend has
+    /// already recorded it (the macOS fork tracker records every root it
+    /// follows), where the unit has nothing left to write.
+    #[cfg(unix)]
+    #[test]
+    fn pinning_a_root_writes_the_record_once() {
+        let backends: [(&str, Arc<dyn UnitBackend>); 2] = [
+            ("records nothing", Arc::new(NoProcesses)),
+            ("records its roots", Arc::new(RecordsPinnedRoots::default())),
+        ];
+        for (name, backend) in backends {
+            let (unit, store) = unit_with_record(backend);
+            let root = Spawned::perl_sleep(&[]);
+            let before = store.writes();
+            unit.add_root(root.watch.clone());
+            assert_eq!(store.writes() - before, 1, "{name}");
+            assert_eq!(recorded_roots(&unit), [root.identity()], "{name}");
         }
     }
 

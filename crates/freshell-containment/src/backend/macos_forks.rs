@@ -8,12 +8,13 @@
 //! the responsible process is reset when a separately signed program such
 //! as the official `node` is exec'd (Task 7's T5, run 38024127146). So each
 //! unit runs one kqueue thread with `EVFILT_PROC` `NOTE_FORK | NOTE_EXIT`
-//! registered on every tracked process. Each batch of fork events triggers
-//! one one-shot scan (`proc_listallpids` plus the zombie-aware lookup) that
-//! tracks every process of this server's uid whose parent, process group or
-//! session is a tracked process (to a fixed point over that snapshot),
-//! registers it the same way, and records it as a root in the unit record,
-//! so a server crash keeps it reachable. A tracked process stays tracked
+//! registered on every tracked process. Each batch of fork
+//! events triggers one one-shot scan (`proc_listallpids` plus the
+//! zombie-aware lookup) that tracks every process of this server's uid
+//! whose parent, process group or session is a tracked process (to a fixed
+//! point over that snapshot), registers it the same way, and records it as
+//! a root in the unit record, so a server crash keeps it reachable; each
+//! batch writes the record at most once. A tracked process stays tracked
 //! until its exit event. Every root starts as its own session leader (the
 //! `--setsid` shim), so a descendant that never calls `setsid` stays
 //! linked to it by its session after its parent exits.
@@ -24,10 +25,11 @@
 //! a batch, the scan runs before exits are applied, so a parent that forks
 //! and exits at once still links its child. Residual (the platform's limit:
 //! kqueue refuses `NOTE_TRACK` with ENOTSUP, and Endpoint Security needs a
-//! restricted entitlement and root): a process in a session it or an
-//! ancestor created with `setsid`, whose session leader was never tracked
-//! because that leader's parent exited before the tracker handled the
-//! fork, is found only by its tag, which a restricted program withholds.
+//! restricted entitlement and root): a session leader inside the unit (a
+//! `setsid` intermediate, or a command run in its own terminal session)
+//! that exits before the scan following its own creation leaves its
+//! session's processes linked to nothing tracked, so they are found only by
+//! their tag, which a restricted program withholds.
 //!
 //! No polling: the thread blocks in `kevent` until an event or its drop.
 
@@ -94,16 +96,19 @@ impl ForkTracker {
     }
 
     /// Tracks a unit root, when it still runs as the incarnation that
-    /// started at `start`, and has the thread scan for what it started
-    /// before this registration.
+    /// started at `start`, records it, and has the thread scan for what it
+    /// started before this registration.
     pub(crate) fn track_root(&self, pid: u32, start: u64) {
         if self.shared.track(pid, start) {
+            self.shared.report(&[(pid, start)], &[]);
             self.shared.scan_requested.store(true, Ordering::SeqCst);
             let _ = self.shared.kq.wake();
         }
     }
 
-    /// The tracked processes as `(pid, start time)`.
+    /// The tracked processes as `(pid, start time)`. After the tracker's
+    /// thread stopped they are never updated again: callers admit each only
+    /// while its pid still names that incarnation.
     pub(crate) fn tracked(&self) -> Vec<(u32, u64)> {
         lock(&self.shared.tracked)
             .iter()
@@ -132,54 +137,59 @@ impl Drop for ForkTracker {
 }
 
 impl Shared {
-    /// Registers `(pid, start)` for its fork and exit events and records it
-    /// as a root. False when it is already tracked, gone, exiting, or no
-    /// longer that incarnation.
+    /// Registers `(pid, start)` for its fork and exit events. False when it
+    /// is already tracked, gone, exiting, or no longer that incarnation.
     fn track(&self, pid: u32, start: u64) -> bool {
-        {
-            let mut tracked = lock(&self.tracked);
-            if tracked.contains_key(&pid) {
+        let mut tracked = lock(&self.tracked);
+        if tracked.contains_key(&pid) {
+            return false;
+        }
+        // Registered first, then checked: the registration attaches to the
+        // process the pid names now.
+        let registered = self.kq.change(
+            pid as usize,
+            libc::EVFILT_PROC,
+            libc::EV_ADD | libc::EV_CLEAR,
+            libc::NOTE_FORK | libc::NOTE_EXIT,
+        );
+        if registered.is_err() {
+            return false; // gone, or already exiting
+        }
+        match darwin::bsdinfo(pid) {
+            Ok(info) if darwin::start_of(&info) == start && !darwin::is_zombie(&info) => {}
+            _ => {
+                self.unregister(pid);
                 return false;
             }
-            // Registered first, then checked: the registration attaches to
-            // the process the pid names now.
-            let registered = self.kq.change(
-                pid as usize,
-                libc::EVFILT_PROC,
-                libc::EV_ADD | libc::EV_CLEAR,
-                libc::NOTE_FORK | libc::NOTE_EXIT,
-            );
-            if registered.is_err() {
-                return false; // gone, or already exiting
-            }
-            match darwin::bsdinfo(pid) {
-                Ok(info) if darwin::start_of(&info) == start && !darwin::is_zombie(&info) => {}
-                _ => {
-                    let _ = self
-                        .kq
-                        .change(pid as usize, libc::EVFILT_PROC, libc::EV_DELETE, 0);
-                    return false;
-                }
-            }
-            tracked.insert(pid, start);
         }
-        if let Some(observer) = lock(&self.observer).clone() {
-            observer.record_root(pid, start);
-        }
+        tracked.insert(pid, start);
         true
     }
 
-    fn untrack(&self, pid: u32) {
-        if lock(&self.tracked).remove(&pid).is_none() {
+    /// Stops following `pid`. True when it was tracked.
+    fn untrack(&self, pid: u32) -> bool {
+        lock(&self.tracked).remove(&pid).is_some()
+    }
+
+    fn unregister(&self, pid: u32) {
+        let _ = self
+            .kq
+            .change(pid as usize, libc::EVFILT_PROC, libc::EV_DELETE, 0);
+    }
+
+    /// One record update for a batch: one write, when anything changed.
+    fn report(&self, added: &[(u32, u64)], removed: &[u32]) {
+        if added.is_empty() && removed.is_empty() {
             return;
         }
         if let Some(observer) = lock(&self.observer).clone() {
-            observer.forget_root(pid);
+            observer.roots_changed(added, removed);
         }
     }
 
     /// The thread: each batch of events runs one scan when a tracked
-    /// process forked (or a root was added), then applies the exits.
+    /// process forked (or a root was added), applies the exits, and records
+    /// the batch's changes at once.
     fn run(&self) {
         loop {
             if self.shutdown.load(Ordering::SeqCst) {
@@ -192,7 +202,7 @@ impl Shared {
                         event = "containment.fork_tracker_failed",
                         unit_id = %self.unit_id,
                         error = %err,
-                        "the unit's fork tracker stopped; its membership falls back to tags, roots and descendants");
+                        "the unit's fork tracker stopped: the processes it follows stay members while they run, and new ones are found only by tags, roots and descendants");
                     return;
                 }
             };
@@ -201,19 +211,27 @@ impl Shared {
             }
             let proc_events = || events.iter().filter(|e| e.filter == libc::EVFILT_PROC);
             let forked = proc_events().any(|e| e.fflags & libc::NOTE_FORK != 0);
+            let mut added = Vec::new();
             if self.scan_requested.swap(false, Ordering::SeqCst) || forked {
-                self.scan();
+                added = self.scan();
             }
+            let mut removed = Vec::new();
             for event in proc_events().filter(|e| e.fflags & libc::NOTE_EXIT != 0) {
-                self.untrack(event.ident as u32);
+                let pid = event.ident as u32;
+                if self.untrack(pid) {
+                    removed.push(pid);
+                }
             }
+            added.retain(|(pid, _)| !removed.contains(pid));
+            self.report(&added, &removed);
         }
     }
 
     /// One one-shot scan: tracks, to a fixed point over one snapshot, every
     /// live process of this server's uid whose parent, process group or
     /// session is tracked (and started no earlier than that process).
-    fn scan(&self) {
+    /// Returns the processes it started tracking.
+    fn scan(&self) -> Vec<(u32, u64)> {
         // SAFETY: getuid has no preconditions and cannot fail.
         let my_uid = unsafe { libc::getuid() };
         let me = std::process::id();
@@ -238,20 +256,22 @@ impl Shared {
                 })
             })
             .collect();
+        let mut added = Vec::new();
         loop {
             let known = lock(&self.tracked).clone();
-            let mut added = false;
+            let mut grew = false;
             for seen in snapshot.iter().filter(|s| !known.contains_key(&s.pid)) {
                 let linked = seen
                     .links
                     .iter()
                     .any(|id| *id > 1 && known.get(id).is_some_and(|start| seen.start >= *start));
                 if linked && self.track(seen.pid, seen.start) {
-                    added = true;
+                    added.push((seen.pid, seen.start));
+                    grew = true;
                 }
             }
-            if !added {
-                return;
+            if !grew {
+                return added;
             }
         }
     }
@@ -269,9 +289,12 @@ mod tests {
     use crate::proc_watch::{ProcWatch, Sig};
     use crate::process;
 
-    /// Every report the tracker makes, one entry per call: (added, removed).
+    /// One report: the roots added and the pids removed.
+    type Report = (Vec<(u32, u64)>, Vec<u32>);
+
+    /// Every report the tracker makes, one entry per call.
     #[derive(Default)]
-    struct Reports(Mutex<Vec<(Vec<(u32, u64)>, Vec<u32>)>>);
+    struct Reports(Mutex<Vec<Report>>);
 
     impl UnitObserver for Reports {
         fn record_root(&self, pid: u32, start: u64) {

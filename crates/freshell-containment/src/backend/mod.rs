@@ -127,8 +127,10 @@ pub(crate) trait UnitObserver: Send + Sync {
     fn record_root(&self, pid: u32, start: u64);
     /// Drops every recorded root with `pid` (that process exited).
     fn forget_root(&self, pid: u32);
-    /// One batch of changes: drops every recorded root with a `removed`
-    /// pid, then adds `added` (each unless present).
+    /// One batch of changes (the macOS fork tracker reports each batch of
+    /// its events at once): drops every recorded root with a `removed` pid,
+    /// then adds `added` (each unless present).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn roots_changed(&self, added: &[(u32, u64)], removed: &[u32]) {
         for pid in removed {
             self.forget_root(*pid);

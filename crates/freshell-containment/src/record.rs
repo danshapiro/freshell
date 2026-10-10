@@ -48,6 +48,9 @@ pub(crate) struct RecordStore {
     /// Every record this store owns now (loaded at open, or written since),
     /// with the lock that marks ownership on disk.
     owned: Mutex<BTreeMap<UnitId, Owned>>,
+    /// Tests: how many record writes were asked of this store.
+    #[cfg(test)]
+    writes: std::sync::atomic::AtomicUsize,
 }
 
 enum StoreKind {
@@ -78,6 +81,8 @@ impl RecordStore {
             return Self {
                 kind: StoreKind::Memory,
                 owned: Mutex::new(BTreeMap::new()),
+                #[cfg(test)]
+                writes: Default::default(),
             };
         }
         let dir = state_root.join("units");
@@ -93,12 +98,16 @@ impl RecordStore {
                     cause: err.to_string(),
                 },
                 owned: Mutex::new(BTreeMap::new()),
+                #[cfg(test)]
+                writes: Default::default(),
             };
         }
         let owned = load_all(&dir);
         Self {
             kind: StoreKind::Disk { dir },
             owned: Mutex::new(owned),
+            #[cfg(test)]
+            writes: Default::default(),
         }
     }
 
@@ -121,6 +130,9 @@ impl RecordStore {
     /// rename; no fsync: it only has to survive a server-process crash).
     /// The first write of a unit takes its lock.
     pub(crate) fn write(&self, record: &UnitRecord) -> io::Result<()> {
+        #[cfg(test)]
+        self.writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let dir = match &self.kind {
             StoreKind::Memory => {
                 let mut owned = self.owned.lock().unwrap();
@@ -179,6 +191,12 @@ impl RecordStore {
             release(lock, &lock_path(dir, id));
         }
         Ok(())
+    }
+
+    /// Tests: how many record writes were asked of this store so far.
+    #[cfg(test)]
+    pub(crate) fn writes(&self) -> usize {
+        self.writes.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn unavailable(&self) -> io::Error {
