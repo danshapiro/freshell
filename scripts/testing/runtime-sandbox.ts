@@ -4512,7 +4512,9 @@ export class ManagedRuntimeOwner {
       const containerId = Task007Hex.parse(event.containerId)
       if (event.url !== `/v1.47/containers/${containerId}/start`) throw new Error('forwarded start address differs from recorded container')
       if (event.helperName) {
-        if (!/^freshell-history-[a-zA-Z0-9-]+$/.test(event.helperName)) throw new Error('unknown registered helper start name')
+        const knownHelperName = /^freshell-history-[a-zA-Z0-9-]+$/.test(event.helperName)
+          || /^freshell-opencode-repair-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(event.helperName)
+        if (!knownHelperName) throw new Error('unknown registered helper start name')
         if (providerIds.has(Task007Hex.parse(event.ownerContainerId))) helperStartRequests++
       } else if (providerIds.has(containerId)) providerContainerStartRequests++
     }

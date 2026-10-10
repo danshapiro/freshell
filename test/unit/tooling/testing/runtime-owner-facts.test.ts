@@ -1088,6 +1088,91 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
     }
   })
 
+  it.each(['history', 'opencode-repair'] as const)(
+    'counts an admitted %s helper start produced by the real broker only for the registered batch', async (family) => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused helper-family web') }, fixtureRepoRoot, 3,
+      {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
+    const batch = await browserFixture(rig), target = batch.output.targets[0]
+    vi.spyOn(rig.runtime, 'prepareTask007StoppedFixture').mockResolvedValue(batch)
+    vi.stubEnv('FRESHELL_RUNTIME_SYNTHETIC_RESUME', '1')
+    const helperId = 'e'.repeat(64), foreignHelperId = 'd'.repeat(64)
+    const foreign = { ...target, soulId: 'foreign-soul', containerId: 'f'.repeat(64),
+      providerVolumeName: `freshell-provider-${'f'.repeat(24)}` }
+    const upstreamSocket = path.join(batch.outputDir, 'upstream.sock'), received: string[] = []
+    const helperName = `freshell-${family}-${randomUUID()}`, foreignName = `freshell-${family}-${randomUUID()}`
+    const upstream = http.createServer((request, response) => {
+      request.resume(); request.on('end', () => {
+        received.push(request.url!)
+        if (request.url!.includes('/create?')) {
+          const name = new URL(request.url!, 'http://docker').searchParams.get('name')
+          response.writeHead(201).end(JSON.stringify({ Id: name === helperName ? helperId : foreignHelperId }))
+        } else response.writeHead(204).end()
+      })
+    })
+    const broker = new RestrictedDockerBroker({ realSocketPath: upstreamSocket, proxySocketPath: batch.input.brokerSocketPath,
+      runtimeRootPrefix: batch.input.ownerRoot, allowedHostBinaryPaths: new Set([batch.input.hostBinaryPath]),
+      allowedImageRefs: new Set([batch.input.imageRef]), allowedWorkspaceRoots: new Set([batch.input.workspacePath]),
+      testRunId: rig.runtime.runId, logPath: path.join(batch.outputDir, 'broker.jsonl') })
+    const receipts = [target, foreign].map(item => ({ ...item, imageRef: batch.input.imageRef,
+      workspacePath: batch.input.workspacePath, createdAt: 'controlled', requestDigest: 'f'.repeat(64) }))
+    Object.assign(broker, { receiptsById: new Map(receipts.map(receipt => [receipt.containerId, receipt])),
+      knownContainerIds: new Set(receipts.map(receipt => receipt.containerId)) })
+    rig.runtime.broker = broker
+    const helperBody = (receipt: typeof target) => ({
+      Image: batch.input.imageRef, User: family === 'history' ? '65534:0' : '0:0', Tty: family === 'history',
+      WorkingDir: batch.input.workspacePath, Entrypoint: ['/runtime/freshell-session-host'],
+      Cmd: family === 'history'
+        ? ['native-history-only', '--provider', 'opencode', '--session-id', receipt.rootSessionId, '--provider-home', '/home/freshell/provider']
+        : ['opencode-stopped-repair-worker', '--stage-dir', '/run/freshell-opencode-transfer',
+          '--workspace-root', batch.input.workspacePath, '--expected-cwd', batch.input.cwd, '--provider-uid', '65534', '--provider-gid', '0'],
+      Env: family === 'history' ? ['HOME=/home/freshell/provider'] : ['HOME=/home/freshell/provider',
+        'XDG_DATA_HOME=/home/freshell/provider/.local/share', 'XDG_CONFIG_HOME=/home/freshell/provider/.config',
+        'OPENCODE_DB=/home/freshell/provider/.local/share/opencode/opencode.db'],
+      HostConfig: { NetworkMode: 'none', ReadonlyRootfs: true, CapDrop: ['ALL'],
+        CapAdd: family === 'history' ? [] : ['SETUID', 'SETGID'], SecurityOpt: ['no-new-privileges'],
+        Memory: 256 * 1024 * 1024, MemorySwap: 256 * 1024 * 1024, NanoCpus: 500_000_000, PidsLimit: 32,
+        Tmpfs: { '/tmp': 'rw,noexec,nosuid,nodev,size=16m' }, Mounts: [
+          { Type: 'bind', Source: batch.input.hostBinaryPath, Target: '/runtime/freshell-session-host', ReadOnly: true },
+          { Type: 'volume', Source: receipt.providerVolumeName, Target: '/home/freshell/provider', ReadOnly: family === 'history' },
+          ...(family === 'history' ? [] : [
+            { Type: 'bind', Source: path.join(path.dirname(receipt.runtimeDir), 'opencode-transfers', `stopped-repair-${'a'.repeat(48)}.ready`),
+              Target: '/run/freshell-opencode-transfer', ReadOnly: true },
+            { Type: 'bind', Source: batch.input.workspacePath, Target: batch.input.workspacePath, ReadOnly: true },
+          ]),
+        ] },
+    })
+    const request = (url: string, body?: unknown) => new Promise<number>((resolve, reject) => {
+      const client = http.request({ socketPath: broker.proxySocketPath, method: 'POST', path: url }, response => {
+        response.resume(); response.on('end', () => resolve(response.statusCode!)); response.on('error', reject)
+      })
+      client.on('error', reject); client.end(body === undefined ? undefined : JSON.stringify(body))
+    })
+    try {
+      await new Promise<void>(resolve => upstream.listen(upstreamSocket, resolve)); await broker.start()
+      expect((await rig.prepareSyntheticStoppedRepairBatch()).activity).toEqual({ setupHelpersCompleted: 0,
+        helperStartRequests: 0, providerContainerStartRequests: 0, providerLaunchRunningEvents: 0 })
+      const refusedUrl = `/v1.47/containers/${'b'.repeat(64)}/start`
+      expect(await request(refusedUrl)).toBe(403)
+      expect(received).not.toContain(refusedUrl)
+      expect(await request(`/v1.47/containers/create?name=${helperName}`, helperBody(target))).toBe(201)
+      const startUrl = `/v1.47/containers/${helperId}/start`
+      expect(await request(startUrl)).toBe(204)
+      expect(received).toContain(startUrl)
+      expect(broker.eventsSnapshot()).toContainEqual(expect.objectContaining({ method: 'POST', url: startUrl,
+        decision: 'forward', helperName, containerId: helperId, ownerContainerId: target.containerId }))
+      expect((await rig.syntheticStoppedRepairBatchFacts()).activity).toEqual({ setupHelpersCompleted: 0,
+        helperStartRequests: 1, providerContainerStartRequests: 0, providerLaunchRunningEvents: 0 })
+      expect(await request(`/v1.47/containers/create?name=${foreignName}`, helperBody(foreign)),
+        JSON.stringify(broker.eventsSnapshot())).toBe(201)
+      expect(await request(`/v1.47/containers/${foreignHelperId}/start`)).toBe(204)
+      expect((await rig.syntheticStoppedRepairBatchFacts()).activity.helperStartRequests).toBe(1)
+      expect(await broker.awaitPendingRequests()).toEqual([])
+    } finally {
+      await broker.close(); upstream.closeAllConnections(); await new Promise<void>(resolve => upstream.close(() => resolve()))
+      vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true })
+    }
+  })
+
   it('measures registered setup completion and forwarded helper/provider requests separately from launch events', async () => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused activity web') }, fixtureRepoRoot, 3,
       {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
