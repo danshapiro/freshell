@@ -115,9 +115,12 @@ jobs:
       # self-placing exec shim on Windows, the tag backend's libproc and
       # kqueue facts on macOS, the process facts, and the design-decision
       # tests that chose each backend's design. `--no-fail-fast` runs every
-      # test binary, so one failure never hides another's result.
+      # test binary, so one failure never hides another's result. The step
+      # takes about a minute with a warm cache; its own timeout keeps a hung
+      # test from using up the whole job.
       - name: Test containment (Windows and macOS)
         if: matrix.os != 'ubuntu-latest'
+        timeout-minutes: 15
         run: cargo test --locked -p freshell-containment --no-fail-fast
 
       # Exercise the native Windows Claude profile lookup and the generated
