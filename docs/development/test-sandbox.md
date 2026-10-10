@@ -58,7 +58,19 @@ the sandbox Cargo target volume. Cargo uses three parallel build jobs within
 the existing container resource limits. The launcher removes its temporary
 directory on exit. Sandbox,
 dependency, and inner-runner failures return failure without host Cargo fallback.
-The other full-suite phases keep their configured backends and coordinator.
+The same exact opt-in routes the source-runtime process suite through the strict
+sandbox. Its prebuild guard, client build, tools build, and locked release Rust
+build still run natively in that order. The sandbox prepares its separate locked
+release binary, then runs the complete runtime suite against the native client
+and tools artifacts without rebuilding those bind-mounted files. It owns an
+executable temporary directory, transports the checkout commit identity, and
+returns failures without host runtime fallback. A direct focused invocation is:
+
+```bash
+FRESHELL_RUST_TEST_SANDBOX=1 pnpm run test:source-runtime
+```
+
+The client and Electron phases keep their configured backends and coordinator.
 The wrapper records its owned container and settles it before returning a
 signal failure; stopping the attached Docker client alone is insufficient.
 Warm dependency caches through the documented ordinary sandbox preparation

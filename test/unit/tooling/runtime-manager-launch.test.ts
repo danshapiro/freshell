@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { EventEmitter } from 'node:events'
+import { spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import { createRequire } from 'node:module'
 import os from 'node:os'
@@ -34,7 +35,7 @@ function createLaunchFixture(): LaunchFixture {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-runtime-manager-'))
   // Spaces in the fixture root prove manager argv and entrypoint paths
   // survive child-process spawning without shell re-parsing.
-  const root = `${base} dir with spaces`
+  const root = path.join(base, 'dir with spaces')
   fs.mkdirSync(root)
 
   const pnpmCjs = path.join(root, 'pnpm.cjs')
@@ -59,7 +60,7 @@ afterEach(() => {
   vi.restoreAllMocks()
   vi.unstubAllEnvs()
   spawn.mockReset()
-  fs.rmSync(fixture.root, { recursive: true, force: true })
+  fs.rmSync(path.dirname(fixture.root), { recursive: true, force: true })
 })
 
 describe('runtime test script manager launches', () => {
@@ -68,7 +69,10 @@ describe('runtime test script manager launches', () => {
       const child = Object.assign(new EventEmitter(), { exitCode: null, killed: false })
       queueMicrotask(() => {
         if (command.endsWith('.cmd')) child.emit('error', new Error('spawn EINVAL'))
-        else child.emit('exit', 0, null)
+        else {
+          child.emit('exit', 0, null)
+          child.emit('close', 0, null)
+        }
       })
       return child
     })
@@ -77,7 +81,10 @@ describe('runtime test script manager launches', () => {
   function mockSpawnSucceedingThroughShell(): void {
     spawn.mockImplementation(() => {
       const child = Object.assign(new EventEmitter(), { exitCode: null, killed: false })
-      queueMicrotask(() => child.emit('exit', 0, null))
+      queueMicrotask(() => {
+        child.emit('exit', 0, null)
+        child.emit('close', 0, null)
+      })
       return child
     })
   }
@@ -90,6 +97,129 @@ describe('runtime test script manager launches', () => {
       shell: options?.shell,
     }))
   }
+
+  it('keeps native preparation but routes the process suite through the strict sandbox on exact opt-in', async () => {
+    vi.stubEnv('FRESHELL_RUST_TEST_SANDBOX', '1')
+    vi.stubEnv('npm_execpath', fixture.pnpmCjs)
+    mockSpawnResolvingChildren()
+
+    expect(await runSourceRuntimeTests(['--', 'filter with space', '', "quote'word", '$(command)', 'unicode-🚀'])).toBe(0)
+    const specs = launchedSpecs()
+    expect(specs.slice(0, 4).map(spec => spec.args)).toEqual([
+      [fixture.pnpmCjs, 'run', 'prebuild'],
+      [fixture.pnpmCjs, 'run', 'build:client'],
+      [fixture.pnpmCjs, 'run', 'build:tools'],
+      ['build', '--release', '-p', 'freshell-server', '--locked'],
+    ])
+    expect(specs).toHaveLength(5)
+    expect(specs[4].command).toBe(path.resolve('scripts/sandbox-test.sh'))
+    expect((specs[4].args as string[])[0]).toBe('--runtime-suite')
+  })
+
+  it.each(['0', 'true', ''])('keeps direct runtime dispatch for non-opt-in %j even with cloud configured', async value => {
+    vi.stubEnv('FRESHELL_RUST_TEST_SANDBOX', value)
+    vi.stubEnv('FRESHELL_VITEST_BACKEND', 'cloud')
+    vi.stubEnv('npm_execpath', fixture.pnpmCjs)
+    mockSpawnResolvingChildren()
+    expect(await runSourceRuntimeTests([])).toBe(0)
+    expect(launchedSpecs().at(-1)).toMatchObject({ command: process.execPath, args: [expectedVitestEntrypoint, 'run', '--config', expect.any(String)] })
+  })
+
+  it.each([17, 125, 143])('returns sandbox failure %s without a host runtime fallback', async code => {
+    vi.stubEnv('FRESHELL_RUST_TEST_SANDBOX', '1')
+    vi.stubEnv('npm_execpath', fixture.pnpmCjs)
+    spawn.mockImplementation((command: string) => {
+      const child = Object.assign(new EventEmitter(), { exitCode: null, killed: false })
+      queueMicrotask(() => {
+        const result = command.endsWith('sandbox-test.sh') ? code : 0
+        child.emit('exit', result, null)
+        child.emit('close', result, null)
+      })
+      return child
+    })
+    expect(await runSourceRuntimeTests([])).toBe(code)
+    expect(spawn).toHaveBeenCalledTimes(5)
+  })
+
+  it.each([0, 31])('executes the sandbox shell boundary with exact argv and cleanup on suite exit %s', async code => {
+    vi.stubEnv('FRESHELL_RUST_TEST_SANDBOX', '1')
+    vi.stubEnv('npm_execpath', fixture.pnpmCjs)
+    const receipt = path.join(fixture.root, 'receipt.jsonl')
+    const helper = path.join(fixture.root, 'record.mjs')
+    fs.writeFileSync(helper, `import fs from 'node:fs';
+      fs.appendFileSync(process.env.RECEIPT, JSON.stringify({kind:process.argv[2], args:process.argv.slice(3),
+        route:process.env.FRESHELL_RUST_TEST_SANDBOX, jobs:process.env.CARGO_BUILD_JOBS,
+        tmp:process.env.TMPDIR, executableTmp:process.env.FRESHELL_TEST_EXECUTABLE_TMP_DIR})+'\\n');
+      process.exit(process.argv[2]==='node' ? Number(process.env.SUITE_EXIT) : 0);`)
+    const quote = (word: string) => `'${word.replaceAll("'", "'\\''")}'`
+    for (const name of ['cargo', 'node']) {
+      fs.writeFileSync(path.join(fixture.binDir, name), `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(helper)} ${name} "$@"\n`, { mode: 0o755 })
+    }
+    let shellOutput = ''
+    spawn.mockImplementation((command: string, args: string[]) => {
+      const child = Object.assign(new EventEmitter(), { exitCode: null, killed: false })
+      queueMicrotask(() => {
+        let status = 0
+        if (command.endsWith('sandbox-test.sh')) {
+          const payload = args[1].replace('/freshell-test-artifacts/', `${quote(fixture.root)}/`)
+          const result = spawnSync('bash', ['-c', payload], {
+            cwd: fixture.root,
+            env: { ...process.env, PATH: `${fixture.binDir}:${process.env.PATH}`, RECEIPT: receipt, SUITE_EXIT: String(code) },
+            encoding: 'utf8', timeout: 10_000,
+          })
+          shellOutput = result.stdout + result.stderr
+          status = result.status ?? 1
+        }
+        child.emit('exit', status, null)
+        child.emit('close', status, null)
+      })
+      return child
+    })
+    const args = ['--', 'filter with space', '', "quote'word", '$(touch SHOULD_NOT_EXIST)', 'a;echo nope', 'line\nbreak', 'unicode-🚀', '/workspace/target/argument']
+    expect(await runSourceRuntimeTests(args), shellOutput).toBe(code)
+    const events = fs.readFileSync(receipt, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+    expect(events.map(event => event.kind)).toEqual(['cargo', 'node'])
+    expect(events[0].args).toEqual(['build', '--release', '-p', 'freshell-server', '--locked'])
+    // Execute the real shell, then inspect the literal node argv that it delivered.
+    expect(events[1].args.slice(0, 4)).toEqual(['--import', 'tsx', '--input-type=module', '-e'])
+    expect(events[1].args.slice(5)).toEqual(['--', ...args.slice(1)])
+    expect(events[1].route).toBe('0')
+    expect(events[1].jobs).toBe('3')
+    expect(events[1].tmp).toBe(events[1].executableTmp)
+    expect(fs.existsSync(events[1].tmp)).toBe(false)
+    expect(fs.existsSync(path.join(fixture.root, 'SHOULD_NOT_EXIST'))).toBe(false)
+    expect(shellOutput).not.toContain('quote')
+    expect(shellOutput).toContain('source_runtime_temp_settled')
+  })
+
+  it('forwards SIGTERM from a simulated listener and removes its handlers after child close', async () => {
+    vi.stubEnv('FRESHELL_RUST_TEST_SANDBOX', '1')
+    vi.stubEnv('npm_execpath', fixture.pnpmCjs)
+    const before = process.listenerCount('SIGTERM')
+    const kill = vi.fn()
+    spawn.mockImplementation((command: string) => {
+      const child = Object.assign(new EventEmitter(), { exitCode: null, killed: false, kill })
+      queueMicrotask(() => {
+        if (command.endsWith('sandbox-test.sh')) {
+          process.emit('SIGTERM')
+          child.emit('exit', null, 'SIGTERM')
+          child.emit('close', null, 'SIGTERM')
+        } else {
+          child.emit('exit', 0, null)
+          child.emit('close', 0, null)
+        }
+      })
+      return child
+    })
+    expect(await runSourceRuntimeTests([])).toBe(143)
+    expect(kill).toHaveBeenCalledExactlyOnceWith('SIGTERM')
+    expect(process.listenerCount('SIGTERM')).toBe(before)
+  })
+
+  it.each(['--passWithNoTests', '--passWithNoTests=true'])('rejects vacuous coverage flag %s before preparation', async arg => {
+    expect(await runSourceRuntimeTests(['--', arg])).toBe(2)
+    expect(spawn).not.toHaveBeenCalled()
+  })
 
   it('launches the source-runtime build phases through node and the detected pnpm entrypoint on native Windows', async () => {
     vi.spyOn(process, 'platform', 'get').mockReturnValue('win32')
