@@ -537,6 +537,21 @@ fn a_screen_its_own_stop_killed_is_not_a_placement_failure() {
             0,
             "the stop's own kill is not a start failure"
         );
+        let in_stop: Vec<String> = logs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|e| {
+                e.fields.get("event").map(String::as_str) == Some("unit.screen_exit_in_stop")
+                    && e.fields.get("unit_id").map(String::as_str) == Some(unit.id().as_str())
+            })
+            .map(|e| e.fields.get("operation_id").cloned().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            in_stop,
+            vec!["term-kill-own".to_string()],
+            "the exit is logged once, under the stop's operation"
+        );
         assert!(
             state.registry.probe("T-own").is_none(),
             "the row ends as the requested stop: removed, not kept Exited"

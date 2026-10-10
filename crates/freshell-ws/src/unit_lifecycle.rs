@@ -396,14 +396,14 @@ fn on_screen_exit(state: &WsState, exit: UnitScreenExit) {
         state
             .registry
             .mark_ending(&exit.terminal_id, UnitEnding::Requested);
-        let keys = unit_keys(&entry.unit, None);
+        let keys = unit_keys(&entry.unit, entry.unit.stop_operation().as_deref());
         tracing::debug!(target: "freshell_unit",
             event = "unit.screen_exit_in_stop",
             unit_id = %keys.unit_id,
             provider = %keys.provider,
             session_id = %keys.session_id.as_deref().unwrap_or(""),
             terminal_id = %exit.terminal_id,
-            operation_id = "",
+            operation_id = %keys.operation_id.as_deref().unwrap_or(""),
             exit_code = exit.exit_code,
             "a unit row's screen exited during its unit's stop");
         return;
