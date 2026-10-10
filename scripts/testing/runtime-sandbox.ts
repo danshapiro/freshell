@@ -4280,16 +4280,16 @@ export class RuntimeHarness {
     execFileSync(mise, ['exec', 'rust@1.96', '--', 'cargo', 'build', '-p', 'freshell-supervisor', '-p', 'freshell-session-host', '--features', 'freshell-supervisor/runtime-test-faults,freshell-session-host/fresh-agent-fixtures'], { cwd: this.repoRoot, stdio: 'inherit' })
     this.testSupervisorBinary = path.join(this.buildDir, 'freshell-supervisor-test')
     this.testHostBinary = path.join(this.buildDir, 'freshell-session-host-test')
-    fs.copyFileSync(path.join(this.repoRoot, 'target/debug/freshell-supervisor'), this.testSupervisorBinary)
-    fs.copyFileSync(path.join(this.repoRoot, 'target/debug/freshell-session-host'), this.testHostBinary)
+    fs.copyFileSync(cargoArtifactPath(this.repoRoot, 'debug', 'freshell-supervisor'), this.testSupervisorBinary)
+    fs.copyFileSync(cargoArtifactPath(this.repoRoot, 'debug', 'freshell-session-host'), this.testHostBinary)
     fs.chmodSync(this.testSupervisorBinary, 0o755)
     fs.chmodSync(this.testHostBinary, 0o755)
 
     execFileSync(mise, ['exec', 'rust@1.96', '--', 'cargo', 'build', '--release', '-p', 'freshell-supervisor', '-p', 'freshell-session-host'], { cwd: this.repoRoot, stdio: 'inherit' })
     this.releaseSupervisorBinary = path.join(this.buildDir, 'freshell-supervisor-release')
     this.releaseHostBinary = path.join(this.buildDir, 'freshell-session-host-release')
-    fs.copyFileSync(path.join(this.repoRoot, 'target/release/freshell-supervisor'), this.releaseSupervisorBinary)
-    fs.copyFileSync(path.join(this.repoRoot, 'target/release/freshell-session-host'), this.releaseHostBinary)
+    fs.copyFileSync(cargoArtifactPath(this.repoRoot, 'release', 'freshell-supervisor'), this.releaseSupervisorBinary)
+    fs.copyFileSync(cargoArtifactPath(this.repoRoot, 'release', 'freshell-session-host'), this.releaseHostBinary)
     fs.chmodSync(this.releaseSupervisorBinary, 0o755)
     fs.chmodSync(this.releaseHostBinary, 0o755)
   }
@@ -4378,6 +4378,12 @@ export function dockerSocketPath(): string {
 
 function docker(args: string[]): string {
   return execFileSync('docker', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024 })
+}
+
+function cargoArtifactPath(repoRoot: string, profile: 'debug' | 'release', binary: string): string {
+  // Cargo resolves an explicit relative target directory from its build cwd.
+  // Copy only that build's outputs; a stale default target is never a fallback.
+  return path.join(path.resolve(repoRoot, process.env.CARGO_TARGET_DIR || 'target'), profile, binary)
 }
 
 function git(cwd: string, args: string[]): string {
@@ -7726,7 +7732,7 @@ export class ManagedRuntimeOwner {
         ? 'managed-fresh-agent-fixtures'
         : qualification.length ? 'managed-provider-qualification' : 'managed-runtime-v1',
     ], { cwd: this.repoRoot, stdio: 'inherit', env: { ...process.env, FRESHELL_BUILD_SOURCE_STATE: sourceState } })
-    const source = path.join(this.repoRoot, 'target', 'release', 'freshell-server')
+    const source = cargoArtifactPath(this.repoRoot, 'release', 'freshell-server')
     const target = path.join(this.runtime.buildDir, 'freshell-server-managed')
     fs.copyFileSync(source, target)
     fs.chmodSync(target, 0o755)
@@ -7741,7 +7747,7 @@ export class ManagedRuntimeOwner {
       '--features', 'provider-qualification',
     ], { cwd: this.repoRoot, stdio: 'inherit' })
     const target = path.join(this.runtime.buildDir, 'freshell-supervisor-qualification')
-    fs.copyFileSync(path.join(this.repoRoot, 'target', 'release', 'freshell-supervisor'), target)
+    fs.copyFileSync(cargoArtifactPath(this.repoRoot, 'release', 'freshell-supervisor'), target)
     fs.chmodSync(target, 0o755)
     return target
   }
