@@ -26,9 +26,10 @@ use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, JobObjectAssociateCompletionPortInformation,
     JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
-    QueryInformationJobObject, SetInformationJobObject, JOBOBJECT_ASSOCIATE_COMPLETION_PORT,
-    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+    JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::SystemServices::JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO;
 use windows_sys::Win32::System::IO::{
@@ -354,9 +355,15 @@ impl PortJob {
         }
     }
 
-    /// Whether a zero message arrives on the port within `limit`.
-    fn zero_message_within(&self, limit: Duration) -> bool {
+    /// Every `(message, key, pid)` the port delivers within `limit`, or
+    /// until `stop` matches one.
+    fn messages(
+        &self,
+        limit: Duration,
+        stop: impl Fn(u32, usize) -> bool,
+    ) -> Vec<(u32, usize, u32)> {
         let deadline = std::time::Instant::now() + limit;
+        let mut out = Vec::new();
         loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             let (mut msg, mut key, mut overlapped) =
@@ -372,12 +379,18 @@ impl PortJob {
                 )
             };
             if ok == 0 {
-                return false; // the deadline passed
+                return out; // the deadline passed
             }
-            if msg == JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO {
-                return true;
+            out.push((msg, key, overlapped as usize as u32));
+            if stop(msg, key) {
+                return out;
             }
         }
+    }
+
+    fn terminate(&self) {
+        // SAFETY: a live job handle.
+        assert_ne!(unsafe { TerminateJobObject(self.job, 1) }, 0);
     }
 }
 
@@ -402,7 +415,8 @@ impl Drop for PortJob {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_unit_empty_wait_ignores_nested_job_zero_messages() {
     // Precondition: this scenario really posts a nested zero message while
-    // its job still has members (shown on a job and port the test owns).
+    // its job still has members (shown on a job and port the test owns),
+    // and that port does receive its own job's zero message.
     {
         let job = PortJob::new();
         let mut child = std::process::Command::new(SHIM)
@@ -414,19 +428,32 @@ async fn the_unit_empty_wait_ignores_nested_job_zero_messages() {
         let shim = Proc::open(child.id());
         let mut lines = windows_support::Lines::new(child.stdout.take().unwrap());
         lines.expect_pid("job-child ");
-        assert!(
-            !job.zero_message_within(Duration::from_millis(200)),
-            "precondition: a zero message before the nested job's child ended"
-        );
+        let zero = |msg: u32, _key: usize| msg == JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO;
+        let before = job.messages(Duration::from_millis(200), zero);
         drop(child.stdin.take());
         lines.expect("child-exited", |l| l == "child-exited");
-        assert!(
-            job.zero_message_within(Duration::from_secs(10)),
-            "precondition: no zero message after the nested job emptied"
+        let nested = job.messages(Duration::from_secs(5), zero);
+        let active = job.active_processes();
+        job.terminate();
+        let own = job.messages(Duration::from_secs(10), |msg, key| {
+            msg == JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO && key == 7
+        });
+        let report = format!(
+            "(message, key, pid) before: {before:?}; after the nested job emptied: {nested:?} \
+             (active processes then: {active}); after the test job ended: {own:?}"
         );
         assert!(
-            job.active_processes() > 0,
-            "precondition: the job itself emptied"
+            own.iter()
+                .any(|(m, k, _)| *m == JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO && *k == 7),
+            "precondition: the test port never got its own job's zero message: {report}"
+        );
+        assert!(
+            !before.iter().any(|(m, _, _)| zero(*m, 0)) && active > 0,
+            "precondition: {report}"
+        );
+        assert!(
+            nested.iter().any(|(m, _, _)| zero(*m, 0)),
+            "precondition: no zero message after the nested job emptied: {report}"
         );
         drop(shim);
         let _ = child.kill();
