@@ -26,6 +26,10 @@ async fn a_codex_pane_is_one_unit_holding_the_tui_and_the_sidecar() {
     let mut ws = h.connect().await;
     let tid = h.create_codex(&mut ws, "crq-one", None).await;
     let unit = h.unit_for(&tid);
+    // The TUI's placement in the unit is confirmed when the start settles.
+    tokio::time::timeout(LIMIT, h.state.units.start_settled(unit.id()))
+        .await
+        .expect("the start settles once its screen is placed");
     let manifest = h.native_manifest(&tid);
     let helper = {
         let manifests = h.manifests.clone();
@@ -91,23 +95,14 @@ async fn quitting_the_codex_tui_ends_the_whole_unit_before_anything_is_published
     )
     .await;
     let exit = h
-        .next_matching(&mut ws, Duration::from_secs(10), |f| {
-            f["type"] == "terminal.exit" && f["terminalId"] == tid
+        .exit_and_vacant(&mut ws, Duration::from_secs(20), &tid, "t-quit", || {
+            assert!(
+                !fake_codex::pid_alive(native),
+                "terminal.exit and Vacant are published only after the app-server is gone"
+            );
         })
-        .await
-        .expect("terminal.exit");
-    assert!(
-        !fake_codex::pid_alive(native),
-        "terminal.exit is published only after the app-server is gone"
-    );
+        .await;
     assert_eq!(exit["exitCode"], 0);
-    h.next_matching(&mut ws, Duration::from_secs(10), |f| {
-        f["type"] == "session.runtimeOwner"
-            && f["sessionId"] == "t-quit"
-            && f["ownerKind"] == "vacant"
-    })
-    .await
-    .expect("the conversation is Vacant at Gone");
     assert!(
         h.state.units.by_terminal(&tid).is_none(),
         "a settled start's entry is removed before Vacant is committed"

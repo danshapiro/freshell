@@ -127,23 +127,14 @@ async fn a_rest_created_codex_pane_is_one_unit_and_its_end_is_published_at_gone(
     )
     .await;
     let exit = h
-        .next_matching(&mut ws, LIMIT, |f| {
-            f["type"] == "terminal.exit" && f["terminalId"] == tid
+        .exit_and_vacant(&mut ws, 2 * LIMIT, &tid, "t-rest", || {
+            assert!(
+                !fake_codex::pid_alive(native),
+                "terminal.exit and Vacant are published only after the app-server is gone"
+            );
         })
-        .await
-        .expect("terminal.exit");
-    assert!(
-        !fake_codex::pid_alive(native),
-        "terminal.exit is published only after the app-server is gone"
-    );
+        .await;
     assert_eq!(exit["exitCode"], 0);
-    h.next_matching(&mut ws, LIMIT, |f| {
-        f["type"] == "session.runtimeOwner"
-            && f["sessionId"] == "t-rest"
-            && f["ownerKind"] == "vacant"
-    })
-    .await
-    .expect("the conversation is Vacant at Gone");
     assert!(
         h.state.units.by_terminal(&tid).is_none(),
         "the settled start's entry is removed before Vacant is committed"

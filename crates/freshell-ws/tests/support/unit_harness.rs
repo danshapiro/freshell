@@ -466,6 +466,50 @@ impl UnitHarness {
         }
     }
 
+    /// Waits within `limit` for `terminal_id`'s `terminal.exit` and for the
+    /// Vacant `session.runtimeOwner` frame of `session_id`, and returns the
+    /// `terminal.exit` frame. Both are published at Gone but through
+    /// different channels (the terminal's own stream and the server-wide
+    /// broadcast), so they can reach the client in either order; `on_frame`
+    /// runs as each of the two arrives.
+    pub async fn exit_and_vacant(
+        &self,
+        ws: &mut TestWs,
+        limit: Duration,
+        terminal_id: &str,
+        session_id: &str,
+        on_frame: impl Fn(),
+    ) -> serde_json::Value {
+        let deadline = tokio::time::Instant::now() + limit;
+        let mut exit = None;
+        let mut vacant = false;
+        while exit.is_none() || !vacant {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let frame = self
+                .next_matching(ws, remaining, |f| {
+                    (f["type"] == "terminal.exit" && f["terminalId"] == terminal_id)
+                        || (f["type"] == "session.runtimeOwner"
+                            && f["sessionId"] == session_id
+                            && f["ownerKind"] == "vacant")
+                })
+                .await
+                .unwrap_or_else(|| {
+                    panic!(
+                        "terminal.exit (seen: {}) and the Vacant frame (seen: {vacant}) \
+                         within {limit:?}",
+                        exit.is_some()
+                    )
+                });
+            on_frame();
+            if frame["type"] == "terminal.exit" {
+                exit = Some(frame);
+            } else {
+                vacant = true;
+            }
+        }
+        exit.expect("terminal.exit")
+    }
+
     /// POSTs `body` to the REST lane; returns the status and the JSON body
     /// (`Null` when it is not JSON). A hand-rolled HTTP/1.1 request (this
     /// crate has no HTTP client), as `rest_ws_shared_gate.rs` does.
