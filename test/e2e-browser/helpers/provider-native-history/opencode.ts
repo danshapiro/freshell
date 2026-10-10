@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
+import { createRequire } from 'node:module'
 
 import {
   MAX_NATIVE_TURNS,
@@ -18,6 +18,8 @@ import { safeOpaqueId } from './safe-io.js'
 const MAX_MESSAGE_ROWS = 128
 const MAX_PART_ROWS = 256
 const MAX_SQLITE_JSON_BYTES = 256 * 1024
+type DatabaseSync = import('node:sqlite').DatabaseSync
+const { DatabaseSync }: typeof import('node:sqlite') = createRequire(import.meta.url)('node:sqlite')
 
 function requireRegularDatabase(filename: string): void {
   if (!path.isAbsolute(filename)) throw new Error('OpenCode database path must be absolute')

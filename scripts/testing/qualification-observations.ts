@@ -5,7 +5,7 @@ import { readCodexNativeObservation } from '../../test/e2e-browser/helpers/provi
 import { readOpenCodeNativeObservation } from '../../test/e2e-browser/helpers/provider-native-history/opencode.js'
 import { readClaudeNativeHistory } from '../../test/e2e-browser/helpers/provider-native-history/claude.js'
 import { readAmplifierNativeHistory } from '../../test/e2e-browser/helpers/provider-native-history/amplifier.js'
-import { readBoundedJsonl } from '../../test/e2e-browser/helpers/provider-native-history/safe-io.js'
+import { readBoundedJsonl, readBoundedJsonlWithPositions } from '../../test/e2e-browser/helpers/provider-native-history/safe-io.js'
 import type { NativeAssistantTurn, NativeHistory } from './provider-native-history.js'
 
 export const NATIVE_RECOVERY_ORIGINALS_FILE = 'native-recovery-originals.json'
@@ -27,6 +27,7 @@ export type NativeRecoveryStageEvidence = {
 }
 export type ObservedNativeConversation = { mode: string; soulId: string; providerStoreId: string; nativeSessionId: string; stages: NativeRecoveryStageEvidence[] }
 type JsonObject = Record<string, any>
+type NativeInput = { id: string; text: string; appendPosition?: { recordIndex: number; byteStart: number; byteEnd: number } }
 const MODE_PROVIDER: Readonly<Record<string, string>> = { claude: 'claude', freshclaude: 'claude', kilroy: 'claude', codex: 'codex', freshcodex: 'codex', opencode: 'opencode', freshopencode: 'opencode', amplifier: 'amplifier' }
 const sha256 = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex')
 const object = (value: unknown, label: string): JsonObject => {
@@ -69,7 +70,14 @@ function jsonReference(evidenceDir: string, reference: unknown): JsonObject {
   return object(JSON.parse(bytes.toString('utf8')), 'native original')
 }
 
-function nativeMaterial(evidenceDir: string, stage: JsonObject, provider: string, root: string): { history: NativeHistory; inputs: { id: string; text: string }[] } {
+function verifyCapturedNativeCopy(evidenceDir: string, reference: unknown, bytesBase64: string, digest: string, label: string): void {
+  const copied = readNativeOriginalReference(evidenceDir, reference).bytes
+  const captured = Buffer.from(bytesBase64, 'base64')
+  if (!copied.equals(captured)) throw new Error(`${label} differs from the captured native original`)
+  equal(sha256(captured), digest, `${label} capture digest`)
+}
+
+function nativeMaterial(evidenceDir: string, stage: JsonObject, provider: string, root: string): { history: NativeHistory; inputs: NativeInput[] } {
   const { filename } = readNativeOriginalReference(evidenceDir, stage.nativeFile)
   if (provider === 'codex') {
     const basename = path.basename(filename), [meta] = readBoundedJsonl(filename, 'Codex referenced native rollout')
@@ -92,8 +100,17 @@ function nativeMaterial(evidenceDir: string, stage: JsonObject, provider: string
     equal(path.basename(events.filename), 'events.jsonl', 'Amplifier exact events reference')
     equal(path.basename(path.dirname(filename)), root, 'Amplifier exact native store directory')
     equal(path.dirname(events.filename), path.dirname(filename), 'Amplifier events/transcript store')
-    const rows = readBoundedJsonl(filename, 'Amplifier native inputs')
-    return { history: readAmplifierNativeHistory(path.dirname(path.dirname(path.dirname(filename))), root), inputs: rows.flatMap((row, index) => row.role === 'user' ? [{ id: String(index), text: typeof row.content === 'string' ? row.content : row.content.filter((part: JsonObject) => part.type === 'text').map((part: JsonObject) => text(part.text, 'Amplifier native input')).join('') }] : []) }
+    const records = readBoundedJsonlWithPositions(filename, 'Amplifier native inputs')
+    const inputs = records.flatMap(record => {
+      const row = record.value
+      if (row.role !== 'user') return []
+      return [{
+        id: String(record.recordIndex),
+        text: typeof row.content === 'string' ? row.content : row.content.filter((part: JsonObject) => part.type === 'text').map((part: JsonObject) => text(part.text, 'Amplifier native input')).join(''),
+        appendPosition: { recordIndex: record.recordIndex, byteStart: record.byteStart, byteEnd: record.byteEnd },
+      }]
+    })
+    return { history: readAmplifierNativeHistory(path.dirname(path.dirname(path.dirname(filename))), root), inputs }
   }
   throw new Error('unsupported native original provider')
 }
@@ -159,6 +176,11 @@ export function deriveNativeRecoveryOriginals(input: {
       const launchAt = timestamp(launch.capturedAt, 'native observation capture')
       if (!Number.isSafeInteger(view.executionGeneration) || view.executionGeneration < 1) throw new Error('native execution generation is missing')
       const namespace = source(stage.namespace)
+      const probe = object(namespace.ownedProbe, 'native current owned namespace probe')
+      equal(probe.containerId, view.containerId, 'native namespace probe container')
+      if (!Number.isSafeInteger(namespace.nativePid) || namespace.nativePid < 1) throw new Error('native namespace probe lacks an actual provider PID')
+      equal(probe.nativePid, namespace.nativePid, 'native namespace probe process')
+      const namespaceAt = timestamp(probe.capturedAt, 'native namespace probe capture')
       if (namespace.uid !== 65534 || namespace.gid !== 0 || namespace.caps !== '0000000000000000' || namespace.readOnlyRoot !== true || namespace.httpsStatus !== 200 || namespace.tlsVerifyMode !== 2 || namespace.tlsCheckHostname !== true) throw new Error('native namespace UID/profile/TLS boundary differs')
       // The Codex process probe has no thread-load RPC producer; its null
       // telemetry cannot replace the launch observation and exact rollout.
@@ -176,10 +198,11 @@ export function deriveNativeRecoveryOriginals(input: {
       text(store.providerVolumeName, 'native original volume')
       const snapshot = object(store.snapshot, 'native store snapshot')
       if (!snapshot.completeEof || !Array.isArray(snapshot.identity) || snapshot.identity.length < 2) throw new Error('native original store is truncated or lacks file identity')
-      const nativeBytes = readNativeOriginalReference(input.evidenceDir, stage.nativeFile).bytes
-      const capturedBytes = Buffer.from(snapshot.querySnapshotBase64 ?? snapshot.bytesBase64, 'base64')
-      if (!capturedBytes.equals(nativeBytes)) throw new Error('native copy differs from the captured store original')
-      equal(sha256(capturedBytes), snapshot.querySnapshotSha256 ?? snapshot.sha256, 'native snapshot digest')
+      verifyCapturedNativeCopy(input.evidenceDir, stage.nativeFile, snapshot.querySnapshotBase64 ?? snapshot.bytesBase64, snapshot.querySnapshotSha256 ?? snapshot.sha256, 'native transcript copy')
+      if (provider === 'amplifier') {
+        const events = object(store.eventsSnapshot, 'Amplifier captured native events')
+        verifyCapturedNativeCopy(input.evidenceDir, stage.nativeEvents, events.bytesBase64, events.sha256, 'Amplifier event copy')
+      }
       if (previousStore && previousNamespace) {
         equal(store.providerVolumeName, previousStore.providerVolumeName, 'native original volume')
         equal(snapshot.path, previousStore.snapshot.path, 'native original store path')
@@ -191,6 +214,7 @@ export function deriveNativeRecoveryOriginals(input: {
         equal(crash.kind, stage.stage === 'after_session_host_crash' ? 'session_host_exit' : 'provider_process_exit', 'native recovery crash kind')
         equal(crash.containerId, previousView.containerId, 'native old container'); equal(crash.incarnationId, previousView.incarnationId, 'native old incarnation')
         const requestedAt = timestamp(crash.requestedAt, 'native crash request'), exitedAt = timestamp(crash.exitedAt, 'native owned exit')
+        if (namespaceAt < exitedAt || timestamp(previousNamespace!.ownedProbe.capturedAt, 'previous native namespace capture') > requestedAt) throw new Error('native namespace probe precedes replacement or follows owned death')
         if (!(previousCompletion <= requestedAt && requestedAt <= exitedAt && exitedAt <= launchAt) || view.containerId === previousView.containerId || view.executionGeneration <= previousView.executionGeneration || observation.evidenceRevision <= previousView.nativeIdentityObservation.evidenceRevision) throw new Error('native crash/exit/replacement order is invalid')
       } else if (stage.crash !== undefined) throw new Error('initial native stage must precede recovery')
       const request = source(stage.request)
@@ -215,6 +239,7 @@ export function deriveNativeRecoveryOriginals(input: {
         prompt = data.slice(0, -1)
       }
       if (stage.stage === 'initial' && !prompt.includes(nonce)) throw new Error('native initial prompt lacks the seed nonce')
+      if (stage.stage !== 'initial' && prompt.includes(nonce)) throw new Error('native recovery input reintroduces the seed nonce')
       const material = nativeMaterial(input.evidenceDir, stage, provider, root)
       equal(material.history.nativeSessionId, root, 'native completed root'); equal(material.history.provider, provider, 'native completed provider')
       if (stage.boundaryFile) {
@@ -239,6 +264,10 @@ export function deriveNativeRecoveryOriginals(input: {
       if (completedAt < sentAt || turn.toolCalls.length) throw new Error('native completion precedes dispatch or includes tools')
       if (provider === 'codex') equal(turn.turnId, newInputs[0]!.id, 'native input/completed turn')
       if (provider === 'opencode' || provider === 'claude') equal(turn.parentMessageId, newInputs[0]!.id, 'native assistant/user parent')
+      if (provider === 'amplifier') {
+        const inputPosition = newInputs[0]!.appendPosition, evidence = turn.nativeEvidence
+        if (!inputPosition || evidence.kind !== 'append_only_record' || inputPosition.recordIndex + 1 !== evidence.recordIndex || inputPosition.byteEnd >= evidence.byteStart) throw new Error('Amplifier completed assistant lacks an unambiguous preceding native input append interval')
+      }
       if (gestures.at(-1)?.reply?.data?.submittedTurnId !== undefined) equal(gestures.at(-1)!.reply.data.submittedTurnId, turn.turnId, 'native submitted/completed turn')
       const recalledNonce = stage.stage !== 'initial' && turn.text.includes(nonce)
       if (stage.stage !== 'initial' && !recalledNonce) throw new Error('native recovery completion does not recall the seed nonce')
