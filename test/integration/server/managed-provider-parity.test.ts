@@ -121,6 +121,10 @@ function ordinaryProviderArgs(argv: string[], provider: Provider): string[] {
   const result: string[] = []
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index]
+    if (provider === 'codex' && arg === '-c' && argv[index + 1] === 'check_for_update_on_startup=false') {
+      index++
+      continue
+    }
     if (arg === '--mcp-config' || arg === '--mcp-config-file') {
       result.push(arg, '<managed-mcp-config>')
       index++
@@ -185,6 +189,16 @@ function normalized(record: RecordRow) {
 }
 
 describe('managed provider parity argv comparison', () => {
+  it('compares Codex arguments around the managed image update suppression without hiding other settings', () => {
+    const record = (argv: string[]): RecordRow => ({ provider: 'codex', kind: 'launch', argv, env: {} })
+    const ordinary = ['--model', 'gpt-5.6-luna', '--sandbox', 'workspace-write']
+    const suppression = ['-c', 'check_for_update_on_startup=false']
+    expect(normalized(record([...suppression, ...ordinary]))).toEqual(normalized(record(ordinary)))
+    expect(normalized(record(['-c', 'check_for_update_on_startup=true', ...ordinary]))).not.toEqual(normalized(record(ordinary)))
+    expect(normalized(record([...suppression, '-c', 'other_setting=false', ...ordinary]))).not.toEqual(normalized(record(ordinary)))
+    expect(normalized(record([...suppression, '--sandbox', 'workspace-write', '--model', 'gpt-5.6-luna']))).not.toEqual(normalized(record(ordinary)))
+  })
+
   it.each([
     {
       provider: 'claude' as const,
@@ -414,6 +428,14 @@ describe('ordinary and managed terminal provider parity', () => {
           wire.recordRows().find(row => row.provider === provider && row.kind === 'identity' && row.terminalId === terminalId)
         )))
       }
+    }
+    if (provider === 'codex') {
+      // The managed image owns the pin and must not ask for updater input
+      // before the native create/resume acknowledgement. Verify that actual
+      // launch policy separately from the remaining provider-visible flags.
+      expect(observed[1].argv.slice(0, 2)).toEqual(['-c', 'check_for_update_on_startup=false'])
+      expect(observed[1].argv.filter((arg: string) => arg === 'check_for_update_on_startup=false')).toHaveLength(1)
+      expect(observed[0].argv).not.toContain('check_for_update_on_startup=false')
     }
     expect(normalized(observed[1])).toEqual(normalized(observed[0]))
     if (provider === 'opencode') {
