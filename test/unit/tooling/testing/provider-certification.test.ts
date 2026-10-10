@@ -22,11 +22,15 @@ import {
 } from '../../../../scripts/testing/provider-certification.js'
 import {
   buildProviderQualificationReceipt,
+  providerNativeProfileMatches,
   validateProviderQualificationReceipt,
   type ProviderQualificationRow,
 } from '../../../../scripts/testing/provider-qualification-receipt.js'
 import { parseGateArgs } from '../../../../scripts/testing/runtime-gate-args.js'
 import { PROVIDER_PARITY_CASE_IDS } from '../../../../scripts/testing/provider-parity-receipt.js'
+import { nativeTurnProof } from '../../../../scripts/testing/provider-native-history.js'
+import { readAmplifierNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/amplifier.js'
+import { readClaudeNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/claude.js'
 
 const repoRoot = path.resolve(__dirname, '../../../..')
 
@@ -262,7 +266,7 @@ describe('provider qualification receipt v2', () => {
       : provider === 'opencode'
         ? { providerVersion: '1.18.21', model: 'opencode/big-pickle', reasoningEffort: 'provider-default', nativeProvider: 'opencode' }
         : provider === 'amplifier'
-          ? { providerVersion: '0.1.1', model: 'glm-5.3', reasoningEffort: 'provider-default', nativeProvider: 'lunaroute' }
+          ? { providerVersion: '0.1.1', model: 'glm-5.3', reasoningEffort: 'provider-default', nativeProvider: 'vllm' }
           : { providerVersion: '2.1.263', model: 'haiku', reasoningEffort: 'low', nativeProvider: 'anthropic' }
     const stages = ['initial', 'after_session_host_crash', 'after_provider_process_crash'] as const
     return {
@@ -301,10 +305,10 @@ describe('provider qualification receipt v2', () => {
         toolCallTypes: [],
         resolvedProvider: profile.nativeProvider,
         resolvedModel: profile.model === 'haiku' ? 'claude-haiku-4-5-20251001' : profile.model.replace(/^opencode\//, ''),
-        resolvedReasoningEffort: profile.reasoningEffort,
-        providerProvenance: `${provider}-native.provider`,
-        modelProvenance: `${provider}-native.model`,
-        reasoningEffortProvenance: `${provider}-native.effort`,
+        resolvedReasoningEffort: provider === 'amplifier' ? 'unknown' : profile.reasoningEffort,
+        providerProvenance: provider === 'amplifier' ? 'amplifier-llm:response.provider' : `${provider}-native.provider`,
+        modelProvenance: provider === 'amplifier' ? 'amplifier-llm:response.model' : `${provider}-native.model`,
+        reasoningEffortProvenance: provider === 'amplifier' ? 'unsupported-native-telemetry' : `${provider}-native.effort`,
       })),
       actualProviderBinary: true,
       completedTurn: true,
@@ -404,6 +408,139 @@ describe('provider qualification receipt v2', () => {
       }),
     }
   }
+
+  function observedProviderRow(
+    provider: 'claude' | 'amplifier',
+    observed: { provider?: string; model?: string; effort?: string } = {},
+  ): ProviderQualificationRow {
+    const row = providerRow(provider)
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-native-profile-'))
+    tempRoots.push(root)
+    const nonce = 'receipt-profile-marker'
+    const stages = ['initial', 'after_session_host_crash', 'after_provider_process_crash'] as const
+    const writeJsonl = (filename: string, records: unknown[]) => {
+      fs.mkdirSync(path.dirname(filename), { recursive: true })
+      fs.writeFileSync(filename, records.map(record => JSON.stringify(record)).join('\n') + '\n')
+    }
+    if (provider === 'claude') {
+      writeJsonl(path.join(root, `${row.nativeSessionId}.jsonl`), stages.flatMap((_stage, index) => [
+        { type: 'user', uuid: `user-${index}`, sessionId: row.nativeSessionId,
+          message: { role: 'user', content: 'recall the marker' } },
+        { type: 'assistant', uuid: `assistant-${index}`, parentUuid: `user-${index}`, sessionId: row.nativeSessionId,
+          timestamp: `2026-09-01T00:00:0${index + 1}.000Z`, message: {
+            id: `message-${index}`, role: 'assistant', model: observed.model ?? 'claude-haiku-4-5-20251001',
+            stop_reason: 'end_turn', content: [{ type: 'text', text: `${nonce} ${index}` }],
+            ...(observed.effort === undefined ? {} : { effort: observed.effort }),
+          } },
+      ]))
+    } else {
+      const directory = path.join(root, 'project', 'sessions', row.nativeSessionId)
+      const at = (index: number, offset: number) => new Date(Date.parse('2026-09-01T00:00:00.000Z') + index * 1000 + offset).toISOString()
+      const event = (index: number, offset: number, name: string, data: unknown) => ({
+        event: name, ts: at(index, offset), session_id: row.nativeSessionId,
+        schema: { name: 'amplifier.log', ver: '1.0.0' }, data,
+      })
+      writeJsonl(path.join(directory, 'events.jsonl'), stages.flatMap((_stage, index) => {
+        const prompt = `recall the marker ${index}`, response = `${nonce} ${index}`
+        return [
+          event(index, 0, 'prompt:submit', { prompt }),
+          event(index, 100, 'llm:response', { model: observed.model ?? 'glm-5.3', provider: observed.provider ?? 'vllm',
+            continuation_count: null, parent_id: null,
+            ...(observed.effort === undefined ? {} : { reasoning_effort: observed.effort }) }),
+          event(index, 200, 'prompt:complete', { response_preview: response, length: response.length, parent_id: null }),
+          event(index, 300, 'prompt:complete', { prompt, response }),
+          event(index, 400, 'cleanup:store_end', {}),
+        ]
+      }))
+      writeJsonl(path.join(directory, 'transcript.jsonl'), stages.flatMap((_stage, index) => [
+        { role: 'user', content: `recall the marker ${index}`, metadata: { timestamp: at(index, 0) } },
+        { role: 'assistant', content: `${nonce} ${index}`, metadata: { timestamp: at(index, 300) } },
+      ]))
+    }
+    const history = provider === 'claude'
+      ? readClaudeNativeHistory(root, row.nativeSessionId)
+      : readAmplifierNativeHistory(root, row.nativeSessionId)
+    row.nativeTurnProofs = history.turns.map((turn, index) => nativeTurnProof(stages[index]!, row.nativeSessionId, turn, nonce))
+    return row
+  }
+
+  it.each(['claude', 'amplifier'] as const)(
+    'accepts actual %s native model evidence with unsupported optional effort telemetry', provider => {
+      const row = observedProviderRow(provider)
+      row.profileVerified = row.nativeTurnProofs.every(proof => providerNativeProfileMatches(row, proof))
+      expect(row.profileVerified).toBe(true)
+      const fixture = evidenceFixture([row])
+      const [validated] = validateProviderQualificationReceipt({
+        repoRoot: fixture.repoRoot, candidateSha, expectedRuntimeImage: runtimeImage, receipt: fixture.receipt,
+      }).providers
+      expect(validated.model).toBe(row.model)
+      expect(validated.reasoningEffort).toBe(row.reasoningEffort)
+      expect(validated.nativeTurnProofs).toEqual(row.nativeTurnProofs)
+      expect(validated.nativeTurnProofs[0]).toMatchObject({
+        resolvedProvider: provider === 'amplifier' ? 'vllm' : 'anthropic',
+        resolvedReasoningEffort: 'unknown', reasoningEffortProvenance: 'unsupported-native-telemetry',
+      })
+    },
+  )
+
+  it('accepts actual Amplifier vllm response provenance separately from the configured profile', () => {
+    const row = observedProviderRow('amplifier')
+    expect(row.nativeTurnProofs.every(proof => providerNativeProfileMatches(row, proof))).toBe(true)
+    expect(() => evidenceFixture([row])).not.toThrow()
+    expect(row.nativeTurnProofs[0]).toMatchObject({
+      resolvedProvider: 'vllm', resolvedModel: 'glm-5.3', providerProvenance: 'amplifier-llm:response.provider',
+      modelProvenance: 'amplifier-llm:response.model',
+    })
+  })
+
+  it.each(['claude', 'amplifier'] as const)('rejects a fabricated known %s effort with unsupported provenance', provider => {
+    const row = observedProviderRow(provider)
+    row.nativeTurnProofs = row.nativeTurnProofs.map(proof => ({
+      ...proof, resolvedReasoningEffort: row.reasoningEffort,
+    }))
+    expect(row.nativeTurnProofs.every(proof => providerNativeProfileMatches(row, proof))).toBe(false)
+    expect(() => evidenceFixture([row])).toThrow(/effort|telemetry|provenance/i)
+  })
+
+  it('rejects Amplifier configuration-only profile values masquerading as native observations', () => {
+    const row = providerRow('amplifier')
+    row.nativeTurnProofs = row.nativeTurnProofs.map(proof => ({
+      ...proof, resolvedProvider: 'lunaroute', resolvedReasoningEffort: row.reasoningEffort,
+      providerProvenance: 'amplifier-session:config.provider',
+      modelProvenance: 'amplifier-session:config.default_model',
+      reasoningEffortProvenance: 'amplifier-session:config.reasoning_effort',
+    }))
+    expect(row.nativeTurnProofs.every(proof => providerNativeProfileMatches(row, proof))).toBe(false)
+    expect(() => evidenceFixture([row])).toThrow(/configuration|native provenance|profile/i)
+  })
+
+  it.each(['claude', 'amplifier'] as const)('rejects a known mismatching %s native effort', provider => {
+    const row = observedProviderRow(provider, { effort: 'high' })
+    expect(row.nativeTurnProofs.every(proof => providerNativeProfileMatches(row, proof))).toBe(false)
+    expect(() => evidenceFixture([row])).toThrow(/reasoning effort/i)
+  })
+
+  it.each(['model', 'provider', 'provider-alias'] as const)('rejects a known mismatching Amplifier native %s', field => {
+    const row = observedProviderRow('amplifier', {
+      [field === 'model' ? 'model' : 'provider']: field === 'model' ? 'different-model'
+        : field === 'provider-alias' ? 'lunaroute' : 'different-provider' })
+    expect(row.nativeTurnProofs.every(proof => providerNativeProfileMatches(row, proof))).toBe(false)
+    expect(() => evidenceFixture([row])).toThrow(/Amplifier.*profile/i)
+  })
+
+  it('rejects unknown effort without unsupported-native-telemetry provenance', () => {
+    const row = observedProviderRow('claude')
+    row.nativeTurnProofs[0]!.reasoningEffortProvenance = 'claude-assistant-message.effort'
+    expect(row.nativeTurnProofs.every(proof => providerNativeProfileMatches(row, proof))).toBe(false)
+    expect(() => evidenceFixture([row])).toThrow(/effort|telemetry|provenance/i)
+  })
+
+  it('rejects a vllm profile whose provenance comes only from configuration', () => {
+    const row = observedProviderRow('amplifier')
+    row.nativeTurnProofs[0]!.modelProvenance = 'amplifier-session:config.default_model'
+    expect(row.nativeTurnProofs.every(proof => providerNativeProfileMatches(row, proof))).toBe(false)
+    expect(() => evidenceFixture([row])).toThrow(/provenance|Amplifier.*profile/i)
+  })
 
   it('builds a candidate/run/image-bound v2 receipt with hashed evidence artifacts', () => {
     const fixture = evidenceFixture()

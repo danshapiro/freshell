@@ -5,7 +5,7 @@ import path from 'node:path'
 import os from 'node:os'
 import { createConnection } from 'node:net'
 import { execFileSync } from 'node:child_process'
-import { DatabaseSync } from 'node:sqlite'
+import { createRequire } from 'node:module'
 import { createHash, randomUUID } from 'node:crypto'
 import { RuntimeHarness } from './runtime-sandbox.js'
 import { seedManagedOpenCodeSource } from '../../test/e2e-browser/fixtures/managed-opencode-source.js'
@@ -14,6 +14,8 @@ import { readCodexNativeHistory, readCodexNativeObservation } from '../../test/e
 import { readOpenCodeNativeHistory, readOpenCodeNativeObservation } from '../../test/e2e-browser/helpers/provider-native-history/opencode.js'
 import { deriveNativeRecoveryOriginals, type NativeOriginalReference } from './qualification-observations.js'
 import type { NativeHistory } from '../../test/e2e-browser/helpers/provider-native-history/types.js'
+
+const { DatabaseSync }: typeof import('node:sqlite') = createRequire(import.meta.url)('node:sqlite')
 
 export type NativeProvider = 'claude' | 'codex' | 'opencode' | 'amplifier'
 export type NativeMode = 'freshclaude' | 'kilroy' | 'freshcodex' | 'freshopencode'
@@ -4034,6 +4036,22 @@ print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(x.split()[1] f
   return finish(namespace, [`${scenario}-current-view.json`, `${scenario}-native-signal-original.json`, `${scenario}-namespace.json`], assertions)
 }
 
+export function observeNativeSoloBashOutcome(input: {
+  nativeRoot: string; toolUseID: string; allowed: boolean; observed: any[]; effectCount: number
+}): { nativeSessionId: string; toolUseID: string; nativeToolResultIsError: boolean; nativeResultIsError: boolean; effectCount: number; completionCount: number } {
+  const providerEvents = input.observed.filter(event => event.kind === 'provider').map(event => event.data.payload.event)
+  const results = providerEvents.filter(event => event?.type === 'freshAgent.result')
+  const toolResults = providerEvents.filter(event => event?.type === 'freshAgent.tool.result')
+    .flatMap(event => event.content ?? []).filter(part => part.tool_use_id === input.toolUseID)
+  if (results.length !== 1 || toolResults.length !== 1 || results[0].nativeSessionId !== input.nativeRoot
+    || toolResults[0].is_error !== !input.allowed || input.effectCount !== (input.allowed ? 1 : 0)) {
+    throw new Error('correlated original native outcome/effect differs from decision')
+  }
+  return { nativeSessionId: results[0].nativeSessionId, toolUseID: input.toolUseID,
+    nativeToolResultIsError: toolResults[0].is_error, nativeResultIsError: results[0].isError,
+    effectCount: input.effectCount, completionCount: results.length }
+}
+
 export async function executeManagedNativeApproval(input: {
   harness: RuntimeHarness; supervisor: any; soulId: string; workspace: string; view: any; scenario: string
   decision: string; inspect: (containerId: string, label: string, requireTranscript: boolean) => Promise<any>
@@ -4327,10 +4345,7 @@ export async function executeManagedNativeApproval(input: {
     originalToolUseId: oldPayload.toolUseID, inputDigest: oldPayload.nativeCheckpoint.inputDigest,
     oldNativeRequestId: oldPayload.nativeRequestId, currentNativeRequestId: currentPayload.nativeRequestId,
     nativeToolResultIsError: toolResult?.is_error, nativeResultIsError: result.isError, effectCount: count })
-  if (result.nativeSessionId !== view.nativeSessionId || !toolResult
-    || toolResult.is_error !== !allowed || count !== expectedEffectCount) {
-    throw new Error('correlated original native outcome/effect differs from decision')
-  }
+  observeNativeSoloBashOutcome({ nativeRoot: view.nativeSessionId, toolUseID: oldPayload.toolUseID, allowed, observed, effectCount: count })
   return [...refusalAssertions, { name: 'same-native-operation-new-current-request-after-death',
     pass: currentPayload.nativeRequestId !== oldPayload.nativeRequestId && current.decision_id === old.decision_id },
     { name: 'native-checkpoint-original-volume-continuity',
@@ -4561,7 +4576,7 @@ if(process.argv[2]==='--observe') {
 }
 `
 
-const claudeNativeInspection = String.raw`
+export const claudeNativeInspection = String.raw`
 import pathlib,os,json,hashlib,ssl,urllib.parse,urllib.request,subprocess,sys,base64
 root=sys.argv[1];required=sys.argv[2]=='true';terminal=len(sys.argv)>3 and sys.argv[3]=='terminal'
 missing_callbacks=len(sys.argv)>4 and sys.argv[4] in (['disabled-hooks','trust-refusal','unwritable-signal'] if terminal else ['disabled-hooks'])

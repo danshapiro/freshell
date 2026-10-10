@@ -15,7 +15,10 @@ import { runTask2RetainedFixture } from '../../../../scripts/testing/task002-con
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import * as retained from '../../../../scripts/testing/task002-retained-fixture.js'
 import { RestrictedDockerBroker } from '../../../../scripts/testing/runtime-test-broker.js'
-import type { NativeHistory } from '../../../../scripts/testing/provider-native-history.js'
+import { nativeTurnProof, type NativeHistory } from '../../../../scripts/testing/provider-native-history.js'
+import { providerNativeProfileMatches } from '../../../../scripts/testing/provider-qualification-receipt.js'
+import { readAmplifierNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/amplifier.js'
+import { readClaudeNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/claude.js'
 import plugin from '../../../../extensions/opencode/freshell-rebind-plugin.js'
 
 const { DatabaseSync }: typeof import('node:sqlite') = createRequire(import.meta.url)('node:sqlite')
@@ -46,6 +49,52 @@ const handle = {
   runId: 'run-owned', candidateSha: 'a'.repeat(40), soulId: 'soul-owned',
   incarnationId: 'incarnation-owned', containerId: 'b'.repeat(64),
   hostBootId: 'boot-owned', nativeSessionId: 'native-owned',
+}
+
+async function nativeOwnerHistory(provider: 'claude' | 'amplifier', nonce: string): Promise<NativeHistory> {
+  const root = path.join(fixtureRepoRoot, 'native-owner-history')
+  const sessionId = handle.nativeSessionId
+  const at = (index: number, offset: number) => new Date(Date.parse('2026-09-01T00:00:00.000Z') + index * 1000 + offset).toISOString()
+  const writeJsonl = async (filename: string, rows: unknown[]) => {
+    await fsp.mkdir(path.dirname(filename), { recursive: true })
+    await fsp.writeFile(filename, rows.map(row => JSON.stringify(row)).join('\n') + '\n')
+  }
+  if (provider === 'claude') {
+    await writeJsonl(path.join(root, `${sessionId}.jsonl`), [0, 1, 2].flatMap(index => [
+      { type: 'user', uuid: `user-${index}`, sessionId, message: { role: 'user', content: 'recall the marker' } },
+      { type: 'attachment', uuid: `context-${index}`, parentUuid: `user-${index}`, sessionId },
+      { type: 'assistant', uuid: `thinking-${index}`, parentUuid: `context-${index}`, sessionId,
+        requestId: `request-${index}`, apiBlockIndex: 0, timestamp: at(index, 200), message: {
+          id: `message-${index}`, role: 'assistant', model: 'claude-haiku-4-5-20251001', stop_reason: 'end_turn',
+          content: [{ type: 'thinking', thinking: 'private synthetic reasoning', signature: 'signature' }],
+        } },
+      { type: 'assistant', uuid: `text-${index}`, parentUuid: `thinking-${index}`, sessionId,
+        requestId: `request-${index}`, apiBlockIndex: 1, timestamp: at(index, 300), message: {
+          id: `message-${index}`, role: 'assistant', model: 'claude-haiku-4-5-20251001', stop_reason: 'end_turn',
+          content: [{ type: 'text', text: `private native answer ${nonce} ${index}` }],
+        } },
+    ]))
+    return readClaudeNativeHistory(root, sessionId)
+  }
+  const directory = path.join(root, 'project', 'sessions', sessionId)
+  const event = (index: number, offset: number, name: string, data: unknown) => ({
+    event: name, ts: at(index, offset), session_id: sessionId, schema: { name: 'amplifier.log', ver: '1.0.0' }, data,
+  })
+  await writeJsonl(path.join(directory, 'events.jsonl'), [0, 1, 2].flatMap(index => {
+    const prompt = `recall the marker ${index}`, response = `private native answer ${nonce} ${index}`
+    return [
+      event(index, 0, 'prompt:submit', { prompt }),
+      event(index, 100, 'llm:response', { provider: 'vllm', model: 'glm-5.3', continuation_count: null, parent_id: null }),
+      event(index, 200, 'prompt:complete', { response_preview: response, length: response.length, parent_id: null }),
+      event(index, 300, 'prompt:complete', { prompt, response }),
+      event(index, 400, 'cleanup:store_end', {}),
+    ]
+  }))
+  await writeJsonl(path.join(directory, 'transcript.jsonl'), [0, 1, 2].flatMap(index => [
+    { role: 'user', content: `recall the marker ${index}`, metadata: { timestamp: at(index, 0) } },
+    { role: 'assistant', content: `private native answer ${nonce} ${index}`, metadata: { timestamp: at(index, 300) } },
+  ]))
+  return readAmplifierNativeHistory(root, sessionId)
 }
 
 describe('Task7 standalone owner cancellation', () => {
@@ -4197,7 +4246,55 @@ describe('run-scoped owner operation settlement', () => {
 })
 
 describe('current handle admission before owner mutation', () => {
-  it('reads unchanged stopped history through the tracked helper and returns only the original three proofs', async () => {
+  it.each([
+    { provider: 'claude', field: 'components', fault: 'not-array' },
+    { provider: 'claude', field: 'components', fault: 'empty' },
+    { provider: 'claude', field: 'components', fault: 'missing-id' },
+    { provider: 'claude', field: 'components', fault: 'parent-type' },
+    { provider: 'claude', field: 'components', fault: 'negative-position' },
+    { provider: 'claude', field: 'components', fault: 'fractional-byte' },
+    { provider: 'claude', field: 'components', fault: 'digest' },
+    { provider: 'claude', field: 'components', fault: 'unknown-key' },
+    { provider: 'claude', field: 'parentChain', fault: 'not-array' },
+    { provider: 'claude', field: 'parentChain', fault: 'digest' },
+    { provider: 'amplifier', field: 'responseEventSha256s', fault: 'not-array' },
+    { provider: 'amplifier', field: 'responseEventSha256s', fault: 'empty' },
+    { provider: 'amplifier', field: 'responseEventSha256s', fault: 'digest' },
+    { provider: 'amplifier', field: 'responseEventSha256s', fault: 'element-type' },
+  ] as const)('refuses malformed retained $provider $field evidence ($fault)', async ({ provider, field, fault }) => {
+    const nonce = `codename-${'e'.repeat(32)}`
+    const history = await nativeOwnerHistory(provider, nonce)
+    const proof = nativeTurnProof('initial', handle.nativeSessionId, history.turns[0]!, nonce)
+    expect(owner.RuntimeProviderNativeTurnProofsSchema.parse([proof])).toEqual([proof])
+    const changed: any = JSON.parse(JSON.stringify(proof))
+    const evidence = changed.nativeEvidence
+    if (fault === 'not-array') evidence[field] = 'not-an-array'
+    if (fault === 'empty') evidence[field] = []
+    if (fault === 'element-type') evidence[field][0] = 123
+    if (field === 'responseEventSha256s') {
+      if (fault === 'digest') evidence[field][0] = 'not-a-digest'
+    } else {
+      if (fault === 'missing-id') delete evidence[field][0].messageId
+      if (fault === 'parent-type') evidence[field][0].parentMessageId = 123
+      if (fault === 'negative-position') evidence[field][0].recordIndex = -1
+      if (fault === 'fractional-byte') evidence[field][0].byteStart = 0.5
+      if (fault === 'digest') evidence[field][0].recordSha256 = 'not-a-digest'
+      if (fault === 'unknown-key') evidence[field][0].unexpected = true
+    }
+    expect(() => owner.RuntimeProviderNativeTurnProofsSchema.parse([changed])).toThrow()
+  })
+
+  it.each(['claude', 'amplifier'] as const)('keeps the outer %s native evidence shape strict', async provider => {
+    const nonce = `codename-${'e'.repeat(32)}`
+    const history = await nativeOwnerHistory(provider, nonce)
+    const proof = nativeTurnProof('initial', handle.nativeSessionId, history.turns[0]!, nonce)
+    expect(owner.RuntimeProviderNativeTurnProofsSchema.parse([proof])).toEqual([proof])
+    expect(() => owner.RuntimeProviderNativeTurnProofsSchema.parse([
+      { ...proof, nativeEvidence: { ...proof.nativeEvidence, unexpected: true } },
+    ])).toThrow()
+  })
+
+  it.each(['codex', 'opencode', 'claude', 'amplifier'] as const)('reads unchanged stopped history for %s through the tracked helper and returns only the original three proofs', async provider => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-stopped-proofs-'))
     const nonce = `codename-${'e'.repeat(32)}`
     const historyFile = path.join(root, 'history.json')
@@ -4206,28 +4303,39 @@ describe('current handle admission before owner mutation', () => {
     const docker = path.join(root, 'docker')
     await fsp.writeFile(docker, `#!${process.execPath}\nconst fs=require('node:fs');const a=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(callsFile)},JSON.stringify({args:a,host:process.env.DOCKER_HOST,api:process.env.DOCKER_API_VERSION})+'\\n');if(a[0]==='create')process.stdout.write('${helperId}');else if(a[0]==='wait')process.stdout.write('0');else if(a[0]==='logs')process.stdout.write(fs.readFileSync(${JSON.stringify(historyFile)},'utf8'));else if(!['start','rm'].includes(a[0]))process.exit(10);\n`, { mode: 0o700 })
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused stopped-proof web') }, fixtureRepoRoot, 5,
-      {}, {}, 'release', { enabledProviders: ['codex'], freshAgentModes: [] })
+      {}, {}, 'release', { enabledProviders: [provider], freshAgentModes: [] })
     const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
-    const row = { ...current, provider: 'codex', launchState: 'stopped', desiredState: 'stopped', cleanupState: 'verified_empty', intentRevision: 1 }
+    const row = { ...current, provider, launchState: 'stopped', desiredState: 'stopped', cleanupState: 'verified_empty', intentRevision: 1 }
     const inventory = vi.spyOn(rig, 'inventory').mockResolvedValue([row])
     Object.defineProperty(rig.runtime, 'broker', { value: { proxySocketPath: path.join(root, 'broker.sock'),
       receiptIds: () => new Set([current.containerId, helperId]), receipts: () => [{ ...current,
         providerVolumeName: 'freshell-provider-aaaaaaaaaaaaaaaaaaaaaaaa', workspacePath: rig.repoRoot, imageRef: rig.runtime.imageRef }] } })
     vi.spyOn(rig, 'ownedContainerState').mockResolvedValue({ present: false, running: false })
-    const claim = vi.spyOn(rig, 'writerClaimFacts').mockResolvedValue({ provider: 'codex', providerStoreId: 'owned-store',
+    const claim = vi.spyOn(rig, 'writerClaimFacts').mockResolvedValue({ provider, providerStoreId: 'owned-store',
       nativeSessionId: current.nativeSessionId, soulId: current.soulId, incarnationId: current.incarnationId,
       activeClaimCount: 0, globalConflictingClaimCount: 0 })
     vi.spyOn(rig.runtime, 'recordLifecycle').mockImplementation(() => undefined)
-    const history: NativeHistory = { schemaVersion: 1, provider: 'codex', nativeSessionId: current.nativeSessionId,
+    const history: NativeHistory = provider === 'codex' || provider === 'opencode' ? { schemaVersion: 1, provider, nativeSessionId: current.nativeSessionId,
       turns: [1, 2, 3].map(index => ({ nativeEvidence: { kind: 'identified_message', turnId: `turn-${index}`, messageId: `message-${index}`, parentMessageId: null },
         text: `private native answer ${nonce} ${index}`, completedAt: index, toolCalls: [], resolvedProvider: 'openai', resolvedModel: 'gpt-5.6-luna',
-        resolvedReasoningEffort: 'low', providerProvenance: 'native-fixture', modelProvenance: 'native-fixture', reasoningEffortProvenance: 'native-fixture' })) }
+        resolvedReasoningEffort: provider === 'opencode' ? 'provider-default' : 'low',
+        providerProvenance: 'native-fixture', modelProvenance: 'native-fixture', reasoningEffortProvenance: 'native-fixture' })) }
+      : await nativeOwnerHistory(provider, nonce)
     await fsp.writeFile(historyFile, JSON.stringify(history))
     vi.stubEnv('PATH', `${root}${path.delimiter}${process.env.PATH}`)
     try {
       const proofs = await rig.managedTerminalStoppedProofs(current, nonce)
       expect(proofs.map(proof => proof.stage)).toEqual(['initial', 'after_session_host_crash', 'after_provider_process_crash'])
       expect(proofs.map(proof => proof.nativeEvidence)).toEqual(history.turns.map(turn => turn.nativeEvidence))
+      const transported = owner.RuntimeProviderNativeTurnProofsSchema.parse(JSON.parse(JSON.stringify(proofs)))
+      expect(transported).toEqual(proofs)
+      const profile = { provider, model: provider === 'codex' ? 'gpt-5.6-luna' : provider === 'opencode' ? 'openai/gpt-5.6-luna'
+        : provider === 'claude' ? 'haiku' : 'glm-5.3',
+        reasoningEffort: provider === 'amplifier' || provider === 'opencode' ? 'provider-default' : 'low' }
+      expect(transported.every(proof => providerNativeProfileMatches(profile, proof))).toBe(true)
+      const stages = ['initial', 'after_session_host_crash', 'after_provider_process_crash'] as const
+      expect(transported).toEqual(history.turns.map((turn, index) => nativeTurnProof(
+        stages[index]!, current.nativeSessionId, turn, nonce)))
       expect(JSON.stringify(proofs)).not.toContain('private native answer')
       expect(JSON.stringify(proofs)).not.toContain(nonce)
       const calls = (await fsp.readFile(callsFile, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
@@ -4240,7 +4348,7 @@ describe('current handle admission before owner mutation', () => {
       await expect(rig.managedTerminalStoppedProofs(current, nonce)).rejects.toThrow(/exactly three/)
       expect(JSON.parse((await fsp.readFile(callsFile, 'utf8')).trim().split('\n').at(-1) ?? '{}').args[0]).toBe('rm')
       const before = await fsp.readFile(callsFile, 'utf8')
-      claim.mockResolvedValue({ provider: 'codex', providerStoreId: 'owned-store', nativeSessionId: current.nativeSessionId,
+      claim.mockResolvedValue({ provider, providerStoreId: 'owned-store', nativeSessionId: current.nativeSessionId,
         soulId: current.soulId, incarnationId: current.incarnationId, activeClaimCount: 1, globalConflictingClaimCount: 0 })
       await expect(rig.managedTerminalStoppedProofs(current, nonce)).rejects.toThrow(/writer/)
       expect(await fsp.readFile(callsFile, 'utf8')).toBe(before)
@@ -4499,6 +4607,183 @@ describe('actual owned runtime cleanup observations', () => {
 })
 
 describe('finite retained fresh native collection', () => {
+  it.each(['rest-tab', 'rest-split', 'mcp-new-tab', 'mcp-split'] as const)('refuses a successful wrong-root %s alias activation', async ingress => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', { enabledProviders: [], freshAgentModes: ['freshclaude'] })
+    const id = randomUUID(), address = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
+    ;(rig as any).freshNativeCollections.set(id, { collectionId: id, soulId: address.soulId, provider: 'claude', mode: 'freshclaude', nativeSessionId: address.nativeSessionId, providerStoreId: 'main-store' })
+    vi.spyOn(rig as any, 'assertCurrentHandle').mockResolvedValue(undefined)
+    vi.spyOn(rig as any, 'currentRuntimeEnclosure').mockResolvedValue({ ...address, soulId: 'unrelated-soul', nativeSessionId: 'unrelated-root', freshAgentSessionId: 'unrelated-session', freshAgentSessionType: 'freshclaude' })
+    vi.spyOn(rig, 'writerClaimFacts').mockResolvedValue({ ...address, soulId: 'unrelated-soul', nativeSessionId: 'unrelated-root', providerStoreId: 'unrelated-store', activeClaimCount: 1, globalConflictingClaimCount: 0 } as any)
+    await expect(rig.observeFreshBrowserIngress(address, id, { ingress,
+      request: { method: 'POST', path: ingress.endsWith('split') ? '/api/panes/pane/split' : '/api/tabs', body: { sessionRef: { provider: 'claude', sessionId: address.nativeSessionId } } },
+      reply: { paneId: 'pane', sessionId: 'unrelated-session' } })).rejects.toThrow(/alias/)
+    expect((rig as any).freshBrowserCollections.get(id).routes).toHaveLength(0)
+  })
+  it('retains an empty raw UI boundary without asking the completed-turn decoder to read it', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', { enabledProviders: [], freshAgentModes: ['freshclaude'] })
+    const id = randomUUID(), current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
+    ;(rig as any).freshNativeCollections.set(id, { collectionId: id, soulId: 'main-soul', mode: 'freshclaude', provider: 'claude', providerStoreId: 'main-store' })
+    vi.spyOn(rig as any, 'assertCurrentHandle').mockResolvedValue(undefined)
+    vi.spyOn(rig as any, 'freshBrowserAllocation').mockResolvedValue({ view: { freshAgentSessionType: 'freshclaude' }, writer: { providerStoreId: 'independent-store' } })
+    vi.spyOn(rig, 'currentRuntimeEnclosure').mockResolvedValue({ freshAgentSessionId: 'actual-public-session' } as any)
+    vi.spyOn(rig as any, 'captureFreshNativeSource').mockResolvedValueOnce({ turns: [] }).mockResolvedValueOnce({ turns: [{ toolCalls: [] }] })
+    const materialize = vi.spyOn(rig as any, 'materializeNativeSource').mockImplementation(async (name: string) => ({ path: name, sha256: 'a'.repeat(64) }))
+    const challenge = await rig.registerFreshBrowserTurn(current, id)
+    const request = { type: 'freshAgent.send', sessionId: 'actual-public-session', requestId: 'actual-request', text: challenge.prompt }
+    await rig.finishFreshBrowserTurn(current, challenge.challengeId, request, { ...request, type: 'freshAgent.send.accepted' })
+    const ui = (rig as any).freshBrowserCollections.get(id).ui
+    expect(materialize).toHaveBeenCalledTimes(2)
+    expect(ui.beforeTurns).toBe(0)
+    expect(ui.boundary).toBeUndefined()
+    expect(ui.after.path).toContain('/completed')
+  })
+  it('makes selected fresh families available in the actual picker from the owned scratch configuration', async () => {
+    const home = path.join(fixtureRepoRoot, 'owned-browser-home')
+    let options!: owner.RuntimeWebConstructOptions
+    const info = { baseUrl: 'http://127.0.0.1:1', wsUrl: 'ws://127.0.0.1:1/ws', token: 'controlled-unused-token', homeDir: home }
+    const rig = new owner.ManagedRuntimeOwner(value => { options = value; return { info,
+      start: async () => { await value.setupHome?.(home); return info }, stop: async () => {} } as any }, fixtureRepoRoot, 5, {}, {}, 'release',
+      { enabledProviders: [], freshAgentModes: ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'] })
+    vi.spyOn(rig.runtime, 'prepare').mockResolvedValue(undefined)
+    vi.spyOn(rig as any, 'buildQualificationSupervisor').mockReturnValue(undefined)
+    vi.spyOn(rig as any, 'buildManagedServer').mockReturnValue('/controlled/unused-server')
+    vi.spyOn(rig.runtime, 'recordProviderQualificationBuild').mockImplementation(() => undefined)
+    vi.spyOn(rig.runtime, 'recordFreshAgentQualificationBuild').mockImplementation(() => undefined)
+    vi.spyOn(rig.runtime, 'startSupervisor').mockResolvedValue({ containerId: 'f'.repeat(64), controlSocket: '/controlled/socket', controlSecretFile: '/controlled/secret' } as any)
+    const React = await import('react'), { Provider } = await import('react-redux'), { configureStore } = await import('@reduxjs/toolkit')
+    const { render } = await import('@testing-library/react/pure'), { default: PanePicker } = await import('../../../../src/components/panes/PanePicker.js')
+    try {
+      await rig.start()
+      const configuration = JSON.parse(await fsp.readFile(path.join(home, '.freshell/config.json'), 'utf8'))
+      const state = { settings: { settings: configuration.settings }, connection: { platform: 'linux', availableClis: { claude: true, codex: true, opencode: true }, featureFlags: { kilroy: options.env.KILROY_ENABLED === '1' } },
+        extensions: { entries: [] }, panes: { activePane: { tab: 'pane' } }, tabs: { activeTabId: 'tab' } }
+      const renderPicker = () => {
+        const store = configureStore({ reducer: () => state })
+        const rendered = render(React.createElement(Provider, { store, children: React.createElement(PanePicker, { tabId: 'tab', paneId: 'pane', isOnlyPane: true, focusEligible: false, onSelect: () => {} }) }))
+        try { return Array.from(rendered.container.querySelectorAll('button')).map(button => button.getAttribute('aria-label')) }
+        finally { rendered.unmount() }
+      }
+      expect(renderPicker()).toEqual(expect.arrayContaining(['Freshclaude', 'Kilroy', 'Freshcodex', 'Freshopencode']))
+      // This is a picker behavior test: removing the fresh family support
+      // changes the rendered choices, while terminal qualification stays empty.
+      configuration.settings.codingCli.enabledProviders = []
+      expect(renderPicker()).not.toContain('Freshclaude')
+      expect(rig.fixtureRegistrationFacts().enabledProviders).toEqual([])
+    } finally { await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
+  })
+  it('drains native event pages without skipping the checkpoint beyond the first page', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', { enabledProviders: [], freshAgentModes: ['freshclaude'] })
+    let calls = 0
+    const permission = { kind: 'permission_requested', data: { payload: { nativeCheckpoint: { toolUseID: 'toolu_actual' } } } }
+    vi.spyOn(rig.runtime, 'adminOk').mockImplementation(async (_supervisor, body) => {
+      calls++
+      expect(body.params.afterSequence).toBe(calls === 1 ? 0 : 2)
+      return { data: { head: 3, reset_required: false, events: calls === 1
+        ? [1, 2].map(sequence => ({ sequence, event: { kind: 'provider', data: { payload: { event: { type: 'freshAgent.status' } } } } }))
+        : [{ sequence: 3, event: permission }] } } as any
+    })
+    const challenge = { soulId: 'owned-soul', cursor: 0, batches: [], events: [] }
+    await expect((rig as any).freshApprovalEvents(challenge, (event: any) => event.kind === 'permission_requested')).resolves.toEqual(permission)
+    expect(challenge.cursor).toBe(3)
+    expect(challenge.events).toHaveLength(3)
+  })
+  it.each([['web', true], ['web', false], ['host', true], ['host', false], ['provider', true], ['provider', false]] as const)('observes the current solo Bash callback and independent effect (%s allow=%s)', async (recovery, allowed) => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'owned-browser-approval-'))
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', { enabledProviders: [], freshAgentModes: ['freshclaude'] })
+    const address = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
+    let current = { ...address, freshAgentSessionType: 'freshclaude', freshAgentSessionId: 'actual-browser-session', launchState: 'running', recoveryState: 'live' }
+    vi.spyOn(rig, 'assertCurrentHandle').mockImplementation(async requested => { expect(requested.incarnationId).toBe(current.incarnationId) })
+    vi.spyOn(rig as any, 'currentRuntimeEnclosure').mockImplementation(async () => current)
+    vi.spyOn(rig, 'freshAgentLaunchFacts').mockResolvedValue({ provider: 'claude', version: '2.1.237', workerPid: 42 })
+    vi.spyOn(rig as any, 'retainNativeOriginal').mockResolvedValue({ path: 'private-controlled.json', sha256: 'a'.repeat(64) })
+    let native: any, card: any, pending: any[] = [], head = 0
+    const allocation = () => ({ view: structuredClone(current), writer: { soulId: address.soulId, incarnationId: current.incarnationId, nativeSessionId: address.nativeSessionId,
+      providerStoreId: 'owned-store', activeClaimCount: 1, globalConflictingClaimCount: 0 }, volume: { providerVolumeName: 'owned-volume' },
+      process: { version: '2.1.237', native: { uid: 65534, pid: native.nativePid, startTicks: current.incarnationId === address.incarnationId ? '100' : '200', executableSha256: native.executableSha256, launch: structuredClone(native.nativeLaunch) } } })
+    vi.spyOn(rig as any, 'freshBrowserAllocation').mockImplementation(async (requested: any) => {
+      const value = allocation(); (rig as any).freshNativeProcesses.set(JSON.stringify(rig.runtimeEnclosureHandle(requested)), value.process); return value
+    })
+    vi.spyOn(rig as any, 'observeLiveFreshAllocations').mockImplementation(async () => [allocation()])
+    ;(rig as any).web = { restartAbrupt: vi.fn(async () => ({ baseUrl: 'http://127.0.0.1:1' })) }
+    vi.spyOn(rig as any, 'withManagedBin').mockImplementation(async (work: any) => work())
+    vi.spyOn(rig, 'inventory').mockImplementation(async () => [current] as any)
+    vi.spyOn(rig.runtime, 'killOwnedRuntimeExact').mockImplementation(() => undefined)
+    vi.spyOn(rig.runtime, 'killOwnedRuntimePidExact').mockImplementation(() => undefined)
+    vi.spyOn(rig, 'ownedContainerState').mockResolvedValue({ present: true, running: false } as any)
+    vi.spyOn(rig as any, 'readOwnedLifecycle').mockImplementation(async () => [
+      { event: 'supervisor.recovery.old_writer_released', data: { soulId: address.soulId, incarnationId: address.incarnationId, containerId: address.containerId, providerStoreId: 'owned-store', outcome: 'verified_empty', writerState: 'released' } },
+      { event: 'supervisor.recovery.replacement_writer_prepared', data: { soulId: address.soulId, priorIncarnationId: address.incarnationId, incarnationId: current.incarnationId, providerStoreId: 'owned-store', nativeSessionId: address.nativeSessionId, writerState: 'prepared' } },
+      { event: 'supervisor.launch_running', data: { soulId: address.soulId, incarnationId: current.incarnationId, containerId: current.containerId } },
+    ])
+    vi.spyOn(rig.runtime, 'adminOk').mockImplementation(async (_supervisor, request) => {
+      expect(request.method).toBe('fresh_agent_read_events')
+      const events = pending; pending = []; head += events.length
+      return { data: { head, reset_required: false, events: events.map((event, index) => ({ sequence: head - events.length + index + 1, event })) } } as any
+    })
+    const effect = path.join(directory, 'effect.jsonl')
+    vi.spyOn(rig, 'ownedProviderExec').mockImplementation(async (_container, args) => {
+      if (args[2]?.startsWith('import pathlib,sys,json;')) return execFileSync('python3', ['-c', args[2], effect], { encoding: 'utf8' })
+      return JSON.stringify(native)
+    })
+    vi.spyOn(rig as any, 'ownedDockerProbe').mockImplementation(async (_container: string, _args: string[], providerUser: boolean) => {
+      const { profileDigest, ...checkpoint } = card.payload.nativeCheckpoint
+      const value = providerUser ? { schemaVersion: 1, checkpoint, phase: 'approval_waiting', nativeSessionId: address.nativeSessionId, toolUseID: card.payload.toolUseID,
+        inputDigest: card.payload.nativeCheckpoint.inputDigest, profileDigest: card.payload.nativeCheckpoint.profileDigest, nativeBinding: card.payload.nativeBinding }
+        : { schemaVersion: 1, decisions: { [card.decision_id]: { state: 'pending', payload: card.payload } } }
+      const bytes = Buffer.from(JSON.stringify(value))
+      return JSON.stringify({ path: _args.at(-1), readerUid: providerUser ? 65534 : 0, bytesBase64: bytes.toString('base64'), sha256: createHash('sha256').update(bytes).digest('hex') })
+    })
+    try {
+      const registered = await rig.registerFreshApproval(address, allowed, recovery)
+      const challenge = (rig as any).freshApprovalChallenges.get(registered.challengeId)
+      const toolUseID = 'toolu_actual_original'
+      card = { decision_id: 'actual-browser-decision', payload: { tool: { name: 'Bash', input: { command: challenge.command } }, toolUseID,
+        nativeCheckpoint: { nativeSessionId: address.nativeSessionId, toolUseID, inputDigest: createHash('sha256').update(JSON.stringify({ command: challenge.command })).digest('hex'), profileDigest: 'e'.repeat(64) },
+        nativeRequestId: 'original-native-callback', nativeBinding: { nativeRequestId: 'original-native-callback', queryGeneration: 1, launch: { incarnationId: address.incarnationId, launchNonce: 'original-nonce' } } } }
+      const assistant = { type: 'assistant', uuid: 'actual-assistant', version: '2.1.237', sessionId: address.nativeSessionId, message: { id: 'actual-message', content: [{ type: 'tool_use', id: toolUseID, name: 'Bash', input: { command: challenge.command } }] } }
+      const deferred = { type: 'attachment', uuid: 'actual-checkpoint', version: '2.1.237', sessionId: address.nativeSessionId, attachment: { type: 'hook_deferred_tool', hookEvent: 'PreToolUse', toolUseID, toolName: 'Bash', toolInput: { command: challenge.command } } }
+      const bytes = Buffer.from(JSON.stringify(assistant) + '\n' + JSON.stringify(deferred) + '\n')
+      Object.assign(card.payload.nativeCheckpoint, { toolName: 'Bash', assistantUuid: assistant.uuid, checkpointUuid: deferred.uuid, nativeVersion: '2.1.237', checkpointDigest: createHash('sha256').update(JSON.stringify(deferred)).digest('hex') })
+      native = { nativeRoot: address.nativeSessionId, nativePid: 42, executableSha256: 'd'.repeat(64), nativeLaunch: structuredClone(card.payload.nativeBinding.launch),
+        transcript: { identity: ['1', '2'], completeEof: true, bytesBase64: bytes.toString('base64'), sha256: createHash('sha256').update(bytes).digest('hex') } }
+      pending = [{ kind: 'permission_requested', data: card }]
+      await rig.captureFreshApprovalCheckpoint(address, registered.challengeId)
+      if (recovery === 'web') {
+        await expect(rig.captureFreshApprovalCheckpoint(address, registered.challengeId)).rejects.toThrow(/recovery/)
+        await rig.crashAndRestartWeb()
+      }
+      if (recovery !== 'web') {
+        if (recovery === 'host') await rig.crashRuntimeHost(address)
+        else await rig.crashProviderWorker(address)
+        current = { ...current, incarnationId: 'replacement-inc', containerId: 'd'.repeat(64), hostBootId: 'replacement-boot' }
+        card = structuredClone(card); card.payload.nativeRequestId = 'current-native-callback'
+        card.payload.nativeBinding = { nativeRequestId: 'current-native-callback', queryGeneration: 1, launch: { incarnationId: current.incarnationId, launchNonce: 'replacement-nonce' } }
+        native = structuredClone(native); native.nativePid = 84; native.nativeLaunch = structuredClone(card.payload.nativeBinding.launch)
+        pending = [{ kind: 'permission_requested', data: card }]
+      }
+      const currentAddress = { ...address, incarnationId: current.incarnationId, containerId: current.containerId, hostBootId: current.hostBootId }
+      const checkpoint = await rig.captureFreshApprovalCheckpoint(currentAddress, registered.challengeId)
+      expect(checkpoint.decisionId).toBe('actual-browser-decision')
+      const decision = { type: 'freshAgent.approval.respond', sessionId: current.freshAgentSessionId, requestId: checkpoint.decisionId, decision: { behavior: allowed ? 'allow' : 'deny' } }
+      await expect(rig.finishFreshApproval(currentAddress, registered.challengeId, { ...decision, requestId: 'stale-card' })).rejects.toThrow(/current browser decision/)
+      expect(fs.existsSync(effect)).toBe(false)
+      if (allowed) await fsp.writeFile(effect, 'effect\n')
+      pending = [{ kind: 'provider', data: { payload: { event: { type: 'freshAgent.permission.dispatch', ok: true, sessionId: current.freshAgentSessionId, requestId: checkpoint.decisionId, nativeRequestId: checkpoint.nativeRequestId } } } },
+        { kind: 'provider', data: { payload: { event: { type: 'freshAgent.tool.result', content: [{ tool_use_id: toolUseID, is_error: !allowed }] } } } },
+        { kind: 'provider', data: { payload: { event: { type: 'freshAgent.result', nativeSessionId: address.nativeSessionId, isError: false } } } }]
+      await rig.finishFreshApproval(currentAddress, registered.challengeId, decision)
+      expect(challenge).toMatchObject({ finished: true, effectCount: allowed ? 1 : 0, recheckedEffectCount: allowed ? 1 : 0 })
+      await expect(rig.finishFreshApproval(currentAddress, registered.challengeId, decision)).rejects.toThrow(/captured current/)
+    } finally { await fsp.rm(directory, { recursive: true, force: true }) }
+  })
+  it('refuses a browser UI challenge on the collection allocation itself', async () => {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', { enabledProviders: [], freshAgentModes: ['freshclaude'] })
+    const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
+    const id = randomUUID()
+    ;(rig as any).freshNativeCollections.set(id, { collectionId: id, soulId: current.soulId, mode: 'freshclaude', nativeSessionId: current.nativeSessionId })
+    await expect((rig as any).registerFreshBrowserTurn(current, id)).rejects.toThrow(/independent allocation/)
+    expect((rig as any).freshBrowserChallenges.size).toBe(0)
+  })
   it('still attempts owned cleanup when writing incomplete collection status fails', async () => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', { enabledProviders: [], freshAgentModes: ['freshclaude'] })
     const collections = (rig as any).freshNativeCollections as Map<string, unknown>
@@ -4654,7 +4939,8 @@ describe('finite retained fresh native collection', () => {
         if (index === 1) await rig.crashProviderWorker(exact)
         if (index < 2) { generation++; previousExited = false }
       }
-      await expect(rig.finishFreshNativeCollection({ ...rig.runtimeEnclosureHandle(current()), nativeSessionId: nativeRoot }, registered.collectionId)).resolves.toMatchObject({ completedStages: 3, closed: true })
+      await expect(rig.finishFreshNativeCollection({ ...rig.runtimeEnclosureHandle(current()), nativeSessionId: nativeRoot }, registered.collectionId)).resolves.toMatchObject({ completedStages: 3, closed: true,
+        providerStoreId: 'owned-native-store', completedNativeTurns: [1, 2, 3].map(index => ({ turnId: `turn-${index}`, assistantMessageId: `assistant-${index}`, completionKind: 'provider_native_completed' })) })
       const manifest = JSON.parse(await fsp.readFile(path.join(rig.runtime.evidenceDir, 'native-recovery-originals.json'), 'utf8'))
       const stoppedRead = JSON.parse(await fsp.readFile(path.join(rig.runtime.evidenceDir, manifest.conversations[0].stopped.path), 'utf8'))
       expect(stoppedRead).toMatchObject({ stopResult: { outcome: 'verified_empty', view: { soulId: handle.soulId, incarnationId: 'inc-3', launchState: 'stopped' } },

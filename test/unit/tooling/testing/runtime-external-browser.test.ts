@@ -80,6 +80,20 @@ afterEach(async () => {
 })
 
 describe('managed browser producers', () => {
+  it('stages the selected browser profile before releasing real create effects', () => {
+    let suppressed = true
+    const content = { kind: 'fresh-agent', sessionType: 'freshclaude', createRequestId: 'real-picker-request', model: 'opus' }
+    const state = { tabs: { activeTabId: 'tab' }, panes: { activePane: { tab: 'pane' }, layouts: { tab: { type: 'leaf', id: 'pane', content } } } }
+    const dispatched: any[] = []
+    vi.stubGlobal('window', { __FRESHELL_TEST_HARNESS__: { getState: () => state, isAllFreshAgentNetworkEffectsSuppressed: () => suppressed,
+      setSuppressAllFreshAgentNetworkEffects: (value: boolean) => { suppressed = value }, dispatch: (action: any) => { expect(suppressed).toBe(false); dispatched.push(action) } } })
+    try {
+      expect((runner as any).stageOwnedFreshBrowserProfile({ mode: 'freshclaude', model: 'haiku', effort: 'low' })).toEqual({ tabId: 'tab', paneId: 'pane', createRequestId: 'real-picker-request' })
+      expect(dispatched).toHaveLength(1)
+      expect(dispatched[0].payload.content).toMatchObject({ createRequestId: 'real-picker-request', model: 'haiku', effort: 'low', permissionMode: 'default' })
+      expect(() => (runner as any).stageOwnedFreshBrowserProfile({ mode: 'freshclaude', model: 'haiku', effort: 'low' })).toThrow(/suppressed/)
+    } finally { vi.unstubAllGlobals() }
+  })
   it('retains existing sanitized saved-history audit after an early failure without a CPU session', async () => {
     await import('../../../e2e-browser/specs/runtime-tabs-rehydrate-rust.spec.js')
     const callback = registeredManagedBrowserCases.get('managed fresh-agent: already-live attach restores stale loss through real hosted HTTP truth')
@@ -3754,7 +3768,9 @@ describe('closed external owner control', () => {
       await new Promise(resolve => setTimeout(resolve, 10))
       return { collectionId, completedStages: 1, closed: false }
     })
-    const closed = vi.spyOn(owned, 'finishFreshNativeCollection').mockResolvedValue({ collectionId, completedStages: 3, closed: true })
+    const nativeResult = { collectionId, completedStages: 3, closed: true, providerStoreId: 'observed-store',
+      completedNativeTurns: [1, 2, 3].map(index => ({ turnId: `native-turn-${index}`, assistantMessageId: `native-message-${index}`, completionKind: 'provider_native_completed' as const })) }
+    const closed = vi.spyOn(owned, 'finishFreshNativeCollection').mockResolvedValue(nativeResult)
     const control = runner.createExternalRuntimeControl(owned, context)
     let lost = false
     const requests: Record<string, any>[] = []
@@ -3774,7 +3790,7 @@ describe('closed external owner control', () => {
     await expect(control({ ...original, nativeCollectionId: '22222222-2222-4222-8222-222222222222' })).rejects.toThrow(/reused/)
     await expect(control({ ...request, action: 'fresh-native-stage', handle, nativeCollectionId: collectionId, path: '/source' })).rejects.toThrow(/operation/)
     await expect(control({ ...request, action: 'fresh-native-stage', handle })).rejects.toThrow(/collection/)
-    await expect(rig.finishFreshNativeCollection(handle, collectionId)).resolves.toMatchObject({ closed: true })
+    await expect(rig.finishFreshNativeCollection(handle, collectionId)).resolves.toEqual(nativeResult)
     expect(registered).toHaveBeenCalledExactlyOnceWith(handle, nonce)
     expect(capture).toHaveBeenCalledExactlyOnceWith(handle, collectionId)
     expect(closed).toHaveBeenCalledExactlyOnceWith(handle, collectionId)
@@ -3783,6 +3799,41 @@ describe('closed external owner control', () => {
     await expect(rig.captureFreshNativeStage(handle, collectionId)).rejects.toThrow(/refused/)
     await expect(control({ ...original, operationId: 'capture-after-finish' })).rejects.toThrow(/finished/)
     expect(captures).toBe(1)
+  })
+
+  it('runs finite browser and native approval consumers through the exact owner RPCs', async () => {
+    const { owned, context, request } = fixture()
+    const address = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'owned-soul', incarnationId: 'owned-inc',
+      containerId: 'b'.repeat(64), hostBootId: 'owned-boot', nativeSessionId: 'owned-root' }
+    const id = '11111111-1111-4111-8111-111111111111', challengeId = '22222222-2222-4222-8222-222222222222'
+    const observe = vi.spyOn(owned, 'observeFreshBrowserIngress').mockResolvedValue(undefined)
+    const uiRegister = vi.spyOn(owned, 'registerFreshBrowserTurn').mockResolvedValue({ challengeId, prompt: 'Reply ready. Do not use tools.' })
+    const uiFinish = vi.spyOn(owned, 'finishFreshBrowserTurn').mockResolvedValue(undefined)
+    const approvalRegister = vi.spyOn(owned, 'registerFreshApproval').mockResolvedValue({ challengeId, prompt: 'owned fixed solo Bash instruction' })
+    const approvalCheckpoint = vi.spyOn(owned, 'captureFreshApprovalCheckpoint').mockResolvedValue({ challengeId, decisionId: 'actual-current-card', toolUseID: 'toolu_original', nativeRequestId: 'actual-current-native-request' })
+    const approvalFinish = vi.spyOn(owned, 'finishFreshApproval').mockResolvedValue(undefined)
+    const control = runner.createExternalRuntimeControl(owned, context)
+    const transport = vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify(await control(JSON.parse(String(init.body)))), { status: 200 }))
+    const rig = new runner.ExternalManagedRuntimeRig(context, transport)
+    const ingress = { ingress: 'ws-attach' as const, request: { type: 'freshAgent.attach', sessionId: 'actual-browser-session' } }
+    await rig.observeFreshBrowserIngress(address, id, ingress)
+    await expect(rig.registerFreshBrowserTurn(address, id)).resolves.toMatchObject({ challengeId })
+    const send = { type: 'freshAgent.send', requestId: 'real-send', text: 'Reply ready. Do not use tools.' }
+    const accepted = { type: 'freshAgent.send.accepted', requestId: 'real-send' }
+    await rig.finishFreshBrowserTurn(address, challengeId, send, accepted)
+    await rig.registerFreshApproval(address, false, 'provider')
+    await rig.captureFreshApprovalCheckpoint(address, challengeId)
+    const decision = { type: 'freshAgent.approval.respond', requestId: 'actual-current-card', decision: { behavior: 'deny' } }
+    await rig.finishFreshApproval(address, challengeId, decision)
+    expect(observe).toHaveBeenCalledExactlyOnceWith(address, id, ingress)
+    expect(uiRegister).toHaveBeenCalledExactlyOnceWith(address, id)
+    expect(uiFinish).toHaveBeenCalledExactlyOnceWith(address, challengeId, send, accepted)
+    expect(approvalRegister).toHaveBeenCalledExactlyOnceWith(address, false, 'provider')
+    expect(approvalCheckpoint).toHaveBeenCalledExactlyOnceWith(address, challengeId)
+    expect(approvalFinish).toHaveBeenCalledExactlyOnceWith(address, challengeId, decision)
+    await expect(control({ ...request, action: 'fresh-approval-finish', handle: address, challengeId })).rejects.toThrow(/actual browser decision/)
+    await expect(control({ ...request, operationId: 'invalid-native-source', action: 'fresh-approval-register', handle: address, freshApprovalAllowed: false, freshApprovalRecovery: 'provider', path: '/arbitrary' })).rejects.toThrow(/operation/)
+    expect(approvalFinish).toHaveBeenCalledOnce()
   })
 
   it('returns fixed fresh-agent launch facts over a pre-native enclosure and refuses native commands', async () => {

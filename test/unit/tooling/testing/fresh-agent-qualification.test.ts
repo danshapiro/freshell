@@ -29,6 +29,79 @@ const runtimeImage = `sha256:${'b'.repeat(64)}`
 const receiptRunId = 'fresh-agent-live-001'
 const tempRoots: string[] = []
 
+describe('observed fresh browser execution', () => {
+  it('rejects inventory labels without an executed request and current activation', async () => {
+    const module = await import('../../../../scripts/testing/fresh-agent-qualification-receipt.js')
+    expect(() => (module as any).deriveFreshBrowserExecution({ mode: 'freshcodex', routes: [], allocations: [], lifecycle: [] }, {})).toThrow(/executed ingress/)
+  })
+  it.each(['approval-native-already-consumed', 'approval-swapped-recovery', 'approval-web-no-restart', 'approval-web-old-restart', 'approval-missing-aux-release', 'approval-aux-release-after-start', 'approval-wrong-exit-process', 'approval-wrong-recovery-root', 'approval-web-process-changed', 'approval-missing-before-files', 'approval-missing-current-files', 'approval-no-native-operation', 'approval-wrong-native-input', 'approval-wrong-checkpoint', 'approval-stale-actor', 'approval-wrong-dispatch-id', 'approval-wrong-native-dispatch', 'alias-wrong-rest-tab', 'alias-wrong-rest-split', 'alias-wrong-mcp-new-tab', 'alias-wrong-mcp-split', 'alias-wrong-request', 'alias-wrong-store', 'alias-stale-writer', 'missing-route', 'wrong-reply', 'two-writers', 'shared-store', 'shared-container', 'release-after-prepare', 'missing-release', 'missing-running', 'web-process-replaced', 'startup-empty', 'approval-missing-deny', 'approval-old-callback', 'approval-effect-replayed', 'approval-duplicate-dispatch', 'approval-extra-completion', 'approval-changed-native-root', 'approval-changed-native-executable'])('reopens originals and rejects %s', fault => {
+    const built = fixture()
+    const current = built.receipt.rows[0]!, reference = current.executionOriginal as { path: string; sha256: string }
+    const filename = path.join(built.evidenceDir, reference.path), original = JSON.parse(fs.readFileSync(filename, 'utf8'))
+    if (fault.startsWith('alias-wrong-') && !['alias-wrong-request', 'alias-wrong-store'].includes(fault)) {
+      const route = original.routes.find((value: any) => value.ingress === fault.slice('alias-wrong-'.length))
+      route.view = original.allocations[1].view; route.reply.sessionId = route.view.freshAgentSessionId
+    }
+    const alias = original.routes.find((value: any) => value.ingress === 'rest-tab')
+    if (fault === 'alias-wrong-request') alias.request.body.sessionRef.sessionId = original.allocations[1].view.nativeSessionId
+    if (fault === 'alias-wrong-store') alias.writer.providerStoreId = 'unrelated-store'
+    if (fault === 'alias-stale-writer') alias.writer.incarnationId = 'stale-incarnation'
+    if (fault === 'missing-route') original.routes.pop()
+    if (fault === 'wrong-reply') original.routes[0].reply.requestId = 'another-request'
+    if (fault === 'two-writers') original.allocations[0].writer.activeClaimCount = 2
+    if (fault === 'shared-store') original.allocations[1].writer.providerStoreId = original.allocations[0].writer.providerStoreId
+    if (fault === 'shared-container') original.allocations[1].view.containerId = original.allocations[0].view.containerId
+    if (fault === 'release-after-prepare') [original.lifecycle[1], original.lifecycle[2]] = [original.lifecycle[2], original.lifecycle[1]]
+    if (fault === 'missing-release') original.lifecycle = original.lifecycle.filter((event: any) => !event.event.endsWith('old_writer_released'))
+    if (fault === 'missing-running') original.lifecycle = original.lifecycle.filter((event: any) => event.event !== 'supervisor.launch_running')
+    if (fault === 'web-process-replaced') original.webRestarts[0].after.process.native.pid += 1
+    if (fault === 'startup-empty') original.supervisorRestarts[0].lifecycle[0].data.scanned = 0
+    if (fault === 'approval-missing-deny') original.approvals.pop()
+    const approval = original.approvals[2]
+    if (fault === 'approval-swapped-recovery') for (const value of original.approvals) if (value.recovery !== 'web') value.recovery = value.recovery === 'host' ? 'provider' : 'host'
+    if (fault === 'approval-web-no-restart') delete original.approvals[0].recoveryObservation
+    if (fault === 'approval-web-old-restart') original.approvals[0].recoveryObservation.requestedAt = 9
+    if (fault === 'approval-missing-aux-release') approval.recoveryObservation.lifecycle.shift()
+    if (fault === 'approval-aux-release-after-start') approval.recoveryObservation.lifecycle.reverse()
+    if (fault === 'approval-wrong-exit-process') approval.recoveryObservation.nativePid += 1
+    if (fault === 'approval-wrong-recovery-root') approval.recoveryObservation.after.view.nativeSessionId = 'unrelated-root'
+    if (fault === 'approval-web-process-changed') original.approvals[0].recoveryObservation.after.process.native.pid += 1
+    const rewriteNative = (snapshot: any, change: (rows: any[]) => any[]) => {
+      const rows = change(Buffer.from(snapshot.transcript.bytesBase64, 'base64').toString().trim().split('\n').map(line => JSON.parse(line)))
+      const bytes = Buffer.from(rows.map(row => JSON.stringify(row)).join('\n') + '\n')
+      snapshot.transcript.bytesBase64 = bytes.toString('base64'); snapshot.transcript.sha256 = createHash('sha256').update(bytes).digest('hex')
+    }
+    const rewriteFile = (file: any, change: (value: any) => void) => {
+      const value = JSON.parse(Buffer.from(file.bytesBase64, 'base64').toString()); change(value)
+      const bytes = Buffer.from(JSON.stringify(value)); file.bytesBase64 = bytes.toString('base64'); file.sha256 = createHash('sha256').update(bytes).digest('hex')
+    }
+    if (fault === 'approval-missing-before-files') delete approval.beforeFiles
+    if (fault === 'approval-missing-current-files') delete approval.currentFiles
+    if (fault === 'approval-no-native-operation') for (const snapshot of [approval.beforeNative, approval.currentNative]) rewriteNative(snapshot, () => [{ type: 'system', sessionId: approval.nativeRoot }])
+    if (fault === 'approval-native-already-consumed') for (const snapshot of [approval.beforeNative, approval.currentNative]) rewriteNative(snapshot, rows => [...rows, { type: 'user', sessionId: approval.nativeRoot, message: { content: [{ type: 'tool_result', tool_use_id: approval.beforeCard.payload.toolUseID }] } }])
+    if (fault === 'approval-wrong-native-input') for (const snapshot of [approval.beforeNative, approval.currentNative]) rewriteNative(snapshot, rows => { rows[0].message.content[0].input.command = 'unrelated operation'; return rows })
+    if (fault === 'approval-wrong-checkpoint') rewriteFile(approval.currentFiles[0], value => { value.checkpoint.toolUseID = 'toolu_other' })
+    if (fault === 'approval-stale-actor') rewriteFile(approval.currentFiles[1], value => { value.decisions[approval.currentCard.decision_id].payload.nativeBinding.nativeRequestId = 'stale-callback' })
+    if (fault === 'approval-wrong-dispatch-id') approval.events[0].data.payload.event.requestId = 'unrelated-decision'
+    if (fault === 'approval-wrong-native-dispatch') approval.events[0].data.payload.event.nativeRequestId = 'unrelated-native-callback'
+    if (fault === 'approval-old-callback') approval.currentCard.payload.nativeRequestId = approval.beforeCard.payload.nativeRequestId
+    if (fault === 'approval-effect-replayed') approval.recheckedEffectCount += 1
+    if (fault === 'approval-duplicate-dispatch') approval.events.push(approval.events[0])
+    if (fault === 'approval-extra-completion') approval.events.push(approval.events.at(-1))
+    if (fault === 'approval-changed-native-root') approval.beforeNative.nativeRoot = approval.currentNative.nativeRoot = 'another-real-root'
+    if (fault === 'approval-changed-native-executable') approval.currentNative.executableSha256 = 'f'.repeat(64)
+    fs.writeFileSync(filename, JSON.stringify(original))
+    current.executionOriginal = { path: reference.path, sha256: createHash('sha256').update(fs.readFileSync(filename)).digest('hex') }
+    const assertionsPath = path.join(built.evidenceDir, 'fresh-agent-qualification-assertions.json')
+    const assertions = JSON.parse(fs.readFileSync(assertionsPath, 'utf8')); assertions.rows = built.receipt.rows
+    fs.writeFileSync(assertionsPath, JSON.stringify(assertions))
+    built.receipt.artifacts.assertions.sha256 = createHash('sha256').update(fs.readFileSync(assertionsPath)).digest('hex')
+    expect(() => validateFreshAgentQualificationReceipt({ repoRoot: built.repoRoot, candidateSha, expectedRuntimeImage: runtimeImage, receipt: built.receipt })).toThrow()
+    expect(() => buildFreshAgentQualificationReceipt({ repoRoot: built.repoRoot, evidenceDir: built.evidenceDir, candidateSha, receiptRunId, runtimeImage, selectedModes: ['freshclaude'], rows: built.receipt.rows })).toThrow()
+  })
+
+})
+
 afterEach(() => {
   while (tempRoots.length) fs.rmSync(tempRoots.pop()!, { recursive: true, force: true })
 })
@@ -65,7 +138,7 @@ function row(mode: FreshAgentQualificationRow['mode'] = 'freshclaude'): FreshAge
       host: ['session_host_exit', 'provider_process_exit'],
     },
     pendingApproval: definition.pending
-      ? { supported: true, survivedWebRestart: true, survivedHostRecovery: true, resolvedExactlyOnce: true, decisionIdHash: 'd'.repeat(64) }
+      ? { supported: true, survivedWebRestart: true, survivedHostRecovery: true, resolvedExactlyOnce: true, decisionIdHash: createHash('sha256').update(['web', 'host', 'provider'].flatMap(recovery => [true, false].map(allowed => 'decision-' + mode + '-' + recovery + '-' + allowed)).join('\n')).digest('hex') }
       : { supported: false },
     writerProof: {
       activeWriterCount: 1,
@@ -74,8 +147,8 @@ function row(mode: FreshAgentQualificationRow['mode'] = 'freshclaude'): FreshAge
       completionCountForPrompt: 1,
     },
     isolation: {
-      providerVolumeNameHash: 'e'.repeat(64),
-      enclosureIdHash: 'f'.repeat(64),
+      providerVolumeNameHash: createHash('sha256').update('owned-volume').digest('hex'),
+      enclosureIdHash: createHash('sha256').update('container-2').digest('hex'),
       independentProviderStore: true,
       independentEnclosure: true,
     },
@@ -90,6 +163,110 @@ function row(mode: FreshAgentQualificationRow['mode'] = 'freshclaude'): FreshAge
       writerClaimReleasedBeforeResume: true,
     },
   }
+}
+
+
+function browserExecutionFixture(current: FreshAgentQualificationRow, stages: any[], evidenceDir: string, write: (name: string, value: any) => { path: string; sha256: string }, prefix: string) {
+  const read = (reference: any) => JSON.parse(fs.readFileSync(path.join(evidenceDir, reference.path), 'utf8'))
+  const stageViews = stages.map(stage => read(stage.launch).response.data.view)
+  const view = { ...stageViews.at(-1), freshAgentSessionType: current.mode, freshAgentSessionId: current.nativeSessionId }
+  const native = read(read(stages.at(-1).profile).process)
+  const allocation = { view, writer: { soulId: current.soulId, incarnationId: view.incarnationId, nativeSessionId: current.nativeSessionId,
+    providerStoreId: current.providerStoreId, activeClaimCount: 1, globalConflictingClaimCount: 0 }, volume: { providerVolumeName: 'owned-volume' }, process: native, limits: current.limits }
+  const otherRoot = 'other-' + current.nativeSessionId
+  const other = structuredClone(allocation)
+  Object.assign(other.view, { soulId: 'other-soul', incarnationId: 'other-inc', containerId: 'other-container', nativeSessionId: otherRoot, freshAgentSessionId: otherRoot,
+    nativeIdentityObservation: { ...view.nativeIdentityObservation, nativeSessionId: otherRoot, incarnationId: 'other-inc' } })
+  Object.assign(other.writer, { soulId: other.view.soulId, incarnationId: other.view.incarnationId, nativeSessionId: otherRoot, providerStoreId: 'other-store' })
+  other.volume.providerVolumeName = 'other-volume'; other.process.native.launch.incarnationId = other.view.incarnationId
+  const routes = FRESH_AGENT_INGRESS_INVENTORY.filter(({ ingress }) => !['startup-restore', 'auto-resume'].includes(ingress)).map(({ ingress }) => {
+    const target = ingress === 'browser-split' ? other.view : view
+    const requestId = 'create-' + ingress
+    if (['browser-picker', 'browser-split', 'ws-create', 'history-resume'].includes(ingress)) return { ingress, view: target,
+      request: { type: 'freshAgent.create', requestId, sessionType: current.mode, ...(ingress === 'history-resume' ? { sessionRef: { provider: current.provider, sessionId: target.nativeSessionId } } : {}) },
+      reply: { type: 'freshAgent.created', requestId, sessionId: target.freshAgentSessionId } }
+    if (ingress === 'ws-attach') return { ingress, view: target, request: { type: 'freshAgent.attach', sessionId: target.freshAgentSessionId } }
+    return { ingress, view: target, writer: structuredClone(allocation.writer), request: { method: 'POST', path: ingress.endsWith('split') ? '/api/panes/actual-pane/split' : '/api/tabs', body: { agent: current.mode, sessionRef: { provider: current.provider, sessionId: target.nativeSessionId } } },
+      reply: { paneId: 'actual-pane', sessionId: target.freshAgentSessionId } }
+  })
+  const lifecycle: any[] = [{ event: 'supervisor.runtime_observer.recovery_scheduled', data: { soulId: current.soulId } }]
+  for (const index of [1, 2]) {
+    lifecycle.push({ event: 'supervisor.recovery.old_writer_released', data: { soulId: current.soulId, incarnationId: stageViews[index - 1].incarnationId,
+      containerId: stageViews[index - 1].containerId, providerStoreId: current.providerStoreId, outcome: 'verified_empty', writerState: 'released' } },
+    { event: 'supervisor.recovery.replacement_writer_prepared', data: { soulId: current.soulId, priorIncarnationId: stageViews[index - 1].incarnationId,
+      incarnationId: stageViews[index].incarnationId, providerStoreId: current.providerStoreId, nativeSessionId: current.nativeSessionId, writerState: 'prepared' } },
+    { event: 'supervisor.launch_running', data: { soulId: current.soulId, incarnationId: stageViews[index].incarnationId, containerId: stageViews[index].containerId } })
+  }
+  const prompt = 'Reply ready. Do not use tools.'
+  let after: { path: string; sha256: string }
+  const firstFile = path.join(evidenceDir, stages[0].nativeFile.path)
+  if (current.provider === 'opencode') {
+    const target = path.join(evidenceDir, prefix, 'ui', 'opencode.db'); fs.mkdirSync(path.dirname(target), { recursive: true }); fs.copyFileSync(firstFile, target)
+    const db = new DatabaseSync(target)
+    db.prepare('UPDATE session SET id=?').run(otherRoot)
+    for (const table of ['message', 'part']) db.prepare('UPDATE ' + table + ' SET session_id=?').run(otherRoot)
+    db.prepare('UPDATE part SET data=? WHERE message_id=?').run(JSON.stringify({ type: 'text', text: prompt }), 'user-0')
+    db.close(); after = { path: path.relative(evidenceDir, target), sha256: createHash('sha256').update(fs.readFileSync(target)).digest('hex') }
+  } else {
+    const rows = fs.readFileSync(firstFile, 'utf8').trim().split('\n').map(line => JSON.parse(line.replaceAll(current.nativeSessionId || 'invalid-root', otherRoot)))
+    for (const row of rows) {
+      if (row.type === 'user' && row.message.role === 'user') row.message.content = prompt
+      if (row.type === 'event_msg' && row.payload.type === 'user_message') row.payload.message = prompt
+    }
+    after = write(prefix + '/ui/' + (current.provider === 'codex' ? 'rollout-' : '') + otherRoot + '.jsonl', rows.map(row => JSON.stringify(row)).join('\n') + '\n')
+  }
+  const ui = { provider: current.provider, nativeRoot: otherRoot, beforeTurns: 0, after,
+    request: { type: 'freshAgent.send', requestId: 'actual-ui-send', sessionId: otherRoot, text: prompt },
+    reply: { type: 'freshAgent.send.accepted', requestId: 'actual-ui-send', sessionId: otherRoot } }
+  const approvals: any[] = []
+  if (['freshclaude', 'kilroy'].includes(current.mode)) for (const recovery of ['web', 'host', 'provider']) for (const allowed of [true, false]) {
+    const decisionId = 'decision-' + current.mode + '-' + recovery + '-' + allowed, toolUseID = 'toolu_' + decisionId
+    const command = "printf 'effect\\n' >> '/owned/effect-" + decisionId + ".jsonl'"
+    const inputDigest = createHash('sha256').update(JSON.stringify({ command })).digest('hex')
+    const assistant = { type: 'assistant', uuid: 'assistant-' + decisionId, version: '2.1.237', sessionId: otherRoot, message: { id: 'message-' + decisionId, content: [{ type: 'tool_use', id: toolUseID, name: 'Bash', input: { command } }] } }
+    const deferred = { type: 'attachment', uuid: 'checkpoint-' + decisionId, version: '2.1.237', sessionId: otherRoot, attachment: { type: 'hook_deferred_tool', hookEvent: 'PreToolUse', toolUseID, toolName: 'Bash', toolInput: { command } } }
+    const bytes = Buffer.from(JSON.stringify(assistant) + '\n' + JSON.stringify(deferred) + '\n')
+    const checkpoint = { nativeSessionId: otherRoot, toolUseID, inputDigest, profileDigest: 'a'.repeat(64), toolName: 'Bash', checkpointUuid: deferred.uuid, assistantUuid: assistant.uuid, nativeVersion: '2.1.237', checkpointDigest: createHash('sha256').update(JSON.stringify(deferred)).digest('hex') }
+    const beforeNative = { nativeRoot: otherRoot, version: current.providerVersion + ' (Claude Code)', executableSha256: 'd'.repeat(64), nativeCwd: '/owned/workspace', nativePid: other.process.native.pid, transcript: { identity: ['1', '2'], completeEof: true, bytesBase64: bytes.toString('base64'), sha256: createHash('sha256').update(bytes).digest('hex') } }
+    const beforeCard = { decision_id: decisionId, payload: { tool: { name: 'Bash', input: { command } }, toolUseID, nativeCheckpoint: checkpoint,
+      nativeRequestId: 'old-' + decisionId, nativeBinding: { nativeRequestId: 'old-' + decisionId, queryGeneration: 1, launch: { incarnationId: 'other-inc', launchNonce: 'old-' + decisionId } } } }
+    const currentCard = structuredClone(beforeCard), afterView = { ...structuredClone(other.view), incarnationId: recovery === 'web' ? 'other-inc' : 'recovered-' + decisionId }
+    currentCard.payload.nativeBinding.launch.incarnationId = afterView.incarnationId
+    if (recovery !== 'web') currentCard.payload.nativeRequestId = 'new-' + decisionId
+    currentCard.payload.nativeBinding.nativeRequestId = currentCard.payload.nativeRequestId
+    const currentNative = structuredClone(beforeNative)
+    Object.assign(beforeNative, { nativeLaunch: beforeCard.payload.nativeBinding.launch })
+    Object.assign(currentNative, { nativeLaunch: currentCard.payload.nativeBinding.launch })
+    const afterAllocation = structuredClone(other)
+    afterAllocation.view = afterView
+    afterAllocation.writer.incarnationId = afterView.incarnationId
+    afterAllocation.process.native.launch.incarnationId = afterView.incarnationId
+    if (recovery !== 'web') { afterView.containerId = 'recovered-container-' + decisionId; afterView.hostBootId = 'recovered-boot-' + decisionId; afterAllocation.process.native.pid += 100; afterAllocation.process.native.startTicks = '200' }
+    currentNative.nativePid = afterAllocation.process.native.pid
+    const auxiliaryLifecycle = [{ event: 'supervisor.recovery.old_writer_released', data: { soulId: other.view.soulId, incarnationId: other.view.incarnationId, containerId: other.view.containerId, providerStoreId: other.writer.providerStoreId, outcome: 'verified_empty', writerState: 'released' } },
+      { event: 'supervisor.recovery.replacement_writer_prepared', data: { soulId: other.view.soulId, priorIncarnationId: other.view.incarnationId, incarnationId: afterView.incarnationId, providerStoreId: other.writer.providerStoreId, nativeSessionId: otherRoot, writerState: 'prepared' } },
+      { event: 'supervisor.launch_running', data: { soulId: other.view.soulId, incarnationId: afterView.incarnationId, containerId: afterView.containerId } }]
+    const recoveryObservation = { kind: recovery === 'web' ? 'web_restart' : recovery === 'host' ? 'session_host_exit' : 'provider_process_exit', requestedAt: 11, completedAt: 13, exitedAt: 12,
+      soulId: other.view.soulId, nativeSessionId: otherRoot, incarnationId: other.view.incarnationId, containerId: other.view.containerId, nativePid: other.process.native.pid, startTicks: other.process.native.startTicks,
+      observation: recovery === 'provider' ? 'exact-native-process-exited' : 'exact-owned-container-stopped', before: structuredClone(other), after: afterAllocation, lifecycle: recovery === 'web' ? [] : auxiliaryLifecycle }
+    const files = (card: any) => {
+      const { profileDigest, ...nativeCheckpoint } = card.payload.nativeCheckpoint
+      return [{ path: '/home/freshell/provider/.freshell/native-checkpoints/claude/' + otherRoot + '.json', readerUid: 65534,
+        value: { schemaVersion: 1, phase: 'approval_waiting', checkpoint: nativeCheckpoint, nativeSessionId: otherRoot, toolUseID, inputDigest, profileDigest, nativeBinding: card.payload.nativeBinding } },
+      { path: '/run/freshell-host-actor/fresh-agent-state.json', readerUid: 0, value: { schemaVersion: 1, decisions: { [card.decision_id]: { state: 'pending', payload: card.payload } } } }]
+        .map(({ value, ...file }) => { const bytes = Buffer.from(JSON.stringify(value)); return { ...file, bytesBase64: bytes.toString('base64'), sha256: createHash('sha256').update(bytes).digest('hex') } })
+    }
+    const events = [{ kind: 'provider', data: { payload: { event: { type: 'freshAgent.permission.dispatch', ok: true, sessionId: otherRoot, requestId: decisionId, nativeRequestId: currentCard.payload.nativeRequestId } } } },
+      { kind: 'provider', data: { payload: { event: { type: 'freshAgent.tool.result', content: [{ tool_use_id: toolUseID, is_error: !allowed }] } } } },
+      { kind: 'provider', data: { payload: { event: { type: 'freshAgent.result', nativeSessionId: otherRoot, isError: false } } } }]
+    approvals.push({ recovery, allowed, nativeRoot: otherRoot, command, beforeCard, currentCard, beforeView: structuredClone(other.view), beforeNative, currentNative, beforeFiles: files(beforeCard), currentFiles: files(currentCard),
+      beforeCapturedAt: 10, currentCapturedAt: 14, recoveryObservation, beforeEffectCount: 0, currentEffectCount: 0, afterView, effectCount: allowed ? 1 : 0, recheckedEffectCount: allowed ? 1 : 0, events,
+      browserDecision: { type: 'freshAgent.approval.respond', sessionId: otherRoot, requestId: decisionId, decision: { behavior: allowed ? 'allow' : 'deny' } } })
+  }
+  const execution = { mode: current.mode, routes, ui, allocations: [allocation, other], stageViews, lifecycle,
+    webRestarts: [{ before: allocation, after: structuredClone(allocation) }],
+    supervisorRestarts: [{ before: view, after: structuredClone(view), lifecycle: [{ event: 'supervisor.startup_scan.finished', data: { scanned: 2 } }] }], approvals }
+  return write(prefix + '/execution.json', execution)
 }
 
 function fixture(
@@ -195,6 +372,7 @@ function fixture(
       writer: { provider: stoppedView.provider, soulId: currentRow.soulId, incarnationId: stoppedView.incarnationId, providerStoreId: currentRow.providerStoreId, nativeSessionId, activeClaimCount: 0, globalConflictingClaimCount: 0 },
       stopCompletedAt: 1_780_000_024_000, stoppedObservedAt: 1_780_000_024_100, writerObservedAt: 1_780_000_024_200,
       readStartedAt: 1_780_000_024_300, readCompletedAt: 1_780_000_024_400, completedTurnCount: 3 })
+    currentRow.executionOriginal = browserExecutionFixture(currentRow, stages, evidenceDir, original, 'browser-' + rowIndex)
     return { mode: currentRow.mode, provider: currentRow.provider, soulId: currentRow.soulId, providerStoreId: currentRow.providerStoreId, nativeSessionId, nonce, stages, stopped }
   })
   original('native-recovery-originals.json', { schemaVersion: 1, candidateSha, runId: receiptRunId, runtimeImage, selected: rows.map(current => current.mode), conversations })
@@ -359,7 +537,7 @@ describe('fresh-agent qualification receipt v1', () => {
       candidateSha,
       expectedRuntimeImage: runtimeImage,
       receipt: built.receipt,
-    }).rows).toEqual([row()])
+    }).rows).toEqual([{ ...row(), executionOriginal: built.receipt.rows[0]!.executionOriginal }])
   })
 
   it('never accepts a deterministic fixture build as live-provider evidence', () => {
