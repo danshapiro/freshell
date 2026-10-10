@@ -53,6 +53,7 @@ import { resetManagedRuntimeRefreshForTest } from '@/lib/recovery/managed-runtim
 import { FreshAgentSnapshotSchema } from '@shared/fresh-agent-contract'
 import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { isClientPerfLoggingEnabled, setClientPerfEnabled } from '@/lib/perf-logger'
+import { getRebindQueue, resetRebindQueueForTests } from '@/lib/rebind-queue'
 
 const CLAUDE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440000'
 
@@ -647,6 +648,322 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+})
+
+describe('stopped managed history', () => {
+  const native = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
+  const summary = {
+    desiredState: 'stopped' as const, recoveryState: 'stopped' as const,
+    durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const,
+  }
+  const content: FreshAgentPaneContent = {
+    kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex', status: 'idle',
+    createRequestId: 'ordinary-stop-original-request', soulId: 'ordinary-stop-original-soul', soulIntentRevision: 12,
+    sessionRef: { provider: 'codex', sessionId: native.threadId }, recoverySummary: summary,
+  }
+  const live = { ...native, capabilities: { ...native.capabilities, send: true, undo: true, fork: true },
+    extensions: { codex: { statusFromLiveState: true, ownerKind: 'fresh-agent' } } }
+  let mountedView: ReturnType<typeof render>
+  function mount(initial: FreshAgentPaneContent, hidden = false) {
+    const store = createStore()
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: initial }))
+    mountedView = render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden={hidden} /></Provider>)
+    return store
+  }
+  function expectNoStarts() {
+    for (const type of ['freshAgent.create', 'freshAgent.attach', 'freshAgent.send', 'pane.reconcile.request']) {
+      expect(sentFreshAgentMessages(type)).toHaveLength(0)
+    }
+  }
+  afterEach(() => { cleanup(); resetRebindQueueForTests(); vi.useRealTimers() })
+
+  it.each(([
+    ['freshclaude', 'claude', savedClaudeNativeHistory],
+    ['kilroy', 'claude', { ...savedClaudeNativeHistory, sessionType: 'kilroy' }],
+    ['freshcodex', 'codex', savedCodexNativeHistory],
+    ['freshopencode', 'opencode', savedOpenCodeNativeHistory],
+  ] as const).flatMap(([sessionType, provider, history]) => (['idle', 'creating', 'starting'] as const)
+    .flatMap((status) => (['intent', 'observation', 'pending'] as const).map((stop) => ({ sessionType, provider, history, status, stop })))))
+  ('retains cold $provider/$sessionType $status history when stopped by $stop without lifecycle frames', async ({ sessionType, provider, history, status, stop }) => {
+    const saved = FreshAgentSnapshotSchema.parse(history)
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(saved)
+    const initial = { ...content, sessionType, provider, status, sessionRef: { provider, sessionId: saved.threadId },
+      recoverySummary: { ...summary, desiredState: stop === 'observation' ? 'running' as const : 'stopped' as const,
+        recoveryState: stop === 'intent' ? 'live' as const : stop === 'pending' ? 'lost' as const : 'stopped' as const } }
+    const store = mount(initial)
+    // Capture from the very first rendered mount; ordinary websocket sends are unsuppressed.
+    expectNoStarts()
+    await expectRenderedText(`Saved native ${provider === 'claude' ? 'Claude' : provider === 'codex' ? 'Codex' : 'OpenCode'} answer`)
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(sessionType, provider, saved.threadId,
+      expect.objectContaining({ soulId: content.soulId }))
+    expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
+    if (stop === 'pending') expect(screen.getByTestId('managed-runtime-recovery-card')).toBeInTheDocument()
+    else expect(screen.queryByTestId('managed-runtime-recovery-card')).not.toBeInTheDocument()
+    expect(getFreshAgentPaneContent(store)).toEqual(initial)
+    expectNoStarts()
+  })
+
+  it('reads a durable legacy resume locator without a volatile runtime or reconcile flag', async () => {
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(native)
+    const initial = { ...content, status: 'creating' as const, sessionRef: undefined, resumeSessionId: native.threadId }
+    const store = mount(initial)
+    expectNoStarts()
+    await expectRenderedText('Saved native Codex answer')
+    expect(getFreshAgentPaneContent(store)).toEqual({ ...initial, sessionRef: content.sessionRef })
+  })
+
+  it.each([
+    undefined,
+    { provider: 'claude', sessionId: CLAUDE_THREAD_ID },
+    { provider: 'codex', sessionId: 'freshcodex-placeholder' },
+    { provider: 'codex', sessionId: '' },
+  ])('does not bootstrap or read a missing, foreign or placeholder saved locator (%j)', async (sessionRef) => {
+    const initial = { ...content, status: 'starting' as const, sessionRef }
+    const store = mount(initial)
+    await act(async () => {})
+    expectNoStarts()
+    expect(apiMock.getFreshAgentThreadSnapshot).not.toHaveBeenCalled()
+    expect(getFreshAgentPaneContent(store)).toEqual({ ...initial, sessionRef: sessionRef?.sessionId ? sessionRef : undefined })
+  })
+
+  it.each(['create', 'reconnect', 'attach'] as const)('checks stopped intent inside the real queued %s callback and releases its slot', async (operation) => {
+    vi.useFakeTimers()
+    resetRebindQueueForTests()
+    const queue = getRebindQueue()
+    const holders: Array<() => void> = []
+    for (let index = 0; index < 4; index += 1) queue.enqueue({ key: `held-${index}`, run: (release) => { holders.push(release) } })
+    await act(async () => { await vi.advanceTimersByTimeAsync(100) })
+    expect(queue.inFlightCount).toBe(4)
+    const reconnects = new Set<() => void>()
+    wsMock.onReconnect.mockImplementation((callback) => { reconnects.add(callback); return () => { reconnects.delete(callback) } })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(native)
+    const running = { ...content, status: 'creating' as const,
+      ...(operation === 'attach' ? { sessionId: native.threadId } : {}),
+      recoverySummary: { ...summary, desiredState: 'running' as const, recoveryState: 'live' as const } }
+    const store = mount(running, operation !== 'reconnect')
+    const initialFrames = [...wsMock.send.mock.calls]
+    if (operation === 'reconnect') {
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
+      mountedView.rerender(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden /></Provider>)
+      act(() => reconnects.forEach((callback) => callback()))
+    }
+    expect(queue.queuedCount).toBeGreaterThan(0)
+    const stopped = { ...getFreshAgentPaneContent(store), recoverySummary: summary }
+    act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: stopped })))
+    const unrelated = vi.fn((release: () => void) => release())
+    queue.enqueue({ key: 'unrelated-pane', run: unrelated })
+    await act(async () => { holders[0](); await vi.advanceTimersByTimeAsync(300) })
+    expect(wsMock.send.mock.calls).toEqual(initialFrames)
+    expect(unrelated).toHaveBeenCalledTimes(1)
+    expect(queue.inFlightCount).toBe(3)
+    expect(queue.queuedCount).toBe(0)
+    expect(getFreshAgentPaneContent(store)).toEqual(stopped)
+    act(() => holders.slice(1).forEach((release) => release()))
+  })
+
+  it.each(['intent', 'observation'] as const)('ignores held live-looking HTTP authority after stopped %s intent, reconnect and delayed create results', async (stop) => {
+    vi.useFakeTimers()
+    const handlers = new Set<(message: any) => void>()
+    const reconnects = new Set<() => void>()
+    wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
+    wsMock.onReconnect.mockImplementation((handler) => { reconnects.add(handler); return () => { reconnects.delete(handler) } })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(live)
+    const running = { ...content, sessionId: native.threadId,
+      recoverySummary: { ...summary, desiredState: 'running' as const, recoveryState: 'live' as const } }
+    const store = mount(running)
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    expect(screen.getByText('Saved native Codex answer')).toBeInTheDocument()
+    const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+    expect(composer).not.toBeDisabled()
+    fireEvent.change(composer, { target: { value: 'Draft retained after ordinary Stop' } })
+    const held = createDeferred<unknown>()
+    const cold = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockImplementation((_type, _provider, _id, options) => options?.soulId ? cold.promise : held.promise)
+    const locator = { sessionId: native.threadId, sessionType: 'freshcodex', provider: 'codex' }
+    act(() => {
+      store.dispatch(markSessionLost(locator))
+      handlers.forEach((handler) => handler({ type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.session.changed' } }))
+    })
+    await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+    const beforeStopFrames = wsMock.send.mock.calls.length
+    const stopped = { ...getFreshAgentPaneContent(store), recoverySummary: { ...summary,
+      desiredState: stop === 'intent' ? 'stopped' as const : 'running' as const,
+      recoveryState: stop === 'intent' ? 'live' as const : 'stopped' as const } }
+    act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: stopped })))
+    await act(async () => {
+      held.resolve({ ...live, status: 'running' })
+      reconnects.forEach((callback) => callback())
+      handlers.forEach((handler) => handler({ type: 'freshAgent.created', requestId: content.createRequestId,
+        provider: 'codex', sessionType: 'freshcodex', sessionId: 'freshcodex-late-placeholder' }))
+      handlers.forEach((handler) => handler({ type: 'freshAgent.create.failed', requestId: content.createRequestId,
+        code: 'SESSION_RESERVED', retryable: true }))
+      await vi.advanceTimersByTimeAsync(2_000)
+      cold.resolve({ ...live, turns: [], status: 'idle' })
+    })
+    expect(wsMock.send.mock.calls.slice(beforeStopFrames)).toHaveLength(0)
+    expect(composer).toBeDisabled()
+    expect(composer).toHaveValue('Draft retained after ordinary Stop')
+    expect(screen.getByText('Saved native Codex answer')).toBeInTheDocument()
+    expect(getFreshAgentPaneContent(store)).toEqual(stopped)
+    expect(Object.values(store.getState().freshAgent.sessions).find((session) => session.sessionId === native.threadId)?.lost).toBe(true)
+  })
+
+  it.each(['freshAgent.created', 'freshAgent.create.failed'] as const)('releases an in-flight real queue slot on delayed %s during stopped intervention', async (type) => {
+    vi.useFakeTimers()
+    resetRebindQueueForTests()
+    const handlers = new Set<(message: any) => void>()
+    wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
+    const queue = getRebindQueue()
+    const holders: Array<() => void> = []
+    for (let index = 0; index < 4; index += 1) queue.enqueue({ key: `in-flight-holder-${index}`,
+      run: (release) => { holders.push(release) } })
+    await act(async () => { await vi.advanceTimersByTimeAsync(100) })
+    const store = mount({ ...content, status: 'creating',
+      recoverySummary: { ...summary, desiredState: 'running', recoveryState: 'live' } }, true)
+    await act(async () => { holders[0](); await vi.advanceTimersByTimeAsync(25) })
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
+    expect(queue.inFlightCount).toBe(4)
+    const stopped = { ...getFreshAgentPaneContent(store), recoverySummary: { ...summary, recoveryState: 'lost' as const } }
+    act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: stopped })))
+    const unrelated = vi.fn((release: () => void) => release())
+    queue.enqueue({ key: 'after-stopped-create', run: unrelated })
+    await act(async () => {
+      handlers.forEach((handler) => handler({ type, requestId: content.createRequestId,
+        sessionId: 'freshcodex-late-placeholder', sessionType: 'freshcodex', provider: 'codex',
+        code: 'SESSION_RESERVED', retryable: true }))
+      await vi.advanceTimersByTimeAsync(100)
+    })
+    expect(unrelated).toHaveBeenCalledTimes(1)
+    expect(queue.inFlightCount).toBe(3)
+    expect(getFreshAgentPaneContent(store)).toEqual(stopped)
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
+    expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
+    act(() => holders.slice(1).forEach((release) => release()))
+  })
+
+  it('ignores a delayed provider materialization after stopped intent without replacing canonical history', async () => {
+    const handlers = new Set<(message: any) => void>()
+    wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(live)
+    const initial = { ...content, sessionId: native.threadId, resumeSessionId: native.threadId }
+    const store = mount(initial)
+    await expectRenderedText('Saved native Codex answer')
+    expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
+    act(() => handlers.forEach((handler) => handler({ type: 'freshAgent.session.materialized',
+      previousSessionId: native.threadId, sessionId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      sessionType: 'freshcodex', provider: 'codex', sessionRef: { provider: 'codex', sessionId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' } })))
+    await act(async () => {})
+    expect(getFreshAgentPaneContent(store)).toEqual(initial)
+    expect(screen.getByText('Saved native Codex answer')).toBeInTheDocument()
+    expectNoStarts()
+  })
+
+  it('holds queued user text after Stop even when stale live status becomes idle', async () => {
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(live)
+    const running = { ...content, sessionId: native.threadId,
+      recoverySummary: { ...summary, desiredState: 'running' as const, recoveryState: 'live' as const } }
+    const store = mount(running)
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled())
+    const locator = { sessionId: native.threadId, sessionType: 'freshcodex', provider: 'codex' }
+    act(() => store.dispatch(setSessionStatus({ ...locator, status: 'running' })))
+    const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+    fireEvent.change(composer, { target: { value: 'Follow-up retained across ordinary Stop' } })
+    fireEvent.keyDown(composer, { key: 'Enter', code: 'Enter' })
+    expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+    expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+    act(() => {
+      store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: {
+        ...getFreshAgentPaneContent(store), recoverySummary: { ...summary, recoveryState: 'live' },
+      } }))
+      store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))
+    })
+    await act(async () => {})
+    expect(composer).toBeDisabled()
+    expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+    expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+    expect(getFreshAgentPaneContent(store)).toMatchObject({ createRequestId: content.createRequestId,
+      sessionRef: content.sessionRef, soulId: content.soulId, soulIntentRevision: content.soulIntentRevision })
+  })
+
+  it.each(['empty', 'unavailable'] as const)('keeps stopped saved identity and loaded turns after a history %s', async (outcome) => {
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(live)
+    const store = mount(content)
+    await expectRenderedText('Saved native Codex answer')
+    apiMock.getFreshAgentThreadSnapshot.mockImplementation(() => outcome === 'empty'
+      ? Promise.resolve({ ...live, turns: [], revision: 100 }) : Promise.reject(new Error('Saved history unavailable')))
+    const next = { ...content, soulIntentRevision: 13 }
+    act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: next })))
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+    await act(async () => {})
+    expect(screen.getByText('Saved native Codex answer')).toBeInTheDocument()
+    expect(getFreshAgentPaneContent(store)).toEqual(next)
+    expectNoStarts()
+  })
+
+  it('blocks a previously scheduled reservation redrive and manual refresh after ordinary Stop', async () => {
+    vi.useFakeTimers()
+    const handlers = new Set<(message: any) => void>()
+    wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
+    const store = mount({ ...content, status: 'creating', recoverySummary: { ...summary, desiredState: 'running', recoveryState: 'live' } })
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
+    const originalFrame = sentFreshAgentMessages('freshAgent.create')[0]
+    act(() => handlers.forEach((handler) => handler({ type: 'freshAgent.create.failed', requestId: content.createRequestId,
+      code: 'SESSION_RESERVED', retryable: true })))
+    const stopped = { ...getFreshAgentPaneContent(store), recoverySummary: summary }
+    act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: stopped })))
+    act(() => store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
+    expect(sentFreshAgentMessages('freshAgent.create')).toEqual([originalFrame])
+    expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
+    expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+    expect(getFreshAgentPaneContent(store)).toEqual(stopped)
+  })
+
+  it('preserves unmanaged creation and running managed attachment with current provider evidence', async () => {
+    const unmanaged = { ...content, status: 'creating' as const, sessionRef: undefined, soulId: undefined,
+      recoverySummary: undefined, soulIntentRevision: undefined }
+    mount(unmanaged)
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
+    cleanup()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(live)
+    const running = { ...content, sessionId: native.threadId,
+      recoverySummary: { ...summary, desiredState: 'running' as const, recoveryState: 'live' as const } }
+    mount(running)
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled())
+    expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1)
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
+  })
+
+  it('keeps explicit Start new conversation available after Stop while withholding Resume', async () => {
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(native)
+    apiMock.stopManagedRuntimeSoul.mockResolvedValue({ outcome: 'verified_empty',
+      soul: { soulId: content.soulId, intentRevision: 13 } })
+    const store = mount({ ...content, status: 'exited' })
+    await expectRenderedText('Saved native Codex answer')
+    expect(screen.queryByRole('button', { name: 'Resume session' })).not.toBeInTheDocument()
+    expectNoStarts()
+    fireEvent.click(screen.getByRole('button', { name: 'Start new session' }))
+    await waitFor(() => expect(apiMock.stopManagedRuntimeSoul).toHaveBeenCalledWith(content.soulId, 12))
+    await waitFor(() => expect(getFreshAgentPaneContent(store).createRequestId).not.toBe(content.createRequestId))
+    expect(getFreshAgentPaneContent(store).soulId).toBeUndefined()
+    expect(getFreshAgentPaneContent(store).sessionRef).toBeUndefined()
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
+  })
+
+  it('withdraws an already-open model mutation dialog when stopped intent arrives', async () => {
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(live)
+    const running = { ...content, sessionId: native.threadId, model: 'gpt-6-astra',
+      recoverySummary: { ...summary, desiredState: 'running' as const, recoveryState: 'live' as const } }
+    const store = mount(running)
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled())
+    fireEvent.click(screen.getByRole('button', { name: /^Model:/ }))
+    expect(await screen.findByRole('dialog', { name: 'Model and thinking level' })).toBeInTheDocument()
+    const stopped = { ...getFreshAgentPaneContent(store), recoverySummary: { ...summary, recoveryState: 'live' as const } }
+    act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: stopped })))
+    expect(screen.queryByRole('dialog', { name: 'Model and thinking level' })).not.toBeInTheDocument()
+    expect(sentFreshAgentMessages('freshAgent.configure')).toHaveLength(0)
+    expect(getFreshAgentPaneContent(store)).toEqual(stopped)
+  })
 })
 
 describe('managed bootstrap history', () => {
