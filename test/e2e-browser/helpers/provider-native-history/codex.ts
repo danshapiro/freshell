@@ -74,16 +74,8 @@ export function readCodexNativeHistory(sessionsRoot: string, exactThreadId: stri
 /** Includes native inputs for independently checking serialized request/turn association. */
 export function readCodexNativeObservation(sessionsRoot: string, exactThreadId: string): { history: NativeHistory; inputs: CodexNativeInput[] } {
   const threadId = safeOpaqueId(exactThreadId, 'Codex native thread id')
-  // Rollout basenames vary by timestamp, so inspect bounded *.jsonl candidates' line-zero session_meta.
-  const candidates = findFiles(
-    sessionsRoot,
-    (basename) => basename.endsWith('.jsonl') && basename.includes(threadId),
-  )
-  const matches = candidates.filter((candidate) => ownsThread(candidate, threadId))
-  if (matches.length === 0) throw new Error(`Codex exact thread session_meta is missing: ${threadId}`)
-  if (matches.length !== 1) throw new Error(`Codex exact thread rollout is ambiguous or duplicated: ${threadId}`)
-
-  const rows = readBoundedJsonl(matches[0], 'Codex native rollout')
+  const selectedSource = selectCodexNativeSource(sessionsRoot, threadId)
+  const rows = readBoundedJsonl(selectedSource, 'Codex native rollout')
   const meta = object(rows[0]?.payload, 'Codex session_meta payload')
   const provider = requiredString(meta.model_provider, 'Codex session_meta model provider')
   const contexts = new Map<string, TurnContext>()
@@ -158,4 +150,19 @@ export function readCodexNativeObservation(sessionsRoot: string, exactThreadId: 
     if (turns.length > MAX_NATIVE_TURNS) throw new Error('Codex native completed turns exceed the evidence bound')
   }
   return { history: { schemaVersion: NATIVE_HISTORY_SCHEMA_VERSION, provider: 'codex', nativeSessionId: threadId, turns }, inputs }
+}
+
+/** The same exact rollout selection used by the semantic reader and raw capture. */
+export function selectCodexNativeSource(sessionsRoot: string, exactThreadId: string): string {
+  const threadId = safeOpaqueId(exactThreadId, 'Codex native thread id')
+  // Rollout basenames vary by timestamp, so inspect bounded *.jsonl candidates' line-zero session_meta.
+  const candidates = findFiles(
+    sessionsRoot,
+    (basename) => basename.endsWith('.jsonl') && basename.includes(threadId),
+  )
+  const matches = candidates.filter((candidate) => ownsThread(candidate, threadId))
+  if (matches.length === 0) throw new Error(`Codex exact thread session_meta is missing: ${threadId}`)
+  if (matches.length !== 1) throw new Error(`Codex exact thread rollout is ambiguous or duplicated: ${threadId}`)
+
+  return matches[0]!
 }

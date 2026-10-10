@@ -20,7 +20,7 @@ import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, docker
   SyntheticStoppedRepairBatchFactsSchema, SyntheticStoppedRepairBatchObservationSchema,
   ManagedMigrationFactsSchema, ManagedStopResultSchema, SyntheticOpenCodeSourceFactsSchema,
   SyntheticOpenCodeHistoryFactsSchema, ManagedOpenCodeAdoptionStatusSchema, Phase3BrowserObservationSchema, Phase4BrowserObservationSchema,
-  FreshCodexSavedHistoryPreservationSchema, FreshCodexSavedHistoryMeasurementSchema, FreshCodexControllerReattachmentSchema, FreshCodexHistoryMeasurementFinishSchema, FreshCodexHistoryMeasurementStartSchema, FreshCodexSavedHistoryOwnershipFactsSchema, FreshCodexControllerStartupFactsSchema, FreshCodexRetainedSnapshotFactsSchema, FreshAgentLaunchFactsSchema, OwnedContainerStateSchema, RuntimeHostProcessStateSchema, RuntimeHandleMismatchFieldsSchema, RuntimeWebProcessFactsSchema,
+  FreshCodexSavedHistoryPreservationSchema, FreshCodexSavedHistoryMeasurementSchema, FreshCodexControllerReattachmentSchema, FreshCodexHistoryMeasurementFinishSchema, FreshCodexHistoryMeasurementStartSchema, FreshCodexSavedHistoryOwnershipFactsSchema, FreshCodexControllerStartupFactsSchema, FreshCodexRetainedSnapshotFactsSchema, FreshAgentLaunchFactsSchema, FreshNativeCollectionResultSchema, OwnedContainerStateSchema, RuntimeHostProcessStateSchema, RuntimeHandleMismatchFieldsSchema, RuntimeWebProcessFactsSchema,
   RuntimeChaosWebOutputFactsSchema, RuntimeSupervisorProcessFactsSchema, RuntimeCandidateIntegritySchema,
   InterruptedOrdinaryStopFactsSchema, InterruptedOrdinaryStopCrashFactsSchema,
   RuntimeChaosLogArtifactsSchema, RuntimeChaosEvidenceArtifactsSchema, RuntimeChaosReceiptArtifactSchema,
@@ -45,7 +45,7 @@ import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
 import type { ExactRuntimeHandle, ManagedRuntimeView, ManagedOpenCodeAdoptionStatus, FixtureNativeState, RuntimeHostFacts, RuntimeOwnerOperationRequest } from './runtime-sandbox.js'
 import type { InterruptedOrdinaryStopFacts, InterruptedOrdinaryStopCrashFacts } from './runtime-sandbox.js'
 import type { NativeChallengeKind, NativeToolEvidence, SyntheticOpenCodeChallenge, SyntheticOpenCodeSourceFacts, SyntheticOpenCodeHistoryFacts } from './runtime-sandbox.js'
-import type { FreshCodexSavedHistoryPreservation, FreshCodexSavedHistoryMeasurement, FreshCodexControllerReattachment, FreshCodexHistoryMeasurementFinish, FreshCodexHistoryMeasurementStart, FreshCodexSavedHistoryOwnershipFacts, RuntimeHostProcessState, FreshCodexControllerStartupFacts, FreshCodexRetainedSnapshotFacts, Phase4BrowserObservation, Phase3BrowserObservation, FreshAgentLaunchFacts, OwnedContainerState, RuntimeWebProcessFacts, RuntimeChaosWebOutputFacts, RuntimeSupervisorProcessFacts, RuntimeCandidateIntegrity } from './runtime-sandbox.js'
+import type { FreshCodexSavedHistoryPreservation, FreshCodexSavedHistoryMeasurement, FreshCodexControllerReattachment, FreshCodexHistoryMeasurementFinish, FreshCodexHistoryMeasurementStart, FreshCodexSavedHistoryOwnershipFacts, RuntimeHostProcessState, FreshCodexControllerStartupFacts, FreshCodexRetainedSnapshotFacts, Phase4BrowserObservation, Phase3BrowserObservation, FreshAgentLaunchFacts, FreshNativeCollectionResult, OwnedContainerState, RuntimeWebProcessFacts, RuntimeChaosWebOutputFacts, RuntimeSupervisorProcessFacts, RuntimeCandidateIntegrity } from './runtime-sandbox.js'
 import type { RuntimeChaosLogs, RuntimeChaosLogArtifacts, RuntimeChaosEvidence, RuntimeChaosEvidenceArtifacts, RuntimeChaosReceiptArtifact } from './runtime-sandbox.js'
 import type { OpencodeLossCredentialEvidence, OpencodeLossAbsenceEvidence, OpencodeLossRecovery, OpencodeLossIncidentEvidence } from './runtime-sandbox.js'
 import type { RuntimeLossAssertions, RuntimeLossAssertionsArtifact, RuntimeLossReceiptArtifact } from './runtime-sandbox.js'
@@ -734,7 +734,7 @@ export class ExternalManagedRuntimeRig {
   }
   private async rpc<T>(
     action: RuntimeOwnerOperationRequest['action'], schema: z.ZodType<T>,
-    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'phase4Browser' | 'historyMeasurementStart' | 'historyMeasurementFinish' | 'historyControllerReattachment' | 'historyMeasurement' | 'historyPreservation' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations' | 'providerObservations' | 'continuityObservation' | 'qualificationTerminalId' | 'qualificationNonce' | 'terminalQualificationNonce' | 'qualificationProofStage' | 'priorMessageIds' | 'otherChallengeId' | 'qualificationReadiness' | 'qualificationDiagnostic' | 'interruptedStopRetainedTurns' | 'fixtureId' | 'repairOperationId' | 'stoppedRepairFault'> = {},
+    params: Pick<RuntimeOwnerOperationRequest, 'handle' | 'enclosure' | 'challengeId' | 'incidentId' | 'expectedControlEpoch' | 'expectedIntentRevision' | 'generation' | 'phase3Browser' | 'phase4Browser' | 'historyMeasurementStart' | 'historyMeasurementFinish' | 'historyControllerReattachment' | 'historyMeasurement' | 'historyPreservation' | 'chaosLogs' | 'chaosEvidence' | 'lossAssertions' | 'freshAgentObservations' | 'providerObservations' | 'continuityObservation' | 'qualificationTerminalId' | 'qualificationNonce' | 'terminalQualificationNonce' | 'qualificationProofStage' | 'priorMessageIds' | 'otherChallengeId' | 'qualificationReadiness' | 'qualificationDiagnostic' | 'interruptedStopRetainedTurns' | 'fixtureId' | 'repairOperationId' | 'stoppedRepairFault' | 'nativeCollectionId' | 'nativeCollectionNonce'> = {},
   ): Promise<T> {
     const operationId = randomUUID()
     const request = {
@@ -963,6 +963,15 @@ export class ExternalManagedRuntimeRig {
   }
   async resetPhase3ApprovalEffect(enclosure: RuntimeEnclosureHandle): Promise<void> {
     await this.rpc('phase3-effect-reset', CompletedOwnerOperationSchema, { enclosure })
+  }
+  async registerFreshNativeCollection(handle: ExactRuntimeHandle, nativeCollectionNonce: string): Promise<FreshNativeCollectionResult> {
+    return this.rpc('fresh-native-register', FreshNativeCollectionResultSchema, { handle, nativeCollectionNonce })
+  }
+  async captureFreshNativeStage(handle: ExactRuntimeHandle, nativeCollectionId: string): Promise<FreshNativeCollectionResult> {
+    return this.rpc('fresh-native-stage', FreshNativeCollectionResultSchema, { handle, nativeCollectionId })
+  }
+  async finishFreshNativeCollection(handle: ExactRuntimeHandle, nativeCollectionId: string): Promise<FreshNativeCollectionResult> {
+    return this.rpc('fresh-native-finish', FreshNativeCollectionResultSchema, { handle, nativeCollectionId })
   }
   async freshAgentLaunchFacts(enclosure: RuntimeEnclosureHandle): Promise<FreshAgentLaunchFacts> {
     return this.rpc('fresh-agent-launch-facts', FreshAgentLaunchFactsSchema, { enclosure })
@@ -1499,6 +1508,18 @@ export function createExternalRuntimeControl(
         await owner.resetPhase3ApprovalEffect(request.enclosure)
         result = { completed: true }
         break
+      case 'fresh-native-register':
+        if (!request.nativeCollectionNonce) throw new Error('fresh native collection nonce required')
+        result = await owner.registerFreshNativeCollection(handle(), request.nativeCollectionNonce)
+        break
+      case 'fresh-native-stage':
+        if (!request.nativeCollectionId) throw new Error('registered fresh native collection required')
+        result = await owner.captureFreshNativeStage(handle(), request.nativeCollectionId)
+        break
+      case 'fresh-native-finish':
+        if (!request.nativeCollectionId) throw new Error('registered fresh native collection required')
+        result = await owner.finishFreshNativeCollection(handle(), request.nativeCollectionId)
+        break
       case 'fresh-agent-launch-facts':
         if (!request.enclosure) throw new Error('exact current runtime enclosure address required')
         result = await owner.freshAgentLaunchFacts(request.enclosure)
@@ -1627,6 +1648,7 @@ export function createExternalRuntimeControl(
       case 'replace-supervisor-abrupt': await owner.restartSupervisorAbrupt(); result = { completed: true }; break
       case 'finish':
       case 'abort': {
+        if (request.action === 'abort') owner.abortFreshNativeCollections()
         const errors: string[] = []
         try { await retained?.cancel() } catch { errors.push('retained fixture cleanup failed') }
         const cleanup = await owner.stop()

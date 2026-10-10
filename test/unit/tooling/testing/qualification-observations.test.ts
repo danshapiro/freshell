@@ -49,12 +49,18 @@ function fixture(missingHostCompletion = false) {
     const launch = write(`stage-${index}/launch.json`, { capturedAt: base + 1_000, response: { data: { view: { soulId: rows[0]!.soulId, providerStoreId: rows[0]!.providerStoreId, nativeSessionId, incarnationId: `inc-${index}`, containerId: `container-${index}`, executionGeneration: index + 1, launchState: 'running', recoveryState: 'live', nativeIdentityObservation: { nativeSessionId, incarnationId: `inc-${index}`, launchNonce: `launch-${index}`, evidenceRevision: index, source: 'fresh_provider_handshake', evidenceDigest: 'c'.repeat(64) } } } } })
     const request = write(`stage-${index}/request.json`, { sentAt: base + 2_000, requestId: `request-${index}`, request: { method: 'fresh_agent_send', params: { soulId: rows[0]!.soulId, text: prompt } }, reply: { data: { submittedTurnId: `turn-${index}` } } })
     const crash = index ? write(`stage-${index}/crash.json`, { kind: index === 1 ? 'session_host_exit' : 'provider_process_exit', containerId: `container-${index - 1}`, incarnationId: `inc-${index - 1}`, requestedAt: base - 2_000, exitedAt: base - 1_000 }) : undefined
-    const namespace = write(`stage-${index}/namespace.json`, { uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true, httpsStatus: 200, tlsVerifyMode: 2, tlsCheckHostname: true, nativeRoot: nativeSessionId, nativeCwd: '/owned/workspace', nativePid: 55 + index, ownedProbe: { containerId: `container-${index}`, nativePid: 55 + index, capturedAt: base + 1_500 }, executableSha256: 'd'.repeat(64), profileSha256: 'e'.repeat(64) })
+    const nativeLaunch = { incarnationId: `inc-${index}`, launchNonce: `launch-${index}`, executionGeneration: index + 1, evidenceRevision: index }
+    const namespace = write(`stage-${index}/namespace.json`, { uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true, httpsStatus: 200, tlsVerifyMode: 2, tlsCheckHostname: true, nativeRoot: nativeSessionId, nativeCwd: '/owned/workspace', nativePid: 55 + index, nativeLaunch, ownedProbe: { containerId: `container-${index}`, nativePid: 55 + index, capturedAt: base + 1_500 }, executableSha256: 'd'.repeat(64), profileSha256: 'e'.repeat(64) })
     const bytes = fs.readFileSync(path.join(evidenceDir, nativeFile.path))
     const store = write(`stage-${index}/store.json`, { containerId: `container-${index}`, providerVolumeName: 'owned-volume', snapshot: { path: '/owned/rollout.jsonl', identity: ['1', '2'], completeEof: true, bytesBase64: bytes.toString('base64'), sha256: digest(bytes) } })
-    return { stage, nativeFile, launch, request, namespace, store, ...(crash ? { crash } : {}) }
+    const process = write(`stage-${index}/process.json`, { provider: 'codex', version: '0.147.0', native: { pid: 55 + index, parentPid: 54 + index, uid: 65534, startTicks: String(100 + index), executable: '/owned/codex', executableSha256: 'd'.repeat(64), profileSha256: 'e'.repeat(64), cwd: '/owned/workspace', launch: nativeLaunch }, sdk: null })
+    const accepted = write(`stage-${index}/accepted.json`, { source: 'registry-current-incarnation', soulId: rows[0]!.soulId, incarnationId: `inc-${index}`, containerId: `container-${index}`, launchNonce: `launch-${index}`, executionGeneration: index + 1, providerStoreId: rows[0]!.providerStoreId, nativeSessionId, spec: { sessionType: 'freshcodex', provider: 'codex', runtimeVariant: 'codex-app-server', providerStoreId: rows[0]!.providerStoreId, nativeSessionId, cwd: '/owned/workspace', model: 'gpt-5.6-luna', effort: 'low' } })
+    const profile = write(`stage-${index}/profile.json`, { mode: 'freshcodex', process, accepted })
+    return { stage, nativeFile, launch, request, namespace, store, profile, ...(crash ? { crash } : {}) }
   })
-  write('native-recovery-originals.json', { schemaVersion: 1, candidateSha, runId: receiptRunId, runtimeImage, selected: ['freshcodex'], conversations: [{ mode: 'freshcodex', provider: 'codex', soulId: rows[0]!.soulId, providerStoreId: rows[0]!.providerStoreId, nativeSessionId, nonce, stages }] })
+  const last = stages.at(-1)!
+  const stopped = write('stopped/read.json', { nativeFile: last.nativeFile, store: last.store })
+  write('native-recovery-originals.json', { schemaVersion: 1, candidateSha, runId: receiptRunId, runtimeImage, selected: ['freshcodex'], conversations: [{ mode: 'freshcodex', provider: 'codex', soulId: rows[0]!.soulId, providerStoreId: rows[0]!.providerStoreId, nativeSessionId, nonce, stages, stopped }] })
   const input = { repoRoot, evidenceDir, candidateSha, receiptRunId, runtimeImage, selectedModes: ['freshcodex'] as const, rows }
   return { input: { ...input, selectedModes: [...input.selectedModes] }, write, stages }
 }
@@ -248,6 +254,9 @@ describe('qualification from private native originals', () => {
     const original = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, 'native-recovery-originals.json'), 'utf8')); original.conversations[0].stages = stages
     write('native-recovery-originals.json', original)
     expect(deriveNativeRecoveryOriginals({ evidenceDir: input.evidenceDir, candidateSha, runId: receiptRunId, runtimeImage, selected: ['freshcodex'] })[0]!.stages.every(stage => stage.profile.effort === null)).toBe(true)
+    const last = stages.at(-1)!
+    original.conversations[0].stopped = write('stopped/read.json', { nativeFile: last.nativeFile, store: last.store })
+    write('native-recovery-originals.json', original)
     const receipt = buildFreshAgentQualificationReceipt(input)
     original.conversations[0].stages[1].observedReasoningEffort = 'low'
     const reference = write('native-recovery-originals.json', original)

@@ -18,6 +18,8 @@ import { defaultReceiptFileName } from './runtime-receipts.js'
 import { buildProviderQualificationReceipt, type ProviderQualificationReceiptV2, type ProviderQualificationRow } from './provider-qualification-receipt.js'
 import { buildFreshAgentQualificationReceipt, type FreshAgentQualificationReceiptV1, type FreshAgentQualificationRow } from './fresh-agent-qualification-receipt.js'
 import type { QualifiableTerminalProvider } from './provider-qualification-selection.js'
+import { deriveNativeRecoveryOriginals, NATIVE_RECOVERY_ORIGINALS_FILE, type NativeOriginalReference, type NativeRecoveryStage } from './qualification-observations.js'
+import type { NativeHistory } from './provider-native-history.js'
 
 import { configuredProviderOnecliGrantFiles } from './runtime-amplifier-onecli.js'
 import { RestrictedDockerBroker, type BrokerEvent, type BrokerReceipt, type BrokerSettlementFailure } from './runtime-test-broker.js'
@@ -658,6 +660,147 @@ export type SyntheticOpenCodeHistoryFacts = z.infer<typeof SyntheticOpenCodeHist
 export const FreshAgentLaunchFactsSchema = z.object({ provider: z.enum(['claude', 'codex', 'opencode']),
   version: z.string().regex(/^\d+\.\d+\.\d+$/), workerPid: z.number().int().min(2) }).strict()
 export type FreshAgentLaunchFacts = z.infer<typeof FreshAgentLaunchFactsSchema>
+
+// Inspect the current native process, rather than running the global terminal CLI.
+// The environment is used inside the owned probe; only these selected facts leave it.
+export const FRESH_AGENT_PROCESS_SCRIPT = String.raw`
+import pathlib,os,sys,json,hashlib,subprocess,base64
+PROC=pathlib.Path('/proc')
+provider,incarnation=sys.argv[1:]
+assert provider in ['claude','codex','opencode']
+def sha(file):
+ h=hashlib.sha256()
+ with file.open('rb') as source:
+  for chunk in iter(lambda:source.read(1024*1024),b''):h.update(chunk)
+ return h.hexdigest()
+def read(p):
+ stat=(p/'stat').read_text();fields=stat[stat.rfind(')')+2:].split()
+ argv=[v.decode() for v in (p/'cmdline').read_bytes().split(b'\0') if v]
+ env=dict(v.decode().split('=',1) for v in (p/'environ').read_bytes().split(b'\0') if b'=' in v)
+ return dict(pid=int(p.name),parentPid=int(fields[1]),startTicks=fields[19],uid=p.stat().st_uid,argv=argv,env=env,exe=(p/'exe').resolve(),cwd=str((p/'cwd').resolve()))
+processes=[]
+for p in PROC.iterdir():
+ if not p.name.isdigit():continue
+ try:processes.append(read(p))
+ except (OSError,ValueError):continue
+sidecar=None;sdk=None
+if provider=='claude':
+ sidecars=[p for p in processes if p['env'].get('FRESHELL_CLAUDE_SIDECAR_ID') and any(pathlib.Path(a).name=='index.mjs' for a in p['argv'][1:])]
+ assert len(sidecars)==1,'unique owned SDK sidecar required'
+ sidecar=sidecars[0];entry=pathlib.Path(next(a for a in sidecar['argv'][1:] if pathlib.Path(a).name=='index.mjs'))
+ assert entry.is_absolute() and entry.is_file() and sidecar['uid']==65534
+ selected=sidecar['env'].get('FRESHELL_CLAUDE_SDK_QUERY_MODULE') or '@anthropic-ai/claude-agent-sdk'
+ resolver="import{pathToFileURL,fileURLToPath}from'node:url';process.stdout.write(fileURLToPath(import.meta.resolve(process.argv[2],pathToFileURL(process.argv[1]).href)));"
+ module=pathlib.Path(subprocess.check_output([str(sidecar['exe']),'--experimental-import-meta-resolve','--input-type=module','-e',resolver,str(entry),selected],text=True,timeout=15)).resolve()
+ package=module.parent
+ while not (package/'package.json').is_file():
+  assert package.parent!=package;package=package.parent
+ metadata=json.loads((package/'package.json').read_text());assert metadata['name']=='@anthropic-ai/claude-agent-sdk'
+ def raw(file):
+  value=file.read_bytes();assert len(value)<=2*1024*1024;return base64.b64encode(value).decode()
+ sdk=dict(packageBytesBase64=raw(package/'package.json'),moduleBytesBase64=raw(module),entryBytesBase64=raw(entry),version=metadata['version'],declaredNativeVersion=metadata.get('claudeCodeVersion'),modulePath=str(module),moduleSha256=sha(module),entryPath=str(entry),entrySha256=sha(entry),selection='sidecar-selected-module-resolution')
+ def descendant(p):
+  seen=set()
+  while p['parentPid'] not in seen:
+   if p['parentPid']==sidecar['pid']:return True
+   seen.add(p['parentPid']);parents=[v for v in processes if v['pid']==p['parentPid']]
+   if len(parents)!=1:return False
+   p=parents[0]
+  return False
+ matches=[p for p in processes if p['pid']!=sidecar['pid'] and p['exe'].name in ['claude','claude.exe'] and p['env'].get('FRESHELL_CLAUDE_SIDECAR_ID')==sidecar['env']['FRESHELL_CLAUDE_SIDECAR_ID'] and descendant(p)]
+else:
+ matches=[p for p in processes if (provider=='codex' and p['exe'].name in ['codex','codex.exe'] and 'app-server' in p['argv']) or (provider=='opencode' and p['exe'].name in ['opencode','opencode.exe'] and 'serve' in p['argv'] and p['env'].get('FRESHELL_OPENCODE_SIDECAR_ID'))]
+assert len(matches)==1,'actual provider child PID is missing or ambiguous'
+p=matches[0];assert p['uid']==65534
+launch=json.loads(p['env']['FRESHELL_NATIVE_IDENTITY_LAUNCH']);assert launch['incarnationId']==incarnation
+if sidecar and sidecar['env'].get('CLAUDE_CMD'):
+ assert pathlib.Path(sidecar['env']['CLAUDE_CMD']).resolve()==p['exe'],'selected native override differs'
+def flag(name):
+ values=[p['argv'][i+1] for i,v in enumerate(p['argv'][:-1]) if v==name]
+ values.extend(v[len(name)+1:] for v in p['argv'] if v.startswith(name+'='))
+ assert len(values)<=1
+ return values[0] if values else None
+profiles=[];home=pathlib.Path(p['env']['HOME']);cwd=pathlib.Path(p['cwd'])
+files=[home/'.claude/settings.json',cwd/'.claude/settings.json',cwd/'.claude/settings.local.json'] if provider=='claude' else [home/'.codex/config.toml'] if provider=='codex' else [home/'.config/opencode/opencode.json',home/'.config/opencode/opencode.jsonc']
+for file in files:profiles.append(dict(path=str(file),sha256=sha(file) if file.is_file() else None))
+native=dict(pid=p['pid'],parentPid=p['parentPid'],startTicks=p['startTicks'],uid=p['uid'],executable=str(p['exe']),executableSha256=sha(p['exe']),cwd=p['cwd'],launch=launch,configuredModel=flag('--model'),configuredEffort=flag('--effort'),profileSha256=hashlib.sha256(json.dumps(profiles,sort_keys=True).encode()).hexdigest())
+version=subprocess.check_output([str(p['exe']),'--version'],env=p['env'],text=True,timeout=15).strip()
+current=read(PROC/str(p['pid']));assert current['startTicks']==p['startTicks'] and current['exe']==p['exe'] and current['argv']==p['argv'] and current['cwd']==p['cwd']
+if sidecar:
+ current=read(PROC/str(sidecar['pid']));assert current['startTicks']==sidecar['startTicks'] and current['argv']==sidecar['argv']
+print(json.dumps(dict(provider=provider,version=version,native=native,sdk=sdk,sidecar=None if not sidecar else dict(pid=sidecar['pid'],startTicks=sidecar['startTicks'],uid=sidecar['uid']))))
+`
+
+export const FreshNativeCollectionResultSchema = z.object({ collectionId: z.string().uuid(),
+  completedStages: z.number().int().min(0).max(3), closed: z.boolean() }).strict()
+export type FreshNativeCollectionResult = z.infer<typeof FreshNativeCollectionResultSchema>
+type FreshNativeCollection = {
+  collectionId: string; mode: string; provider: string; soulId: string; providerStoreId: string; nativeSessionId: string
+  nonce: string; stages: Record<string, unknown>[]; lastHandle: ExactRuntimeHandle; closed: boolean; failed: boolean
+  crash?: Record<string, unknown>
+  stopped?: NativeOriginalReference
+}
+const NativeDigest = z.string().regex(/^[a-f0-9]{64}$/)
+const FreshNativeProcessSchema = z.object({ provider: z.enum(['claude', 'codex', 'opencode']), version: z.string(),
+  native: z.object({ pid: z.number().int().min(2), parentPid: z.number().int().positive(), startTicks: z.string().regex(/^\d+$/),
+    uid: z.literal(65534), executable: z.string().refine(path.isAbsolute), executableSha256: NativeDigest,
+    cwd: z.string().refine(path.isAbsolute), profileSha256: NativeDigest,
+    configuredModel: z.string().nullable().optional(), configuredEffort: z.string().nullable().optional(),
+    launch: z.object({ incarnationId: z.string().min(1) }).passthrough(),
+  }).strict(), sdk: z.object({ version: z.string(), declaredNativeVersion: z.string(),
+    modulePath: z.string().optional(), entryPath: z.string().optional(), moduleSha256: NativeDigest, entrySha256: NativeDigest,
+    selection: z.literal('sidecar-selected-module-resolution'), packageBytesBase64: z.string().optional(),
+    moduleBytesBase64: z.string().optional(), entryBytesBase64: z.string().optional(),
+  }).strict().nullable(), sidecar: z.object({ pid: z.number().int().positive(), startTicks: z.string(), uid: z.literal(65534) }).strict().nullable().optional(),
+}).strict()
+const RawNativeSnapshotSchema = z.object({ path: z.string().refine(path.isAbsolute), identity: z.array(z.string()).min(2),
+  completeEof: z.literal(true), sha256: NativeDigest, bytesBase64: z.string(), querySnapshotBase64: z.string().optional(), querySnapshotSha256: NativeDigest.optional() }).strict()
+type FreshCapturedNativeHistory = NativeHistory & { rawSource: { snapshot: z.infer<typeof RawNativeSnapshotSchema> } | null }
+
+const FRESH_ACCEPTED_PROFILE_SCRIPT = String.raw`
+import sqlite3,sys,json
+db=sqlite3.connect('file:/var/lib/freshell-supervisor/runtime.sqlite3?mode=ro',uri=True)
+db.row_factory=sqlite3.Row;db.execute('PRAGMA query_only=ON');db.execute('PRAGMA trusted_schema=OFF');db.execute('BEGIN')
+rows=db.execute('SELECT i.soul_id AS soulId,i.incarnation_id AS incarnationId,i.container_id AS containerId,i.host_boot_id AS hostBootId,i.launch_nonce AS launchNonce,i.execution_generation AS executionGeneration,s.provider_store_id AS providerStoreId,s.native_session_id AS nativeSessionId,i.fresh_agent_spec AS spec FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id WHERE i.soul_id=? AND i.incarnation_id=? AND i.launch_state=\'running\'',sys.argv[1:]).fetchall()
+assert len(rows)==1;value=dict(rows[0]);spec=json.loads(value['spec'])
+value['spec']={key:spec.get(key) for key in ['sessionType','provider','runtimeVariant','providerStoreId','nativeSessionId','cwd','model','effort','runAsUid','runAsGid']}
+value['source']='registry-current-incarnation';print(json.dumps(value));db.close()
+`
+
+const FRESH_NATIVE_NAMESPACE_SCRIPT = String.raw`
+import pathlib,os,sys,json,ssl,urllib.request,urllib.parse
+provider,pid,root=sys.argv[1:];p=pathlib.Path('/proc')/pid
+env=dict(v.decode().split('=',1) for v in (p/'environ').read_bytes().split(b'\0') if b'=' in v)
+argv=[v.decode() for v in (p/'cmdline').read_bytes().split(b'\0') if v]
+native_root=None
+if provider=='claude':
+ hook=json.loads((pathlib.Path(env['FRESHELL_NATIVE_IDENTITY_SIGNAL_DIR'])/'session-start.json').read_text())
+ native_root=hook['native']['session_id'];assert native_root==root
+elif provider=='opencode':
+ assert argv.count('--port')==1 and argv.count('--hostname')==1 and argv[argv.index('--hostname')+1]=='127.0.0.1'
+ port=int(argv[argv.index('--port')+1]);assert 0<port<65536
+ local=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+ with local.open('http://127.0.0.1:'+str(port)+'/session/'+urllib.parse.quote(root,safe='')+'?directory='+urllib.parse.quote(str((p/'cwd').resolve()),safe=''),timeout=10) as response:
+  assert response.status==200;raw=response.read(1024*1024+1);assert len(raw)<=1024*1024
+  info=json.loads(raw);native_root=info['id'];assert native_root==root and info.get('parentID') is None
+ca=env.get('SSL_CERT_FILE') or env['NODE_EXTRA_CA_CERTS'];context=ssl.create_default_context(cafile=ca)
+proxy=env.get('HTTPS_PROXY') or env.get('https_proxy');opener=urllib.request.build_opener(urllib.request.ProxyHandler({'https':proxy}),urllib.request.HTTPSHandler(context=context))
+url='https://api.anthropic.com/v1/models' if provider=='claude' else 'https://api.openai.com/v1/models' if provider=='opencode' else 'https://chatgpt.com/backend-api/codex/models?client_version=0.147.0'
+headers={'anthropic-version':'2023-06-01','authorization':'Bearer '+env['CLAUDE_CODE_OAUTH_TOKEN']} if provider=='claude' and env.get('CLAUDE_CODE_OAUTH_TOKEN') else {'anthropic-version':'2023-06-01','x-api-key':env['ANTHROPIC_API_KEY']} if provider=='claude' else {'Authorization':'Bearer onecli-managed'}
+with opener.open(urllib.request.Request(url,headers=headers),timeout=20) as response:
+ status=response.status;assert status==200;response.read(1024*1024)
+print(json.dumps(dict(uid=os.getuid(),gid=os.getgid(),caps=next(row.split()[1] for row in pathlib.Path('/proc/self/status').read_text().splitlines() if row.startswith('CapEff:')),readOnlyRoot=bool(os.statvfs('/').f_flag&os.ST_RDONLY),nativePid=int(pid),nativeRoot=native_root,nativeCwd=str((p/'cwd').resolve()),nativeLaunch=json.loads(env['FRESHELL_NATIVE_IDENTITY_LAUNCH']),tlsVerifyMode=context.verify_mode.value,tlsCheckHostname=context.check_hostname,httpsStatus=status)))
+`
+
+const FRESH_NATIVE_EXIT_SCRIPT = String.raw`
+import pathlib,sys,json
+p=pathlib.Path('/proc')/sys.argv[1];exited=False
+try:
+ stat=(p/'stat').read_text();fields=stat[stat.rfind(')')+2:].split()
+ exited=fields[19]!=sys.argv[2] or fields[0]=='Z'
+except FileNotFoundError:exited=True
+print(json.dumps(dict(exited=exited)))
+`
 export const RuntimeWebProcessFactsSchema = z.object({ pid: z.number().int().positive(),
   bootAttemptCount: z.number().int().positive() }).strict()
 export type RuntimeWebProcessFacts = z.infer<typeof RuntimeWebProcessFactsSchema>
@@ -1325,7 +1468,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'interrupted-stop-history', 'interrupted-stop-arm', 'interrupted-stop-counters', 'interrupted-stop-facts',
     'interrupted-stop-crash-facts', 'interrupted-stop-artifact',
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts', 'supervisor-process-facts',
-    'managed-opt-in', 'opencode-version', 'opencode-continuity-startup', 'opencode-continuity-first-turn', 'opencode-continuity-effect-count', 'opencode-continuity-follow-up', 'opencode-continuity-long-tool', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'loss-incident', 'loss-assertions', 'loss-receipt', 'fresh-agent-ingresses', 'fresh-agent-receipt', 'provider-receipt', 'fresh-agent-launch-facts', 'container-state', 'host-process-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
+    'managed-opt-in', 'opencode-version', 'opencode-continuity-startup', 'opencode-continuity-first-turn', 'opencode-continuity-effect-count', 'opencode-continuity-follow-up', 'opencode-continuity-long-tool', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'loss-incident', 'loss-assertions', 'loss-receipt', 'fresh-agent-ingresses', 'fresh-agent-receipt', 'provider-receipt', 'fresh-agent-launch-facts', 'fresh-native-register', 'fresh-native-stage', 'fresh-native-finish', 'container-state', 'host-process-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
     'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort', 'incident-matches-soul',
     'native-challenge-register', 'native-effect-count', 'native-effect-reset', 'chaos-web-output', 'chaos-long-tool-running', 'chaos-logs', 'chaos-evidence', 'chaos-receipt',
@@ -1346,6 +1489,8 @@ const RuntimeOwnerOperationRequestSchema = z.object({
   enclosure: z.object({ runId: z.string().min(1), candidateSha: z.string().regex(/^[a-f0-9]{40}$/),
     soulId: z.string().min(1), incarnationId: z.string().min(1), containerId: z.string().regex(/^[a-f0-9]{64}$/),
     hostBootId: z.string().min(1) }).strict().optional(),
+  nativeCollectionId: z.string().uuid().optional(),
+  nativeCollectionNonce: z.string().regex(/^codename-[a-f0-9]{32}$/).optional(),
   challengeId: z.string().min(1).optional(),
   incidentId: z.string().min(1).max(200).optional(),
   expectedControlEpoch: z.number().int().nonnegative().optional(),
@@ -4370,6 +4515,12 @@ export class ManagedRuntimeOwner {
   private readonly recordedHistoryHolds = new Set<string>()
   private readonly savedHistoryFixtureStates = new Map<string, unknown>()
   private readonly nativeChallenges = new Map<string, { soulId: string; nativeSessionId: string; marker: string }>()
+  private readonly freshNativeProcesses = new Map<string, z.infer<typeof FreshNativeProcessSchema>>()
+  private readonly freshNativeCollections = new Map<string, FreshNativeCollection>()
+  private readonly nativeCaptures = new Set<Promise<unknown>>()
+  private readonly nativeCaptureFailures: string[] = []
+  private nativeCollectionsClosing = false
+  private nativeCollectionsAborted = false
   private readonly providerProbes = new Map<string, { child?: ChildProcess; settlement: Promise<string> }>()
   private syntheticSource?: { source: SyntheticSource; root: string; nonce: string }
   private stoppedRepairBatch?: Task007PreparedStoppedFixture
@@ -5239,11 +5390,17 @@ export class ManagedRuntimeOwner {
   async stop(): Promise<{ ok: boolean; errors: string[] }> {
     if (this.stopSettlement) return this.stopSettlement
     this.stopSettlement = (async () => {
+      this.nativeCollectionsClosing = true
+      await Promise.allSettled([...this.nativeCaptures])
       const result = await settleOwnedRuntimeCleanup(() => this.stopWebAndReleaseHeldHosts(), () => this.runtime.cleanup())
       if (result.ok && this.syntheticSource) {
         try { await fsp.rm(this.syntheticSource.root, { recursive: true, force: true }) }
         catch { result.ok = false; result.errors.push('owned synthetic source cleanup failed') }
       }
+      if (this.freshNativeCollections.size) this.runtime.writeArtifact('native-collection-status.json', {
+        complete: [...this.freshNativeCollections.values()].every(collection => collection.closed && !collection.failed),
+        failures: this.nativeCaptureFailures.length,
+      })
       const cleanupPath = path.join(this.runtime.evidenceDir, 'cleanup.json')
       let runtimeCleanup: Record<string, unknown> = {}
       try { runtimeCleanup = objectFields(JSON.parse(fs.readFileSync(cleanupPath, 'utf8')), 'invalid owner cleanup artifact') }
@@ -5454,7 +5611,10 @@ export class ManagedRuntimeOwner {
 
   async crashRuntimeHost(handle: ExactRuntimeHandle): Promise<void> {
     await this.assertCurrentHandle(handle)
+    const collection = this.nativeCollectionForCrash(handle, 'session_host_exit')
+    const requestedAt = Date.now()
     this.runtime.killOwnedRuntimeExact(handle.containerId)
+    if (collection) await this.retainFreshNativeExit(collection, handle, 'session_host_exit', requestedAt)
   }
 
   runtimeEnclosureHandle(view: Pick<ManagedRuntimeView, 'soulId' | 'incarnationId' | 'containerId' | 'hostBootId'>): RuntimeEnclosureHandle {
@@ -5488,16 +5648,296 @@ export class ManagedRuntimeOwner {
       : mode === 'freshcodex' ? 'codex' : mode === 'freshopencode' ? 'opencode' : null
     const registeredProvider = mode === 'kilroy' ? 'kilroy' : provider
     if (!provider || row.provider !== registeredProvider) throw new Error('fresh-agent provider registration differs')
-    const raw = await this.ownedProviderExec(handle.containerId, [provider, '--version'])
-    const version = raw.match(/\b\d+\.\d+\.\d+\b/)?.[0]
-    if (!version) throw new Error('provider version reply is invalid')
-    const pattern = provider === 'claude' ? /(?:^|\s)claude(?:$|\s)/m
-      : provider === 'codex' ? /codex.*app-server|app-server.*codex/m : /opencode.*serve/m
-    const processes = await this.ownedProviderExec(handle.containerId, ['ps', '-eo', 'pid,args'])
-    const process = processes.split('\n').find(line => pattern.test(line))
-    const workerPid = Number(process?.trim().match(/^(\d+)/)?.[1])
-    if (!Number.isSafeInteger(workerPid) || workerPid <= 1) throw new Error('actual provider child PID was not found')
-    return { provider, version, workerPid }
+    if (this.nativeCollectionsClosing || this.stopSettlement) throw new Error('fresh native collection is finished')
+    const process = FreshNativeProcessSchema.parse(JSON.parse(await this.ownedProviderExec(handle.containerId,
+      ['python3', '-c', FRESH_AGENT_PROCESS_SCRIPT, provider, handle.incarnationId])))
+    const native = process.native
+    const version = typeof process.version === 'string' ? process.version.match(/\b\d+\.\d+\.\d+\b/)?.[0] : undefined
+    if (process.provider !== provider || !version || !Number.isSafeInteger(native.pid) || native.pid <= 1
+      || native.uid !== 65534 || !/^\d+$/.test(native.startTicks ?? '') || native.launch?.incarnationId !== handle.incarnationId
+      || !/^[a-f0-9]{64}$/.test(native.executableSha256 ?? '') || !/^[a-f0-9]{64}$/.test(native.profileSha256 ?? '')
+      || !path.isAbsolute(native.executable ?? '') || !path.isAbsolute(native.cwd ?? '')) throw new Error('actual provider child PID/profile is invalid')
+    if (provider === 'claude' && (!process.sdk || process.sdk.selection !== 'sidecar-selected-module-resolution')) {
+      throw new Error('owned SDK selected module is missing')
+    }
+    const current = await this.currentRuntimeEnclosure(handle)
+    if (current.executionGeneration !== row.executionGeneration || current.nativeIdentityObservation?.launchNonce !== row.nativeIdentityObservation?.launchNonce) {
+      throw new Error('current native launch changed during capture')
+    }
+    this.freshNativeProcesses.set(JSON.stringify(handle), { ...process, version })
+    return { provider, version, workerPid: native.pid }
+  }
+
+  private trackNativeCapture<T>(work: () => Promise<T>): Promise<T> {
+    const result = Promise.resolve().then(work).then(value => {
+      this.nativeCaptures.delete(result)
+      return value
+    }, error => {
+      this.nativeCaptures.delete(result)
+      this.nativeCaptureFailures.push('native original capture failed')
+      this.runtime.recordLifecycle('external.native_collection_failed', { severity: 'warn' })
+      throw error
+    })
+    this.nativeCaptures.add(result)
+    return result
+  }
+
+  private nativeCollectionResult(collection: FreshNativeCollection): FreshNativeCollectionResult {
+    return { collectionId: collection.collectionId, completedStages: collection.stages.length, closed: collection.closed }
+  }
+
+  private async currentFreshCollection(handle: ExactRuntimeHandle, collectionId: string): Promise<FreshNativeCollection> {
+    if (this.nativeCollectionsClosing || this.stopSettlement || this.nativeCollectionsAborted) throw new Error('fresh native collection is finished')
+    const collection = this.freshNativeCollections.get(collectionId)
+    if (!collection || collection.closed || collection.failed || collection.soulId !== handle.soulId
+      || collection.nativeSessionId !== handle.nativeSessionId) throw new Error('registered open fresh native collection required')
+    await this.assertCurrentHandle(handle)
+    return collection
+  }
+
+  async registerFreshNativeCollection(handle: ExactRuntimeHandle, nonce: string): Promise<FreshNativeCollectionResult> {
+    if (this.nativeCollectionsClosing || this.stopSettlement || this.nativeCollectionsAborted) throw new Error('fresh native collection is finished')
+    return this.trackNativeCapture(async () => {
+      if (!/^codename-[a-f0-9]{32}$/.test(nonce)) throw new Error('fixed fresh native collection nonce required')
+      await this.freshAgentLaunchFacts(this.runtimeEnclosureHandle(handle))
+      await this.assertCurrentHandle(handle)
+      const row = await this.currentRuntimeEnclosure(this.runtimeEnclosureHandle(handle))
+      if (this.freshNativeCollections.size >= this.freshAgentModes.length
+        || [...this.freshNativeCollections.values()].some(collection => collection.soulId === handle.soulId || collection.mode === row.freshAgentSessionType)) {
+        throw new Error('fresh mode/soul collection is already registered')
+      }
+      const writer = await this.writerClaimFacts(handle)
+      if (!writer.providerStoreId || writer.activeClaimCount !== 1 || writer.globalConflictingClaimCount !== 0) throw new Error('current fresh collection writer/store is absent or conflicting')
+      const collection: FreshNativeCollection = { collectionId: randomUUID(), mode: row.freshAgentSessionType!,
+        provider: row.freshAgentSessionType === 'kilroy' ? 'claude' : row.provider!, soulId: handle.soulId,
+        providerStoreId: writer.providerStoreId, nativeSessionId: handle.nativeSessionId, nonce, stages: [], lastHandle: handle, closed: false, failed: false }
+      this.freshNativeCollections.set(collection.collectionId, collection)
+      return this.nativeCollectionResult(collection)
+    })
+  }
+
+  private async retainNativeOriginal(relative: string, value: Buffer | Record<string, unknown>): Promise<NativeOriginalReference> {
+    const bytes = Buffer.isBuffer(value) ? value : Buffer.from(JSON.stringify({ execution: {
+      candidateSha: this.runtime.candidateSha, runId: this.runtime.runId, runtimeImage: this.runtime.imageRef }, ...value }))
+    if (bytes.length === 0 || bytes.length > 8 * 1024 * 1024) throw new Error('native original exceeds the serialized evidence bound')
+    const filename = path.join(this.runtime.evidenceDir, relative)
+    await fsp.mkdir(path.dirname(filename), { recursive: true, mode: 0o700 })
+    await fsp.writeFile(filename, bytes, { mode: 0o600, flag: 'wx' })
+    return { path: relative, sha256: createHash('sha256').update(bytes).digest('hex') }
+  }
+
+  private async captureFreshNativeSource(handle: ExactRuntimeHandle, provider: string, boundary = false): Promise<FreshCapturedNativeHistory> {
+    const source = provider === 'claude' ? '/home/freshell/provider/.claude/projects'
+      : provider === 'codex' ? '/home/freshell/provider/.codex/sessions' : '/home/freshell/provider/.local/share/opencode/opencode.db'
+    const script = "const{captureNativeHistory}=await import(process.argv[1]);process.stdout.write(JSON.stringify(captureNativeHistory(process.argv[2],process.argv[3],process.argv[4],process.argv[5]==='boundary')));"
+    const raw = await this.ownedProviderExec(handle.containerId, ['node', '--no-warnings', '--import',
+      path.join(this.repoRoot, 'node_modules/tsx/dist/loader.mjs'), '--input-type=module', '-e', script,
+      path.join(this.repoRoot, 'test/e2e-browser/helpers/provider-native-history/probe-cli.ts'), provider, source, handle.nativeSessionId,
+      boundary ? 'boundary' : 'completion'])
+    if (Buffer.byteLength(raw) > 8 * 1024 * 1024) throw new Error('native capture exceeds the serialized evidence bound')
+    const captured = objectFields(JSON.parse(raw), 'invalid raw native source')
+    if (captured.provider !== provider || captured.nativeSessionId !== handle.nativeSessionId || !Array.isArray(captured.turns)) throw new Error('raw native source identity differs')
+    if (captured.rawSource !== null) RawNativeSnapshotSchema.parse(objectFields(captured.rawSource, 'raw source is absent').snapshot)
+    return captured as FreshCapturedNativeHistory
+  }
+
+  private async materializeNativeSource(prefix: string, captured: FreshCapturedNativeHistory): Promise<NativeOriginalReference | undefined> {
+    if (captured.rawSource === null && captured.turns.length === 0) return undefined
+    const snapshot = RawNativeSnapshotSchema.parse(captured.rawSource?.snapshot)
+    if (snapshot.completeEof !== true || !Array.isArray(snapshot.identity) || snapshot.identity.length < 2) throw new Error('native snapshot is partial or lacks identity')
+    const bytes = Buffer.from(snapshot.querySnapshotBase64 ?? snapshot.bytesBase64, 'base64')
+    if (createHash('sha256').update(bytes).digest('hex') !== (snapshot.querySnapshotSha256 ?? snapshot.sha256)) throw new Error('raw native snapshot digest differs')
+    return this.retainNativeOriginal(`${prefix}/${path.basename(snapshot.path)}`, bytes)
+  }
+
+  async captureFreshNativeStage(handle: ExactRuntimeHandle, collectionId: string): Promise<FreshNativeCollectionResult> {
+    if (this.nativeCollectionsClosing || this.stopSettlement) throw new Error('fresh native collection is finished')
+    return this.trackNativeCapture(async () => {
+      const collection = await this.currentFreshCollection(handle, collectionId)
+      try {
+        const index = collection.stages.length
+        if (index >= 3 || (index > 0 && !collection.crash)) throw new Error('fresh native stage needs the exact preceding owned crash')
+        const stage: NativeRecoveryStage = index === 0 ? 'initial' : index === 1 ? 'after_session_host_crash' : 'after_provider_process_crash'
+        const prefix = `fresh-native-${collectionId}/stage-${index}`
+        await this.freshAgentLaunchFacts(this.runtimeEnclosureHandle(handle))
+        const process = this.freshNativeProcesses.get(JSON.stringify(this.runtimeEnclosureHandle(handle)))!
+        const row = await this.currentRuntimeEnclosure(this.runtimeEnclosureHandle(handle)), capturedAt = Date.now()
+        const accepted = objectFields(JSON.parse(await this.ownedDockerProbe(this.supervisor.containerId,
+          ['python3', '-c', FRESH_ACCEPTED_PROFILE_SCRIPT, handle.soulId, handle.incarnationId], false)), 'accepted current fresh profile is absent')
+        for (const field of ['soulId', 'incarnationId', 'containerId', 'hostBootId', 'nativeSessionId'] as const) {
+          if (accepted[field] !== handle[field]) throw new Error(`accepted current profile ${field} differs`)
+        }
+        if (accepted.providerStoreId !== collection.providerStoreId || objectFields(accepted.spec, 'accepted fresh spec is absent').providerStoreId !== collection.providerStoreId
+          || accepted.executionGeneration !== row.executionGeneration || accepted.launchNonce !== row.nativeIdentityObservation?.launchNonce) throw new Error('accepted current profile/store differs')
+        const acceptedReference = await this.retainNativeOriginal(`${prefix}/accepted.json`, { ...accepted, capturedAt })
+        const writer = await this.writerClaimFacts(handle)
+        if (writer.providerStoreId !== collection.providerStoreId || writer.activeClaimCount !== 1 || writer.globalConflictingClaimCount !== 0) throw new Error('fresh native writer changed')
+        const writerReference = await this.retainNativeOriginal(`${prefix}/writer.json`, { ...writer, capturedAt: Date.now() })
+        const launch = await this.retainNativeOriginal(`${prefix}/launch.json`, { capturedAt,
+          authorityProjection: { source: 'inventory+accepted-spec+writer-claim', accepted: acceptedReference, writer: writerReference },
+          response: { data: { view: { ...row, providerStoreId: accepted.providerStoreId } } } })
+        const namespace = objectFields(JSON.parse(await this.ownedProviderExec(handle.containerId,
+          ['python3', '-c', FRESH_NATIVE_NAMESPACE_SCRIPT, collection.provider, String(process.native.pid), handle.nativeSessionId])), 'native namespace is absent')
+        if (namespace.nativePid !== process.native.pid || namespace.nativeCwd !== process.native.cwd) throw new Error('current native namespace/process differs')
+        const namespaceReference = await this.retainNativeOriginal(`${prefix}/namespace.json`, { ...namespace,
+          executableSha256: process.native.executableSha256, profileSha256: process.native.profileSha256,
+          ownedProbe: { containerId: handle.containerId, nativePid: process.native.pid, capturedAt: Date.now() } })
+        const sdk: Record<string, unknown> | null = process.sdk ? { ...process.sdk } : null
+        if (sdk) {
+          for (const [bytesField, referenceField, filename] of [['packageBytesBase64', 'packageSource', 'sdk-package.json'], ['moduleBytesBase64', 'moduleSource', 'sdk-module.mjs'], ['entryBytesBase64', 'entrySource', 'sidecar-entry.mjs']]) {
+            sdk[referenceField!] = await this.retainNativeOriginal(`${prefix}/${filename}`, Buffer.from(z.string().parse(sdk[bytesField!]), 'base64'))
+            delete sdk[bytesField!]
+          }
+        }
+        const processReference = await this.retainNativeOriginal(`${prefix}/process.json`, { ...process, sdk })
+        const profile = await this.retainNativeOriginal(`${prefix}/profile.json`, { mode: collection.mode, process: processReference, accepted: acceptedReference })
+        const boundary = await this.captureFreshNativeSource(handle, collection.provider, true)
+        const boundaryFile = await this.materializeNativeSource(`${prefix}/boundary`, boundary)
+        if (!boundaryFile) await this.retainNativeOriginal(`${prefix}/empty-boundary.json`, { provider: collection.provider,
+          nativeSessionId: handle.nativeSessionId, containerId: handle.containerId, observed: 'exact-root-transcript-absent', capturedAt: Date.now() })
+        const prompt = index === 0 ? `Remember this codename: ${collection.nonce}. Reply stored. Do not use tools.`
+          : 'Recall the saved codename from this conversation. Reply with the codename only. Do not use tools.'
+        const requestId = `request-${randomUUID()}`, sentAt = Date.now(), request = { method: 'fresh_agent_send', params: { soulId: handle.soulId, text: prompt } }
+        const reply = await this.runtime.adminRaw(this.supervisor, request, { requestId })
+        const requestReference = await this.retainNativeOriginal(`${prefix}/request.json`, { requestId, sentAt, request, reply })
+        if (reply.result?.Err) throw new Error('owned native request was refused')
+        const deadline = Date.now() + 60_000
+        let captured: FreshCapturedNativeHistory | undefined
+        while (Date.now() < deadline) {
+          if (this.nativeCollectionsAborted) throw new Error('native collection aborted')
+          await this.assertCurrentHandle(handle)
+          // A provider may acknowledge the input before its first completed row or
+          // between append writes. Keep the exact handle live and retry the raw read
+          // until a complete source can be parsed; acceptance never counts as a turn.
+          try { captured = await this.captureFreshNativeSource(handle, collection.provider) }
+          catch { captured = undefined }
+          if (captured && captured.turns.length > boundary.turns.length) break
+          await new Promise(resolve => setTimeout(resolve, 100))
+        }
+        if (!captured || captured.turns.length !== boundary.turns.length + 1) throw new Error('owned native completion is missing or ambiguous')
+        const nativeFile = await this.materializeNativeSource(`${prefix}/completed`, captured)
+        if (!nativeFile) throw new Error('completed native raw source is missing')
+        const receipt = this.runtime.broker.receipts().filter(value => value.containerId === handle.containerId
+          && value.soulId === handle.soulId && value.incarnationId === handle.incarnationId)
+        if (receipt.length !== 1 || !receipt[0]!.providerVolumeName) throw new Error('exact owned native provider volume is missing')
+        const store = await this.retainNativeOriginal(`${prefix}/store.json`, { containerId: handle.containerId,
+          providerVolumeName: receipt[0]!.providerVolumeName, ...captured.rawSource })
+        const currentProcess = FreshNativeProcessSchema.parse(JSON.parse(await this.ownedProviderExec(handle.containerId,
+          ['python3', '-c', FRESH_AGENT_PROCESS_SCRIPT, collection.provider, handle.incarnationId])))
+        if (JSON.stringify(currentProcess.native) !== JSON.stringify(process.native) || JSON.stringify(currentProcess.sdk) !== JSON.stringify(process.sdk)
+          || JSON.stringify(currentProcess.sidecar) !== JSON.stringify(process.sidecar)) throw new Error('native process/profile changed during capture')
+        await this.assertCurrentHandle(handle)
+        const retainedStage = { stage, launch, namespace: namespaceReference, profile, request: requestReference, nativeFile, store,
+          ...(boundaryFile && boundary.turns.length ? { boundaryFile } : {}),
+          ...(collection.crash ? { crash: await this.retainNativeOriginal(`${prefix}/crash.json`, collection.crash) } : {}) }
+        collection.stages.push(retainedStage)
+        collection.lastHandle = handle
+        collection.crash = undefined
+        await this.sealFreshNativeOriginals(collection)
+        deriveNativeRecoveryOriginals({ evidenceDir: this.runtime.evidenceDir, candidateSha: this.runtime.candidateSha,
+          runId: this.runtime.runId, runtimeImage: this.runtime.imageRef, selected: [collection.mode],
+          originalReference: { path: `fresh-native-${collectionId}/manifest.json`, sha256: createHash('sha256').update(await fsp.readFile(path.join(this.runtime.evidenceDir, `fresh-native-${collectionId}/manifest.json`))).digest('hex') },
+          requiredStages: collection.stages.map(value => value.stage as NativeRecoveryStage) })
+        return this.nativeCollectionResult(collection)
+      } catch (error) { collection.failed = true; throw error }
+    })
+  }
+
+  private async sealFreshNativeOriginals(collection: FreshNativeCollection): Promise<void> {
+    const filename = path.join(this.runtime.evidenceDir, `fresh-native-${collection.collectionId}/manifest.json`)
+    await fsp.mkdir(path.dirname(filename), { recursive: true, mode: 0o700 })
+    await fsp.writeFile(filename, JSON.stringify({ schemaVersion: 1, candidateSha: this.runtime.candidateSha,
+      runId: this.runtime.runId, runtimeImage: this.runtime.imageRef, selected: [collection.mode], conversations: [{
+        mode: collection.mode, provider: collection.provider, soulId: collection.soulId, providerStoreId: collection.providerStoreId,
+        nativeSessionId: collection.nativeSessionId, nonce: collection.nonce, stages: collection.stages }] }), { mode: 0o600 })
+  }
+
+  private nativeCollectionForCrash(handle: ExactRuntimeHandle, kind: string): FreshNativeCollection | undefined {
+    const collection = [...this.freshNativeCollections.values()].find(value => value.soulId === handle.soulId && !value.closed)
+    const addressFields = ['runId', 'candidateSha', 'soulId', 'incarnationId', 'containerId', 'hostBootId', 'nativeSessionId'] as const
+    if (collection && (collection.failed || collection.crash || addressFields.some(field => collection.lastHandle[field] !== handle[field])
+      || collection.stages.length !== (kind === 'session_host_exit' ? 1 : 2))) throw new Error('registered native crash order/current handle differs')
+    return collection
+  }
+
+  private async retainFreshNativeExit(collection: FreshNativeCollection, handle: ExactRuntimeHandle, kind: string, requestedAt: number): Promise<void> {
+    const deadline = Date.now() + 30_000
+    const process = this.freshNativeProcesses.get(JSON.stringify(this.runtimeEnclosureHandle(handle)))
+    while (Date.now() < deadline) {
+      if (this.nativeCollectionsAborted) throw new Error('native collection aborted')
+      const state = await this.ownedContainerState(this.runtimeEnclosureHandle(handle))
+      let exited = !state.running && state.present
+      if (kind === 'provider_process_exit' && state.running && process) {
+        const observation = objectFields(JSON.parse(await this.ownedProviderExec(handle.containerId,
+          ['python3', '-c', FRESH_NATIVE_EXIT_SCRIPT, String(process.native.pid), process.native.startTicks])), 'native exit observation is absent')
+        exited = observation.exited === true
+      }
+      if (exited) {
+        collection.crash = { kind, containerId: handle.containerId, incarnationId: handle.incarnationId, requestedAt,
+          exitedAt: Date.now(), ...(process ? { nativePid: process.native.pid, startTicks: process.native.startTicks } : {}),
+          observation: state.running ? 'exact-native-process-exited' : 'exact-owned-container-stopped' }
+        return
+      }
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+    collection.failed = true
+    throw new Error('exact owned native exit was not observed')
+  }
+
+  async finishFreshNativeCollection(handle: ExactRuntimeHandle, collectionId: string): Promise<FreshNativeCollectionResult> {
+    if (this.nativeCollectionsClosing || this.stopSettlement) throw new Error('fresh native collection is finished')
+    return this.trackNativeCapture(async () => {
+      const collection = await this.currentFreshCollection(handle, collectionId)
+      try {
+        if (collection.stages.length !== 3 || collection.crash) throw new Error('all three native recovery stages must settle before Stop')
+        const result = await this.stopSoul(handle.soulId)
+        if (result.outcome !== 'verified_empty') throw new Error('fresh native Stop did not verify empty')
+        const row = (await this.inventory()).filter(view => view.soulId === handle.soulId)
+          .find(view => view.incarnationId === handle.incarnationId)
+        if (!row || row.launchState !== 'stopped' || row.desiredState !== 'stopped' || row.cleanupState !== 'verified_empty'
+          || row.nativeSessionId !== handle.nativeSessionId || row.containerId !== handle.containerId || row.hostBootId !== handle.hostBootId) throw new Error('exact stopped fresh native source is absent')
+        const writer = await this.writerClaimFacts(handle)
+        if (writer.providerStoreId !== collection.providerStoreId || writer.activeClaimCount !== 0 || writer.globalConflictingClaimCount !== 0) throw new Error('fresh native stopped source still has a writer')
+        const receipts = this.runtime.broker.receipts().filter(receipt => receipt.containerId === handle.containerId && receipt.incarnationId === handle.incarnationId && receipt.soulId === handle.soulId)
+        if (receipts.length !== 1 || !receipts[0]!.providerVolumeName || receipts[0]!.workspacePath !== this.repoRoot
+          || receipts[0]!.imageRef !== this.runtime.imageRef) throw new Error('exact stopped fresh provider receipt is absent')
+        if ((await this.ownedContainerState(this.runtimeEnclosureHandle(handle))).running) throw new Error('stopped fresh provider is running')
+        const captured = await this.readStoppedNativeHistory(handle, collection.provider, receipts[0]!)
+        const prefix = `fresh-native-${collectionId}/stopped`
+        const nativeFile = await this.materializeNativeSource(`${prefix}/completed`, captured)
+        const store = await this.retainNativeOriginal(`${prefix}/store.json`, { containerId: handle.containerId,
+          providerVolumeName: receipts[0]!.providerVolumeName, ...captured.rawSource })
+        const last = collection.stages.at(-1)!.nativeFile as NativeOriginalReference
+        const lastBytes = await fsp.readFile(path.join(this.runtime.evidenceDir, last.path))
+        const finalBytes = await fsp.readFile(path.join(this.runtime.evidenceDir, nativeFile!.path))
+        const { captureNativeHistory } = await import('../../test/e2e-browser/helpers/provider-native-history/probe-cli.js')
+        const lastFilename = path.join(this.runtime.evidenceDir, last.path)
+        const lastHistory = captureNativeHistory(collection.provider, collection.provider === 'opencode' ? lastFilename : path.dirname(lastFilename), collection.nativeSessionId)
+        if (JSON.stringify(captured.turns) !== JSON.stringify(lastHistory.turns)) throw new Error('stopped native completions differ from the retained current source')
+        if (collection.provider !== 'opencode' && !finalBytes.subarray(0, lastBytes.length).equals(lastBytes)) throw new Error('stopped native retained prefix changed')
+        collection.stopped = await this.retainNativeOriginal(`${prefix}/read.json`, { nativeFile, store, stopResult: result, writer, completedTurnCount: captured.turns.length })
+        collection.closed = true
+        if ([...this.freshNativeCollections.values()].every(value => value.closed && !value.failed)
+          && this.freshAgentModes.every(mode => [...this.freshNativeCollections.values()].some(value => value.mode === mode))) {
+          const collections = this.freshAgentModes.map(mode => [...this.freshNativeCollections.values()].find(value => value.mode === mode)!)
+          await fsp.writeFile(path.join(this.runtime.evidenceDir, NATIVE_RECOVERY_ORIGINALS_FILE), JSON.stringify({
+            schemaVersion: 1, candidateSha: this.runtime.candidateSha, runId: this.runtime.runId, runtimeImage: this.runtime.imageRef,
+            selected: this.freshAgentModes, conversations: collections.map(value => ({ mode: value.mode, provider: value.provider,
+              soulId: value.soulId, providerStoreId: value.providerStoreId, nativeSessionId: value.nativeSessionId, nonce: value.nonce,
+              stages: value.stages, stopped: value.stopped })) }), { mode: 0o600 })
+        }
+        return this.nativeCollectionResult(collection)
+      } catch (error) { collection.failed = true; throw error }
+    })
+  }
+
+  abortFreshNativeCollections(): void {
+    this.nativeCollectionsAborted = true
+    this.nativeCollectionsClosing = true
+    for (const collection of this.freshNativeCollections.values()) if (!collection.closed) collection.failed = true
+    for (const probe of this.providerProbes.values()) {
+      if (probe.child && probe.child.exitCode === null && probe.child.signalCode === null) probe.child.kill('SIGKILL')
+    }
   }
 
   /** A prior tracked enclosure may be stopped or removed; this never qualifies a native root. */
@@ -5864,12 +6304,15 @@ export class ManagedRuntimeOwner {
   async crashProviderWorker(handle: ExactRuntimeHandle): Promise<void> {
     await this.assertCurrentHandle(handle)
     const row = (await this.inventory()).find(view => view.soulId === handle.soulId && view.launchState === 'running')
+    const collection = this.nativeCollectionForCrash(handle, 'provider_process_exit')
     const facts = row?.freshAgentSessionType
       ? await this.freshAgentLaunchFacts(this.runtimeEnclosureHandle(handle))
       : await this.chaosHostFacts(handle)
     if (!Number.isSafeInteger(facts.workerPid) || facts.workerPid <= 1) throw new Error('exact host-recorded provider child PID required')
     this.runtime.recordLifecycle('external.provider_worker_crash', { severity: 'info', ...handle, workerPid: facts.workerPid })
+    const requestedAt = Date.now()
     this.runtime.killOwnedRuntimePidExact(handle.containerId, facts.workerPid)
+    if (collection) await this.retainFreshNativeExit(collection, handle, 'provider_process_exit', requestedAt)
   }
 
   async registerNativeChallenge(handle: ExactRuntimeHandle, kind: NativeChallengeKind): Promise<{ challengeId: string }> {
@@ -6125,6 +6568,20 @@ export class ManagedRuntimeOwner {
       || claim.nativeSessionId !== handle.nativeSessionId || claim.activeClaimCount !== 0 || claim.globalConflictingClaimCount !== 0) {
       throw new Error('stopped native history requires a current zero-writer claim')
     }
+    const history = await this.readStoppedNativeHistory(handle, provider, receipt)
+    const turns = history.turns.filter((turn: import('./provider-native-history.js').NativeAssistantTurn) => turn.text.includes(nonce))
+    if (turns.length !== 3) throw new Error(`native exact-session history must contain exactly three nonce-bearing completed assistant responses; found ${turns.length}`)
+    const [initial, hostCrash, providerCrash] = turns
+    if (!initial || !hostCrash || !providerCrash) throw new Error('three stopped native turns are required')
+    const { nativeTurnProof } = await import('./provider-native-history.js')
+    return RuntimeProviderNativeTurnProofsSchema.parse([
+      nativeTurnProof('initial', handle.nativeSessionId, initial, nonce),
+      nativeTurnProof('after_session_host_crash', handle.nativeSessionId, hostCrash, nonce),
+      nativeTurnProof('after_provider_process_crash', handle.nativeSessionId, providerCrash, nonce),
+    ])
+  }
+
+  private async readStoppedNativeHistory(handle: ExactRuntimeHandle, provider: string, receipt: BrokerReceipt): Promise<FreshCapturedNativeHistory> {
     const source = provider === 'claude' ? '/home/freshell/provider/.claude/projects'
       : provider === 'codex' ? '/home/freshell/provider/.codex/sessions'
       : provider === 'opencode' ? '/home/freshell/provider/.local/share/opencode/opencode.db' : '/home/freshell/provider/.amplifier/projects'
@@ -6145,20 +6602,11 @@ export class ManagedRuntimeOwner {
       const status = (await this.trackedDockerProbe(handle.containerId, ['wait', helperId], true)).trim()
       if (status !== '0') throw new Error('native history helper refused the exact stopped source')
       const raw = await this.trackedDockerProbe(handle.containerId, ['logs', helperId], true)
-      const history: import('./provider-native-history.js').NativeHistory = JSON.parse(raw)
+      const history: FreshCapturedNativeHistory = JSON.parse(raw)
       if (history.schemaVersion !== 1 || history.provider !== provider || history.nativeSessionId !== handle.nativeSessionId) {
         throw new Error('stopped native history identity differs')
       }
-      const turns = history.turns.filter(turn => turn.text.includes(nonce))
-      if (turns.length !== 3) throw new Error(`native exact-session history must contain exactly three nonce-bearing completed assistant responses; found ${turns.length}`)
-      const [initial, hostCrash, providerCrash] = turns
-      if (!initial || !hostCrash || !providerCrash) throw new Error('three stopped native turns are required')
-      const { nativeTurnProof } = await import('./provider-native-history.js')
-      return RuntimeProviderNativeTurnProofsSchema.parse([
-        nativeTurnProof('initial', handle.nativeSessionId, initial, nonce),
-        nativeTurnProof('after_session_host_crash', handle.nativeSessionId, hostCrash, nonce),
-        nativeTurnProof('after_provider_process_crash', handle.nativeSessionId, providerCrash, nonce),
-      ])
+      return history
     } catch (error) {
       failure = error
       throw error
@@ -6735,6 +7183,7 @@ export class ManagedRuntimeOwner {
     if (this.runtime.phase !== 5 || this.fixtureFreshAgentModes.length !== 0 || modes.size !== rows.length
       || modes.size === 0 || modes.size !== this.freshAgentModes.length
       || this.freshAgentModes.some(mode => !rows.some(row => row.mode === mode))) throw new Error('exact registered production fresh-agent modes required')
+    if (this.nativeCaptureFailures.length || [...this.freshNativeCollections.values()].some(value => !value.closed || value.failed)) throw new Error('native original collection is incomplete')
     if (!this.stopSettlement) throw new Error('owned cleanup must settle before fresh-agent receipt publication')
     const cleanup = await this.stopSettlement
     if (!cleanup.ok || cleanup.errors.length > 0) throw new Error('owned cleanup failed before fresh-agent receipt publication')
