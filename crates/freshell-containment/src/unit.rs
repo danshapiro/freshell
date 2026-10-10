@@ -1822,18 +1822,27 @@ mod tests {
 
     #[cfg(unix)]
     impl Spawned {
-        /// `perl -e 'sleep 600'` with `extra` arguments (perl ignores them,
+        /// `perl` sleeping 600 s with `extra` arguments (perl ignores them,
         /// so `app-server --managed-daemon` shapes a Codex daemon-family
-        /// process).
+        /// process). Returns once perl runs: `spawn` returns before the
+        /// child's exec has finished, and until then its
+        /// `/proc/<pid>/cmdline` reads this test's own argv, then nothing.
         fn perl_sleep(extra: &[&str]) -> Self {
-            let child = std::process::Command::new("perl")
-                .args(["-e", "sleep 600"])
+            use std::io::{BufRead, BufReader};
+            let mut child = std::process::Command::new("perl")
+                .args(["-e", r#"$| = 1; print "running\n"; sleep 600"#])
                 .args(extra)
+                .stdout(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
             // Our own unreaped child: its pid names it.
             let watch = ProcWatch::open(child.id()).unwrap();
-            Self { child, watch }
+            let out = child.stdout.take().unwrap();
+            let spawned = Self { child, watch };
+            let mut line = String::new();
+            BufReader::new(out).read_line(&mut line).unwrap();
+            assert_eq!(line, "running\n", "perl did not start");
+            spawned
         }
 
         /// `perl` holding an exclusive `flock` on `path` until it is killed,
