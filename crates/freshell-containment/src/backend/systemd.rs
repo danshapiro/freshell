@@ -20,12 +20,15 @@
 //! is stopped explicitly once it has emptied.
 //!
 //! The whole-unit kill freezes the slice, then either `cgroup.kill`s it or,
-//! when Codex's own daemon family runs in it, SIGKILLs every other member
-//! through a pidfd while the slice is frozen and thaws it: the daemon family
-//! is spared in place and never moved or signalled (Stage 2: LB-49). Every
-//! wait watches the unit SLICE's `cgroup.events` (never a scope directory,
-//! which systemd can remove before its notification fires) and has a
-//! deadline (Stage 2: LB-05).
+//! when Codex's own daemon family runs in it (or the freeze cannot be
+//! confirmed), SIGKILLs every other member through a pidfd and thaws it: the
+//! daemon family is spared in place and never moved or signalled (Stage 2:
+//! LB-49). The thaw is armed as soon as the freeze is written, so a kill
+//! dropped mid-way still thaws the slice. Every wait watches the unit
+//! SLICE's `cgroup.events` (never a scope directory, which systemd can
+//! remove before its notification fires) and has a deadline (Stage 2:
+//! LB-05); a wait that cannot watch it never counts as frozen or empty, and
+//! a slice is stopped only when it reads empty.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -333,14 +336,14 @@ impl SystemdUnit {
                 .is_some_and(|rest| rest.starts_with('/'))
     }
 
-    /// The kill's work once the slice is frozen (or could not be): one
-    /// snapshot, the spared set, the kill, and always the thaw.
-    fn kill_frozen(&self) -> io::Result<KillSummary> {
+    /// The kill's work once the slice is frozen (`frozen`) or could not be
+    /// confirmed so: one snapshot, the spared set, the kill, and the thaw.
+    fn kill_frozen(&self, thaw: Option<Thaw>, frozen: bool) -> io::Result<KillSummary> {
         let pids = self.pids();
         let spared = spared_within(&pids);
-        let killed = self.kill_all_but(&pids, &spared);
+        let killed = self.kill_all_but(&pids, &spared, frozen);
         // Thawed whatever the kill did, so spared processes resume in place.
-        let thawed = std::fs::write(self.dir.join("cgroup.freeze"), "0");
+        let thawed = thaw.map_or(Ok(()), Thaw::now);
         let killed = killed?;
         if let Err(err) = thawed {
             // A slice systemd removed meanwhile has nothing left to thaw.
@@ -360,15 +363,26 @@ impl SystemdUnit {
     }
 
     /// SIGKILLs every process of `pids` outside `spared`; returns how many.
-    /// With nothing spared, the kernel kills the whole slice (`cgroup.kill`,
-    /// race-free against forks), else `systemctl --user kill`. With spared
-    /// processes, each other pid is pinned and re-checked as a slice member
-    /// before its SIGKILL (frozen tasks cannot fork, exit or exec, and a
-    /// fatal signal still kills them), so no recycled pid is ever signalled;
-    /// a pid that cannot be pinned for another reason than being gone (for
-    /// example, no descriptor left) fails the kill after the others.
-    fn kill_all_but(&self, pids: &BTreeSet<u32>, spared: &BTreeSet<u32>) -> io::Result<usize> {
-        if !spared.is_empty() {
+    ///
+    /// Only a slice confirmed `frozen` with nothing spared is killed whole by
+    /// the kernel (`cgroup.kill`, race-free against forks; else `systemctl
+    /// --user kill`). A slice that may still be running can start a
+    /// daemon-family process after the snapshot, which a whole-slice kill
+    /// would kill too; so then, as when processes are spared, each other pid
+    /// is pinned and re-checked before its SIGKILL: still a slice member (no
+    /// recycled pid is ever signalled) and, by its own argv, still not of the
+    /// daemon family. Frozen tasks cannot fork, exit or exec, and a fatal
+    /// signal still kills them; what an unfrozen slice forks after the
+    /// snapshot is left to the post-Gone sweep. A pid that cannot be pinned
+    /// for another reason than being gone (for example, no descriptor left)
+    /// fails the kill after the others.
+    fn kill_all_but(
+        &self,
+        pids: &BTreeSet<u32>,
+        spared: &BTreeSet<u32>,
+        frozen: bool,
+    ) -> io::Result<usize> {
+        if !spared.is_empty() || !frozen {
             let mut killed = 0;
             let mut pin_error = None;
             for pid in pids.difference(spared) {
@@ -381,7 +395,8 @@ impl SystemdUnit {
                     }
                 };
                 let member = cgroup_of(watch.pid()).is_some_and(|cg| self.contains(&cg));
-                if member && !watch.has_exited() && watch.signal(Sig::Kill).is_ok() {
+                let daemon = process::argv(watch.pid()).is_ok_and(|a| is_codex_daemon_family(&a));
+                if member && !daemon && !watch.has_exited() && watch.signal(Sig::Kill).is_ok() {
                     killed += 1;
                 }
             }
@@ -398,6 +413,34 @@ impl SystemdUnit {
             }
         }
         Ok(pids.len())
+    }
+}
+
+/// Thaws a slice it was made for when dropped, unless thawed already: made
+/// right after the slice's `cgroup.freeze` is set, it moves with the kill,
+/// so a kill dropped mid-way (its stop cancelled, or its blocking task
+/// cancelled before it ran, as at a runtime shutdown) still thaws the slice
+/// and a spared daemon family in it runs on.
+struct Thaw(Option<PathBuf>);
+
+impl Thaw {
+    fn armed(slice_dir: &Path) -> Self {
+        Self(Some(slice_dir.join("cgroup.freeze")))
+    }
+
+    /// Thaws now, returning the write's error.
+    fn now(mut self) -> io::Result<()> {
+        self.0
+            .take()
+            .map_or(Ok(()), |freeze| std::fs::write(freeze, "0"))
+    }
+}
+
+impl Drop for Thaw {
+    fn drop(&mut self) {
+        if let Some(freeze) = self.0.take() {
+            let _ = std::fs::write(freeze, "0");
+        }
     }
 }
 
@@ -471,19 +514,31 @@ impl UnitBackend for SystemdUnit {
             if !self.dir.is_dir() {
                 return Ok(KillSummary::default());
             }
-            let not_frozen = match std::fs::write(self.dir.join("cgroup.freeze"), "1") {
-                Ok(()) => tokio::time::timeout(
-                    FREEZE_DEADLINE,
-                    inotify::wait_flag(self.dir.clone(), "frozen ", 1),
-                )
-                .await
-                .err()
-                .map(|_| format!("no frozen event within {} ms", FREEZE_DEADLINE.as_millis())),
+            let (thaw, not_frozen) = match std::fs::write(self.dir.join("cgroup.freeze"), "1") {
+                Ok(()) => {
+                    // From here on the slice is thawed whatever happens.
+                    let thaw = Thaw::armed(&self.dir);
+                    let frozen = tokio::time::timeout(
+                        FREEZE_DEADLINE,
+                        inotify::wait_flag(self.dir.clone(), "frozen ", 1),
+                    )
+                    .await;
+                    let not_frozen = match frozen {
+                        Ok(Ok(())) => None,
+                        Ok(Err(err)) => Some(format!("cgroup.events watch: {err}")),
+                        Err(_) => Some(format!(
+                            "no frozen event within {} ms",
+                            FREEZE_DEADLINE.as_millis()
+                        )),
+                    };
+                    (Some(thaw), not_frozen)
+                }
                 Err(_) if !self.dir.is_dir() => return Ok(KillSummary::default()),
-                Err(err) => Some(format!("cgroup.freeze: {err}")),
+                Err(err) => (None, Some(format!("cgroup.freeze: {err}"))),
             };
             let unit = self.clone();
-            let summary = tokio::task::spawn_blocking(move || unit.kill_frozen())
+            let frozen = not_frozen.is_none();
+            let summary = tokio::task::spawn_blocking(move || unit.kill_frozen(thaw, frozen))
                 .await
                 .map_err(io::Error::other)??;
             Ok(KillSummary {
@@ -521,7 +576,7 @@ impl UnitBackend for SystemdUnit {
         )))
     }
 
-    fn wait_empty(&self) -> Option<BoxFuture<'static, ()>> {
+    fn wait_empty(&self) -> Option<BoxFuture<'static, io::Result<()>>> {
         Some(Box::pin(inotify::wait_flag(
             self.dir.clone(),
             "populated ",
@@ -532,10 +587,34 @@ impl UnitBackend for SystemdUnit {
     /// Stops the emptied slice (implicit slices are never collected). A slice
     /// that did not empty (a spared daemon or survivors, already logged by
     /// the unit) is left running.
+    ///
+    /// Stopping a slice kills everything in it, so `emptied` alone is not
+    /// enough: one read of `cgroup.events` must show it empty now (a read
+    /// that fails or shows it populated keeps it, with an error for the
+    /// unit to log). A slice that does not exist is stopped all the same: a
+    /// placement killed mid-way may still have it created, and the user
+    /// manager handles that earlier start request first.
     fn remove(&self, emptied: bool) -> io::Result<()> {
-        if emptied && self.dir.is_dir() {
-            self.shared.systemctl(&["stop", &self.slice])?;
+        if !emptied {
+            return Ok(());
         }
+        match std::fs::read_to_string(self.dir.join("cgroup.events")) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(io::Error::other(format!(
+                    "{} kept: cgroup.events: {err}",
+                    self.slice
+                )))
+            }
+            Ok(events) if events.lines().any(|l| l.trim() == "populated 0") => {}
+            Ok(_) => {
+                return Err(io::Error::other(format!(
+                    "{} kept: it holds processes again",
+                    self.slice
+                )))
+            }
+        }
+        self.shared.systemctl(&["stop", &self.slice])?;
         Ok(())
     }
 }
@@ -543,6 +622,406 @@ impl UnitBackend for SystemdUnit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log_capture::{capture, CapturedEvent, FieldValue};
+    use crate::record::RecordStore;
+    use crate::unit::{AgentUnit, StopMode, StopReason, StopRequest, UnitLabel};
+
+    /// A process of the test's own, pinned while it is the test's unreaped
+    /// child, killed through that pin and reaped when dropped.
+    struct Own {
+        child: std::process::Child,
+        watch: ProcWatch,
+    }
+
+    impl Own {
+        fn spawn(program: &str, args: &[&str]) -> Self {
+            let child = std::process::Command::new(program)
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let watch = ProcWatch::open(child.id()).unwrap();
+            Self { child, watch }
+        }
+
+        /// A stand-in for Codex's managed daemon (judged by its argv).
+        fn daemon() -> Self {
+            Self::spawn(
+                "perl",
+                &["-e", "sleep 600", "app-server", "--managed-daemon"],
+            )
+        }
+
+        fn sleep() -> Self {
+            Self::spawn("sleep", &["600"])
+        }
+
+        fn pid(&self) -> u32 {
+            self.watch.pid()
+        }
+
+        /// Whether it exits within 5 s (it was killed).
+        fn dies(&self) -> bool {
+            self.watch
+                .wait_exited_blocking(Duration::from_secs(5))
+                .unwrap()
+        }
+    }
+
+    impl Drop for Own {
+        fn drop(&mut self) {
+            let _ = self.watch.signal(Sig::Kill);
+            let _ = self.child.wait();
+        }
+    }
+
+    /// Writes an executable script without this multi-threaded process ever
+    /// holding a write descriptor to it: a child another test forked
+    /// meanwhile would hold it open, and running the script would then fail
+    /// with ETXTBSY.
+    fn write_script(path: &Path, body: &str) {
+        let status = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "printf '%s' \"$2\" > \"$1\" && chmod 755 \"$1\"",
+                "sh",
+            ])
+            .arg(path)
+            .arg(body)
+            .status()
+            .unwrap();
+        assert!(status.success(), "{status:?}");
+    }
+
+    /// A stand-in for one unit slice: a directory holding the cgroup files
+    /// the backend reads and writes (the test plays the kernel's part), and a
+    /// `systemctl` that only records its arguments. Its processes are the
+    /// test's own children, so the slice's cgroup is the test's own.
+    struct FakeSlice {
+        root: tempfile::TempDir,
+        unit: Arc<SystemdUnit>,
+    }
+
+    impl FakeSlice {
+        /// Populated, not frozen, and it never freezes by itself (as when a
+        /// member sleeps uninterruptibly).
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("slice");
+            std::fs::create_dir(&dir).unwrap();
+            let systemctl = root.path().join("systemctl");
+            write_script(
+                &systemctl,
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+                    root.path().join("systemctl.log").display()
+                ),
+            );
+            let id = UnitId::mint();
+            let unit = Arc::new(SystemdUnit {
+                shared: Arc::new(Shared {
+                    systemd_run: PathBuf::from("/nonexistent/systemd-run"),
+                    systemctl,
+                    bus_env: Vec::new(),
+                    no_expand: true,
+                    manager_cgroup: "/user.slice/user-1000.slice/user@1000.service".into(),
+                    ns: "0123456789abcdef".into(),
+                    boot: "01234567".into(),
+                }),
+                unit_id: id.as_str().to_string(),
+                slice: format!("freshell-n0123456789abcdef-{}.slice", id.as_str()),
+                cgroup: cgroup_of(std::process::id()).unwrap(),
+                dir,
+            });
+            let slice = Self { root, unit };
+            slice.write("cgroup.procs", "");
+            slice.set_events(1, 0);
+            slice.write("cgroup.freeze", "0\n");
+            slice
+        }
+
+        fn dir(&self) -> &Path {
+            &self.unit.dir
+        }
+
+        fn write(&self, file: &str, content: &str) {
+            std::fs::write(self.dir().join(file), content).unwrap();
+        }
+
+        fn read(&self, file: &str) -> String {
+            std::fs::read_to_string(self.dir().join(file))
+                .unwrap()
+                .trim()
+                .to_string()
+        }
+
+        fn set_events(&self, populated: u8, frozen: u8) {
+            self.write(
+                "cgroup.events",
+                &format!("populated {populated}\nfrozen {frozen}\n"),
+            );
+        }
+
+        fn set_procs(&self, procs: &[&Own]) {
+            let pids: Vec<String> = procs.iter().map(|p| p.pid().to_string()).collect();
+            self.write("cgroup.procs", &pids.join("\n"));
+        }
+
+        /// Makes every watch and read of `cgroup.events` fail (a symlink
+        /// loop: ELOOP), as when no inotify instance or watch can be had.
+        fn break_events(&self) {
+            let events = self.dir().join("cgroup.events");
+            std::fs::remove_file(&events).unwrap();
+            std::os::unix::fs::symlink("cgroup.events", &events).unwrap();
+        }
+
+        /// The argument lists `systemctl` was run with.
+        fn systemctl_calls(&self) -> Vec<String> {
+            std::fs::read_to_string(self.root.path().join("systemctl.log"))
+                .map(|log| log.lines().map(str::to_string).collect())
+                .unwrap_or_default()
+        }
+
+        /// A Codex unit on this slice (keys `s-1` / `t-1`).
+        fn agent_unit(&self) -> AgentUnit {
+            AgentUnit::new(
+                UnitId::parse(&self.unit.unit_id).unwrap(),
+                self.unit.clone(),
+                Capability {
+                    kind: BackendKind::SystemdScope,
+                    full: true,
+                    reason: None,
+                },
+                Arc::new(RecordStore::open(Path::new(""))),
+                UnitLabel {
+                    provider: "codex".into(),
+                    session_id: Some("s-1".into()),
+                    terminal_id: Some("t-1".into()),
+                    mode: "codex".into(),
+                    create_request_id: None,
+                },
+                None,
+            )
+        }
+    }
+
+    fn current_thread() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn named<'a>(events: &'a [CapturedEvent], name: &str) -> Vec<&'a CapturedEvent> {
+        events
+            .iter()
+            .filter(|e| e.fields.get("event") == Some(&FieldValue::Text(name.into())))
+            .collect()
+    }
+
+    /// A stop whose cgroup watches cannot be set up never takes the failure
+    /// for "frozen" or "emptied": it logs the unconfirmed freeze with the
+    /// unit's keys, still spares the daemon-family process, and never stops
+    /// the slice (stopping it would kill the spared daemon family with it).
+    #[test]
+    fn a_stop_whose_cgroup_watch_fails_logs_the_unconfirmed_freeze_and_keeps_the_slice() {
+        let slice = FakeSlice::new();
+        slice.break_events();
+        let doomed = Own::sleep();
+        let daemon = Own::daemon();
+        slice.set_procs(&[&doomed, &daemon]);
+        let unit = slice.agent_unit();
+        let events = capture(|| {
+            current_thread().block_on(async {
+                unit.stop(
+                    StopRequest::new(StopMode::Force, StopReason::ShiftX, "ws").operation("op-1"),
+                )
+                .wait_swept()
+                .await;
+            })
+        });
+        assert!(doomed.dies(), "the slice's other process survived");
+        assert!(
+            !daemon.watch.has_exited(),
+            "the daemon-family process was killed"
+        );
+        assert_eq!(
+            slice.systemctl_calls(),
+            Vec::<String>::new(),
+            "a slice never seen empty was stopped"
+        );
+        assert_eq!(
+            slice.read("cgroup.freeze"),
+            "0",
+            "the slice was left frozen"
+        );
+        let unconfirmed = named(&events, "unit.stop.freeze_timeout");
+        assert!(!unconfirmed.is_empty(), "the missed freeze was not logged");
+        for event in unconfirmed {
+            assert_eq!(event.level, tracing::Level::WARN);
+            assert_eq!(event.str("unit_id"), unit.id().as_str());
+            assert_eq!(event.str("provider"), "codex");
+            assert_eq!(event.str("session_id"), "s-1");
+            assert_eq!(event.str("terminal_id"), "t-1");
+            assert_eq!(event.str("operation_id"), "op-1");
+            assert!(event.str("detail").contains("cgroup.events"), "{event:?}");
+        }
+    }
+
+    /// The slice is stopped only when one read of its `cgroup.events` shows
+    /// it empty, whatever the caller says about the empty event (a populated
+    /// slice can hold a spared Codex daemon family, which would die with
+    /// it), or when it does not exist yet: a placement still under way can
+    /// create it later, and the stop then removes it.
+    #[test]
+    fn only_a_slice_that_reads_empty_or_absent_is_stopped() {
+        let slice = FakeSlice::new();
+        let stop = format!("--user stop {}", slice.unit.slice);
+        assert!(slice.unit.remove(true).is_err(), "a populated slice");
+        assert_eq!(slice.systemctl_calls(), Vec::<String>::new());
+
+        slice.set_events(0, 0);
+        slice.unit.remove(false).unwrap();
+        assert_eq!(slice.systemctl_calls(), Vec::<String>::new());
+        slice.unit.remove(true).unwrap();
+        assert_eq!(slice.systemctl_calls(), std::slice::from_ref(&stop));
+
+        std::fs::remove_dir_all(slice.dir()).unwrap();
+        slice.unit.remove(true).unwrap();
+        assert_eq!(slice.systemctl_calls(), [stop.clone(), stop]);
+    }
+
+    /// The thaw does not depend on the kill finishing: a stop dropped while
+    /// its kill waits for the slice to freeze (as at a server shutdown)
+    /// leaves the slice thawed, so a spared daemon family in it runs on.
+    #[test]
+    fn a_stop_dropped_while_the_slice_freezes_leaves_it_thawed() {
+        let slice = FakeSlice::new();
+        let unit = slice.agent_unit();
+        let runtime = current_thread();
+        runtime.block_on(async {
+            let _ = unit.stop(StopRequest::new(StopMode::Force, StopReason::ShiftX, "ws"));
+            // The kill freezes the slice, then waits up to a second for a
+            // "frozen 1" that never comes.
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+            while slice.read("cgroup.freeze") != "1" {
+                assert!(tokio::time::Instant::now() < deadline, "never froze");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        drop(runtime);
+        assert_eq!(
+            slice.read("cgroup.freeze"),
+            "0",
+            "the slice was left frozen"
+        );
+    }
+
+    /// A kill that cannot confirm the slice frozen never uses the kernel's
+    /// whole-slice kill: a running slice can start a daemon-family process
+    /// after the snapshot, and `cgroup.kill` would kill it too. It kills each
+    /// process of its snapshot through a pin instead.
+    #[test]
+    fn an_unconfirmed_freeze_kills_the_snapshot_one_by_one() {
+        let slice = FakeSlice::new();
+        let doomed = Own::sleep();
+        slice.set_procs(&[&doomed]);
+        let summary = current_thread()
+            .block_on(slice.unit.clone().kill_all(Vec::new()))
+            .unwrap();
+        assert_eq!(
+            summary.not_frozen.as_deref(),
+            Some("no frozen event within 1000 ms")
+        );
+        assert!(
+            !slice.dir().join("cgroup.kill").exists(),
+            "the whole-slice kill ran on a slice that was not frozen"
+        );
+        assert!(doomed.dies(), "the snapshot's process survived");
+        assert_eq!(
+            slice.read("cgroup.freeze"),
+            "0",
+            "the slice was left frozen"
+        );
+    }
+
+    /// An unfrozen slice's processes can still exec: each is judged again by
+    /// its own argv once pinned, so one that became a daemon-family process
+    /// after the snapshot is never killed. Only a frozen slice with nothing
+    /// spared is killed whole.
+    #[test]
+    fn an_unfrozen_kill_judges_each_process_again_before_its_signal() {
+        let slice = FakeSlice::new();
+        let daemon = Own::daemon();
+        let doomed = Own::sleep();
+        let pids = BTreeSet::from([daemon.pid(), doomed.pid()]);
+        // The snapshot judged neither of the daemon family (as before an exec).
+        let killed = slice
+            .unit
+            .kill_all_but(&pids, &BTreeSet::new(), false)
+            .unwrap();
+        assert_eq!(killed, 1);
+        assert!(doomed.dies(), "the other process survived");
+        assert!(
+            !daemon.watch.has_exited(),
+            "the daemon-family process was killed"
+        );
+        assert!(!slice.dir().join("cgroup.kill").exists());
+
+        let killed = slice
+            .unit
+            .kill_all_but(&BTreeSet::from([daemon.pid()]), &BTreeSet::new(), true)
+            .unwrap();
+        assert_eq!(killed, 1);
+        assert_eq!(
+            slice.read("cgroup.kill"),
+            "1",
+            "a frozen slice is killed whole"
+        );
+    }
+
+    /// A cgroup wait resolves on the flag (already shown, or shown later:
+    /// the change wakes it) or on a removed cgroup, and is an error whenever
+    /// it cannot watch or read the file: never the flag.
+    #[test]
+    fn a_cgroup_wait_resolves_only_on_the_flag_or_a_removed_cgroup() {
+        let slice = FakeSlice::new();
+        let dir = slice.dir().to_path_buf();
+        current_thread().block_on(async {
+            inotify::wait_flag(dir.clone(), "populated ", 1)
+                .await
+                .unwrap();
+            let waiter = tokio::spawn(inotify::wait_flag(dir.clone(), "frozen ", 1));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!waiter.is_finished(), "resolved before the flag was shown");
+            slice.set_events(1, 1);
+            tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("the change did not wake the wait")
+                .unwrap()
+                .unwrap();
+
+            let removed = slice.root.path().join("removed");
+            inotify::wait_flag(removed, "populated ", 0).await.unwrap();
+
+            // No watch can be set up on a path through a regular file.
+            let file = slice.root.path().join("file");
+            std::fs::write(&file, "").unwrap();
+            let err = inotify::wait_flag(file, "populated ", 0).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::NotADirectory, "{err}");
+
+            slice.write("cgroup.events", "populated 1\n");
+            let err = inotify::wait_flag(dir.clone(), "frozen ", 1)
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+
+            slice.break_events();
+            inotify::wait_flag(dir.clone(), "populated ", 0)
+                .await
+                .unwrap_err();
+        });
+    }
 
     /// Only systemd 254 and newer expand `$VAR` in `systemd-run` arguments
     /// (and know `--expand-environment=no`); an older one refuses the flag,

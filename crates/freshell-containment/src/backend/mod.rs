@@ -59,8 +59,10 @@ pub(crate) struct KillSummary {
     /// See [`MemberList::withheld`].
     pub withheld: u64,
     /// Why the kill could not confirm its container frozen first (cgroup
-    /// backends; `None` elsewhere). The kill still ran; the unit logs it
-    /// with its keys (`unit.stop.freeze_timeout`).
+    /// backends; `None` elsewhere): no frozen event within the deadline, or
+    /// the error of the freeze write or of its watch. The kill still ran,
+    /// one snapshot process at a time; the unit logs it with its keys
+    /// (`unit.stop.freeze_timeout`).
     pub not_frozen: Option<String>,
 }
 
@@ -106,8 +108,9 @@ pub(crate) trait UnitBackend: Send + Sync {
     /// One-shot: `Ok` when `pid` is in the unit, `ErrorKind::NotFound` when
     /// it is gone, another error when it lives outside the unit.
     fn confirm_placement(&self, pid: u32, roots: &[(u32, u64)]) -> io::Result<()>;
-    /// The kernel's "unit is empty" event, when the backend has one.
-    fn wait_empty(&self) -> Option<BoxFuture<'static, ()>>;
+    /// The kernel's "unit is empty" event, when the backend has one. An
+    /// error means the wait could not watch the unit: never "empty".
+    fn wait_empty(&self) -> Option<BoxFuture<'static, io::Result<()>>>;
     /// Release the unit's OS container after the post-Gone sweep;
     /// `emptied` says whether the emptiness event arrived.
     fn remove(&self, emptied: bool) -> io::Result<()>;

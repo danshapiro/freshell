@@ -64,7 +64,7 @@ impl UnitBackend for RootsUnit {
         ))
     }
 
-    fn wait_empty(&self) -> Option<BoxFuture<'static, ()>> {
+    fn wait_empty(&self) -> Option<BoxFuture<'static, io::Result<()>>> {
         None
     }
 

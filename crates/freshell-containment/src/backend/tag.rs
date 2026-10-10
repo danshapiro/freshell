@@ -268,7 +268,7 @@ impl UnitBackend for TagUnit {
         )))
     }
 
-    fn wait_empty(&self) -> Option<BoxFuture<'static, ()>> {
+    fn wait_empty(&self) -> Option<BoxFuture<'static, io::Result<()>>> {
         None
     }
 

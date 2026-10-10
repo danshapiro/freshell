@@ -1070,9 +1070,19 @@ impl AgentUnit {
         self.kill_whole_unit(keys, &[]).await;
         let (emptied, survivors) = match self.inner.backend.wait_empty() {
             Some(empty) => {
-                let emptied = tokio::time::timeout(POST_GONE_EMPTY_WAIT, empty)
-                    .await
-                    .is_ok();
+                let emptied = match tokio::time::timeout(POST_GONE_EMPTY_WAIT, empty).await {
+                    Ok(Ok(())) => true,
+                    // Never "empty": the container is kept, since a spared
+                    // process may still run in it.
+                    Ok(Err(err)) => {
+                        events::release_failed(
+                            keys,
+                            &format!("cannot watch the unit for emptiness, so it is kept: {err}"),
+                        );
+                        false
+                    }
+                    Err(_) => false,
+                };
                 let unit = self.clone();
                 let survivors = blocking(move || unit.members().unwrap_or_default())
                     .await
@@ -1245,7 +1255,7 @@ mod tests {
         fn confirm_placement(&self, _pid: u32, _roots: &[(u32, u64)]) -> io::Result<()> {
             Ok(())
         }
-        fn wait_empty(&self) -> Option<BoxFuture<'static, ()>> {
+        fn wait_empty(&self) -> Option<BoxFuture<'static, io::Result<()>>> {
             None
         }
         fn remove(&self, _emptied: bool) -> io::Result<()> {
@@ -1281,7 +1291,7 @@ mod tests {
         fn confirm_placement(&self, pid: u32, roots: &[(u32, u64)]) -> io::Result<()> {
             NoProcesses.confirm_placement(pid, roots)
         }
-        fn wait_empty(&self) -> Option<BoxFuture<'static, ()>> {
+        fn wait_empty(&self) -> Option<BoxFuture<'static, io::Result<()>>> {
             None
         }
         fn remove(&self, emptied: bool) -> io::Result<()> {

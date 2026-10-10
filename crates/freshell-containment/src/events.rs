@@ -154,8 +154,9 @@ pub fn stop_failed(k: &UnitLogKeys, attempt: u32, final_attempt: bool, error: &s
 }
 
 /// The whole-unit kill could not confirm the unit's cgroup frozen first
-/// (`detail`: no frozen event within the deadline, or the write's error);
-/// the kill went ahead on the unfrozen cgroup.
+/// (`detail`: no frozen event within the deadline, or the error of the
+/// freeze write or of its watch); the kill went ahead without relying on the
+/// freeze.
 pub fn freeze_timeout(k: &UnitLogKeys, detail: &str) {
     keyed!(warn, k, "unit.stop.freeze_timeout", detail = %detail,
         "unit kill went ahead without a frozen cgroup");
@@ -195,7 +196,9 @@ pub fn root_not_pinned(k: &UnitLogKeys, pid: u32, recorded_start: u64, reason: &
         "recorded unit root not pinned");
 }
 
-/// Releasing the unit's OS container after the sweep failed.
+/// Releasing the unit's OS container after the sweep failed, or was skipped
+/// because the unit could not be watched for emptiness (the container is
+/// then kept).
 pub fn release_failed(k: &UnitLogKeys, error: &str) {
     keyed!(warn, k, "unit.release_failed", error = %error, "unit release failed");
 }
