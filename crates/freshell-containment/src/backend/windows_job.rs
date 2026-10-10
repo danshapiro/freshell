@@ -785,3 +785,207 @@ impl UnitBackend for RecordedUnit {
         Ok(())
     }
 }
+
+/// In-crate checks of what the runner's own messages cannot reach: the port
+/// thread's handling of a zero message posted under a unit's key, and the
+/// order of a sparing stop's recording and ending of members (through a
+/// recording observer). Members are `cmd.exe` processes waiting on their
+/// piped stdin, assigned to the unit's job by handle (in-crate tests have no
+/// shim binary); `cmd.exe /k rem <words>` carries `<words>` on its command
+/// line, so a member can be daemon-family-shaped.
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::process::{Child, Command, Stdio};
+    use std::task::{Context, Waker};
+    use std::time::Duration;
+
+    use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+    use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+
+    use super::*;
+
+    /// A unit job on `backend` (and its completion port).
+    fn new_unit(backend: &JobBackend) -> JobUnit {
+        JobUnit::create(&UnitId::mint(), backend.shim.clone(), backend.port.clone())
+            .expect("a unit job")
+    }
+
+    /// A `cmd.exe` member of a unit's job, waiting on its stdin; killed on
+    /// drop.
+    struct Member(Child);
+
+    impl Member {
+        fn start(unit: &JobUnit, words: &[&str]) -> Self {
+            let child = Command::new("cmd.exe")
+                .args(["/d", "/q", "/k", "rem"])
+                .args(words)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("start cmd.exe");
+            let member = Member(child);
+            unit.shared
+                .with_job(|job| {
+                    // SAFETY: two live handles; std's child handle has every
+                    // access right assignment needs.
+                    if unsafe { AssignProcessToJobObject(job, member.0.as_raw_handle()) } == 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                })
+                .expect("assign the member to the unit's job");
+            member
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+
+        /// True once the member has exited within `limit`.
+        fn exits_within(&self, limit: Duration) -> bool {
+            // SAFETY: std's live child handle; a bounded wait.
+            let rc =
+                unsafe { WaitForSingleObject(self.0.as_raw_handle(), limit.as_millis() as u32) };
+            rc == WAIT_OBJECT_0
+        }
+    }
+
+    impl Drop for Member {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Posts a zero message under `unit`'s key, as a nested job's would
+    /// arrive (Microsoft documents them; the runner never delivers one).
+    fn post_zero(unit: &JobUnit) {
+        let (owner, key) = unit.port.as_ref().expect("the unit has a port");
+        // SAFETY: a live port; zero messages carry no OVERLAPPED.
+        let ok = unsafe {
+            PostQueuedCompletionStatus(
+                owner.0.handle.as_raw_handle(),
+                JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO,
+                *key,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(ok, 0, "post a zero message: {}", io::Error::last_os_error());
+    }
+
+    /// Whether `wait` is still pending (one poll).
+    fn pending(wait: &mut BoxFuture<'static, io::Result<()>>) -> bool {
+        Pin::new(wait)
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    }
+
+    /// LB-08 (V5 §3.7): a zero message under the unit's key (a nested job
+    /// emptying) completes the unit's empty wait only when the unit job's
+    /// own active process count reads 0. A port thread that took every zero
+    /// message as "empty" fails here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_zero_message_while_a_member_runs_leaves_the_empty_wait_pending() {
+        let backend = JobBackend::new(None);
+        let unit = new_unit(&backend);
+        let member = Member::start(&unit, &["member"]);
+        let mut empty = unit.wait_empty().expect("the unit has an empty event");
+        assert!(
+            pending(&mut empty),
+            "the wait completed with a member running"
+        );
+        // An empty unit on the same port: its confirmed zero message,
+        // posted second, shows the port thread has handled the first.
+        let marker = new_unit(&backend);
+        let mut handled = marker.shared.empty.subscribe();
+        post_zero(&unit);
+        post_zero(&marker);
+        tokio::time::timeout(Duration::from_secs(10), handled.changed())
+            .await
+            .expect("the port thread handled both messages within 10 s")
+            .expect("the marker unit is alive");
+        assert!(
+            pending(&mut empty),
+            "a zero message completed the empty wait while the unit's member runs"
+        );
+        drop(member);
+        tokio::time::timeout(Duration::from_secs(10), empty)
+            .await
+            .expect("the empty wait completes once the unit's last member exited")
+            .expect("the wait watched the unit");
+    }
+
+    /// Each root the observer was handed, with whether that process lived
+    /// on for a while after being recorded.
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<(u32, u64, bool)>>);
+
+    /// How long a recorded process must stay alive to count as recorded
+    /// before it was ended (the stop waits in `record_root` meanwhile, so a
+    /// process recorded first cannot die in this window; one already
+    /// terminated is gone well within it).
+    const STILL_RUNNING_FOR: Duration = Duration::from_secs(2);
+
+    impl UnitObserver for Recorder {
+        fn record_root(&self, pid: u32, start: u64) {
+            let alive = process::open_process(pid, PROCESS_SYNCHRONIZE).is_ok_and(|handle| {
+                // SAFETY: a live handle with SYNCHRONIZE; a bounded wait.
+                let rc = unsafe {
+                    WaitForSingleObject(
+                        handle.as_raw_handle(),
+                        STILL_RUNNING_FOR.as_millis() as u32,
+                    )
+                };
+                rc == WAIT_TIMEOUT
+            });
+            lock(&self.0).push((pid, start, alive));
+        }
+
+        fn forget_root(&self, _pid: u32) {}
+    }
+
+    /// Plan review R1-F3: a stop that spares a daemon-family member clears
+    /// kill-on-close, so from then on a server crash would leave the other
+    /// members running. The stop therefore records each of them as a root
+    /// (the job's members at the clearing) BEFORE it ends it, and never
+    /// records the spared member.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sparing_stop_records_each_member_it_ends_while_that_member_still_runs() {
+        let backend = JobBackend::new(None);
+        let unit = Arc::new(new_unit(&backend));
+        let recorder = Arc::new(Recorder::default());
+        unit.set_observer(recorder.clone());
+        let family = Member::start(&unit, &["app-server", "--managed-daemon"]);
+        let plain = Member::start(&unit, &["plain"]);
+        let plain_start = process::start_time(plain.pid()).expect("the plain member's start");
+
+        let summary = unit.clone().kill_all(Vec::new()).await.expect("the stop");
+
+        let recorded = lock(&recorder.0).clone();
+        assert!(
+            recorded.contains(&(plain.pid(), plain_start, true)),
+            "the plain member {} was not recorded while it still ran: {recorded:?}",
+            plain.pid()
+        );
+        assert!(
+            recorded.iter().all(|(pid, _, _)| *pid != family.pid()),
+            "the spared member {} was recorded: {recorded:?}",
+            family.pid()
+        );
+        assert!(
+            summary.spared.iter().any(|s| s.pid == family.pid()),
+            "the daemon-family member was not spared: {summary:?}"
+        );
+        assert!(
+            plain.exits_within(Duration::from_secs(10)),
+            "the plain member outlived the stop"
+        );
+        assert!(
+            !family.exits_within(Duration::ZERO),
+            "the spared member was ended"
+        );
+    }
+}
