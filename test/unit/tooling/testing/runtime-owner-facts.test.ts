@@ -15,7 +15,10 @@ import { runTask2RetainedFixture } from '../../../../scripts/testing/task002-con
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import * as retained from '../../../../scripts/testing/task002-retained-fixture.js'
 import { RestrictedDockerBroker } from '../../../../scripts/testing/runtime-test-broker.js'
-import type { NativeHistory } from '../../../../scripts/testing/provider-native-history.js'
+import { nativeTurnProof, type NativeHistory } from '../../../../scripts/testing/provider-native-history.js'
+import { providerNativeProfileMatches } from '../../../../scripts/testing/provider-qualification-receipt.js'
+import { readAmplifierNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/amplifier.js'
+import { readClaudeNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/claude.js'
 import plugin from '../../../../extensions/opencode/freshell-rebind-plugin.js'
 
 const { DatabaseSync }: typeof import('node:sqlite') = createRequire(import.meta.url)('node:sqlite')
@@ -46,6 +49,52 @@ const handle = {
   runId: 'run-owned', candidateSha: 'a'.repeat(40), soulId: 'soul-owned',
   incarnationId: 'incarnation-owned', containerId: 'b'.repeat(64),
   hostBootId: 'boot-owned', nativeSessionId: 'native-owned',
+}
+
+async function nativeOwnerHistory(provider: 'claude' | 'amplifier', nonce: string): Promise<NativeHistory> {
+  const root = path.join(fixtureRepoRoot, 'native-owner-history')
+  const sessionId = handle.nativeSessionId
+  const at = (index: number, offset: number) => new Date(Date.parse('2026-09-01T00:00:00.000Z') + index * 1000 + offset).toISOString()
+  const writeJsonl = async (filename: string, rows: unknown[]) => {
+    await fsp.mkdir(path.dirname(filename), { recursive: true })
+    await fsp.writeFile(filename, rows.map(row => JSON.stringify(row)).join('\n') + '\n')
+  }
+  if (provider === 'claude') {
+    await writeJsonl(path.join(root, `${sessionId}.jsonl`), [0, 1, 2].flatMap(index => [
+      { type: 'user', uuid: `user-${index}`, sessionId, message: { role: 'user', content: 'recall the marker' } },
+      { type: 'attachment', uuid: `context-${index}`, parentUuid: `user-${index}`, sessionId },
+      { type: 'assistant', uuid: `thinking-${index}`, parentUuid: `context-${index}`, sessionId,
+        requestId: `request-${index}`, apiBlockIndex: 0, timestamp: at(index, 200), message: {
+          id: `message-${index}`, role: 'assistant', model: 'claude-haiku-4-5-20251001', stop_reason: 'end_turn',
+          content: [{ type: 'thinking', thinking: 'private synthetic reasoning', signature: 'signature' }],
+        } },
+      { type: 'assistant', uuid: `text-${index}`, parentUuid: `thinking-${index}`, sessionId,
+        requestId: `request-${index}`, apiBlockIndex: 1, timestamp: at(index, 300), message: {
+          id: `message-${index}`, role: 'assistant', model: 'claude-haiku-4-5-20251001', stop_reason: 'end_turn',
+          content: [{ type: 'text', text: `private native answer ${nonce} ${index}` }],
+        } },
+    ]))
+    return readClaudeNativeHistory(root, sessionId)
+  }
+  const directory = path.join(root, 'project', 'sessions', sessionId)
+  const event = (index: number, offset: number, name: string, data: unknown) => ({
+    event: name, ts: at(index, offset), session_id: sessionId, schema: { name: 'amplifier.log', ver: '1.0.0' }, data,
+  })
+  await writeJsonl(path.join(directory, 'events.jsonl'), [0, 1, 2].flatMap(index => {
+    const prompt = `recall the marker ${index}`, response = `private native answer ${nonce} ${index}`
+    return [
+      event(index, 0, 'prompt:submit', { prompt }),
+      event(index, 100, 'llm:response', { provider: 'vllm', model: 'glm-5.3', continuation_count: null, parent_id: null }),
+      event(index, 200, 'prompt:complete', { response_preview: response, length: response.length, parent_id: null }),
+      event(index, 300, 'prompt:complete', { prompt, response }),
+      event(index, 400, 'cleanup:store_end', {}),
+    ]
+  }))
+  await writeJsonl(path.join(directory, 'transcript.jsonl'), [0, 1, 2].flatMap(index => [
+    { role: 'user', content: `recall the marker ${index}`, metadata: { timestamp: at(index, 0) } },
+    { role: 'assistant', content: `private native answer ${nonce} ${index}`, metadata: { timestamp: at(index, 300) } },
+  ]))
+  return readAmplifierNativeHistory(root, sessionId)
 }
 
 describe('Task7 standalone owner cancellation', () => {
@@ -4106,7 +4155,55 @@ describe('run-scoped owner operation settlement', () => {
 })
 
 describe('current handle admission before owner mutation', () => {
-  it('reads unchanged stopped history through the tracked helper and returns only the original three proofs', async () => {
+  it.each([
+    { provider: 'claude', field: 'components', fault: 'not-array' },
+    { provider: 'claude', field: 'components', fault: 'empty' },
+    { provider: 'claude', field: 'components', fault: 'missing-id' },
+    { provider: 'claude', field: 'components', fault: 'parent-type' },
+    { provider: 'claude', field: 'components', fault: 'negative-position' },
+    { provider: 'claude', field: 'components', fault: 'fractional-byte' },
+    { provider: 'claude', field: 'components', fault: 'digest' },
+    { provider: 'claude', field: 'components', fault: 'unknown-key' },
+    { provider: 'claude', field: 'parentChain', fault: 'not-array' },
+    { provider: 'claude', field: 'parentChain', fault: 'digest' },
+    { provider: 'amplifier', field: 'responseEventSha256s', fault: 'not-array' },
+    { provider: 'amplifier', field: 'responseEventSha256s', fault: 'empty' },
+    { provider: 'amplifier', field: 'responseEventSha256s', fault: 'digest' },
+    { provider: 'amplifier', field: 'responseEventSha256s', fault: 'element-type' },
+  ] as const)('refuses malformed retained $provider $field evidence ($fault)', async ({ provider, field, fault }) => {
+    const nonce = `codename-${'e'.repeat(32)}`
+    const history = await nativeOwnerHistory(provider, nonce)
+    const proof = nativeTurnProof('initial', handle.nativeSessionId, history.turns[0]!, nonce)
+    expect(owner.RuntimeProviderNativeTurnProofsSchema.parse([proof])).toEqual([proof])
+    const changed: any = JSON.parse(JSON.stringify(proof))
+    const evidence = changed.nativeEvidence
+    if (fault === 'not-array') evidence[field] = 'not-an-array'
+    if (fault === 'empty') evidence[field] = []
+    if (fault === 'element-type') evidence[field][0] = 123
+    if (field === 'responseEventSha256s') {
+      if (fault === 'digest') evidence[field][0] = 'not-a-digest'
+    } else {
+      if (fault === 'missing-id') delete evidence[field][0].messageId
+      if (fault === 'parent-type') evidence[field][0].parentMessageId = 123
+      if (fault === 'negative-position') evidence[field][0].recordIndex = -1
+      if (fault === 'fractional-byte') evidence[field][0].byteStart = 0.5
+      if (fault === 'digest') evidence[field][0].recordSha256 = 'not-a-digest'
+      if (fault === 'unknown-key') evidence[field][0].unexpected = true
+    }
+    expect(() => owner.RuntimeProviderNativeTurnProofsSchema.parse([changed])).toThrow()
+  })
+
+  it.each(['claude', 'amplifier'] as const)('keeps the outer %s native evidence shape strict', async provider => {
+    const nonce = `codename-${'e'.repeat(32)}`
+    const history = await nativeOwnerHistory(provider, nonce)
+    const proof = nativeTurnProof('initial', handle.nativeSessionId, history.turns[0]!, nonce)
+    expect(owner.RuntimeProviderNativeTurnProofsSchema.parse([proof])).toEqual([proof])
+    expect(() => owner.RuntimeProviderNativeTurnProofsSchema.parse([
+      { ...proof, nativeEvidence: { ...proof.nativeEvidence, unexpected: true } },
+    ])).toThrow()
+  })
+
+  it.each(['codex', 'opencode', 'claude', 'amplifier'] as const)('reads unchanged stopped history for %s through the tracked helper and returns only the original three proofs', async provider => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-stopped-proofs-'))
     const nonce = `codename-${'e'.repeat(32)}`
     const historyFile = path.join(root, 'history.json')
@@ -4115,28 +4212,39 @@ describe('current handle admission before owner mutation', () => {
     const docker = path.join(root, 'docker')
     await fsp.writeFile(docker, `#!${process.execPath}\nconst fs=require('node:fs');const a=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(callsFile)},JSON.stringify({args:a,host:process.env.DOCKER_HOST,api:process.env.DOCKER_API_VERSION})+'\\n');if(a[0]==='create')process.stdout.write('${helperId}');else if(a[0]==='wait')process.stdout.write('0');else if(a[0]==='logs')process.stdout.write(fs.readFileSync(${JSON.stringify(historyFile)},'utf8'));else if(!['start','rm'].includes(a[0]))process.exit(10);\n`, { mode: 0o700 })
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused stopped-proof web') }, fixtureRepoRoot, 5,
-      {}, {}, 'release', { enabledProviders: ['codex'], freshAgentModes: [] })
+      {}, {}, 'release', { enabledProviders: [provider], freshAgentModes: [] })
     const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
-    const row = { ...current, provider: 'codex', launchState: 'stopped', desiredState: 'stopped', cleanupState: 'verified_empty', intentRevision: 1 }
+    const row = { ...current, provider, launchState: 'stopped', desiredState: 'stopped', cleanupState: 'verified_empty', intentRevision: 1 }
     const inventory = vi.spyOn(rig, 'inventory').mockResolvedValue([row])
     Object.defineProperty(rig.runtime, 'broker', { value: { proxySocketPath: path.join(root, 'broker.sock'),
       receiptIds: () => new Set([current.containerId, helperId]), receipts: () => [{ ...current,
         providerVolumeName: 'freshell-provider-aaaaaaaaaaaaaaaaaaaaaaaa', workspacePath: rig.repoRoot, imageRef: rig.runtime.imageRef }] } })
     vi.spyOn(rig, 'ownedContainerState').mockResolvedValue({ present: false, running: false })
-    const claim = vi.spyOn(rig, 'writerClaimFacts').mockResolvedValue({ provider: 'codex', providerStoreId: 'owned-store',
+    const claim = vi.spyOn(rig, 'writerClaimFacts').mockResolvedValue({ provider, providerStoreId: 'owned-store',
       nativeSessionId: current.nativeSessionId, soulId: current.soulId, incarnationId: current.incarnationId,
       activeClaimCount: 0, globalConflictingClaimCount: 0 })
     vi.spyOn(rig.runtime, 'recordLifecycle').mockImplementation(() => undefined)
-    const history: NativeHistory = { schemaVersion: 1, provider: 'codex', nativeSessionId: current.nativeSessionId,
+    const history: NativeHistory = provider === 'codex' || provider === 'opencode' ? { schemaVersion: 1, provider, nativeSessionId: current.nativeSessionId,
       turns: [1, 2, 3].map(index => ({ nativeEvidence: { kind: 'identified_message', turnId: `turn-${index}`, messageId: `message-${index}`, parentMessageId: null },
         text: `private native answer ${nonce} ${index}`, completedAt: index, toolCalls: [], resolvedProvider: 'openai', resolvedModel: 'gpt-5.6-luna',
-        resolvedReasoningEffort: 'low', providerProvenance: 'native-fixture', modelProvenance: 'native-fixture', reasoningEffortProvenance: 'native-fixture' })) }
+        resolvedReasoningEffort: provider === 'opencode' ? 'provider-default' : 'low',
+        providerProvenance: 'native-fixture', modelProvenance: 'native-fixture', reasoningEffortProvenance: 'native-fixture' })) }
+      : await nativeOwnerHistory(provider, nonce)
     await fsp.writeFile(historyFile, JSON.stringify(history))
     vi.stubEnv('PATH', `${root}${path.delimiter}${process.env.PATH}`)
     try {
       const proofs = await rig.managedTerminalStoppedProofs(current, nonce)
       expect(proofs.map(proof => proof.stage)).toEqual(['initial', 'after_session_host_crash', 'after_provider_process_crash'])
       expect(proofs.map(proof => proof.nativeEvidence)).toEqual(history.turns.map(turn => turn.nativeEvidence))
+      const transported = owner.RuntimeProviderNativeTurnProofsSchema.parse(JSON.parse(JSON.stringify(proofs)))
+      expect(transported).toEqual(proofs)
+      const profile = { provider, model: provider === 'codex' ? 'gpt-5.6-luna' : provider === 'opencode' ? 'openai/gpt-5.6-luna'
+        : provider === 'claude' ? 'haiku' : 'glm-5.3',
+        reasoningEffort: provider === 'amplifier' || provider === 'opencode' ? 'provider-default' : 'low' }
+      expect(transported.every(proof => providerNativeProfileMatches(profile, proof))).toBe(true)
+      const stages = ['initial', 'after_session_host_crash', 'after_provider_process_crash'] as const
+      expect(transported).toEqual(history.turns.map((turn, index) => nativeTurnProof(
+        stages[index]!, current.nativeSessionId, turn, nonce)))
       expect(JSON.stringify(proofs)).not.toContain('private native answer')
       expect(JSON.stringify(proofs)).not.toContain(nonce)
       const calls = (await fsp.readFile(callsFile, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
@@ -4149,7 +4257,7 @@ describe('current handle admission before owner mutation', () => {
       await expect(rig.managedTerminalStoppedProofs(current, nonce)).rejects.toThrow(/exactly three/)
       expect(JSON.parse((await fsp.readFile(callsFile, 'utf8')).trim().split('\n').at(-1) ?? '{}').args[0]).toBe('rm')
       const before = await fsp.readFile(callsFile, 'utf8')
-      claim.mockResolvedValue({ provider: 'codex', providerStoreId: 'owned-store', nativeSessionId: current.nativeSessionId,
+      claim.mockResolvedValue({ provider, providerStoreId: 'owned-store', nativeSessionId: current.nativeSessionId,
         soulId: current.soulId, incarnationId: current.incarnationId, activeClaimCount: 1, globalConflictingClaimCount: 0 })
       await expect(rig.managedTerminalStoppedProofs(current, nonce)).rejects.toThrow(/writer/)
       expect(await fsp.readFile(callsFile, 'utf8')).toBe(before)

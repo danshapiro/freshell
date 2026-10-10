@@ -1120,8 +1120,16 @@ export const OpencodeReadinessDiagnosticSchema = z.object({
 export type OpencodeReadinessDiagnostic = z.infer<typeof OpencodeReadinessDiagnosticSchema>
 const OpencodeQualificationProofStageSchema = z.enum(['initial', 'after_session_host_crash', 'after_provider_process_crash'])
 export type OpencodeQualificationProofStage = z.infer<typeof OpencodeQualificationProofStageSchema>
+const NativeMessageComponentEvidenceSchema = z.object({
+  messageId: z.string().min(1), parentMessageId: z.string().min(1).nullable(),
+  recordIndex: z.number().int().nonnegative(), byteStart: z.number().int().nonnegative(),
+  byteEnd: z.number().int().positive(), recordSha256: NativeDigest,
+}).strict()
+const NativeMessageComponentsSchema = z.array(NativeMessageComponentEvidenceSchema).nonempty().optional()
 const OpencodeQualificationNativeEvidenceSchema = z.object({ kind: z.literal('identified_message'),
-  turnId: z.string(), messageId: z.string(), parentMessageId: z.string().nullable() }).strict()
+  turnId: z.string(), messageId: z.string(), parentMessageId: z.string().nullable(),
+  components: NativeMessageComponentsSchema, parentChain: NativeMessageComponentsSchema,
+}).strict()
 const OpencodeQualificationNativeTurnSchema = z.object({
   nativeEvidence: OpencodeQualificationNativeEvidenceSchema, turnId: z.string().optional(), messageId: z.string().optional(),
   parentMessageId: z.string().nullable().optional(), completedAt: z.union([z.string(), z.number()]), text: z.string(),
@@ -1297,7 +1305,7 @@ export const RuntimeProviderNativeTurnProofsSchema = z.array(OpencodeQualificati
     z.object({ kind: z.literal('append_only_record'), recordIndex: z.number().int().nonnegative(),
       byteStart: z.number().int().nonnegative(), byteEnd: z.number().int().nonnegative(),
       recordSha256: z.string(), prefixSha256Before: z.string(), completionEventOrdinal: z.number().int().nonnegative(),
-      completionEventSha256: z.string() }).strict()]),
+      completionEventSha256: z.string(), responseEventSha256s: z.array(NativeDigest).nonempty().optional() }).strict()]),
 }))
 export const RuntimeProviderObservationSchema: z.ZodType<ProviderQualificationRow> = z.object({
   provider: z.string().min(1), modes: z.array(z.string().min(1)), providerVersion: z.string().min(1),
