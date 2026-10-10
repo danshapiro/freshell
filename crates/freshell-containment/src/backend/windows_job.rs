@@ -692,28 +692,14 @@ pub(crate) struct RecordedUnit;
 impl RecordedUnit {
     /// `(pid, start)` of every live root and descendant.
     fn tree(roots: &[(u32, u64)]) -> Vec<(u32, u64)> {
-        let links = process::parent_links();
-        let mut out: Vec<(u32, u64)> = roots
+        let live: Vec<(u32, u64)> = roots
             .iter()
             .copied()
             .filter(|(pid, start)| process::start_time(*pid).ok() == Some(*start))
             .collect();
-        let mut next = 0;
-        while next < out.len() {
-            let (parent, parent_start) = out[next];
-            next += 1;
-            for (pid, _) in links.iter().filter(|(_, pp)| *pp == parent) {
-                if out.iter().any(|(p, _)| p == pid) {
-                    continue;
-                }
-                if let Ok(start) = process::start_time(*pid) {
-                    if start >= parent_start {
-                        out.push((*pid, start));
-                    }
-                }
-            }
-        }
-        out
+        process::tree_by_start(&live, &process::parent_links(), |pid| {
+            process::start_time(pid).ok()
+        })
     }
 }
 

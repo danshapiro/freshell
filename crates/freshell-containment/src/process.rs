@@ -357,6 +357,44 @@ fn split_command_line(line: &str) -> Vec<String> {
 // image names). A process handle pins its process, and Windows never reuses
 // a pid while any handle to that process is open.
 
+/// The processes reachable from `roots` (each a live `(pid, start)`)
+/// through `links` (`(pid, parent pid)` pairs), roots first. A link is
+/// followed only to a child that started no earlier than its parent:
+/// Windows never re-parents, so a process whose parent exited still names
+/// that parent's pid, which a later process may reuse, and such a process
+/// started before the pid's new owner. `start_of` reads a process's start
+/// time (`None` when it is gone).
+#[cfg(any(windows, test))]
+pub(crate) fn tree_by_start(
+    roots: &[(u32, u64)],
+    links: &[(u32, u32)],
+    start_of: impl Fn(u32) -> Option<u64>,
+) -> Vec<(u32, u64)> {
+    let mut out: Vec<(u32, u64)> = Vec::new();
+    for root in roots {
+        if !out.iter().any(|(pid, _)| *pid == root.0) {
+            out.push(*root);
+        }
+    }
+    let mut next = 0;
+    while next < out.len() {
+        let (parent, parent_start) = out[next];
+        next += 1;
+        for (pid, _) in links
+            .iter()
+            .filter(|(pid, pp)| *pp == parent && *pid != parent)
+        {
+            if out.iter().any(|(p, _)| p == pid) {
+                continue;
+            }
+            if let Some(start) = start_of(*pid).filter(|start| *start >= parent_start) {
+                out.push((*pid, start));
+            }
+        }
+    }
+    out
+}
+
 /// Windows: the creation time of the process `handle` names (100 ns
 /// intervals since 1601, `GetProcessTimes`). `(pid, start)` names one
 /// process forever, as on Linux.

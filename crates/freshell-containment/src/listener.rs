@@ -74,18 +74,35 @@ pub fn listening_socket_owner(port: u16, candidates: &[u32]) -> Option<u32> {
     if owners.is_empty() {
         return None;
     }
-    let mut seen = std::collections::HashSet::new();
-    let mut frontier: Vec<u32> = candidates.to_vec();
-    while let Some(pid) = frontier.pop() {
-        if !seen.insert(pid) {
-            continue;
-        }
-        if owners.contains(&pid) {
-            return Some(pid);
-        }
-        frontier.extend(crate::process::children(pid));
-    }
-    None
+    owner_among(
+        &owners,
+        candidates,
+        &crate::process::parent_links(),
+        |pid| crate::process::start_time(pid).ok(),
+    )
+}
+
+/// The first of `candidates` and their descendants that is one of
+/// `owners`. Descendants are found through `links` (`(pid, parent pid)`),
+/// following a link only to a child that started no earlier than its parent
+/// ([`crate::process::tree_by_start`]): a process whose original parent
+/// exited can name a pid that a candidate reuses, and it is no descendant
+/// of that candidate.
+#[cfg(any(windows, test))]
+fn owner_among(
+    owners: &[u32],
+    candidates: &[u32],
+    links: &[(u32, u32)],
+    start_of: impl Fn(u32) -> Option<u64>,
+) -> Option<u32> {
+    let roots: Vec<(u32, u64)> = candidates
+        .iter()
+        .filter_map(|pid| start_of(*pid).map(|start| (*pid, start)))
+        .collect();
+    crate::process::tree_by_start(&roots, links, start_of)
+        .into_iter()
+        .map(|(pid, _)| pid)
+        .find(|pid| owners.contains(pid))
 }
 
 #[cfg(windows)]
@@ -174,4 +191,41 @@ mod windows_tables {
 #[cfg(all(unix, not(target_os = "linux")))]
 pub fn listening_socket_owner(_port: u16, _candidates: &[u32]) -> Option<u32> {
     None // macOS: Task 7 (libproc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::owner_among;
+
+    /// Candidate 10 started at 100, 20 is its child and 40 its grandchild.
+    /// 30 names 10 as its parent but started at 50, before the candidate:
+    /// its real parent was an earlier process 10 that exited before the
+    /// candidate reused the pid (Windows never re-parents); 50 is 30's
+    /// child.
+    const LINKS: [(u32, u32); 5] = [(10, 1), (20, 10), (30, 10), (40, 20), (50, 30)];
+
+    fn start(pid: u32) -> Option<u64> {
+        match pid {
+            10 => Some(100),
+            20 => Some(150),
+            30 => Some(50),
+            40 => Some(160),
+            50 => Some(60),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn the_listener_is_the_candidate_or_one_of_its_descendants_at_any_depth() {
+        assert_eq!(owner_among(&[10], &[10], &LINKS, start), Some(10));
+        assert_eq!(owner_among(&[20], &[10], &LINKS, start), Some(20));
+        assert_eq!(owner_among(&[40], &[10], &LINKS, start), Some(40));
+        assert_eq!(owner_among(&[40], &[99], &LINKS, start), None);
+    }
+
+    #[test]
+    fn a_listener_whose_recorded_parent_pid_a_candidate_reused_is_not_its_descendant() {
+        assert_eq!(owner_among(&[30], &[10], &LINKS, start), None);
+        assert_eq!(owner_among(&[50], &[10], &LINKS, start), None);
+    }
 }
