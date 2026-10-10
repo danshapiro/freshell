@@ -1983,7 +1983,7 @@ describe('current running fresh-session lookup', () => {
 })
 
 describe('startup replacement fixture observes bounded automatic recovery', () => {
-  it.each(['scheduled', 'blocked', 'unrelated-live'] as const)('observes %s inventory without forcing or rearming recovery', async scenario => {
+  it.each(['scheduled', 'blocked', 'unrelated-live', 'late-live', 'deadline-live', 'pending', 'near-deadline'] as const)('observes %s inventory without forcing or rearming recovery', async scenario => {
     const { exercisePhase3StartupReplacementCrash } = await import('../../../runtime/gates/phase-3.test.js')
     const h = new owner.RuntimeHarness(fixtureRepoRoot, 'startup-backoff-unit', 3, { bootstrapProviders: [] })
     let starts = 0
@@ -2007,7 +2007,9 @@ describe('startup replacement fixture observes bounded automatic recovery', () =
         : { ok: true, sessionId: 'native-root', history: ['create', 'automatic_resume'] })
     const recoveryTimes: number[] = []
     const inventoryTimes: number[] = []
-    vi.spyOn(h, 'adminOk').mockImplementation(async (_instance, body) => {
+    const readTimeouts: Array<number | undefined> = []
+    let pendingReads = 0
+    vi.spyOn(h, 'adminOk').mockImplementation(async (_instance, body, options) => {
       const elapsed = Date.now()
       switch (body.method) {
         case 'health': return { kind: 'health', data: { controlEpoch: 1 } }
@@ -2018,6 +2020,23 @@ describe('startup replacement fixture observes bounded automatic recovery', () =
         case 'inventory': {
           if (starts < 3) return { kind: 'inventory', data: [row()] }
           inventoryTimes.push(elapsed)
+          readTimeouts.push(options?.timeoutMs)
+          if (scenario === 'pending') {
+            pendingReads++
+            const timeout = options?.timeoutMs ?? owner.CONTROL_ROUND_TRIP_TIMEOUT_MS
+            return await new Promise((_resolve, reject) => setTimeout(() => {
+              pendingReads--
+              reject(new Error(`control round trip exceeded ${timeout}ms`))
+            }, timeout))
+          }
+          if (scenario === 'late-live' || scenario === 'deadline-live') {
+            vi.setSystemTime(scenario === 'late-live' ? 9_001 : 8_000)
+            return { kind: 'inventory', data: [{ ...row(), incarnationId: 'replacement-incarnation' }] }
+          }
+          if (scenario === 'near-deadline') {
+            vi.setSystemTime(7_990)
+            return { kind: 'inventory', data: [{ ...row(), launchState: 'stopped', recoveryState: 'blocked' }] }
+          }
           const recovered = elapsed >= 2_000 && scenario !== 'blocked'
           return { kind: 'inventory', data: recovered
             ? [{ ...row(), soulId: scenario === 'unrelated-live' ? 'other-soul' : soulId, incarnationId: 'replacement-incarnation' }]
@@ -2038,12 +2057,63 @@ describe('startup replacement fixture observes bounded automatic recovery', () =
       // failure is observed without creating an unhandled rejection.
       const checked = scenario === 'scheduled'
         ? expect(execution).resolves.toMatchObject({ recoveryOutcome: 'reattached', nativeSessionStable: true, stopOutcome: 'verified_empty' })
-        : expect(execution).rejects.toThrow(/within 8000ms/)
+        : expect(execution).rejects.toThrow(/within 8000ms|control round trip exceeded 8000ms/)
       await Promise.all([vi.runAllTimersAsync(), checked])
       expect(waitForFault).toHaveBeenCalledExactlyOnceWith('supervisor-2', 8_000)
       expect(recoveryTimes).toEqual(scenario === 'scheduled' ? [2_000] : [])
-      expect(inventoryTimes.at(-1)).toBe(scenario === 'scheduled' ? 2_000 : 7_900)
+      expect(inventoryTimes.at(-1)).toBe(scenario === 'scheduled' ? 2_000 : scenario === 'blocked' || scenario === 'unrelated-live' ? 7_900 : 0)
+      expect(readTimeouts[0]).toBe(8_000)
+      if (scenario === 'scheduled') {
+        expect(readTimeouts.at(-2)).toBe(6_000)
+        expect(readTimeouts.at(-1)).toBeUndefined() // existing post-recovery inventory keeps its default
+      }
+      if (scenario === 'pending' || scenario === 'near-deadline') expect(Date.now()).toBe(8_000)
+      expect(pendingReads).toBe(0)
+      expect(vi.getTimerCount()).toBe(0)
     } finally { vi.useRealTimers() }
+  })
+})
+
+describe('owned inventory control read timeout', () => {
+  it.each(['adminRaw', 'adminOk', 'adminEnvelopeRaw'] as const)('settles %s and destroys its owned socket within the requested read budget', async method => {
+    const h = new owner.RuntimeHarness(fixtureRepoRoot, 'control-timeout-unit', 3, { bootstrapProviders: [] })
+    const socketPath = path.join(fixtureRepoRoot, 'control.sock')
+    const sockets = new Set<net.Socket>()
+    const timers = new Set<NodeJS.Timeout>()
+    let requests = 0
+    let closed = 0
+    const server = net.createServer(socket => {
+      sockets.add(socket)
+      socket.once('data', () => {
+        requests++
+        // A bounded fallback makes the pre-fix RED settle too, instead of
+        // waiting the unchanged default two-minute control timeout.
+        const timer = setTimeout(() => {
+          timers.delete(timer)
+          const payload = Buffer.from(JSON.stringify({ result: { Ok: { kind: 'inventory', data: [] } } }))
+          const frame = Buffer.alloc(4 + payload.length)
+          frame.writeUInt32BE(payload.length)
+          payload.copy(frame, 4)
+          socket.end(frame)
+        }, 100)
+        timers.add(timer)
+        socket.once('close', () => { clearTimeout(timer); timers.delete(timer) })
+      })
+      socket.once('close', () => { sockets.delete(socket); closed++ })
+    })
+    await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(socketPath, resolve) })
+    const instance = { controlSocket: socketPath, controlSecret: 'controlled-secret' } as owner.SupervisorInstance
+    try {
+      const read = method === 'adminEnvelopeRaw'
+        ? h.adminEnvelopeRaw(instance, { body: h.inventoryBody() }, { timeoutMs: 25 })
+        : h[method](instance, h.inventoryBody(), { timeoutMs: 25 })
+      await expect(read).rejects.toThrow(/control round trip exceeded 25ms/)
+      await vi.waitFor(() => { expect(requests).toBe(1); expect(closed).toBe(1); expect(sockets.size).toBe(0); expect(timers.size).toBe(0) })
+    } finally {
+      for (const timer of timers) clearTimeout(timer)
+      for (const socket of sockets) socket.destroy()
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+    }
   })
 })
 

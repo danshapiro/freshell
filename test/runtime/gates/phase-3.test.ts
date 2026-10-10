@@ -500,8 +500,8 @@ export async function exercisePhase3StartupReplacementCrash(
   })
   // Retirement spends the interrupted try and preserves its automatic 2s
   // backoff. Observe the scheduled retry; do not mint an immediate new try.
-  await waitUntil(async () => {
-    const view = latestSoulView(await inventory(h, reconciled), crashSoul.soulId)
+  await waitUntil(async (remainingMs) => {
+    const view = latestSoulView(await inventory(h, reconciled, remainingMs), crashSoul.soulId)
     return view?.launchState === 'running' && view?.recoveryState === 'live'
   }, 8_000)
   const final = dataOf(
@@ -796,8 +796,8 @@ async function controlEpoch(h: RuntimeHarness, supervisor: SupervisorInstance): 
   return numericField(health, 'controlEpoch', 'control_epoch')
 }
 
-async function inventory(h: RuntimeHarness, supervisor: SupervisorInstance): Promise<any[]> {
-  return dataOf(await h.adminOk(supervisor, h.inventoryBody()), 'inventory')
+async function inventory(h: RuntimeHarness, supervisor: SupervisorInstance, timeoutMs?: number): Promise<any[]> {
+  return dataOf(await h.adminOk(supervisor, h.inventoryBody(), { timeoutMs }), 'inventory')
 }
 
 function latestSoulView(views: any[], soulId: string): any | undefined {
@@ -924,11 +924,14 @@ function shellRegexEscape(value: string): string {
   return value.replace(/[\\/.*+?[^\]$(){}=!<>|:-]/g, '\\$&')
 }
 
-async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs: number): Promise<void> {
+async function waitUntil(predicate: (remainingMs: number) => boolean | Promise<boolean>, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    if (await predicate()) return
-    await new Promise((resolve) => setTimeout(resolve, 100))
+    const matched = await predicate(deadline - Date.now())
+    const remainingMs = deadline - Date.now()
+    if (remainingMs <= 0) break
+    if (matched) return
+    await new Promise((resolve) => setTimeout(resolve, Math.min(100, remainingMs)))
   }
   throw new Error(`condition did not become true within ${timeoutMs}ms`)
 }

@@ -3282,14 +3282,14 @@ export class RuntimeHarness {
     throw new Error(`supervisor health timeout: ${String(lastError)}`)
   }
 
-  async adminRaw(instance: SupervisorInstance, body: any, options: { requestId?: string; auth?: string } = {}): Promise<AdminReply> {
+  async adminRaw(instance: SupervisorInstance, body: any, options: { requestId?: string; auth?: string; timeoutMs?: number } = {}): Promise<AdminReply> {
     return await this.adminEnvelopeRaw(instance, {
       protocolVersion: CONTROL_PROTOCOL_VERSION,
       requestId: options.requestId ?? `request-${randomUUID()}`,
       role: 'web',
       auth: options.auth ?? instance.controlSecret,
       body,
-    })
+    }, { timeoutMs: options.timeoutMs })
   }
 
   async adminSendAndDrop(instance: SupervisorInstance, body: any, options: { requestId?: string; auth?: string } = {}): Promise<void> {
@@ -3317,12 +3317,12 @@ export class RuntimeHarness {
     })
   }
 
-  async adminEnvelopeRaw(instance: SupervisorInstance, envelope: Record<string, unknown>): Promise<AdminReply> {
+  async adminEnvelopeRaw(instance: SupervisorInstance, envelope: Record<string, unknown>, options: { timeoutMs?: number } = {}): Promise<AdminReply> {
     const payload = Buffer.from(JSON.stringify(envelope))
     const frame = Buffer.allocUnsafe(4 + payload.length)
     frame.writeUInt32BE(payload.length, 0)
     payload.copy(frame, 4)
-    return await unixRoundTrip(instance.controlSocket, frame) as AdminReply
+    return await unixRoundTrip(instance.controlSocket, frame, options.timeoutMs) as AdminReply
   }
 
   async adminOversizedFrame(instance: SupervisorInstance, announcedBytes = 1024 * 1024 + 1): Promise<AdminReply> {
@@ -3331,7 +3331,7 @@ export class RuntimeHarness {
     return await unixRoundTrip(instance.controlSocket, frame) as AdminReply
   }
 
-  async adminOk(instance: SupervisorInstance, body: any, options: { requestId?: string; auth?: string } = {}): Promise<any> {
+  async adminOk(instance: SupervisorInstance, body: any, options: { requestId?: string; auth?: string; timeoutMs?: number } = {}): Promise<any> {
     const reply = await this.adminRaw(instance, body, options)
     if (reply.result?.Err) {
       const error = new Error(`${reply.result.Err.code}: ${reply.result.Err.message}`) as Error & { runtimeError?: AdminError }
