@@ -7,6 +7,8 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   configuredAmplifierOnecliGrantFiles,
   requireAmplifierOnecliBootstrap,
+  readAmplifierQualificationProfile,
+  stageAmplifierQualificationProfile,
 } from '../../../../scripts/testing/runtime-amplifier-onecli.js'
 import { phase2BootstrapFiles } from '../../../../scripts/testing/runtime-sandbox.js'
 
@@ -106,5 +108,52 @@ describe('live Amplifier OneCLI qualification grants', () => {
     expect(() => requireAmplifierOnecliBootstrap({ [key]: grant })).toThrow(/private/)
     fs.chmodSync(grant, 0o000)
     expect(() => requireAmplifierOnecliBootstrap({ [key]: grant })).toThrow(/readable/)
+  })
+})
+
+describe('selected ordinary Amplifier full qualification profile', () => {
+  function profile() {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'amplifier-ordinary-profile-'))
+    directories.push(directory)
+    fs.mkdirSync(path.join(directory, 'bundles'))
+    fs.writeFileSync(path.join(directory, 'settings.yaml'), 'bundle:\n  active: default\n')
+    fs.writeFileSync(path.join(directory, 'bundles/default.yaml'), 'providers:\n  - module: provider-vllm\n    config:\n      default_model: selected-unit-model\n')
+    return { directory, env: { FRESHELL_RUNTIME_AMPLIFIER_CONFIG_HOME: directory } }
+  }
+  it('stages a private byte-preserving snapshot without credential or native-history files', () => {
+    const { directory, env } = profile()
+    fs.writeFileSync(path.join(directory, 'keys.env'), 'credential-must-not-be-copied')
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'amplifier-staged-profile-'))
+    directories.push(home)
+    const selected = readAmplifierQualificationProfile(env)
+    stageAmplifierQualificationProfile(selected, home)
+    for (const relative of ['settings.yaml', 'bundles/default.yaml']) {
+      const file = path.join(home, '.amplifier', relative)
+      expect(fs.readFileSync(file)).toEqual(fs.readFileSync(path.join(directory, relative)))
+      expect(fs.statSync(file).mode & 0o777).toBe(0o600)
+    }
+    expect(fs.readdirSync(path.join(home, '.amplifier'))).toEqual(['bundles', 'settings.yaml'])
+  })
+  it.each(['settings.yaml', 'bundles/default.yaml'])('refuses a missing or linked selected %s', relative => {
+    const { directory, env } = profile()
+    const file = path.join(directory, relative), saved = `${file}.saved`
+    fs.renameSync(file, saved)
+    expect(() => readAmplifierQualificationProfile(env)).toThrow(/missing or unreadable/)
+    fs.symlinkSync(saved, file)
+    expect(() => readAmplifierQualificationProfile(env)).toThrow(/missing or unreadable/)
+  })
+  it.each([
+    ['settings.yaml', 'bundle: [unclosed', /invalid YAML/],
+    ['settings.yaml', 'bundle:\n  active: another\n', /default bundle/],
+    ['settings.yaml', 'config: {}\n', /default bundle/],
+    ['bundles/default.yaml', 'providers: []\n', /no explicit providers/],
+  ] as const)('refuses an unusable ordinary selection from %s: %s', (relative, contents, reason) => {
+    const { directory, env } = profile()
+    fs.writeFileSync(path.join(directory, relative), contents)
+    expect(() => readAmplifierQualificationProfile(env)).toThrow(reason)
+  })
+  it('requires an explicit absolute ordinary root without reading ambient provider homes', () => {
+    expect(() => readAmplifierQualificationProfile({})).toThrow(/CONFIG_HOME/)
+    expect(() => readAmplifierQualificationProfile({ FRESHELL_RUNTIME_AMPLIFIER_CONFIG_HOME: 'relative-root' })).toThrow(/absolute/)
   })
 })

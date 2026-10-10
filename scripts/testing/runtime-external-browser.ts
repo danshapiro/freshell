@@ -59,7 +59,7 @@ import type { RuntimeProviderReceiptArtifacts } from './runtime-sandbox.js'
 import type { FreshAgentQualificationRow } from './fresh-agent-qualification-receipt.js'
 import { RetainedFixtureBrowserSession, runTask2RetainedFixture, Task2RetainedBrowserStageSchema,
   type Task2RetainedBrowserStage } from './task002-retained-fixture.js'
-import { requireAmplifierOnecliBootstrap } from './runtime-amplifier-onecli.js'
+import { requireAmplifierOnecliBootstrap, readAmplifierQualificationProfile, stageAmplifierQualificationProfile } from './runtime-amplifier-onecli.js'
 
 type OwnedProcessIdentity = { pid: number; startTicks: string; executable: string; cwd: string }
 
@@ -2392,11 +2392,14 @@ function selectsPhase3Approval(selection: ExternalBrowserSelection, environment:
 
 /** Preserve the existing fixed permission and observable-recovery preset on the owned web. */
 export function createExternalManagedWebFactory(selection: ExternalBrowserSelection, environment: NodeJS.ProcessEnv,
-  webFactory: RuntimeWebFactory): RuntimeWebFactory {
+  webFactory: RuntimeWebFactory, retainedArtifacts = false): RuntimeWebFactory {
   const preset: Record<string, string> = selectsPhase3Approval(selection, environment) ? {
     FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION: 'ask', FRESHELL_MANAGED_RECOVERY_TEST_DELAY_MS: '7000',
   } : {}
   const spec = path.basename(selection.spec)
+  const amplifierProfile = !retainedArtifacts && spec === 'runtime-managed-provider-qualification-rust.spec.ts'
+    && selection.provider === 'amplifier'
+    ? readAmplifierQualificationProfile(environment) : undefined
   const continuityTitle = 'Phase 2 managed runtime continuity › P2-G04: OpenAI-authenticated OpenCode tool turn survives web replacement in one native session'
   if (spec === 'runtime-opencode-provider-qualification-rust.spec.ts'
     || (spec === 'runtime-terminal-continuity-rust.spec.ts' && (!selection.grep || new RegExp(selection.grep).test(continuityTitle)))) {
@@ -2407,7 +2410,12 @@ export function createExternalManagedWebFactory(selection: ExternalBrowserSelect
       FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: bootstrap.environmentFile,
       FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: bootstrap.caFile })
   }
-  return options => webFactory({ ...options, env: { ...options.env, ...preset } })
+  return options => webFactory({ ...options, env: { ...options.env, ...preset },
+    ...(amplifierProfile ? { setupHome: async (home: string) => {
+      await options.setupHome?.(home)
+      stageAmplifierQualificationProfile(amplifierProfile, home)
+    } } : {}),
+  })
 }
 
 function selectsInterruptedOrdinaryStop(selection: ExternalBrowserSelection, environment: NodeJS.ProcessEnv): boolean {
@@ -2447,7 +2455,7 @@ export function createExternalManagedRuntimeOwner(root: string, selection: Exter
     FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '60000',
   } : {}
   if (!deterministic && !retainedArtifacts && providers.includes('amplifier')) requireAmplifierOnecliBootstrap(environment)
-  return new ManagedRuntimeOwner(createExternalManagedWebFactory(selection, environment, webFactory), root, phase,
+  return new ManagedRuntimeOwner(createExternalManagedWebFactory(selection, environment, webFactory, retainedArtifacts), root, phase,
     {}, supervisorEnv, deterministic || tabs || sourceSelection || selectsPhase3Approval(selection, environment) ? 'test' : 'release', { enabledProviders: providers, freshAgentModes: modes,
       fixtureFreshAgentModes: deterministic ? modes : [] }, undefined, {
       bootstrapProviders: deterministic || retainedArtifacts ? [] : sourceSelection ? ['opencode']
