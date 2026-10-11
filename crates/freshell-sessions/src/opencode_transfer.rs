@@ -901,6 +901,23 @@ pub struct SourceReaderCosts {
     pub packed_store_high_water: u64,
     pub aggregate_fallbacks: u64,
     pub aggregate_rejections: u64,
+    // Inclusive operation totals overlap: compression is inside representation,
+    // and reads/representation are inside saved reference qualification/assembly.
+    // Interrupted operations contribute only after returning.
+    pub loose_lookup_us: u64,
+    pub loose_lookup_attempts: u64,
+    pub representation_us: u64,
+    pub representation_hits: u64,
+    pub representation_misses: u64,
+    pub compression_us: u64,
+    pub saved_reference_us: u64,
+    pub saved_reference_attempts: u64,
+    pub workspace_git_us: u64,
+    pub workspace_git_attempts: u64,
+    pub workspace_git_successes: u64,
+    pub workspace_git_refusals: u64,
+    pub workspace_git_command_us: u64,
+    pub workspace_git_command_starts: u64,
 }
 
 fn elapsed_us(started: Instant) -> u64 {
@@ -1067,6 +1084,62 @@ impl SourcePhase {
                         .reader_costs
                         .as_ref()
                         .map(|costs| costs.aggregate_rejections),
+                    loose_lookup_us = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.loose_lookup_us),
+                    loose_lookup_attempts = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.loose_lookup_attempts),
+                    representation_us = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.representation_us),
+                    representation_hits = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.representation_hits),
+                    representation_misses = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.representation_misses),
+                    compression_us = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.compression_us),
+                    saved_reference_us = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.saved_reference_us),
+                    saved_reference_attempts = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.saved_reference_attempts),
+                    workspace_git_us = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.workspace_git_us),
+                    workspace_git_attempts = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.workspace_git_attempts),
+                    workspace_git_successes = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.workspace_git_successes),
+                    workspace_git_refusals = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.workspace_git_refusals),
+                    workspace_git_command_us = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.workspace_git_command_us),
+                    workspace_git_command_starts = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.workspace_git_command_starts),
                     "opencode.source.phase"
                 );
             } else {
@@ -1113,6 +1186,62 @@ impl SourcePhase {
                         .reader_costs
                         .as_ref()
                         .map(|costs| costs.aggregate_rejections),
+                    loose_lookup_us = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.loose_lookup_us),
+                    loose_lookup_attempts = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.loose_lookup_attempts),
+                    representation_us = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.representation_us),
+                    representation_hits = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.representation_hits),
+                    representation_misses = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.representation_misses),
+                    compression_us = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.compression_us),
+                    saved_reference_us = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.saved_reference_us),
+                    saved_reference_attempts = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.saved_reference_attempts),
+                    workspace_git_us = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.workspace_git_us),
+                    workspace_git_attempts = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.workspace_git_attempts),
+                    workspace_git_successes = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.workspace_git_successes),
+                    workspace_git_refusals = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.workspace_git_refusals),
+                    workspace_git_command_us = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.workspace_git_command_us),
+                    workspace_git_command_starts = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.workspace_git_command_starts),
                     "opencode.source.phase"
                 );
             }
@@ -1985,8 +2114,8 @@ impl<'a> AssetResolver<'a> {
         let result = self.resolve_rows_inner(rows);
         let closed = self.packed_decoders.finish();
         let result = result.and(closed);
+        self.refresh_reader_costs();
         if let Some(progress) = &mut self.source_progress {
-            progress.event.reader_costs = Some(self.packed_decoders.costs.clone());
             progress.finish(result.as_ref().err());
         }
         result
@@ -2374,9 +2503,25 @@ impl<'a> AssetResolver<'a> {
         if !mount.canonical_root.join(".git").is_dir() {
             return Ok(());
         }
-        let Ok(store) = inspect_git_tree(&mount.canonical_root, tree) else {
+        let started = Instant::now();
+        let inspection = inspect_git_tree_with_costs(
+            &mount.canonical_root,
+            tree,
+            Some(&mut self.packed_decoders.costs),
+        );
+        let costs = &mut self.packed_decoders.costs;
+        costs.workspace_git_attempts = costs.workspace_git_attempts.saturating_add(1);
+        costs.workspace_git_us = costs.workspace_git_us.saturating_add(elapsed_us(started));
+        if inspection.is_ok() {
+            costs.workspace_git_successes = costs.workspace_git_successes.saturating_add(1);
+        } else {
+            costs.workspace_git_refusals = costs.workspace_git_refusals.saturating_add(1);
+        }
+        self.refresh_reader_costs();
+        let Ok(store) = inspection else {
             return Ok(());
         };
+        let mount = self.workspace_mounts.get(session_id).unwrap();
         let identity_bytes = serde_json::to_vec(&mount.identity)
             .map_err(|error| TransferError::Serialization(error.to_string()))?;
         let source_identity = format!("workspace:{}:{}", digest(&identity_bytes), store.identity);
@@ -2401,6 +2546,34 @@ impl<'a> AssetResolver<'a> {
     }
 
     fn record_saved_snapshot(&mut self, tree: &str, session_id: &str) -> Result<(), TransferError> {
+        let started = Instant::now();
+        let result = self.record_saved_snapshot_inner(tree, session_id);
+        self.packed_decoders.costs.saved_reference_attempts = self
+            .packed_decoders
+            .costs
+            .saved_reference_attempts
+            .saturating_add(1);
+        self.packed_decoders.costs.saved_reference_us = self
+            .packed_decoders
+            .costs
+            .saved_reference_us
+            .saturating_add(elapsed_us(started));
+        self.refresh_reader_costs();
+        result
+    }
+
+    fn refresh_reader_costs(&mut self) {
+        if let Some(progress) = &mut self.source_progress {
+            progress.event.reader_costs = Some(self.packed_decoders.costs.clone());
+            progress.progress(progress.event.completed_count, progress.event.total_count);
+        }
+    }
+
+    fn record_saved_snapshot_inner(
+        &mut self,
+        tree: &str,
+        session_id: &str,
+    ) -> Result<(), TransferError> {
         if tree.len() != 40 || !tree.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(TransferError::Blocked(
                 "saved snapshot is not a SHA1 tree reference".into(),
@@ -2441,9 +2614,20 @@ impl<'a> AssetResolver<'a> {
                 progress.event.reader_costs = Some(self.packed_decoders.costs.clone());
                 progress.progress(progress.event.completed_count.saturating_add(1), None);
             }
-            object?
-                .map(|object| self.object_representations.resolve(id, object, remaining))
-                .transpose()
+            let result = object.and_then(|object| {
+                object
+                    .map(|object| {
+                        self.object_representations.resolve(
+                            id,
+                            object,
+                            remaining,
+                            &mut self.packed_decoders.costs,
+                        )
+                    })
+                    .transpose()
+            });
+            self.refresh_reader_costs();
+            result
         })?;
         let mut objects = Vec::new();
         if let Some(closure) = closure {
@@ -2752,27 +2936,39 @@ impl SnapshotPackedDecoders {
             ));
         }
         // Current loose objects keep precedence over every packed decoder.
-        for store in stores {
-            let path = store.join(&object_id[..2]).join(&object_id[2..]);
-            match fs::symlink_metadata(&path) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
-                Ok(metadata)
-                    if !metadata.is_file()
-                        || metadata.file_type().is_symlink()
-                        || path.canonicalize()? != path =>
-                {
-                    return Err(TransferError::Blocked(
-                        "saved snapshot object is not an exact regular file".into(),
-                    ))
+        let started = Instant::now();
+        let loose = (|| {
+            for store in stores {
+                let path = store.join(&object_id[..2]).join(&object_id[2..]);
+                match fs::symlink_metadata(&path) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                    Ok(metadata)
+                        if !metadata.is_file()
+                            || metadata.file_type().is_symlink()
+                            || path.canonicalize()? != path =>
+                    {
+                        return Err(TransferError::Blocked(
+                            "saved snapshot object is not an exact regular file".into(),
+                        ))
+                    }
+                    Ok(metadata) if metadata.len() > MAX_BUNDLE_BYTES => {
+                        return Err(TransferError::Blocked(
+                            "saved snapshot object exceeds the transfer bound".into(),
+                        ))
+                    }
+                    Ok(_) => return Ok(Some(SnapshotObjectSource::Loose(fs::read(path)?))),
                 }
-                Ok(metadata) if metadata.len() > MAX_BUNDLE_BYTES => {
-                    return Err(TransferError::Blocked(
-                        "saved snapshot object exceeds the transfer bound".into(),
-                    ))
-                }
-                Ok(_) => return Ok(Some(SnapshotObjectSource::Loose(fs::read(path)?))),
             }
+            Ok(None)
+        })();
+        self.costs.loose_lookup_attempts = self.costs.loose_lookup_attempts.saturating_add(1);
+        self.costs.loose_lookup_us = self
+            .costs
+            .loose_lookup_us
+            .saturating_add(elapsed_us(started));
+        if let Some(object) = loose? {
+            return Ok(Some(object));
         }
         // Git retains pack descriptors and negative lookup state. Freshly
         // inspect all ordered stores before EVERY native query, including
@@ -3677,6 +3873,20 @@ impl SnapshotRepresentations {
         id: &str,
         object: SnapshotObjectSource,
         remaining: u64,
+        costs: &mut SourceReaderCosts,
+    ) -> Result<Arc<SavedObjectRepresentation>, TransferError> {
+        let started = Instant::now();
+        let result = self.resolve_inner(id, object, remaining, costs);
+        costs.representation_us = costs.representation_us.saturating_add(elapsed_us(started));
+        result
+    }
+
+    fn resolve_inner(
+        &mut self,
+        id: &str,
+        object: SnapshotObjectSource,
+        remaining: u64,
+        costs: &mut SourceReaderCosts,
     ) -> Result<Arc<SavedObjectRepresentation>, TransferError> {
         let encoding = match &object {
             SnapshotObjectSource::Loose(compressed) => {
@@ -3690,17 +3900,21 @@ impl SnapshotRepresentations {
         };
         let key = (id.to_string(), encoding);
         if let Some(resident) = self.resident.get(&key) {
+            costs.representation_hits = costs.representation_hits.saturating_add(1);
             check_snapshot_closure_bytes(resident.metadata.compressed_bytes, remaining)?;
             return Ok(resident.clone());
         }
+        costs.representation_misses = costs.representation_misses.saturating_add(1);
         let (kind, body, compressed) = match object {
             SnapshotObjectSource::Loose(compressed) => {
                 let (kind, body) = decode_snapshot_object(id, &compressed)?;
                 (kind, body, compressed)
             }
             SnapshotObjectSource::Packed { kind, body } => {
-                let compressed = compress_snapshot_object(&kind, &body)?;
-                (kind, body, compressed)
+                let started = Instant::now();
+                let compressed = compress_snapshot_object(&kind, &body);
+                costs.compression_us = costs.compression_us.saturating_add(elapsed_us(started));
+                (kind, body, compressed?)
             }
         };
         check_snapshot_closure_bytes(compressed.len() as u64, remaining)?;
@@ -4233,6 +4447,14 @@ struct GitRepository {
 }
 
 fn inspect_git_tree(mount: &Path, tree: &str) -> Result<GitTreeInspection, TransferError> {
+    inspect_git_tree_with_costs(mount, tree, None)
+}
+
+fn inspect_git_tree_with_costs(
+    mount: &Path,
+    tree: &str,
+    mut costs: Option<&mut SourceReaderCosts>,
+) -> Result<GitTreeInspection, TransferError> {
     if !(tree.len() == 40 || tree.len() == 64) || !tree.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         return Err(TransferError::Blocked(
@@ -4242,7 +4464,7 @@ fn inspect_git_tree(mount: &Path, tree: &str) -> Result<GitTreeInspection, Trans
     let mount = fs::canonicalize(mount).map_err(|error| {
         TransferError::Blocked(format!("exact workspace mount is unavailable: {error}"))
     })?;
-    let top_level = git_text_in_mount(&mount, &["rev-parse", "--show-toplevel"])?;
+    let top_level = git_text_in_mount(&mount, &["rev-parse", "--show-toplevel"], &mut costs)?;
     let top_level = PathBuf::from(top_level.trim());
     let top_level = fs::canonicalize(top_level).map_err(|error| {
         TransferError::Blocked(format!("workspace Git root cannot be resolved: {error}"))
@@ -4252,7 +4474,7 @@ fn inspect_git_tree(mount: &Path, tree: &str) -> Result<GitTreeInspection, Trans
             "snapshot Git root is not the exact managed workspace mount".into(),
         ));
     }
-    let git_dir = git_path_in_mount(&mount, "--absolute-git-dir")?;
+    let git_dir = git_path_in_mount(&mount, "--absolute-git-dir", &mut costs)?;
     if !git_dir.starts_with(&mount) {
         return Err(TransferError::Blocked(
             "snapshot Git directory is outside the exact managed workspace mount".into(),
@@ -4262,7 +4484,7 @@ fn inspect_git_tree(mount: &Path, tree: &str) -> Result<GitTreeInspection, Trans
         work_tree: mount.clone(),
         git_dir,
     };
-    let common_dir = git_path_in_repository(&repository, "--git-common-dir")?;
+    let common_dir = git_path_in_repository(&repository, "--git-common-dir", &mut costs)?;
     let common_dir = if common_dir.is_absolute() {
         common_dir
     } else {
@@ -4278,10 +4500,13 @@ fn inspect_git_tree(mount: &Path, tree: &str) -> Result<GitTreeInspection, Trans
             "snapshot object store is outside the exact managed workspace mount".into(),
         ));
     }
-    let object_format =
-        git_text_in_repository(&repository, &["rev-parse", "--show-object-format"])?
-            .trim()
-            .to_string();
+    let object_format = git_text_in_repository(
+        &repository,
+        &["rev-parse", "--show-object-format"],
+        &mut costs,
+    )?
+    .trim()
+    .to_string();
     let expected_id_length = match object_format.as_str() {
         "sha1" => 40,
         "sha256" => 64,
@@ -4344,14 +4569,16 @@ fn inspect_git_tree(mount: &Path, tree: &str) -> Result<GitTreeInspection, Trans
             continue;
         }
         verify_git_loose_object_paths(&mount, &object_stores, std::slice::from_ref(&current_tree))?;
-        let object_kind = git_text_in_repository(&repository, &["cat-file", "-t", &current_tree])?;
+        let object_kind =
+            git_text_in_repository(&repository, &["cat-file", "-t", &current_tree], &mut costs)?;
         if object_kind.trim() != "tree" {
             return Err(TransferError::Blocked(
                 "snapshot reference does not identify a Git tree object".into(),
             ));
         }
         objects.insert(current_tree.clone());
-        let entries = git_output_in_repository(&repository, &["ls-tree", "-z", &current_tree])?;
+        let entries =
+            git_output_in_repository(&repository, &["ls-tree", "-z", &current_tree], &mut costs)?;
         for entry in entries
             .stdout
             .split(|byte| *byte == 0)
@@ -4384,11 +4611,13 @@ fn inspect_git_tree(mount: &Path, tree: &str) -> Result<GitTreeInspection, Trans
     let mut object_records = Vec::with_capacity(objects.len());
     let mut closure_bytes = 0_u64;
     for object in objects {
-        let object_kind = git_text_in_repository(&repository, &["cat-file", "-t", &object])?;
-        let object_size = git_text_in_repository(&repository, &["cat-file", "-s", &object])?
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| TransferError::Blocked("Git object size is invalid".into()))?;
+        let object_kind =
+            git_text_in_repository(&repository, &["cat-file", "-t", &object], &mut costs)?;
+        let object_size =
+            git_text_in_repository(&repository, &["cat-file", "-s", &object], &mut costs)?
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| TransferError::Blocked("Git object size is invalid".into()))?;
         closure_bytes = closure_bytes.saturating_add(object_size);
         object_records.push((object, object_kind.trim().to_string(), object_size));
     }
@@ -4556,8 +4785,12 @@ fn verify_git_loose_object_paths(
     Ok(())
 }
 
-fn git_path_in_mount(mount: &Path, argument: &str) -> Result<PathBuf, TransferError> {
-    let path = PathBuf::from(git_text_in_mount(mount, &["rev-parse", argument])?.trim());
+fn git_path_in_mount(
+    mount: &Path,
+    argument: &str,
+    costs: &mut Option<&mut SourceReaderCosts>,
+) -> Result<PathBuf, TransferError> {
+    let path = PathBuf::from(git_text_in_mount(mount, &["rev-parse", argument], costs)?.trim());
     if path.is_absolute() {
         fs::canonicalize(path).map_err(|error| {
             TransferError::Blocked(format!("workspace Git path is unavailable: {error}"))
@@ -4572,8 +4805,10 @@ fn git_path_in_mount(mount: &Path, argument: &str) -> Result<PathBuf, TransferEr
 fn git_path_in_repository(
     repository: &GitRepository,
     argument: &str,
+    costs: &mut Option<&mut SourceReaderCosts>,
 ) -> Result<PathBuf, TransferError> {
-    let path = PathBuf::from(git_text_in_repository(repository, &["rev-parse", argument])?.trim());
+    let path =
+        PathBuf::from(git_text_in_repository(repository, &["rev-parse", argument], costs)?.trim());
     if path.is_absolute() {
         fs::canonicalize(path).map_err(|error| {
             TransferError::Blocked(format!("workspace Git path is unavailable: {error}"))
@@ -4585,8 +4820,12 @@ fn git_path_in_repository(
     }
 }
 
-fn git_text_in_mount(mount: &Path, arguments: &[&str]) -> Result<String, TransferError> {
-    let output = git_output_in_mount(mount, arguments)?;
+fn git_text_in_mount(
+    mount: &Path,
+    arguments: &[&str],
+    costs: &mut Option<&mut SourceReaderCosts>,
+) -> Result<String, TransferError> {
+    let output = git_output_in_mount(mount, arguments, costs)?;
     String::from_utf8(output.stdout)
         .map_err(|_| TransferError::Blocked("Git returned non-UTF-8 metadata".into()))
 }
@@ -4594,21 +4833,27 @@ fn git_text_in_mount(mount: &Path, arguments: &[&str]) -> Result<String, Transfe
 fn git_text_in_repository(
     repository: &GitRepository,
     arguments: &[&str],
+    costs: &mut Option<&mut SourceReaderCosts>,
 ) -> Result<String, TransferError> {
-    let output = git_output_in_repository(repository, arguments)?;
+    let output = git_output_in_repository(repository, arguments, costs)?;
     String::from_utf8(output.stdout)
         .map_err(|_| TransferError::Blocked("Git returned non-UTF-8 metadata".into()))
 }
 
-fn git_output_in_mount(mount: &Path, arguments: &[&str]) -> Result<Output, TransferError> {
+fn git_output_in_mount(
+    mount: &Path,
+    arguments: &[&str],
+    costs: &mut Option<&mut SourceReaderCosts>,
+) -> Result<Output, TransferError> {
     let mut command = sanitized_git_command();
     command.arg("-C").arg(mount).args(arguments);
-    checked_git_output(command)
+    checked_git_output(command, costs)
 }
 
 fn git_output_in_repository(
     repository: &GitRepository,
     arguments: &[&str],
+    costs: &mut Option<&mut SourceReaderCosts>,
 ) -> Result<Output, TransferError> {
     let mut command = sanitized_git_command();
     command
@@ -4617,7 +4862,7 @@ fn git_output_in_repository(
         .arg("--work-tree")
         .arg(&repository.work_tree)
         .args(arguments);
-    checked_git_output(command)
+    checked_git_output(command, costs)
 }
 
 fn sanitized_git_command() -> Command {
@@ -4643,8 +4888,20 @@ fn sanitized_git_command() -> Command {
     command
 }
 
-fn checked_git_output(mut command: Command) -> Result<Output, TransferError> {
-    let output = command.output().map_err(|error| {
+fn checked_git_output(
+    mut command: Command,
+    costs: &mut Option<&mut SourceReaderCosts>,
+) -> Result<Output, TransferError> {
+    let started = Instant::now();
+    let output = command.output();
+    if let Some(costs) = costs.as_deref_mut() {
+        // A start is an attempt, including failure to spawn an OS child.
+        costs.workspace_git_command_starts = costs.workspace_git_command_starts.saturating_add(1);
+        costs.workspace_git_command_us = costs
+            .workspace_git_command_us
+            .saturating_add(elapsed_us(started));
+    }
+    let output = output.map_err(|error| {
         TransferError::Blocked(format!("local Git object-store check failed: {error}"))
     })?;
     if !output.status.success() {
@@ -7443,6 +7700,12 @@ mod native_source_inventory_tests {
     fn saved_object_observer_reports_actual_native_reader_costs() {
         let fixture = reuse_fixture(true);
         packed_pressure_stores(&fixture);
+        let plain = export_exact_session(
+            &fixture.inventory,
+            "ses_exact",
+            ExportOptions::new(fixture.dir.path().join("extract")),
+        )
+        .unwrap();
         snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed = events.clone();
@@ -7460,6 +7723,15 @@ mod native_source_inventory_tests {
         )
         .unwrap();
         assert_eq!(exported.manifest().saved_snapshots.len(), 2);
+        assert_eq!(
+            fs::read(&plain.payload_path).unwrap(),
+            fs::read(&exported.payload_path).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(plain.manifest()).unwrap(),
+            serde_json::to_value(exported.manifest()).unwrap()
+        );
+        assert_settled_native_fixture();
         let counts = snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().counts.clone());
         let events = events.lock().unwrap();
         let event = events
@@ -7484,6 +7756,36 @@ mod native_source_inventory_tests {
         assert_eq!(costs["packedStoreHighWater"], 6);
         assert_eq!(costs["aggregateFallbacks"], 0);
         assert_eq!(costs["aggregateRejections"], 0);
+        assert_eq!(costs["looseLookupAttempts"], 30);
+        assert!(
+            costs["compressionUs"].as_u64().unwrap() > 0,
+            "actual packed miss compression records elapsed work"
+        );
+        assert!(
+            costs["looseLookupUs"].as_u64().unwrap() > 0,
+            "actual ordered misses record elapsed work"
+        );
+        assert_eq!(costs["representationMisses"], 4);
+        assert_eq!(costs["representationHits"], 26);
+        assert_eq!(costs["savedReferenceAttempts"], 10);
+        assert_eq!(costs["workspaceGitAttempts"], 0);
+        for key in [
+            "looseLookupUs",
+            "representationUs",
+            "compressionUs",
+            "savedReferenceUs",
+            "workspaceGitUs",
+            "workspaceGitCommandUs",
+        ] {
+            assert!(costs[key].is_u64(), "completed export reports actual {key}");
+        }
+        assert!(
+            costs["representationUs"].as_u64().unwrap() >= costs["compressionUs"].as_u64().unwrap()
+        );
+        assert!(
+            costs["savedReferenceUs"].as_u64().unwrap()
+                >= costs["representationUs"].as_u64().unwrap()
+        );
         for key in [
             "freshInspectionUs",
             "nativeQueryUs",
@@ -7507,6 +7809,212 @@ mod native_source_inventory_tests {
                 .count()
                 <= 1,
             "reader costs preserve existing five-second progress throttling"
+        );
+    }
+
+    #[test]
+    fn saved_object_observer_reports_loose_and_optional_workspace_costs() {
+        for outcome in [
+            "success",
+            "missing",
+            "command_failure",
+            "loose_refusal",
+            "representation_refusal",
+            "prelookup_refusal",
+        ] {
+            let fixture = reuse_fixture(false);
+            let workspace = fixture.dir.path().join("workspace");
+            let output = sanitized_git_command()
+                .arg("-C")
+                .arg(&workspace)
+                .args(["init", "-q"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let git_dir = workspace.join(".git");
+            if outcome == "success" {
+                let blob = fixture_git(
+                    &git_dir,
+                    &["hash-object", "-w", "--stdin"],
+                    Some(b"synthetic overlapping saved blob"),
+                );
+                assert_eq!(blob, fixture.blob);
+                let subtree = fixture_git(
+                    &git_dir,
+                    &["mktree"],
+                    Some(format!("100644 blob {blob}\tnested\n").as_bytes()),
+                );
+                for (name, expected) in ["first", "second"].into_iter().zip(&fixture.trees) {
+                    let tree = fixture_git(
+                        &git_dir,
+                        &["mktree"],
+                        Some(
+                            format!("100644 blob {blob}\t{name}\n040000 tree {subtree}\tsubtree\n")
+                                .as_bytes(),
+                        ),
+                    );
+                    assert_eq!(&tree, expected);
+                }
+            } else if outcome == "command_failure" {
+                fs::write(git_dir.join("config"), b"[invalid config").unwrap();
+            } else if outcome == "loose_refusal" {
+                let path = fixture_object_path(&fixture, &fixture.trees[0]);
+                fs::remove_file(&path).unwrap();
+                fs::create_dir(path).unwrap();
+            } else if outcome == "representation_refusal" {
+                let path = fixture_object_path(&fixture, &fixture.trees[0]);
+                fs::remove_file(&path).unwrap();
+                fs::write(path, b"invalid zlib").unwrap();
+            }
+            snapshot_reuse_test_hooks::STATE.with(|state| {
+                *state.borrow_mut() = snapshot_reuse_test_hooks::State {
+                    closure_bound: (outcome == "prelookup_refusal").then_some(1),
+                    ..Default::default()
+                };
+            });
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed = events.clone();
+            let result = export_exact_session(
+                &fixture.inventory,
+                "ses_exact",
+                ExportOptions::new(fixture.dir.path().join("extract")).with_progress_observer(
+                    move |event| {
+                        observed
+                            .lock()
+                            .unwrap()
+                            .push(serde_json::to_value(event).unwrap());
+                    },
+                ),
+            );
+            let refused = outcome.ends_with("refusal");
+            assert_eq!(result.is_err(), refused, "{outcome}");
+            let events = events.lock().unwrap();
+            let event = events
+                .iter()
+                .find(|event| {
+                    event["phase"] == "saved_objects"
+                        && event["state"] == if refused { "failed" } else { "completed" }
+                })
+                .unwrap();
+            let costs = &event["readerCosts"];
+            assert_eq!(
+                costs["looseLookupAttempts"],
+                if refused { 1 } else { 30 },
+                "{outcome}"
+            );
+            assert_eq!(
+                costs["savedReferenceAttempts"],
+                if refused { 1 } else { 10 },
+                "{outcome}"
+            );
+            assert_eq!(
+                costs["representationMisses"],
+                if outcome == "loose_refusal" || outcome == "prelookup_refusal" {
+                    0
+                } else if refused {
+                    1
+                } else {
+                    4
+                },
+                "{outcome}"
+            );
+            assert_eq!(
+                costs["representationHits"],
+                if refused { 0 } else { 26 },
+                "{outcome}"
+            );
+            assert_eq!(
+                costs["workspaceGitAttempts"],
+                if refused { 0 } else { 9 },
+                "{outcome}"
+            );
+            assert_eq!(
+                costs["workspaceGitSuccesses"],
+                if outcome == "success" { 9 } else { 0 },
+                "{outcome}"
+            );
+            assert_eq!(
+                costs["workspaceGitRefusals"],
+                if outcome == "missing" || outcome == "command_failure" {
+                    9
+                } else {
+                    0
+                },
+                "{outcome}"
+            );
+            if outcome == "command_failure" {
+                assert_eq!(
+                    costs["workspaceGitCommandStarts"], 9,
+                    "actual failing Git command attempts"
+                );
+            } else if !refused {
+                assert!(costs["workspaceGitCommandStarts"].as_u64().unwrap() > 9);
+            }
+            assert!(costs["looseLookupUs"].as_u64().unwrap() > 0);
+            assert!(costs["savedReferenceUs"].as_u64().unwrap() > 0);
+            if outcome != "loose_refusal" && outcome != "prelookup_refusal" {
+                assert!(costs["representationUs"].as_u64().unwrap() > 0);
+            }
+            if !refused {
+                assert!(costs["workspaceGitUs"].as_u64().unwrap() > 0);
+                assert!(costs["workspaceGitCommandUs"].as_u64().unwrap() > 0);
+            }
+            assert_eq!(costs["nativeQueries"], 0);
+            assert_eq!(costs["freshInspections"], 0);
+            assert_eq!(costs["compressionUs"], 0);
+            assert!(costs
+                .as_object()
+                .unwrap()
+                .values()
+                .all(serde_json::Value::is_u64));
+            for key in [
+                "looseLookupUs",
+                "representationUs",
+                "savedReferenceUs",
+                "workspaceGitUs",
+                "workspaceGitCommandUs",
+            ] {
+                assert!(costs[key].is_u64(), "{outcome}: measured {key}");
+            }
+            assert!(
+                costs["workspaceGitUs"].as_u64().unwrap()
+                    >= costs["workspaceGitCommandUs"].as_u64().unwrap()
+            );
+            if let Ok(exported) = result {
+                assert_eq!(exported.manifest().saved_snapshots.len(), 2);
+                assert!(exported
+                    .manifest()
+                    .saved_snapshots
+                    .iter()
+                    .all(|reference| reference.objects.len() == 3));
+                assert_eq!(
+                    exported
+                        .manifest()
+                        .assets
+                        .iter()
+                        .filter(|asset| asset.kind == "git_tree_reference")
+                        .count(),
+                    if outcome == "success" { 2 } else { 0 }
+                );
+                let payload: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&exported.payload_path).unwrap()).unwrap();
+                assert!(payload.to_string().contains(&fixture.trees[0]));
+                assert!(payload.to_string().contains(&fixture.trees[1]));
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_git_command_cost_counts_failed_spawn_attempt() {
+        let fixture = tempfile::tempdir().unwrap();
+        let command = Command::new(fixture.path().join("missing-owned-git"));
+        let mut costs = SourceReaderCosts::default();
+        assert!(checked_git_output(command, &mut Some(&mut costs)).is_err());
+        assert_eq!(costs.workspace_git_command_starts, 1);
+        assert!(costs.workspace_git_command_us > 0);
+        assert_eq!(
+            costs.native_spawns, 0,
+            "workspace attempts never relabel packed owners"
         );
     }
 
