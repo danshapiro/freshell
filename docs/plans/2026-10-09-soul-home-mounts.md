@@ -356,7 +356,7 @@ if let Some(home) = &mounts.operator_home {
 }
 ```
 
-`create_stopped` calls it and merges the returned tmpfs map with the existing `runtime_tmpfs(runtime_mode)` output in `docker_create_body`. In `runtime_host_environment`, thread a `mounted_home: Option<&Path>` argument from `create_stopped` and emit `FRESHELL_OPERATOR_HOME_MOUNT=1` plus `FRESHELL_OPERATOR_HOME=<path>` when present. In `verify_inspect_config`, assert the home `:ro` bind and mask tmpfs only when the inspected env contains `FRESHELL_OPERATOR_HOME_MOUNT=1` — pre-upgrade containers lack the marker and must keep passing.
+`create_stopped` calls it and merges the returned tmpfs map with the existing `runtime_tmpfs(runtime_mode)` output in `docker_create_body`. In `runtime_host_environment`, thread a `mounted_home: Option<&Path>` argument from `create_stopped` and emit `FRESHELL_OPERATOR_HOME_MOUNT=1` plus `FRESHELL_OPERATOR_HOME=<path>` when present. In `verify_inspect_config`, assert the home `:ro` bind and mask tmpfs only when the inspected env contains `FRESHELL_OPERATOR_HOME_MOUNT=1` — pre-upgrade containers lack the marker and must keep passing. TIME-INVARIANCE CONTRACT: the mask set is creation-time state (filtered to destinations existing at `create_stopped`), while the existing inspection path recomputes workload mounts and compares tmpfs topology exactly — a mask directory appearing or disappearing later would make the fresh recomputation disagree with the soul's live mounts and reject a healthy durable soul. The expectation must therefore come from PERSISTED creation-time state, not recomputation: store the resolved `OperatorHomeMount` (home + filtered `mask_rel_paths`) in the terminal's persisted mount record at `create_stopped` (the same record inspection reads today, backend.rs verify_inspect_config ~993-1030; if no mount record is persisted there yet, add the field to whatever durable record `create_stopped`'s caller already stores for verification), and have `verify_inspect_config` compare the container's live tmpfs/bind topology against the STORED list when the marker is present. Add a unit test beside the marker test covering the late-directory case: a mount created with masks `[.freshell]` because `.config/gcloud` was absent, verified AFTER the directory appears on the host, must still pass against the stored list (and a container whose live topology no longer matches its own stored list must fail).
 
 - [ ] **Step 4: Run the focused test**
 
@@ -506,7 +506,11 @@ Build the spec by mirroring the fresh-agent qualification spec's real imports/ri
 //    supervisor runs as root in its container, so the HOME env path is
 //    deliberately NOT used — the env fallback declines for root supervisors).
 // 2. await rig.start()  // prepare() has now wiped and recreated testRoot
-// 3. Create the home fixtures (owned by the test process, i.e. the operator):
+// 3. Create the home fixtures (owned by the test process, i.e. the operator).
+//    The harness umask is 0077, so EVERY directory the child must traverse is
+//    created with an EXPLICIT mode — recursive mkdir under 0077 yields 0700
+//    dirs and the 65534:0 child cannot reach even the 0640 key:
+//    - <home>/ created, then chmod 0750 <home> <home>/.amplifier <home>/.config
 //    - <home>/.amplifier/ms-runpod.key  ("e2e-key-not-real", mode 0640)
 //    - <home>/.config/opencode/opencode.json:
 //      { "$schema": "https://opencode.ai/config.json",
@@ -541,6 +545,14 @@ test('freshopencode soul resolves {file:} API key references under the operator 
   const paneText = await rig.capturePaneText()
   expect(paneText).not.toContain('Configuration is invalid')
   expect(paneText).not.toContain('bad file reference')
+  // POSITIVE CONTROL FIRST — readable-unmasked-path proof, from the child's
+  // own identity: the helper (65534:0, SYNCHRONOUS, throws on nonzero exit)
+  // returns without throwing for the unmasked 0640 key. This proves traversal
+  // and group-read work, so the canary failures below are attributable ONLY
+  // to the masks, not to a traversal hole in the fixture.
+  expect(() =>
+    rig.ownedProviderExec(soulRef, ['cat', `${home}/.amplifier/ms-runpod.key`])
+  ).not.toThrow()
   // Control-plane masking proof, from the child's own identity: a WORKING mask
   // makes each canary ABSENT (tmpfs shows an empty root-owned dir), so `cat`
   // exits nonzero — and the rig's provider-uid exec helper (65534:0,
@@ -687,6 +699,19 @@ Expected: FAIL — the script does not exist yet.
 set -euo pipefail
 home="${FRESHELL_OPERATOR_HOME:-$HOME}"
 changed=0
+# Ensure every control-plane mask destination exists BEFORE any soul binds the
+# home: runc cannot mount a tmpfs mask over a missing directory in the read-only
+# bind, and a soul created while a destination is absent gets that mask filtered
+# for its whole lifetime. Creating them here (empty, owner-operated) means every
+# home-bound incarnation mounts the full mask set. Run this at deploy, before
+# new incarnations — see the invariant note below.
+for dir in "$home/.freshell" "$home/.amplifier/onecli" "$home/.config/gcloud"; do
+  if [ ! -d "$dir" ]; then
+    mkdir -p "$dir"
+    echo "mkdir -p $dir"
+    changed=1
+  fi
+done
 # Group traversal for the home root itself and every ancestor root a referenced
 # config path can sit under — a 0700 home root blocks the child from reaching
 # even a prepared ~/.amplifier key.
@@ -743,7 +768,7 @@ Docs content:
 `docs/development/managed-runtime.md`:
 - Replace the "no unrelated home" bullet (~220-225) and the rootless uid rationale (~329-338) with the new contract: souls mount the operator home read-only at its canonical path; provider children keep 65534:0; under the rootless production daemon the child's gid 0 is the operator's group, so group-readable reference targets (0750 directories, 0640 key files) resolve with no identity change; the `--operator-home` flag, the compose wiring, and the owner/euid guards (containerized supervisors pass the flag explicitly; rootless-home env fallback works only for non-root host supervisors); the tmpfs mask list (`.freshell`, `.amplifier/onecli`, `.config/gcloud`) and why each entry is control-plane or infrastructure authorization material; the additive `FRESHELL_OPERATOR_HOME_MOUNT`/`FRESHELL_OPERATOR_HOME` env markers and that pre-upgrade running containers lack them; the `operator_home_readiness` event (home-root scope: `home_root_traversable_by_child`) and how to read it when a `{file:}` reference fails; the rootful-degradation note (group 0 is not the operator group, feature degrades to legacy readability, observed via the readiness event, never gated).
 - Add the operator prep section referencing `scripts/prepare-operator-home.sh`, the re-run-after-rotation rule, and the tracked upstream Amplifier item (write keys 0640, `~/.amplifier` 0750), with the reasoning that under the rootless mapping group-dan access is effectively "processes running as the operator" on this single-user host.
-- State the two accepted residuals precisely: (1) a reference to a deliberately owner-only file outside the prep-covered roots — or a key rotated at 0600 before the prep re-run — needs the one-line prep extension/re-run; the provider CLI's error names the exact path, and this mode-based boundary is the user-ratified tradeoff (repeat the User Request block's boundary bullet verbatim here so doc readers see the same contract); (2) the mask set is computed at container creation, so a control-plane path CREATED AFTER a soul is running is unmasked for that soul until its next incarnation — primary protection is those paths' own owner-only modes (gcloud/onecli create 0700 dirs), and every new incarnation re-derives the masks.
+- State the two accepted residuals precisely: (1) a reference to a deliberately owner-only file outside the prep-covered roots — or a key rotated at 0600 before the prep re-run — needs the one-line prep extension/re-run; the provider CLI's error names the exact path, and this mode-based boundary is the user-ratified tradeoff (repeat the User Request block's boundary bullet verbatim here so doc readers see the same contract); (2) the mask set is computed at container creation, so a control-plane path CREATED AFTER a soul is running is unmasked for that soul until its next incarnation — primary protection is those paths' own owner-only modes (gcloud/onecli create 0700 dirs), and every new incarnation re-derives the masks. ALSO state the mask/filter invariant pair that closes the exposure window: the prep script mkdir's every mask destination at deploy, so on a prepared host each home-bound soul mounts the FULL mask set for its lifetime and a prep re-run cannot expose a running soul (its masks were complete at creation); on an unprepared host the filter can fire, but unprepared content is owner-only (0700/0600), so the unmasked paths expose nothing a child can read. Exposure would require simultaneously group-readable content AND a missing mask destination — the prep step creates exactly the opposite pairing, and manual partial prep is out of model.
 
 `docker/runtime/README.md` (~19-30): update the uid story (session host uid 0; provider children 65534:0 unchanged; no passwd entry — same as today) and reword the 0600-secret guarantee around the masked-home boundary.
 
