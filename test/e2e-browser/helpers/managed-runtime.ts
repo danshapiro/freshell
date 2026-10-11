@@ -12,7 +12,7 @@ import {
 } from '../../../scripts/testing/provider-qualification-receipt.js'
 import { RuntimeHarness, type SupervisorInstance } from '../../../scripts/testing/runtime-sandbox.js'
 import { RustServer } from './rust-server.js'
-import type { TestServerInfo } from './test-server.js'
+import type { E2eServerInfo as TestServerInfo } from './server-fixture-support.js'
 import type { QualifiableTerminalProvider } from '../../../scripts/testing/provider-qualification-selection.js'
 import {
   buildFreshAgentQualificationReceipt,
@@ -100,7 +100,7 @@ export class ManagedRuntimeBrowserRig {
     webHomeDir?: string,
   ) {
     this.repoRoot = fs.realpathSync(repoRoot)
-    this.runtime = new RuntimeHarness(this.repoRoot, undefined, phase)
+    this.runtime = new RuntimeHarness(this.repoRoot, undefined, phase, webHomeDir, serverEnv.XDG_CONFIG_HOME)
     this.serverEnv = { ...serverEnv }
     this.webHomeDir = webHomeDir
     this.supervisorEnv = { ...supervisorEnv }

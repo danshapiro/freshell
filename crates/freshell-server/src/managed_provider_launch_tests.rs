@@ -16,6 +16,85 @@ use std::{
     time::Duration,
 };
 
+#[test]
+fn provider_parity_explicit_opencode_roots() {
+    use crate::managed_provider_references::sources::{
+        discover_opencode, plan_opencode_sources, select_opencode_resource_roots, OpencodeDiscovery,
+    };
+    let owned = tempfile::tempdir().unwrap();
+    let workspace = owned.path().join("workspace");
+    let project = workspace.join(".opencode");
+    let ancestor = owned.path().join(".opencode");
+    let home = owned.path().join("home");
+    let global = home.join(".config/opencode");
+    for directory in [&project, &ancestor, &global] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    let plugin = workspace.join("selected-plugin.js");
+    std::fs::write(&plugin, "export default {};\n").unwrap();
+    let configuration = serde_json::to_vec(&json!({"plugin":[plugin]})).unwrap();
+    std::fs::write(workspace.join("opencode.jsonc"), &configuration).unwrap();
+    let project_config = project.join("opencode.json");
+    std::fs::write(&project_config, &configuration).unwrap();
+    let ancestor_marker = ancestor.join("unrelated-resource");
+    std::fs::write(&ancestor_marker, "retain unrelated ancestor bytes").unwrap();
+
+    // Exercise the actual TypeScript fixture environment through a finite child,
+    // then pass its values to the real native source producer.
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let helper = std::process::Command::new("pnpm")
+        .args(["exec", "tsx", "--eval", "import(process.argv[1]).then(module => process.stdout.write(JSON.stringify(module.providerParityCommands(process.argv[2]))))"])
+        .arg(repo.join("test/integration/server/provider-parity-environment.ts"))
+        .arg(&workspace)
+        .current_dir(repo)
+        .output().unwrap();
+    assert!(
+        helper.status.success(),
+        "finite fixture environment producer failed"
+    );
+    let environment: BTreeMap<String, String> = serde_json::from_slice(&helper.stdout).unwrap();
+    let lookup = |key: &str| environment.get(key).cloned();
+    let request = || OpencodeDiscovery {
+        home: &home,
+        cwd: &workspace,
+        worktree: &workspace,
+        config_root: &global,
+        env: &lookup,
+    };
+    let sources = discover_opencode(request()).unwrap();
+    for original in [workspace.join("opencode.jsonc"), project_config.clone()] {
+        assert!(sources.iter().any(|source| source.logical_path == original));
+    }
+    let plan =
+        plan_opencode_sources(sources, &workspace, &home, &|_, _, name| lookup(name)).unwrap();
+    assert!(plan
+        .iter()
+        .any(|source| source.configured_resources.contains(&workspace)));
+    let roots = select_opencode_resource_roots(&request()).unwrap();
+    assert!(roots.iter().any(|root| root.logical_path == project));
+    assert_eq!(
+        std::fs::read_to_string(&ancestor_marker).unwrap(),
+        "retain unrelated ancestor bytes"
+    );
+    assert!(
+        !roots.iter().any(|root| root.logical_path == ancestor),
+        "fixture selected an unrelated ancestor outside its owned project"
+    );
+
+    // A broken selected source remains an error; isolating discovery does not
+    // make missing selected inputs acceptable.
+    std::fs::remove_file(&project_config).unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(project.join("missing-selected"), &project_config).unwrap();
+        assert!(discover_opencode(request()).is_err());
+    }
+}
+
 // Read only the fixture's actual native process (or its bounded hook ancestry).
 // argv/environment bytes stay transient; only profile compliance is reported.
 const NATIVE_EXEC_PROFILE: &str = r#"
@@ -711,6 +790,20 @@ async fn managed_provider_amplifier_terminal_native_startup_consumes_prepared_in
     .unwrap();
     std::fs::write(skill.join("run"),"#!/usr/bin/env node\nconst fs=require('node:fs'),path=require('node:path');process.stdout.write(fs.readFileSync(path.join(__dirname,'resource'),'utf8')+':'+require('probe-dependency'));").unwrap();
     std::fs::set_permissions(skill.join("run"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let large_resources = skill.join("node_modules/probe-dependency/selected-resources");
+    std::fs::create_dir(&large_resources).unwrap();
+    for index in 0..10_005 {
+        std::fs::write(
+            large_resources.join(format!("selected-{index:05}")),
+            b"complete-selected-resource",
+        )
+        .unwrap();
+    }
+    let source_owner_before = std::fs::symlink_metadata(skill.join("run")).unwrap();
+    let outside_target = workspace.join("task3-unrelated-target");
+    std::fs::write(&outside_target, b"unrelated-target-nonce").unwrap();
+    std::fs::set_permissions(&outside_target, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let outside_before = std::fs::symlink_metadata(&outside_target).unwrap();
     let context_module = r#"__amplifier_module_type__='context'
 import hashlib,json
 from pathlib import Path
@@ -748,6 +841,28 @@ async def mount(coordinator,config=None):
     async def consume(event,data):
         uv=subprocess.check_output(['uv','--version'],text=True).strip()
         output=subprocess.check_output([str(Path.home()/'.amplifier/skills/probe/run')])
+        resources=Path.home()/'.amplifier/skills/probe/node_modules/probe-dependency/selected-resources'
+        eligible=list(resources.iterdir())
+        if len(eligible)!=10005 or any(p.read_bytes()!=b'complete-selected-resource' or p.lstat().st_uid!=65534 or p.lstat().st_gid!=0 for p in eligible): raise RuntimeError('complete large selected projection unavailable')
+        sibling=Path.home()/'.amplifier/skills/provider-created-sibling'
+        link=Path.home()/'.amplifier/skills/provider-created-link'
+        target=Path(config['receipt']).parent/'task3-unrelated-target'
+        ownership_receipt=Path(config['receipt']).with_suffix('.ownership.json')
+        def physical(p):
+            stat=p.lstat()
+            return [stat.st_ino,stat.st_uid,stat.st_gid,stat.st_mode & 0o777]
+        if not ownership_receipt.exists():
+            sibling.write_bytes(b'provider-created-sibling-nonce')
+            sibling.chmod(0o640)
+            link.symlink_to(target)
+            ownership_receipt.write_text(json.dumps({'sibling':physical(sibling),'link':physical(link),'target':physical(target)}))
+        preserved=json.loads(ownership_receipt.read_text())
+        if sibling.read_bytes()!=b'provider-created-sibling-nonce' or link.read_bytes()!=b'unrelated-target-nonce' or preserved!={'sibling':physical(sibling),'link':physical(link),'target':physical(target)}: raise RuntimeError('adopted provider state or unrelated target ownership changed')
+        stub=Path.home()/'.amplifier/projects'/str(Path.cwd().resolve()).replace('/','-').replace('\\','-').replace(':','')/'sessions'/coordinator.session_id
+        if not stub.is_dir() or any(p.lstat().st_uid!=65534 for p in [stub,stub/'metadata.json',stub/'transcript.jsonl',stub/'events.jsonl']): raise RuntimeError('exact Amplifier stub not provider owned')
+        private=Path('/run/freshell-private').lstat()
+        if (os.getuid(),os.getgid(),private.st_uid,private.st_gid,private.st_mode & 0o777)!=(65534,0,0,0,0o710): raise RuntimeError('exact provider private-parent topology unavailable')
+
         selected=yaml.safe_load((Path.home()/'.amplifier/settings.yaml').read_text())['bundle']['active']
         loaded=await load_bundle(selected)
         loaded.resolve_pending_context()
@@ -769,7 +884,7 @@ async def mount(coordinator,config=None):
         stack=resource.getrlimit(resource.RLIMIT_STACK)[0]
         profile={'stackAtLeast8MiB':stack==resource.RLIM_INFINITY or stack>=8388608,'aggregateWithin1MiB':len(argv)+len(env)+8*(len(strings)+2)+len(os.readlink('/proc/self/exe').encode())+1<=1048576,'completeStringsWithin32Pages':all(len(value)+1<=131072 for value in strings)}
         if not all(profile.values()): raise RuntimeError('closed final native execution profile exceeded')
-        result={'finalExecProfile':profile,'nativeCallback':event=='on_session_ready','exactIdentity':data.get('session_id')==config['session_id'],'physicalHome':str(Path.home()),'authenticated':authenticated,'scopedAlias':os.environ.get('FRESHELL')=='1','onecli':hashlib.sha256(os.environ.get('OPENAI_API_KEY','').encode()).hexdigest()==config['key_digest'],'nativeModuleInstaller':uv.startswith('uv 0.8.22'),'resourceAndDependency':hashlib.sha256(output).hexdigest(),'nativeNamespaceContexts':contexts}
+        result={'finalExecProfile':profile,'nativeCallback':event=='on_session_ready','exactIdentity':data.get('session_id')==config['session_id'],'physicalHome':str(Path.home()),'authenticated':authenticated,'scopedAlias':os.environ.get('FRESHELL')=='1','onecli':hashlib.sha256(os.environ.get('OPENAI_API_KEY','').encode()).hexdigest()==config['key_digest'],'nativeModuleInstaller':uv.startswith('uv 0.8.22'),'resourceAndDependency':hashlib.sha256(output).hexdigest(),'nativeNamespaceContexts':contexts,'completeOwnershipProjection':True}
         Path(config['receipt']).write_text(json.dumps(result))
         return HookResult(action='continue')
     _consumer=consume
@@ -1152,7 +1267,7 @@ async def on_session_ready(coordinator):
             json!({"provider":"amplifier","route":"terminal","exited":output.exited,"exitCode":output.exit_code,"outputBytes":text.len(),"classes":classes,"classifiedErrors":classified_errors})
         );
     }
-    let expected = json!({"finalExecProfile":native_exec_profile(),"nativeCallback":true,"exactIdentity":true,"physicalHome":"/home/freshell/provider","authenticated":true,"scopedAlias":true,"onecli":true,"nativeModuleInstaller":true,"resourceAndDependency":hash(b"closed-amplifier-resource:closed-amplifier-dependency"),"nativeNamespaceContexts":{"closed-native-bundle:context/self.md":hash(b"native-self-namespace-context"),"probe:context/selected.md":hash(b"native-nested-namespace-context"),"same-root:context/selected.md":hash(b"native-same-root-ancestor-context"),"same-no-root:context/selected.md":hash(b"native-same-no-root-ancestor-context"),"unnamed-root:context/selected.md":hash(b"native-unnamed-root-ancestor-context")}});
+    let expected = json!({"finalExecProfile":native_exec_profile(),"nativeCallback":true,"exactIdentity":true,"physicalHome":"/home/freshell/provider","authenticated":true,"scopedAlias":true,"onecli":true,"nativeModuleInstaller":true,"resourceAndDependency":hash(b"closed-amplifier-resource:closed-amplifier-dependency"),"completeOwnershipProjection":true,"nativeNamespaceContexts":{"closed-native-bundle:context/self.md":hash(b"native-self-namespace-context"),"probe:context/selected.md":hash(b"native-nested-namespace-context"),"same-root:context/selected.md":hash(b"native-same-root-ancestor-context"),"same-no-root:context/selected.md":hash(b"native-same-no-root-ancestor-context"),"unnamed-root:context/selected.md":hash(b"native-unnamed-root-ancestor-context")}});
     assert_eq!(observed.expect("real Amplifier must activate selected local module and executable skill before a model turn"),expected);
     assert!(
         !output.exited,
@@ -1169,6 +1284,26 @@ async def on_session_ready(coordinator):
     assert_eq!(
         std::fs::read_to_string(bundle.join("bundle.yaml")).unwrap(),
         bundle_document
+    );
+    use std::os::unix::fs::MetadataExt;
+    for (path, before) in [
+        (skill.join("run"), &source_owner_before),
+        (outside_target.clone(), &outside_before),
+    ] {
+        let after = std::fs::symlink_metadata(path).unwrap();
+        assert_eq!(
+            (after.ino(), after.uid(), after.gid(), after.mode()),
+            (before.ino(), before.uid(), before.gid(), before.mode()),
+            "provider preparation changed an original source or unrelated target inode"
+        );
+    }
+    assert_eq!(
+        std::fs::read(&outside_target).unwrap(),
+        b"unrelated-target-nonce"
+    );
+    println!(
+        "provider_launch_ownership {}",
+        json!({"provider":"amplifier","resources":10005,"providerUid":65534,"providerGid":0,"exactPrivateParent0710":true,"originalSourcesPreserved":true,"newStubProviderOwned":true})
     );
     let soul = SoulId::parse(terminal.soul_id.clone()).unwrap();
     let prior = registry.active_handle_for_soul(soul.clone()).await.unwrap();

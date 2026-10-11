@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { execFileSync, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
+import http from 'node:http'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
@@ -142,7 +143,8 @@ export class RuntimeHarness {
   private readonly assertions: AssertionRecord[] = []
   private brokerStarted = false
 
-  constructor(repoRoot: string, runId = randomUUID(), phase: 1 | 2 | 3 | 4 | 5 = 1) {
+  constructor(repoRoot: string, runId = randomUUID(), phase: 1 | 2 | 3 | 4 | 5 = 1,
+    private readonly providerFixtureHome?: string, private readonly providerFixtureXdgConfigHome?: string) {
     this.repoRoot = fs.realpathSync(repoRoot)
     this.phase = phase
     this.runId = runId
@@ -250,6 +252,26 @@ export class RuntimeHarness {
     for (const volume of providerVolumes) {
       try { docker(['volume', 'rm', volume]) } catch (error) { errors.push(`provider volume ${volume}: ${String(error)}`) }
     }
+    // Publishers may succeed before a runtime receives a receipt. Keep their
+    // exact typed ownership checks in the still-live broker during cleanup.
+    const indexedVolumes = new Set((this.broker?.eventsSnapshot?.() ?? []).flatMap(event => {
+      const volume = event.providerVolumeName
+      return event.decision === 'forward' && event.method === 'POST'
+        && event.url.startsWith('/v1.47/containers/create?')
+        && /^[a-f0-9]{64}$/.test(event.containerId ?? '')
+        && /^freshell-inputs-[a-f0-9]{24}$/.test(volume ?? '')
+        && event.helperName === `${volume}-publisher` ? [volume!] : []
+    }))
+    for (const volume of indexedVolumes) {
+      try {
+        const url = `/v1.47/volumes/${volume}`
+        const deleted = await brokerRequestStatus(this.broker.proxySocketPath, 'DELETE', url)
+        if (deleted !== 204 && deleted !== 404) throw new Error('owned indexed volume deletion unavailable')
+        if (await brokerRequestStatus(this.broker.proxySocketPath, 'GET', url) !== 404) {
+          throw new Error('owned indexed volume absence unconfirmed')
+        }
+      } catch (error) { errors.push(`indexed volume ${volume}: ${String(error)}`) }
+    }
     for (const volume of [...this.trackedVolumes]) {
       try { docker(['volume', 'rm', volume]) } catch (error) { errors.push(`volume ${volume}: ${String(error)}`) }
     }
@@ -270,7 +292,7 @@ export class RuntimeHarness {
         ...this.trackedContainers,
         ...this.broker?.receiptIds?.() ?? [],
       ])],
-      volumes: [...this.trackedVolumes, ...providerVolumes],
+      volumes: [...new Set([...this.trackedVolumes, ...providerVolumes, ...indexedVolumes])],
       unsafeBrokerAttempts: this.broker?.unsafeAttempts?.() ?? [],
       completedAt: new Date().toISOString(),
     }
@@ -420,6 +442,9 @@ export class RuntimeHarness {
       '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--cap-add', 'DAC_OVERRIDE', '--cap-add', 'CHOWN', '--security-opt', 'no-new-privileges',
       '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=64m',
       '-v', `${this.testRoot}:${this.testRoot}:rw`,
+      // Helpers are created by the host Docker daemon; their exchange sources
+      // must live in the existing same-path shared root, outside private /tmp.
+      '-e', `TMPDIR=${this.testRoot}`,
       '-v', `${this.buildDir}:${this.buildDir}:ro`,
       '-v', `${volumeName}:/var/lib/freshell-supervisor:rw`,
     ]
@@ -1058,12 +1083,38 @@ export class RuntimeHarness {
   }
 
   private phase2ProviderUserRoots(): string[] {
+    const home = this.providerFixtureHome ?? os.homedir()
+    const validateFixtureDirectory = (selected: string) => {
+      const metadata = fs.lstatSync(selected)
+      if (!path.isAbsolute(selected) || path.normalize(selected) !== selected || fs.realpathSync(selected) !== selected
+        || !metadata.isDirectory() || metadata.isSymbolicLink()
+        || (process.getuid && metadata.uid !== process.getuid())) {
+        throw new Error('provider fixture root must retain its selected owned physical directory')
+      }
+    }
+    if (this.providerFixtureHome !== undefined) validateFixtureDirectory(home)
+    let opencodeRoot = path.join(home, '.config/opencode')
+    if (this.providerFixtureHome !== undefined && this.providerFixtureXdgConfigHome !== undefined) {
+      const selected = this.providerFixtureXdgConfigHome
+      const relative = path.relative(home, selected)
+      const nativeRoots = ['.claude/projects', '.codex/sessions', '.amplifier/projects', '.local/share/opencode']
+      if (!relative || path.isAbsolute(relative) || relative === '..' || relative.startsWith(`..${path.sep}`)
+        || nativeRoots.some(root => relative === root || relative.startsWith(`${root}${path.sep}`))) {
+        throw new Error('provider fixture XDG root must remain outside native stores within its owned HOME')
+      }
+      validateFixtureDirectory(selected)
+      opencodeRoot = path.join(selected, 'opencode')
+    }
     const roots: string[] = []
-    for (const relative of ['.claude', '.codex', '.config/opencode', '.amplifier']) {
+    for (const selected of [path.join(home, '.claude'), path.join(home, '.codex'), opencodeRoot, path.join(home, '.amplifier')]) {
       try {
-        const root = fs.realpathSync(path.join(os.homedir(), relative))
-        if (fs.statSync(root).isDirectory()) roots.push(root)
-      } catch {}
+        const root = fs.realpathSync(selected)
+        const metadata = fs.lstatSync(root)
+        if (this.providerFixtureHome !== undefined) validateFixtureDirectory(selected)
+        if (metadata.isDirectory()) roots.push(root)
+      } catch (error) {
+        if (this.providerFixtureHome !== undefined && (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
     }
     return roots
   }
@@ -1136,6 +1187,18 @@ export class RuntimeHarness {
       }
     }
   }
+}
+
+function brokerRequestStatus(socketPath: string, method: 'GET' | 'DELETE', url: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const request = http.request({ socketPath, path: url, method }, response => {
+      response.resume()
+      response.once('error', reject)
+      response.once('end', () => resolve(response.statusCode ?? 0))
+    })
+    request.once('error', reject)
+    request.end()
+  })
 }
 
 export function defaultLimits(): RuntimeLimits {

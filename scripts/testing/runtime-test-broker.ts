@@ -47,6 +47,14 @@ function privateHelperEnvironment(value: unknown, home: boolean): boolean {
   return !home || names.has('HOME')
 }
 
+function mappedProviderDestination(value: string): boolean {
+  const home = '/home/freshell/provider'
+  if (!isStrictDescendant(value, home)) return false
+  // Ordinary selected inputs cannot alias the provider's native stores.
+  return !['.claude/projects', '.codex/sessions', '.amplifier/projects', '.local/share/opencode']
+    .some(relative => value === `${home}/${relative}` || isStrictDescendant(value, `${home}/${relative}`))
+}
+
 function preparedMountsMatch(actual: unknown[], input: PreparedInputAuthorization): boolean {
   const expected: Record<string, unknown>[] = input.configurationBinds.map((bind) => ({
     Type: 'bind', Source: path.join(input.stageRoot, bind.sourceRelativePath), Target: bind.effectiveDestination, ReadOnly: true,
@@ -187,6 +195,7 @@ export class RestrictedDockerBroker {
   private readonly claudeCandidates = new Map<string, ClaudeCandidateAuthorization>()
   private readonly candidateVolumes = new Set<string>()
   private readonly initialProviderVolumes = new Map<string,InitialProviderVolumeAuthorization>()
+  private readonly initialReservations = new Map<string, { reservationId: string; incarnationId: string }>()
   private readonly preparedInputs = new Map<string, PreparedInputAuthorization>()
   private readonly inputVolumes = new Set<string>()
   private readonly inputPublishers = new Map<string, {
@@ -206,6 +215,14 @@ export class RestrictedDockerBroker {
   constructor(private readonly policy: RestrictedDockerBrokerPolicy) {}
 
   authorizeClaudeCandidate(input: ClaudeCandidateAuthorization): void {
+    this.validateClaudeCandidateAuthorization(input)
+    const key = candidateVolumeName(input), previous = this.claudeCandidates.get(key)
+    if (previous && JSON.stringify(previous) !== JSON.stringify(input)) throw new Error('Claude candidate request changed')
+    if (!previous && this.claudeCandidates.size >= 6) throw new Error('closed Claude fixture exceeds its two routes and two replans')
+    this.claudeCandidates.set(key, structuredClone(input))
+  }
+
+  private validateClaudeCandidateAuthorization(input: ClaudeCandidateAuthorization): void {
     const initial = this.initialProviderVolumes.get(input.providerVolumeName)
     const uuid = (value: string) => /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value)
     const fixture = path.dirname(this.policy.runtimeRootPrefix)
@@ -213,6 +230,7 @@ export class RestrictedDockerBroker {
     const destination = (value: string) => typeof value === 'string' && path.isAbsolute(value)
       && path.normalize(value) === value && !/[\x00-\x1f\x7f]/.test(value)
       && (value === input.workspacePath || isStrictDescendant(value, input.workspacePath)
+        || mappedProviderDestination(value)
         || [...this.policy.allowedProviderUserRoots ?? []].some((root) => value === root || isStrictDescendant(value, root)))
     const unit = (value: string, prefix: string, file = false) => typeof value === 'string'
       && new RegExp(`^${prefix}/[a-zA-Z0-9_-]{1,128}${file ? '/source' : ''}$`).test(value)
@@ -220,7 +238,7 @@ export class RestrictedDockerBroker {
       || !uuid(input.requestId) || !uuid(input.reservationId) || !input.generationId.startsWith('grant-') || !uuid(input.generationId.slice(6))
       || relative !== `scenarios/${relative.split('/')[1]}/control/provider-roots/${input.generationId}`
       || !/^[a-zA-Z0-9_-]{1,128}$/.test(relative.split('/')[1] ?? '')
-      || !this.policy.allowedWorkspaceRoots?.has(input.workspacePath) || !destination(input.cwd)
+      || !this.isAllowedWorkspacePath(input.workspacePath) || !destination(input.cwd)
       || !(input.cwd === input.workspacePath || isStrictDescendant(input.cwd, input.workspacePath))
       || (input.gitCommonDir !== undefined && (!path.isAbsolute(input.gitCommonDir) || path.normalize(input.gitCommonDir) !== input.gitCommonDir
         || /[\x00-\x1f\x7f]/.test(input.gitCommonDir) || !(input.gitCommonDir === input.workspacePath || isStrictDescendant(input.gitCommonDir, input.workspacePath) || isStrictDescendant(input.gitCommonDir, fixture))))
@@ -251,11 +269,9 @@ export class RestrictedDockerBroker {
         claim(mount.effectiveDestination)
       }
     }
-    const key = candidateVolumeName(input), previous = this.claudeCandidates.get(key)
-    if (previous && JSON.stringify(previous) !== JSON.stringify(input)) throw new Error('Claude candidate request changed')
-    if (!previous && this.claudeCandidates.size >= 6) throw new Error('closed Claude fixture exceeds its two routes and two replans')
-    this.claudeCandidates.set(key, structuredClone(input))
   }
+
+
 
   authorizeInitialProviderVolume(input:InitialProviderVolumeAuthorization):void {
     const stable=`freshell-provider-${createHash('sha256').update(`${input.installationId}\0${input.soulId}`).digest('hex').slice(0,24)}`
@@ -287,10 +303,12 @@ export class RestrictedDockerBroker {
     const destination = (value: string) => path.isAbsolute(value) && path.normalize(value) === value
       && !/[\x00-\x1f\x7f]/.test(value)
       && (this.isAllowedWorkspacePath(value)
+        || mappedProviderDestination(value)
         || [...this.policy.allowedProviderUserRoots ?? []].some((root) => value === root || isStrictDescendant(value, root)))
     const targets = new Set<string>()
     const claim = (value: string) => {
-      if (!destination(value) || targets.has(value)) throw new Error('prepared input target is outside selected fixture roots or duplicated')
+      if (!destination(value)) throw new Error('prepared input target is outside selected fixture roots')
+      if (targets.has(value)) throw new Error('prepared input target is duplicated')
       targets.add(value)
     }
     for (const bind of input.configurationBinds) {
@@ -388,6 +406,11 @@ export class RestrictedDockerBroker {
     const target = parseContainerTarget(url)
     const destructive = isDestructiveDockerRequest(method, target?.action)
 
+    if (method === 'POST' && (url === `${DOCKER_API_PREFIX}/volumes/create`
+      || url.startsWith(`${DOCKER_API_PREFIX}/containers/create?`))) {
+      this.registerPublishedFixtureInputs(body, url)
+    }
+
     if (method === 'GET' && url === '/_ping') {
       await this.forwardAndReply(request, response, body, { destructive: false })
       return
@@ -445,6 +468,24 @@ export class RestrictedDockerBroker {
     const candidate = candidateVolume && this.claudeCandidates.get(candidateVolume)
     if (method === 'GET' && candidate) {
       await this.forwardAndReply(request, response, body, { destructive: false })
+      return
+    }
+    if (method === 'GET' && candidateVolume && !candidate
+      && /^freshell-claude-candidate-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(candidateVolume)) {
+      const rejection = this.initialClaudePublicationRejection(candidateVolume.slice('freshell-claude-candidate-'.length))
+      if (rejection) {
+        this.block(response, method, url, 403, `candidate absence qualification unavailable at ${rejection}`, false)
+        return
+      }
+      const inspected = await this.forward(request, body)
+      if (inspected.statusCode !== 404) {
+        this.block(response, method, url, 403, 'unregistered candidate probe may expose only actual absence', false)
+        return
+      }
+      // Absence is read-only evidence. Register no candidate or mutation owner;
+      // the later exact POST still requires the complete publication handoff.
+      this.record({ method, url, decision: 'forward', destructive: false, unsafeAttempt: false })
+      replyDocker(response, inspected)
       return
     }
     if (method === 'DELETE' && candidate && this.candidateVolumes.has(candidateVolume!)) {
@@ -507,6 +548,9 @@ export class RestrictedDockerBroker {
           this.block(response,method,url,403,'initial volume must match the exact reserved soul source',true)
           return
         }
+        this.initialReservations.set(initial.providerVolumeName, {
+          reservationId: labels['freshell.input.reservation'], incarnationId: labels['freshell.input.incarnation'],
+        })
         await this.forwardAndReply(request,response,body,{destructive:false})
         return
       }
@@ -644,7 +688,7 @@ export class RestrictedDockerBroker {
             if (typeof parsed.Id !== 'string' || !/^[a-f0-9]{64}$/.test(parsed.Id) || this.receiptIds().has(parsed.Id)) throw new Error('invalid Claude source helper identity')
             helper.containerId = parsed.Id
           }
-          this.record({ method, url, decision: 'forward', destructive: false, unsafeAttempt: false, helperName: name, containerId: helper.containerId, requestDigest: sha256(body) })
+          this.record({ method, url, decision: 'forward', destructive: false, unsafeAttempt: false, helperName: name, containerId: helper.containerId, requestDigest: sha256(body), reason: this.helperRejectionReason(forwarded, helper.expected) })
           replyDocker(response, forwarded)
         } catch {
           this.record({ method, url, decision: 'forward', reason: 'Claude source helper acknowledgement unavailable', destructive: false, unsafeAttempt: false, helperName: name, requestDigest: sha256(body) })
@@ -654,7 +698,8 @@ export class RestrictedDockerBroker {
         return
       }
       if (/^freshell-inputs-[a-f0-9]{24}-publisher$/.test(name) || mountpointHelper) {
-        const input=mountpointHelper ? this.validateMountpointHelper(body) : this.validateInputPublisher(name,body)
+        const mountpoint = mountpointHelper ? this.validateMountpointHelper(body) : undefined
+        const input=mountpointHelper ? mountpoint?.input : this.validateInputPublisher(name,body)
         let previousAbsent=true
         if (input && this.inputPublishers.has(name)) {
           const previous=await this.forward({method:'GET',url:`${DOCKER_API_PREFIX}/containers/${name}/json`,headers:{}} as IncomingMessage,Buffer.alloc(0))
@@ -662,7 +707,7 @@ export class RestrictedDockerBroker {
           this.record({method:'GET',url:`${DOCKER_API_PREFIX}/containers/${name}/json`,decision:'forward',destructive:false,unsafeAttempt:false,helperName:name})
         }
         if (!input || !previousAbsent) {
-          this.block(response,method,url,403,'indexed publisher must match an owned fixed preparation',false)
+          this.block(response,method,url,403,mountpoint?.reason ?? 'indexed publisher must match an owned fixed preparation',false)
           return
         }
         const publisher:{input:PreparedInputAuthorization;expected:Record<string,any>;containerId?:string}={input,expected:JSON.parse(body.toString())}
@@ -674,7 +719,7 @@ export class RestrictedDockerBroker {
             if (typeof parsed.Id!=='string' || !/^[a-f0-9]{64}$/.test(parsed.Id) || this.receiptIds().has(parsed.Id)) throw new Error('invalid indexed publisher identity')
             publisher.containerId=parsed.Id
           }
-          this.record({method,url,decision:'forward',destructive:false,unsafeAttempt:false,helperName:name,containerId:publisher.containerId,providerVolumeName:mountpointHelper ? input.providerVolumeName : input.indexedFiles!.volumeName})
+          this.record({method,url,decision:'forward',destructive:false,unsafeAttempt:false,helperName:name,containerId:publisher.containerId,providerVolumeName:mountpointHelper ? input.providerVolumeName : input.indexedFiles!.volumeName,reason:this.helperRejectionReason(forwarded,publisher.expected)})
           replyDocker(response,forwarded)
         } catch {
           response.statusCode=503
@@ -947,8 +992,7 @@ export class RestrictedDockerBroker {
     if (!Array.isArray(mounts)) return false
     const exchangeTarget = reader ? '/run/freshell-source-exchange' : '/run/freshell-input-exchange'
     const exchange = mounts.find((mount) => mount?.Type === 'bind' && mount.Target === exchangeTarget && mount.ReadOnly === true
-      && typeof mount.Source === 'string' && path.dirname(mount.Source) === os.tmpdir()
-      && /^freshell-inputs-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(path.basename(mount.Source)))
+      && this.isAllowedExchangeSource(mount.Source, 'freshell-inputs'))
     if (!exchange) return false
     const expected: Record<string, any>[] = [
       { Type: 'bind', Source: input.hostBinaryPath, Target: '/runtime/freshell-session-host', ReadOnly: true },
@@ -1017,10 +1061,9 @@ export class RestrictedDockerBroker {
     if (!Array.isArray(mounts)
       || mounts.some((mount) => !mount || Object.keys(mount).some((key) => !['Type','Source','Target','ReadOnly','VolumeOptions'].includes(key)))) return false
     const binary = mounts.find((mount) => mount.Type === 'bind' && mount.Source === owner.hostBinaryPath && mount.Target === '/runtime/freshell-session-host' && mount.ReadOnly === true)
-    const workspace = mounts.find((mount) => mount.Type === 'bind' && mount.Source === mount.Target && this.policy.allowedWorkspaceRoots?.has(mount.Source) && mount.ReadOnly === true)
+    const workspace = mounts.find((mount) => mount.Type === 'bind' && mount.Source === mount.Target && this.isAllowedWorkspacePath(mount.Source) && mount.ReadOnly === true)
     const exchange = mounts.find((mount) => mount.Type === 'bind' && mount.Target === '/run/freshell-source-exchange' && mount.ReadOnly === true
-      && typeof mount.Source === 'string' && path.dirname(mount.Source) === os.tmpdir()
-      && /^freshell-inputs-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(path.basename(mount.Source)))
+      && this.isAllowedExchangeSource(mount.Source, 'freshell-inputs'))
     if (!binary || !workspace || !exchange || [binary,workspace,exchange].some(mount => mount.VolumeOptions !== undefined)) return false
     const home = mounts.find(mount => mount.Target === '/home/freshell/provider')
     if (home) {
@@ -1098,26 +1141,33 @@ export class RestrictedDockerBroker {
     const binary=mounts.find((mount)=>mount.Type==='bind' && mount.Source===input.hostBinaryPath && mount.Target==='/runtime/freshell-session-host' && mount.ReadOnly===true)
     const volume=mounts.find((mount)=>mount.Type==='volume' && mount.Source===input.indexedFiles!.volumeName && mount.Target==='/run/freshell-input-files' && mount.ReadOnly===false && equalRecord(mount.VolumeOptions,{NoCopy:true}))
     const exchange=mounts.find((mount)=>mount.Type==='bind' && mount.Target==='/run/freshell-input-exchange' && mount.ReadOnly===true
-      && typeof mount.Source==='string' && path.dirname(mount.Source)===os.tmpdir()
-      && /^freshell-inputs-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(path.basename(mount.Source)))
+      && this.isAllowedExchangeSource(mount.Source, 'freshell-inputs'))
     if (!binary || !volume || !exchange || [binary,volume,exchange].some((mount)=>Object.keys(mount).some((key)=>!['Type','Source','Target','ReadOnly','VolumeOptions'].includes(key)))
       || binary.VolumeOptions!==undefined || exchange.VolumeOptions!==undefined) return
     return input
   }
 
-  private validateMountpointHelper(body:Buffer):PreparedInputAuthorization | undefined {
+  private validateMountpointHelper(body:Buffer): { input?: PreparedInputAuthorization; reason?: string } {
+    const reject = (phase: 'json' | 'owner' | 'image' | 'labels' | 'identity_argv' | 'environment' | 'shape'
+      | 'limits_authority' | 'mount_count' | 'exchange' | 'mounts') => ({ reason: `mountpoint helper unavailable at ${phase}` })
     let parsed:Record<string,any>
-    try {parsed=JSON.parse(body.toString())} catch {return}
-    const input=[...this.preparedInputs.values()].find((input)=>parsed.Image===input.imageRef
-      && equalRecord(parsed.Labels,{'com.freshell.installation-id':input.installationId,
-        'com.freshell.soul-id':input.soulId,'com.freshell.incarnation-id':input.incarnationId}))
-    if (!input || parsed.User!=='0:0' || parsed.Tty!==false
+    try {parsed=JSON.parse(body.toString())} catch {return reject('json')}
+    const owners=[...this.preparedInputs.values()].filter((input)=>
+      parsed.Labels?.['com.freshell.installation-id']===input.installationId
+      && parsed.Labels?.['com.freshell.soul-id']===input.soulId
+      && parsed.Labels?.['com.freshell.incarnation-id']===input.incarnationId)
+    if (!owners.length) return reject('owner')
+    const input=owners.find((input)=>parsed.Image===input.imageRef)
+    if (!input) return reject('image')
+    if (!equalRecord(parsed.Labels,{'com.freshell.installation-id':input.installationId,
+      'com.freshell.soul-id':input.soulId,'com.freshell.incarnation-id':input.incarnationId})) return reject('labels')
+    if (parsed.User!=='0:0' || parsed.Tty!==false
       || JSON.stringify(parsed.Entrypoint)!==JSON.stringify(['/runtime/freshell-session-host'])
-      || JSON.stringify(parsed.Cmd)!==JSON.stringify(['prepare-provider-mountpoints'])
-      || !privateHelperEnvironment(parsed.Env,false)) return
+      || JSON.stringify(parsed.Cmd)!==JSON.stringify(['prepare-provider-mountpoints'])) return reject('identity_argv')
+    if (!privateHelperEnvironment(parsed.Env,false)) return reject('environment')
     const host=parsed.HostConfig ?? {}
     if (Object.keys(parsed).some((key)=>!['Image','User','Tty','Labels','Entrypoint','Cmd','Env','HostConfig'].includes(key))
-      || Object.keys(host).some((key)=>!['NetworkMode','ReadonlyRootfs','CapDrop','CapAdd','SecurityOpt','Memory','MemorySwap','NanoCpus','PidsLimit','LogConfig','Mounts'].includes(key))) return
+      || Object.keys(host).some((key)=>!['NetworkMode','ReadonlyRootfs','CapDrop','CapAdd','SecurityOpt','Memory','MemorySwap','NanoCpus','PidsLimit','LogConfig','Mounts'].includes(key))) return reject('shape')
     if (host.NetworkMode!=='none' || host.ReadonlyRootfs!==true
       || JSON.stringify(host.CapDrop)!==JSON.stringify(['ALL'])
       || JSON.stringify(host.CapAdd)!==JSON.stringify(['CHOWN','SETGID','SETUID'])
@@ -1125,19 +1175,213 @@ export class RestrictedDockerBroker {
       || host.Memory!==128*1024*1024 || host.MemorySwap!==128*1024*1024
       || host.NanoCpus!==500_000_000 || host.PidsLimit!==32
       || !equalRecord(host.LogConfig,{Type:'none',Config:host.LogConfig?.Config})
-      || Object.keys(host.LogConfig?.Config ?? {}).length) return
+      || Object.keys(host.LogConfig?.Config ?? {}).length) return reject('limits_authority')
     const mounts=host.Mounts
-    if (!Array.isArray(mounts) || mounts.length!==3) return
+    if (!Array.isArray(mounts) || mounts.length!==3) return reject('mount_count')
     const binary=mounts.find((mount)=>mount.Type==='bind' && mount.Source===input.hostBinaryPath
       && mount.Target==='/runtime/freshell-session-host' && mount.ReadOnly===true)
     const volume=mounts.find((mount)=>mount.Type==='volume' && mount.Source===input.providerVolumeName
       && mount.Target==='/home/freshell/provider' && mount.ReadOnly===false && equalRecord(mount.VolumeOptions,{NoCopy:true}))
-    const exchange=mounts.find((mount)=>mount.Type==='bind' && mount.Target==='/run/freshell-input-exchange' && mount.ReadOnly===true
-      && typeof mount.Source==='string' && path.dirname(mount.Source)===os.tmpdir()
-      && /^freshell-inputs-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(path.basename(mount.Source)))
+    const exchange=mounts.find((mount)=>mount.Type==='bind' && mount.Target==='/run/freshell-input-exchange' && mount.ReadOnly===true)
+    if (!exchange || !this.isAllowedExchangeSource(exchange.Source, 'freshell-inputs')) return reject('exchange')
     if (!binary || !volume || !exchange || [binary,volume,exchange].some((mount)=>Object.keys(mount).some((key)=>!['Type','Source','Target','ReadOnly','VolumeOptions'].includes(key)))
-      || binary.VolumeOptions!==undefined || exchange.VolumeOptions!==undefined) return
-    return input
+      || binary.VolumeOptions!==undefined || exchange.VolumeOptions!==undefined) return reject('mounts')
+    return { input }
+  }
+
+  // Browser fixtures publish through the actual controller, whose generated
+  // stages exist before Docker receives their first request. Register that
+  // immutable handoff here; the ordinary Docker validators still decide every
+  // request. Explicit native fixture handoffs continue to use the same APIs.
+  private initialClaudePublicationRejection(requestId: string): string | undefined {
+    let phase = 'physical_stage'
+    try {
+      const root = path.dirname(this.policy.runtimeRootPrefix)
+      for (const scenario of this.fixtureDirectories(path.join(root, 'scenarios'), 32)) {
+        const control = path.join(root, 'scenarios', scenario, 'control')
+        for (const grant of this.fixtureDirectories(path.join(control, 'provider-roots'), 128)) {
+          if (!/^grant-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(grant)) continue
+          const stageRoot = path.join(control, 'provider-roots', grant)
+          const bindingFile = path.join(stageRoot, '.freshell/claude-candidate-binding.json')
+          if (!fs.existsSync(bindingFile)) continue
+          phase = 'owner_capability'
+          const binding = this.fixtureMetadata(bindingFile).value
+          const capability = this.fixtureMetadata(path.join(control, 'mcp-capabilities', `${grant}.json`), 128 * 1024).value
+          const owner = [...this.initialProviderVolumes.values()].find(owner => owner.soulId === binding.soulId && owner.soulId === capability.soulId)
+          if (!owner || capability.incarnationId != null || binding.version !== 1 || binding.provider !== 'claude'
+            || binding.generationId !== grant || binding.intentRevision !== 1 || binding.registryAttemptId != null
+            || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(binding.initialReservationId ?? '')) continue
+          phase = 'prepared_metadata'
+          const context = this.fixtureMetadata(path.join(stageRoot, '.freshell/prepared-context.json'))
+          const result = this.fixtureMetadata(path.join(stageRoot, '.freshell/prepared-result.json'))
+          const inputs = context.value.preparedInputs
+          if (!context.value.preparation?.claude || !inputs || inputs.generationId !== grant
+            || context.value.mcpCapability?.grantId !== grant || inputs.initialAuthReservation !== binding.initialReservationId
+            || JSON.stringify(result.value.providerLaunchContext) !== JSON.stringify(context.value)
+            || !Array.isArray(result.value.providerSecretReferences) || inputs.manifest?.relativePath !== '.freshell/input-manifest.json'
+            || sha256Hex(context.bytes) !== binding.preparedContextSha256 || sha256Hex(result.bytes) !== binding.preparedResultSha256) continue
+          phase = 'authority_binding'
+          if (sha256Hex(Buffer.from(JSON.stringify({ kind: 'initial_reservation', reservationId: binding.initialReservationId }))) !== binding.authoritySha256) continue
+          phase = 'manifest_artifact'
+          const manifest = this.fixtureMetadata(path.join(stageRoot, inputs.manifest.relativePath), 64 * 1024 * 1024)
+          const binary = fs.lstatSync(owner.hostBinaryPath)
+          if (sha256Hex(manifest.bytes) !== binding.manifestSha256 || inputs.manifest.sha256 !== binding.manifestSha256
+            || !binary.isFile() || binary.isSymbolicLink() || binary.size > 128 * 1024 * 1024
+            || sha256Hex(fs.readFileSync(owner.hostBinaryPath)) !== owner.binarySha256) continue
+          phase = 'selected_target'
+          this.validateClaudeCandidateAuthorization({ ...owner, generationId: grant, stageRoot,
+            requestId, reservationId: binding.initialReservationId, workspacePath: binding.workspacePath, cwd: binding.cwd,
+            gitCommonDir: binding.gitCommonDir === null ? undefined : binding.gitCommonDir, manifestRelativePath: inputs.manifest.relativePath,
+            configurationBinds: inputs.configBinds ?? [], resourceMounts: inputs.resourceMounts ?? [] })
+          return undefined
+        }
+      }
+    } catch { /* Unqualified publication exposes no daemon metadata. */ }
+    return phase
+  }
+
+  private registerPublishedFixtureInputs(body: Buffer, url: string): void {
+    let phase = 'owner'
+    try {
+      const request = JSON.parse(body.toString())
+      const labels = request.Labels ?? {}
+      const owner = [...this.initialProviderVolumes.values()].find(source =>
+        source.installationId === labels['com.freshell.installation-id']
+        && source.soulId === labels['com.freshell.soul-id'])
+      if (!owner || (request.Image !== undefined && request.Image !== owner.imageRef)) return
+      const candidate = labels['com.freshell.claude-candidate'] === 'ordinary'
+      const generation = labels['com.freshell.input-generation']
+      const incarnationId = labels['com.freshell.incarnation-id']
+      if (candidate && this.claudeCandidates.has(`freshell-claude-candidate-${labels['com.freshell.source-request-id']}`)) return
+      if (!candidate && [...this.preparedInputs.values()].some(input => input.installationId === owner.installationId
+        && input.soulId === owner.soulId && input.incarnationId === incarnationId
+        && (generation === undefined || generation === input.generationId))) return
+      const reservation = this.initialReservations.get(owner.providerVolumeName)
+      if (!candidate && (!reservation || reservation.incarnationId !== incarnationId)) return
+      const root = path.dirname(this.policy.runtimeRootPrefix)
+      phase = 'physical_directories'
+      const scenarios = this.fixtureDirectories(path.join(root, 'scenarios'), 32)
+      for (const scenario of scenarios) {
+        const control = path.join(root, 'scenarios', scenario, 'control')
+        for (const grant of this.fixtureDirectories(path.join(control, 'provider-roots'), 128)) {
+          if (!/^grant-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(grant)
+            || (generation !== undefined && generation !== grant)) continue
+          const stageRoot = path.join(control, 'provider-roots', grant)
+          phase = 'capability_metadata'
+          const capability = this.fixtureMetadata(path.join(control, 'mcp-capabilities', `${grant}.json`), 128 * 1024).value
+          if (capability.soulId !== owner.soulId || (capability.incarnationId != null
+            && capability.incarnationId !== incarnationId)) continue
+          const contextDocument = this.fixtureMetadata(path.join(stageRoot, '.freshell/prepared-context.json'))
+          phase = 'prepared_metadata'
+          const resultDocument = this.fixtureMetadata(path.join(stageRoot, '.freshell/prepared-result.json'))
+          const context = contextDocument.value
+          const result = resultDocument.value
+          const inputs = context.preparedInputs
+          if (!inputs || inputs.generationId !== grant || context.mcpCapability?.grantId !== grant
+            || JSON.stringify(result.providerLaunchContext) !== JSON.stringify(context)
+            || !Array.isArray(result.providerSecretReferences)
+            || inputs.manifest?.relativePath !== '.freshell/input-manifest.json') continue
+          const manifest = this.fixtureMetadata(path.join(stageRoot, inputs.manifest.relativePath), 64 * 1024 * 1024)
+          phase = 'manifest_hash'
+          if (sha256Hex(manifest.bytes) !== inputs.manifest.sha256) continue
+          phase = 'host_artifact'
+          const binary = fs.lstatSync(owner.hostBinaryPath)
+          if (!binary.isFile() || binary.isSymbolicLink() || binary.size > 128 * 1024 * 1024
+            || sha256Hex(fs.readFileSync(owner.hostBinaryPath)) !== owner.binarySha256) continue
+          if (candidate) {
+            phase = 'candidate_binding'
+            const binding = this.fixtureMetadata(path.join(stageRoot, '.freshell/claude-candidate-binding.json')).value
+            if (binding.version !== 1 || binding.provider !== 'claude' || binding.soulId !== owner.soulId
+              || binding.generationId !== grant || binding.intentRevision !== 1 || binding.registryAttemptId != null
+              || binding.initialReservationId !== inputs.initialAuthReservation
+              || binding.initialReservationId !== labels['com.freshell.source-reservation-id']
+              || binding.manifestSha256 !== inputs.manifest.sha256
+              || binding.preparedContextSha256 !== sha256Hex(contextDocument.bytes)
+              || binding.preparedResultSha256 !== sha256Hex(resultDocument.bytes)) continue
+            phase = 'candidate_authorization'
+            this.authorizeClaudeCandidate({ ...owner, generationId: grant, stageRoot,
+              reservationId: binding.initialReservationId, requestId: labels['com.freshell.source-request-id'],
+              workspacePath: binding.workspacePath, cwd: binding.cwd, gitCommonDir: binding.gitCommonDir === null ? undefined : binding.gitCommonDir,
+              manifestRelativePath: inputs.manifest.relativePath, configurationBinds: inputs.configBinds ?? [],
+              resourceMounts: inputs.resourceMounts ?? [],
+            })
+          } else {
+            if (inputs.initialAuthReservation !== reservation!.reservationId) continue
+            const indexedSecretSources: { grantIndex: number; sourceId: number }[] = []
+            result.providerSecretReferences.forEach((reference: Record<string, any>, grantIndex: number) => {
+              if (!['claude_configuration_file', 'codex_configuration_file', 'opencode_configuration_file', 'amplifier_configuration_file'].includes(reference.profile)) return
+              const source = reference.providerRelativePath?.match(/^\.freshell\/references\/(\d+)$/)?.[1]
+              if (source === undefined) throw new Error('fixture configuration source index invalid')
+              indexedSecretSources.push({ grantIndex, sourceId: Number(source) })
+            })
+            if (indexedSecretSources.length !== inputs.manifest.sourceCount) continue
+            phase = 'prepared_authorization'
+            this.authorizePreparedInputs({ ...owner, incarnationId, generationId: grant, stageRoot,
+              configurationBinds: (inputs.configBinds ?? []).map((bind: Record<string, any>) => ({
+                sourceRelativePath: bind.sourceRelativePath, effectiveDestination: bind.effectiveDestination,
+              })), resourceMounts: (inputs.resourceMounts ?? []).map((mount: Record<string, any>) => ({
+                providerRelativePath: mount.providerRelativePath, effectiveDestination: mount.effectiveDestination, kind: mount.kind,
+              })), indexedFiles: inputs.indexedFiles, indexedSecretSources,
+            })
+          }
+          return
+        }
+      }
+      this.record({ method: 'POST', url, decision: 'block', reason: `fixture publication unavailable at ${phase}`, destructive: false, unsafeAttempt: false })
+    } catch (error) {
+      // Only fixed validator categories are observable. Discard all other
+      // exception messages, which may include filesystem or input details.
+      const categories: Record<string, string> = {
+        'prepared input owner/stage is outside this fixture run': 'owner_or_stage',
+        'prepared input metadata exceeds control profile': 'metadata_limit',
+        'prepared input target is outside selected fixture roots': 'target_root',
+        'prepared input target is duplicated': 'duplicate_target',
+        'prepared template source is invalid': 'invalid_template_source',
+        'prepared resource source is invalid': 'invalid_resource_source',
+        'prepared indexed volume identity/profile is invalid': 'indexed_identity_or_profile',
+        'prepared indexed source id is invalid': 'indexed_source_id',
+        'prepared private source has no indexed volume': 'missing_indexed_volume',
+        'prepared private input index is invalid': 'private_input_index',
+        'prepared input generation changed; reconcile before replacement': 'changed_generation',
+      }
+      const category = error instanceof Error ? categories[error.message] ?? 'unclassified' : 'unclassified'
+      this.record({ method: 'POST', url, decision: 'block', reason: `fixture publication unavailable at ${phase}: ${category}`, destructive: false, unsafeAttempt: false })
+    }
+  }
+
+  private fixtureDirectories(directory: string, limit: number): string[] {
+    if (!fs.existsSync(directory)) return []
+    this.physicalFixturePath(directory)
+    const entries = fs.readdirSync(directory, { withFileTypes: true })
+    if (entries.length > limit || entries.some(entry => entry.isSymbolicLink())) throw new Error('fixture directory profile invalid')
+    return entries.filter(entry => entry.isDirectory()).map(entry => entry.name)
+  }
+
+  private physicalFixturePath(file: string): void {
+    const root = path.dirname(this.policy.runtimeRootPrefix)
+    const relative = path.relative(root, file)
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('fixture metadata outside owned root')
+    let parent = root
+    const owner = fs.lstatSync(root).uid
+    for (const part of relative.split(path.sep)) {
+      parent = path.join(parent, part)
+      const stat = fs.lstatSync(parent)
+      if (stat.isSymbolicLink() || stat.uid !== owner) throw new Error('fixture metadata physical owner changed')
+    }
+  }
+
+  private fixtureMetadata(file: string, limit = 1024 * 1024): { value: Record<string, any>; bytes: Buffer } {
+    this.physicalFixturePath(file)
+    const descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)
+    try {
+      const stat = fs.fstatSync(descriptor)
+      if (!stat.isFile() || stat.size > limit) throw new Error('fixture metadata profile exceeded')
+      const bytes = Buffer.alloc(stat.size)
+      if (fs.readSync(descriptor, bytes) !== stat.size || fs.readSync(descriptor, Buffer.alloc(1)) !== 0) throw new Error('fixture metadata changed')
+      const value = JSON.parse(bytes.toString('utf8'))
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('fixture metadata invalid')
+      return { value, bytes }
+    } finally { fs.closeSync(descriptor) }
   }
 
   private validateHistoryHelper(name: string, body: Buffer): BrokerReceipt | undefined {
@@ -1192,7 +1436,7 @@ export class RestrictedDockerBroker {
     const volume = mounts.find((mount) => mount.Type === 'volume' && mount.Target === '/home/freshell/provider' && mount.ReadOnly === true && same(mount.VolumeOptions, { NoCopy: true }))
     const exchange = mounts.find((mount) => mount.Type === 'bind' && mount.Target === '/run/freshell-auth-exchange' && mount.ReadOnly === true)
     if (!binary || !volume || !exchange || typeof exchange.Source !== 'string'
-      || !new RegExp(`^freshell-auth-${uuid}$`).test(path.basename(exchange.Source)) || path.dirname(exchange.Source) !== os.tmpdir()
+      || !this.isAllowedExchangeSource(exchange.Source, 'freshell-auth')
       || !this.policy.allowedHostBinaryPaths.has(binary.Source) || !this.policy.allowedImageRefs.has(parsed.Image)) return
     return this.receipts().find((receipt) => receipt.providerVolumeName === volume.Source
       && receipt.imageRef === parsed.Image && receipt.hostBinaryPath === binary.Source)
@@ -1204,6 +1448,34 @@ export class RestrictedDockerBroker {
       if (candidate === root || isStrictDescendant(candidate, root)) return true
     }
     return false
+  }
+
+  private isAllowedExchangeSource(source: unknown, prefix: 'freshell-inputs' | 'freshell-auth'): source is string {
+    if (typeof source !== 'string' || path.normalize(source) !== source
+      || !new RegExp(`^${prefix}-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$`).test(path.basename(source))) return false
+    if (path.dirname(source) === os.tmpdir()) return true
+    if (path.dirname(source) !== path.dirname(this.policy.runtimeRootPrefix)) return false
+    try {
+      this.physicalFixturePath(source)
+      return fs.lstatSync(source).isDirectory()
+    } catch { return false }
+  }
+
+  /** Called only for the already validated fixed helpers; never persist daemon payloads. */
+  private helperRejectionReason(response: DockerResponse, expected: Record<string, any>): string | undefined {
+    if (response.statusCode === 201) return
+    let missingBindSource = false
+    if (response.body.length <= 64 * 1024) {
+      try {
+        const message = JSON.parse(response.body.toString()).message
+        missingBindSource = typeof message === 'string'
+          && message.startsWith('invalid mount config for type "bind": bind source path does not exist:')
+      } catch {}
+    }
+    const exchange = expected.HostConfig.Mounts.find((mount: Record<string, any>) =>
+      mount.Type === 'bind' && ['/run/freshell-source-exchange', '/run/freshell-input-exchange'].includes(mount.Target))
+    const hostExists = exchange ? fs.existsSync(exchange.Source) : false
+    return `upstream helper rejected: status=${response.statusCode}; cause=${missingBindSource ? 'missing_bind_source' : 'unclassified'}; ownedExchangeHostExists=${hostExists}`
   }
 
   private async forwardAndReply(request: IncomingMessage, response: ServerResponse, body: Buffer, event: { destructive: boolean; containerId?: string; helperName?:string }): Promise<void> {
@@ -1295,5 +1567,9 @@ function isStrictDescendant(candidate: string, root: string): boolean {
 }
 
 function sha256(bytes: Buffer): string {
-  return `sha256:${createHash('sha256').update(bytes).digest('hex')}`
+  return `sha256:${sha256Hex(bytes)}`
+}
+
+function sha256Hex(bytes: Buffer): string {
+  return createHash('sha256').update(bytes).digest('hex')
 }

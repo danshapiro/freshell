@@ -1,11 +1,125 @@
 import { createHash } from 'node:crypto'
+import { spawnSync } from 'node:child_process'
 import os from 'node:os'
 import fs from 'node:fs/promises'
 import http from 'node:http'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { describe, expect, it, vi } from 'vitest'
 
 import { RestrictedDockerBroker, type ClaudeCandidateAuthorization, type PreparedInputAuthorization } from '../../../../scripts/testing/runtime-test-broker.js'
+import { authorizeProviderParityRequest, captureProviderParityVolumes, cleanupProviderParityVolumes } from '../../../integration/server/provider-parity-broker.js'
+import { makeProviderParityResourcesReadable, providerParityCommands, providerParityFailureDiagnostics, writeProviderParityEnvironment } from '../../../integration/server/provider-parity-environment.js'
+
+it('executes file and package TUI entrypoints while observing the selected project settings', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-parity-selection-'))
+  try {
+    const workspace = path.join(directory, 'workspace')
+    const home = path.join(directory, 'home')
+    const packageRoot = path.join(home, '.freshell/opencode')
+    const entry = path.join(packageRoot, 'freshell-rebind-plugin.ts')
+    await fs.mkdir(path.join(workspace, '.opencode'), { recursive: true })
+    await fs.mkdir(path.join(home, 'project/.opencode'), { recursive: true })
+    await fs.mkdir(packageRoot, { recursive: true })
+    await fs.copyFile('extensions/opencode/freshell-rebind-plugin.ts', entry)
+    await fs.writeFile(path.join(packageRoot, 'package.json'), JSON.stringify({ exports: { './tui': './freshell-rebind-plugin.ts' } }))
+    const userConfig = { plugin: ['file:///selected/user-plugin.js'], custom: { retained: true },
+      mcp: { vendor: { type: 'local', command: ['retained-user-tool'] } } }
+    await fs.writeFile(path.join(workspace, '.opencode/opencode.json'), JSON.stringify(userConfig))
+    const projected = path.join(home, 'project/.opencode/opencode.json')
+    const selectedTui = path.join(directory, 'tui.json')
+    const consumer = `import { observeOpenCodeParitySelection } from ${JSON.stringify(pathToFileURL(path.resolve('test/fixtures/providers/parity-provider.mjs')).href)};
+process.stdout.write(JSON.stringify(await observeOpenCodeParitySelection(...process.argv.slice(1), { command: 'actual-mcp', args: ['argument'] })));`
+    const inspect = () => {
+      const child = spawnSync(process.execPath, ['--input-type=module', '-e', consumer, home, workspace, selectedTui], { encoding: 'utf8' })
+      expect(child.error).toBeUndefined()
+      expect(child.status, child.stderr).toBe(0)
+      return JSON.parse(child.stdout)
+    }
+    for (const managed of [false, true]) {
+      if (managed) await fs.writeFile(projected, JSON.stringify({ ...userConfig, mcp: { ...userConfig.mcp,
+        freshell: { type: 'local', command: ['actual-mcp', 'argument'] } } }))
+      else await fs.unlink(projected).catch(() => {})
+      const spec = pathToFileURL(managed ? packageRoot : entry).href
+      await fs.writeFile(selectedTui, JSON.stringify({ theme: 'selected', plugin: ['file:///selected/user-plugin.js', spec] }))
+      const observed = inspect()
+      expect(JSON.parse(observed.projectedProjectConfig)).toEqual(userConfig)
+      expect(observed.rebindPlugin).toMatchObject({ spec, hello: true, sessionId: 'ses_parity' })
+      expect(JSON.parse(observed.tuiConfig)).toEqual({ theme: 'selected', plugin: ['file:///selected/user-plugin.js', spec] })
+    }
+    const configuredBridge = { ...userConfig, mcp: { ...userConfig.mcp,
+      freshell: { type: 'local', command: ['selected-user-bridge'] } } }
+    await fs.writeFile(projected, JSON.stringify(configuredBridge))
+    expect(JSON.parse(inspect().projectedProjectConfig)).toEqual(configuredBridge)
+    await fs.unlink(entry)
+    const missing = spawnSync(process.execPath, ['--input-type=module', '-e', consumer, home, workspace, selectedTui], { encoding: 'utf8' })
+    expect(missing.status).not.toBe(0)
+  } finally { await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+it('classifies owned provider publication failures without retaining error bodies', () => {
+  const secret = 'synthetic-private-error-body'
+  const logs = [
+    'null', 'false', '[]', 'not-json',
+    JSON.stringify({ event: 'provider.projection.transaction.started', stage: 'stage' }),
+    JSON.stringify({ event: 'provider.projection.transaction.failed', stage: 'publish', cause: `provider transaction install .config/${secret}: Invalid cross-device link (os error 18)` }),
+    JSON.stringify({ event: 'session_host.fatal', error: `provider refresh control ${secret}` }),
+    JSON.stringify({ event: 'session_host.fatal', error: secret }),
+  ].join('\n')
+  const diagnostic = providerParityFailureDiagnostics(logs)
+  expect(diagnostic).toMatchObject({
+    transactionFailures: [{ stage: 'publish', operation: 'install', errno: 'cross_device' }],
+    workerFailures: [{ operation: 'control', errno: 'unknown' }, { operation: 'unknown', errno: 'unknown' }],
+  })
+  expect(diagnostic.transactionEvents).toEqual([
+    { event: 'provider.projection.transaction.started', stage: 'stage' },
+    { event: 'provider.projection.transaction.failed', stage: 'publish' },
+  ])
+  expect(JSON.stringify(diagnostic)).not.toContain(secret)
+})
+
+it('executes selected OpenCode resources after fixture readability preparation', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-parity-readable-'))
+  try {
+    writeProviderParityEnvironment(directory, '.opencode/plugins/parity')
+    makeProviderParityResourcesReadable(path.join(directory, '.opencode'))
+    const execution = spawnSync(path.join(directory, '.opencode/plugins/parity/command'), [], { encoding: 'utf8' })
+    expect(execution.error).toBeUndefined()
+    expect(execution.status, execution.stderr).toBe(0)
+    expect(JSON.parse(execution.stdout)).toEqual({ dependency: 'installed-dependency-nonce', resource: 'selected-resource-nonce', entries: 4201 })
+  } finally { await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+it('executes complete selected parity resources inside an ESM workspace', async () => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-parity-module-'))
+  try {
+    await fs.writeFile(path.join(workspace, 'package.json'), JSON.stringify({ type: 'module' }))
+    const home = path.join(workspace, '.codex')
+    const selected = 'skills/parity-environment'
+    writeProviderParityEnvironment(home, selected)
+    const execution = spawnSync(path.join(home, selected, 'command'), [], { encoding: 'utf8' })
+    expect(execution.error).toBeUndefined()
+    expect(execution.status, execution.stderr).toBe(0)
+    expect(JSON.parse(execution.stdout)).toEqual({
+      dependency: 'installed-dependency-nonce', resource: 'selected-resource-nonce', entries: 4201,
+    })
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true })
+  }
+})
+
+it('executes the isolated parity command from a different controller directory', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-parity-command-'))
+  try {
+    const workspace = path.join(directory, 'workspace')
+    writeProviderParityEnvironment(workspace, '.')
+    await fs.rename(path.join(workspace, 'command'), path.join(workspace, 'parity-codex'))
+    const execution = spawnSync(providerParityCommands(workspace).CODEX_CMD, [], { cwd: directory, encoding: 'utf8' })
+    expect(execution.error).toBeUndefined()
+    expect(execution.status, execution.stderr).toBe(0)
+    expect(JSON.parse(execution.stdout)).toEqual({ dependency: 'installed-dependency-nonce', resource: 'selected-resource-nonce', entries: 4201 })
+  } finally { await fs.rm(directory, { recursive: true, force: true }) }
+})
 
 const runtimeDir = '/tmp/owned/r/scenario/x/incarnation-one'
 const actorKey = createHash('sha256').update('installation-one\0soul-one').digest('hex')
@@ -566,6 +680,76 @@ describe('fixed initial Claude candidate broker', () => {
 })
 
 describe('scoped Claude source observer broker', () => {
+  it.each(['source', 'mountpoints'] as const)('allows the producer %s exchange only directly under the owned shared root', async role => {
+    await withHttpBroker(async ({ directory, request, forwarded, broker: instance }) => {
+      const owner = { ...sourceAuthorization(), hostBinaryPath: path.join(directory, 'freshell-session-host') }
+      instance.authorizeInitialProviderVolume(owner)
+      const input = publisherAuthorization()
+      input.hostBinaryPath = owner.hostBinaryPath
+      input.stageRoot = path.join(directory, 'scenarios/scenario/control/provider-roots', input.generationId)
+      instance.authorizePreparedInputs(input)
+      const body = role === 'source' ? sourceHelperBody() : publisherBody(input)
+      body.HostConfig.Mounts[0].Source = owner.hostBinaryPath
+      if (role === 'mountpoints') {
+        body.User = '0:0'; body.Cmd = ['prepare-provider-mountpoints']
+        body.Labels = { 'com.freshell.installation-id': input.installationId, 'com.freshell.soul-id': input.soulId, 'com.freshell.incarnation-id': input.incarnationId }
+        body.HostConfig.CapAdd = ['CHOWN', 'SETGID', 'SETUID']
+        body.HostConfig.Mounts[1] = { Type: 'volume', Source: input.providerVolumeName, Target: '/home/freshell/provider', ReadOnly: false, VolumeOptions: { NoCopy: true } }
+      }
+      const basename = 'freshell-inputs-33333333-3333-4333-8333-333333333333'
+      const exchange = path.join(directory, basename)
+      await fs.mkdir(exchange, { mode: 0o700 })
+      const linked = path.join(directory, 'freshell-inputs-44444444-4444-4444-8444-444444444444')
+      await fs.symlink(exchange, linked)
+      body.HostConfig.Mounts[2].Source = exchange
+      const name = role === 'source' ? sourceName : 'freshell-mountpoints-11111111-1111-4111-8111-111111111111'
+      for (const rejected of [directory + '-sibling/' + basename, path.join(directory, 'nested', basename), path.join(directory, 'native'), linked]) {
+        const changed = structuredClone(body)
+        changed.HostConfig.Mounts[2].Source = rejected
+        expect((await request('POST', `/v1.47/containers/create?name=${name}`, changed)).status).toBe(403)
+        expect(forwarded).toHaveLength(0)
+      }
+      const writable = structuredClone(body)
+      writable.HostConfig.Mounts[2].ReadOnly = false
+      expect((await request('POST', `/v1.47/containers/create?name=${name}`, writable)).status).toBe(403)
+      expect(forwarded).toHaveLength(0)
+      expect((await request('POST', `/v1.47/containers/create?name=${name}`, body)).status).toBe(201)
+    }, undefined, true)
+  })
+  it('records bounded upstream helper rejection and host exchange absence without daemon payloads', async () => {
+    await withHttpBroker(async ({ request, broker: instance, rejectHelperCreate }) => {
+      instance.authorizeInitialProviderVolume(sourceAuthorization())
+      rejectHelperCreate()
+      expect((await request('POST', `/v1.47/containers/create?name=${sourceName}`, sourceHelperBody())).status).toBe(400)
+      expect(instance.eventsSnapshot().at(-1)).toMatchObject({
+        decision: 'forward',
+        reason: 'upstream helper rejected: status=400; cause=missing_bind_source; ownedExchangeHostExists=false',
+      })
+      expect(JSON.stringify(instance.eventsSnapshot())).not.toContain('PRIVATE_DAEMON_SENTINEL')
+    })
+  })
+  it('allows the reserved fixed reader for an owned nested project and denies outside or writable mounts', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker: instance }) => {
+      instance.authorizeInitialProviderVolume(sourceAuthorization())
+      const body = sourceHelperBody()
+      body.WorkingDir = '/workspace/project/nested'
+      body.HostConfig.Mounts[1] = { Type: 'bind', Source: '/workspace/project', Target: '/workspace/project', ReadOnly: true }
+      for (const outside of ['/workspace-sibling/project', '/outside/project']) {
+        const changed = structuredClone(body)
+        changed.WorkingDir = outside
+        changed.HostConfig.Mounts[1].Source = outside
+        changed.HostConfig.Mounts[1].Target = outside
+        expect((await request('POST', `/v1.47/containers/create?name=${sourceName}`, changed)).status).toBe(403)
+        expect(forwarded).toHaveLength(0)
+      }
+      const writable = structuredClone(body)
+      writable.HostConfig.Mounts[1].ReadOnly = false
+      expect((await request('POST', `/v1.47/containers/create?name=${sourceName}`, writable)).status).toBe(403)
+      expect(forwarded).toHaveLength(0)
+      expect((await request('POST', `/v1.47/containers/create?name=${sourceName}`, body)).status).toBe(201)
+      expect(forwarded).toHaveLength(1)
+    })
+  })
   it('allows the reserved fixed reader and exact private lifecycle without creating initial HOME or exposing logs', async () => {
     await withHttpBroker(async ({ request, forwarded, broker: instance }) => {
       const body = sourceHelperBody()
@@ -654,6 +838,31 @@ describe('scoped Claude source observer broker', () => {
 })
 
 describe('receipt-owned auth exchange HTTP routes', () => {
+  it('allows the producer auth exchange only directly under the owned shared root', async () => {
+    await withHttpBroker(async ({ directory, request, forwarded }) => {
+      const binds = [...ordinaryBinds, actorBind].map(bind => bind.replace('/tmp/owned', directory))
+      expect((await request('POST', '/v1.47/containers/create?name=owned-runtime', createBody(binds))).status).toBe(201)
+      const body = authHelperBody()
+      body.HostConfig.Mounts[0].Source = path.join(directory, 'freshell-session-host')
+      const exchange = path.join(directory, authName)
+      await fs.mkdir(exchange, { mode: 0o710 })
+      const linked = path.join(directory, authName.replace('111111111111', '222222222222'))
+      await fs.symlink(exchange, linked)
+      body.HostConfig.Mounts[2].Source = exchange
+      const before = forwarded.length
+      for (const rejected of [directory + '-sibling/' + authName, path.join(directory, 'nested', authName), path.join(directory, 'native'), linked]) {
+        const changed = structuredClone(body)
+        changed.HostConfig.Mounts[2].Source = rejected
+        expect((await request('POST', `/v1.47/containers/create?name=${authName}`, changed)).status).toBe(403)
+        expect(forwarded).toHaveLength(before)
+      }
+      const writable = structuredClone(body)
+      writable.HostConfig.Mounts[2].ReadOnly = false
+      expect((await request('POST', `/v1.47/containers/create?name=${authName}`, writable)).status).toBe(403)
+      expect(forwarded).toHaveLength(before)
+      expect((await request('POST', `/v1.47/containers/create?name=${authName}`, body)).status).toBe(201)
+    }, undefined, true)
+  })
   it('allows only the fixed private helper, lifecycle and ownership inspection with Docker logs disabled', async () => {
     await withHttpBroker(async ({ request, forwarded }) => {
       await request('POST', '/v1.47/containers/create?name=owned-runtime', createBody([...ordinaryBinds, actorBind]))
@@ -690,15 +899,18 @@ describe('receipt-owned auth exchange HTTP routes', () => {
 
 type ForwardedRequest = { method: string; url: string; body: any }
 type BrokerHttpFixture = {
+  directory: string
   setRuntimeRunning:(running:boolean)=>void
   request(method: string, url: string, body?: unknown): Promise<{ status: number; body: string }>
   forwarded: ForwardedRequest[]
   broker: RestrictedDockerBroker
   loseHelperAck(): void
+  rejectHelperCreate(): void
   returnHelperId(id: string): void
   replaceHelperInspection():void
   loseCandidateVolumeAck(): void
   replaceCandidateVolumeInspection(): void
+  clearCandidateVolumeInspection(): void
 }
 
 function publisherAuthorization():PreparedInputAuthorization {
@@ -723,7 +935,286 @@ function publisherBody(input:PreparedInputAuthorization):any {
         {Type:'bind',Source:path.join(os.tmpdir(),'freshell-inputs-11111111-1111-4111-8111-111111111111'),Target:'/run/freshell-input-exchange',ReadOnly:true}]}};
 }
 
+async function publishControllerPreparation(directory: string, input: Pick<PreparedInputAuthorization,
+  'soulId' | 'generationId' | 'stageRoot' | 'configurationBinds' | 'resourceMounts' | 'indexedFiles'>,
+  reservationId: string, provider: 'claude' | 'codex') {
+  const metadata = path.join(input.stageRoot, '.freshell')
+  await fs.mkdir(metadata, { recursive: true })
+  const manifest = Buffer.from(JSON.stringify({ version: 1, sources: [], aliases: [], recipes: [] }))
+  await fs.writeFile(path.join(metadata, 'input-manifest.json'), manifest)
+  const context = {
+    preparation: provider === 'claude' ? { claude: { mcp_args: [] } } : { codex: { tui_args: [], sidecar_args: [] } },
+    config: [], mcpCapability: { grantId: input.generationId, endpoint: 'http://127.0.0.1:1/api/managed-mcp', providerRelativePath: '.freshell/mcp-capability.json' },
+    preparedInputs: { generationId: input.generationId, initialAuthReservation: reservationId,
+      manifest: { relativePath: '.freshell/input-manifest.json', sha256: createHash('sha256').update(manifest).digest('hex'), sourceCount: 0, aliasCount: 0, recipeCount: 0 },
+      configBinds: input.configurationBinds.map(bind => ({ ...bind, logicalDestination: bind.effectiveDestination })),
+      resourceMounts: input.resourceMounts.map(mount => ({ ...mount, logicalDestination: mount.effectiveDestination })),
+      ...(input.indexedFiles ? { indexedFiles: input.indexedFiles } : {}),
+    },
+  }
+  const contextBytes = Buffer.from(JSON.stringify(context))
+  const resultBytes = Buffer.from(JSON.stringify({ providerLaunchContext: context, providerSecretReferences: [] }))
+  await fs.writeFile(path.join(metadata, 'prepared-context.json'), contextBytes)
+  await fs.writeFile(path.join(metadata, 'prepared-result.json'), resultBytes)
+  const capabilities = path.join(directory, 'scenarios/scenario/control/mcp-capabilities')
+  await fs.mkdir(capabilities, { recursive: true })
+  await fs.writeFile(path.join(capabilities, `${input.generationId}.json`), JSON.stringify({
+    endpoint: context.mcpCapability.endpoint, scope: 'synthetic-controller-scope', soulId: input.soulId,
+    incarnationId: null, expiresAt: Date.now() + 60_000, preparation: { phase: 'pending', priorGrantIds: [] },
+  }))
+  return { metadata, capabilities, context, contextBytes, resultBytes }
+}
+
 describe('fixed indexed publisher broker',()=>{
+  it('probes actual candidate absence before creation only with a qualified owned publication', async () => {
+    await withHttpBroker(async ({ directory, request, forwarded, broker: instance, replaceCandidateVolumeInspection, clearCandidateVolumeInspection }) => {
+      const input = candidateAuthorization()
+      const binary = Buffer.from('candidate absence host artifact')
+      input.hostBinaryPath = path.join(directory, 'freshell-session-host')
+      await fs.writeFile(input.hostBinaryPath, binary)
+      input.binarySha256 = createHash('sha256').update(binary).digest('hex')
+      input.stageRoot = path.join(directory, 'scenarios/scenario/control/provider-roots', input.generationId)
+      const { metadata, context, contextBytes, resultBytes } = await publishControllerPreparation(directory, input, input.reservationId, 'claude')
+      const binding = { version: 1, provider: 'claude', soulId: input.soulId, generationId: input.generationId,
+        initialReservationId: input.reservationId, intentRevision: 1, registryAttemptId: null,
+        authoritySha256: createHash('sha256').update(JSON.stringify({ kind: 'initial_reservation', reservationId: input.reservationId })).digest('hex'), workspacePath: input.workspacePath, cwd: input.cwd,
+        gitCommonDir: null,
+        manifestSha256: context.preparedInputs.manifest.sha256,
+        preparedContextSha256: createHash('sha256').update(contextBytes).digest('hex'),
+        preparedResultSha256: createHash('sha256').update(resultBytes).digest('hex') }
+      const publication = path.join(metadata, 'claude-candidate-binding.json')
+      await fs.writeFile(publication, JSON.stringify(binding))
+      const url = `/v1.47/volumes/freshell-claude-candidate-${input.requestId}`
+      expect((await request('GET', url)).status).toBe(403)
+      expect(instance.eventsSnapshot().at(-1)).toMatchObject({
+        reason: 'candidate absence qualification unavailable at owner_capability',
+      })
+      instance.authorizeInitialProviderVolume({ ...sourceAuthorization(), hostBinaryPath: input.hostBinaryPath, binarySha256: input.binarySha256 })
+      await fs.writeFile(publication, JSON.stringify({ ...binding, preparedResultSha256: 'f'.repeat(64) }))
+      expect((await request('GET', url)).status).toBe(403)
+      expect(instance.eventsSnapshot().at(-1)).toMatchObject({
+        reason: 'candidate absence qualification unavailable at prepared_metadata',
+      })
+      expect(forwarded).toHaveLength(0)
+      await fs.writeFile(publication, JSON.stringify(binding))
+      await fs.writeFile(publication, JSON.stringify({ ...binding, authoritySha256: 'e'.repeat(64) }))
+      expect((await request('GET', url)).status).toBe(403)
+      expect(instance.eventsSnapshot().at(-1)).toMatchObject({
+        reason: 'candidate absence qualification unavailable at authority_binding',
+      })
+      await fs.writeFile(publication, JSON.stringify({ ...binding, gitCommonDir: '../foreign' }))
+      expect((await request('GET', url)).status).toBe(403)
+      expect(instance.eventsSnapshot().at(-1)).toMatchObject({
+        reason: 'candidate absence qualification unavailable at selected_target',
+      })
+      expect(forwarded).toHaveLength(0)
+      await fs.writeFile(publication, JSON.stringify(binding))
+      replaceCandidateVolumeInspection()
+      const foreign = await request('GET', url)
+      expect(foreign.status).toBe(403)
+      expect(foreign.body).not.toContain('PRIVATE_FOREIGN_CANDIDATE')
+      clearCandidateVolumeInspection()
+      expect((await request('GET', url)).status).toBe(404)
+      expect((await request('DELETE', url)).status).toBe(403)
+      const malformed = url.replace(input.requestId, '11111111-1111-1111-1111-111111111111')
+      expect((await request('GET', malformed)).status).toBe(403)
+      expect(forwarded.every(operation => operation.method === 'GET')).toBe(true)
+      const changed = { Name: url.split('/').at(-1), Driver: 'local', DriverOpts: {}, Labels: { foreign: 'owner' } }
+      expect((await request('POST', '/v1.47/volumes/create', changed)).status).toBe(403)
+      expect(forwarded.every(operation => operation.method === 'GET')).toBe(true)
+    }, undefined, true)
+  })
+  it('cleans the exact registered failed-launch volume and retains changed or attached ownership', async () => {
+    await withHttpBroker(async ({ directory }) => {
+      const binary = Buffer.from('registered failed-launch artifact')
+      const owner = { ...sourceAuthorization(), hostBinaryPath: path.join(directory, 'freshell-session-host'),
+        binarySha256: createHash('sha256').update(binary).digest('hex') }
+      await fs.writeFile(owner.hostBinaryPath, binary)
+      const labels = {
+        'com.freshell.installation-id': owner.installationId, 'com.freshell.soul-id': owner.soulId,
+        'freshell.input.daemon': owner.daemonId, 'freshell.input.image': owner.imageRef,
+        'freshell.input.binary-sha256': owner.binarySha256, 'freshell.input.intent': '1',
+        'freshell.input.reservation': '11111111-1111-4111-8111-111111111111',
+        'freshell.input.incarnation': 'incarnation-one',
+      }
+      let currentLabels = { ...labels }, daemon = owner.daemonId, attached = false, exists = true
+      const removals: string[][] = []
+      const run = (args: string[]): string => {
+        if (args[0] === 'info') return daemon
+        if (args[0] === 'container') return attached ? 'e'.repeat(64) : ''
+        if (args[1] === 'ls') return exists ? owner.providerVolumeName : ''
+        if (args[1] === 'inspect') return JSON.stringify({ Name: owner.providerVolumeName, Driver: 'local', Options: null, Labels: currentLabels })
+        if (args[1] === 'rm') { removals.push(args); exists = false; return owner.providerVolumeName }
+        throw new Error('unexpected cleanup command')
+      }
+      const captured = captureProviderParityVolumes([owner], run)
+      currentLabels['freshell.input.incarnation'] = 'foreign'
+      expect(() => cleanupProviderParityVolumes(captured, run)).toThrow()
+      currentLabels = { ...labels }
+      attached = true
+      expect(() => cleanupProviderParityVolumes(captured, run)).toThrow()
+      attached = false
+      daemon = 'foreign'
+      expect(() => cleanupProviderParityVolumes(captured, run)).toThrow()
+      daemon = owner.daemonId
+      expect(removals).toEqual([])
+      expect(cleanupProviderParityVolumes(captured, run)).toEqual([owner.providerVolumeName])
+      expect(removals).toEqual([['volume', 'rm', owner.providerVolumeName]])
+      expect(exists).toBe(false)
+    }, undefined, true)
+  })
+  it('registers the exact owned published Claude candidate before its ordinary volume request', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker: instance, directory }) => {
+      const input = candidateAuthorization()
+      input.workspacePath = '/workspace/project'
+      input.cwd = '/workspace/project/nested'
+      input.configurationBinds[0].effectiveDestination = '/home/freshell/provider/.claude/settings.json'
+      input.resourceMounts[0].effectiveDestination = '/home/freshell/provider/.claude/skills'
+      input.hostBinaryPath = path.join(directory, 'freshell-session-host')
+      const binary = Buffer.from('owned candidate host artifact')
+      await fs.writeFile(input.hostBinaryPath, binary)
+      input.binarySha256 = createHash('sha256').update(binary).digest('hex')
+      input.stageRoot = path.join(directory, 'scenarios/scenario/control/provider-roots', input.generationId)
+      instance.authorizeInitialProviderVolume({ ...sourceAuthorization(), hostBinaryPath: input.hostBinaryPath, binarySha256: input.binarySha256 })
+      const { metadata, context, contextBytes, resultBytes } = await publishControllerPreparation(directory, input, input.reservationId, 'claude')
+      await fs.writeFile(path.join(metadata, 'claude-candidate-binding.json'), JSON.stringify({
+        version: 1, provider: 'claude', soulId: input.soulId, generationId: input.generationId,
+        initialReservationId: input.reservationId, intentRevision: 1,
+        workspacePath: input.workspacePath, cwd: input.cwd, gitCommonDir: null,
+        manifestSha256: context.preparedInputs.manifest.sha256,
+        preparedContextSha256: createHash('sha256').update(contextBytes).digest('hex'),
+        preparedResultSha256: createHash('sha256').update(resultBytes).digest('hex'),
+      }))
+      const volume = { Name: `freshell-claude-candidate-${input.requestId}`, Driver: 'local', DriverOpts: {}, Labels: candidateLabels(input) }
+      const bindingPath = path.join(metadata, 'claude-candidate-binding.json')
+      const originalBinding = await fs.readFile(bindingPath)
+      for (const field of ['soulId', 'generationId', 'initialReservationId', 'gitCommonDir', 'preparedContextSha256', 'preparedResultSha256', 'manifestSha256']) {
+        const changed = JSON.parse(originalBinding.toString())
+        changed[field] = 'foreign'
+        await fs.writeFile(bindingPath, JSON.stringify(changed))
+        expect((await request('POST', '/v1.47/volumes/create', volume)).status, field).toBe(403)
+        expect(forwarded).toHaveLength(0)
+      }
+      await fs.writeFile(bindingPath, originalBinding)
+      for (const destination of ['/home/freshell/provider-sibling/.claude/skills', '/outside/skills', '/home/freshell/provider/.claude/projects']) {
+        const changed = structuredClone(input)
+        changed.resourceMounts[0].effectiveDestination = destination
+        expect(() => instance.authorizeClaudeCandidate(changed), destination).toThrow()
+      }
+      expect((await request('POST', '/v1.47/volumes/create', volume)).status, JSON.stringify(instance.eventsSnapshot())).toBe(201)
+      const before = forwarded.length
+      const changed = structuredClone(volume)
+      changed.Labels['com.freshell.soul-id'] = 'foreign'
+      expect((await request('POST', '/v1.47/volumes/create', changed)).status).toBe(403)
+      expect(forwarded).toHaveLength(before)
+    }, undefined, true)
+  })
+  it('registers the exact owned published preparation before its indexed volume request', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker: instance, directory }) => {
+      const source = sourceAuthorization()
+      const hostBinaryPath = path.join(directory, 'freshell-session-host')
+      const binary = Buffer.from('owned fixture host artifact')
+      await fs.writeFile(hostBinaryPath, binary)
+      const owner = { ...source, hostBinaryPath, binarySha256: createHash('sha256').update(binary).digest('hex') }
+      instance.authorizeInitialProviderVolume(owner)
+      const generationId = 'grant-44444444-4444-4444-8444-444444444444'
+      const input = { ...publisherAuthorization(), soulId: owner.soulId, generationId, hostBinaryPath, providerVolumeName: owner.providerVolumeName,
+        stageRoot: path.join(directory, 'scenarios/scenario/control/provider-roots', generationId),
+        configurationBinds: [{ sourceRelativePath: '.freshell/templates/codex-0', effectiveDestination: '/home/freshell/provider/.codex/config.toml' }],
+        resourceMounts: [{ providerRelativePath: '.freshell/provider-roots/root-0', effectiveDestination: '/home/freshell/provider/.codex/skills', kind: 'directory' as const }],
+        indexedFiles: { volumeName: `freshell-inputs-${createHash('sha256').update(`${owner.soulId}\0${generationId}`).digest('hex').slice(0, 24)}`, aliases: [] },
+        indexedSecretSources: [] }
+      const { metadata, capabilities, context } = await publishControllerPreparation(directory, input, '11111111-1111-4111-8111-111111111111', 'codex')
+      const initial = { Name: owner.providerVolumeName, Driver: 'local', Labels: {
+        'com.freshell.installation-id': owner.installationId, 'com.freshell.soul-id': owner.soulId,
+        'freshell.input.reservation': context.preparedInputs.initialAuthReservation,
+        'freshell.input.incarnation': input.incarnationId, 'freshell.input.intent': '1',
+        'freshell.input.daemon': owner.daemonId, 'freshell.input.image': owner.imageRef,
+        'freshell.input.binary-sha256': owner.binarySha256,
+      } }
+      expect((await request('POST', '/v1.47/volumes/create', initial)).status).toBe(201)
+      const volume = { Name: input.indexedFiles.volumeName, Driver: 'local', DriverOpts: indexedOptions, Labels: publisherLabels(input) }
+      const capabilityPath = path.join(capabilities, `${generationId}.json`)
+      const capabilityBytes = await fs.readFile(capabilityPath)
+      for (const field of ['soulId', 'incarnationId']) {
+        const changed = JSON.parse(capabilityBytes.toString())
+        changed[field] = 'foreign'
+        await fs.writeFile(capabilityPath, JSON.stringify(changed))
+        expect((await request('POST', '/v1.47/volumes/create', volume)).status, field).toBe(403)
+        expect(forwarded).toHaveLength(1)
+      }
+      await fs.writeFile(capabilityPath, capabilityBytes)
+      const resultPath = path.join(metadata, 'prepared-result.json')
+      const resultBytes = await fs.readFile(resultPath)
+      for (const field of ['generationId', 'initialAuthReservation', 'manifest']) {
+        const changed = JSON.parse(resultBytes.toString())
+        changed.providerLaunchContext.preparedInputs[field] = 'foreign'
+        await fs.writeFile(resultPath, JSON.stringify(changed))
+        expect((await request('POST', '/v1.47/volumes/create', volume)).status, field).toBe(403)
+        expect(forwarded).toHaveLength(1)
+      }
+      await fs.writeFile(resultPath, Buffer.alloc(1024 * 1024 + 1, 32))
+      expect((await request('POST', '/v1.47/volumes/create', volume)).status).toBe(403)
+      await fs.rm(resultPath)
+      await fs.symlink(path.join(metadata, 'prepared-context.json'), resultPath)
+      expect((await request('POST', '/v1.47/volumes/create', volume)).status).toBe(403)
+      await fs.rm(resultPath)
+      await fs.writeFile(resultPath, resultBytes)
+      await fs.writeFile(hostBinaryPath, 'changed owned artifact')
+      expect((await request('POST', '/v1.47/volumes/create', volume)).status).toBe(403)
+      await fs.writeFile(hostBinaryPath, binary)
+      expect(forwarded).toHaveLength(1)
+      const invalidContext = structuredClone(context)
+      invalidContext.preparedInputs.configBinds[0].sourceRelativePath = '.freshell/PRIVATE_TEMPLATE_SENTINEL'
+      await fs.writeFile(path.join(metadata, 'prepared-context.json'), JSON.stringify(invalidContext))
+      await fs.writeFile(resultPath, JSON.stringify({ providerLaunchContext: invalidContext, providerSecretReferences: [] }))
+      expect((await request('POST', '/v1.47/volumes/create', volume)).status).toBe(403)
+      expect(instance.eventsSnapshot().slice(-2)[0]).toMatchObject({
+        reason: 'fixture publication unavailable at prepared_authorization: invalid_template_source',
+      })
+      expect(JSON.stringify(instance.eventsSnapshot())).not.toContain('PRIVATE_TEMPLATE_SENTINEL')
+      await fs.writeFile(path.join(metadata, 'prepared-context.json'), JSON.stringify(context))
+      await fs.writeFile(resultPath, resultBytes)
+      for (const destination of ['/home/freshell/provider-sibling/.codex/skills', '/outside/skills', '/home/freshell/provider/.codex/sessions']) {
+        const changed = structuredClone(input)
+        changed.resourceMounts[0].effectiveDestination = destination
+        expect(() => instance.authorizePreparedInputs(changed), destination).toThrow()
+      }
+      expect((await request('POST', '/v1.47/volumes/create', volume)).status, JSON.stringify(instance.eventsSnapshot().slice(-4))).toBe(201)
+      const before = forwarded.length
+      for (const mutation of ['owner', 'generation', 'permissions', 'volume']) {
+        const changed = structuredClone(volume)
+        if (mutation === 'owner') changed.Labels['com.freshell.soul-id'] = 'foreign'
+        if (mutation === 'generation') changed.Labels['com.freshell.input-generation'] = 'grant-foreign'
+        if (mutation === 'permissions') changed.DriverOpts.o = 'size=64m,mode=0755'
+        if (mutation === 'volume') changed.Name = `freshell-inputs-${'f'.repeat(24)}`
+        expect((await request('POST', '/v1.47/volumes/create', changed)).status, mutation).toBe(403)
+        expect(forwarded).toHaveLength(before)
+      }
+    }, undefined, true)
+  })
+  it('registers each parity request before its first volume observation while retaining foreign denials', async () => {
+    await withHttpBroker(async ({ request, forwarded, broker: instance }) => {
+      const { soulId: _soulId, providerVolumeName: _volume, ...source } = sourceAuthorization()
+      const owner = authorizeProviderParityRequest(instance, source, 'provider-parity-codex-exact-request')
+      expect(instance.receipts()).toEqual([])
+      expect((await request('GET', `/v1.47/volumes/${owner.providerVolumeName}`)).status).toBe(200)
+      expect(forwarded).toHaveLength(1)
+      const denied = [
+        ['GET', `/v1.47/volumes/freshell-provider-${'f'.repeat(24)}`],
+        ['GET', `/v1.47/volumes/${owner.providerVolumeName}?foreign=1`],
+        ['DELETE', `/v1.47/volumes/${owner.providerVolumeName}`],
+        ['POST', '/v1.47/volumes/create'],
+      ]
+      for (const [method, url] of denied) {
+        expect((await request(method, url)).status).toBe(403)
+        expect(forwarded).toHaveLength(1)
+      }
+      expect(() => instance.authorizeInitialProviderVolume({ ...owner, soulId: 'foreign' })).toThrow()
+      expect(() => instance.authorizeInitialProviderVolume({ ...owner, daemonId: 'foreign' })).toThrow()
+      expect(() => instance.authorizeInitialProviderVolume({ ...owner, binarySha256: 'b'.repeat(64) })).toThrow()
+    })
+  })
   it('observes and creates only the explicitly reserved initial soul volume before any workload receipt',async()=>{
     await withHttpBroker(async ({request,forwarded,broker:instance})=>{
       const installationId='installation-one',soulId='soul-initial';
@@ -762,20 +1253,30 @@ describe('fixed indexed publisher broker',()=>{
       body.Labels={'com.freshell.installation-id':input.installationId,'com.freshell.soul-id':input.soulId,'com.freshell.incarnation-id':input.incarnationId};
       body.HostConfig.CapAdd=['CHOWN','SETGID','SETUID'];
       body.HostConfig.Mounts[1]={Type:'volume',Source:input.providerVolumeName,Target:'/home/freshell/provider',ReadOnly:false,VolumeOptions:{NoCopy:true}};
+      const wrongEnvironment=structuredClone(body);
+      wrongEnvironment.Env=['PATH=PRIVATE_MOUNTPOINT_SENTINEL'];
+      expect((await request('POST',`/v1.47/containers/create?name=${name}`,wrongEnvironment)).status).toBe(403);
+      expect(instance.eventsSnapshot().at(-1)?.reason).toBe('mountpoint helper unavailable at environment');
+      expect(JSON.stringify(instance.eventsSnapshot())).not.toContain('PRIVATE_MOUNTPOINT_SENTINEL');
+      expect(forwarded).toHaveLength(0);
       expect((await request('POST',`/v1.47/containers/create?name=${name}`,body)).status).toBe(201);
       const before=forwarded.length;
-      for (const mutate of [
-        (value:any)=>value.HostConfig.CapAdd.push('DAC_OVERRIDE'),
-        (value:any)=>value.Cmd.push('/outside'),
-        (value:any)=>value.HostConfig.Mounts[1].Source='freshell-provider-ffffffffffffffffffffffff',
-        (value:any)=>value.HostConfig.Mounts[1].VolumeOptions.NoCopy=false,
-        (value:any)=>value.HostConfig.Mounts.push({Type:'bind',Source:'/operator-home',Target:'/outside',ReadOnly:false}),
-        (value:any)=>value.Labels['com.freshell.soul-id']='foreign',
-      ]) {
+      for (const [phase, mutate] of [
+        ['limits_authority', (value:any)=>value.HostConfig.CapAdd.push('DAC_OVERRIDE')],
+        ['identity_argv', (value:any)=>value.Cmd.push('/outside')],
+        ['mounts', (value:any)=>value.HostConfig.Mounts[1].Source='freshell-provider-ffffffffffffffffffffffff'],
+        ['mounts', (value:any)=>value.HostConfig.Mounts[1].VolumeOptions.NoCopy=false],
+        ['mount_count', (value:any)=>value.HostConfig.Mounts.push({Type:'bind',Source:'/operator-home',Target:'/outside',ReadOnly:false})],
+        ['owner', (value:any)=>value.Labels['com.freshell.soul-id']='foreign'],
+        ['image', (value:any)=>value.Image='foreign-image'],
+        ['labels', (value:any)=>value.Labels['extra']='PRIVATE_LABEL_SENTINEL'],
+      ] as const) {
         const changed=structuredClone(body);mutate(changed);
         expect((await request('POST',`/v1.47/containers/create?name=${name.replace('111111111111','222222222222')}`,changed)).status).toBe(403);
+        expect(instance.eventsSnapshot().at(-1)?.reason).toBe(`mountpoint helper unavailable at ${phase}`);
         expect(forwarded).toHaveLength(before);
       }
+      expect(JSON.stringify(instance.eventsSnapshot())).not.toContain('PRIVATE_LABEL_SENTINEL');
       expect((await request('POST',`/v1.47/containers/${helperId}/start`)).status).toBe(204);
       expect((await request('POST',`/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200);
       expect((await request('DELETE',`/v1.47/containers/${helperId}?force=1`)).status).toBe(204);
@@ -880,12 +1381,13 @@ describe('fixed indexed publisher broker',()=>{
   });
 });
 
-async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>,gateways?:Set<string>) {
+async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>,gateways?:Set<string>, physicalStage = false) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'frs-broker-history-'))
   const socket = path.join(dir, 'docker.sock')
   const proxy = path.join(dir, 'broker.sock')
   const forwarded: ForwardedRequest[] = []
   let loseAck = false
+  let rejectHelper = false
   let runtimeRunning=false
   let helperAckId = helperId
   let indexedVolumeMetadata:unknown
@@ -941,6 +1443,11 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
       res.statusCode=200;res.end(JSON.stringify({Id:helperId,Config:foreignHelper?{...inspected,User:'0:0'}:inspected,HostConfig:inspected.HostConfig}));return;
     }
     if (req.url?.startsWith('/v1.47/containers/create?')) {
+      if (body.Entrypoint && rejectHelper) {
+        res.statusCode = 400
+        res.end(JSON.stringify({ message: 'invalid mount config for type "bind": bind source path does not exist: PRIVATE_DAEMON_SENTINEL' }))
+        return
+      }
       if(body.Cmd?.[0]==='publish-provider-inputs') sourceHelperDeleted=false
       if (body.Entrypoint?.[0] === '/runtime/freshell-session-host' && loseAck) {
         req.socket.destroy()
@@ -965,8 +1472,8 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
     allowedHostGatewayAddresses:gateways,
     realSocketPath: socket,
     proxySocketPath: proxy,
-    runtimeRootPrefix: '/tmp/owned/r',
-    allowedHostBinaryPaths: new Set(['/tmp/owned/freshell-session-host', '/tmp/owned/other-approved-host']),
+    runtimeRootPrefix: physicalStage ? path.join(dir, 'r') : '/tmp/owned/r',
+    allowedHostBinaryPaths: new Set(physicalStage ? [path.join(dir, 'freshell-session-host')] : ['/tmp/owned/freshell-session-host', '/tmp/owned/other-approved-host']),
     allowedImageRefs: new Set(['sha256:fixture-image', 'sha256:other-approved-image']),
     allowTerminalWorkloads: true,
     allowedWorkspaceRoots: new Set(['/workspace']),
@@ -985,8 +1492,8 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
   try {
     await new Promise<void>((resolve) => upstream.listen(socket, resolve))
     await instance.start()
-    await run({ request, forwarded, broker: instance, setRuntimeRunning:(running)=>{runtimeRunning=running}, loseHelperAck: () => { loseAck = true }, returnHelperId: (id) => { helperAckId = id },replaceHelperInspection:()=>{foreignHelper=true},
-      loseCandidateVolumeAck:()=>{candidateVolumeAckUnavailable=true},replaceCandidateVolumeInspection:()=>{candidateVolumeMetadata.Labels['com.freshell.soul-id']='foreign'} })
+    await run({ directory: dir, request, forwarded, broker: instance, setRuntimeRunning:(running)=>{runtimeRunning=running}, loseHelperAck: () => { loseAck = true }, rejectHelperCreate: () => { rejectHelper = true }, returnHelperId: (id) => { helperAckId = id },replaceHelperInspection:()=>{foreignHelper=true},
+      loseCandidateVolumeAck:()=>{candidateVolumeAckUnavailable=true},replaceCandidateVolumeInspection:()=>{candidateVolumeMetadata ??= { Name: 'PRIVATE_FOREIGN_CANDIDATE', Driver: 'local', Labels: {} }; candidateVolumeMetadata.Labels['com.freshell.soul-id']='foreign'}, clearCandidateVolumeInspection:()=>{candidateVolumeMetadata=undefined} })
   } finally {
     await instance.close()
     await new Promise<void>((resolve) => upstream.close(() => resolve()))
