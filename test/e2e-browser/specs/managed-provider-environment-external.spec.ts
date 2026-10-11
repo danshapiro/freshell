@@ -108,7 +108,7 @@ test('executes selected resources with Bun in both managed stages and retains id
   expect(receipt.nativeSessionId).toBeTruthy()
   const beforeCreates = await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
     .filter((message: any) => message.type === 'terminal.create').length)
-  await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.forceDisconnect())
+  await new TestHarness(page).forceDisconnect()
   await new TestHarness(page).waitForConnection(120_000)
   await expect.poll(async () => (await activePane(page)).content).toMatchObject({ terminalId,
     sessionRef: { provider: 'opencode', sessionId: receipt.nativeSessionId } })
@@ -138,7 +138,7 @@ for (const scenario of ['missing-reference', 'startup-before-identity']) {
     await expect(diagnostic).toContainText(scenario === 'missing-reference' ? /missing-selected/i : /startup-fixture/i)
     const creates = await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
       .filter((message: any) => message.type === 'terminal.create').length)
-    await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.forceDisconnect())
+    await new TestHarness(page).forceDisconnect()
     await new TestHarness(page).waitForConnection(120_000)
     expect((await activePane(page)).content).toMatchObject({ terminalId, status: 'error' })
     expect(await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()

@@ -178,7 +178,8 @@ async function socketCreate(rig: ManagedRuntimeBrowserRig, requestId: string, mo
     ws.send(JSON.stringify(hello))
     const ready = await poll('authenticated ready', async () => messages.find(message => message.type === 'ready'), 30_000)
     if (capabilities?.managedRuntimeV1) assert.equal(ready.capabilities?.managedRuntimeV1, true)
-    ws.send(JSON.stringify({ type: 'terminal.create', requestId, mode, cwd, cols: 100, rows: 30 }))
+    const create = { type: 'terminal.create', requestId, mode, shell: 'system', cwd } satisfies ClientMessage
+    ws.send(JSON.stringify(create))
     return await poll('terminal create response', async () => messages.find(message =>
       message.requestId === requestId && (message.type === 'terminal.created' || message.type === 'error')), 120_000)
   } finally {
