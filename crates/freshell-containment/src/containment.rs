@@ -5,6 +5,7 @@
 //! root is pinned by pid AND start time before anything can signal it
 //! (Stage 2: LB-02).
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -321,42 +322,202 @@ pub fn global_containment() -> Option<Containment> {
     GLOBAL.get().cloned()
 }
 
-/// The per-process state root of [`global_or_fallback_containment`].
-static FALLBACK_ROOT: OnceLock<PathBuf> = OnceLock::new();
+/// The containment [`global_or_fallback_containment`] made for a process
+/// that installed none, with what its exit handler needs.
+struct Fallback {
+    containment: Containment,
+    /// Its per-process state root (unit records live in `<root>/units/`).
+    root: PathBuf,
+    /// The process that made it. A child forked without exec inherits this
+    /// memory and the exit handler, and must touch neither its parent's
+    /// units nor their records.
+    pid: u32,
+    /// The records its store took over when it opened (a directory an
+    /// earlier process with the same pid left behind): units this process
+    /// never created, which its exit never stops. (Windows stops none at
+    /// exit: see [`Fallback::kill_own_units`].)
+    #[cfg_attr(windows, allow(dead_code))]
+    inherited: BTreeSet<UnitId>,
+}
 
-/// Removes the fallback containment's state root when the process exits:
-/// no server ever reads it again (only a server's own state root is
-/// reconciled at boot), so nothing outlives the process that wrote it.
-extern "C" fn remove_fallback_root() {
-    if let Some(root) = FALLBACK_ROOT.get() {
-        let _ = std::fs::remove_dir_all(root);
+static FALLBACK: OnceLock<Fallback> = OnceLock::new();
+
+impl Fallback {
+    /// Kills every unit this process created that is still recorded (it
+    /// never reached Gone: a test that ended early), one after another on
+    /// this thread, each as `TagUnit::kill_recorded_now` finds its members
+    /// (Codex's daemon family spared).
+    ///
+    /// Windows needs none: the fallback has no shim, so no member can be
+    /// placed in its units, and a job kills its members when this process's
+    /// handles close at exit.
+    #[cfg(unix)]
+    fn kill_own_units(&self) {
+        for record in self.containment.recorded_units().unwrap_or_default() {
+            if !self.inherited.contains(&record.unit_id) {
+                let _ = crate::backend::tag::TagUnit::kill_recorded_now(&record);
+            }
+        }
     }
+}
+
+/// Runs when a process with the fallback containment exits. Nothing can
+/// reach its units afterwards (no server ever reads its state root: only a
+/// server's own state root is reconciled at boot), so the units it created
+/// that are still recorded are killed first, then the root is removed.
+/// Synchronous and bounded (one sweep per such unit); a panic is contained
+/// here, never unwound into the C runtime. A server's own containment never
+/// registers it: its running units outlive it by design.
+extern "C" fn stop_fallback_units_and_remove_root() {
+    let Some(fallback) = FALLBACK.get() else {
+        return;
+    };
+    if fallback.pid != std::process::id() {
+        return;
+    }
+    // Unwind-safe: nothing observes the state after a panic but this
+    // handler, which goes on to the root's removal.
+    #[cfg(unix)]
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fallback.kill_own_units()));
+    let _ = std::fs::remove_dir_all(&fallback.root);
 }
 
 /// The process-global containment; where none was installed (tests, tools
 /// that never boot a server), one per-process tag-backend containment whose
 /// unit records live in a per-process directory under the system temp
 /// directory (never a relative path: creating a unit writes its record
-/// there). That directory is removed when the process exits.
+/// there). When the process exits, the units it created there that never
+/// reached Gone are killed and that directory is removed.
 pub fn global_or_fallback_containment() -> Containment {
     if let Some(global) = global_containment() {
         return global;
     }
-    static FALLBACK: OnceLock<Containment> = OnceLock::new();
     FALLBACK
         .get_or_init(|| {
-            let root = FALLBACK_ROOT
-                .get_or_init(|| {
-                    // SAFETY: registers a plain `extern "C"` function with no
-                    // arguments; it only reads a set-once static.
-                    unsafe { libc::atexit(remove_fallback_root) };
-                    std::env::temp_dir().join(format!("freshell-units-{}", std::process::id()))
-                })
-                .clone();
-            Containment::tag_backend(SelectOptions {
+            let pid = std::process::id();
+            let root = std::env::temp_dir().join(format!("freshell-units-{pid}"));
+            let containment = Containment::tag_backend(SelectOptions {
                 shim: None,
-                state_root: root,
-            })
+                state_root: root.clone(),
+            });
+            let inherited = containment
+                .recorded_units()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|record| record.unit_id)
+                .collect();
+            // SAFETY: registers a plain `extern "C"` function with no
+            // arguments; it only reads a set-once static.
+            unsafe { libc::atexit(stop_fallback_units_and_remove_root) };
+            Fallback {
+                containment,
+                root,
+                pid,
+                inherited,
+            }
         })
+        .containment
         .clone()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::proc_watch::Sig;
+    use std::time::Duration;
+
+    /// A plain `sleep 600` child of the test (no tag), pinned while it is
+    /// our own unreaped child, killed through that pin and reaped on drop.
+    struct Sleep {
+        child: std::process::Child,
+        watch: ProcWatch,
+    }
+
+    impl Sleep {
+        fn start() -> Self {
+            let child = std::process::Command::new("sleep")
+                .arg("600")
+                .spawn()
+                .unwrap();
+            let watch = ProcWatch::open(child.id()).unwrap();
+            Self { child, watch }
+        }
+
+        fn root(&self) -> (u32, u64) {
+            (self.watch.pid(), self.watch.identity().start)
+        }
+
+        /// Not killed: no exit within a bounded wait that ends at once on
+        /// an exit.
+        fn still_running(&self) -> bool {
+            !self
+                .watch
+                .wait_exited_blocking(Duration::from_millis(300))
+                .unwrap()
+        }
+    }
+
+    impl Drop for Sleep {
+        fn drop(&mut self) {
+            let _ = self.watch.signal(Sig::Kill);
+            let _ = self.child.wait();
+        }
+    }
+
+    fn record_with_roots(roots: Vec<(u32, u64)>) -> UnitRecord {
+        UnitRecord {
+            unit_id: UnitId::mint(),
+            provider: "codex".into(),
+            mode: "codex".into(),
+            terminal_id: None,
+            create_request_id: None,
+            conversation_keys: Vec::new(),
+            roots,
+            state: UnitRecordState::Running,
+            legacy_tag: None,
+        }
+    }
+
+    /// The exit sweep reaches only units this process created, and in each
+    /// only the roots whose pid still names the recorded incarnation: a
+    /// root recorded with another start time (its process exited and the
+    /// pid was reused) and a unit the store took over at open are never
+    /// signalled; the unit's own live root is killed.
+    #[test]
+    fn the_exit_sweep_kills_only_its_own_units_live_roots() {
+        let state = tempfile::tempdir().unwrap();
+        let containment = Containment::tag_backend(SelectOptions {
+            shim: None,
+            state_root: state.path().to_path_buf(),
+        });
+        let (stale, inherited_root, mut own) = (Sleep::start(), Sleep::start(), Sleep::start());
+        let (pid, start) = stale.root();
+        let inherited = record_with_roots(vec![inherited_root.root()]);
+        for record in [
+            record_with_roots(vec![(pid, start + 1)]),
+            inherited.clone(),
+            record_with_roots(vec![own.root()]),
+        ] {
+            containment.store.write(&record).unwrap();
+        }
+        let fallback = Fallback {
+            containment,
+            root: state.path().to_path_buf(),
+            pid: std::process::id(),
+            inherited: BTreeSet::from([inherited.unit_id]),
+        };
+
+        fallback.kill_own_units();
+
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(own.child.wait().unwrap().signal(), Some(libc::SIGKILL));
+        assert!(
+            stale.still_running(),
+            "a root with another start time was killed"
+        );
+        assert!(
+            inherited_root.still_running(),
+            "a unit this process did not create was killed"
+        );
+    }
 }

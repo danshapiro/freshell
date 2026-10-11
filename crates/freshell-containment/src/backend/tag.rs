@@ -35,6 +35,7 @@ use std::sync::Arc;
 use super::{Backend, BackendKind, Capability, KillSummary, MemberList, UnitBackend};
 use crate::proc_watch::ProcWatch;
 use crate::process::{self, is_codex_daemon_family, EnvRead};
+use crate::record::UnitRecord;
 use crate::unit::{MemberRole, Placement};
 use crate::{BoxFuture, UnitId, UNIT_ENV};
 
@@ -280,6 +281,22 @@ impl TagUnit {
             spared,
             withheld,
         }
+    }
+
+    /// Kills the unit `record` names, found as a reopen finds it (its tag,
+    /// the legacy one for an adopted sidecar; its live recorded roots, each
+    /// verified by pid AND start time; their descendants), with the sweep
+    /// [`UnitBackend::kill_all`] runs, Codex's daemon family spared,
+    /// synchronously on the calling thread: for a process exit, where no
+    /// runtime is left to run `kill_all` on. It follows no forks (on macOS
+    /// every process the unit's fork tracker followed is recorded as a
+    /// root).
+    pub(crate) fn kill_recorded_now(record: &UnitRecord) -> io::Result<KillSummary> {
+        let (key, value) = match &record.legacy_tag {
+            Some((key, value)) => (key.as_str(), value.as_str()),
+            None => (UNIT_ENV, record.unit_id.as_str()),
+        };
+        Self::legacy(key, value, &record.unit_id).kill_all_now(&record.roots)
     }
 
     fn kill_all_now(&self, roots: &[(u32, u64)]) -> io::Result<KillSummary> {
