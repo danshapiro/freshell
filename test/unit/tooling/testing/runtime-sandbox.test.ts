@@ -192,6 +192,89 @@ it.each(['claude', 'opencode'] as const)('qualifies original isolated HOME alias
   }
 })
 
+describe('closed managed environment fixture inputs', () => {
+  it.each(['selected-workspace', 'selected-bootstrap', 'ambient-bootstrap'] as const)(
+    'routes only the explicitly selected fixture inputs: %s', async selection => {
+      const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'frs-input-'))
+      const repository = path.join(directory, 'repository')
+      const home = path.join(directory, 'home')
+      const workspace = selection === 'selected-workspace'
+        ? path.join(directory, 'selected-workspace') : path.join(repository, 'selected-workspace')
+      const grant = path.join(directory, 'selected.env')
+      const socket = path.join(directory, 'daemon.sock')
+      const forwarded: string[] = []
+      const daemon = http.createServer((request, response) => {
+        request.resume()
+        forwarded.push(request.url!)
+        response.writeHead(201).end(JSON.stringify({ Id: 'd'.repeat(64) }))
+      })
+      const previousDockerHost = process.env.DOCKER_HOST
+      const bootstrapKey = 'FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE'
+      const previousBootstrap = process.env[bootstrapKey]
+      let harness: RuntimeHarness | undefined
+      try {
+        await fs.mkdir(path.join(repository, 'test/runtime'), { recursive: true })
+        await fs.mkdir(home)
+        await fs.mkdir(workspace)
+        await fs.writeFile(path.join(repository, 'test/runtime/gate-manifest.json'), '{}')
+        await fs.writeFile(grant, 'synthetic-selected-grant', { mode: 0o600 })
+        const host = path.join(directory, 'host')
+        await fs.writeFile(host, 'owned fixture host artifact')
+        await new Promise<void>(resolve => daemon.listen(socket, resolve))
+        process.env.DOCKER_HOST = `unix://${socket}`
+        if (selection === 'ambient-bootstrap') process.env[bootstrapKey] = grant
+        else delete process.env[bootstrapKey]
+        harness = new RuntimeHarness(repository, undefined, 2, home, undefined, {
+          workspaceRoots: [workspace], bootstrapFiles: selection === 'selected-bootstrap' ? [grant] : [],
+        })
+        useOwnedHarnessArtifacts(harness, host)
+        await harness.prepare()
+        const create = (selectedWorkspace: string, bootstrap?: string) => new Promise<number>((resolve, reject) => {
+          const request = http.request({ socketPath: harness!.broker.proxySocketPath,
+            path: '/v1.47/containers/create?name=closed-fixture', method: 'POST' }, response => {
+            response.resume(); response.once('end', () => resolve(response.statusCode!))
+          })
+          request.once('error', reject)
+          request.end(JSON.stringify({ Image: harness!.imageRef, Env: [], Labels: {
+            project: 'freshell', 'com.freshell.managed': 'true',
+            'com.freshell.installation-id': 'installation-fixture',
+            'com.freshell.soul-id': 'soul-fixture', 'com.freshell.incarnation-id': 'incarnation-fixture',
+            'com.freshell.runtime-test-run-id': harness!.runId,
+          }, HostConfig: { NetworkMode: 'bridge', ExtraHosts: [], PidMode: '', ReadonlyRootfs: true,
+            Privileged: false, CapDrop: ['ALL'], CapAdd: ['CHOWN', 'SETGID', 'SETUID'],
+            SecurityOpt: ['no-new-privileges:true'], RestartPolicy: { Name: 'no' },
+            NanoCpus: 500_000_000, Memory: 128 * 1024 * 1024, PidsLimit: 64,
+            Tmpfs: { '/tmp': 'rw,noexec,nosuid,nodev,size=128m' }, Binds: [
+              `${host}:/runtime/freshell-session-host:ro`,
+              `${path.join(harness!.testRoot, 'r/scenario/x/incarnation-fixture')}:/run/freshell:rw`,
+              `freshell-provider-${'a'.repeat(24)}:/home/freshell/provider:rw`,
+              `${selectedWorkspace}:${selectedWorkspace}:rw`,
+              ...(bootstrap ? [`${bootstrap}:/run/freshell-bootstrap/provider-0:ro`] : []),
+            ] } }))
+        })
+        const expected = selection === 'ambient-bootstrap' ? 403 : 201
+        expect(await create(workspace, selection === 'selected-workspace' ? undefined : grant),
+          JSON.stringify(harness.broker.eventsSnapshot())).toBe(expected)
+        expect(forwarded).toEqual(expected === 201 ? ['/v1.47/containers/create?name=closed-fixture'] : [])
+        // Closing the selected roots must also remove the repository's ambient grant.
+        forwarded.length = 0
+        expect(await create(repository)).toBe(403)
+        expect(forwarded).toEqual([])
+      } finally {
+        await harness?.broker?.close()
+        await new Promise<void>(resolve => daemon.close(() => resolve()))
+        if (previousDockerHost === undefined) delete process.env.DOCKER_HOST
+        else process.env.DOCKER_HOST = previousDockerHost
+        if (previousBootstrap === undefined) delete process.env[bootstrapKey]
+        else process.env[bootstrapKey] = previousBootstrap
+        if (harness) await fs.rm(harness.testRoot, { recursive: true, force: true })
+        await fs.rm(directory, { recursive: true, force: true })
+        vi.restoreAllMocks()
+      }
+    },
+  )
+})
+
 describe('runtime harness indexed input cleanup', () => {
   it.each(['removed', 'foreign-label', 'attached', 'retained-after-delete'] as const)(
     'settles the actual publisher before exact nonforce cleanup: %s', async outcome => {

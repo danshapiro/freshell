@@ -96,6 +96,11 @@ export function phase2BootstrapFiles(
   return [...files]
 }
 
+export type RuntimeFixtureInputs = {
+  workspaceRoots: string[]
+  bootstrapFiles: string[]
+}
+
 export class RuntimeGateAssertionError extends Error {
   constructor(
     readonly caseId: string,
@@ -144,7 +149,8 @@ export class RuntimeHarness {
   private brokerStarted = false
 
   constructor(repoRoot: string, runId = randomUUID(), phase: 1 | 2 | 3 | 4 | 5 = 1,
-    private readonly providerFixtureHome?: string, private readonly providerFixtureXdgConfigHome?: string) {
+    private readonly providerFixtureHome?: string, private readonly providerFixtureXdgConfigHome?: string,
+    _fixtureInputs?: RuntimeFixtureInputs) {
     this.repoRoot = fs.realpathSync(repoRoot)
     this.phase = phase
     this.runId = runId
