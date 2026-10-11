@@ -550,11 +550,28 @@ async fn codex_terminal_create_argv_default_managed_and_flag_zero_optout() {
         "AUTH_TOKEN",
         "CODEX_ARGV_CAPTURE_PATH",
         "CODEX_CMD",
+        "CODEX_HOME",
         "FAKE_CODEX_APP_SERVER_ARG_LOG",
         "FRESHELL_CODEX_MANAGED_LAUNCH",
         "FRESHELL_URL",
         "PORT",
     ]);
+    // The app-servers this test starts use its own Codex home, never the
+    // user's ~/.codex; the conversations it resumes had a turn there.
+    let codex_home = tempfile::tempdir().expect("isolated codex home");
+    for thread_id in ["thread-e2e-resume", "thread-e2e-auto-resume"] {
+        let meta = serde_json::json!({"type": "session_meta", "payload": {"id": thread_id}});
+        std::fs::create_dir_all(codex_home.path().join("sessions")).unwrap();
+        std::fs::write(
+            codex_home
+                .path()
+                .join("sessions")
+                .join(format!("rollout-{thread_id}.jsonl")),
+            format!("{meta}\n"),
+        )
+        .expect("seed the resumed conversation's rollout");
+    }
+    std::env::set_var("CODEX_HOME", codex_home.path());
     let dispatcher = write_codex_dispatcher();
     let tmp_cwd = std::env::temp_dir().join(format!("freshell-codex-e2e-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_cwd).unwrap();

@@ -85,6 +85,32 @@ function hasExplicitCodexHome() {
   return typeof process.env.CODEX_HOME === 'string' && process.env.CODEX_HOME.trim().length > 0
 }
 
+// Tests never reach the user's real Codex home. Freshell reads (and walks) the
+// home this fake reports in `initialize`, and without an explicit CODEX_HOME the
+// fake falls back to <HOME>/.codex, as real Codex does. So when CODEX_HOME is
+// unset and that fallback lies inside the real user's home directory (from the
+// password database, so an unset or overridden HOME cannot hide it), the fake
+// refuses to start, before it reads or writes anything: a test must set
+// CODEX_HOME or an isolated HOME. The native role has the same rule.
+function refuseTheRealUsersCodexHome() {
+  if (hasExplicitCodexHome()) return
+  let realHome
+  try {
+    realHome = path.resolve(os.userInfo().homedir)
+  } catch {
+    return // no password-database entry: there is no real user home to protect
+  }
+  const fallback = path.resolve(os.homedir(), '.codex')
+  const relative = path.relative(realHome, fallback)
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return
+  process.stderr.write(
+    `fake-app-server: CODEX_HOME is unset and the fallback Codex home ${fallback} is inside the `
+      + `real user's home ${realHome}; set CODEX_HOME (or an isolated HOME). The fake never uses `
+      + 'the real ~/.codex.\n',
+  )
+  process.exit(1)
+}
+
 function allowsDurableFixtureWrites() {
   return process.env.FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES === '1'
 }
@@ -547,6 +573,7 @@ function maybeWriteRolloutForMethod(method, params) {
   }
 }
 
+refuseTheRealUsersCodexHome()
 const listenUrl = parseListenUrl(process.argv.slice(2))
 const behavior = loadBehavior()
 // The realistic native role (FAKE_CODEX_ROLE=native, set only by

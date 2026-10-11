@@ -178,6 +178,14 @@ pub(crate) fn store_in(dir: &tempfile::TempDir) -> Arc<CodexSidecarStore> {
     Arc::new(CodexSidecarStore::new(dir.path().to_path_buf()))
 }
 
+/// The Codex home every fake app-server this test process spawns uses (one
+/// empty temp dir): never the user's ~/.codex, which the fixture refuses.
+fn isolated_codex_home() -> &'static std::path::Path {
+    static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| tempfile::tempdir().expect("an isolated Codex home"))
+        .path()
+}
+
 /// The committed fake app-server fixture (repo-owned test harness).
 pub(crate) fn fake_app_server_fixture() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -220,6 +228,7 @@ pub(crate) async fn spawn_own_fake_app_server_with_behavior(
         .arg("ws://127.0.0.1:0")
         .env(crate::durability::CODEX_SIDECAR_OWNERSHIP_ENV, ownership_id)
         .env(FIXTURE_PORT_FILE_ENV, &port_file_path)
+        .env("CODEX_HOME", isolated_codex_home())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

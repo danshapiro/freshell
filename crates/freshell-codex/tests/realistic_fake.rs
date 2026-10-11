@@ -1320,6 +1320,64 @@ async fn the_native_refuses_to_run_without_an_explicit_codex_home() {
     }
 }
 
+/// The single-process fake never falls back to the real user's `~/.codex`
+/// (Freshell reads and walks whatever Codex home the fake reports). With
+/// `CODEX_HOME` and `HOME` both unset, its fallback home comes from the
+/// password database, the real one: the fake refuses to start, before it
+/// reads or writes anything, and says why. With an isolated `HOME` it starts
+/// and reports `<HOME>/.codex` as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_single_process_fake_refuses_the_real_users_codex_home() {
+    use tokio::io::AsyncReadExt;
+    let spawn = |home: Option<&Path>, port: u16| {
+        let mut cmd = tokio::process::Command::new("node");
+        cmd.arg(fixture_path("fake-app-server.mjs"))
+            .args(["--listen", &format!("ws://127.0.0.1:{port}")])
+            .env_remove("CODEX_HOME")
+            .env_remove("HOME")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        if let Some(home) = home {
+            cmd.env("HOME", home);
+        }
+        cmd.spawn().expect("spawn the single-process fake")
+    };
+
+    let mut refused = spawn(None, unique_free_port());
+    let mut stderr = refused.stderr.take().expect("the fake's stderr");
+    let status = tokio::time::timeout(Duration::from_secs(5), refused.wait())
+        .await
+        .expect("the fake exits at once")
+        .expect("wait for the fake");
+    let mut text = String::new();
+    let _ = stderr.read_to_string(&mut text).await;
+    assert_eq!(status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("CODEX_HOME is unset") && text.contains("never uses the real ~/.codex"),
+        "{text}"
+    );
+
+    let home = tempfile::tempdir().unwrap();
+    let port = unique_free_port();
+    let mut isolated = spawn(Some(home.path()), port);
+    let mut rpc = Rpc::connect(port).await;
+    let ready = rpc
+        .call(
+            "initialize",
+            json!({"clientInfo": {"name": "t", "version": "1"}}),
+        )
+        .await
+        .expect("initialize");
+    assert_eq!(
+        ready["codexHome"],
+        json!(home.path().join(".codex")),
+        "an isolated HOME keeps working: {ready}"
+    );
+    isolated.kill().await.expect("stop this test's own fake");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_start_or_resume_holds_no_lock() {
     // (1) Error overrides: real Codex holds nothing for a start or resume it refused.

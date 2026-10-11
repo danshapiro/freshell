@@ -56,6 +56,8 @@ async fn the_codex_sidecar_starts_with_the_recorded_soft_limit() {
 
     let dir = tempfile::tempdir().expect("temp dir");
     let soft_file = dir.path().join("soft");
+    // The sidecar's own Codex home, never the user's ~/.codex.
+    let codex_home = dir.path().join("codex-home");
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs");
     let script = dir.path().join("recording-codex.sh");
@@ -64,8 +66,9 @@ async fn the_codex_sidecar_starts_with_the_recorded_soft_limit() {
         format!(
             "i=0\nwhile [ \"$(ulimit -Sn)\" != {ORIGINAL_SOFT} ] && [ $i -lt 40 ]; do \
              sleep 0.05; i=$((i+1)); done\n\
-             ulimit -Sn > '{}'\nexec node '{}' \"$@\"\n",
+             ulimit -Sn > '{}'\nCODEX_HOME='{}' exec node '{}' \"$@\"\n",
             soft_file.display(),
+            codex_home.display(),
             fixture.display()
         ),
     )

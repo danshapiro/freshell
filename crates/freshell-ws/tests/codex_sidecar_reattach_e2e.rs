@@ -888,9 +888,11 @@ fn empty_reconciler() -> (
 /// `CODEX_HOME` for the app-servers the scenario starts, holding
 /// `thread_id`'s rollout as Codex writes it at a conversation's first turn: a
 /// resume of `thread_id` then finds a conversation that materialized. Drop
-/// unsets `CODEX_HOME` (the scenarios run one at a time under [`test_lock`]).
+/// restores the prior `CODEX_HOME` (the scenarios run one at a time under
+/// [`test_lock`]).
 struct ScenarioCodexHome {
     _dir: tempfile::TempDir,
+    prior: Option<std::ffi::OsString>,
 }
 
 impl ScenarioCodexHome {
@@ -904,14 +906,18 @@ impl ScenarioCodexHome {
             format!("{meta}\n"),
         )
         .expect("seed the conversation's rollout");
+        let prior = std::env::var_os("CODEX_HOME");
         std::env::set_var("CODEX_HOME", dir.path());
-        Self { _dir: dir }
+        Self { _dir: dir, prior }
     }
 }
 
 impl Drop for ScenarioCodexHome {
     fn drop(&mut self) {
-        std::env::remove_var("CODEX_HOME");
+        match self.prior.take() {
+            Some(prior) => std::env::set_var("CODEX_HOME", prior),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
     }
 }
 
@@ -1056,6 +1062,9 @@ fn restore_reattaches_tui_to_surviving_sidecar_preserving_in_flight_turn() {
         std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
 
         let session_id = "0199da92-e2e-reattach-thread";
+        // The survivor and any app-server the restore might start use the
+        // scenario's own Codex home, never the user's ~/.codex.
+        let _codex_home = ScenarioCodexHome::with_rollout(session_id);
         let ownership_id = "codex-sidecar-da920e2e-0001-4aaa-8aaa-aaaaaaaaaaaa";
         let log_a = std::env::temp_dir().join(format!(
             "freshell-codex-reattach-e2e-oplog-a-{}.jsonl",

@@ -1123,10 +1123,36 @@ async fn restore_class_queue_overflow_fails_loud_as_queue_full() {
 
 // ── the spawn integration leg: real child + real proxy + fake TUI ─────────────────
 
+/// This test process's own Codex home (an empty temp dir) for the fake
+/// app-servers it starts: never the user's ~/.codex, which the fixture
+/// refuses.
+fn isolated_codex_home() -> &'static std::path::Path {
+    static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| tempfile::tempdir().expect("an isolated codex home"))
+        .path()
+}
+
+/// The fake app-server command: the fixture under [`isolated_codex_home`]
+/// unless the spawn's context sets `CODEX_HOME` (a wrapper script that
+/// defaults the variable and then execs the fixture).
 fn fake_app_server_command() -> String {
-    let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs");
-    format!("node {}", fixture.display())
+    static WRAPPER: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    let wrapper = WRAPPER.get_or_init(|| {
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs");
+        let wrapper = isolated_codex_home().join("fake-app-server.sh");
+        std::fs::write(
+            &wrapper,
+            format!(
+                ": \"${{CODEX_HOME:={}}}\"\nexport CODEX_HOME\nexec node '{}' \"$@\"\n",
+                isolated_codex_home().display(),
+                fixture.display()
+            ),
+        )
+        .expect("write the fake app-server wrapper");
+        wrapper
+    });
+    format!("sh {}", wrapper.display())
 }
 
 /// A Codex home of the test's own (never the user's ~/.codex) holding
@@ -1534,6 +1560,7 @@ async fn plan_retry_spawns_fresh_after_claimed_reattach_ensure_ready_fails() {
         .arg("--listen")
         .arg(&listen_ws_url)
         .env(CODEX_SIDECAR_OWNERSHIP_ENV, survivor_ownership)
+        .env("CODEX_HOME", isolated_codex_home())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

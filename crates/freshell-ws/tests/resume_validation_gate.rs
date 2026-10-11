@@ -738,11 +738,15 @@ async fn restore_true_sidecar_live_legacy_resume_id_is_refused_at_the_door() {
     // The codex fake app-server fixture (the codex.rs crash-recovery tests'
     // scripted peer), pinned to mint the exact thread id this test keys on.
     // Env mutation is process-global; this is the ONLY test in this binary
-    // that spawns a codex sidecar, so nothing else reads these vars.
+    // that spawns a codex sidecar, so nothing else reads these vars. The
+    // sidecar runs under this test's own Codex home, never the user's
+    // ~/.codex.
+    let codex_home = tempfile::tempdir().expect("isolated codex home");
     std::env::set_var(
         "CODEX_CMD",
         format!(
-            "node {}/../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs",
+            "env CODEX_HOME={} node {}/../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs",
+            codex_home.path().display(),
             env!("CARGO_MANIFEST_DIR")
         ),
     );
