@@ -1245,6 +1245,88 @@ impl Drop for OwnChild {
     }
 }
 
+/// An agent main process (not the screen) that exits after the unit was
+/// bound but before its start settled is a typed start failure of the
+/// agent, never a crash: ERROR `unit.placement_failed` with role `agent`,
+/// no crash event, the stop's reason `placement-failed` and the row kept
+/// `Exited` as a start failure (Task 17 review M5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_exit_before_the_start_settled_is_a_start_failure_not_a_crash() {
+    let logs = crate::invariants::capture::capture();
+    let root = tempfile::tempdir().unwrap();
+    let (state, mut crashes) = unit_state(root.path());
+    let mut scope = StartScope::begin(
+        &state,
+        "codex",
+        "codex",
+        "crq-agent-early",
+        "T-agent-early",
+        None,
+    )
+    .expect("start");
+    let pid = spawn_screen(&state, &scope, "T-agent-early", "sleep 30").await;
+    assert_eq!(scope.spawned("T-agent-early", pid), Spawned::Running);
+    let unit = scope.unit();
+    let mut main = OwnChild::sleeping();
+    unit.set_main(main.pin());
+    // Bound (its main is watched from now on), not settled: the create has
+    // neither committed nor given the start up.
+    scope.bind();
+    let seen = attach_collector(&state, "T-agent-early");
+
+    main.0.kill().expect("the agent's main exits");
+    let stop = {
+        let watched = unit.clone();
+        eventually("the agent's exit stops the unit", move || {
+            watched.stop_in_flight().is_some()
+        })
+        .await;
+        unit.stop_in_flight().unwrap()
+    };
+    let report = stop.wait_for(LIMIT).await.expect("Gone");
+    assert_eq!(report.reason, "placement-failed");
+    let failed = {
+        let logs = logs.lock().unwrap_or_else(|p| p.into_inner());
+        logs.iter()
+            .filter(|e| {
+                e.fields.get("event").map(String::as_str) == Some("unit.placement_failed")
+                    && e.fields.get("unit_id").map(String::as_str) == Some(unit.id().as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(failed.len(), 1, "one placement failure line: {failed:?}");
+    assert_eq!(failed[0].level, "ERROR");
+    assert_eq!(
+        failed[0].fields.get("role").map(String::as_str),
+        Some("agent")
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), crashes.recv())
+            .await
+            .is_err(),
+        "a start failure is never a crash"
+    );
+    assert_eq!(
+        exit_codes(&seen),
+        vec![1],
+        "published as a failed start (an agent exit has no code of its own)"
+    );
+    assert_eq!(
+        state.registry.ending("T-agent-early"),
+        Some(freshell_terminal::UnitEnding::StartFailed { exit_code: 1 }),
+        "the row ends as a start failure"
+    );
+
+    // The create sees its start cancelled and gives it up.
+    assert!(scope.cancelled());
+    let settled = state.units.start_settled(unit.id());
+    scope.abandon(None);
+    tokio::time::timeout(LIMIT, settled)
+        .await
+        .expect("the start ends settled");
+}
+
 /// The router applies a thread's status change a few task hops after the
 /// proxy forwarded the same frame to the TUI, so a TUI that ends its turn
 /// and quits at once can exit while the pane's thread table still says the

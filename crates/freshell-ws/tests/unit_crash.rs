@@ -715,3 +715,46 @@ async fn a_screen_exit_after_shutdown_started_is_left_to_retention() {
     );
     assert!(h.unit_for(&tid).stop_in_flight().is_none(), "no stop began");
 }
+
+/// During a server shutdown the app-server's own exit is left to the
+/// shutdown too (it stops or keeps every unit): no end, no crash event for
+/// auto-resume while the server stops, and the unit's record stays for the
+/// next boot (Task 17 review M5).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_app_server_exit_after_shutdown_started_is_left_to_the_shutdown() {
+    let mut h = UnitHarness::start(HarnessOpts {
+        auto_resume: AutoResumeMode::Capture,
+        ..Default::default()
+    })
+    .await;
+    let mut ws = h.connect().await;
+    let tid = h.create_codex(&mut ws, "crq-sdm", Some("t-sdm")).await;
+    ready(&h, &mut ws, &tid).await;
+    start_settled(&h, &tid).await;
+
+    h.state
+        .shutdown_started
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let native = h.kill_native(&tid);
+
+    assert!(
+        exit_within(&h, &mut ws, &tid, Duration::from_secs(2))
+            .await
+            .is_none(),
+        "no terminal.exit"
+    );
+    assert!(
+        !fake_codex::pid_alive(native),
+        "the app-server is dead (the test killed it)"
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            h.crash_rx.as_mut().unwrap().recv()
+        )
+        .await
+        .is_err(),
+        "no crash event while the server stops"
+    );
+    assert!(h.unit_for(&tid).stop_in_flight().is_none(), "no stop began");
+}
