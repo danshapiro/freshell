@@ -40,11 +40,15 @@ export async function sequenceProviderResponse(options: {
     return ready(snapshot) && !snapshot.text.includes(options.response.expected) ? snapshot : null
   }, 90_000)
   try {
-    await awaitReady()
+    const beforePrepare = await awaitReady()
     await options.prepare(options.response.command)
     // Replay can arrive during focus/typing. Sample current completed writes
     // again immediately before Enter; no historical count is carried forward.
     const beforeSend = await awaitReady()
+    // A replacement must not receive Enter for input typed on the prior stream.
+    if (beforeSend.streamId !== beforePrepare.streamId) {
+      throw new Error('browser terminal stream changed during prompt preparation')
+    }
     options.report('pre_send', beforeSend)
     await options.submit()
     await options.waitFor('provider response sequencing signal', async () => {

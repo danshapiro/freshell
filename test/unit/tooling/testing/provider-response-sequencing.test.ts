@@ -117,6 +117,20 @@ describe('provider browser response sequencing with the actual emulator', () => 
     expect(test.actions).toEqual(['prepare', 'submit'])
   })
 
+  it.each([false, true])('refuses Enter when the stream changes during preparation with writesPending=%s', async writesPending => {
+    const test = rig()
+    test.duringPrepare(async () => {
+      test.update({
+        streamId: 'replacement', attachStreamId: 'replacement', attachRequestId: 'replacement-attach',
+        writesPending, highestObservedSeq: 2, completedSeq: writesPending ? 1 : 2,
+      })
+    })
+    if (writesPending) test.scheduled.push(async () => { test.update({ writesPending: false, completedSeq: 2 }) })
+    test.scheduled.push(() => test.write(test.response.expected))
+    await expect(test.run()).rejects.toThrow('stream changed during prompt preparation')
+    expect(test.actions).toEqual(['prepare'])
+  })
+
   it('refuses a response on a different stream after dispatch', async () => {
     const test = rig()
     test.scheduled.push(async () => {
