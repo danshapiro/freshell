@@ -6979,7 +6979,7 @@ export class ManagedRuntimeOwner {
   async managedTerminalStoppedProofs(handle: ExactRuntimeHandle, nonce: string): Promise<ProviderQualificationRow['nativeTurnProofs']> {
     if (this.runtime.phase !== 5) throw new Error('Phase 5 managed terminal qualification required')
     if (!/^codename-[a-f0-9]{32}$/.test(nonce)) throw new Error('fixed terminal qualification nonce required')
-    const rows = (await this.inventory()).filter(row => row.soulId === handle.soulId)
+    const rows = (await this.inventory()).filter(row => row.soulId === handle.soulId && row.incarnationId === handle.incarnationId)
     const row = rows[0]
     if (handle.runId !== this.runtime.runId || handle.candidateSha !== this.runtime.candidateSha || rows.length !== 1
       || row.launchState !== 'stopped' || row.desiredState !== 'stopped' || row.cleanupState !== 'verified_empty'
