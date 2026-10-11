@@ -178,6 +178,19 @@ impl DeterministicFreshAgentTransport {
         )
         .await
         .map_err(non_ambiguous)?;
+        // The same completed turn is now saved under this native identity.
+        // The existing proxy binds previousSessionId to its presentation ID.
+        self.event_tx
+            .send(AgentEvent::Provider {
+                payload: json!({
+                    "type":"freshAgent.session.materialized",
+                    "provider":self.provider.as_str(),
+                    "previousSessionId":native_session_id,
+                    "sessionId":native_session_id,
+                }),
+            })
+            .await
+            .map_err(|_| non_ambiguous("deterministic event receiver closed"))?;
         self.event_tx
             .send(AgentEvent::Provider {
                 payload: json!({
@@ -874,6 +887,49 @@ mod tests {
                 native_id,
             )
             .expect("the actual fixture completion must be saved in its owned native store");
+            let provider_events: Vec<_> = events
+                .events
+                .iter()
+                .filter_map(|entry| {
+                    if let AgentEvent::Provider { payload } = &entry.event {
+                        Some(payload)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let materialized = provider_events
+                .iter()
+                .position(|payload| payload["type"] == "freshAgent.session.materialized")
+                .expect(
+                    "saved fixture native identity must materialize through the existing UI event",
+                );
+            let assistant = provider_events
+                .iter()
+                .position(|payload| payload["type"] == "freshAgent.event")
+                .unwrap();
+            let completed = provider_events
+                .iter()
+                .position(|payload| payload["type"] == "freshAgent.turn.complete")
+                .unwrap();
+            assert!(materialized < assistant && assistant < completed);
+            assert_eq!(saved["threadId"], native_id);
+            for event in [materialized, assistant, completed] {
+                assert_eq!(provider_events[event]["sessionId"], saved["threadId"]);
+                assert_eq!(provider_events[event]["provider"], provider.as_str());
+            }
+            assert_eq!(
+                provider_events[materialized]["previousSessionId"],
+                native_id
+            );
+            assert_eq!(
+                provider_events[assistant]["event"]["assistantMessageId"],
+                provider_events[completed]["assistantMessageId"]
+            );
+            assert_eq!(
+                provider_events[completed]["completionKind"],
+                "provider_native_completed"
+            );
             assert!(saved["turns"]
                 .as_array()
                 .unwrap()
