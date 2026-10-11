@@ -1991,13 +1991,14 @@ impl<'a> AssetResolver<'a> {
         if self
             .saved_snapshots
             .get(&(session_id.to_string(), tree.to_string()))
-            .is_none_or(|reference| {
-                reference.availability != SavedSnapshotAvailability::RetainedClosure
+            .is_some_and(|reference| {
+                reference.availability == SavedSnapshotAvailability::UnavailableInQualifiedLocations
             })
         {
-            return Err(TransferError::Blocked(
-                "native snapshot part lacks its complete retained tree closure".into(),
-            ));
+            // Snapshot and step parts preserve saved history just like revert
+            // references. Missing undo objects do not erase that reference;
+            // corrupt or incomplete retained objects already failed above.
+            return Ok(());
         }
         let mount = self.workspace_mounts.get(session_id).ok_or_else(|| {
             TransferError::Blocked(

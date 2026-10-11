@@ -2852,6 +2852,143 @@ fn write_owned_git_object(store: &Path, kind: &str, bytes: &[u8]) -> String {
 }
 
 #[test]
+fn durable_souls_rehearsal_pipeline_preserves_unavailable_snapshot_parts() {
+    use freshell_sessions::opencode_transfer::{SavedSnapshotAvailability, SavedSnapshotSummary};
+    for kind in ["snapshot", "step-start", "step-finish"] {
+        let mut fixture = fixture_with_baseline_event();
+        let tree = "1234567890abcdef1234567890abcdef12345678";
+        let mut part = serde_json::json!({
+            "id":"prt_one","sessionID":"ses_root","messageID":"msg_one",
+            "type":kind,"snapshot":tree
+        });
+        if kind == "step-finish" {
+            part["reason"] = serde_json::json!("stop");
+            part["cost"] = serde_json::json!(0);
+            part["tokens"] = serde_json::json!({"input":1,"output":1,"reasoning":0,"cache":{"read":0,"write":0}});
+        }
+        let part_json = serde_json::to_string_pretty(&part).unwrap();
+        let source = Connection::open(fixture.root.join("source.sqlite")).unwrap();
+        source
+            .execute(
+                "UPDATE part SET id='prt_one',data=?1 WHERE id='part_one'",
+                [&part_json],
+            )
+            .unwrap();
+        // Snapshot rows are preserved legacy history. The pinned V1 event
+        // schema supports step parts, not a snapshot part event.
+        let event_json = if kind == "snapshot" {
+            source
+                .query_row("SELECT data FROM event WHERE id='evt_base'", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap()
+        } else {
+            let json = serde_json::to_string_pretty(&serde_json::json!({
+                "sessionID":"ses_root","part":part,"time":1
+            }))
+            .unwrap();
+            source
+                .execute(
+                    "UPDATE event SET type='message.part.updated.1',data=?1 WHERE id='evt_base'",
+                    [&json],
+                )
+                .unwrap();
+            json
+        };
+        drop(source);
+        reexport_owned_fixture(&mut fixture);
+        let manifest: OpenCodeTransferManifest =
+            serde_json::from_str(&fixture.descriptor.manifest_json).unwrap();
+        assert_eq!(manifest.row_count(), 6);
+        let [reference] = manifest.saved_snapshots.as_slice() else {
+            panic!("native part and event qualify the same exact saved reference");
+        };
+        assert_eq!(reference.tree, tree);
+        assert_eq!(
+            reference.availability,
+            SavedSnapshotAvailability::UnavailableInQualifiedLocations
+        );
+        assert!(reference.objects.is_empty());
+        assert!(manifest.assets.is_empty());
+        let expected_summary = SavedSnapshotSummary::QualifiedReferences {
+            retained_closure_count: 0,
+            unavailable_reference_count: 1,
+        };
+        let imported = import_bundle(
+            &fixture.descriptor,
+            &fixture.staged_directory,
+            &fixture.destination_database,
+            &fixture.workspace,
+        )
+        .unwrap();
+        assert_eq!(imported.row_count, 6);
+        assert_eq!(imported.asset_count, 0);
+        assert_eq!(imported.saved_snapshot_summary, expected_summary);
+        let current = verify_current_store(
+            &fixture.descriptor,
+            &fixture.destination_database,
+            &fixture.workspace,
+        )
+        .unwrap();
+        assert_eq!(current.row_count, 6);
+        assert_eq!(current.saved_snapshot_summary, expected_summary);
+        let home = fixture.destination_database.ancestors().nth(4).unwrap();
+        let data_home = home.join(".local/share");
+        let config_home = home.join(".config");
+        fs::create_dir_all(&config_home).unwrap();
+        let (uid, gid) = rehearsal_current_identity();
+        let reader = InstalledStoreReaderContext {
+            database_path: &fixture.destination_database,
+            workspace_root: &fixture.workspace,
+            provider_uid: uid,
+            provider_gid: gid,
+            home,
+            xdg_data_home: &data_home,
+            xdg_config_home: &config_home,
+            cwd: &fixture.workspace,
+        };
+        let readable = verify_installed_store(&fixture.descriptor, &reader).unwrap();
+        assert_eq!(readable.row_count, 6);
+        assert_eq!(readable.saved_snapshot_summary, expected_summary);
+        assert!(!fixture
+            .destination_database
+            .parent()
+            .unwrap()
+            .join("snapshot")
+            .exists());
+        let payload: serde_json::Value = serde_json::from_slice(
+            &fs::read(fixture.staged_directory.join("entry-0000.bin")).unwrap(),
+        )
+        .unwrap();
+        let installed = Connection::open(&fixture.destination_database).unwrap();
+        for expected in payload["rows"].as_array().unwrap() {
+            let row: SerializedRow = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(
+                read_row_by_key(&installed, &row.table, &row.key).unwrap(),
+                row
+            );
+        }
+        let installed_part: String = installed
+            .query_row("SELECT data FROM part WHERE id='prt_one'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(installed_part, part_json);
+        assert_eq!(
+            installed
+                .query_row("SELECT data FROM event WHERE id='evt_base'", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            event_json
+        );
+        let decoded: serde_json::Value = serde_json::from_str(&installed_part).unwrap();
+        assert_eq!(decoded["type"], kind);
+        assert_eq!(decoded["snapshot"], tree);
+    }
+}
+
+#[test]
 fn durable_souls_rehearsal_pipeline_transfers_exact_native_snapshot_closure() {
     use sha2::Digest;
     let mut fixture = saved_revert_fixture(false);
