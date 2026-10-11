@@ -244,12 +244,34 @@ pub fn unique_free_port() -> u16 {
 
 /// Test-only bounded wait (product code never polls; this is harness code).
 pub async fn wait_until(what: &str, limit: Duration, f: impl Fn() -> bool) {
+    wait_for_state(
+        what,
+        limit,
+        || if f() { Ok(()) } else { Err(String::new()) },
+    )
+    .await
+}
+
+/// [`wait_until`] for a check that says what it saw: `f` answers `Ok(value)`
+/// once the awaited state holds, else `Err(what it saw)`. A timeout panics
+/// with the last thing seen, so a failure shows which part was missing.
+pub async fn wait_for_state<T>(
+    what: &str,
+    limit: Duration,
+    f: impl Fn() -> Result<T, String>,
+) -> T {
     let deadline = tokio::time::Instant::now() + limit;
-    while !f() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for {what}"
-        );
+    loop {
+        let seen = match f() {
+            Ok(value) => return value,
+            Err(seen) => seen,
+        };
+        if tokio::time::Instant::now() >= deadline {
+            if seen.is_empty() {
+                panic!("timed out waiting for {what}");
+            }
+            panic!("timed out waiting for {what}; last seen: {seen}");
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
