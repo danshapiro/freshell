@@ -87,6 +87,15 @@ async function fixtureState(rig: ManagedFixtureRig, view: ManagedRuntimeView): P
   return rig.fixtureNativeState(rig.exactRuntimeHandle(view))
 }
 
+async function originalFreshAllocation(rig: ManagedFixtureRig, sessionId: string): Promise<ManagedRuntimeView | null> {
+  const view = await rig.runningViewForFreshSession(sessionId)
+  if (!view) return null
+  const matches = (await rig.inventory()).filter(row => row.freshAgentSessionId === sessionId && row.launchState === 'running')
+  expect(matches, 'one current owned original allocation').toHaveLength(1)
+  expect(matches[0]).toEqual(view)
+  return view
+}
+
 async function replacement(
   rig: ManagedFixtureRig,
   sessionId: string,
@@ -110,6 +119,7 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
       providerSettings: Object.fromEntries(MODES.map(({ mode }) => [mode, {}])),
     })
     const sent: any[] = []
+    const createdReplies: any[] = []
     const allocations: OwnedHistoryAllocation[] = []
     const observation = new ManagedHistoryAwaitedPhases()
     let resourceFailures = 0
@@ -124,9 +134,17 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
     page.on('pageerror', () => {
       if (resourceFailures++ < 32) observation.navigation({ resourceType: 'other', category: 'page-error' })
     })
-    page.on('websocket', socket => socket.on('framesent', frame => {
-      try { sent.push(JSON.parse(String(frame.payload))) } catch { /* non-JSON frame */ }
-    }))
+    page.on('websocket', socket => {
+      socket.on('framesent', frame => {
+        try { sent.push(JSON.parse(String(frame.payload))) } catch { /* non-JSON frame */ }
+      })
+      socket.on('framereceived', frame => {
+        try {
+          const message = JSON.parse(String(frame.payload))
+          if (message.type === 'freshAgent.created') createdReplies.push(message)
+        } catch { /* non-JSON frame */ }
+      })
+    })
     try {
       const info = await observation.run('start', 'bootstrap', () => rig.start())
       const response = await observation.run('goto', 'bootstrap', () => page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`, { timeout: 60_000 }))
@@ -149,9 +167,37 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
           const tabId = state.tabs.activeTabId!
           const leaf = state.panes.layouts[tabId]
           return leaf?.type === 'leaf' && leaf.content.kind === 'fresh-agent' && leaf.content.sessionId
-            ? { tabId, paneId: leaf.id, sessionId: leaf.content.sessionId, createRequestId: leaf.content.createRequestId } : null
+            ? { tabId, paneId: leaf.id, sessionId: leaf.content.sessionId, createRequestId: leaf.content.createRequestId,
+              sessionType: leaf.content.sessionType, provider: leaf.content.provider, sessionRef: leaf.content.sessionRef,
+              soulId: leaf.content.soulId, incarnationId: leaf.content.incarnationId } : null
         }))
-        const view = await phase('first-inventory', () => waitFor('owned fixture activation', () => rig.runningViewForFreshSession(created.sessionId)))
+        const wireProvider = definition.provider === 'kilroy' ? 'claude' : definition.provider
+        const { view, createdSessionId } = await phase('first-inventory', () => waitFor('owned fixture activation', async () => {
+          expect(created).toMatchObject({ sessionType: definition.mode, provider: wireProvider })
+          const requests = sent.filter(frame => frame.type === 'freshAgent.create' && frame.requestId === created.createRequestId)
+          expect(requests, 'one original pane creation request').toHaveLength(1)
+          expect(requests[0]).toMatchObject({ tabId: created.tabId, sessionType: definition.mode, provider: wireProvider })
+          const replies = createdReplies.filter(reply => reply.requestId === created.createRequestId)
+          if (!replies.length) return null
+          expect(replies, 'one original creation acknowledgement').toHaveLength(1)
+          const reply = replies[0]
+          expect(reply).toMatchObject({ sessionType: definition.mode, provider: wireProvider, runtimeProvider: definition.provider })
+          expect(typeof reply.sessionId).toBe('string')
+          expect(reply.sessionId).toBeTruthy()
+          // Inventory may already have promoted the pane to native identity.
+          // External lookup deliberately addresses the original presentation only.
+          const view = await originalFreshAllocation(rig, reply.sessionId)
+          if (!view) return null
+          expect(view).toMatchObject({ provider: definition.provider, freshAgentSessionType: definition.mode,
+            freshAgentSessionId: reply.sessionId, profile: 'default_agent' })
+          rig.exactRuntimeHandle(view)
+          expect(reply.sessionRef).toEqual({ provider: wireProvider, sessionId: view.nativeSessionId })
+          expect([reply.sessionId, view.nativeSessionId]).toContain(created.sessionId)
+          if (created.sessionRef) expect(created.sessionRef).toEqual(reply.sessionRef)
+          if (created.soulId) expect(created.soulId).toBe(view.soulId)
+          if (created.incarnationId) expect(created.incarnationId).toBe(view.incarnationId)
+          return { view, createdSessionId: reply.sessionId as string }
+        }))
         const pane = page.locator('[data-context="fresh-agent"][data-pane-id="' + created.paneId + '"]')
         const composer = pane.getByRole('textbox', { name: 'Chat message input' })
         await phase('composer-enabled', () => expect(composer).toBeEnabled())
@@ -161,10 +207,9 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
           const state = await fixtureState(rig, view)
           return state.dispatchCount === 1 && state.completionCount === 1 ? state : null
         }))
-        const wireProvider = definition.provider === 'kilroy' ? 'claude' : definition.provider
         expect(view.nativeSessionId).toBeTruthy()
         const paneObservation = { ...created, sessionType: definition.mode, provider: wireProvider,
-          createdSessionId: created.sessionId, nativeSessionId: view.nativeSessionId! }
+          createdSessionId, nativeSessionId: view.nativeSessionId! }
         const nativePane = await phase('native-pane', () => waitFor('browser pane bound to the actual owned allocation',
           () => page.evaluate(observeOwnedFreshBrowserPane, paneObservation)))
         allocations.push(paneObservation)
@@ -205,10 +250,15 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
             expect(frame.sessionRef).toEqual(matches[0].sessionRef)
           }
         }
-        const current = await phase('history-current', () => rig.runningViewForFreshSession(created.sessionId))
-        expect(current?.soulId).toBe(view.soulId)
-        expect(current?.incarnationId).toBe(view.incarnationId)
-        expect(current?.nativeSessionId).toBe(view.nativeSessionId)
+        await phase('history-current', async () => {
+          const current = await originalFreshAllocation(rig, createdSessionId)
+          expect(current?.soulId).toBe(view.soulId)
+          expect(current?.incarnationId).toBe(view.incarnationId)
+          expect(current?.nativeSessionId).toBe(view.nativeSessionId)
+          expect(current).toMatchObject({ provider: view.provider, profile: view.profile,
+            freshAgentSessionType: definition.mode, freshAgentSessionId: createdSessionId })
+          expect(rig.exactRuntimeHandle(current!)).toEqual(rig.exactRuntimeHandle(view))
+        })
         await phase('history-dispatch', async () => expect((await fixtureState(rig, view)).dispatchCount).toBe(1))
       }
     } finally {

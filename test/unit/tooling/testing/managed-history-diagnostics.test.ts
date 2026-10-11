@@ -2,6 +2,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { TestCase, TestResult } from '@playwright/test/reporter'
 import * as external from '../../../../scripts/testing/runtime-external-browser.js'
+import { buildManagedRuntimeMergePlan } from '../../../../src/lib/recovery/managed-runtime-recovery.js'
 
 const original = vi.hoisted(() => ({
   cases: new Map<string, (context: any) => Promise<void>>(),
@@ -39,7 +40,7 @@ const owned = {
 const testCase = { id: 'owned-case', location: { file, line: 73, column: 1 },
   titlePath: () => [file, 'managed fixture', 'History opens existing pane'] } as TestCase
 
-afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs() })
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllEnvs() })
 
 function reporterPath() {
   for (const [key, value] of Object.entries(owned)) vi.stubEnv(key, value)
@@ -149,9 +150,13 @@ describe('managed History original awaited phase diagnostics', () => {
 })
 
 type HistoryFault = 'unknown' | 'provider' | 'mode' | 'root' | 'misbound-pane' | 'create' | 'create-owner' | 'send' | 'missing-target' | 'new-allocation' | 'resume'
+type StartupFault = 'ack-request' | 'ack-mode' | 'ack-provider' | 'ack-runtime-provider' | 'ack-root' | 'ack-duplicate'
+  | 'create-tab' | 'pane-request' | 'pane-mode' | 'pane-provider' | 'pane-root' | 'pane-soul' | 'pane-incarnation'
+  | 'inventory-missing' | 'inventory-stale' | 'inventory-ambiguous' | 'inventory-other-alias' | 'inventory-profile'
+  | 'reply-run' | 'current-soul' | 'current-incarnation' | 'current-root' | 'current-ambiguous'
 
 /** Execute the registered browser case, including its actual global collector and finally. */
-async function historyCallback(fault?: HistoryFault) {
+async function historyCallback(fault?: HistoryFault, startup: 'presentation' | 'native' = 'presentation', startupFault?: StartupFault) {
   await import('../../../e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.js')
   vi.stubEnv('FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST', '1')
   const definitions = [
@@ -161,6 +166,11 @@ async function historyCallback(fault?: HistoryFault) {
   const allocated: any[] = []
   let observedNativePane = false
   let framesent!: (frame: { payload: string }) => void
+  let framereceived: (frame: { payload: string }) => void = () => {}
+  let sendCount = 0
+  let inventoryAfterHistory = 0
+  const promotions: number[] = []
+  const observedStartupIds: string[] = []
   const frame = (value: any) => framesent({ payload: JSON.stringify(value) })
   const current = () => allocated.at(-1)!
   const locator: any = {
@@ -168,18 +178,48 @@ async function historyCallback(fault?: HistoryFault) {
     _expect: async () => ({ matches: true, received: 'controlled locator', log: [] }),
     last: () => locator, getByRole: () => locator,
     click: async () => {}, fill: async () => {},
-    press: async () => {},
+    press: async () => {
+      const item = current(), content = state.panes.layouts[item.tabId].content
+      const request = { type: 'freshAgent.create', requestId: content.createRequestId, tabId: item.tabId,
+        sessionType: content.sessionType, provider: content.provider }
+      if (startupFault === 'create-tab') request.tabId = 'other-tab'
+      frame(request)
+      const ack = { type: 'freshAgent.created', requestId: content.createRequestId,
+        sessionId: item.sessionId, sessionType: content.sessionType, provider: content.provider,
+        runtimeProvider: item.view.provider, sessionRef: { provider: content.provider, sessionId: item.view.nativeSessionId } }
+      if (startupFault === 'ack-request') ack.requestId = 'other-request'
+      if (startupFault === 'ack-mode') ack.sessionType = 'freshopencode'
+      if (startupFault === 'ack-provider') ack.provider = 'opencode'
+      if (startupFault === 'ack-runtime-provider') ack.runtimeProvider = 'opencode'
+      if (startupFault === 'ack-root') ack.sessionRef.sessionId = 'wrong-ack-root'
+      framereceived({ payload: JSON.stringify(ack) })
+      if (startupFault === 'ack-duplicate') framereceived({ payload: JSON.stringify(ack) })
+      if (startup === 'native') promote(item)
+      const pane = state.panes.layouts[item.tabId].content
+      if (startupFault === 'pane-request') pane.createRequestId = 'other-pane-request'
+      if (startupFault === 'pane-mode') pane.sessionType = 'freshopencode'
+      if (startupFault === 'pane-provider') pane.provider = 'opencode'
+      if (startupFault === 'pane-root') pane.sessionId = 'wrong-pane-root'
+      if (startupFault === 'pane-soul') pane.soulId = 'other-pane-soul'
+      if (startupFault === 'pane-incarnation') pane.incarnationId = 'stale-pane-incarnation'
+    },
   }
   const page: any = {
     on: (event: string, callback: any) => {
-      if (event === 'websocket') callback({ on: (_event: string, listener: any) => { framesent = listener } })
+      if (event === 'websocket') callback({ on: (kind: string, listener: any) => {
+        if (kind === 'framesent') framesent = listener
+        if (kind === 'framereceived') framereceived = listener
+      } })
     },
     goto: async () => ({ status: () => 200 }),
     keyboard: { press: async () => {
       observedNativePane = false
       const index = allocated.length, [sessionType, provider] = definitions[index]
       const tabId = `tab-${index}`, paneId = `pane-${index}`, sessionId = `created-${index}`
-      const view = { soulId: `soul-${index}`, incarnationId: `incarnation-${index}`, nativeSessionId: `native-${index}` }
+      const view = { soulId: `soul-${index}`, incarnationId: `incarnation-${index}`, nativeSessionId: `native-${index}`,
+        freshAgentSessionId: sessionId, freshAgentSessionType: sessionType,
+        provider: sessionType === 'kilroy' ? 'kilroy' : provider, profile: 'default_agent',
+        launchState: 'running', intentRevision: 1, containerId: String(index + 1).repeat(64), hostBootId: `boot-${index}` }
       const content = { kind: 'fresh-agent', sessionType, provider, sessionId, createRequestId: `request-${index}` }
       state.tabs.activeTabId = tabId
       state.tabs.tabs.push({ id: tabId })
@@ -190,6 +230,9 @@ async function historyCallback(fault?: HistoryFault) {
     locator: () => ({ ...locator, getByRole: (_role: string, options: any) => options.name === 'Send' ? {
       ...locator, click: async () => {
         const item = current(), content = state.panes.layouts[item.tabId].content
+        // Both inventory interleavings precede the first dispatched fixture turn.
+        expect(content.sessionId).toBe(item.view.nativeSessionId)
+        sendCount++
         content.sessionId = item.view.nativeSessionId
         content.sessionRef = { provider: content.provider, sessionId: item.view.nativeSessionId }
       },
@@ -199,21 +242,64 @@ async function historyCallback(fault?: HistoryFault) {
       try { const result = operation(argument); observedNativePane = true; return result } finally { vi.unstubAllGlobals() }
     },
   }
+  const promote = (item: any) => {
+    const soul = { ...item.view, freshAgentCreateRequestId: `request-${allocated.indexOf(item)}`,
+      desiredState: 'running', recoveryState: 'live' }
+    const view = { viewId: `view-${item.paneId}`, soulId: item.view.soulId, revision: 1,
+      kind: 'automatic_primary', visibility: 'visible', preferredTabId: item.tabId, preferredPaneId: item.paneId }
+    const plan = buildManagedRuntimeMergePlan({ revision: 1, souls: [soul], viewIntents: [view] } as any, state)
+    expect(plan.creates).toHaveLength(0)
+    expect(plan.updates).toHaveLength(1)
+    state.panes.layouts[item.tabId].content = plan.updates[0].content
+    promotions.push(allocated.indexOf(item))
+  }
   original.start.mockResolvedValue({ baseUrl: 'https://fixture.invalid', token: 'private-token' })
   original.stop.mockClear().mockResolvedValue({ ok: true, errors: [] })
   original.waitForHarness.mockResolvedValue(undefined)
   original.waitForConnection.mockResolvedValue(undefined)
-  original.state.mockImplementation(async () => structuredClone(state))
+  original.state.mockImplementation(async () => {
+    if (allocated.length > sendCount) observedStartupIds.push(state.panes.layouts[current().tabId].content.sessionId)
+    return structuredClone(state)
+  })
   original.tabCount.mockImplementation(async () => state.tabs.tabs.length)
   original.layout.mockImplementation(async (tabId: string) => structuredClone(state.panes.layouts[tabId]))
   original.activeTab.mockImplementation(async () => state.tabs.activeTabId)
-  const inventory = () => allocated.map(item => item.view)
+  const inventory = () => {
+    const rows = allocated.map(item => ({ ...item.view }))
+    if (!rows.length) return rows
+    if (startupFault === 'inventory-missing') return []
+    if (startupFault === 'inventory-stale') rows[0].launchState = 'stopped'
+    if (startupFault === 'inventory-profile') rows[0].profile = 'test_fixture'
+    if (startupFault === 'inventory-ambiguous') rows.push({ ...rows[0], soulId: 'ambiguous-soul' })
+    if (startupFault === 'inventory-other-alias') rows[0].freshAgentSessionId = 'unrelated-original-presentation'
+    if (inventoryAfterHistory > 1 && startupFault?.startsWith('current-')) {
+      if (startupFault === 'current-soul') rows[0].soulId = 'changed-current-soul'
+      if (startupFault === 'current-incarnation') rows[0].incarnationId = 'changed-current-incarnation'
+      if (startupFault === 'current-root') rows[0].nativeSessionId = 'changed-current-root'
+      if (startupFault === 'current-ambiguous') rows.push({ ...rows[0], incarnationId: 'ambiguous-current-incarnation' })
+    }
+    return rows
+  }
+  const descriptor = external.resolveManagedExternalDescriptor(owned)!
+  const transport = vi.fn(async (_url: string, init: RequestInit) => {
+    const request = JSON.parse(String(init.body))
+    if (startup === 'presentation' && current()?.tabId
+      && state.panes.layouts[current().tabId].content.sessionId === current().sessionId) promote(current())
+    if (original.history.mock.calls.length) inventoryAfterHistory++
+    expect(request.action).toBe('inventory')
+    expect(request).toMatchObject({ runId: descriptor.runId, candidateSha: descriptor.candidateSha,
+      scenarioId: 'browser-managed-runtime' })
+    return new Response(JSON.stringify({ runId: startupFault === 'reply-run' ? '22222222-2222-4222-8222-222222222222' : request.runId, candidateSha: request.candidateSha,
+      operationId: request.operationId, result: inventory() }), { status: 200 })
+  })
+  const externalRig = new external.ExternalManagedRuntimeRig(descriptor, transport)
+  const lookups = vi.spyOn(externalRig, 'runningViewForFreshSession')
   original.rig = {
     repoRoot: '/controlled/checkout',
-    runningViewForFreshSession: async (sessionId: string) => allocated.find(item => item.sessionId === sessionId)?.view,
-    exactRuntimeHandle: (view: any) => view,
+    runningViewForFreshSession: externalRig.runningViewForFreshSession.bind(externalRig),
+    exactRuntimeHandle: externalRig.exactRuntimeHandle.bind(externalRig),
     fixtureNativeState: async () => ({ dispatchCount: 1, completionCount: 1 }),
-    inventory: async () => inventory(),
+    inventory: externalRig.inventory.bind(externalRig),
   }
   original.history.mockClear().mockImplementation(async () => {
     const index = allocated.length - 1
@@ -228,7 +314,8 @@ async function historyCallback(fault?: HistoryFault) {
       if (fault === 'create') messages.push({ ...messages[0], type: 'freshAgent.create' })
       if (fault === 'send') messages.push({ ...target, type: 'freshAgent.send' })
       if (fault === 'missing-target') messages.pop()
-      if (fault === 'new-allocation') allocated.push({ view: { soulId: 'new-soul' } })
+      if (fault === 'new-allocation') allocated.push({ view: { ...current().view, soulId: 'new-soul',
+        freshAgentSessionId: 'new-allocation-presentation' } })
       if (fault === 'resume' || fault === 'create-owner') messages[index] = {
         ...target, type: 'freshAgent.create', tabId: current().tabId,
         requestId: fault === 'create-owner' ? 'unowned-request' : target.createRequestId,
@@ -247,8 +334,68 @@ async function historyCallback(fault?: HistoryFault) {
     return snapshot
   })
   const run = original.cases.get('completed owned native fixture history opens its existing browser pane')!({ page })
-  return { run, allocated }
+  void run.catch(() => {}) // Controlled clocks may settle refusal before the caller awaits it.
+  return { run, allocated, lookups, transport, promotions, observedStartupIds, sends: () => sendCount }
 }
+
+describe('managed History startup inventory binding', () => {
+  it.each(['presentation', 'native'] as const)('uses the original acknowledgement with %s startup identity through all four modes', async startup => {
+    vi.spyOn(process.stdout, 'write').mockReturnValue(true)
+    vi.useFakeTimers()
+    const { run, allocated, lookups, transport, promotions, observedStartupIds, sends } = await historyCallback(undefined, startup)
+    await vi.advanceTimersByTimeAsync(90_001)
+    await expect(run).resolves.toBeUndefined()
+    expect(allocated).toHaveLength(4)
+    expect(promotions).toEqual([0, 1, 2, 3])
+    expect(observedStartupIds).toEqual(allocated.map(item => startup === 'native' ? item.view.nativeSessionId : item.sessionId))
+    expect(lookups.mock.calls.map(([alias]) => alias)).toEqual(allocated.flatMap(item => [item.sessionId, item.sessionId]))
+    expect(sends()).toBe(4)
+    expect(original.history).toHaveBeenCalledTimes(4)
+    expect(original.stop).toHaveBeenCalledOnce()
+    expect(new Set(transport.mock.calls.map(([, init]) => JSON.parse(String(init.body)).operationId)).size).toBe(transport.mock.calls.length)
+  })
+
+  it.each<StartupFault>(['ack-request', 'ack-mode', 'ack-provider', 'ack-runtime-provider', 'ack-root', 'ack-duplicate',
+    'create-tab', 'pane-request', 'pane-mode', 'pane-provider', 'pane-root', 'pane-soul', 'pane-incarnation',
+    'inventory-missing', 'inventory-stale', 'inventory-ambiguous', 'inventory-other-alias', 'inventory-profile', 'reply-run',
+    'current-soul', 'current-incarnation', 'current-root', 'current-ambiguous'])(
+    'refuses %s through the actual callback and closes exactly once', async startupFault => {
+      const phases: string[] = []
+      vi.spyOn(process.stdout, 'write').mockImplementation((chunk: any) => {
+        for (const event of external.parseManagedHistoryDiagnosticText(String(chunk))) {
+          if (event.state === 'failed') phases.push(event.phase!)
+        }
+        return true
+      })
+      vi.useFakeTimers()
+      const { run, allocated, lookups, sends } = await historyCallback(undefined, 'native', startupFault)
+      await vi.advanceTimersByTimeAsync(90_001)
+      const cause: Record<StartupFault, RegExp> = {
+        'ack-request': /timed out waiting for owned fixture activation/,
+        'ack-mode': /freshopencode/, 'ack-provider': /opencode/, 'ack-runtime-provider': /opencode/,
+        'ack-root': /wrong-ack-root/, 'ack-duplicate': /Received length: 2/, 'create-tab': /other-tab/,
+        'pane-request': /Received length: 0/, 'pane-mode': /freshopencode/, 'pane-provider': /opencode/,
+        'pane-root': /wrong-pane-root/, 'pane-soul': /other-pane-soul/, 'pane-incarnation': /stale-pane-incarnation/,
+        'inventory-missing': /timed out waiting for owned fixture activation/,
+        'inventory-stale': /timed out waiting for owned fixture activation/,
+        'inventory-ambiguous': /Received length: 2/,
+        'inventory-other-alias': /timed out waiting for owned fixture activation/,
+        'inventory-profile': /test_fixture/, 'reply-run': /invalid run, candidate, operation or shape/,
+        'current-soul': /changed-current-soul/, 'current-incarnation': /changed-current-incarnation/,
+        'current-root': /changed-current-root/,
+        'current-ambiguous': /Received length: 2/,
+      }
+      await expect(run).rejects.toThrow(cause[startupFault])
+      const afterHistory = startupFault.startsWith('current-')
+      expect(phases).toEqual([afterHistory ? 'history-current' : 'first-inventory'])
+      expect(allocated).toHaveLength(1)
+      expect(sends()).toBe(afterHistory ? 1 : 0)
+      expect(original.history).toHaveBeenCalledTimes(afterHistory ? 1 : 0)
+      if (startupFault === 'inventory-other-alias') expect(lookups.mock.calls.every(([alias]) => alias === 'created-0')).toBe(true)
+      expect(original.stop).toHaveBeenCalledOnce()
+    },
+  )
+})
 
 describe('managed History original wire ownership', () => {
   it('accepts each allocation-backed background attach while requiring the target through all four modes', async () => {
