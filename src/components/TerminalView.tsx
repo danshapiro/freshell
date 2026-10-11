@@ -3925,7 +3925,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     const currentContent = contentRef.current
     if (!tid || !currentContent) return false
     if (!paneRefreshTargetMatchesContent(request.target, currentContent)) return false
-    if (isManagedRuntimeRecoveryDecision(currentContent.recoverySummary)) return false
+    if (isManagedRuntimeRecoveryDecision(currentContent.recoverySummary) && !canReplayManagedTerminal(currentContent)) return false
 
     handledRefreshRequestIdRef.current = request.requestId
     // An explicit pane refresh is user intent, not automatic recovery cycling:

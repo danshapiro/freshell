@@ -1008,5 +1008,25 @@ for (const runtimeStatus of ['blocked', 'exited'] as const) {
     await expect.poll(() => paneContent(page)).toMatchObject({ terminalId: before.terminalId,
       createRequestId: before.createRequestId, soulId: SOUL_ID, runtimeStatus })
     await expect(page.getByTestId('managed-runtime-recovery-card')).toBeVisible()
+    if (runtimeStatus === 'blocked') {
+      await harness.clearSentWsMessages()
+      // Invoke the existing user-visible Refresh command, through its menu.
+      await page.locator('[data-context="tab"]').first().click({ button: 'right' })
+      await page.getByRole('menuitem', { name: 'Refresh tab', exact: true }).click()
+      await expect.poll(async () => {
+        const frames = await harness.getSentWsMessages() as Array<{ type?: string; terminalId?: string; intent?: string }>
+        const detach = frames.findIndex(frame => frame.type === 'terminal.detach' && frame.terminalId === before.terminalId)
+        const attach = frames.findIndex(frame => frame.type === 'terminal.attach' && frame.terminalId === before.terminalId && frame.intent === 'viewport_hydrate')
+        return detach >= 0 && attach > detach
+      }).toBe(true)
+      const refreshed = await harness.getSentWsMessages() as Array<{ type?: string }>
+      expect(refreshed.filter(frame => ['terminal.create', 'terminal.input', 'pane.reconcile.request'].includes(frame.type ?? ''))).toEqual([])
+      await expect.poll(() => paneContent(page)).toMatchObject({ terminalId: before.terminalId,
+        createRequestId: before.createRequestId, soulId: SOUL_ID, runtimeStatus })
+      await expect.poll(async () => {
+        const state = await harness.getState()
+        return state.panes.refreshRequestsByPane?.[state.tabs.activeTabId!]
+      }).toBeUndefined()
+    }
   })
 }

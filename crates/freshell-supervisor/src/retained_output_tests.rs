@@ -73,6 +73,292 @@ async fn retained_output_read(
     }
 }
 
+async fn retained_output_replacement(
+    supervisor: &Supervisor,
+    soul: SoulId,
+    with_spool: bool,
+) -> crate::registry::ReplacementPreparation {
+    let registry = &supervisor.registry;
+    let start = registry
+        .begin_recovery(
+            soul.clone(),
+            RecoveryTrigger::ManualRetry,
+            RecoveryPath::CheckpointRestore,
+        )
+        .await
+        .unwrap();
+    registry
+        .mark_stop_outcome(
+            start.context.prior_handle.incarnation_id().clone(),
+            StopOutcome::VerifiedEmpty,
+        )
+        .await
+        .unwrap();
+    let replacement = registry
+        .prepare_replacement(
+            start.clone(),
+            start.context.prior_handle.terminal().cloned(),
+            None,
+            None,
+            RecoveryPath::CheckpointRestore,
+        )
+        .await
+        .unwrap();
+    let runtime_dir = supervisor
+        .config
+        .runtime_root
+        .join(replacement.prepared.incarnation_id.as_str());
+    std::fs::create_dir(&runtime_dir).unwrap();
+    registry
+        .commit_created(
+            replacement.prepared.incarnation_id.clone(),
+            crate::registry::BackendCreatedRecord {
+                daemon_id: freshell_runtime_protocol::DockerDaemonId::new(),
+                container_id: replacement
+                    .prepared
+                    .incarnation_id
+                    .as_str()
+                    .replace('-', "")
+                    .repeat(2),
+                image_ref: format!("sha256:{}", "b".repeat(64)),
+                host_binary_path: runtime_dir.join("host"),
+                runtime_dir: runtime_dir.clone(),
+                immutable_config_digest: format!("sha256:{}", "c".repeat(64)),
+            },
+        )
+        .await
+        .unwrap();
+    if with_spool {
+        registry
+            .commit_execution_grant(
+                replacement.prepared.incarnation_id.clone(),
+                freshell_runtime_protocol::HostBootId::new(),
+                checkpoints::tests::limits(),
+            )
+            .await
+            .unwrap();
+        registry
+            .mark_running(replacement.prepared.incarnation_id.clone())
+            .await
+            .unwrap();
+        std::fs::write(runtime_dir.join("terminal-spool-descriptor.json"), serde_json::to_vec(&serde_json::json!({
+            "schemaVersion":1,"incarnationId":replacement.prepared.incarnation_id,"terminalId":"retained-terminal",
+            "streamEpoch":format!("launch-prefix-replacement-hostboot-{}", replacement.prepared.incarnation_id),"segmentLimitBytes":33554432
+        })).unwrap()).unwrap();
+        std::fs::write(runtime_dir.join("terminal-spool-current.jsonl"), serde_json::to_string(&serde_json::json!({"frame":{
+            "terminalId":"retained-terminal","streamEpoch":format!("launch-prefix-replacement-hostboot-{}", replacement.prepared.incarnation_id),"seqStart":1,"seqEnd":1,"data":format!("replacement output {}", replacement.prepared.incarnation_id)
+        }})).unwrap()+"\n").unwrap();
+    }
+    replacement
+}
+
+async fn retained_output_assert_warm_and_cold(
+    supervisor: Supervisor,
+    soul: SoulId,
+    accepted: Option<freshell_runtime_protocol::IncarnationId>,
+) {
+    let config = (*supervisor.config).clone();
+    let database_root = supervisor
+        .registry
+        .database_path()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let assert_read = |output: freshell_runtime_protocol::RuntimeOutputBatch| {
+        assert_eq!(
+            output.stream_epoch,
+            accepted
+                .as_ref()
+                .map(|id| format!("launch-prefix-replacement-hostboot-{id}"))
+                .unwrap_or_else(|| "launch-prefix-hostboot-exact".into())
+        );
+        assert_eq!(
+            output.frames[0].data,
+            accepted
+                .as_ref()
+                .map(|id| format!("replacement output {id}"))
+                .unwrap_or_else(|| "x".repeat(65536))
+        );
+        assert_eq!(output.reset_required, accepted.is_some());
+    };
+    assert_read(
+        retained_output_read(&supervisor, soul.clone(), 0)
+            .await
+            .expect("warm read resolves accepted output"),
+    );
+    drop(supervisor);
+    let cold = Supervisor::new(
+        crate::registry::Registry::open(database_root, None).unwrap(),
+        std::sync::Arc::new(RecoveryBackend(std::sync::Mutex::new(
+            BackendRuntimeState::Exited,
+        ))),
+        config,
+    )
+    .unwrap();
+    assert_read(
+        retained_output_read(&cold, soul, 0)
+            .await
+            .expect("cold read resolves accepted output"),
+    );
+}
+
+#[tokio::test]
+async fn retained_output_owned_preparing_replacement_keeps_committed_prior() {
+    let root = tempfile::tempdir().unwrap();
+    let (supervisor, context) =
+        retained_output_fixture(root.path(), BackendRuntimeState::Exited).await;
+    retained_output_replacement(&supervisor, context.soul_id.clone(), false).await;
+    retained_output_assert_warm_and_cold(supervisor, context.soul_id, None).await;
+}
+
+#[tokio::test]
+async fn retained_output_failed_activation_without_spool_keeps_committed_prior() {
+    let root = tempfile::tempdir().unwrap();
+    let (supervisor, context) =
+        retained_output_fixture(root.path(), BackendRuntimeState::Exited).await;
+    let replacement =
+        retained_output_replacement(&supervisor, context.soul_id.clone(), false).await;
+    supervisor
+        .registry
+        .mark_stop_outcome(
+            replacement.prepared.incarnation_id,
+            StopOutcome::VerifiedEmpty,
+        )
+        .await
+        .unwrap();
+    supervisor
+        .registry
+        .mark_recovery_blocked(
+            context.soul_id.clone(),
+            Some(replacement.attempt_id),
+            RecoveryBlockReason::ProviderUnavailable,
+            vec!["synthetic activation failure".into()],
+        )
+        .await
+        .unwrap();
+    retained_output_assert_warm_and_cold(supervisor, context.soul_id, None).await;
+}
+
+#[tokio::test]
+async fn retained_output_wrong_identity_spool_cannot_displace_committed_prior() {
+    let root = tempfile::tempdir().unwrap();
+    let (supervisor, context) =
+        retained_output_fixture(root.path(), BackendRuntimeState::Exited).await;
+    let replacement = retained_output_replacement(&supervisor, context.soul_id.clone(), true).await;
+    supervisor
+        .registry
+        .mark_stop_outcome(
+            replacement.prepared.incarnation_id,
+            StopOutcome::VerifiedEmpty,
+        )
+        .await
+        .unwrap();
+    supervisor
+        .registry
+        .mark_recovery_blocked(
+            context.soul_id.clone(),
+            Some(replacement.attempt_id),
+            RecoveryBlockReason::WrongNativeIdentity,
+            vec!["synthetic wrong identity".into()],
+        )
+        .await
+        .unwrap();
+    retained_output_assert_warm_and_cold(supervisor, context.soul_id, None).await;
+}
+
+#[tokio::test]
+async fn retained_output_accepted_replacement_becomes_source_and_survives_later_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let (supervisor, context) =
+        retained_output_fixture(root.path(), BackendRuntimeState::Exited).await;
+    let replacement = retained_output_replacement(&supervisor, context.soul_id.clone(), true).await;
+    supervisor
+        .registry
+        .mark_recovery_success(
+            context.soul_id.clone(),
+            replacement.prepared.incarnation_id.clone(),
+            replacement.attempt_id,
+        )
+        .await
+        .unwrap();
+    let output = retained_output_read(&supervisor, context.soul_id.clone(), 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        output.frames[0].data,
+        format!("replacement output {}", replacement.prepared.incarnation_id)
+    );
+    let failed = retained_output_replacement(&supervisor, context.soul_id.clone(), true).await;
+    supervisor
+        .registry
+        .mark_stop_outcome(failed.prepared.incarnation_id, StopOutcome::VerifiedEmpty)
+        .await
+        .unwrap();
+    supervisor
+        .registry
+        .mark_recovery_blocked(
+            context.soul_id.clone(),
+            Some(failed.attempt_id),
+            RecoveryBlockReason::WrongNativeIdentity,
+            vec![],
+        )
+        .await
+        .unwrap();
+    retained_output_assert_warm_and_cold(
+        supervisor,
+        context.soul_id,
+        Some(replacement.prepared.incarnation_id),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn retained_output_legacy_success_with_overwritten_attempt_keeps_accepted_stream() {
+    let root = tempfile::tempdir().unwrap();
+    let (supervisor, context) =
+        retained_output_fixture(root.path(), BackendRuntimeState::Exited).await;
+    let replacement = retained_output_replacement(&supervisor, context.soul_id.clone(), true).await;
+    supervisor
+        .registry
+        .mark_recovery_success(
+            context.soul_id.clone(),
+            replacement.prepared.incarnation_id.clone(),
+            replacement.attempt_id.clone(),
+        )
+        .await
+        .unwrap();
+    // Old successful rows did not carry an exact accepted-incarnation ref.
+    let conn = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+    conn.execute(
+        "UPDATE recovery_attempts SET evidence_ref=NULL WHERE attempt_id=?1",
+        [replacement.attempt_id.as_str()],
+    )
+    .unwrap();
+    drop(conn);
+    let failed = retained_output_replacement(&supervisor, context.soul_id.clone(), false).await;
+    supervisor
+        .registry
+        .mark_stop_outcome(failed.prepared.incarnation_id, StopOutcome::VerifiedEmpty)
+        .await
+        .unwrap();
+    supervisor
+        .registry
+        .mark_recovery_blocked(
+            context.soul_id.clone(),
+            Some(failed.attempt_id),
+            RecoveryBlockReason::ProviderUnavailable,
+            vec![],
+        )
+        .await
+        .unwrap();
+    retained_output_assert_warm_and_cold(
+        supervisor,
+        context.soul_id,
+        Some(replacement.prepared.incarnation_id),
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn retained_output_blocked_handle_replays_without_input_authority() {
     let root = tempfile::tempdir().unwrap();

@@ -778,18 +778,34 @@ impl Registry {
         &self,
         soul_id: SoulId,
     ) -> Result<RetainedOutputSource, RegistryError> {
-        // The existing context resolver proves installation ownership and
-        // selects the current committed incarnation (or its committed prior).
-        let context = self.recovery_context(soul_id).await?;
-        let handle = context.prior_handle;
-        Ok(RetainedOutputSource {
-            incarnation_id: handle.incarnation_id().clone(),
-            runtime_dir: handle.runtime_dir().to_path_buf(),
-            terminal: handle.terminal().cloned().ok_or_else(|| {
-                RegistryError::InvalidState("soul has no retained terminal".into())
-            })?,
-            native_session_id: context.native_session_id,
+        let installation = self.installation_id().clone();
+        self.run_blocking(move |mut conn| {
+            // Read one registry snapshot. Recovery's current control handle
+            // can be an unaccepted replacement; retained reads instead follow
+            // the last successful acceptance, independently of launch state.
+            let tx = conn.transaction()?;
+            let native_session_id: Option<String> = tx
+                .query_row(
+                    "SELECT native_session_id FROM souls WHERE soul_id=?1",
+                    [soul_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| RegistryError::UnknownSoul(soul_id.clone()))?;
+            let incarnation_id = load_retained_incarnation(&tx, &soul_id)?;
+            let handle = load_owned_handle(&tx, installation, &incarnation_id)?;
+            let source = RetainedOutputSource {
+                incarnation_id,
+                runtime_dir: handle.runtime_dir().to_path_buf(),
+                terminal: handle.terminal().cloned().ok_or_else(|| {
+                    RegistryError::InvalidState("soul has no retained terminal".into())
+                })?,
+                native_session_id,
+            };
+            tx.commit()?;
+            Ok(source)
         })
+        .await
     }
 
     pub async fn begin_stop(&self, soul_id: SoulId) -> Result<OwnedRuntimeHandle, RegistryError> {
@@ -1743,8 +1759,8 @@ impl Registry {
                 params![next_window, next_successes, now, soul_id.as_str()],
             )?;
             tx.execute(
-                "UPDATE recovery_attempts SET verdict='succeeded',finished_at=?1 WHERE attempt_id=?2",
-                params![now, attempt_id.as_str()],
+                "UPDATE recovery_attempts SET verdict='succeeded',finished_at=?1,evidence_ref=?3 WHERE attempt_id=?2",
+                params![now, attempt_id.as_str(), serde_json::to_string(&vec![format!("{ACCEPTED_INCARNATION_REF}{}", incarnation_id.as_str())])?],
             )?;
             tx.execute(
                 "UPDATE incarnations SET provider_preparation_pending=1 WHERE incarnation_id=?1",
@@ -2560,6 +2576,80 @@ fn load_prepared_row(
         intent_revision: raw.3,
         existing_request: true,
     })
+}
+
+const ACCEPTED_INCARNATION_REF: &str = "accepted-incarnation://";
+
+fn load_retained_incarnation(
+    conn: &Connection,
+    soul_id: &SoulId,
+) -> Result<IncarnationId, RegistryError> {
+    type AcceptedAttempt = (String, String, Option<String>, i64, i64);
+    let accepted: Option<AcceptedAttempt> = conn.query_row(
+        "SELECT attempt_id,prior_incarnation_id,evidence_ref,started_at,finished_at FROM recovery_attempts WHERE soul_id=?1 AND verdict='succeeded' AND finished_at IS NOT NULL ORDER BY rowid DESC LIMIT 1",
+        [soul_id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    ).optional()?;
+    let candidates = if let Some((attempt, prior, evidence, started, finished)) = accepted {
+        let exact = evidence
+            .map(|value| serde_json::from_str::<Vec<String>>(&value))
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .find_map(|value| {
+                value
+                    .strip_prefix(ACCEPTED_INCARNATION_REF)
+                    .map(str::to_owned)
+            });
+        if let Some(exact) = exact {
+            let belongs: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM incarnations WHERE incarnation_id=?1 AND soul_id=?2 AND prior_incarnation_id=?3)",
+                params![exact, soul_id.as_str(), prior], |row| row.get(0),
+            )?;
+            if !belongs {
+                return Err(RegistryError::Integrity(
+                    "accepted retained incarnation relationship is missing".into(),
+                ));
+            }
+            vec![exact]
+        } else {
+            // Older success rows lack the acceptance reference. Their original
+            // attempt link is sufficient when preserved. begin_recovery can
+            // overwrite that link on the accepted prior, so otherwise require
+            // one child created within this successful attempt's interval.
+            // Spool existence and current launch state are never acceptance.
+            let mut stmt = conn.prepare("SELECT incarnation_id FROM incarnations WHERE soul_id=?1 AND prior_incarnation_id=?2 AND recovery_attempt_id=?3")?;
+            let linked = stmt
+                .query_map(params![soul_id.as_str(), prior, attempt], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            if linked.is_empty() {
+                let mut stmt = conn.prepare("SELECT incarnation_id FROM incarnations WHERE soul_id=?1 AND prior_incarnation_id=?2 AND created_at BETWEEN ?3 AND ?4")?;
+                let candidates = stmt
+                    .query_map(params![soul_id.as_str(), prior, started, finished], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                candidates
+            } else {
+                linked
+            }
+        }
+    } else {
+        let mut stmt = conn.prepare("SELECT incarnation_id FROM incarnations WHERE soul_id=?1 AND prior_incarnation_id IS NULL")?;
+        let candidates = stmt
+            .query_map([soul_id.as_str()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        candidates
+    };
+    let [raw] = candidates.as_slice() else {
+        return Err(RegistryError::InvalidState(
+            "retained output acceptance is missing or ambiguous; preserve runtime data and inspect the successful recovery attempt".into(),
+        ));
+    };
+    IncarnationId::parse(raw.clone())
+        .map_err(|_| RegistryError::Integrity("invalid retained incarnation id".into()))
 }
 
 pub(crate) fn load_owned_handle(

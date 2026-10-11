@@ -4765,6 +4765,9 @@ impl TerminalRegistry {
         let terminal = self
             .managed_descriptor(terminal_id)
             .ok_or_else(|| "managed terminal not found".to_string())?;
+        if !self.is_pty_running(terminal_id) {
+            return Err("recovery is blocked: retained managed terminal has ended".to_string());
+        }
         let controller = self
             .managed_controller
             .read()
@@ -5075,7 +5078,7 @@ impl TerminalRegistry {
         // its exit until the replay drain completes, exactly as the local
         // PTY natural-exit path does.
         let mut staged_notify: Vec<PacedExitNotify> = Vec::new();
-        for (conn_id, subscriber) in state.subscribers.iter_mut() {
+        for subscriber in state.subscribers.values_mut() {
             if subscriber.paced_deferred {
                 subscriber.paced_exit_pending = Some(exit_code);
                 if let Some(notify) = subscriber.paced_exit_notify.clone() {

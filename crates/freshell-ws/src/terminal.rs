@@ -3411,9 +3411,12 @@ fn settle_managed_compat_adoption(
             .create_request_id
             .as_deref()
             .is_some_and(|id| id != create.request_id)
-        || !registry.is_pty_running(&descriptor.terminal_id)
+        || registry
+            .managed_descriptor(&descriptor.terminal_id)
+            .as_ref()
+            != Some(descriptor)
     {
-        return Err("managed adoption identity or liveness changed".to_string());
+        return Err("managed adoption identity or membership changed".to_string());
     }
     let locator = descriptor
         .resume_session_id
@@ -3556,6 +3559,7 @@ mod managed_runtime_id_tests {
 
     struct LookupOnlyController {
         descriptor: ManagedTerminalDescriptor,
+        final_tail: bool,
     }
 
     impl ManagedTerminalController for LookupOnlyController {
@@ -3581,7 +3585,13 @@ mod managed_runtime_id_tests {
             _terminal: ManagedTerminalDescriptor,
             _data: String,
         ) -> ManagedTerminalFuture<'a, Result<(), String>> {
-            Box::pin(async { Ok(()) })
+            Box::pin(async move {
+                assert!(
+                    !self.final_tail,
+                    "ended compatibility facade must not dispatch controller input"
+                );
+                Ok(())
+            })
         }
 
         fn resize<'a>(
@@ -3606,7 +3616,29 @@ mod managed_runtime_id_tests {
             _after_seq: i64,
             _max_bytes: u64,
         ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
-            Box::pin(async { Err("not needed".into()) })
+            Box::pin(async move {
+                if !self.final_tail {
+                    return Err("not needed".into());
+                }
+                Ok(ManagedOutputRead {
+                    lifecycle: None,
+                    completion: Some(freshell_terminal::registry::ManagedOutputCompletion {
+                        stream_epoch: self.descriptor.stream_id.clone(),
+                        incarnation_id: self.descriptor.incarnation_id.clone(),
+                        head_seq: 1,
+                        exit_code: Some(17),
+                    }),
+                    stream_epoch: Some(self.descriptor.stream_id.clone()),
+                    incarnation_id: Some(self.descriptor.incarnation_id.clone()),
+                    reset_required: false,
+                    truncated: false,
+                    retained_from_seq: 1,
+                    head_seq: 1,
+                    exit_code: Some(17),
+                    native_session_id: self.descriptor.resume_session_id.clone(),
+                    chunks: vec![],
+                })
+            })
         }
     }
 
@@ -3669,6 +3701,7 @@ mod managed_runtime_id_tests {
         };
         registry.set_managed_controller(Some(Arc::new(LookupOnlyController {
             descriptor: descriptor.clone(),
+            final_tail: false,
         })));
 
         let adopted =
@@ -3717,6 +3750,7 @@ mod managed_runtime_id_tests {
             .registry
             .set_managed_controller(Some(Arc::new(LookupOnlyController {
                 descriptor: descriptor.clone(),
+                final_tail: false,
             })));
         if already_registered {
             state.registry.register_managed(descriptor);
@@ -3832,6 +3866,11 @@ mod managed_runtime_id_tests {
             )
         };
         assert!(check(&descriptor).is_ok());
+        registry.finish_managed_exit(&descriptor.terminal_id, 17);
+        assert!(
+            check(&descriptor).is_ok(),
+            "exact ended managed membership remains adoptable"
+        );
         descriptor.mode = "claude".into();
         assert!(check(&descriptor).is_err());
         descriptor.mode = "opencode".into();
@@ -3840,6 +3879,132 @@ mod managed_runtime_id_tests {
         descriptor.create_request_id = Some("create-match".into());
         descriptor.resume_session_id = Some("ses_other".into());
         assert!(check(&descriptor).is_err());
+        descriptor.resume_session_id = Some("ses_match".into());
+        descriptor.incarnation_id = "another-incarnation".into();
+        assert!(
+            check(&descriptor).is_err(),
+            "stale incarnation cannot adopt retained membership"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_legacy_create_reuses_ended_facade_and_replays_final_tail() {
+        let mut state = super::pane_reconcile_gate_tests::state();
+        state.cli_commands = Arc::new(vec![freshell_platform::CliCommandSpec {
+            name: "opencode".into(),
+            label: "OpenCode".into(),
+            default_cmd: "opencode".into(),
+            ..Default::default()
+        }]);
+        let request = "legacy-ended-managed-create";
+        let terminal = stable_managed_uuid(request, b"terminal")
+            .simple()
+            .to_string();
+        let descriptor = ManagedTerminalDescriptor {
+            soul_id: "retained-ended-soul".into(),
+            incarnation_id: "retained-ended-incarnation".into(),
+            terminal_id: terminal.clone(),
+            stream_id: "retained-ended-stream".into(),
+            mode: "opencode".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: Some("ses_retained_ended".into()),
+            create_request_id: Some(request.into()),
+        };
+        state.registry.register_managed(descriptor.clone());
+        state
+            .registry
+            .ingest_managed_output(&terminal, 1, 1, "final retained tail\n".into());
+        assert!(state.registry.finish_managed_exit(&terminal, 17));
+        assert!(!state.registry.is_pty_running(&terminal));
+        // The lookup controller makes launch fail; a successful create must
+        // have retained this exact already-ended facade without launching.
+        state
+            .registry
+            .set_managed_controller(Some(Arc::new(LookupOnlyController {
+                descriptor: descriptor.clone(),
+                final_tail: true,
+            })));
+        let frames = Arc::new(std::sync::Mutex::new(Vec::<ServerMessage>::new()));
+        let collector = Arc::clone(&frames);
+        let sink: freshell_terminal::FrameSink =
+            Arc::new(move |frame| collector.lock().unwrap().push(frame));
+        let create = serde_json::from_value(serde_json::json!({ "requestId":request, "mode":"opencode", "shell":"system", "restore":true,
+            "sessionRef":{"provider":"opencode","sessionId":"ses_retained_ended"} })).unwrap();
+        assert!(
+            super::handle_create(
+                create,
+                None,
+                &mut crate::create_gate::CreateOutput::Channel(&sink),
+                &state,
+                17,
+                true,
+                &mut crate::create_limit::CreateRateLimiter::new(100, 1000),
+                &super::ConnectionIdentity::default(),
+                super::now_ms()
+            )
+            .await
+        );
+        assert!(frames.lock().unwrap().iter().any(|frame| matches!(frame, ServerMessage::TerminalCreated(created) if created.terminal_id == terminal)),
+            "legacy create must acknowledge the exact retained ended handle");
+        assert_eq!(
+            state.registry.managed_descriptor(&terminal),
+            Some(descriptor)
+        );
+        // Attach rereads the completed source without launching a replacement,
+        // preserving the original managed identity and final replay tail.
+        let attach = super::TerminalAttach {
+            terminal_id: terminal.clone(),
+            intent: freshell_protocol::TerminalAttachIntent::ViewportHydrate,
+            cols: 120,
+            rows: 30,
+            attach_request_id: None,
+            surface_reset: None,
+            expected_session_ref: None,
+            max_replay_bytes: None,
+            replay_page_bytes: None,
+            priority: None,
+            since_seq: Some(0),
+            create_request_id: None,
+            tab_id: None,
+            observed_epoch: None,
+            observed_generation: None,
+        };
+        assert!(matches!(
+            super::handle_attach(attach, &state, 17, &sink, false, false, None).await,
+            super::AttachReply::Legacy
+        ));
+        let frames = frames.lock().unwrap();
+        assert!(frames.iter().any(|frame| matches!(frame, ServerMessage::TerminalOutput(output) if output.terminal_id == terminal && output.data.contains("final retained tail"))));
+        assert!(frames.iter().any(|frame| matches!(frame, ServerMessage::TerminalExit(exit) if exit.terminal_id == terminal && exit.exit_code == 17)));
+        drop(frames);
+    }
+
+    #[tokio::test]
+    async fn managed_ended_compat_facade_refuses_input_without_controller_dispatch() {
+        let registry = freshell_terminal::TerminalRegistry::new();
+        let descriptor = ManagedTerminalDescriptor {
+            soul_id: "ended-input-soul".into(),
+            incarnation_id: "ended-input-incarnation".into(),
+            terminal_id: "ended-input-terminal".into(),
+            stream_id: "ended-input-stream".into(),
+            mode: "opencode".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: Some("ses_ended_input".into()),
+            create_request_id: Some("ended-input-create".into()),
+        };
+        registry.register_managed(descriptor.clone());
+        registry.finish_managed_exit(&descriptor.terminal_id, 17);
+        registry.set_managed_controller(Some(Arc::new(LookupOnlyController {
+            descriptor: descriptor.clone(),
+            final_tail: true,
+        })));
+        assert!(
+            registry
+                .managed_input(&descriptor.terminal_id, "must not dispatch".into())
+                .await
+                .is_err(),
+            "ended facade must refuse input before controller dispatch"
+        );
     }
 }
 

@@ -6058,6 +6058,7 @@ describe('TerminalView lifecycle updates', () => {
       mode?: TerminalPaneContent['mode']
       recoverySummary?: TerminalPaneContent['recoverySummary']
       soulId?: string
+      runtimeStatus?: TerminalPaneContent['runtimeStatus']
       hidden?: boolean
       clearSends?: boolean
       requestId?: string
@@ -6098,6 +6099,7 @@ describe('TerminalView lifecycle updates', () => {
         ...(opts?.streamId ? { streamId: opts.streamId } : {}),
         ...(opts?.recoverySummary ? { recoverySummary: opts.recoverySummary } : {}),
         ...(opts?.soulId ? { soulId: opts.soulId } : {}),
+        ...(opts?.runtimeStatus ? { runtimeStatus: opts.runtimeStatus } : {}),
         ...(opts?.contentServerInstanceId ? { serverInstanceId: opts.contentServerInstanceId } : {}),
       }
 
@@ -6648,6 +6650,45 @@ describe('TerminalView lifecycle updates', () => {
       })
 
       expect(store.getState().panes.refreshRequestsByPane[tabId]).toBeUndefined()
+    })
+
+    it('refreshes the exact retained blocked handle without recreating or sending input', async () => {
+      const { store, tabId, paneId, terminalId } = await renderTerminalHarness({
+        terminalId: 'term-retained-blocked-refresh', soulId: 'retained-soul', runtimeStatus: 'blocked',
+        streamId: 'retained-stream', fromStore: true,
+        recoverySummary: { desiredState: 'running', recoveryState: 'blocked', reason: 'wrong_native_identity',
+          durabilityState: 'resume_captured', allocationState: 'verified_durable' },
+      })
+      const before = (store.getState().panes.layouts[tabId] as Extract<PaneNode, { type: 'leaf' }>).content
+      wsMocks.send.mockClear()
+      act(() => { store.dispatch(requestPaneRefresh({ tabId, paneId })) })
+      await waitFor(() => {
+        const sends = wsMocks.send.mock.calls.map(([msg]) => msg)
+        const detach = sends.findIndex(msg => msg.type === 'terminal.detach' && msg.terminalId === terminalId)
+        const attach = sends.findIndex(msg => msg.type === 'terminal.attach' && msg.terminalId === terminalId)
+        expect(detach).toBeGreaterThanOrEqual(0)
+        expect(attach).toBeGreaterThan(detach)
+        expect(sends[attach]).toMatchObject({ terminalId, sinceSeq: 0, intent: 'viewport_hydrate' })
+        expect(store.getState().panes.refreshRequestsByPane[tabId]).toBeUndefined()
+      })
+      expect((store.getState().panes.layouts[tabId] as Extract<PaneNode, { type: 'leaf' }>).content).toMatchObject(before)
+      expect(wsMocks.send.mock.calls.map(([msg]) => msg).filter(msg =>
+        ['terminal.create', 'terminal.input', 'pane.reconcile.request'].includes(msg.type))).toEqual([])
+    })
+
+    it('refuses blocked refresh when retained runtime membership is unknown', async () => {
+      const { store, tabId, paneId } = await renderTerminalHarness({
+        terminalId: 'term-unknown-blocked-refresh', soulId: 'unconfirmed-soul', fromStore: true,
+        ackInitialAttach: false, waitForMessageHandler: false, waitForTerminalInstance: false,
+        recoverySummary: { desiredState: 'running', recoveryState: 'blocked', reason: 'unknown_handle',
+          durabilityState: 'unknown', allocationState: 'allocated' },
+      })
+      wsMocks.send.mockClear()
+      act(() => { store.dispatch(requestPaneRefresh({ tabId, paneId })) })
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)) })
+      expect(wsMocks.send.mock.calls.map(([msg]) => msg).filter(msg =>
+        ['terminal.detach', 'terminal.attach', 'terminal.create', 'terminal.input'].includes(msg.type))).toEqual([])
+      expect(store.getState().panes.refreshRequestsByPane[tabId]?.[paneId]).toBeDefined()
     })
 
     it('sends sinceSeq=0 when attaching without previously rendered output', async () => {
