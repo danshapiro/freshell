@@ -12,7 +12,7 @@ import { seedManagedOpenCodeSource } from '../../test/e2e-browser/fixtures/manag
 import { ManagedRuntimeSoulSchema } from '../../shared/managed-runtime.js'
 import { readCodexNativeHistory, readCodexNativeObservation } from '../../test/e2e-browser/helpers/provider-native-history/codex.js'
 import { readOpenCodeNativeHistory, readOpenCodeNativeObservation } from '../../test/e2e-browser/helpers/provider-native-history/opencode.js'
-import { deriveNativeRecoveryOriginals, type NativeOriginalReference } from './qualification-observations.js'
+import { deriveNativeRecoveryOriginals, nativeNamespaceAccessMatches, type NativeOriginalReference } from './qualification-observations.js'
 import type { NativeHistory } from '../../test/e2e-browser/helpers/provider-native-history/types.js'
 
 const { DatabaseSync }: typeof import('node:sqlite') = createRequire(import.meta.url)('node:sqlite')
@@ -1638,7 +1638,7 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
   if (requiresController && !serverPath) throw new Error('actual terminal recovery requires the owned real server artifact')
   const provider = mode === 'freshcodex' || terminal ? 'codex' : 'opencode', scenario = `${mode}-${caseId}`
   const observationSource = terminal ? 'codex_app_server' : 'fresh_provider_handshake'
-  const references = ['env_file', 'auth_file', 'ca_file'].map(suffix => {
+  const references = (mode === 'freshopencode' ? [] : ['env_file', 'auth_file', 'ca_file']).map(suffix => {
     const source = sources.find(file => file.name === `${provider}/grants/${suffix}`)
     if (!source) throw new Error(`selected ${provider} ${suffix} reference missing`)
     return { sourcePath: source.path, profile: `${provider}_onecli_${suffix === 'env_file' ? 'environment' : suffix}` }
@@ -1651,7 +1651,7 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
   const storeId = 'store-' + randomUUID(), soulId = 'soul-' + randomUUID()
   const settings = provider === 'codex'
     ? { model: 'gpt-5.6-luna', effort: 'low', permissionMode: 'on-request', sandbox: 'workspace-write' }
-    : { model: 'openai/gpt-5.6-luna' }
+    : { model: 'opencode/big-pickle' }
   const request = { method: 'launch', params: { soulId, provider, providerStoreId: storeId,
     creationSeedRef: 'native-create-' + randomUUID(), profile: 'custom', projectKey: scenario,
     limits: { cpuMilli: 2000, memoryBytes: 2 * 1024 ** 3, swapBytes: 0, pidsMax: 256 },
@@ -1808,7 +1808,7 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
               ['python3', '-c', receiverLoadFaultReceipt, workspace]))
             if (view.incarnationId !== receipt.incarnationId) throw new Error('actual initial fresh wrong-root publication was not contained')
             namespace = JSON.parse(await harness.execOwnedContainerAsExact(owned.containerId, '65534:0',
-              ['python3', '-c', receiverNativeNamespace, provider, receipt.nativeSessionId, workspace]))
+              ['python3', '-c', receiverNativeNamespace, provider, receipt.nativeSessionId, workspace, mode]))
             break
           } catch (error) { diagnostics.push(error instanceof Error ? error.message : 'current native fault capture unavailable') }
         }
@@ -1835,7 +1835,7 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
         || namespace.nativeLaunch.requestedNativeSessionId !== expectedRoot) {
         throw new Error('actual current fresh receiver does not prove a different native root')
       }
-      if (!receiverNativeNamespaceMatches(namespace, provider, workspace, receipt.nativeSessionId)
+      if (!receiverNativeNamespaceMatches(namespace, provider, workspace, receipt.nativeSessionId, mode)
         || namespace.executableSha256 !== receipt.executableSha256
         || (provider === 'opencode' && namespace.nativeMessageCount !== 0)) throw new Error('actual native receiver namespace/profile/pin/TLS differs')
       if (caseId === 'cancellation') {
@@ -1964,10 +1964,10 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
     throw new Error('current managed native receiver observation missing or misbound before input')
   }
   const namespace = JSON.parse(await harness.execOwnedContainerAsExact(view.containerId, '65534:0',
-    ['python3', '-c', receiverNativeNamespace, provider, view.nativeSessionId, workspace]))
+    ['python3', '-c', receiverNativeNamespace, provider, view.nativeSessionId, workspace, mode]))
   if (caseId === 'current-native-turn') retainOwnedNativeProbe(namespace, view.containerId)
   harness.writeArtifact(`${scenario}-namespace-private.json`, namespace)
-  if (!receiverNativeNamespaceMatches(namespace, provider, workspace, view.nativeSessionId)
+  if (!receiverNativeNamespaceMatches(namespace, provider, workspace, view.nativeSessionId, mode)
     || (provider === 'opencode' && namespace.nativeMessageCount !== 0)) {
     throw new Error('actual native receiver namespace/profile/pin/TLS differs')
   }
@@ -2001,8 +2001,8 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
       }
       await new Promise(resolve => setTimeout(resolve, 200))
     }
-    if (!before || before.history.turns.some(turn => turn.toolCalls.length || turn.resolvedModel !== 'gpt-5.6-luna'
-      || turn.resolvedProvider !== 'openai' || (provider === 'codex' && turn.resolvedReasoningEffort !== 'low'))) {
+    if (!before || before.history.turns.some(turn => turn.toolCalls.length || !receiverNativeTurnProfileMatches(turn, mode)
+      || (provider === 'codex' && turn.resolvedReasoningEffort !== 'low'))) {
       throw new Error('bounded native receiver seed did not complete with selected native profile and zero tools')
     }
     const probe = await harness.adminOk(supervisor, harness.probeRecoveryBody(soulId))
@@ -2025,10 +2025,10 @@ async function executeManagedReceiverNative(harness: RuntimeHarness,
       throw new Error('native receiver replacement did not bind current identity to the original owned volume')
     }
     const afterNamespace = JSON.parse(await harness.execOwnedContainerAsExact(current.containerId, '65534:0',
-      ['python3', '-c', receiverNativeNamespace, provider, view.nativeSessionId, workspace]))
+      ['python3', '-c', receiverNativeNamespace, provider, view.nativeSessionId, workspace, mode]))
     harness.writeArtifact(`${scenario}-replacement-namespace-private.json`, afterNamespace)
     if (afterNamespace.uid !== 65534 || afterNamespace.gid !== 0 || afterNamespace.caps !== namespace.caps
-      || !afterNamespace.readOnlyRoot || afterNamespace.httpsStatus !== 200 || afterNamespace.tlsVerifyMode !== 2
+      || !afterNamespace.readOnlyRoot || !nativeNamespaceAccessMatches(afterNamespace, mode) || afterNamespace.tlsVerifyMode !== 2
       || !afterNamespace.tlsCheckHostname || afterNamespace.nativeCwd !== workspace || afterNamespace.nativeVersion !== namespace.nativeVersion
       || afterNamespace.executableSha256 !== namespace.executableSha256 || afterNamespace.profileSha256 !== namespace.profileSha256
       || afterNamespace.activeNativeProcesses !== 1 || (provider === 'opencode' && afterNamespace.nativeRoot !== view.nativeSessionId)) {
@@ -2154,7 +2154,7 @@ async function executeReceiverNativeTurn(harness: RuntimeHarness, supervisor: an
         if (turns.length > 1) throw new Error('native serialized prompt produced duplicate completions')
         if (turns.length === 1) {
           const turn = turns[0]!
-          if (turn.toolCalls.length || turn.resolvedProvider !== 'openai' || turn.resolvedModel !== 'gpt-5.6-luna' || (expectedText && !turn.text.includes(expectedText))) throw new Error('native no-tool completion/profile/recall differs')
+          if (turn.toolCalls.length || !receiverNativeTurnProfileMatches(turn, mode) || (expectedText && !turn.text.includes(expectedText))) throw new Error('native no-tool completion/profile/recall differs')
           return captured
         }
       }
@@ -2177,10 +2177,10 @@ async function executeReceiverNativeTurn(harness: RuntimeHarness, supervisor: an
   harness.writeArtifact(`${scenario}-recovery.json`, recovery)
   const current = recovery.data.view, observed = current?.nativeIdentityObservation
   if (recovery.data.outcome !== 'replaced' || current.launchState !== 'running' || current.recoveryState !== 'live' || current.containerId === view.containerId || current.incarnationId === view.incarnationId || current.nativeSessionId !== root || observed?.nativeSessionId !== root || observed.incarnationId !== current.incarnationId || observed.source !== view.nativeIdentityObservation.source || !observed.launchNonce || observed.launchNonce === view.nativeIdentityObservation.launchNonce || observed.evidenceRevision <= view.nativeIdentityObservation.evidenceRevision || harness.broker.receipts().find(receipt => receipt.containerId === current.containerId)?.providerVolumeName !== originalVolume) throw new Error('native replacement differs from current root/incarnation/original volume')
-  const currentNamespace = JSON.parse(await harness.execOwnedContainerAsExact(current.containerId, '65534:0', ['python3', '-c', namespaceScript, provider, root, workspace]))
+  const currentNamespace = JSON.parse(await harness.execOwnedContainerAsExact(current.containerId, '65534:0', ['python3', '-c', namespaceScript, provider, root, workspace, mode]))
   retainOwnedNativeProbe(currentNamespace, current.containerId)
   harness.writeArtifact(`${scenario}-replacement-namespace-private.json`, currentNamespace)
-  if (!receiverNativeNamespaceMatches(currentNamespace, provider, workspace, root) || currentNamespace.executableSha256 !== namespace.executableSha256 || currentNamespace.profileSha256 !== namespace.profileSha256) throw new Error('native replacement namespace/profile differs')
+  if (!receiverNativeNamespaceMatches(currentNamespace, provider, workspace, root, mode) || currentNamespace.executableSha256 !== namespace.executableSha256 || currentNamespace.profileSha256 !== namespace.profileSha256) throw new Error('native replacement namespace/profile differs')
   const restored = await captureReceiverStore(harness, current.containerId, provider, root, scenario, 'restored-before-input')
   if (seed.snapshot.path !== restored.snapshot.path || JSON.stringify(seed.snapshot.identity.slice(0, 2)) !== JSON.stringify(restored.snapshot.identity.slice(0, 2)) || JSON.stringify(seed.history) !== JSON.stringify(restored.history) || (provider === 'codex' && !Buffer.from(restored.snapshot.bytesBase64, 'base64').subarray(0, Buffer.from(seed.snapshot.bytesBase64, 'base64').length).equals(Buffer.from(seed.snapshot.bytesBase64, 'base64')))) throw new Error('native original completed store changed before replacement input')
   const recallRequest = await send('Reply with only the private marker from before. Do not use tools.', 'recall')
@@ -2204,9 +2204,14 @@ function readCurrentCodexReceipt(file: string): Buffer {
   return fs.readFileSync(file)
 }
 
-function receiverNativeNamespaceMatches(namespace: any, provider: 'codex' | 'opencode', workspace: string, root: string): boolean {
+function receiverNativeTurnProfileMatches(turn: NativeHistory['turns'][number], mode: string): boolean {
+  return turn.resolvedProvider === (mode === 'freshopencode' ? 'opencode' : 'openai')
+    && turn.resolvedModel === (mode === 'freshopencode' ? 'big-pickle' : 'gpt-5.6-luna')
+}
+
+function receiverNativeNamespaceMatches(namespace: any, provider: 'codex' | 'opencode', workspace: string, root: string, mode: string = provider): boolean {
   return namespace.uid === 65534 && namespace.gid === 0 && namespace.caps === '0000000000000000'
-    && namespace.readOnlyRoot === true && namespace.httpsStatus === 200 && namespace.tlsVerifyMode === 2
+    && namespace.readOnlyRoot === true && nativeNamespaceAccessMatches(namespace, mode) && namespace.tlsVerifyMode === 2
     && namespace.tlsCheckHostname === true && namespace.nativeCwd === workspace
     && namespace.nativeVersion === (provider === 'codex' ? 'codex-cli 0.147.0' : '1.18.21')
     && namespace.activeNativeProcesses === 1 && (provider !== 'opencode' || namespace.nativeRoot === root)
@@ -2303,9 +2308,36 @@ roots=[item['event']['data']['native_session_id'] for item in events if item['ev
 print(json.dumps({'schemaVersion':state['schemaVersion'],'provider':profile['provider'],'cwd':profile['cwd'],'nativeSessionId':profile.get('nativeSessionId'),'startedRoots':roots,'commandCount':len(state['commands']),'decisionCount':len(state['decisions']),'sha256':hashlib.sha256(raw).hexdigest()}))
 `
 
+/** Free access names come from this exact native process, never a fixed upstream alias.
+ * A verified TLS peer is access evidence only; the native store must still prove completion. */
+export function openCodeFreeAccessScript(): string {
+  return String.raw`
+def probe_free_opencode_access(local,port,workspace,environment):
+ import socket,hashlib
+ forbidden=('OPENAI_','ANTHROPIC_','ONECLI_','LUNAROUTE_','OPENCODE_API_KEY','FRESHELL_MANAGED_CLAUDE_ONECLI_','FRESHELL_MANAGED_CODEX_ONECLI_','FRESHELL_MANAGED_OPENCODE_ONECLI_','FRESHELL_MANAGED_AMPLIFIER_ONECLI_')
+ assert not any(key.startswith(forbidden) for key in environment),'free native credential reference leaked'
+ assert not any(environment.get(key) for key in ['SSL_CERT_FILE','SSL_CERT_DIR','NODE_EXTRA_CA_CERTS','HTTPS_PROXY','HTTP_PROXY','ALL_PROXY','https_proxy','http_proxy','all_proxy']),'free native paid CA/proxy leaked'
+ with local.open('http://127.0.0.1:'+str(port)+'/config/providers?directory='+urllib.parse.quote(workspace,safe=''),timeout=10) as response:
+  assert response.status==200;raw=response.read(1024*1024+1);assert len(raw)<=1024*1024
+  catalog=json.loads(raw)
+ providers=catalog['providers'];providers=list(providers.values()) if isinstance(providers,dict) else providers
+ selected=[provider for provider in providers if provider.get('id')=='opencode'];assert len(selected)==1
+ model=selected[0]['models']['big-pickle'];assert model['id']=='big-pickle' and model['providerID']=='opencode'
+ endpoint=model['api']['url'];url=urllib.parse.urlsplit(endpoint)
+ assert url.scheme=='https' and url.hostname and not url.username and not url.password and not url.query and not url.fragment,'unsupported native free endpoint'
+ context=ssl.create_default_context(cafile='/etc/ssl/certs/ca-certificates.crt')
+ with socket.create_connection((url.hostname,url.port or 443),timeout=20) as connection:
+  with context.wrap_socket(connection,server_hostname=url.hostname) as peer:
+   certificate=peer.getpeercert(binary_form=True);assert certificate
+ access=dict(source='native-config-providers',providerId=model['providerID'],modelId=model['id'],endpoint=endpoint,ca='system-default',peerCertificateSha256=hashlib.sha256(certificate).hexdigest())
+ return context,access
+`
+}
+
 export const receiverNativeNamespace = String.raw`
 import os,sys,json,pathlib,hashlib,subprocess,ssl,urllib.request,urllib.parse
-provider,root,workspace=sys.argv[1:];assert provider in ['codex','opencode'] and root and pathlib.Path(workspace).is_absolute()
+${openCodeFreeAccessScript()}
+provider,root,workspace=sys.argv[1:4];mode=sys.argv[4] if len(sys.argv)>4 else provider;assert provider in ['codex','opencode'] and root and pathlib.Path(workspace).is_absolute()
 matches=[]
 for process in pathlib.Path('/proc').iterdir():
  if not process.name.isdigit():continue
@@ -2335,15 +2367,21 @@ if provider=='opencode':
  assert native_info['id']==root and native_info.get('parentID') is None and native_info['directory']==workspace and isinstance(messages,list)
  assert all(isinstance(row,dict) and isinstance(row.get('info'),dict) and row['info']['sessionID']==root for row in messages)
  native_cwd=native_info['directory'];message_count=len(messages)
-ca=pathlib.Path(environment.get('SSL_CERT_FILE') or environment['NODE_EXTRA_CA_CERTS']);context=ssl.create_default_context(cafile=str(ca))
-proxy=environment.get('HTTPS_PROXY') or environment.get('https_proxy')
-opener=urllib.request.build_opener(urllib.request.ProxyHandler({'https':proxy}),urllib.request.HTTPSHandler(context=context))
-with opener.open(urllib.request.Request('https://chatgpt.com/backend-api/codex/models?client_version=0.147.0',headers={'Authorization':'Bearer onecli-managed'}),timeout=20) as response:status=response.status;response.read()
+ca=pathlib.Path(environment.get('SSL_CERT_FILE') or environment['NODE_EXTRA_CA_CERTS']) if mode!='freshopencode' else None
+free_access=None
+if mode=='freshopencode':
+ assert provider=='opencode'
+ context,free_access=probe_free_opencode_access(local,port,workspace,environment);status=None
+else:
+ context=ssl.create_default_context(cafile=str(ca))
+ proxy=environment.get('HTTPS_PROXY') or environment.get('https_proxy')
+ opener=urllib.request.build_opener(urllib.request.ProxyHandler({'https':proxy}),urllib.request.HTTPSHandler(context=context))
+ with opener.open(urllib.request.Request('https://chatgpt.com/backend-api/codex/models?client_version=0.147.0',headers={'Authorization':'Bearer onecli-managed'}),timeout=20) as response:status=response.status;response.read()
 home=pathlib.Path(environment['HOME']);profiles=[]
 for name in (['.codex/config.toml'] if provider=='codex' else ['.config/opencode/opencode.json','.config/opencode/opencode.jsonc']):
  file=home/name;profiles.append({'path':name,'sha256':hashlib.sha256(file.read_bytes()).hexdigest() if file.exists() else None})
 profile_hash=hashlib.sha256(json.dumps(profiles,sort_keys=True).encode()).hexdigest()
-print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(row.split()[1] for row in pathlib.Path('/proc/self/status').read_text().splitlines() if row.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'nativeCwd':native_cwd,'nativeProcessCwd':str((process/'cwd').resolve()),'nativeLaunch':json.loads(environment['FRESHELL_NATIVE_IDENTITY_LAUNCH']) if environment.get('FRESHELL_NATIVE_IDENTITY_LAUNCH') else None,'nativeRoot':native_info['id'] if native_info else None,'nativeMessageCount':message_count,'nativeVersion':subprocess.check_output([str(executable),'--version'],env=environment,text=True,timeout=15).strip(),'executableSha256':hashlib.sha256(executable.read_bytes()).hexdigest(),'profileSha256':profile_hash,'profileFiles':profiles,'activeNativeProcesses':len(matches),'nativePid':int(process.name),'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname,'httpsStatus':status,'caSha256':hashlib.sha256(ca.read_bytes()).hexdigest()}))
+print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'caps':next(row.split()[1] for row in pathlib.Path('/proc/self/status').read_text().splitlines() if row.startswith('CapEff:')),'readOnlyRoot':bool(os.statvfs('/').f_flag&os.ST_RDONLY),'nativeCwd':native_cwd,'nativeProcessCwd':str((process/'cwd').resolve()),'nativeLaunch':json.loads(environment['FRESHELL_NATIVE_IDENTITY_LAUNCH']) if environment.get('FRESHELL_NATIVE_IDENTITY_LAUNCH') else None,'nativeRoot':native_info['id'] if native_info else None,'nativeMessageCount':message_count,'nativeVersion':subprocess.check_output([str(executable),'--version'],env=environment,text=True,timeout=15).strip(),'executableSha256':hashlib.sha256(executable.read_bytes()).hexdigest(),'profileSha256':profile_hash,'profileFiles':profiles,'activeNativeProcesses':len(matches),'nativePid':int(process.name),'tlsVerifyMode':context.verify_mode.value,'tlsCheckHostname':context.check_hostname,'httpsStatus':status,'caSha256':hashlib.sha256(ca.read_bytes()).hexdigest() if ca else None,'freeModelAccess':free_access}))
 `
 
 // The terminal TUI uses an embedded native server rather than the fresh

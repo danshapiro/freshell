@@ -49,7 +49,7 @@ const MODE_CONTRACT = {
   freshopencode: {
     provider: 'opencode',
     runtimeVariant: 'opencode-per-soul-http',
-    model: 'openai/gpt-5.6-luna',
+    model: 'opencode/big-pickle',
     effort: 'provider-default',
     pendingApproval: false,
   },
@@ -578,6 +578,7 @@ function validateNativeProfiles(repoRoot: string, evidenceDir: string, rows: Fre
         if (accepted[field] !== expected) throw new Error(`accepted current profile ${field} differs`)
       }
       const native = object(process.native, 'native profile process'), spec = object(accepted.spec, 'accepted fresh profile')
+      if (row.mode === 'freshopencode' && (!Array.isArray(spec.providerSecretReferences) || spec.providerSecretReferences.length !== 0)) throw new Error('free accepted profile has missing or nonempty provider grant references')
       if (native.pid !== namespace.nativePid || native.uid !== 65534 || !/^\d+$/.test(native.startTicks ?? '') || !Number.isSafeInteger(native.parentPid)
         || native.parentPid < 1 || !path.isAbsolute(native.executable ?? '')) throw new Error('profile actual native process identity differs')
       for (const field of ['executableSha256', 'profileSha256'] as const) stringEqual(native[field], namespace[field], `profile ${field}`)
@@ -627,8 +628,8 @@ function validateNativeProfiles(repoRoot: string, evidenceDir: string, rows: Fre
   }
   for (const [index, row] of rows.entries()) {
     for (const stage of observed[index]!.stages) {
-      const expectedProvider = row.provider === 'claude' ? 'anthropic' : 'openai'
-      const expectedModel = row.provider === 'claude' ? 'claude-haiku-4-5-20251001' : 'gpt-5.6-luna'
+      const expectedProvider = row.provider === 'claude' ? 'anthropic' : row.mode === 'freshopencode' ? 'opencode' : 'openai'
+      const expectedModel = row.provider === 'claude' ? 'claude-haiku-4-5-20251001' : row.mode === 'freshopencode' ? 'big-pickle' : 'gpt-5.6-luna'
       stringEqual(stage.profile.provider, expectedProvider, 'native completed profile provider')
       stringEqual(stage.profile.observedModel, expectedModel, 'native completed profile model')
       if (stage.profile.effort !== null && stage.profile.effort !== row.effort) throw new Error('native observed effort differs from intended profile')

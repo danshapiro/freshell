@@ -17,7 +17,7 @@ import fsp from 'node:fs/promises'
 import { defaultReceiptFileName } from './runtime-receipts.js'
 import { buildProviderQualificationReceipt, type ProviderQualificationReceiptV2, type ProviderQualificationRow } from './provider-qualification-receipt.js'
 import { buildFreshAgentQualificationReceipt, deriveFreshBrowserExecution, validateFreshBrowserAlias, validateFreshApprovalCheckpoint, validateFreshApprovalDispatch, validateFreshApprovalRecovery, nativeCompletedTurnProofs, type FreshBrowserIngressObservation, type FreshAgentQualificationReceiptV1, type FreshAgentQualificationRow } from './fresh-agent-qualification-receipt.js'
-import { claudeNativeInspection, nativeCheckpointTranscriptRetained, observeNativeSoloBashOutcome } from './runtime-native-feasibility.js'
+import { claudeNativeInspection, nativeCheckpointTranscriptRetained, observeNativeSoloBashOutcome, openCodeFreeAccessScript } from './runtime-native-feasibility.js'
 import type { QualifiableTerminalProvider } from './provider-qualification-selection.js'
 import { deriveNativeRecoveryOriginals, NATIVE_RECOVERY_ORIGINALS_FILE, type NativeOriginalReference, type NativeRecoveryStage } from './qualification-observations.js'
 import type { NativeHistory } from './provider-native-history.js'
@@ -791,13 +791,15 @@ db=sqlite3.connect('file:/var/lib/freshell-supervisor/runtime.sqlite3?mode=ro',u
 db.row_factory=sqlite3.Row;db.execute('PRAGMA query_only=ON');db.execute('PRAGMA trusted_schema=OFF');db.execute('BEGIN')
 rows=db.execute('SELECT i.soul_id AS soulId,i.incarnation_id AS incarnationId,i.container_id AS containerId,i.host_boot_id AS hostBootId,i.launch_nonce AS launchNonce,i.execution_generation AS executionGeneration,s.provider_store_id AS providerStoreId,s.native_session_id AS nativeSessionId,i.fresh_agent_spec AS spec FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id WHERE i.soul_id=? AND i.incarnation_id=? AND i.launch_state=\'running\'',sys.argv[1:]).fetchall()
 assert len(rows)==1;value=dict(rows[0]);spec=json.loads(value['spec'])
-value['spec']={key:spec.get(key) for key in ['sessionType','provider','runtimeVariant','providerStoreId','nativeSessionId','cwd','model','effort','runAsUid','runAsGid']}
+value['spec']={key:spec.get(key,[] if key=='providerSecretReferences' else None) for key in ['sessionType','provider','runtimeVariant','providerStoreId','nativeSessionId','cwd','model','effort','runAsUid','runAsGid','providerSecretReferences']}
 value['source']='registry-current-incarnation';print(json.dumps(value));db.close()
 `
 
-const FRESH_NATIVE_NAMESPACE_SCRIPT = String.raw`
+
+export const FRESH_NATIVE_NAMESPACE_SCRIPT = String.raw`
 import pathlib,os,sys,json,ssl,urllib.request,urllib.parse
-provider,pid,root=sys.argv[1:];p=pathlib.Path('/proc')/pid
+${openCodeFreeAccessScript()}
+provider,pid,root=sys.argv[1:4];mode=sys.argv[4] if len(sys.argv)>4 else None;p=pathlib.Path('/proc')/pid
 env=dict(v.decode().split('=',1) for v in (p/'environ').read_bytes().split(b'\0') if b'=' in v)
 argv=[v.decode() for v in (p/'cmdline').read_bytes().split(b'\0') if v]
 native_root=None
@@ -811,13 +813,18 @@ elif provider=='opencode':
  with local.open('http://127.0.0.1:'+str(port)+'/session/'+urllib.parse.quote(root,safe='')+'?directory='+urllib.parse.quote(str((p/'cwd').resolve()),safe=''),timeout=10) as response:
   assert response.status==200;raw=response.read(1024*1024+1);assert len(raw)<=1024*1024
   info=json.loads(raw);native_root=info['id'];assert native_root==root and info.get('parentID') is None
-ca=env.get('SSL_CERT_FILE') or env['NODE_EXTRA_CA_CERTS'];context=ssl.create_default_context(cafile=ca)
-proxy=env.get('HTTPS_PROXY') or env.get('https_proxy');opener=urllib.request.build_opener(urllib.request.ProxyHandler({'https':proxy}),urllib.request.HTTPSHandler(context=context))
-url='https://api.anthropic.com/v1/models' if provider=='claude' else 'https://api.openai.com/v1/models' if provider=='opencode' else 'https://chatgpt.com/backend-api/codex/models?client_version=0.147.0'
-headers={'anthropic-version':'2023-06-01','authorization':'Bearer '+env['CLAUDE_CODE_OAUTH_TOKEN']} if provider=='claude' and env.get('CLAUDE_CODE_OAUTH_TOKEN') else {'anthropic-version':'2023-06-01','x-api-key':env['ANTHROPIC_API_KEY']} if provider=='claude' else {'Authorization':'Bearer onecli-managed'}
-with opener.open(urllib.request.Request(url,headers=headers),timeout=20) as response:
- status=response.status;assert status==200;response.read(1024*1024)
-print(json.dumps(dict(uid=os.getuid(),gid=os.getgid(),caps=next(row.split()[1] for row in pathlib.Path('/proc/self/status').read_text().splitlines() if row.startswith('CapEff:')),readOnlyRoot=bool(os.statvfs('/').f_flag&os.ST_RDONLY),nativePid=int(pid),nativeRoot=native_root,nativeCwd=str((p/'cwd').resolve()),nativeLaunch=json.loads(env['FRESHELL_NATIVE_IDENTITY_LAUNCH']),tlsVerifyMode=context.verify_mode.value,tlsCheckHostname=context.check_hostname,httpsStatus=status)))
+free_access=None
+if mode=='freshopencode':
+ assert provider=='opencode'
+ context,free_access=probe_free_opencode_access(local,port,str((p/'cwd').resolve()),env);status=None
+else:
+ ca=env.get('SSL_CERT_FILE') or env['NODE_EXTRA_CA_CERTS'];context=ssl.create_default_context(cafile=ca)
+ proxy=env.get('HTTPS_PROXY') or env.get('https_proxy');opener=urllib.request.build_opener(urllib.request.ProxyHandler({'https':proxy}),urllib.request.HTTPSHandler(context=context))
+ url='https://api.anthropic.com/v1/models' if provider=='claude' else 'https://api.openai.com/v1/models' if provider=='opencode' else 'https://chatgpt.com/backend-api/codex/models?client_version=0.147.0'
+ headers={'anthropic-version':'2023-06-01','authorization':'Bearer '+env['CLAUDE_CODE_OAUTH_TOKEN']} if provider=='claude' and env.get('CLAUDE_CODE_OAUTH_TOKEN') else {'anthropic-version':'2023-06-01','x-api-key':env['ANTHROPIC_API_KEY']} if provider=='claude' else {'Authorization':'Bearer onecli-managed'}
+ with opener.open(urllib.request.Request(url,headers=headers),timeout=20) as response:
+  status=response.status;assert status==200;response.read(1024*1024)
+print(json.dumps(dict(uid=os.getuid(),gid=os.getgid(),caps=next(row.split()[1] for row in pathlib.Path('/proc/self/status').read_text().splitlines() if row.startswith('CapEff:')),readOnlyRoot=bool(os.statvfs('/').f_flag&os.ST_RDONLY),nativePid=int(pid),nativeRoot=native_root,nativeCwd=str((p/'cwd').resolve()),nativeLaunch=json.loads(env['FRESHELL_NATIVE_IDENTITY_LAUNCH']),tlsVerifyMode=context.verify_mode.value,tlsCheckHostname=context.check_hostname,httpsStatus=status,freeModelAccess=free_access)))
 `
 
 const FRESH_NATIVE_EXIT_SCRIPT = String.raw`
@@ -6245,7 +6252,7 @@ export class ManagedRuntimeOwner {
           authorityProjection: { source: 'inventory+accepted-spec+writer-claim', accepted: acceptedReference, writer: writerReference },
           response: { data: { view: { ...row, providerStoreId: accepted.providerStoreId } } } })
         const namespace = objectFields(JSON.parse(await this.ownedProviderExec(handle.containerId,
-          ['python3', '-c', FRESH_NATIVE_NAMESPACE_SCRIPT, collection.provider, String(process.native.pid), handle.nativeSessionId])), 'native namespace is absent')
+          ['python3', '-c', FRESH_NATIVE_NAMESPACE_SCRIPT, collection.provider, String(process.native.pid), handle.nativeSessionId, collection.mode])), 'native namespace is absent')
         if (namespace.nativePid !== process.native.pid || namespace.nativeCwd !== process.native.cwd) throw new Error('current native namespace/process differs')
         const namespaceReference = await this.retainNativeOriginal(`${prefix}/namespace.json`, { ...namespace,
           executableSha256: process.native.executableSha256, profileSha256: process.native.profileSha256,

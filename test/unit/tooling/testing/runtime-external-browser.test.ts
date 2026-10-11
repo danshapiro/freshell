@@ -29,7 +29,7 @@ import { runSelectedFreshAgentQualification } from '../../../../scripts/testing/
 
 import { playwright, campaignGate } from '../../../../scripts/testing/runtime-landing-campaign.js'
 import * as runner from '../../../../scripts/testing/runtime-external-browser.js'
-import { ManagedRuntimeOwner, RuntimeHarness, assertExactRuntimeHandle, type SupervisorInstance, type Phase3BrowserObservation, type RuntimeLossAssertions, type RuntimeWebConstructOptions } from '../../../../scripts/testing/runtime-sandbox.js'
+import { ManagedRuntimeOwner, RuntimeHarness, assertExactRuntimeHandle, stripRuntimeWebEnvironment, type SupervisorInstance, type Phase3BrowserObservation, type RuntimeLossAssertions, type RuntimeWebConstructOptions } from '../../../../scripts/testing/runtime-sandbox.js'
 import { runTask2RetainedFixture, RetainedFixtureBrowserSession } from '../../../../scripts/testing/task002-retained-fixture.js'
 import * as retainedDriver from '../../../../scripts/testing/task002-retained-fixture.js'
 import { stopManagedRuntimeSoul, createManagedOpenCodeRuntimeBrowserRig } from '../../../e2e-browser/helpers/managed-runtime.js'
@@ -245,6 +245,31 @@ const descriptor = {
 const smokeSpec = 'test/e2e-browser/specs/runtime-external-target-smoke-rust.spec.ts'
 
 describe('selected production owner registration', () => {
+  it.each(['freshopencode', 'freshcodex', 'freshclaude', 'kilroy'] as const)('selects only the required production bootstrap for %s', mode => {
+    const owner = runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, {
+      spec: 'test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts', mode,
+    }, {}, () => { throw new Error('web unused') })
+    expect((owner.runtime as any).ownerIsolation.bootstrapProviders).toEqual(mode === 'freshopencode' ? [] : [mode === 'freshcodex' ? 'codex' : 'claude'])
+    expect(owner.fixtureRegistrationFacts().fixtureFreshAgentModes).toEqual([])
+    if (mode === 'freshopencode') {
+      vi.stubEnv('FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE', '/unit/unreadable')
+      try { expect((owner.runtime as any).phase2BootstrapFiles()).toEqual([]) } finally { vi.unstubAllEnvs() }
+    }
+  })
+  it('scrubs free FreshOpenCode credentials after explicit web overrides without enabling fixtures', () => {
+    let actual!: RuntimeWebConstructOptions
+    const factory = runner.createExternalManagedWebFactory({
+      spec: 'test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts', mode: 'freshopencode',
+    }, {}, options => { actual = options; return {} as any })
+    const env = { OPENAI_API_KEY: 'unit-sentinel', ANTHROPIC_API_KEY: 'unit-sentinel',
+      FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: '/unit/unreadable', FRESHELL_MANAGED_CODEX_ONECLI_AUTH_FILE: '/unit/unreadable',
+      HTTPS_PROXY: 'http://unit.invalid', NODE_EXTRA_CA_CERTS: '/unit/unreadable', FRESHELL_RUNTIME_CONTROL_SOCKET: '/owned/control' }
+    factory({ repoRoot: fixtureRepoRoot, env, setupHome: async () => {} } as RuntimeWebConstructOptions)
+    const observed = { ...env, ...actual.env }
+    stripRuntimeWebEnvironment(observed, actual)
+    expect(observed).toEqual({ FRESHELL_RUNTIME_CONTROL_SOCKET: '/owned/control' })
+    expect(actual.providerFreeFixture).not.toBe(true)
+  })
   describe('actual provider consumers', () => {
     beforeAll(() => {
       ensureRustServerBuilt(sourceRoot)
@@ -1464,6 +1489,31 @@ describe('owned web process lifetime (Node process fixture only)', () => {
     await fsp.writeFile(owned.entry, `require('node:http').createServer((req,res)=>{res.setHeader('content-type','application/json');if(req.headers['x-auth-token']!==process.env.AUTH_TOKEN){res.writeHead(401);res.end('{}');return}res.end(JSON.stringify({runtime:'rust',commit:'${'a'.repeat(40)}',buildDirty:false}))}).listen(Number(process.env.PORT),'127.0.0.1')`)
     return owned
   }
+  it('launches selected free FreshOpenCode with paid overrides removed from the actual owned web process', async () => {
+    const { fixture: directory, entry, setup } = await fixture()
+    let constructed!: RuntimeWebConstructOptions
+    const factory = runner.createExternalManagedWebFactory({
+      spec: 'test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts', mode: 'freshopencode',
+    }, {}, options => { constructed = options; return new runner.ManagedRuntimeWebServer(options) })
+    const server = factory({ binary: process.execPath, repoRoot: process.cwd(), candidateSha: 'a'.repeat(40), buildDirty: false,
+      setupHome: setup, preserveHomeOnStop: false, env: { NODE_OPTIONS: `--require=${entry}`,
+        OPENAI_API_KEY: 'unit-sentinel', OPENCODE_API_KEY: 'unit-sentinel', ANTHROPIC_API_KEY: 'unit-sentinel',
+        FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: '/unit/unreadable', FRESHELL_MANAGED_CODEX_ONECLI_AUTH_FILE: '/unit/unreadable',
+        HTTPS_PROXY: 'http://unit.invalid', NODE_EXTRA_CA_CERTS: '/unit/unreadable', FRESHELL_RUNTIME_CONTROL_SOCKET: '/owned/control' } })
+    let pid: number | undefined
+    try {
+      const info = await server.start(); pid = info.pid
+      const observed = await (await fetch(`${info.baseUrl}/api/server-info`)).json()
+      expect(observed.environmentKeys).toContain('FRESHELL_RUNTIME_CONTROL_SOCKET')
+      for (const key of ['OPENAI_API_KEY', 'OPENCODE_API_KEY', 'ANTHROPIC_API_KEY', 'FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE',
+        'FRESHELL_MANAGED_CODEX_ONECLI_AUTH_FILE', 'HTTPS_PROXY', 'NODE_EXTRA_CA_CERTS']) expect(observed.environmentKeys).not.toContain(key)
+      expect(constructed.providerFreeFixture).not.toBe(true)
+    } finally {
+      await server.stop()
+      if (pid) await expect(fsp.stat(`/proc/${pid}`)).rejects.toThrow()
+      await fsp.rm(directory, { recursive: true })
+    }
+  })
   it.each([
     { identity: 'generated', token: undefined }, { identity: 'configured', token: 'owned-configured-test-token' },
   ])('retains its $identity authentication identity after owned stop/start', async ({ token }) => {
