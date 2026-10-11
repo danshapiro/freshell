@@ -376,6 +376,7 @@ test.describe('Fresh Agent', () => {
       await terminal.waitForTerminal()
       const sessionId = '63333000-0000-4333-8333-000000000178'
       const repoRoot = '/home/user/code/freshell'
+      const checkoutPath = repoRoot + '/.worktrees/managed-history'
       await stubFreshclaudeThread(page, sessionId)
       await installFreshclaudeStripPane(page, sessionId)
       const { tabId, paneId } = await getActiveLeaf(harness)
@@ -384,7 +385,7 @@ test.describe('Fresh Agent', () => {
       await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.setSuppressAllFreshAgentNetworkEffects(true))
       let directoryResponses = 0
       const target = { sessionId, provider: 'claude', sessionType: 'freshclaude', projectPath: repoRoot,
-        cwd: repoRoot, title: 'Exact fresh history target', lastActivityAt: Date.now(), isRunning: false }
+        cwd: checkoutPath, checkoutPath, title: 'Exact fresh history target', lastActivityAt: Date.now(), isRunning: false }
       await page.route('**/api/session-directory?*', async route => {
         directoryResponses += 1
         await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
@@ -408,7 +409,7 @@ test.describe('Fresh Agent', () => {
       const responsesBeforeOpen = directoryResponses
       const framesBeforeOpen = await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.().length ?? 0)
 
-      await openFreshHistorySession(page, { repoRoot, provider: 'claude', nativeSessionId: sessionId })
+      await openFreshHistorySession(page, { repoRoot: checkoutPath, provider: 'claude', nativeSessionId: sessionId })
 
       expect(directoryResponses).toBeGreaterThan(responsesBeforeOpen)
       await expect(page.getByRole('heading', { name: 'Projects', exact: true })).toHaveCount(0)

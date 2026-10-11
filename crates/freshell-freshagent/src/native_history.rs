@@ -350,6 +350,9 @@ pub(crate) fn read_opencode_path(path: &Path, id: &str) -> Result<Value, String>
     let active = active.values();
     let rolled_back = rolled_back.values();
     let mut snapshot = crate::build_opencode_snapshot_json(id, &info, &json!([]), None);
+    snapshot["extensions"]["opencode"]["nativeHistoryActivity"] = json!({
+        "at":info["time"]["updated"],"source":"native_timestamp",
+    });
     snapshot["latestTurnId"] = active
         .last()
         .map(|turn| turn["turnId"].clone())
@@ -405,10 +408,14 @@ fn read_claude(home: &Path, id: &str, provider: &str) -> Result<Value, String> {
     let mut turns = RetainedTurns::new(&retention);
     let mut ordinal = 0;
     let mut omitted_items = 0;
+    let mut native_activity = None;
     for record in source {
         let Some((record, omitted)) = record.map_err(|e| e.to_string())? else {
             continue;
         };
+        if let Some(at) = freshell_sessions::time::parse_timestamp_ms(&record["timestamp"]) {
+            native_activity = Some(native_activity.map_or(at, |prior: i64| prior.max(at)));
+        }
         if let Some(turn) = crate::claude_snapshot::parse_transcript_turn_indexed(
             &record,
             id,
@@ -444,6 +451,10 @@ fn read_claude(home: &Path, id: &str, provider: &str) -> Result<Value, String> {
         .map(|turn| turn["turnId"].clone())
         .unwrap_or(Value::Null);
     snapshot["turns"] = json!(turns);
+    snapshot["extensions"]["claude"]["nativeHistoryActivity"] = json!({
+        "at":native_activity.unwrap_or(revision),
+        "source":if native_activity.is_some(){"native_timestamp"}else{"source_modification"},
+    });
     finish_retention(
         provider,
         &mut snapshot,

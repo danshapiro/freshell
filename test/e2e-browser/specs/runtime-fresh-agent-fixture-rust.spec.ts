@@ -7,8 +7,10 @@
 import { expect } from '@playwright/test'
 
 import { validateFreshAgentIngressInventory } from '../../../scripts/testing/fresh-agent-ingress-inventory.js'
+import { observeOwnedFreshBrowserPane } from '../../../scripts/testing/runtime-external-browser.js'
 import { test } from '../helpers/fixtures.js'
-import { createManagedRuntimeBrowserRig, type ManagedFixtureRig, type ManagedRuntimeView, type FixtureNativeState } from '../helpers/managed-runtime.js'
+import { createManagedRuntimeBrowserRig, openFreshHistorySession, type ManagedFixtureRig, type ManagedRuntimeView, type FixtureNativeState } from '../helpers/managed-runtime.js'
+import { TestHarness } from '../helpers/test-harness.js'
 
 const FIXTURE_ENV = 'FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST'
 const PENDING_CONTROL = '[freshell-fixture:pending-approval]'
@@ -68,6 +70,91 @@ async function replacement(
 }
 
 test.describe.serial('managed fresh-agent deterministic fixture', () => {
+  test('completed owned native fixture history opens its existing browser pane', async ({ page }) => {
+    test.skip(process.env[FIXTURE_ENV] !== '1', `set ${FIXTURE_ENV}=1 explicitly`)
+    test.setTimeout(900_000)
+    const modeNames = MODES.map(({ mode }) => mode)
+    const rig = createManagedRuntimeBrowserRig(process.cwd(), 3, {}, {
+      FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '250',
+    }, 'test', {
+      enabledProviders: [], freshAgentModes: modeNames, fixtureFreshAgentModes: modeNames,
+      providerSettings: Object.fromEntries(MODES.map(({ mode }) => [mode, {}])),
+    })
+    const sent: any[] = []
+    page.on('websocket', socket => socket.on('framesent', frame => {
+      try { sent.push(JSON.parse(String(frame.payload))) } catch { /* non-JSON frame */ }
+    }))
+    try {
+      const info = await rig.start()
+      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`, { timeout: 60_000 })
+      const harness = new TestHarness(page)
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+      for (const definition of MODES) {
+        await page.keyboard.press('Alt+t')
+        const label = { freshclaude: 'Freshclaude', kilroy: 'Kilroy', freshcodex: 'Freshcodex', freshopencode: 'Freshopencode' }[definition.mode]
+        const picker = page.getByRole('toolbar', { name: /pane type picker/i }).last()
+        await expect(picker).toBeVisible()
+        await picker.getByRole('button', { name: label, exact: true }).click()
+        const directory = page.getByLabel('Starting directory for ' + label)
+        await directory.fill(rig.repoRoot)
+        await directory.press('Enter')
+        const created = await waitFor('browser-created managed fixture pane', async () => {
+          const state = await harness.getState()
+          const tabId = state.tabs.activeTabId!
+          const leaf = state.panes.layouts[tabId]
+          return leaf?.type === 'leaf' && leaf.content.kind === 'fresh-agent' && leaf.content.sessionId
+            ? { tabId, paneId: leaf.id, sessionId: leaf.content.sessionId, createRequestId: leaf.content.createRequestId } : null
+        })
+        const view = await waitFor('owned fixture activation', () => rig.runningViewForFreshSession(created.sessionId))
+        const pane = page.locator('[data-context="fresh-agent"][data-pane-id="' + created.paneId + '"]')
+        const composer = pane.getByRole('textbox', { name: 'Chat message input' })
+        await expect(composer).toBeEnabled()
+        await composer.fill(`deterministic saved fixture turn for ${definition.mode}`)
+        await pane.getByRole('button', { name: 'Send', exact: true }).click()
+        await waitFor('actual fixture completion', async () => {
+          const state = await fixtureState(rig, view)
+          return state.dispatchCount === 1 && state.completionCount === 1 ? state : null
+        })
+        const wireProvider = definition.provider === 'kilroy' ? 'claude' : definition.provider
+        expect(view.nativeSessionId).toBeTruthy()
+        const paneObservation = { ...created, sessionType: definition.mode, provider: wireProvider,
+          createdSessionId: created.sessionId, nativeSessionId: view.nativeSessionId! }
+        const nativePane = await waitFor('browser pane bound to the actual owned allocation',
+          () => page.evaluate(observeOwnedFreshBrowserPane, paneObservation))
+        const tabCount = await harness.getTabCount()
+        const layout = await harness.getPaneLayout(created.tabId)
+        const soulIds = (await rig.inventory()).map(row => row.soulId).sort()
+        const cursor = sent.length
+        await openFreshHistorySession(page, { repoRoot: rig.repoRoot, provider: wireProvider, nativeSessionId: view.nativeSessionId! })
+        await expect(pane).toBeVisible()
+        expect(await harness.getActiveTabId()).toBe(created.tabId)
+        expect(await harness.getTabCount()).toBe(tabCount)
+        expect(await harness.getPaneLayout(created.tabId)).toEqual(layout)
+        expect((await rig.inventory()).map(row => row.soulId).sort()).toEqual(soulIds)
+        await waitFor('actual owned History wire ingress', () => sent.slice(cursor).find(frame =>
+          frame.type === 'freshAgent.attach' && frame.sessionId === nativePane.sessionId
+          || frame.type === 'freshAgent.create' && frame.sessionRef?.sessionId === view.nativeSessionId) ?? null)
+        const historyFrames = sent.slice(cursor).filter(frame => ['freshAgent.create', 'freshAgent.attach', 'freshAgent.send'].includes(frame.type))
+        expect(historyFrames.filter(frame => frame.type === 'freshAgent.send')).toHaveLength(0)
+        expect(historyFrames.length).toBeGreaterThan(0)
+        for (const frame of historyFrames) {
+          expect(frame.provider).toBe(wireProvider)
+          if (frame.type === 'freshAgent.create') expect(frame.sessionRef).toMatchObject({ provider: wireProvider, sessionId: view.nativeSessionId })
+          else expect(frame.sessionId).toBe(nativePane.sessionId)
+        }
+        const current = await rig.runningViewForFreshSession(created.sessionId)
+        expect(current?.soulId).toBe(view.soulId)
+        expect(current?.incarnationId).toBe(view.incarnationId)
+        expect(current?.nativeSessionId).toBe(view.nativeSessionId)
+        expect((await fixtureState(rig, view)).dispatchCount).toBe(1)
+      }
+    } finally {
+      const cleanup = await rig.stop()
+      expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
+    }
+  })
+
   test('all modes share activation and exact-native recovery without provider access', async () => {
     test.skip(process.env[FIXTURE_ENV] !== '1', `set ${FIXTURE_ENV}=1 explicitly`)
     test.setTimeout(900_000)

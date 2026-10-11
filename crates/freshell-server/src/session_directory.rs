@@ -67,6 +67,10 @@ use serde_json::{json, Map, Value};
 
 use crate::boot::{is_authed, unauthorized};
 
+#[cfg(feature = "managed-runtime-v1")]
+#[path = "managed_session_directory.rs"]
+mod managed;
+
 /// `MAX_DIRECTORY_PAGE_ITEMS` (`shared/read-models.ts:6`).
 const MAX_DIRECTORY_PAGE_ITEMS: usize = 50;
 
@@ -543,15 +547,34 @@ fn validate_limit(raw_limit: &str) -> Result<usize, Value> {
 
 /// The session-directory sub-router (`GET /api/session-directory`).
 pub fn router(state: SessionDirectoryState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/api/session-directory", get(session_directory))
-        .with_state(state)
+        .with_state(state);
+    #[cfg(feature = "managed-runtime-v1")]
+    let router = router.layer(axum::Extension(managed::Cache::default()));
+    router
+}
+
+#[cfg(feature = "managed-runtime-v1")]
+pub fn router_with_managed_client(
+    state: SessionDirectoryState,
+    client: Option<freshell_runtime_client::RuntimeClient>,
+) -> Router {
+    let router = router(state);
+    match client {
+        Some(client) => router.layer(axum::Extension(client)),
+        None => router,
+    }
 }
 
 async fn session_directory(
     State(state): State<SessionDirectoryState>,
     headers: HeaderMap,
     Query(raw): Query<std::collections::HashMap<String, String>>,
+    #[cfg(feature = "managed-runtime-v1")] client: Option<
+        axum::Extension<freshell_runtime_client::RuntimeClient>,
+    >,
+    #[cfg(feature = "managed-runtime-v1")] axum::Extension(cache): axum::Extension<managed::Cache>,
 ) -> Response {
     if !is_authed(&headers, &state.auth_token) {
         return unauthorized();
@@ -618,6 +641,24 @@ async fn session_directory(
             }
             None => (Vec::new(), Arc::new(Vec::new())),
         };
+    #[cfg(feature = "managed-runtime-v1")]
+    let (items, managed_running, managed_partial) = {
+        let mut items = items;
+        let snapshot = match client {
+            Some(client) => managed::read(&client.0, &cache).await,
+            None => managed::Snapshot {
+                items: Vec::new(),
+                partial: false,
+            },
+        };
+        let running: std::collections::HashMap<_, _> = snapshot
+            .items
+            .iter()
+            .map(|item| (item.key(), item.is_running))
+            .collect();
+        items.extend(snapshot.items);
+        (items, running, snapshot.partial)
+    };
     // STATUS-STRIP: assign the monotonic snapshot sequence AFTER the index
     // snapshot is captured — captured order is authoritative, and a seq
     // assigned pre-await would interleave with concurrent requests.
@@ -732,6 +773,16 @@ async fn session_directory(
     // part of the sidebar's "running" set, matching the original's
     // `TerminalMetadataService.list()` input to `toItems`.
     let items = join_live_terminals(items, &identities);
+    #[cfg(feature = "managed-runtime-v1")]
+    let items = items
+        .into_iter()
+        .map(|mut item| {
+            if let Some(running) = managed_running.get(&item.key()) {
+                item.is_running = *running;
+            }
+            item
+        })
+        .collect();
     // Unified agent names (Task 2): resolve every scoped item's durable name
     // BEFORE the query (search/sort must see the manual rename), through the
     // SAME naming authority every rename route targets. A manual or
@@ -744,6 +795,10 @@ async fn session_directory(
         apply_naming_projection(items, state.identity.naming().as_ref()).await;
     match apply_query(items, &query, &identities) {
         Ok(mut page) => {
+            #[cfg(feature = "managed-runtime-v1")]
+            if managed_partial {
+                page["partial"] = json!(true);
+            }
             page["revision"] = json!(revision);
             page["snapshotSeq"] = json!(snapshot_seq);
             page["serverInstance"] = json!(state.server_instance.as_str());
