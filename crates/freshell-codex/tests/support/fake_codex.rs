@@ -357,9 +357,51 @@ pub fn flock_rows_once(path: &Path) -> Vec<String> {
 /// Test-only "does one read of `/proc/locks` show a lock on this file" (see
 /// [`flock_rows_once`]). Use it only to check that a lock was RELEASED: one
 /// read can miss a held lock's row, but never shows a row that was not there.
-/// To check that a lock is held, use [`holds_lock_fd`].
+/// To check that a lock is held, use [`holds_lock_fd`]. It cannot check a
+/// file that was deleted (there is no token to match, so it answers "not
+/// held" either way); for a lock whose file a graceful unload deletes, use a
+/// [`LockProbe`] opened before the delete.
 pub fn lock_held(path: &Path) -> bool {
     !flock_rows_once(path).is_empty()
+}
+
+/// A second open file description of a lock file, opened while the file
+/// exists. It keeps the file reachable after the holder deletes it (Codex's
+/// graceful unload unlinks the lock file), so a release can still be proved
+/// afterwards. Path-based checks ([`lock_held`], [`holds_lock_fd`]) find
+/// nothing to check once the path is gone, and so pass either way.
+pub struct LockProbe(std::fs::File);
+
+impl LockProbe {
+    /// Opens `path` read-only. No lock is taken.
+    pub fn open(path: &Path) -> LockProbe {
+        LockProbe(
+            std::fs::File::open(path)
+                .unwrap_or_else(|error| panic!("open {}: {error}", path.display())),
+        )
+    }
+
+    /// Whether another open file description holds a `flock` on the file:
+    /// the kernel refuses this probe a non-blocking exclusive `flock`. A lock
+    /// the probe is granted is given back at once. This is the kernel's own
+    /// answer, with no `/proc/locks` read involved.
+    pub fn held_elsewhere(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        let fd = self.0.as_raw_fd();
+        // SAFETY: flock(2) on a descriptor this probe owns and keeps open.
+        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            // SAFETY: as above; gives back the lock just granted.
+            unsafe { libc::flock(fd, libc::LOCK_UN) };
+            return false;
+        }
+        let error = std::io::Error::last_os_error();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::EWOULDBLOCK),
+            "the lock probe's flock failed: {error}"
+        );
+        true
+    }
 }
 
 /// True when `pid` holds a lock on `path` through one of its own file descriptors:

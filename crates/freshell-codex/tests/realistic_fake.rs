@@ -573,7 +573,9 @@ async fn helper_turn_events_reach_only_connections_open_at_spawn() {
 #[tokio::test(flavor = "multi_thread")]
 async fn unloads_are_announced_and_release_the_lock() {
     // (1) The last subscriber leaves: after the unload delay the lock is released and
-    // the file deleted, then notLoaded and thread/closed are broadcast.
+    // the file deleted, then notLoaded and thread/closed are broadcast. Each release is
+    // proved through a probe opened while the lock was held: a check by path finds
+    // nothing once the file is deleted.
     let home = tempfile::tempdir().unwrap();
     let fake = FakeAppServer::spawn(
         json!({"threadStartThreadId": "t-u", "threadUnloadDelayMs": 300}),
@@ -589,6 +591,8 @@ async fn unloads_are_announced_and_release_the_lock() {
         holds_lock_fd(fake.native().await.pid, &lock),
         "t-u is locked while loaded"
     );
+    let probe = LockProbe::open(&lock);
+    assert!(probe.held_elsewhere(), "the probe meets t-u's held lock");
     driver
         .call("thread/unsubscribe", json!({"threadId": "t-u"}))
         .await
@@ -603,6 +607,10 @@ async fn unloads_are_announced_and_release_the_lock() {
         .expect("notLoaded arrived before thread/closed");
     assert_eq!(status_type(&not_loaded), "notLoaded", "{not_loaded}");
     assert!(!lock.exists(), "an unloaded thread's lock file is deleted");
+    assert!(
+        !probe.held_elsewhere(),
+        "an unloaded thread's lock is released"
+    );
     let loaded = observer
         .call("thread/loaded/list", json!({}))
         .await
@@ -610,11 +618,12 @@ async fn unloads_are_announced_and_release_the_lock() {
     assert!(!loaded["data"].as_array().unwrap().contains(&json!("t-u")));
 
     // (2) A helper closed by its parent: interrupted turn, notLoaded, lock released,
-    // no thread/closed.
+    // no thread/closed. The parent closes it 1 s after the spawn, so the probe is
+    // opened, and the lock seen held, well before the close.
     let home2 = tempfile::tempdir().unwrap();
     let closing = FakeAppServer::spawn(
         json!({"threadStartThreadId": "t-cr", "threadUnloadDelayMs": 300,
-               "helperThreadOnTurn": {"id": "t-c", "durationMs": 60000, "closeAfterMs": 300}}),
+               "helperThreadOnTurn": {"id": "t-c", "durationMs": 60000, "closeAfterMs": 1000}}),
         home2.path(),
         &[],
     )
@@ -623,6 +632,21 @@ async fn unloads_are_announced_and_release_the_lock() {
     let mut driver2 = connected(closing.port).await;
     driver2.call("thread/start", json!({})).await.unwrap();
     start_turn(&mut driver2, "t-cr").await;
+    // The fake takes a helper's lock before it announces the helper.
+    observer2
+        .next_notification_for("thread/status/changed", "t-c", Duration::from_secs(5))
+        .await
+        .expect("the helper is announced");
+    let helper_lock = thread_lock_path(home2.path(), "t-c");
+    assert!(
+        holds_lock_fd(closing.native().await.pid, &helper_lock),
+        "the native holds the helper's lock while it runs"
+    );
+    let helper_probe = LockProbe::open(&helper_lock);
+    assert!(
+        helper_probe.held_elsewhere(),
+        "the probe meets the helper's held lock"
+    );
     let ended = observer2
         .next_notification_for("turn/completed", "t-c", Duration::from_secs(5))
         .await
@@ -640,7 +664,7 @@ async fn unloads_are_announced_and_release_the_lock() {
         }
     }
     assert!(
-        !lock_held(&thread_lock_path(home2.path(), "t-c")),
+        !helper_probe.held_elsewhere(),
         "a closed helper's lock is released"
     );
     assert!(
