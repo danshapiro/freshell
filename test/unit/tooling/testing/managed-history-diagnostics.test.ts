@@ -6,6 +6,7 @@ import * as external from '../../../../scripts/testing/runtime-external-browser.
 const original = vi.hoisted(() => ({
   cases: new Map<string, (context: any) => Promise<void>>(),
   start: vi.fn(), stop: vi.fn(), waitForHarness: vi.fn(), waitForConnection: vi.fn(),
+  rig: {} as any, history: vi.fn(), state: vi.fn(), tabCount: vi.fn(), layout: vi.fn(), activeTab: vi.fn(),
 }))
 vi.mock('../../../e2e-browser/helpers/fixtures.js', () => ({
   test: Object.assign((title: string, callback: (context: any) => Promise<void>) => original.cases.set(title, callback), {
@@ -13,13 +14,17 @@ vi.mock('../../../e2e-browser/helpers/fixtures.js', () => ({
   }),
 }))
 vi.mock('../../../e2e-browser/helpers/managed-runtime.js', () => ({
-  createManagedRuntimeBrowserRig: () => ({ start: original.start, stop: original.stop }),
-  openFreshHistorySession: vi.fn(),
+  createManagedRuntimeBrowserRig: () => ({ ...original.rig, start: original.start, stop: original.stop }),
+  openFreshHistorySession: (...args: any[]) => original.history(...args),
 }))
 vi.mock('../../../e2e-browser/helpers/test-harness.js', () => ({
   TestHarness: class {
     waitForHarness = original.waitForHarness
     waitForConnection = original.waitForConnection
+    getState = original.state
+    getTabCount = original.tabCount
+    getPaneLayout = original.layout
+    getActiveTabId = original.activeTab
   },
 }))
 
@@ -141,4 +146,143 @@ describe('managed History original awaited phase diagnostics', () => {
     expect(original.waitForConnection).not.toHaveBeenCalled()
     expect(retained.join('')).not.toContain('private-token')
   })
+})
+
+type HistoryFault = 'unknown' | 'provider' | 'mode' | 'root' | 'misbound-pane' | 'create' | 'create-owner' | 'send' | 'missing-target' | 'new-allocation' | 'resume'
+
+/** Execute the registered browser case, including its actual global collector and finally. */
+async function historyCallback(fault?: HistoryFault) {
+  await import('../../../e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.js')
+  vi.stubEnv('FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST', '1')
+  const definitions = [
+    ['freshclaude', 'claude'], ['kilroy', 'claude'], ['freshcodex', 'codex'], ['freshopencode', 'opencode'],
+  ]
+  const state: any = { tabs: { activeTabId: '', tabs: [] }, panes: { layouts: {} } }
+  const allocated: any[] = []
+  let observedNativePane = false
+  let framesent!: (frame: { payload: string }) => void
+  const frame = (value: any) => framesent({ payload: JSON.stringify(value) })
+  const current = () => allocated.at(-1)!
+  const locator: any = {
+    constructor: { name: 'Locator' },
+    _expect: async () => ({ matches: true, received: 'controlled locator', log: [] }),
+    last: () => locator, getByRole: () => locator,
+    click: async () => {}, fill: async () => {},
+    press: async () => {},
+  }
+  const page: any = {
+    on: (event: string, callback: any) => {
+      if (event === 'websocket') callback({ on: (_event: string, listener: any) => { framesent = listener } })
+    },
+    goto: async () => ({ status: () => 200 }),
+    keyboard: { press: async () => {
+      observedNativePane = false
+      const index = allocated.length, [sessionType, provider] = definitions[index]
+      const tabId = `tab-${index}`, paneId = `pane-${index}`, sessionId = `created-${index}`
+      const view = { soulId: `soul-${index}`, incarnationId: `incarnation-${index}`, nativeSessionId: `native-${index}` }
+      const content = { kind: 'fresh-agent', sessionType, provider, sessionId, createRequestId: `request-${index}` }
+      state.tabs.activeTabId = tabId
+      state.tabs.tabs.push({ id: tabId })
+      state.panes.layouts[tabId] = { type: 'leaf', id: paneId, content }
+      allocated.push({ tabId, paneId, sessionId, view })
+    } },
+    getByRole: () => locator, getByLabel: () => locator,
+    locator: () => ({ ...locator, getByRole: (_role: string, options: any) => options.name === 'Send' ? {
+      ...locator, click: async () => {
+        const item = current(), content = state.panes.layouts[item.tabId].content
+        content.sessionId = item.view.nativeSessionId
+        content.sessionRef = { provider: content.provider, sessionId: item.view.nativeSessionId }
+      },
+    } : locator }),
+    evaluate: async (operation: any, argument: any) => {
+      vi.stubGlobal('window', { __FRESHELL_TEST_HARNESS__: { getState: () => state } })
+      try { const result = operation(argument); observedNativePane = true; return result } finally { vi.unstubAllGlobals() }
+    },
+  }
+  original.start.mockResolvedValue({ baseUrl: 'https://fixture.invalid', token: 'private-token' })
+  original.stop.mockClear().mockResolvedValue({ ok: true, errors: [] })
+  original.waitForHarness.mockResolvedValue(undefined)
+  original.waitForConnection.mockResolvedValue(undefined)
+  original.state.mockImplementation(async () => structuredClone(state))
+  original.tabCount.mockImplementation(async () => state.tabs.tabs.length)
+  original.layout.mockImplementation(async (tabId: string) => structuredClone(state.panes.layouts[tabId]))
+  original.activeTab.mockImplementation(async () => state.tabs.activeTabId)
+  const inventory = () => allocated.map(item => item.view)
+  original.rig = {
+    repoRoot: '/controlled/checkout',
+    runningViewForFreshSession: async (sessionId: string) => allocated.find(item => item.sessionId === sessionId)?.view,
+    exactRuntimeHandle: (view: any) => view,
+    fixtureNativeState: async () => ({ dispatchCount: 1, completionCount: 1 }),
+    inventory: async () => inventory(),
+  }
+  original.history.mockClear().mockImplementation(async () => {
+    const index = allocated.length - 1
+    const attach = (item: any) => ({ type: 'freshAgent.attach', ...state.panes.layouts[item.tabId].content })
+    const messages = allocated.map(attach)
+    if (index === 1 && fault) {
+      const target = messages.at(-1)!
+      if (fault === 'unknown') messages.push({ ...target, sessionId: 'unowned-session' })
+      if (fault === 'provider') messages[0].provider = 'opencode'
+      if (fault === 'mode') messages[0].sessionType = 'kilroy'
+      if (fault === 'root') messages[0].sessionRef = { provider: 'claude', sessionId: 'wrong-root' }
+      if (fault === 'create') messages.push({ ...messages[0], type: 'freshAgent.create' })
+      if (fault === 'send') messages.push({ ...target, type: 'freshAgent.send' })
+      if (fault === 'missing-target') messages.pop()
+      if (fault === 'new-allocation') allocated.push({ view: { soulId: 'new-soul' } })
+      if (fault === 'resume' || fault === 'create-owner') messages[index] = {
+        ...target, type: 'freshAgent.create', tabId: current().tabId,
+        requestId: fault === 'create-owner' ? 'unowned-request' : target.createRequestId,
+      }
+    }
+    for (const message of messages) frame(message)
+    // Cancel only the controlled probe's original 90s boundary; no host timer wedge.
+    if (index === 1 && fault === 'missing-target') {
+      const now = Date.now()
+      vi.spyOn(Date, 'now').mockReturnValueOnce(now).mockReturnValue(now + 90_001)
+    }
+  })
+  if (fault === 'misbound-pane') original.state.mockImplementation(async () => {
+    const snapshot = structuredClone(state)
+    if (allocated.length === 2 && observedNativePane) snapshot.panes.layouts['tab-1'].content.sessionId = 'native-0'
+    return snapshot
+  })
+  const run = original.cases.get('completed owned native fixture history opens its existing browser pane')!({ page })
+  return { run, allocated }
+}
+
+describe('managed History original wire ownership', () => {
+  it('accepts each allocation-backed background attach while requiring the target through all four modes', async () => {
+    vi.spyOn(process.stdout, 'write').mockReturnValue(true)
+    const { run, allocated } = await historyCallback()
+    await expect(run).resolves.toBeUndefined()
+    expect(allocated).toHaveLength(4)
+    expect(original.history).toHaveBeenCalledTimes(4)
+    expect(original.stop).toHaveBeenCalledOnce()
+  })
+
+  it('accepts an explicit target resume without another allocation', async () => {
+    vi.spyOn(process.stdout, 'write').mockReturnValue(true)
+    const { run, allocated } = await historyCallback('resume')
+    await expect(run).resolves.toBeUndefined()
+    expect(allocated).toHaveLength(4)
+    expect(original.stop).toHaveBeenCalledOnce()
+  })
+
+  it.each<HistoryFault>(['unknown', 'provider', 'mode', 'root', 'misbound-pane', 'create', 'create-owner', 'send', 'missing-target', 'new-allocation'])(
+    'rejects %s ownership or activity through the original callback and closes the rig', async fault => {
+      vi.spyOn(process.stdout, 'write').mockReturnValue(true)
+      const { run, allocated } = await historyCallback(fault)
+      const cause: Partial<Record<HistoryFault, RegExp>> = {
+        unknown: /Received length: 0/,
+        provider: /opencode/, mode: /kilroy/, root: /wrong-root/, 'misbound-pane': /native-0/,
+        create: /freshclaude/, 'create-owner': /unowned-request/, send: /freshAgent.send/,
+        'missing-target': /timed out waiting for actual owned History wire ingress/,
+        'new-allocation': /new-soul/,
+      }
+      await expect(run).rejects.toThrow(cause[fault])
+      expect(allocated).toHaveLength(fault === 'new-allocation' ? 3 : 2)
+      expect(original.history).toHaveBeenCalledTimes(fault === 'misbound-pane' ? 1 : 2)
+      expect(original.stop).toHaveBeenCalledOnce()
+    },
+  )
 })
