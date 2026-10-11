@@ -8635,7 +8635,13 @@ pub(crate) async fn respawn_agent_terminal_relaying_claim(
                 Err(PlanLaunchError::ThreadHeld { thread_id, holder }) => {
                     scope.abandon(None);
                     return Err(RespawnError::LaunchUnresolvable(
-                        crate::unit_holders::respawn_refusal(state, &thread_id, &holder).await,
+                        crate::unit_holders::respawn_refusal(
+                            state,
+                            &thread_id,
+                            &holder,
+                            &req.create_request_id,
+                        )
+                        .await,
                     ));
                 }
                 Err(error) => {

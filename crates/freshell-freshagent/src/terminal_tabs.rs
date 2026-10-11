@@ -846,25 +846,32 @@ fn codex_launch_error_response(
 /// with today's 409 `RESTORE_UNAVAILABLE` carrying `liveTerminalId`; any
 /// other holder is a program outside Freshell, answered 409
 /// `CONVERSATION_HELD_ELSEWHERE` naming it by pid and process name (never
-/// its command line), with the ERROR `unit.writer_conflict` log. Blocking
-/// (a member read can scan every process).
+/// its command line), with the ERROR `unit.writer_conflict` log under the
+/// create's `create_request_id`. Blocking (a member read can scan every
+/// process).
 fn thread_held_response(
     units: &freshell_containment::UnitDirectory,
     thread_id: &str,
     holder: &freshell_containment::LockHolder,
+    create_request_id: &str,
 ) -> Response {
     match units
         .entry_with_member(holder.pid)
         .and_then(|entry| entry.terminal_id)
     {
         Some(terminal_id) => fail_json_restore_unavailable(thread_id, Some(&terminal_id), None),
-        None => held_elsewhere_response(thread_id, holder),
+        None => held_elsewhere_response(thread_id, holder, create_request_id),
     }
 }
 
 /// 409 `CONVERSATION_HELD_ELSEWHERE` for `holder`, a program outside
-/// Freshell, plus the ERROR `unit.writer_conflict` log.
-fn held_elsewhere_response(thread_id: &str, holder: &freshell_containment::LockHolder) -> Response {
+/// Freshell, plus the ERROR `unit.writer_conflict` log (`request_id`: the
+/// refused create's `create_request_id`).
+fn held_elsewhere_response(
+    thread_id: &str,
+    holder: &freshell_containment::LockHolder,
+    create_request_id: &str,
+) -> Response {
     freshell_containment::events::writer_conflict(
         &freshell_containment::events::UnitLogKeys {
             provider: "codex".to_string(),
@@ -872,6 +879,7 @@ fn held_elsewhere_response(thread_id: &str, holder: &freshell_containment::LockH
             ..Default::default()
         },
         thread_id,
+        create_request_id,
         Some((holder.pid, &holder.name)),
         "preflight",
         "",
@@ -3176,15 +3184,20 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                     {
                         let units = state.units.clone();
                         let thread_id = resume_session_id.clone().unwrap_or_default();
+                        let request_id = create_request_id.clone();
                         let (fallback_thread, fallback_holder) =
                             (thread_id.clone(), holder.clone());
                         // A failed membership read still names the holder.
                         return Err(tokio::task::spawn_blocking(move || {
-                            thread_held_response(&units, &thread_id, &holder)
+                            thread_held_response(&units, &thread_id, &holder, &request_id)
                         })
                         .await
                         .unwrap_or_else(|_| {
-                            held_elsewhere_response(&fallback_thread, &fallback_holder)
+                            held_elsewhere_response(
+                                &fallback_thread,
+                                &fallback_holder,
+                                &create_request_id,
+                            )
                         }));
                     }
                     // A conversation that never materialized: the answer

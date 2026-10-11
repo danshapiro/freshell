@@ -166,6 +166,7 @@ pub async fn report_writer_conflict(
     crate::events::writer_conflict(
         keys,
         thread_id,
+        "",
         holder
             .as_ref()
             .map(|holder| (holder.pid, holder.name.as_str())),

@@ -887,11 +887,12 @@ impl FreshCodexState {
     /// home or a lookup that cannot finish in time is "could not check" and
     /// the resume proceeds). A holder that is a member of a pane's unit is
     /// that pane; any other is a program outside Freshell (ERROR
-    /// `unit.writer_conflict`).
+    /// `unit.writer_conflict` under the create's `request_id`).
     async fn resume_holder(
         &self,
         client: &CodexAppServerClient,
         thread_id: &str,
+        request_id: &str,
     ) -> Option<ResumeHolder> {
         let keys = freshell_containment::events::UnitLogKeys {
             provider: PROVIDER.to_string(),
@@ -921,6 +922,7 @@ impl FreshCodexState {
         freshell_containment::events::writer_conflict(
             &keys,
             thread_id,
+            request_id,
             Some((holder.pid, &holder.name)),
             "preflight",
             "",
@@ -2585,7 +2587,10 @@ impl FreshCodexState {
         // beside it: a pane's app-server gets the live-session answer (as a
         // live terminal PTY does above), a program outside Freshell is named
         // by pid and process name.
-        if let Some(holder) = self.resume_holder(&client, &resume_session_id).await {
+        if let Some(holder) = self
+            .resume_holder(&client, &resume_session_id, &request_id)
+            .await
+        {
             client.close().await;
             let mut child = child;
             let _ = child.start_kill();
@@ -23365,6 +23370,10 @@ pub(crate) mod tests {
         );
         assert_eq!(conflict.fields["holder_name"], "perl", "{conflict:?}");
         assert_eq!(conflict.fields["source"], "preflight", "{conflict:?}");
+        assert_eq!(
+            conflict.fields["request_id"], "req-held-outside",
+            "the refusal is tied to its create: {conflict:?}"
+        );
         drop(holder);
     }
 

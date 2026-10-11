@@ -96,14 +96,18 @@ pub const HOLDER_OUTSIDE_VIEW: &str = "held by a process outside Freshell's view
 
 /// Codex refused a writer, or would have ("already has an active writer" /
 /// "open in another app"), which `source` saw (`preflight`, `proxy`,
-/// `freshcodex`, `rest`). Always an ERROR. `holder` is the holder's pid and
-/// process name (never its command line) when one is visible; when none is
-/// (another uid or pid namespace, no known Codex home, a lookup that could
-/// not finish: `detail` says which), `holder_visible` is false and the reason
-/// is [`HOLDER_OUTSIDE_VIEW`]: the lock is never reported as released.
+/// `freshcodex`, `rest`). Always an ERROR. `request_id` is the refused
+/// reopen's request (a createRequestId, a REST create's, a freshcodex
+/// create's requestId; empty when there is none), so the line can be tied
+/// to its reopen. `holder` is the holder's pid and process name (never its
+/// command line) when one is visible; when none is (another uid or pid
+/// namespace, no known Codex home, a lookup that could not finish: `detail`
+/// says which), `holder_visible` is false and the reason is
+/// [`HOLDER_OUTSIDE_VIEW`]: the lock is never reported as released.
 pub fn writer_conflict(
     k: &UnitLogKeys,
     thread_id: &str,
+    request_id: &str,
     holder: Option<(u32, &str)>,
     source: &str,
     detail: &str,
@@ -115,7 +119,7 @@ pub fn writer_conflict(
     } else {
         HOLDER_OUTSIDE_VIEW
     };
-    keyed!(error, k, "unit.writer_conflict", thread_id = %thread_id, holder_pid,
+    keyed!(error, k, "unit.writer_conflict", thread_id = %thread_id, request_id = %request_id, holder_pid,
         holder_name = %holder_name, holder_visible, reason = %reason, source = %source,
         detail = %detail, "conversation writer conflict");
 }
@@ -282,7 +286,7 @@ mod tests {
             escalated(&k, "SIGINT", "SIGKILL", 1000);
             unconfirmed(&k, 5000, "main");
             start_waited(&k, "auto-resume", 40);
-            writer_conflict(&k, "t-1", None, "proxy", "no holder visible");
+            writer_conflict(&k, "t-1", "", None, "proxy", "no holder visible");
             main_discovery_failed(&k, 41000, 4242);
             resume_preflight_skipped(&k, "t-1", "no_codex_home", "");
         });
@@ -346,8 +350,8 @@ mod tests {
     fn a_writer_conflict_names_its_holder_or_says_it_is_outside_view() {
         let k = keys();
         let events = capture(|| {
-            writer_conflict(&k, "t-1", Some((4242, "perl")), "preflight", "");
-            writer_conflict(&k, "t-2", None, "proxy", "no holder visible");
+            writer_conflict(&k, "t-1", "crq-1", Some((4242, "perl")), "preflight", "");
+            writer_conflict(&k, "t-2", "", None, "proxy", "no holder visible");
         });
         assert_eq!(events.len(), 2);
         for event in &events {
@@ -362,6 +366,7 @@ mod tests {
         assert_eq!(seen.str("holder_name"), "perl");
         assert_eq!(seen.fields["holder_visible"], FieldValue::Bool(true));
         assert_eq!(seen.str("source"), "preflight");
+        assert_eq!(seen.str("request_id"), "crq-1", "tied to its reopen");
         assert_eq!(seen.str("reason"), "");
         let unseen = &events[1];
         assert_eq!(unseen.u64("holder_pid"), 0);
@@ -372,6 +377,7 @@ mod tests {
         );
         assert_eq!(unseen.str("detail"), "no holder visible");
         assert_eq!(unseen.str("source"), "proxy");
+        assert_eq!(unseen.str("request_id"), "", "no reopen request");
     }
 
     #[test]

@@ -112,9 +112,10 @@ fn assert_names_the_outside_holder(
     }
 }
 
-/// The ERROR `unit.writer_conflict` the refusal logged for `thread`:
-/// holder by pid and process name, no command line.
-async fn assert_conflict_logged(thread: &str, holder_pid: u32, source: &str) {
+/// The ERROR `unit.writer_conflict` the refusal of the reopen `request_id`
+/// logged for `thread`: holder by pid and process name, no command line,
+/// and the reopen's request id, so it can be tied to its reopen.
+async fn assert_conflict_logged(thread: &str, holder_pid: u32, source: &str, request_id: &str) {
     let pid = holder_pid.to_string();
     let event = captured()
         .wait_for(
@@ -137,6 +138,11 @@ async fn assert_conflict_logged(thread: &str, holder_pid: u32, source: &str) {
         "{event:?}"
     );
     assert!(!event.fields.contains_key("holder_command"), "{event:?}");
+    assert_eq!(
+        event.fields.get("request_id").map(String::as_str),
+        Some(request_id),
+        "{event:?}"
+    );
 }
 
 /// A restore (sidebar, Resume dialog) of a conversation a process outside
@@ -166,7 +172,7 @@ async fn an_outside_holder_is_reported_at_once_and_nothing_is_started() {
         h.state.units.by_create_request("crq-out").is_none()
     })
     .await;
-    assert_conflict_logged("t-out", holder.pid(), "preflight").await;
+    assert_conflict_logged("t-out", holder.pid(), "preflight", "crq-out").await;
     assert!(
         fake_codex::pid_alive(holder.pid()),
         "the outside holder is never signalled"
@@ -194,11 +200,22 @@ async fn every_reopen_door_reports_the_outside_holder() {
     })
     .await;
 
-    assert_conflict_logged("t-out-i", holder.pid(), "preflight").await;
+    assert_conflict_logged("t-out-i", holder.pid(), "preflight", "crq-out-i").await;
 
     let rest_holder = fake_codex::OutsideHolder::hold(&h.lock("t-out-r"));
     let rest_argv = rest_holder.argv();
-    let (status, body) = h.rest_create_codex(Some("t-out-r")).await;
+    h.seed_rollout("t-out-r");
+    let (status, body) = h
+        .post(
+            "/api/tabs",
+            json!({
+                "mode": "codex",
+                "cwd": h.home.path().display().to_string(),
+                "sessionRef": {"provider": "codex", "sessionId": "t-out-r"},
+                "createRequestId": "crq-out-r",
+            }),
+        )
+        .await;
     assert_eq!(status, 409, "{body}");
     assert_eq!(body["code"], "CONVERSATION_HELD_ELSEWHERE", "{body}");
     assert_eq!(body["holderPid"], rest_holder.pid(), "{body}");
@@ -218,7 +235,7 @@ async fn every_reopen_door_reports_the_outside_holder() {
             "argv leaked: {body}"
         );
     }
-    assert_conflict_logged("t-out-r", rest_holder.pid(), "preflight").await;
+    assert_conflict_logged("t-out-r", rest_holder.pid(), "preflight", "crq-out-r").await;
     assert!(fake_codex::pid_alive(holder.pid()));
     assert!(fake_codex::pid_alive(rest_holder.pid()));
 }
@@ -255,7 +272,7 @@ async fn an_auto_resume_of_a_conversation_held_outside_freshell_is_refused_and_n
         ),
         other => panic!("expected the holder refusal, got {other:?}"),
     }
-    assert_conflict_logged("t-auto-out", holder.pid(), "preflight").await;
+    assert_conflict_logged("t-auto-out", holder.pid(), "preflight", "crq-auto-out").await;
 
     eventually("the attempt's sidecar was stopped", || {
         h.state.units.by_create_request("crq-auto-out").is_none()
@@ -485,7 +502,7 @@ async fn a_reopen_parked_on_a_stop_reports_an_outside_holder_that_took_the_conve
     };
     assert!(killed, "the reopen ran only after the kill's Gone");
     assert_names_the_outside_holder(&error, &holder, &argv);
-    assert_conflict_logged("t-park", holder.pid(), "preflight").await;
+    assert_conflict_logged("t-park", holder.pid(), "preflight", "crq-park-new").await;
 }
 
 /// Holds up every outside-holder lookup that starts while alive by `ms`

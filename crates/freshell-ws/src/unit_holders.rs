@@ -76,10 +76,10 @@ fn conflict_keys(state: &WsState, terminal_id: Option<&str>, thread_id: &str) ->
 }
 
 /// Classifies the holder of the conversation `thread_id` a reopen wants and
-/// logs it: a pane's unit member at INFO `unit.reopen.holder` (`request_id`:
-/// the reopen's create, empty when none), a program outside Freshell at
-/// ERROR `unit.writer_conflict` (`source: preflight`) by pid and process
-/// name.
+/// logs it: a pane's unit member at INFO `unit.reopen.holder`, a program
+/// outside Freshell at ERROR `unit.writer_conflict` (`source: preflight`) by
+/// pid and process name; both carry `request_id`, the reopen's
+/// createRequestId.
 async fn classify_and_log(
     state: &WsState,
     thread_id: &str,
@@ -105,6 +105,7 @@ async fn classify_and_log(
         HolderClass::Outside { pid, name } => events::writer_conflict(
             &conflict_keys(state, None, thread_id),
             thread_id,
+            request_id,
             Some((*pid, name)),
             "preflight",
             "",
@@ -146,13 +147,15 @@ pub(crate) async fn answer_thread_held(
 /// The refusal of a respawn (auto-resume; no client to answer) whose
 /// conversation `thread_id` is held by `holder`: nothing starts, and the
 /// holder is named (a pane by its terminal, a program outside Freshell by
-/// pid and process name) and logged as for a reopen.
+/// pid and process name) and logged as for a reopen, under the respawned
+/// pane's `create_request_id`.
 pub(crate) async fn respawn_refusal(
     state: &WsState,
     thread_id: &str,
     holder: &LockHolder,
+    create_request_id: &str,
 ) -> String {
-    match classify_and_log(state, thread_id, holder, "").await {
+    match classify_and_log(state, thread_id, holder, create_request_id).await {
         HolderClass::Unit { terminal_id } => {
             format!("codex conversation {thread_id} is already open in terminal {terminal_id}")
         }
