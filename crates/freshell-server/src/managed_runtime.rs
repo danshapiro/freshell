@@ -220,6 +220,7 @@ impl ServerManagedRuntimeController {
         self.client.clone()
     }
 
+    #[cfg(test)]
     async fn recovery_in_flight(&self, soul_id: &str) -> bool {
         self.recovery
             .slots
