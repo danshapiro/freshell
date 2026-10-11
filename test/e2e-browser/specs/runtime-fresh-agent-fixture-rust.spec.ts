@@ -7,7 +7,7 @@
 import { expect } from '@playwright/test'
 
 import { validateFreshAgentIngressInventory } from '../../../scripts/testing/fresh-agent-ingress-inventory.js'
-import { observeOwnedFreshBrowserPane } from '../../../scripts/testing/runtime-external-browser.js'
+import { ManagedHistoryAwaitedPhases, observeOwnedFreshBrowserPane } from '../../../scripts/testing/runtime-external-browser.js'
 import { test } from '../helpers/fixtures.js'
 import { createManagedRuntimeBrowserRig, openFreshHistorySession, type ManagedFixtureRig, type ManagedRuntimeView, type FixtureNativeState } from '../helpers/managed-runtime.js'
 import { TestHarness } from '../helpers/test-harness.js'
@@ -23,6 +23,7 @@ const MODES = [
 ] as const
 
 type Created = { paneId: string; sessionId: string; view: ManagedRuntimeView }
+type ObservedResourceType = Parameters<ManagedHistoryAwaitedPhases['navigation']>[0]['resourceType']
 
 function unwrap(body: any): any {
   return body?.data ?? body
@@ -81,60 +82,75 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
       providerSettings: Object.fromEntries(MODES.map(({ mode }) => [mode, {}])),
     })
     const sent: any[] = []
+    const observation = new ManagedHistoryAwaitedPhases()
+    let resourceFailures = 0
+    page.on('response', response => {
+      if (response.status() >= 400 && resourceFailures++ < 32) observation.navigation({
+        status: response.status(), resourceType: response.request().resourceType() as ObservedResourceType, category: 'response',
+      })
+    })
+    page.on('requestfailed', request => {
+      if (resourceFailures++ < 32) observation.navigation({ resourceType: request.resourceType() as ObservedResourceType, category: 'request-failed' })
+    })
+    page.on('pageerror', () => {
+      if (resourceFailures++ < 32) observation.navigation({ resourceType: 'other', category: 'page-error' })
+    })
     page.on('websocket', socket => socket.on('framesent', frame => {
       try { sent.push(JSON.parse(String(frame.payload))) } catch { /* non-JSON frame */ }
     }))
     try {
-      const info = await rig.start()
-      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`, { timeout: 60_000 })
+      const info = await observation.run('start', 'bootstrap', () => rig.start())
+      const response = await observation.run('goto', 'bootstrap', () => page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`, { timeout: 60_000 }))
+      if (response) observation.navigation({ status: response.status(), resourceType: 'document', category: 'response' })
       const harness = new TestHarness(page)
-      await harness.waitForHarness()
-      await harness.waitForConnection()
+      await observation.run('harness', 'bootstrap', () => harness.waitForHarness())
+      await observation.run('connection', 'bootstrap', () => harness.waitForConnection())
       for (const definition of MODES) {
-        await page.keyboard.press('Alt+t')
+        const phase = <T>(name: Parameters<ManagedHistoryAwaitedPhases['run']>[0], operation: () => T | Promise<T>) => observation.run(name, definition.mode, operation)
+        await phase('new-tab', () => page.keyboard.press('Alt+t'))
         const label = { freshclaude: 'Freshclaude', kilroy: 'Kilroy', freshcodex: 'Freshcodex', freshopencode: 'Freshopencode' }[definition.mode]
         const picker = page.getByRole('toolbar', { name: /pane type picker/i }).last()
-        await expect(picker).toBeVisible()
-        await picker.getByRole('button', { name: label, exact: true }).click()
+        await phase('picker-visible', () => expect(picker).toBeVisible())
+        await phase('picker-click', () => picker.getByRole('button', { name: label, exact: true }).click())
         const directory = page.getByLabel('Starting directory for ' + label)
-        await directory.fill(rig.repoRoot)
-        await directory.press('Enter')
-        const created = await waitFor('browser-created managed fixture pane', async () => {
+        await phase('directory-fill', () => directory.fill(rig.repoRoot))
+        await phase('directory-enter', () => directory.press('Enter'))
+        const created = await phase('pane-observation', () => waitFor('browser-created managed fixture pane', async () => {
           const state = await harness.getState()
           const tabId = state.tabs.activeTabId!
           const leaf = state.panes.layouts[tabId]
           return leaf?.type === 'leaf' && leaf.content.kind === 'fresh-agent' && leaf.content.sessionId
             ? { tabId, paneId: leaf.id, sessionId: leaf.content.sessionId, createRequestId: leaf.content.createRequestId } : null
-        })
-        const view = await waitFor('owned fixture activation', () => rig.runningViewForFreshSession(created.sessionId))
+        }))
+        const view = await phase('first-inventory', () => waitFor('owned fixture activation', () => rig.runningViewForFreshSession(created.sessionId)))
         const pane = page.locator('[data-context="fresh-agent"][data-pane-id="' + created.paneId + '"]')
         const composer = pane.getByRole('textbox', { name: 'Chat message input' })
-        await expect(composer).toBeEnabled()
-        await composer.fill(`deterministic saved fixture turn for ${definition.mode}`)
-        await pane.getByRole('button', { name: 'Send', exact: true }).click()
-        await waitFor('actual fixture completion', async () => {
+        await phase('composer-enabled', () => expect(composer).toBeEnabled())
+        await phase('composer-fill', () => composer.fill(`deterministic saved fixture turn for ${definition.mode}`))
+        await phase('send', () => pane.getByRole('button', { name: 'Send', exact: true }).click())
+        await phase('completion', () => waitFor('actual fixture completion', async () => {
           const state = await fixtureState(rig, view)
           return state.dispatchCount === 1 && state.completionCount === 1 ? state : null
-        })
+        }))
         const wireProvider = definition.provider === 'kilroy' ? 'claude' : definition.provider
         expect(view.nativeSessionId).toBeTruthy()
         const paneObservation = { ...created, sessionType: definition.mode, provider: wireProvider,
           createdSessionId: created.sessionId, nativeSessionId: view.nativeSessionId! }
-        const nativePane = await waitFor('browser pane bound to the actual owned allocation',
-          () => page.evaluate(observeOwnedFreshBrowserPane, paneObservation))
-        const tabCount = await harness.getTabCount()
-        const layout = await harness.getPaneLayout(created.tabId)
-        const soulIds = (await rig.inventory()).map(row => row.soulId).sort()
+        const nativePane = await phase('native-pane', () => waitFor('browser pane bound to the actual owned allocation',
+          () => page.evaluate(observeOwnedFreshBrowserPane, paneObservation)))
+        const tabCount = await phase('tab-count', () => harness.getTabCount())
+        const layout = await phase('layout', () => harness.getPaneLayout(created.tabId))
+        const soulIds = (await phase('inventory-before', () => rig.inventory())).map(row => row.soulId).sort()
         const cursor = sent.length
-        await openFreshHistorySession(page, { repoRoot: rig.repoRoot, provider: wireProvider, nativeSessionId: view.nativeSessionId! })
-        await expect(pane).toBeVisible()
-        expect(await harness.getActiveTabId()).toBe(created.tabId)
-        expect(await harness.getTabCount()).toBe(tabCount)
-        expect(await harness.getPaneLayout(created.tabId)).toEqual(layout)
-        expect((await rig.inventory()).map(row => row.soulId).sort()).toEqual(soulIds)
-        await waitFor('actual owned History wire ingress', () => sent.slice(cursor).find(frame =>
+        await phase('history-open', () => openFreshHistorySession(page, { repoRoot: rig.repoRoot, provider: wireProvider, nativeSessionId: view.nativeSessionId! }))
+        await phase('history-pane-visible', () => expect(pane).toBeVisible())
+        await phase('history-active-tab', async () => expect(await harness.getActiveTabId()).toBe(created.tabId))
+        await phase('history-tab-count', async () => expect(await harness.getTabCount()).toBe(tabCount))
+        await phase('history-layout', async () => expect(await harness.getPaneLayout(created.tabId)).toEqual(layout))
+        await phase('history-inventory', async () => expect((await rig.inventory()).map(row => row.soulId).sort()).toEqual(soulIds))
+        await phase('history-wire', () => waitFor('actual owned History wire ingress', () => sent.slice(cursor).find(frame =>
           frame.type === 'freshAgent.attach' && frame.sessionId === nativePane.sessionId
-          || frame.type === 'freshAgent.create' && frame.sessionRef?.sessionId === view.nativeSessionId) ?? null)
+          || frame.type === 'freshAgent.create' && frame.sessionRef?.sessionId === view.nativeSessionId) ?? null))
         const historyFrames = sent.slice(cursor).filter(frame => ['freshAgent.create', 'freshAgent.attach', 'freshAgent.send'].includes(frame.type))
         expect(historyFrames.filter(frame => frame.type === 'freshAgent.send')).toHaveLength(0)
         expect(historyFrames.length).toBeGreaterThan(0)
@@ -143,11 +159,11 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
           if (frame.type === 'freshAgent.create') expect(frame.sessionRef).toMatchObject({ provider: wireProvider, sessionId: view.nativeSessionId })
           else expect(frame.sessionId).toBe(nativePane.sessionId)
         }
-        const current = await rig.runningViewForFreshSession(created.sessionId)
+        const current = await phase('history-current', () => rig.runningViewForFreshSession(created.sessionId))
         expect(current?.soulId).toBe(view.soulId)
         expect(current?.incarnationId).toBe(view.incarnationId)
         expect(current?.nativeSessionId).toBe(view.nativeSessionId)
-        expect((await fixtureState(rig, view)).dispatchCount).toBe(1)
+        await phase('history-dispatch', async () => expect((await fixtureState(rig, view)).dispatchCount).toBe(1))
       }
     } finally {
       const cleanup = await rig.stop()
