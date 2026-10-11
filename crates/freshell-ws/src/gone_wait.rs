@@ -196,6 +196,19 @@ impl GoneWaits {
         }
     }
 
+    /// The keys of every parked request (diagnostics and tests).
+    pub fn parked_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .entries
+            .lock()
+            .expect("gone waits lock")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
+
     /// Whether a request is parked under `key`.
     pub fn is_parked(&self, key: &str) -> bool {
         self.entries

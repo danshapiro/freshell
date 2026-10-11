@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use freshell_ownership::OwnershipState;
 use serde_json::json;
-use unit_harness::{fake_codex, GoneDelay, HarnessOpts, TestWs, UnitHarness};
+use unit_harness::{fake_codex, GoneDelay, HarnessOpts, TestWs, ThreadReadHeldUp, UnitHarness};
 
 async fn ready(h: &UnitHarness, ws: &mut TestWs) -> String {
     let frame = h
@@ -160,6 +160,9 @@ async fn the_stuck_restart_waits_for_gone() {
     .await;
 }
 
+/// An attach by the conversation while its unit is being stopped is parked
+/// (Gone is held, so the attach provably reaches the `Stopping` key) and
+/// answered only after the Gone, never refused with a request to poll.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attach_by_session_ref_during_stopping_waits_instead_of_refusing() {
     let h = UnitHarness::start(HarnessOpts {
@@ -167,12 +170,27 @@ async fn an_attach_by_session_ref_during_stopping_waits_instead_of_refusing() {
         ..Default::default()
     })
     .await;
+    let _gone = GoneDelay::set(2500);
     let mut ws = h.connect().await;
     let tid = h.create_codex(&mut ws, "crq-at", Some("t-at")).await;
+    ready(&h, &mut ws).await;
+    start_settled(&h, &tid).await;
     h.send(
         &mut ws,
         json!({"type": "terminal.kill", "terminalId": tid, "requestId": "rk", "createRequestId": "crq-at"}),
     )
+    .await;
+    eventually("the conversation is Stopping", || {
+        matches!(
+            h.state
+                .ownership
+                .as_ref()
+                .unwrap()
+                .observe("codex", "t-at")
+                .state,
+            OwnershipState::Stopping { .. }
+        )
+    })
     .await;
     let mut other = h.connect().await;
     h.send(
@@ -182,6 +200,19 @@ async fn an_attach_by_session_ref_during_stopping_waits_instead_of_refusing() {
             "sessionRef": {"provider": "codex", "sessionId": "t-at"}}),
     )
     .await;
+    let attach_key_suffix = format!(":{tid}");
+    eventually("the attach is parked", || {
+        h.state
+            .gone_waits
+            .parked_keys()
+            .iter()
+            .any(|key| key.starts_with("attach:") && key.ends_with(&attach_key_suffix))
+    })
+    .await;
+    assert!(
+        h.state.units.by_terminal(&tid).is_some(),
+        "parked before the Gone"
+    );
     let answer = h
         .next_matching(&mut other, Duration::from_secs(10), |f| {
             f["requestId"] == "ra"
@@ -197,6 +228,10 @@ async fn an_attach_by_session_ref_during_stopping_waits_instead_of_refusing() {
     assert_eq!(
         answer["code"], "INVALID_TERMINAL_ID",
         "answered after Gone, when the terminal is gone: {answer}"
+    );
+    assert!(
+        h.state.units.by_terminal(&tid).is_none(),
+        "answered only after the Gone"
     );
 }
 
@@ -492,9 +527,28 @@ async fn a_switch_of_an_extra_thread_answers_the_holder_while_the_main_switch_su
         json!({"provider": "codex", "sessionId": sid, "targetKind": "terminal", "mode": "codex",
             "cwd": h.home.path().display().to_string(), "deviceId": "test-device"})
     };
-    let (extra, main) = tokio::join!(
-        h.post("/api/sessions/handoff", switch("t-sw-extra")),
+    // The main switch's stop of the pane first reads the threads its
+    // app-server holds; holding that read up keeps the extra key `Live`
+    // (its stop has not moved it to `Stopping`) while the extra switch,
+    // sent once the main switch has entered its handoff, runs.
+    let _held_up = ThreadReadHeldUp::set(900);
+    let registry = h.state.ownership.clone().unwrap();
+    let (main, extra) = tokio::join!(
         h.post("/api/sessions/handoff", switch("t-sw-main")),
+        async {
+            eventually("the main switch is in its handoff", || {
+                matches!(
+                    registry.observe("codex", "t-sw-main").state,
+                    OwnershipState::Handoff { .. }
+                )
+            })
+            .await;
+            assert!(
+                live_under(&h, "t-sw-extra", &prior),
+                "the extra key is still Live when its switch is sent"
+            );
+            h.post("/api/sessions/handoff", switch("t-sw-extra")).await
+        },
     );
     assert_eq!(extra.1["ok"], json!(false), "{}", extra.1);
     assert_eq!(
