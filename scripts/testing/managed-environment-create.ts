@@ -3,11 +3,12 @@ import fs from 'node:fs'
 import http from 'node:http'
 import path from 'node:path'
 import { ErrorCode, type ErrorMessage } from '../../shared/ws-protocol.js'
+import { dockerSocketPath } from './runtime-sandbox.js'
 
 export async function readManagedEnvironmentDaemonId(): Promise<string> {
   const dockerHost = process.env.DOCKER_HOST
   assert(!dockerHost || dockerHost.startsWith('unix://'), 'Managed target requires the existing local Unix Docker endpoint')
-  const socketPath = dockerHost?.slice(7) || '/var/run/docker.sock'
+  const socketPath = dockerSocketPath()
   return new Promise((resolve, reject) => {
     const request = http.get({ socketPath, path: '/v1.47/info', timeout: 30_000 }, response => {
       const chunks: Buffer[] = []
