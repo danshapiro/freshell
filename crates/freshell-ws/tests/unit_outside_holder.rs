@@ -302,14 +302,14 @@ async fn an_auto_resume_of_a_conversation_held_outside_freshell_is_refused_and_n
 /// A conversation a live pane's app-server holds without the owner registry
 /// knowing (loaded by another client of that app-server, announced on no
 /// connection) is that pane's: a reopen answers the holding pane, through
-/// either door, and reports no outside program.
+/// either door, reports no outside program, and leaves the holding pane
+/// alive and unchanged.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reopen_of_a_thread_another_panes_app_server_holds_answers_that_pane() {
     let _ = captured();
     let h = UnitHarness::start(HarnessOpts::default()).await;
     let mut ws = h.connect().await;
-    let (holder_tid, _loader) =
-        quietly_holding_pane(&h, &mut ws, "crq-holder", "t-quiet-held").await;
+    let mut holder = quietly_holding_pane(&h, &mut ws, "crq-holder", "t-quiet-held").await;
 
     let mut other = h.connect().await;
     h.send(&mut other, reopen("crq-quiet", "t-quiet-held", true))
@@ -320,18 +320,24 @@ async fn a_reopen_of_a_thread_another_panes_app_server_holds_answers_that_pane()
     assert_eq!(created["type"], "terminal.created", "{created}");
     assert_eq!(
         created["terminalId"],
-        holder_tid.as_str(),
+        holder.terminal_id.as_str(),
         "the reopen names the holding pane's terminal"
     );
     eventually("the attempt's sidecar was stopped", || {
         h.state.units.by_create_request("crq-quiet").is_none()
     })
     .await;
+    holder.assert_untouched(&h).await;
 
     let (status, body) = h.rest_create_codex(Some("t-quiet-held")).await;
     assert_eq!(status, 409, "{body}");
     assert_eq!(body["code"], "RESTORE_UNAVAILABLE", "{body}");
-    assert_eq!(body["liveTerminalId"], holder_tid.as_str(), "{body}");
+    assert_eq!(
+        body["liveTerminalId"],
+        holder.terminal_id.as_str(),
+        "{body}"
+    );
+    holder.assert_untouched(&h).await;
     assert!(
         captured()
             .first(
@@ -346,15 +352,14 @@ async fn a_reopen_of_a_thread_another_panes_app_server_holds_answers_that_pane()
 
 /// The interactive reopen (a create with a `sessionRef` and no restore
 /// flag) of a conversation another pane's app-server holds without the
-/// owner registry knowing answers that pane too, and reports no outside
-/// program.
+/// owner registry knowing answers that pane too, reports no outside
+/// program, and leaves the holding pane alive and unchanged.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_interactive_reopen_of_a_thread_another_panes_app_server_holds_answers_that_pane() {
     let _ = captured();
     let h = UnitHarness::start(HarnessOpts::default()).await;
     let mut ws = h.connect().await;
-    let (holder_tid, _loader) =
-        quietly_holding_pane(&h, &mut ws, "crq-holder-i", "t-quiet-held-i").await;
+    let mut holder = quietly_holding_pane(&h, &mut ws, "crq-holder-i", "t-quiet-held-i").await;
 
     let mut other = h.connect().await;
     h.send(&mut other, reopen("crq-quiet-i", "t-quiet-held-i", false))
@@ -365,13 +370,14 @@ async fn an_interactive_reopen_of_a_thread_another_panes_app_server_holds_answer
     assert_eq!(created["type"], "terminal.created", "{created}");
     assert_eq!(
         created["terminalId"],
-        holder_tid.as_str(),
+        holder.terminal_id.as_str(),
         "the interactive reopen names the holding pane's terminal"
     );
     eventually("the interactive attempt's sidecar was stopped", || {
         h.state.units.by_create_request("crq-quiet-i").is_none()
     })
     .await;
+    holder.assert_untouched(&h).await;
     assert!(
         captured()
             .first(
@@ -384,18 +390,72 @@ async fn an_interactive_reopen_of_a_thread_another_panes_app_server_holds_answer
     );
 }
 
+/// A Codex pane whose app-server holds a conversation the owner registry
+/// does not know it holds ([`quietly_holding_pane`]), as it was before a
+/// reopen beside it.
+struct QuietHolder {
+    terminal_id: String,
+    thread_id: String,
+    /// The client that made the app-server load the thread (kept for the
+    /// test's lifetime: a round trip on it shows the app-server alive).
+    loader: fake_codex::Rpc,
+    unit_id: freshell_containment::UnitId,
+    native_pid: u32,
+}
+
+impl QuietHolder {
+    /// The pane is alive and unchanged after the failed attempt beside it
+    /// was cleaned up (call it once the attempt was answered and its unit
+    /// is gone): its app-server answers on its own connection and still
+    /// has the conversation loaded (a stop or signal that reached it
+    /// earlier closes that connection first), it still holds the lock, the
+    /// pane keeps the same unit, app-server and running screen, and no
+    /// stop of that unit was started.
+    async fn assert_untouched(&mut self, h: &UnitHarness) {
+        let loaded = self
+            .loader
+            .call("thread/loaded/list", json!({}))
+            .await
+            .expect("the holding pane's app-server answers");
+        assert!(
+            loaded["data"]
+                .as_array()
+                .is_some_and(|ids| ids.iter().any(|id| id == self.thread_id.as_str())),
+            "the holding pane still has {} loaded: {loaded}",
+            self.thread_id
+        );
+        assert!(
+            fake_codex::holds_lock_fd(self.native_pid, &h.lock(&self.thread_id)),
+            "the holding pane still holds the lock"
+        );
+        let unit = h.unit_for(&self.terminal_id);
+        assert_eq!(unit.id(), &self.unit_id, "the same unit");
+        assert_eq!(
+            h.native_pid(&self.terminal_id),
+            self.native_pid,
+            "the same app-server"
+        );
+        assert!(
+            unit.stop_in_flight().is_none(),
+            "no stop of the holding pane's unit was started"
+        );
+        assert!(
+            h.state.registry.is_pty_running(&self.terminal_id),
+            "the holding pane's screen still runs"
+        );
+    }
+}
+
 /// Creates a Codex pane (`request_id`) whose app-server then loads
 /// `thread_id` for another client of it, announced on no connection: the
 /// pane's native holds that conversation's lock while the owner registry
-/// does not know it. The rollout of `thread_id` is seeded. Returns the
-/// pane's terminal id and the client that made it load the thread (kept for
-/// the test's lifetime).
+/// does not know it. The rollout of `thread_id` is seeded.
 async fn quietly_holding_pane(
     h: &UnitHarness,
     ws: &mut TestWs,
     request_id: &str,
     thread_id: &str,
-) -> (String, fake_codex::Rpc) {
+) -> QuietHolder {
     let holder_tid = h
         .create_codex(ws, request_id, Some(&format!("{thread_id}-shown")))
         .await;
@@ -408,17 +468,21 @@ async fn quietly_holding_pane(
         .next()
         .and_then(|port| port.trim_end_matches('/').parse().ok())
         .unwrap_or_else(|| panic!("a port in {url}"));
-    let mut second_client = fake_codex::Rpc::connect(port).await;
-    second_client
+    let mut loader = fake_codex::Rpc::connect(port).await;
+    loader
         .call("fixture/loadThread", json!({"threadId": thread_id}))
         .await
         .expect("the app-server loads the thread");
-    assert!(fake_codex::holds_lock_fd(
-        h.native_pid(&holder_tid),
-        &h.lock(thread_id)
-    ));
+    let native_pid = h.native_pid(&holder_tid);
+    assert!(fake_codex::holds_lock_fd(native_pid, &h.lock(thread_id)));
     h.seed_rollout(thread_id);
-    (holder_tid, second_client)
+    QuietHolder {
+        unit_id: h.unit_for(&holder_tid).id().clone(),
+        terminal_id: holder_tid,
+        thread_id: thread_id.to_string(),
+        loader,
+        native_pid,
+    }
 }
 
 /// A holder lookup that cannot finish in time (a hung network mount) is
