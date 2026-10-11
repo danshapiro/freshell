@@ -701,11 +701,30 @@ describe('managed runtime recovery merge', () => {
       recoveryState, launchState: recoveryState === 'live' ? 'running' : 'stopped',
       desiredState: recoveryState === 'lost' || recoveryState === 'stopped' ? 'stopped' : 'running',
     })
-    const plan = buildManagedRuntimeMergePlan(snapshot([retained]), baseState())
-    expect(plan.creates[0].content).toMatchObject({
-      terminalId: 'terminal-one', soulId: 'soul-one', runtimeStatus,
-    })
-    expect(plan.creates[0].tab).toMatchObject({ soulId: 'soul-one', runtimeStatus })
+    const state = baseState()
+    if (retained.desiredState === 'stopped') {
+      state.panes.layouts['user-tab'].content = {
+        kind: 'terminal', createRequestId: 'create-one', terminalId: 'terminal-one',
+        streamId: 'transport-stream', mode: 'opencode', status: 'running', soulId: 'soul-one',
+        viewIntentId: 'view-one', sessionRef: { provider: 'opencode', sessionId: 'ses_one' },
+      }
+    }
+    const plan = buildManagedRuntimeMergePlan(snapshot([retained]), state)
+    if (retained.desiredState === 'stopped') {
+      expect(plan.creates).toHaveLength(0)
+      expect(plan.updates).toHaveLength(1)
+      expect(plan.updates[0].content).toMatchObject({
+        terminalId: 'terminal-one', streamId: 'transport-stream', soulId: 'soul-one', runtimeStatus,
+        sessionRef: { provider: 'opencode', sessionId: 'ses_one' },
+      })
+      expect(plan.updates[0].tabUpdates).toMatchObject({ soulId: 'soul-one', runtimeStatus })
+    } else {
+      expect(plan.creates).toHaveLength(1)
+      expect(plan.creates[0].content).toMatchObject({
+        terminalId: 'terminal-one', soulId: 'soul-one', runtimeStatus,
+      })
+      expect(plan.creates[0].tab).toMatchObject({ soulId: 'soul-one', runtimeStatus })
+    }
   })
 
   it('updates an already represented stopped/lost Fresh Agent in place', () => {
