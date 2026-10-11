@@ -686,14 +686,17 @@ pub(crate) fn release_for_main(state: &WsState, terminal_id: &str, thread_id: &s
 }
 
 /// A claim [`release_for_main`] prepared was refused: the thread, which the
-/// app-server still holds, is held as an extra thread again. When that is
-/// refused too (another pane, or another transition, took the key in the
-/// meantime) the thread is not left unheld for good: WARN
-/// `unit.thread_restore_refused`, and its next announcement, or the read
-/// before a stop, tries again.
+/// app-server still holds, is held as an extra thread again, keeping the
+/// status it last reported (a turn it runs still counts for
+/// [`turn_running`]). When that is refused too (another pane, or another
+/// transition, took the key in the meantime) the thread is not left unheld
+/// for good: WARN `unit.thread_restore_refused`, and its next announcement,
+/// or the read before a stop, tries again.
 pub(crate) fn restore_extra(state: &WsState, terminal_id: &str, thread_id: &str) {
-    with_existing_table(state, terminal_id, |table| table.threads.remove(thread_id));
-    if note_with_status(state, terminal_id, thread_id, None) != Hold::Refused {
+    let status = with_existing_table(state, terminal_id, |table| table.threads.remove(thread_id))
+        .flatten()
+        .and_then(|known| known.status);
+    if note_with_status(state, terminal_id, thread_id, status.as_deref()) != Hold::Refused {
         return;
     }
     if let Some(entry) = state.units.by_terminal(terminal_id) {
@@ -1010,6 +1013,22 @@ mod tests {
         assert!(
             held_as_extra(&state, "t-x"),
             "the next announcement holds it for this pane"
+        );
+    }
+
+    /// Task 14 re-review R2-N2: a thread held again after a refused claim
+    /// keeps the status it last reported, so a turn it is running still
+    /// counts before its next status arrives (Task 17's quit rule).
+    #[tokio::test]
+    async fn a_restored_thread_keeps_its_last_status() {
+        let (state, _containment) = state_with_unit();
+        observe_status(&state, TERMINAL, "t-x", "active");
+        assert!(release_for_main(&state, TERMINAL, "t-x"));
+        restore_extra(&state, TERMINAL, "t-x");
+        assert!(held_as_extra(&state, "t-x"));
+        assert!(
+            turn_running(&state, TERMINAL),
+            "the restored thread's running turn still counts"
         );
     }
 
