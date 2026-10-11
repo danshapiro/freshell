@@ -1,9 +1,11 @@
 //! Env-gated fault injection for system tests (never active unless the
 //! process runs with FRESHELL_TEST_HOOKS=1). One hook holds the Gone
 //! CONFIRMATION (not the kill) so the unconfirmed path is testable end to
-//! end; the other slows the write of the Stopping record, which every signal
-//! waits for. Plus one read-only view for tests (the unit's emptiness wait)
-//! and the cleanup of a test state root's systemd namespace slice.
+//! end; another slows the write of the Stopping record, which every signal
+//! waits for; a third holds up the read of the Codex thread lock files a
+//! unit's members hold (a Codex home on a hung network mount). Plus one
+//! read-only view for tests (the unit's emptiness wait) and the cleanup of a
+//! test state root's systemd namespace slice.
 
 /// The delay to hold Gone confirmation for, from
 /// `FRESHELL_TEST_UNIT_GONE_DELAY_MS` (only with `FRESHELL_TEST_HOOKS=1`).
@@ -16,6 +18,15 @@ pub fn gone_delay() -> Option<std::time::Duration> {
 /// `FRESHELL_TEST_HOOKS=1`).
 pub fn persist_delay() -> Option<std::time::Duration> {
     hook_delay("FRESHELL_TEST_UNIT_PERSIST_DELAY_MS")
+}
+
+/// How long the read of the Codex thread lock files a unit's members hold
+/// is held up before it starts, from
+/// `FRESHELL_TEST_UNIT_THREAD_SCAN_DELAY_MS` (only with
+/// `FRESHELL_TEST_HOOKS=1`): a stand-in for a Codex home on a hung network
+/// mount, where that read blocks.
+pub fn thread_scan_delay() -> Option<std::time::Duration> {
+    hook_delay("FRESHELL_TEST_UNIT_THREAD_SCAN_DELAY_MS")
 }
 
 /// Test support: the "unit is empty" wait the post-Gone sweep uses, when
