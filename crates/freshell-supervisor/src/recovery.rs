@@ -7806,7 +7806,7 @@ pub(crate) mod tests {
 }
 
 #[cfg(test)]
-mod automatic_retry_tests {
+pub(crate) mod automatic_retry_tests {
     use super::*;
     use crate::{backend::*, registry::Registry, service::SupervisorConfig};
     use freshell_runtime_protocol::{
@@ -7835,10 +7835,20 @@ mod automatic_retry_tests {
         std::process::abort();
     }
 
+    struct BaselineStopReadiness {
+        provider_home: PathBuf,
+        workspace: PathBuf,
+        baseline: OpenCodeAdoptionBaseline,
+        pending: tokio::sync::Notify,
+        complete: tokio::sync::Notify,
+        launch: Mutex<Option<freshell_runtime_protocol::NativeIdentityLaunch>>,
+    }
+
     struct RetryBackend {
         root: PathBuf,
         clock: Arc<AtomicI64>,
         hosts: Mutex<Vec<(PathBuf, tokio::task::JoinHandle<()>)>>,
+        baseline_stop: Option<Arc<BaselineStopReadiness>>,
     }
     impl Drop for RetryBackend {
         fn drop(&mut self) {
@@ -7853,6 +7863,7 @@ mod automatic_retry_tests {
                 root: root.into(),
                 clock,
                 hosts: Mutex::new(vec![]),
+                baseline_stop: None,
             }
         }
         fn record(&self, name: &str, value: &str) {
@@ -7939,13 +7950,15 @@ mod automatic_retry_tests {
             let retained_post_read_failure = runtime.join("retained-fault-after-ready");
             let native_required = native_file.exists() || retained_observation.exists();
             let final_identity_path = runtime.join("final-wrong-identity");
+            let baseline_stop = self.baseline_stop.clone();
+            let terminal = handle.terminal().cloned();
             let host_incarnation = handle.incarnation_id().clone();
             let facts_root = self.root.clone();
             let task = tokio::spawn(async move {
                 loop {
                     let (mut socket, _) = listener.accept().await.unwrap();
                     let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
-                    if retained_observation.exists()
+                    if (retained_observation.exists() || baseline_stop.is_some())
                         && !matches!(&request.body, HostCommand::Hello { .. })
                     {
                         assert_eq!(
@@ -7962,6 +7975,134 @@ mod automatic_retry_tests {
                         .unwrap_or_else(|_| "0".into())
                         .parse()
                         .unwrap();
+                    if let Some(readiness) = &baseline_stop {
+                        let result = match request.body {
+                            HostCommand::Hello {
+                                incarnation_id,
+                                challenge,
+                            } => HostResult::Hello {
+                                proof: host_proof(&secret, &challenge, &boot, &incarnation_id),
+                                host_boot_id: boot.clone(),
+                                capabilities: vec!["native-identity-observation-v1".into()],
+                                effective_limits: limits,
+                            },
+                            HostCommand::GrantExecution {
+                                execution_generation,
+                                resume_spec,
+                                native_identity_launch,
+                                ..
+                            } => {
+                                use freshell_agent_runtime::opencode_transfer::{
+                                    verify_installed_store, InstalledStoreReaderContext,
+                                };
+                                let spec = resume_spec.unwrap();
+                                assert_eq!(
+                                    spec.opencode_adoption_baseline,
+                                    Some(readiness.baseline.clone())
+                                );
+                                assert_eq!(
+                                    spec.provider_session.native_session_id,
+                                    readiness.baseline.descriptor.root_session_id
+                                );
+                                let terminal = terminal.as_ref().unwrap();
+                                assert!(terminal.opencode_transfer.is_none());
+                                let home = &readiness.provider_home;
+                                let receipt = verify_installed_store(
+                                    &readiness.baseline.descriptor,
+                                    &InstalledStoreReaderContext {
+                                        database_path: &home
+                                            .join(".local/share/opencode/opencode.db"),
+                                        workspace_root: &readiness.workspace,
+                                        provider_uid: terminal.run_as_uid,
+                                        provider_gid: terminal.run_as_gid,
+                                        home,
+                                        xdg_data_home: &home.join(".local/share"),
+                                        xdg_config_home: &home.join(".config"),
+                                        cwd: &readiness.workspace,
+                                    },
+                                )
+                                .unwrap();
+                                assert!(receipt.row_count > 0);
+                                RetryBackend::record_at(
+                                    &facts_root,
+                                    "baseline-current-reads",
+                                    &serde_json::to_string(&receipt).unwrap(),
+                                );
+                                RetryBackend::record_at(
+                                    &facts_root,
+                                    "baseline-grants",
+                                    &execution_generation.to_string(),
+                                );
+                                std::fs::write(&generation_path, execution_generation.to_string())
+                                    .unwrap();
+                                *readiness.launch.lock().unwrap() =
+                                    Some(native_identity_launch.unwrap());
+                                HostResult::GrantAccepted {
+                                    host_boot_id: boot.clone(), worker_pid: 42, worker_launch_count: 1,
+                                    fixture_evidence: serde_json::json!({}), native_session_id: None,
+                                    native_identity_observation: None, opencode_transfer_receipt: None,
+                                    opencode_adoption: freshell_runtime_protocol::OpenCodeAdoptionStatus::AwaitingObservation,
+                                }
+                            }
+                            HostCommand::Status { .. } => {
+                                readiness.pending.notify_one();
+                                readiness.complete.notified().await;
+                                let launch = readiness.launch.lock().unwrap().clone().unwrap();
+                                assert_eq!(launch.execution_generation, generation);
+                                assert_eq!(launch.incarnation_id, host_incarnation);
+                                assert_eq!(
+                                    launch.requested_native_session_id.as_deref(),
+                                    Some(readiness.baseline.descriptor.root_session_id.as_str())
+                                );
+                                let observation = freshell_runtime_protocol::NativeIdentityObservation {
+                                    native_session_id: readiness.baseline.descriptor.root_session_id.clone(),
+                                    incarnation_id: launch.incarnation_id, launch_nonce: launch.launch_nonce,
+                                    evidence_revision: launch.evidence_revision,
+                                    source: freshell_runtime_protocol::NativeIdentitySource::OpencodeTui,
+                                    evidence_digest: format!("{:x}", Sha256::digest(std::fs::read(facts_root.join("baseline-current-reads")).unwrap())),
+                                };
+                                RetryBackend::record_at(
+                                    &facts_root,
+                                    "baseline-late-observations",
+                                    &serde_json::to_string(&observation).unwrap(),
+                                );
+                                HostResult::Status {
+                                    host_boot_id: boot.clone(),
+                                    worker_pid: Some(42),
+                                    worker_launch_count: 1,
+                                    max_control_epoch: 1,
+                                    max_execution_generation: generation,
+                                    fixture_evidence: serde_json::json!({}),
+                                    exited: false,
+                                    native_session_id: Some(observation.native_session_id.clone()),
+                                    native_identity_observation: Some(observation),
+                                    opencode_transfer_receipt: None,
+                                    opencode_adoption: Default::default(),
+                                }
+                            }
+                            HostCommand::Stop { .. } => {
+                                RetryBackend::record_at(
+                                    &facts_root,
+                                    "baseline-host-stops",
+                                    host_incarnation.as_str(),
+                                );
+                                HostResult::Stopped
+                            }
+                            other => {
+                                panic!("cancelled baseline Resume cannot send more work: {other:?}")
+                            }
+                        };
+                        write_frame(
+                            &mut socket,
+                            &HostReply {
+                                request_id: request.request_id,
+                                result: Ok(result),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        continue;
+                    }
                     let result = match request.body {
                         HostCommand::Hello {
                             incarnation_id,
@@ -8251,6 +8392,9 @@ mod automatic_retry_tests {
             })
         }
         async fn start_host(&self, handle: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            if self.baseline_stop.is_some() {
+                self.record("baseline-host-starts", handle.incarnation_id().as_str());
+            }
             std::fs::write(handle.runtime_dir().join("fixture-started"), b"started").unwrap();
             self.host(handle).await;
             Ok(())
@@ -10407,6 +10551,330 @@ mod automatic_retry_tests {
             attempt_id: reserved.reserved_attempt_id.unwrap().to_string(),
             handle,
         }
+    }
+
+    pub(crate) async fn assert_baseline_only_stop_cancellation(
+        dir: &tempfile::TempDir,
+        registry: &Registry,
+        soul: &SoulId,
+    ) -> RecoveryContext {
+        use freshell_runtime_protocol::{
+            AdminCommand, AdminResult, ControlRole, RequestId, StopRequest,
+        };
+        let initial = registry.recovery_context(soul.clone()).await.unwrap();
+        let readiness = Arc::new(BaselineStopReadiness {
+            provider_home: dir.path().join(format!("provider-{soul}")),
+            workspace: dir.path().join("workspace"),
+            baseline: initial.opencode_adoption_baseline.clone().unwrap(),
+            pending: tokio::sync::Notify::new(),
+            complete: tokio::sync::Notify::new(),
+            launch: Mutex::new(None),
+        });
+        let mut backend = RetryBackend::new(dir.path(), Arc::new(AtomicI64::new(0)));
+        backend.baseline_stop = Some(readiness.clone());
+        let backend = Arc::new(backend);
+        let config = (*super::tests::missing_supervisor(dir, registry.clone()).config).clone();
+        let supervisor = Supervisor::new(registry.clone(), backend.clone(), config).unwrap();
+        let revision = registry
+            .start_stopped_data_repair(soul.clone(), initial.intent_revision)
+            .await
+            .unwrap();
+        let current = registry.recovery_context(soul.clone()).await.unwrap();
+        let spec = resume_catalog::exact_resume_candidate(&current, None)
+            .unwrap()
+            .unwrap();
+        registry
+            .store_verified_recovery_resume_spec_fenced(
+                soul.clone(),
+                spec.clone(),
+                current.write_fence(),
+            )
+            .await
+            .unwrap();
+        let reserved = registry
+            .reserve_due_recovery_retry(soul.clone(), revision, registry.recovery_now_ms())
+            .await
+            .unwrap()
+            .unwrap();
+        let start = registry
+            .begin_recovery(
+                soul.clone(),
+                RecoveryTrigger::ManualRetry,
+                RecoveryPath::NativeResume,
+            )
+            .await
+            .unwrap();
+        registry
+            .mark_stop_outcome(
+                initial.prior_handle.incarnation_id().clone(),
+                StopOutcome::VerifiedEmpty,
+            )
+            .await
+            .unwrap();
+        // Resume an already reserved/owned Created replacement through the
+        // same production path used after an interrupted preparation. Only the
+        // transport peer is controlled; import and current reader are real.
+        let replacement = registry
+            .prepare_replacement(
+                start,
+                terminal_without_first_boot_state(current.terminal),
+                None,
+                Some(spec),
+                RecoveryPath::NativeResume,
+            )
+            .await
+            .unwrap();
+        let runtime = supervisor
+            .ensure_incarnation_dir(&replacement.prepared)
+            .unwrap();
+        let created = backend
+            .create_stopped(&CreateRuntimeSpec {
+                installation_id: registry.installation_id().clone(),
+                soul_id: soul.clone(),
+                incarnation_id: replacement.prepared.incarnation_id.clone(),
+                image_ref: supervisor.config.image_ref.clone(),
+                host_binary_path: supervisor.config.host_binary_path.clone(),
+                runtime_dir: runtime.clone(),
+                limits: initial.requested_limits,
+                test_run_id: "baseline-stop".into(),
+                terminal: replacement.terminal.clone(),
+                fresh_agent: None,
+                opencode_transfer_dir: None,
+                provider_volume_name: initial.prior_handle.provider_volume_name().to_owned(),
+            })
+            .await
+            .unwrap();
+        registry
+            .commit_created(
+                replacement.prepared.incarnation_id.clone(),
+                crate::registry::BackendCreatedRecord {
+                    daemon_id: created.daemon_id,
+                    container_id: created.container_id,
+                    image_ref: supervisor.config.image_ref.clone(),
+                    runtime_dir: runtime,
+                    host_binary_path: supervisor.config.host_binary_path.clone(),
+                    immutable_config_digest: created.immutable_config_digest,
+                    launch_policy: None,
+                },
+            )
+            .await
+            .unwrap();
+        let conn = Connection::open(registry.database_path()).unwrap();
+        let initial_souls: u64 = conn
+            .query_row("SELECT count(*) FROM souls", [], |row| row.get(0))
+            .unwrap();
+        conn.execute_batch("CREATE TABLE baseline_stop_effects(kind TEXT);
+            CREATE TRIGGER baseline_stop_live AFTER UPDATE OF recovery_state ON souls WHEN NEW.recovery_state='live' BEGIN INSERT INTO baseline_stop_effects VALUES('live'); END;").unwrap();
+        drop(conn);
+        let recovering = {
+            let supervisor = supervisor.clone();
+            let soul = soul.clone();
+            tokio::spawn(async move {
+                supervisor
+                    .recover(RecoverRequest {
+                        soul_id: soul,
+                        trigger: RecoveryTrigger::StartupReconcile,
+                        expected_intent_revision: Some(revision),
+                        expected_control_epoch: Some(supervisor.registry.control_epoch()),
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), readiness.pending.notified())
+            .await
+            .expect("actual native readiness must wait after reading the imported baseline");
+        assert!(!recovering.is_finished());
+        assert_eq!(backend.count("baseline-current-reads"), 1);
+        assert_eq!(backend.count("baseline-grants"), 1);
+        let stopping = {
+            let supervisor = supervisor.clone();
+            let mut envelope = Envelope::new(
+                RequestId::new(),
+                ControlRole::Web,
+                AdminCommand::Stop(StopRequest {
+                    soul_id: soul.clone(),
+                    expected_intent_revision: Some(revision),
+                    expected_control_epoch: Some(registry.control_epoch()),
+                }),
+            );
+            envelope.auth = Some(supervisor.config.control_secret.clone());
+            tokio::spawn(async move { supervisor.dispatch(envelope).await })
+        };
+        let stopped = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let current = registry.recovery_context(soul.clone()).await.unwrap();
+                if current.desired_state == DesiredState::Stopped {
+                    break current;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ordinary Stop commits while native readiness retains lifecycle custody");
+        assert_eq!(stopped.intent_revision, revision + 1);
+        assert!(!stopping.is_finished());
+        assert_eq!(backend.count("baseline-host-stops"), 0);
+        readiness.complete.notify_one();
+        let recovery = tokio::time::timeout(Duration::from_secs(5), recovering)
+            .await
+            .expect("cancelled readiness must release recovery without another host read")
+            .unwrap();
+        assert_eq!(
+            recovery.unwrap_err().code,
+            RuntimeErrorCode::StaleIntentRevision
+        );
+        let stop = tokio::time::timeout(Duration::from_secs(5), stopping)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            stop.result.unwrap(),
+            AdminResult::Stop {
+                outcome: StopOutcome::VerifiedEmpty,
+                ..
+            }
+        ));
+        let after = registry.recovery_context(soul.clone()).await.unwrap();
+        assert_eq!(after.desired_state, DesiredState::Stopped);
+        assert_eq!(after.recovery_state, RecoveryState::Stopped);
+        assert_eq!(after.intent_revision, stopped.intent_revision);
+        assert_eq!(
+            after.opencode_adoption_baseline,
+            initial.opencode_adoption_baseline
+        );
+        assert_eq!(after.native_session_id, initial.native_session_id);
+        assert_eq!(
+            after.native_identity_launch,
+            readiness.launch.lock().unwrap().clone()
+        );
+        assert_eq!(after.native_import_revision, initial.native_import_revision);
+        assert_eq!(
+            after.native_import_source_generation,
+            initial.native_import_source_generation
+        );
+        assert_eq!(
+            after.native_import_authority,
+            initial.native_import_authority
+        );
+        assert_eq!(after.provider_store_id, initial.provider_store_id);
+        assert_eq!(
+            after.prior_handle.incarnation_id(),
+            &replacement.prepared.incarnation_id
+        );
+        assert_eq!(after.successful_recoveries_in_window, 0);
+        assert_eq!(
+            backend.count("creates"),
+            1,
+            "only the pre-Stop prepared enclosure exists"
+        );
+        assert_eq!(
+            backend.count("baseline-grants"),
+            1,
+            "no execution grant after Stop"
+        );
+        assert_eq!(backend.count("baseline-late-observations"), 1);
+        assert_eq!(
+            backend.count("baseline-host-starts"),
+            1,
+            "no new provider host start after Stop"
+        );
+        assert!(registry.pending_stop_handles().await.unwrap().is_empty());
+        assert!(registry
+            .recovery_retry(soul.clone(), revision)
+            .await
+            .unwrap()
+            .is_none());
+        let refused_input = {
+            let supervisor = supervisor.clone();
+            let soul = soul.clone();
+            tokio::spawn(async move {
+                Box::pin(assert_stopped_input_refused(&supervisor, &soul)).await;
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), refused_input)
+            .await
+            .expect("stopped input refusal must complete without host IPC")
+            .unwrap();
+        let conn = Connection::open(registry.database_path()).unwrap();
+        let counts: (u64, u64, u64) = conn.query_row("SELECT (SELECT count(*) FROM souls),(SELECT count(*) FROM baseline_stop_effects),(SELECT count(*) FROM input_commands)", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(
+            counts,
+            (initial_souls, 0, 0),
+            "no fresh soul, transient LIVE or input journal entry"
+        );
+        let generation: u64 = conn
+            .query_row(
+                "SELECT execution_generation FROM incarnations WHERE incarnation_id=?1",
+                [replacement.prepared.incarnation_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            generation, 1,
+            "Stop cannot mint another execution generation"
+        );
+        let observation: Option<String> = conn
+            .query_row(
+                "SELECT native_identity_observation FROM incarnations WHERE incarnation_id=?1",
+                [replacement.prepared.incarnation_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            observation.is_none(),
+            "late observation must not publish after Stop"
+        );
+        let verdict: String = conn
+            .query_row(
+                "SELECT verdict FROM recovery_attempts WHERE attempt_id=?1",
+                [reserved.reserved_attempt_id.unwrap().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(verdict, "cancelled");
+        let writers: u64 = conn
+            .query_row(
+                "SELECT count(*) FROM writer_claims WHERE soul_id=?1",
+                [soul.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(writers, 0);
+        let events: Vec<serde_json::Value> =
+            std::fs::read_to_string(&supervisor.config.lifecycle_log)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert!(events.iter().any(|event| event["event"]
+            == "supervisor.native_startup_wait_finished"
+            && event["data"]["outcome"] == "stop_intent"));
+        eprintln!(
+            "{}",
+            serde_json::json!({"severity":"info", "event":"task007.baseline_only_stop.completed", "currentReads":backend.count("baseline-current-reads"), "lateObservations":backend.count("baseline-late-observations"), "executionGrants":backend.count("baseline-grants"), "preparedEnclosures":backend.count("creates"), "runningIntentRevision":revision, "stoppedIntentRevision":after.intent_revision, "writerClaims":writers, "liveTransitions":counts.1, "inputEntries":counts.2, "stopOutcome":"verified_empty", "attemptVerdict":verdict})
+        );
+        close_retry_hosts(&backend).await;
+        after
+    }
+
+    async fn assert_stopped_input_refused(supervisor: &Supervisor, soul: &SoulId) {
+        use freshell_runtime_protocol::{
+            AdminCommand, ControlRole, RequestId, TerminalInputRequest,
+        };
+        let mut input = Envelope::new(
+            RequestId::new(),
+            ControlRole::Web,
+            AdminCommand::TerminalInput(TerminalInputRequest {
+                soul_id: soul.clone(),
+                data: "fictional input must be refused".into(),
+                expected_control_epoch: Some(supervisor.registry.control_epoch()),
+            }),
+        );
+        input.auth = Some(supervisor.config.control_secret.clone());
+        assert!(
+            Box::pin(supervisor.dispatch(input)).await.result.is_err(),
+            "stopped repaired soul must refuse input before host IPC"
+        );
     }
 
     async fn close_retry_hosts(backend: &RetryBackend) {

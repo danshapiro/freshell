@@ -4696,20 +4696,47 @@ async fn stopped_repair_resume_failure_retry_preserves_baseline() {
     if run_task007_owned_case_child(Task007OwnedCase::BaselineRetry).await {
         return;
     }
-    Box::pin(stopped_repair_baseline_case(false, false)).await;
+    Box::pin(stopped_repair_baseline_case(
+        StoppedRepairBaselineCase::Retry,
+    ))
+    .await;
 }
 
 #[tokio::test]
 async fn pending_stopped_repair_withdrawal_allows_startup_without_losing_baseline() {
-    Box::pin(stopped_repair_baseline_case(true, false)).await;
+    Box::pin(stopped_repair_baseline_case(
+        StoppedRepairBaselineCase::PendingWithdrawal,
+    ))
+    .await;
 }
 
 #[tokio::test]
 async fn stopped_repair_created_preflight_preserves_baseline() {
-    Box::pin(stopped_repair_baseline_case(false, true)).await;
+    Box::pin(stopped_repair_baseline_case(
+        StoppedRepairBaselineCase::CreatedPreflight,
+    ))
+    .await;
 }
 
-async fn stopped_repair_baseline_case(pending_startup: bool, created_preflight: bool) {
+#[tokio::test]
+async fn baseline_only_resume_stop_cancels_late_readiness_preserving_imported_graph() {
+    Box::pin(stopped_repair_baseline_case(
+        StoppedRepairBaselineCase::StopCancellation,
+    ))
+    .await;
+}
+
+enum StoppedRepairBaselineCase {
+    Retry,
+    PendingWithdrawal,
+    CreatedPreflight,
+    StopCancellation,
+}
+
+async fn stopped_repair_baseline_case(case: StoppedRepairBaselineCase) {
+    let pending_startup = matches!(case, StoppedRepairBaselineCase::PendingWithdrawal);
+    let created_preflight = matches!(case, StoppedRepairBaselineCase::CreatedPreflight);
+    let stop_cancellation = matches!(case, StoppedRepairBaselineCase::StopCancellation);
     use freshell_runtime_protocol::{
         CanonicalOwnerChoice, DesiredState, PreflightLostSoulsRequest, RecoverRequest,
         RecoveryOutcome, RecoveryState, RecoveryTrigger, RepairBatchSourceSelection, RequestId,
@@ -5201,7 +5228,19 @@ async fn stopped_repair_baseline_case(pending_startup: bool, created_preflight: 
     if created_preflight {
         crate::recovery::tests::assert_created_repaired_preflight(&dir, &registry, &soul).await;
     }
-    for _ in 0..2 {
+    let cancelled = if stop_cancellation {
+        Some(
+            Box::pin(
+                crate::recovery::automatic_retry_tests::assert_baseline_only_stop_cancellation(
+                    &dir, &registry, &soul,
+                ),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    for _ in 0..if stop_cancellation { 0 } else { 2 } {
         let context = registry.recovery_context(soul.clone()).await.unwrap();
         let outcome = supervisor
             .recover(RecoverRequest {
@@ -5236,14 +5275,45 @@ async fn stopped_repair_baseline_case(pending_startup: bool, created_preflight: 
     drop(supervisor);
     drop(registry);
     let reopened = Registry::open(dir.path(), None).unwrap();
-    assert_eq!(
-        reopened
-            .recovery_context(soul)
-            .await
-            .unwrap()
-            .opencode_adoption_baseline,
-        Some(baseline)
-    );
+    let reopened_context = reopened.recovery_context(soul).await.unwrap();
+    assert_eq!(reopened_context.opencode_adoption_baseline, Some(baseline));
+    if let Some(cancelled) = cancelled {
+        let reopened_supervisor =
+            crate::recovery::tests::missing_supervisor(&dir, reopened.clone());
+        assert_eq!(
+            reopened_supervisor
+                .reconcile_startup()
+                .await
+                .unwrap()
+                .scanned,
+            0,
+            "reopen cannot resume a cancelled repaired soul"
+        );
+        assert_eq!(reopened_context.desired_state, DesiredState::Stopped);
+        assert_eq!(reopened_context.recovery_state, RecoveryState::Stopped);
+        assert_eq!(reopened_context.intent_revision, cancelled.intent_revision);
+        assert_eq!(
+            reopened_context.native_session_id,
+            cancelled.native_session_id
+        );
+        assert_eq!(
+            reopened_context.provider_store_id,
+            cancelled.provider_store_id
+        );
+        assert_eq!(
+            reopened_context.native_import_revision,
+            cancelled.native_import_revision
+        );
+        assert_eq!(
+            reopened_context.native_import_source_generation,
+            cancelled.native_import_source_generation
+        );
+        assert_eq!(
+            reopened_context.prior_handle.incarnation_id(),
+            cancelled.prior_handle.incarnation_id()
+        );
+        assert!(reopened.pending_stop_handles().await.unwrap().is_empty());
+    }
     assert_eq!(fs::read(&database).unwrap(), source_bytes);
     for (store, bytes) in stores {
         assert_eq!(fs::read(store).unwrap(), bytes);
