@@ -38,23 +38,38 @@ import { assertManagedTerminalCreated } from '../../../../scripts/testing/manage
 import type { ErrorMessage } from '../../../../shared/ws-protocol.js'
 
 describe('managed environment create failure retention', () => {
-  it.each(['known', 'unknown'] as const)('retains safe %s failure evidence before normal owned cleanup', async kind => {
+  it.each(['known', 'unknown', 'file-os', 'file-index', 'file-auth', 'file-unknown'] as const)('retains safe %s failure evidence before normal owned cleanup', async kind => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'frs-create-failure-'))
     const home = path.join(directory, 'home')
     await fs.mkdir(home)
     const rig = new ManagedRuntimeBrowserRig(directory, 2, {}, {}, 'release', { enabledProviders: [] }, home)
     const secretMarkers = ['AUTH_SECRET_MARKER', 'CONFIG_SECRET_MARKER', 'CONVERSATION_SECRET_MARKER']
-    const reason = 'selected workspace input mountpoint is unavailable'
+    const reasons = {
+      known: 'selected workspace input mountpoint is unavailable', unknown: 'UNKNOWN',
+      'file-os': 'workspace filesystem error', 'file-index': 'prepared provider inputs configuration source',
+      'file-auth': 'initial auth reserved runtime artifact changed or unreadable', 'file-unknown': 'UNKNOWN',
+    }
+    const reason = reasons[kind]
+    const fileEvidence = kind.startsWith('file-')
+    const producerReason = kind === 'file-os' ? 'workspace: Permission denied (os error 13)'
+      : kind === 'file-index' ? 'prepared provider inputs configuration source: invalid, conflicting or over-bound metadata; reprepare before launch'
+        : reason
     const response: ErrorMessage = { type: 'error', code: 'PTY_SPAWN_FAILED', timestamp: new Date().toISOString(),
-      message: kind === 'known' ? `runtime backend configuration rejected: ${reason}; ${secretMarkers.join(' ')}`
+      message: reason !== 'UNKNOWN' ? `managed runtime launch failed: runtime supervisor rejected request: BackendUnavailable: runtime backend configuration rejected: ${producerReason}; ${secretMarkers.join(' ')}`
         : secretMarkers.join(' ') }
     const failureEvent = { event: 'supervisor.activation_failed', data: { stage: 'create_stopped_runtime',
       errorCode: 'BACKEND_UNAVAILABLE', errorClass: 'runtime_activation_failed', payload: secretMarkers } }
-    const logs = vi.spyOn(rig.runtime, 'containerLogs').mockReturnValue(JSON.stringify(failureEvent))
+    const runtimeRoot = path.join(rig.runtime.testRoot, 'r', 'browse-owned', 'x')
+    const lifecycle = path.join(path.dirname(runtimeRoot), 'evidence', 'lifecycle.jsonl')
+    if (fileEvidence) {
+      await fs.mkdir(path.dirname(lifecycle), { recursive: true })
+      await fs.writeFile(lifecycle, `${JSON.stringify(failureEvent)}\n`)
+    }
+    const logs = vi.spyOn(rig.runtime, 'containerLogs').mockReturnValue(fileEvidence ? secretMarkers.join(' ') : JSON.stringify(failureEvent))
     const web = { capturedOutput: vi.fn(() => ({ stdout: JSON.stringify(failureEvent), stderr: secretMarkers.join(' ') })),
       stop: async () => fs.rm(home, { recursive: true }) }
     rig.web = web as unknown as typeof rig.web
-    rig.supervisor = { containerId: 'd'.repeat(64) } as typeof rig.supervisor
+    rig.supervisor = { containerId: 'd'.repeat(64), runtimeRoot } as typeof rig.supervisor
     try {
       expect(() => assertManagedTerminalCreated(rig, response)).toThrow()
       expect(await rig.stop()).toEqual({ ok: true, errors: [] })
@@ -62,8 +77,9 @@ describe('managed environment create failure retention', () => {
       const stored = await fs.readFile(path.join(rig.runtime.evidenceDir, 'incidents/managed-environment-create-failure.json'), 'utf8')
       const incident = JSON.parse(stored)
       expect(incident).toMatchObject({ severity: 'error', event: 'managed_environment.create_failed',
-        code: 'PTY_SPAWN_FAILED', reason: kind === 'known' ? reason : 'UNKNOWN',
+        code: 'PTY_SPAWN_FAILED', reason,
         supervisor: { event: 'supervisor.activation_failed', stage: 'create_stopped_runtime', errorCode: 'BACKEND_UNAVAILABLE' } })
+      if (kind === 'file-os') expect(incident.osError).toBe(13)
       for (const marker of secretMarkers) expect(stored).not.toContain(marker)
       expect(logs).toHaveBeenCalledWith(rig.supervisor.containerId)
       expect(web.capturedOutput).toHaveBeenCalledOnce()
