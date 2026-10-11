@@ -3124,15 +3124,11 @@ impl Supervisor {
                 worker_pid,
                 worker_launch_count,
                 fixture_evidence,
-                native_session_id: _,
+                native_session_id,
                 opencode_transfer_receipt,
                 ..
-            } => Ok(AcceptedGrant {
-                host_boot_id,
-                worker_pid,
-                worker_launch_count,
-                fixture_evidence,
-                native_session_id: native_identity_observation
+            } => {
+                let observed_root = native_identity_observation
                     .as_ref()
                     .filter(|observation| {
                         observation.matches_launch(&native_identity_launch)
@@ -3141,22 +3137,51 @@ impl Supervisor {
                                 workload.fresh_agent.is_some(),
                             )
                     })
-                    .map(|observation| observation.native_session_id.clone()),
-                native_identity_observation,
-                opencode_transfer_receipt: validate_opencode_transfer_receipt(
-                    workload
-                        .terminal
-                        .as_ref()
-                        .and_then(|terminal| terminal.opencode_transfer.as_ref()),
-                    workload.terminal.as_ref().and_then(|terminal| {
-                        terminal
-                            .opencode_transfer
+                    .map(|observation| observation.native_session_id.clone());
+                // Fixture roots are presentation identity only. Ordinary
+                // providers still need current matching native evidence.
+                let fixture_root = if native_identity_observation.is_none()
+                    && host_boot_id == host.host_boot_id
+                    && workload.fresh_agent.as_ref().is_some_and(|agent| {
+                        identity_context.fresh_agent.as_ref() == Some(agent)
+                            && crate::registry::deterministic_fresh_agent_fixture(
+                                &identity_context.provider,
+                                agent,
+                            )
+                    }) {
+                    native_session_id.filter(|root| {
+                        !root.is_empty()
+                            && !root.chars().any(char::is_control)
+                            && native_identity_launch
+                                .requested_native_session_id
+                                .as_deref()
+                                .is_none_or(|requested| requested == root)
+                    })
+                } else {
+                    None
+                };
+                Ok(AcceptedGrant {
+                    host_boot_id,
+                    worker_pid,
+                    worker_launch_count,
+                    fixture_evidence,
+                    native_session_id: observed_root.or(fixture_root),
+                    native_identity_observation,
+                    opencode_transfer_receipt: validate_opencode_transfer_receipt(
+                        workload
+                            .terminal
                             .as_ref()
-                            .map(|_| (terminal.run_as_uid, terminal.run_as_gid))
-                    }),
-                    opencode_transfer_receipt,
-                )?,
-            }),
+                            .and_then(|terminal| terminal.opencode_transfer.as_ref()),
+                        workload.terminal.as_ref().and_then(|terminal| {
+                            terminal
+                                .opencode_transfer
+                                .as_ref()
+                                .map(|_| (terminal.run_as_uid, terminal.run_as_gid))
+                        }),
+                        opencode_transfer_receipt,
+                    )?,
+                })
+            }
             _ => Err(RuntimeError::new(
                 RuntimeErrorCode::HostAuthenticationFailed,
                 "unexpected grant reply",
@@ -3807,6 +3832,312 @@ fn validate_opencode_transfer_receipt(
             RuntimeErrorCode::HostAuthenticationFailed,
             "host grant acknowledgement has no matching OpenCode readiness receipt",
         )),
+    }
+}
+
+#[cfg(test)]
+mod grant_identity_tests {
+    use super::*;
+    use freshell_runtime_protocol::{
+        FreshAgentFixtureTransport, FreshProvider, NativeIdentityObservation, NativeIdentitySource,
+    };
+    use rusqlite::{params, Connection};
+
+    #[tokio::test]
+    async fn authenticated_grant_root_preserves_native_proof_and_typed_fixture_binding() {
+        for case in [
+            "ordinary-raw",
+            "current-proof",
+            "wrong-nonce",
+            "wrong-revision",
+            "wrong-incarnation",
+            "wrong-source",
+            "wrong-proof-root",
+            "fixture",
+            "absent-root",
+            "empty-root",
+            "control-root",
+            "wrong-requested-root",
+            "wrong-mode",
+            "wrong-provider",
+            "wrong-profile",
+            "wrong-boot",
+            "fixture-stale-proof",
+            "untyped-evidence",
+            "bad-auth",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+            let soul = SoulId::new();
+            let prepared = crate::registry::tests::materialize_fresh_runtime(
+                &registry,
+                soul.clone(),
+                dir.path(),
+            )
+            .await;
+            let runtime = dir.path().join("owned-host");
+            std::fs::create_dir(&runtime).unwrap();
+            std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
+            let mut agent = registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap()
+                .fresh_agent
+                .unwrap();
+            let fixture = matches!(
+                case,
+                "fixture"
+                    | "absent-root"
+                    | "empty-root"
+                    | "control-root"
+                    | "wrong-requested-root"
+                    | "wrong-mode"
+                    | "wrong-provider"
+                    | "wrong-profile"
+                    | "wrong-boot"
+                    | "fixture-stale-proof"
+            );
+            agent.fixture_transport = fixture.then_some(FreshAgentFixtureTransport::Deterministic);
+            if case == "wrong-mode" {
+                agent.session_type = "freshcodex".into();
+            }
+            if case == "wrong-provider" {
+                agent.provider = FreshProvider::Codex;
+                agent.session_type = "freshcodex".into();
+            }
+            let conn = Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+            conn.execute("UPDATE incarnations SET runtime_dir=?1,fresh_agent_spec=?2,fixture_kind=NULL,launch_state='created' WHERE incarnation_id=?3",
+                params![runtime.to_string_lossy(), serde_json::to_string(&agent).unwrap(), prepared.incarnation_id.as_str()]).unwrap();
+            if matches!(case, "wrong-requested-root" | "wrong-proof-root") {
+                conn.execute(
+                    "UPDATE souls SET native_session_id='requested-root' WHERE soul_id=?1",
+                    [soul.as_str()],
+                )
+                .unwrap();
+            }
+            let supervisor = crate::recovery::tests::supervisor_with_runtime_state(
+                &dir,
+                registry.clone(),
+                crate::backend::BackendRuntimeState::Running,
+            );
+            let handle = registry
+                .owned_handle(prepared.incarnation_id.clone())
+                .await
+                .unwrap();
+            let was_never_dispatched = registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap()
+                .never_dispatched;
+            let listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
+            let expected_handle = handle.clone();
+            // Controlled proof shapes test admission, not native qualification.
+            let responder = tokio::spawn(async move {
+                let boot = HostBootId::new();
+                let mut reply_observation = None;
+                for step in 0..if case == "bad-auth" { 1 } else { 2 } {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                    assert_eq!(request.role, ControlRole::Supervisor);
+                    let result = match request.body {
+                        HostCommand::Hello {
+                            incarnation_id,
+                            challenge,
+                        } if step == 0 => {
+                            assert_eq!(&incarnation_id, expected_handle.incarnation_id());
+                            HostResult::Hello {
+                                proof: if case == "bad-auth" {
+                                    "invalid-proof".into()
+                                } else {
+                                    host_proof(
+                                        b"synthetic-secret",
+                                        &challenge,
+                                        &boot,
+                                        &incarnation_id,
+                                    )
+                                },
+                                host_boot_id: boot.clone(),
+                                capabilities: vec![],
+                                effective_limits: expected_handle.requested_limits(),
+                            }
+                        }
+                        HostCommand::GrantExecution {
+                            incarnation_id,
+                            soul_id,
+                            host_boot_id,
+                            control_epoch,
+                            execution_generation,
+                            native_identity_launch,
+                            fresh_agent,
+                            ..
+                        } if step == 1 => {
+                            assert_eq!(&incarnation_id, expected_handle.incarnation_id());
+                            assert_eq!(&soul_id, expected_handle.soul_id());
+                            assert_eq!(host_boot_id, boot);
+                            assert!(control_epoch > 0 && execution_generation > 0);
+                            if case == "wrong-profile" {
+                                assert_ne!(fresh_agent.as_deref(), expected_handle.fresh_agent());
+                            } else {
+                                assert_eq!(fresh_agent.as_deref(), expected_handle.fresh_agent());
+                            }
+                            assert_eq!(
+                                request.auth.as_deref(),
+                                Some(
+                                    host_proof(
+                                        b"synthetic-secret",
+                                        "command-auth",
+                                        &boot,
+                                        &incarnation_id
+                                    )
+                                    .as_str()
+                                )
+                            );
+                            let launch = native_identity_launch.unwrap();
+                            assert_eq!(
+                                launch.launch_nonce,
+                                expected_handle.launch_nonce().as_str()
+                            );
+                            assert_eq!(launch.execution_generation, execution_generation);
+                            if case == "current-proof"
+                                || case == "fixture-stale-proof"
+                                || case.starts_with("wrong-") && !fixture
+                            {
+                                let mut observation = NativeIdentityObservation {
+                                    native_session_id: "proof-root".into(),
+                                    incarnation_id: incarnation_id.clone(),
+                                    launch_nonce: launch.launch_nonce,
+                                    evidence_revision: launch.evidence_revision,
+                                    source: NativeIdentitySource::FreshProviderHandshake,
+                                    evidence_digest: "a".repeat(64),
+                                };
+                                match case {
+                                    "wrong-nonce" | "fixture-stale-proof" => {
+                                        observation.launch_nonce = "another-launch".into()
+                                    }
+                                    "wrong-revision" => observation.evidence_revision += 1,
+                                    "wrong-incarnation" => {
+                                        observation.incarnation_id = IncarnationId::new()
+                                    }
+                                    "wrong-source" => {
+                                        observation.source = NativeIdentitySource::ClaudeNativeEvent
+                                    }
+                                    _ => {}
+                                }
+                                reply_observation = Some(observation);
+                            }
+                            HostResult::GrantAccepted {
+                                host_boot_id: if case == "wrong-boot" {
+                                    HostBootId::new()
+                                } else {
+                                    boot.clone()
+                                },
+                                worker_pid: 123,
+                                worker_launch_count: 1,
+                                fixture_evidence: serde_json::json!({"fixtureTransport":"deterministic"}),
+                                native_session_id: match case {
+                                    "absent-root" => None,
+                                    "empty-root" => Some(String::new()),
+                                    "control-root" => Some("invalid\nroot".into()),
+                                    _ => Some("raw-root".into()),
+                                },
+                                native_identity_observation: reply_observation.clone(),
+                                opencode_transfer_receipt: None,
+                                opencode_adoption: Default::default(),
+                            }
+                        }
+                        _ => panic!(
+                            "grant consumer must not dispatch input, Status or provider probes"
+                        ),
+                    };
+                    write_frame(
+                        &mut socket,
+                        &HostReply {
+                            request_id: request.request_id,
+                            result: Ok(result),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                reply_observation
+            });
+            let authenticated = supervisor
+                .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+                .await;
+            if case == "bad-auth" {
+                assert!(matches!(
+                    authenticated,
+                    Err(RuntimeError {
+                        code: RuntimeErrorCode::HostAuthenticationFailed,
+                        ..
+                    })
+                ));
+                tokio::time::timeout(Duration::from_secs(5), responder)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(registry
+                    .recovery_context(soul)
+                    .await
+                    .unwrap()
+                    .native_identity_launch
+                    .is_none());
+                continue;
+            }
+            let host = authenticated.unwrap();
+            let grant = registry
+                .commit_execution_grant(
+                    handle.incarnation_id().clone(),
+                    host.host_boot_id.clone(),
+                    handle.requested_limits(),
+                )
+                .await
+                .unwrap();
+            if case == "wrong-profile" {
+                agent.model = Some("changed-unregistered-profile".into());
+            }
+            let workload = LaunchWorkload {
+                soul_id: soul.clone(),
+                fixture: None,
+                terminal: None,
+                fresh_agent: Some(agent),
+                resume_spec: None,
+            };
+            let accepted = supervisor
+                .send_grant(&handle, &workload, &host, &grant)
+                .await
+                .unwrap();
+            let observation = tokio::time::timeout(Duration::from_secs(5), responder)
+                .await
+                .unwrap()
+                .unwrap();
+            let expected = match case {
+                "fixture" => Some("raw-root"),
+                "current-proof" => Some("proof-root"),
+                _ => None,
+            };
+            assert_eq!(accepted.native_session_id.as_deref(), expected, "{case}");
+            assert_eq!(accepted.native_identity_observation, observation, "{case}");
+            let context = registry.recovery_context(soul).await.unwrap();
+            assert_eq!(context.never_dispatched, was_never_dispatched);
+            assert_eq!(context.accepted_command_count, 0);
+            assert_eq!(context.completed_command_count, 0);
+            assert!(UnixStream::connect(runtime.join("host.sock"))
+                .await
+                .is_err());
+            let mut stale_grant = grant.clone();
+            stale_grant.execution_generation += 1;
+            let stale = supervisor
+                .send_grant(&handle, &workload, &host, &stale_grant)
+                .await;
+            assert!(matches!(
+                stale,
+                Err(RuntimeError {
+                    code: RuntimeErrorCode::RegistryFailure,
+                    ..
+                })
+            ));
+        }
     }
 }
 
