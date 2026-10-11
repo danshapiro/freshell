@@ -735,6 +735,10 @@ enum EnsureAliveError {
     /// Task 13 (D8): another create/attach holds this sessionRef's lease -- the caller
     /// answers `freshAgent.error { code: "SESSION_RESERVED" }` (retryable, never lost).
     Reserved,
+    /// Task 16: Codex refused the respawn's resume because a program outside
+    /// Freshell holds the conversation; the text names it for the user
+    /// ([`HeldAnswer::Elsewhere`]). The session stays mapped, still exited.
+    HeldElsewhere(String),
 }
 
 /// A codex thread this process now has a live, registered runtime for -- either it was
@@ -767,6 +771,10 @@ enum ResumeSessionError {
     /// Task 13 (D8): another create/attach holds this sessionRef's lease -- the caller
     /// answers `freshAgent.error { code: "SESSION_RESERVED" }` (retryable, never lost).
     Reserved,
+    /// Task 16: Codex refused the resume because a program outside Freshell
+    /// holds the conversation; the text names it for the user
+    /// ([`HeldAnswer::Elsewhere`]).
+    HeldElsewhere(String),
 }
 
 impl FreshCodexState {
@@ -906,18 +914,8 @@ impl FreshCodexState {
             thread_id,
         )
         .await?;
-        if let Some(units) = self.units.get().cloned() {
-            let pid = holder.pid;
-            let in_a_pane = tokio::task::spawn_blocking(move || {
-                units
-                    .entry_with_member(pid)
-                    .is_some_and(|entry| entry.terminal_id.is_some())
-            })
-            .await
-            .unwrap_or(false);
-            if in_a_pane {
-                return Some(ResumeHolder::Pane);
-            }
+        if self.holder_in_a_pane(holder.pid).await {
+            return Some(ResumeHolder::Pane);
         }
         freshell_containment::events::writer_conflict(
             &keys,
@@ -930,25 +928,40 @@ impl FreshCodexState {
         Some(ResumeHolder::Outside(holder))
     }
 
+    /// Whether `pid` is a member of a pane's unit (one with a terminal):
+    /// that pane holds what `pid` holds. `false` when no units are wired
+    /// (tests) or the member read failed: the holder is then still named,
+    /// never hidden.
+    async fn holder_in_a_pane(&self, pid: u32) -> bool {
+        let Some(units) = self.units.get().cloned() else {
+            return false;
+        };
+        tokio::task::spawn_blocking(move || {
+            units
+                .entry_with_member(pid)
+                .is_some_and(|entry| entry.terminal_id.is_some())
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     /// Logs Codex's own writer refusal of a `thread/resume` of `thread_id`
     /// ("already has an active writer") at ERROR (`unit.writer_conflict`,
     /// `source: freshcodex`), naming the holder one bounded lookup finds
-    /// under the Codex home this sidecar reported (Task 16). Other errors log
-    /// nothing here.
+    /// under the Codex home this sidecar reported (Task 16), and returns the
+    /// answer that tells the user who holds the conversation ([`HeldAnswer`]).
+    /// Other errors log nothing and answer `None`.
     async fn note_resume_refusal(
         &self,
         client: &CodexAppServerClient,
         thread_id: &str,
         err: &CodexAppServerError,
-    ) {
-        if !err
-            .to_string()
-            .contains(freshell_codex::remote_proxy::WRITER_CONFLICT_TEXT)
-        {
-            return;
+    ) -> Option<HeldAnswer> {
+        if !is_codex_writer_conflict(err) {
+            return None;
         }
         let home = client.codex_home().await;
-        freshell_containment::report_writer_conflict(
+        let holder = freshell_containment::report_writer_conflict(
             &freshell_containment::events::UnitLogKeys {
                 provider: PROVIDER.to_string(),
                 session_id: Some(thread_id.to_string()),
@@ -959,6 +972,19 @@ impl FreshCodexState {
             "freshcodex",
         )
         .await;
+        Some(match holder {
+            Some(holder) if self.holder_in_a_pane(holder.pid).await => HeldAnswer::Pane,
+            Some(holder) => HeldAnswer::Elsewhere(
+                freshell_protocol::conversation_held_elsewhere_message(holder.pid, &holder.name),
+            ),
+            None => HeldAnswer::Elsewhere(held_by_an_unseen_program_message(&err.to_string())),
+        })
+    }
+
+    /// Tells the pane of `session_id` that its conversation is open in
+    /// another program (Task 16): its error banner shows `message`.
+    fn tell_held_elsewhere(&self, session_id: &str, message: &str) {
+        self.emit_fresh_agent_error(session_id, CONVERSATION_HELD_ELSEWHERE, message);
     }
 
     /// Whether the session index never saw `thread_id` on disk (a
@@ -1215,7 +1241,8 @@ impl FreshCodexState {
                 "codex thread reserved by another lifecycle operation".to_string(),
                 session_id.to_string(),
             )),
-            Err(ResumeSessionError::Transient(detail)) => {
+            Err(ResumeSessionError::Transient(detail))
+            | Err(ResumeSessionError::HeldElsewhere(detail)) => {
                 Err(("codex resume failed".to_string(), detail))
             }
         }
@@ -2604,7 +2631,7 @@ impl FreshCodexState {
                 ResumeHolder::Pane => self.fail_create_session_reserved(&request_id),
                 ResumeHolder::Outside(holder) => self.fail_create(
                     &request_id,
-                    "CONVERSATION_HELD_ELSEWHERE",
+                    CONVERSATION_HELD_ELSEWHERE,
                     &freshell_protocol::conversation_held_elsewhere_message(
                         holder.pid,
                         &holder.name,
@@ -2628,10 +2655,13 @@ impl FreshCodexState {
                 },
             )
             .await;
-        if let Err(err) = &resume_result {
-            self.note_resume_refusal(&client, &resume_session_id, err)
-                .await;
-        }
+        let held = match &resume_result {
+            Err(err) => {
+                self.note_resume_refusal(&client, &resume_session_id, err)
+                    .await
+            }
+            Ok(_) => None,
+        };
         let started = match resume_result {
             Ok(started) => started,
             // The thread never had a turn (Codex wrote no rollout) and the
@@ -2674,7 +2704,15 @@ impl FreshCodexState {
                 if is_codex_thread_not_found(&err) {
                     self.mark_thread_dead(&resume_session_id).await;
                 }
-                self.fail_create(&request_id, "FRESH_AGENT_CREATE_FAILED", &err.to_string());
+                match held {
+                    Some(HeldAnswer::Pane) => self.fail_create_session_reserved(&request_id),
+                    Some(HeldAnswer::Elsewhere(message)) => {
+                        self.fail_create(&request_id, CONVERSATION_HELD_ELSEWHERE, &message)
+                    }
+                    None => {
+                        self.fail_create(&request_id, "FRESH_AGENT_CREATE_FAILED", &err.to_string())
+                    }
+                }
                 return;
             }
         };
@@ -3590,6 +3628,13 @@ impl FreshCodexState {
                 self.send_error(&request_id, "CODEX_RESPAWN_FAILED", &err);
                 return;
             }
+            Err(EnsureAliveError::HeldElsewhere(message)) => {
+                // The send's own failure (the client releases the send),
+                // and the pane's banner tells the user who holds it.
+                self.send_error(&request_id, "CODEX_RESPAWN_FAILED", &message);
+                self.tell_held_elsewhere(&session_id, &message);
+                return;
+            }
             Err(EnsureAliveError::Reserved) => {
                 // Task 13 (D8): another create/attach holds this sessionRef -- the
                 // retryable non-lost error channel; the client re-drive converges.
@@ -4251,6 +4296,10 @@ impl FreshCodexState {
                 self.emit_fresh_agent_error(&session_id, "CODEX_RESPAWN_FAILED", &err);
                 return;
             }
+            Err(EnsureAliveError::HeldElsewhere(message)) => {
+                self.tell_held_elsewhere(&session_id, &message);
+                return;
+            }
             Err(EnsureAliveError::Reserved) => {
                 // Task 13 (D8) discipline, mirrored from handle_send: another
                 // create/attach holds this sessionRef — retryable, never lost.
@@ -4468,6 +4517,14 @@ impl FreshCodexState {
             }
             Err(EnsureAliveError::RespawnFailed(err)) => {
                 reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &err));
+                return;
+            }
+            Err(EnsureAliveError::HeldElsewhere(message)) => {
+                reply_sink(rollback_error_frame(
+                    &op,
+                    CONVERSATION_HELD_ELSEWHERE,
+                    &message,
+                ));
                 return;
             }
             Err(EnsureAliveError::Reserved) => {
@@ -4845,6 +4902,14 @@ impl FreshCodexState {
             }
             Err(EnsureAliveError::RespawnFailed(err)) => {
                 reply_sink(fork_error_frame(&msg.session_id, &err));
+                return;
+            }
+            Err(EnsureAliveError::HeldElsewhere(message)) => {
+                reply_sink(fork_error_frame_with_code(
+                    &msg.session_id,
+                    CONVERSATION_HELD_ELSEWHERE,
+                    &message,
+                ));
                 return;
             }
             Err(EnsureAliveError::Reserved) => {
@@ -6320,6 +6385,10 @@ impl FreshCodexState {
                     self.send_error(&None, "CODEX_ATTACH_RESPAWN_FAILED", &err);
                     return;
                 }
+                Err(EnsureAliveError::HeldElsewhere(message)) => {
+                    self.tell_held_elsewhere(&msg.session_id, &message);
+                    return;
+                }
                 Err(EnsureAliveError::Reserved) => {
                     // Task 13 (D8): loser answer -- retryable, never lost.
                     self.emit_fresh_agent_error(
@@ -6365,6 +6434,10 @@ impl FreshCodexState {
                 }
                 Err(ResumeSessionError::Transient(err)) => {
                     self.send_error(&None, "CODEX_ATTACH_RESUME_FAILED", &err);
+                    return;
+                }
+                Err(ResumeSessionError::HeldElsewhere(message)) => {
+                    self.tell_held_elsewhere(&msg.session_id, &message);
                     return;
                 }
                 Err(ResumeSessionError::Reserved) => {
@@ -6758,9 +6831,12 @@ impl FreshCodexState {
                 },
             )
             .await;
-        if let Err(err) = &first_attempt {
-            self.note_resume_refusal(&client, session_id, err).await;
-        }
+        // Task 16: Codex refusing the resume as held is logged once (the
+        // first refusal of this recovery) and answered with its holder.
+        let mut held = match &first_attempt {
+            Err(err) => self.note_resume_refusal(&client, session_id, err).await,
+            Ok(_) => None,
+        };
 
         let resume_result = match first_attempt {
             Ok(started) => Ok(started),
@@ -6769,7 +6845,7 @@ impl FreshCodexState {
             // app-server rejected one of them; `handle_send` re-applies the real settings
             // on the next turn regardless.
             Err(_) => {
-                client
+                let retry = client
                     .resume_thread(
                         session_id,
                         StartThreadParams {
@@ -6780,7 +6856,11 @@ impl FreshCodexState {
                             history_mode: None, // resume carries no mode param
                         },
                     )
-                    .await
+                    .await;
+                if let (None, Err(err)) = (&held, &retry) {
+                    held = self.note_resume_refusal(&client, session_id, err).await;
+                }
+                retry
             }
         };
 
@@ -6826,7 +6906,13 @@ impl FreshCodexState {
                 if let Some(mut g) = lease_guard.take() {
                     g.fail();
                 }
-                return Err(EnsureAliveError::RespawnFailed(err.to_string()));
+                return Err(match held.filter(|_| is_codex_writer_conflict(&err)) {
+                    Some(HeldAnswer::Pane) => EnsureAliveError::Reserved,
+                    Some(HeldAnswer::Elsewhere(message)) => {
+                        EnsureAliveError::HeldElsewhere(message)
+                    }
+                    None => EnsureAliveError::RespawnFailed(err.to_string()),
+                });
             }
         };
         // TERM-25: never silently proceed against the wrong thread. Re-registering the
@@ -8590,9 +8676,10 @@ impl FreshCodexState {
                 },
             )
             .await;
-        if let Err(err) = &resume_result {
-            self.note_resume_refusal(&client, thread_id, err).await;
-        }
+        let held = match &resume_result {
+            Err(err) => self.note_resume_refusal(&client, thread_id, err).await,
+            Ok(_) => None,
+        };
         let started = match resume_result {
             Ok(started) => started,
             Err(err) => {
@@ -8612,7 +8699,13 @@ impl FreshCodexState {
                     self.mark_thread_dead(thread_id).await;
                     return Err(ResumeSessionError::NotFound);
                 }
-                return Err(ResumeSessionError::Transient(err.to_string()));
+                return Err(match held {
+                    Some(HeldAnswer::Pane) => ResumeSessionError::Reserved,
+                    Some(HeldAnswer::Elsewhere(message)) => {
+                        ResumeSessionError::HeldElsewhere(message)
+                    }
+                    None => ResumeSessionError::Transient(err.to_string()),
+                });
             }
         };
 
@@ -9189,6 +9282,38 @@ fn is_codex_include_turns_unavailable(err: &CodexAppServerError) -> bool {
 /// never had a turn): `-32600 "no rollout found for thread id …"`.
 fn is_codex_no_rollout(err: &CodexAppServerError) -> bool {
     err.to_string().to_lowercase().contains("no rollout found")
+}
+
+/// The wire code of a refusal naming the program that holds a conversation
+/// (Task 16).
+const CONVERSATION_HELD_ELSEWHERE: &str = "CONVERSATION_HELD_ELSEWHERE";
+
+/// Whether `err` is Codex refusing a writer ("already has an active
+/// writer"): another process holds the conversation.
+fn is_codex_writer_conflict(err: &CodexAppServerError) -> bool {
+    err.to_string()
+        .contains(freshell_codex::remote_proxy::WRITER_CONFLICT_TEXT)
+}
+
+/// The text telling the user that a program this server cannot see holds
+/// the conversation Codex refused (`codex_text`, kept for diagnosis): the
+/// lock is never reported as free (Task 16).
+fn held_by_an_unseen_program_message(codex_text: &str) -> String {
+    format!(
+        "This conversation is open in another program, and Freshell cannot see which one. \
+         Close it there, then reopen it here. ({codex_text})"
+    )
+}
+
+/// How a resume lane answers Codex refusing its `thread/resume` because
+/// another process holds the conversation (Task 16).
+enum HeldAnswer {
+    /// A member of a live Freshell pane's unit holds it: the lane's
+    /// live-session answer (`SESSION_RESERVED`), as the create lane gives.
+    Pane,
+    /// The user-facing text: the program outside Freshell by pid and process
+    /// name, or, when none is visible, that Freshell cannot see which one.
+    Elsewhere(String),
 }
 
 /// Who holds a conversation a freshcodex resume wants (Task 16).
@@ -23435,7 +23560,8 @@ pub(crate) mod tests {
     /// Task 16: Codex refusing the resume itself ("already has an active
     /// writer") is a writer conflict logged at ERROR (`source: freshcodex`);
     /// with no holder this server can see, it is "held by a process outside
-    /// Freshell's view", never released.
+    /// Freshell's view", never released, and the create's failure says so in
+    /// plain words (review M3: every resume lane answers alike).
     #[tokio::test]
     async fn codex_refusing_a_resume_as_held_is_logged_as_a_writer_conflict() {
         let _guard = ENV_LOCK.lock().await;
@@ -23452,6 +23578,15 @@ pub(crate) mod tests {
         .await;
         let frame = create_answer(&mut rx).await;
         assert_eq!(frame["type"], "freshAgent.create.failed", "{frame}");
+        assert_eq!(frame["code"], "CONVERSATION_HELD_ELSEWHERE", "{frame}");
+        assert!(
+            frame["message"].as_str().is_some_and(|m| m.starts_with(
+                "This conversation is open in another program, and Freshell cannot see \
+                 which one."
+            ) && m
+                .contains("already has an active writer")),
+            "{frame}"
+        );
         let conflict = capture
             .events()
             .into_iter()
@@ -23464,6 +23599,230 @@ pub(crate) mod tests {
             conflict.fields["reason"],
             "held by a process outside Freshell's view"
         );
+    }
+
+    /// The fake's `thread/resume` refused the way Codex refuses a
+    /// conversation another process holds.
+    fn refuse_resume_as_held(thread_id: &str) -> String {
+        json!({
+            "overrides": {
+                "thread/resume": {
+                    "error": {
+                        "code": -32600,
+                        "message": format!(
+                            "thread-store conflict: thread {thread_id} already has an active writer"
+                        ),
+                    }
+                }
+            }
+        })
+        .to_string()
+    }
+
+    /// Every frame on `rx` up to and including the first `freshAgent.error`
+    /// event for `session_id` (the pane's error banner). Panics when none
+    /// arrives within the budget.
+    async fn frames_until_error_banner(
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        session_id: &str,
+    ) -> Vec<Value> {
+        let mut frames = Vec::new();
+        let found = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                let banner = frame["type"] == "freshAgent.event"
+                    && frame["sessionId"] == session_id
+                    && frame["event"]["type"] == "freshAgent.error";
+                frames.push(frame);
+                if banner {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(
+            found.is_ok(),
+            "no error banner for {session_id}; frames: {frames:?}"
+        );
+        frames
+    }
+
+    /// The `unit.writer_conflict` events `capture` holds that name the
+    /// holder `pid` (the capture keeps every test's events about its
+    /// session id, and the fake mints the same thread ids in every test).
+    fn writer_conflicts_naming(
+        capture: &tracing_capture::GlobalCapture,
+        pid: u32,
+    ) -> Vec<tracing_capture::CapturedEvent> {
+        let pid = pid.to_string();
+        capture
+            .events()
+            .into_iter()
+            .filter(|e| {
+                e.fields.get("event").map(String::as_str) == Some("unit.writer_conflict")
+                    && e.fields.get("holder_pid") == Some(&pid)
+            })
+            .collect()
+    }
+
+    /// Task 16 (review M3): a `freshAgent.attach` that resumes a conversation
+    /// (a reload after a server restart) and that Codex refuses as held tells
+    /// the user who holds it: the pane's error banner carries the same plain
+    /// message the create lane gives, naming the program the lock lookup
+    /// found by pid and process name. Nothing is resumed.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_attach_whose_resume_codex_refuses_names_the_program_holding_it() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(&refuse_resume_as_held("thread-attach-held"));
+        let capture = tracing_capture::capture_by_session("thread-attach-held");
+        let home = std::env::var_os("CODEX_HOME").expect("the isolated CODEX_HOME");
+        let holder = OutsideHolder::hold(&freshell_containment::codex_thread_lock_path(
+            std::path::Path::new(&home),
+            "thread-attach-held",
+        ));
+        let pid = holder.0.id();
+        let (st, mut rx) = state_with_bus();
+
+        st.handle_attach(attach_msg("thread-attach-held")).await;
+        let frames = frames_until_error_banner(&mut rx, "thread-attach-held").await;
+        let banner = frames.last().expect("the banner");
+        assert_eq!(
+            banner["event"]["code"], "CONVERSATION_HELD_ELSEWHERE",
+            "{banner}"
+        );
+        assert_eq!(
+            banner["event"]["message"],
+            freshell_protocol::conversation_held_elsewhere_message(pid, "perl"),
+            "{banner}"
+        );
+        assert!(
+            !st.sessions.lock().await.contains_key("thread-attach-held"),
+            "nothing was resumed"
+        );
+        let conflicts = writer_conflicts_naming(&capture, pid);
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert_eq!(conflicts[0].fields["source"], "freshcodex");
+        drop(holder);
+    }
+
+    /// Task 16 (review M3): when Codex refuses an attach's resume as held but
+    /// no holder is visible to this server, the banner says so in plain words
+    /// and keeps Codex's own text; it never claims the conversation is free.
+    #[tokio::test]
+    async fn an_attach_whose_resume_codex_refuses_with_no_visible_holder_says_so() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(&refuse_resume_as_held("thread-attach-unseen"));
+        let (st, mut rx) = state_with_bus();
+
+        st.handle_attach(attach_msg("thread-attach-unseen")).await;
+        let frames = frames_until_error_banner(&mut rx, "thread-attach-unseen").await;
+        let banner = frames.last().expect("the banner");
+        assert_eq!(
+            banner["event"]["code"], "CONVERSATION_HELD_ELSEWHERE",
+            "{banner}"
+        );
+        let message = banner["event"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with(
+                "This conversation is open in another program, and Freshell cannot see \
+                 which one. Close it there, then reopen it here."
+            ),
+            "{banner}"
+        );
+        assert!(
+            message.contains("thread thread-attach-unseen already has an active writer"),
+            "Codex's own text is kept: {banner}"
+        );
+    }
+
+    /// Task 16 (review M3): a send to a crashed freshcodex pane whose
+    /// recovery resume Codex refuses as held tells the user who holds the
+    /// conversation: the send's own failure and the pane's error banner carry
+    /// the plain message naming the program. The refusal (seen on the first
+    /// resume and on its no-settings retry) is logged once.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_crash_recovery_codex_refuses_as_held_names_the_program_holding_it() {
+        let _guard = ENV_LOCK.lock().await;
+        let (st, mut rx) = state_with_bus();
+        configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
+        simulate_unrequested_crash(&st, &thread_id).await;
+        configure_fake_codex_cmd(&refuse_resume_as_held(&thread_id));
+        let capture = tracing_capture::capture_by_session(&thread_id);
+        let home = std::env::var_os("CODEX_HOME").expect("the isolated CODEX_HOME");
+        let holder = OutsideHolder::hold(&freshell_containment::codex_thread_lock_path(
+            std::path::Path::new(&home),
+            &thread_id,
+        ));
+        let pid = holder.0.id();
+        let expected = freshell_protocol::conversation_held_elsewhere_message(pid, "perl");
+
+        st.handle_send(FreshAgentSend {
+            request_id: Some("req-held-send".to_string()),
+            ..send_msg(&thread_id, "hello again")
+        })
+        .await;
+        let frames = frames_until_error_banner(&mut rx, &thread_id).await;
+        let banner = frames.last().expect("the banner");
+        assert_eq!(
+            banner["event"]["code"], "CONVERSATION_HELD_ELSEWHERE",
+            "{banner}"
+        );
+        assert_eq!(banner["event"]["message"], expected.as_str(), "{banner}");
+        let failed_send = frames
+            .iter()
+            .find(|f| f["type"] == "error" && f["requestId"] == "req-held-send")
+            .unwrap_or_else(|| panic!("the send's own failure: {frames:?}"));
+        assert!(
+            failed_send["message"]
+                .as_str()
+                .is_some_and(|m| m.ends_with(expected.as_str())),
+            "{failed_send}"
+        );
+        let conflicts = writer_conflicts_naming(&capture, pid);
+        assert_eq!(conflicts.len(), 1, "one refusal, one log: {conflicts:?}");
+        assert_eq!(conflicts[0].fields["source"], "freshcodex");
+        drop(holder);
+    }
+
+    /// Task 16 (review M3): a crash recovery whose conversation a member of a
+    /// live Freshell pane's unit holds answers with that pane's live-session
+    /// answer, `SESSION_RESERVED` (as the create lane and the live-terminal
+    /// guard do), never "another program".
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_crash_recovery_a_freshell_pane_holds_answers_session_reserved() {
+        let _guard = ENV_LOCK.lock().await;
+        let (st, mut rx) = state_with_bus();
+        configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
+        simulate_unrequested_crash(&st, &thread_id).await;
+        configure_fake_codex_cmd(&refuse_resume_as_held(&thread_id));
+        let home = std::env::var_os("CODEX_HOME").expect("the isolated CODEX_HOME");
+        let units = freshell_containment::UnitDirectory::new();
+        let unit = freshell_containment::Containment::tag_backend(Default::default())
+            .create_unit(freshell_containment::UnitId::mint(), Default::default())
+            .expect("a pane's unit");
+        units.register(freshell_containment::UnitEntry {
+            unit: unit.clone(),
+            provider: "codex".to_string(),
+            mode: "codex".to_string(),
+            create_request_id: Some("crq-holding-pane".to_string()),
+            terminal_id: Some("term-holding-pane".to_string()),
+        });
+        let holder = OutsideHolder::hold_in_unit(
+            &freshell_containment::codex_thread_lock_path(std::path::Path::new(&home), &thread_id),
+            &unit,
+        );
+        st.set_unit_directory(units);
+
+        st.handle_attach(attach_msg(&thread_id)).await;
+        let frames = frames_until_error_banner(&mut rx, &thread_id).await;
+        let banner = frames.last().expect("the answer");
+        assert_eq!(banner["event"]["code"], "SESSION_RESERVED", "{banner}");
+        drop(holder);
     }
 
     /// Node parity (`runtime-manager.ts:106-108`): a `freshAgent.create` whose

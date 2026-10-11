@@ -140,13 +140,14 @@ pub const CONFLICT_NO_VISIBLE_HOLDER: &str = "no process this server can see hol
 /// server's ambient one). With no home, no visible holder, or a lookup that
 /// could not finish in time, it still logs at ERROR, `holder_visible=false`
 /// with the reason "held by a process outside Freshell's view"
-/// (`detail` says which); it never reports the lock as released.
+/// (`detail` says which); it never reports the lock as released. Returns the
+/// holder it named (`None`: none visible), for a caller that tells the user.
 pub async fn report_writer_conflict(
     keys: &crate::events::UnitLogKeys,
     codex_home: Option<&Path>,
     thread_id: &str,
     source: &str,
-) {
+) -> Option<LockHolder> {
     let (holder, detail) = match codex_home.filter(|home| home.is_absolute()) {
         None => (None, CONFLICT_NO_KNOWN_HOME.to_string()),
         Some(home) => {
@@ -173,6 +174,7 @@ pub async fn report_writer_conflict(
         source,
         &detail,
     );
+    holder
 }
 
 /// [`lock_holders_within`] over its own `gate` and `lookup` (testable).
