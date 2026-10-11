@@ -407,10 +407,13 @@ impl QuietHolder {
     /// The pane is alive and unchanged after the failed attempt beside it
     /// was cleaned up (call it once the attempt was answered and its unit
     /// is gone): its app-server answers on its own connection and still
-    /// has the conversation loaded (a stop or signal that reached it
-    /// earlier closes that connection first), it still holds the lock, the
-    /// pane keeps the same unit, app-server and running screen, and no
-    /// stop of that unit was started.
+    /// has the conversation loaded (a SIGKILL that reached it earlier
+    /// closes that connection first), and its manifest records no signal
+    /// (a polite SIGTERM or SIGINT leaves it answering for a moment, but it
+    /// records the signal in its handler, which ran before that answer);
+    /// it still holds the lock, the pane keeps the same unit, app-server
+    /// and running screen, and no stop of that unit was started (a stop
+    /// through the registry).
     async fn assert_untouched(&mut self, h: &UnitHarness) {
         let loaded = self
             .loader
@@ -423,6 +426,11 @@ impl QuietHolder {
                 .is_some_and(|ids| ids.iter().any(|id| id == self.thread_id.as_str())),
             "the holding pane still has {} loaded: {loaded}",
             self.thread_id
+        );
+        let signals = h.native_manifest(&self.terminal_id).signals;
+        assert!(
+            signals.is_empty(),
+            "the holding pane's app-server was never signalled: {signals:?}"
         );
         assert!(
             fake_codex::holds_lock_fd(self.native_pid, &h.lock(&self.thread_id)),
