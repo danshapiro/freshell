@@ -1827,14 +1827,14 @@ fn export_exact_session_inner<W: Write>(
         let snapshot_objects = asset_resolver
             .snapshot_objects
             .iter()
-            .map(|((project_id, worktree_sha1, object_id), compressed_hex)| {
-                SerializedSnapshotObject {
+            .map(
+                |((project_id, worktree_sha1, object_id), output)| SerializedSnapshotObject {
                     project_id: project_id.clone(),
                     worktree_sha1: worktree_sha1.clone(),
                     object_id: object_id.clone(),
-                    compressed_hex: compressed_hex.as_ref().clone(),
-                }
-            })
+                    compressed_hex: output.compressed_hex.as_ref().clone(),
+                },
+            )
             .collect::<Vec<_>>();
         let native_cleanup_baselines = capture_native_cleanup_baselines(&rows)?;
         let payload_path = extraction.path().join("bundle.json");
@@ -2097,7 +2097,7 @@ struct AssetResolver<'a> {
     snapshot_data_home: Option<PathBuf>,
     snapshot_projects: HashMap<String, String>,
     saved_snapshots: BTreeMap<(String, String), SavedSnapshotReference>,
-    snapshot_objects: BTreeMap<(String, String, String), Arc<String>>,
+    snapshot_objects: BTreeMap<(String, String, String), SnapshotOutput>,
     object_representations: SnapshotRepresentations,
     packed_decoders: SnapshotPackedDecoders,
     source_progress: Option<SourcePhase>,
@@ -2637,6 +2637,11 @@ impl<'a> AssetResolver<'a> {
                             id,
                             object,
                             remaining,
+                            self.snapshot_objects.get(&(
+                                project_id.clone(),
+                                worktree_sha1.clone(),
+                                id.to_string(),
+                            )),
                             &mut self.packed_decoders.costs,
                         )
                     })
@@ -2653,7 +2658,7 @@ impl<'a> AssetResolver<'a> {
                 // the one validated serialized content allocation.
                 self.snapshot_objects.insert(
                     (project_id.clone(), worktree_sha1.clone(), object_id),
-                    representation.compressed_hex.clone(),
+                    representation.output,
                 );
             }
         }
@@ -3558,6 +3563,10 @@ impl SnapshotPackedDecoder {
     }
 
     fn from_command(mut command: Command) -> Result<Self, TransferError> {
+        #[cfg(all(test, unix))]
+        {
+            command = snapshot_reuse_test_hooks::late_owner_command(command);
+        }
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -4168,15 +4177,29 @@ enum SnapshotEncoding {
     PackedDefault,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnapshotOutputProvenance {
+    Loose,
+    PackedDefault,
+}
+
+// Required serialized output retains only its existing allocation and encoding
+// provenance. Current body/adjacency authority stays in the native read/walk.
+struct SnapshotOutput {
+    compressed_hex: Arc<String>,
+    provenance: SnapshotOutputProvenance,
+}
+
 struct SavedObjectRepresentation {
     edges: SnapshotEdges,
     metadata: SnapshotObjectMetadata,
     compressed_hex: Arc<String>,
+    provenance: SnapshotOutputProvenance,
 }
 
 struct RetainedSnapshotObject {
     metadata: SnapshotObjectMetadata,
-    compressed_hex: Arc<String>,
+    output: SnapshotOutput,
 }
 
 impl SnapshotClosureObject for Arc<SavedObjectRepresentation> {
@@ -4184,7 +4207,10 @@ impl SnapshotClosureObject for Arc<SavedObjectRepresentation> {
     fn into_retained(self) -> Self::Retained {
         RetainedSnapshotObject {
             metadata: self.metadata.clone(),
-            compressed_hex: self.compressed_hex.clone(),
+            output: SnapshotOutput {
+                compressed_hex: self.compressed_hex.clone(),
+                provenance: self.provenance,
+            },
         }
     }
     fn compressed_bytes(&self) -> u64 {
@@ -4219,10 +4245,11 @@ impl SnapshotRepresentations {
         id: &str,
         object: SnapshotObjectSource,
         remaining: u64,
+        output: Option<&SnapshotOutput>,
         costs: &mut SourceReaderCosts,
     ) -> Result<Arc<SavedObjectRepresentation>, TransferError> {
         let started = Instant::now();
-        let result = self.resolve_inner(id, object, remaining, costs);
+        let result = self.resolve_inner(id, object, remaining, output, costs);
         costs.representation_us = costs.representation_us.saturating_add(elapsed_us(started));
         result
     }
@@ -4232,6 +4259,7 @@ impl SnapshotRepresentations {
         id: &str,
         object: SnapshotObjectSource,
         remaining: u64,
+        output: Option<&SnapshotOutput>,
         costs: &mut SourceReaderCosts,
     ) -> Result<Arc<SavedObjectRepresentation>, TransferError> {
         let encoding = match &object {
@@ -4251,12 +4279,38 @@ impl SnapshotRepresentations {
             return Ok(resident.clone());
         }
         costs.representation_misses = costs.representation_misses.saturating_add(1);
+        #[cfg(test)]
+        let output = output.filter(|_| {
+            !snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().packed_output_disabled)
+        });
+        let provenance = match &object {
+            SnapshotObjectSource::Loose(_) => SnapshotOutputProvenance::Loose,
+            SnapshotObjectSource::Packed { .. } => SnapshotOutputProvenance::PackedDefault,
+        };
         let (kind, body, compressed) = match object {
             SnapshotObjectSource::Loose(compressed) => {
                 let (kind, body) = decode_snapshot_object(id, &compressed)?;
                 (kind, body, compressed)
             }
             SnapshotObjectSource::Packed { kind, body } => {
+                if let Some(output) = output
+                    .filter(|output| output.provenance == SnapshotOutputProvenance::PackedDefault)
+                {
+                    let (compressed_bytes, compressed_sha256) =
+                        snapshot_output_commitment(&output.compressed_hex)?;
+                    check_snapshot_closure_bytes(compressed_bytes, remaining)?;
+                    let representation = Arc::new(SavedObjectRepresentation {
+                        edges: validated_snapshot_edges(&kind, &body)?,
+                        metadata: SnapshotObjectMetadata {
+                            object_id: id.to_string(),
+                            compressed_bytes,
+                            compressed_sha256,
+                        },
+                        compressed_hex: output.compressed_hex.clone(),
+                        provenance,
+                    });
+                    return Ok(self.admit(key, representation));
+                }
                 let started = Instant::now();
                 let compressed = compress_snapshot_object(&kind, &body);
                 costs.compression_us = costs.compression_us.saturating_add(elapsed_us(started));
@@ -4279,7 +4333,16 @@ impl SnapshotRepresentations {
             edges,
             metadata,
             compressed_hex: Arc::new(hex::encode(compressed)),
+            provenance,
         });
+        Ok(self.admit(key, representation))
+    }
+
+    fn admit(
+        &mut self,
+        key: (String, SnapshotEncoding),
+        representation: Arc<SavedObjectRepresentation>,
+    ) -> Arc<SavedObjectRepresentation> {
         // Include retained output bytes even though they normally share the
         // emitted map's allocation; replaced encodings must remain bounded too.
         let retained_bytes = representation
@@ -4294,9 +4357,27 @@ impl SnapshotRepresentations {
             }
             self.bytes += retained_bytes;
             self.resident.insert(key, representation.clone());
+            #[cfg(test)]
+            snapshot_reuse_test_hooks::count("memo_admit");
         }
-        Ok(representation)
+        representation
     }
+}
+
+fn snapshot_output_commitment(compressed_hex: &str) -> Result<(u64, String), TransferError> {
+    let mut hasher = Sha256::new();
+    let mut scratch = [0u8; 4096];
+    for chunk in compressed_hex.as_bytes().chunks(scratch.len() * 2) {
+        let decoded = &mut scratch[..chunk.len() / 2];
+        hex::decode_to_slice(chunk, decoded).map_err(|_| {
+            TransferError::Blocked("snapshot object has invalid encoded bytes".into())
+        })?;
+        hasher.update(decoded);
+    }
+    Ok((
+        (compressed_hex.len() / 2) as u64,
+        hex::encode(hasher.finalize()),
+    ))
 }
 
 fn snapshot_closure_bound() -> u64 {
@@ -4319,6 +4400,9 @@ mod snapshot_reuse_test_hooks {
         pub counts: BTreeMap<&'static str, usize>,
         pub filesystem_counts: BTreeMap<&'static str, usize>,
         pub budget: Option<usize>,
+        pub packed_output_disabled: bool,
+        #[cfg(unix)]
+        pub packed_late_fault: Option<(i32, bool, std::path::PathBuf)>,
         #[cfg_attr(not(unix), allow(dead_code))]
         pub aggregate_disabled: bool,
         pub before_reference: Option<Box<dyn FnMut(usize)>>,
@@ -4329,6 +4413,32 @@ mod snapshot_reuse_test_hooks {
     }
     thread_local! {
         pub(super) static STATE: RefCell<State> = RefCell::new(State::default());
+    }
+    #[cfg(unix)]
+    pub(super) fn late_owner_command(command: std::process::Command) -> std::process::Command {
+        let fault = STATE.with(|state| state.borrow().packed_late_fault.clone());
+        let Some((status, trailing, pids)) = fault else {
+            return command;
+        };
+        let mut wrapped = std::process::Command::new("python3");
+        wrapped.args(["-c", "import os, pathlib, subprocess, sys\nchild = subprocess.Popen(sys.argv[4:])\npathlib.Path(sys.argv[3]).write_text(str(os.getpid()) + ' ' + str(child.pid))\nresult = child.wait()\nif sys.argv[2] == 'true': sys.stdout.buffer.write(b'late output')\nsys.exit(int(sys.argv[1]) if result == 0 else result)\n"]);
+        wrapped
+            .arg(status.to_string())
+            .arg(trailing.to_string())
+            .arg(pids)
+            .arg(command.get_program())
+            .args(command.get_args());
+        for (key, value) in command.get_envs() {
+            match value {
+                Some(value) => {
+                    wrapped.env(key, value);
+                }
+                None => {
+                    wrapped.env_remove(key);
+                }
+            }
+        }
+        wrapped
     }
     pub(super) fn count_filesystem(operation: &'static str) {
         STATE.with(|state| {
@@ -4867,48 +4977,109 @@ fn inspect_git_tree_with_costs(
     let mut objects = BTreeSet::new();
     let mut pending_trees = vec![tree.to_string()];
     let mut inspected_trees = BTreeSet::new();
-    // Visit each tree separately so its storage paths are checked before Git
-    // reads it; recursive `ls-tree` could open unchecked descendant trees.
-    while let Some(current_tree) = pending_trees.pop() {
-        if !inspected_trees.insert(current_tree.clone()) {
-            continue;
-        }
-        verify_git_loose_object_paths(&mount, object_stores, std::slice::from_ref(&current_tree))?;
-        let object_kind =
-            git_text_in_repository(repository, &["cat-file", "-t", &current_tree], &mut costs)?;
-        if object_kind.trim() != "tree" {
-            return Err(TransferError::Blocked(
-                "snapshot reference does not identify a Git tree object".into(),
-            ));
-        }
-        objects.insert(current_tree.clone());
-        let entries =
-            git_output_in_repository(repository, &["ls-tree", "-z", &current_tree], &mut costs)?;
-        for entry in entries
-            .stdout
-            .split(|byte| *byte == 0)
-            .filter(|entry| !entry.is_empty())
-        {
-            let header_end = entry
-                .iter()
-                .position(|byte| *byte == b'\t')
-                .ok_or_else(|| {
-                    TransferError::Blocked("Git tree contains an invalid entry".into())
-                })?;
-            let header = std::str::from_utf8(&entry[..header_end]).map_err(|_| {
-                TransferError::Blocked("Git tree entry metadata is not UTF-8".into())
-            })?;
-            let fields: Vec<_> = header.split_whitespace().collect();
-            if fields.len() != 3 || fields[1] == "commit" {
+    #[cfg(test)]
+    let old_trees = workspace_metadata_test_hooks::STATE
+        .with(|state| state.borrow().old_trees || state.borrow().legacy);
+    #[cfg(not(test))]
+    let old_trees = false;
+    if let Some(initial) = initial.as_ref().filter(|_| !old_trees) {
+        run_workspace_git_child(
+            workspace_git_command(repository, &["cat-file", "--batch"]),
+            &mut costs,
+            |owner| {
+                while let Some(current_tree) = pending_trees.pop() {
+                    if !inspected_trees.insert(current_tree.clone()) {
+                        continue;
+                    }
+                    workspace_metadata_barrier("tree_before", &current_tree);
+                    let before = observe_workspace_git_filesystem(
+                        &mount,
+                        &qualified,
+                        std::slice::from_ref(&current_tree),
+                        &initial.config,
+                    )?
+                    .ok_or_else(workspace_changed)?;
+                    if before.context != initial.filesystem.context {
+                        return Err(workspace_changed());
+                    }
+                    // All edges stay provisional until both this owner and the
+                    // independent final native census have settled successfully.
+                    objects.insert(current_tree.clone());
+                    owner.tree(&current_tree, expected_id_length, |object, is_tree| {
+                        if is_tree {
+                            pending_trees.push(object.clone());
+                        }
+                        objects.insert(object);
+                    })?;
+                    workspace_metadata_barrier("tree_after", &current_tree);
+                    let after = observe_workspace_git_filesystem(
+                        &mount,
+                        &qualified,
+                        std::slice::from_ref(&current_tree),
+                        &initial.config,
+                    )?
+                    .ok_or_else(workspace_changed)?;
+                    if before != after {
+                        return Err(workspace_changed());
+                    }
+                }
+                workspace_metadata_barrier("tree_close", "");
+                owner.finish()?;
+                workspace_metadata_barrier("tree_settled", "");
+                Ok(())
+            },
+        )?;
+    } else {
+        // Visit each tree separately so its storage paths are checked before Git
+        // reads it; recursive `ls-tree` could open unchecked descendant trees.
+        while let Some(current_tree) = pending_trees.pop() {
+            if !inspected_trees.insert(current_tree.clone()) {
+                continue;
+            }
+            verify_git_loose_object_paths(
+                &mount,
+                object_stores,
+                std::slice::from_ref(&current_tree),
+            )?;
+            let object_kind =
+                git_text_in_repository(repository, &["cat-file", "-t", &current_tree], &mut costs)?;
+            if object_kind.trim() != "tree" {
                 return Err(TransferError::Blocked(
-                    "snapshot tree contains an unsupported submodule entry".into(),
+                    "snapshot reference does not identify a Git tree object".into(),
                 ));
             }
-            let object = fields[2].to_string();
-            if fields[1] == "tree" {
-                pending_trees.push(object.clone());
+            objects.insert(current_tree.clone());
+            let entries = git_output_in_repository(
+                repository,
+                &["ls-tree", "-z", &current_tree],
+                &mut costs,
+            )?;
+            for entry in entries
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|entry| !entry.is_empty())
+            {
+                let header_end = entry
+                    .iter()
+                    .position(|byte| *byte == b'\t')
+                    .ok_or_else(|| {
+                        TransferError::Blocked("Git tree contains an invalid entry".into())
+                    })?;
+                let header = std::str::from_utf8(&entry[..header_end]).map_err(|_| {
+                    TransferError::Blocked("Git tree entry metadata is not UTF-8".into())
+                })?;
+                let fields: Vec<_> = header.split_whitespace().collect();
+                if fields.len() != 3 || fields[1] == "commit" {
+                    return Err(TransferError::Blocked(
+                        "snapshot tree contains an unsupported submodule entry".into(),
+                    ));
+                }
+                let object = fields[2].to_string();
+                if fields[1] == "tree" {
+                    pending_trees.push(object.clone());
+                }
+                objects.insert(object);
             }
-            objects.insert(object);
         }
     }
     let referenced_objects = objects.iter().cloned().collect::<Vec<_>>();
@@ -4919,7 +5090,7 @@ fn inspect_git_tree_with_costs(
         let observation = observe_workspace_git(&mount, &current, &referenced_objects, &mut costs)?
             .ok_or_else(workspace_changed)?;
         if current != qualified
-            || observation.context != initial.context
+            || observation.filesystem.context != initial.filesystem.context
             || observation.config != initial.config
         {
             return Err(workspace_changed());
@@ -5027,6 +5198,21 @@ fn qualify_workspace_git(
             ))
         }
     };
+    let (object_stores, alternate_identity) = qualify_workspace_stores(mount, &common_dir)?;
+
+    Ok(QualifiedWorkspaceGit {
+        repository,
+        common_dir,
+        object_format,
+        object_stores,
+        alternate_identity,
+    })
+}
+
+fn qualify_workspace_stores(
+    mount: &Path,
+    common_dir: &Path,
+) -> Result<(Vec<PathBuf>, Vec<String>), TransferError> {
     let objects_dir =
         checked_git_store_directory(mount, &common_dir.join("objects"), "Git object directory")?;
     let mut object_stores = vec![objects_dir.clone()];
@@ -5065,13 +5251,7 @@ fn qualify_workspace_git(
         inspect_git_pack_directory(mount, object_store)?;
     }
 
-    Ok(QualifiedWorkspaceGit {
-        repository,
-        common_dir,
-        object_format,
-        object_stores,
-        alternate_identity,
-    })
+    Ok((object_stores, alternate_identity))
 }
 
 fn workspace_changed() -> TransferError {
@@ -5106,9 +5286,14 @@ fn workspace_metadata_barrier(phase: &'static str, object: &str) {
 // much as selected files: a new earlier loose copy changes native resolution.
 #[derive(PartialEq, Eq)]
 struct WorkspaceGitObservation {
+    filesystem: WorkspaceGitFilesystem,
+    config: Vec<u8>,
+}
+
+#[derive(PartialEq, Eq)]
+struct WorkspaceGitFilesystem {
     context: WorkspaceGitPaths,
     loose: WorkspaceGitPaths,
-    config: Vec<u8>,
 }
 
 #[derive(Default, PartialEq, Eq)]
@@ -5211,6 +5396,25 @@ fn observe_workspace_git(
 ) -> Result<Option<WorkspaceGitObservation>, TransferError> {
     let repository = &qualified.repository;
     let config = workspace_git_config(repository, costs)?;
+    let Some(filesystem) = observe_workspace_git_filesystem(mount, qualified, objects, &config)?
+    else {
+        return Ok(None);
+    };
+    if workspace_git_config(repository, costs)? != config {
+        return Err(workspace_changed());
+    }
+    Ok(Some(WorkspaceGitObservation { filesystem, config }))
+}
+
+// The native config bytes describe the dependency inventory, never current
+// proof. Every call reacquires all bindings, contents, absences and pack entries.
+fn observe_workspace_git_filesystem(
+    mount: &Path,
+    qualified: &QualifiedWorkspaceGit,
+    objects: &[String],
+    config: &[u8],
+) -> Result<Option<WorkspaceGitFilesystem>, TransferError> {
+    let repository = &qualified.repository;
     let mut paths = BTreeMap::new();
     for path in [
         mount.to_path_buf(),
@@ -5225,12 +5429,16 @@ fn observe_workspace_git(
             paths.insert(dir.join(name), true);
         }
     }
-    if !workspace_config_dependencies(&config, mount, &mut paths)? {
+    if !workspace_config_dependencies(config, mount, &mut paths)? {
         // The successful native enumeration identified a valid include whose
         // named-user expansion we cannot completely observe. Only initial
         // discovery may select fresh per-object children; later discovery is
         // context drift and callers refuse it without starting another census.
         return Ok(None);
+    }
+    let (stores, alternate_identity) = qualify_workspace_stores(mount, &qualified.common_dir)?;
+    if stores != qualified.object_stores || alternate_identity != qualified.alternate_identity {
+        return Err(workspace_changed());
     }
     for store in &qualified.object_stores {
         for path in [
@@ -5247,10 +5455,9 @@ fn observe_workspace_git(
             }
         }
     }
-    let mut observation = WorkspaceGitObservation {
+    let mut observation = WorkspaceGitFilesystem {
         context: WorkspaceGitPaths::default(),
         loose: WorkspaceGitPaths::default(),
-        config,
     };
     for (path, contents) in paths {
         observe_workspace_path(
@@ -5260,11 +5467,6 @@ fn observe_workspace_git(
             &mut observation.context.absent,
             &mut observation.context.bindings,
         )?;
-    }
-    // Config enumeration and its dependent files must describe the same native
-    // context; Git, including its include/conditional-include rules, owns parsing.
-    if workspace_git_config(repository, costs)? != observation.config {
-        return Err(workspace_changed());
     }
     let mut loose = BTreeSet::new();
     for store in &qualified.object_stores {
@@ -5445,6 +5647,74 @@ fn workspace_metadata_records(
     Ok(records)
 }
 
+// Git normalizes modes to a type class; names remain opaque and are discarded.
+// State is fixed size even for long modes/names, just like native tree decoding.
+#[derive(Default)]
+struct WorkspaceTreeParser {
+    phase: u8,
+    mode: u32,
+    digits: bool,
+    name: bool,
+    oid: [u8; 32],
+    oid_used: usize,
+}
+
+impl WorkspaceTreeParser {
+    fn consume(
+        &mut self,
+        bytes: &[u8],
+        width: usize,
+        edge: &mut impl FnMut(String, bool),
+    ) -> Result<(), TransferError> {
+        for &byte in bytes {
+            match self.phase {
+                0 => {
+                    if byte == b' ' && self.digits {
+                        self.phase = 1;
+                    } else if (b'0'..=b'7').contains(&byte) {
+                        self.mode = self
+                            .mode
+                            .wrapping_shl(3)
+                            .wrapping_add(u32::from(byte - b'0'));
+                        self.digits = true;
+                    } else {
+                        return Err(TransferError::Blocked(
+                            "malformed mode in workspace Git tree".into(),
+                        ));
+                    }
+                }
+                1 => {
+                    if byte == 0 {
+                        if !self.name {
+                            return Err(TransferError::Blocked(
+                                "empty filename in workspace Git tree".into(),
+                            ));
+                        }
+                        self.phase = 2;
+                    } else {
+                        self.name = true;
+                    }
+                }
+                _ => {
+                    self.oid[self.oid_used] = byte;
+                    self.oid_used += 1;
+                    if self.oid_used == width {
+                        let class = self.mode & 0o170000;
+                        if !matches!(class, 0o040000 | 0o100000 | 0o120000) {
+                            return Err(TransferError::Blocked(
+                                "snapshot tree contains an unsupported submodule entry".into(),
+                            ));
+                        }
+                        edge(hex::encode(&self.oid[..width]), class == 0o040000);
+                        *self = Self::default();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 struct WorkspaceGitChild {
     child: Child,
     input: Option<ChildStdin>,
@@ -5488,6 +5758,9 @@ impl WorkspaceGitChild {
             let state = state.borrow();
             (state.fail_drain_spawn, state.fail_drain_read)
         });
+        #[cfg(test)]
+        let fail_join =
+            workspace_metadata_test_hooks::STATE.with(|state| state.borrow().fail_drain_join);
         #[cfg(all(test, target_os = "linux"))]
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let drain = if fail_start {
@@ -5515,6 +5788,8 @@ impl WorkspaceGitChild {
                         let keep = count.min(16 * 1024 - retained.len());
                         retained.extend_from_slice(&bytes[..keep]);
                     }
+                    #[cfg(test)]
+                    assert!(!fail_join, "injected workspace drainer join failure");
                     Ok(retained)
                 })
         };
@@ -5549,7 +5824,7 @@ impl WorkspaceGitChild {
         })
     }
 
-    fn query(&mut self, object: &str, width: usize) -> Result<(String, u64), TransferError> {
+    fn header(&mut self, object: &str, width: usize) -> Result<(String, u64), TransferError> {
         if object.len() != width
             || !(width == 40 || width == 64)
             || !object.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -5595,12 +5870,72 @@ impl WorkspaceGitChild {
         let size = fields[2]
             .parse::<u64>()
             .map_err(|_| TransferError::Blocked("invalid workspace Git object size".into()))?;
+        Ok((fields[1].to_string(), size))
+    }
+
+    fn query(&mut self, object: &str, width: usize) -> Result<(String, u64), TransferError> {
+        let metadata = self.header(object, width)?;
         if !self.output.buffer().is_empty() {
             return Err(TransferError::Blocked(
                 "unsolicited workspace Git metadata output".into(),
             ));
         }
-        Ok((fields[1].to_string(), size))
+        Ok(metadata)
+    }
+
+    fn tree(
+        &mut self,
+        object: &str,
+        width: usize,
+        mut edge: impl FnMut(String, bool),
+    ) -> Result<(), TransferError> {
+        #[cfg(test)]
+        workspace_metadata_test_hooks::count("tree_query");
+        let (kind, size) = self.header(object, width)?;
+        if kind != "tree" {
+            return Err(TransferError::Blocked(
+                "snapshot reference does not identify a Git tree object".into(),
+            ));
+        }
+        let canonical = format!("tree {size}\0");
+        let mut sha1 = sha1::Sha1::new();
+        let mut sha256 = Sha256::new();
+        if width == 40 {
+            sha1.update(canonical.as_bytes());
+        } else {
+            sha256.update(canonical.as_bytes());
+        }
+        let mut parser = WorkspaceTreeParser::default();
+        let mut remaining = size;
+        let mut buffer = [0; PAYLOAD_WRITE_BUFFER_BYTES];
+        while remaining != 0 {
+            let count = remaining.min(buffer.len() as u64) as usize;
+            self.output.read_exact(&mut buffer[..count])?;
+            if width == 40 {
+                sha1.update(&buffer[..count]);
+            } else {
+                sha256.update(&buffer[..count]);
+            }
+            parser.consume(&buffer[..count], width / 2, &mut edge)?;
+            remaining -= count as u64;
+        }
+        let mut newline = [0];
+        self.output.read_exact(&mut newline)?;
+        let hash = if width == 40 {
+            hex::encode(sha1.finalize())
+        } else {
+            hex::encode(sha256.finalize())
+        };
+        if newline != [b'\n']
+            || parser.phase != 0
+            || parser.digits
+            || !hash.eq_ignore_ascii_case(object)
+        {
+            return Err(TransferError::Blocked(
+                "invalid workspace Git tree body or identity".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn finish(&mut self) -> Result<(), TransferError> {
@@ -5677,6 +6012,7 @@ mod workspace_metadata_test_hooks {
     pub(super) struct State {
         pub fusion: bool,
         pub legacy: bool,
+        pub old_trees: bool,
         pub records: Vec<(String, String, u64)>,
         pub barrier: Option<Barrier>,
         pub counts: BTreeMap<&'static str, usize>,
@@ -5684,6 +6020,7 @@ mod workspace_metadata_test_hooks {
         pub retained_stderr: usize,
         pub fail_drain_spawn: bool,
         pub fail_drain_read: bool,
+        pub fail_drain_join: bool,
         #[cfg(target_os = "linux")]
         pub drainer_tids: Vec<u32>,
     }
@@ -8034,6 +8371,10 @@ mod native_source_inventory_tests {
     }
 
     fn reuse_fixture(packed: bool) -> ReuseFixture {
+        reuse_fixture_with_blob(packed, b"synthetic overlapping saved blob")
+    }
+
+    fn reuse_fixture_with_blob(packed: bool, body: &[u8]) -> ReuseFixture {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
         fs::create_dir(&workspace).unwrap();
@@ -8044,10 +8385,7 @@ mod native_source_inventory_tests {
         fs::create_dir_all(&git_dir).unwrap();
         let git = |args: &[&str], input: Option<&[u8]>| fixture_git(&git_dir, args, input);
         git(&["init", "--bare", "-q"], None);
-        let blob = git(
-            &["hash-object", "-w", "--stdin"],
-            Some(b"synthetic overlapping saved blob"),
-        );
+        let blob = git(&["hash-object", "-w", "--stdin"], Some(body));
         let subtree = git(
             &["mktree"],
             Some(format!("100644 blob {blob}\tnested\n").as_bytes()),
@@ -8114,14 +8452,27 @@ mod native_source_inventory_tests {
         fixture: &ReuseFixture,
         budget: Option<usize>,
     ) -> (OpenCodeNativeSnapshot, BTreeMap<&'static str, usize>, u64) {
+        // Budget zero is the existing independently executed ordinary producer
+        // control. Explicit policies below also exercise output reuse at zero.
+        reuse_export_policy(fixture, budget, budget != Some(0))
+    }
+
+    fn reuse_export_policy(
+        fixture: &ReuseFixture,
+        budget: Option<usize>,
+        reuse_output: bool,
+    ) -> (OpenCodeNativeSnapshot, BTreeMap<&'static str, usize>, u64) {
         snapshot_reuse_test_hooks::STATE.with(|state| {
             *state.borrow_mut() = snapshot_reuse_test_hooks::State {
                 budget,
+                packed_output_disabled: !reuse_output,
                 ..Default::default()
             };
         });
         let progress = std::sync::Arc::new(std::sync::Mutex::new(0));
         let observed = progress.clone();
+        let reader_costs = Arc::new(std::sync::Mutex::new(None));
+        let observed_costs = reader_costs.clone();
         let exported = export_exact_session(
             &fixture.inventory,
             "ses_exact",
@@ -8129,15 +8480,341 @@ mod native_source_inventory_tests {
                 move |event| {
                     if event.phase == "saved_objects" && event.state == "completed" {
                         *observed.lock().unwrap() = event.completed_count;
+                        *observed_costs.lock().unwrap() = event.reader_costs.clone();
                     }
                 },
             ),
         )
         .unwrap();
-        let counts = snapshot_reuse_test_hooks::STATE
+        let mut counts = snapshot_reuse_test_hooks::STATE
             .with(|state| std::mem::take(&mut state.borrow_mut().counts));
+        counts.insert(
+            "fresh_inspections",
+            reader_costs
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .fresh_inspections as usize,
+        );
         let reads = *progress.lock().unwrap();
         (exported, counts, reads)
+    }
+
+    #[test]
+    fn packed_output_reuse_survives_memo_pressure_with_every_current_native_proof() {
+        let fixture = reuse_fixture(true);
+        for budget in [0, 1, 1400, 3000] {
+            let (old, old_counts, old_reads) = reuse_export_policy(&fixture, Some(budget), false);
+            let (new, new_counts, new_reads) = reuse_export_policy(&fixture, Some(budget), true);
+            assert_eq!(
+                fs::read(&old.payload_path).unwrap(),
+                fs::read(&new.payload_path).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_vec(old.manifest()).unwrap(),
+                serde_json::to_vec(new.manifest()).unwrap()
+            );
+            assert_eq!(
+                source_graph_fingerprint(old.manifest()).unwrap(),
+                source_graph_fingerprint(new.manifest()).unwrap()
+            );
+            assert_eq!((old_reads, new_reads), (30, 30));
+            for counts in [&old_counts, &new_counts] {
+                assert_eq!(counts["fresh_inspections"], 30);
+                assert_eq!(counts["packed_query"], 30);
+                assert_eq!(counts["packed_validate"], 30);
+                assert_eq!(counts["packed_spawn"], 1);
+                assert_eq!(counts["packed_reap"], 1);
+                assert_eq!(counts["packed_drain_spawn"], counts["packed_drain_join"]);
+            }
+            eprintln!("packed output budget={budget}: old={old_counts:?} new={new_counts:?}");
+            assert_eq!(new_counts["deflate"], 4, "completed output eliminates repeat compression even when memo cannot retain the working set");
+            assert_eq!(new_counts["hex"], 4);
+            if budget <= 1 {
+                assert_eq!(old_counts["deflate"], 30);
+                assert_eq!(old_counts["hex"], 30);
+            } else {
+                assert!(old_counts["deflate"] > new_counts["deflate"]);
+                assert!(
+                    old_counts["memo_admit"] > 0,
+                    "objects individually fit the memo but their working set does not"
+                );
+            }
+            assert_exported_snapshot_native_readback(&fixture, &old, &format!("old-{budget}"));
+            assert_exported_snapshot_native_readback(&fixture, &new, &format!("new-{budget}"));
+        }
+    }
+
+    fn assert_exported_snapshot_native_readback(
+        fixture: &ReuseFixture,
+        snapshot: &OpenCodeNativeSnapshot,
+        name: &str,
+    ) {
+        let payload: serde_json::Value =
+            serde_json::from_slice(&fs::read(&snapshot.payload_path).unwrap()).unwrap();
+        let objects: Vec<SerializedSnapshotObject> =
+            serde_json::from_value(payload["snapshot_objects"].clone()).unwrap();
+        let destination = fixture.dir.path().join(name).join("opencode.db");
+        for object in &objects {
+            install_snapshot_object(object, &snapshot.manifest().saved_snapshots, &destination)
+                .unwrap();
+            let bucket = destination
+                .parent()
+                .unwrap()
+                .join("snapshot")
+                .join(&object.project_id)
+                .join(&object.worktree_sha1);
+            let path = bucket
+                .join("objects")
+                .join(&object.object_id[..2])
+                .join(&object.object_id[2..]);
+            let compressed = fs::read(path).unwrap();
+            assert_eq!(compressed, hex::decode(&object.compressed_hex).unwrap());
+            let (kind, body) = decode_snapshot_object(&object.object_id, &compressed).unwrap();
+            let output = Command::new("git")
+                .arg("--git-dir")
+                .arg(&bucket)
+                .args(["cat-file", &kind, &object.object_id])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, body, "full native installed object body");
+        }
+        for reference in &snapshot.manifest().saved_snapshots {
+            let bucket = destination
+                .parent()
+                .unwrap()
+                .join("snapshot")
+                .join(&reference.project_id)
+                .join(&reference.worktree_sha1);
+            let stores = qualified_snapshot_stores(&bucket, &bucket.join("objects")).unwrap();
+            let closure = read_snapshot_closure(&stores, &reference.tree)
+                .unwrap()
+                .unwrap();
+            assert_eq!(closure.len(), reference.objects.len());
+            for object in &reference.objects {
+                let bytes = &closure[&object.object_id];
+                assert_eq!(bytes.len() as u64, object.compressed_bytes);
+                assert_eq!(digest(bytes), object.compressed_sha256);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packed_output_reuse_refuses_actual_late_owner_failure_before_export_publication() {
+        for (status, trailing) in [(9, false), (0, true)] {
+            let fixture = reuse_fixture(true);
+            let pids = fixture.dir.path().join("owned-native-pids");
+            snapshot_reuse_test_hooks::STATE.with(|state| {
+                *state.borrow_mut() = snapshot_reuse_test_hooks::State {
+                    budget: Some(0),
+                    packed_late_fault: Some((status, trailing, pids.clone())),
+                    ..Default::default()
+                };
+            });
+            let result = export_exact_session(
+                &fixture.inventory,
+                "ses_exact",
+                ExportOptions::new(fixture.dir.path().join("extract")),
+            );
+            assert!(
+                result.is_err(),
+                "real late status/output cannot publish a complete warm-hit export"
+            );
+            assert_eq!(
+                fs::read_dir(fixture.dir.path().join("extract"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+            let counts =
+                snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().counts.clone());
+            assert_eq!(
+                counts["deflate"], 4,
+                "late failure occurs after all warm output hits"
+            );
+            assert_eq!(counts["hex"], 4);
+            assert_eq!(counts["packed_query"], 30);
+            assert_eq!(counts["packed_validate"], 30);
+            assert_eq!(counts["packed_reap"], counts["packed_spawn"]);
+            assert_eq!(counts["packed_drain_join"], counts["packed_drain_spawn"]);
+            for pid in fs::read_to_string(pids).unwrap().split_whitespace() {
+                assert!(
+                    !Path::new(&format!("/proc/{pid}")).exists(),
+                    "exact owned native/wrapper child settled"
+                );
+            }
+        }
+        snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+    }
+
+    #[test]
+    fn packed_output_reuse_preserves_current_nondefault_loose_encoding_transitions() {
+        let fixture = reuse_fixture(true);
+        let packed = read_snapshot_object(std::slice::from_ref(&fixture.store), &fixture.blob)
+            .unwrap()
+            .unwrap();
+        let (_, body) = decode_snapshot_object(&fixture.blob, &packed).unwrap();
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::none());
+        write!(encoder, "blob {}\0", body.len()).unwrap();
+        encoder.write_all(&body).unwrap();
+        let loose = encoder.finish().unwrap();
+        assert_ne!(loose, packed);
+        let mut exports = Vec::new();
+        for reuse in [false, true] {
+            let path = fixture_object_path(&fixture, &fixture.blob);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let current_loose = loose.clone();
+            snapshot_reuse_test_hooks::STATE.with(|state| {
+                *state.borrow_mut() = snapshot_reuse_test_hooks::State {
+                    budget: Some(0),
+                    packed_output_disabled: !reuse,
+                    before_reference: Some(Box::new(move |number| {
+                        if number == 2 || number == 4 {
+                            fs::write(&path, &current_loose).unwrap();
+                        }
+                        if number == 3 || number == 5 {
+                            fs::remove_file(&path).unwrap();
+                        }
+                    })),
+                    ..Default::default()
+                };
+            });
+            let exported = export_exact_session(
+                &fixture.inventory,
+                "ses_exact",
+                ExportOptions::new(fixture.dir.path().join("extract")),
+            )
+            .unwrap();
+            assert_exported_snapshot_native_readback(
+                &fixture,
+                &exported,
+                if reuse {
+                    "transitions-new"
+                } else {
+                    "transitions-old"
+                },
+            );
+            exports.push(exported);
+        }
+        assert_eq!(
+            fs::read(&exports[0].payload_path).unwrap(),
+            fs::read(&exports[1].payload_path).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(exports[0].manifest()).unwrap(),
+            serde_json::to_vec(exports[1].manifest()).unwrap()
+        );
+        assert_eq!(
+            source_graph_fingerprint(exports[0].manifest()).unwrap(),
+            source_graph_fingerprint(exports[1].manifest()).unwrap()
+        );
+        for reference in &exports[1].manifest().saved_snapshots {
+            let blob = reference
+                .objects
+                .iter()
+                .find(|object| object.object_id == fixture.blob)
+                .unwrap();
+            assert_eq!(blob.compressed_sha256, digest(&packed));
+            assert_ne!(blob.compressed_sha256, digest(&loose));
+        }
+    }
+
+    #[test]
+    fn packed_output_reuse_hashes_full_multichunk_encoding_and_installs_native_bodies() {
+        let body = (0u64..2048)
+            .map(|index| digest(&index.to_le_bytes()))
+            .collect::<String>();
+        let fixture = reuse_fixture_with_blob(true, body.as_bytes());
+        let (old, old_counts, _) = reuse_export_policy(&fixture, Some(0), false);
+        let (new, new_counts, _) = reuse_export_policy(&fixture, Some(0), true);
+        assert_eq!((old_counts["deflate"], new_counts["deflate"]), (30, 4));
+        assert_eq!((old_counts["hex"], new_counts["hex"]), (30, 4));
+        assert_eq!(
+            fs::read(&old.payload_path).unwrap(),
+            fs::read(&new.payload_path).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(old.manifest()).unwrap(),
+            serde_json::to_vec(new.manifest()).unwrap()
+        );
+        assert_eq!(
+            source_graph_fingerprint(old.manifest()).unwrap(),
+            source_graph_fingerprint(new.manifest()).unwrap()
+        );
+        assert!(new.manifest().saved_snapshots[0]
+            .objects
+            .iter()
+            .any(|object| object.compressed_bytes > 8192));
+        assert_exported_snapshot_native_readback(&fixture, &old, "multichunk-old");
+        assert_exported_snapshot_native_readback(&fixture, &new, "multichunk-new");
+        let actual = read_snapshot_object(std::slice::from_ref(&fixture.store), &fixture.blob)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            snapshot_output_commitment(&hex::encode(&actual)).unwrap(),
+            (actual.len() as u64, digest(&actual))
+        );
+        for invalid in [
+            "0",
+            "xx",
+            &("00".repeat(8192) + "0"),
+            &("00".repeat(8192) + "zz"),
+        ] {
+            assert!(snapshot_output_commitment(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn packed_output_reuse_keeps_native_destination_tuples_distinct() {
+        let mut fixture = reuse_fixture(true);
+        let workspace = fixture.dir.path().join("other-workspace");
+        fs::create_dir(&workspace).unwrap();
+        let worktree = hex::encode(sha1::Sha1::digest(workspace.to_string_lossy().as_bytes()));
+        let bucket = fixture
+            .inventory
+            .default_database
+            .parent()
+            .unwrap()
+            .join("snapshot/prj")
+            .join(worktree);
+        fixture_git(&bucket, &["init", "--bare", "-q"], None);
+        copy_fixture_objects(&fixture.store, &bucket.join("objects"));
+        fixture.inventory = fixture.inventory.with_trusted_workspace_mount(
+            "prj",
+            None,
+            "/synthetic/other",
+            workspace,
+        );
+        let db = Connection::open(&fixture.inventory.default_database).unwrap();
+        db.execute("INSERT INTO session(id,slug,project_id,parent_id,directory,title,version,time_created,time_updated,revert) VALUES ('ses_other','other','prj','ses_exact','/synthetic/other','other','1',1,1,?1)", [serde_json::json!({"snapshot":fixture.trees[0]}).to_string()]).unwrap();
+        drop(db);
+        let (old, old_counts, old_reads) = reuse_export_policy(&fixture, Some(0), false);
+        let (new, new_counts, new_reads) = reuse_export_policy(&fixture, Some(0), true);
+        assert_eq!((old_reads, new_reads), (33, 33));
+        assert_eq!(old_counts["deflate"], 33);
+        assert_eq!(
+            new_counts["deflate"], 7,
+            "a different native bucket must produce its own first encoding"
+        );
+        assert_eq!(new_counts["packed_query"], 33);
+        assert_eq!(new_counts["packed_validate"], 33);
+        assert_eq!(
+            fs::read(&old.payload_path).unwrap(),
+            fs::read(&new.payload_path).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(old.manifest()).unwrap(),
+            serde_json::to_vec(new.manifest()).unwrap()
+        );
+        assert_eq!(
+            source_graph_fingerprint(old.manifest()).unwrap(),
+            source_graph_fingerprint(new.manifest()).unwrap()
+        );
+        assert_exported_snapshot_native_readback(&fixture, &old, "tuples-old");
+        assert_exported_snapshot_native_readback(&fixture, &new, "tuples-new");
     }
 
     fn assert_reused_export(packed: bool) {
@@ -10004,14 +10681,78 @@ mod native_source_inventory_tests {
         );
         assert_eq!(
             costs.workspace_git_command_starts,
-            if cfg!(unix) {
-                19 + 2 * 2
-            } else {
-                4 + 2 * 2 + 258
-            },
+            if cfg!(unix) { 20 } else { 4 + 2 * 2 + 258 },
             "the complete qualified census must remove measured launches"
         );
         assert_eq!(costs.native_spawns, 0);
+    }
+
+    #[cfg(unix)]
+    fn workspace_many_tree_fixture(format: &str, count: usize) -> (TempDir, PathBuf, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let git_dir = workspace.join(".git");
+        fixture_git(
+            &git_dir,
+            &["init", "-q", &format!("--object-format={format}")],
+            None,
+        );
+        let a = fixture_git(
+            &git_dir,
+            &["hash-object", "-w", "--stdin"],
+            Some(b"fixed leaf a"),
+        );
+        let b = fixture_git(
+            &git_dir,
+            &["hash-object", "-w", "--stdin"],
+            Some(b"fixed leaf b"),
+        );
+        let mut tree = fixture_git(
+            &git_dir,
+            &["mktree"],
+            Some(format!("100644 blob {a}\ta\n120000 blob {b}\tb\n").as_bytes()),
+        );
+        let first = tree.clone();
+        for i in 1..count {
+            tree = fixture_git(&git_dir, &["mktree"], Some(format!("040000 tree {tree}\tchain{i}\n040000 tree {first}\trepeated\n100755 blob {a}\tleaf\n").as_bytes()));
+        }
+        (dir, workspace, tree.to_ascii_uppercase())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_tree_owner_reduces_many_tree_actual_starts() {
+        let mut measured = Vec::new();
+        for format in ["sha1", "sha256"] {
+            for count in [8, 64] {
+                let (_dir, workspace, tree) = workspace_many_tree_fixture(format, count);
+                workspace_metadata_test_hooks::STATE
+                    .with(|state| *state.borrow_mut() = Default::default());
+                let mut costs = SourceReaderCosts::default();
+                let inspected =
+                    inspect_git_tree_with_costs(&workspace, &tree, Some(&mut costs)).unwrap();
+                let records = workspace_metadata_test_hooks::STATE
+                    .with(|state| state.borrow().records.clone());
+                assert_eq!(records.len(), count + 2);
+                assert!(records.iter().any(|record| record.0 == tree));
+                assert_eq!(
+                    inspected.closure_sha256,
+                    digest(&serde_json::to_vec(&records).unwrap())
+                );
+                eprintln!(
+                    "many tree {format} T={count} U={} actual starts={}",
+                    records.len(),
+                    costs.workspace_git_command_starts
+                );
+                measured.push(costs.workspace_git_command_starts);
+            }
+        }
+        assert_eq!(
+            measured,
+            [20, 20, 20, 20],
+            "one guarded native tree owner removes the per-tree launch slope"
+        );
     }
 
     fn copy_fixture_objects(source: &Path, target: &Path) {
@@ -10130,11 +10871,7 @@ mod native_source_inventory_tests {
                 assert_eq!(measurements[0], 4 + 2 * 2 + 2 * 34);
                 assert_eq!(
                     measurements[1],
-                    if cfg!(unix) {
-                        19 + 2 * 2
-                    } else {
-                        4 + 2 * 2 + 34
-                    }
+                    if cfg!(unix) { 20 } else { 4 + 2 * 2 + 34 }
                 );
                 assert_eq!(measurements[2], 4 + 2 * 2 + 34);
                 eprintln!("complete workspace tuples {format}/packed={packed}: legacy/census/fusion starts {measurements:?}");
@@ -10184,6 +10921,293 @@ mod native_source_inventory_tests {
             assert_eq!(outputs[0], outputs[1]);
             assert_eq!(outputs[0], outputs[2]);
         }
+        workspace_metadata_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_tree_owner_preserves_many_tree_records_and_native_domain() {
+        for format in ["sha1", "sha256"] {
+            for count in [8, 64] {
+                for packed in [false, true] {
+                    let (_dir, workspace, tree) = workspace_many_tree_fixture(format, count);
+                    let git = workspace.join(".git");
+                    fixture_git(&git, &["update-ref", "refs/fixture/root", &tree], None);
+                    if packed {
+                        fixture_git(&git, &["repack", "-a", "-d"], None);
+                        fixture_git(&git, &["prune-packed"], None);
+                    }
+                    let alternate = workspace.join("alternate.git");
+                    fixture_git(
+                        &alternate,
+                        &["init", "--bare", "-q", &format!("--object-format={format}")],
+                        None,
+                    );
+                    copy_fixture_objects(&git.join("objects"), &alternate.join("objects"));
+                    fs::write(
+                        git.join("objects/info/alternates"),
+                        format!("{0}\n{0}\n", alternate.join("objects").display()),
+                    )
+                    .unwrap();
+                    let mut outputs = Vec::new();
+                    let mut starts = Vec::new();
+                    for mode in ["old_tree", "new_tree", "fusion"] {
+                        workspace_metadata_test_hooks::STATE.with(|state| {
+                            *state.borrow_mut() = workspace_metadata_test_hooks::State {
+                                old_trees: mode == "old_tree",
+                                fusion: mode == "fusion",
+                                ..Default::default()
+                            }
+                        });
+                        let mut costs = SourceReaderCosts::default();
+                        let inspected =
+                            inspect_git_tree_with_costs(&workspace, &tree, Some(&mut costs))
+                                .unwrap();
+                        let records = workspace_metadata_test_hooks::STATE
+                            .with(|state| state.borrow().records.clone());
+                        let bytes = serde_json::to_vec(&records).unwrap();
+                        outputs.push((
+                            inspected.identity,
+                            inspected.closure_bytes,
+                            inspected.closure_sha256,
+                            records,
+                            bytes,
+                        ));
+                        starts.push(costs.workspace_git_command_starts);
+                    }
+                    assert_eq!(outputs[0], outputs[1]);
+                    assert_eq!(outputs[0], outputs[2]);
+                    assert_eq!(
+                        starts,
+                        [
+                            19 + 2 * count as u64,
+                            20,
+                            4 + 2 * count as u64 + count as u64 + 2
+                        ]
+                    );
+                    eprintln!("many-tree complete tuple equality {format} T{count} packed={packed} starts={starts:?}");
+                }
+            }
+            let (_dir, workspace, _) = workspace_many_tree_fixture(format, 8);
+            let git = workspace.join(".git");
+            let blob = fixture_git(
+                &git,
+                &["hash-object", "-w", "--stdin"],
+                Some(b"native mode leaf"),
+            );
+            let empty = fixture_git(&git, &["mktree"], Some(b""));
+            for mode in [
+                "40000",
+                "040000",
+                "0040000",
+                "40777",
+                "100644",
+                "100600",
+                "100664",
+                "100755",
+                "120000",
+                "120777",
+                "100000",
+                "000000100644",
+                "777777777777777777777777777777777777777777100644",
+                "160000",
+                "000000",
+                "20000",
+                "140000",
+                "170000",
+                "777777",
+                "1008",
+                "",
+            ] {
+                let is_tree = ["40000", "040000", "0040000", "40777"].contains(&mode);
+                for name in [b"opaque\xff\t\n\\/name".as_slice(), b"", &vec![b'n'; 70000]] {
+                    let mut body = format!("{mode} ").into_bytes();
+                    body.extend(name);
+                    body.push(0);
+                    body.extend(hex::decode(if is_tree { &empty } else { &blob }).unwrap());
+                    let tree = fixture_git(
+                        &git,
+                        &["hash-object", "--literally", "-t", "tree", "-w", "--stdin"],
+                        Some(&body),
+                    );
+                    let mut outputs = Vec::new();
+                    for old_trees in [true, false] {
+                        workspace_metadata_test_hooks::STATE.with(|state| {
+                            *state.borrow_mut() = workspace_metadata_test_hooks::State {
+                                old_trees,
+                                ..Default::default()
+                            }
+                        });
+                        let result = inspect_git_tree(&workspace, &tree);
+                        let records = workspace_metadata_test_hooks::STATE
+                            .with(|state| state.borrow().records.clone());
+                        outputs.push(
+                            result
+                                .map(|value| {
+                                    (
+                                        value.identity,
+                                        value.closure_bytes,
+                                        value.closure_sha256,
+                                        records,
+                                    )
+                                })
+                                .ok(),
+                        );
+                    }
+                    assert_eq!(
+                        outputs[0],
+                        outputs[1],
+                        "native mode {format}/{mode}, name length {}",
+                        name.len()
+                    );
+                }
+            }
+        }
+        workspace_metadata_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_tree_owner_preserves_native_packed_resolution_over_unused_loose_copy() {
+        for format in ["sha1", "sha256"] {
+            let (_dir, workspace, tree) = workspace_many_tree_fixture(format, 8);
+            let git = workspace.join(".git");
+            fixture_git(&git, &["update-ref", "refs/fixture/root", &tree], None);
+            fixture_git(&git, &["repack", "-a", "-d"], None);
+            fixture_git(&git, &["prune-packed"], None);
+            let child = fixture_git(&git, &["ls-tree", &tree], None)
+                .lines()
+                .rfind(|line| line.contains(" tree "))
+                .unwrap()
+                .split_whitespace()
+                .nth(2)
+                .unwrap()
+                .to_string();
+            let loose = git.join("objects").join(&child[..2]).join(&child[2..]);
+            fs::create_dir_all(loose.parent().unwrap()).unwrap();
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(b"tree 0\0").unwrap();
+            let wrong = encoder.finish().unwrap();
+            let mut outputs = Vec::new();
+            for old_trees in [true, false] {
+                if old_trees {
+                    fs::write(&loose, &wrong).unwrap();
+                } else {
+                    fs::remove_file(&loose).unwrap();
+                }
+                let added = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let observed = added.clone();
+                let path = loose.clone();
+                let bytes = wrong.clone();
+                workspace_metadata_test_hooks::STATE.with(|state| {
+                    *state.borrow_mut() = workspace_metadata_test_hooks::State {
+                        old_trees,
+                        barrier: Some(Box::new(move |at, _| {
+                            if at == "tree_after"
+                                && !observed.swap(true, std::sync::atomic::Ordering::SeqCst)
+                            {
+                                fs::write(&path, &bytes).unwrap();
+                            }
+                        })),
+                        ..Default::default()
+                    }
+                });
+                let inspection = inspect_git_tree(&workspace, &tree).unwrap();
+                if !old_trees {
+                    assert!(added.load(std::sync::atomic::Ordering::SeqCst));
+                }
+                let records = workspace_metadata_test_hooks::STATE
+                    .with(|state| state.borrow().records.clone());
+                assert_eq!(records.len(), 10);
+                outputs.push((
+                    inspection.identity,
+                    inspection.closure_bytes,
+                    inspection.closure_sha256,
+                    records,
+                ));
+            }
+            assert_eq!(outputs[0],outputs[1],"Git chooses its current packed body; unused duplicate bodies are not separately certified");
+            let root = git
+                .join("objects")
+                .join(tree[..2].to_ascii_lowercase())
+                .join(tree[2..].to_ascii_lowercase());
+            fs::create_dir_all(root.parent().unwrap()).unwrap();
+            fs::write(&root, &wrong).unwrap();
+            // A loose-only wrong body must fail its actual returned identity.
+            for entry in fs::read_dir(git.join("objects/pack")).unwrap() {
+                fs::remove_file(entry.unwrap().path()).unwrap();
+            }
+            workspace_metadata_test_hooks::STATE
+                .with(|state| *state.borrow_mut() = Default::default());
+            assert!(inspect_git_tree(&workspace, &tree).is_err());
+        }
+        workspace_metadata_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_tree_owner_preserves_many_tree_entire_native_export() {
+        let fixture = reuse_fixture(false);
+        let (_many, workspace, tree) = workspace_many_tree_fixture("sha1", 64);
+        copy_fixture_objects(&workspace.join(".git/objects"), &fixture.store);
+        let target_workspace = fixture.dir.path().join("workspace");
+        fixture_git(&target_workspace.join(".git"), &["init", "-q"], None);
+        copy_fixture_objects(
+            &workspace.join(".git/objects"),
+            &target_workspace.join(".git/objects"),
+        );
+        let db = Connection::open(fixture.dir.path().join("data/opencode.db")).unwrap();
+        // Update every retained reference through ordinary SQL fixture setup.
+        for old in &fixture.trees {
+            for (table, column) in [
+                ("session", "revert"),
+                ("part", "data"),
+                ("session_input", "prompt"),
+                ("session_context_epoch", "snapshot"),
+                ("event", "data"),
+            ] {
+                db.execute(
+                    &format!("UPDATE {table} SET {column}=replace({column},?1,?2)"),
+                    rusqlite::params![old, tree.to_ascii_lowercase()],
+                )
+                .unwrap();
+            }
+        }
+        drop(db);
+        let mut outputs = Vec::new();
+        for mode in ["old_tree", "new_tree", "fusion"] {
+            workspace_metadata_test_hooks::STATE.with(|state| {
+                *state.borrow_mut() = workspace_metadata_test_hooks::State {
+                    old_trees: mode == "old_tree",
+                    fusion: mode == "fusion",
+                    ..Default::default()
+                }
+            });
+            let bundle = export_exact_session(
+                &fixture.inventory,
+                "ses_exact",
+                ExportOptions::new(fixture.dir.path().join("many-extract")),
+            )
+            .unwrap();
+            assert!(bundle
+                .manifest()
+                .assets
+                .iter()
+                .any(|asset| asset.kind == "git_tree_reference"));
+            assert!(bundle
+                .manifest()
+                .saved_snapshots
+                .iter()
+                .all(|saved| saved.objects.len() == 66));
+            outputs.push((
+                fs::read(&bundle.payload_path).unwrap(),
+                serde_json::to_vec(bundle.manifest()).unwrap(),
+                source_graph_fingerprint(bundle.manifest()).unwrap(),
+            ));
+        }
+        assert_eq!(outputs[0], outputs[1]);
+        assert_eq!(outputs[0], outputs[2]);
         workspace_metadata_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
     }
 
@@ -10618,6 +11642,554 @@ mod native_source_inventory_tests {
                 });
             }
         }
+        workspace_metadata_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_tree_owner_fresh_guards_before_each_native_read() {
+        for (phase, mutation) in [
+            ("tree_before", "selected"),
+            ("tree_before", "duplicate_selected"),
+            ("descendant", "selected"),
+            ("descendant", "fanout"),
+            ("tree_after", "config"),
+            ("last_after", "config"),
+            ("descendant", "config"),
+            ("tree_before", "pack_entry"),
+            ("descendant", "pack_remove"),
+            ("descendant", "index_replace"),
+            ("descendant", "alternate_order"),
+            ("descendant", "alternate_nested"),
+            ("descendant", "alternate_outside"),
+            ("descendant", "include"),
+            ("descendant", "include_absent"),
+            ("descendant", "named_user"),
+            ("descendant", "commondir"),
+            ("descendant", "worktree_config"),
+            ("descendant", "git_marker"),
+            ("descendant", "format"),
+            ("tree_close", "selected"),
+            ("tree_settled", "selected"),
+        ] {
+            let (dir, workspace, root) = workspace_many_tree_fixture("sha1", 8);
+            let git = workspace.join(".git");
+            fixture_git(&git, &["update-ref", "refs/fixture/root", &root], None);
+            fixture_git(&git, &["repack", "-a", "-d"], None);
+            fixture_git(&git, &["prune-packed"], None);
+            let selected = if phase == "descendant" {
+                fixture_git(&git, &["ls-tree", &root], None)
+                    .lines()
+                    .rfind(|line| line.contains(" tree "))
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(2)
+                    .unwrap()
+                    .to_string()
+            } else {
+                root.to_ascii_lowercase()
+            };
+            let alternate = workspace.join("alternate.git");
+            fixture_git(&alternate, &["init", "--bare", "-q"], None);
+            copy_fixture_objects(&git.join("objects"), &alternate.join("objects"));
+            let alternate_store = alternate.join("objects");
+            fs::write(
+                git.join("objects/info/alternates"),
+                format!("{0}\n{0}\n", alternate_store.display()),
+            )
+            .unwrap();
+            let leaf = if mutation == "duplicate_selected" {
+                alternate_store.join(&selected[..2]).join(&selected[2..])
+            } else {
+                git.join("objects")
+                    .join(&selected[..2])
+                    .join(&selected[2..])
+            };
+            fs::create_dir_all(leaf.parent().unwrap()).unwrap();
+            let parked = dir.path().join("parked");
+            fs::write(&parked, b"unqualified fixture").unwrap();
+            let include = git.join("fixture-include");
+            if mutation == "include" {
+                fs::write(&include, "[core]\nignorecase=false\n").unwrap();
+            }
+            if mutation.starts_with("include") {
+                fixture_git(&git, &["config", "include.path", "fixture-include"], None);
+            }
+            let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let changed = fired.clone();
+            let mut first = true;
+            let mut responses = 0;
+            let owned_workspace = workspace.clone();
+            workspace_metadata_test_hooks::STATE.with(|state| {
+                *state.borrow_mut() = workspace_metadata_test_hooks::State {
+                    barrier: Some(Box::new(move |at, object| {
+                        let target = if phase == "last_after" {
+                            if at != "tree_after" {
+                                return;
+                            }
+                            responses += 1;
+                            if responses != 8 {
+                                return;
+                            }
+                            "tree_after"
+                        } else if phase == "descendant" {
+                            if at != "tree_before" {
+                                return;
+                            }
+                            if first {
+                                first = false;
+                                return;
+                            }
+                            "tree_before"
+                        } else {
+                            phase
+                        };
+                        if at != target || changed.load(std::sync::atomic::Ordering::SeqCst) {
+                            return;
+                        }
+                        if phase == "descendant" {
+                            assert!(object.eq_ignore_ascii_case(&selected));
+                        }
+                        changed.store(true, std::sync::atomic::Ordering::SeqCst);
+                        match mutation {
+                            "selected" | "duplicate_selected" => {
+                                std::os::unix::fs::symlink(&parked, &leaf).unwrap()
+                            }
+                            "fanout" => {
+                                fs::remove_dir(leaf.parent().unwrap()).unwrap();
+                                std::os::unix::fs::symlink(dir.path(), leaf.parent().unwrap())
+                                    .unwrap();
+                            }
+                            "config" => {
+                                let mut f = OpenOptions::new()
+                                    .append(true)
+                                    .open(git.join("config"))
+                                    .unwrap();
+                                writeln!(f, "# changed bytes, same effective config").unwrap();
+                            }
+                            "pack_entry" => {
+                                fs::write(git.join("objects/pack/new.keep"), b"new").unwrap()
+                            }
+                            "pack_remove" | "index_replace" => {
+                                let extension = if mutation == "pack_remove" {
+                                    "pack"
+                                } else {
+                                    "idx"
+                                };
+                                let path = fs::read_dir(git.join("objects/pack"))
+                                    .unwrap()
+                                    .map(|e| e.unwrap().path())
+                                    .find(|p| p.extension().is_some_and(|e| e == extension))
+                                    .unwrap();
+                                if mutation == "pack_remove" {
+                                    fs::remove_file(path).unwrap();
+                                } else {
+                                    let bytes = fs::read(&path).unwrap();
+                                    fs::remove_file(&path).unwrap();
+                                    fs::write(path, bytes).unwrap();
+                                }
+                            }
+                            "alternate_order" => fs::write(
+                                git.join("objects/info/alternates"),
+                                format!("{}\n", alternate_store.display()),
+                            )
+                            .unwrap(),
+                            "alternate_nested" => {
+                                fs::write(alternate_store.join("info/alternates"), "missing\n")
+                                    .unwrap()
+                            }
+                            "alternate_outside" => fs::write(
+                                git.join("objects/info/alternates"),
+                                format!("{}\n", dir.path().display()),
+                            )
+                            .unwrap(),
+                            "include" | "include_absent" => {
+                                fs::write(&include, "[core]\nignorecase=false\n# changed\n")
+                                    .unwrap()
+                            }
+                            "named_user" => {
+                                let mut f = OpenOptions::new()
+                                    .append(true)
+                                    .open(git.join("config"))
+                                    .unwrap();
+                                writeln!(f, "[include]\npath=~nonexistent-fixture/config").unwrap();
+                            }
+                            "commondir" => fs::write(git.join("commondir"), ".\n").unwrap(),
+                            "worktree_config" => {
+                                fs::write(git.join("config.worktree"), "[core]\nignorecase=false\n")
+                                    .unwrap()
+                            }
+                            "git_marker" => {
+                                fs::rename(&git, owned_workspace.join("parked.git")).unwrap();
+                                fs::write(&git, "gitdir: parked.git\n").unwrap();
+                            }
+                            "format" => {
+                                let mut f = OpenOptions::new()
+                                    .append(true)
+                                    .open(git.join("config"))
+                                    .unwrap();
+                                writeln!(f, "[extensions]\nobjectFormat=sha256").unwrap();
+                            }
+                            _ => unreachable!(),
+                        }
+                    })),
+                    ..Default::default()
+                }
+            });
+            let mut costs = SourceReaderCosts::default();
+            assert!(
+                inspect_git_tree_with_costs(&workspace, &root, Some(&mut costs)).is_err(),
+                "{phase}/{mutation}"
+            );
+            if phase == "last_after" {
+                assert_eq!(
+                    costs.workspace_git_command_starts, 7,
+                    "known tree-response drift settles before another native child"
+                );
+            }
+            assert!(
+                fired.load(std::sync::atomic::Ordering::SeqCst),
+                "{phase}/{mutation}"
+            );
+            workspace_metadata_test_hooks::STATE.with(|state| {
+                let state = state.borrow();
+                let queries = state.counts.get("tree_query").copied().unwrap_or(0);
+                assert_eq!(
+                    queries,
+                    if phase == "tree_before" {
+                        0
+                    } else if phase == "tree_close"
+                        || phase == "tree_settled"
+                        || phase == "last_after"
+                    {
+                        8
+                    } else {
+                        1
+                    },
+                    "fresh guard before further read {phase}/{mutation}"
+                );
+                assert_eq!(state.counts["spawn"], state.counts["reap"]);
+                assert_eq!(state.counts["drain_spawn"], state.counts["drain_join"]);
+            });
+        }
+        workspace_metadata_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+        let (_dir, workspace, tree) = workspace_many_tree_fixture("sha1", 8);
+        let root_path = workspace
+            .join(".git/objects")
+            .join(tree[..2].to_ascii_lowercase())
+            .join(tree[2..].to_ascii_lowercase());
+        let original = fs::read(&root_path).unwrap();
+        fs::remove_file(&root_path).unwrap();
+        assert!(inspect_git_tree(&workspace, &tree).is_err());
+        fs::write(&root_path, &original).unwrap();
+        inspect_git_tree(&workspace, &tree).unwrap();
+        let loose = workspace
+            .join(".git/objects")
+            .join(tree[..2].to_ascii_lowercase())
+            .join(tree[2..].to_ascii_lowercase());
+        fs::remove_file(&loose).unwrap();
+        fs::write(loose, b"current wrong loose body").unwrap();
+        assert!(
+            inspect_git_tree(&workspace, &tree).is_err(),
+            "no body or negative authority survives an inspection"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_tree_owner_protocol_and_settlement_refuses_partial_proof() {
+        let mut unrelated = Command::new("python3")
+            .arg("-c")
+            .arg("import time; time.sleep(120)")
+            .spawn()
+            .unwrap();
+        for width in [40, 64] {
+            let leaf = vec![17; width / 2];
+            let mut body = b"100644 opaque\xff\t\n\\/name\0".to_vec();
+            body.extend(&leaf);
+            let oid_for = |body: &[u8]| {
+                let canonical = [format!("tree {}\0", body.len()).as_bytes(), body].concat();
+                if width == 40 {
+                    hex::encode(sha1::Sha1::digest(&canonical))
+                } else {
+                    hex::encode(Sha256::digest(&canonical))
+                }
+            };
+            let oid = oid_for(&body);
+            let frame = |oid: &str, body: &[u8]| {
+                [
+                    format!("{oid} tree {}\n", body.len()).as_bytes(),
+                    body,
+                    b"\n",
+                ]
+                .concat()
+            };
+            let valid = frame(&oid, &body);
+            type TreeResponse = (&'static str, String, Vec<u8>, Vec<u8>, u8, bool, bool);
+            let mut cases: Vec<TreeResponse> = vec![
+                ("valid", oid.clone(), valid.clone(), vec![], 0, false, true),
+                (
+                    "stderr_pressure",
+                    oid.clone(),
+                    valid.clone(),
+                    vec![],
+                    0,
+                    false,
+                    true,
+                ),
+                (
+                    "empty",
+                    oid_for(b""),
+                    frame(&oid_for(b""), b""),
+                    vec![],
+                    0,
+                    false,
+                    true,
+                ),
+                (
+                    "missing",
+                    oid.clone(),
+                    format!("{oid} missing\n").into_bytes(),
+                    vec![],
+                    0,
+                    true,
+                    false,
+                ),
+                (
+                    "wrong_oid",
+                    oid.clone(),
+                    frame(&"0".repeat(width), &body),
+                    vec![],
+                    0,
+                    true,
+                    false,
+                ),
+                (
+                    "wrong_width",
+                    oid.clone(),
+                    frame(&"0".repeat(if width == 40 { 64 } else { 40 }), &body),
+                    vec![],
+                    0,
+                    true,
+                    false,
+                ),
+                (
+                    "wrong_kind",
+                    oid.clone(),
+                    valid.clone(),
+                    vec![],
+                    0,
+                    true,
+                    false,
+                ),
+                (
+                    "wrong_hash",
+                    oid.clone(),
+                    {
+                        let mut changed = body.clone();
+                        *changed.last_mut().unwrap() ^= 1;
+                        frame(&oid, &changed)
+                    },
+                    vec![],
+                    0,
+                    true,
+                    false,
+                ),
+                ("no_response", oid.clone(), vec![], vec![], 0, true, false),
+                (
+                    "overflow",
+                    oid.clone(),
+                    format!("{oid} tree 18446744073709551616\n").into_bytes(),
+                    vec![],
+                    0,
+                    true,
+                    false,
+                ),
+                (
+                    "large_truncated",
+                    oid.clone(),
+                    format!("{oid} tree 18446744073709551615\n").into_bytes(),
+                    vec![],
+                    0,
+                    true,
+                    false,
+                ),
+                (
+                    "bad_header",
+                    oid.clone(),
+                    vec![255, b'\n'],
+                    vec![],
+                    0,
+                    true,
+                    false,
+                ),
+                (
+                    "oversized_header",
+                    oid.clone(),
+                    vec![b'x'; 300],
+                    vec![],
+                    0,
+                    true,
+                    false,
+                ),
+                (
+                    "late_output",
+                    oid.clone(),
+                    valid.clone(),
+                    b"late".to_vec(),
+                    0,
+                    false,
+                    false,
+                ),
+                (
+                    "late_status",
+                    oid.clone(),
+                    valid.clone(),
+                    vec![],
+                    7,
+                    false,
+                    false,
+                ),
+                (
+                    "duplicate",
+                    oid.clone(),
+                    [valid.as_slice(), valid.as_slice()].concat(),
+                    vec![],
+                    0,
+                    true,
+                    false,
+                ),
+                (
+                    "wrong_newline",
+                    oid.clone(),
+                    [&valid[..valid.len() - 1], b"!"].concat(),
+                    vec![],
+                    0,
+                    true,
+                    false,
+                ),
+                (
+                    "truncated_body",
+                    oid.clone(),
+                    valid[..valid.len() - 3].to_vec(),
+                    vec![],
+                    0,
+                    true,
+                    false,
+                ),
+            ];
+            cases[6].2 = [
+                format!("{oid} blob {}\n", body.len()).as_bytes(),
+                &body,
+                b"\n",
+            ]
+            .concat();
+            for bad in [
+                b"1008 x\0".as_slice(),
+                b"100644 \0",
+                b"100644 no-nul",
+                b"100644 x\0short",
+                b"100",
+                b"160000 link\0",
+            ] {
+                let mut bad = bad.to_vec();
+                if bad.starts_with(b"160000") {
+                    bad.extend(&leaf);
+                }
+                let bad_oid = oid_for(&bad);
+                cases.push((
+                    "malformed_tree",
+                    bad_oid.clone(),
+                    frame(&bad_oid, &bad),
+                    vec![],
+                    0,
+                    true,
+                    false,
+                ));
+            }
+            for (name, request, response, tail, status, immediate, success) in cases {
+                workspace_metadata_test_hooks::STATE
+                    .with(|state| *state.borrow_mut() = Default::default());
+                let result = run_workspace_git_child(
+                    workspace_protocol_child(
+                        &response,
+                        &tail,
+                        if name == "stderr_pressure" {
+                            1024 * 1024
+                        } else {
+                            0
+                        },
+                        status,
+                        immediate,
+                    ),
+                    &mut None,
+                    |owner| {
+                        let mut edges = Vec::new();
+                        owner.tree(&request, width, |oid, tree| edges.push((oid, tree)))?;
+                        owner.finish()?;
+                        Ok(edges)
+                    },
+                );
+                assert_eq!(result.is_ok(), success, "{width}/{name}");
+                if name == "valid" {
+                    assert_eq!(result.unwrap(), [(hex::encode(&leaf), false)]);
+                }
+                workspace_metadata_test_hooks::STATE.with(|state| {
+                    let state = state.borrow();
+                    assert_eq!(state.counts["spawn"], state.counts["reap"]);
+                    assert_eq!(state.counts["drain_spawn"], state.counts["drain_join"]);
+                    assert!(state.retained_stderr <= 16 * 1024);
+                    if name == "stderr_pressure" {
+                        assert_eq!(state.retained_stderr, 16 * 1024);
+                    }
+                    for pid in &state.owned_pids {
+                        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+                    }
+                });
+                assert!(unrelated.try_wait().unwrap().is_none());
+            }
+            for fault in ["spawn", "read", "join", "closed_input", "broken_pipe"] {
+                workspace_metadata_test_hooks::STATE.with(|state| {
+                    *state.borrow_mut() = workspace_metadata_test_hooks::State {
+                        fail_drain_spawn: fault == "spawn",
+                        fail_drain_read: fault == "read",
+                        fail_drain_join: fault == "join",
+                        ..Default::default()
+                    }
+                });
+                let command = if fault == "broken_pipe" {
+                    let mut c = Command::new("python3");
+                    c.arg("-c").arg("pass");
+                    c
+                } else {
+                    workspace_protocol_child(&valid, b"", 4096, 0, false)
+                };
+                let result = run_workspace_git_child(command, &mut None, |owner| {
+                    if fault == "closed_input" {
+                        owner.input.take();
+                    }
+                    if fault == "broken_pipe" {
+                        owner.child.wait()?;
+                    }
+                    owner.tree(&oid, width, |_, _| {})?;
+                    owner.finish()
+                });
+                assert!(result.is_err(), "{fault}");
+                workspace_metadata_test_hooks::STATE.with(|state| {
+                    let state = state.borrow();
+                    assert_eq!(state.counts["spawn"], state.counts["reap"]);
+                    assert_eq!(
+                        state.counts.get("drain_spawn"),
+                        state.counts.get("drain_join")
+                    );
+                    for pid in &state.owned_pids {
+                        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+                    }
+                });
+            }
+        }
+        unrelated.kill().unwrap();
+        unrelated.wait().unwrap();
         workspace_metadata_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
     }
 
@@ -11944,7 +13516,7 @@ mod native_source_inventory_tests {
                 object.object_id.clone(),
             )];
             assert!(
-                Arc::ptr_eq(first, second),
+                Arc::ptr_eq(&first.compressed_hex, &second.compressed_hex),
                 "destination tuples share emitted bytes without another hex allocation"
             );
         }
@@ -11983,7 +13555,7 @@ mod native_source_inventory_tests {
         }];
         let references =
             vec![resolver.saved_snapshots[&("ses_exact".into(), fixture.trees[0].clone())].clone()];
-        for ((project_id, worktree_sha1, object_id), compressed_hex) in &resolver.snapshot_objects {
+        for ((project_id, worktree_sha1, object_id), output) in &resolver.snapshot_objects {
             if project_id != "prj" {
                 continue;
             }
@@ -11992,7 +13564,7 @@ mod native_source_inventory_tests {
                     project_id: project_id.clone(),
                     worktree_sha1: worktree_sha1.clone(),
                     object_id: object_id.clone(),
-                    compressed_hex: compressed_hex.as_ref().clone(),
+                    compressed_hex: output.compressed_hex.as_ref().clone(),
                 },
                 &references,
                 &destination,
@@ -12042,14 +13614,22 @@ mod native_source_inventory_tests {
             let fixture = reuse_fixture(packed);
             let (plain, _, reads) = reuse_export(&fixture, Some(0));
             for budget in [1, 1400, 3000] {
+                let (old, old_counts, old_reads) =
+                    reuse_export_policy(&fixture, Some(budget), false);
                 let (bounded, counts, bounded_reads) = reuse_export(&fixture, Some(budget));
                 assert!(
-                    counts["hex"] > 4,
+                    old_counts["hex"] > 4,
                     "budget exhaustion must execute ordinary conversion fallback"
                 );
                 if budget == 1 {
-                    assert_eq!(counts["hex"], 30);
+                    assert_eq!(old_counts["hex"], 30);
                 }
+                assert_eq!(counts["hex"], if packed { 4 } else { old_counts["hex"] });
+                assert_eq!(old_reads, bounded_reads);
+                assert_eq!(
+                    fs::read(&old.payload_path).unwrap(),
+                    fs::read(&bounded.payload_path).unwrap()
+                );
                 assert_eq!(reads, bounded_reads);
                 assert_eq!(
                     fs::read(&plain.payload_path).unwrap(),

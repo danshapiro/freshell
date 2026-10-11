@@ -3280,6 +3280,216 @@ fn durable_souls_rehearsal_pipeline_transfers_exact_native_snapshot_closure() {
 }
 
 #[test]
+fn durable_souls_rehearsal_pipeline_many_tree_workspace_current_and_installed_reader() {
+    use sha2::Digest;
+    let mut fixture = saved_revert_fixture(false);
+    // Construct an ordinary repository without invoking an external CLI. Its
+    // committed tree is deliberately different from the native snapshot tree.
+    let git_dir = fixture.workspace.join(".git");
+    fs::create_dir_all(git_dir.join("refs/heads")).unwrap();
+    fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(
+        git_dir.join("config"),
+        "[core]\nrepositoryformatversion = 0\nbare = false\n",
+    )
+    .unwrap();
+    let committed_tree = write_owned_git_object(&git_dir.join("objects"), "tree", b"");
+    let commit = write_owned_git_object(
+        &git_dir.join("objects"),
+        "commit",
+        format!("tree {committed_tree}\nauthor Fixture <fixture@example.invalid> 1 +0000\ncommitter Fixture <fixture@example.invalid> 1 +0000\n\nfixture\n").as_bytes(),
+    );
+    fs::write(git_dir.join("refs/heads/main"), format!("{commit}\n")).unwrap();
+    let bucket_id = hex::encode(sha1::Sha1::digest(
+        fixture
+            .workspace
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .as_bytes(),
+    ));
+    let source_store = fixture
+        .root
+        .join("snapshot/project-one")
+        .join(&bucket_id)
+        .join("objects");
+    let body = b"synthetic retained snapshot bytes";
+    let blob = write_owned_git_object(&source_store, "blob", body);
+    let mut entry = b"100644 asset.txt\0".to_vec();
+    entry.extend(hex::decode(&blob).unwrap());
+    let nested = write_owned_git_object(&source_store, "tree", &entry);
+    let second = write_owned_git_object(&source_store, "blob", b"second fixed native leaf");
+    let mut tree = nested.clone();
+    for index in 1..64 {
+        let mut entry = format!("40000 chain{index}\0").into_bytes();
+        entry.extend(hex::decode(&tree).unwrap());
+        entry.extend(b"100755 leaf\0");
+        entry.extend(hex::decode(&second).unwrap());
+        entry.extend(b"40000 repeated\0");
+        entry.extend(hex::decode(&nested).unwrap());
+        tree = write_owned_git_object(&source_store, "tree", &entry);
+    }
+    for fanout in fs::read_dir(&source_store).unwrap() {
+        let fanout = fanout.unwrap();
+        let target = git_dir.join("objects").join(fanout.file_name());
+        fs::create_dir_all(&target).unwrap();
+        for object in fs::read_dir(fanout.path()).unwrap() {
+            let object = object.unwrap();
+            fs::copy(object.path(), target.join(object.file_name())).unwrap();
+        }
+    }
+    let source = Connection::open(fixture.root.join("source.sqlite")).unwrap();
+    source
+        .execute(
+            "UPDATE session SET revert=?1 WHERE id='ses_root'",
+            [serde_json::json!({"messageID":"msg_cleanup_2","snapshot":tree}).to_string()],
+        )
+        .unwrap();
+    drop(source);
+    let source = Connection::open(fixture.root.join("source.sqlite")).unwrap();
+    source.execute("UPDATE part SET data=json_set(data,'$.type','step-start','$.snapshot',?1) WHERE id=(SELECT id FROM part LIMIT 1)",[&tree]).unwrap();
+    drop(source);
+    let before = fs::read(fixture.root.join("source.sqlite")).unwrap();
+    reexport_owned_fixture(&mut fixture);
+    let manifest: OpenCodeTransferManifest =
+        serde_json::from_str(&fixture.descriptor.manifest_json).unwrap();
+    assert_eq!(
+        manifest.saved_snapshots[0].availability,
+        freshell_sessions::opencode_transfer::SavedSnapshotAvailability::RetainedClosure
+    );
+    assert_eq!(manifest.saved_snapshots[0].objects.len(), 66);
+    assert!(manifest
+        .assets
+        .iter()
+        .any(|asset| asset.kind == "git_tree_reference"));
+    let payload = fs::read(fixture.staged_directory.join("entry-0000.bin")).unwrap();
+    let imported = import_bundle_payload(
+        &fixture.descriptor,
+        payload.as_slice(),
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .unwrap();
+    let destination_store = fixture
+        .destination_database
+        .parent()
+        .unwrap()
+        .join("snapshot/project-one")
+        .join(&bucket_id)
+        .join("objects");
+    for saved in &manifest.saved_snapshots {
+        for object in &saved.objects {
+            let oid = &object.object_id;
+            let path = destination_store.join(&oid[..2]).join(&oid[2..]);
+            let bytes = fs::read(&path).unwrap();
+            assert_eq!(
+                bytes,
+                fs::read(source_store.join(&oid[..2]).join(&oid[2..])).unwrap()
+            );
+            assert_eq!(
+                hex::encode(sha2::Sha256::digest(&bytes)),
+                object.compressed_sha256
+            );
+            let mut decoder = flate2::read::ZlibDecoder::new(bytes.as_slice());
+            let mut canonical = Vec::new();
+            std::io::Read::read_to_end(&mut decoder, &mut canonical).unwrap();
+            assert_eq!(hex::encode(sha1::Sha1::digest(&canonical)), *oid);
+            let nul = canonical.iter().position(|b| *b == 0).unwrap();
+            let kind = std::str::from_utf8(&canonical[..nul])
+                .unwrap()
+                .split(' ')
+                .next()
+                .unwrap();
+            let output = std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(destination_store.parent().unwrap())
+                .args(["cat-file", kind, oid])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "native installed snapshot readback"
+            );
+            assert_eq!(output.stdout, canonical[nul + 1..]);
+        }
+    }
+    let current = verify_current_store(
+        &fixture.descriptor,
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .unwrap();
+    assert_eq!(
+        current.saved_snapshot_summary,
+        imported.saved_snapshot_summary
+    );
+    let native_payload: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+    let destination = Connection::open(&fixture.destination_database).unwrap();
+    for expected in native_payload["rows"].as_array().unwrap() {
+        let row: SerializedRow = serde_json::from_value(expected.clone()).unwrap();
+        assert_eq!(
+            read_row_by_key(&destination, &row.table, &row.key).unwrap(),
+            row
+        );
+    }
+    drop(destination);
+    let home = fixture.destination_database.ancestors().nth(4).unwrap();
+    let xdg_data_home = home.join(".local/share");
+    let xdg_config_home = home.join(".config");
+    fs::create_dir_all(&xdg_config_home).unwrap();
+    let reader = InstalledStoreReaderContext {
+        database_path: &fixture.destination_database,
+        workspace_root: &fixture.workspace,
+        provider_uid: rehearsal_current_identity().0,
+        provider_gid: rehearsal_current_identity().1,
+        home,
+        xdg_data_home: &xdg_data_home,
+        xdg_config_home: &xdg_config_home,
+        cwd: &fixture.workspace,
+    };
+    let installed = verify_installed_store(&fixture.descriptor, &reader).unwrap();
+    assert_eq!(installed.structural_sha256, imported.structural_sha256);
+    assert_eq!(
+        installed.saved_snapshot_summary,
+        imported.saved_snapshot_summary
+    );
+    let destination_before = fs::read(&fixture.destination_database).unwrap();
+    let compressed_before = fs::read(
+        git_dir
+            .join("objects")
+            .join(&nested[..2])
+            .join(&nested[2..]),
+    )
+    .unwrap();
+    let conflict = git_dir
+        .join("objects")
+        .join(&nested[..2])
+        .join(&nested[2..]);
+    fs::write(&conflict, b"current wrong workspace descendant").unwrap();
+    assert!(verify_current_store(
+        &fixture.descriptor,
+        &fixture.destination_database,
+        &fixture.workspace
+    )
+    .is_err());
+    assert!(verify_installed_store(&fixture.descriptor, &reader).is_err());
+    assert_eq!(
+        fs::read(&conflict).unwrap(),
+        b"current wrong workspace descendant"
+    );
+    assert_eq!(
+        fs::read(&fixture.destination_database).unwrap(),
+        destination_before
+    );
+    assert_eq!(
+        fs::read(fixture.root.join("source.sqlite")).unwrap(),
+        before
+    );
+    fs::write(&conflict, compressed_before).unwrap();
+    verify_installed_store(&fixture.descriptor, &reader).unwrap();
+}
+
+#[test]
 #[cfg(target_os = "linux")]
 fn durable_souls_rehearsal_pipeline_batch_reads_selected_graphs_without_rescanning_store() {
     use freshell_sessions::opencode_transfer::capture_qualified_batch;
