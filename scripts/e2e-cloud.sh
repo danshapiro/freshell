@@ -469,6 +469,22 @@ cmd_run() {
   done
   pw_args=("${normalized[@]}")
 
+  # External browser targets are a closed fixture/project pair. Validate before
+  # identity, image lookup or paid dispatch; ordinary lanes remain unchanged.
+  local external_handoff=false
+  if [ -n "${FRESHELL_E2E_EXTERNAL_FIXTURE_KIND:-}${FRESHELL_MANAGED_ENVIRONMENT_FIXTURE:-}${FRESHELL_CODE_CHECKPOINT_FIXTURE:-}" ]; then
+    external_handoff=true
+  fi
+  for arg in "${pw_args[@]}"; do
+    case "$arg" in
+      --project=chromium-external-target|*managed-provider-environment-external.spec.ts|*code-checkpoint-workspace-external.spec.ts)
+        external_handoff=true ;;
+    esac
+  done
+  if $external_handoff; then
+    (cd "$ROOT" && pnpm exec tsx scripts/testing/e2e-external-target.ts validate "${pw_args[@]}")
+  fi
+
   # The container entrypoint treats --dry-run as a diagnostic-only request: it
   # calculates and prints shard assignments, then exits before Playwright runs.
   # Such a task has no completion/retry receipt by design, so keep Cloud Run's
@@ -647,6 +663,9 @@ cmd_run() {
   trap cleanup_run_job EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
+  if $external_handoff; then
+    (cd "$ROOT" && pnpm exec tsx scripts/testing/e2e-external-target.ts append-env "$RUN_ENV_FILE" "${pw_args[@]}")
+  fi
 
   # 4 CPU / 4Gi (the coordinator's pre-authorized escalation for the
   # unified-agent-names acceptance lane): the 2-CPU instances' cold-attempt
