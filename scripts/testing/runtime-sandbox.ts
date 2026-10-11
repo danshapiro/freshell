@@ -2516,7 +2516,70 @@ export async function prepareTask007LibTestArtifact(input: {
     features: z.array(z.string()).parse(artifact.features), sourcePath }
 }
 
+export type TransferResourcePolicy = {
+  operationTimeoutMs: number
+  cleanupTimeoutMs: number
+  lifecycleMs: number
+  memoryBytes: number
+}
+const TRANSFER_FIXTURE_POLICY: TransferResourcePolicy = {
+  operationTimeoutMs: 300_000, cleanupTimeoutMs: 30_000, lifecycleMs: 600_000, memoryBytes: 1024 ** 3,
+}
+
+function admitTransferPolicy(policy: TransferResourcePolicy): TransferResourcePolicy {
+  if (![policy.operationTimeoutMs, policy.cleanupTimeoutMs, policy.lifecycleMs, policy.memoryBytes].every(value => Number.isSafeInteger(value) && value > 0)
+    || policy.operationTimeoutMs > policy.lifecycleMs || policy.operationTimeoutMs > 7_200_000 || policy.lifecycleMs > 7_200_000
+    || policy.cleanupTimeoutMs > 30_000 || policy.memoryBytes > 2 * 1024 ** 3) throw new Error('finite transfer resource ceiling required')
+  return { ...policy }
+}
+
 export class RuntimeHarness {
+  private transferPolicy?: TransferResourcePolicy
+  private transferAllocationUnknown = false
+  private readonly transferPendingNames = new Set<string>()
+  private readonly transferDeadlines = new Map<string, number>()
+  private transferDocker(args: string[], cleanup = false, deadline?: number): string {
+    const policy = this.transferPolicy ?? TRANSFER_FIXTURE_POLICY
+    const timeout = Math.min(cleanup ? policy.cleanupTimeoutMs : policy.operationTimeoutMs, deadline === undefined ? Infinity : deadline - Date.now())
+    if (timeout < 1) throw new Error('owned transfer cleanup budget expired')
+    return execFileSync('docker', args, { encoding: 'utf8', timeout,
+      killSignal: 'SIGKILL', maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })
+  }
+  private allocateTransferContainer(args: string[], name: string): string {
+    this.transferPendingNames.add(name)
+    try {
+      const id = this.transferDocker(['create', '--name', name, ...args]).trim()
+      if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('owned transfer allocation acknowledgement invalid')
+      this.trackedContainers.add(id); this.transferPendingNames.delete(name)
+      return id
+    } catch (error) { this.transferAllocationUnknown = true; throw error }
+  }
+  private transferRemaining(containerId: string): number {
+    const policy = this.transferPolicy ?? TRANSFER_FIXTURE_POLICY
+    const remaining = (this.transferDeadlines.get(containerId) ?? Date.now() + policy.lifecycleMs) - Date.now()
+    if (remaining < 1) throw new Error('owned transfer lifecycle expired')
+    return Math.min(policy.operationTimeoutMs, remaining)
+  }
+  private async cleanupTransfer(): Promise<{ ok: boolean; errors: string[] }> {
+    const original = this.transferOwnedIds(), errors: string[] = []
+    const deadline = Date.now() + this.transferPolicy!.cleanupTimeoutMs
+    for (const id of original.containers) {
+      try { this.transferDocker(['rm', '-f', id], true, deadline) } catch { errors.push('owned transfer container removal failed') }
+    }
+    for (const volume of original.volumes) {
+      try { this.transferDocker(['volume', 'rm', volume], true, deadline) } catch { errors.push('owned transfer volume removal failed') }
+    }
+    let absent = false
+    try { this.verifyTransferCleanup(original, deadline); absent = true } catch { errors.push('owned transfer absence unresolved') }
+    if (this.transferAllocationUnknown) errors.push('owned transfer allocation acknowledgement unresolved')
+    if (absent && !this.transferAllocationUnknown) {
+      this.trackedContainers.clear(); this.trackedVolumes.clear(); this.transferDeadlines.clear()
+    }
+    ensurePrivateDirectory(this.evidenceDir)
+    writePrivateJson(path.join(this.evidenceDir, 'cleanup.json'), { ok: errors.length === 0, errors, ...original,
+      verifiedResourcesAbsent: absent && !this.transferAllocationUnknown, allocationUnknown: this.transferAllocationUnknown })
+    return { ok: errors.length === 0, errors }
+  }
   private task2FiniteFixtures = false
   task2ServerBinary = ""
   readonly repoRoot: string
@@ -3093,11 +3156,12 @@ export class RuntimeHarness {
   }
 
   /** Finite offline transfer qualification; no ambient homes/grants or broker. */
-  async prepareTransfer(imageDigest: string): Promise<void> {
-    if (!/^sha256:[a-f0-9]{64}$/.test(imageDigest) || !dockerIsRootless()) {
+  async prepareTransfer(imageDigest: string, policy: TransferResourcePolicy = TRANSFER_FIXTURE_POLICY): Promise<void> {
+    this.transferPolicy = admitTransferPolicy(policy)
+    if (!/^sha256:[a-f0-9]{64}$/.test(imageDigest) || !JSON.parse(this.transferDocker(['info', '--format', '{{json .SecurityOptions}}'])).some((value: string) => /rootless/i.test(value))) {
       throw new Error('transfer requires an exact immutable image and rootless Docker')
     }
-    const inspected = docker(['image', 'inspect', imageDigest, '--format', '{{.Id}}']).trim()
+    const inspected = this.transferDocker(['image', 'inspect', imageDigest, '--format', '{{.Id}}']).trim()
     if (inspected !== imageDigest) throw new Error('transfer image identity mismatch')
     if (fs.existsSync(this.testRoot)) throw new Error('transfer scratch already exists')
     fs.mkdirSync(this.testRoot, { recursive: true, mode: 0o700 })
@@ -3106,29 +3170,32 @@ export class RuntimeHarness {
     this.recordLifecycle('transfer.prepare.completed', { imageDigest, candidateSha: this.candidateSha })
   }
 
-  startTransferProvider(stageBinary: string, schemaFile: string, migrationsFile: string, workspacePaths: readonly string[] = []): { containerId: string; volumeName: string } {
+  startTransferProvider(stageBinary: string, schemaFile: string, migrationsFile: string, workspacePaths: readonly string[] = [], policy?: TransferResourcePolicy): { containerId: string; volumeName: string } {
+    this.transferPolicy = admitTransferPolicy(policy ?? this.transferPolicy ?? TRANSFER_FIXTURE_POLICY)
     for (const file of [stageBinary, schemaFile, migrationsFile]) {
       if (!path.isAbsolute(file) || !fs.statSync(file).isFile()) throw new Error('exact transfer artifact file required')
     }
     const volumeName = `freshell-transfer-${this.runId.slice(0, 12)}-${randomUUID().slice(0, 8)}`
-    docker(['volume', 'create', '--label', `com.freshell.runtime-test-run-id=${this.runId}`, volumeName])
     this.trackedVolumes.add(volumeName)
+    try { this.transferDocker(['volume', 'create', '--label', `com.freshell.runtime-test-run-id=${this.runId}`, volumeName]) }
+    catch (error) { this.transferAllocationUnknown = true; throw error }
     // Trusted rootless volume initialization finishes before any provider
     // runs. Only the owned volume root changes; provider operations get no caps.
-    const initializer = docker([
-      'create', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--cap-add', 'CHOWN',
+    const initializerName = `${volumeName}-init`
+    const initializer = this.allocateTransferContainer([
+      '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--cap-add', 'CHOWN',
       '--security-opt', 'no-new-privileges', '--label', `com.freshell.runtime-test-run-id=${this.runId}`,
       '--mount', `type=volume,source=${volumeName},target=/scratch`, this.imageRef,
       'python3', '-c', 'import os; p="/scratch/.freshell-transfer-owner"; f=os.open(p,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600); os.write(f,b"owned-transfer-volume"); os.fsync(f); os.close(f); os.chown(p,65534,0); os.chmod("/scratch",0o700); os.chown("/scratch",65534,0)',
-    ]).trim()
+    ], initializerName)
     if (!/^[a-f0-9]{64}$/.test(initializer)) throw new Error('invalid transfer initializer id')
     this.trackedContainers.add(initializer)
-    docker(['start', '-a', initializer])
-    const exitCode = Number(docker(['inspect', '--format', '{{.State.ExitCode}}', initializer]).trim())
+    this.transferDocker(['start', '-a', initializer])
+    const exitCode = Number(this.transferDocker(['inspect', '--format', '{{.State.ExitCode}}', initializer]).trim())
     if (exitCode !== 0) throw new Error('owned volume initialization failed')
-    const containerId = docker([
-      'run', '-d', '--network', 'none', '--read-only', '--user', '65534:0', '--cap-drop', 'ALL',
-      '--security-opt', 'no-new-privileges', '--cpus', '2', '--memory', '1g', '--memory-swap', '1g', '--pids-limit', '128',
+    const containerId = this.allocateTransferContainer([
+      '--network', 'none', '--read-only', '--user', '65534:0', '--cap-drop', 'ALL',
+      '--security-opt', 'no-new-privileges', '--cpus', '2', '--memory', String(this.transferPolicy!.memoryBytes), '--memory-swap', String(this.transferPolicy!.memoryBytes), '--pids-limit', '128',
       '--tmpfs', '/tmp:rw,nosuid,nodev,size=128m,mode=1777',
       '--label', `com.freshell.runtime-test-run-id=${this.runId}`,
       '--mount', `type=volume,source=${volumeName},target=/scratch`,
@@ -3144,10 +3211,13 @@ export class RuntimeHarness {
           || workspace === '/' || workspace === '/scratch' || !fs.statSync(workspace).isDirectory()) throw new Error('exact qualified workspace required')
         return ['--mount', `type=bind,source=${workspace},target=${workspace},readonly`]
       }),
-      '-w', '/scratch', this.imageRef, 'sleep', '600',
-    ]).trim()
+      '-w', '/scratch', this.imageRef, 'sleep', String(Math.ceil(this.transferPolicy!.lifecycleMs / 1000)),
+    ], `${volumeName}-provider`)
+    const startedAt = Date.now()
+    this.transferDocker(['start', containerId])
     if (!/^[a-f0-9]{64}$/.test(containerId)) throw new Error('invalid transfer provider id')
     this.trackedContainers.add(containerId)
+    this.transferDeadlines.set(containerId, startedAt + this.transferPolicy!.lifecycleMs)
     this.recordLifecycle('transfer.provider.started', { containerId, volumeName, imageDigest: this.imageRef, providerUid: 65534, providerGid: 0 })
     return { containerId, volumeName }
   }
@@ -3156,18 +3226,18 @@ export class RuntimeHarness {
     if (!this.trackedContainers.has(containerId) || !/^[a-z0-9-]+\.json$/.test(fileName)) throw new Error('owned transfer request required')
     execFileSync('docker', ['exec', '-i', '--user', '65534:0', containerId, 'python3', '-c',
       'import os,sys; p="/scratch/"+sys.argv[1]; f=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600); b=sys.stdin.buffer.read(1048577); assert len(b)<=1048576; os.write(f,b); os.fsync(f); os.close(f)', fileName,
-    ], { input: JSON.stringify(value), encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 })
+    ], { input: JSON.stringify(value), encoding: 'utf8', timeout: this.transferRemaining(containerId), killSignal: 'SIGKILL', maxBuffer: 1024 * 1024 })
   }
 
   async copyTransferFileExact(containerId: string, sourceFile: string, destinationFile: string): Promise<void> {
     if (!this.trackedContainers.has(containerId) || !/^\/scratch\/[a-z0-9-]+\.(json|bin)$/.test(destinationFile)) throw new Error('exact owned transfer file required')
     const child = spawn('docker', ['exec', '-i', '--user', '65534:0', containerId, 'node', '-e',
       'const fs=require("node:fs");const f=fs.openSync(process.argv[1],"wx",0o600);let count=0;process.stdin.on("data",b=>{count+=b.length;if(count>8589934592)process.exit(1);fs.writeSync(f,b)});process.stdin.on("end",()=>{fs.fsyncSync(f);fs.closeSync(f)});', destinationFile,
-    ], { cwd: this.repoRoot, stdio: ['pipe', 'ignore', 'pipe'], timeout: 300_000 })
+    ], { cwd: this.repoRoot, stdio: ['pipe', 'ignore', 'pipe'], timeout: this.transferRemaining(containerId), killSignal: 'SIGKILL' })
     this.recordLifecycle('transfer.file.copy.started', { containerId, childPid: child.pid, sourceReference: sourceFile, destinationReference: destinationFile })
     const completion = new Promise<void>((resolve, reject) => {
       child.once('error', reject)
-      child.once('exit', (code, signal) => code === 0 ? resolve() : reject(new Error(`owned transfer copy failed: ${code ?? signal}`)))
+      child.once('close', (code, signal) => code === 0 ? resolve() : reject(new Error(`owned transfer copy failed: ${code ?? signal}`)))
       child.stderr.resume()
     })
     const results = await Promise.allSettled([pipeline(fs.createReadStream(sourceFile), child.stdin), completion])
@@ -3179,10 +3249,10 @@ export class RuntimeHarness {
     if (!this.trackedContainers.has(containerId) || !/^\/scratch\/(?:native-[a-zA-Z0-9_-]+\.json|native-private\.log)$/.test(sourceFile)) throw new Error('exact owned native artifact required')
     const child = spawn('docker', ['exec', '--user', '65534:0', containerId, 'node', '-e',
       'require("node:fs").createReadStream(process.argv[1]).pipe(process.stdout)', sourceFile,
-    ], { cwd: this.repoRoot, stdio: ['ignore', 'pipe', 'pipe'], timeout: 300_000 })
+    ], { cwd: this.repoRoot, stdio: ['ignore', 'pipe', 'pipe'], timeout: this.transferRemaining(containerId), killSignal: 'SIGKILL' })
     const completion = new Promise<void>((resolve, reject) => {
       child.once('error', reject)
-      child.once('exit', (code, signal) => code === 0 ? resolve() : reject(new Error(`owned native capture failed: ${code ?? signal}`)))
+      child.once('close', (code, signal) => code === 0 ? resolve() : reject(new Error(`owned native capture failed: ${code ?? signal}`)))
       child.stderr.resume()
     })
     const results = await Promise.allSettled([pipeline(child.stdout, fs.createWriteStream(destinationFile, { mode: 0o600, flags: 'wx' })), completion])
@@ -3191,14 +3261,15 @@ export class RuntimeHarness {
   }
 
   transferOwnedIds(): { containers: string[]; volumes: string[] } {
-    return { containers: [...this.trackedContainers], volumes: [...this.trackedVolumes] }
+    return { containers: [...this.trackedContainers, ...this.transferPendingNames], volumes: [...this.trackedVolumes] }
   }
 
-  verifyTransferCleanup(original: { containers: string[]; volumes: string[] }): void {
+  verifyTransferCleanup(original: { containers: string[]; volumes: string[] }, deadline = Date.now() + (this.transferPolicy ?? TRANSFER_FIXTURE_POLICY).cleanupTimeoutMs): void {
     // Successful inventory calls prove absence; daemon/transport failure is
     // never interpreted as a missing owned object.
-    const containers = new Set(docker(['ps', '-aq', '--no-trunc']).trim().split('\n'))
-    const volumes = new Set(docker(['volume', 'ls', '-q']).trim().split('\n'))
+    const containers = new Set(this.transferDocker(['ps', '-aq', '--no-trunc'], true, deadline).trim().split('\n'))
+    if (this.transferPendingNames.size) for (const name of this.transferDocker(['ps', '-a', '--format', '{{.Names}}'], true, deadline).trim().split('\n')) containers.add(name)
+    const volumes = new Set(this.transferDocker(['volume', 'ls', '-q'], true, deadline).trim().split('\n'))
     if (original.containers.some((id) => containers.has(id)) || original.volumes.some((id) => volumes.has(id))) {
       throw new Error('owned transfer resources remain after cleanup')
     }
@@ -3244,6 +3315,7 @@ export class RuntimeHarness {
   }
 
   async cleanup(): Promise<{ ok: boolean; errors: string[] }> {
+    if (this.transferPolicy) return this.cleanupTransfer()
     const errors: string[] = []
     await Promise.allSettled([...this.task007Children])
     const brokers = [this.broker, ...this.task007Brokers].filter((broker): broker is RestrictedDockerBroker => !!broker)
@@ -4020,7 +4092,7 @@ export class RuntimeHarness {
   execTransferProviderExact(containerId: string, command: string[]): string {
     if (!this.trackedContainers.has(containerId)) throw new Error('owned finite transfer container required')
     return execFileSync('docker', ['exec', '--user', '65534:0', containerId, ...command], {
-      encoding: 'utf8', timeout: 300_000, maxBuffer: 16 * 1024 * 1024,
+      encoding: 'utf8', timeout: this.transferRemaining(containerId), killSignal: 'SIGKILL', maxBuffer: 16 * 1024 * 1024,
     })
   }
 
@@ -4172,7 +4244,7 @@ export class RuntimeHarness {
     this.trackedContainers.delete(containerId)
   }
   inspectContainer(containerId: string): any {
-    const output = docker(['inspect', containerId])
+    const output = this.transferPolicy ? this.transferDocker(['inspect', containerId]) : docker(['inspect', containerId])
     return JSON.parse(output)[0]
   }
 

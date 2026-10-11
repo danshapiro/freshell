@@ -51,6 +51,73 @@ const handle = {
   hostBootId: 'boot-owned', nativeSessionId: 'native-owned',
 }
 
+describe('finite transfer ownership', () => {
+  it('executes a delayed owned operation, refuses a stalled operation and refuses work after lifecycle expiry', async () => {
+    const directory = path.join(fixtureRepoRoot, 'transfer-operation')
+    await fsp.mkdir(directory)
+    const calls = path.join(directory, 'calls.jsonl')
+    await fsp.writeFile(path.join(directory,'docker'),`#!${process.execPath}\nconst fs=require('node:fs'),a=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(a)+'\\n');if(a[0]==='info')process.stdout.write('["rootless"]');else if(a[0]==='image')process.stdout.write('sha256:${'b'.repeat(64)}');else if(a[0]==='volume'&&a[1]==='create')process.stdout.write(a.at(-1));else if(a[0]==='create')process.stdout.write('${'a'.repeat(64)}');else if(a[0]==='inspect')process.stdout.write('0');else if(a[0]==='exec')setTimeout(()=>process.stdout.write('owned delayed completion'),Number(a.at(-1)));\n`,{mode:0o700})
+    const migration=path.join(directory,'migrations.json');await fsp.writeFile(migration,'[]')
+    const h=new owner.RuntimeHarness(fixtureRepoRoot,randomUUID(),2)
+    vi.stubEnv('PATH',`${directory}${path.delimiter}${process.env.PATH}`)
+    try {
+      await h.prepareTransfer(`sha256:${'b'.repeat(64)}`,{operationTimeoutMs:400,cleanupTimeoutMs:1_000,lifecycleMs:2_000,memoryBytes:1024**3})
+      const owned=h.startTransferProvider(process.execPath,path.join(fixtureRepoRoot,'crates/freshell-sessions/src/opencode_schema_v1_18_21.sql'),migration)
+      expect(h.execTransferProviderExact(owned.containerId,['delay','100'])).toBe('owned delayed completion')
+      expect(()=>h.execTransferProviderExact(owned.containerId,['delay','900'])).toThrow()
+      await new Promise(resolve=>setTimeout(resolve,2_050))
+      const before=await fsp.readFile(calls,'utf8')
+      expect(()=>h.execTransferProviderExact(owned.containerId,['delay','1'])).toThrow(/expired/)
+      expect(await fsp.readFile(calls,'utf8')).toBe(before)
+      await expect(h.cleanup()).resolves.toEqual({ok:true,errors:[]})
+    } finally {vi.unstubAllEnvs();await fsp.rm(h.testRoot,{recursive:true,force:true})}
+  },10_000)
+  it('retains exact pending allocation diagnostics after a missing create acknowledgement', async () => {
+    const directory=path.join(fixtureRepoRoot,'transfer-allocation')
+    await fsp.mkdir(directory)
+    await fsp.writeFile(path.join(directory,'docker'),`#!${process.execPath}\nconst a=process.argv.slice(2);if(a[0]==='info')process.stdout.write('["rootless"]');else if(a[0]==='image')process.stdout.write('sha256:${'b'.repeat(64)}');else if(a[0]==='volume'&&a[1]==='create')process.stdout.write(a.at(-1));else if(a[0]==='create')process.exit(9);\n`,{mode:0o700})
+    const migration=path.join(directory,'migrations.json');await fsp.writeFile(migration,'[]')
+    const h=new owner.RuntimeHarness(fixtureRepoRoot,randomUUID(),2)
+    vi.stubEnv('PATH',`${directory}${path.delimiter}${process.env.PATH}`)
+    try {
+      await h.prepareTransfer(`sha256:${'b'.repeat(64)}`)
+      expect(()=>h.startTransferProvider(process.execPath,path.join(fixtureRepoRoot,'crates/freshell-sessions/src/opencode_schema_v1_18_21.sql'),migration)).toThrow()
+      const original=h.transferOwnedIds()
+      expect(original.containers).toHaveLength(1);expect(original.volumes).toHaveLength(1)
+      expect(original.containers[0]).toBe(`${original.volumes[0]}-init`)
+      expect((await h.cleanup()).ok).toBe(false)
+      const evidence=JSON.parse(await fsp.readFile(path.join(h.evidenceDir,'cleanup.json'),'utf8'))
+      expect(evidence.allocationUnknown).toBe(true);expect(evidence.verifiedResourcesAbsent).toBe(false)
+      expect(h.transferOwnedIds()).toEqual(original)
+    } finally {vi.unstubAllEnvs();await fsp.rm(h.testRoot,{recursive:true,force:true})}
+  })
+  it('refuses stalled transfer cleanup transport and retains unresolved resources', async () => {
+    const directory = path.join(fixtureRepoRoot, 'transfer-transport')
+    await fsp.mkdir(directory)
+    const calls = path.join(directory, 'calls.jsonl')
+    const blocked = path.join(directory, 'blocked')
+    await fsp.writeFile(path.join(directory, 'docker'), `#!${process.execPath}\nconst fs=require('node:fs'),a=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(a)+'\\n');if(fs.existsSync(${JSON.stringify(blocked)})){setTimeout(()=>process.exit(9),900)}else if(a[0]==='info')process.stdout.write('["rootless"]');else if(a[0]==='image')process.stdout.write('sha256:${'b'.repeat(64)}');else if(a[0]==='volume'&&a[1]==='create')process.stdout.write(a.at(-1));else if(['create','run'].includes(a[0]))process.stdout.write('${'a'.repeat(64)}');else if(a[0]==='inspect')process.stdout.write('0');\n`, { mode: 0o700 })
+    const h = new owner.RuntimeHarness(fixtureRepoRoot, randomUUID(), 2)
+    const migration = path.join(directory, 'migrations.json'); await fsp.writeFile(migration, '[]')
+    vi.stubEnv('PATH', `${directory}${path.delimiter}${process.env.PATH}`)
+    try {
+      await h.prepareTransfer(`sha256:${'b'.repeat(64)}`, { operationTimeoutMs: 250, cleanupTimeoutMs: 250, lifecycleMs: 1_000, memoryBytes: 1024 ** 3 })
+      h.startTransferProvider(process.execPath, path.join(fixtureRepoRoot, 'crates/freshell-sessions/src/opencode_schema_v1_18_21.sql'), migration)
+      const original = h.transferOwnedIds()
+      await fsp.writeFile(blocked, 'stall')
+      const started = Date.now()
+      const cleanup = await h.cleanup()
+      expect(Date.now() - started).toBeLessThan(3_000)
+      expect(cleanup.ok).toBe(false)
+      expect(h.transferOwnedIds()).toEqual(original)
+      expect(() => h.verifyTransferCleanup(original)).toThrow()
+      await fsp.unlink(blocked)
+      await expect(h.cleanup()).resolves.toEqual({ ok: true, errors: [] })
+      h.verifyTransferCleanup(original)
+    } finally { vi.unstubAllEnvs(); await fsp.rm(h.testRoot, { recursive: true, force: true }) }
+  }, 10_000)
+})
+
 async function nativeOwnerHistory(provider: 'claude' | 'amplifier', nonce: string): Promise<NativeHistory> {
   const root = path.join(fixtureRepoRoot, 'native-owner-history')
   const sessionId = handle.nativeSessionId
