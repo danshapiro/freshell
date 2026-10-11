@@ -6160,6 +6160,47 @@ mod interrupted_transaction_tests {
 
     #[tokio::test]
     async fn ordinary_stop_docker_silence_releases_lock_and_retries_same_intent() {
+        run_ordinary_stop_docker_silence().await;
+    }
+
+    async fn run_ordinary_stop_docker_silence() {
+        // Each registry has its own Docker peer and files, but lifecycle writes
+        // share process-wide incident/rotation locks. A foreign test registry
+        // must not consume this fixture's actual backend-completion budgets.
+        if run_docker_stop_test_child(
+            "FRESHELL_DOCKER_SILENCE_TEST_CHILD",
+            "service::interrupted_transaction_tests::ordinary_stop_docker_silence_releases_lock_and_retries_same_intent",
+        ).await {
+            return;
+        }
+        complete_ordinary_stop_docker_silence().await;
+    }
+
+    async fn run_docker_stop_test_child(child_env: &'static str, test_name: &'static str) -> bool {
+        if std::env::var(child_env).as_deref() == Ok("1") {
+            return false;
+        }
+        let output = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(child_env, "1")
+                .env_remove("FRESHELL_RUNTIME_CAPABILITY_DIR")
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        true
+    }
+
+    async fn complete_ordinary_stop_docker_silence() {
         let mut failures = Vec::new();
         for point in [
             "initial_inspect",
@@ -6358,6 +6399,42 @@ mod interrupted_transaction_tests {
             failures.is_empty(),
             "unbounded Stop backend futures: {failures:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ordinary_stop_docker_silence_is_independent_of_foreign_registry_logging() {
+        // The regression's deliberate lock holder also needs its own process:
+        // it must not introduce the same contention into unrelated tests.
+        if run_docker_stop_test_child(
+            "FRESHELL_DOCKER_SILENCE_COORDINATOR_TEST_CHILD",
+            "service::interrupted_transaction_tests::ordinary_stop_docker_silence_is_independent_of_foreign_registry_logging",
+        ).await {
+            return;
+        }
+        let foreign = tempfile::tempdir().unwrap();
+        let foreign_registry = Registry::open(foreign.path().join("registry"), None).unwrap();
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _registry = foreign_registry;
+            let _coordinator = crate::loss_report::incident_file_coordinator();
+            held_tx.send(()).unwrap();
+            // Always release this test's lock, including on a failed child.
+            // This is only the holder's deadlock escape; the original six
+            // backend deadlines still run unchanged inside the child.
+            matches!(
+                release_rx.recv_timeout(Duration::from_secs(180)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            )
+        });
+        held_rx.await.unwrap();
+        let result = tokio::spawn(run_ordinary_stop_docker_silence()).await;
+        drop(release_tx);
+        assert!(
+            holder.join().unwrap(),
+            "foreign coordinator must remain held until every phase completes"
+        );
+        result.expect("foreign registry logging must not consume the Stop fixture's budgets");
     }
 
     async fn host(supervisor: &Supervisor, root: &Path) -> tokio::task::JoinHandle<()> {
