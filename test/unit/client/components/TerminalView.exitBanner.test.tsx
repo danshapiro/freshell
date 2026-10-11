@@ -368,6 +368,58 @@ describe('TerminalView exited-pane error banner', () => {
     expect(paneState(store)).toMatchObject({terminalId:'retained-managed',streamId:'retained-epoch',status:'exited'})
   })
 
+  it.each([
+    ['blocked', 'blocked', 'error'], ['lost', 'exited', 'error'], ['stopped', 'exited', 'exited'],
+  ] as const)('projects an authoritative %s terminal status without replacing its retained identity', async (recoveryState, runtimeStatus, status) => {
+    const { store, paneContent } = makeStore({ mode: 'codex', status: 'running', recoveryState: 'live' })
+    act(() => store.dispatch(updatePaneContent({ tabId: TAB, paneId: PANE, content: {
+      ...paneContent, terminalId: 'retained-managed', streamId: 'retained-epoch', runtimeStatus: 'running',
+    } })))
+    await renderPane(store, paneState(store))
+    const summary = { ...paneContent.recoverySummary!, recoveryState,
+      reason: 'STORE_UNREADABLE', attemptId: 'attempt-retained', incidentId: 'incident-retained' }
+    act(() => messageHandler!({ type: 'terminal.status', terminalId: 'retained-managed',
+      status: runtimeStatus, recoverySummary: summary }))
+    expect(paneState(store)).toMatchObject({ status, runtimeStatus, recoverySummary: summary,
+      terminalId: 'retained-managed', streamId: 'retained-epoch', createRequestId: REQ,
+      sessionRef: { provider: 'codex', sessionId: SESSION_ID } })
+    expect(store.getState().tabs.tabs[0].status).toBe(status)
+  })
+
+  it.each([
+    ['blocked', 'error'], ['lost', 'error'], ['stopped', 'exited'],
+  ] as const)('keeps an authoritative %s final status when an unqualified running frame arrives later', async (recoveryState, status) => {
+    const { store, paneContent } = makeStore({ mode: 'codex', status, recoveryState })
+    act(() => store.dispatch(updatePaneContent({ tabId: TAB, paneId: PANE, content: {
+      ...paneContent, terminalId: 'retained-managed', streamId: 'retained-epoch',
+      runtimeStatus: recoveryState === 'blocked' ? 'blocked' : 'exited',
+    } })))
+    await renderPane(store, paneState(store))
+    act(() => messageHandler!({ type: 'terminal.status', terminalId: 'retained-managed', status: 'running' }))
+    expect(paneState(store)).toMatchObject({ status, recoverySummary: { recoveryState },
+      terminalId: 'retained-managed', streamId: 'retained-epoch', createRequestId: REQ })
+    expect(store.getState().tabs.tabs[0].status).toBe(status)
+  })
+
+  it.each([
+    ['blocked', 'error'], ['lost', 'error'], ['stopped', 'exited'],
+  ] as const)('retains the %s final status when replay completes with unavailable exit evidence', async (recoveryState, status) => {
+    const { store, paneContent } = makeStore({ mode: 'codex', status, recoveryState,
+      lifecycle: { lastTerminalId: 'retained-managed', exit: { exitCode: 9, at: Date.now() } } })
+    act(() => store.dispatch(updatePaneContent({ tabId: TAB, paneId: PANE, content: {
+      ...paneContent, terminalId: 'retained-managed', streamId: 'retained-epoch',
+      runtimeStatus: recoveryState === 'blocked' ? 'blocked' : 'exited',
+    } })))
+    await renderPane(store, paneState(store))
+    act(() => messageHandler!({ type: 'terminal.exit', terminalId: 'retained-managed',
+      exitCode: -1, managedRetained: true, exitCodeAvailable: false }))
+    expect(paneState(store)).toMatchObject({ status, recoverySummary: { recoveryState },
+      terminalId: 'retained-managed', streamId: 'retained-epoch', createRequestId: REQ })
+    expect(store.getState().tabs.tabs[0].status).toBe(status)
+    expect(selectExitRecordFrom(store.getState().terminalLifecycle, PANE)).toBeUndefined()
+    expect(screen.queryByText(/code -1/)).toBeNull()
+  })
+
   it('shows a codeless alert with Relaunch for an exited agent pane with NO exit record (post-reload)', async () => {
     const { store, paneContent } = makeStore({
       mode: 'claude',

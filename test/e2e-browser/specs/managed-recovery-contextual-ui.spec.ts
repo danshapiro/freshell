@@ -310,7 +310,7 @@ test('fresh-agent: cold lost pane without a soul retains saved history and a clo
   expect(response.request().method()).toBe('GET')
   expect(response.status()).toBe(200)
   const snapshot = await response.json()
-  await expect(page.getByText('Sanitized prompt', { exact: true })).toBeVisible()
+  await expect(page.getByTestId('terminal-work-area').getByText('Sanitized prompt', { exact: true })).toBeVisible()
   await expect(page.getByText(SAVED_HISTORY_TEXT, { exact: true })).toBeVisible()
   await expect(page.getByText(arrayAnswer, { exact: false })).toBeVisible()
   expect(JSON.stringify(snapshot.turns)).toContain('Latest saved array tool output')
@@ -988,6 +988,8 @@ test('routine notices stay silent while cleanup failure is a yellow actionable p
 for (const runtimeStatus of ['blocked', 'exited'] as const) {
   test(`retained managed ${runtimeStatus} terminal attaches for replay without recreating its provider`, async ({ freshellPage, page, terminal, harness }) => {
     await terminal.waitForTerminal()
+    await terminal.executeCommandInserted("printf '%s%s\\n' 'retained-' 'contextual-output'")
+    await terminal.waitForOutput('retained-contextual-output')
     await installPane(page, 'terminal', runtimeStatus === 'blocked' ? 'blocked' : 'lost')
     const before = await paneContent(page)
     if (before.kind !== 'terminal' || !before.terminalId) throw new Error('Expected the existing terminal handle')
@@ -999,7 +1001,7 @@ for (const runtimeStatus of ['blocked', 'exited'] as const) {
       const root = state.panes.layouts[tabId]
       if (root?.type !== 'leaf') throw new Error('Expected one pane')
       harness.dispatch({ type: 'panes/updatePaneContent', payload: { tabId, paneId: root.id,
-        content: { ...root.content, runtimeStatus, status: runtimeStatus === 'exited' ? 'exited' : 'running' } } })
+        content: { ...root.content, runtimeStatus, status: runtimeStatus === 'exited' ? 'exited' : 'error' } } })
     }, runtimeStatus)
     await expect.poll(async () => (await harness.getSentWsMessages() as Array<{ type?: string; terminalId?: string }>).
       some((frame) => frame.type === 'terminal.attach' && frame.terminalId === before.terminalId)).toBe(true)
@@ -1008,6 +1010,7 @@ for (const runtimeStatus of ['blocked', 'exited'] as const) {
     await expect.poll(() => paneContent(page)).toMatchObject({ terminalId: before.terminalId,
       createRequestId: before.createRequestId, soulId: SOUL_ID, runtimeStatus })
     await expect(page.getByTestId('managed-runtime-recovery-card')).toBeVisible()
+    await terminal.waitForOutput('retained-contextual-output')
     if (runtimeStatus === 'blocked') {
       await harness.clearSentWsMessages()
       // Invoke the existing user-visible Refresh command, through its menu.
@@ -1028,5 +1031,46 @@ for (const runtimeStatus of ['blocked', 'exited'] as const) {
         return state.panes.refreshRequestsByPane?.[state.tabs.activeTabId!]
       }).toBeUndefined()
     }
+  })
+}
+
+for (const recoveryState of ['blocked', 'lost', 'stopped'] as const) {
+  test(`Overview retains ${recoveryState} diagnostics and opens the same managed replay`, async ({ freshellPage, page, terminal, harness }) => {
+    await terminal.waitForTerminal()
+    await terminal.executeCommandInserted("printf '%s%s\\n' 'overview-' 'retained-output'")
+    await terminal.waitForOutput('overview-retained-output')
+    await installPane(page, 'terminal', recoveryState)
+    const before = await paneContent(page)
+    if (before.kind !== 'terminal' || !before.terminalId) throw new Error('Expected the existing terminal')
+    const runtimeStatus = recoveryState === 'blocked' ? 'blocked' : 'exited'
+    const row = { terminalId: before.terminalId, title: 'Retained contextual agent', mode: 'codex',
+      status: runtimeStatus, runtimeStatus, soulId: SOUL_ID, incarnationId: 'contextual-incarnation',
+      sessionRef: before.sessionRef, recoverySummary: recoverySummary(recoveryState),
+      hasClients: false, createdAt: 1, lastActivityAt: 2 }
+    await page.route(/\/api\/terminals(?:\?.*)?$/, route => route.fulfill({ json: [row] }))
+    await page.evaluate(({ runtimeStatus, recoveryState }) => {
+      const harness = window.__FRESHELL_TEST_HARNESS__!
+      const state = harness.getState()
+      const tabId = state.tabs.activeTabId!
+      const root = state.panes.layouts[tabId]
+      if (root.type !== 'leaf') throw new Error('Expected one pane')
+      harness.dispatch({ type: 'panes/updatePaneContent', payload: { tabId, paneId: root.id,
+        content: { ...root.content, runtimeStatus, status: recoveryState === 'stopped' ? 'exited' : 'error' } } })
+    }, { runtimeStatus, recoveryState })
+    await harness.clearSentWsMessages()
+    await page.getByTitle('Panes (Ctrl+B O)').click()
+    const card = page.locator(`[data-context="overview-terminal"][data-terminal-id="${before.terminalId}"]`)
+    await expect(card).toBeVisible()
+    await expect(card).toContainText(recoveryState === 'blocked' ? 'Blocked' : recoveryState === 'lost' ? 'Lost' : 'Stopped')
+    await expect(card).toContainText('provider_unavailable')
+    await expect(page.getByText(`0 running, ${runtimeStatus === 'exited' ? 1 : 0} exited`, { exact: true })).toBeVisible()
+    await card.click()
+    await terminal.waitForOutput('overview-retained-output')
+    expect(await paneContent(page)).toMatchObject({ terminalId: before.terminalId, soulId: SOUL_ID,
+      createRequestId: before.createRequestId, sessionRef: before.sessionRef,
+      status: recoveryState === 'stopped' ? 'exited' : 'error',
+      recoverySummary: { recoveryState, reason: 'provider_unavailable' } })
+    const frames = await harness.getSentWsMessages() as Array<{ type?: string }>
+    expect(frames.filter(frame => ['terminal.create', 'terminal.input'].includes(frame.type ?? ''))).toEqual([])
   })
 }

@@ -49,6 +49,29 @@ function makeStore() {
   })
 }
 
+const retainedCases = [
+  { recoveryState: 'blocked', runtimeStatus: 'blocked', paneStatus: 'error', label: 'Blocked' },
+  { recoveryState: 'lost', runtimeStatus: 'exited', paneStatus: 'error', label: 'Lost' },
+  { recoveryState: 'stopped', runtimeStatus: 'exited', paneStatus: 'exited', label: 'Stopped' },
+] as const
+
+function retainedDirectoryPage({ recoveryState, runtimeStatus }: typeof retainedCases[number]) {
+  return {
+    items: [{
+      terminalId: 'retained-managed', title: 'Retained managed', mode: 'codex',
+      status: runtimeStatus, runtimeStatus, soulId: 'soul-retained', hasClients: false,
+      createdAt: 1, lastActivityAt: 2,
+      recoverySummary: {
+        desiredState: 'running', recoveryState, reason: 'STORE_UNREADABLE',
+        attemptId: 'attempt-retained', incidentId: 'incident-retained',
+      },
+      sessionRef: { provider: 'codex', sessionId: 'native-retained' },
+    }],
+    nextCursor: null,
+    revision: 1,
+  }
+}
+
 describe('BackgroundSessions', () => {
   beforeEach(() => {
     sentMessages.length = 0
@@ -79,21 +102,33 @@ describe('BackgroundSessions', () => {
     cleanup()
   })
 
-  it.each(['blocked', 'exited'] as const)('attaches a retained managed %s row with its existing identity', async (status) => {
-    mockGetTerminalDirectoryPage.mockResolvedValue({items:[{terminalId:'retained-managed',title:'Retained managed',
-      mode:'codex',status,runtimeStatus:status,soulId:'soul-retained',hasClients:false,createdAt:1,lastActivityAt:2,
-      sessionRef:{provider:'codex',sessionId:'native-retained'}}],nextCursor:null,revision:1})
-    const store=makeStore()
-    const user=userEvent.setup()
+  it.each(retainedCases)('shows the retained $recoveryState row reason and final status', async (row) => {
+    mockGetTerminalDirectoryPage.mockResolvedValue(retainedDirectoryPage(row))
+    render(<Provider store={makeStore()}><BackgroundSessions /></Provider>)
+    await screen.findByRole('button', { name: 'Attach' })
+    expect(screen.getByText('STORE_UNREADABLE')).toBeVisible()
+    expect(screen.getByText(row.label)).toBeVisible()
+  })
+
+  it.each(retainedCases)('attaches the retained $recoveryState row with its exact status and existing identity', async (row) => {
+    mockGetTerminalDirectoryPage.mockResolvedValue(retainedDirectoryPage(row))
+    const store = makeStore()
+    const user = userEvent.setup()
     render(<Provider store={store}><BackgroundSessions /></Provider>)
-    await user.click(await screen.findByRole('button',{name:'Attach'}))
-    const [tab]=store.getState().tabs.tabs
-    const layout=store.getState().panes.layouts[tab.id]
+    const attach = await screen.findByRole('button', { name: 'Attach' })
+    await user.click(attach)
+    const [tab] = store.getState().tabs.tabs
+    const layout = store.getState().panes.layouts[tab.id]
     expect(layout.type).toBe('leaf')
-    if(layout.type!=='leaf') throw new Error('expected leaf')
-    expect(layout.content).toMatchObject({terminalId:'retained-managed',mode:'codex',soulId:'soul-retained',runtimeStatus:status,
-      sessionRef:{provider:'codex',sessionId:'native-retained'}})
-    expect(layout.content.status).toBe(status==='exited'?'exited':'running')
+    if (layout.type !== 'leaf') throw new Error('expected leaf')
+    expect(layout.content).toMatchObject({
+      terminalId: 'retained-managed', mode: 'codex', soulId: 'soul-retained', runtimeStatus: row.runtimeStatus,
+      sessionRef: { provider: 'codex', sessionId: 'native-retained' },
+    })
+    expect(layout.content.status).toBe(row.paneStatus)
+    expect(tab.status).toBe(layout.content.status)
+    expect(layout.content).toMatchObject({ recoverySummary: { reason: 'STORE_UNREADABLE',
+      attemptId: 'attempt-retained', incidentId: 'incident-retained' } })
   })
 
   it('attaches with the real terminal mode, not hardcoded shell', async () => {

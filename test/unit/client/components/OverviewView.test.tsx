@@ -98,6 +98,24 @@ function renderOverview(store: ReturnType<typeof buildStore>) {
   )
 }
 
+const retainedCases = [
+  { recoveryState: 'blocked', runtimeStatus: 'blocked', paneStatus: 'error', label: 'Blocked' },
+  { recoveryState: 'lost', runtimeStatus: 'exited', paneStatus: 'error', label: 'Lost' },
+  { recoveryState: 'stopped', runtimeStatus: 'exited', paneStatus: 'exited', label: 'Stopped' },
+] as const
+
+function retainedRow({ recoveryState, runtimeStatus }: typeof retainedCases[number]) {
+  return scopedRow({
+    status: runtimeStatus,
+    runtimeStatus,
+    soulId: 'soul-retained',
+    recoverySummary: {
+      desiredState: 'running', recoveryState, reason: 'STORE_UNREADABLE',
+      attemptId: 'attempt-retained', incidentId: 'incident-retained',
+    },
+  })
+}
+
 describe('OverviewView terminal cards — unified agent names', () => {
   beforeEach(() => {
     mockApiGet.mockReset()
@@ -109,16 +127,32 @@ describe('OverviewView terminal cards — unified agent names', () => {
 
   afterEach(() => cleanup())
 
-  it.each(['blocked', 'exited'] as const)('opens the retained managed %s card without creating a shell replacement', async (status) => {
-    mockApiGet.mockResolvedValue([scopedRow({status,runtimeStatus:status,soulId:'soul-retained'})])
-    const store=buildStore()
+  it.each(retainedCases)('shows the retained $recoveryState reason and status without counting it as running', async (row) => {
+    mockApiGet.mockResolvedValue([retainedRow(row)])
+    renderOverview(buildStore())
+    const card = await screen.findByRole('button', { name: 'Open terminal Row last-known name' })
+    expect(within(card).getByText('STORE_UNREADABLE')).toBeVisible()
+    expect(within(card).getByText(row.label)).toBeVisible()
+    expect(screen.getByText(`0 running, ${row.runtimeStatus === 'exited' ? 1 : 0} exited`)).toBeVisible()
+  })
+
+  it.each(retainedCases)('opens the retained $recoveryState card with its exact status and existing identity', async (row) => {
+    mockApiGet.mockResolvedValue([retainedRow(row)])
+    const store = buildStore()
     renderOverview(store)
-    fireEvent.click(await screen.findByRole('button',{name:'Open terminal Row last-known name'}))
-    const [tab]=store.getState().tabs.tabs
-    const layout=store.getState().panes.layouts[tab.id]
+    const card = await screen.findByRole('button', { name: 'Open terminal Row last-known name' })
+    fireEvent.click(card)
+    const [tab] = store.getState().tabs.tabs
+    const layout = store.getState().panes.layouts[tab.id]
     expect(layout.type).toBe('leaf')
-    if(layout.type!=='leaf') throw new Error('expected leaf')
-    expect(layout.content).toMatchObject({terminalId:'term-1',mode:'claude',soulId:'soul-retained',runtimeStatus:status})
+    if (layout.type !== 'leaf') throw new Error('expected leaf')
+    expect(layout.content).toMatchObject({
+      terminalId: 'term-1', mode: 'claude', soulId: 'soul-retained', runtimeStatus: row.runtimeStatus,
+    })
+    expect(layout.content.status).toBe(row.paneStatus)
+    expect(tab.status).toBe(layout.content.status)
+    expect(layout.content).toMatchObject({ recoverySummary: { reason: 'STORE_UNREADABLE',
+      attemptId: 'attempt-retained', incidentId: 'incident-retained' } })
     expect(mockApiPost).not.toHaveBeenCalled()
   })
 

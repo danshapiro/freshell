@@ -615,7 +615,7 @@ describe('managed runtime recovery merge', () => {
     })
     const plan = buildManagedRuntimeMergePlan(snapshot([blocked]), baseState())
     expect(plan.creates[0].content).toMatchObject({
-      status: 'recovering',
+      status: 'error',
       soulId: 'soul-one',
       sessionRef: { provider: 'opencode', sessionId: 'ses_one' },
       recoverySummary: {
@@ -659,8 +659,53 @@ describe('managed runtime recovery merge', () => {
       kind: 'terminal',
       soulId: 'soul-one',
       viewIntentId: 'view-one',
+      status: 'error',
       recoverySummary: { desiredState: 'stopped', recoveryState: 'lost' },
     })
+  })
+
+  it.each([
+    ['live', 'running', 'running'],
+    ['recovering', 'stopped', 'recovering'],
+    ['blocked', 'stopped', 'error'],
+    ['lost', 'stopped', 'error'],
+    ['stopped', 'stopped', 'exited'],
+  ] as const)('projects %s recovery with launch state %s while retaining the same conversation and diagnostics', (recoveryState, launchState, status) => {
+    const state = baseState()
+    state.panes.layouts['user-tab'].content = {
+      kind: 'terminal', createRequestId: 'create-one', terminalId: 'terminal-one',
+      streamId: 'transport-stream', mode: 'opencode', status: 'running', soulId: 'soul-one',
+      viewIntentId: 'view-one', sessionRef: { provider: 'opencode', sessionId: 'ses_one' },
+    }
+    const retained = soul({ recoveryState, launchState,
+      desiredState: recoveryState === 'lost' || recoveryState === 'stopped' ? 'stopped' : 'running',
+      recoveryReason: 'STORE_UNREADABLE', recoveryAttemptId: 'attempt-retained', incidentId: 'incident-retained' })
+    const plan = buildManagedRuntimeMergePlan(snapshot([retained]), state)
+    expect(plan.creates).toHaveLength(0)
+    expect(plan.updates).toHaveLength(1)
+    expect(plan.updates[0].content).toMatchObject({
+      terminalId: 'terminal-one', streamId: 'transport-stream', status,
+      soulId: 'soul-one', incarnationId: 'incarnation-one',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_one' },
+      recoverySummary: { recoveryState, reason: 'STORE_UNREADABLE',
+        attemptId: 'attempt-retained', incidentId: 'incident-retained' },
+    })
+    expect(plan.updates[0].tabUpdates.status).toBe(status)
+  })
+
+  it.each([
+    ['live', 'running'], ['recovering', 'recovering'], ['blocked', 'blocked'],
+    ['lost', 'exited'], ['stopped', 'exited'],
+  ] as const)('projects %s inventory into the authoritative retained transport status %s', (recoveryState, runtimeStatus) => {
+    const retained = soul({
+      recoveryState, launchState: recoveryState === 'live' ? 'running' : 'stopped',
+      desiredState: recoveryState === 'lost' || recoveryState === 'stopped' ? 'stopped' : 'running',
+    })
+    const plan = buildManagedRuntimeMergePlan(snapshot([retained]), baseState())
+    expect(plan.creates[0].content).toMatchObject({
+      terminalId: 'terminal-one', soulId: 'soul-one', runtimeStatus,
+    })
+    expect(plan.creates[0].tab).toMatchObject({ soulId: 'soul-one', runtimeStatus })
   })
 
   it('updates an already represented stopped/lost Fresh Agent in place', () => {
