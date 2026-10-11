@@ -29,7 +29,7 @@ import { runSelectedFreshAgentQualification } from '../../../../scripts/testing/
 
 import { playwright, campaignGate } from '../../../../scripts/testing/runtime-landing-campaign.js'
 import * as runner from '../../../../scripts/testing/runtime-external-browser.js'
-import { ManagedRuntimeOwner, RuntimeHarness, assertExactRuntimeHandle, stripRuntimeWebEnvironment, type SupervisorInstance, type Phase3BrowserObservation, type RuntimeLossAssertions, type RuntimeWebConstructOptions } from '../../../../scripts/testing/runtime-sandbox.js'
+import { ManagedRuntimeOwner, RuntimeHarness, assertExactRuntimeHandle, stripRuntimeWebEnvironment, type ManagedRuntimeView, type SupervisorInstance, type Phase3BrowserObservation, type RuntimeLossAssertions, type RuntimeWebConstructOptions } from '../../../../scripts/testing/runtime-sandbox.js'
 import { runTask2RetainedFixture, RetainedFixtureBrowserSession } from '../../../../scripts/testing/task002-retained-fixture.js'
 import * as retainedDriver from '../../../../scripts/testing/task002-retained-fixture.js'
 import { stopManagedRuntimeSoul, createManagedOpenCodeRuntimeBrowserRig } from '../../../e2e-browser/helpers/managed-runtime.js'
@@ -4523,6 +4523,51 @@ describe('closed external owner control', () => {
 })
 
 describe('external finite fixture client', () => {
+  it.each(['freshopencode', 'freshclaude'])('finds a materialized %s replacement through the actual external lookup', async (mode) => {
+    const { replacement } = await import('../../../e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.js')
+    const presentationId = mode + '-owned-picker-request', nativeId = 'ses_owned_native'
+    const observation = { tabId: 'owned-tab', paneId: 'owned-pane', createRequestId: 'owned-picker-request',
+      sessionType: mode, provider: mode === 'freshopencode' ? 'opencode' : 'claude',
+      createdSessionId: presentationId, nativeSessionId: nativeId }
+    vi.stubGlobal('window', { __FRESHELL_TEST_HARNESS__: { getState: () => ({ panes: { layouts: {
+      'owned-tab': { type: 'leaf', id: 'owned-pane', content: { kind: 'fresh-agent',
+        createRequestId: observation.createRequestId, sessionType: mode, provider: observation.provider,
+        sessionId: nativeId, sessionRef: { provider: observation.provider, sessionId: nativeId } } },
+    } } }) } })
+    const created = { reply: { sessionId: presentationId }, ...runner.observeOwnedFreshBrowserPane(observation)! }
+    const original = { soulId: 'owned-soul', incarnationId: 'prior-incarnation', containerId: 'b'.repeat(64),
+      hostBootId: 'owned-boot', nativeSessionId: nativeId, freshAgentSessionId: presentationId,
+      freshAgentSessionType: mode, provider: observation.provider, launchState: 'running', intentRevision: 1 }
+    const healthy = { ...original, incarnationId: 'replacement-incarnation', containerId: 'c'.repeat(64) }
+    // Another presentation of the same native conversation is never the target.
+    const unrelated = { ...healthy, soulId: 'other-soul', freshAgentSessionId: 'other-presentation' }
+    let rows: ManagedRuntimeView[] = [original, unrelated]
+    const transport = vi.fn(async (_url: string, init: RequestInit) => {
+      const request = JSON.parse(String(init.body))
+      expect(request.action).toBe('inventory')
+      return new Response(JSON.stringify({ runId: request.runId, candidateSha: request.candidateSha,
+        operationId: request.operationId, result: rows }), { status: 200 })
+    })
+    const rig = new runner.ExternalManagedRuntimeRig(runner.resolveManagedExternalDescriptor(descriptor)!, transport)
+    try {
+      expect(created).toMatchObject({ paneId: observation.paneId, sessionId: nativeId, reply: { sessionId: presentationId } })
+      await expect(rig.runningViewForFreshSession(nativeId)).resolves.toBeNull()
+      await expect(rig.runningViewForFreshSession(presentationId)).resolves.toEqual(original)
+      vi.useFakeTimers()
+      let settled = false
+      const outcome = replacement(rig, created, original.incarnationId).then(
+        view => { settled = true; return { view } }, error => ({ error: String(error) }))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(settled).toBe(false)
+      rows = [{ ...healthy, containerId: undefined }, unrelated]
+      await vi.advanceTimersByTimeAsync(250)
+      expect(settled).toBe(false)
+      rows = [healthy, unrelated]
+      await vi.advanceTimersByTimeAsync(240_000)
+      expect(await outcome).toEqual({ view: healthy })
+      expect(created.sessionId).toBe(nativeId)
+    } finally { vi.useRealTimers(); vi.unstubAllGlobals() }
+  })
   it('awaits the owner terminal notice count and validates the body-free reply', async () => {
     const owned = new ManagedRuntimeOwner(() => { throw new Error('unused notice web') }, fixtureRepoRoot)
     const context = { ...runner.resolveManagedExternalDescriptor(descriptor)!, runId: owned.runtime.runId, candidateSha: owned.runtime.candidateSha }

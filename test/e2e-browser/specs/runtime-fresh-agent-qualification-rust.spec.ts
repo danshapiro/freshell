@@ -70,9 +70,11 @@ async function sendBrowserNoToolTurn(page: Page, paneId: string, instruction: st
   await composer.press('Enter')
 }
 
-async function replacement(rig: ManagedFixtureRig, sessionId: string, prior: string): Promise<ManagedRuntimeView> {
+export async function replacement(rig: ManagedFixtureRig, created: { reply: { sessionId: string } }, prior: string): Promise<ManagedRuntimeView> {
   return waitFor('replacement incarnation', async () => {
-    const view = await rig.runningViewForFreshSession(sessionId)
+    // The pane materializes to native identity; runtime inventory retains the
+    // presentation identity from this exact create reply across recovery.
+    const view = await rig.runningViewForFreshSession(created.reply.sessionId)
     return view?.containerId && view.incarnationId !== prior ? view : null
   })
 }
@@ -217,10 +219,10 @@ async function qualify(page: Page, rig: ManagedFixtureRig, definition: Definitio
   await rig.observeFreshBrowserIngress(rig.exactRuntimeHandle(main), id, { ingress: 'ws-attach', request: attach })
   await rig.restartSupervisor()
   await rig.crashRuntimeHost(rig.exactRuntimeHandle(main))
-  main = await replacement(rig, initial.sessionId, main.incarnationId)
+  main = await replacement(rig, initial, main.incarnationId)
   await rig.captureFreshNativeStage(rig.exactRuntimeHandle(main), id)
   await rig.crashProviderWorker(rig.exactRuntimeHandle(main))
-  main = await replacement(rig, initial.sessionId, main.incarnationId)
+  main = await replacement(rig, initial, main.incarnationId)
   await rig.captureFreshNativeStage(rig.exactRuntimeHandle(main), id)
 
   if (definition.pendingApproval) {
@@ -237,7 +239,7 @@ async function qualify(page: Page, rig: ManagedFixtureRig, definition: Definitio
         const prior = other.incarnationId
         if (recovery === 'host') await rig.crashRuntimeHost(rig.exactRuntimeHandle(other))
         else await rig.crashProviderWorker(rig.exactRuntimeHandle(other))
-        other = await replacement(rig, auxiliary.sessionId, prior)
+        other = await replacement(rig, auxiliary, prior)
       }
       const current = await rig.captureFreshApprovalCheckpoint(rig.exactRuntimeHandle(other), challenge.challengeId)
       const decisionCursor = wire.sent.length

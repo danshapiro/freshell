@@ -778,7 +778,7 @@ describe('picker profile staging', () => {
       kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude', status: 'creating',
       createRequestId: 'lost-picker-ack', initialCwd: '/owned-picker-repo',
     } }))
-    const creates = (socket: PickerSocket) => socket.frames.filter((frame) => frame.type === 'freshAgent.create')
+    const creates = (socket: InstanceType<typeof PickerSocket>) => socket.frames.filter((frame) => frame.type === 'freshAgent.create')
     try {
       const connected = client.connect()
       PickerSocket.instances[0].ready(freshCapability)
