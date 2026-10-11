@@ -885,6 +885,28 @@ fn native_history_references_root(db: &Connection, root: &str) -> Result<bool, T
     Ok(false)
 }
 
+// Fixed-size, body-free operation attempts and elapsed microseconds, including
+// partial failed operations. These describe reader cost only;
+// they are not storage authority, provider evidence or restoration readiness.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceReaderCosts {
+    pub fresh_inspections: u64,
+    pub fresh_inspection_us: u64,
+    pub native_queries: u64,
+    pub native_query_us: u64,
+    pub native_spawns: u64,
+    pub native_spawn_us: u64,
+    pub settlement_us: u64,
+    pub packed_store_high_water: u64,
+    pub aggregate_fallbacks: u64,
+    pub aggregate_rejections: u64,
+}
+
+fn elapsed_us(started: Instant) -> u64 {
+    started.elapsed().as_micros().min(u64::MAX as u128) as u64
+}
+
 /// Body-free diagnostics from the operation currently reading a source. Counts
 /// describe work performed, not authority, completeness, or recovery readiness.
 #[derive(Debug, Clone, Serialize)]
@@ -899,6 +921,8 @@ pub struct SourceTransferProgress {
     pub completed_count: u64,
     pub total_count: Option<u64>,
     pub error_class: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reader_costs: Option<SourceReaderCosts>,
 }
 
 type SourceProgressObserver = std::sync::Arc<dyn Fn(SourceTransferProgress) + Send + Sync>;
@@ -985,6 +1009,7 @@ impl SourcePhase {
                 completed_count: 0,
                 total_count: None,
                 error_class: None,
+                reader_costs: (phase == "saved_objects").then(SourceReaderCosts::default),
             },
         };
         phase.emit();
@@ -1008,6 +1033,40 @@ impl SourcePhase {
                     completed_count = event.completed_count,
                     total_count = event.total_count,
                     error_class = event.error_class,
+                    fresh_inspections = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.fresh_inspections),
+                    fresh_inspection_us = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.fresh_inspection_us),
+                    native_queries = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.native_queries),
+                    native_query_us = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.native_query_us),
+                    native_spawns = event.reader_costs.as_ref().map(|costs| costs.native_spawns),
+                    native_spawn_us = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.native_spawn_us),
+                    settlement_us = event.reader_costs.as_ref().map(|costs| costs.settlement_us),
+                    packed_store_high_water = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.packed_store_high_water),
+                    aggregate_fallbacks = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.aggregate_fallbacks),
+                    aggregate_rejections = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.aggregate_rejections),
                     "opencode.source.phase"
                 );
             } else {
@@ -1020,6 +1079,40 @@ impl SourcePhase {
                     count_unit = event.count_unit,
                     completed_count = event.completed_count,
                     total_count = event.total_count,
+                    fresh_inspections = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.fresh_inspections),
+                    fresh_inspection_us = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.fresh_inspection_us),
+                    native_queries = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.native_queries),
+                    native_query_us = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.native_query_us),
+                    native_spawns = event.reader_costs.as_ref().map(|costs| costs.native_spawns),
+                    native_spawn_us = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.native_spawn_us),
+                    settlement_us = event.reader_costs.as_ref().map(|costs| costs.settlement_us),
+                    packed_store_high_water = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.packed_store_high_water),
+                    aggregate_fallbacks = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.aggregate_fallbacks),
+                    aggregate_rejections = event
+                        .reader_costs
+                        .as_ref()
+                        .map(|costs| costs.aggregate_rejections),
                     "opencode.source.phase"
                 );
             }
@@ -1893,6 +1986,7 @@ impl<'a> AssetResolver<'a> {
         let closed = self.packed_decoders.finish();
         let result = result.and(closed);
         if let Some(progress) = &mut self.source_progress {
+            progress.event.reader_costs = Some(self.packed_decoders.costs.clone());
             progress.finish(result.as_ref().err());
         }
         result
@@ -2344,7 +2438,8 @@ impl<'a> AssetResolver<'a> {
             // occurrence, before any resident computation can be reused.
             let object = self.packed_decoders.read(&stores, id);
             if let Some(progress) = &mut self.source_progress {
-                progress.progress(progress.event.completed_count + 1, None);
+                progress.event.reader_costs = Some(self.packed_decoders.costs.clone());
+                progress.progress(progress.event.completed_count.saturating_add(1), None);
             }
             object?
                 .map(|object| self.object_representations.resolve(id, object, remaining))
@@ -2550,6 +2645,9 @@ struct SnapshotPackedDecoders {
     context: Option<(PathBuf, PathBuf, Vec<PathBuf>)>,
     storage: Option<Vec<SnapshotStorageStamp>>,
     children: BTreeMap<PathBuf, SnapshotPackedDecoder>,
+    costs: SourceReaderCosts,
+    #[cfg(unix)]
+    aggregate: Option<SnapshotPackedDecoder>,
     #[cfg(test)]
     residency_limit: Option<usize>,
 }
@@ -2575,14 +2673,24 @@ impl SnapshotPackedDecoders {
 
     fn finish(&mut self) -> Result<(), TransferError> {
         self.storage = None;
+        self.finish_owners()
+    }
+
+    fn finish_owners(&mut self) -> Result<(), TransferError> {
+        let started = Instant::now();
         // Join every owned child even when an earlier decoder failed.
         let mut result = Ok(());
+        #[cfg(unix)]
+        if let Some(mut decoder) = self.aggregate.take() {
+            result = decoder.finish();
+        }
         for (_, mut decoder) in std::mem::take(&mut self.children) {
             let closed = decoder.finish();
             if result.is_ok() {
                 result = closed;
             }
         }
+        self.costs.settlement_us = self.costs.settlement_us.saturating_add(elapsed_us(started));
         result
     }
 
@@ -2594,13 +2702,43 @@ impl SnapshotPackedDecoders {
             if self.children.len() >= limit {
                 // Close stdin, check late output/status, reap and join the
                 // exact evicted child before opening replacement resources.
-                let (_, mut decoder) = self.children.pop_first().unwrap();
-                decoder.finish()?;
+                let started = Instant::now();
+                let closed = {
+                    let (_, mut decoder) = self.children.pop_first().unwrap();
+                    decoder.finish()
+                };
+                self.costs.settlement_us =
+                    self.costs.settlement_us.saturating_add(elapsed_us(started));
+                closed?;
             }
-            self.children
-                .insert(store.to_path_buf(), SnapshotPackedDecoder::spawn(store)?);
+            let started = Instant::now();
+            let spawned = SnapshotPackedDecoder::spawn(store);
+            self.costs.native_spawns = self.costs.native_spawns.saturating_add(1);
+            self.costs.native_spawn_us = self
+                .costs
+                .native_spawn_us
+                .saturating_add(elapsed_us(started));
+            self.children.insert(store.to_path_buf(), spawned?);
         }
         Ok(self.children.get_mut(store).unwrap())
+    }
+
+    fn has_pack(&self, store: &Path) -> bool {
+        let pack = store.join("pack");
+        self.storage.as_ref().is_some_and(|storage| {
+            storage
+                .iter()
+                .any(|stamp| stamp.path.parent() == Some(pack.as_path()))
+        })
+    }
+
+    #[cfg(unix)]
+    fn use_aggregate(&self, stores: &[PathBuf]) -> bool {
+        let enabled = stores.len() > 1;
+        #[cfg(test)]
+        let enabled = enabled
+            && !snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().aggregate_disabled);
+        enabled
     }
 
     fn read(
@@ -2639,37 +2777,99 @@ impl SnapshotPackedDecoders {
         // Git retains pack descriptors and negative lookup state. Freshly
         // inspect all ordered stores before EVERY native query, including
         // directory/file identity, pack metadata and alternate/config bytes.
-        if let Some((native, workspace, qualified)) = &self.context {
-            if qualified_snapshot_stores(native, workspace)? != *qualified {
-                self.finish()?;
-                return Err(TransferError::Blocked(
-                    "packed snapshot source context changed during its current read".into(),
-                ));
+        let started = Instant::now();
+        let inspected = (|| {
+            if let Some((native, workspace, qualified)) = &self.context {
+                if qualified_snapshot_stores(native, workspace)? != *qualified {
+                    self.finish()?;
+                    return Err(TransferError::Blocked(
+                        "packed snapshot source context changed during its current read".into(),
+                    ));
+                }
             }
-        }
-        let storage = snapshot_packed_storage(stores)?;
+            snapshot_packed_storage(stores)
+        })();
+        self.costs.fresh_inspections = self.costs.fresh_inspections.saturating_add(1);
+        self.costs.fresh_inspection_us = self
+            .costs
+            .fresh_inspection_us
+            .saturating_add(elapsed_us(started));
+        let storage = inspected?;
         if self.storage.as_ref() != Some(&storage) {
             self.finish()?;
             self.storage = Some(storage);
         }
+        let packed_stores = stores.iter().filter(|store| self.has_pack(store)).count() as u64;
+        self.costs.packed_store_high_water = self.costs.packed_store_high_water.max(packed_stores);
+        // A success proves the requested current content, not the health of
+        // unselected duplicate copies. A miss/rejected response is provisional:
+        // settle this exact owner before independently reading ordered stores.
+        #[cfg(unix)]
+        if self.use_aggregate(stores) && packed_stores > 0 {
+            if !self.children.is_empty() {
+                self.finish_owners()?;
+            }
+            if self.aggregate.is_none() {
+                let git_dir = stores
+                    .iter()
+                    .find(|store| self.has_pack(store))
+                    .unwrap()
+                    .parent()
+                    .unwrap();
+                let started = Instant::now();
+                let spawned = SnapshotPackedDecoder::spawn_aggregate(stores, git_dir);
+                self.costs.native_spawns = self.costs.native_spawns.saturating_add(1);
+                self.costs.native_spawn_us = self
+                    .costs
+                    .native_spawn_us
+                    .saturating_add(elapsed_us(started));
+                if spawned.is_err() {
+                    self.costs.aggregate_rejections =
+                        self.costs.aggregate_rejections.saturating_add(1);
+                }
+                self.aggregate = spawned.ok();
+            }
+            if let Some(decoder) = &mut self.aggregate {
+                let started = Instant::now();
+                let result = decoder.read(object_id);
+                self.costs.native_queries = self.costs.native_queries.saturating_add(1);
+                self.costs.native_query_us = self
+                    .costs
+                    .native_query_us
+                    .saturating_add(elapsed_us(started));
+                match result {
+                    Ok(Some(object)) => return Ok(Some(object)),
+                    Ok(None) => {}
+                    Err(_) => {
+                        self.costs.aggregate_rejections =
+                            self.costs.aggregate_rejections.saturating_add(1)
+                    }
+                }
+                self.finish_owners()?;
+            }
+            self.costs.aggregate_fallbacks = self.costs.aggregate_fallbacks.saturating_add(1);
+        }
         for store in stores {
-            let pack = store.join("pack");
-            if !self
-                .storage
-                .as_ref()
-                .unwrap()
-                .iter()
-                .any(|stamp| stamp.path.parent() == Some(pack.as_path()))
-            {
+            if !self.has_pack(store) {
                 continue;
             }
-            let result = self.decoder(store)?.read(object_id);
+            self.decoder(store)?;
+            let started = Instant::now();
+            let result = self.children.get_mut(store).unwrap().read(object_id);
+            self.costs.native_queries = self.costs.native_queries.saturating_add(1);
+            self.costs.native_query_us = self
+                .costs
+                .native_query_us
+                .saturating_add(elapsed_us(started));
             match result {
                 Ok(Some(object)) => return Ok(Some(object)),
                 Ok(None) => {}
                 Err(error) => {
                     // A framing/identity/I/O error never leaves a reusable child.
+                    let started = Instant::now();
                     self.children.remove(store);
+                    self.costs.settlement_us =
+                        self.costs.settlement_us.saturating_add(elapsed_us(started));
                     return Err(error);
                 }
             }
@@ -2772,6 +2972,10 @@ impl SnapshotPackedDecoder {
         let git_dir = store.parent().ok_or_else(|| {
             TransferError::Blocked("snapshot store lacks native Git directory".into())
         })?;
+        Self::from_command(Self::command(git_dir))
+    }
+
+    fn command(git_dir: &Path) -> Command {
         let mut command = sanitized_git_command();
         command
             .arg("--git-dir")
@@ -2779,10 +2983,35 @@ impl SnapshotPackedDecoder {
             .arg("--work-tree")
             .arg(git_dir)
             .arg("cat-file")
-            .arg("--batch")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .arg("--batch");
+        command
+    }
+
+    #[cfg(unix)]
+    fn spawn_aggregate(stores: &[PathBuf], git_dir: &Path) -> Result<Self, TransferError> {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let mut alternates = Vec::new();
+        for store in &stores[1..] {
+            if !alternates.is_empty() {
+                alternates.push(b':');
+            }
+            // Git accepts C-quoted paths in its alternate-directory list.
+            // Preserve native path bytes, including list separators and nonUTF8.
+            alternates.push(b'"');
+            for &byte in store.as_os_str().as_bytes() {
+                match byte {
+                    b'"' | b'\\' => alternates.extend_from_slice(&[b'\\', byte]),
+                    0x20..=0x7e => alternates.push(byte),
+                    _ => alternates.extend_from_slice(format!("\\{byte:03o}").as_bytes()),
+                }
+            }
+            alternates.push(b'"');
+        }
+        let mut command = Self::command(git_dir);
+        command.env("GIT_OBJECT_DIRECTORY", &stores[0]).env(
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            std::ffi::OsString::from_vec(alternates),
+        );
         Self::from_command(command)
     }
 
@@ -3527,6 +3756,8 @@ mod snapshot_reuse_test_hooks {
     pub(super) struct State {
         pub counts: BTreeMap<&'static str, usize>,
         pub budget: Option<usize>,
+        #[cfg_attr(not(unix), allow(dead_code))]
+        pub aggregate_disabled: bool,
         pub before_reference: Option<Box<dyn FnMut(usize)>>,
         pub references: usize,
         pub closure_bound: Option<u64>,
@@ -6643,6 +6874,729 @@ mod native_source_inventory_tests {
         }
     }
 
+    #[cfg(unix)]
+    fn packed_file(store: &Path) -> PathBuf {
+        fs::read_dir(store.join("pack"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "pack")
+            })
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_aggregate_accepts_only_current_proved_duplicate_bodies() {
+        // Retain184's actual complete qualified wrong-body fixture. Its old
+        // both-direction equivalence FAIL remains evidence; this test protects
+        // the assessed correct-content success contract, not duplicate health.
+        let fixture = reuse_fixture(true);
+        let (stores, late_id, body) = packed_pressure_stores(&fixture);
+        let earlier = stores[1].parent().unwrap();
+        assert_eq!(
+            fixture_git(earlier, &["hash-object", "-w", "--stdin"], Some(&body)),
+            late_id
+        );
+        fixture_git(
+            earlier,
+            &["update-ref", "refs/fixture/object", &late_id],
+            None,
+        );
+        fixture_git(earlier, &["repack", "-a", "-d"], None);
+        fixture_git(earlier, &["prune-packed"], None);
+        let corrupt = |store: &Path| {
+            let path = packed_file(store);
+            let original = fs::read(&path).unwrap();
+            let mut replacement = fs::read(packed_file(&stores[2])).unwrap();
+            assert_eq!(replacement.len(), original.len());
+            let end = replacement.len();
+            replacement[end - 20..].copy_from_slice(&original[original.len() - 20..]);
+            fs::remove_file(&path).unwrap();
+            fs::write(path, replacement).unwrap();
+        };
+        corrupt(&stores[1]);
+        // Native Git sorts pack candidates by mtime before alternate order.
+        // Give the disposable packs one stable timestamp so this regression
+        // executes184's two opposite selected-copy orders deterministically.
+        for store in &stores {
+            for entry in fs::read_dir(store.join("pack")).unwrap() {
+                File::open(entry.unwrap().path())
+                    .unwrap()
+                    .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+                    .unwrap();
+            }
+        }
+        let native = fixture.store.parent().unwrap();
+        let workspace = fixture.dir.path().join("workspace/.git/objects");
+        for reversed in [false, true] {
+            let mut ordered = stores.clone();
+            if reversed {
+                ordered.swap(1, 4);
+            }
+            fs::write(
+                fixture.store.join("info/alternates"),
+                ordered[..5]
+                    .iter()
+                    .map(|path| format!("{}\n", path.display()))
+                    .collect::<String>(),
+            )
+            .unwrap();
+            let qualified = qualified_snapshot_stores(native, &workspace).unwrap();
+            assert_eq!(qualified, ordered);
+            snapshot_reuse_test_hooks::STATE.with(|state| {
+                *state.borrow_mut() = snapshot_reuse_test_hooks::State {
+                    aggregate_disabled: true,
+                    ..Default::default()
+                }
+            });
+            let baseline = read_snapshot_object(&qualified, &late_id);
+            assert_eq!(
+                baseline.is_err(),
+                !reversed,
+                "preserve184's observed baseline, not claim its failure was green"
+            );
+            snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+            let mut decoders = SnapshotPackedDecoders::default();
+            decoders.qualify(native, &workspace, &qualified).unwrap();
+            let Some(SnapshotObjectSource::Packed {
+                kind,
+                body: current,
+            }) = decoders.read(&qualified, &late_id).unwrap()
+            else {
+                panic!("a freshly proved valid representation may succeed despite an unselected corrupt duplicate");
+            };
+            assert_eq!(kind, "blob");
+            assert_eq!(current, body);
+            decoders.finish().unwrap();
+            assert_eq!(decoders.costs.aggregate_rejections, u64::from(reversed));
+            assert_eq!(decoders.costs.aggregate_fallbacks, u64::from(reversed));
+            assert_settled_native_fixture();
+        }
+        corrupt(&stores[4]);
+        let qualified = qualified_snapshot_stores(native, &workspace).unwrap();
+        let mut decoders = SnapshotPackedDecoders::default();
+        decoders.qualify(native, &workspace, &qualified).unwrap();
+        assert!(
+            decoders.read(&qualified, &late_id).is_err(),
+            "all wrong bodies remain refused"
+        );
+        decoders.finish().unwrap();
+        assert_settled_native_fixture();
+    }
+
+    #[cfg(unix)]
+    fn assert_settled_native_fixture() {
+        let counts = snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().counts.clone());
+        assert_eq!(
+            counts.get("packed_spawn").copied().unwrap_or(0),
+            counts.get("packed_reap").copied().unwrap_or(0)
+        );
+        assert_eq!(
+            counts.get("packed_drain_spawn").copied().unwrap_or(0),
+            counts.get("packed_drain_join").copied().unwrap_or(0)
+        );
+        assert!(counts.get("packed_peak").copied().unwrap_or(0) <= MAX_RESIDENT_SNAPSHOT_DECODERS);
+        assert!(
+            counts.get("packed_drain_peak").copied().unwrap_or(0) <= MAX_RESIDENT_SNAPSHOT_DECODERS
+        );
+    }
+
+    #[cfg(unix)]
+    fn response_fixture(body: Option<&[u8]>, exit: i32, trailing: bool) -> SnapshotPackedDecoder {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(
+                r#"while IFS= read -r oid; do
+            if [ "$1" = missing ]; then printf '%s missing\n' "$oid";
+            else printf '%s blob %s\n%s\n' "$oid" "$2" "$1"; fi
+            done
+            if [ "$4" = yes ]; then printf '%s' 'unsolicited trailing output'; fi
+            exit "$3""#,
+            )
+            .arg("owned-aggregate-response-fixture")
+            .arg(
+                body.map(|body| std::str::from_utf8(body).unwrap())
+                    .unwrap_or("missing"),
+            )
+            .arg(body.map_or(0, <[u8]>::len).to_string())
+            .arg(exit.to_string())
+            .arg(if trailing { "yes" } else { "no" });
+        SnapshotPackedDecoder::from_command(command).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn injected_aggregate(
+        stores: &[PathBuf],
+        response: SnapshotPackedDecoder,
+    ) -> SnapshotPackedDecoders {
+        SnapshotPackedDecoders {
+            aggregate: Some(response),
+            storage: Some(snapshot_packed_storage(stores).unwrap()),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_aggregate_misses_require_current_bounded_fallback() {
+        let fixture = reuse_fixture(true);
+        let (stores, late_id, body) = packed_pressure_stores(&fixture);
+        snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+        let mut decoders = injected_aggregate(&stores, response_fixture(None, 0, false));
+        let Some(SnapshotObjectSource::Packed { body: current, .. }) =
+            decoders.read(&stores, &late_id).unwrap()
+        else {
+            panic!("a false aggregate miss must use independent current fallback");
+        };
+        assert_eq!(current, body);
+        assert!(decoders.aggregate.is_none());
+        assert_eq!(decoders.costs.aggregate_fallbacks, 1);
+        assert_eq!(decoders.costs.native_queries, 1 + (stores.len() - 1) as u64);
+        let absent = "0".repeat(40);
+        for _ in 0..4 {
+            assert!(decoders.read(&stores, &absent).unwrap().is_none());
+            assert!(decoders.aggregate.is_none());
+            assert!(decoders.children.len() <= MAX_RESIDENT_SNAPSHOT_DECODERS);
+        }
+        assert_eq!(
+            decoders.costs.aggregate_fallbacks, 5,
+            "no cached absence skips later current fallback"
+        );
+        assert_eq!(decoders.costs.aggregate_rejections, 0);
+        assert_eq!(decoders.costs.fresh_inspections, 5);
+        decoders.finish().unwrap();
+        assert_settled_native_fixture();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_aggregate_late_failures_refuse_before_fallback_or_publication() {
+        let fixture = reuse_fixture(true);
+        let (stores, late_id, body) = packed_pressure_stores(&fixture);
+        for (valid, exit, trailing, drain_failed) in [
+            (false, 9, false, false),
+            (false, 0, true, false),
+            (true, 9, false, false),
+            (true, 0, true, false),
+            (false, 0, false, true),
+            (true, 0, false, true),
+        ] {
+            snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+            let mut response = response_fixture(valid.then_some(body.as_slice()), exit, trailing);
+            if drain_failed {
+                let original = response.stderr.take().unwrap();
+                response.stderr = Some(std::thread::spawn(move || {
+                    original.join().unwrap()?;
+                    Err(io::Error::other("owned fixture stderr drain failure"))
+                }));
+            }
+            let mut decoders = injected_aggregate(&stores, response);
+            let result = decoders.read(&stores, &late_id);
+            if valid {
+                assert!(result.unwrap().is_some());
+                let mounts = HashMap::new();
+                let mut resolver =
+                    AssetResolver::new(fixture.dir.path().join("owned-output"), &mounts);
+                resolver.packed_decoders = decoders;
+                assert!(resolver.resolve_rows(&mut []).is_err(),
+                    "the actual export resolver completion boundary refuses late failure after valid bytes");
+            } else {
+                assert!(
+                    result.is_err(),
+                    "late aggregate failure cannot be recovered by fallback"
+                );
+                assert!(decoders.children.is_empty());
+                decoders.finish().unwrap();
+            }
+            let counts =
+                snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().counts.clone());
+            assert_eq!(
+                counts["packed_spawn"], 1,
+                "no fallback spawn precedes failed aggregate settlement"
+            );
+            assert_settled_native_fixture();
+        }
+        // A clean miss may leave fallback owners. Their late error must settle
+        // before a later aggregate can open or return otherwise valid bytes.
+        snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+        let mut decoders = SnapshotPackedDecoders {
+            storage: Some(snapshot_packed_storage(&stores).unwrap()),
+            ..Default::default()
+        };
+        decoders
+            .children
+            .insert(stores[0].clone(), response_fixture(None, 9, false));
+        assert!(decoders.read(&stores, &late_id).is_err());
+        assert!(decoders.aggregate.is_none());
+        decoders.finish().unwrap();
+        assert_eq!(
+            snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().counts["packed_spawn"]),
+            1
+        );
+        assert_settled_native_fixture();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_aggregate_preserves_native_unix_path_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        for name in [
+            b"space in path".as_slice(),
+            b"colon:path",
+            b"quote\"path",
+            b"back\\slash",
+            b"native-\xff",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let native = dir.path().join("native");
+            let workspace = dir.path().join(std::ffi::OsString::from_vec(name.to_vec()));
+            let git_dir = workspace.join(".git");
+            fs::create_dir_all(&native).unwrap();
+            fs::create_dir_all(&git_dir).unwrap();
+            for (git, body) in [
+                (&native, b"unrelated native object".as_slice()),
+                (&git_dir, b"current path object"),
+            ] {
+                fixture_git(git, &["init", "--bare", "-q"], None);
+                let id = fixture_git(git, &["hash-object", "-w", "--stdin"], Some(body));
+                fixture_git(git, &["update-ref", "refs/fixture/object", &id], None);
+                fixture_git(git, &["repack", "-a", "-d"], None);
+                fixture_git(git, &["prune-packed"], None);
+            }
+            let id = fixture_git(&git_dir, &["rev-parse", "refs/fixture/object"], None);
+            let stores = qualified_snapshot_stores(&native, &git_dir.join("objects")).unwrap();
+            assert_eq!(stores.len(), 2);
+            snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+            let mut decoders = SnapshotPackedDecoders::default();
+            decoders
+                .qualify(&native, &git_dir.join("objects"), &stores)
+                .unwrap();
+            let Some(SnapshotObjectSource::Packed { body, .. }) =
+                decoders.read(&stores, &id).unwrap()
+            else {
+                panic!("native path bytes must reach the correct qualified store");
+            };
+            assert_eq!(body, b"current path object");
+            assert_eq!(decoders.costs.aggregate_fallbacks, 0);
+            decoders.finish().unwrap();
+            assert_settled_native_fixture();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_aggregate_replaced_pack_cannot_supply_retired_bytes() {
+        let fixture = reuse_fixture(true);
+        let (stores, late_id, body) = packed_pressure_stores(&fixture);
+        snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+        let mut decoders = SnapshotPackedDecoders::default();
+        let workspace = fixture.dir.path().join("workspace/.git/objects");
+        decoders
+            .qualify(fixture.store.parent().unwrap(), &workspace, &stores)
+            .unwrap();
+        let Some(SnapshotObjectSource::Packed { body: current, .. }) =
+            decoders.read(&stores, &late_id).unwrap()
+        else {
+            panic!("warm actual aggregate");
+        };
+        assert_eq!(current, body);
+        assert!(decoders.aggregate.is_some());
+        let replacements = fs::read_dir(stores[0].join("pack"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        for entry in fs::read_dir(stores[4].join("pack")).unwrap() {
+            let original = entry.unwrap().path();
+            let replacement = replacements
+                .iter()
+                .find(|path| path.extension() == original.extension())
+                .unwrap();
+            fs::remove_file(&original).unwrap();
+            fs::copy(replacement, original).unwrap();
+        }
+        assert!(
+            decoders.read(&stores, &late_id).unwrap().is_none(),
+            "all-store current stamps must retire aggregate's old open pack descriptors"
+        );
+        decoders.finish().unwrap();
+        assert_settled_native_fixture();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_aggregate_cold_miss_observes_new_pack_and_context_changes() {
+        let fixture = reuse_fixture(true);
+        let (stores, late_id, late_body) = packed_pressure_stores(&fixture);
+        snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+        let native = fixture.store.parent().unwrap();
+        let workspace = fixture.dir.path().join("workspace/.git/objects");
+        let mut decoders = SnapshotPackedDecoders::default();
+        decoders.qualify(native, &workspace, &stores).unwrap();
+        let new_body = b"new aggregate native object after cold miss";
+        let mut raw = format!("blob {}\0", new_body.len()).into_bytes();
+        raw.extend_from_slice(new_body);
+        let id = hex::encode(sha1::Sha1::digest(raw));
+        assert!(decoders.read(&stores, &id).unwrap().is_none());
+        let git = stores[4].parent().unwrap();
+        assert_eq!(
+            fixture_git(git, &["hash-object", "-w", "--stdin"], Some(new_body)),
+            id
+        );
+        fixture_git(git, &["update-ref", "refs/fixture/new", &id], None);
+        fixture_git(git, &["repack", "-a", "-d"], None);
+        fixture_git(git, &["prune-packed"], None);
+        let Some(SnapshotObjectSource::Packed { body, .. }) = decoders.read(&stores, &id).unwrap()
+        else {
+            panic!("fresh new pack replaces negative native state");
+        };
+        assert_eq!(body, new_body);
+        for mutation in 0..4 {
+            let before = decoders.costs.native_spawns;
+            match mutation {
+                0 => {
+                    let config = native.join("config");
+                    let mut bytes = fs::read(&config).unwrap();
+                    bytes.extend_from_slice(b"\n# current fixture context\n");
+                    fs::write(config, bytes).unwrap();
+                }
+                1 => fs::write(native.join("commondir"), ".\n").unwrap(),
+                2 => {
+                    let alternate = fixture.store.join("info/alternates");
+                    let mut bytes = fs::read(&alternate).unwrap();
+                    bytes.push(b'\n');
+                    fs::write(alternate, bytes).unwrap();
+                }
+                _ => {
+                    let new_workspace = fixture.dir.path().join("workspace/.git2/objects");
+                    assert_eq!(
+                        qualified_snapshot_stores(native, &new_workspace).unwrap(),
+                        stores
+                    );
+                    decoders.qualify(native, &new_workspace, &stores).unwrap();
+                }
+            }
+            let Some(SnapshotObjectSource::Packed { body, .. }) =
+                decoders.read(&stores, &late_id).unwrap()
+            else {
+                panic!("changed context still independently reads current body");
+            };
+            assert_eq!(body, late_body);
+            assert!(
+                decoders.costs.native_spawns > before,
+                "changed config/common/alternate/source context must retire previous aggregate"
+            );
+        }
+        drop(decoders);
+        assert_settled_native_fixture();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_aggregate_does_not_bypass_wrong_loose_or_uninspected_stores() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        for mutation in 0..4 {
+            let fixture = reuse_fixture(true);
+            let (stores, _, _) = packed_pressure_stores(&fixture);
+            snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+            let (warm, _, _) = reuse_export(&fixture, None);
+            assert_eq!(warm.manifest().saved_snapshots.len(), 2);
+            match mutation {
+                0 => {
+                    let wrong =
+                        compress_snapshot_object("blob", b"wrong current loose content").unwrap();
+                    let path = stores[0].join(&fixture.blob[..2]).join(&fixture.blob[2..]);
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    fs::write(path, wrong).unwrap();
+                }
+                1 => {
+                    let pack = stores[2].join("pack");
+                    let original = stores[2].join("owned-original-pack");
+                    fs::rename(&pack, &original).unwrap();
+                    symlink(original, pack).unwrap();
+                }
+                2 => fs::set_permissions(&stores[2], fs::Permissions::from_mode(0o000)).unwrap(),
+                _ => fs::write(
+                    fixture.store.join("info/alternates"),
+                    format!("{}\n", fixture.dir.path().join("outside/objects").display()),
+                )
+                .unwrap(),
+            }
+            let result = export_exact_session(
+                &fixture.inventory,
+                "ses_exact",
+                ExportOptions::new(fixture.dir.path().join("extract")),
+            );
+            if mutation == 2 {
+                fs::set_permissions(&stores[2], fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            assert!(
+                result.is_err(),
+                "current loose identity and every store's qualification remain mandatory"
+            );
+            assert_settled_native_fixture();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_current_inspection_and_query_keep_partial_operation_costs() {
+        let fixture = reuse_fixture(true);
+        let (stores, late_id, _) = packed_pressure_stores(&fixture);
+        let mut decoders =
+            injected_aggregate(&stores, response_fixture(Some(b"wrong identity"), 0, false));
+        assert!(
+            decoders.read(&stores, &late_id).is_ok(),
+            "clean rejection may recover exact current body"
+        );
+        assert_eq!(decoders.costs.aggregate_rejections, 1);
+        assert!(decoders.costs.native_query_us > 0);
+        let pack = stores[0].join("pack");
+        fs::remove_dir_all(&pack).unwrap();
+        fs::write(pack, b"not a directory").unwrap();
+        assert!(decoders.read(&stores, &late_id).is_err());
+        assert_eq!(decoders.costs.fresh_inspections, 2);
+        assert!(decoders.costs.fresh_inspection_us > 0);
+        decoders.finish().unwrap();
+        assert_settled_native_fixture();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_aggregate_preserves_missing_root_reference_and_blocks_missing_child() {
+        for missing_child in [false, true] {
+            let fixture = reuse_fixture(true);
+            packed_pressure_stores(&fixture);
+            let tree = if missing_child {
+                let mut body = b"100644 missing\0".to_vec();
+                body.extend_from_slice(&[0x11; 20]);
+                let native = fixture.store.parent().unwrap();
+                let tree = fixture_git(
+                    native,
+                    &["hash-object", "-t", "tree", "-w", "--stdin"],
+                    Some(&body),
+                );
+                let prefix = fixture.store.join("pack/pack");
+                fixture_git(
+                    native,
+                    &["pack-objects", prefix.to_str().unwrap()],
+                    Some(format!("{tree}\n").as_bytes()),
+                );
+                fixture_git(native, &["prune-packed"], None);
+                assert!(!fixture_object_path(&fixture, &tree).exists());
+                tree
+            } else {
+                "f".repeat(40)
+            };
+            let database = Connection::open(fixture.dir.path().join("data/opencode.db")).unwrap();
+            database
+                .execute(
+                    "UPDATE session SET revert=?1 WHERE id='ses_exact'",
+                    [serde_json::json!({"snapshot":tree}).to_string()],
+                )
+                .unwrap();
+            drop(database);
+            snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+            let result = export_exact_session(
+                &fixture.inventory,
+                "ses_exact",
+                ExportOptions::new(fixture.dir.path().join("extract")),
+            );
+            if missing_child {
+                assert!(matches!(result, Err(TransferError::Blocked(ref reason)) if reason.contains("incomplete tree closure")),
+                    "a retained native tree with missing child is never a complete exported closure");
+                assert_eq!(
+                    fs::read_dir(fixture.dir.path().join("extract"))
+                        .unwrap()
+                        .count(),
+                    0
+                );
+            } else {
+                let exported = result.unwrap();
+                let retained = exported
+                    .manifest()
+                    .saved_snapshots
+                    .iter()
+                    .find(|reference| reference.tree == tree)
+                    .unwrap();
+                assert_eq!(retained.session_id, "ses_exact");
+                assert_eq!(
+                    retained.availability,
+                    SavedSnapshotAvailability::UnavailableInQualifiedLocations
+                );
+                assert!(retained.objects.is_empty());
+                assert!(
+                    fs::read_to_string(&exported.payload_path)
+                        .unwrap()
+                        .contains(&tree),
+                    "missing root reference is preserved"
+                );
+            }
+            assert_settled_native_fixture();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_object_observer_reports_actual_native_reader_costs() {
+        let fixture = reuse_fixture(true);
+        packed_pressure_stores(&fixture);
+        snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = events.clone();
+        let exported = export_exact_session(
+            &fixture.inventory,
+            "ses_exact",
+            ExportOptions::new(fixture.dir.path().join("extract")).with_progress_observer(
+                move |event| {
+                    observed
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::to_value(event).unwrap());
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(exported.manifest().saved_snapshots.len(), 2);
+        let counts = snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().counts.clone());
+        let events = events.lock().unwrap();
+        let event = events
+            .iter()
+            .find(|event| event["phase"] == "saved_objects" && event["state"] == "completed")
+            .unwrap();
+        assert_eq!(event["completedCount"], 30);
+        let costs = &event["readerCosts"];
+        assert_eq!(
+            costs["freshInspections"].as_u64(),
+            Some(30),
+            "every current packed occurrence performs fresh source inspection"
+        );
+        assert_eq!(
+            costs["nativeQueries"].as_u64(),
+            Some(counts["packed_query"] as u64)
+        );
+        assert_eq!(
+            costs["nativeSpawns"].as_u64(),
+            Some(counts["packed_spawn"] as u64)
+        );
+        assert_eq!(costs["packedStoreHighWater"], 6);
+        assert_eq!(costs["aggregateFallbacks"], 0);
+        assert_eq!(costs["aggregateRejections"], 0);
+        for key in [
+            "freshInspectionUs",
+            "nativeQueryUs",
+            "nativeSpawnUs",
+            "settlementUs",
+        ] {
+            assert!(
+                costs[key].as_u64().unwrap() > 0,
+                "actual {key} is measured through final settlement"
+            );
+        }
+        assert!(costs
+            .as_object()
+            .unwrap()
+            .values()
+            .all(serde_json::Value::is_u64));
+        assert!(
+            events
+                .iter()
+                .filter(|event| event["phase"] == "saved_objects" && event["state"] == "progress")
+                .count()
+                <= 1,
+            "reader costs preserve existing five-second progress throttling"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_aggregate_reduces_late_hit_startups_and_preserves_complete_export() {
+        let fixture = reuse_fixture(true);
+        let (stores, late_id, late_body) = packed_pressure_stores(&fixture);
+        let mut reader_counts = Vec::new();
+        let mut exports = Vec::new();
+        for disabled in [true, false] {
+            snapshot_reuse_test_hooks::STATE.with(|state| {
+                *state.borrow_mut() = snapshot_reuse_test_hooks::State {
+                    aggregate_disabled: disabled,
+                    ..Default::default()
+                };
+            });
+            let mut decoders = SnapshotPackedDecoders::default();
+            decoders
+                .qualify(
+                    fixture.store.parent().unwrap(),
+                    &fixture.dir.path().join("workspace/.git/objects"),
+                    &stores,
+                )
+                .unwrap();
+            for _ in 0..8 {
+                let Some(SnapshotObjectSource::Packed { kind, body }) =
+                    decoders.read(&stores, &late_id).unwrap()
+                else {
+                    panic!("each repeated current late hit must remain readable");
+                };
+                assert_eq!(kind, "blob");
+                assert_eq!(body, late_body);
+            }
+            decoders.finish().unwrap();
+            let counts =
+                snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().counts.clone());
+            assert_eq!(counts["packed_validate"], 8);
+            assert_eq!(counts["packed_spawn"], counts["packed_reap"]);
+            assert_eq!(counts["packed_drain_spawn"], counts["packed_drain_join"]);
+            assert!(counts["packed_peak"] <= MAX_RESIDENT_SNAPSHOT_DECODERS);
+            assert!(counts["packed_drain_peak"] <= MAX_RESIDENT_SNAPSHOT_DECODERS);
+            reader_counts.push(counts);
+            snapshot_reuse_test_hooks::STATE.with(|state| {
+                *state.borrow_mut() = snapshot_reuse_test_hooks::State {
+                    aggregate_disabled: disabled,
+                    ..Default::default()
+                };
+            });
+            let exported = export_exact_session(
+                &fixture.inventory,
+                "ses_exact",
+                ExportOptions::new(fixture.dir.path().join("extract")),
+            )
+            .unwrap();
+            let counts =
+                snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().counts.clone());
+            assert_eq!(counts["packed_validate"], 30);
+            assert_eq!(counts["packed_spawn"], counts["packed_reap"]);
+            assert_eq!(counts["packed_drain_spawn"], counts["packed_drain_join"]);
+            assert!(counts["packed_peak"] <= MAX_RESIDENT_SNAPSHOT_DECODERS);
+            assert!(counts["packed_drain_peak"] <= MAX_RESIDENT_SNAPSHOT_DECODERS);
+            exports.push((exported, counts));
+        }
+        assert_eq!(
+            fs::read(&exports[0].0.payload_path).unwrap(),
+            fs::read(&exports[1].0.payload_path).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(exports[0].0.manifest()).unwrap(),
+            serde_json::to_value(exports[1].0.manifest()).unwrap()
+        );
+        assert_eq!(
+            source_graph_fingerprint(exports[0].0.manifest()).unwrap(),
+            source_graph_fingerprint(exports[1].0.manifest()).unwrap()
+        );
+        eprintln!(
+            "current late hit measurements: {reader_counts:?}; complete export launches: {} -> {}",
+            exports[0].1["packed_spawn"], exports[1].1["packed_spawn"]
+        );
+        assert!(
+            reader_counts[1]["packed_spawn"] < reader_counts[0]["packed_spawn"],
+            "verified aggregate must remove repeated late-hit native startup pressure"
+        );
+        assert!(
+            exports[1].1["packed_spawn"] < exports[0].1["packed_spawn"],
+            "complete output equality must retain the startup saving"
+        );
+    }
+
     #[test]
     fn packed_decoder_residency_bounds_real_alternates_without_changing_hits_or_misses() {
         let fixture = reuse_fixture(true);
@@ -6653,7 +7607,12 @@ mod native_source_inventory_tests {
         let mut outputs = Vec::new();
         let mut measurements = Vec::new();
         for limit in [Some(stores.len()), None, Some(2)] {
-            snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+            snapshot_reuse_test_hooks::STATE.with(|state| {
+                *state.borrow_mut() = snapshot_reuse_test_hooks::State {
+                    aggregate_disabled: true,
+                    ..Default::default()
+                }
+            });
             let mut decoders = SnapshotPackedDecoders {
                 residency_limit: limit,
                 ..Default::default()
@@ -6754,7 +7713,12 @@ mod native_source_inventory_tests {
     fn packed_decoder_pressure_refuses_evicted_late_exit_and_joins_every_child() {
         let fixture = reuse_fixture(true);
         let (stores, late_id, _) = packed_pressure_stores(&fixture);
-        snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+        snapshot_reuse_test_hooks::STATE.with(|state| {
+            *state.borrow_mut() = snapshot_reuse_test_hooks::State {
+                aggregate_disabled: true,
+                ..Default::default()
+            }
+        });
         let mut decoders = SnapshotPackedDecoders {
             storage: Some(snapshot_packed_storage(&stores).unwrap()),
             residency_limit: Some(2),
@@ -6799,7 +7763,12 @@ mod native_source_inventory_tests {
     fn packed_decoder_pressure_replaced_pack_cannot_supply_retired_bytes() {
         let fixture = reuse_fixture(true);
         let (stores, late_id, late_body) = packed_pressure_stores(&fixture);
-        snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+        snapshot_reuse_test_hooks::STATE.with(|state| {
+            *state.borrow_mut() = snapshot_reuse_test_hooks::State {
+                aggregate_disabled: true,
+                ..Default::default()
+            }
+        });
         let mut decoders = SnapshotPackedDecoders {
             residency_limit: Some(2),
             ..Default::default()
