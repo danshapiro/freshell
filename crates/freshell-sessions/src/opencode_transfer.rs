@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::sync::Arc;
@@ -28,6 +28,7 @@ const EXPORT_VERSION: u32 = 1;
 const OPENCODE_SCHEMA_VERSION: &str = "opencode-1.18.21";
 const PINNED_SCHEMA_SQL: &str = include_str!("opencode_schema_v1_18_21.sql");
 const MAX_BUNDLE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const PAYLOAD_WRITE_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_SOURCE_CANDIDATES: usize = 32;
 const EXTRACT_DIR_PREFIX: &str = "opencode-extract-";
 
@@ -1691,16 +1692,20 @@ pub fn export_exact_session(
     options: ExportOptions,
 ) -> Result<OpenCodeNativeSnapshot, TransferError> {
     options.run_phase("root_export", Some(root_session_id), "roots", |phase| {
-        let exported = export_exact_session_inner(inventory, root_session_id, options.clone())?;
+        let exported =
+            export_exact_session_inner(inventory, root_session_id, options.clone(), |path| {
+                File::create(path)
+            })?;
         phase.progress(1, Some(1));
         Ok(exported)
     })
 }
 
-fn export_exact_session_inner(
+fn export_exact_session_inner<W: Write>(
     inventory: &HostOpenCodeInventory,
     root_session_id: &str,
     options: ExportOptions,
+    create_payload_writer: impl FnOnce(&Path) -> io::Result<W>,
 ) -> Result<OpenCodeNativeSnapshot, TransferError> {
     if root_session_id.is_empty() || root_session_id.len() > 256 {
         return Err(TransferError::Blocked(
@@ -1836,11 +1841,9 @@ fn export_exact_session_inner(
         let mut row_digests = Vec::with_capacity(rows.len());
         let (payload_bytes, payload_sha256) =
             options.run_phase("serialize", Some(root_session_id), "bytes", |phase| {
-                let file = File::create(&payload_path)?;
-                let mut hasher = Sha256::new();
-                let mut writer = HashingWriter::new(file, &mut hasher, MAX_BUNDLE_BYTES);
-                let serialized = serde_json::to_writer(
-                    &mut writer,
+                let file = create_payload_writer(&payload_path)?;
+                let (payload_bytes, payload_sha256) = serialize_transfer_payload(
+                    file,
                     &TransferPayload {
                         version: EXPORT_VERSION,
                         root_session_id,
@@ -1848,18 +1851,10 @@ fn export_exact_session_inner(
                         assets: &assets,
                         snapshot_objects: &snapshot_objects,
                     },
-                );
-                if writer.limit_exceeded {
-                    return Err(TransferError::Blocked(
-                        "exact-session bundle exceeds 8 GiB".into(),
-                    ));
-                }
-                serialized.map_err(|error| TransferError::Serialization(error.to_string()))?;
-                writer.flush()?;
-                let payload_bytes = writer.bytes;
-                drop(writer);
+                    MAX_BUNDLE_BYTES,
+                )?;
                 phase.progress(payload_bytes, Some(payload_bytes));
-                Ok((payload_bytes, hex::encode(hasher.finalize())))
+                Ok((payload_bytes, payload_sha256))
             })?;
         options.run_phase("row_digests", Some(root_session_id), "rows", |phase| {
             for (index, row) in rows.iter().enumerate() {
@@ -1953,6 +1948,27 @@ struct TransferPayload<'a> {
     rows: &'a [SerializedRow],
     assets: &'a [SerializedAssetMetadata],
     snapshot_objects: &'a [SerializedSnapshotObject],
+}
+
+fn serialize_transfer_payload(
+    inner: impl Write,
+    payload: &TransferPayload<'_>,
+    limit: u64,
+) -> Result<(u64, String), TransferError> {
+    let mut hasher = Sha256::new();
+    let buffered = BufWriter::with_capacity(PAYLOAD_WRITE_BUFFER_BYTES, inner);
+    let mut writer = HashingWriter::new(buffered, &mut hasher, limit);
+    let serialized = serde_json::to_writer(&mut writer, payload);
+    if writer.limit_exceeded {
+        return Err(TransferError::Blocked(
+            "exact-session bundle exceeds 8 GiB".into(),
+        ));
+    }
+    serialized.map_err(|error| TransferError::Serialization(error.to_string()))?;
+    writer.flush()?;
+    let payload_bytes = writer.bytes;
+    drop(writer);
+    Ok((payload_bytes, hex::encode(hasher.finalize())))
 }
 
 struct HashingWriter<'a, W> {
@@ -6599,6 +6615,228 @@ mod online_backup_tests {
 #[cfg(test)]
 mod native_source_inventory_tests {
     use super::*;
+
+    #[derive(Default)]
+    struct PayloadWriter {
+        bytes: Vec<u8>,
+        writes: usize,
+        flushes: usize,
+        max_write: Option<usize>,
+        fail_write: bool,
+        fail_flush: bool,
+    }
+
+    impl Write for PayloadWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            if self.fail_write {
+                return Err(io::Error::other("injected payload write failure"));
+            }
+            let written = bytes.len().min(self.max_write.unwrap_or(usize::MAX));
+            self.bytes.extend_from_slice(&bytes[..written]);
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            if self.fail_flush {
+                return Err(io::Error::other("injected payload flush failure"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn payload_serialization_coalesces_writes_without_changing_complete_export() {
+        let fixture = reuse_fixture(false);
+        let file = fixture.dir.path().join("workspace/reference.txt");
+        fs::write(&file, b"retained workspace asset").unwrap();
+        let db = Connection::open(&fixture.inventory.default_database).unwrap();
+        for index in 0..160 {
+            let part =
+                serde_json::json!({"type":"text","text":"escaped \" text\\\n\tλ".repeat(48)});
+            db.execute("INSERT INTO part(id,message_id,session_id,time_created,time_updated,data) VALUES (?1,'msg','ses_exact',1,1,?2)", rusqlite::params![format!("text{index}"), part.to_string()]).unwrap();
+        }
+        db.execute("INSERT INTO part(id,message_id,session_id,time_created,time_updated,data) VALUES ('file','msg','ses_exact',1,1,?1)", [serde_json::json!({"type":"file","mime":"text/plain","url":format!("file://{}", file.display())}).to_string()]).unwrap();
+        drop(db);
+        let (exported, _, _) = reuse_export(&fixture, None);
+        let expected = fs::read(&exported.payload_path).unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&expected).unwrap();
+        let rows: Vec<SerializedRow> = serde_json::from_value(document["rows"].clone()).unwrap();
+        let assets: Vec<SerializedAssetMetadata> =
+            serde_json::from_value(document["assets"].clone()).unwrap();
+        let objects: Vec<SerializedSnapshotObject> =
+            serde_json::from_value(document["snapshot_objects"].clone()).unwrap();
+        assert!(rows.len() > 160);
+        assert_eq!(assets.len(), 1);
+        assert_eq!(objects.len(), 4);
+        assert_eq!(exported.manifest.saved_snapshots.len(), 2);
+        let payload = TransferPayload {
+            version: EXPORT_VERSION,
+            root_session_id: "ses_exact",
+            rows: &rows,
+            assets: &assets,
+            snapshot_objects: &objects,
+        };
+        let mut unbuffered = PayloadWriter::default();
+        serde_json::to_writer(&mut unbuffered, &payload).unwrap();
+        assert_eq!(unbuffered.bytes, expected);
+        let mut write_error = PayloadWriter {
+            fail_write: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            serialize_transfer_payload(&mut write_error, &payload, MAX_BUNDLE_BYTES),
+            Err(TransferError::Serialization(_))
+        ));
+        assert!(write_error.bytes.is_empty());
+        assert_eq!(write_error.flushes, 0);
+        for max_write in [None, Some(997)] {
+            let mut underlying = PayloadWriter {
+                max_write,
+                ..Default::default()
+            };
+            let counted_export = export_exact_session_inner(
+                &fixture.inventory,
+                "ses_exact",
+                ExportOptions::new(fixture.dir.path().join("extract")),
+                |_| Ok(&mut underlying),
+            )
+            .unwrap();
+            let bytes = counted_export.manifest.payload_bytes;
+            let sha256 = &counted_export.manifest.payload_sha256;
+            assert_eq!(underlying.bytes, expected);
+            assert_eq!(bytes, expected.len() as u64);
+            assert_eq!(*sha256, digest(&expected));
+            assert_eq!(bytes, exported.manifest.payload_bytes);
+            assert_eq!(*sha256, exported.manifest.payload_sha256);
+            assert_eq!(underlying.flushes, 1);
+            assert_eq!(
+                serde_json::to_value(counted_export.manifest()).unwrap(),
+                serde_json::to_value(exported.manifest()).unwrap()
+            );
+            assert_eq!(
+                source_graph_fingerprint(counted_export.manifest()).unwrap(),
+                source_graph_fingerprint(exported.manifest()).unwrap()
+            );
+            eprintln!(
+                "payload bytes={bytes}, underlying writes={} -> {}, max_write={max_write:?}",
+                unbuffered.writes, underlying.writes
+            );
+            assert!(
+                underlying.writes < unbuffered.writes / 10,
+                "production serialization must coalesce actual underlying fragment writes"
+            );
+        }
+    }
+
+    #[test]
+    fn payload_serialization_refuses_bounds_and_propagates_final_flush_failures() {
+        let payload = TransferPayload {
+            version: EXPORT_VERSION,
+            root_session_id: "ses_escaped_\"\\\n",
+            rows: &[],
+            assets: &[],
+            snapshot_objects: &[],
+        };
+        let expected = serde_json::to_vec(&payload).unwrap();
+        let mut exact = PayloadWriter {
+            max_write: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(
+            serialize_transfer_payload(&mut exact, &payload, expected.len() as u64).unwrap(),
+            (expected.len() as u64, digest(&expected))
+        );
+        assert_eq!(exact.bytes, expected);
+        let mut zero_write = PayloadWriter {
+            max_write: Some(0),
+            ..Default::default()
+        };
+        assert!(matches!(
+            serialize_transfer_payload(&mut zero_write, &payload, MAX_BUNDLE_BYTES),
+            Err(TransferError::Io(_))
+        ));
+        assert!(zero_write.bytes.is_empty());
+        assert!(zero_write.writes > 0);
+        assert_eq!(zero_write.flushes, 0);
+        for limit in [0, expected.len() as u64 - 1] {
+            let mut underlying = PayloadWriter::default();
+            assert!(matches!(
+                serialize_transfer_payload(&mut underlying, &payload, limit),
+                Err(TransferError::Blocked(reason)) if reason == "exact-session bundle exceeds 8 GiB"
+            ));
+            assert!(underlying.bytes.len() as u64 <= limit);
+            assert_eq!(underlying.flushes, 0);
+        }
+        // The complete small document fits in the production buffer, so this
+        // first underlying write fails only when the final flush drains it.
+        let mut deferred_write_error = PayloadWriter {
+            fail_write: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            serialize_transfer_payload(&mut deferred_write_error, &payload, MAX_BUNDLE_BYTES),
+            Err(TransferError::Io(error)) if error == "injected payload write failure"
+        ));
+        assert!(deferred_write_error.bytes.is_empty());
+        let mut flush_error = PayloadWriter {
+            fail_flush: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            serialize_transfer_payload(&mut flush_error, &payload, MAX_BUNDLE_BYTES),
+            Err(TransferError::Io(error)) if error == "injected payload flush failure"
+        ));
+        assert_eq!(flush_error.bytes, expected);
+        assert_eq!(flush_error.flushes, 1);
+    }
+
+    #[test]
+    fn payload_serialization_final_flush_failure_refuses_export_and_cleans_extraction() {
+        let fixture = reuse_fixture(false);
+        let extraction_root = fixture.dir.path().join("extract");
+        let (complete, _, _) = reuse_export(&fixture, None);
+        let expected = fs::read(&complete.payload_path).unwrap();
+        assert!(expected.len() < PAYLOAD_WRITE_BUFFER_BYTES);
+        drop(complete);
+        for fail_write in [true, false] {
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed = events.clone();
+            let mut underlying = PayloadWriter {
+                fail_write,
+                fail_flush: !fail_write,
+                ..Default::default()
+            };
+            let result = export_exact_session_inner(
+                &fixture.inventory,
+                "ses_exact",
+                ExportOptions::new(extraction_root.clone()).with_progress_observer(move |event| {
+                    observed.lock().unwrap().push(event);
+                }),
+                |_| Ok(&mut underlying),
+            );
+            assert!(matches!(result, Err(TransferError::Io(_))));
+            assert_eq!(fs::read_dir(&extraction_root).unwrap().count(), 0);
+            if fail_write {
+                assert!(underlying.bytes.is_empty());
+                assert!(underlying.writes > 0);
+                assert_eq!(underlying.flushes, 0);
+            } else {
+                assert_eq!(underlying.bytes, expected);
+                assert_eq!(underlying.flushes, 1);
+            }
+            let captured = events.lock().unwrap();
+            let serialize = captured
+                .iter()
+                .filter(|event| event.phase == "serialize")
+                .collect::<Vec<_>>();
+            assert_eq!(serialize.first().unwrap().state, "started");
+            assert_eq!(serialize.last().unwrap().state, "failed");
+            assert!(!serialize.iter().any(|event| event.state == "completed"));
+            assert!(!captured.iter().any(|event| event.phase == "row_digests"));
+        }
+    }
 
     struct ReuseFixture {
         dir: TempDir,
