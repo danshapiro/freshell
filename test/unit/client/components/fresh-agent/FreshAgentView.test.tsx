@@ -974,11 +974,13 @@ describe('managed bootstrap history', () => {
     { sessionType: 'freshopencode', provider: 'opencode', history: savedOpenCodeNativeHistory, text: 'Saved native OpenCode answer' },
   ] as const
 
-  function foldFresh(store: ReturnType<typeof createStore>) {
-    const request = buildReconcileRequest(store.getState() as RootState, { includeFreshAgent: true })!
-    return foldVerdicts(store.dispatch as AppDispatch, request, { type: 'pane.reconcile.result',
-      reconcileId: request.reconcileId, bootId: 'bootstrap-new-boot', serverInstanceId: 'bootstrap-server',
-      verdicts: [{ paneKey: request.panes[0].paneKey, verdict: 'fresh', reason: 'identity_never_observed' }] })
+  function resetManagedBootstrap(store: ReturnType<typeof createStore>) {
+    // Managed panes never enter the legacy web-index request. Exercise the
+    // retained bootstrap transition itself and let the mounted view perform
+    // its original-request create and owned-history reads.
+    expect(buildReconcileRequest(store.getState() as RootState, { includeFreshAgent: true })).toBeNull()
+    store.dispatch(resetFreshAgentPaneForReconcileCreate({ tabId: 'tab-1', paneId: 'pane-1',
+      intent: 'fresh', reason: 'identity_never_observed' }))
   }
 
   function mountPending(historyRead: ReturnType<typeof createDeferred<unknown>>, nativeRead = historyRead) {
@@ -992,7 +994,7 @@ describe('managed bootstrap history', () => {
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: { kind: 'fresh-agent', ...locator,
       sessionRef: { provider: 'codex', sessionId: native.threadId }, resumeSessionId: native.threadId,
       createRequestId: 'pending-original-request', status: 'connected', soulId: 'pending-owned-soul', soulIntentRevision: 7 } }))
-    foldFresh(store)
+    resetManagedBootstrap(store)
     const mount = () => render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
     const emit = (message: unknown) => handlers.forEach((handler) => handler(message))
     return { store, native, locator, mount, emit }
@@ -1046,7 +1048,8 @@ describe('managed bootstrap history', () => {
         await act(async () => {
           store.dispatch(setBootId('bootstrap-new-boot'))
           store.dispatch(markSessionLost(locator))
-          expect(foldFresh(store).fresh).toBe(1)
+          resetManagedBootstrap(store)
+          expect(getFreshAgentPaneContent(store).pendingReconcile).toBe('fresh')
           await vi.advanceTimersByTimeAsync(0)
         })
         expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.slice(beforeResetCalls)).toHaveLength(1)
@@ -1282,12 +1285,11 @@ describe('managed bootstrap history', () => {
     fixture.store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: {
       ...getFreshAgentPaneContent(fixture.store), sessionRef: { provider: 'codex', sessionId: 'superseded-native' }, resumeSessionId: 'superseded-native',
     } }))
-    const request = buildReconcileRequest(fixture.store.getState() as RootState, { includeFreshAgent: true })!
-    const sessionRef = { provider: 'codex', sessionId: fixture.native.threadId }
-    const result = foldVerdicts(fixture.store.dispatch as AppDispatch, request, { type: 'pane.reconcile.result',
-      reconcileId: request.reconcileId, bootId: 'bootstrap-boot', serverInstanceId: 'bootstrap-server',
-      verdicts: [{ paneKey: request.panes[0].paneKey, verdict: 'respawn', sessionRef }] })
-    expect(result.respawned).toBe(1)
+    expect(buildReconcileRequest(fixture.store.getState() as RootState, { includeFreshAgent: true })).toBeNull()
+    const sessionRef = { provider: 'codex' as const, sessionId: fixture.native.threadId }
+    fixture.store.dispatch(resetFreshAgentPaneForReconcileCreate({ tabId: 'tab-1', paneId: 'pane-1',
+      intent: 'respawn', sessionRef }))
+    expect(getFreshAgentPaneContent(fixture.store).pendingReconcile).toBe('respawn')
     fixture.mount()
     try {
       await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
