@@ -1,9 +1,9 @@
 //! Presentation-only composition of actual owned fresh-agent history.
 use super::*;
 use freshell_runtime_client::RuntimeClient;
-use freshell_runtime_protocol::{DesiredState, LaunchState, RuntimeView};
+use freshell_runtime_protocol::{DesiredState, IncarnationId, LaunchState, RuntimeView};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     time::{Duration, Instant},
 };
 
@@ -13,7 +13,13 @@ const READ_BUDGET: Duration = Duration::from_secs(10);
 const PRESENTATION_TTL: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Default)]
-pub(super) struct Cache(Arc<tokio::sync::Mutex<HashMap<String, (Instant, DirItem)>>>);
+pub(super) struct Cache(Arc<tokio::sync::Mutex<HashMap<String, CachedItem>>>);
+
+struct CachedItem {
+    at: Instant,
+    incarnation_id: IncarnationId,
+    item: DirItem,
+}
 
 pub(super) struct Snapshot {
     pub(super) items: Vec<DirItem>,
@@ -35,31 +41,52 @@ pub(super) async fn read(client: &RuntimeClient, cache: &Cache) -> Snapshot {
         }
     };
     let mut cached = cache.0.lock().await;
-    cached.retain(|_, (at, _)| at.elapsed() < PRESENTATION_TTL);
+    cached.retain(|_, entry| entry.at.elapsed() < PRESENTATION_TTL);
     let mut pending = Vec::new();
+    let mut souls = BTreeMap::new();
     for view in inventory
         .into_iter()
         .filter(|v| v.fresh_agent_session_type.is_some())
     {
+        souls
+            .entry(view.soul_id.clone())
+            .or_insert_with(Vec::new)
+            .push(view);
+    }
+    for views in souls.into_values() {
+        let view = &views[0];
         let Some(native_id) = view
             .native_session_id
             .as_deref()
             .filter(|id| !id.is_empty())
         else {
-            diagnostic(&view, "native_identity_unavailable");
+            diagnostic(view, "native_identity_unavailable");
             snapshot.partial = true;
             continue;
         };
         let key = format!(
-            "{}:{}:{}:{}",
-            view.soul_id, view.incarnation_id, view.intent_revision, native_id
+            "{}:{}:{}:{}:{:?}",
+            view.soul_id,
+            view.intent_revision,
+            view.evidence_revision,
+            native_id,
+            views
+                .iter()
+                .map(|v| (&v.incarnation_id, &v.container_id, v.execution_generation))
+                .collect::<Vec<_>>()
         );
-        if let Some((_, item)) = cached.get(&key) {
-            let mut item = item.clone();
-            item.is_running = running(&view);
+        if let Some(entry) = cached.get(&key) {
+            let Some(current) = views
+                .iter()
+                .find(|v| v.incarnation_id == entry.incarnation_id)
+            else {
+                continue;
+            };
+            let mut item = entry.item.clone();
+            item.is_running = running(current);
             snapshot.items.push(item);
         } else {
-            pending.push((key, view));
+            pending.push((key, views));
         }
     }
     drop(cached);
@@ -71,30 +98,39 @@ pub(super) async fn read(client: &RuntimeClient, cache: &Cache) -> Snapshot {
     let mut pending = pending.into_iter().take(MAX_NATIVE_READS);
     loop {
         while tasks.len() < READ_CONCURRENCY {
-            let Some((key, view)) = pending.next() else {
+            let Some((key, views)) = pending.next() else {
                 break;
             };
             let client = client.clone();
             tasks.spawn(async move {
-                let history = client.fresh_agent_history(view.soul_id.clone()).await;
-                (key, view, history)
+                let history = client.fresh_agent_history(views[0].soul_id.clone()).await;
+                (key, views, history)
             });
         }
         if tasks.is_empty() {
             break;
         }
         match tokio::time::timeout_at(deadline, tasks.join_next()).await {
-            Ok(Some(Ok((key, view, history)))) => {
-                let item = history.ok().and_then(|history| project(&view, &history));
-                if let Some(item) = item {
-                    cache
-                        .0
-                        .lock()
-                        .await
-                        .insert(key, (Instant::now(), item.clone()));
+            Ok(Some(Ok((key, views, history)))) => {
+                let projected = history.ok().and_then(|history| {
+                    let incarnation_id = history["managedDirectory"]["incarnationId"].as_str()?;
+                    let view = views
+                        .iter()
+                        .find(|v| v.incarnation_id.as_str() == incarnation_id)?;
+                    Some((view.incarnation_id.clone(), project(view, &history)?))
+                });
+                if let Some((incarnation_id, item)) = projected {
+                    cache.0.lock().await.insert(
+                        key,
+                        CachedItem {
+                            at: Instant::now(),
+                            incarnation_id,
+                            item: item.clone(),
+                        },
+                    );
                     snapshot.items.push(item);
                 } else {
-                    diagnostic(&view, "owned_history_unavailable_or_invalid");
+                    diagnostic(&views[0], "owned_history_unavailable_or_invalid");
                     snapshot.partial = true;
                 }
             }
@@ -285,10 +321,23 @@ mod tests {
         cwd: &str,
     ) -> (Registry, RuntimeView) {
         let registry = Registry::open(root, None).unwrap();
+        let view = register_in(&registry, root, provider, session_type, native_id, cwd).await;
+        (registry, view)
+    }
+
+    async fn register_in(
+        registry: &Registry,
+        root: &Path,
+        provider: &str,
+        session_type: &str,
+        native_id: &str,
+        cwd: &str,
+    ) -> RuntimeView {
         let soul_id = SoulId::new();
+        let store_id = format!("store-{soul_id}");
         let fresh_agent: FreshAgentLaunchSpec = serde_json::from_value(json!({
             "sessionId": "fresh-retained-thread", "provider": provider, "sessionType": session_type,
-            "runtimeVariant": provider, "providerStoreId": "store-test", "cwd": cwd,
+            "runtimeVariant": provider, "providerStoreId": store_id, "cwd": cwd,
             "workspacePath": "/workspace", "runAsUid": 1000, "runAsGid": 1000,
             "nativeSessionId": native_id
         }))
@@ -297,7 +346,7 @@ mod tests {
             .prepare_launch(LaunchPreparation {
                 soul_id: soul_id.clone(),
                 provider: provider.into(),
-                provider_store_id: "store-test".into(),
+                provider_store_id: store_id,
                 native_session_id: Some(native_id.into()),
                 creation_seed_ref: "seed-test".into(),
                 request_id: RequestId::new(),
@@ -313,9 +362,26 @@ mod tests {
             })
             .await
             .unwrap();
+        start_registered(registry, root, &soul_id, prepared.incarnation_id, native_id).await;
+        registry
+            .inventory()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|v| v.soul_id == soul_id)
+            .unwrap()
+    }
+
+    async fn start_registered(
+        registry: &Registry,
+        root: &Path,
+        soul_id: &SoulId,
+        incarnation_id: IncarnationId,
+        native_id: &str,
+    ) {
         registry
             .commit_created(
-                prepared.incarnation_id.clone(),
+                incarnation_id.clone(),
                 BackendCreatedRecord {
                     daemon_id: DockerDaemonId::new(),
                     container_id: "a".repeat(64),
@@ -329,13 +395,13 @@ mod tests {
             .await
             .unwrap();
         let grant = registry
-            .commit_execution_grant(prepared.incarnation_id.clone(), HostBootId::new(), limits())
+            .commit_execution_grant(incarnation_id.clone(), HostBootId::new(), limits())
             .await
             .unwrap();
         let context = registry.recovery_context(soul_id.clone()).await.unwrap();
         let launch = registry
             .bind_native_identity_launch(NativeIdentityLaunch {
-                incarnation_id: prepared.incarnation_id.clone(),
+                incarnation_id: incarnation_id.clone(),
                 launch_nonce: context.prior_handle.launch_nonce().as_str().into(),
                 evidence_revision: context.evidence_revision,
                 execution_generation: grant.execution_generation,
@@ -361,18 +427,7 @@ mod tests {
             )
             .await
             .unwrap();
-        registry
-            .mark_running(prepared.incarnation_id)
-            .await
-            .unwrap();
-        let view = registry
-            .inventory()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|v| v.soul_id == soul_id)
-            .unwrap();
-        (registry, view)
+        registry.mark_running(incarnation_id).await.unwrap();
     }
     async fn start_control(
         root: &std::path::Path,
@@ -514,6 +569,156 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), 200);
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn managed_directory_keeps_one_current_row_after_owned_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let web = tempfile::tempdir().unwrap();
+        let provider_home = root.path().join("provider");
+        let native_id = "63333000-0000-4333-8333-000000000210";
+        native_fixture(&provider_home, "claude", native_id);
+        let (registry, old) = register(
+            root.path(),
+            "claude",
+            "freshclaude",
+            native_id,
+            root.path().to_str().unwrap(),
+        )
+        .await;
+        let (socket, control) = start_control(
+            root.path(),
+            registry.clone(),
+            Arc::new(NativeBackend {
+                history_home: Some(provider_home),
+                mismatch: false,
+            }),
+        )
+        .await;
+        let app = router(directory_state(web.path())).layer(axum::Extension(RuntimeClient::new(
+            socket,
+            "test-control-secret",
+        )));
+        let original = directory_page(app.clone()).await;
+        assert_eq!(original["items"][0]["sessionId"], native_id);
+        assert_eq!(original["items"][0]["isRunning"], true);
+        let fence = registry
+            .recovery_context(old.soul_id.clone())
+            .await
+            .unwrap()
+            .write_fence();
+        let recovery = registry
+            .begin_recovery_fenced(
+                old.soul_id.clone(),
+                RecoveryTrigger::ProviderExit,
+                RecoveryPath::NativeResume,
+                fence,
+            )
+            .await
+            .unwrap();
+        let agent = recovery.context.prior_handle.fresh_agent().unwrap().clone();
+        registry
+            .mark_stop_outcome(old.incarnation_id.clone(), StopOutcome::VerifiedEmpty)
+            .await
+            .unwrap();
+        let replacement = registry
+            .prepare_replacement(
+                recovery,
+                None,
+                Some(agent),
+                None,
+                RecoveryPath::NativeResume,
+            )
+            .await
+            .unwrap();
+        start_registered(
+            &registry,
+            root.path(),
+            &old.soul_id,
+            replacement.prepared.incarnation_id.clone(),
+            native_id,
+        )
+        .await;
+        let inventory = registry.inventory().await.unwrap();
+        assert_eq!(inventory.len(), 2);
+        assert_eq!(
+            inventory
+                .iter()
+                .find(|v| v.incarnation_id == old.incarnation_id)
+                .unwrap()
+                .launch_state,
+            LaunchState::Stopped
+        );
+        assert_eq!(
+            registry
+                .recovery_context(old.soul_id.clone())
+                .await
+                .unwrap()
+                .prior_handle
+                .incarnation_id(),
+            &replacement.prepared.incarnation_id
+        );
+        for stopping in [false, true] {
+            if stopping {
+                registry.begin_stop(old.soul_id.clone()).await.unwrap();
+            }
+            let page = directory_page(app.clone()).await;
+            let rows = page["items"].as_array().unwrap();
+            assert_eq!(
+                rows.len(),
+                1,
+                "one saved store/root must remain visible after replacement: {page}"
+            );
+            assert_eq!(rows[0]["sessionId"], native_id);
+            assert_eq!(rows[0]["sessionType"], "freshclaude");
+            assert_eq!(rows[0]["isRunning"], !stopping);
+            assert!(page.get("integrityError").is_none(), "{page}");
+        }
+        control.abort();
+    }
+
+    #[tokio::test]
+    async fn managed_directory_quarantines_distinct_owned_stores_with_same_native_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let web = tempfile::tempdir().unwrap();
+        let provider_home = root.path().join("provider");
+        let native_id = "63333000-0000-4333-8333-000000000211";
+        native_fixture(&provider_home, "claude", native_id);
+        let (registry, first) = register(
+            root.path(),
+            "claude",
+            "freshclaude",
+            native_id,
+            root.path().to_str().unwrap(),
+        )
+        .await;
+        let second = register_in(
+            &registry,
+            root.path(),
+            "claude",
+            "freshclaude",
+            native_id,
+            root.path().to_str().unwrap(),
+        )
+        .await;
+        assert_ne!(first.soul_id, second.soul_id);
+        let (socket, control) = start_control(
+            root.path(),
+            registry,
+            Arc::new(NativeBackend {
+                history_home: Some(provider_home),
+                mismatch: false,
+            }),
+        )
+        .await;
+        let page = directory_page(router(directory_state(web.path())).layer(axum::Extension(
+            RuntimeClient::new(socket, "test-control-secret"),
+        )))
+        .await;
+        assert!(page["items"].as_array().unwrap().is_empty(), "{page}");
+        assert_eq!(page["integrityError"]["collisionCount"], 1);
+        assert_eq!(page["partial"], true);
+        control.abort();
     }
 
     #[tokio::test]

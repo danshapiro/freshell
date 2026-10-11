@@ -841,6 +841,7 @@ impl Supervisor {
                 // Presentation context comes from the persisted owned launch.
                 // It does not assert provider identity, LIVE, or loss evidence.
                 snapshot["managedDirectory"] = serde_json::json!({
+                    "incarnationId": handle.incarnation_id(),
                     "cwd": agent.cwd,
                     "workspacePath": agent.workspace_path,
                     "gitCommonDir": agent.git_common_dir,
