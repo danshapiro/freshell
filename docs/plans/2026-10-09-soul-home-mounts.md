@@ -49,9 +49,9 @@ The load-bearing stage falsified the request's proposed mechanism and replaced i
 
 - pnpm 10.34.5 exactly; `pnpm run <script> <args>` forwards args directly (no `--` separator). Use `pnpm exec` for installed binaries.
 - **Provider children stay 65534:0 everywhere.** No launch-record, protocol, digest, uid-constant, or fixture-identity changes. Any test that currently asserts `65534:0` stays as-is.
-- The home mount is derived from an explicit supervisor flag or, only for a non-root supervisor, its `HOME` env: `--operator-home <path>` wins (canonicalized, owner-guarded); otherwise `HOME` is used only when the supervisor's euid is non-zero, its `HOME` canonicalizes, and the home's owner uid equals the supervisor's euid — a containerized or root supervisor (the rig's default, compose deployments) gets NO home mount, because its `HOME` is not the operator's host home. Never refuse a launch over the home mount.
+- The home mount is derived from an explicit supervisor flag or, only for a non-root supervisor, its `HOME` env: `--operator-home <path>` wins (canonicalized, owner-guarded); otherwise `HOME` is used only when the supervisor's euid is non-zero, its `HOME` canonicalizes, and the home's owner uid equals the supervisor's euid — a containerized or root supervisor (the rig's default) gets NO home mount from the env path, because its `HOME` is not the operator's host home; containerized deployments (the rig's Task 3 spec, compose via Task 4's wiring) pass the flag explicitly. Never refuse a launch over the home mount.
 - Mask list (tmpfs, fixed): `<home>/.freshell`, `<home>/.amplifier/onecli`, `<home>/.config/gcloud`, filtered to destinations that exist. The tmpfs-over-bind shape is validated; `verify_inspect_config` must only assert the new mounts/env for containers that carry the additive marker env (pre-upgrade containers must keep passing).
-- **Host prep (owned, one-time, verified — never enforced by launch code):** referenced files under the operator home must be group-readable (0640 keys) under group-traversable directories (0750), per the rootless gid mapping. The owned step is `scripts/prepare-operator-home.sh` (created by Task 4; idempotent), referenced from the self-hosted launch runbook; Amplifier should write 0640/0750 going forward. On rootful daemons group 0 is not the operator group, so the feature degrades to today's behavior with an observable readiness event — documented, not gated.
+- **Host prep (owned, idempotent, re-runnable — never enforced by launch code):** referenced files under the operator home must be group-readable (0640 keys) under group-traversable directories (0750), per the rootless gid mapping. The owned step is `scripts/prepare-operator-home.sh` (created by Task 4): it makes the known config roots group-traversable (`~/.amplifier`, `~/.config`, `~/.local/share`) and the `~/.amplifier/*.key` files group-readable, is safe to re-run (runbook: re-run after any Amplifier key rotation), and has a behavioral vitest harness. Residual, stated precisely: a reference to a deliberately owner-only file (0600/0700 outside the known roots) does not resolve until the operator extends the prep by one line — the provider CLI's own error names the exact path, and Amplifier must write 0640/0750 going forward (tracked upstream item in Task 4). On rootful daemons group 0 is not the operator group, so the feature degrades to today's behavior with an observable readiness event — documented, not gated.
 - Red-Green-Refactor TDD: every task adds its failing test first, watches it fail for the stated reason, implements minimally, refactors while green, and runs the impacted set.
 - Test coordination (AGENTS.md): narrowed `cargo test -p <crate> -- <filters...>` selectors are delegated (no coordinator gate); cargo accepts one positional filter, so multiple filters go after `--` (the libtest harness takes several). Do not kill foreign gate holders. New e2e specs are `LOCAL_ONLY` (register in `test/e2e-browser/playwright.config.ts`, where `LOCAL_ONLY_SPECS` is defined — the cloud config imports it).
 - Never restart the production self-hosted server (port 3001) without the user's explicit "APPROVED". Building and running scratch supervisors/souls in the worktree is fine.
@@ -540,14 +540,18 @@ test('freshopencode soul resolves {file:} API key references under the operator 
   const paneText = await rig.capturePaneText()
   expect(paneText).not.toContain('Configuration is invalid')
   expect(paneText).not.toContain('bad file reference')
-  // Control-plane masking proof, from the child's own identity: the rig's
-  // provider-uid exec helper (65534:0) must be DENIED on every masked path.
+  // Control-plane masking proof, from the child's own identity: a WORKING mask
+  // makes each canary ABSENT (tmpfs shows an empty root-owned dir), so `cat`
+  // exits nonzero — and the rig's provider-uid exec helper (65534:0,
+  // runtime-sandbox.ts ~896) takes an ARGUMENT ARRAY and throws on nonzero
+  // exit. Assert the rejection (the mask working) rather than any "denied"
+  // wording.
   for (const secret of [
     `${home}/.freshell/config.json`,
     `${home}/.amplifier/onecli/canary`,
     `${home}/.config/gcloud/canary`,
   ]) {
-    await expect(rig.ownedProviderExec(soulRef, `cat ${secret}`)).resolves.toMatch(/denied|Permission/i)
+    await expect(rig.ownedProviderExec(soulRef, ['cat', secret])).rejects.toThrow()
   }
 })
 ```
@@ -558,7 +562,7 @@ Allow-list changes in BOTH files: add the policy types/arms in `runtime-test-bro
 
 Run: `pnpm run test:e2e:local test/e2e-browser/specs/runtime-opencode-home-file-reference-rust.spec.ts --project=chromium` (match the qualification spec's canonical invocation if it differs)
 
-Expected: FAIL before Task 1's supervisor change is wired into the rig's supervisor — the freshopencode pane shows `Configuration is invalid ... bad file reference` exactly like the production incident, because the `{file:}` reference rides the `OPENCODE_CONFIG_CONTENT` inline lane and the target is unreadable to the 65534:0 child (the validator confirmed the lane). After Task 1 lands, the same command must PASS. If Tasks 1-2 are already on the branch, temporarily confirm the red by unsetting the supervisor HOME env override in a scratch run and record it in the commit message — never weaken the spec to fabricate a red.
+Expected: FAIL before Task 1's supervisor change is wired into the rig's supervisor — the freshopencode pane shows `Configuration is invalid ... bad file reference` exactly like the production incident, because the `{file:}` reference rides the `OPENCODE_CONFIG_CONTENT` inline lane and the target is unreadable to the 65534:0 child (the validator confirmed the lane). After Task 1 lands, the same command must PASS. If Tasks 1-2 are already on the branch, temporarily confirm the red by removing the rig's `operatorHome` flag option in a scratch run (NOT the HOME env — the explicit `--operator-home` flag takes precedence over the env fallback, so unsetting HOME cannot remove the mount) and record it in the commit message — never weaken the spec to fabricate a red.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -589,42 +593,97 @@ git add test/e2e-browser/specs/runtime-opencode-home-file-reference-rust.spec.ts
 git commit -m "test(e2e): freshopencode soul boots with {file:} operator-home key references"
 ```
 
-### Task 4: Host-prep script and posture documentation
+### Task 4: Host-prep script, compose wiring, and posture documentation
 
 **Files:**
 - Create: `scripts/prepare-operator-home.sh`
+- Create: `test/unit/scripts/prepare-operator-home.test.ts`
+- Modify: `docker/runtime/compose.yaml` (supervisor service: operator-home bind + `--operator-home`)
 - Modify: `docs/development/managed-runtime.md` (~217, ~220-225, ~329-338)
-- Modify: `docs/development/self-hosted-launch-runbook.md` (one-time prep step)
+- Modify: `docs/development/self-hosted-launch-runbook.md` (prep step + re-run-after-rotation note)
 - Modify: `docker/runtime/README.md` (~19-30)
 
 **Interfaces:**
-- Consumes: Task 1's mount/mask/env contract, Task 2's readiness event, the load-bearing ledger and validator reports as evidence sources.
-- Produces: `scripts/prepare-operator-home.sh` — the OWNED, idempotent, one-time host-prep step for the ratified group-read change (the plan does not leave the prep as an unexecuted doc note); documentation. No server behavior change.
+- Consumes: Task 1's mount/mask/env contract and `--operator-home` flag, Task 2's readiness event, the load-bearing ledger and validator reports as evidence sources.
+- Produces: `scripts/prepare-operator-home.sh` — the OWNED, idempotent host-prep step for the ratified group-read change (behavioral test below); compose-deployment wiring so rootless compose souls get the home mount too; documentation. No server behavior change.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-Docs + script task: no Rust/TS test. The script is verified by a shellcheck-style review and a documented dry-run mode. (State this explicitly in the commit message.)
+The prep script is load-bearing behavior and gets a real test (the repo rule set exempts only pure docs):
 
-- [ ] **Step 2: N/A**
+```ts
+import { execFileSync } from 'node:child_process'
+import { chmodSync, mkdirSync, statSync, writeFileSync } from 'node:fs'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { describe, expect, it } from 'vitest'
+
+const SCRIPT = join(__dirname, '..', '..', '..', 'scripts', 'prepare-operator-home.sh')
+
+function fixtureHome(): string {
+  const home = mkdtempSync(join(tmpdir(), 'prep-home-'))
+  mkdirSync(join(home, '.amplifier'), { recursive: true })
+  chmodSync(join(home, '.amplifier'), 0o700)
+  writeFileSync(join(home, '.amplifier', 'ms-runpod.key'), 'k')
+  chmodSync(join(home, '.amplifier', 'ms-runpod.key'), 0o600)
+  mkdirSync(join(home, '.config'), { recursive: true })
+  chmodSync(join(home, '.config'), 0o700)
+  return home
+}
+
+function run(home: string): void {
+  execFileSync('bash', [SCRIPT], { env: { ...process.env, FRESHELL_OPERATOR_HOME: home } })
+}
+
+describe('prepare-operator-home', () => {
+  it('makes the known config roots group-traversable and the keys group-readable', () => {
+    const home = fixtureHome()
+    run(home)
+    expect(statSync(join(home, '.amplifier')).mode & 0o050).toBe(0o050)
+    expect(statSync(join(home, '.amplifier', 'ms-runpod.key')).mode & 0o040).toBe(0o040)
+    expect(statSync(join(home, '.config')).mode & 0o050).toBe(0o050)
+  })
+
+  it('is idempotent and tolerates an empty home', () => {
+    const home = fixtureHome()
+    run(home)
+    const afterFirst = statSync(join(home, '.amplifier', 'ms-runpod.key')).mode
+    run(home)
+    const afterSecond = statSync(join(home, '.amplifier', 'ms-runpod.key')).mode
+    expect(afterFirst).toBe(afterSecond)
+    const empty = mkdtempSync(join(tmpdir(), 'prep-empty-'))
+    expect(() => run(empty)).not.toThrow()
+  })
+})
+```
+
+- [ ] **Step 2: Run the test and verify the intended failure**
+
+Run: `pnpm run test:vitest run test/unit/scripts/prepare-operator-home.test.ts --config config/vitest/vitest.config.ts`
+
+Expected: FAIL — the script does not exist yet.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-`scripts/prepare-operator-home.sh` (idempotent, exits 0 even when targets are absent; prints what it changed and what to check via the readiness event):
+`scripts/prepare-operator-home.sh` (idempotent, exits 0 even when targets are absent; prints what it changed):
 
 ```bash
 #!/usr/bin/env bash
-# One-time operator-home prep for soul home mounts (see docs/development/managed-runtime.md).
+# Operator-home prep for soul home mounts (see docs/development/managed-runtime.md).
 # Under the rootless Docker daemon, provider children run with gid 0, which maps
 # to the operator's group — group bits are how in-home config references resolve.
-# Run once as the operator after deploying the soul home-mount feature.
+# Safe to re-run at any time; re-run after Amplifier key rotations.
 set -euo pipefail
 home="${FRESHELL_OPERATOR_HOME:-$HOME}"
 changed=0
-if [ -d "$home/.amplifier" ]; then
-  chmod g+rx "$home/.amplifier"
-  echo "chmod g+rx $home/.amplifier"
-  changed=1
-fi
+for dir in "$home/.amplifier" "$home/.config" "$home/.local/share"; do
+  if [ -d "$dir" ]; then
+    chmod g+rx "$dir"
+    echo "chmod g+rx $dir"
+    changed=1
+  fi
+done
 for key in "$home"/.amplifier/*.key; do
   [ -e "$key" ] || continue
   chmod g+r "$key"
@@ -632,32 +691,52 @@ for key in "$home"/.amplifier/*.key; do
   changed=1
 done
 if [ "$changed" -eq 0 ]; then
-  echo "nothing to prepare (no ~/.amplifier or keys under it)"
+  echo "nothing to prepare (no known config roots present)"
 fi
-echo "note: Amplifier should write keys 0640 and ~/.amplifier 0750 going forward so rotation preserves this."
+echo "note: Amplifier must write keys 0640 and ~/.amplifier 0750 going forward so rotation preserves this (tracked upstream item)."
 ```
 
-`docs/development/self-hosted-launch-runbook.md`: add the one-time step — after deploying, run `scripts/prepare-operator-home.sh` once as the operator; the `operator_home_readiness` event (Task 2) confirms the home root's group traversal afterward.
+`docker/runtime/compose.yaml` — the supervisor service gets the operator-home bind and flag so rootless compose deployments deliver the feature too (the root supervisor declines the HOME env fallback by design; the flag is explicit intent and the rootless mapping makes the operator's files container-0-owned, so the owner guard holds):
 
-`docs/development/managed-runtime.md`:
-- Replace the "no unrelated home" bullet (~220-225) and the rootless uid rationale (~329-338) with the new contract: souls mount the operator home read-only at its canonical path; provider children keep 65534:0; under the rootless production daemon the child's gid 0 is the operator's group, so group-readable reference targets (0750 directories, 0640 key files) resolve with no identity change; the `--operator-home` flag and the owner/euid guards (containerized/root supervisors get no home mount); the tmpfs mask list (`.freshell`, `.amplifier/onecli`, `.config/gcloud`) and why each entry is control-plane or infrastructure authorization material; the additive `FRESHELL_OPERATOR_HOME_MOUNT`/`FRESHELL_OPERATOR_HOME` env markers and that pre-upgrade running containers lack them; the `operator_home_readiness` event (home-root scope: `home_root_traversable_by_child`) and how to read it when a `{file:}` reference fails; the rootful-degradation note (group 0 is not the operator group, feature degrades to legacy readability, observed via the readiness event, never gated); the residual that owner-only references OUTSIDE `~/.amplifier` need their own group bits (the prep script covers the known incident class, the readiness event surfaces the home root, and nothing scans arbitrary configs).
-- Add the operator prep section referencing `scripts/prepare-operator-home.sh` and the Amplifier-going-forward requirement (0640 keys, 0750 dirs), with the reasoning that under the rootless mapping group-dan access is effectively "processes running as the operator" on this single-user host.
+```yaml
+# supervisor service volumes (add beside the existing binds):
+#   - ${FRESHELL_OPERATOR_HOME:-/home/${USER}}:/home/op:ro
+# command/args (add beside the existing supervisor args):
+#   --operator-home /home/op
+```
 
-`docker/runtime/README.md` (~19-30): update the uid story (session host uid 0; provider children 65534:0 unchanged; no passwd entry — same as today) and reword the 0600-secret guarantee around the masked-home boundary.
+(Write the real entries by mirroring the compose file's existing bind/arg style at docker/runtime/compose.yaml.)
 
-- [ ] **Step 4: N/A**
+- [ ] **Step 4: Run the focused test**
 
-- [ ] **Step 5: N/A**
+Run: `pnpm run test:vitest run test/unit/scripts/prepare-operator-home.test.ts --config config/vitest/vitest.config.ts`
+
+Expected: PASS
+
+- [ ] **Step 5: Refactor while green**
+
+None needed; the script is single-purpose.
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Docs + shell script; run `bash -n scripts/prepare-operator-home.sh` and any docs lint the repo has (`grep -r "managed-runtime.md" package.json` for a docs check script; otherwise note the skip).
+Run: `bash -n scripts/prepare-operator-home.sh` plus the vitest run above; run the compose config lint the repo uses for docker/runtime if one exists (otherwise note the skip). Docs changes (below) are review-verified.
+
+Docs content:
+
+`docs/development/self-hosted-launch-runbook.md`: add the prep step — after deploying, run `scripts/prepare-operator-home.sh` once as the operator, and re-run it after any Amplifier key rotation (rotation that recreates keys at 0600 would otherwise restore the original failure); the `operator_home_readiness` event confirms the home root's group traversal afterward.
+
+`docs/development/managed-runtime.md`:
+- Replace the "no unrelated home" bullet (~220-225) and the rootless uid rationale (~329-338) with the new contract: souls mount the operator home read-only at its canonical path; provider children keep 65534:0; under the rootless production daemon the child's gid 0 is the operator's group, so group-readable reference targets (0750 directories, 0640 key files) resolve with no identity change; the `--operator-home` flag, the compose wiring, and the owner/euid guards (containerized supervisors pass the flag explicitly; rootless-home env fallback works only for non-root host supervisors); the tmpfs mask list (`.freshell`, `.amplifier/onecli`, `.config/gcloud`) and why each entry is control-plane or infrastructure authorization material; the additive `FRESHELL_OPERATOR_HOME_MOUNT`/`FRESHELL_OPERATOR_HOME` env markers and that pre-upgrade running containers lack them; the `operator_home_readiness` event (home-root scope: `home_root_traversable_by_child`) and how to read it when a `{file:}` reference fails; the rootful-degradation note (group 0 is not the operator group, feature degrades to legacy readability, observed via the readiness event, never gated).
+- Add the operator prep section referencing `scripts/prepare-operator-home.sh`, the re-run-after-rotation rule, and the tracked upstream Amplifier item (write keys 0640, `~/.amplifier` 0750), with the reasoning that under the rootless mapping group-dan access is effectively "processes running as the operator" on this single-user host.
+- State the two accepted residuals precisely: (1) a reference to a deliberately owner-only file outside the known config roots needs its own one-line prep — the provider CLI's error names the exact path; (2) the mask set is computed at container creation, so a control-plane path CREATED AFTER a soul is running is unmasked for that soul until its next incarnation — primary protection is those paths' own owner-only modes (gcloud/onecli create 0700 dirs), and every new incarnation re-derives the masks.
+
+`docker/runtime/README.md` (~19-30): update the uid story (session host uid 0; provider children 65534:0 unchanged; no passwd entry — same as today) and reword the 0600-secret guarantee around the masked-home boundary.
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add scripts/prepare-operator-home.sh docs/development/managed-runtime.md docs/development/self-hosted-launch-runbook.md docker/runtime/README.md
-git commit -m "docs(managed-runtime): operator home mounts, masks, group-read prep script, and posture"
+git add scripts/prepare-operator-home.sh test/unit/scripts/prepare-operator-home.test.ts docker/runtime/compose.yaml docs/development/managed-runtime.md docs/development/self-hosted-launch-runbook.md docker/runtime/README.md
+git commit -m "feat(deploy): operator home prep script with behavioral test, compose wiring, and posture docs"
 ```
 
 ## Verification (user-visible outcome)
