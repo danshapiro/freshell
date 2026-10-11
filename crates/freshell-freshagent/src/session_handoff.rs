@@ -3458,8 +3458,10 @@ impl SessionHandoffRunner {
         generation: u64,
     ) -> Option<StopOutcomePriv> {
         let stop = self.unit_stop(terminal_id, operation_id)?;
-        // Round-3 review I-1 (prior-reap window): the stop is issued but
-        // unconfirmed — the abort-window test's deterministic hold.
+        // Round-3 review I-1 (prior-reap window): the abort-window test's
+        // deterministic hold. The stop future is lazy: at this hold the stop
+        // has NOT begun (it begins at the spawn below), so the prior is still
+        // untouched here.
         if let Some(hooks) = self.test_hooks.as_ref() {
             if let Some(pause) = hooks.pause_after_terminal_prior_kill.as_ref() {
                 let _ = pause.notified().await;
@@ -4684,11 +4686,15 @@ async fn kill_and_confirm_terminal_pid(
     reap_timeout_ms: u64,
 ) -> bool {
     // A terminal in a pane unit: stopped through the single stop path, and
-    // only its Gone (within the budget) is the confirmation.
+    // only its Gone (within the budget) is the confirmation. The stop future
+    // is lazy, so it runs on its own task: a budget that runs out never drops
+    // a stop that has not begun, and the stop goes on to its Gone.
     if let Some(stop) = pane_stops.stop(terminal_id, None) {
-        return tokio::time::timeout(std::time::Duration::from_millis(reap_timeout_ms), stop)
-            .await
-            .is_ok();
+        let stop = tokio::spawn(stop);
+        return matches!(
+            tokio::time::timeout(std::time::Duration::from_millis(reap_timeout_ms), stop).await,
+            Ok(Ok(_))
+        );
     }
     let pid = recorded_pid.or_else(|| registry.pid_of(terminal_id));
     if !registry.kill(terminal_id) && pid.is_none() {

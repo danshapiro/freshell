@@ -9045,12 +9045,6 @@ fn is_codex_include_turns_unavailable(err: &CodexAppServerError) -> bool {
         || message.contains("list_turns is not supported yet")
 }
 
-/// The reference has no dedicated "is this genuinely a missing thread" check for
-/// `thread/resume` failures -- `ensureRuntime` (`adapter.ts:762-799`) propagates ANY resume
-/// error unwrapped, which `sendFreshAgentError`'s generic fallback turns into a plain 500
-/// (`router.ts:165-166`). This port goes one step further and surfaces a proper 404 when the
-/// app-server's own error text says so, so a garbage/expired thread id (as opposed to a
-/// real spawn/RPC failure) doesn't masquerade as a server error.
 /// Codex refused a `thread/resume` because the thread has no rollout (it
 /// never had a turn): `-32600 "no rollout found for thread id …"`.
 fn is_codex_no_rollout(err: &CodexAppServerError) -> bool {
@@ -9066,6 +9060,12 @@ struct NewThreadParams {
     permission_mode: Option<String>,
 }
 
+/// The reference has no dedicated "is this genuinely a missing thread" check for
+/// `thread/resume` failures -- `ensureRuntime` (`adapter.ts:762-799`) propagates ANY resume
+/// error unwrapped, which `sendFreshAgentError`'s generic fallback turns into a plain 500
+/// (`router.ts:165-166`). This port goes one step further and surfaces a proper 404 when the
+/// app-server's own error text says so, so a garbage/expired thread id (as opposed to a
+/// real spawn/RPC failure) doesn't masquerade as a server error.
 fn is_codex_thread_not_found(err: &CodexAppServerError) -> bool {
     let message = err.to_string().to_lowercase();
     message.contains("not found")

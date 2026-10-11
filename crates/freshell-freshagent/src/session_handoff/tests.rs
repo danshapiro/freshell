@@ -9000,6 +9000,9 @@ struct StopperOptions {
     user_kill_joins: bool,
     /// The Gone (and so the row's end) waits for the test to notify it.
     gone_hold: Option<Arc<tokio::sync::Notify>>,
+    /// The stop begins only this long after its future is first polled (the
+    /// WebSocket stopper's read before a stop).
+    start_delay: Option<Duration>,
 }
 
 impl RecordingStopper {
@@ -9025,9 +9028,13 @@ impl crate::PaneUnitStopper for RecordingStopper {
         let StopperOptions {
             user_kill_joins,
             gone_hold,
+            start_delay,
         } = self.options.clone();
         Box::pin(async move {
             let entry = entry?;
+            if let Some(delay) = start_delay {
+                tokio::time::sleep(delay).await;
+            }
             let ended = terminal_id.clone();
             let mut request = freshell_containment::StopRequest::new(
                 freshell_containment::StopMode::Force,
@@ -9398,6 +9405,36 @@ async fn a_handoff_aborted_during_its_unit_priors_stop_never_restores_it_live() 
 
     gone_hold.notify_one();
     await_cond("the prior is Gone", || u.prior.screen.has_exited()).await;
+}
+
+/// A reap budget that runs out before a pane unit's stop has begun never
+/// drops that stop: the answer is only "not confirmed in time", and the stop
+/// still runs to the pane's Gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reap_budget_that_runs_out_never_drops_a_pane_units_stop() {
+    let _guard = ENV_LOCK.lock().await;
+    let sid = format!("reap-budget-{}", uuid::Uuid::new_v4());
+    let u = build_unit_rig_with(
+        &sid,
+        freshell_ownership::HoldKind::Main,
+        StopperOptions {
+            start_delay: Some(Duration::from_millis(200)),
+            ..StopperOptions::default()
+        },
+    );
+    let confirmed = super::kill_and_confirm_terminal_pid(
+        &u.rig.registry,
+        &super::PaneStops::of(&u.rig.fresh_agent),
+        &u.prior.terminal_id,
+        None,
+        20,
+    )
+    .await;
+    assert!(!confirmed, "not confirmed within the 20 ms budget");
+    await_cond("the stop still runs to the pane's Gone", || {
+        u.prior.screen.has_exited()
+    })
+    .await;
 }
 
 /// A user's kill (Shift-X) that joins the handoff's stop of its prior takes
