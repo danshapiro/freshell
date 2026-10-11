@@ -3636,13 +3636,14 @@ impl FreshCodexState {
                 return;
             }
             Err(EnsureAliveError::Reserved) => {
-                // Task 13 (D8): another create/attach holds this sessionRef -- the
-                // retryable non-lost error channel; the client re-drive converges.
-                self.emit_fresh_agent_error(
-                    &session_id,
-                    "SESSION_RESERVED",
-                    "Another resume for this session is in flight",
-                );
+                // Task 13 (D8): another create/attach holds this sessionRef (or,
+                // Task 16, a live pane holds the conversation) -- the retryable
+                // non-lost error channel; the client re-drive converges. The
+                // send itself was refused, so it is released like every other
+                // refused send (review R2-M1).
+                const RESERVED: &str = "Another resume for this session is in flight";
+                self.send_error(&request_id, "SESSION_RESERVED", RESERVED);
+                self.emit_fresh_agent_error(&session_id, "SESSION_RESERVED", RESERVED);
                 return;
             }
         }
@@ -23902,6 +23903,40 @@ pub(crate) mod tests {
         let frames = frames_until_error_banner(&mut rx, &thread_id).await;
         let banner = frames.last().expect("the answer");
         assert_eq!(banner["event"]["code"], "SESSION_RESERVED", "{banner}");
+        pane.assert_alive_and_unchanged().await;
+    }
+
+    /// Review R2-M1: a send to a crashed freshcodex pane whose recovery
+    /// Codex refuses because a live Freshell pane holds the conversation is
+    /// released like every other refused send: its own failure on the
+    /// send's request id (the client drops the pending message and its
+    /// local echo), then the pane's live-session answer (`SESSION_RESERVED`).
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_send_whose_crash_recovery_a_freshell_pane_holds_is_released() {
+        let _guard = ENV_LOCK.lock().await;
+        let (st, mut rx) = state_with_bus();
+        configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
+        simulate_unrequested_crash(&st, &thread_id).await;
+        configure_fake_codex_cmd(&refuse_resume_as_held(&thread_id));
+        let mut pane = HoldingPane::hold(&thread_id);
+        st.set_unit_directory(Arc::clone(&pane.units));
+
+        st.handle_send(FreshAgentSend {
+            request_id: Some("req-pane-held-send".to_string()),
+            ..send_msg(&thread_id, "hello again")
+        })
+        .await;
+        let frames = frames_until_error_banner(&mut rx, &thread_id).await;
+        let banner = frames.last().expect("the answer");
+        assert_eq!(banner["event"]["code"], "SESSION_RESERVED", "{banner}");
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["type"] == "error" && f["requestId"] == "req-pane-held-send"),
+            "the send is released on its own request id: {frames:?}"
+        );
         pane.assert_alive_and_unchanged().await;
     }
 
