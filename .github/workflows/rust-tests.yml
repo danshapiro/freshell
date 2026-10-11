@@ -75,6 +75,13 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Workspace tests
         run: cargo test --workspace --exclude freshell-tauri --locked
+      # The runner has a user systemd manager, so the run above selects the
+      # systemd containment backend. Linux hosts without one get the tag
+      # backend, which CI must prove too: without XDG_RUNTIME_DIR the systemd
+      # probe fails and the tag backend is selected (its
+      # `selection_matches_the_host` test prints which one).
+      - name: Containment and WS tests on the tag containment backend
+        run: env -u XDG_RUNTIME_DIR -u DBUS_SESSION_BUS_ADDRESS cargo test -p freshell-containment -p freshell-ws --locked
 
   gate:
     name: rust-gate
