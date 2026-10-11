@@ -2720,7 +2720,10 @@ export class RuntimeHarness {
     ensurePrivateDirectory(runtimeRoot)
     const workspacePath = path.join(ownerRoot, `task007-${kind}-workspace`)
     fs.mkdirSync(workspacePath, { mode: 0o755 })
-    git(workspacePath, ['init', '--quiet'])
+    // This generated workspace is read by provider UID 65534. A private
+    // owner umask must not make its workspace or Git metadata inaccessible.
+    fs.chmodSync(workspacePath, 0o755)
+    git(workspacePath, ['init', '--shared=0644', '--quiet'])
     const gitCommonDir = fs.realpathSync(path.join(workspacePath, '.git'))
     this.task007WorkspaceRoots.add(workspacePath)
     this.task007WorkspaceRoots.add(gitCommonDir)
