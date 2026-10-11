@@ -101,6 +101,16 @@ export type RuntimeFixtureInputs = {
   bootstrapFiles: string[]
 }
 
+function validateOwnedFixturePath(selected: string, kind: 'directory' | 'file', label: string): string {
+  const metadata = fs.lstatSync(selected)
+  if (!path.isAbsolute(selected) || path.normalize(selected) !== selected || fs.realpathSync(selected) !== selected
+    || !(kind === 'directory' ? metadata.isDirectory() : metadata.isFile()) || metadata.isSymbolicLink()
+    || (process.getuid && metadata.uid !== process.getuid())) {
+    throw new Error(`${label} must retain its selected owned physical ${kind}`)
+  }
+  return selected
+}
+
 export class RuntimeGateAssertionError extends Error {
   constructor(
     readonly caseId: string,
@@ -147,11 +157,15 @@ export class RuntimeHarness {
   private readonly trackedVolumes = new Set<string>()
   private readonly assertions: AssertionRecord[] = []
   private brokerStarted = false
+  private readonly fixtureInputs: RuntimeFixtureInputs | undefined
 
   constructor(repoRoot: string, runId = randomUUID(), phase: 1 | 2 | 3 | 4 | 5 = 1,
     private readonly providerFixtureHome?: string, private readonly providerFixtureXdgConfigHome?: string,
-    _fixtureInputs?: RuntimeFixtureInputs) {
+    fixtureInputs?: RuntimeFixtureInputs) {
     this.repoRoot = fs.realpathSync(repoRoot)
+    this.fixtureInputs = fixtureInputs && {
+      workspaceRoots: [...fixtureInputs.workspaceRoots], bootstrapFiles: [...fixtureInputs.bootstrapFiles],
+    }
     this.phase = phase
     this.runId = runId
     this.candidateSha = git(this.repoRoot, ['rev-parse', 'HEAD']).trim()
@@ -1076,10 +1090,16 @@ export class RuntimeHarness {
   }
 
   private phase2BootstrapFiles(): string[] {
+    if (this.fixtureInputs) {
+      return this.fixtureInputs.bootstrapFiles.map(selected => validateOwnedFixturePath(selected, 'file', 'bootstrap fixture input'))
+    }
     return phase2BootstrapFiles()
   }
 
   private phase2WorkspaceRoots(): string[] {
+    if (this.fixtureInputs) {
+      return this.fixtureInputs.workspaceRoots.map(selected => validateOwnedFixturePath(selected, 'directory', 'workspace fixture root'))
+    }
     const roots = new Set<string>([this.repoRoot, this.testRoot])
     try {
       const common = git(this.repoRoot, ['rev-parse', '--git-common-dir']).trim()
@@ -1090,14 +1110,7 @@ export class RuntimeHarness {
 
   private phase2ProviderUserRoots(): string[] {
     const home = this.providerFixtureHome ?? os.homedir()
-    const validateFixtureDirectory = (selected: string) => {
-      const metadata = fs.lstatSync(selected)
-      if (!path.isAbsolute(selected) || path.normalize(selected) !== selected || fs.realpathSync(selected) !== selected
-        || !metadata.isDirectory() || metadata.isSymbolicLink()
-        || (process.getuid && metadata.uid !== process.getuid())) {
-        throw new Error('provider fixture root must retain its selected owned physical directory')
-      }
-    }
+    const validateFixtureDirectory = (selected: string) => validateOwnedFixturePath(selected, 'directory', 'provider fixture root')
     if (this.providerFixtureHome !== undefined) validateFixtureDirectory(home)
     let opencodeRoot = path.join(home, '.config/opencode')
     if (this.providerFixtureHome !== undefined && this.providerFixtureXdgConfigHome !== undefined) {
