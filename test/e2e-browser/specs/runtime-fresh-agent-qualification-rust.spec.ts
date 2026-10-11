@@ -14,9 +14,8 @@ import {
   type QualifiableFreshAgentMode,
 } from '../../../scripts/testing/fresh-agent-qualification-selection.js'
 import { FRESH_AGENT_QUALIFICATION_LIVE_ENV } from '../../../scripts/testing/runtime-fresh-agent-qualification.js'
-import { executeAction } from '../../../tools/freshell-mcp/freshell-tool.js'
 import { test } from '../helpers/fixtures.js'
-import { createManagedRuntimeBrowserRig, splitFreshBrowserPane, type ManagedRuntimeView, type ManagedFixtureRig } from '../helpers/managed-runtime.js'
+import { createManagedRuntimeBrowserRig, splitFreshBrowserPane, observeFreshMcpIngress, type ManagedRuntimeView, type ManagedFixtureRig } from '../helpers/managed-runtime.js'
 import { observeOwnedFreshBrowserPane, stageOwnedFreshBrowserProfile } from '../../../scripts/testing/runtime-external-browser.js'
 import { TestHarness } from '../helpers/test-harness.js'
 
@@ -142,25 +141,6 @@ async function actualCreate(page: Page, rig: ManagedFixtureRig, definition: Defi
   } finally { await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.setSuppressAllFreshAgentNetworkEffects(false)) }
 }
 
-async function observeMcp(action: string, params: Record<string, unknown>) {
-  const prior = globalThis.fetch
-  const requests: any[] = []
-  globalThis.fetch = async (input, init) => {
-    const response = await prior(input, init)
-    const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url)
-    if (init?.method === 'POST' && /^\/api\/(?:tabs|panes\/[^/]+\/split)$/.test(url.pathname)) {
-      requests.push({ request: { method: init.method, path: url.pathname, body: JSON.parse(String(init.body)) },
-        reply: dataOf(await response.clone().json()) })
-    }
-    return response
-  }
-  try {
-    const result = dataOf(await executeAction(action, params))
-    if (requests.length !== 1 || !result?.paneId) throw new Error('actual MCP request/reply was not observed')
-    return requests[0]!
-  } finally { globalThis.fetch = prior }
-}
-
 async function reloadOwnedBrowser(page: Page, rig: ManagedFixtureRig) {
   await page.goto(rig.info.baseUrl + '/?token=' + rig.info.token + '&e2e=1')
   await new TestHarness(page).waitForConnection()
@@ -191,7 +171,7 @@ async function qualify(page: Page, rig: ManagedFixtureRig, definition: Definitio
     effort: definition.effort === 'provider-default' ? undefined : definition.effort,
     permissionMode: 'default', sessionRef: { provider: definition.provider, sessionId: main.nativeSessionId } }
   for (const [ingress, action] of [['mcp-new-tab', 'new-tab'], ['mcp-split', 'split-pane']] as const) {
-    const observed = await observeMcp(action, { ...params, ...(action === 'split-pane' ? { target: auxiliary.paneId, direction: 'horizontal' } : {}) })
+    const observed = await observeFreshMcpIngress(action, { ...params, ...(action === 'split-pane' ? { target: auxiliary.paneId, direction: 'horizontal' } : {}) })
     const view = await aliasActivation(rig, initial, observed.reply)
     await rig.observeFreshBrowserIngress(rig.exactRuntimeHandle(view), id, { ingress, ...observed })
   }

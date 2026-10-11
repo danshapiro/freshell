@@ -4,6 +4,47 @@ import type { E2eServerInfo } from './server-fixture-support.js'
 import { resolveManagedExternalDescriptor } from '../../../scripts/testing/runtime-external-browser.js'
 import { ExternalManagedRuntimeRig } from './external-managed-runtime.js'
 import { expect, type Page } from '@playwright/test'
+import { executeAction } from '../../../tools/freshell-mcp/freshell-tool.js'
+import { resolveCanonicalAction } from '../../../tools/node-client-runtime/action-capabilities.js'
+
+/** Observe the real MCP client's create transport; callers retain native alias checks. */
+export async function observeFreshMcpIngress(action: string, params: Record<string, unknown>, invoke = executeAction) {
+  const prior = globalThis.fetch
+  const requests: any[] = []
+  const dataOf = (result: any): any => result?.data?.data ?? result?.data ?? result
+  const hasPaneId = (result: any): boolean => typeof result?.paneId === 'string' && result.paneId.trim().length > 0
+  let result: any
+  let invocationFailed = false
+  globalThis.fetch = async (input, init) => {
+    const response = await prior(input, init)
+    const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url)
+    if (init?.method === 'POST' && /^\/api\/(?:tabs|panes\/[^/]+\/split)$/.test(url.pathname)) {
+      const observation = { request: { method: init.method, path: url.pathname, body: JSON.parse(String(init.body)) },
+        reply: undefined as any, httpOk: response.ok, status: 'absent', errorPresent: false }
+      requests.push(observation)
+      const envelope = await response.clone().json()
+      observation.reply = dataOf(envelope)
+      observation.status = envelope?.status === undefined ? 'absent'
+        : envelope.status === 'ok' || envelope.status === 'error' ? envelope.status : 'other'
+      observation.errorPresent = Boolean(envelope?.error || observation.reply?.error)
+    }
+    return response
+  }
+  try {
+    try { result = dataOf(await invoke(action, params)) } catch { invocationFailed = true }
+    const observed = requests[0]
+    const errorPresent = invocationFailed || Boolean(result?.error) || requests.some(row => row.errorPresent)
+    if (requests.length !== 1 || !hasPaneId(result) || errorPresent || !observed?.httpOk
+      || !['ok', 'absent'].includes(observed.status) || !hasPaneId(observed.reply) || observed.reply.paneId !== result.paneId) {
+      // Log only finite transport facts: provider errors and input bodies can contain secrets.
+      throw new Error('actual MCP request/reply was not observed: ' + JSON.stringify({
+        action: resolveCanonicalAction(action) ?? 'unknown', requestCount: requests.length,
+        paneIdPresent: hasPaneId(result), errorPresent, status: observed?.status ?? 'absent',
+      }))
+    }
+    return { request: observed.request, reply: observed.reply }
+  } finally { globalThis.fetch = prior }
+}
 
 /** Split the observed fresh pane through the actual browser menu within one finite action budget. */
 export async function splitFreshBrowserPane(page: Page, paneId: string): Promise<void> {
