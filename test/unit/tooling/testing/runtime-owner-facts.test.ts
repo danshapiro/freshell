@@ -20,6 +20,7 @@ import { providerNativeProfileMatches } from '../../../../scripts/testing/provid
 import { readAmplifierNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/amplifier.js'
 import { readClaudeNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/claude.js'
 import plugin from '../../../../extensions/opencode/freshell-rebind-plugin.js'
+import * as managed from '../../../e2e-browser/helpers/managed-runtime.js'
 
 const { DatabaseSync }: typeof import('node:sqlite') = createRequire(import.meta.url)('node:sqlite')
 
@@ -52,6 +53,210 @@ const handle = {
   incarnationId: 'incarnation-owned', containerId: 'b'.repeat(64),
   hostBootId: 'boot-owned', nativeSessionId: 'native-owned',
 }
+
+describe('same transaction qualification Stop completion', () => {
+  async function fixture() {
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused Stop web') }, fixtureRepoRoot, 5,
+      {}, {}, 'release', { enabledProviders: ['amplifier'], freshAgentModes: [] })
+    const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
+    const root = path.join(fixtureRepoRoot, 'stop-completion')
+    await fsp.mkdir(root)
+    await fsp.writeFile(path.join(root, 'host-state.json'), JSON.stringify({ hostBootId: current.hostBootId }))
+    const database = path.join(root, 'runtime.sqlite3'), calls = path.join(root, 'calls.jsonl'), hold = path.join(root, 'hold-read')
+    const runningEnclosure = path.join(root, 'running-enclosure')
+    const db = new DatabaseSync(database)
+    db.exec(`CREATE TABLE souls(soul_id TEXT,provider TEXT,provider_store_id TEXT,native_session_id TEXT,intent_revision INTEGER,desired_state TEXT);
+      CREATE TABLE incarnations(soul_id TEXT,incarnation_id TEXT,container_id TEXT,host_boot_id TEXT,execution_generation INTEGER,launch_state TEXT,cleanup_state TEXT);
+      CREATE TABLE ordinary_stops(soul_id TEXT,incarnation_id TEXT,intent_revision INTEGER,execution_generation INTEGER,outcome TEXT,revoke_pending INTEGER,settled INTEGER);
+      CREATE TABLE writer_claims(soul_id TEXT,provider TEXT,provider_store_id TEXT,native_session_id TEXT,incarnation_id TEXT,intent_revision INTEGER);`)
+    db.prepare('INSERT INTO souls VALUES(?,?,?,?,?,?)').run(current.soulId, 'amplifier', 'owned-store', current.nativeSessionId, 7, 'running')
+    db.prepare('INSERT INTO incarnations VALUES(?,?,?,?,?,?,?)').run(current.soulId, current.incarnationId, current.containerId, current.hostBootId, 1, 'running', 'none')
+    db.prepare('INSERT INTO writer_claims VALUES(?,?,?,?,?,?)').run(current.soulId, 'amplifier', 'owned-store', current.nativeSessionId, current.incarnationId, 7)
+    const view = () => {
+      const soul = db.prepare('SELECT * FROM souls').get() as any, incarnation = db.prepare('SELECT * FROM incarnations').get() as any
+      return { soulId: current.soulId, provider: soul.provider, nativeSessionId: soul.native_session_id, incarnationId: incarnation.incarnation_id,
+        containerId: incarnation.container_id, hostBootId: incarnation.host_boot_id, intentRevision: soul.intent_revision,
+        executionGeneration: incarnation.execution_generation, launchState: incarnation.launch_state, cleanupState: incarnation.cleanup_state,
+        desiredState: soul.desired_state, recoveryState: soul.desired_state === 'running' ? 'live' : 'stopped',
+        durabilityState: 'resume_captured', allocationState: 'verified_durable', evidenceRevision: 1, successfulRecoveriesInWindow: 0 }
+    }
+    Object.defineProperty(rig, 'supervisor', { value: { containerId: 'd'.repeat(64), runtimeRoot: path.join(root, 'runtime'),
+      scenarioId: 'browser-managed-runtime', volumeName: 'owned-supervisor-volume', binaryKind: 'release' } })
+    Object.defineProperty(rig.runtime, 'broker', { value: { receipts: () => [{ ...current, runtimeDir: root }],
+      receiptIds: () => new Set([current.containerId, rig.supervisor.containerId]) } })
+    // External Docker and supervisor-admin IO use the fixture database. The
+    // actual owner/client/helper execute the real read-only SQLite projection.
+    await fsp.writeFile(path.join(root, 'docker'), `#!${process.execPath}\nconst fs=require('node:fs'),cp=require('node:child_process'),a=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(a)+'\\n');
+if(a[0]==='exec'){const limit=setTimeout(()=>process.exit(2),5000);const read=()=>{if(fs.existsSync(${JSON.stringify(hold)})){setTimeout(read,10);return;}clearTimeout(limit);const p=a.indexOf('python3');process.stdout.write(cp.execFileSync('python3',['-c',a[p+2].replaceAll('/var/lib/freshell-supervisor/runtime.sqlite3',${JSON.stringify(database)}),...a.slice(p+3)],{encoding:'utf8'}));};read();}
+else if(a[0]==='ps')process.stdout.write('${current.containerId}');
+else if(a[0]==='inspect'){const{DatabaseSync}=require('node:sqlite'),d=new DatabaseSync(${JSON.stringify(database)});process.stdout.write(JSON.stringify([{Id:'${current.containerId}',State:{Running:fs.existsSync(${JSON.stringify(runningEnclosure)})||d.prepare('SELECT launch_state FROM incarnations').get().launch_state!=='stopped'}}]));d.close();}
+else process.exit(1);\n`, { mode: 0o700 })
+    vi.stubEnv('PATH', `${root}${path.delimiter}${process.env.PATH}`)
+    let stopCount = 0
+    vi.spyOn(rig.runtime, 'adminOk').mockImplementation(async (_supervisor, request) => {
+      if (request.method === 'inventory') return { kind: 'inventory', data: [view()] }
+      if (request.method === 'health') return { kind: 'health', data: { controlEpoch: 4 } }
+      if (request.method === 'qualification_writer_claim') {
+        const count = (db.prepare('SELECT count(*) AS n FROM writer_claims WHERE soul_id=? AND incarnation_id=?').get(current.soulId, current.incarnationId) as any).n
+        const conflicts = (db.prepare('SELECT count(*) AS n FROM writer_claims WHERE provider_store_id=? AND native_session_id=? AND (soul_id!=? OR incarnation_id!=?)').get('owned-store', current.nativeSessionId, current.soulId, current.incarnationId) as any).n
+        return { kind: 'qualification_writer_claim', data: { provider: 'amplifier', providerStoreId: 'owned-store',
+          nativeSessionId: current.nativeSessionId, soulId: current.soulId, incarnationId: current.incarnationId,
+          activeClaimCount: count, globalConflictingClaimCount: conflicts } }
+      }
+      if (request.method === 'stop') {
+        stopCount++
+        db.exec("UPDATE souls SET intent_revision=8,desired_state='stopped'; UPDATE incarnations SET launch_state='stopping',cleanup_state='termination_unconfirmed'")
+        db.prepare('INSERT INTO ordinary_stops VALUES(?,?,?,?,?,?,?)').run(current.soulId, current.incarnationId, 8, 1, 'backend_unavailable', 0, 0)
+        return { kind: 'stop', data: { outcome: 'backend_unavailable', view: view() } }
+      }
+      throw new Error(`unexpected fixture admin IO: ${request.method}`)
+    })
+    const descriptor = { schemaVersion: 1 as const, runId: current.runId, candidateSha: current.candidateSha,
+      baseUrl: 'http://127.0.0.1', wsUrl: 'ws://127.0.0.1/ws', token: 'owned-fixture-token' }
+    const control = external.createExternalRuntimeControl(rig, descriptor)
+    const requests: any[] = []
+    const server = http.createServer(async (request, response) => {
+      const chunks: Buffer[] = []
+      for await (const chunk of request) chunks.push(Buffer.from(chunk))
+      const input = JSON.parse(Buffer.concat(chunks).toString()); requests.push(input)
+      response.setHeader('content-type', 'application/json')
+      try { response.end(JSON.stringify(await control(input))) }
+      catch { response.statusCode = 409; response.end('{}') }
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    const address = server.address() as net.AddressInfo
+    const client = new external.ExternalManagedRuntimeRig({ ...descriptor, baseUrl: `http://127.0.0.1:${address.port}` })
+    const complete = () => db.exec("UPDATE ordinary_stops SET outcome='verified_empty',settled=1,revoke_pending=0; UPDATE incarnations SET launch_state='stopped',cleanup_state='verified_empty'; DELETE FROM writer_claims")
+    const waitForProbe = async () => {
+      for (let attempt = 0; attempt < 200; attempt++) {
+        if (requests.some(request => request.action === 'stop-completion-facts') && fs.existsSync(calls)) return
+        await new Promise(resolve => setTimeout(resolve, 5))
+      }
+      throw new Error('actual owner observation was not invoked')
+    }
+    return { rig, client, current, db, view, complete, waitForProbe, stopCount: () => stopCount, requests, calls, hold, runningEnclosure,
+      close: async () => {
+        await Promise.allSettled([...(rig as any).providerProbes.values()].map((probe: any) => probe.settlement))
+        expect((rig as any).providerProbes.size).toBe(0)
+        server.closeAllConnections(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+        db.close(); vi.unstubAllEnvs()
+      } }
+  }
+
+  it('preserves the initial pending reply and waits for the same recorded transaction before qualifying', async () => {
+    const f = await fixture()
+    try {
+      let published = false
+      const result = managed.completeManagedRuntimeStop(f.client, f.current.soulId).then(value => { published = true; return value })
+      void result.catch(() => {})
+      await f.waitForProbe()
+      expect(published).toBe(false)
+      expect(f.stopCount()).toBe(1)
+      expect(f.db.prepare('SELECT outcome,settled,intent_revision FROM ordinary_stops').get()).toMatchObject({ outcome: 'backend_unavailable', settled: 0, intent_revision: 8 })
+      expect((f.db.prepare('SELECT count(*) AS n FROM writer_claims').get() as any).n).toBe(1)
+      f.complete()
+      const observed = await result
+      expect(observed.initial).toMatchObject({ outcome: 'backend_unavailable', view: { intentRevision: 8 } })
+      expect(observed.completion).toMatchObject({ outcome: 'verified_empty', settled: true, revokePending: false,
+        intentRevision: 8, executionGeneration: 1, view: { incarnationId: f.current.incarnationId, launchState: 'stopped' } })
+      expect(f.stopCount()).toBe(1)
+      expect(new Set(f.requests.filter(request => request.action === 'stop-completion-facts').map(request => request.expectedIntentRevision))).toEqual(new Set([8]))
+    } finally { await f.close() }
+  })
+
+  it.each(['revision', 'generation', 'root', 'store', 'incarnation', 'container', 'host-boot', 'writer', 'conflicting-writer', 'missing-record', 'ownership', 'owned-receipt', 'running-enclosure'])(
+    'refuses changed %s facts without another Stop or qualification', async change => {
+      const f = await fixture()
+      try {
+        const result = managed.completeManagedRuntimeStop(f.client, f.current.soulId)
+        // Attach before changing IO to keep a fast invariant refusal handled.
+        const refusal = expect(result).rejects.toThrow(/Stop|stop|writer|owned|identity|current|transaction|completion|refused/)
+        await f.waitForProbe()
+        f.complete()
+        const changes: Record<string, string> = {
+          revision: 'UPDATE souls SET intent_revision=9', generation: 'UPDATE incarnations SET execution_generation=2',
+          root: "UPDATE souls SET native_session_id='foreign-root'", incarnation: "UPDATE incarnations SET incarnation_id='foreign-incarnation'",
+          store: "UPDATE souls SET provider_store_id='foreign-store'",
+          container: `UPDATE incarnations SET container_id='${'e'.repeat(64)}'`, 'host-boot': "UPDATE incarnations SET host_boot_id='foreign-boot'",
+          writer: `INSERT INTO writer_claims VALUES('${f.current.soulId}','amplifier','owned-store','${f.current.nativeSessionId}','${f.current.incarnationId}',8)`,
+          'conflicting-writer': `INSERT INTO writer_claims VALUES('other-soul','amplifier','owned-store','${f.current.nativeSessionId}','other-incarnation',8)`,
+          'missing-record': 'DELETE FROM ordinary_stops', ownership: "UPDATE ordinary_stops SET outcome='blocked_ownership',settled=0",
+        }
+        if (change === 'owned-receipt') (f.rig.runtime.broker as any).receipts = () => []
+        else if (change === 'running-enclosure') await fsp.writeFile(f.runningEnclosure, '')
+        else f.db.exec(changes[change])
+        await refusal
+        expect(f.stopCount()).toBe(1)
+      } finally { await f.close() }
+    },
+  )
+
+  it('waits for recorded revoke settlement even after empty and zero-writer observations', async () => {
+    const f = await fixture()
+    try {
+      let published = false
+      const result = managed.completeManagedRuntimeStop(f.client, f.current.soulId).then(value => { published = true; return value })
+      void result.catch(() => {})
+      await f.waitForProbe()
+      f.complete()
+      f.db.exec('UPDATE ordinary_stops SET settled=0,revoke_pending=1')
+      const priorReads = f.requests.filter(request => request.action === 'stop-completion-facts').length
+      for (let attempt = 0; attempt < 200; attempt++) {
+        if (f.requests.filter(request => request.action === 'stop-completion-facts').length > priorReads) break
+        await new Promise(resolve => setTimeout(resolve, 5))
+      }
+      expect(f.requests.filter(request => request.action === 'stop-completion-facts').length).toBeGreaterThan(priorReads)
+      expect(published).toBe(false)
+      f.db.exec('UPDATE ordinary_stops SET settled=1,revoke_pending=0')
+      await expect(result).resolves.toMatchObject({ completion: { outcome: 'verified_empty', settled: true, revokePending: false } })
+      expect(f.stopCount()).toBe(1)
+    } finally { await f.close() }
+  })
+
+  it('uses one deadline for persistent pending state and publishes no completion', async () => {
+    const f = await fixture()
+    try {
+      const result = managed.completeManagedRuntimeStop(f.client, f.current.soulId)
+      const refusal = expect(result).rejects.toThrow(/deadline|timed out/)
+      await f.waitForProbe()
+      // Advance elapsed time only; real process IO and finite owner probes stay
+      // owned and are joined below. A poll must not renew the 60-second budget.
+      const now = Date.now()
+      vi.spyOn(Date, 'now').mockReturnValue(now + 60_001)
+      await refusal
+      expect(f.stopCount()).toBe(1)
+      expect((f.db.prepare('SELECT settled FROM ordinary_stops').get() as any).settled).toBe(0)
+    } finally { vi.restoreAllMocks(); await f.close() }
+  })
+
+  it('bounds a silent owner read and cannot publish its late completion', async () => {
+    const f = await fixture()
+    await fsp.writeFile(f.hold, '')
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+    let published = false
+    try {
+      const result = managed.completeManagedRuntimeStop(f.client, f.current.soulId).then(value => { published = true; return value })
+      const refusal = expect(result).rejects.toThrow(/timed out|deadline/)
+      for (let attempt = 0; attempt < 5_000; attempt++) {
+        if (fs.existsSync(f.calls)) break
+        await vi.advanceTimersByTimeAsync(1)
+        await new Promise(resolve => setImmediate(resolve))
+      }
+      expect(fs.existsSync(f.calls)).toBe(true)
+      await vi.advanceTimersByTimeAsync(60_001)
+      await refusal
+      expect(published).toBe(false)
+      expect(f.stopCount()).toBe(1)
+      // Late genuine evidence is joined, but cannot certify this expired wait.
+      f.complete()
+      await fsp.unlink(f.hold)
+    } finally {
+      vi.useRealTimers()
+      await f.close()
+      expect(published).toBe(false)
+    }
+  })
+})
 
 describe('finite transfer ownership', () => {
   it('executes a delayed owned operation, refuses a stalled operation and refuses work after lifecycle expiry', async () => {
