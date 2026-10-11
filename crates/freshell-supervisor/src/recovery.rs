@@ -2579,7 +2579,11 @@ impl Supervisor {
                             },
                             observed,
                             _,
-                        )) => {
+                        )) if observed.native_session_id.is_some() => {
+                            // Missing identity also classifies as unreadable,
+                            // but must settle the initial blocked reservation.
+                            // Only a known retained root uses this no-attempt
+                            // store-qualification refusal.
                             // Reader hints are not persisted retry schedules.
                             if let RecoveryProbe::Blocked { retry_hint, .. } = &mut probe {
                                 retry_hint.automatic_after_ms = None;

@@ -2184,6 +2184,49 @@ async fn dispatched_missing_identity_cannot_certify_loss() {
             freshell_runtime_protocol::RecoveryOutcome::Blocked
         );
         assert!(final_result.incident_id.is_none());
+        let attempt_summary = |conn: &Connection| -> (i64, i64) {
+            conn.query_row(
+                "SELECT COUNT(*),COUNT(CASE WHEN soul_id=?1 AND intent_revision=?2 AND verdict='blocked' AND finished_at IS NOT NULL THEN 1 END) FROM recovery_attempts",
+                params![context.soul_id.as_str(), context.intent_revision],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            attempt_summary(&conn),
+            (1, 1),
+            "{mode}: initial probe reservation settled"
+        );
+        let settled_retry = registry
+            .recovery_retry(context.soul_id.clone(), context.intent_revision)
+            .await
+            .unwrap();
+        // Reopen the durable registry and exercise startup, observation and
+        // the same intent again. Missing identity must stay blocked without
+        // turning a restart into another attempt or a replacement.
+        drop(conn);
+        drop(supervisor);
+        drop(registry);
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+        supervisor.reconcile_startup().await.unwrap();
+        supervisor.observe_once().await.unwrap();
+        let repeated = supervisor
+            .recover(freshell_runtime_protocol::RecoverRequest {
+                soul_id: context.soul_id.clone(),
+                trigger: freshell_runtime_protocol::RecoveryTrigger::StartupReconcile,
+                expected_intent_revision: Some(context.intent_revision),
+                expected_control_epoch: Some(registry.control_epoch()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            repeated.outcome,
+            freshell_runtime_protocol::RecoveryOutcome::Blocked,
+            "{mode}: missing identity stays blocked after restart"
+        );
+        assert!(repeated.incident_id.is_none());
+        let conn = Connection::open(registry.database_path()).unwrap();
         let launch_state: String = conn
             .query_row(
                 "SELECT launch_state FROM incarnations WHERE incarnation_id=?1",
@@ -2199,17 +2242,18 @@ async fn dispatched_missing_identity_cannot_certify_loss() {
             .query_row("SELECT COUNT(*) FROM loss_incidents", [], |row| row.get(0))
             .unwrap();
         assert_eq!(loss_incidents, 0, "{mode}: no certified loss");
-        let attempts: (i64, i64) = conn
-            .query_row(
-                "SELECT COUNT(*),COUNT(CASE WHEN soul_id=?1 AND intent_revision=?2 AND verdict='blocked' AND finished_at IS NOT NULL THEN 1 END) FROM recovery_attempts",
-                rusqlite::params![context.soul_id.as_str(), context.intent_revision],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
         assert_eq!(
-            attempts,
+            attempt_summary(&conn),
             (1, 1),
-            "{mode}: initial probe reservation settled"
+            "{mode}: restart retains the settled initial probe"
+        );
+        assert_eq!(
+            registry
+                .recovery_retry(context.soul_id.clone(), context.intent_revision)
+                .await
+                .unwrap(),
+            settled_retry,
+            "{mode}: restart retains the same settled retry budget"
         );
         let replacements: i64 = conn
             .query_row(
@@ -2232,15 +2276,21 @@ async fn dispatched_missing_identity_cannot_certify_loss() {
             .unwrap();
         assert_eq!(loss_exports, 0);
         assert_eq!(fs::read_to_string(output).unwrap(), "existing output");
+        let final_context = registry.recovery_context(context.soul_id).await.unwrap();
+        assert_eq!(final_context.prior_handle.provider_volume_name(), volume);
         assert_eq!(
-            registry
-                .recovery_context(context.soul_id)
-                .await
-                .unwrap()
-                .prior_handle
-                .provider_volume_name(),
-            volume
+            final_context.prior_handle.incarnation_id(),
+            context.prior_handle.incarnation_id(),
+            "{mode}: missing identity retains the same incarnation"
         );
+        assert_eq!(final_context.intent_revision, context.intent_revision);
+        assert_eq!(final_context.desired_state, DesiredState::Running);
+        assert_eq!(
+            final_context.recovery_state,
+            freshell_runtime_protocol::RecoveryState::Blocked
+        );
+        assert!(final_context.native_session_id.is_none());
+        assert!(final_context.recovery_attempt_id.is_none());
     }
 }
 
