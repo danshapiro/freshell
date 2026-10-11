@@ -1327,6 +1327,103 @@ async fn an_agent_exit_before_the_start_settled_is_a_start_failure_not_a_crash()
         .expect("the start ends settled");
 }
 
+/// A running pane's unit whose main process (not its screen) is `main`,
+/// pinned before the bind so the bind hook watches it; bound, committed and
+/// settled.
+async fn running_pane_with_main(
+    state: &WsState,
+    tid: &str,
+    crq: &str,
+    script: &str,
+    main: ProcWatch,
+) -> UnitEntry {
+    let mut scope = StartScope::begin(state, "codex", "codex", crq, tid, None).expect("start");
+    let pid = spawn_screen(state, &scope, tid, script).await;
+    assert_eq!(scope.spawned(tid, pid), Spawned::Running);
+    let unit = scope.unit();
+    unit.set_main(main);
+    scope.bind();
+    scope.commit();
+    tokio::time::timeout(LIMIT, state.units.start_settled(unit.id()))
+        .await
+        .expect("the placed start settles");
+    state.units.get(unit.id()).expect("a running pane's entry")
+}
+
+/// The one captured `event` line of `unit`.
+fn unit_line(
+    logs: &Arc<Mutex<Vec<crate::invariants::capture::CapturedEvent>>>,
+    unit: &AgentUnit,
+    event: &str,
+) -> crate::invariants::capture::CapturedEvent {
+    let logs = logs.lock().unwrap_or_else(|p| p.into_inner());
+    let lines: Vec<_> = logs
+        .iter()
+        .filter(|e| {
+            e.fields.get("event").map(String::as_str) == Some(event)
+                && e.fields.get("unit_id").map(String::as_str) == Some(unit.id().as_str())
+        })
+        .cloned()
+        .collect();
+    assert_eq!(lines.len(), 1, "one {event} line: {lines:?}");
+    lines[0].clone()
+}
+
+/// The lines that decide a unit's end name the stop they start: the
+/// agent's own exit (`unit.agent_exited`) and a screen restart that failed
+/// (`unit.screen.respawn_failed`) carry that stop's operation id, as its
+/// own lines do (Task 17 review N2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_lines_that_end_a_unit_name_the_stop_they_start() {
+    let logs = crate::invariants::capture::capture();
+    let root = tempfile::tempdir().unwrap();
+    let (state, _crashes) = unit_state(root.path());
+
+    // The agent's main process exits on its own.
+    let mut main = OwnChild::sleeping();
+    let entry = running_pane_with_main(&state, "T-n2a", "crq-n2a", "sleep 30", main.pin()).await;
+    main.0.kill().expect("the agent's main exits");
+    let watched = entry.unit.clone();
+    eventually("the agent's exit stops the unit", move || {
+        watched.stop_in_flight().is_some()
+    })
+    .await;
+    let operation = entry.unit.stop_operation().expect("the stop's operation");
+    assert!(operation.starts_with("unit-exit-"), "{operation}");
+    let line = unit_line(&logs, &entry.unit, "unit.agent_exited");
+    assert_eq!(
+        line.fields.get("operation_id"),
+        Some(&operation),
+        "{line:?}"
+    );
+
+    // A screen restart that fails (here: past the respawn cap).
+    state.registry.set_respawn_generation_cap(1);
+    let main = OwnChild::sleeping();
+    let entry =
+        running_pane_with_main(&state, "T-n2b", "crq-n2b", "read -r _; exit 1", main.pin()).await;
+    let first = entry.unit.screen().expect("the screen").pid();
+    assert!(state.registry.input("T-n2b", b"crash\n").found);
+    let watched = entry.unit.clone();
+    eventually("a new screen runs", move || {
+        watched.screen().is_some_and(|screen| screen.pid() != first)
+    })
+    .await;
+    assert!(state.registry.input("T-n2b", b"crash\n").found);
+    let watched = entry.unit.clone();
+    eventually("the failed restart stops the unit", move || {
+        watched.stop_in_flight().is_some()
+    })
+    .await;
+    let operation = entry.unit.stop_operation().expect("the stop's operation");
+    let line = unit_line(&logs, &entry.unit, "unit.screen.respawn_failed");
+    assert_eq!(
+        line.fields.get("operation_id"),
+        Some(&operation),
+        "{line:?}"
+    );
+}
+
 /// The router applies a thread's status change a few task hops after the
 /// proxy forwarded the same frame to the TUI, so a TUI that ends its turn
 /// and quits at once can exit while the pane's thread table still says the
