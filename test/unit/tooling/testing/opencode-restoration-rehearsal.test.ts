@@ -89,6 +89,26 @@ describe('explicit real-root rehearsal admission', () => {
       expect(() => admitRehearsalManifest({ ...manifest(), kind: 'fixture-root-dispatch', rootEvidence: completed }, candidate)).toThrow()
     } finally { fs.rmSync(directory, { recursive: true, force: true }) }
   })
+  it('prepares all root originals before consumers and cleans up a failed preparation', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-rehearsal-prepare-'))
+    const roots = manifest().roots.map(root => root.rootSessionId)
+    let cleaned = 0
+    try {
+      const prepare = async () => {
+        await promisify(execFile)(process.execPath, ['-e',
+          'const fs=require("node:fs"),path=require("node:path"),[dir,...roots]=process.argv.slice(1);for(const root of roots)fs.writeFileSync(path.join(dir,root+".json"),JSON.stringify({root}),{flag:"wx",mode:0o600});', directory, ...roots])
+      }
+      const execute = async (root: string): Promise<RootRehearsalEvidence> => {
+        const artifact = path.join(directory, `${root}.json`)
+        expect(JSON.parse(fs.readFileSync(artifact, 'utf8'))).toEqual({ root })
+        return { rootSessionId: root, graphDigest: 'f'.repeat(64), exportArtifact: artifact, importArtifact: artifact,
+          readerArtifact: artifact, nativeArtifact: artifact, nativeReadableSessionCount: 1, savedSnapshotSummary: {} }
+      }
+      await expect(dispatchRehearsalRoots({ roots, prepare, execute, cleanup: async () => { cleaned++ } })).resolves.toHaveLength(7)
+      await expect(dispatchRehearsalRoots({ roots, prepare, execute, cleanup: async () => { cleaned++ } })).rejects.toThrow()
+      expect(cleaned).toBe(2)
+    } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+  })
   it('refuses failed native child, absent originals, six/eight roots and failed owned cleanup', async () => {
     const roots = manifest().roots.map((root) => root.rootSessionId)
     let executed = 0, cleaned = 0

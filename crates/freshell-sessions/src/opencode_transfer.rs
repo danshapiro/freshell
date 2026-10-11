@@ -392,11 +392,82 @@ pub struct QualifiedSnapshotReceipt {
 #[derive(Debug, Clone)]
 pub struct QualifiedSourceSnapshot {
     path: PathBuf,
+    files: SnapshotFiles,
     receipt: QualifiedSnapshotReceipt,
     tool_output_directory: PathBuf,
     workspace_mounts: Vec<WorkspaceMountMapping>,
     trusted_directory_mounts: Vec<PathBuf>,
     _capture_guard: Option<std::sync::Arc<TempDir>>,
+}
+
+// Whole-file integrity is established once when a private snapshot is
+// qualified. Each export still checks its complete selected closure and these
+// file identities before and after reading. Include WAL/journal changes so a
+// SQLite writer cannot silently change a copy without touching its main file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotFileIdentity {
+    bytes: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    unix_identity: [u64; 7],
+    #[cfg(not(unix))]
+    created: std::time::SystemTime,
+}
+
+impl SnapshotFileIdentity {
+    fn read(path: &Path) -> Result<Self, TransferError> {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(TransferError::Blocked(
+                "qualified snapshot file binding changed".into(),
+            ));
+        }
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            bytes: metadata.len(),
+            modified: metadata.modified()?,
+            #[cfg(unix)]
+            unix_identity: [
+                metadata.dev(),
+                metadata.ino(),
+                metadata.uid().into(),
+                metadata.mode().into(),
+                metadata.ctime() as u64,
+                metadata.ctime_nsec() as u64,
+                metadata.gid().into(),
+            ],
+            #[cfg(not(unix))]
+            created: metadata.created()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotFiles {
+    database: SnapshotFileIdentity,
+    sidecars: Vec<Option<SnapshotFileIdentity>>,
+}
+
+impl SnapshotFiles {
+    fn read(path: &Path) -> Result<Self, TransferError> {
+        let mut sidecars = Vec::new();
+        for suffix in ["-wal", "-journal"] {
+            let mut sidecar = path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            match SnapshotFileIdentity::read(Path::new(&sidecar)) {
+                Ok(identity) => sidecars.push(Some(identity)),
+                Err(TransferError::Io(_)) if !Path::new(&sidecar).try_exists()? => {
+                    sidecars.push(None)
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(Self {
+            database: SnapshotFileIdentity::read(path)?,
+            sidecars,
+        })
+    }
 }
 
 impl QualifiedSourceSnapshot {
@@ -468,6 +539,7 @@ pub fn capture_qualified_snapshot(
     let bytes = fs::metadata(snapshot_file)?.len();
     let mut qualified = QualifiedSourceSnapshot {
         path: snapshot_file.canonicalize()?,
+        files: SnapshotFiles::read(snapshot_file)?,
         receipt: QualifiedSnapshotReceipt {
             source_store_id: digest(source_path.to_string_lossy().as_bytes()),
             canonical_source_database: source_path.clone(),
@@ -574,6 +646,7 @@ pub fn qualify_existing_snapshot(
     drop(snapshot);
     let mut qualified = trusted.clone();
     qualified.path = snapshot_file.to_path_buf();
+    qualified.files = SnapshotFiles::read(snapshot_file)?;
     qualified.receipt.snapshot_bytes = metadata.len();
     qualified.receipt.snapshot_sha256 = hash_file(snapshot_file)?;
     for root in &trusted.receipt.roots {
@@ -1160,7 +1233,7 @@ pub fn export_exact_session(
     if let Some(qualified) = &inventory.qualified_snapshot {
         if source_path.canonicalize()? != qualified.path
             || fs::metadata(&qualified.path)?.len() != qualified.receipt.snapshot_bytes
-            || hash_file(&qualified.path)? != qualified.receipt.snapshot_sha256
+            || SnapshotFiles::read(&qualified.path)? != qualified.files
             || !qualified
                 .receipt
                 .roots
@@ -1191,7 +1264,7 @@ pub fn export_exact_session(
         create_online_backup(&source, &snapshot_path)?;
     }
     if let Some(qualified) = &inventory.qualified_snapshot {
-        if hash_file(&qualified.path)? != qualified.receipt.snapshot_sha256 {
+        if SnapshotFiles::read(&qualified.path)? != qualified.files {
             return Err(TransferError::Blocked(
                 "qualified source snapshot changed during export".into(),
             ));
@@ -1335,7 +1408,7 @@ pub fn export_exact_session(
         remove_snapshot_files(&snapshot_path)?;
     }
     if let Some(qualified) = &inventory.qualified_snapshot {
-        if hash_file(&qualified.path)? != qualified.receipt.snapshot_sha256 {
+        if SnapshotFiles::read(&qualified.path)? != qualified.files {
             return Err(TransferError::Blocked(
                 "qualified snapshot changed while its complete root was serialized".into(),
             ));

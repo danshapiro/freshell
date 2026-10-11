@@ -2996,6 +2996,154 @@ fn durable_souls_rehearsal_pipeline_transfers_exact_native_snapshot_closure() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn durable_souls_rehearsal_pipeline_batch_reads_selected_graphs_without_rescanning_store() {
+    use freshell_sessions::opencode_transfer::capture_qualified_batch;
+    const CHILD: &str = "FRESHELL_TEST_QUALIFIED_BATCH_IO_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "opencode_transfer::tests::durable_souls_rehearsal_pipeline_batch_reads_selected_graphs_without_rescanning_store",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+    let fixture = fixture();
+    let source_path = fixture.root.join("source.sqlite");
+    let source = Connection::open(&source_path).unwrap();
+    source.execute("INSERT INTO session (id,project_id,slug,directory,title,version,time_created,time_updated) SELECT 'ses_second',project_id,'second',directory,'second','1.18.21',1,1 FROM session WHERE id='ses_root'", []).unwrap();
+    source.execute("INSERT INTO message (id,session_id,time_created,time_updated,data) VALUES ('msg_second','ses_second',1,1,'{\"text\":\"selected second root\"}')", []).unwrap();
+    source.execute("INSERT INTO session (id,project_id,slug,directory,title,version,time_created,time_updated) SELECT 'ses_unselected',project_id,'unselected',directory,'unselected','1.18.21',1,1 FROM session WHERE id='ses_root'", []).unwrap();
+    // A large unrelated native row exposes accidental complete-store scans,
+    // even when the OS page cache makes their elapsed time look inexpensive.
+    source.execute("INSERT INTO message (id,session_id,time_created,time_updated,data) VALUES ('msg_unselected','ses_unselected',1,1,?1)", [serde_json::json!({"text":"x".repeat(32 * 1024 * 1024)}).to_string()]).unwrap();
+    drop(source);
+    let before = fs::read(&source_path).unwrap();
+    let inventory = HostOpenCodeInventory::new(source_path.clone())
+        .with_trusted_mount_for_selected_session(fixture.workspace.clone());
+    let roots = vec!["ses_root".to_string(), "ses_second".to_string()];
+    let qualified = capture_qualified_batch(
+        &inventory,
+        &roots,
+        ExportOptions::new(fixture.root.join("batch-capture")),
+    )
+    .unwrap();
+    let read_bytes = || {
+        fs::read_to_string("/proc/self/io")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("rchar: "))
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+    };
+    let start = read_bytes();
+    for root in &roots {
+        let exported = export_exact_session(
+            &qualified.inventory(),
+            root,
+            ExportOptions::new(fixture.root.join("batch-exports")),
+        )
+        .unwrap();
+        assert_eq!(
+            exported.manifest().source_store_id,
+            fixture.descriptor.source_store_id
+        );
+        let payload: serde_json::Value =
+            serde_json::from_reader(exported.open_payload().unwrap()).unwrap();
+        assert_eq!(payload["root_session_id"], *root);
+        assert!(!payload.to_string().contains("msg_unselected"));
+        if root == "ses_root" {
+            assert_eq!(
+                exported.manifest().generation,
+                fixture.descriptor.source_generation
+            );
+            assert_eq!(exported.manifest().assets.len(), 1);
+        } else {
+            assert!(payload.to_string().contains("selected second root"));
+        }
+    }
+    let actual = read_bytes() - start;
+    let budget = qualified.receipt().snapshot_bytes + 16 * 1024 * 1024;
+    eprintln!("{{\"severity\":\"info\",\"event\":\"opencode.test.qualified_export_reads\",\"readBytes\":{actual},\"budgetBytes\":{budget}}}");
+    assert!(actual < budget, "actual selected exports read {actual} bytes; budget {budget} bytes forbids repeated whole-store scans");
+    assert_eq!(fs::read(&source_path).unwrap(), before);
+}
+
+#[test]
+fn durable_souls_rehearsal_pipeline_qualified_batch_refuses_file_and_sidecar_changes() {
+    use freshell_sessions::opencode_transfer::capture_qualified_snapshot;
+    let fixture = fixture();
+    let inventory = HostOpenCodeInventory::new(fixture.root.join("source.sqlite"))
+        .with_trusted_mount_for_selected_session(fixture.workspace.clone());
+    let roots = vec!["ses_root".to_string()];
+    for fault in [
+        "outside-root",
+        "unselected-write",
+        "replacement",
+        "journal",
+        "wal",
+    ] {
+        let path = fixture.root.join(format!("{fault}.sqlite"));
+        let qualified = capture_qualified_snapshot(
+            &inventory,
+            &roots,
+            &path,
+            ExportOptions::new(fixture.root.join("file-capture")),
+        )
+        .unwrap();
+        match fault {
+            "outside-root" => {}
+            "unselected-write" => {
+                let copy = Connection::open(&path).unwrap();
+                copy.execute("INSERT INTO session (id,project_id,slug,directory,title,version,time_created,time_updated) SELECT 'ses_unselected',project_id,'unselected',directory,'unselected','1.18.21',1,1 FROM session WHERE id='ses_root'", []).unwrap();
+            }
+            "replacement" => {
+                let replacement = fixture.root.join("replacement-new.sqlite");
+                fs::copy(&path, &replacement).unwrap();
+                fs::rename(replacement, &path).unwrap();
+            }
+            "journal" | "wal" => {
+                fs::write(
+                    format!(
+                        "{}{suffix}",
+                        path.display(),
+                        suffix = if fault == "wal" { "-wal" } else { "-journal" }
+                    ),
+                    b"accidental private snapshot writer",
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            export_exact_session(
+                &qualified.inventory(),
+                if fault == "outside-root" {
+                    "ses_outside"
+                } else {
+                    "ses_root"
+                },
+                ExportOptions::new(fixture.root.join("file-exports"))
+            )
+            .is_err(),
+            "must refuse {fault} before publishing an export"
+        );
+    }
+}
+
+#[test]
 fn durable_souls_rehearsal_pipeline_qualified_copy_retains_original_source_authority() {
     use freshell_sessions::opencode_transfer::{
         capture_qualified_snapshot, qualify_existing_snapshot,

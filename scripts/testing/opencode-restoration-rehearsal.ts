@@ -84,6 +84,7 @@ export type RehearsalReceipt = {
 /** Finite lifecycle plumbing. Its output alone is never a real receipt. */
 export async function dispatchRehearsalRoots(input: {
   roots: readonly string[]
+  prepare?: () => Promise<void>
   execute: (root: string) => Promise<RootRehearsalEvidence>
   cleanup: () => Promise<void>
 }): Promise<RootRehearsalEvidence[]> {
@@ -91,6 +92,7 @@ export async function dispatchRehearsalRoots(input: {
   const completed: RootRehearsalEvidence[] = []
   const failed: string[] = []
   try {
+    await input.prepare?.()
     for (const root of input.roots) {
       try {
         const evidence = await input.execute(root)
@@ -177,21 +179,29 @@ export async function runRealRootRehearsal(input: { manifestFile: string; scratc
   fs.writeFileSync(migrations, '[]', { mode: 0o644, flag: 'wx' }); fs.chmodSync(migrations, 0o644)
   const rootById = new Map(manifest.roots.map((root) => [root.rootSessionId, root]))
   const stage = promisify(execFile)
+  const requests = manifest.roots.map((root, index) => {
+    const directory = path.join(input.scratchDir, `root-${index}`)
+    return { candidateSha, imageDigest: manifest.imageDigest, sourceDatabase: manifest.snapshotFile, rootSessionId: root.rootSessionId,
+      extractionRoot: path.join(directory, 'extractions'), workspacePath: root.workspacePath, descriptorFile: path.join(directory, 'descriptor.json'),
+      payloadFile: path.join(directory, 'payload.json'), destinationStoreId: root.destinationStoreId, destinationDatabase: '/scratch/provider/.local/share/opencode/opencode.db',
+      providerHome: '/scratch/provider', providerUid: 65534, providerGid: 0, receiptFile: path.join(directory, 'export.json'),
+      sourceSnapshot: { canonicalOriginalDatabase: manifest.canonicalOriginalDatabase, originalDefaultDatabase: manifest.originalDefaultDatabase,
+        sourceStoreId: manifest.sourceIdentity, snapshotSha256: manifest.snapshotSha256, snapshotBytes: manifest.snapshotBytes,
+        roots: manifest.roots.map((item) => ({ rootSessionId: item.rootSessionId, graphDigest: item.graphDigest })),
+        workspaces: [...new Set(manifest.roots.map((item) => item.workspacePath))] },
+    }
+  })
   const rootEvidence = await dispatchRehearsalRoots({ roots: manifest.roots.map((root) => root.rootSessionId),
+    prepare: async () => {
+      for (const request of requests) fs.mkdirSync(path.dirname(request.receiptFile), { mode: 0o700 })
+      const exportRequest = path.join(input.scratchDir, 'export-batch-request.json'); writePrivate(exportRequest, requests)
+      // Keep qualification alive for the complete batch, within the previous
+      // cumulative export budget. Per-root import/read/native checks follow.
+      await stage(adapter, ['--stage', 'export', '--request-file', exportRequest], { cwd: repoRoot, timeout: 600_000 * requests.length, maxBuffer: 1024 * 1024 })
+    },
     execute: async (rootSessionId) => {
       const root = rootById.get(rootSessionId)!, index = manifest.roots.indexOf(root)
-      const directory = path.join(input.scratchDir, `root-${index}`); fs.mkdirSync(directory, { mode: 0o700 })
-      const request = { candidateSha, imageDigest: manifest.imageDigest, sourceDatabase: manifest.snapshotFile, rootSessionId,
-        extractionRoot: path.join(directory, 'extractions'), workspacePath: root.workspacePath, descriptorFile: path.join(directory, 'descriptor.json'),
-        payloadFile: path.join(directory, 'payload.json'), destinationStoreId: root.destinationStoreId, destinationDatabase: '/scratch/provider/.local/share/opencode/opencode.db',
-        providerHome: '/scratch/provider', providerUid: 65534, providerGid: 0, receiptFile: path.join(directory, 'export.json'),
-        sourceSnapshot: { canonicalOriginalDatabase: manifest.canonicalOriginalDatabase, originalDefaultDatabase: manifest.originalDefaultDatabase,
-          sourceStoreId: manifest.sourceIdentity, snapshotSha256: manifest.snapshotSha256, snapshotBytes: manifest.snapshotBytes,
-          roots: manifest.roots.map((item) => ({ rootSessionId: item.rootSessionId, graphDigest: item.graphDigest })),
-          workspaces: [...new Set(manifest.roots.map((item) => item.workspacePath))] },
-      }
-      const exportRequest = path.join(directory, 'export-request.json'); writePrivate(exportRequest, request)
-      await stage(adapter, ['--stage', 'export', '--request-file', exportRequest], { cwd: repoRoot, timeout: 600_000, maxBuffer: 1024 * 1024 })
+      const directory = path.join(input.scratchDir, `root-${index}`), request = requests[index]!
       const exported = JSON.parse(fs.readFileSync(request.receiptFile, 'utf8'))
       if (exported.status !== 'complete' || exported.evidence.sourceStoreId !== manifest.sourceIdentity || exported.evidence.graphDigest !== root.graphDigest) throw new Error('original source export differs from preflight')
       const owned = harness.startTransferProvider(adapter, schema, migrations, [root.workspacePath])
