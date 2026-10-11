@@ -947,11 +947,12 @@ impl FreshCodexState {
 
     /// Logs Codex's own writer refusal of a `thread/resume` of `thread_id`
     /// ("already has an active writer") at ERROR (`unit.writer_conflict`,
-    /// `source: freshcodex`, under `request_id`: the create's requestId; the
-    /// other lanes pass an empty one), naming the holder one bounded lookup
-    /// finds under the Codex home this sidecar reported (Task 16), and
-    /// returns the answer that tells the user who holds the conversation
-    /// ([`HeldAnswer`]). Other errors log nothing and answer `None`.
+    /// `source: freshcodex`, under `request_id`: the create's or the fork's
+    /// requestId; the other lanes pass an empty one), naming the holder one
+    /// bounded lookup finds under the Codex home this sidecar reported
+    /// (Task 16), and returns the answer that tells the user who holds the
+    /// conversation ([`HeldAnswer`]). Other errors log nothing and answer
+    /// `None`.
     async fn note_resume_refusal(
         &self,
         client: &CodexAppServerClient,
@@ -5234,10 +5235,16 @@ impl FreshCodexState {
             Err(err) => {
                 // Task 16 (review R2-M3): Codex refusing the child as held is
                 // logged at ERROR naming its holder (looked up while the
-                // child's sidecar still runs) and answered with that holder,
-                // as on every other resume lane.
+                // child's sidecar still runs), under the fork's request id
+                // (review R3-n2), and answered with that holder, as on every
+                // other resume lane.
                 let held = self
-                    .note_resume_refusal(&child_client, &child_id, "", &err)
+                    .note_resume_refusal(
+                        &child_client,
+                        &child_id,
+                        msg.request_id.as_deref().unwrap_or_default(),
+                        &err,
+                    )
                     .await;
                 shut_down_fork_child(&child_client, &mut child_proc, &child_ownership_id).await;
                 let (code, message) = match held {
@@ -17635,6 +17642,10 @@ pub(crate) mod tests {
         assert_eq!(conflicts.len(), 1, "{conflicts:?}");
         assert_eq!(conflicts[0].fields["source"], "freshcodex");
         assert_eq!(conflicts[0].fields["thread_id"], "child-held-fork");
+        assert_eq!(
+            conflicts[0].fields["request_id"], "fork-req-held",
+            "the ERROR is tied to the fork Codex refused"
+        );
         assert!(holder.answers(), "the holder is never signalled");
     }
 
@@ -17665,6 +17676,10 @@ pub(crate) mod tests {
             conflicts.len(),
             1,
             "Codex's own refusal stays an ERROR, naming the pane's process: {conflicts:?}"
+        );
+        assert_eq!(
+            conflicts[0].fields["request_id"], "fork-req-held",
+            "the ERROR is tied to the fork Codex refused"
         );
         pane.assert_alive_and_unchanged().await;
     }
