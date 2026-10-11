@@ -1784,10 +1784,14 @@ fn copy_provider_config_references_with_ownership(
             };
             CopySelection {
                 source: root.join(&reference.relative_path),
-                destination_relative: reference.provider_relative_path.clone().into(),
+                destination_relative: physical_provider_destination(
+                    context,
+                    &reference.provider_relative_path,
+                ),
             }
         })
         .collect::<Vec<_>>();
+    let config_selection_count = selections.len();
     selections.extend(
         context
             .prepared_inputs
@@ -1800,6 +1804,37 @@ fn copy_provider_config_references_with_ownership(
     );
     let protected = private_bound_destinations(context);
     let mut excluded = provider_credential_sources(user_provider_root);
+    // A prepared config leaf is the selected view of the raw file still held
+    // by its complete resource directory. Copy that view at its typed physical
+    // destination, retaining every other resource and the shared conflict policy.
+    for config in &selections[..config_selection_count] {
+        if !std::fs::metadata(&config.source).is_ok_and(|metadata| metadata.is_file()) {
+            continue;
+        }
+        let Ok(selected_source) = std::fs::canonicalize(&config.source) else {
+            continue;
+        };
+        for resource in &selections[config_selection_count..] {
+            let Ok(suffix) = config
+                .destination_relative
+                .strip_prefix(&resource.destination_relative)
+            else {
+                continue;
+            };
+            if suffix.as_os_str().is_empty() {
+                continue;
+            }
+            let original = resource.source.join(suffix);
+            if !std::fs::metadata(&original).is_ok_and(|metadata| metadata.is_file()) {
+                continue;
+            }
+            if let Ok(original) = std::fs::canonicalize(original) {
+                if original != selected_source {
+                    excluded.push(original);
+                }
+            }
+        }
+    }
     for selection in &selections {
         for relative in &protected {
             if let Ok(suffix) = Path::new(relative).strip_prefix(&selection.destination_relative) {
@@ -1850,6 +1885,69 @@ fn resource_mount_roots(
         .iter()
         .flat_map(|inputs| &inputs.resource_mounts)
         .map(|root| PathBuf::from(&root.provider_relative_path))
+        .collect()
+}
+
+// A resource's native HOME alias is a separate volume-subpath mount. Publish
+// through its declared physical HOME path, where the transaction and journal
+// share a filesystem. Every selected source still goes through the copier.
+fn physical_provider_destination(
+    context: &freshell_runtime_protocol::ProviderLaunchContext,
+    relative: &str,
+) -> PathBuf {
+    use freshell_runtime_protocol::ProviderResourceKind;
+    let destination = Path::new(relative);
+    context
+        .prepared_inputs
+        .iter()
+        .flat_map(|inputs| &inputs.resource_mounts)
+        .filter_map(|unit| {
+            let alias = Path::new(&unit.effective_destination)
+                .strip_prefix("/home/freshell/provider")
+                .ok()?;
+            if alias.as_os_str().is_empty() {
+                return None;
+            }
+            let suffix = destination.strip_prefix(alias).ok()?;
+            if unit.kind == ProviderResourceKind::File && !suffix.as_os_str().is_empty() {
+                return None;
+            }
+            Some((
+                alias.components().count(),
+                if suffix.as_os_str().is_empty() {
+                    PathBuf::from(&unit.provider_relative_path)
+                } else {
+                    Path::new(&unit.provider_relative_path).join(suffix)
+                },
+            ))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .map_or_else(|| destination.to_path_buf(), |(_, physical)| physical)
+}
+
+fn protected_resource_alias_entries(
+    context: &freshell_runtime_protocol::ProviderLaunchContext,
+    entries: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let aliases = context
+        .prepared_inputs
+        .iter()
+        .flat_map(|inputs| &inputs.resource_mounts)
+        .filter_map(|unit| {
+            Path::new(&unit.effective_destination)
+                .strip_prefix("/home/freshell/provider")
+                .ok()
+                .filter(|alias| !alias.as_os_str().is_empty())
+        })
+        .collect::<Vec<_>>();
+    entries
+        .iter()
+        .filter(move |relative| {
+            aliases
+                .iter()
+                .any(|alias| Path::new(relative).starts_with(alias))
+        })
+        .cloned()
         .collect()
 }
 
@@ -2095,7 +2193,11 @@ fn refresh_provider_config_in_stage(
     )?;
     let mut destinations = provider_config_references(context)
         .iter()
-        .map(|reference| reference.provider_relative_path.clone())
+        .map(|reference| {
+            physical_provider_destination(context, &reference.provider_relative_path)
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect::<Vec<_>>();
     destinations.extend(
         context
@@ -2116,13 +2218,18 @@ fn refresh_provider_config_in_stage(
             .map_err(|_| "provider projection identity exceeds 64 MiB")?,
     )
     .map_err(|error| error.to_string())?;
+    // Legacy manifests may name native aliases. Those entries confer no stale
+    // removal authority across a mount boundary; retain their files and inodes.
+    // Store only exact protected entries in the existing bounded metadata.
+    let mut protected = private_bound_destinations(context);
+    let previous = read_projection_manifest(provider_home)?;
+    let current = read_projection_manifest(&projection)?;
+    protected.extend(protected_resource_alias_entries(context, &previous));
+    protected.extend(protected_resource_alias_entries(context, &current));
     std::fs::write(
         stage.path().join("private-mountpoints.json"),
-        freshell_runtime_protocol::bounded_json_bytes(
-            &private_bound_destinations(context),
-            MAX_PROJECTION_METADATA_BYTES,
-        )
-        .map_err(|_| "private mountpoint metadata exceeds 64 MiB")?,
+        freshell_runtime_protocol::bounded_json_bytes(&protected, MAX_PROJECTION_METADATA_BYTES)
+            .map_err(|_| "private mountpoint metadata exceeds 64 MiB")?,
     )
     .map_err(|_| "private mountpoint metadata write failed")?;
     let mounted = freshell_runtime_protocol::bounded_json_bytes(
@@ -2429,7 +2536,9 @@ fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<()
         // selected skills alias. The common copier resolves those routes from
         // the staged graph, then validates every physical publication parent.
         // Manifest entries instead name physical inodes used for stale removal.
-        if previous.contains(relative) || current.contains(relative) {
+        if !protected.contains(relative)
+            && (previous.contains(relative) || current.contains(relative))
+        {
             let mut parent = provider_home.to_path_buf();
             for part in path.parent().into_iter().flat_map(Path::components) {
                 parent.push(part.as_os_str());
@@ -4300,8 +4409,27 @@ mod tests {
             "dependency-initial",
         )
         .unwrap();
+        // The selected template is the prepared view; its containing resource
+        // unit still supplies the original, unprepared config leaf.
+        std::fs::write(unit.join("opencode.jsonc"), r#"{"rules":"raw-resource"}"#).unwrap();
+        let selected_config = source.join(".freshell/selected-config.json");
+        std::fs::write(&selected_config, r#"{"rules":"prepared-initial"}"#).unwrap();
         std::fs::write(destination.join("native-owned-sibling"), "preserved").unwrap();
         let inode = std::fs::metadata(&destination).unwrap().ino();
+        let alias = home.join(".config/opencode");
+        std::fs::create_dir_all(&alias).unwrap();
+        std::fs::write(alias.join("provider-state"), "native-alias-state").unwrap();
+        let alias_inode = std::fs::metadata(&alias).unwrap().ino();
+        // The native alias is a separate volume-subpath mount. A prior logical
+        // manifest must not authorize publication or stale removal through it.
+        write_projection_manifest(
+            &home,
+            &std::collections::BTreeSet::from([
+                ".config/opencode".into(),
+                ".config/opencode/provider-state".into(),
+            ]),
+        )
+        .unwrap();
         let capability = McpCapabilityReference {
             grant_id: format!("grant-{}", uuid::Uuid::new_v4()),
             endpoint: "http://host.docker.internal:1234".into(),
@@ -4323,14 +4451,27 @@ mod tests {
                 resource_mounts: vec![ProviderResourceMount {
                     stage_relative_path: ".freshell/resource-units/root-0".into(),
                     provider_relative_path: ".freshell/provider-roots/root-0".into(),
-                    logical_destination: "/synthetic/outside/.opencode".into(),
-                    effective_destination: "/synthetic/outside/.opencode".into(),
+                    logical_destination: "/home/freshell/provider/.config/opencode".into(),
+                    effective_destination: "/home/freshell/provider/.config/opencode".into(),
                     kind: ProviderResourceKind::Directory,
                 }],
                 indexed_files: None,
             }),
             mcp_capability: Some(capability),
-            config: vec![],
+            config: vec![
+                ProviderConfigReference {
+                    root: ProviderConfigRoot::UserProvider,
+                    relative_path: ".freshell/resource-units/root-0".into(),
+                    provider_relative_path: ".config/opencode".into(),
+                    format: "directory".into(),
+                },
+                ProviderConfigReference {
+                    root: ProviderConfigRoot::UserProvider,
+                    relative_path: ".freshell/selected-config.json".into(),
+                    provider_relative_path: ".config/opencode/opencode.jsonc".into(),
+                    format: "jsonc".into(),
+                },
+            ],
             preparation: ProviderPreparation::Opencode {
                 project_config: vec![],
                 tui_config: None,
@@ -4340,6 +4481,31 @@ mod tests {
         };
         let uid = unsafe { libc::geteuid() };
         let gid = unsafe { libc::getegid() };
+        copy_provider_config_references(
+            &context,
+            "opencode",
+            owned.path(),
+            &source,
+            &home,
+            uid,
+            gid,
+        )
+        .unwrap();
+        let config = destination.join("opencode.jsonc");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&config).unwrap()).unwrap()
+                ["rules"],
+            "prepared-initial"
+        );
+        // Initial publication writes its current manifest. Restore the legacy
+        // alias entries so refresh still exercises their lack of authority over
+        // the separately mounted native alias and its provider-created state.
+        let mut legacy = read_projection_manifest(&home).unwrap();
+        legacy.extend([
+            ".config/opencode".to_string(),
+            ".config/opencode/provider-state".to_string(),
+        ]);
+        write_projection_manifest(&home, &legacy).unwrap();
         refresh_provider_config_references(
             &context,
             "opencode",
@@ -4359,6 +4525,7 @@ mod tests {
             "dependency-refreshed",
         )
         .unwrap();
+        std::fs::write(&selected_config, r#"{"rules":"prepared-refreshed"}"#).unwrap();
         refresh_provider_config_references(
             &context,
             "opencode",
@@ -4373,10 +4540,53 @@ mod tests {
             std::fs::read_to_string(destination.join("node_modules/dependency/index.js")).unwrap(),
             "dependency-refreshed"
         );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&config).unwrap()).unwrap()
+                ["rules"],
+            "prepared-refreshed"
+        );
         assert_eq!(std::fs::metadata(&destination).unwrap().ino(), inode);
+        assert_eq!(std::fs::metadata(&alias).unwrap().ino(), alias_inode);
+        assert_eq!(
+            std::fs::read_to_string(alias.join("provider-state")).unwrap(),
+            "native-alias-state"
+        );
+        assert!(!read_projection_manifest(&home)
+            .unwrap()
+            .iter()
+            .any(|entry| Path::new(entry).starts_with(".config/opencode")));
         assert_eq!(
             std::fs::read_to_string(destination.join("native-owned-sibling")).unwrap(),
             "preserved"
+        );
+        // A valid resource unit cannot mask a missing independently selected
+        // configuration reference, even when both map to the same physical root.
+        let manifest = std::fs::read(home.join(PROVIDER_PROJECTION_MANIFEST)).unwrap();
+        let mut missing = context.clone();
+        missing.config[1].relative_path = ".freshell/missing-selected-config".into();
+        assert!(refresh_provider_config_references(
+            &missing,
+            "opencode",
+            owned.path(),
+            &source,
+            &home,
+            uid,
+            gid,
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(home.join(PROVIDER_PROJECTION_MANIFEST)).unwrap(),
+            manifest
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.join("node_modules/dependency/index.js")).unwrap(),
+            "dependency-refreshed"
+        );
+        assert_eq!(std::fs::metadata(&destination).unwrap().ino(), inode);
+        assert_eq!(std::fs::metadata(&alias).unwrap().ino(), alias_inode);
+        assert_eq!(
+            std::fs::read_to_string(alias.join("provider-state")).unwrap(),
+            "native-alias-state"
         );
     }
 
