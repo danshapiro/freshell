@@ -525,8 +525,11 @@ pub fn reconcile_loaded(state: &WsState, terminal_id: &str) {
 /// home on a hung network mount) means the threads could not be checked,
 /// never that none is held: WARN `unit.threads.unchecked`, and the stop
 /// goes on; the read is left to finish on its own and its result is
-/// dropped. A unit's stop runs this once (a stop joining one in flight
-/// skips it), so a hung home holds up at most one read per stopped pane.
+/// dropped. Only a stop request that arrives before the unit's stop has
+/// begun runs this (a stop joining one in flight skips it), so a hung home
+/// holds up about one read thread per stopped pane: stop requests that
+/// arrive together, before the first of them begins the stop (a Shift-X
+/// racing an idle reap), each start one.
 pub(crate) fn reconcile_before_stop(state: &WsState, terminal_id: &str) {
     refresh_lock_paths(state, terminal_id);
     let Some(read) = LockRead::prepare(state, terminal_id) else {
