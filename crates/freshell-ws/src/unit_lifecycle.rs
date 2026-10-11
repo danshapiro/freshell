@@ -1410,12 +1410,17 @@ fn unit_kill_fence(
 /// The fence of a kill reaching a unit that is still starting (its row holds
 /// no retained claim yet), as for a Live pane (Task 13 review M3): an
 /// observed pair the kill carries must be the current pair of the
-/// conversation the unit is starting, while that conversation is Starting
-/// or Live; otherwise the kill is refused as stale and cancels nothing (a
-/// delayed kill from another device cannot cancel the start of an
-/// auto-resumed or stuck-restart replacement). A kill carrying no pair has
-/// no retained stamp to fall back to and is not fenced; nor is a start of a
-/// fresh conversation (no session id yet).
+/// conversation the unit is starting, whatever that conversation's state;
+/// otherwise the kill is refused as stale, teaching the current pair, and
+/// cancels nothing (a delayed kill from another device cannot cancel the
+/// start of an auto-resumed or stuck-restart replacement). That includes a
+/// conversation that is still free (re-review 3, R3-M1): a restore-type
+/// create (a stuck restart, a sidebar or Resume reopen) starts its
+/// app-server before it claims the conversation and claims it only once the
+/// app-server listens, so for most of its start the key is Vacant. A unit
+/// with its own key Stopping never gets here (the kill joins). A kill
+/// carrying no pair has no retained stamp to fall back to and is not
+/// fenced; nor is a start of a fresh conversation (no session id yet).
 fn starting_unit_kill_fence(
     ownership: &freshell_ownership::RuntimeOwnershipRegistry,
     kill: &freshell_protocol::TerminalKill,
@@ -1428,21 +1433,10 @@ fn starting_unit_kill_fence(
     };
     let session_id = entry.unit.label().session_id?;
     let current = ownership.observe(&entry.provider, &session_id);
-    match &current.state {
-        freshell_ownership::OwnershipState::Starting { .. }
-        | freshell_ownership::OwnershipState::Live { .. } => {
-            let stale =
-                observed.epoch != current.epoch || observed.generation != current.generation;
-            stale.then(|| {
-                crate::terminal::stale_kill_refusal(
-                    &current.state,
-                    current.epoch,
-                    current.generation,
-                )
-            })
-        }
-        _ => None,
-    }
+    let stale = observed.epoch != current.epoch || observed.generation != current.generation;
+    stale.then(|| {
+        crate::terminal::stale_kill_refusal(&current.state, current.epoch, current.generation)
+    })
 }
 
 /// A kill named a terminal nothing runs for: `Ok(())` only when the owner
