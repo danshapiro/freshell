@@ -48,7 +48,7 @@ fn provider_parity_explicit_opencode_roots() {
         .unwrap();
     let helper = std::process::Command::new("pnpm")
         .args(["exec", "tsx", "--eval", "import(process.argv[1]).then(module => process.stdout.write(JSON.stringify(module.providerParityCommands(process.argv[2]))))"])
-        .arg(repo.join("test/integration/server/provider-parity-environment.ts"))
+        .arg(repo.join("test/helpers/provider-parity-environment.ts"))
         .arg(&workspace)
         .current_dir(repo)
         .output().unwrap();
@@ -93,6 +93,84 @@ fn provider_parity_explicit_opencode_roots() {
         std::os::unix::fs::symlink(project.join("missing-selected"), &project_config).unwrap();
         assert!(discover_opencode(request()).is_err());
     }
+}
+
+#[test]
+fn managed_provider_environment_selects_only_its_cwd_configuration() {
+    use crate::managed_provider_references::sources::{
+        discover_opencode, select_opencode_resource_roots, OpencodeDiscovery,
+    };
+    let owned = tempfile::tempdir().unwrap();
+    let workspace = owned.path().join("workspace");
+    let home = owned.path().join("home");
+    let global = home.join(".config/opencode");
+    let unrelated = owned.path().join(".opencode");
+    for directory in [&workspace, &global, &unrelated] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    let marker = unrelated.join("unrelated-resource");
+    std::fs::write(&marker, "unrelated owned ancestor").unwrap();
+    let global_config = global.join("opencode.json");
+    std::fs::write(&global_config, "{}").unwrap();
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    // This is the same selection function the full managed driver dispatches.
+    let helper = std::process::Command::new("pnpm")
+        .args(["exec", "tsx", "--eval", "import(process.argv[1]).then(module => process.stdout.write(JSON.stringify(module.managedEnvironmentOpencodeSelection())))"])
+        .arg(repo.join("test/helpers/provider-parity-environment.ts"))
+        .current_dir(repo)
+        .output().unwrap();
+    assert!(helper.status.success(), "owned fixture selector failed");
+    let environment: BTreeMap<String, String> = serde_json::from_slice(&helper.stdout).unwrap();
+    let lookup = |key: &str| environment.get(key).cloned();
+    for scenario in [
+        "healthy",
+        "missing-reference",
+        "startup-before-identity",
+        "preflight",
+    ] {
+        let cwd = workspace.join(scenario);
+        std::fs::create_dir_all(&cwd).unwrap();
+        let selected = cwd.join("opencode.json");
+        std::fs::write(&selected, "{}").unwrap();
+        let request = || OpencodeDiscovery {
+            home: &home,
+            cwd: &cwd,
+            worktree: &workspace,
+            config_root: &global,
+            env: &lookup,
+        };
+        let roots = select_opencode_resource_roots(&request()).unwrap();
+        assert!(
+            !roots.iter().any(|root| root.logical_path == unrelated),
+            "managed fixture selected an unrelated ancestor outside its owned workspace"
+        );
+        let sources = discover_opencode(request()).unwrap();
+        assert!(
+            sources.iter().any(|source| source.logical_path == selected),
+            "explicit relative selection lost the scenario's cwd configuration"
+        );
+        assert!(
+            sources
+                .iter()
+                .any(|source| source.logical_path == global_config),
+            "global plugin and absolute-reference configuration was lost"
+        );
+        // Closing ancestor discovery must still reject a broken selected input.
+        std::fs::remove_file(&selected).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(cwd.join("missing-selected"), &selected).unwrap();
+            assert!(discover_opencode(request()).is_err());
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(marker).unwrap(),
+        "unrelated owned ancestor"
+    );
 }
 
 // Read only the fixture's actual native process (or its bounded hook ancestry).

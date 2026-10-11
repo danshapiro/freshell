@@ -1,6 +1,11 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
+/** Select each managed environment scenario's own relative configuration. */
+export function managedEnvironmentOpencodeSelection(): Record<string, string> {
+  return {}
+}
+
 /** Establish selected fixture roots before the harness captures its policy. */
 export function prepareProviderParityUserRoots(home: string, xdgConfigHome: string): void {
   for (const root of ['.claude', '.codex', '.amplifier']) {

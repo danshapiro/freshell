@@ -9,6 +9,7 @@ import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION, type ClientMessage } from '../../shared/ws-protocol.js'
 import { ManagedRuntimeBrowserRig, type ManagedRuntimeView } from '../../test/e2e-browser/helpers/managed-runtime.js'
 import { authorizeProviderParityRequest, captureProviderParityVolumes, cleanupProviderParityVolumes } from '../../test/helpers/provider-parity-broker.js'
+import { managedEnvironmentOpencodeSelection } from '../../test/helpers/provider-parity-environment.js'
 import { fakeOnecliGrants } from '../../test/integration/server/provider-parity-onecli.js'
 import type { InitialProviderVolumeAuthorization } from './runtime-test-broker.js'
 import { resolvePairedExternalFixture } from './e2e-external-target.js'
@@ -239,7 +240,7 @@ export async function runManagedEnvironmentTarget() {
     const home = path.join(root, 'home'), xdg = path.join(home, 'fixture-xdg'), workspace = path.join(root, 'workspace')
     // The synthetic grant is the only selected OneCLI input. RustServer merges
     // ambient env, so explicitly close optional host auth/CA references too.
-    const environment = { ...grants.serverEnv, HOME: home, XDG_CONFIG_HOME: xdg,
+    const environment = { ...grants.serverEnv, ...managedEnvironmentOpencodeSelection(), HOME: home, XDG_CONFIG_HOME: xdg,
       FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: '', FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: '' }
     rig = new ManagedRuntimeBrowserRig(repoRoot, 2, { ...environment, FRESHELL_MANAGED_ENVIRONMENT_FIXTURE_ONLY: '1' },
       environment, 'release', { enabledProviders: ['opencode'] }, home,
