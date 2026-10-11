@@ -1,9 +1,9 @@
 //! Presentation-only composition of actual owned fresh-agent history.
 use super::*;
 use freshell_runtime_client::RuntimeClient;
-use freshell_runtime_protocol::{DesiredState, IncarnationId, LaunchState, RuntimeView};
+use freshell_runtime_protocol::{DesiredState, IncarnationId, LaunchState, RuntimeView, SoulId};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     time::{Duration, Instant},
 };
 
@@ -13,10 +13,27 @@ const READ_BUDGET: Duration = Duration::from_secs(10);
 const PRESENTATION_TTL: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Default)]
-pub(super) struct Cache(Arc<tokio::sync::Mutex<HashMap<String, CachedItem>>>);
+pub(super) struct Cache(Arc<tokio::sync::Mutex<PresentationCache>>);
+
+#[derive(Default)]
+struct PresentationCache {
+    entries: HashMap<String, CachedRead>,
+    next_after: Option<SoulId>,
+}
+
+struct CachedRead {
+    attempted_at: Instant,
+    refresh_succeeded: bool,
+    item: Option<CachedItem>,
+}
+
+impl CachedRead {
+    fn refresh_due(&self) -> bool {
+        self.attempted_at.elapsed() >= PRESENTATION_TTL
+    }
+}
 
 struct CachedItem {
-    at: Instant,
     incarnation_id: IncarnationId,
     item: DirItem,
 }
@@ -40,9 +57,16 @@ pub(super) async fn read(client: &RuntimeClient, cache: &Cache) -> Snapshot {
             return snapshot;
         }
     };
-    let mut cached = cache.0.lock().await;
-    cached.retain(|_, entry| entry.at.elapsed() < PRESENTATION_TTL);
-    let mut pending = Vec::new();
+    // Serialize discovery passes, including the lock wait in the same budget.
+    // TTL schedules refresh; it must not erase already discovered presentation.
+    let mut cached = match tokio::time::timeout_at(deadline, cache.0.lock()).await {
+        Ok(cached) => cached,
+        Err(_) => {
+            tracing::warn!(target: "freshell_server::session_directory", reason = "managed_discovery_busy", "managed_directory_partial");
+            snapshot.partial = true;
+            return snapshot;
+        }
+    };
     let mut souls = BTreeMap::new();
     for view in inventory
         .into_iter()
@@ -53,6 +77,7 @@ pub(super) async fn read(client: &RuntimeClient, cache: &Cache) -> Snapshot {
             .or_insert_with(Vec::new)
             .push(view);
     }
+    let mut groups = Vec::new();
     for views in souls.into_values() {
         let view = &views[0];
         let Some(native_id) = view
@@ -72,24 +97,31 @@ pub(super) async fn read(client: &RuntimeClient, cache: &Cache) -> Snapshot {
             native_id,
             views
                 .iter()
-                .map(|v| (&v.incarnation_id, &v.container_id, v.execution_generation))
+                .map(|v| (
+                    &v.incarnation_id,
+                    &v.container_id,
+                    v.execution_generation,
+                    v.launch_state
+                ))
                 .collect::<Vec<_>>()
         );
-        if let Some(entry) = cached.get(&key) {
-            let Some(current) = views
-                .iter()
-                .find(|v| v.incarnation_id == entry.incarnation_id)
-            else {
-                continue;
-            };
-            let mut item = entry.item.clone();
-            item.is_running = running(current);
-            snapshot.items.push(item);
-        } else {
-            pending.push((key, views));
-        }
+        groups.push((key, views));
     }
-    drop(cached);
+    let current_keys: HashSet<_> = groups.iter().map(|(key, _)| key.as_str()).collect();
+    cached
+        .entries
+        .retain(|key, _| current_keys.contains(key.as_str()));
+    let mut pending: Vec<_> = groups
+        .iter()
+        .filter(|(key, _)| cached.entries.get(key).is_none_or(CachedRead::refresh_due))
+        .cloned()
+        .collect();
+    // Advance past actual dispatched reads, even if they fail or time out.
+    // Otherwise expired/unreadable roots at the beginning starve the tail.
+    if let Some(after) = &cached.next_after {
+        let split = pending.partition_point(|(_, views)| &views[0].soul_id <= after);
+        pending.rotate_left(split);
+    }
     if pending.len() > MAX_NATIVE_READS {
         tracing::warn!(target: "freshell_server::session_directory", reason = "native_read_budget", pending_count = pending.len(), "managed_directory_partial");
         snapshot.partial = true;
@@ -101,6 +133,7 @@ pub(super) async fn read(client: &RuntimeClient, cache: &Cache) -> Snapshot {
             let Some((key, views)) = pending.next() else {
                 break;
             };
+            cached.next_after = Some(views[0].soul_id.clone());
             let client = client.clone();
             tasks.spawn(async move {
                 let history = client.fresh_agent_history(views[0].soul_id.clone()).await;
@@ -112,26 +145,24 @@ pub(super) async fn read(client: &RuntimeClient, cache: &Cache) -> Snapshot {
         }
         match tokio::time::timeout_at(deadline, tasks.join_next()).await {
             Ok(Some(Ok((key, views, history)))) => {
-                let projected = history.ok().and_then(|history| {
-                    let incarnation_id = history["managedDirectory"]["incarnationId"].as_str()?;
-                    let view = views
-                        .iter()
-                        .find(|v| v.incarnation_id.as_str() == incarnation_id)?;
-                    Some((view.incarnation_id.clone(), project(view, &history)?))
-                });
-                if let Some((incarnation_id, item)) = projected {
-                    cache.0.lock().await.insert(
-                        key,
-                        CachedItem {
-                            at: Instant::now(),
-                            incarnation_id,
-                            item: item.clone(),
-                        },
-                    );
-                    snapshot.items.push(item);
-                } else {
+                let projected = history
+                    .ok()
+                    .and_then(|history| project_owned(&views, &history));
+                if projected.is_none() {
                     diagnostic(&views[0], "owned_history_unavailable_or_invalid");
                     snapshot.partial = true;
+                }
+                let entry = cached.entries.entry(key).or_insert(CachedRead {
+                    attempted_at: Instant::now(),
+                    refresh_succeeded: false,
+                    item: None,
+                });
+                entry.attempted_at = Instant::now();
+                entry.refresh_succeeded = projected.is_some();
+                // A failed refresh may retain the last presentation for the
+                // unchanged owner identity, but it always remains partial.
+                if let Some(item) = projected {
+                    entry.item = Some(item);
                 }
             }
             _ => {
@@ -143,7 +174,41 @@ pub(super) async fn read(client: &RuntimeClient, cache: &Cache) -> Snapshot {
             }
         }
     }
+    for (key, views) in groups {
+        let Some(entry) = cached.entries.get(&key) else {
+            snapshot.partial = true;
+            continue;
+        };
+        let Some(saved) = &entry.item else {
+            snapshot.partial = true;
+            continue;
+        };
+        let Some(current) = views
+            .iter()
+            .find(|v| v.incarnation_id == saved.incarnation_id)
+        else {
+            snapshot.partial = true;
+            continue;
+        };
+        if !entry.refresh_succeeded || entry.refresh_due() {
+            snapshot.partial = true;
+        }
+        let mut item = saved.item.clone();
+        item.is_running = running(current);
+        snapshot.items.push(item);
+    }
     snapshot
+}
+
+fn project_owned(views: &[RuntimeView], history: &Value) -> Option<CachedItem> {
+    let incarnation_id = history["managedDirectory"]["incarnationId"].as_str()?;
+    let view = views
+        .iter()
+        .find(|v| v.incarnation_id.as_str() == incarnation_id)?;
+    Some(CachedItem {
+        incarnation_id: view.incarnation_id.clone(),
+        item: project(view, history)?,
+    })
 }
 
 fn diagnostic(view: &RuntimeView, reason: &str) {
@@ -243,9 +308,12 @@ mod tests {
 
     /// No processes or containers are created. The real supervisor owns the stop
     /// decision and registry writes; only the external runtime backend is replaced.
+    #[derive(Default)]
     struct NativeBackend {
         history_home: Option<PathBuf>,
         mismatch: bool,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+        slow_souls: HashSet<SoulId>,
     }
 
     #[async_trait]
@@ -257,6 +325,10 @@ mod tests {
             native_id: &str,
             _: &std::path::Path,
         ) -> Result<serde_json::Value, BackendError> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.slow_souls.contains(handle.soul_id()) {
+                tokio::time::sleep(READ_BUDGET + Duration::from_secs(1)).await;
+            }
             assert_eq!(handle.fresh_agent().unwrap().provider.as_str(), provider);
             let mut snapshot = freshell_freshagent::native_history::read(
                 provider,
@@ -353,7 +425,7 @@ mod tests {
                 payload_digest: "payload-test".into(),
                 requested_limits: limits(),
                 profile: RuntimeProfile::Custom,
-                project_key: "workspace".into(),
+                project_key: format!("project-{soul_id}"),
                 fixture: None,
                 terminal: None,
                 fresh_agent: Some(fresh_agent),
@@ -553,6 +625,10 @@ mod tests {
     }
 
     async fn directory_page(app: Router) -> Value {
+        directory_query(app, "").await
+    }
+
+    async fn directory_query(app: Router, query: &str) -> Value {
         use axum::{
             body::{to_bytes, Body},
             http::Request,
@@ -560,7 +636,9 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/session-directory?surface=history&priority=visible")
+                    .uri(format!(
+                        "/api/session-directory?surface=history&priority=visible{query}"
+                    ))
                     .header("x-auth-token", "tok")
                     .body(Body::empty())
                     .unwrap(),
@@ -569,6 +647,226 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), 200);
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn managed_directory_timeout_advances_past_dispatched_souls() {
+        let root = tempfile::tempdir().unwrap();
+        let web = tempfile::tempdir().unwrap();
+        let provider_home = root.path().join("provider");
+        let registry = Registry::open(root.path(), None).unwrap();
+        let mut views = Vec::new();
+        for ordinal in 0..5 {
+            let native_id = format!("63333000-0000-4333-8333-000000001{ordinal:03}");
+            native_fixture(&provider_home, "claude", &native_id);
+            views.push(
+                register_in(
+                    &registry,
+                    root.path(),
+                    "claude",
+                    "freshclaude",
+                    &native_id,
+                    root.path().to_str().unwrap(),
+                )
+                .await,
+            );
+        }
+        views.sort_by(|a, b| a.soul_id.cmp(&b.soul_id));
+        let later_id = views.last().unwrap().native_session_id.as_deref().unwrap();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (socket, control) = start_control(
+            root.path(),
+            registry,
+            Arc::new(NativeBackend {
+                history_home: Some(provider_home),
+                mismatch: false,
+                reads: reads.clone(),
+                slow_souls: views
+                    .iter()
+                    .take(4)
+                    .map(|view| view.soul_id.clone())
+                    .collect(),
+            }),
+        )
+        .await;
+        let app = router(directory_state(web.path())).layer(axum::Extension(RuntimeClient::new(
+            socket,
+            "test-control-secret",
+        )));
+        let initial = directory_page(app.clone()).await;
+        assert!(initial["items"].as_array().unwrap().is_empty());
+        assert_eq!(initial["partial"], true);
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "deadline holds the per-request concurrency bound"
+        );
+        let refreshed = directory_page(app).await;
+        assert_eq!(
+            refreshed["items"][0]["sessionId"], later_id,
+            "the next request must advance beyond timed-out reads"
+        );
+        assert_eq!(refreshed["partial"], true);
+        control.abort();
+    }
+
+    #[tokio::test]
+    async fn managed_directory_retains_partial_after_failed_refresh_on_warm_requests() {
+        let root = tempfile::tempdir().unwrap();
+        let web = tempfile::tempdir().unwrap();
+        let provider_home = root.path().join("provider");
+        let native_id = "63333000-0000-4333-8333-000000000212";
+        native_fixture(&provider_home, "claude", native_id);
+        let (registry, _) = register(
+            root.path(),
+            "claude",
+            "freshclaude",
+            native_id,
+            root.path().to_str().unwrap(),
+        )
+        .await;
+        let (socket, control) = start_control(
+            root.path(),
+            registry,
+            Arc::new(NativeBackend {
+                history_home: Some(provider_home.clone()),
+                mismatch: false,
+                ..Default::default()
+            }),
+        )
+        .await;
+        let app = router(directory_state(web.path())).layer(axum::Extension(RuntimeClient::new(
+            socket,
+            "test-control-secret",
+        )));
+        let initial = directory_page(app.clone()).await;
+        assert!(initial.get("partial").is_none());
+        tokio::time::sleep(PRESENTATION_TTL + Duration::from_millis(30)).await;
+        std::fs::write(
+            provider_home
+                .join(".claude/projects/fixture")
+                .join(format!("{native_id}.jsonl")),
+            "{malformed",
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let failed = directory_page(app.clone()).await;
+            assert_eq!(
+                failed["items"][0]["sessionId"], native_id,
+                "last known presentation survives failed refresh"
+            );
+            assert_eq!(
+                failed["partial"], true,
+                "warm failed-refresh state must remain truthful"
+            );
+        }
+        control.abort();
+    }
+
+    #[tokio::test]
+    async fn managed_directory_discovers_beyond_read_cap_across_expired_refresh_and_pages() {
+        check_discovery_progress(false).await;
+    }
+
+    #[tokio::test]
+    async fn managed_directory_unreadable_first_batch_cannot_starve_later_history() {
+        check_discovery_progress(true).await;
+    }
+
+    async fn check_discovery_progress(unreadable_first_batch: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let web = tempfile::tempdir().unwrap();
+        let provider_home = root.path().join("provider");
+        let registry = Registry::open(root.path(), None).unwrap();
+        let mut views = Vec::new();
+        for ordinal in 0..51 {
+            let native_id = format!("63333000-0000-4333-8333-{ordinal:012}");
+            views.push(
+                register_in(
+                    &registry,
+                    root.path(),
+                    "claude",
+                    "freshclaude",
+                    &native_id,
+                    root.path().to_str().unwrap(),
+                )
+                .await,
+            );
+        }
+        views.sort_by(|a, b| a.soul_id.cmp(&b.soul_id));
+        let newest_id = views.last().unwrap().native_session_id.as_deref().unwrap();
+        for view in &views {
+            let native_id = view.native_session_id.as_deref().unwrap();
+            if !unreadable_first_batch || native_id == newest_id {
+                native_fixture(&provider_home, "claude", native_id);
+            }
+        }
+        let newest_file = provider_home
+            .join(".claude/projects/fixture")
+            .join(format!("{newest_id}.jsonl"));
+        let records = std::fs::read_to_string(&newest_file)
+            .unwrap()
+            .replace("2026-10-11T10:00:00Z", "2026-10-12T10:00:00Z")
+            .replace("2026-10-11T10:00:01Z", "2026-10-12T10:00:01Z")
+            .replace("Saved managed request", "Newest late discovered request");
+        std::fs::write(newest_file, records).unwrap();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (socket, control) = start_control(
+            root.path(),
+            registry,
+            Arc::new(NativeBackend {
+                history_home: Some(provider_home),
+                mismatch: false,
+                reads: reads.clone(),
+                ..Default::default()
+            }),
+        )
+        .await;
+        let app = router(directory_state(web.path())).layer(axum::Extension(RuntimeClient::new(
+            socket,
+            "test-control-secret",
+        )));
+        let initial = directory_page(app.clone()).await;
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 50);
+        assert_eq!(initial["partial"], true);
+        assert!(!initial["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["sessionId"] == newest_id));
+        tokio::time::sleep(PRESENTATION_TTL + Duration::from_millis(30)).await;
+        let refreshed = directory_page(app.clone()).await;
+        assert_eq!(
+            refreshed["items"][0]["sessionId"], newest_id,
+            "ordinary refresh must discover the later, newest native root"
+        );
+        assert!(reads.load(std::sync::atomic::Ordering::SeqCst) <= 100);
+        if unreadable_first_batch {
+            assert_eq!(refreshed["partial"], true);
+            assert_eq!(refreshed["items"].as_array().unwrap().len(), 1);
+        } else {
+            let cursor = refreshed["nextCursor"]
+                .as_str()
+                .expect("discovered inventory must support normal paging");
+            let second_page = directory_query(app.clone(), &format!("&cursor={cursor}")).await;
+            assert_eq!(second_page["items"].as_array().unwrap().len(), 1);
+            assert_eq!(second_page["nextCursor"], Value::Null);
+            let mut ids = refreshed["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .chain(second_page["items"].as_array().unwrap())
+                .map(|row| row["sessionId"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(ids.len(), 51);
+            assert!(second_page.get("partial").is_none());
+        }
+        let search = directory_query(app, "&query=Newest&tier=title").await;
+        assert_eq!(search["items"].as_array().unwrap().len(), 1);
+        assert_eq!(search["items"][0]["sessionId"], newest_id);
+        control.abort();
     }
 
     #[tokio::test]
@@ -592,6 +890,7 @@ mod tests {
             Arc::new(NativeBackend {
                 history_home: Some(provider_home),
                 mismatch: false,
+                ..Default::default()
             }),
         )
         .await;
@@ -708,6 +1007,7 @@ mod tests {
             Arc::new(NativeBackend {
                 history_home: Some(provider_home),
                 mismatch: false,
+                ..Default::default()
             }),
         )
         .await;
@@ -755,6 +1055,7 @@ mod tests {
                     Arc::new(NativeBackend {
                         history_home: Some(provider_home),
                         mismatch: false,
+                        ..Default::default()
                     }),
                 )
                 .await;
@@ -851,6 +1152,7 @@ mod tests {
                 Arc::new(NativeBackend {
                     history_home: Some(provider_home),
                     mismatch: fault == "mismatched_root",
+                    ..Default::default()
                 }),
             )
             .await;
