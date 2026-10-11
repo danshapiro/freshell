@@ -109,6 +109,11 @@ pub struct HandoffTestHooks {
     pub pause_post_abort_broadcast: Option<std::sync::Arc<tokio::sync::Notify>>,
     pub pause_post_abort_broadcast_once: std::sync::atomic::AtomicBool,
     pub pause_post_abort_broadcast_parked: std::sync::atomic::AtomicBool,
+    /// Make the runner panic while it waits for its TERMINAL prior's unit
+    /// stop (notified by the test once the stop is in flight): the unwind
+    /// the abort cleanup must keep the key through until the prior's Gone.
+    /// Never notified in production.
+    pub panic_mid_unit_prior_stop: tokio::sync::Notify,
     /// Ordered step labels ("Reaped", "TargetStarted") — test assertions.
     pub events: std::sync::Mutex<Vec<&'static str>>,
 }
@@ -136,6 +141,7 @@ impl Default for HandoffTestHooks {
             pause_post_abort_broadcast: None,
             pause_post_abort_broadcast_once: std::sync::atomic::AtomicBool::new(false),
             pause_post_abort_broadcast_parked: std::sync::atomic::AtomicBool::new(false),
+            panic_mid_unit_prior_stop: tokio::sync::Notify::new(),
             events: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -1955,6 +1961,65 @@ impl SessionHandoffRunner {
         }
     }
 
+    /// The abort cleanup's wait for a dying unit prior. A terminal prior in a
+    /// pane unit whose stop is in flight (begun under this handoff's own
+    /// operation, so the key is still this operation's `Handoff`, never
+    /// `Stopping`) is confirmed dead only at its unit's Gone. The cleanup
+    /// waits for that Gone on the stop's own handle before it fails the
+    /// operation, so the conversation is never freed while the old process
+    /// may still hold its lock: meanwhile a competing start keeps the typed
+    /// in-progress answer. A stop that never confirms Gone keeps the key
+    /// `Handoff`, as a fenced reap does. Any other prior, or a stop already
+    /// Gone, returns at once.
+    async fn await_prior_units_gone(
+        &self,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        owner: &OwnerIdentity,
+    ) {
+        if owner.kind != RuntimeOwnerKind::Terminal {
+            return;
+        }
+        let Some(terminal_id) = owner.terminal_id.as_deref() else {
+            return;
+        };
+        let Some(entry) = self.fresh_agent.units.by_terminal(terminal_id) else {
+            return;
+        };
+        let Some(stop) = entry
+            .unit
+            .stop_in_flight()
+            .filter(|stop| stop.try_report().is_none())
+        else {
+            return; // no stop, or it is already Gone
+        };
+        let unit_id = entry.unit.id().to_string();
+        tracing::warn!(target: "freshell_unit",
+            event = "unit.handoff.abort_waits_for_gone",
+            unit_id = %unit_id,
+            provider = %provider,
+            session_id = %session_id,
+            terminal_id = %terminal_id,
+            operation_id = %operation_id,
+            "the handoff ended while its prior's stop was in flight; the conversation stays \
+             in the handoff until the prior is gone");
+        if let Some(hooks) = self.test_hooks.as_ref() {
+            hooks.record("AbortAwaitsPriorGone");
+        }
+        let started = std::time::Instant::now();
+        let _ = stop.wait().await;
+        tracing::info!(target: "freshell_unit",
+            event = "unit.handoff.abort_prior_gone",
+            unit_id = %unit_id,
+            provider = %provider,
+            session_id = %session_id,
+            terminal_id = %terminal_id,
+            operation_id = %operation_id,
+            wait_ms = started.elapsed().as_millis() as u64,
+            "the aborted handoff's prior is gone; the conversation is released");
+    }
+
     /// Round-2 review: a POSITIVE liveness re-probe of the prior runtime (a
     /// reap timeout does NOT imply liveness — and neither does an abort
     /// inside the prior-kill await, round-3 review I-1). Terminal priors:
@@ -2592,7 +2657,17 @@ impl SessionHandoffRunner {
             Some((owner, _)) => {
                 let live = match decision {
                     AbortFailDecision::Probe => {
-                        self.probe_prior_live(provider, session_id, owner).await
+                        self.await_prior_units_gone(provider, session_id, operation_id, owner)
+                            .await;
+                        let live = self.probe_prior_live(provider, session_id, owner).await;
+                        if !live {
+                            // A stop that began after the wait's check (the
+                            // probe answers not live for it): wait for its
+                            // Gone too.
+                            self.await_prior_units_gone(provider, session_id, operation_id, owner)
+                                .await;
+                        }
+                        live
                     }
                     AbortFailDecision::Known(live) => live,
                 };
@@ -3469,7 +3544,16 @@ impl SessionHandoffRunner {
         }
         let mut stop = tokio::spawn(stop);
         let budget = std::time::Duration::from_millis(self.reap_timeout_ms);
+        let test_panic = async {
+            match self.test_hooks.as_ref() {
+                Some(hooks) => hooks.panic_mid_unit_prior_stop.notified().await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
+            () = test_panic => panic!(
+                "test seam: the handoff runner panics while its unit prior's stop is in flight"
+            ),
             joined = &mut stop => Some(match joined {
                 Ok(Some(report)) if is_user_kill(&report.reason) => {
                     StopOutcomePriv::StoppedByUserKill

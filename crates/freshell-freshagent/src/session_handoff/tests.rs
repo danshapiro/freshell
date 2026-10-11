@@ -9350,14 +9350,22 @@ async fn a_handoff_never_stops_an_extra_hold() {
     u.rig.registry.kill(&u.prior.terminal_id);
 }
 
-/// Handoff edge (c): a handoff aborted while its unit prior's stop is in
-/// flight never puts that prior back `Live`. The prior's row stays Running
-/// until its unit's Gone, but a unit whose stop has begun is dying, so the
-/// abort's liveness re-probe answers not live and the key ends Vacant.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_handoff_aborted_during_its_unit_priors_stop_never_restores_it_live() {
-    let _guard = ENV_LOCK.lock().await;
-    let sid = format!("aborted-mid-stop-{}", uuid::Uuid::new_v4());
+/// How a handoff's task ends while its unit prior's stop is in flight.
+enum MidStopUnwind {
+    /// Its `JoinHandle` is aborted (cancellation).
+    Abort,
+    /// The runner panics (the test seam inside the stop's wait).
+    Panic,
+}
+
+/// Unwinds a switch away from a unit prior while the prior's stop is in
+/// flight and its Gone is held, then checks the key: it stays this
+/// operation's `Handoff` until the prior's Gone (a competing start keeps the
+/// typed in-progress answer; nothing reopens the conversation while the old
+/// process may still hold its lock), and then ends `Vacant`, never `Live`
+/// (a dying prior is never restored).
+async fn the_key_waits_for_the_priors_gone_after(unwind: MidStopUnwind) {
+    let sid = format!("unwound-mid-stop-{}", uuid::Uuid::new_v4());
     let gone_hold = Arc::new(tokio::sync::Notify::new());
     let u = build_unit_rig_with(
         &sid,
@@ -9379,6 +9387,12 @@ async fn a_handoff_aborted_during_its_unit_priors_stop_never_restores_it_live() 
             .is_some_and(|entry| entry.unit.stop_in_flight().is_some())
     })
     .await;
+    let prior_stop = u
+        .stopper
+        .units
+        .by_terminal(&u.prior.terminal_id)
+        .and_then(|entry| entry.unit.stop_in_flight())
+        .expect("the prior's stop is in flight");
     assert!(
         u.rig
             .registry
@@ -9387,8 +9401,39 @@ async fn a_handoff_aborted_during_its_unit_priors_stop_never_restores_it_live() 
         "precondition: the dying prior's row is still Running"
     );
 
-    handle.abort();
-    let _ = handle.task.await;
+    match unwind {
+        MidStopUnwind::Abort => {
+            handle.abort();
+            let _ = handle.task.await;
+        }
+        MidStopUnwind::Panic => {
+            u.hooks.panic_mid_unit_prior_stop.notify_one();
+            let joined = handle.task.await;
+            assert!(
+                joined.as_ref().is_err_and(|err| err.is_panic()),
+                "the runner panicked mid-stop: {joined:?}"
+            );
+        }
+    }
+    // Either the cleanup frees the key, or it waits for the prior's Gone.
+    await_cond("the abort cleanup decides", || {
+        !matches!(
+            u.rig.ownership.observe("codex", &sid).state,
+            OwnershipState::Handoff { .. }
+        ) || hook_events(&u.hooks).contains(&"AbortAwaitsPriorGone")
+    })
+    .await;
+    let state = u.rig.ownership.observe("codex", &sid).state;
+    assert!(
+        matches!(state, OwnershipState::Handoff { .. }),
+        "the conversation is not freed before the prior's Gone: {state:?}"
+    );
+    assert!(
+        prior_stop.try_report().is_none(),
+        "precondition: the prior's Gone is still held"
+    );
+
+    gone_hold.notify_one();
     await_cond("the abort cleanup settles the key", || {
         !matches!(
             u.rig.ownership.observe("codex", &sid).state,
@@ -9396,15 +9441,36 @@ async fn a_handoff_aborted_during_its_unit_priors_stop_never_restores_it_live() 
         )
     })
     .await;
+    assert!(
+        prior_stop.try_report().is_some(),
+        "the key settled only after the prior's Gone"
+    );
     let state = u.rig.ownership.observe("codex", &sid).state;
     assert_eq!(
         state,
         OwnershipState::Vacant,
         "the dying prior is never restored Live"
     );
+}
 
-    gone_hold.notify_one();
-    await_cond("the prior is Gone", || u.prior.screen.has_exited()).await;
+/// Handoff edge (c): a handoff aborted while its unit prior's stop is in
+/// flight never puts that prior back `Live`, and does not free the
+/// conversation before the prior's Gone. The prior's row stays Running until
+/// its unit's Gone, but a unit whose stop has begun is dying: the cleanup
+/// waits for its Gone, its re-probe then answers not live, and the key ends
+/// Vacant.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handoff_aborted_during_its_unit_priors_stop_never_restores_it_live() {
+    let _guard = ENV_LOCK.lock().await;
+    the_key_waits_for_the_priors_gone_after(MidStopUnwind::Abort).await;
+}
+
+/// The same for a panic in the handoff (a bug anywhere in the runner after
+/// the prior's stop began): the unwind keeps the key until the prior's Gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_panic_in_a_handoff_during_its_unit_priors_stop_keeps_the_key_until_gone() {
+    let _guard = ENV_LOCK.lock().await;
+    the_key_waits_for_the_priors_gone_after(MidStopUnwind::Panic).await;
 }
 
 /// A reap budget that runs out before a pane unit's stop has begun never
