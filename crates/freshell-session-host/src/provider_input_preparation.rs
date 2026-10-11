@@ -619,7 +619,8 @@ mod tests {
     fn private_native_auth_case(case: &str, test: &str) {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         const CHILD: &str = "FRESHELL_TEST_PRIVATE_NATIVE_AUTH_ROOT";
-        if let Some(root) = std::env::var_os(CHILD) {
+        let restricted = std::env::var_os("FRESHELL_TEST_RESTRICTED_READER").is_some();
+        if restricted {
             assert_eq!(unsafe { libc::geteuid() }, 0);
             let status = std::fs::read_to_string("/proc/self/status").unwrap();
             let capabilities = status
@@ -630,6 +631,8 @@ mod tests {
                 u64::from_str_radix(capabilities, 16).unwrap(),
                 (1 << 0) | (1 << 6) | (1 << 7)
             );
+        }
+        if let Some(root) = std::env::var_os(CHILD) {
             let root = std::path::PathBuf::from(root);
             let home = root.join("home");
             let stage = root.join("stage");
@@ -664,11 +667,13 @@ mod tests {
                     indexed_files: None,
                 }),
             };
-            // The deployed controller cannot traverse this private provider HOME.
-            assert!(
-                freshell_platform::native_auth_exchange::read_selected_native_auth(&home, &[])
-                    .is_err()
-            );
+            if restricted {
+                // The deployed controller cannot traverse this private provider HOME.
+                assert!(
+                    freshell_platform::native_auth_exchange::read_selected_native_auth(&home, &[])
+                        .is_err()
+                );
+            }
             let mut secrets = ResolvedProviderSecrets::default();
             let result = prepare(
                 Some(&context),
@@ -703,11 +708,11 @@ mod tests {
             }
             return;
         }
-        assert_eq!(
-            unsafe { libc::geteuid() },
-            0,
-            "this process/identity test requires the documented disposable sandbox"
-        );
+        let identity = if restricted {
+            (65534, 0)
+        } else {
+            (unsafe { libc::geteuid() }, unsafe { libc::getegid() })
+        };
         let owned = tempfile::tempdir().unwrap();
         let home = owned.path().join("home");
         let stage = owned.path().join("stage");
@@ -725,18 +730,24 @@ mod tests {
             }
             "absent" => {}, _ => unreachable!(),
         }
-        for directory in [
-            &home,
-            &home.join(".local"),
-            &home.join(".local/share"),
-            &home.join(".local/share/opencode"),
-        ] {
-            crate::set_owner(directory, 65534, 0).unwrap();
-            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
         if matches!(case, "selected" | "reserved") {
-            crate::set_owner(&auth, 65534, 0).unwrap();
             std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
+            if restricted {
+                crate::set_owner(&auth, identity.0, identity.1).unwrap();
+            }
+        }
+        // Set permissions while still the owner, then transfer deepest paths
+        // first. The controller has neither FOWNER nor DAC traversal rights.
+        for directory in [
+            home.join(".local/share/opencode"),
+            home.join(".local/share"),
+            home.join(".local"),
+            home.clone(),
+        ] {
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+            if restricted {
+                crate::set_owner(&directory, identity.0, identity.1).unwrap();
+            }
         }
         let source = if case == "selected" {
             r#"{"fixture":"{env:AUTH_NONCE}"}"#
@@ -781,18 +792,23 @@ mod tests {
         )
         .unwrap();
         let before = std::fs::metadata(&home).unwrap();
-        let joined = std::process::Command::new("/usr/bin/setpriv")
-            .args([
-                "--bounding-set=-all,+chown,+setuid,+setgid",
-                "--inh-caps=-all",
-                "--ambient-caps=-all",
-            ])
-            .arg(std::env::current_exe().unwrap())
+        // Inherit the wrapper's exact capabilities; dropping the bounding set
+        // here would itself require SETPCAP, which the controller never has.
+        let joined = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test, "--nocapture", "--test-threads=1"])
             .env(CHILD, owned.path())
             .status()
             .unwrap();
         let after = std::fs::metadata(&home).unwrap();
+        // Join provider-owned cleanup before assertions can panic, preserving
+        // the private HOME mode even when the behavioral child fails.
+        crate::run_provider_refresh_cleanup(
+            identity.0,
+            identity.1,
+            "/usr/bin/find",
+            &[home.to_str().unwrap(), "-mindepth", "1", "-delete"],
+        )
+        .unwrap();
         assert_eq!(
             (before.uid(), before.gid(), before.mode()),
             (after.uid(), after.gid(), after.mode())
