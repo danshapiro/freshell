@@ -30,9 +30,13 @@
 //!
 //! PROCESS SAFETY: kills ONLY pids this test spawned — the survivor fixture
 //! child (reaped by the reattach teardown path, with an explicit own-child
-//! kill fallback) and panes via `registry.kill`. Loopback ephemeral ports
-//! only — never 3001/3002. Temp stores only — the machine's live sidecars
-//! stay structurally unreachable.
+//! kill fallback) and panes via `registry.kill`. A fresh-path scenario
+//! collects its evidence, then kills its pane and waits for the pane's unit
+//! to reach Gone, and only then asserts, so a failing run leaves no process
+//! behind. Loopback ephemeral ports only — never 3001/3002: every pane is
+//! pointed at a test-only Freshell URL and token
+//! ([`isolate_freshell_context`]). Temp stores only — the machine's live
+//! sidecars stay structurally unreachable.
 //!
 //! Linux-only: reattach identity evidence is `/proc`-based
 //! (`verify_sidecar_identity` is Unverifiable elsewhere, so no claim path
@@ -72,6 +76,10 @@ const FRESHELL_CONTEXT_ENV_KEYS: [&str; 6] = [
     "FRESHELL_TAB_ID",
     "FRESHELL_PANE_ID",
 ];
+/// The Freshell port every pane this binary starts is pointed at: one
+/// nothing listens on (the managed-launch e2e convention), never the live
+/// server's default (`PORT` unset gives 3001).
+const TEST_FRESHELL_PORT: &str = "23125";
 
 // ─── the set-once global manager over a swappable test reconciler/store ──────
 
@@ -170,6 +178,21 @@ impl Drop for TestEnvRestore {
             }
         }
     }
+}
+
+/// Points the panes a scenario starts at [`TEST_FRESHELL_PORT`] with a
+/// synthetic token (`PORT`, `FRESHELL_URL` and `AUTH_TOKEN` are what a
+/// pane's Freshell URL and token come from), restoring the previous values
+/// on drop.
+fn isolate_freshell_context() -> TestEnvRestore {
+    let restore = TestEnvRestore::capture(&["AUTH_TOKEN", "FRESHELL_URL", "PORT"]);
+    std::env::set_var("PORT", TEST_FRESHELL_PORT);
+    std::env::set_var(
+        "FRESHELL_URL",
+        format!("http://127.0.0.1:{TEST_FRESHELL_PORT}"),
+    );
+    std::env::set_var("AUTH_TOKEN", SYNTHETIC_FRESHELL_TOKEN);
+    restore
 }
 
 /// Install the ONE process-wide launch manager (set-once): its factory
@@ -392,7 +415,7 @@ struct CapturedCodexProcess {
     env: BTreeMap<String, String>,
 }
 
-async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
+async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry, WsState) {
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings =
@@ -459,7 +482,7 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
         units: Default::default(),
     };
 
-    let router = freshell_ws::router(state);
+    let router = freshell_ws::router(state.clone());
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral loopback port");
@@ -468,7 +491,7 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
         let _ = axum::serve(listener, router).await;
     });
 
-    (format!("ws://{addr}/ws"), registry)
+    (format!("ws://{addr}/ws"), registry, state)
 }
 
 type TestWs =
@@ -587,26 +610,45 @@ async fn create_codex_restore_terminal_expect_error(
 }
 
 /// Poll the capture file the dispatcher or fake app-server writes until it
-/// appears, then parse its allowlisted process capture.
-fn wait_for_captured_process(path: &std::path::Path) -> CapturedCodexProcess {
+/// appears, then parse its allowlisted process capture. Non-panicking
+/// (evidence): `Err` says what went wrong.
+fn poll_captured_process(path: &std::path::Path) -> Result<CapturedCodexProcess, String> {
     let deadline = std::time::Instant::now() + RECV_TIMEOUT;
     loop {
         if let Ok(raw) = std::fs::read_to_string(path) {
             if !raw.is_empty() {
-                return serde_json::from_str(&raw).expect("captured process is JSON");
+                return serde_json::from_str(&raw)
+                    .map_err(|err| format!("captured process is not JSON: {err}"));
             }
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "spawned codex child never wrote its argv capture at {}",
-            path.display()
-        );
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "spawned codex child never wrote its argv capture at {}",
+                path.display()
+            ));
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
 }
 
+fn wait_for_captured_process(path: &std::path::Path) -> CapturedCodexProcess {
+    poll_captured_process(path).unwrap_or_else(|err| panic!("{err}"))
+}
+
+fn poll_captured_argv(path: &std::path::Path) -> Result<Vec<String>, String> {
+    poll_captured_process(path).map(|process| process.argv)
+}
+
 fn wait_for_captured_argv(path: &std::path::Path) -> Vec<String> {
     wait_for_captured_process(path).argv
+}
+
+/// The pane's `--remote` proxy URL: the TUI argv's first pair.
+fn remote_proxy_url(argv: &[String]) -> Option<String> {
+    match argv {
+        [flag, url, ..] if flag == "--remote" => Some(url.clone()),
+        _ => None,
+    }
 }
 
 fn resume_pair_position(argv: &[String], session_id: &str) -> Option<usize> {
@@ -728,18 +770,27 @@ async fn spawn_survivor(
 
 // ─── the TUI: dial the proxy, initialize, thread/resume ──────────────────────
 
-/// Read frames until the JSON-RPC response for `id` arrives.
-async fn wait_for_rpc_id(tui: &mut TestWs, id: i64) -> serde_json::Value {
+/// Read frames until the JSON-RPC response for `id` arrives. Non-panicking
+/// (evidence): `Err` says what went wrong.
+async fn wait_for_rpc_id(tui: &mut TestWs, id: i64) -> Result<serde_json::Value, String> {
     loop {
-        let msg = tokio::time::timeout(RECV_TIMEOUT, tui.next())
-            .await
-            .expect("rpc reply through the proxy within timeout")
-            .expect("proxy stream open")
-            .expect("no ws error");
+        let msg = match tokio::time::timeout(RECV_TIMEOUT, tui.next()).await {
+            Err(_elapsed) => return Err(format!("no reply to rpc {id} through the proxy in time")),
+            Ok(None) => {
+                return Err(format!(
+                    "the proxy stream closed before the reply to rpc {id}"
+                ))
+            }
+            Ok(Some(Err(err))) => {
+                return Err(format!("ws error before the reply to rpc {id}: {err}"))
+            }
+            Ok(Some(Ok(msg))) => msg,
+        };
         if let WsMessage::Text(text) = msg {
-            let value: serde_json::Value = serde_json::from_str(&text).expect("json frame");
+            let value: serde_json::Value = serde_json::from_str(&text)
+                .map_err(|err| format!("a frame through the proxy is not JSON: {err}"))?;
             if value.get("id") == Some(&json!(id)) {
-                return value;
+                return Ok(value);
             }
         }
     }
@@ -748,31 +799,35 @@ async fn wait_for_rpc_id(tui: &mut TestWs, id: i64) -> serde_json::Value {
 /// Play the TUI: dial the pane's `--remote` proxy URL, complete
 /// `initialize`/`initialized`, then send `thread/resume {threadId}` and
 /// return its response frame (result OR error — the caller asserts which).
-async fn tui_resume_via_proxy(proxy_url: &str, thread_id: &str) -> serde_json::Value {
+/// Non-panicking (evidence, collected before the cleanup): `Err` says which
+/// step failed.
+async fn tui_resume_via_proxy(
+    proxy_url: &str,
+    thread_id: &str,
+) -> Result<serde_json::Value, String> {
     let (mut tui, _) = tokio_tungstenite::connect_async(proxy_url)
         .await
-        .expect("fake TUI dials the --remote proxy URL");
+        .map_err(|err| format!("the fake TUI could not dial the --remote proxy URL: {err}"))?;
     tui.send(WsMessage::Text(
         json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).to_string(),
     ))
     .await
-    .expect("send initialize");
-    let init = wait_for_rpc_id(&mut tui, 1).await;
-    assert!(
-        init.get("result").is_some(),
-        "initialize through the relay failed: {init}"
-    );
+    .map_err(|err| format!("send initialize: {err}"))?;
+    let init = wait_for_rpc_id(&mut tui, 1).await?;
+    if init.get("result").is_none() {
+        return Err(format!("initialize through the relay failed: {init}"));
+    }
     tui.send(WsMessage::Text(
         json!({"jsonrpc": "2.0", "method": "initialized"}).to_string(),
     ))
     .await
-    .expect("send initialized");
+    .map_err(|err| format!("send initialized: {err}"))?;
     tui.send(WsMessage::Text(
         json!({"jsonrpc": "2.0", "id": 2, "method": "thread/resume", "params": {"threadId": thread_id}})
             .to_string(),
     ))
     .await
-    .expect("send thread/resume");
+    .map_err(|err| format!("send thread/resume: {err}"))?;
     wait_for_rpc_id(&mut tui, 2).await
 }
 
@@ -866,6 +921,25 @@ async fn poll_proxy_refused(proxy_url: &str, budget: Duration) -> bool {
             return false;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Kills a pane and waits for its unit's Gone (the managed-launch e2e's
+/// `kill_and_wait_gone`), so no process the pane started, its app-server
+/// included, outlives the scenario. Non-panicking, like the rest of a
+/// scenario's cleanup: `Err` (asserted after the cleanup) when the pane has
+/// no unit or its unit did not reach Gone in time.
+async fn kill_and_wait_gone(state: &WsState, terminal_id: &str) -> Result<(), String> {
+    let unit = state.units.by_terminal(terminal_id).map(|entry| entry.unit);
+    state.registry.kill(terminal_id);
+    let Some(stop) = unit.and_then(|unit| unit.stop_in_flight()) else {
+        return Err(format!("the pane {terminal_id} has no unit stopping"));
+    };
+    match stop.wait_for(Duration::from_secs(30)).await {
+        Some(_) => Ok(()),
+        None => Err(format!(
+            "the unit of pane {terminal_id} did not reach Gone in 30 s"
+        )),
     }
 }
 
@@ -985,9 +1059,7 @@ fn prepared_codex_launch_reuses_reserved_setup_and_discards_after_adopt_failure(
         }
         std::env::set_var("CODEX_CMD", codex_dispatcher());
         std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "1");
-        std::env::set_var("PORT", "23125");
-        std::env::set_var("FRESHELL_URL", "http://127.0.0.1:23125");
-        std::env::set_var("AUTH_TOKEN", SYNTHETIC_FRESHELL_TOKEN);
+        let _freshell_context = isolate_freshell_context();
         std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
         swap_test_reconciler(None, None);
         let _codex_home = ScenarioCodexHome::with_rollout("thread-prepared-adoption-failure");
@@ -997,7 +1069,7 @@ fn prepared_codex_launch_reuses_reserved_setup_and_discards_after_adopt_failure(
         std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &tui_capture);
         std::env::set_var("FAKE_CODEX_APP_SERVER_ARG_LOG", &sidecar_capture);
 
-        let (ws_url, registry) = spawn_server().await;
+        let (ws_url, registry, _state) = spawn_server().await;
         let mut ws = connect_and_handshake(&ws_url).await;
         let cwd = scenario_cwd("prepared-adoption-failure");
         let error = create_codex_restore_terminal_expect_error(
@@ -1053,6 +1125,7 @@ fn restore_reattaches_tui_to_surviving_sidecar_preserving_in_flight_turn() {
         install_global_manager();
         ensure_mcp_deps_resolvable();
         TEST_FAIL_ADOPTION.store(false, Ordering::SeqCst);
+        let _freshell_context = isolate_freshell_context();
         std::env::set_var("CODEX_CMD", codex_dispatcher());
         // DEV-0006 S5.e: unset = managed launch ON (the leg under test).
         std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
@@ -1120,7 +1193,7 @@ fn restore_reattaches_tui_to_surviving_sidecar_preserving_in_flight_turn() {
         swap_test_reconciler(Some(reconciler.clone()), Some(store.clone()));
 
         // (2) The restore create through the WS door.
-        let (ws_url, registry) = spawn_server().await;
+        let (ws_url, registry, _state) = spawn_server().await;
         let mut ws = connect_and_handshake(&ws_url).await;
         let capture = capture_path("reattach");
         let replacement_capture = capture_path("reattach-replacement-sidecar");
@@ -1179,6 +1252,7 @@ fn restore_reattaches_tui_to_surviving_sidecar_preserving_in_flight_turn() {
         std::env::remove_var("FAKE_CODEX_APP_SERVER_ARG_LOG");
 
         // (3c) Asserts.
+        let resume_reply = resume_reply.unwrap_or_else(|err| panic!("{err}"));
         assert!(
             resume_reply.get("result").is_some(),
             "thread/resume must SUCCEED against the claimed survivor: {resume_reply}"
@@ -1230,6 +1304,7 @@ fn restore_falls_back_to_fresh_sidecar_without_tracked_survivor() {
         install_global_manager();
         ensure_mcp_deps_resolvable();
         TEST_FAIL_ADOPTION.store(false, Ordering::SeqCst);
+        let _freshell_context = isolate_freshell_context();
         std::env::set_var("CODEX_CMD", codex_dispatcher());
         std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
 
@@ -1252,7 +1327,7 @@ fn restore_falls_back_to_fresh_sidecar_without_tracked_survivor() {
             json!({ "appendThreadOperationLogPath": log_b }).to_string(),
         );
 
-        let (ws_url, registry) = spawn_server().await;
+        let (ws_url, _registry, state) = spawn_server().await;
         let mut ws = connect_and_handshake(&ws_url).await;
         let capture = capture_path("fresh");
         std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &capture);
@@ -1262,10 +1337,30 @@ fn restore_falls_back_to_fresh_sidecar_without_tracked_survivor() {
                 .await;
         let terminal_id = created["terminalId"].as_str().unwrap().to_string();
 
+        // Evidence, then cleanup, then asserts (the scenario-1 discipline):
+        // nothing between the create and the pane's Gone panics, so a
+        // failing run still leaves no process behind.
+        let argv = poll_captured_argv(&capture);
+        let proxy_url = argv.as_deref().ok().and_then(remote_proxy_url);
+        let resume_reply = match &proxy_url {
+            Some(proxy_url) => tui_resume_via_proxy(proxy_url, session_id).await,
+            None => Err("the TUI argv names no --remote proxy URL".to_string()),
+        };
+        let logged = poll_thread_resume_logged(&log_b, session_id, RECV_TIMEOUT);
+
+        let gone = kill_and_wait_gone(&state, &terminal_id).await;
+        let torn_down = match &proxy_url {
+            Some(proxy_url) => poll_proxy_refused(proxy_url, Duration::from_secs(8)).await,
+            None => false,
+        };
+        swap_test_reconciler(None, None);
+        std::env::remove_var("CODEX_ARGV_CAPTURE_PATH");
+        std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
+
         // Byte-compatible with today's managed resume argv (the S5.e golden
         // shape, codex_managed_launch_e2e.rs Phase 3): the `--remote`
         // 4-tuple, the bel notification pair, the resume pair LAST.
-        let argv = wait_for_captured_argv(&capture);
+        let argv = argv.unwrap_or_else(|err| panic!("{err}"));
         assert_eq!(argv[0], "--remote", "argv: {argv:?}");
         let proxy_url = argv[1].clone();
         assert!(
@@ -1289,17 +1384,7 @@ fn restore_falls_back_to_fresh_sidecar_without_tracked_survivor() {
             argv.len(),
             "resume pair must be last: {argv:?}"
         );
-
-        // Evidence, then cleanup, then asserts (the scenario-1 discipline).
-        let resume_reply = tui_resume_via_proxy(&proxy_url, session_id).await;
-        let logged = poll_thread_resume_logged(&log_b, session_id, RECV_TIMEOUT);
-
-        registry.kill(&terminal_id);
-        let torn_down = poll_proxy_refused(&proxy_url, Duration::from_secs(8)).await;
-        swap_test_reconciler(None, None);
-        std::env::remove_var("CODEX_ARGV_CAPTURE_PATH");
-        std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
-
+        let resume_reply = resume_reply.unwrap_or_else(|err| panic!("{err}"));
         assert!(
             resume_reply.get("result").is_some(),
             "thread/resume must succeed on the fresh path: {resume_reply}"
@@ -1309,6 +1394,7 @@ fn restore_falls_back_to_fresh_sidecar_without_tracked_survivor() {
             "the NEW fixture instance's op log (log-B) must record thread/resume \
              for {session_id} — today's fresh-spawn path serves the plan"
         );
+        gone.unwrap_or_else(|err| panic!("{err}"));
         assert!(
             torn_down,
             "pane kill must tear the fresh sidecar's proxy down"
@@ -1328,6 +1414,7 @@ fn active_writer_collision_surfaces_minus32600_only_on_the_fresh_path() {
         std::env::set_var("CODEX_CMD", codex_dispatcher());
         std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
 
+        let _freshell_context = isolate_freshell_context();
         // EMPTY reconciler + the scripted active-writer rejection: the
         // incident's failure mode, now confined to the no-survivor path (the
         // reattach scenario above proves the same resume SUCCEEDS when a
@@ -1349,7 +1436,7 @@ fn active_writer_collision_surfaces_minus32600_only_on_the_fresh_path() {
             .to_string(),
         );
 
-        let (ws_url, registry) = spawn_server().await;
+        let (ws_url, _registry, state) = spawn_server().await;
         let mut ws = connect_and_handshake(&ws_url).await;
         let capture = capture_path("writer");
         std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &capture);
@@ -1359,19 +1446,26 @@ fn active_writer_collision_surfaces_minus32600_only_on_the_fresh_path() {
                 .await;
         let terminal_id = created["terminalId"].as_str().unwrap().to_string();
 
-        let argv = wait_for_captured_argv(&capture);
-        assert_eq!(argv[0], "--remote", "argv: {argv:?}");
-        let proxy_url = argv[1].clone();
+        // Evidence, then cleanup, then asserts: nothing between the create
+        // and the pane's Gone panics.
+        let argv = poll_captured_argv(&capture);
+        let proxy_url = argv.as_deref().ok().and_then(remote_proxy_url);
+        let resume_reply = match &proxy_url {
+            Some(proxy_url) => tui_resume_via_proxy(proxy_url, session_id).await,
+            None => Err("the TUI argv names no --remote proxy URL".to_string()),
+        };
 
-        // Evidence, then cleanup, then asserts.
-        let resume_reply = tui_resume_via_proxy(&proxy_url, session_id).await;
-
-        registry.kill(&terminal_id);
-        let _ = poll_proxy_refused(&proxy_url, Duration::from_secs(8)).await;
+        let gone = kill_and_wait_gone(&state, &terminal_id).await;
+        if let Some(proxy_url) = &proxy_url {
+            let _ = poll_proxy_refused(proxy_url, Duration::from_secs(8)).await;
+        }
         swap_test_reconciler(None, None);
         std::env::remove_var("CODEX_ARGV_CAPTURE_PATH");
         std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
 
+        let argv = argv.unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(argv[0], "--remote", "argv: {argv:?}");
+        let resume_reply = resume_reply.unwrap_or_else(|err| panic!("{err}"));
         let error = resume_reply
             .get("error")
             .unwrap_or_else(|| panic!("the fresh path must surface the scripted rejection: {resume_reply}"));
@@ -1388,5 +1482,6 @@ fn active_writer_collision_surfaces_minus32600_only_on_the_fresh_path() {
                 .is_some_and(|m| m.contains("active writer")),
             "the -32600 message must carry the active-writer signature: {resume_reply}"
         );
+        gone.unwrap_or_else(|err| panic!("{err}"));
     });
 }
