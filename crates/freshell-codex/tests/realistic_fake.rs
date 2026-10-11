@@ -4,6 +4,8 @@
 
 #[path = "support/fake_codex.rs"]
 mod fake_codex;
+#[path = "support/lost_port.rs"]
+mod lost_port;
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -84,15 +86,22 @@ struct LauncherRun {
 /// still running then is reported with no exit code, and its native and every
 /// process the native pinned are killed.
 async fn launcher_exit(behavior: Value, home: &Path, codex_home: Option<&str>) -> LauncherRun {
+    let listen = format!("ws://127.0.0.1:{}", unique_free_port());
+    launcher_exit_listening_on(&listen, behavior, home, codex_home).await
+}
+
+/// [`launcher_exit`] with the fake told to listen on `listen`.
+async fn launcher_exit_listening_on(
+    listen: &str,
+    behavior: Value,
+    home: &Path,
+    codex_home: Option<&str>,
+) -> LauncherRun {
     use tokio::io::AsyncReadExt;
     let manifest_dir = home.join("manifests");
     let mut cmd = tokio::process::Command::new("node");
     cmd.arg(fixture_path("fake-codex-launcher.mjs"))
-        .args([
-            "app-server",
-            "--listen",
-            &format!("ws://127.0.0.1:{}", unique_free_port()),
-        ])
+        .args(["app-server", "--listen", listen])
         // Never the developer's home, even if the fake falls back to `~/.codex`.
         .env("HOME", home)
         .env_remove("CODEX_HOME")
@@ -180,6 +189,62 @@ async fn launcher_spawns_a_separate_native_that_owns_the_listener() {
     );
     let mut rpc = Rpc::connect(fake.port).await;
     rpc.initialize().await;
+}
+
+/// A native whose port another socket holds exits with its own status, 98,
+/// writes one stderr line and records why in its manifest, never claiming to
+/// listen (whoever chose the port retries on a new one). Any other listen
+/// error still fails the start as an uncaught error (status 1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_native_whose_port_is_taken_exits_98_and_says_why() {
+    let home = tempfile::tempdir().unwrap();
+    let codex_home = home.path().to_str().unwrap();
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a loopback port");
+    let taken = holder.local_addr().expect("the held port").port();
+    let run = launcher_exit_listening_on(
+        &format!("ws://127.0.0.1:{taken}"),
+        json!({}),
+        home.path(),
+        Some(codex_home),
+    )
+    .await;
+    assert_eq!(run.code, Some(98), "{}", run.stderr);
+    assert_eq!(
+        run.stderr
+            .lines()
+            .filter(|line| line.starts_with(&format!(
+                "fake-app-server: listen 127.0.0.1:{taken} failed: EADDRINUSE"
+            )))
+            .count(),
+        1,
+        "{}",
+        run.stderr
+    );
+    let native = run.native.expect("the native's manifest");
+    assert_eq!(native.listen_error.as_deref(), Some("EADDRINUSE"));
+    assert!(!native.listening, "it never claims to listen");
+    drop(holder);
+
+    // 192.0.2.1 (a documentation address) is on no interface: EADDRNOTAVAIL.
+    let other = tempfile::tempdir().unwrap();
+    let run = launcher_exit_listening_on(
+        &format!("ws://192.0.2.1:{}", unique_free_port()),
+        json!({}),
+        other.path(),
+        Some(other.path().to_str().unwrap()),
+    )
+    .await;
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
+    assert!(run.stderr.contains("EADDRNOTAVAIL"), "{}", run.stderr);
+    let native = run.native.expect("the native's manifest");
+    assert_eq!(native.listen_error, None, "only a taken port is recorded");
+    assert!(!native.listening);
+
+    let fake = FakeAppServer::spawn(json!({}), home.path(), &[]).await;
+    assert!(
+        fake.native().await.listening,
+        "a native that listens says so"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1074,12 +1139,26 @@ async fn signals_carry_the_unit_record_state_and_wedge_knobs_hold() {
 #[tokio::test(flavor = "multi_thread")]
 async fn listen_delay_holds_off_the_listener() {
     let home = tempfile::tempdir().unwrap();
-    let t0 = Instant::now();
-    let fake = FakeAppServer::spawn(json!({"listenDelayMs": 1500}), home.path(), &[]).await;
-    assert!(
-        std::net::TcpStream::connect(("127.0.0.1", fake.port)).is_err(),
-        "nothing listens while listenDelayMs runs"
-    );
+    // Started on a port it may lose when the delay ends (a new fake then
+    // starts on a new port), so the check runs per start.
+    let home = home.path();
+    let (fake, t0) =
+        lost_port::retrying_a_lost_port("the delayed fake listens", move || async move {
+            let t0 = Instant::now();
+            let mut fake = FakeAppServer::spawn_on_port(
+                unique_free_port(),
+                json!({"listenDelayMs": 1500}),
+                home,
+                &[],
+            )
+            .await;
+            assert!(
+                std::net::TcpStream::connect(("127.0.0.1", fake.port)).is_err(),
+                "nothing listens while listenDelayMs runs"
+            );
+            fake.listened().await.map(|()| (fake, t0))
+        })
+        .await;
     let _rpc = connected(fake.port).await;
     assert!(t0.elapsed() >= Duration::from_millis(1500));
 }

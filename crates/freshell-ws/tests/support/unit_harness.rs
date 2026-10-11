@@ -11,6 +11,8 @@
 #![allow(dead_code)]
 #[path = "../../../freshell-codex/tests/support/fake_codex.rs"]
 pub mod fake_codex;
+#[path = "../../../freshell-codex/tests/support/lost_port.rs"]
+pub mod lost_port;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

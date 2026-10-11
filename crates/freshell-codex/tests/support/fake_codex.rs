@@ -16,6 +16,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::Message;
 
+// Every file that loads this module also loads `support/lost_port.rs` as
+// the sibling module `lost_port` (a file loaded twice is two modules).
+use super::lost_port;
+
 pub fn fixture_path(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../test/fixtures/coding-cli/codex-app-server")
@@ -84,6 +88,9 @@ pub struct NativeManifest {
     /// reports), recorded by the native while the pid certainly named that process.
     #[serde(default, rename = "startTimes")]
     pub start_times: BTreeMap<u32, u64>,
+    /// Whether the native listens (set by the native itself).
+    #[serde(default)]
+    pub listening: bool,
     /// Why the native never listened: `EADDRINUSE` when another socket bound
     /// its port first (the fake then exits with status 98). `None` for a
     /// native that listened.
@@ -144,10 +151,21 @@ pub struct FakeAppServer {
 }
 
 impl FakeAppServer {
+    /// A fake listening on a port of its own. The port is chosen and released
+    /// before the native binds it, so another socket can take it first; that
+    /// native exits 98 and a new fake starts on a new port.
     pub async fn spawn(behavior: Value, codex_home: &Path, extra_env: &[(&str, &str)]) -> Self {
-        Self::spawn_on_port(unique_free_port(), behavior, codex_home, extra_env).await
+        let behavior = &behavior;
+        lost_port::retrying_a_lost_port("the fake app-server listens", move || async move {
+            let mut fake =
+                Self::spawn_on_port(unique_free_port(), behavior.clone(), codex_home, extra_env)
+                    .await;
+            fake.listened().await.map(|()| fake)
+        })
+        .await
     }
 
+    /// A fake on `port`, returned once its native runs (before it listens).
     pub async fn spawn_on_port(
         port: u16,
         behavior: Value,
@@ -184,6 +202,22 @@ impl FakeAppServer {
             manifest_dir,
             launcher: (launcher_pid, launcher_start),
             native: (manifest.pid, manifest.start_time(manifest.pid)),
+        }
+    }
+
+    /// Waits until the native listens. When the launcher exits first, its
+    /// status says why (98: the native lost its port).
+    pub async fn listened(&mut self) -> Result<(), String> {
+        let manifest_dir = self.manifest_dir.clone();
+        let launcher = self.launcher.0;
+        tokio::select! {
+            status = self.child.wait() => Err(format!(
+                "fake app-server exited before listening: {}",
+                status.map_or_else(|error| error.to_string(), |status| status.to_string())
+            )),
+            () = wait_until("the native to listen", Duration::from_secs(10), move || {
+                read_native_manifest(&manifest_dir, launcher).is_some_and(|native| native.listening)
+            }) => Ok(()),
         }
     }
 

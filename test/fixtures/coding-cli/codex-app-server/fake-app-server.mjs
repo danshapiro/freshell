@@ -737,6 +737,7 @@ function listen() {
     nativeRole?.noteListenError(error.code)
     process.exit(LOST_PORT_EXIT_CODE)
   })
+  wss.on('listening', () => nativeRole?.noteListening())
   wss.on('connection', handleConnection)
 }
 const watches = new Map()
