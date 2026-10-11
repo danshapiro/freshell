@@ -55,7 +55,7 @@ import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-
 import { isClientPerfLoggingEnabled, setClientPerfEnabled } from '@/lib/perf-logger'
 import { getRebindQueue, resetRebindQueueForTests } from '@/lib/rebind-queue'
 import { installTestHarness } from '@/lib/test-harness'
-import { stageOwnedFreshBrowserProfile } from '../../../../../scripts/testing/runtime-external-browser.js'
+import { observeOwnedFreshBrowserPane, stageOwnedFreshBrowserProfile } from '../../../../../scripts/testing/runtime-external-browser.js'
 
 const CLAUDE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440000'
 
@@ -652,6 +652,27 @@ afterEach(() => {
   cleanup()
 })
 
+function createPickerSocketClass() {
+  return class PickerSocket {
+    static OPEN = 1
+    static instances: PickerSocket[] = []
+    readyState = PickerSocket.OPEN
+    onopen: (() => void) | null = null
+    onmessage: ((event: { data: string }) => void) | null = null
+    onclose: ((event: { code: number; reason: string }) => void) | null = null
+    onerror: (() => void) | null = null
+    frames: Record<string, unknown>[] = []
+    constructor(_url: string) { PickerSocket.instances.push(this) }
+    send(data: string) { this.frames.push(JSON.parse(data)) }
+    close() { this.onclose?.({ code: 1000, reason: '' }) }
+    emit(frame: Record<string, unknown>) { this.onmessage?.({ data: JSON.stringify(frame) }) }
+    ready(freshCapability = true) {
+      this.onopen?.()
+      this.emit({ type: 'ready', capabilities: { paneReconcileV1: true, paneReconcileFreshAgentV1: freshCapability } })
+    }
+  }
+}
+
 describe('picker profile staging', () => {
   afterEach(() => {
     cleanup()
@@ -661,28 +682,89 @@ describe('picker profile staging', () => {
     resetRebindQueueForTests()
   })
 
+  describe.each([false, true])('materialized pane observation after reconnect: %s', (reconnect) => {
+    it.each([false, true])('observes the exact staged pane after created and native materialization (same batch: %s)', async (sameBatch) => {
+      vi.useFakeTimers()
+      const { WsClient, RECONCILE_VERDICT_WAIT_MS } = await vi.importActual<typeof import('@/lib/ws-client')>('@/lib/ws-client')
+      const MaterializingSocket = createPickerSocketClass()
+      vi.stubGlobal('WebSocket', MaterializingSocket)
+      const client = new WsClient('ws://materializing-picker.test/ws')
+      wsMock.send.mockImplementation((message) => client.send(message))
+      wsMock.onReconnect.mockImplementation((handler) => client.onReconnect(handler))
+      wsMock.onMessage.mockImplementation((handler) => client.onMessage(handler))
+      const store = createStore()
+      // The app's real global fold runs before the mounted pane subscription.
+      client.onMessage((message) => { handleFreshAgentMessage(store.dispatch as AppDispatch, message, client) })
+      installTestHarness(store as unknown as AppStore, () => 'ready', async () => {}, () => {}, wsMock.send)
+      const harness = window.__FRESHELL_TEST_HARNESS__!
+      harness.setSuppressAllFreshAgentNetworkEffects(true)
+      const content: FreshAgentPaneContent = { kind: 'fresh-agent', sessionType: 'freshopencode', provider: 'opencode',
+        createRequestId: 'materializing-picker-request', initialCwd: '/owned-picker-repo', status: 'creating' }
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(new Promise(() => {}))
+      try {
+        const connected = client.connect()
+        MaterializingSocket.instances[0].ready()
+        await connected
+        client.clearReconcileCreateHold()
+        render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+        let staged: ReturnType<typeof stageOwnedFreshBrowserProfile> = null
+        act(() => { staged = stageOwnedFreshBrowserProfile({ mode: 'freshopencode', model: 'opencode/big-pickle', effort: 'provider-default' }) })
+        const creates = () => MaterializingSocket.instances.flatMap(socket => socket.frames).filter(frame => frame.type === 'freshAgent.create')
+        expect(creates()).toHaveLength(1)
+        const request = creates()[0]
+        expect(request).toMatchObject({ requestId: content.createRequestId, sessionType: content.sessionType,
+          provider: content.provider, model: 'opencode/big-pickle', cwd: content.initialCwd })
+        const createdSessionId = 'freshopencode-materializing-picker-request'
+        const nativeSessionId = 'ses_exact_picker_native'
+        const created = { type: 'freshAgent.created', requestId: request.requestId, sessionType: content.sessionType,
+          provider: content.provider, sessionId: createdSessionId, sessionRef: { provider: content.provider, sessionId: createdSessionId } }
+        const materialized = { type: 'freshAgent.session.materialized', previousSessionId: createdSessionId,
+          sessionId: nativeSessionId, sessionType: content.sessionType, provider: content.provider,
+          sessionRef: { provider: content.provider, sessionId: nativeSessionId } }
+        const observation = { ...staged!, sessionType: content.sessionType, provider: content.provider, createdSessionId, nativeSessionId }
+        if (sameBatch) {
+          act(() => { MaterializingSocket.instances[0].emit(created); MaterializingSocket.instances[0].emit(materialized) })
+        } else {
+          act(() => MaterializingSocket.instances[0].emit(created))
+          expect(observeOwnedFreshBrowserPane(observation)).toEqual({ paneId: 'pane-1', sessionId: createdSessionId })
+          act(() => MaterializingSocket.instances[0].emit(materialized))
+        }
+        expect(getFreshAgentPaneContent(store)).toMatchObject({ createRequestId: content.createRequestId,
+          sessionId: nativeSessionId, sessionRef: { provider: content.provider, sessionId: nativeSessionId },
+          resumeSessionId: nativeSessionId, model: 'opencode/big-pickle' })
+        expect(getFreshAgentSessionId()).toBe(nativeSessionId)
+        expect(Object.values(store.getState().freshAgent.sessions).map(session => session.sessionId)).toContain(nativeSessionId)
+        expect(Object.values(store.getState().freshAgent.sessions).map(session => session.sessionId)).not.toContain(createdSessionId)
+        expect(store.getState().freshAgent.pendingCreates[content.createRequestId].sessionId).toBe(nativeSessionId)
+        if (reconnect) {
+          MaterializingSocket.instances[0].onclose?.({ code: 4009, reason: 'restart' })
+          const connectedAgain = client.connect()
+          await act(async () => { MaterializingSocket.instances[1].ready(); await connectedAgain })
+          await act(async () => { await vi.advanceTimersByTimeAsync(RECONCILE_VERDICT_WAIT_MS) })
+          expect(MaterializingSocket.instances[1].frames.filter(frame => frame.type === 'freshAgent.attach'))
+            .toContainEqual(expect.objectContaining({ sessionId: nativeSessionId, sessionType: content.sessionType, provider: content.provider }))
+        }
+        expect(creates()).toHaveLength(1)
+        expect(observeOwnedFreshBrowserPane(observation)).toEqual({ paneId: 'pane-1', sessionId: nativeSessionId })
+        // A matching session elsewhere never replaces the original staged route.
+        act(() => store.dispatch(initLayout({ tabId: 'unrelated-tab', paneId: 'unrelated-pane', content: getFreshAgentPaneContent(store) })))
+        for (const mismatch of [{ tabId: 'missing-tab' }, { paneId: 'missing-pane' }, { createRequestId: 'other-request' },
+          { sessionType: 'freshcodex' }, { provider: 'codex' }, { nativeSessionId: 'ses_other_native' }]) {
+          expect(observeOwnedFreshBrowserPane({ ...observation, ...mismatch })).toBeNull()
+        }
+      } finally {
+        cleanup()
+        client.disconnect()
+        vi.unstubAllGlobals()
+      }
+    })
+  })
+
   it.each([false, true])('retries the staged request after a lost acknowledgement and missing negotiated fresh verdict (fresh capability: %s)', async (freshCapability) => {
     vi.useFakeTimers()
     const { WsClient, RECONCILE_VERDICT_WAIT_MS } = await vi.importActual<typeof import('@/lib/ws-client')>('@/lib/ws-client')
-    class PickerSocket {
-      static OPEN = 1
-      static instances: PickerSocket[] = []
-      readyState = PickerSocket.OPEN
-      onopen: (() => void) | null = null
-      onmessage: ((event: { data: string }) => void) | null = null
-      onclose: ((event: { code: number; reason: string }) => void) | null = null
-      onerror: (() => void) | null = null
-      frames: Record<string, unknown>[] = []
-      constructor(_url: string) { PickerSocket.instances.push(this) }
-      send(data: string) { this.frames.push(JSON.parse(data)) }
-      close() { this.onclose?.({ code: 1000, reason: '' }) }
-      ready() {
-        this.onopen?.()
-        this.onmessage?.({ data: JSON.stringify({ type: 'ready', capabilities: {
-          paneReconcileV1: true, paneReconcileFreshAgentV1: freshCapability,
-        } }) })
-      }
-    }
+    const PickerSocket = createPickerSocketClass()
     vi.stubGlobal('WebSocket', PickerSocket)
     const client = new WsClient('ws://picker.test/ws')
     wsMock.send.mockImplementation((message) => client.send(message))
@@ -699,7 +781,7 @@ describe('picker profile staging', () => {
     const creates = (socket: PickerSocket) => socket.frames.filter((frame) => frame.type === 'freshAgent.create')
     try {
       const connected = client.connect()
-      PickerSocket.instances[0].ready()
+      PickerSocket.instances[0].ready(freshCapability)
       await connected
       client.clearReconcileCreateHold()
       render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
@@ -711,7 +793,7 @@ describe('picker profile staging', () => {
       // negotiates reconciliation, and receives no fresh-agent verdict.
       PickerSocket.instances[0].onclose?.({ code: 4009, reason: 'restart' })
       const reconnected = client.connect()
-      await act(async () => { PickerSocket.instances[1].ready(); await reconnected })
+      await act(async () => { PickerSocket.instances[1].ready(freshCapability); await reconnected })
       expect(creates(PickerSocket.instances[1])).toHaveLength(0)
       await act(async () => { await vi.advanceTimersByTimeAsync(RECONCILE_VERDICT_WAIT_MS) })
       expect(creates(PickerSocket.instances[1])).toEqual([original])
