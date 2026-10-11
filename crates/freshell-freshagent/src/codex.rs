@@ -23394,14 +23394,36 @@ pub(crate) mod tests {
 
     /// A process outside Freshell holding a conversation's writer lock (as
     /// a shell `codex` does): a `perl` that takes `flock(LOCK_EX)` on the
-    /// lock file itself. This test's own child: killed and reaped on drop.
+    /// lock file itself and then answers every line on its stdin. This
+    /// test's own child: killed and reaped on drop.
     #[cfg(target_os = "linux")]
-    struct OutsideHolder(std::process::Child);
+    struct OutsideHolder {
+        child: std::process::Child,
+        stdin: std::process::ChildStdin,
+        stdout: std::io::BufReader<std::process::ChildStdout>,
+    }
 
     #[cfg(target_os = "linux")]
     impl OutsideHolder {
         fn hold(lock: &std::path::Path) -> Self {
             Self::hold_with_env(lock, &[])
+        }
+
+        fn pid(&self) -> u32 {
+            self.child.id()
+        }
+
+        /// Whether the holder answers a round trip on its stdin. A signal
+        /// sent to it before the round trip ends it before it can answer
+        /// (it installs no handler), so `false` also covers a holder still
+        /// dying from a signal sent moments ago.
+        fn answers(&mut self) -> bool {
+            use std::io::{BufRead as _, Write as _};
+            if writeln!(self.stdin, "ping").is_err() {
+                return false;
+            }
+            let mut said = String::new();
+            matches!(self.stdout.read_line(&mut said), Ok(n) if n > 0) && said.trim() == "alive"
         }
 
         /// The holder started as a member of `unit` (placed by its tag, as
@@ -23421,20 +23443,25 @@ pub(crate) mod tests {
                 .args([
                     "-e",
                     "use Fcntl qw(:flock); open(my $f, '>>', $ARGV[0]) or die; \
-                     flock($f, LOCK_EX) or die; $| = 1; print \"locked\\n\"; sleep 600",
+                     flock($f, LOCK_EX) or die; $| = 1; print \"locked\\n\"; \
+                     while (<STDIN>) { print \"alive\\n\" }",
                 ])
                 .arg(lock)
                 .envs(env.iter().map(|(k, v)| (k, v)))
-                .stdin(std::process::Stdio::null())
+                .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .spawn()
                 .expect("perl starts");
+            let stdin = child.stdin.take().unwrap();
+            let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
             let mut said = String::new();
-            std::io::BufReader::new(child.stdout.take().unwrap())
-                .read_line(&mut said)
-                .unwrap();
+            stdout.read_line(&mut said).unwrap();
             assert_eq!(said.trim(), "locked");
-            Self(child)
+            Self {
+                child,
+                stdin,
+                stdout,
+            }
         }
     }
 
@@ -23442,8 +23469,92 @@ pub(crate) mod tests {
     impl Drop for OutsideHolder {
         fn drop(&mut self) {
             // Still this test's unreaped child, so its pid cannot be reused.
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// A live Freshell pane holding a conversation's writer lock: a
+    /// tag-backend unit with a terminal, registered in its own
+    /// `UnitDirectory` (wire it with `set_unit_directory`), whose member
+    /// holds the lock (placed by its tag, as a pane's app-server is placed
+    /// in its pane's unit).
+    #[cfg(target_os = "linux")]
+    struct HoldingPane {
+        units: Arc<freshell_containment::UnitDirectory>,
+        unit: freshell_containment::AgentUnit,
+        lock: std::path::PathBuf,
+        holder: OutsideHolder,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl HoldingPane {
+        const TERMINAL_ID: &'static str = "term-holding-pane";
+
+        /// A pane holding `thread_id` under the isolated `CODEX_HOME`.
+        fn hold(thread_id: &str) -> Self {
+            let home = std::env::var_os("CODEX_HOME").expect("the isolated CODEX_HOME");
+            let lock = freshell_containment::codex_thread_lock_path(
+                std::path::Path::new(&home),
+                thread_id,
+            );
+            let units = freshell_containment::UnitDirectory::new();
+            let unit = freshell_containment::Containment::tag_backend(Default::default())
+                .create_unit(freshell_containment::UnitId::mint(), Default::default())
+                .expect("a pane's unit");
+            units.register(freshell_containment::UnitEntry {
+                unit: unit.clone(),
+                provider: "codex".to_string(),
+                mode: "codex".to_string(),
+                create_request_id: Some("crq-holding-pane".to_string()),
+                terminal_id: Some(Self::TERMINAL_ID.to_string()),
+            });
+            let holder = OutsideHolder::hold_in_unit(&lock, &unit);
+            Self {
+                units,
+                unit,
+                lock,
+                holder,
+            }
+        }
+
+        /// The pane is alive and unchanged after a failed attempt beside it
+        /// was cleaned up (call it once the attempt was answered, which
+        /// happens after its teardown): its process still answers (a signal
+        /// the teardown sent ends it first), still holds the lock, is still
+        /// a member of the same registered unit with the same terminal, and
+        /// no stop of that unit was started.
+        async fn assert_alive_and_unchanged(&mut self) {
+            assert!(
+                self.holder.answers(),
+                "the holding pane's process is alive after the attempt's cleanup"
+            );
+            let pid = self.holder.pid();
+            let lock = self.lock.clone();
+            let units = Arc::clone(&self.units);
+            let (holders, entry) = tokio::task::spawn_blocking(move || {
+                (
+                    freshell_containment::lock_holders(&[lock]),
+                    units.entry_with_member(pid),
+                )
+            })
+            .await
+            .expect("the one-shot reads");
+            assert!(
+                holders.iter().any(|holder| holder.pid == pid),
+                "the holding pane still holds the lock: {holders:?}"
+            );
+            let entry = entry.expect("the holder is still a member of its pane's unit");
+            assert_eq!(entry.unit.id(), self.unit.id(), "the same unit");
+            assert_eq!(
+                entry.terminal_id.as_deref(),
+                Some(Self::TERMINAL_ID),
+                "the same terminal"
+            );
+            assert!(
+                self.unit.stop_in_flight().is_none(),
+                "no stop of the holding pane's unit was started"
+            );
         }
     }
 
@@ -23463,7 +23574,7 @@ pub(crate) mod tests {
             std::path::Path::new(&home),
             "thread-held-outside",
         ));
-        let pid = holder.0.id();
+        let pid = holder.pid();
         let (st, mut rx) = state_with_bus();
 
         st.handle_create(
@@ -23506,35 +23617,18 @@ pub(crate) mod tests {
     /// Freshell pane's unit holds (that pane's app-server, which the owner
     /// registry may not know holds it) is that pane's: the create answers
     /// `SESSION_RESERVED`, the live-session answer the live-terminal guard
-    /// gives, resumes nothing beside the holder, and never reports it as
-    /// another program.
+    /// gives, resumes nothing beside the holder, never reports it as
+    /// another program, and leaves the holding pane alive and unchanged
+    /// (review R2-M2).
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_resume_of_a_conversation_a_freshell_panes_unit_holds_answers_session_reserved() {
         let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd("{}");
         let capture = tracing_capture::capture_by_session("thread-held-by-pane");
-        let home = std::env::var_os("CODEX_HOME").expect("the isolated CODEX_HOME");
-        let units = freshell_containment::UnitDirectory::new();
-        let unit = freshell_containment::Containment::tag_backend(Default::default())
-            .create_unit(freshell_containment::UnitId::mint(), Default::default())
-            .expect("a pane's unit");
-        units.register(freshell_containment::UnitEntry {
-            unit: unit.clone(),
-            provider: "codex".to_string(),
-            mode: "codex".to_string(),
-            create_request_id: Some("crq-holding-pane".to_string()),
-            terminal_id: Some("term-holding-pane".to_string()),
-        });
-        let holder = OutsideHolder::hold_in_unit(
-            &freshell_containment::codex_thread_lock_path(
-                std::path::Path::new(&home),
-                "thread-held-by-pane",
-            ),
-            &unit,
-        );
+        let mut pane = HoldingPane::hold("thread-held-by-pane");
         let (st, mut rx) = state_with_bus();
-        st.set_unit_directory(units);
+        st.set_unit_directory(Arc::clone(&pane.units));
 
         st.handle_create(
             resume_create("req-held-by-pane", "thread-held-by-pane"),
@@ -23554,7 +23648,7 @@ pub(crate) mod tests {
             }),
             "a Freshell pane is never reported as another program"
         );
-        drop(holder);
+        pane.assert_alive_and_unchanged().await;
     }
 
     /// Task 16: Codex refusing the resume itself ("already has an active
@@ -23681,7 +23775,7 @@ pub(crate) mod tests {
             std::path::Path::new(&home),
             "thread-attach-held",
         ));
-        let pid = holder.0.id();
+        let pid = holder.pid();
         let (st, mut rx) = state_with_bus();
 
         st.handle_attach(attach_msg("thread-attach-held")).await;
@@ -23756,7 +23850,7 @@ pub(crate) mod tests {
             std::path::Path::new(&home),
             &thread_id,
         ));
-        let pid = holder.0.id();
+        let pid = holder.pid();
         let expected = freshell_protocol::conversation_held_elsewhere_message(pid, "perl");
 
         st.handle_send(FreshAgentSend {
@@ -23790,7 +23884,8 @@ pub(crate) mod tests {
     /// Task 16 (review M3): a crash recovery whose conversation a member of a
     /// live Freshell pane's unit holds answers with that pane's live-session
     /// answer, `SESSION_RESERVED` (as the create lane and the live-terminal
-    /// guard do), never "another program".
+    /// guard do), never "another program", and leaves the holding pane alive
+    /// and unchanged (review R2-M2).
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_crash_recovery_a_freshell_pane_holds_answers_session_reserved() {
@@ -23800,29 +23895,14 @@ pub(crate) mod tests {
         let thread_id = create_real_fake_session(&st, &mut rx).await;
         simulate_unrequested_crash(&st, &thread_id).await;
         configure_fake_codex_cmd(&refuse_resume_as_held(&thread_id));
-        let home = std::env::var_os("CODEX_HOME").expect("the isolated CODEX_HOME");
-        let units = freshell_containment::UnitDirectory::new();
-        let unit = freshell_containment::Containment::tag_backend(Default::default())
-            .create_unit(freshell_containment::UnitId::mint(), Default::default())
-            .expect("a pane's unit");
-        units.register(freshell_containment::UnitEntry {
-            unit: unit.clone(),
-            provider: "codex".to_string(),
-            mode: "codex".to_string(),
-            create_request_id: Some("crq-holding-pane".to_string()),
-            terminal_id: Some("term-holding-pane".to_string()),
-        });
-        let holder = OutsideHolder::hold_in_unit(
-            &freshell_containment::codex_thread_lock_path(std::path::Path::new(&home), &thread_id),
-            &unit,
-        );
-        st.set_unit_directory(units);
+        let mut pane = HoldingPane::hold(&thread_id);
+        st.set_unit_directory(Arc::clone(&pane.units));
 
         st.handle_attach(attach_msg(&thread_id)).await;
         let frames = frames_until_error_banner(&mut rx, &thread_id).await;
         let banner = frames.last().expect("the answer");
         assert_eq!(banner["event"]["code"], "SESSION_RESERVED", "{banner}");
-        drop(holder);
+        pane.assert_alive_and_unchanged().await;
     }
 
     /// Node parity (`runtime-manager.ts:106-108`): a `freshAgent.create` whose
