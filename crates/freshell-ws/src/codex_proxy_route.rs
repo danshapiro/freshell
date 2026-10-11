@@ -1146,4 +1146,67 @@ mod tests {
             "the refused adoption left the extra hold as it was"
         );
     }
+
+    /// Task 14 re-review R2-M1: this pane's hold of a thread was refused,
+    /// because another pane holds it as an extra thread. An adoption of the
+    /// thread on this pane passes its guards and is then refused by the
+    /// owner registry for the same reason. It released nothing, so it must
+    /// not clear the refused mark: once the other pane lets the thread go,
+    /// the thread's next status holds it for this pane.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_adoption_keeps_a_refused_hold_to_be_tried_again() {
+        use freshell_ownership::{HoldKind, HoldOutcome, OwnerIdentity, OwnershipState};
+        let mut state = test_state();
+        let ownership = StdArc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.ownership = Some(StdArc::clone(&ownership));
+        let _containment = crate::unit_threads::register_test_unit(&state, "term-holder");
+        let other = OwnerIdentity {
+            kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+            terminal_id: Some("term-other".into()),
+            unit_id: Some("unit-other".into()),
+            hold: HoldKind::Extra,
+            ..Default::default()
+        };
+        assert!(matches!(
+            ownership.hold_extra("codex", "t-x", other, "test", 0),
+            HoldOutcome::Held { .. }
+        ));
+        let held_by = |terminal_id: &str| {
+            matches!(
+                ownership.observe("codex", "t-x").state,
+                OwnershipState::Live { ref owner, .. }
+                    if owner.hold == HoldKind::Extra
+                        && owner.terminal_id.as_deref() == Some(terminal_id)
+            )
+        };
+        // This pane's app-server holds the thread too: its hold is refused.
+        crate::unit_threads::observe_status(&state, "term-holder", "t-x", "idle");
+        assert!(held_by("term-other"));
+
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-holder",
+                candidate(
+                    CandidateSource::ThreadStartResponse,
+                    "t-x",
+                    Some("/tmp/sessions/rollout-t-x.jsonl"),
+                    false,
+                ),
+            ),
+        )
+        .await;
+        assert!(
+            state.identity.session_ref_for("term-holder").is_none(),
+            "the adoption was refused"
+        );
+        assert!(held_by("term-other"));
+
+        ownership.release_extra("codex", "t-x", "unit-other");
+        crate::unit_threads::observe_status(&state, "term-holder", "t-x", "active");
+        assert!(
+            held_by("term-holder"),
+            "the thread's next status holds it for this pane"
+        );
+    }
 }

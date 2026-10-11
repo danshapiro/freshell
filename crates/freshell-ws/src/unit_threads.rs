@@ -659,13 +659,18 @@ impl LockRead {
 /// already holds would only adopt it, leaving it an extra hold, and a
 /// rebind would then release the original instead of aliasing it). Returns
 /// whether a hold was released; [`restore_extra`] puts it back when the
-/// claim is refused.
+/// claim is refused. Only a hold the unit has is touched: a refused hold
+/// stays marked refused, so a refused claim leaves it to be tried again
+/// (its caller restores nothing, since nothing was released).
 pub(crate) fn release_for_main(state: &WsState, terminal_id: &str, thread_id: &str) -> bool {
     let released = with_existing_table(state, terminal_id, |table| {
-        table
-            .threads
-            .get_mut(thread_id)
-            .is_some_and(|known| std::mem::replace(&mut known.hold, Hold::None) == Hold::OnUnit)
+        match table.threads.get_mut(thread_id) {
+            Some(known) if known.hold == Hold::OnUnit => {
+                known.hold = Hold::None;
+                true
+            }
+            _ => false,
+        }
     })
     .unwrap_or(false);
     if !released {
