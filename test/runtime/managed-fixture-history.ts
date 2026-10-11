@@ -207,7 +207,11 @@ async function main(): Promise<void> {
     log('managed_fixture_history_native_reply', { ...facts, ok: !!history.result.Ok })
     assert(!history.result.Err, 'actual native-history-only helper refused')
     assert.equal(history.result.Ok?.kind, 'fresh_agent_history')
-    const native = FreshAgentSnapshotSchema.parse(history.result.Ok.data)
+    // The supervisor adds presentation context outside the strict native
+    // snapshot contract. Validate that context separately without admitting
+    // any other extra native field.
+    const { managedDirectory, ...nativeSnapshot } = history.result.Ok.data
+    const native = FreshAgentSnapshotSchema.parse(nativeSnapshot)
     assert.equal(native.provider, 'claude')
     assert.equal(native.threadId, handle.nativeSessionId)
     assert.equal(native.sessionType, 'freshclaude')
@@ -218,11 +222,15 @@ async function main(): Promise<void> {
     assert.equal(assistants.length, 1, 'one actual saved assistant completion required')
     assert.equal(assistants[0].messageId, completed.assistantMessageId,
       'native reader must return the completion saved by this actual Send')
-    const binding = history.result.Ok.data.managedDirectory
+    const binding = z.object({ incarnationId: z.string().min(1), cwd: z.string().min(1),
+      workspacePath: z.string().min(1), gitCommonDir: z.string().nullable(),
+      sessionType: z.literal('freshclaude') }).strict().parse(managedDirectory)
     assert.equal(binding.incarnationId, handle.incarnationId)
     assert.equal(binding.cwd, root)
     assert.equal(binding.workspacePath, root)
     assert.equal(binding.sessionType, 'freshclaude')
+    assert.equal(binding.gitCommonDir, path.resolve(root,
+      execFileSync('git', ['rev-parse', '--git-common-dir'], { cwd: root, encoding: 'utf8' }).trim()))
     const activity = history.result.Ok.data.extensions.claude.nativeHistoryActivity
     assert(Number.isSafeInteger(activity.at) && activity.at >= 0, 'integer native activity required')
     facts.nativeReader = { ok: true, turnCount: native.turns.length, activityType: typeof activity.at,
@@ -248,7 +256,7 @@ async function main(): Promise<void> {
     assert.equal(matches[0].sessionType, 'freshclaude')
     assert.equal(matches[0].cwd, root)
     assert.equal(matches[0].checkoutPath, root)
-    assert.equal(matches[0].projectPath, path.dirname(binding.gitCommonDir))
+    assert.equal(matches[0].projectPath, path.dirname(binding.gitCommonDir!))
     assert(!page.partial && !page.integrityError, 'directory projection is incomplete')
     boundary = 'unchanged-owner'
     await owner.assertCurrentHandle(handle)
