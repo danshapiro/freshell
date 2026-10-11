@@ -351,13 +351,16 @@ impl PtyTerminal {
             // under the lock a pinned kill holds while it signals: such a
             // kill never reaches a pid the child no longer owns.
             #[cfg(unix)]
-            if let Some(pid) = pid {
-                wait_exited_unreaped(pid);
-            }
-            let code = waiter_leader.reap(|| match child.wait() {
-                Ok(status) => status.exit_code() as i64,
-                Err(_) => 0,
-            });
+            let code = {
+                if let Some(pid) = pid {
+                    wait_exited_unreaped(pid);
+                }
+                waiter_leader.reap(|| reaped_exit_code(child.wait()))
+            };
+            // No pinned kill elsewhere: the child is waited for outside the
+            // lock, so a reader of its exit code waits only up to its limit.
+            #[cfg(not(unix))]
+            let code = wait_then_record(&waiter_leader, || reaped_exit_code(child.wait()));
             let _ = code_tx.send(code);
             if cfg!(windows) {
                 waiter_master.lock().expect("master mutex").take();
@@ -592,6 +595,31 @@ impl LeaderExit {
     }
 }
 
+/// The exit code a PTY child's waiter records when its exit status could
+/// not be read (a failed wait): a failure, never 0, which a unit reads as
+/// the agent's own clean end (or the user quitting Codex).
+const UNREAD_EXIT_CODE: i64 = 1;
+
+/// The exit code of a PTY child's wait: its own code, or
+/// [`UNREAD_EXIT_CODE`] when the wait failed.
+fn reaped_exit_code(waited: io::Result<portable_pty::ExitStatus>) -> i64 {
+    match waited {
+        Ok(status) => status.exit_code() as i64,
+        Err(_) => UNREAD_EXIT_CODE,
+    }
+}
+
+/// Waits for the child (`wait` returns its exit code) with no lock held,
+/// then records the code under the lock and wakes every waiter: a reader of
+/// the code ([`ChildExitCode::wait`]) never waits past its limit for a
+/// child that still runs. Where no pinned kill needs the reap under the
+/// lock (everywhere but unix).
+#[cfg(any(not(unix), test))]
+fn wait_then_record(leader: &LeaderExit, wait: impl FnOnce() -> i64) -> i64 {
+    let code = wait();
+    leader.reap(|| code)
+}
+
 /// A handle on a PTY child's exit code ([`PtyTerminal::exit_code`]).
 #[derive(Clone)]
 pub struct ChildExitCode(Arc<LeaderExit>);
@@ -746,9 +774,10 @@ fn spawn_reader(
         // (`terminal-registry.ts:1491` cleanupMcpConfig + tr:1479 finishTerminalPtyExit
         // parity) with the exit code from the waiter thread. The recv is bounded:
         // stream EOF implies the child is exiting, so `child.wait()` completes and
-        // the waiter always sends exactly once.
+        // the waiter always sends exactly once (a waiter that died without
+        // sending leaves the code unread, never a clean 0).
         if let Some(hook) = on_exit {
-            let code = code_rx.recv().unwrap_or(0);
+            let code = code_rx.recv().unwrap_or(UNREAD_EXIT_CODE);
             hook(code);
         }
     })
@@ -1087,6 +1116,50 @@ mod tests {
         let result = PtyTerminal::spawn(&spec, &env, "t-missing", "s-missing", None);
         let err = result.err().expect("spawn must fail cleanly");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// A wait that fails never reads as a clean exit: exit code 0 is the
+    /// agent's own clean end (or the user quitting Codex), which ends a unit
+    /// as remembered-stopped with no auto-resume.
+    #[test]
+    fn a_failed_wait_is_never_read_as_a_clean_exit() {
+        assert_eq!(
+            reaped_exit_code(Ok(portable_pty::ExitStatus::with_exit_code(0))),
+            0
+        );
+        assert_eq!(
+            reaped_exit_code(Ok(portable_pty::ExitStatus::with_exit_code(3))),
+            3
+        );
+        let unread = reaped_exit_code(Err(io::Error::other("the wait failed")));
+        assert_ne!(unread, 0, "an unread exit status is a failure");
+        assert_eq!(unread, UNREAD_EXIT_CODE);
+    }
+
+    /// Where the child is waited for outside the lock (everywhere but unix),
+    /// a reader of its exit code is answered at its limit while the child
+    /// still runs, and gets the code once it is recorded.
+    #[test]
+    fn a_child_waited_for_outside_the_lock_leaves_its_code_readable_within_a_limit() {
+        let leader = Arc::new(LeaderExit::default());
+        let reader = ChildExitCode(Arc::clone(&leader));
+        let code = wait_then_record(&leader, || {
+            // The child still runs: another thread asks for its code.
+            let (answered_tx, answered) = std::sync::mpsc::channel();
+            let asking = reader.clone();
+            std::thread::spawn(move || {
+                let _ = answered_tx.send(asking.wait(std::time::Duration::from_millis(50)));
+            });
+            let answer = answered.recv_timeout(std::time::Duration::from_secs(5));
+            assert_eq!(
+                answer,
+                Ok(None),
+                "a reader of a running child's code is answered at its limit"
+            );
+            7
+        });
+        assert_eq!(code, 7);
+        assert_eq!(reader.wait(std::time::Duration::ZERO), Some(7));
     }
 
     /// A terminal whose own exit hook releases the last reference to it is
