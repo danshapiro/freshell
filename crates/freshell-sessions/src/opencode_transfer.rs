@@ -12,9 +12,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use rusqlite::backup::Backup;
+use rusqlite::backup::{Backup, Progress, StepResult};
 use rusqlite::types::ValueRef;
 use rusqlite::{params_from_iter, Connection, OpenFlags, Row};
 use serde::{Deserialize, Serialize};
@@ -3295,14 +3295,48 @@ fn open_source_read_only(path: &Path) -> Result<Connection, TransferError> {
 }
 
 fn create_online_backup(source: &Connection, destination: &Path) -> Result<(), TransferError> {
+    create_online_backup_with_progress(source, destination, |_| Ok(()))
+}
+
+fn create_online_backup_with_progress(
+    source: &Connection,
+    destination: &Path,
+    mut progress: impl FnMut(Progress) -> Result<(), TransferError>,
+) -> Result<(), TransferError> {
+    // BEGIN alone is deferred: read main before starting the incremental
+    // backup so other connections cannot restart it with every new commit.
+    // WAL writers keep committing against this fixed snapshot. Rollback
+    // journals retain SQLite's normal read lock until the copy completes.
+    let read_transaction = source.unchecked_transaction()?;
+    read_transaction.query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))?;
     let mut target = Connection::open(destination)?;
-    let backup = Backup::new(source, &mut target)?;
-    backup
-        .run_to_completion(128, Duration::from_millis(5), None)
-        .map_err(|error| {
+    let backup = Backup::new(&read_transaction, &mut target)?;
+    let mut last_progress = Instant::now();
+    loop {
+        let result = backup.step(2048).map_err(|error| {
             TransferError::Blocked(format!("consistent SQLite snapshot failed: {error}"))
         })?;
+        progress(backup.progress())?;
+        match result {
+            StepResult::Done => break,
+            StepResult::More => last_progress = Instant::now(),
+            StepResult::Busy | StepResult::Locked => {
+                if last_progress.elapsed() >= Duration::from_secs(5) {
+                    return Err(TransferError::Blocked(
+                        "consistent SQLite snapshot remained locked without progress".into(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            _ => {
+                return Err(TransferError::Blocked(
+                    "unknown SQLite backup result".into(),
+                ))
+            }
+        }
+    }
     drop(backup);
+    read_transaction.rollback()?;
     // The new private copy must not retain WAL mode: SQLite's root reader
     // reasserts WAL ownership on open, changing ctime even without a write.
     // Stabilize only this extraction-owned database before it is qualified;
@@ -4679,6 +4713,193 @@ mod windows_extraction_acl_tests {
             &windows_acl::read_acl_evidence(&path).unwrap()
         ));
         assert_eq!(prepare_extraction_root(&path).unwrap(), path);
+    }
+}
+
+#[cfg(test)]
+mod online_backup_tests {
+    use super::*;
+
+    fn source_fixture(path: &Path, journal: &str) -> Connection {
+        let writer = Connection::open(path).unwrap();
+        writer
+            .execute_batch(&format!(
+                "PRAGMA page_size=4096; PRAGMA journal_mode={journal};
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE payload(id INTEGER PRIMARY KEY, revision INTEGER, body BLOB);
+             WITH RECURSIVE rows(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM rows WHERE id<3072)
+             INSERT INTO payload SELECT id,0,zeroblob(4050) FROM rows;"
+            ))
+            .unwrap();
+        writer
+    }
+
+    fn revision(connection: &Connection) -> i64 {
+        connection
+            .query_row("SELECT revision FROM payload WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn online_backup_completes_initial_wal_snapshot_while_each_step_has_a_writer_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.db");
+        let writer = source_fixture(&path, "WAL");
+        let reader = open_source_read_only(&path).unwrap();
+        let destination = directory.path().join("snapshot.db");
+        let mut steps = 0;
+        let mut remaining = Vec::new();
+        let result = create_online_backup_with_progress(&reader, &destination, |progress| {
+            steps += 1;
+            remaining.push(progress.remaining);
+            writer.execute("UPDATE payload SET revision=revision+1 WHERE id=1", [])?;
+            if steps == 64 {
+                return Err(TransferError::Blocked(
+                    "fixture backup failed to finish in 64 steps".into(),
+                ));
+            }
+            Ok(())
+        });
+        assert!(result.is_ok(), "backup must make bounded progress with ongoing WAL commits: {result:?}; remaining={remaining:?}");
+        assert!(
+            steps > 1,
+            "fixture must exercise writes between backup steps"
+        );
+        assert!(
+            remaining.windows(2).all(|pair| pair[1] < pair[0]),
+            "pinned backup must advance: {remaining:?}"
+        );
+        assert!(
+            reader.is_autocommit(),
+            "capture must release its read transaction"
+        );
+        let pages: i64 = writer
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        eprintln!(
+            "online_backup_fixture sqlite={} pages={pages} steps={steps} writer_commits={steps} remaining={remaining:?}",
+            rusqlite::version()
+        );
+        let snapshot = open_source_read_only(&destination).unwrap();
+        assert_eq!(revision(&snapshot), 0);
+        assert_eq!(
+            snapshot
+                .query_row(
+                    "SELECT count(*) FROM payload WHERE length(body)=4050",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            3072
+        );
+        assert_eq!(revision(&writer), steps);
+        assert_eq!(
+            snapshot
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            snapshot
+                .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "delete"
+        );
+    }
+
+    #[test]
+    fn online_backup_releases_rollback_journal_reader_after_success_and_interruption() {
+        for interrupt in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("source.db");
+            let writer = source_fixture(&path, "DELETE");
+            writer.busy_timeout(Duration::ZERO).unwrap();
+            let reader = open_source_read_only(&path).unwrap();
+            let destination = directory.path().join("snapshot.db");
+            let mut steps = 0;
+            let result = create_online_backup_with_progress(&reader, &destination, |_| {
+                steps += 1;
+                let error = writer
+                    .execute("UPDATE payload SET revision=revision+1 WHERE id=1", [])
+                    .unwrap_err();
+                assert_eq!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy)
+                );
+                if interrupt {
+                    Err(TransferError::Blocked("owned fixture interruption".into()))
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(result.is_err(), interrupt);
+            assert!(steps > 0);
+            assert!(
+                reader.is_autocommit(),
+                "success and error must release the pinned reader"
+            );
+            writer
+                .execute("UPDATE payload SET revision=revision+1 WHERE id=1", [])
+                .unwrap();
+            if interrupt {
+                let aborted = open_source_read_only(&destination).unwrap();
+                assert_eq!(
+                    aborted
+                        .query_row(
+                            "SELECT count(*) FROM sqlite_schema WHERE name='payload'",
+                            [],
+                            |row| row.get::<_, i64>(0)
+                        )
+                        .unwrap(),
+                    0,
+                    "partial backup must roll back"
+                );
+                let retry = directory.path().join("retry.db");
+                create_online_backup(&reader, &retry).unwrap();
+                assert_eq!(revision(&open_source_read_only(&retry).unwrap()), 1);
+            } else {
+                assert_eq!(revision(&open_source_read_only(&destination).unwrap()), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn online_backup_refuses_persistent_destination_lock_and_releases_reader() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.db");
+        let writer = source_fixture(&path, "WAL");
+        let reader = open_source_read_only(&path).unwrap();
+        let destination = directory.path().join("snapshot.db");
+        let locked = Connection::open(&destination).unwrap();
+        locked
+            .execute_batch("BEGIN EXCLUSIVE; CREATE TABLE blocker(id INTEGER)")
+            .unwrap();
+        // Even a regression that retries forever must fail this owned fixture
+        // finitely, after two unsuccessful steps through the real backup API.
+        let mut attempts = 0;
+        let result = create_online_backup_with_progress(&reader, &destination, |_| {
+            attempts += 1;
+            if attempts == 2 {
+                Err(TransferError::Blocked(
+                    "fixture lock retry bound exhausted".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(
+            matches!(result, Err(TransferError::Blocked(ref reason)) if reason.contains("remained locked without progress")),
+            "persistent lock must refuse rather than retry indefinitely: {result:?}"
+        );
+        assert!(reader.is_autocommit());
+        locked.execute_batch("ROLLBACK").unwrap();
+        writer
+            .execute("UPDATE payload SET revision=revision+1 WHERE id=1", [])
+            .unwrap();
+        create_online_backup(&reader, &destination).unwrap();
+        assert_eq!(revision(&open_source_read_only(&destination).unwrap()), 1);
     }
 }
 
