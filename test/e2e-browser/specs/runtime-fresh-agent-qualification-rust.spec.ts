@@ -16,7 +16,7 @@ import {
 import { FRESH_AGENT_QUALIFICATION_LIVE_ENV } from '../../../scripts/testing/runtime-fresh-agent-qualification.js'
 import { executeAction } from '../../../tools/freshell-mcp/freshell-tool.js'
 import { test } from '../helpers/fixtures.js'
-import { createManagedRuntimeBrowserRig, type ManagedRuntimeView, type ManagedFixtureRig } from '../helpers/managed-runtime.js'
+import { createManagedRuntimeBrowserRig, splitFreshBrowserPane, type ManagedRuntimeView, type ManagedFixtureRig } from '../helpers/managed-runtime.js'
 import { observeOwnedFreshBrowserPane, stageOwnedFreshBrowserProfile } from '../../../scripts/testing/runtime-external-browser.js'
 import { TestHarness } from '../helpers/test-harness.js'
 
@@ -104,7 +104,7 @@ async function paneFor(page: Page, observation: Parameters<typeof observeOwnedFr
   return waitFor('actual fresh pane', () => page.evaluate(observeOwnedFreshBrowserPane, observation))
 }
 
-async function actualCreate(page: Page, rig: ManagedFixtureRig, definition: Definition, wire: WireObservations, split: boolean) {
+async function actualCreate(page: Page, rig: ManagedFixtureRig, definition: Definition, wire: WireObservations, splitPaneId?: string) {
   const cursor = wire.sent.length
   const beforeSouls = (await rig.inventory()).map(view => view.soulId).sort()
   // The existing harness holds network effects only while the real picker
@@ -112,10 +112,8 @@ async function actualCreate(page: Page, rig: ManagedFixtureRig, definition: Defi
   // picker interaction and its subsequently observed wire request remain real.
   await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.setSuppressAllFreshAgentNetworkEffects(true))
   try {
-    if (split) {
-      await page.locator('[data-context="fresh-agent"]').last().click({ button: 'right' })
-      await page.getByRole('menuitem', { name: /split horizontally/i }).click()
-    } else await page.keyboard.press('Alt+t')
+    if (splitPaneId) await splitFreshBrowserPane(page, splitPaneId)
+    else await page.keyboard.press('Alt+t')
     const label = { freshclaude: 'Freshclaude', kilroy: 'Kilroy', freshcodex: 'Freshcodex', freshopencode: 'Freshopencode' }[definition.mode]
     const picker = page.getByRole('toolbar', { name: /pane type picker/i }).last()
     await expect(picker).toBeVisible()
@@ -169,7 +167,7 @@ async function reloadOwnedBrowser(page: Page, rig: ManagedFixtureRig) {
 }
 
 async function qualify(page: Page, rig: ManagedFixtureRig, definition: Definition, wire: WireObservations): Promise<FreshAgentQualificationRow> {
-  const initial = await actualCreate(page, rig, definition, wire, false)
+  const initial = await actualCreate(page, rig, definition, wire)
   let main = initial.view
   const collection = await rig.registerFreshNativeCollection(rig.exactRuntimeHandle(main), 'codename-' + randomBytes(16).toString('hex'))
   const id = collection.collectionId
@@ -177,7 +175,7 @@ async function qualify(page: Page, rig: ManagedFixtureRig, definition: Definitio
   await rig.observeFreshBrowserIngress(rig.exactRuntimeHandle(main), id, { ingress: 'ws-create', request: initial.request, reply: initial.reply })
   await rig.captureFreshNativeStage(rig.exactRuntimeHandle(main), id)
 
-  const auxiliary = await actualCreate(page, rig, definition, wire, true)
+  const auxiliary = await actualCreate(page, rig, definition, wire, initial.paneId)
   let other = auxiliary.view
   await rig.observeFreshBrowserIngress(rig.exactRuntimeHandle(other), id, { ingress: 'browser-split', request: auxiliary.request, reply: auxiliary.reply })
   const ui = await rig.registerFreshBrowserTurn(rig.exactRuntimeHandle(other), id)
