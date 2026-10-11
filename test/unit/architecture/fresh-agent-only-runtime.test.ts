@@ -9,11 +9,12 @@ const repoRoot = process.cwd()
 // legacy Node backend is intentionally not an allowed production root.
 const productionRuntimeRoots = ['src', 'shared'] as const
 
+// test/integration/server contains clients of the Rust managed runtime and
+// their teardown callbacks, rather than a retained Node backend root.
 const retiredNodeBackendPaths = [
   'server',
   'test/server',
   'test/unit/server',
-  'test/integration/server',
   'test/integration/session-repair.test.ts',
   'tsconfig.server.json',
   'dist/server',
