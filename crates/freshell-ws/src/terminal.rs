@@ -81,6 +81,10 @@ mod terminal_create_ordering_tests;
 #[path = "terminal_launch_prep_tests.rs"]
 mod terminal_launch_prep_tests;
 
+#[cfg(test)]
+#[path = "managed_fixture_denies_host_pty.rs"]
+mod managed_fixture_denies_host_pty;
+
 #[path = "connection_writer.rs"]
 mod connection_writer;
 #[path = "interactive_creates.rs"]

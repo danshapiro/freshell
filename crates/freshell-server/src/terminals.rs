@@ -1473,6 +1473,63 @@ mod title_scope_tests {
     }
 }
 
+#[cfg(all(test, feature = "managed-runtime-v1"))]
+mod managed_fixture_denies_host_pty {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn http_cli_fallback() {
+        let registry = TerminalRegistry::new().with_managed_environment_fixture_only(true);
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
+        let state = freshell_freshagent::FreshAgentState::new(
+            Arc::new("fixture-token".into()),
+            Arc::new(tx),
+        )
+        .with_terminal_registry(registry.clone());
+        // CLI and MCP create-tab requests use this production authenticated route.
+        let response = freshell_freshagent::router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tabs")
+                    .header("x-auth-token", "fixture-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":"shell","cwd":"/tmp"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let rows = registry.directory();
+        let pids: Vec<_> = rows
+            .iter()
+            .filter_map(|row| registry.pid_of(&row.terminal_id))
+            .collect();
+        for row in &rows {
+            registry.kill(&row.terminal_id);
+        }
+        assert!(rows.is_empty(), "ordinary rows must be absent: {rows:?}");
+        assert!(
+            pids.is_empty(),
+            "ordinary child PIDs must be absent: {pids:?}"
+        );
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("managed environment fixture denies host PTY"),
+            "{body}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod sidebar_projection_tests {
     use super::*;

@@ -1629,6 +1629,12 @@ pub trait PaneIdentityBinder: Send + Sync + std::fmt::Debug {
 }
 
 impl TerminalRegistry {
+    /// Construction seam for the closed managed-environment acceptance target.
+    /// The refusal behavior is added after its endpoint regression is observed.
+    pub fn with_managed_environment_fixture_only(self, _fixture_only: bool) -> Self {
+        self
+    }
+
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(RegistryInner {
@@ -15550,3 +15556,76 @@ mod tests {
 #[cfg(test)]
 #[path = "managed_output_tests.rs"]
 mod managed_output_tests;
+
+#[cfg(test)]
+mod fixture_denies_host_pty {
+    use super::*;
+
+    fn missing_program() -> SpawnSpec {
+        SpawnSpec {
+            program: "/freshell-fixture-missing-program".into(),
+            args: vec![],
+            env_overrides: BTreeMap::new(),
+            cwd: Some("/tmp".into()),
+            cols: 80,
+            rows: 24,
+        }
+    }
+
+    fn create(registry: &TerminalRegistry) -> io::Result<()> {
+        registry.create(
+            &missing_program(),
+            &BTreeMap::new(),
+            "fixture-host".into(),
+            "fixture-stream".into(),
+            "shell",
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn refuses_before_opening_a_host_pty() {
+        let registry = TerminalRegistry::new().with_managed_environment_fixture_only(true);
+        let error = create(&registry).expect_err("host creation must be refused");
+        assert!(registry.directory().is_empty());
+        assert_eq!(registry.pid_of("fixture-host"), None);
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert!(error
+            .to_string()
+            .contains("managed environment fixture denies host PTY"));
+    }
+
+    #[test]
+    fn ordinary_construction_keeps_existing_spawn_errors() {
+        for registry in [
+            TerminalRegistry::new(),
+            TerminalRegistry::new().with_managed_environment_fixture_only(false),
+        ] {
+            let error = create(&registry).expect_err("the selected program does not exist");
+            assert_ne!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+            assert!(registry.directory().is_empty());
+        }
+    }
+
+    #[test]
+    fn managed_facade_remains_available_without_a_host_pid() {
+        let registry = TerminalRegistry::new().with_managed_environment_fixture_only(true);
+        registry.register_managed(ManagedTerminalDescriptor {
+            soul_id: "fixture-soul".into(),
+            incarnation_id: "fixture-incarnation".into(),
+            terminal_id: "fixture-managed".into(),
+            stream_id: "fixture-stream".into(),
+            mode: "opencode".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: None,
+            create_request_id: Some("fixture-create".into()),
+        });
+        assert!(registry.is_managed("fixture-managed"));
+        assert_eq!(registry.pid_of("fixture-managed"), None);
+        assert!(registry.ingest_managed_output("fixture-managed", 1, 1, "fixture output".into()));
+        assert_eq!(registry.directory()[0].snapshot, "fixture output");
+    }
+}
