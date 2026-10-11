@@ -813,7 +813,7 @@ impl Supervisor {
                         "saved native session identity unavailable",
                     )
                 })?;
-                let snapshot = self
+                let mut snapshot = self
                     .backend
                     .read_native_history(
                         handle,
@@ -838,6 +838,14 @@ impl Supervisor {
                         "native history identity mismatch",
                     ));
                 }
+                // Presentation context comes from the persisted owned launch.
+                // It does not assert provider identity, LIVE, or loss evidence.
+                snapshot["managedDirectory"] = serde_json::json!({
+                    "cwd": agent.cwd,
+                    "workspacePath": agent.workspace_path,
+                    "gitCommonDir": agent.git_common_dir,
+                    "sessionType": agent.session_type,
+                });
                 Ok(AdminResult::FreshAgentHistory(snapshot))
             }
             AdminCommand::FreshAgentReadEvents(request) => {

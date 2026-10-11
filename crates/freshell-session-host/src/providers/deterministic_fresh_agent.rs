@@ -161,6 +161,23 @@ impl DeterministicFreshAgentTransport {
                 .map_err(non_ambiguous)?;
             (native, turn_id, message_id)
         };
+        let completion = json!({"provider":self.provider.as_str(), "nativeId":native_session_id,
+            "turnId":turn_id, "messageId":message_id, "requestId":request_id.as_str(), "at":unix_millis()});
+        #[cfg(test)]
+        write_native_completion(&self.state_dir, &completion).map_err(non_ambiguous)?;
+        #[cfg(not(test))]
+        provider_state_worker(
+            &self.state_dir,
+            self.run_as_uid,
+            self.run_as_gid,
+            "completion",
+            Some(
+                &serde_json::to_vec(&completion)
+                    .map_err(|error| non_ambiguous(error.to_string()))?,
+            ),
+        )
+        .await
+        .map_err(non_ambiguous)?;
         self.event_tx
             .send(AgentEvent::Provider {
                 payload: json!({
@@ -451,6 +468,111 @@ fn read_state(state_dir: &Path) -> Result<Option<FixtureState>, String> {
         .map_err(|error| format!("decode deterministic provider state: {error}"))
 }
 
+/// Save the turn emitted by this deterministic transport in its own native
+/// store. Production calls run inside the existing provider-UID state worker.
+fn write_native_completion(state_dir: &Path, completion: &Value) -> Result<(), String> {
+    use std::io::Write;
+    let home = state_dir
+        .parent()
+        .ok_or("fixture provider home unavailable")?;
+    let provider = completion["provider"]
+        .as_str()
+        .ok_or("fixture provider missing")?;
+    let id = completion["nativeId"]
+        .as_str()
+        .filter(|id| !id.is_empty() && !id.contains(['/', '\\']))
+        .ok_or("fixture native identity invalid")?;
+    let user_id = format!(
+        "user-{}",
+        short_hash(
+            completion["requestId"]
+                .as_str()
+                .ok_or("fixture request missing")?
+        )
+    );
+    let message_id = completion["messageId"]
+        .as_str()
+        .ok_or("fixture message missing")?;
+    let text = "deterministic fixture completion";
+    if provider == "opencode" {
+        // The runtime image already includes Python for its owned SQLite
+        // fixtures. Use the same provider UID, no migration or host-home IO.
+        let directory = home.join(".local/share/opencode");
+        fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        let script = r#"import sqlite3,json,sys
+c=json.load(sys.stdin); db=sqlite3.connect(sys.argv[1]); native=c['nativeId']; at=c['at']
+db.executescript('CREATE TABLE IF NOT EXISTS session(id TEXT PRIMARY KEY,title TEXT,time_updated INTEGER); CREATE TABLE IF NOT EXISTS message(id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE IF NOT EXISTS part(id TEXT PRIMARY KEY,session_id TEXT,message_id TEXT,time_created INTEGER,data TEXT);')
+db.execute('INSERT INTO session VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET time_updated=excluded.time_updated',(native,'Deterministic fixture history',at))
+for role,key,text in [('user','user-'+c['requestId'],'deterministic fixture request'),('assistant',c['messageId'],'deterministic fixture completion')]:
+ data={'id':key,'sessionID':native,'role':role,'time':{'created':at,'completed':at}}
+ db.execute('INSERT OR IGNORE INTO message VALUES(?,?,?,?)',(key,native,at,json.dumps(data)))
+ part={'id':'part-'+key,'sessionID':native,'messageID':key,'type':'text','text':text}
+ db.execute('INSERT OR IGNORE INTO part VALUES(?,?,?,?,?)',('part-'+key,native,key,at,json.dumps(part)))
+db.commit(); db.close()
+"#;
+        let mut child = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(script)
+            .arg(directory.join("opencode.db"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        child
+            .stdin
+            .take()
+            .ok_or("fixture native writer stdin unavailable")?
+            .write_all(&serde_json::to_vec(completion).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+        return if child.wait().map_err(|error| error.to_string())?.success() {
+            Ok(())
+        } else {
+            Err("fixture native SQLite writer failed".into())
+        };
+    }
+    let (path, records) = match provider {
+        "claude" | "kilroy" => (
+            home.join(".claude/projects/managed-fixture")
+                .join(format!("{id}.jsonl")),
+            vec![
+                json!({"type":"user","uuid":user_id,"sessionId":id,"cwd":"/workspace","message":{"role":"user","content":"deterministic fixture request"}}),
+                json!({"type":"assistant","uuid":message_id,"parentUuid":user_id,"sessionId":id,"message":{"id":message_id,"role":"assistant","content":[{"type":"text","text":text}],"stop_reason":"end_turn"}}),
+            ],
+        ),
+        "codex" => (
+            home.join(".codex/sessions")
+                .join(format!("rollout-fixture-{id}.jsonl")),
+            vec![
+                json!({"type":"turn_context","payload":{"turn_id":completion["turnId"]}}),
+                json!({"type":"response_item","payload":{"type":"message","id":user_id,"role":"user","content":[{"type":"input_text","text":"deterministic fixture request"}]}}),
+                json!({"type":"response_item","payload":{"type":"message","id":message_id,"role":"assistant","content":[{"type":"output_text","text":text}]}}),
+                json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":completion["turnId"]}}),
+            ],
+        ),
+        _ => return Err("unsupported fixture native provider".into()),
+    };
+    fs::create_dir_all(path.parent().ok_or("fixture native parent unavailable")?)
+        .map_err(|error| error.to_string())?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| error.to_string())?;
+    if provider == "codex" && file.metadata().map_err(|error| error.to_string())?.len() == 0 {
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"session_meta","payload":{"id":id,"cwd":"/workspace"}})
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    for record in records {
+        writeln!(file, "{record}").map_err(|error| error.to_string())?;
+    }
+    file.sync_all().map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 async fn read_provider_state(
     state_dir: &Path,
@@ -600,6 +722,11 @@ pub(crate) fn run_state_worker(args: &[String]) -> Result<(), String> {
                 .map_err(|error| format!("decode provider-state write: {error}"))?;
             write_state(state_dir, &state)
         }
+        [operation] if operation == "completion" => {
+            let completion: Value =
+                serde_json::from_reader(std::io::stdin()).map_err(|error| error.to_string())?;
+            write_native_completion(state_dir, &completion)
+        }
         [operation] if operation == "snapshot" => {
             let input: Value =
                 serde_json::from_reader(std::io::stdin()).map_err(|error| error.to_string())?;
@@ -616,7 +743,7 @@ pub(crate) fn run_state_worker(args: &[String]) -> Result<(), String> {
             )?;
             serde_json::to_writer(std::io::stdout(), &snapshot).map_err(|error| error.to_string())
         }
-        _ => Err("fixture state worker requires read, write or snapshot".into()),
+        _ => Err("fixture state worker requires read, write, completion or snapshot".into()),
     }
 }
 
@@ -674,67 +801,86 @@ mod tests {
 
     #[tokio::test]
     async fn provider_native_completion_crosses_the_durable_actor_once() {
-        let root = tempfile::tempdir().unwrap();
-        let profile = FreshAgentProfile {
-            provider: FreshProvider::Opencode,
-            runtime_variant: "opencode-per-soul-http".into(),
-            cwd: "/workspace".into(),
-            model: Some("opencode/big-pickle".into()),
-            effort: None,
-            permission_mode: None,
-            sandbox: Some("workspace-write".into()),
-            provider_store_id: "soul-native-proof".into(),
-            native_session_id: None,
-            plugins: None,
-            model_selection: None,
-            session_ref: None,
-            provider_launch_context: None,
-            provider_secret_references: Vec::new(),
-        };
-        let transport = DeterministicFreshAgentTransport::open(
-            root.path().join("provider"),
-            &profile,
-            unsafe { libc::getuid() },
-            unsafe { libc::getgid() },
-        )
-        .await
-        .unwrap();
-        let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
-            root.path().join("actor"),
-            profile,
-            transport.clone(),
-        )
-        .await
-        .unwrap();
-        let request = RequestId::parse("request-fixture-native-proof").unwrap();
-        let state = actor
-            .dispatch(
-                request,
-                "complete deterministically".into(),
-                None::<FreshAgentTurnSettings>,
+        for provider in [
+            FreshProvider::Claude,
+            FreshProvider::Kilroy,
+            FreshProvider::Codex,
+            FreshProvider::Opencode,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let profile = FreshAgentProfile {
+                provider: provider.clone(),
+                runtime_variant: "opencode-per-soul-http".into(),
+                cwd: "/workspace".into(),
+                model: Some("opencode/big-pickle".into()),
+                effort: None,
+                permission_mode: None,
+                sandbox: Some("workspace-write".into()),
+                provider_store_id: "soul-native-proof".into(),
+                native_session_id: None,
+                plugins: None,
+                model_selection: None,
+                session_ref: None,
+                provider_launch_context: None,
+                provider_secret_references: Vec::new(),
+            };
+            let transport = DeterministicFreshAgentTransport::open(
+                root.path().join("provider"),
+                &profile,
+                unsafe { libc::getuid() },
+                unsafe { libc::getgid() },
             )
             .await
             .unwrap();
-        assert_eq!(
-            state,
-            freshell_runtime_protocol::CommandState::ProviderAcked
-        );
-        tokio::task::yield_now().await;
-        let events = actor.read_events(0, 20).await;
-        assert!(events.events.iter().any(|entry| matches!(
-            &entry.event,
-            AgentEvent::Provider { payload }
-                if payload.get("completionKind").and_then(Value::as_str)
-                    == Some("provider_native_completed")
-        )));
-        let persisted: Value = serde_json::from_slice(
-            &fs::read(root.path().join("provider").join(STATE_FILE)).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(persisted["dispatchCount"], 1);
-        assert_eq!(persisted["completionCount"], 1);
-        assert!(!persisted.to_string().contains("complete deterministically"));
-        transport.stop().await.unwrap();
+            let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+                root.path().join("actor"),
+                profile,
+                transport.clone(),
+            )
+            .await
+            .unwrap();
+            let request = RequestId::parse("request-fixture-native-proof").unwrap();
+            let state = actor
+                .dispatch(
+                    request,
+                    "complete deterministically".into(),
+                    None::<FreshAgentTurnSettings>,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                state,
+                freshell_runtime_protocol::CommandState::ProviderAcked
+            );
+            tokio::task::yield_now().await;
+            let events = actor.read_events(0, 20).await;
+            assert!(events.events.iter().any(|entry| matches!(
+                &entry.event,
+                AgentEvent::Provider { payload }
+                    if payload.get("completionKind").and_then(Value::as_str)
+                        == Some("provider_native_completed")
+            )));
+            let persisted: Value = serde_json::from_slice(
+                &fs::read(root.path().join("provider").join(STATE_FILE)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(persisted["dispatchCount"], 1);
+            assert_eq!(persisted["completionCount"], 1);
+            assert!(!persisted.to_string().contains("complete deterministically"));
+            let native_id = persisted["nativeSessionId"].as_str().unwrap();
+            let saved = freshell_freshagent::native_history::read(
+                provider.as_str(),
+                root.path(),
+                native_id,
+            )
+            .expect("the actual fixture completion must be saved in its owned native store");
+            assert!(saved["turns"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|turn| { turn["summary"] == "deterministic fixture completion" }));
+            transport.stop().await.unwrap();
+        }
     }
 
     #[tokio::test]

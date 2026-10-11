@@ -62,7 +62,18 @@ export async function openFreshHistorySession(page: Page, identity: {
   // Wait for refresh to finish before looking for the exact history row;
   // a visible Sidebar row cannot stand in for indexed history.
   await expect(refresh).toBeEnabled({ timeout: remaining() })
-  const project = page.locator('[data-context="history-project"][data-project-path=' + JSON.stringify(identity.repoRoot) + ']')
+  // The actual indexed row owns its project group. A linked checkout can
+  // group under its common repository while retaining a different cwd.
+  const indexed = await page.evaluate(({ provider, nativeSessionId }) => {
+    const projects = window.__FRESHELL_TEST_HARNESS__?.getState().sessions.windows?.history.projects ?? []
+    return projects.flatMap(project => project.sessions
+      .filter(session => session.provider === provider && session.sessionId === nativeSessionId)
+      .map(session => ({ projectPath: project.projectPath, cwd: session.cwd, checkoutPath: session.checkoutPath })))
+  }, identity)
+  expect(indexed, 'exact provider/native root must have one indexed History group').toHaveLength(1)
+  const checkout = indexed[0].checkoutPath ?? indexed[0].cwd
+  if (checkout) expect(checkout, 'indexed host checkout must match the owned launch').toBe(identity.repoRoot)
+  const project = page.locator('[data-context="history-project"][data-project-path=' + JSON.stringify(indexed[0].projectPath) + ']')
   await expect(project).toBeVisible({ timeout: remaining() })
   const history = page.locator('[data-context="history-session"][data-provider=' + JSON.stringify(identity.provider)
     + '][data-session-id=' + JSON.stringify(identity.nativeSessionId) + ']')

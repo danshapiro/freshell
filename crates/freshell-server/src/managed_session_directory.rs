@@ -1,0 +1,684 @@
+//! Presentation-only composition of actual owned fresh-agent history.
+use super::*;
+use freshell_runtime_client::RuntimeClient;
+use freshell_runtime_protocol::{DesiredState, LaunchState, RuntimeView};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
+
+const MAX_NATIVE_READS: usize = 50;
+const READ_CONCURRENCY: usize = 4;
+const READ_BUDGET: Duration = Duration::from_secs(10);
+const PRESENTATION_TTL: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Default)]
+pub(super) struct Cache(Arc<tokio::sync::Mutex<HashMap<String, (Instant, DirItem)>>>);
+
+pub(super) struct Snapshot {
+    pub(super) items: Vec<DirItem>,
+    pub(super) partial: bool,
+}
+
+pub(super) async fn read(client: &RuntimeClient, cache: &Cache) -> Snapshot {
+    let deadline = tokio::time::Instant::now() + READ_BUDGET;
+    let mut snapshot = Snapshot {
+        items: Vec::new(),
+        partial: false,
+    };
+    let inventory = match tokio::time::timeout_at(deadline, client.inventory()).await {
+        Ok(Ok(inventory)) => inventory,
+        _ => {
+            tracing::warn!(target: "freshell_server::session_directory", reason = "managed_inventory_unavailable", "managed_directory_partial");
+            snapshot.partial = true;
+            return snapshot;
+        }
+    };
+    let mut cached = cache.0.lock().await;
+    cached.retain(|_, (at, _)| at.elapsed() < PRESENTATION_TTL);
+    let mut pending = Vec::new();
+    for view in inventory
+        .into_iter()
+        .filter(|v| v.fresh_agent_session_type.is_some())
+    {
+        let Some(native_id) = view
+            .native_session_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+        else {
+            diagnostic(&view, "native_identity_unavailable");
+            snapshot.partial = true;
+            continue;
+        };
+        let key = format!(
+            "{}:{}:{}:{}",
+            view.soul_id, view.incarnation_id, view.intent_revision, native_id
+        );
+        if let Some((_, item)) = cached.get(&key) {
+            let mut item = item.clone();
+            item.is_running = running(&view);
+            snapshot.items.push(item);
+        } else {
+            pending.push((key, view));
+        }
+    }
+    drop(cached);
+    if pending.len() > MAX_NATIVE_READS {
+        tracing::warn!(target: "freshell_server::session_directory", reason = "native_read_budget", pending_count = pending.len(), "managed_directory_partial");
+        snapshot.partial = true;
+    }
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut pending = pending.into_iter().take(MAX_NATIVE_READS);
+    loop {
+        while tasks.len() < READ_CONCURRENCY {
+            let Some((key, view)) = pending.next() else {
+                break;
+            };
+            let client = client.clone();
+            tasks.spawn(async move {
+                let history = client.fresh_agent_history(view.soul_id.clone()).await;
+                (key, view, history)
+            });
+        }
+        if tasks.is_empty() {
+            break;
+        }
+        match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+            Ok(Some(Ok((key, view, history)))) => {
+                let item = history.ok().and_then(|history| project(&view, &history));
+                if let Some(item) = item {
+                    cache
+                        .0
+                        .lock()
+                        .await
+                        .insert(key, (Instant::now(), item.clone()));
+                    snapshot.items.push(item);
+                } else {
+                    diagnostic(&view, "owned_history_unavailable_or_invalid");
+                    snapshot.partial = true;
+                }
+            }
+            _ => {
+                snapshot.partial = true;
+                tracing::warn!(target: "freshell_server::session_directory", reason = "native_read_timeout", "managed_directory_partial");
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                break;
+            }
+        }
+    }
+    snapshot
+}
+
+fn diagnostic(view: &RuntimeView, reason: &str) {
+    tracing::warn!(target: "freshell_server::session_directory", soul_id = %view.soul_id,
+        incarnation_id = %view.incarnation_id, intent_revision = view.intent_revision,
+        execution_generation = view.execution_generation, reason, "managed_directory_partial");
+}
+
+fn running(view: &RuntimeView) -> bool {
+    view.desired_state == DesiredState::Running && view.launch_state == LaunchState::Running
+}
+
+fn project(view: &RuntimeView, history: &Value) -> Option<DirItem> {
+    let native_id = view.native_session_id.as_deref()?;
+    let native_provider = view.provider.as_deref()?;
+    let provider = if native_provider == "kilroy" {
+        "claude"
+    } else {
+        native_provider
+    };
+    let context = &history["managedDirectory"];
+    let session_type = view.fresh_agent_session_type.as_deref()?;
+    if history["threadId"].as_str() != Some(native_id)
+        || history["provider"].as_str() != Some(provider)
+        || context["sessionType"].as_str() != Some(session_type)
+    {
+        return None;
+    }
+    let turns = history["turns"].as_array()?;
+    if turns.is_empty() {
+        return None;
+    }
+    let cwd = context["cwd"].as_str()?.to_owned();
+    if !Path::new(&cwd).is_absolute() {
+        return None;
+    }
+    let project_path = context["gitCommonDir"]
+        .as_str()
+        .and_then(|common| {
+            Path::new(common)
+                .file_name()
+                .filter(|name| *name == ".git")
+                .and_then(|_| Path::new(common).parent())
+        })
+        .map(|root| root.to_string_lossy().into_owned())
+        .or_else(|| freshell_platform::git_meta::resolve_git_repo_root(&cwd))?;
+    let title = history["summary"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            turns
+                .iter()
+                .find_map(|turn| turn["summary"].as_str().filter(|s| !s.trim().is_empty()))
+        })
+        .map(|s| s.chars().take(160).collect::<String>());
+    let last_activity_at =
+        history["extensions"][provider]["nativeHistoryActivity"]["at"].as_i64()?;
+    let indexed = IndexedSession {
+        session_id: native_id.into(),
+        legacy_session_id: None,
+        provider: provider.into(),
+        project_path,
+        title,
+        title_provider_generated: false,
+        summary: None,
+        first_user_message: None,
+        title_source: None,
+        last_activity_at,
+        created_at: None,
+        cwd: Some(cwd),
+        git_branch: None,
+        is_subagent: false,
+        is_non_interactive: false,
+        source_file: None,
+        token_usage: None,
+    };
+    let mut item = dir_item_from_indexed_with_source_files(&indexed, Vec::new());
+    item.session_type = Some(session_type.into());
+    item.is_running = running(view);
+    Some(item)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use freshell_runtime_protocol::*;
+    use freshell_supervisor::{
+        admission::AdmissionPolicy,
+        backend::{
+            BackendCreated, BackendError, BackendInspection, CreateRuntimeSpec, RuntimeBackend,
+        },
+        registry::{BackendCreatedRecord, LaunchPreparation, OwnedRuntimeHandle, Registry},
+        service::{serve_control, Supervisor, SupervisorConfig},
+    };
+    use tower::ServiceExt;
+
+    /// No processes or containers are created. The real supervisor owns the stop
+    /// decision and registry writes; only the external runtime backend is replaced.
+    struct NativeBackend {
+        history_home: Option<PathBuf>,
+        mismatch: bool,
+    }
+
+    #[async_trait]
+    impl RuntimeBackend for NativeBackend {
+        async fn read_native_history(
+            &self,
+            handle: &OwnedRuntimeHandle,
+            provider: &str,
+            native_id: &str,
+            _: &std::path::Path,
+        ) -> Result<serde_json::Value, BackendError> {
+            assert_eq!(handle.fresh_agent().unwrap().provider.as_str(), provider);
+            let mut snapshot = freshell_freshagent::native_history::read(
+                provider,
+                self.history_home.as_deref().expect("owned native fixture"),
+                native_id,
+            )
+            .map_err(BackendError::Unavailable)?;
+            if self.mismatch {
+                snapshot["threadId"] = json!("wrong-owned-root");
+            }
+            Ok(snapshot)
+        }
+        async fn create_stopped(
+            &self,
+            _: &CreateRuntimeSpec,
+        ) -> Result<BackendCreated, BackendError> {
+            unreachable!()
+        }
+        async fn start_host(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            unreachable!()
+        }
+        async fn inspect(&self, _: &OwnedRuntimeHandle) -> Result<BackendInspection, BackendError> {
+            unreachable!()
+        }
+        async fn request_stop(&self, _: &OwnedRuntimeHandle, _: u64) -> Result<(), BackendError> {
+            unreachable!()
+        }
+        async fn force_stop(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            unreachable!()
+        }
+        async fn verify_empty(&self, _: &OwnedRuntimeHandle) -> Result<bool, BackendError> {
+            unreachable!()
+        }
+        async fn list_known(
+            &self,
+            _: &[OwnedRuntimeHandle],
+        ) -> Result<Vec<(IncarnationId, BackendInspection)>, BackendError> {
+            unreachable!()
+        }
+        async fn read_limits(&self, _: &OwnedRuntimeHandle) -> Result<RuntimeLimits, BackendError> {
+            unreachable!()
+        }
+        async fn enable_long_lived(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            unreachable!()
+        }
+    }
+
+    fn limits() -> RuntimeLimits {
+        RuntimeLimits {
+            cpu_milli: 500,
+            memory_bytes: 64 * 1024 * 1024,
+            swap_bytes: 0,
+            pids_max: 32,
+        }
+    }
+
+    async fn register(
+        root: &Path,
+        provider: &str,
+        session_type: &str,
+        native_id: &str,
+        cwd: &str,
+    ) -> (Registry, RuntimeView) {
+        let registry = Registry::open(root, None).unwrap();
+        let soul_id = SoulId::new();
+        let fresh_agent: FreshAgentLaunchSpec = serde_json::from_value(json!({
+            "sessionId": "fresh-retained-thread", "provider": provider, "sessionType": session_type,
+            "runtimeVariant": provider, "providerStoreId": "store-test", "cwd": cwd,
+            "workspacePath": "/workspace", "runAsUid": 1000, "runAsGid": 1000,
+            "nativeSessionId": native_id
+        }))
+        .unwrap();
+        let prepared = registry
+            .prepare_launch(LaunchPreparation {
+                soul_id: soul_id.clone(),
+                provider: provider.into(),
+                provider_store_id: "store-test".into(),
+                native_session_id: Some(native_id.into()),
+                creation_seed_ref: "seed-test".into(),
+                request_id: RequestId::new(),
+                payload_digest: "payload-test".into(),
+                requested_limits: limits(),
+                profile: RuntimeProfile::Custom,
+                project_key: "workspace".into(),
+                fixture: None,
+                terminal: None,
+                fresh_agent: Some(fresh_agent),
+                view_intent: None,
+                admission: AdmissionPolicy::default(),
+            })
+            .await
+            .unwrap();
+        registry
+            .commit_created(
+                prepared.incarnation_id.clone(),
+                BackendCreatedRecord {
+                    daemon_id: DockerDaemonId::new(),
+                    container_id: "a".repeat(64),
+                    image_ref: format!("sha256:{}", "b".repeat(64)),
+                    runtime_dir: root.join("runtime"),
+                    host_binary_path: root.join("host"),
+                    immutable_config_digest: format!("sha256:{}", "c".repeat(64)),
+                    launch_policy: None,
+                },
+            )
+            .await
+            .unwrap();
+        let grant = registry
+            .commit_execution_grant(prepared.incarnation_id.clone(), HostBootId::new(), limits())
+            .await
+            .unwrap();
+        let context = registry.recovery_context(soul_id.clone()).await.unwrap();
+        let launch = registry
+            .bind_native_identity_launch(NativeIdentityLaunch {
+                incarnation_id: prepared.incarnation_id.clone(),
+                launch_nonce: context.prior_handle.launch_nonce().as_str().into(),
+                evidence_revision: context.evidence_revision,
+                execution_generation: grant.execution_generation,
+                requested_native_session_id: context.native_session_id.clone(),
+            })
+            .await
+            .unwrap();
+        let context = registry.recovery_context(soul_id.clone()).await.unwrap();
+        // Controlled setup for the retained-runtime backend fixture, not native
+        // qualification: exercise the production current-launch publication gate.
+        registry
+            .record_native_identity_observation(
+                soul_id.clone(),
+                NativeIdentityObservation {
+                    native_session_id: native_id.into(),
+                    incarnation_id: launch.incarnation_id,
+                    launch_nonce: launch.launch_nonce,
+                    evidence_revision: launch.evidence_revision,
+                    source: NativeIdentitySource::FreshProviderHandshake,
+                    evidence_digest: "a".repeat(64),
+                },
+                context.write_fence(),
+            )
+            .await
+            .unwrap();
+        registry
+            .mark_running(prepared.incarnation_id)
+            .await
+            .unwrap();
+        let view = registry
+            .inventory()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|v| v.soul_id == soul_id)
+            .unwrap();
+        (registry, view)
+    }
+    async fn start_control(
+        root: &std::path::Path,
+        registry: Registry,
+        backend: Arc<dyn RuntimeBackend>,
+    ) -> (PathBuf, tokio::task::JoinHandle<()>) {
+        let socket = root.join("control.sock");
+        let supervisor = Supervisor::new(
+            registry.clone(),
+            backend.clone(),
+            SupervisorConfig {
+                runtime_root: root.into(),
+                control_socket_path: socket.clone(),
+                host_binary_path: std::env::current_exe().unwrap(),
+                image_ref: format!("sha256:{}", "b".repeat(64)),
+                test_run_id: "stop-lost-fixture".into(),
+                control_secret: "test-control-secret".into(),
+                lifecycle_log: root.join("lifecycle.jsonl"),
+                admission: AdmissionPolicy::default(),
+            },
+        )
+        .unwrap();
+        let socket_for_server = socket.clone();
+        let control =
+            tokio::spawn(
+                async move { serve_control(supervisor, &socket_for_server).await.unwrap() },
+            );
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !socket.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        (socket, control)
+    }
+
+    fn native_fixture(home: &Path, provider: &str, native_id: &str) {
+        if provider == "opencode" {
+            let folder = home.join(".local/share/opencode");
+            std::fs::create_dir_all(&folder).unwrap();
+            let db = rusqlite::Connection::open(folder.join("opencode.db")).unwrap();
+            db.execute_batch("CREATE TABLE session(id TEXT PRIMARY KEY,title TEXT,time_updated INTEGER); CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE part(id TEXT PRIMARY KEY,session_id TEXT,message_id TEXT,time_created INTEGER,data TEXT);").unwrap();
+            db.execute(
+                "INSERT INTO session VALUES(?1,'Saved managed request',1791712801000)",
+                [native_id],
+            )
+            .unwrap();
+            for (ordinal, role) in [(0, "user"), (1, "assistant")] {
+                let id = format!("message{ordinal}");
+                let data = json!({"id":id,"sessionID":native_id,"role":role,"time":{"created":1791712800000i64+ordinal,"completed":1791712801000i64+ordinal}});
+                db.execute(
+                    "INSERT INTO message VALUES(?1,?2,?3,?4)",
+                    rusqlite::params![id, native_id, ordinal, data.to_string()],
+                )
+                .unwrap();
+                let part = json!({"id":format!("part{ordinal}"),"sessionID":native_id,"messageID":id,"type":"text","text":format!("Saved managed {role}")});
+                db.execute(
+                    "INSERT INTO part VALUES(?1,?2,?3,?4,?5)",
+                    rusqlite::params![
+                        format!("part{ordinal}"),
+                        native_id,
+                        id,
+                        ordinal,
+                        part.to_string()
+                    ],
+                )
+                .unwrap();
+            }
+        } else {
+            let (folder, records) = if provider == "codex" {
+                (
+                    home.join(".codex/sessions/2026/10/11"),
+                    vec![
+                        json!({"type":"session_meta","timestamp":"2026-10-11T10:00:00Z","payload":{"id":native_id,"cwd":"/workspace"}}),
+                        json!({"type":"turn_context","timestamp":"2026-10-11T10:00:00Z","payload":{"turn_id":"turn187"}}),
+                        json!({"type":"response_item","timestamp":"2026-10-11T10:00:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Saved managed request"}]}}),
+                        json!({"type":"response_item","timestamp":"2026-10-11T10:00:01Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Saved managed answer"}]}}),
+                        json!({"type":"event_msg","timestamp":"2026-10-11T10:00:01Z","payload":{"type":"task_complete","turn_id":"turn187"}}),
+                    ],
+                )
+            } else {
+                (
+                    home.join(".claude/projects/fixture"),
+                    vec![
+                        json!({"type":"user","uuid":"user187","sessionId":native_id,"cwd":"/workspace","timestamp":"2026-10-11T10:00:00Z","message":{"role":"user","content":"Saved managed request"}}),
+                        json!({"type":"assistant","uuid":"answer187","parentUuid":"user187","sessionId":native_id,"timestamp":"2026-10-11T10:00:01Z","message":{"id":"msg187","role":"assistant","content":[{"type":"text","text":"Saved managed answer"}],"stop_reason":"end_turn"}}),
+                    ],
+                )
+            };
+            std::fs::create_dir_all(&folder).unwrap();
+            let filename = if provider == "codex" {
+                format!("rollout-2026-10-11T10-00-00-{native_id}.jsonl")
+            } else {
+                format!("{native_id}.jsonl")
+            };
+            std::fs::write(
+                folder.join(filename),
+                records
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .unwrap();
+        }
+    }
+
+    fn directory_state(home: &Path) -> SessionDirectoryState {
+        SessionDirectoryState {
+            auth_token: Arc::new("tok".into()),
+            settings: crate::settings_store::SettingsStore::load(
+                Some(home),
+                vec!["claude".into(), "codex".into(), "opencode".into()],
+            ),
+            session_index: None,
+            identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+            metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: Arc::new("srv-managed-test".into()),
+            collision_signatures: Default::default(),
+            legacy_name_migration_completed: false,
+        }
+    }
+
+    async fn directory_page(app: Router) -> Value {
+        use axum::{
+            body::{to_bytes, Body},
+            http::Request,
+        };
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/session-directory?surface=history&priority=visible")
+                    .header("x-auth-token", "tok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn managed_history_directory_reads_owned_native_store_with_empty_web_home() {
+        for (provider, session_type) in [
+            ("claude", "freshclaude"),
+            ("kilroy", "kilroy"),
+            ("codex", "freshcodex"),
+            ("opencode", "freshopencode"),
+        ] {
+            for stopped in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let web = tempfile::tempdir().unwrap();
+                let provider_home = root.path().join("provider");
+                let native_id = "63333000-0000-4333-8333-000000000187";
+                native_fixture(&provider_home, provider, native_id);
+                let project = root.path().join("project");
+                let gitdir = project.join(".git/worktrees/managed");
+                let cwd = root.path().join("checkout");
+                std::fs::create_dir_all(&gitdir).unwrap();
+                std::fs::create_dir_all(&cwd).unwrap();
+                std::fs::write(cwd.join(".git"), format!("gitdir: {}\n", gitdir.display()))
+                    .unwrap();
+                std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+                let cwd = cwd.to_str().unwrap();
+                let (registry, view) =
+                    register(root.path(), provider, session_type, native_id, cwd).await;
+                if stopped {
+                    registry.begin_stop(view.soul_id.clone()).await.unwrap();
+                }
+                let (socket, control) = start_control(
+                    root.path(),
+                    registry,
+                    Arc::new(NativeBackend {
+                        history_home: Some(provider_home),
+                        mismatch: false,
+                    }),
+                )
+                .await;
+                let client = RuntimeClient::new(socket, "test-control-secret");
+                let saved = client
+                    .fresh_agent_history(view.soul_id.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(saved["threadId"], native_id);
+                assert!(!saved["turns"].as_array().unwrap().is_empty(), "{provider}");
+                let page = directory_page(
+                    router(directory_state(web.path())).layer(axum::Extension(client)),
+                )
+                .await;
+                control.abort();
+                let row = page["items"].as_array().unwrap().iter().find(|v| {
+                    v["provider"]
+                        == if provider == "kilroy" {
+                            "claude"
+                        } else {
+                            provider
+                        }
+                        && v["sessionId"] == native_id
+                });
+                assert!(row.is_some(), "completed owned native root missing from actual session directory: {provider} {page}");
+                let row = row.unwrap();
+                assert_eq!(row["cwd"], cwd);
+                assert_eq!(row["projectPath"], project.to_str().unwrap());
+                assert_eq!(row["checkoutPath"], cwd);
+                assert_eq!(row["sessionType"], session_type);
+                assert_eq!(row["isRunning"], !stopped);
+                assert!(row.get("isNonInteractive").is_none());
+            }
+        }
+    }
+    #[tokio::test]
+    async fn managed_directory_refuses_missing_unreadable_and_mismatched_identity_without_hiding_local_rows(
+    ) {
+        use freshell_sessions::directory_index::ClaudeSource;
+        for fault in [
+            "missing_identity",
+            "missing_store",
+            "malformed_store",
+            "mismatched_root",
+            "local_collision",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let web = tempfile::tempdir().unwrap();
+            let provider_home = root.path().join("provider");
+            let native_id = "63333000-0000-4333-8333-000000000187";
+            let local_id = "63333000-0000-4333-8333-000000000188";
+            native_fixture(&provider_home, "claude", native_id);
+            native_fixture(web.path(), "claude", local_id);
+            if fault == "local_collision" {
+                native_fixture(web.path(), "claude", native_id);
+            }
+            if fault == "missing_store" {
+                std::fs::remove_file(
+                    provider_home
+                        .join(".claude/projects/fixture")
+                        .join(format!("{native_id}.jsonl")),
+                )
+                .unwrap();
+            }
+            if fault == "malformed_store" {
+                std::fs::write(
+                    provider_home
+                        .join(".claude/projects/fixture")
+                        .join(format!("{native_id}.jsonl")),
+                    "{malformed",
+                )
+                .unwrap();
+            }
+            let (registry, view) = register(
+                root.path(),
+                "claude",
+                "freshclaude",
+                native_id,
+                root.path().to_str().unwrap(),
+            )
+            .await;
+            if fault == "missing_identity" {
+                rusqlite::Connection::open(root.path().join("runtime.sqlite3"))
+                    .unwrap()
+                    .execute(
+                        "UPDATE souls SET native_session_id=NULL WHERE soul_id=?1",
+                        [view.soul_id.as_str()],
+                    )
+                    .unwrap();
+            }
+            let (socket, control) = start_control(
+                root.path(),
+                registry.clone(),
+                Arc::new(NativeBackend {
+                    history_home: Some(provider_home),
+                    mismatch: fault == "mismatched_root",
+                }),
+            )
+            .await;
+            let client = RuntimeClient::new(socket, "test-control-secret");
+            let mut state = directory_state(web.path());
+            state.session_index = Some(Arc::new(SessionIndex::with_ttl_and_cache_path(
+                vec![Arc::new(ClaudeSource::new(web.path().join(".claude")))],
+                Duration::from_secs(1),
+                None,
+            )));
+            let app = router(state).layer(axum::Extension(client));
+            use axum::{
+                body::{to_bytes, Body},
+                http::Request,
+            };
+            let response = app.oneshot(Request::builder().uri("/api/session-directory?surface=history&priority=visible&includeNonInteractive=true").header("x-auth-token","tok").body(Body::empty()).unwrap()).await.unwrap();
+            let page: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            control.abort();
+            let rows = page["items"].as_array().unwrap();
+            assert!(
+                rows.iter().any(|row| row["sessionId"] == local_id),
+                "healthy local row hidden: {fault} {page}"
+            );
+            assert!(
+                !rows.iter().any(|row| row["sessionId"] == native_id),
+                "invalid or ambiguous managed row invented: {fault} {page}"
+            );
+            assert_eq!(page["partial"], true, "{fault}");
+            let current = registry.inventory().await.unwrap();
+            assert_eq!(current[0].desired_state, DesiredState::Running);
+            assert_ne!(current[0].recovery_state, RecoveryState::Lost);
+        }
+    }
+}
