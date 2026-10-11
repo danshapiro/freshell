@@ -133,6 +133,20 @@ async fn launcher_exit(behavior: Value, home: &Path, codex_home: Option<&str>) -
     }
 }
 
+/// Writes `id`'s rollout under `<codex_home>/sessions/`, as Codex does at a
+/// conversation's first turn: the fake (like Codex) resumes only a thread
+/// that has one.
+fn seed_rollout(codex_home: &Path, id: &str) {
+    let sessions = codex_home.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let meta = json!({"type": "session_meta", "payload": {"id": id, "cwd": "/"}});
+    std::fs::write(
+        sessions.join(format!("rollout-{id}.jsonl")),
+        format!("{meta}\n"),
+    )
+    .unwrap();
+}
+
 /// Whether any rollout file under `<codex_home>/sessions/` names `id`.
 fn rollout_exists(codex_home: &Path, id: &str) -> bool {
     fn walk(dir: &Path, id: &str) -> bool {
@@ -341,6 +355,8 @@ async fn flock_refuses_a_second_writer_and_releases_on_native_exit() {
         holds_lock_fd(a.native().await.pid, &lock),
         "native A holds the thread lock"
     );
+    // t-lock had a turn (its rollout is on disk), so only the lock refuses.
+    seed_rollout(home.path(), "t-lock");
     let b = FakeAppServer::spawn(json!({}), home.path(), &[]).await;
     let mut rpc_b = Rpc::connect(b.port).await;
     rpc_b.initialize().await;
@@ -769,8 +785,10 @@ async fn ephemeral_title_threads_have_no_lock_and_refuse_queue_and_goal() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_never_materialized_thread_cannot_be_resumed() {
     let home = tempfile::tempdir().unwrap();
+    // A loads t-old before it has a rollout (opting out of the check).
     let a = FakeAppServer::spawn(
-        json!({"threadStartThreadId": "t-new", "turnCompleteDelayMs": 50}),
+        json!({"threadStartThreadId": "t-new", "turnCompleteDelayMs": 50,
+               "resumeNeedsRollout": false}),
         home.path(),
         &[],
     )
@@ -797,7 +815,8 @@ async fn a_never_materialized_thread_cannot_be_resumed() {
     })
     .await;
 
-    let b = FakeAppServer::spawn(json!({"resumeNeedsRollout": true}), home.path(), &[]).await;
+    // By default, like Codex, B resumes only a thread with a rollout.
+    let b = FakeAppServer::spawn(json!({}), home.path(), &[]).await;
     let mut rpc_b = connected(b.port).await;
     let refused = rpc_b
         .call("thread/resume", json!({"threadId": "t-new"}))
@@ -838,6 +857,7 @@ async fn a_never_materialized_thread_cannot_be_resumed() {
 async fn the_tui_survives_app_server_death_and_reconnects() {
     // (1) Reconnects to a new app-server on the same port and re-resumes its thread.
     let home = tempfile::tempdir().unwrap();
+    seed_rollout(home.path(), "t-r");
     let a = FakeAppServer::spawn(json!({}), home.path(), &[]).await;
     let remote = format!("ws://127.0.0.1:{}", a.port);
     let mut tui = FakeTui::spawn(&remote, &["resume", "t-r"], &[]).await;
@@ -1336,7 +1356,9 @@ async fn a_refused_start_or_resume_holds_no_lock() {
             "{id}: a refused open holds no lock"
         );
     }
-    // Another app-server can open both right away.
+    // Another app-server can open both right away (both had turns).
+    seed_rollout(home.path(), "t-ref");
+    seed_rollout(home.path(), "t-res");
     let other = FakeAppServer::spawn(json!({}), home.path(), &[]).await;
     let mut rpc2 = connected(other.port).await;
     for id in ["t-ref", "t-res"] {

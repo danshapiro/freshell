@@ -829,6 +829,10 @@ fn codex_launch_error_response(
         // spawn_gate_error_response's QueueFull -> 429.
         CodexLaunchError::QueueFull => StatusCode::TOO_MANY_REQUESTS,
         CodexLaunchError::Cancelled => StatusCode::INTERNAL_SERVER_ERROR,
+        // A failed attempt's unit not confirmed gone: nothing more starts.
+        CodexLaunchError::Unconfirmed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        // The spawn starts a new conversation before it gets here.
+        CodexLaunchError::NotMaterialized { .. } => StatusCode::INTERNAL_SERVER_ERROR,
     };
     fail_json(status, error.to_string())
 }
@@ -1597,7 +1601,166 @@ pub(crate) async fn spawn_terminal_pane(
 /// failed create (`router.ts:819`, `cw:429-448`).
 /// kata b8ke Task 6: the handoff runner's spawn entry (under-ticket mode —
 /// the settle surfaces the terminal's `OwnerIdentity` instead of committing).
+///
+/// A Codex conversation that never materialized (killed before its first
+/// turn: no rollout, so Codex cannot resume it) is started NEW for the same
+/// request, outside a handoff: the claims on the old conversation are given
+/// up, its pane-ledger row is retired and the spawn runs again with no
+/// sessionRef (Stage 2: LB-41). A handoff (which moves that exact
+/// conversation) keeps the typed failure.
 pub(crate) async fn spawn_terminal_pane_with_handoff(
+    state: &FreshAgentState,
+    body: &Value,
+    tab_id: &str,
+    pane_id: &str,
+    handoff: Option<&HandoffToken>,
+) -> Result<TerminalSpawnResult, Response> {
+    let failure = match Box::pin(spawn_terminal_pane_once(
+        state, body, tab_id, pane_id, handoff,
+    ))
+    .await
+    {
+        Ok(spawned) => return Ok(spawned),
+        Err(failure) => failure,
+    };
+    let Some(NotMaterialized(stale)) = failure.extensions().get::<NotMaterialized>().cloned()
+    else {
+        return Err(failure);
+    };
+    if handoff.is_some() {
+        return Err(failure);
+    }
+    let mode = body
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("codex")
+        .to_string();
+    tracing::info!(target: "freshell_unit",
+        event = "unit.resume.not_materialized",
+        unit_id = "",
+        provider = %mode,
+        session_id = %stale,
+        terminal_id = "",
+        operation_id = "",
+        entry_point = "rest-create",
+        "the conversation never had a turn (no rollout), so it is started new instead of resumed");
+    if let Some(retire) = &state.on_stale_resume {
+        retire(&mode, &stale);
+    }
+    let mut fresh = body.clone();
+    if let Some(fields) = fresh.as_object_mut() {
+        fields.remove("sessionRef");
+    }
+    Box::pin(spawn_terminal_pane_once(
+        state, &fresh, tab_id, pane_id, None,
+    ))
+    .await
+}
+
+/// The marker a spawn failure carries when the Codex conversation it was to
+/// resume never materialized ([`spawn_terminal_pane_with_handoff`] restarts
+/// on it as a new conversation).
+#[derive(Debug, Clone)]
+struct NotMaterialized(String);
+
+/// Decision 8's bound on a REST route's wait for a conversation's Gone.
+pub(crate) const REST_GONE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What a REST route does about a conversation whose unit is being stopped.
+pub(crate) enum GoneGate {
+    /// Not stopping, or Gone within the bound: run the route now.
+    Proceed,
+    /// Still stopping at the bound: answer this `202 {"ok":false,
+    /// "status":"stopping"}`; the route runs on its own at Gone.
+    Deferred(Response),
+}
+
+/// The conversation a REST create resumes (its `sessionRef`), canonical.
+fn rest_resume_key(
+    registry: &freshell_ownership::RuntimeOwnershipRegistry,
+    body: &Value,
+) -> Option<SessionLocator> {
+    let locator: SessionLocator = serde_json::from_value(body.get("sessionRef")?.clone()).ok()?;
+    if locator.provider.is_empty() || locator.session_id.is_empty() {
+        return None;
+    }
+    let session_id = registry.resolve_canonical(&locator.provider, &locator.session_id);
+    Some(SessionLocator {
+        provider: locator.provider,
+        session_id,
+    })
+}
+
+/// A REST create that resumes a conversation whose unit is being stopped
+/// waits (event-driven) for that unit's Gone, at most [`REST_GONE_WAIT`]
+/// (Decision 8): Gone in time, the route runs now; otherwise it answers
+/// `202 {"ok":false,"status":"stopping"}` and `continuation` (the route
+/// itself) runs on a spawned task at Gone, exactly as the synchronous path
+/// would. The settle is logged as `unit.start.waited`.
+pub(crate) async fn wait_for_gone_or_defer<F, Fut>(
+    state: &FreshAgentState,
+    body: &Value,
+    entry_point: &'static str,
+    continuation: F,
+) -> GoneGate
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Response> + Send + 'static,
+{
+    let Some(registry) = state.ownership.clone() else {
+        return GoneGate::Proceed;
+    };
+    let Some(key) = rest_resume_key(&registry, body) else {
+        return GoneGate::Proceed;
+    };
+    if !matches!(
+        registry.observe(&key.provider, &key.session_id).state,
+        freshell_ownership::OwnershipState::Stopping { .. }
+    ) {
+        return GoneGate::Proceed;
+    }
+    let keys = crate::ownership_lane::stopping_log_keys(&registry, &key.provider, &key.session_id);
+    let started = std::time::Instant::now();
+    let wait =
+        crate::ownership_lane::wait_while_stopping(&registry, &key.provider, &key.session_id);
+    if tokio::time::timeout(REST_GONE_WAIT, wait).await.is_ok() {
+        freshell_containment::events::start_waited(
+            &keys,
+            entry_point,
+            started.elapsed().as_millis() as u64,
+        );
+        return GoneGate::Proceed;
+    }
+    tokio::spawn(async move {
+        crate::ownership_lane::wait_while_stopping(&registry, &key.provider, &key.session_id).await;
+        freshell_containment::events::start_waited(
+            &keys,
+            entry_point,
+            started.elapsed().as_millis() as u64,
+        );
+        let answered = continuation().await;
+        tracing::info!(target: "freshell_unit",
+            event = "unit.start.deferred_answered",
+            unit_id = %keys.unit_id,
+            provider = %keys.provider,
+            session_id = %keys.session_id.as_deref().unwrap_or(""),
+            terminal_id = %keys.terminal_id.as_deref().unwrap_or(""),
+            operation_id = %keys.operation_id.as_deref().unwrap_or(""),
+            entry_point,
+            status = answered.status().as_u16(),
+            "a REST create that waited past its bound for a Gone ran at Gone");
+    });
+    GoneGate::Deferred(
+        (
+            StatusCode::ACCEPTED,
+            Json(json!({ "ok": false, "status": "stopping" })),
+        )
+            .into_response(),
+    )
+}
+
+/// One run of [`spawn_terminal_pane_with_handoff`].
+async fn spawn_terminal_pane_once(
     state: &FreshAgentState,
     body: &Value,
     tab_id: &str,
@@ -2920,7 +3083,20 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                             )),
                         );
                     }
-                    return Err(codex_launch_error_response(error));
+                    // A conversation that never materialized: the answer
+                    // carries the marker the spawn pipeline restarts on as a
+                    // new conversation (Stage 2: LB-41).
+                    let not_materialized = match &error {
+                        freshell_codex::launch_lifecycle::CodexLaunchError::NotMaterialized {
+                            session_id,
+                        } => Some(NotMaterialized(session_id.clone())),
+                        _ => None,
+                    };
+                    let mut response = codex_launch_error_response(error);
+                    if let Some(marker) = not_materialized {
+                        response.extensions_mut().insert(marker);
+                    }
+                    return Err(response);
                 }
             }
         } else {

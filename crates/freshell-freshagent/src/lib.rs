@@ -122,6 +122,26 @@ pub type SidecarLivenessProbe = std::sync::Arc<
         + Sync,
 >;
 
+/// The single stop path of a terminal pane's containment unit, as this crate
+/// reaches it (it cannot depend on `freshell-ws`, which owns that path):
+/// `freshell-server`'s `main.rs` installs the WebSocket layer's
+/// implementation ([`FreshAgentState::with_pane_unit_stopper`]). The session
+/// handoff stops a prior terminal pane through it (Stage 2: LB-25), and the
+/// automation kill routes use it too.
+pub trait PaneUnitStopper: Send + Sync {
+    /// Stops (Force) the unit of the pane whose terminal is `terminal_id`
+    /// under `operation_id` (a fresh one when `None`), with `reason`
+    /// (`"handoff"`, `"respawn"`, else a kill command), and resolves at the
+    /// unit's Gone with its report. `None` for a row outside any unit, which
+    /// is stopped the legacy way and resolves at once.
+    fn stop_terminal(
+        &self,
+        terminal_id: String,
+        reason: &'static str,
+        operation_id: Option<String>,
+    ) -> futures_util::future::BoxFuture<'static, Option<freshell_containment::StopReport>>;
+}
+
 /// Handle pairing the shared gate with the permit-wait timeout
 /// (`CreateProtectConfig.spawn_timeout_ms`, resolved once in main.rs so both
 /// doors share one env snapshot).
@@ -1597,6 +1617,124 @@ pub mod ownership_lane {
         }
     }
 
+    /// The log keys of the stop a request waits for: the conversation, and
+    /// the unit, terminal and operation of the owner being stopped (empty
+    /// when the key is not `Stopping`).
+    pub fn stopping_log_keys(
+        registry: &RuntimeOwnershipRegistry,
+        provider: &str,
+        session_id: &str,
+    ) -> freshell_containment::events::UnitLogKeys {
+        let mut keys = freshell_containment::events::UnitLogKeys {
+            unit_id: String::new(),
+            provider: provider.to_string(),
+            session_id: Some(session_id.to_string()),
+            terminal_id: None,
+            operation_id: None,
+        };
+        if let freshell_ownership::OwnershipState::Stopping {
+            owner,
+            operation_id,
+            ..
+        } = registry.observe(provider, session_id).state
+        {
+            if let Some(owner) = owner {
+                keys.unit_id = owner.unit_id.unwrap_or_default();
+                keys.terminal_id = owner.terminal_id;
+            }
+            keys.operation_id = Some(operation_id);
+        }
+        keys
+    }
+
+    /// Waits while `(provider, session_id)` is `Stopping` (a unit being
+    /// stopped holds it until its Gone is confirmed) and returns the first
+    /// snapshot whose state is not `Stopping`. Woken only by registry
+    /// transitions ([`RuntimeOwnershipRegistry::wait_settled`]), never by a
+    /// timer. It has no deadline of its own: every caller bounds it (the
+    /// REST routes' 5 s) or runs it in a task cancelled with its request
+    /// (a parked WebSocket request), and never awaits it inline in a shared
+    /// loop.
+    pub async fn wait_while_stopping(
+        registry: &Arc<RuntimeOwnershipRegistry>,
+        provider: &str,
+        session_id: &str,
+    ) -> freshell_ownership::OwnershipSnapshot {
+        loop {
+            let snapshot = registry.observe(provider, session_id);
+            if !matches!(
+                snapshot.state,
+                freshell_ownership::OwnershipState::Stopping { .. }
+            ) {
+                return snapshot;
+            }
+            let _ = registry.wait_settled(provider, session_id).await;
+        }
+    }
+
+    #[cfg(test)]
+    mod wait_while_stopping_tests {
+        use super::*;
+        use freshell_ownership::{BeginOutcome, CommitOutcome, OwnershipState};
+
+        fn live_in_unit(registry: &RuntimeOwnershipRegistry, sid: &str, unit_id: &str) {
+            let BeginOutcome::Granted { generation } = registry.begin_start(
+                "codex",
+                sid,
+                RuntimeOwnerKind::Terminal,
+                "op-start",
+                None,
+                "test",
+                1,
+            ) else {
+                panic!("expected Granted");
+            };
+            let owner = OwnerIdentity {
+                terminal_id: Some("t1".into()),
+                unit_id: Some(unit_id.into()),
+                ..OwnerIdentity::default()
+            };
+            assert_eq!(
+                registry.commit_live("codex", sid, "op-start", generation, owner),
+                CommitOutcome::Committed
+            );
+        }
+
+        #[tokio::test]
+        async fn a_key_not_stopping_answers_at_once() {
+            let registry = Arc::new(RuntimeOwnershipRegistry::new());
+            let vacant = wait_while_stopping(&registry, "codex", "free").await;
+            assert_eq!(vacant.state, OwnershipState::Vacant);
+            live_in_unit(&registry, "held", "u1");
+            let live = wait_while_stopping(&registry, "codex", "held").await;
+            assert!(matches!(live.state, OwnershipState::Live { .. }));
+        }
+
+        #[tokio::test]
+        async fn a_stopping_key_is_waited_for_until_its_unit_is_gone() {
+            let registry = Arc::new(RuntimeOwnershipRegistry::new());
+            live_in_unit(&registry, "s1", "u1");
+            assert_eq!(
+                registry.begin_unit_stop("u1", "op-stop", "test", 2).len(),
+                1
+            );
+            let waiting = tokio::spawn({
+                let registry = Arc::clone(&registry);
+                async move { wait_while_stopping(&registry, "codex", "s1").await }
+            });
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!waiting.is_finished(), "a Stopping key is waited for");
+            assert_eq!(registry.commit_unit_stop("u1", "op-stop").len(), 1);
+            let settled = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+                .await
+                .expect("woken by the commit")
+                .expect("the wait task");
+            assert_eq!(settled.state, OwnershipState::Vacant);
+        }
+    }
+
     /// The terminal lane's wire owner fields for a typed refusal frame: the
     /// additive `ownerKind`/`ownerGeneration`(/`ownerEpoch`) triple an
     /// `error` frame or a REST 409 envelope carries when the coordinator
@@ -2116,6 +2254,10 @@ pub struct FreshAgentState {
     /// Door 3: arm 2 of the in-gate liveness precondition (see
     /// [`SidecarLivenessProbe`]). `None` = arm contributes false.
     pub(crate) sidecar_liveness: Option<SidecarLivenessProbe>,
+    /// The WebSocket layer's single stop path for a terminal pane's unit
+    /// ([`PaneUnitStopper`]). `None` until wired (tests of this crate alone):
+    /// callers then keep their legacy row kill and log a WARN.
+    pub(crate) pane_unit_stopper: Option<Arc<dyn PaneUnitStopper>>,
     /// The shared server-side layout snapshot (AUTO-01 spine, Task 13): the
     /// WS `ui.layout.sync` ingestion (`freshell_ws::terminal`'s
     /// `ClientMessage::UiLayoutSync` arm) REPLACES it, and the REST
@@ -2338,6 +2480,7 @@ impl FreshAgentState {
             resume_probe: None,
             on_stale_resume: None,
             sidecar_liveness: None,
+            pane_unit_stopper: None,
             layout: layout_store::LayoutStore::default(),
             terminal_created_hook: None,
             model_capabilities: Arc::new(model_capabilities::ModelCapabilityRegistry::new(
@@ -2760,6 +2903,19 @@ impl FreshAgentState {
     pub fn with_sidecar_liveness(mut self, probe: SidecarLivenessProbe) -> Self {
         self.sidecar_liveness = Some(probe);
         self
+    }
+
+    /// Wire the WebSocket layer's single stop path for a terminal pane's
+    /// unit ([`PaneUnitStopper`]). A consuming `with_*` builder like
+    /// [`Self::with_sidecar_liveness`], for the same reason.
+    pub fn with_pane_unit_stopper(mut self, stopper: Arc<dyn PaneUnitStopper>) -> Self {
+        self.pane_unit_stopper = Some(stopper);
+        self
+    }
+
+    /// The wired [`PaneUnitStopper`], if any.
+    pub fn pane_unit_stopper(&self) -> Option<Arc<dyn PaneUnitStopper>> {
+        self.pane_unit_stopper.clone()
     }
 
     /// SESSION-09 fix-forward: replace this state's own `sessions_revision`
@@ -4743,6 +4899,22 @@ async fn create_tab(
             LEGACY_RESUME_IDENTITY_REFUSAL.to_string(),
         );
     }
+    // A resume of a conversation whose unit is being stopped waits for its
+    // Gone, at most Decision 8's 5 s; past that the route answers 202
+    // stopping and runs at Gone (Stage 2: LB-20).
+    let gate = terminal_tabs::wait_for_gone_or_defer(&state, &body, "rest-create", {
+        let (state, body) = (state.clone(), body.clone());
+        move || create_tab_authorized(state, body)
+    })
+    .await;
+    if let terminal_tabs::GoneGate::Deferred(answer) = gate {
+        return answer;
+    }
+    create_tab_authorized(state, body).await
+}
+
+/// `POST /api/tabs` after its auth and request-shape checks.
+async fn create_tab_authorized(state: FreshAgentState, body: Value) -> Response {
     let agent = body.get("agent").and_then(Value::as_str).unwrap_or("");
     // Slice 1 (docs/plans/2026-07-18-agent-api-mcp-parity-spec.md \u00a72.1): `agent`
     // absent -> terminal / browser / editor tab creation (router.ts:710-793).

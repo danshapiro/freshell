@@ -4468,6 +4468,9 @@ async fn a_codex_handoff_on_an_old_rebound_reference_resolves_the_permanent_alia
     crate::codex::tests::configure_fake_codex_cmd("{}");
     let old_tid = format!("old-thread-{}", uuid::Uuid::new_v4());
     let new_tid = format!("new-thread-{}", uuid::Uuid::new_v4());
+    // The conversation had turns before the rebind: its rollout is on disk,
+    // so the terminal target's resume finds it.
+    crate::codex::tests::seed_rollout_in_isolated_home(&new_tid);
     let rig = build_rig(None);
 
     // The pre-rebind terminal owner under the OLD thread id.
@@ -4731,9 +4734,18 @@ async fn the_row_removed_but_pid_alive_window_reports_unconfirmed() {
     // THE CONTRACT: the row-absent + pid-alive window is UNCONFIRMED
     // (pre-r13 the row-based poll answered Confirmed — the row's
     // absence was treated as exit proof).
-    let confirmed =
-        kill_and_confirm_terminal_pid(&registry, "ghost-row-removed-tid", Some(live_pid), 200)
-            .await;
+    let no_units = super::PaneStops {
+        units: freshell_containment::UnitDirectory::new(),
+        stopper: None,
+    };
+    let confirmed = kill_and_confirm_terminal_pid(
+        &registry,
+        &no_units,
+        "ghost-row-removed-tid",
+        Some(live_pid),
+        200,
+    )
+    .await;
     assert!(
         !confirmed,
         "the row-removed-but-pid-alive window must NOT report Confirmed"
@@ -8964,4 +8976,374 @@ async fn the_replacement_probe_never_confirms_a_terminal_prior_on_a_missing_row(
     .await
     .expect("the probe confirms once the pid is dead");
     assert!(matches!(answer, super::ReapAnswer::Confirmed));
+}
+
+// ── Task 15: a terminal prior in a pane unit (Stage 2: LB-25, LB-31) ────────
+
+/// A test [`crate::PaneUnitStopper`] over the rig's unit directory: records
+/// every call, stops the pane's unit (Force) under the given operation and
+/// resolves at Gone with the unit's report, after ending the row the way
+/// the WebSocket layer's Gone does. With `user_kill_joins`, a Shift-X joins
+/// the stop right after it begins (the report's reason becomes `shift-x`).
+struct RecordingStopper {
+    units: Arc<freshell_containment::UnitDirectory>,
+    registry: freshell_terminal::TerminalRegistry,
+    hooks: Arc<HandoffTestHooks>,
+    calls: std::sync::Mutex<Vec<(String, &'static str, Option<String>)>>,
+    user_kill_joins: bool,
+}
+
+impl RecordingStopper {
+    fn calls(&self) -> Vec<(String, &'static str, Option<String>)> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl crate::PaneUnitStopper for RecordingStopper {
+    fn stop_terminal(
+        &self,
+        terminal_id: String,
+        reason: &'static str,
+        operation_id: Option<String>,
+    ) -> futures_util::future::BoxFuture<'static, Option<freshell_containment::StopReport>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((terminal_id.clone(), reason, operation_id.clone()));
+        let entry = self.units.by_terminal(&terminal_id);
+        let registry = self.registry.clone();
+        let hooks = Arc::clone(&self.hooks);
+        let user_kill_joins = self.user_kill_joins;
+        Box::pin(async move {
+            let entry = entry?;
+            let ended = terminal_id.clone();
+            let mut request = freshell_containment::StopRequest::new(
+                freshell_containment::StopMode::Force,
+                freshell_containment::StopReason::Handoff,
+                "test-pane-stopper",
+            )
+            .on_gone(Box::new(move |_| {
+                Box::pin(async move {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        registry.complete_unit_end(&ended, freshell_terminal::UnitEnding::Requested)
+                    })
+                    .await;
+                })
+            }));
+            if let Some(operation_id) = operation_id {
+                request = request.operation(operation_id);
+            }
+            let stop = entry.unit.stop(request);
+            if user_kill_joins {
+                let _ = entry.unit.stop(freshell_containment::StopRequest::new(
+                    freshell_containment::StopMode::Force,
+                    freshell_containment::StopReason::ShiftX,
+                    "test-user-kill",
+                ));
+            }
+            let report = stop.wait().await;
+            hooks.record("StopperResolved");
+            Some(report)
+        })
+    }
+}
+
+/// A conversation's terminal prior in a pane unit: a tag-backend unit whose
+/// agent (screen and main) is a `bash` that ignores SIGINT, as a unit row
+/// of the rig's registry, holding the conversation Live (`hold`).
+struct UnitPrior {
+    terminal_id: String,
+    screen: freshell_containment::ProcWatch,
+    _state_root: tempfile::TempDir,
+}
+
+fn unit_prior(
+    units: &freshell_containment::UnitDirectory,
+    containment: &freshell_containment::Containment,
+    state_root: tempfile::TempDir,
+    registry: &freshell_terminal::TerminalRegistry,
+    ownership: &RuntimeOwnershipRegistry,
+    sid: &str,
+    hold: freshell_ownership::HoldKind,
+) -> UnitPrior {
+    let terminal_id = format!("t-unit-prior-{}", uuid::Uuid::new_v4().simple());
+    let unit = containment
+        .create_unit(
+            freshell_containment::UnitId::mint(),
+            freshell_containment::UnitLabel {
+                provider: "codex".into(),
+                session_id: Some(sid.into()),
+                terminal_id: Some(terminal_id.clone()),
+                mode: "codex".into(),
+                create_request_id: Some(format!("crq-{terminal_id}")),
+            },
+        )
+        .expect("the prior's unit");
+    let placement = unit
+        .placement(freshell_containment::MemberRole::Screen)
+        .expect("the screen's placement");
+    let spec = freshell_platform::SpawnSpec {
+        program: "bash".into(),
+        args: vec!["-c".into(), "trap '' INT; while :; do sleep 1; done".into()],
+        env_overrides: Default::default(),
+        cwd: None,
+        cols: 80,
+        rows: 24,
+    };
+    let child_env: std::collections::BTreeMap<String, String> = std::env::vars()
+        .filter(|(key, _)| key == "PATH" || key == "HOME")
+        .collect();
+    let pid = registry
+        .create_in_unit(
+            &spec,
+            &child_env,
+            terminal_id.clone(),
+            format!("stream-{terminal_id}"),
+            "codex",
+            Some(sid),
+            Some(&format!("crq-{terminal_id}")),
+            None,
+            None,
+            freshell_terminal::UnitPlacement {
+                unit_id: unit.id().to_string(),
+                wrapper: placement.wrapper,
+                env: placement.env,
+                main_is_screen: true,
+            },
+        )
+        .expect("the prior's screen");
+    let start = freshell_containment::process::start_time(pid).expect("the screen's start time");
+    let screen =
+        freshell_containment::ProcWatch::open_expecting(pid, start).expect("the screen pinned");
+    unit.set_screen(screen.clone());
+    unit.set_main(screen.clone());
+    units.register(freshell_containment::UnitEntry {
+        unit: unit.clone(),
+        provider: "codex".into(),
+        mode: "codex".into(),
+        create_request_id: Some(format!("crq-{terminal_id}")),
+        terminal_id: Some(terminal_id.clone()),
+    });
+    let BeginOutcome::Granted { generation } = ownership.begin_start(
+        "codex",
+        sid,
+        RuntimeOwnerKind::Terminal,
+        "op-unit-prior",
+        None,
+        "test",
+        1_000,
+    ) else {
+        panic!("fixture: the prior's claim must grant")
+    };
+    assert_eq!(
+        ownership.commit_live(
+            "codex",
+            sid,
+            "op-unit-prior",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: RuntimeOwnerKind::Terminal,
+                terminal_id: Some(terminal_id.clone()),
+                live_session_key: None,
+                pid: Some(pid),
+                ownership_id: None,
+                unit_id: Some(unit.id().to_string()),
+                hold,
+            },
+        ),
+        freshell_ownership::CommitOutcome::Committed
+    );
+    UnitPrior {
+        terminal_id,
+        screen,
+        _state_root: state_root,
+    }
+}
+
+/// A rig whose REST state runs terminal panes in units (a tag-backend
+/// containment, its directory) and stops them through a
+/// [`RecordingStopper`], with a terminal prior in a unit holding `sid`.
+struct UnitRig {
+    rig: Rig,
+    stopper: Arc<RecordingStopper>,
+    hooks: Arc<HandoffTestHooks>,
+    prior: UnitPrior,
+}
+
+fn build_unit_rig(sid: &str, hold: freshell_ownership::HoldKind, user_kill_joins: bool) -> UnitRig {
+    let hooks = Arc::new(HandoffTestHooks::default());
+    let mut rig = build_rig(Some(Arc::clone(&hooks)));
+    let state_root = tempfile::tempdir().expect("unit state root");
+    let containment =
+        freshell_containment::Containment::tag_backend(freshell_containment::SelectOptions {
+            shim: None,
+            state_root: state_root.path().to_path_buf(),
+        });
+    let units = freshell_containment::UnitDirectory::new();
+    let stopper = Arc::new(RecordingStopper {
+        units: Arc::clone(&units),
+        registry: rig.registry.clone(),
+        hooks: Arc::clone(&hooks),
+        calls: Default::default(),
+        user_kill_joins,
+    });
+    let fresh_agent = rig
+        .fresh_agent
+        .clone()
+        .with_units(Arc::clone(&units), containment.clone())
+        .with_pane_unit_stopper(stopper.clone());
+    let mut fresh_codex = crate::FreshCodexState::new(
+        Arc::new("handoff-test-token".to_string()),
+        Arc::new(tokio::sync::broadcast::channel::<String>(64).0),
+        json!({ "freshAgent": { "enabled": true } }),
+    );
+    fresh_codex.set_ownership(Arc::clone(&rig.ownership));
+    let runner = SessionHandoffRunner::new(
+        Arc::new("handoff-test-token".to_string()),
+        Arc::new(tokio::sync::broadcast::channel::<String>(64).0),
+        Arc::clone(&rig.ownership),
+        rig.registry.clone(),
+        fresh_codex,
+        rig.fresh_claude.clone(),
+        rig.fresh_opencode.clone(),
+        fresh_agent.clone(),
+        Arc::new(vec![sleeper_cli_spec("codex")]),
+    )
+    .with_reap_timeout_ms(10_000)
+    .with_test_hooks(Arc::clone(&hooks));
+    rig.runner = Arc::new(runner);
+    rig.fresh_agent = fresh_agent;
+    let prior = unit_prior(
+        &units,
+        &containment,
+        state_root,
+        &rig.registry,
+        &rig.ownership,
+        sid,
+        hold,
+    );
+    UnitRig {
+        rig,
+        stopper,
+        hooks,
+        prior,
+    }
+}
+
+fn hook_events(hooks: &HandoffTestHooks) -> Vec<&'static str> {
+    hooks.events.lock().unwrap().clone()
+}
+
+/// A switch away from a Codex terminal pane in its unit stops the pane
+/// through the single stop path (the pane-unit stopper, under the
+/// handoff's own operation) and waits for its Gone; the target starts only
+/// after that, on the first attempt.
+#[tokio::test(flavor = "multi_thread")]
+async fn handoff_from_a_codex_terminal_unit_waits_for_gone() {
+    let _guard = ENV_LOCK.lock().await;
+    let _codex_env = crate::codex::tests::ENV_LOCK.lock().await;
+    crate::codex::tests::configure_fake_codex_cmd("{}");
+    let sid = format!("unit-prior-{}", uuid::Uuid::new_v4());
+    let u = build_unit_rig(&sid, freshell_ownership::HoldKind::Main, false);
+
+    let handle = u
+        .rig
+        .runner
+        .spawn_handoff(handoff_req_fresh("codex", &sid, "freshcodex"));
+    let result = handle.completion.await.expect("handoff completed");
+    assert_eq!(result["ok"], json!(true), "first-attempt success: {result}");
+
+    let calls = u.stopper.calls();
+    assert_eq!(calls.len(), 1, "the stopper is called once: {calls:?}");
+    assert_eq!(calls[0].0, u.prior.terminal_id);
+    assert_eq!(calls[0].1, "handoff");
+    assert!(calls[0].2.is_some(), "under the handoff's own operation");
+    assert!(
+        u.prior.screen.has_exited(),
+        "the prior is dead once the stopper resolved"
+    );
+    let events = hook_events(&u.hooks);
+    let resolved = events.iter().position(|e| *e == "StopperResolved");
+    let started = events.iter().position(|e| *e == "TargetSpawnAttempted");
+    assert!(
+        matches!((resolved, started), (Some(r), Some(s)) if r < s),
+        "the target starts only after the prior's Gone: {events:?}"
+    );
+    match u.rig.ownership.observe("codex", &sid).state {
+        OwnershipState::Live { owner, .. } => {
+            assert_eq!(owner.kind, RuntimeOwnerKind::FreshAgent)
+        }
+        other => panic!("the fresh target holds the conversation, got {other:?}"),
+    }
+}
+
+/// A switch of a conversation another pane's unit holds as an EXTRA thread
+/// never stops that pane: the answer names the holder's terminal and the
+/// holder runs on (Decision 1; Stage 2: LB-25).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handoff_never_stops_an_extra_hold() {
+    let _guard = ENV_LOCK.lock().await;
+    let sid = format!("extra-held-{}", uuid::Uuid::new_v4());
+    let u = build_unit_rig(&sid, freshell_ownership::HoldKind::Extra, false);
+
+    let handle = u
+        .rig
+        .runner
+        .spawn_handoff(handoff_req_fresh("codex", &sid, "freshcodex"));
+    let result = handle.completion.await.expect("handoff completed");
+    assert_eq!(result["ok"], json!(false), "{result}");
+    assert_eq!(
+        result["error"]["code"],
+        json!("HELD_BY_ANOTHER_PANE"),
+        "{result}"
+    );
+    assert_eq!(
+        result["error"]["holderTerminalId"],
+        json!(u.prior.terminal_id),
+        "the answer names the holder's terminal: {result}"
+    );
+    assert!(u.stopper.calls().is_empty(), "nothing is stopped");
+    assert!(!u.prior.screen.has_exited(), "the holder runs on");
+    assert!(matches!(
+        u.rig.ownership.observe("codex", &sid).state,
+        OwnershipState::Live { owner, .. }
+            if owner.terminal_id.as_deref() == Some(u.prior.terminal_id.as_str())
+    ));
+    u.rig.registry.kill(&u.prior.terminal_id);
+}
+
+/// A user's kill (Shift-X) that joins the handoff's stop of its prior takes
+/// the stop over: the user stopped the conversation, so the handoff starts
+/// no target and the conversation ends Vacant (Stage 2: LB-31).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_user_kill_joining_a_handoff_stop_cancels_the_target() {
+    let _guard = ENV_LOCK.lock().await;
+    let sid = format!("user-killed-{}", uuid::Uuid::new_v4());
+    let u = build_unit_rig(&sid, freshell_ownership::HoldKind::Main, true);
+
+    let handle = u
+        .rig
+        .runner
+        .spawn_handoff(handoff_req_fresh("codex", &sid, "freshcodex"));
+    let result = handle.completion.await.expect("handoff completed");
+    assert_eq!(result["ok"], json!(false), "{result}");
+    assert_eq!(
+        result["error"]["code"],
+        json!("STALE_GENERATION"),
+        "{result}"
+    );
+    assert_eq!(result["error"]["retryable"], json!(false), "{result}");
+    assert_eq!(u.stopper.calls().len(), 1);
+    let events = hook_events(&u.hooks);
+    assert!(
+        !events
+            .iter()
+            .any(|e| *e == "TargetSpawnAttempted" || *e == "TargetStarted"),
+        "no target is started: {events:?}"
+    );
+    assert!(u.prior.screen.has_exited(), "the prior is Gone");
+    assert_eq!(
+        u.rig.ownership.observe("codex", &sid).state,
+        OwnershipState::Vacant
+    );
 }

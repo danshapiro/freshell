@@ -456,6 +456,10 @@ async fn run_loop(
         pane_reconcile_v1,
     );
     let mut interactive_create_finished = false;
+    // Requests this connection parked until a conversation's unit is Gone
+    // come back here and are dispatched like freshly received ones
+    // (`crate::gone_wait`); they are cancelled when the loop ends.
+    let mut redelivery_rx = state.gone_waits.register_connection(conn_id);
     if ui_screenshot_v1 {
         let sender = ws_tx.clone();
         state.screenshots.add_capable_client(
@@ -636,6 +640,34 @@ async fn run_loop(
                     _ => {}
                 }
             }
+            // A request parked until Gone, handed back at Gone: dispatched
+            // exactly like a freshly received message (with its original
+            // receipt time).
+            Some(redelivered) = redelivery_rx.recv() => {
+                if !dispatch_client_message(
+                    redelivered.message,
+                    redelivered.received_at,
+                    &mut ws_tx,
+                    state,
+                    conn_id,
+                    &conn_sink,
+                    terminal_output_batch_v1,
+                    paced_terminal_replay_v1,
+                    pane_reconcile_v1,
+                    pane_reconcile_fresh_agent_v1,
+                    &interactive_create_tx,
+                    &create_cancel_rx,
+                    &mut host_stats_last_refresh_at,
+                    &mut conn_identity,
+                    &mut paced_sessions,
+                    &paced_exit_notify,
+                )
+                .await
+                {
+                    close_reason = "send_error";
+                    break;
+                }
+            }
             // E2R3 (the atomic exit-transition decision): the notify arm
             // is the DISPATCH-side PRE-ARM — an extension hint, never a
             // transition commitment. A session still in its credited
@@ -795,6 +827,9 @@ async fn run_loop(
     // the lease sweep below runs.
     let _ = create_cancel_tx.send(true);
     drop(interactive_create_tx);
+    // Every request this connection parked until a Gone dies with it.
+    state.gone_waits.cancel_connection(conn_id);
+    drop(redelivery_rx);
     drop(ws_rx); // release the read half before waiting for a started create
     ws_tx.stop_without_close();
     if !writer_finished {
@@ -1027,6 +1062,52 @@ async fn handle_client_text(
     let Ok(message) = serde_json::from_value::<ClientMessage>(value) else {
         return true;
     };
+    dispatch_client_message(
+        message,
+        now_ms(),
+        ws_tx,
+        state,
+        conn_id,
+        conn_sink,
+        terminal_output_batch_v1,
+        paced_terminal_replay_v1,
+        pane_reconcile_v1,
+        pane_reconcile_fresh_agent_v1,
+        interactive_create_tx,
+        create_cancel_rx,
+        host_stats_last_refresh_at,
+        conn_identity,
+        paced_sessions,
+        paced_exit_notify,
+    )
+    .await
+}
+
+/// Dispatches one typed client message received at `received_at` (the
+/// message's receipt time: a create's provenance asserts it). A message a
+/// parked request hands back to its connection at Gone
+/// ([`crate::gone_wait`]) comes through here too, exactly like a freshly
+/// received one, with its original receipt time. Returns `false` to close
+/// the connection (only on an unrecoverable send failure).
+#[allow(clippy::too_many_arguments)] // Connection-scoped plumbing, two call sites.
+async fn dispatch_client_message(
+    message: ClientMessage,
+    received_at: i64,
+    ws_tx: &mut WsSink,
+    state: &WsState,
+    conn_id: u64,
+    conn_sink: &FrameSink,
+    terminal_output_batch_v1: bool,
+    paced_terminal_replay_v1: bool,
+    pane_reconcile_v1: bool,
+    pane_reconcile_fresh_agent_v1: bool,
+    interactive_create_tx: &mpsc::Sender<interactive_creates::Job>,
+    create_cancel_rx: &tokio::sync::watch::Receiver<bool>,
+    host_stats_last_refresh_at: &mut Option<std::time::Instant>,
+    conn_identity: &mut ConnectionIdentity,
+    paced_sessions: &mut crate::paced_replay::PacedSessions,
+    paced_exit_notify: &Option<freshell_terminal::PacedExitNotify>,
+) -> bool {
     match &message {
         ClientMessage::TerminalAttach(attach)
             if terminal_dims_in_range(attach.cols, attach.rows) =>
@@ -1138,8 +1219,9 @@ async fn handle_client_text(
             // captured ONCE here, at message receipt. The value rides the whole
             // create chain (dedupe wait, gated-restore permit queue, spawn,
             // post-spawn binding/pending-marker writes) unchanged, so slow
-            // work can never manufacture a later attribution.
-            let asserted_at = now_ms();
+            // work can never manufacture a later attribution. A create
+            // redelivered at Gone keeps its original receipt time.
+            let asserted_at = received_at;
             // Server-wide requestId -> terminal dedupe (legacy `createdByRequestId`
             // parity): registered BEFORE the rate limiter and BEFORE the
             // paneReconcileV1 adopt/sessionRef-lease branches inside `handle_create`,
@@ -1242,6 +1324,11 @@ async fn handle_client_text(
         }
         ClientMessage::TerminalAttach(attach) => {
             if terminal_dims_in_range(attach.cols, attach.rows) {
+                // A later attach of the terminal supersedes one this
+                // connection parked until a Gone.
+                state
+                    .gone_waits
+                    .cancel(&crate::gone_wait::attach_key(conn_id, &attach.terminal_id));
                 // b8ke ext r8 F2: terminal.attach participates in the
                 // coordinator — the attach's observed (epoch, generation)
                 // fence is consulted BEFORE the durable restamp: a queued
@@ -1258,7 +1345,16 @@ async fn handle_client_text(
                 // attach).
                 let mut attach_session_ref: Option<SessionLocator> = None;
                 let mut attach_observed_fence: Option<freshell_ownership::ObservedFence> = None;
-                if let Some(session_ref) = state.identity.session_ref_for(&attach.terminal_id) {
+                // A terminal the registry no longer holds (one whose unit
+                // reached Gone, a parked attach handed back) has nothing to
+                // restamp or register: the attach answers INVALID_TERMINAL_ID
+                // below, never an owner refusal for its retired identity.
+                let attach_identity = state
+                    .registry
+                    .exists(&attach.terminal_id)
+                    .then(|| state.identity.session_ref_for(&attach.terminal_id))
+                    .flatten();
+                if let Some(session_ref) = attach_identity {
                     attach_session_ref = Some(session_ref.clone());
                     // A half-sent observed pair is the typed invalid-fence
                     // refusal (the F7 discipline — never a silent legacy
@@ -1304,6 +1400,23 @@ async fn handle_client_text(
                         ownership.observe(&session_ref.provider, &session_ref.session_id)
                     });
                     if let Some(snap) = snap {
+                        // The conversation's unit is being stopped: the attach
+                        // waits for its Gone (parked, never refused) and runs
+                        // again then (Stage 2: LB-20, LB-21).
+                        if matches!(
+                            snap.state,
+                            freshell_ownership::OwnershipState::Stopping { .. }
+                        ) && crate::gone_wait::park_until_gone(
+                            state,
+                            conn_id,
+                            crate::gone_wait::attach_key(conn_id, &attach.terminal_id),
+                            &session_ref,
+                            crate::gone_wait::WS_ATTACH,
+                            ClientMessage::TerminalAttach(attach.clone()),
+                            received_at,
+                        ) {
+                            return true;
+                        }
                         let refused_reason = match &snap.state {
                             // An in-flight lifecycle transition owns the
                             // session — the queued attach answers the typed
@@ -1586,6 +1699,22 @@ async fn handle_client_text(
                             state: refused_state,
                             generation,
                         } => {
+                            // A stop began since the precheck: wait for its
+                            // Gone like the precheck would have.
+                            if matches!(
+                                refused_state,
+                                freshell_ownership::OwnershipState::Stopping { .. }
+                            ) && crate::gone_wait::park_until_gone(
+                                state,
+                                conn_id,
+                                crate::gone_wait::attach_key(conn_id, &attach.terminal_id),
+                                session_ref,
+                                crate::gone_wait::WS_ATTACH,
+                                ClientMessage::TerminalAttach(attach.clone()),
+                                received_at,
+                            ) {
+                                return true;
+                            }
                             tracing::warn!(target: "freshell_ws::terminal",
                                 terminal_id = %attach.terminal_id,
                                 session_id = %session_ref.session_id,
@@ -1799,6 +1928,10 @@ async fn handle_client_text(
             // connection's paced session for this terminal (the registry-side
             // deferral dies with the subscriber the detach removes).
             paced_sessions.cancel(&detach.terminal_id);
+            // ... and an attach of it this connection parked until a Gone.
+            state
+                .gone_waits
+                .cancel(&crate::gone_wait::attach_key(conn_id, &detach.terminal_id));
             handle_detach(&detach, ws_tx, state, conn_id).await
         }
         // Responsive-terminal-restore Workstream 1: the paced replay
@@ -1854,6 +1987,26 @@ async fn handle_client_text(
                 let Some(create) = freshell_protocol::direct_provider_create(create) else {
                     return true;
                 };
+                // A resume of a conversation whose unit is being stopped
+                // waits for that unit's Gone (parked under the pane's
+                // create-request id, dispatched again then; Stage 2: LB-20).
+                // A stop that begins after this check is answered by the
+                // lane's own retryable refusal, whose retry is parked.
+                if let Some(locator) = fresh_agent_create_key(state, &create) {
+                    if crate::gone_wait::is_stopping(state, &locator.provider, &locator.session_id)
+                        && crate::gone_wait::park_until_gone(
+                            state,
+                            conn_id,
+                            create.request_id.clone(),
+                            &locator,
+                            crate::gone_wait::FRESH_AGENT_CREATE,
+                            ClientMessage::FreshAgentCreate(create.clone()),
+                            received_at,
+                        )
+                    {
+                        return true;
+                    }
+                }
                 // D8 (restore-open-sessions-only): thread this connection's
                 // provenance (hello identity + the create's `tabId`) down the
                 // provider `handle_create` chain so the identity-sink binding
@@ -1865,7 +2018,8 @@ async fn handle_client_text(
                 // identity write) unchanged, so a pane whose create completes
                 // after the pane closed still attributes at the browser's
                 // assertion.
-                let provenance = conn_identity.bind_provenance(create.tab_id.as_deref(), now_ms());
+                let provenance =
+                    conn_identity.bind_provenance(create.tab_id.as_deref(), received_at);
                 match create.provider {
                     Some(freshell_protocol::AgentProvider::Codex) => {
                         let fresh_codex = state.fresh_codex.clone();
@@ -2879,6 +3033,9 @@ pub(crate) enum PlanLaunchError {
     Cancelled,
     /// Everything else -> PTY_SPAWN_FAILED with this message (today's shape).
     Failed(String),
+    /// The resumed conversation never materialized (no rollout; Stage 2:
+    /// LB-41): the caller starts a new conversation for the same request.
+    NotMaterialized { session_id: String },
 }
 
 impl PlanLaunchError {
@@ -2889,6 +3046,9 @@ impl PlanLaunchError {
             }
             PlanLaunchError::Cancelled => "codex launch planning cancelled".to_string(),
             PlanLaunchError::Failed(message) => message,
+            PlanLaunchError::NotMaterialized { session_id } => format!(
+                "codex conversation {session_id} never materialized (no rollout); it cannot be resumed"
+            ),
         }
     }
 }
@@ -2955,6 +3115,9 @@ async fn plan_codex_managed_launch(
     result.map_err(|error| match error {
         freshell_codex::launch_lifecycle::CodexLaunchError::QueueFull => PlanLaunchError::QueueFull,
         freshell_codex::launch_lifecycle::CodexLaunchError::Cancelled => PlanLaunchError::Cancelled,
+        freshell_codex::launch_lifecycle::CodexLaunchError::NotMaterialized { session_id } => {
+            PlanLaunchError::NotMaterialized { session_id }
+        }
         other => PlanLaunchError::Failed(other.to_string()),
     })
 }
@@ -4419,6 +4582,10 @@ pub(crate) struct PreparedLaunch {
     /// restore-class creates) — handle_create must then NOT run it again,
     /// only apply the carried notice / stale-ref lease release.
     pub resume_gate: Option<ResumeGateCarry>,
+    /// Some(id) when the Codex conversation the create resumes never
+    /// materialized (no rollout): handle_create starts a new conversation
+    /// for the same request instead (Stage 2: LB-41).
+    pub not_materialized: Option<String>,
 }
 
 /// Outcome of the wire-resume disk-existence gate, carried from wherever the
@@ -4654,6 +4821,9 @@ pub(crate) enum PrepareError {
     Cancelled,
     /// Plan failed (T4/T6 residue) -> error{code:PTY_SPAWN_FAILED}.
     PlanFailed(String),
+    /// The conversation's unit is being stopped: nothing was planned, and
+    /// the caller parks the create until that unit is Gone.
+    Stopping(SessionLocator),
 }
 
 /// P1's prepare phase: resume-identity derivation + the codex managed plan,
@@ -4670,6 +4840,27 @@ pub(crate) async fn prepare_launch(
     // disagree).
     let mode = create.mode.clone();
     let mut prep = derive_launch_prep(create, &mode);
+    // The conversation's owner decides before anything is planned: a unit
+    // being stopped holds it (the create waits for its Gone, Stage 2:
+    // LB-20), or a live pane holds it, as its main conversation or as an
+    // extra thread (the later claim answers that holder, so no app-server is
+    // started for it: Task 14 review M4).
+    let mut held_live = false;
+    if let (Some(locator), Some(ownership)) = (
+        create_session_locator(create).filter(|_| mode == "codex"),
+        state.ownership.as_ref(),
+    ) {
+        match ownership
+            .observe(&locator.provider, &locator.session_id)
+            .state
+        {
+            freshell_ownership::OwnershipState::Stopping { .. } => {
+                return Err(PrepareError::Stopping(locator));
+            }
+            freshell_ownership::OwnershipState::Live { .. } => held_live = true,
+            _ => {}
+        }
+    }
     // Resume-validation door 1, codex leg (reconciled with #589): codex
     // restore-class planning happens OFF-permit right below, so the
     // disk-existence gate for codex WIRE ids must run before it — a
@@ -4710,7 +4901,9 @@ pub(crate) async fn prepare_launch(
         std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
     // The managed session host plans its own Codex app-server and proxy.
     // Only a legacy web-owned launch needs a plan before the spawn gate.
-    let codex_launch = if !managed_runtime_v1
+    let mut not_materialized = None;
+    let codex_launch = if !held_live
+        && !managed_runtime_v1
         && prep.resume_session_id.is_some()
         && codex_create_uses_managed_launch(&mode, managed_flag.as_deref())
     {
@@ -4757,6 +4950,13 @@ pub(crate) async fn prepare_launch(
         .await;
         match planned {
             Ok(launch) => Some(PreparedCodexLaunch::new(setup, launch, scope)),
+            // No claim exists yet: the start is given up on its own, and
+            // handle_create starts a new conversation for the request.
+            Err(PlanLaunchError::NotMaterialized { session_id }) => {
+                scope.abandon(None);
+                not_materialized = Some(session_id);
+                None
+            }
             Err(error) => {
                 // No claim exists yet: the start is given up on its own.
                 let killed = state.units.killed_start(&create.request_id);
@@ -4770,6 +4970,9 @@ pub(crate) async fn prepare_launch(
                         freshell_codex::launch_plan::CODEX_START_CANCELLED_MESSAGE.to_string(),
                     ),
                     PlanLaunchError::Failed(message) => PrepareError::PlanFailed(message),
+                    PlanLaunchError::NotMaterialized { .. } => {
+                        unreachable!("handled by the arm above")
+                    }
                 });
             }
         }
@@ -4780,6 +4983,7 @@ pub(crate) async fn prepare_launch(
         prep,
         codex_launch,
         resume_gate,
+        not_materialized,
     })
 }
 
@@ -4917,6 +5121,14 @@ async fn admit_create_naming(
 /// the dispatch arm — the provenance value's assertion time — so the slowest
 /// create (gated-restore queue, cold sidecar plan, slow spawn) still attributes
 /// the browser's assertion, never this function's completion time.
+///
+/// A create that reaches a conversation whose unit is being stopped is
+/// parked until that unit's Gone ([`crate::gone_wait`]) and returns without
+/// answering; it is answered when it runs again then. A Codex conversation
+/// that never materialized (killed before its first turn: no rollout, so
+/// Codex cannot resume it) is started NEW for the same request: the claims
+/// on the old conversation are given up, its pane-ledger row is retired and
+/// the create runs again with no resume id (Stage 2: LB-41).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_create(
     create: TerminalCreate,
@@ -4928,6 +5140,106 @@ pub(crate) async fn handle_create(
     create_limiter: &mut crate::create_limit::CreateRateLimiter,
     conn_identity: &ConnectionIdentity,
     asserted_at: i64,
+) -> bool {
+    let entry_point = create_entry_point(&create);
+    let mut prepared = prepared;
+    // A restore whose prepared resume never materialized took no claim yet.
+    let mut not_materialized = prepared.as_mut().and_then(|p| p.not_materialized.take());
+    let mut create = create;
+    if not_materialized.is_none() {
+        let original = create.clone();
+        let answered = Box::pin(handle_create_once(
+            create,
+            prepared,
+            out,
+            state,
+            conn_id,
+            pane_reconcile_v1,
+            create_limiter,
+            conn_identity,
+            asserted_at,
+            &mut not_materialized,
+        ))
+        .await;
+        if not_materialized.is_none() {
+            return answered;
+        }
+        create = original;
+    }
+    let stale = not_materialized.expect("a conversation that never materialized");
+    start_new_conversation_instead(state, &create.mode, &stale, entry_point).await;
+    create.session_ref = None;
+    create.resume_session_id = None;
+    // The same request runs again: it is not charged the rate limit twice.
+    let mut fresh_limiter = crate::create_limit::CreateRateLimiter::new(
+        state.create_protect.rate_limit,
+        state.create_protect.rate_window_ms,
+    );
+    let mut again = None;
+    Box::pin(handle_create_once(
+        create,
+        None,
+        out,
+        state,
+        conn_id,
+        pane_reconcile_v1,
+        &mut fresh_limiter,
+        conn_identity,
+        asserted_at,
+        &mut again,
+    ))
+    .await
+}
+
+/// The `unit.start.waited` / `unit.resume.not_materialized` entry point of a
+/// WebSocket create.
+fn create_entry_point(create: &TerminalCreate) -> &'static str {
+    if create.restore == Some(true) {
+        crate::gone_wait::WS_RESTORE
+    } else {
+        crate::gone_wait::WS_CREATE
+    }
+}
+
+/// A Codex conversation that never materialized is started new instead of
+/// resumed (Stage 2: LB-41): its pane-ledger row is retired, the way the
+/// resume gate retires a stale id, so nothing tries to resume it again, and
+/// INFO `unit.resume.not_materialized` is logged. No notice, no error frame.
+pub(crate) async fn start_new_conversation_instead(
+    state: &WsState,
+    provider: &str,
+    session_id: &str,
+    entry_point: &'static str,
+) {
+    tracing::info!(target: "freshell_unit",
+        event = "unit.resume.not_materialized",
+        unit_id = "",
+        provider = %provider,
+        session_id = %session_id,
+        terminal_id = "",
+        operation_id = "",
+        entry_point,
+        "the conversation never had a turn (no rollout), so it is started new instead of resumed");
+    let ledger = Arc::clone(&state.pane_ledger);
+    let (retire_provider, stale_id) = (provider.to_string(), session_id.to_string());
+    let _ =
+        spawn_blocking_in_span(move || ledger.retire_missing(&retire_provider, &stale_id)).await;
+}
+
+/// [`handle_create`], once: `not_materialized` is set (and nothing answered)
+/// when the Codex conversation the create resumes never materialized.
+#[allow(clippy::too_many_arguments)]
+async fn handle_create_once(
+    create: TerminalCreate,
+    prepared: Option<PreparedLaunch>,
+    out: &mut crate::create_gate::CreateOutput<'_>,
+    state: &WsState,
+    conn_id: u64,
+    pane_reconcile_v1: bool,
+    create_limiter: &mut crate::create_limit::CreateRateLimiter,
+    conn_identity: &ConnectionIdentity,
+    asserted_at: i64,
+    not_materialized: &mut Option<String>,
 ) -> bool {
     // A create for a pane a kill stopped spawns nothing (every flavor and
     // mode; a prepared launch is given up as it drops).
@@ -5317,6 +5629,22 @@ pub(crate) async fn handle_create(
                             state: refused_state,
                             generation: _,
                         } => {
+                            // The holder's unit is being stopped: the create
+                            // waits for its Gone (Stage 2: LB-20).
+                            if matches!(
+                                refused_state,
+                                freshell_ownership::OwnershipState::Stopping { .. }
+                            ) && crate::gone_wait::park_until_gone(
+                                state,
+                                conn_id,
+                                create.request_id.clone(),
+                                &locator,
+                                create_entry_point(&create),
+                                ClientMessage::TerminalCreate(create.clone()),
+                                asserted_at,
+                            ) {
+                                return true;
+                            }
                             tracing::warn!(
                                 target: "freshell_ws::terminal",
                                 provider = %locator.provider,
@@ -5410,7 +5738,29 @@ pub(crate) async fn handle_create(
                             )
                             .await;
                         }
-                        freshell_ownership::BeginOutcome::Blocked { retry_after_ms, .. } => {
+                        freshell_ownership::BeginOutcome::Blocked {
+                            retry_after_ms,
+                            state: blocked_state,
+                        } => {
+                            // A unit being stopped holds the conversation: the
+                            // create waits for its Gone (parked, never
+                            // awaited here) and runs again then (Stage 2:
+                            // LB-20, LB-21). Every other in-flight state keeps
+                            // the retryable refusal.
+                            if matches!(
+                                blocked_state,
+                                freshell_ownership::OwnershipState::Stopping { .. }
+                            ) && crate::gone_wait::park_until_gone(
+                                state,
+                                conn_id,
+                                create.request_id.clone(),
+                                &locator,
+                                create_entry_point(&create),
+                                ClientMessage::TerminalCreate(create.clone()),
+                                asserted_at,
+                            ) {
+                                return true;
+                            }
                             // SESSION_RESERVED-style, retryable, owner fields
                             // when the blocked state names a live owner.
                             return send_session_reserved(
@@ -6631,6 +6981,18 @@ pub(crate) async fn handle_create(
             .await;
             match planned {
                 Ok(launch) => (Some(setup), Some(launch), Some(scope)),
+                // The conversation never materialized: the start is given up
+                // (the old conversation's claims go after its unit's Gone)
+                // and the create runs again as a new conversation.
+                Err(PlanLaunchError::NotMaterialized { session_id }) => {
+                    scope.abandon(Some(take_create_claims(
+                        &mut terminal_ownership,
+                        &mut session_ref_lease,
+                        &mut _terminal_start_cancellation,
+                    )));
+                    *not_materialized = Some(session_id);
+                    return true;
+                }
                 Err(error) => {
                     let message = match error {
                         PlanLaunchError::Cancelled => {
@@ -7962,7 +8324,18 @@ pub async fn respawn_agent_terminal(
     state: &WsState,
     req: &AgentRespawnRequest,
 ) -> Result<String, RespawnError> {
-    respawn_agent_terminal_relaying_claim(state, req, None).await
+    respawn_agent_terminal_relaying_claim(state, req, None)
+        .await
+        .map(|respawned| respawned.terminal_id)
+}
+
+/// A replacement agent terminal the respawn seam started.
+pub(crate) struct Respawned {
+    pub(crate) terminal_id: String,
+    /// The Codex conversation it was to resume never materialized (no
+    /// rollout; Stage 2: LB-41): it runs a NEW conversation, so the
+    /// caller's claim on the old one is released, never committed to it.
+    pub(crate) new_conversation: bool,
 }
 
 /// [`respawn_agent_terminal`] for a caller that holds the conversation's
@@ -7973,7 +8346,7 @@ pub(crate) async fn respawn_agent_terminal_relaying_claim(
     state: &WsState,
     req: &AgentRespawnRequest,
     mut claim_relay: Option<crate::unit_lifecycle::ClaimRelay>,
-) -> Result<String, RespawnError> {
+) -> Result<Respawned, RespawnError> {
     let host_os = host_os_live();
     let is_wsl = is_wsl_env_live();
     // Headless respawn: no wire `shell` field — the system shell, exactly
@@ -8029,7 +8402,8 @@ pub(crate) async fn respawn_agent_terminal_relaying_claim(
         .expect("resume validation task panicked")
     };
     let launch_intent = outcome.launch_intent;
-    let resume_session_id = outcome.resume_session_id;
+    let mut resume_session_id = outcome.resume_session_id;
+    let mut new_conversation = false;
     if let Some(stale) = outcome.stale_session_id.as_deref() {
         tracing::warn!(
             mode = %req.mode,
@@ -8143,6 +8517,50 @@ pub(crate) async fn respawn_agent_terminal_relaying_claim(
                 &mut scope,
             )
             .await;
+            let planned = match planned {
+                // The conversation never materialized (crashed before its
+                // first turn): the replacement starts a new conversation in
+                // a start of its own (taking over the claim relay).
+                Err(PlanLaunchError::NotMaterialized { session_id }) => {
+                    let relay = scope.take_claim_relay();
+                    scope.abandon(None);
+                    start_new_conversation_instead(
+                        state,
+                        &req.provider,
+                        &session_id,
+                        "auto-resume",
+                    )
+                    .await;
+                    resume_session_id = None;
+                    new_conversation = true;
+                    scope = crate::unit_lifecycle::StartScope::begin(
+                        state,
+                        "codex",
+                        &mode,
+                        &req.create_request_id,
+                        &terminal_id,
+                        None,
+                    )
+                    .map_err(|error| {
+                        RespawnError::LaunchUnresolvable(format!(
+                            "codex unit could not be recorded: {error}"
+                        ))
+                    })?;
+                    if let Some(relay) = relay {
+                        scope.release_claim_after_gone(relay);
+                    }
+                    plan_codex_launch_in_unit(
+                        state,
+                        setup,
+                        None,
+                        freshell_codex::launch_lifecycle::LaunchClass::Interactive,
+                        None,
+                        &mut scope,
+                    )
+                    .await
+                }
+                planned => planned,
+            };
             match planned {
                 Ok(launch) => (Some(launch), Some(scope)),
                 Err(error) => {
@@ -8606,7 +9024,10 @@ pub(crate) async fn respawn_agent_terminal_relaying_claim(
         &state.broadcast_tx,
         create_meta_record,
     );
-    Ok(terminal_id)
+    Ok(Respawned {
+        terminal_id,
+        new_conversation,
+    })
 }
 
 /// Rust port of `isValidClaudeSessionId` (`shared/session-contract.ts:34,44-46`;
@@ -10876,6 +11297,30 @@ async fn handle_kill(
             "a terminal.kill named neither a terminal nor a create-request id; nothing is stopped");
         return reply.send(KillAnswer::invalid(KILL_NAMES_NO_PANE));
     }
+    // A create of the pane parked until a conversation's Gone is withdrawn
+    // (it will never run). With no unit for the pane, nothing was ever
+    // started for it: the kill is done (and remembered, so a late copy of
+    // the create is answered as stopped).
+    if let Some(crq) = kill.create_request_id.as_deref() {
+        let names_a_running_pane = || {
+            resolve_kill_unit(state, &kill).is_some()
+                || kill
+                    .terminal_id
+                    .as_deref()
+                    .is_some_and(|tid| state.registry.exists(tid))
+                || state.registry.terminal_for_create_request(crq).is_some()
+        };
+        if state.gone_waits.cancel(crq) && !names_a_running_pane() {
+            if kill.reason.as_deref() != Some("stuck-recovery") {
+                state.units.remember_killed_start(crq);
+            }
+            tracing::info!(target: "freshell_ws::terminal",
+                event = "terminal.kill.parked_create_withdrawn",
+                create_request_id = %crq,
+                "a kill withdrew a create parked until a Gone; nothing was started for the pane");
+            return reply.send(KillAnswer::done());
+        }
+    }
     if let Some(entry) = resolve_kill_unit(state, &kill) {
         return crate::unit_lifecycle::kill_unit(kill, entry, reply, state, initiator).await;
     }
@@ -11297,7 +11742,7 @@ async fn kill_not_found(
 /// terminal existed, was killed and reaped (`registry.kill` is an immediate
 /// SIGKILL-and-reap), and `terminals.changed` was broadcast; `false` =
 /// unknown id, nothing broadcast.
-fn kill_and_broadcast(state: &WsState, terminal_id: &str) -> bool {
+pub(crate) fn kill_and_broadcast(state: &WsState, terminal_id: &str) -> bool {
     if state.registry.kill(terminal_id) {
         after_terminal_removed(state, terminal_id);
         return true;
@@ -11416,6 +11861,33 @@ pub(crate) fn after_terminal_removed(state: &WsState, terminal_id: &str) {
         );
     }
     broadcast_terminals_changed(state);
+}
+
+/// The owner-registry key a `freshAgent.create` resumes (its provider's,
+/// resolved to the canonical conversation), if it resumes one.
+fn fresh_agent_create_key(
+    state: &WsState,
+    create: &freshell_protocol::FreshAgentCreate,
+) -> Option<SessionLocator> {
+    let provider = match create.provider? {
+        freshell_protocol::AgentProvider::Codex => "codex",
+        freshell_protocol::AgentProvider::Claude => "claude",
+        freshell_protocol::AgentProvider::Opencode => "opencode",
+        _ => return None,
+    };
+    let session_id = create
+        .session_ref
+        .as_ref()
+        .map(|locator| locator.session_id.as_str())
+        .filter(|id| !id.is_empty())?;
+    let canonical = state
+        .ownership
+        .as_ref()?
+        .resolve_canonical(provider, session_id);
+    Some(SessionLocator {
+        provider: provider.to_string(),
+        session_id: canonical,
+    })
 }
 
 /// Whether a `freshAgent.interrupt`/`freshAgent.kill` frame should route to the codex
@@ -12452,6 +12924,7 @@ mod terminals_changed_tests {
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             fresh_agent_respawn_counts: Default::default(),
             ownership: None,
+            gone_waits: Default::default(),
             units: Default::default(),
         };
         (state, rx)
@@ -12652,6 +13125,7 @@ mod terminal_kill_stop_wedge_tests {
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             fresh_agent_respawn_counts: Default::default(),
             ownership: Some(Arc::clone(&ownership)),
+            gone_waits: Default::default(),
             units: Default::default(),
         };
         (state, ownership, "t-kill-wedge".to_string())
@@ -13076,6 +13550,7 @@ mod terminal_meta_created_tests {
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             fresh_agent_respawn_counts: Default::default(),
             ownership: None,
+            gone_waits: Default::default(),
             units: Default::default(),
         };
         (state, rx)
@@ -13721,6 +14196,7 @@ mod pane_reconcile_gate_tests {
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             fresh_agent_respawn_counts: Default::default(),
             ownership: None,
+            gone_waits: Default::default(),
             units: Default::default(),
         }
     }
@@ -14309,6 +14785,7 @@ mod host_stats_dispatch_tests {
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             fresh_agent_respawn_counts: Default::default(),
             ownership: None,
+            gone_waits: Default::default(),
             units: Default::default(),
         }
     }

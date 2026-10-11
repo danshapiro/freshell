@@ -1114,6 +1114,97 @@ async fn assert_no_frame_contains(rx: &mut tokio::sync::broadcast::Receiver<Stri
     }
 }
 
+/// Task 15 (Decision 8; Stage 2: LB-20): a REST resume of a conversation
+/// whose unit is being stopped waits for that unit's Gone at most 5 s; past
+/// that it answers `202 {"ok":false,"status":"stopping"}` and the create runs
+/// on its own at Gone, exactly as the synchronous route would (the resumed
+/// tab lands in the layout store).
+#[tokio::test(start_paused = true)]
+async fn a_rest_resume_of_a_stopping_conversation_answers_202_and_finishes_at_gone() {
+    let http = Arc::new(ResumeServeHttp::with_sessions(&[(
+        "ses_stopping_1",
+        resume_session_body("ses_stopping_1", Some("/serve/dir")),
+    )]));
+    let registry = std::sync::Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+    let (state, _sink) = state_with_resume_http(http.clone()).await;
+    let state = state.with_ownership(std::sync::Arc::clone(&registry));
+
+    // The conversation is held by a unit whose stop has begun (Stopping).
+    let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+        "opencode",
+        "ses_stopping_1",
+        freshell_ownership::RuntimeOwnerKind::Terminal,
+        "op-held",
+        None,
+        "test",
+        1,
+    ) else {
+        panic!("fixture: the holder's claim must grant")
+    };
+    assert_eq!(
+        registry.commit_live(
+            "opencode",
+            "ses_stopping_1",
+            "op-held",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                terminal_id: Some("t-held".into()),
+                unit_id: Some("u-held".into()),
+                ..freshell_ownership::OwnerIdentity::default()
+            },
+        ),
+        freshell_ownership::CommitOutcome::Committed
+    );
+    assert_eq!(
+        registry
+            .begin_unit_stop("u-held", "op-stop", "test", 2)
+            .len(),
+        1
+    );
+
+    let started = tokio::time::Instant::now();
+    let (status, body) = post(
+        app(state.clone()),
+        "/api/tabs",
+        json!({
+            "agent": "opencode",
+            "sessionRef": { "provider": "opencode", "sessionId": "ses_stopping_1" },
+        }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body, json!({ "ok": false, "status": "stopping" }));
+    assert!(
+        started.elapsed() >= Duration::from_secs(5),
+        "the route waited its 5 s bound first"
+    );
+    assert!(
+        state.layout.list_tabs().0.is_empty(),
+        "nothing is created while the conversation is stopping"
+    );
+
+    // Gone: the conversation is released, and the create runs on its own.
+    assert_eq!(registry.commit_unit_stop("u-held", "op-stop").len(), 1);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while state.layout.list_tabs().0.is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the resumed tab lands in the layout store at Gone"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        state
+            .panes
+            .lock()
+            .unwrap()
+            .values()
+            .any(|pane| pane.durable_id.as_deref() == Some("ses_stopping_1")),
+        "the resumed pane holds the conversation"
+    );
+}
+
 #[tokio::test]
 async fn rest_resume_durable_ses_is_born_durable_with_ledger_settings_and_route() {
     let http = Arc::new(ResumeServeHttp::with_sessions(&[(

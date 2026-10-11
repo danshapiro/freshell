@@ -2226,25 +2226,29 @@ async fn async_main() -> ExitCode {
     // create pipeline. The set_spawn_gate/set_identity_sink calls above are
     // unaffected: Arc<OnceLock> cells initialized in new(), shared by every
     // clone including this rebound value.
-    let fresh_agent_state = fresh_agent_state
-        .with_resume_probe({
-            let probe = session_existence.clone(); // the hoisted Arc'd probe
-            std::sync::Arc::new(move |provider: &str, session_id: &str| {
-                use freshell_platform::resume_gate::{ResumeExistence, ResumeProbeAnswer};
-                use freshell_ws::existence::SessionExistence;
-                let existence = match probe.exists_for_gate(provider, session_id) {
-                    SessionExistence::Present => ResumeExistence::Present,
-                    SessionExistence::Absent => ResumeExistence::Absent,
-                    SessionExistence::Unknown | SessionExistence::ProviderUnavailable => {
-                        ResumeExistence::Unknown
-                    }
-                };
-                ResumeProbeAnswer {
-                    existence,
-                    ever_observed_on_disk: probe.ever_observed_on_disk(provider, session_id),
+    let resume_probe: freshell_platform::resume_gate::ResumeProbeFn = {
+        let probe = session_existence.clone(); // the hoisted Arc'd probe
+        std::sync::Arc::new(move |provider: &str, session_id: &str| {
+            use freshell_platform::resume_gate::{ResumeExistence, ResumeProbeAnswer};
+            use freshell_ws::existence::SessionExistence;
+            let existence = match probe.exists_for_gate(provider, session_id) {
+                SessionExistence::Present => ResumeExistence::Present,
+                SessionExistence::Absent => ResumeExistence::Absent,
+                SessionExistence::Unknown | SessionExistence::ProviderUnavailable => {
+                    ResumeExistence::Unknown
                 }
-            })
+            };
+            ResumeProbeAnswer {
+                existence,
+                ever_observed_on_disk: probe.ever_observed_on_disk(provider, session_id),
+            }
         })
+    };
+    // freshcodex: a resume Codex refuses for a thread the index never saw on
+    // disk starts a new thread (Stage 2: LB-41).
+    fresh_codex_state.set_resume_probe(std::sync::Arc::clone(&resume_probe));
+    let fresh_agent_state = fresh_agent_state
+        .with_resume_probe(resume_probe)
         .with_on_stale_resume({
             let ledger = pane_ledger.clone(); // the Arc<PaneLedger> built above
             std::sync::Arc::new(move |provider: &str, stale_id: &str| {
@@ -2389,6 +2393,7 @@ async fn async_main() -> ExitCode {
         shutdown_started: std::sync::Arc::clone(&shutdown_started),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         pane_ledger: std::sync::Arc::clone(&pane_ledger),
+        gone_waits: Default::default(),
         units: unit_services.clone(),
     };
 
@@ -2399,6 +2404,11 @@ async fn async_main() -> ExitCode {
     // including those of REST-created panes and of the Codex seed — runs
     // through `stop_terminal_unit`.
     freshell_ws::unit_lifecycle::wire(&ws_state, &tokio::runtime::Handle::current());
+    // The handoff and the automation routes stop a terminal pane's unit
+    // through the WebSocket layer's single stop path (Stage 2: LB-25).
+    let fresh_agent_state = fresh_agent_state.with_pane_unit_stopper(Arc::new(
+        freshell_ws::unit_stopper::WsPaneUnitStopper::new(ws_state.clone()),
+    ));
 
     // Lane D1 (Task 5): the auto-resume hub — consumes the crash events the
     // PTY exit hook sends and drives bounded respawns. A boot-time background
@@ -4810,6 +4820,7 @@ mod sessions_sweep_tests {
                 freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             fresh_agent_respawn_counts: Default::default(),
             ownership: None,
+            gone_waits: Default::default(),
             units: Default::default(),
         };
 

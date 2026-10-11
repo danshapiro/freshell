@@ -47,6 +47,7 @@ pub mod create_dedupe;
 pub(crate) mod create_gate;
 pub mod create_limit;
 pub mod existence;
+pub mod gone_wait;
 pub mod host_stats_collector;
 pub mod host_stats_interest;
 pub mod hosted_fresh_agent;
@@ -74,6 +75,7 @@ pub mod tabs_store_model;
 pub mod terminal;
 pub mod terminal_meta;
 pub mod unit_lifecycle;
+pub mod unit_stopper;
 pub mod unit_threads;
 
 pub use codex_identity::codex_sessions_root;
@@ -421,6 +423,11 @@ pub struct WsState {
     /// pane runs through [`crate::unit_lifecycle::stop_terminal_unit`]. Reads
     /// as the directory (`state.units.by_terminal(..)`).
     pub units: crate::unit_lifecycle::UnitServices,
+    /// Requests parked until a conversation's unit is Gone (a create,
+    /// restore, attach or fresh-agent create that reached a `Stopping`
+    /// conversation): each waits in its own task and is re-submitted at
+    /// Gone, cancelled with its request or its connection.
+    pub gone_waits: Arc<crate::gone_wait::GoneWaits>,
 }
 
 /// The `/ws` sub-router, pre-bound to its state (mergeable into the server app).
@@ -1145,6 +1152,7 @@ pub(crate) fn test_ws_state() -> WsState {
         reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
         ownership: None,
+        gone_waits: Default::default(),
         units: Default::default(),
     }
 }

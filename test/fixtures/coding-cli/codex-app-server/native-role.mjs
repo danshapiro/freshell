@@ -12,7 +12,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { acquireThreadLock, heldThreadIds, releaseThreadLock } from './fake-lock.mjs'
 
-export function createNativeRole({ behavior, codexHome, broadcast, openConnections, sendTo }) {
+export function createNativeRole({ behavior, codexHome, broadcast, hasRollout, materialize, openConnections, sendTo }) {
   // The native creates, locks and deletes real thread lock files, so it never falls
   // back to the user's own ~/.codex: an unset or empty CODEX_HOME is a startup error.
   if (!codexHome) {
@@ -177,15 +177,10 @@ export function createNativeRole({ behavior, codexHome, broadcast, openConnectio
   function isEphemeral(threadId) {
     return threads.get(threadId)?.ephemeral === true
   }
-  function hasRollout(threadId) {
-    const wanted = `rollout-${encodeURIComponent(threadId)}.jsonl`
-    try {
-      return fs.readdirSync(path.join(codexHome, 'sessions'), { recursive: true })
-        .some((entry) => path.basename(String(entry)) === wanted)
-    } catch {
-      return false
-    }
-  }
+  // Like Codex, a thread that never had a turn (no rollout) cannot be resumed:
+  // `thread/resume` answers `-32600 "no rollout found for thread id <id>"` (a
+  // behavior can set `resumeNeedsRollout: false` to resume any id).
+  const resumeNeedsRollout = behavior.resumeNeedsRollout !== false
 
   // ── Helper threads (Codex collab agents) ────────────────────────────────────
   async function spawnHelperThread(rootThreadId, spec) {
@@ -310,6 +305,8 @@ export function createNativeRole({ behavior, codexHome, broadcast, openConnectio
         process.exit(1)
       }
       registerThread(id, { preloaded: true }, [])
+      // Conversations opened earlier in the pane have had turns: on disk.
+      materialize(id)
     }
     if (behavior.spawnHelperProcess) spawnOwnGroupHelper()
     if (behavior.mcpChild) spawnMcpChild()
@@ -346,7 +343,7 @@ export function createNativeRole({ behavior, codexHome, broadcast, openConnectio
           registerThread(id, {}, [socket])
           return null
         }
-        if (behavior.resumeNeedsRollout && !hasRollout(id)) {
+        if (resumeNeedsRollout && !hasRollout(id)) {
           return { error: { code: -32600, message: `no rollout found for thread id ${id}` } }
         }
         const lockError = await lockOrError(id)
@@ -366,6 +363,14 @@ export function createNativeRole({ behavior, codexHome, broadcast, openConnectio
         if (lockError) return { error: lockError }
         registerThread(id, { preloaded: true }, [])
         return { result: { threadId: id } }
+      }
+      case 'thread/shellCommand': {
+        // A model-free shell command materializes the conversation, like a turn.
+        if (!threads.has(threadId)) {
+          return { error: { code: -32600, message: `thread not loaded: ${threadId}` } }
+        }
+        materialize(threadId)
+        return { result: {} }
       }
       case 'thread/unsubscribe': {
         const thread = threads.get(threadId)

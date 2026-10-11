@@ -61,9 +61,14 @@ fn evaluate_user_create_gate(
     match existence {
         ResumeExistence::Present | ResumeExistence::Unknown => ResumeGateDecision::Proceed,
         ResumeExistence::Absent => {
-            // Zero-turn carve-out belongs only to user-create. The managed
-            // coordinator requires its own durable never-dispatched proof.
-            if provider == "claude" && !ever_observed_on_disk {
+            // Zero-turn carve-out: a Claude transcript never seen on disk may
+            // be a legitimate zero-turn session (the managed coordinator
+            // requires its own durable never-dispatched proof); a Codex
+            // conversation never seen on disk is left to the planner
+            // ([`codex_never_materialized`]).
+            if (provider == "claude" && !ever_observed_on_disk)
+                || codex_never_materialized(provider, existence, ever_observed_on_disk)
+            {
                 ResumeGateDecision::Proceed
             } else {
                 ResumeGateDecision::SpawnFresh
@@ -72,10 +77,29 @@ fn evaluate_user_create_gate(
     }
 }
 
+/// A Codex conversation the index has never seen on disk may simply never
+/// have had a turn: Codex writes its rollout only at the first turn, so a
+/// conversation killed before it has none (Stage 2: LB-41). Under either
+/// intent the gate lets such an id through, and the Codex planner's rollout
+/// check under the app-server's own Codex home decides (it starts a new
+/// conversation when there is none). A conversation that WAS on disk and is
+/// gone keeps its refusals.
+fn codex_never_materialized(
+    provider: &str,
+    existence: ResumeExistence,
+    ever_observed_on_disk: bool,
+) -> bool {
+    provider == "codex" && existence == ResumeExistence::Absent && !ever_observed_on_disk
+}
+
 fn evaluate_managed_recovery_gate(
     provider: &str,
     existence: ResumeExistence,
+    ever_observed_on_disk: bool,
 ) -> ResumeGateDecision {
+    if codex_never_materialized(provider, existence, ever_observed_on_disk) {
+        return ResumeGateDecision::Proceed;
+    }
     match (provider_validated(provider), existence) {
         (true, ResumeExistence::Present) => ResumeGateDecision::Proceed,
         _ => ResumeGateDecision::BlockedRecovery,
@@ -92,7 +116,9 @@ pub fn evaluate_resume_gate_for_intent(
         ResumeIntent::UserCreate => {
             evaluate_user_create_gate(provider, existence, ever_observed_on_disk)
         }
-        ResumeIntent::ManagedRecovery => evaluate_managed_recovery_gate(provider, existence),
+        ResumeIntent::ManagedRecovery => {
+            evaluate_managed_recovery_gate(provider, existence, ever_observed_on_disk)
+        }
     }
 }
 
@@ -142,11 +168,37 @@ mod tests {
     }
 
     #[test]
-    fn codex_and_opencode_absent_spawn_fresh() {
+    fn codex_and_opencode_absent_after_being_on_disk_spawn_fresh() {
         assert_eq!(evaluate_resume_gate("codex", Absent, true), SpawnFresh);
         assert_eq!(evaluate_resume_gate("opencode", Absent, true), SpawnFresh);
-        assert_eq!(evaluate_resume_gate("codex", Absent, false), SpawnFresh);
         assert_eq!(evaluate_resume_gate("opencode", Absent, false), SpawnFresh);
+    }
+
+    /// A Codex conversation never seen on disk may simply never have had a
+    /// turn (Codex writes its rollout only at the first turn): the gate lets
+    /// it through under either intent, and the planner's rollout check under
+    /// the app-server's own Codex home decides (Stage 2: LB-41).
+    #[test]
+    fn codex_absent_and_never_seen_on_disk_proceeds_under_both_intents() {
+        for intent in [ResumeIntent::UserCreate, ResumeIntent::ManagedRecovery] {
+            assert_eq!(
+                evaluate_resume_gate_for_intent("codex", Absent, false, intent),
+                Proceed,
+                "{intent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_absent_after_being_on_disk_keeps_its_refusals() {
+        assert_eq!(
+            evaluate_resume_gate_for_intent("codex", Absent, true, ResumeIntent::UserCreate),
+            SpawnFresh
+        );
+        assert_eq!(
+            evaluate_resume_gate_for_intent("codex", Absent, true, ResumeIntent::ManagedRecovery),
+            BlockedRecovery
+        );
     }
 
     #[test]
@@ -222,11 +274,14 @@ mod tests {
                 Proceed
             );
             for existence in [Absent, Unknown] {
+                // A Codex conversation absent and never seen on disk is left
+                // to the planner's rollout check (its own test above).
+                let ever_observed = provider == "codex" && existence == Absent;
                 assert_eq!(
                     evaluate_resume_gate_for_intent(
                         provider,
                         existence,
-                        false,
+                        ever_observed,
                         ResumeIntent::ManagedRecovery,
                     ),
                     BlockedRecovery

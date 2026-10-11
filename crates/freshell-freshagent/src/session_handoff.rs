@@ -277,6 +277,17 @@ enum StopOutcomePriv {
     /// reason and answers the typed retryable failure; a new writer can
     /// never start against the unconfirmable prior.
     PlatformLimitedFenced,
+    /// The prior's unit stop reached Gone, but a user's kill (Shift-X or a
+    /// kill command) took that stop over: the user stopped the
+    /// conversation, so the handoff starts no target (Stage 2: LB-31).
+    StoppedByUserKill,
+}
+
+/// Whether a stop report's final reason is a user's kill (Shift-X or a kill
+/// command), which takes over a weaker stop it joins.
+fn is_user_kill(reason: &str) -> bool {
+    reason == freshell_containment::StopReason::ShiftX.as_str()
+        || reason == freshell_containment::StopReason::KillCommand.as_str()
 }
 
 /// The server-wide atomic handoff runner. Minted in `freshell-server::main`
@@ -1110,6 +1121,32 @@ impl SessionHandoffRunner {
                     }
                 }
             }
+            // A conversation another pane's unit holds as an EXTRA thread
+            // (its app-server has it loaded besides the conversation that
+            // pane shows) is never switched away from that pane: nothing is
+            // stopped, and the answer names the holder's terminal so the
+            // client can jump there (Decision 1; Stage 2: LB-25).
+            BeginOutcome::AdoptLive { owner, generation }
+                if owner.hold == freshell_ownership::HoldKind::Extra =>
+            {
+                tracing::info!(target: "freshell_unit",
+                    event = "unit.reopen.holder",
+                    unit_id = %owner.unit_id.as_deref().unwrap_or(""),
+                    provider = %req.provider,
+                    session_id = %req.session_id,
+                    terminal_id = %owner.terminal_id.as_deref().unwrap_or(""),
+                    operation_id = %operation_id,
+                    "a switch of a thread another pane's unit holds answers that pane");
+                let mut failure = typed_failure(
+                    "HELD_BY_ANOTHER_PANE",
+                    "the conversation is open in another pane (as a thread its agent has \
+                     loaded); switch to that pane",
+                    false,
+                    generation,
+                );
+                failure["error"]["holderTerminalId"] = json!(owner.terminal_id);
+                return failure;
+            }
             // `begin_handoff` grants from Vacant AND from Live of any kind, so
             // AdoptLive/OwnedByOtherKind are unreachable arms — mapped to the
             // same typed, retryable in-flight answer rather than unwrapped.
@@ -1193,6 +1230,55 @@ impl SessionHandoffRunner {
                     if let Some(hooks) = self.test_hooks.as_ref() {
                         hooks.record("Reaped");
                     }
+                }
+                StopOutcomePriv::StoppedByUserKill => {
+                    // The user stopped the conversation (a Shift-X or a kill
+                    // command joined the prior's stop and took it over): the
+                    // prior is Gone and the handoff starts no target; the key
+                    // ends Vacant (Stage 2: LB-31).
+                    guard.prior_stop = PriorStopPhase::Reaped;
+                    guard.prior_still_live = false;
+                    let _ = guard.disarm_and_fail();
+                    self.broadcast_failure_truth(
+                        &req,
+                        &operation_id,
+                        generation,
+                        prior_kind,
+                        "STOPPED_BY_USER",
+                    )
+                    .await;
+                    self.log_transition(
+                        TransitionLog {
+                            operation_id: &operation_id,
+                            provider: &req.provider,
+                            session_id: &req.session_id,
+                            initiator: &initiator,
+                            epoch: self.ownership.boot_epoch(),
+                            generation,
+                            live_session_key: owner.live_session_key.as_deref(),
+                            from_kind: prior_kind,
+                            to_kind: Some(req.target_kind),
+                            runtime_id: owner.terminal_id.as_deref(),
+                            pid: owner.pid,
+                            outcome: "prior_stopped_by_user",
+                            duration_ms: began.elapsed().as_millis() as u64,
+                            failure_reason: Some("STOPPED_BY_USER"),
+                            stale: None,
+                        },
+                        "ownership.handoff.done",
+                        TransitionLevel::Warn,
+                    );
+                    let generation = self
+                        .ownership
+                        .observe(&req.provider, &req.session_id)
+                        .generation;
+                    return typed_failure(
+                        "STALE_GENERATION",
+                        "the conversation was stopped while it was being switched; nothing was \
+                         started",
+                        false,
+                        generation,
+                    );
                 }
                 StopOutcomePriv::ReapTimeout { fenced: true } => {
                     // b8ke delta review F3: a REAL reap timeout — the kill
@@ -1878,13 +1964,22 @@ impl SessionHandoffRunner {
         owner: &OwnerIdentity,
     ) -> bool {
         match owner.kind {
+            // A row in a pane unit stays Running until its unit's Gone: once
+            // the unit's stop has begun it is dying, never live (a restore
+            // would put a dying pane back Live).
             RuntimeOwnerKind::Terminal => owner
                 .terminal_id
                 .as_deref()
                 .map(|tid| {
-                    self.registry.probe(tid).is_some_and(|row| {
-                        row.status == freshell_protocol::TerminalRunStatus::Running
-                    })
+                    let stopping = self
+                        .fresh_agent
+                        .units
+                        .by_terminal(tid)
+                        .is_some_and(|entry| entry.unit.stop_in_flight().is_some());
+                    !stopping
+                        && self.registry.probe(tid).is_some_and(|row| {
+                            row.status == freshell_protocol::TerminalRunStatus::Running
+                        })
                 })
                 .unwrap_or(false),
             RuntimeOwnerKind::FreshAgent => match provider {
@@ -2187,6 +2282,21 @@ impl SessionHandoffRunner {
                 let Some(terminal_id) = owner.terminal_id.as_deref() else {
                     return StopOutcomePriv::Reaped;
                 };
+                // A target in a pane unit: its Gone through the single stop
+                // path is the confirmation.
+                if let Some(outcome) = self
+                    .stop_unit_for_handoff(
+                        req,
+                        owner,
+                        terminal_id,
+                        "handoff-runner-stale-commit",
+                        operation_id,
+                        generation,
+                    )
+                    .await
+                {
+                    return outcome;
+                }
                 // b8ke e4 post-cap F1: confirmed death is the recorded
                 // pid's OS-LEVEL death — NEVER the registry kill's return
                 // and never the row-based predicate. kill_internal removes
@@ -2368,7 +2478,9 @@ impl SessionHandoffRunner {
     fn uncommitted_target_reap_confirmed(outcome: &StopOutcomePriv) -> bool {
         matches!(
             outcome,
-            StopOutcomePriv::Reaped | StopOutcomePriv::ReapTimeout { fenced: false }
+            StopOutcomePriv::Reaped
+                | StopOutcomePriv::StoppedByUserKill
+                | StopOutcomePriv::ReapTimeout { fenced: false }
         )
     }
 
@@ -2378,7 +2490,9 @@ impl SessionHandoffRunner {
         guard: &mut HandoffGuard,
     ) -> bool {
         match outcome {
-            StopOutcomePriv::Reaped => {
+            // The target's Gone (a user's kill that took its stop over is
+            // the same confirmed death).
+            StopOutcomePriv::Reaped | StopOutcomePriv::StoppedByUserKill => {
                 let _ = guard.disarm_and_fail();
                 true
             }
@@ -2851,6 +2965,7 @@ impl SessionHandoffRunner {
         watch: crate::terminal_tabs::HandoffSpawnWatch,
     ) -> impl std::future::Future<Output = ReapAnswer> + Send + 'static {
         let registry = self.registry.clone();
+        let pane_stops = PaneStops::of(&self.fresh_agent);
         let reap_timeout_ms = self.reap_timeout_ms;
         let provider = provider.to_string();
         let session_id = session_id.to_string();
@@ -2875,6 +2990,7 @@ impl SessionHandoffRunner {
                 let recorded_pid = watch.published_pid();
                 if !kill_and_confirm_terminal_pid(
                     &registry,
+                    &pane_stops,
                     &terminal_id,
                     recorded_pid,
                     reap_timeout_ms,
@@ -2892,6 +3008,7 @@ impl SessionHandoffRunner {
                     && entry.resume_session_id.as_deref() == Some(session_id.as_str())
                     && !kill_and_confirm_terminal_pid(
                         &registry,
+                        &pane_stops,
                         &entry.terminal_id,
                         registry.pid_of(&entry.terminal_id),
                         reap_timeout_ms,
@@ -2976,7 +3093,9 @@ impl SessionHandoffRunner {
                 // truth. Release the fresh lane's held lease exactly like
                 // the second-kill arm did (the awaited confirmed tree
                 // death is the precise release).
-                StopOutcomePriv::Reaped | StopOutcomePriv::ReapTimeout { fenced: false } => {
+                StopOutcomePriv::Reaped
+                | StopOutcomePriv::StoppedByUserKill
+                | StopOutcomePriv::ReapTimeout { fenced: false } => {
                     if target.kind == RuntimeOwnerKind::FreshAgent {
                         self.release_fresh_lane_lease(provider, session_id);
                     }
@@ -3042,6 +3161,7 @@ impl SessionHandoffRunner {
                 let recorded_pid = watch.published_pid();
                 if !kill_and_confirm_terminal_pid(
                     &self.registry,
+                    &PaneStops::of(&self.fresh_agent),
                     &terminal_id,
                     recorded_pid,
                     self.reap_timeout_ms,
@@ -3196,7 +3316,14 @@ impl SessionHandoffRunner {
         // b8ke ext r13 F7: the recorded-PID OS-level death is the
         // confirmation — never the row's absence (a concurrent kill
         // removes the row before its blocking PTY kill completes).
-        kill_and_confirm_terminal_pid(&self.registry, terminal_id, None, self.reap_timeout_ms).await
+        kill_and_confirm_terminal_pid(
+            &self.registry,
+            &PaneStops::of(&self.fresh_agent),
+            terminal_id,
+            None,
+            self.reap_timeout_ms,
+        )
+        .await
     }
 
     /// Stop the prior runtime and await the CONFIRMED reap (bounded by
@@ -3295,6 +3422,90 @@ impl SessionHandoffRunner {
             .and_then(|entry| entry.unit.stop_in_flight())
     }
 
+    /// The stop of a pane unit's terminal through the [`PaneUnitStopper`]
+    /// (the single stop path), under `operation_id`: `None` when the
+    /// terminal is outside any unit, or when no stopper is wired (WARN; the
+    /// caller keeps its legacy kill).
+    ///
+    /// [`PaneUnitStopper`]: crate::PaneUnitStopper
+    fn unit_stop(
+        &self,
+        terminal_id: &str,
+        operation_id: &str,
+    ) -> Option<futures_util::future::BoxFuture<'static, Option<freshell_containment::StopReport>>>
+    {
+        PaneStops::of(&self.fresh_agent).stop(terminal_id, Some(operation_id))
+    }
+
+    /// A prior terminal in a pane unit, stopped through
+    /// [`Self::unit_stop`] and awaited within the reap budget: its Gone is
+    /// the confirmed reap; a stop a user's kill took over (Shift-X or a
+    /// kill command joined it) ends the handoff without a target
+    /// (Stage 2: LB-31); past the budget the stop runs on detached and the
+    /// key stays fenced until its Gone (the reap-timeout regime). `None`:
+    /// not a unit row (or no stopper), the caller keeps its legacy arm.
+    async fn stop_unit_for_handoff(
+        self: &Arc<Self>,
+        req: &HandoffRequest,
+        owner: &OwnerIdentity,
+        terminal_id: &str,
+        initiator: &str,
+        operation_id: &str,
+        generation: u64,
+    ) -> Option<StopOutcomePriv> {
+        let stop = self.unit_stop(terminal_id, operation_id)?;
+        // Round-3 review I-1 (prior-reap window): the stop is issued but
+        // unconfirmed — the abort-window test's deterministic hold.
+        if let Some(hooks) = self.test_hooks.as_ref() {
+            if let Some(pause) = hooks.pause_after_terminal_prior_kill.as_ref() {
+                let _ = pause.notified().await;
+            }
+        }
+        let mut stop = tokio::spawn(stop);
+        let budget = std::time::Duration::from_millis(self.reap_timeout_ms);
+        tokio::select! {
+            joined = &mut stop => Some(match joined {
+                Ok(Some(report)) if is_user_kill(&report.reason) => {
+                    StopOutcomePriv::StoppedByUserKill
+                }
+                Ok(_) => StopOutcomePriv::Reaped,
+                // The stop task died: its Gone is unconfirmed (fenced; the
+                // replacement probe settles it).
+                Err(_) => {
+                    self.broadcast_fenced_reap_timeout(req, owner, operation_id, generation);
+                    self.spawn_reap_confirmation_watcher(
+                        req,
+                        operation_id,
+                        generation,
+                        initiator,
+                        owner,
+                        "REAP_TIMEOUT",
+                        std::future::ready(ReapAnswer::Lost),
+                    );
+                    StopOutcomePriv::ReapTimeout { fenced: true }
+                }
+            }),
+            _ = tokio::time::sleep(budget) => {
+                self.broadcast_fenced_reap_timeout(req, owner, operation_id, generation);
+                self.spawn_reap_confirmation_watcher(
+                    req,
+                    operation_id,
+                    generation,
+                    initiator,
+                    owner,
+                    "REAP_TIMEOUT",
+                    async move {
+                        match stop.await {
+                            Ok(_) => ReapAnswer::Confirmed,
+                            Err(_) => ReapAnswer::Lost,
+                        }
+                    },
+                );
+                Some(StopOutcomePriv::ReapTimeout { fenced: true })
+            }
+        }
+    }
+
     async fn stop_runtime(
         self: &Arc<Self>,
         req: &HandoffRequest,
@@ -3312,6 +3523,23 @@ impl SessionHandoffRunner {
                 let Some(terminal_id) = owner.terminal_id.as_deref() else {
                     return StopOutcomePriv::Reaped; // no runtime identity: nothing to stop
                 };
+                // A prior in a pane unit is stopped through the single stop
+                // path, under this handoff's own operation (so the stop
+                // leaves the handoff's key to it), and its Gone is the
+                // confirmation (Stage 2: LB-25).
+                if let Some(outcome) = self
+                    .stop_unit_for_handoff(
+                        req,
+                        owner,
+                        terminal_id,
+                        initiator,
+                        operation_id,
+                        generation,
+                    )
+                    .await
+                {
+                    return outcome;
+                }
                 // b8ke ext r6 F2: confirmed death is the recorded pid's
                 // OS-LEVEL death — NEVER registry.kill()'s return and never
                 // the row-based predicate. kill_internal removes the row
@@ -4446,10 +4674,18 @@ async fn await_terminal_dead(registry: &freshell_terminal::TerminalRegistry, ter
 /// unconfirmed reap per its fail-closed discipline, never as Confirmed.
 async fn kill_and_confirm_terminal_pid(
     registry: &freshell_terminal::TerminalRegistry,
+    pane_stops: &PaneStops,
     terminal_id: &str,
     recorded_pid: Option<u32>,
     reap_timeout_ms: u64,
 ) -> bool {
+    // A terminal in a pane unit: stopped through the single stop path, and
+    // only its Gone (within the budget) is the confirmation.
+    if let Some(stop) = pane_stops.stop(terminal_id, None) {
+        return tokio::time::timeout(std::time::Duration::from_millis(reap_timeout_ms), stop)
+            .await
+            .is_ok();
+    }
     let pid = recorded_pid.or_else(|| registry.pid_of(terminal_id));
     if !registry.kill(terminal_id) && pid.is_none() {
         // No row AND no pid evidence: nothing to probe — the legacy
@@ -4475,6 +4711,55 @@ async fn kill_and_confirm_terminal_pid(
             )
             .await;
             registry.terminal_is_dead(terminal_id)
+        }
+    }
+}
+
+/// How the handoff's kills reach a terminal in a pane unit: the unit
+/// directory and the wired [`crate::PaneUnitStopper`] (the single stop
+/// path). Cheap to clone into a detached cleanup.
+#[derive(Clone)]
+pub(crate) struct PaneStops {
+    units: Arc<freshell_containment::UnitDirectory>,
+    stopper: Option<Arc<dyn crate::PaneUnitStopper>>,
+}
+
+impl PaneStops {
+    fn of(fresh_agent: &crate::FreshAgentState) -> Self {
+        Self {
+            units: Arc::clone(&fresh_agent.units),
+            stopper: fresh_agent.pane_unit_stopper(),
+        }
+    }
+
+    /// The stop (resolving at Gone) of `terminal_id`'s unit under
+    /// `operation_id` (a fresh one when `None`); `None` when the terminal is
+    /// outside any unit, or when no stopper is wired (WARN: the caller keeps
+    /// its legacy row kill).
+    fn stop(
+        &self,
+        terminal_id: &str,
+        operation_id: Option<&str>,
+    ) -> Option<futures_util::future::BoxFuture<'static, Option<freshell_containment::StopReport>>>
+    {
+        self.units.by_terminal(terminal_id)?;
+        match self.stopper.as_ref() {
+            Some(stopper) => Some(stopper.stop_terminal(
+                terminal_id.to_string(),
+                "handoff",
+                operation_id.map(str::to_string),
+            )),
+            None => {
+                tracing::warn!(target: "freshell_unit",
+                    event = "unit.stopper_unwired",
+                    unit_id = "",
+                    provider = "",
+                    session_id = "",
+                    terminal_id = %terminal_id,
+                    operation_id = %operation_id.unwrap_or(""),
+                    "no pane-unit stopper is wired; the handoff kills the pane's row the legacy way");
+                None
+            }
         }
     }
 }

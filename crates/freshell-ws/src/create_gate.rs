@@ -122,6 +122,30 @@ pub(crate) fn spawn_gated_restore_create(
                     state.create_dedupe.clear_if_in_flight(&create.request_id);
                     return;
                 }
+                // The conversation's unit is being stopped: the restore waits
+                // for its Gone without a permit (nothing was planned) and is
+                // dispatched again then, taking a fresh dedupe reservation.
+                Err(crate::terminal::PrepareError::Stopping(locator)) => {
+                    let request_id = create.request_id.clone();
+                    let parked = crate::gone_wait::park_until_gone(
+                        &state,
+                        conn_id,
+                        request_id.clone(),
+                        &locator,
+                        crate::gone_wait::WS_RESTORE,
+                        freshell_protocol::ClientMessage::TerminalCreate(create),
+                        asserted_at,
+                    );
+                    if !parked {
+                        tracing::info!(
+                            target: "freshell_ws::spawn_gate",
+                            request_id = %request_id,
+                            "restore_create_cancelled"
+                        );
+                    }
+                    state.create_dedupe.clear_if_in_flight(&request_id);
+                    return;
+                }
                 Err(crate::terminal::PrepareError::PlanQueueFull) => {
                     let mut out = CreateOutput::Channel(&sink);
                     let _ = crate::terminal::send_create_error(

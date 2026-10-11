@@ -232,6 +232,8 @@ async fn a_restore_create_that_gives_up_early_releases_its_conversation_only_at_
             .claim_session_ref(&locator, "crq-other-holder", 0, 1_000),
         freshell_terminal::registry::SessionRefClaim::Acquired
     ));
+    // The conversation had turns (its rollout is on disk).
+    h.seed_rollout("t-early");
     // Gone is confirmed 1.5 s after the kill, so the release order shows.
     let _gone_delay = GoneDelay::set(1500);
     let mut ws = h.connect().await;

@@ -455,6 +455,7 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
         ownership: None,
+        gone_waits: Default::default(),
         units: Default::default(),
     };
 
@@ -883,6 +884,37 @@ fn empty_reconciler() -> (
     (dir, store, Arc::new(reconciler))
 }
 
+/// A Codex home of the scenario's own (never the user's ~/.codex), set as
+/// `CODEX_HOME` for the app-servers the scenario starts, holding
+/// `thread_id`'s rollout as Codex writes it at a conversation's first turn: a
+/// resume of `thread_id` then finds a conversation that materialized. Drop
+/// unsets `CODEX_HOME` (the scenarios run one at a time under [`test_lock`]).
+struct ScenarioCodexHome {
+    _dir: tempfile::TempDir,
+}
+
+impl ScenarioCodexHome {
+    fn with_rollout(thread_id: &str) -> Self {
+        let dir = tempfile::tempdir().expect("scenario codex home");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("create the rollout dir");
+        let meta = json!({"type": "session_meta", "payload": {"id": thread_id, "cwd": "/tmp"}});
+        std::fs::write(
+            sessions.join(format!("rollout-{thread_id}.jsonl")),
+            format!("{meta}\n"),
+        )
+        .expect("seed the conversation's rollout");
+        std::env::set_var("CODEX_HOME", dir.path());
+        Self { _dir: dir }
+    }
+}
+
+impl Drop for ScenarioCodexHome {
+    fn drop(&mut self) {
+        std::env::remove_var("CODEX_HOME");
+    }
+}
+
 fn scenario_cwd(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "freshell-codex-reattach-e2e-{name}-{}",
@@ -952,6 +984,7 @@ fn prepared_codex_launch_reuses_reserved_setup_and_discards_after_adopt_failure(
         std::env::set_var("AUTH_TOKEN", SYNTHETIC_FRESHELL_TOKEN);
         std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
         swap_test_reconciler(None, None);
+        let _codex_home = ScenarioCodexHome::with_rollout("thread-prepared-adoption-failure");
 
         let tui_capture = capture_path("prepared-adoption-failure-tui");
         let sidecar_capture = capture_path("prepared-adoption-failure-sidecar");
@@ -1199,6 +1232,7 @@ fn restore_falls_back_to_fresh_sidecar_without_tracked_survivor() {
         // The dispatcher-spawned sidecar reads the process-global behavior:
         // op log B records which listener served the traffic.
         let session_id = "0199da92-e2e-fresh-fallback-thread";
+        let _codex_home = ScenarioCodexHome::with_rollout(session_id);
         let log_b = std::env::temp_dir().join(format!(
             "freshell-codex-reattach-e2e-oplog-b-{}.jsonl",
             std::process::id()
@@ -1293,6 +1327,7 @@ fn active_writer_collision_surfaces_minus32600_only_on_the_fresh_path() {
         swap_test_reconciler(Some(reconciler), Some(store));
 
         let session_id = "0199da92-e2e-active-writer-thread";
+        let _codex_home = ScenarioCodexHome::with_rollout(session_id);
         std::env::set_var(
             "FAKE_CODEX_APP_SERVER_BEHAVIOR",
             json!({

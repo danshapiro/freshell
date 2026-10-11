@@ -613,6 +613,10 @@ impl ReattachedCodexAppServerRuntime {
 }
 
 impl CodexLaunchRuntime for ReattachedCodexAppServerRuntime {
+    fn reattached(&self) -> bool {
+        true
+    }
+
     /// Reattach readiness: `cwd` is IGNORED — the survivor already has one
     /// (it was spawned with the original create cwd). Re-verify identity,
     /// then probe-dial `record.ws_url` with ONE bounded connect

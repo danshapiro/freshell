@@ -148,6 +148,8 @@ fn uuid_like_suffix() -> String {
 
 struct DualRoleCodexFake {
     dir: std::path::PathBuf,
+    /// `CODEX_HOME` before the fake set its own (restored on drop).
+    prior_codex_home: Option<std::ffi::OsString>,
 }
 
 impl DualRoleCodexFake {
@@ -196,7 +198,29 @@ impl DualRoleCodexFake {
             "FAKE_CODEX_DISPATCHER_LOG",
             dir.join("dispatcher-log.jsonl"),
         );
-        Self { dir }
+        // The app-servers' Codex home (where Freshell looks for a resumed
+        // conversation's rollout): the fake's own, never the user's ~/.codex.
+        let codex_home = dir.join("codex-home");
+        std::fs::create_dir_all(codex_home.join("sessions")).expect("create fake codex home");
+        let prior_codex_home = std::env::var_os("CODEX_HOME");
+        std::env::set_var("CODEX_HOME", &codex_home);
+        Self {
+            dir,
+            prior_codex_home,
+        }
+    }
+
+    /// Writes `thread_id`'s rollout, as Codex does at a conversation's first
+    /// turn: a resume of it then finds a conversation that materialized.
+    fn seed_rollout(&self, thread_id: &str) {
+        let meta = json!({"type": "session_meta", "payload": {"id": thread_id, "cwd": "/tmp"}});
+        std::fs::write(
+            self.dir
+                .join("codex-home/sessions")
+                .join(format!("rollout-{thread_id}.jsonl")),
+            format!("{meta}\n"),
+        )
+        .expect("seed the conversation's rollout");
     }
 
     fn rows_from(&self, file: &str) -> Vec<Value> {
@@ -254,6 +278,10 @@ impl Drop for DualRoleCodexFake {
             "FAKE_CODEX_DISPATCHER_LOG",
         ] {
             std::env::remove_var(var);
+        }
+        match self.prior_codex_home.take() {
+            Some(prior) => std::env::set_var("CODEX_HOME", prior),
+            None => std::env::remove_var("CODEX_HOME"),
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
@@ -585,6 +613,7 @@ async fn build_ws_state_with_probe(
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
         ownership: Some(Arc::clone(&ownership)),
+        gone_waits: Default::default(),
         units: Default::default(),
     };
 
@@ -3061,6 +3090,7 @@ async fn snapshot_get_never_spawns_while_a_terminal_owns_the_session() {
     let codex_fake = DualRoleCodexFake::install();
     let mut h = spawn_merged_server().await;
     let sid = format!("snap-term-{}", uuid::Uuid::new_v4());
+    codex_fake.seed_rollout(&sid);
     // Terminal owner first (mode codex — the sleeper spec spawns a real
     // Running PTY that claims Live{Terminal} through the coordinator).
     send_json(
@@ -4112,7 +4142,10 @@ async fn an_ordinary_codex_cold_resume_with_recovered_settings_lands_end_to_end(
 /// Establish a live freshcodex owner for `sid` (the fake app-server serves
 /// the durable `thread/resume`) and return once the coordinator records it
 /// Live — Task 6's `establish_fresh_claude_owner`, codex flavor.
-async fn establish_freshcodex_session(h: &mut MergedHarness, sid: &str) {
+async fn establish_freshcodex_session(h: &mut MergedHarness, fake: &DualRoleCodexFake, sid: &str) {
+    // A conversation that already had turns (its rollout is on disk), so a
+    // later resume of it in a terminal pane finds it.
+    fake.seed_rollout(sid);
     send_json(
         &mut h.ws,
         &json!({
@@ -4435,7 +4468,7 @@ async fn race_snapshot_paused_after_lookup_cannot_resurrect_during_handoff() {
     let codex_fake = DualRoleCodexFake::install();
     let mut h = spawn_merged_server().await;
     let sid = format!("r1-{}", uuid::Uuid::new_v4());
-    establish_freshcodex_session(&mut h, &sid).await;
+    establish_freshcodex_session(&mut h, &codex_fake, &sid).await;
     let watermark = codex_fake.thread_op_rows().len();
 
     // Park the snapshot GET mid-flight (multi_thread flavor so the parked
@@ -4606,7 +4639,7 @@ async fn race_snapshot_parked_after_capture_answers_typed_after_handoff() {
     let codex_fake = DualRoleCodexFake::install();
     let mut h = spawn_merged_server().await;
     let sid = format!("r1b-{}", uuid::Uuid::new_v4());
-    establish_freshcodex_session(&mut h, &sid).await;
+    establish_freshcodex_session(&mut h, &codex_fake, &sid).await;
     let watermark = codex_fake.thread_op_rows().len();
 
     // Install the AFTER-CAPTURE pause: the GET parks holding its already-
@@ -4811,7 +4844,7 @@ async fn race_queued_snapshot_before_cleanup_is_fenced_by_generation() {
     let codex_fake = DualRoleCodexFake::install();
     let mut h = spawn_merged_server().await;
     let sid = format!("r3-{}", uuid::Uuid::new_v4());
-    establish_freshcodex_session(&mut h, &sid).await;
+    establish_freshcodex_session(&mut h, &codex_fake, &sid).await;
     let watermark = codex_fake.thread_op_rows().len();
 
     // Park the snapshot GET (queued before the handoff begins).
@@ -4896,7 +4929,7 @@ async fn race_reap_timeout_no_early_target_start_and_recoverable() {
 
     // ── Arm A: the prior re-probes LIVE → restored ──────────────────────
     let sid_a = format!("r4a-{}", uuid::Uuid::new_v4());
-    establish_freshcodex_session(&mut h, &sid_a).await;
+    establish_freshcodex_session(&mut h, &codex_fake, &sid_a).await;
     let spawn_watermark = codex_fake.sidecar_spawn_rows().len();
 
     let (post_a, post_a_task) = {
@@ -4980,7 +5013,7 @@ async fn race_reap_timeout_no_early_target_start_and_recoverable() {
 
     // ── Arm B: the prior is unconfirmable → Vacant ───────────────────────
     let sid_b = format!("r4b-{}", uuid::Uuid::new_v4());
-    establish_freshcodex_session(&mut h, &sid_b).await;
+    establish_freshcodex_session(&mut h, &codex_fake, &sid_b).await;
     hooks.force_reap_timeout.store(true, Ordering::SeqCst);
 
     let (post_b, post_b_task) = {
@@ -5067,7 +5100,7 @@ async fn race_target_spawn_failure_no_blank_session_id_preserved() {
     hooks.fail_target_spawn_once.store(true, Ordering::SeqCst);
     let mut h = spawn_merged_server_with_hooks(Arc::clone(&hooks)).await;
     let sid = format!("r5-{}", uuid::Uuid::new_v4());
-    establish_freshcodex_session(&mut h, &sid).await;
+    establish_freshcodex_session(&mut h, &codex_fake, &sid).await;
     let op_watermark = codex_fake.thread_op_rows().len();
     let spawn_watermark = codex_fake.sidecar_spawn_rows().len();
 
@@ -5183,7 +5216,7 @@ async fn race_browser_disconnect_mid_handoff_reaches_consistent_state() {
     });
     let mut h = spawn_merged_server_with_hooks(Arc::clone(&hooks)).await;
     let sid = format!("r6-{}", uuid::Uuid::new_v4());
-    establish_freshcodex_session(&mut h, &sid).await;
+    establish_freshcodex_session(&mut h, &codex_fake, &sid).await;
 
     // Fire the handoff POST from a background task, then drop the
     // connection while the runner is parked mid-handoff.
@@ -5286,7 +5319,7 @@ async fn race_coordinator_cancellation_and_sidecar_crash_leave_consistent_state(
     });
     let mut h = spawn_merged_server_with_hooks(Arc::clone(&hooks)).await;
     let sid = format!("r7-{}", uuid::Uuid::new_v4());
-    establish_freshcodex_session(&mut h, &sid).await;
+    establish_freshcodex_session(&mut h, &codex_fake, &sid).await;
     let capture_start = events.lock().expect("capture lock").len();
     let spawn_watermark = codex_fake.sidecar_spawn_rows().len();
 

@@ -667,10 +667,11 @@ fn on_screen_exit(state: &WsState, exit: UnitScreenExit) {
 }
 
 /// The registry's handler for a kill of a unit row (the kill paths not yet
-/// routed through the unit lifecycle: an idle reap, a handoff, a recovery,
-/// a test): the whole unit is stopped (Force) through the single stop path,
-/// and the row ends at Gone. `false` when the unit is not in the directory,
-/// so the registry kills the row as before.
+/// routed through the unit lifecycle: an idle reap, a recovery, a test):
+/// the whole unit is stopped (Force) through the single stop path under a
+/// fresh operation, and the row ends at Gone. `false` when the unit is not
+/// in the directory, so the registry kills the row as before. (A handoff
+/// stops its prior through the pane-unit stopper, under its own operation.)
 pub fn kill_hook(state: WsState, rt: tokio::runtime::Handle) -> freshell_terminal::UnitKillHook {
     Arc::new(move |terminal_id: &str, unit_id: &str, by: &'static str| {
         let Some(entry) = UnitId::parse(unit_id).and_then(|id| state.units.get(&id)) else {
@@ -692,36 +693,12 @@ pub fn kill_hook(state: WsState, rt: tokio::runtime::Handle) -> freshell_termina
                 mode: StopMode::Force,
                 reason,
                 initiator: format!("registry-kill-{by}"),
-                operation_id: registry_kill_operation(&state, unit_id),
+                operation_id: fresh_operation("term-kill"),
                 record_stopped_pane: false,
             },
         );
         true
     })
-}
-
-/// The operation a registry kill stops a unit under. A key of the unit in
-/// `Handoff` with this unit as its prior belongs to that handoff, which is
-/// stopping its prior through this very kill: the stop runs under the
-/// handoff's own operation, so the unit's stop leaves that key to the
-/// handoff (it commits it to its target) instead of moving it to Stopping
-/// under a new operation, which would make the handoff's commit stale.
-/// Otherwise a fresh kill operation.
-fn registry_kill_operation(state: &WsState, unit_id: &str) -> String {
-    state
-        .ownership
-        .as_ref()
-        .and_then(|ownership| {
-            ownership.keys_for_unit(unit_id).into_iter().find_map(
-                |(_, key_state)| match key_state {
-                    freshell_ownership::OwnershipState::Handoff { operation_id, .. } => {
-                        Some(operation_id)
-                    }
-                    _ => None,
-                },
-            )
-        })
-        .unwrap_or_else(|| fresh_operation("term-kill"))
 }
 
 /// The WebSocket implementation of the directory's [`UnitLifecycle`]: the
@@ -1083,6 +1060,13 @@ impl StartScope {
         self.claim_relay = Some(relay);
     }
 
+    /// Takes back the relay [`Self::release_claim_after_gone`] gave this
+    /// start (the start is given up, and another start of the same pane
+    /// takes over the claim).
+    pub fn take_claim_relay(&mut self) -> Option<ClaimRelay> {
+        self.claim_relay.take()
+    }
+
     /// Whether a stop cancelled this start.
     pub fn cancelled(&self) -> bool {
         let unit = self.unit();
@@ -1393,7 +1377,26 @@ pub(crate) async fn kill_unit(
         }
     }
 
-    // 3.
+    // 3. A kill joining a crash's stop (an agent exit in flight) cancels
+    //    that crash's auto-resume first: the hub reads the cancel by the
+    //    crashed terminal's id when the crash reaches it at Gone (a user
+    //    kill takes the stop over and no crash is sent at all; a stuck
+    //    restart does not, and its own replacement must be the pane's
+    //    only one; Stage 2: LB-36, LB-31).
+    if let Some(terminal_id) = entry.terminal_id.as_deref() {
+        if entry.unit.stop_in_flight().is_some()
+            && matches!(
+                state.registry.ending(terminal_id),
+                Some(UnitEnding::AgentExited { .. })
+            )
+        {
+            state
+                .auto_resume_cancels
+                .lock()
+                .expect("auto_resume_cancels lock")
+                .insert(terminal_id.to_string());
+        }
+    }
     let settled = state.units.start_settled(entry.unit.id());
     let (reason, initiator) = if stuck_recovery {
         (

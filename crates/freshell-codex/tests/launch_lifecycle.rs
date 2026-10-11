@@ -1129,6 +1129,27 @@ fn fake_app_server_command() -> String {
     format!("node {}", fixture.display())
 }
 
+/// A Codex home of the test's own (never the user's ~/.codex) holding
+/// `thread_id`'s rollout, as Codex writes it at a conversation's first turn,
+/// and the spawn context that points the fake app-server at it: a resume of
+/// `thread_id` then finds a conversation that materialized.
+fn isolated_home_with_rollout(thread_id: &str) -> (tempfile::TempDir, CodexSidecarLaunchContext) {
+    let home = tempfile::tempdir().expect("isolated codex home");
+    let sessions = home.path().join("sessions");
+    std::fs::create_dir_all(&sessions).expect("create the rollout dir");
+    let meta = json!({"type": "session_meta", "payload": {"id": thread_id, "cwd": "/"}});
+    std::fs::write(
+        sessions.join(format!("rollout-{thread_id}.jsonl")),
+        format!("{meta}\n"),
+    )
+    .expect("seed the conversation's rollout");
+    let context = CodexSidecarLaunchContext {
+        config_args: vec![],
+        env: BTreeMap::from([("CODEX_HOME".to_string(), home.path().display().to_string())]),
+    };
+    (home, context)
+}
+
 async fn wait_for_arg_log(path: &std::path::Path) -> serde_json::Value {
     let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
     loop {
@@ -1393,9 +1414,11 @@ async fn plan_retry_falls_back_to_fresh_spawn_after_reattach_failure() {
     // fallback pinned to the committed fixture (never the real `codex`).
     let factory_reconciler = reconciler.clone();
     let factory_store = store.clone();
+    let (_codex_home, context) = isolated_home_with_rollout("s-1");
     let planner = CodexLaunchPlanner::new(Box::new(move |plan| {
         let reconciler = factory_reconciler.clone();
         let store = factory_store.clone();
+        let context = context.clone();
         Box::pin(async move {
             if let Some(session_id) = plan.session_id.as_deref() {
                 if let Some(record) = reconciler.claim_for_session(session_id).await {
@@ -1403,10 +1426,13 @@ async fn plan_retry_falls_back_to_fresh_spawn_after_reattach_failure() {
                         as Arc<dyn CodexLaunchRuntime>;
                 }
             }
-            Arc::new(SpawnedCodexAppServerRuntime::with_command_and_store(
-                fake_app_server_command(),
-                store,
-            )) as Arc<dyn CodexLaunchRuntime>
+            Arc::new(
+                SpawnedCodexAppServerRuntime::with_command_store_and_context(
+                    fake_app_server_command(),
+                    store,
+                    context,
+                ),
+            ) as Arc<dyn CodexLaunchRuntime>
         })
     }));
 
@@ -1573,10 +1599,12 @@ async fn plan_retry_spawns_fresh_after_claimed_reattach_ensure_ready_fails() {
     let invocations = factory_invocations.clone();
     let factory_reconciler = reconciler.clone();
     let factory_store = store.clone();
+    let (_codex_home, context) = isolated_home_with_rollout("s-1");
     let planner = CodexLaunchPlanner::new(Box::new(move |plan| {
         factory_invocations.fetch_add(1, Ordering::SeqCst);
         let reconciler = factory_reconciler.clone();
         let store = factory_store.clone();
+        let context = context.clone();
         Box::pin(async move {
             if let Some(session_id) = plan.session_id.as_deref() {
                 if let Some(record) = reconciler.claim_for_session(session_id).await {
@@ -1584,10 +1612,13 @@ async fn plan_retry_spawns_fresh_after_claimed_reattach_ensure_ready_fails() {
                         as Arc<dyn CodexLaunchRuntime>;
                 }
             }
-            Arc::new(SpawnedCodexAppServerRuntime::with_command_and_store(
-                fake_app_server_command(),
-                store,
-            )) as Arc<dyn CodexLaunchRuntime>
+            Arc::new(
+                SpawnedCodexAppServerRuntime::with_command_store_and_context(
+                    fake_app_server_command(),
+                    store,
+                    context,
+                ),
+            ) as Arc<dyn CodexLaunchRuntime>
         })
     }));
 
@@ -2683,6 +2714,7 @@ mod unit_sidecar {
             home.path(),
             json!({"threadStartThreadId": "t-race"}),
         );
+        seed_rollout(home.path(), "t-race");
         let seed = tag_seed("t-race");
         let launch = manager
             .plan_create_with_retry_uncancellable(
@@ -2731,6 +2763,7 @@ mod unit_sidecar {
             home2.path(),
             json!({"threadStartThreadId": "t-done"}),
         );
+        seed_rollout(home2.path(), "t-done");
         let seed2 = tag_seed("t-done");
         let launch2 = manager2
             .plan_create_with_retry_uncancellable(
@@ -3197,6 +3230,7 @@ mod unit_sidecar {
         let paused_a = PausedChild::pause(native_a, manifest_a.start_time(native_a));
 
         let home_b = tempfile::tempdir().unwrap();
+        seed_rollout(home_b.path(), "t-b");
         let lifecycle = Arc::new(RecordingLifecycle::default());
         let seed_b = recording_seed("t-b", lifecycle.clone());
         let built: Arc<Mutex<Vec<Arc<SpawnedCodexAppServerRuntime>>>> =
@@ -3384,6 +3418,194 @@ mod unit_sidecar {
         }
     }
 
+    /// A planner over the realistic fake whose attempts' units come from
+    /// `seed`'s lifecycle, under `home` (the app-server's Codex home).
+    fn realistic_planner(
+        home: &Path,
+        store: Arc<CodexSidecarStore>,
+        behavior: serde_json::Value,
+    ) -> CodexLaunchPlanner {
+        let home = home.to_path_buf();
+        CodexLaunchPlanner::new(Box::new(move |plan| {
+            let runtime = Arc::new(
+                SpawnedCodexAppServerRuntime::with_command_store_context_and_seed(
+                    fake_codex::launcher_command(),
+                    store.clone(),
+                    fake_context(behavior.clone(), &home),
+                    plan.unit_seed.clone().expect("seeded plan"),
+                ),
+            ) as Arc<dyn CodexLaunchRuntime>;
+            Box::pin(async move { runtime })
+        }))
+    }
+
+    /// A rollout of `thread_id` under `codex_home` (a conversation that had
+    /// its first turn).
+    fn seed_rollout(codex_home: &Path, thread_id: &str) {
+        let sessions = codex_home.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let meta = json!({"type": "session_meta", "payload": {"id": thread_id, "cwd": "/"}});
+        std::fs::write(
+            sessions.join(format!("{thread_id}.jsonl")),
+            format!("{meta}\n"),
+        )
+        .unwrap();
+    }
+
+    /// A resume of a conversation that never materialized (no rollout under
+    /// the Codex home the new app-server reported) ends the plan at once as
+    /// `NotMaterialized`: the attempt's unit is stopped (Gone before the
+    /// answer) and no second attempt starts (Stage 2: LB-41).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resume_without_a_rollout_is_not_materialized_and_never_retried() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(CodexSidecarStore::new(home.path().join("records")));
+        let lifecycle = Arc::new(RecordingLifecycle::default());
+        let planner = realistic_planner(home.path(), store.clone(), json!({}));
+        let result = timeout(
+            LIMIT,
+            planner.plan_create_with_retry(
+                &plan_input_with_seed("t-never", recording_seed("t-never", lifecycle.clone())),
+                5,
+                0,
+            ),
+        )
+        .await
+        .expect("the plan settles");
+        assert!(
+            matches!(&result, Err(CodexLaunchError::NotMaterialized { session_id }) if session_id == "t-never"),
+            "{result:?}"
+        );
+        assert_eq!(lifecycle.attempts().len(), 1, "never retried");
+        let unit = lifecycle.attempts()[0].clone();
+        assert!(
+            unit.stop_in_flight()
+                .is_some_and(|stop| stop.try_report().is_some()),
+            "the attempt's unit is Gone before the answer"
+        );
+        for pid in manifest_pids(&home.path().join("manifests")) {
+            wait_dead(pid).await;
+        }
+        assert!(store.load_all().is_empty(), "its sidecar record is removed");
+    }
+
+    /// A resume of a conversation that materialized proceeds as before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resume_with_a_rollout_proceeds() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(CodexSidecarStore::new(home.path().join("records")));
+        seed_rollout(home.path(), "t-on-disk");
+        let planner = realistic_planner(home.path(), store.clone(), json!({}));
+        let launch = timeout(
+            LIMIT,
+            planner.plan_create_with_retry(
+                &plan_input_with_seed("t-on-disk", tag_seed("t-on-disk")),
+                5,
+                0,
+            ),
+        )
+        .await
+        .expect("the plan settles")
+        .expect("planned");
+        assert_eq!(launch.session_id.as_deref(), Some("t-on-disk"));
+        launch
+            .sidecar
+            .stop_and_finish(StopMode::Force, StopReason::ShiftX, "test")
+            .await
+            .expect("stopped");
+    }
+
+    /// A lifecycle whose stops reach Gone only `hold` after the unit's
+    /// processes are dead (the Gone callback holds them).
+    struct SlowGoneLifecycle {
+        recording: RecordingLifecycle,
+        hold: Duration,
+    }
+
+    impl CodexUnitLifecycle for SlowGoneLifecycle {
+        fn attempt_started(&self, unit: &AgentUnit) {
+            self.recording.attempt_started(unit);
+        }
+
+        fn start_cancelled(&self) -> bool {
+            false
+        }
+
+        fn stop(
+            &self,
+            unit: &AgentUnit,
+            mode: StopMode,
+            reason: StopReason,
+            initiator: &str,
+        ) -> StopHandle {
+            let hold = self.hold;
+            unit.stop(
+                StopRequest::new(mode, reason, initiator)
+                    .on_gone(Box::new(move |_| Box::pin(tokio::time::sleep(hold)))),
+            )
+        }
+
+        fn is_stopping(&self, unit: &AgentUnit) -> bool {
+            unit.stop_in_flight().is_some()
+        }
+    }
+
+    /// The wait for a failed attempt's Gone on a create request is bounded:
+    /// past [`GONE_WAIT_BOUND`] the plan ends `Unconfirmed` (no further
+    /// attempt may start beside a unit that may still hold the conversation
+    /// lock), and the sidecar is finished in the background once the unit
+    /// is Gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_attempt_not_gone_within_the_bound_ends_the_plan() {
+        use freshell_codex::launch_lifecycle::GONE_WAIT_BOUND;
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(CodexSidecarStore::new(home.path().join("records")));
+        let lifecycle = Arc::new(SlowGoneLifecycle {
+            recording: RecordingLifecycle::default(),
+            hold: GONE_WAIT_BOUND + Duration::from_secs(2),
+        });
+        let seed = UnitSeed {
+            services: CodexUnitServices {
+                containment: shared_containment(),
+                lifecycle: lifecycle.clone(),
+            },
+            label: codex_label("t-slow-gone"),
+        };
+        let planner = realistic_planner(home.path(), store.clone(), json!({}));
+        let started = std::time::Instant::now();
+        // No rollout: the first attempt fails (NotMaterialized), and its
+        // unit's Gone is held past the bound.
+        let result = timeout(
+            LIMIT,
+            planner.plan_create_with_retry(&plan_input_with_seed("t-slow-gone", seed), 5, 0),
+        )
+        .await
+        .expect("the plan settles");
+        let waited = started.elapsed();
+        assert!(
+            matches!(result, Err(CodexLaunchError::Unconfirmed(_))),
+            "{result:?}"
+        );
+        assert!(
+            waited >= GONE_WAIT_BOUND && waited < GONE_WAIT_BOUND + Duration::from_secs(2),
+            "the wait ended at the bound ({waited:?})"
+        );
+        assert_eq!(
+            lifecycle.recording.attempts().len(),
+            1,
+            "no further attempt"
+        );
+        let unit = lifecycle.recording.attempts()[0].clone();
+        unit.stop_in_flight()
+            .expect("the stop runs on")
+            .wait()
+            .await;
+        fake_codex::wait_until("the sidecar is finished after its Gone", LIMIT, || {
+            store.load_all().is_empty()
+        })
+        .await;
+    }
+
     /// The sidecar record keeps the Codex home Codex itself reported, never
     /// the server's own environment (Stage 2: LB-29, R9).
     #[tokio::test(flavor = "multi_thread")]
@@ -3423,6 +3645,7 @@ mod unit_sidecar {
         // A planned, adopted pane: recorded before any client connects.
         let store = Arc::new(CodexSidecarStore::new(home.path().join("records")));
         let manager = manager_with_realistic_runtime(store.clone(), &codex_a, json!({}));
+        seed_rollout(&codex_a, "t-home");
         let launch = manager
             .plan_create_with_retry_uncancellable(
                 &plan_input_with_seed("t-home", tag_seed("t-home")),
@@ -3470,6 +3693,7 @@ mod unit_sidecar {
         std::fs::create_dir_all(&codex_a).unwrap();
         let store = Arc::new(CodexSidecarStore::new(home.path().join("records")));
         let manager = manager_with_realistic_runtime(store.clone(), &codex_a, json!({}));
+        seed_rollout(&codex_a, "t-held");
         let launch = manager
             .plan_create_with_retry_uncancellable(
                 &plan_input_with_seed("t-held", tag_seed("t-held")),
@@ -3589,6 +3813,7 @@ mod unit_sidecar {
         let manager = manager_with_realistic_runtime(store.clone(), home.path(), wedged.clone());
         let mut natives = Vec::new();
         for (session, terminal) in [("t-sd-1", "T-sd-1"), ("t-sd-2", "T-sd-2")] {
+            seed_rollout(home.path(), session);
             let launch = manager
                 .plan_create_with_retry_uncancellable(
                     &plan_input_with_seed(session, tag_seed(session)),
@@ -3619,6 +3844,7 @@ mod unit_sidecar {
         // and the stops go on.
         let home2 = tempfile::tempdir().unwrap();
         let manager2 = manager_with_realistic_runtime(store, home2.path(), wedged);
+        seed_rollout(home2.path(), "t-sd-3");
         let launch = manager2
             .plan_create_with_retry_uncancellable(
                 &plan_input_with_seed("t-sd-3", tag_seed("t-sd-3")),
@@ -3658,6 +3884,7 @@ mod unit_sidecar {
             home.path(),
             json!({}),
         ));
+        seed_rollout(home.path(), "t-pty");
         let launch = manager
             .plan_create_with_retry_uncancellable(
                 &plan_input_with_seed("t-pty", tag_seed("t-pty")),

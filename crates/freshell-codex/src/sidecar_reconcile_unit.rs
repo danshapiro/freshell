@@ -147,14 +147,27 @@ impl ReattachedCodexAppServerRuntime {
                 // everything it started), then the record goes. Killing it
                 // releases Codex's thread locks, so the retry's fresh spawn
                 // can resume the thread.
-                seed.stop(
-                    &unit,
-                    StopMode::Force,
-                    StopReason::StartCancelled,
-                    "codex-reattach-unusable",
-                )
-                .wait()
-                .await;
+                // Bounded (a create request waits on this): a unit not
+                // confirmed Gone in time keeps its record (the next boot
+                // finishes it), and the plan sees the unit's stop still in
+                // flight and starts no further attempt beside it.
+                if seed
+                    .stop(
+                        &unit,
+                        StopMode::Force,
+                        StopReason::StartCancelled,
+                        "codex-reattach-unusable",
+                    )
+                    .wait_for(crate::launch_lifecycle::GONE_WAIT_BOUND)
+                    .await
+                    .is_none()
+                {
+                    return Err(format!(
+                        "codex sidecar reattach failed: verified survivor unusable ({reason}); \
+                         its unit was not confirmed gone within {}s",
+                        crate::launch_lifecycle::GONE_WAIT_BOUND.as_secs()
+                    ));
+                }
                 remove_pruned(&self.store, &record.ownership_id);
                 unit_event!(
                     warn,

@@ -388,6 +388,12 @@ pub struct FreshCodexState {
     /// Task 13b: cross-kind liveness -- true when a live terminal PTY owns
     /// `(provider, session_id)`. Wired by `main.rs`; defaults to always-false.
     terminal_liveness: crate::TerminalLivenessProbe,
+    /// The session index's disk-history answer for a resume target (the
+    /// same probe the REST create gate uses), wired by `main.rs`: a resume
+    /// Codex refuses with `no rollout found` for a thread the index never
+    /// saw on disk starts a new thread instead (Stage 2: LB-41). Unwired
+    /// (tests): the refusal stays a create failure.
+    resume_probe: Arc<std::sync::OnceLock<freshell_platform::resume_gate::ResumeProbeFn>>,
     /// Per-parent-session fork single-flight (delta-review rounds 2+3, D2-F2): the
     /// client leaves the Fork action enabled while a fork is in flight, so a rapid
     /// duplicate click would otherwise mint TWO children for one parent — once the
@@ -785,6 +791,7 @@ impl FreshCodexState {
             ownership_stamps: Arc::new(std::sync::Mutex::new(HashMap::new())),
             condemned_priors: Arc::new(StdMutex::new(HashMap::new())),
             terminal_liveness: Arc::new(|_, _| false),
+            resume_probe: Arc::new(std::sync::OnceLock::new()),
             fork_in_flight: crate::InFlightRegistry::new(),
             codex_quiet_window_ms: Arc::new(AtomicU64::new(codex_quiet_window_ms_from_env())),
             rollback_in_flight: crate::InFlightRegistry::new(),
@@ -852,6 +859,20 @@ impl FreshCodexState {
     /// before this state is cloned into the router).
     pub fn set_terminal_liveness(&mut self, probe: crate::TerminalLivenessProbe) {
         self.terminal_liveness = probe;
+    }
+
+    /// Wire the resume target's disk-history probe (see the field). Set
+    /// once; every clone of this state shares it.
+    pub fn set_resume_probe(&self, probe: freshell_platform::resume_gate::ResumeProbeFn) {
+        let _ = self.resume_probe.set(probe);
+    }
+
+    /// Whether the session index never saw `thread_id` on disk (a
+    /// conversation that never had a turn). `false` when no probe is wired.
+    fn never_on_disk(&self, thread_id: &str) -> bool {
+        self.resume_probe
+            .get()
+            .is_some_and(|probe| !probe(PROVIDER, thread_id).ever_observed_on_disk)
     }
 
     /// Replace the default lease map with the ONE server-wide shared map (Task 12;
@@ -2297,44 +2318,18 @@ impl FreshCodexState {
         // minted runtime is torn down below (never two writers, never an
         // orphan); the unarmed ticket's drop settles the provisional
         // record typed on every failure return.
-        if let Some(ticket) = own_ticket.as_mut() {
-            let Some(registry) = self.ownership.as_ref() else {
-                unreachable!("a live ticket implies a wired coordinator");
-            };
-            match registry.rekey_starting(
-                PROVIDER,
-                ticket.session_id(),
-                &thread_id,
-                ticket.operation_id(),
-                ticket.generation(),
-            ) {
-                freshell_ownership::CommitOutcome::Committed => {
-                    // The ticket survives the id change: the rekeyed key is
-                    // the registration-tail commit's target (and the RAII
-                    // typed fail's, on any later failure return).
-                    ticket.rekey_session_id(&thread_id);
-                }
-                outcome => {
-                    tracing::error!(target: "invariant",
-                        provider = PROVIDER, session_id = %thread_id, request_id = %request_id,
-                        outcome = ?outcome,
-                        "freshagent.codex.create_rekey_refused: the minted thread id was \
-                         claimed by another owner during the create window — the minted \
-                         runtime is torn down (kata b8ke ext r22 F1)"
-                    );
-                    client.close().await;
-                    let mut child = child;
-                    let _ = child.start_kill();
-                    reap_owned_codex_sidecars(&ownership_id);
-                    crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-                    self.fail_create(
-                        &request_id,
-                        "FRESH_AGENT_CREATE_FAILED",
-                        "the minted thread id was claimed by another owner during the create; torn down",
-                    );
-                    return;
-                }
-            }
+        if !self.rekey_claim(&mut own_ticket, &thread_id, &request_id) {
+            client.close().await;
+            let mut child = child;
+            let _ = child.start_kill();
+            reap_owned_codex_sidecars(&ownership_id);
+            crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
+            self.fail_create(
+                &request_id,
+                "FRESH_AGENT_CREATE_FAILED",
+                "the minted thread id was claimed by another owner during the create; torn down",
+            );
+            return;
         }
 
         self.finish_create(
@@ -2507,6 +2502,33 @@ impl FreshCodexState {
             .await;
         let started = match resume_result {
             Ok(started) => started,
+            // The thread never had a turn (Codex wrote no rollout) and the
+            // index never saw it on disk: the create starts a NEW thread in
+            // the same sidecar and answers it as a fresh create (Stage 2:
+            // LB-41).
+            Err(err) if is_codex_no_rollout(&err) && self.never_on_disk(&resume_session_id) => {
+                self.start_instead_of_never_materialized(
+                    request_id,
+                    resume_session_id,
+                    client,
+                    notifs,
+                    ownership_id,
+                    child,
+                    NewThreadParams {
+                        cwd,
+                        model,
+                        effort,
+                        sandbox,
+                        permission_mode,
+                    },
+                    lease_guard,
+                    own_ticket,
+                    provenance,
+                    naming_handle,
+                )
+                .await;
+                return;
+            }
             Err(err) => {
                 client.close().await;
                 let mut child = child;
@@ -2636,6 +2658,147 @@ impl FreshCodexState {
             naming_handle,
         )
         .await;
+    }
+
+    /// [`Self::handle_create_resume`]'s thread never materialized: `thread/start`
+    /// in the same sidecar with the create's params, the claim moves from the
+    /// old thread id to the new one (the old id resolves to the new thread,
+    /// as a fresh create's provisional id does), the old id's session lease
+    /// is released, and the create is answered as a fresh create
+    /// (`freshAgent.created` with the new id). INFO
+    /// `unit.resume.not_materialized`.
+    #[allow(clippy::too_many_arguments)]
+    async fn start_instead_of_never_materialized(
+        &self,
+        request_id: String,
+        stale_thread_id: String,
+        client: Arc<CodexAppServerClient>,
+        notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
+        ownership_id: String,
+        child: tokio::process::Child,
+        params: NewThreadParams,
+        mut lease_guard: Option<crate::FreshSessionLeaseGuard>,
+        mut own_ticket: Option<freshell_ownership::OperationTicket>,
+        provenance: Option<crate::BindProvenance>,
+        naming_handle: Option<String>,
+    ) {
+        tracing::info!(target: "freshell_unit",
+            event = "unit.resume.not_materialized",
+            unit_id = "",
+            provider = PROVIDER,
+            session_id = %stale_thread_id,
+            terminal_id = "",
+            operation_id = %own_ticket
+                .as_ref()
+                .map(|ticket| ticket.operation_id().to_string())
+                .unwrap_or_default(),
+            entry_point = "fresh-agent-create",
+            "the thread never had a turn (no rollout), so it is started new instead of resumed");
+        let NewThreadParams {
+            cwd,
+            model,
+            effort,
+            sandbox,
+            permission_mode,
+        } = params;
+        let started = client
+            .start_thread(StartThreadParams {
+                cwd: cwd.clone(),
+                model: Some(model.clone()),
+                sandbox: sandbox.clone(),
+                approval_policy: permission_mode.clone(),
+                // Threads freshell starts adopt the paginated history mode.
+                history_mode: Some(HistoryMode::Paginated),
+            })
+            .await;
+        let rekeyed = match &started {
+            Ok(started) => self.rekey_claim(&mut own_ticket, &started.thread_id, &request_id),
+            Err(_) => false,
+        };
+        // The old thread id's session lease goes either way.
+        if let Some(mut guard) = lease_guard.take() {
+            guard.fail();
+        }
+        let thread_id = match started {
+            Ok(started) if rekeyed => started.thread_id,
+            outcome => {
+                client.close().await;
+                let mut child = child;
+                let _ = child.start_kill();
+                reap_owned_codex_sidecars(&ownership_id);
+                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
+                let message = match outcome {
+                    Err(err) => err.to_string(),
+                    Ok(_) => "the new thread id was claimed by another owner during the create; \
+                              torn down"
+                        .to_string(),
+                };
+                self.fail_create(&request_id, "CODEX_THREAD_START_FAILED", &message);
+                return;
+            }
+        };
+        self.finish_create(
+            request_id,
+            thread_id,
+            client,
+            notifs,
+            ownership_id,
+            child,
+            model,
+            effort,
+            cwd,
+            sandbox,
+            permission_mode,
+            None,
+            Some(HistoryMode::Paginated),
+            own_ticket,
+            provenance,
+            None,
+            naming_handle,
+        )
+        .await;
+    }
+
+    /// Moves a create's in-flight claim to the thread id Codex minted (the
+    /// mint-time rekey of a fresh create, and of a resume that started new
+    /// instead). `true` when there was no claim to move or it moved (the
+    /// ticket survives the id change: the new key is the registration-tail
+    /// commit's target, and the RAII typed fail's on any later failure
+    /// return); `false` when another owner took the new id inside the
+    /// create window (the caller tears the minted runtime down).
+    fn rekey_claim(
+        &self,
+        own_ticket: &mut Option<freshell_ownership::OperationTicket>,
+        thread_id: &str,
+        request_id: &str,
+    ) -> bool {
+        let Some(ticket) = own_ticket.as_mut() else {
+            return true;
+        };
+        let Some(registry) = self.ownership.as_ref() else {
+            unreachable!("a live ticket implies a wired coordinator");
+        };
+        match registry.rekey_starting(
+            PROVIDER,
+            ticket.session_id(),
+            thread_id,
+            ticket.operation_id(),
+            ticket.generation(),
+        ) {
+            freshell_ownership::CommitOutcome::Committed => {
+                ticket.rekey_session_id(thread_id);
+                true
+            }
+            outcome => {
+                tracing::error!(target: "invariant",
+                    provider = PROVIDER, session_id = %thread_id, request_id = %request_id,
+                    outcome = ?outcome,
+                    "freshagent.codex.create_rekey_refused: the minted thread id was \
+                     claimed by another owner during the create window — the minted \
+                     runtime is torn down (kata b8ke ext r22 F1)");
+                false
+            }
+        }
     }
 
     /// Shared tail of `handle_create` and `handle_create_resume`: register the session
@@ -8888,6 +9051,21 @@ fn is_codex_include_turns_unavailable(err: &CodexAppServerError) -> bool {
 /// (`router.ts:165-166`). This port goes one step further and surfaces a proper 404 when the
 /// app-server's own error text says so, so a garbage/expired thread id (as opposed to a
 /// real spawn/RPC failure) doesn't masquerade as a server error.
+/// Codex refused a `thread/resume` because the thread has no rollout (it
+/// never had a turn): `-32600 "no rollout found for thread id …"`.
+fn is_codex_no_rollout(err: &CodexAppServerError) -> bool {
+    err.to_string().to_lowercase().contains("no rollout found")
+}
+
+/// The params a create starts a thread with.
+struct NewThreadParams {
+    cwd: Option<String>,
+    model: String,
+    effort: Option<String>,
+    sandbox: Option<String>,
+    permission_mode: Option<String>,
+}
+
 fn is_codex_thread_not_found(err: &CodexAppServerError) -> bool {
     let message = err.to_string().to_lowercase();
     message.contains("not found")
@@ -23049,6 +23227,100 @@ pub(crate) mod tests {
         );
     }
 
+    /// Stage 2: LB-41 — a freshcodex resume of a thread that never had a
+    /// turn: Codex answers `-32600 "no rollout found for thread id …"`, and
+    /// when the session index never saw the thread on disk the create starts
+    /// a NEW thread in the same sidecar and answers it as a fresh create.
+    /// A thread that WAS on disk keeps the create failure.
+    async fn resume_never_materialized(ever_observed_on_disk: bool) -> (Value, FreshCodexState) {
+        configure_fake_codex_cmd(
+            &json!({
+                "threadStartThreadId": "thread-started-instead",
+                "overrides": {
+                    "thread/resume": {
+                        "error": {
+                            "code": -32600,
+                            "message": "no rollout found for thread id thread-never-turned"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let (st, mut rx) = state_with_bus();
+        st.set_resume_probe(Arc::new(move |_provider: &str, _session_id: &str| {
+            freshell_platform::resume_gate::ResumeProbeAnswer {
+                existence: freshell_platform::resume_gate::ResumeExistence::Absent,
+                ever_observed_on_disk,
+            }
+        }));
+        st.handle_create(
+            FreshAgentCreate {
+                naming_handle: None,
+                observed_epoch: None,
+                observed_generation: None,
+                request_id: "req-never-turned".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                provider: Some(freshell_protocol::AgentProvider::Codex),
+                cwd: None,
+                legacy_restore_context: None,
+                resume_session_id: None,
+                session_ref: Some(freshell_protocol::SessionLocator {
+                    provider: "codex".to_string(),
+                    session_id: "thread-never-turned".to_string(),
+                }),
+                model: None,
+                model_selection: None,
+                permission_mode: None,
+                sandbox: None,
+                effort: None,
+                plugins: None,
+                tab_id: None,
+            },
+            None,
+        )
+        .await;
+        let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["type"] == "freshAgent.created"
+                    || frame["type"] == "freshAgent.create.failed"
+                {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("the fake app-server responds within the budget");
+        (frame, st)
+    }
+
+    #[tokio::test]
+    async fn a_resume_of_a_thread_that_never_had_a_turn_starts_a_new_thread() {
+        let _guard = ENV_LOCK.lock().await;
+        let (frame, st) = resume_never_materialized(false).await;
+        assert_eq!(frame["type"], "freshAgent.created", "{frame}");
+        assert_eq!(
+            frame["sessionId"], "thread-started-instead",
+            "answered as a fresh create with the new thread: {frame}"
+        );
+        assert!(st
+            .sessions
+            .lock()
+            .await
+            .contains_key("thread-started-instead"));
+        assert!(!st.sessions.lock().await.contains_key("thread-never-turned"));
+        st.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_resume_of_a_thread_that_was_on_disk_keeps_failing() {
+        let _guard = ENV_LOCK.lock().await;
+        let (frame, st) = resume_never_materialized(true).await;
+        assert_eq!(frame["type"], "freshAgent.create.failed", "{frame}");
+        assert!(st.sessions.lock().await.is_empty());
+    }
+
     // -- TERM-25: wrong-thread resume rejection --
 
     /// TERM-25 (restore-matrix SCENARIO 7): when `thread/resume` answers with a DIFFERENT
@@ -23669,6 +23941,23 @@ pub(crate) mod tests {
     pub(crate) fn configure_fake_codex_cmd(behavior_json: &str) {
         std::env::set_var("CODEX_CMD", format!("node {}", fake_codex_app_server_cmd()));
         std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior_json);
+    }
+
+    /// Writes `thread_id`'s rollout into the isolated `CODEX_HOME` the
+    /// [`ENV_LOCK`] guard installed, as Codex does at a conversation's first
+    /// turn: a later resume of it finds a conversation that materialized.
+    pub(crate) fn seed_rollout_in_isolated_home(thread_id: &str) {
+        let sessions = std::path::Path::new(
+            &std::env::var_os("CODEX_HOME").expect("the ENV_LOCK guard's isolated CODEX_HOME"),
+        )
+        .join("sessions");
+        std::fs::create_dir_all(&sessions).expect("create the rollout dir");
+        let meta = serde_json::json!({"type": "session_meta", "payload": {"id": thread_id, "cwd": "/tmp"}});
+        std::fs::write(
+            sessions.join(format!("rollout-{thread_id}.jsonl")),
+            format!("{meta}\n"),
+        )
+        .expect("seed the conversation's rollout");
     }
 
     /// Create a session whose sidecar is a REAL fake-app-server-driven codex process (not

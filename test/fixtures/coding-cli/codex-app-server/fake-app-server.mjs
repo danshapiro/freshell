@@ -195,6 +195,44 @@ function ensureDurableArtifact(threadId, lineage = {}) {
   }
 }
 
+// The rollout that belongs to `threadId`, by the same ownership proof Freshell's
+// rollout lookup uses (durability::locate_rollout): a `.jsonl` file under
+// $CODEX_HOME/sessions whose name contains the id and whose first line is a
+// `session_meta` record whose payload names the id (a harness-seeded flat
+// `sessions/<id>.jsonl` counts). `null` when there is none.
+function findOwnedRollout(threadId) {
+  const root = path.join(getCodexHome(), 'sessions')
+  let entries
+  try {
+    entries = fs.readdirSync(root, { recursive: true })
+  } catch {
+    return null
+  }
+  for (const entry of entries) {
+    const name = path.basename(String(entry))
+    if (!name.endsWith('.jsonl') || !name.includes(threadId)) continue
+    const file = path.join(root, String(entry))
+    try {
+      const first = fs.readFileSync(file, 'utf8').split('\n', 1)[0]
+      const record = JSON.parse(first)
+      if (record?.type === 'session_meta'
+        && (record.payload?.id === threadId || record.payload?.session_id === threadId)) {
+        return file
+      }
+    } catch {
+      // not a rollout of this thread
+    }
+  }
+  return null
+}
+
+// Codex writes a thread's rollout only when the conversation materializes (its
+// first turn or shell command), never at `thread/start`; later turns append to
+// the same file. Returns the rollout's path.
+function ensureMaterialized(threadId) {
+  return findOwnedRollout(threadId) ?? ensureDurableArtifact(threadId).thread.path
+}
+
 function writeBytes(stream, totalBytes, chunkSize = 16 * 1024) {
   if (!Number.isFinite(totalBytes) || totalBytes <= 0) {
     return Promise.resolve()
@@ -521,6 +559,8 @@ const nativeRole = process.env.FAKE_CODEX_ROLE === 'native'
       // null without an explicit CODEX_HOME: the native role then refuses to start.
       codexHome: hasExplicitCodexHome() ? getCodexHome() : null,
       broadcast: (method, params) => broadcastNotification(method, params),
+      hasRollout: (threadId) => findOwnedRollout(threadId) !== null,
+      materialize: (threadId) => ensureMaterialized(threadId),
       openConnections: () => [...(wss?.clients ?? [])].filter((client) => client.readyState === 1),
       sendTo: (socket, method, params) => {
         if (socket.readyState === 1) socket.send(JSON.stringify({ jsonrpc: '2.0', method, params }))
@@ -949,7 +989,8 @@ function handleConnection(socket) {
       maybeWriteRolloutForMethod(method, message.params)
       // A non-ephemeral turn's rollout. The native role writes it here, before the
       // answer, so a native killed at any point after answering turn/start (SIGKILL
-      // included) leaves a resumable conversation; the single-process fake keeps
+      // included) leaves a resumable conversation; the first turn materializes the
+      // conversation and later turns keep its rollout. The single-process fake keeps
       // writing it after its awaited turn, below.
       const turnRolloutThreadId = method === 'turn/start'
         && message.params?.threadId
@@ -957,7 +998,7 @@ function handleConnection(socket) {
         ? message.params.threadId
         : null
       const nativeRolloutPath = nativeRole && turnRolloutThreadId
-        ? ensureDurableArtifact(turnRolloutThreadId).thread.path
+        ? ensureMaterialized(turnRolloutThreadId)
         : null
       socket.send(JSON.stringify({
         id: message.id,

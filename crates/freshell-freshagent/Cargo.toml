@@ -107,7 +107,9 @@ tracing = "0.1"
 libc = "0.2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# `test-util` unlocks `#[tokio::test(start_paused = true)]`: the REST routes'
+# 5 s bound on a wait for a conversation's Gone runs on paused time.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
 # DIAG-01 test facility: a capturing `Layer` + `tracing::subscriber::set_default`
 # to assert lifecycle events fire, without depending on the global subscriber

@@ -422,6 +422,7 @@ fn respawn_state_with_probe(
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
         ownership: None,
+        gone_waits: Default::default(),
         units: Default::default(),
     };
 

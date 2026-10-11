@@ -279,6 +279,7 @@ impl UnitHarness {
                 freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             fresh_agent_respawn_counts: Default::default(),
             ownership: Some(ownership),
+            gone_waits: Default::default(),
             units: freshell_ws::unit_lifecycle::UnitServices {
                 directory: freshell_containment::UnitDirectory::new(),
                 containment,
@@ -314,7 +315,12 @@ impl UnitHarness {
         .with_units(
             state.units.directory.clone(),
             state.units.containment.clone(),
-        );
+        )
+        // As `main.rs` wires it: the handoff stops a pane unit through the
+        // WebSocket layer's single stop path.
+        .with_pane_unit_stopper(Arc::new(
+            freshell_ws::unit_stopper::WsPaneUnitStopper::new(state.clone()),
+        ));
         if let Some(binder) = opts.rest_identity_binder.clone() {
             fresh_agent_state = fresh_agent_state.with_pane_identity_binder(binder);
         }
@@ -409,14 +415,37 @@ impl UnitHarness {
         (ws, inventory)
     }
 
-    /// Creates a Codex pane (a fresh one, or a restore of `resume`), attaches
-    /// to it and returns its terminal id. Panics on a create error.
+    /// Writes a minimal rollout for `thread_id` under the harness
+    /// `CODEX_HOME` (`sessions/<id>.jsonl`, first line a `session_meta`
+    /// record naming it): the conversation exists on disk, as one a user
+    /// resumes does (Codex resumes only a conversation that had a turn).
+    pub fn seed_rollout(&self, thread_id: &str) {
+        let sessions = self.codex_home.join("sessions");
+        std::fs::create_dir_all(&sessions).expect("the sessions directory");
+        let path = sessions.join(format!("{thread_id}.jsonl"));
+        if path.exists() {
+            return;
+        }
+        let meta = json!({
+            "timestamp": "2026-10-11T00:00:00.000Z",
+            "type": "session_meta",
+            "payload": { "id": thread_id, "cwd": self.home.path().display().to_string() },
+        });
+        std::fs::write(&path, format!("{meta}\n")).expect("the seeded rollout");
+    }
+
+    /// Creates a Codex pane (a fresh one, or a restore of `resume`, whose
+    /// rollout is seeded first), attaches to it and returns its terminal
+    /// id. Panics on a create error.
     pub async fn create_codex(
         &self,
         ws: &mut TestWs,
         request_id: &str,
         resume: Option<&str>,
     ) -> String {
+        if let Some(session_id) = resume {
+            self.seed_rollout(session_id);
+        }
         let mut create = json!({
             "type": "terminal.create",
             "requestId": request_id,
@@ -587,13 +616,15 @@ impl UnitHarness {
     }
 
     /// Creates a Codex pane through the REST lane (`POST /api/tabs`; a
-    /// restore of `resume` when given); returns the status and body.
+    /// restore of `resume`, whose rollout is seeded first, when given);
+    /// returns the status and body.
     pub async fn rest_create_codex(&self, resume: Option<&str>) -> (u16, serde_json::Value) {
         let mut body = json!({
             "mode": "codex",
             "cwd": self.home.path().display().to_string(),
         });
         if let Some(session_id) = resume {
+            self.seed_rollout(session_id);
             body["sessionRef"] = json!({ "provider": "codex", "sessionId": session_id });
         }
         self.post("/api/tabs", body).await

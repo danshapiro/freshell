@@ -77,6 +77,15 @@ pub const CODEX_SIDECAR_NOT_ADOPTABLE_MESSAGE: &str =
 /// sidecar-spawn budget (S5.d.1 unification; also `freshell-freshagent`'s spawn).
 pub const SIDECAR_START_BUDGET: Duration = Duration::from_secs(45);
 
+/// How long a sidecar's stop is waited for before the waiter moves on
+/// ([`CodexLaunchSidecar::stop_and_finish`]): a Force stop's grace plus the
+/// containment's unconfirmed mark, so by then the unit is Gone or the
+/// containment has logged it unconfirmed (ERROR `unit.stop.unconfirmed`).
+/// The stop itself runs on, and the sidecar is finished at its Gone.
+pub const GONE_WAIT_BOUND: Duration = Duration::from_secs(
+    freshell_containment::FORCE_GRACE.as_secs() + freshell_containment::UNCONFIRMED_AFTER.as_secs(),
+);
+
 // ─── the runtime seam (CodexRuntimeLike, launch-planner.ts:34-52, scoped) ───────────────
 
 /// `runtime.ensureReady()`'s result: the app-server's own listen URL (NOT what the TUI
@@ -148,6 +157,13 @@ pub trait CodexLaunchRuntime: Send + Sync {
     /// The containment unit this runtime's app-server runs in, if any.
     fn unit(&self) -> Option<AgentUnit> {
         None
+    }
+
+    /// Whether this runtime reattaches an app-server that survived a server
+    /// restart (it already has its conversation loaded) rather than
+    /// starting a new one.
+    fn reattached(&self) -> bool {
+        false
     }
 
     /// After Gone: remove the sidecar record (never before Gone).
@@ -236,6 +252,16 @@ pub enum CodexLaunchError {
     /// while queued — the client is gone (disconnect/shutdown). Never
     /// user-visible: callers abandon silently.
     Cancelled,
+    /// The resumed conversation never materialized: no rollout of it exists
+    /// under the Codex home the new app-server reported (Codex writes the
+    /// rollout only at a conversation's first turn, so one killed before it
+    /// cannot be resumed; Stage 2: LB-41). A decision, never retried: every
+    /// caller starts a new conversation for the same request instead.
+    NotMaterialized { session_id: String },
+    /// A failed attempt's unit was not confirmed Gone within
+    /// [`GONE_WAIT_BOUND`]: no further attempt starts while it may still
+    /// hold the conversation lock (attempts never overlap). Never retried.
+    Unconfirmed(String),
 }
 
 impl std::fmt::Display for CodexLaunchError {
@@ -247,6 +273,11 @@ impl std::fmt::Display for CodexLaunchError {
                 f.write_str("codex plan queue full; too many queued codex launches")
             }
             CodexLaunchError::Cancelled => f.write_str("codex launch planning cancelled"),
+            CodexLaunchError::NotMaterialized { session_id } => write!(
+                f,
+                "codex conversation {session_id} never materialized (no rollout); it cannot be resumed"
+            ),
+            CodexLaunchError::Unconfirmed(message) => f.write_str(message),
         }
     }
 }
@@ -428,9 +459,14 @@ impl CodexLaunchSidecar {
     }
 
     /// Stop, wait for Gone, then [`Self::finish_after_gone`]. A retained or
-    /// already finished sidecar is left alone.
+    /// already finished sidecar is left alone. The wait is bounded by
+    /// [`GONE_WAIT_BOUND`] (it runs on create requests and must not hold them
+    /// forever): past it, `Err` says the unit is not confirmed Gone, and a
+    /// spawned task finishes the sidecar once it is (the stop itself runs on;
+    /// a unit that never confirms keeps its Stopping record for the next
+    /// boot).
     pub async fn stop_and_finish(
-        &self,
+        self: &Arc<Self>,
         mode: StopMode,
         reason: StopReason,
         initiator: &str,
@@ -439,7 +475,18 @@ impl CodexLaunchSidecar {
             return Ok(());
         };
         if let Some(handle) = handle {
-            handle.wait().await;
+            if handle.wait_for(GONE_WAIT_BOUND).await.is_none() {
+                let sidecar = Arc::clone(self);
+                tokio::spawn(async move {
+                    handle.wait().await;
+                    sidecar.finish_after_gone().await;
+                });
+                return Err(format!(
+                    "the codex app-server's unit was not confirmed gone within {}s; \
+                     its stop goes on",
+                    GONE_WAIT_BOUND.as_secs()
+                ));
+            }
         }
         self.finish_after_gone().await;
         Ok(())
@@ -464,7 +511,7 @@ impl CodexLaunchSidecar {
     /// `sidecar.shutdown()` (`launch-planner.ts:281-316`), kept for the
     /// seedless managed session host: a Force stop that waits for Gone and
     /// finishes. Idempotent; a retained sidecar is left alone.
-    pub async fn shutdown(&self) -> Result<(), String> {
+    pub async fn shutdown(self: &Arc<Self>) -> Result<(), String> {
         self.stop_and_finish(
             StopMode::Force,
             StopReason::StartCancelled,
@@ -511,6 +558,55 @@ impl std::fmt::Debug for CodexTerminalLaunch {
             )
             .finish_non_exhaustive()
     }
+}
+
+/// Why one start attempt of a plan failed.
+enum StartFailure {
+    Failed(String),
+    NotMaterialized(String),
+}
+
+/// Whether the conversation `session_id` a plan resumes has a rollout under
+/// the Codex home the new app-server reported (`initialize`'s `codexHome`).
+/// Read on a blocking thread. With no reported home the check is skipped
+/// (WARN `unit.resume.not_materialized_check_skipped`) and the resume
+/// proceeds: Codex itself then decides.
+async fn resume_target_materialized(
+    runtime: &dyn CodexLaunchRuntime,
+    ready: &CodexRuntimeReady,
+    session_id: &str,
+) -> bool {
+    let keys = runtime
+        .unit()
+        .map(|unit| unit_log_keys(&unit))
+        .unwrap_or_default();
+    let Some(codex_home) = ready
+        .codex_home
+        .clone()
+        .filter(|home| std::path::Path::new(home).is_absolute())
+    else {
+        unit_event!(
+            warn,
+            "freshell_unit",
+            keys,
+            "unit.resume.not_materialized_check_skipped",
+            thread_id = %session_id,
+            "the app-server reported no Codex home, so whether the resumed conversation \
+             materialized was not checked; the resume proceeds"
+        );
+        return true;
+    };
+    let thread_id = session_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::durability::locate_thread_rollout_in_home(
+            std::path::Path::new(&codex_home),
+            &thread_id,
+        )
+        .is_some()
+    })
+    .await
+    // A lookup that panicked decides nothing: Codex itself then does.
+    .unwrap_or(true)
 }
 
 // ─── the planner (launch-planner.ts:108-201, scoped) ────────────────────────────────────
@@ -576,8 +672,21 @@ impl CodexLaunchPlanner {
             mpsc::UnboundedReceiver<RemoteProxyEvent>,
             CodexRuntimeReady,
         );
-        let started: Result<Started, String> = async {
-            let ready = runtime.ensure_ready(plan.runtime_cwd.clone()).await?;
+        let started: Result<Started, StartFailure> = async {
+            let ready = runtime
+                .ensure_ready(plan.runtime_cwd.clone())
+                .await
+                .map_err(StartFailure::Failed)?;
+            // A new app-server can resume only a conversation that
+            // materialized (Stage 2: LB-41); a reattached survivor already
+            // has its conversation loaded.
+            if let Some(sid) = plan.session_id.as_deref() {
+                if !runtime.reattached()
+                    && !resume_target_materialized(runtime.as_ref(), &ready, sid).await
+                {
+                    return Err(StartFailure::NotMaterialized(sid.to_string()));
+                }
+            }
             // Task 4: resume launches know their session id at plan time —
             // note it so the runtime's durable record carries the
             // restore-time reattach key. Best-effort (the record write
@@ -590,7 +699,7 @@ impl CodexLaunchPlanner {
                 plan.require_candidate_persistence,
             ))
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| StartFailure::Failed(error.to_string()))?;
             Ok((proxy, events, ready))
         }
         .await;
@@ -621,23 +730,40 @@ impl CodexLaunchPlanner {
                     events,
                 })
             }
-            Err(message) => {
+            Err(failure) => {
                 // The failed attempt's unit is stopped and confirmed Gone
                 // before the next attempt starts (a failed reattach may still
-                // hold the conversation lock, so attempts never overlap).
-                if let Err(teardown) = sidecar
+                // hold the conversation lock, so attempts never overlap). A
+                // unit not confirmed Gone within the bound ends the plan: no
+                // attempt may start beside it.
+                let teardown = sidecar
                     .stop_and_finish(
                         StopMode::Force,
                         StopReason::StartCancelled,
                         "codex-sidecar-start-failed",
                     )
-                    .await
-                {
-                    return Err(CodexLaunchError::Failed(format!(
-                        "Codex launch sidecar teardown failed after planning error: {teardown}"
+                    .await;
+                let unit_not_gone = runtime
+                    .unit()
+                    .and_then(|unit| unit.stop_in_flight())
+                    .is_some_and(|stop| stop.try_report().is_none());
+                if let Err(teardown) = teardown {
+                    return Err(CodexLaunchError::Unconfirmed(format!(
+                        "Codex launch sidecar teardown after a planning error was not confirmed: {teardown}"
                     )));
                 }
-                Err(CodexLaunchError::Failed(message))
+                if unit_not_gone {
+                    return Err(CodexLaunchError::Unconfirmed(format!(
+                        "the failed codex start attempt's unit was not confirmed gone within {}s",
+                        GONE_WAIT_BOUND.as_secs()
+                    )));
+                }
+                Err(match failure {
+                    StartFailure::Failed(message) => CodexLaunchError::Failed(message),
+                    StartFailure::NotMaterialized(session_id) => {
+                        CodexLaunchError::NotMaterialized { session_id }
+                    }
+                })
             }
         }
     }
@@ -676,6 +802,14 @@ impl CodexLaunchPlanner {
                             "codex_start_cancelled: a kill cancelled the start; no further attempt"
                         );
                         return Err(CodexLaunchError::Cancelled);
+                    }
+                    // A conversation that never materialized is a decision,
+                    // and an attempt not confirmed Gone forbids another.
+                    if matches!(
+                        error,
+                        CodexLaunchError::NotMaterialized { .. } | CodexLaunchError::Unconfirmed(_)
+                    ) {
+                        return Err(error);
                     }
                     let is_config_error = matches!(error, CodexLaunchError::Config(_));
                     match plan_codex_launch_retry(

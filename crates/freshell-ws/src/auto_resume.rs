@@ -785,6 +785,12 @@ pub(crate) struct WsAutoResumeDriver {
     /// the unit is Gone, so the conversation is never released while the
     /// replacement's Codex may still hold it. The hub never waits for it.
     pending_claim_relay: std::sync::Arc<std::sync::Mutex<Option<ClaimRelaySender>>>,
+    /// Replacements that started a NEW conversation because the one they
+    /// were to resume never materialized (Stage 2: LB-41): their respawn
+    /// released the claim on the old conversation, so `complete_claim`
+    /// commits nothing for them (they own their new conversation the way a
+    /// fresh pane does).
+    new_conversations: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// The sending half of a respawn start's [`crate::unit_lifecycle::ClaimRelay`].
@@ -1203,7 +1209,17 @@ impl AutoResumeDriver for WsAutoResumeDriver {
         let locator = session_locator(provider, session_id);
         let create_request_id = create_request_id.to_string();
         let new_terminal_id = new_terminal_id.to_string();
+        let started_new_conversation = self
+            .new_conversations
+            .lock()
+            .expect("new conversations lock")
+            .remove(&new_terminal_id);
         async move {
+            // A replacement that started a new conversation released the
+            // old one's claim at its respawn: nothing to commit.
+            if started_new_conversation {
+                return true;
+            }
             if state.registry.complete_session_ref_claim(
                 &locator,
                 &create_request_id,
@@ -1401,6 +1417,9 @@ impl AutoResumeDriver for WsAutoResumeDriver {
         let (relay_tx, relay_rx) = tokio::sync::oneshot::channel();
         let relay_slot = std::sync::Arc::clone(&self.pending_claim_relay);
         drop(relay_slot.lock().expect("pending claim relay lock").take());
+        let pending_slot = std::sync::Arc::clone(&self.pending_ownership);
+        let pending_attach_guard_slot = std::sync::Arc::clone(&self.pending_attach_guard);
+        let new_conversations = std::sync::Arc::clone(&self.new_conversations);
         async move {
             let respawned = crate::terminal::respawn_agent_terminal_relaying_claim(
                 &state,
@@ -1411,6 +1430,31 @@ impl AutoResumeDriver for WsAutoResumeDriver {
             if respawned.is_err() {
                 *relay_slot.lock().expect("pending claim relay lock") = Some(relay_tx);
             }
+            let respawned = respawned.map(|respawned| {
+                if respawned.new_conversation {
+                    // The old conversation never materialized and the
+                    // replacement runs a new one: the claim on the old one
+                    // is released now (the ticket's typed fail, the attach
+                    // guard, the sessionRef lease), never committed to it.
+                    drop((
+                        pending_slot.lock().expect("pending ownership lock").take(),
+                        pending_attach_guard_slot
+                            .lock()
+                            .expect("pending attach guard lock")
+                            .take(),
+                        FailSessionRefClaim {
+                            registry: state.registry.clone(),
+                            locator: session_locator(&req.provider, &req.session_id),
+                            create_request_id: req.create_request_id.clone(),
+                        },
+                    ));
+                    new_conversations
+                        .lock()
+                        .expect("new conversations lock")
+                        .insert(respawned.terminal_id.clone());
+                }
+                respawned.terminal_id
+            });
             respawned.map_err(|err| match err {
                 crate::terminal::RespawnError::LaunchUnresolvable(msg) => msg,
                 crate::terminal::RespawnError::Spawn(io) => io.to_string(),
@@ -1535,6 +1579,7 @@ pub fn spawn_auto_resume_hub(
             pending_ownership: Default::default(),
             pending_attach_guard: Default::default(),
             pending_claim_relay: Default::default(),
+            new_conversations: Default::default(),
         },
         rx,
         HubConfig::from_env(),
@@ -1556,6 +1601,7 @@ pub fn spawn_auto_resume_hub_with_schedules(
             pending_ownership: Default::default(),
             pending_attach_guard: Default::default(),
             pending_claim_relay: Default::default(),
+            new_conversations: Default::default(),
         },
         rx,
         HubConfig::with_schedules(delays, identity_grace_delays),
@@ -3159,6 +3205,7 @@ mod tests {
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             fresh_agent_respawn_counts: Default::default(),
             ownership: Some(std::sync::Arc::clone(&ownership)),
+            gone_waits: Default::default(),
             units: Default::default(),
         };
         (state, ownership)
@@ -3206,6 +3253,7 @@ mod tests {
             pending_ownership: Default::default(),
             pending_attach_guard: Default::default(),
             pending_claim_relay: Default::default(),
+            new_conversations: Default::default(),
         };
         let locator = freshell_protocol::SessionLocator {
             provider: "codex".to_string(),
@@ -3286,6 +3334,7 @@ mod tests {
             pending_ownership: Default::default(),
             pending_attach_guard: Default::default(),
             pending_claim_relay: Default::default(),
+            new_conversations: Default::default(),
         };
         let sid = "ses-r13-f2-adopt".to_string();
         spawn_real_shell_row(&state, "t-incumbent", "claude");
@@ -3393,6 +3442,7 @@ mod tests {
             pending_ownership: Default::default(),
             pending_attach_guard: Default::default(),
             pending_claim_relay: Default::default(),
+            new_conversations: Default::default(),
         };
         let sid = "ses-fenceheal-t3-respawn".to_string();
         // The broadcast receiver subscribed BEFORE the commit (the shared
@@ -3461,6 +3511,7 @@ mod tests {
             pending_ownership: Default::default(),
             pending_attach_guard: Default::default(),
             pending_claim_relay: Default::default(),
+            new_conversations: Default::default(),
         };
         let sid = "ses-r13-f2-adopt-live".to_string();
         spawn_real_shell_row(&state, "t-incumbent-live", "claude");
@@ -3526,6 +3577,7 @@ mod tests {
             pending_ownership: Default::default(),
             pending_attach_guard: Default::default(),
             pending_claim_relay: Default::default(),
+            new_conversations: Default::default(),
         });
         let sid = "ses-r14-f4-stale-retry".to_string();
         spawn_real_shell_row(&state, "t-crashed", "claude");

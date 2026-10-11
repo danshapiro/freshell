@@ -162,7 +162,27 @@ pub(crate) async fn split_pane(
             LEGACY_RESUME_IDENTITY_REFUSAL.to_string(),
         );
     }
+    // A resume of a conversation whose unit is being stopped waits for its
+    // Gone, at most Decision 8's 5 s; past that the route answers 202
+    // stopping and splits at Gone (Stage 2: LB-20).
+    let gate = crate::terminal_tabs::wait_for_gone_or_defer(&state, &body, "rest-create", {
+        let (state, body) = (state.clone(), body.clone());
+        let raw_pane_id = raw_pane_id.clone();
+        move || split_pane_authorized(state, raw_pane_id, body)
+    })
+    .await;
+    if let crate::terminal_tabs::GoneGate::Deferred(answer) = gate {
+        return answer;
+    }
+    split_pane_authorized(state, raw_pane_id, body).await
+}
 
+/// `POST /api/panes/{id}/split` after its auth and request-shape checks.
+async fn split_pane_authorized(
+    state: FreshAgentState,
+    raw_pane_id: String,
+    body: Value,
+) -> Response {
     let pane_id = match resolve_pane_target(&state, &raw_pane_id) {
         PaneTarget::Pane { pane_id, .. } => pane_id,
         PaneTarget::Reject(resp) => return resp,
