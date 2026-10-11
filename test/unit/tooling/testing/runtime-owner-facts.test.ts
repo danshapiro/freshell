@@ -5100,18 +5100,22 @@ describe('finite retained fresh native collection', () => {
     const id = randomUUID(), current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
     ;(rig as any).freshNativeCollections.set(id, { collectionId: id, soulId: 'main-soul', mode: 'freshclaude', provider: 'claude', providerStoreId: 'main-store' })
     vi.spyOn(rig as any, 'assertCurrentHandle').mockResolvedValue(undefined)
-    vi.spyOn(rig as any, 'freshBrowserAllocation').mockResolvedValue({ view: { freshAgentSessionType: 'freshclaude' }, writer: { providerStoreId: 'independent-store' } })
-    vi.spyOn(rig, 'currentRuntimeEnclosure').mockResolvedValue({ freshAgentSessionId: 'actual-public-session' } as any)
+    const view = { ...current, freshAgentSessionType: 'freshclaude', provider: 'claude', freshAgentSessionId: 'actual-public-session', launchState: 'running', recoveryState: 'live',
+      nativeIdentityObservation: { nativeSessionId: current.nativeSessionId, incarnationId: current.incarnationId, launchNonce: 'actual-launch' } }
+    vi.spyOn(rig as any, 'freshBrowserAllocation').mockResolvedValue({ view, writer: { providerStoreId: 'independent-store' } })
+    vi.spyOn(rig, 'currentRuntimeEnclosure').mockResolvedValue(view as any)
     vi.spyOn(rig as any, 'captureFreshNativeSource').mockResolvedValueOnce({ turns: [] }).mockResolvedValueOnce({ turns: [{ toolCalls: [] }] })
     const materialize = vi.spyOn(rig as any, 'materializeNativeSource').mockImplementation(async (name: string) => ({ path: name, sha256: 'a'.repeat(64) }))
     const challenge = await rig.registerFreshBrowserTurn(current, id)
-    const request = { type: 'freshAgent.send', sessionId: 'actual-public-session', requestId: 'actual-request', text: challenge.prompt }
-    await rig.finishFreshBrowserTurn(current, challenge.challengeId, request, { ...request, type: 'freshAgent.send.accepted' })
+    const request = { type: 'freshAgent.send', sessionId: current.nativeSessionId, requestId: 'actual-request', text: challenge.prompt }
+    const reply = { ...request, type: 'freshAgent.send.accepted', sessionId: view.freshAgentSessionId }
+    await rig.finishFreshBrowserTurn(current, challenge.challengeId, request, reply)
     const ui = (rig as any).freshBrowserCollections.get(id).ui
     expect(materialize).toHaveBeenCalledTimes(2)
     expect(ui.beforeTurns).toBe(0)
     expect(ui.boundary).toBeUndefined()
     expect(ui.after.path).toContain('/completed')
+    expect(ui).toMatchObject({ request, reply, view })
   })
   it('makes selected fresh families available in the actual picker from the owned scratch configuration', async () => {
     const home = path.join(fixtureRepoRoot, 'owned-browser-home')
@@ -5167,7 +5171,8 @@ describe('finite retained fresh native collection', () => {
     const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'owned-browser-approval-'))
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', { enabledProviders: [], freshAgentModes: ['freshclaude'] })
     const address = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
-    let current = { ...address, freshAgentSessionType: 'freshclaude', freshAgentSessionId: 'actual-browser-session', launchState: 'running', recoveryState: 'live' }
+    let current = { ...address, provider: 'claude', freshAgentSessionType: 'freshclaude', freshAgentSessionId: 'actual-browser-session', launchState: 'running', recoveryState: 'live',
+      nativeIdentityObservation: { nativeSessionId: address.nativeSessionId, incarnationId: address.incarnationId, launchNonce: 'original-nonce' } }
     vi.spyOn(rig, 'assertCurrentHandle').mockImplementation(async requested => { expect(requested.incarnationId).toBe(current.incarnationId) })
     vi.spyOn(rig as any, 'currentRuntimeEnclosure').mockImplementation(async () => current)
     vi.spyOn(rig, 'freshAgentLaunchFacts').mockResolvedValue({ provider: 'claude', version: '2.1.237', workerPid: 42 })
@@ -5231,7 +5236,8 @@ describe('finite retained fresh native collection', () => {
       if (recovery !== 'web') {
         if (recovery === 'host') await rig.crashRuntimeHost(address)
         else await rig.crashProviderWorker(address)
-        current = { ...current, incarnationId: 'replacement-inc', containerId: 'd'.repeat(64), hostBootId: 'replacement-boot' }
+        current = { ...current, incarnationId: 'replacement-inc', containerId: 'd'.repeat(64), hostBootId: 'replacement-boot',
+          nativeIdentityObservation: { ...current.nativeIdentityObservation, incarnationId: 'replacement-inc', launchNonce: 'replacement-nonce' } }
         card = structuredClone(card); card.payload.nativeRequestId = 'current-native-callback'
         card.payload.nativeBinding = { nativeRequestId: 'current-native-callback', queryGeneration: 1, launch: { incarnationId: current.incarnationId, launchNonce: 'replacement-nonce' } }
         native = structuredClone(native); native.nativePid = 84; native.nativeLaunch = structuredClone(card.payload.nativeBinding.launch)
@@ -5240,11 +5246,11 @@ describe('finite retained fresh native collection', () => {
       const currentAddress = { ...address, incarnationId: current.incarnationId, containerId: current.containerId, hostBootId: current.hostBootId }
       const checkpoint = await rig.captureFreshApprovalCheckpoint(currentAddress, registered.challengeId)
       expect(checkpoint.decisionId).toBe('actual-browser-decision')
-      const decision = { type: 'freshAgent.approval.respond', sessionId: current.freshAgentSessionId, requestId: checkpoint.decisionId, decision: { behavior: allowed ? 'allow' : 'deny' } }
+      const decision = { type: 'freshAgent.approval.respond', sessionId: current.nativeSessionId, requestId: checkpoint.decisionId, decision: { behavior: allowed ? 'allow' : 'deny' } }
       await expect(rig.finishFreshApproval(currentAddress, registered.challengeId, { ...decision, requestId: 'stale-card' })).rejects.toThrow(/current browser decision/)
       expect(fs.existsSync(effect)).toBe(false)
       if (allowed) await fsp.writeFile(effect, 'effect\n')
-      pending = [{ kind: 'provider', data: { payload: { event: { type: 'freshAgent.permission.dispatch', ok: true, sessionId: current.freshAgentSessionId, requestId: checkpoint.decisionId, nativeRequestId: checkpoint.nativeRequestId } } } },
+      pending = [{ kind: 'provider', data: { payload: { event: { type: 'freshAgent.permission.dispatch', ok: true, sessionId: current.nativeSessionId, requestId: checkpoint.decisionId, nativeRequestId: checkpoint.nativeRequestId } } } },
         { kind: 'provider', data: { payload: { event: { type: 'freshAgent.tool.result', content: [{ tool_use_id: toolUseID, is_error: !allowed }] } } } },
         { kind: 'provider', data: { payload: { event: { type: 'freshAgent.result', nativeSessionId: address.nativeSessionId, isError: false } } } }]
       await rig.finishFreshApproval(currentAddress, registered.challengeId, decision)

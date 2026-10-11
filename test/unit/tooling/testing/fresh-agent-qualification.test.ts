@@ -5,7 +5,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { ManagedRuntimeOwner } from '../../../../scripts/testing/runtime-sandbox.js'
 
 import {
   buildFreshAgentQualificationReceipt,
@@ -30,6 +31,68 @@ const receiptRunId = 'fresh-agent-live-001'
 const tempRoots: string[] = []
 
 describe('observed fresh browser execution', () => {
+  it.each(['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'] as const)('reopens materialized browser identities for %s without changing observed frames', mode => {
+    const built = fixture([row(mode)], 'production', 'low', true)
+    expect(validateFreshAgentQualificationReceipt({ repoRoot: built.repoRoot, candidateSha, expectedRuntimeImage: runtimeImage, receipt: built.receipt }).rows).toEqual(built.receipt.rows)
+    const original = readBrowserExecution(built)
+    expect(original.ui.request.sessionId).toBe(original.allocations[1].view.nativeSessionId)
+    expect(original.ui.reply.sessionId).toBe(original.allocations[1].view.freshAgentSessionId)
+    expect(original.ui.request.sessionId).not.toBe(original.ui.reply.sessionId)
+  })
+  it('reopens the actual materialized history create reply on the original native root', () => {
+    const built = fixture([row()], 'production', 'low', true)
+    const original = readBrowserExecution(built)
+    const history = original.routes.find((route: any) => route.ingress === 'history-resume')
+    history.request = { type: 'freshAgent.create', requestId: 'actual-history-create', sessionType: 'freshclaude',
+      sessionRef: { provider: 'claude', sessionId: history.view.nativeSessionId } }
+    history.reply = { type: 'freshAgent.created', requestId: history.request.requestId, sessionId: history.view.nativeSessionId }
+    rewriteBrowserExecution(built, original)
+    expect(validateFreshAgentQualificationReceipt({ repoRoot: built.repoRoot, candidateSha, expectedRuntimeImage: runtimeImage, receipt: built.receipt }).rows).toEqual(built.receipt.rows)
+    for (const fault of ['provider', 'request', 'reply-session']) {
+      const invalid = structuredClone(original), route = invalid.routes.find((value: any) => value.ingress === 'history-resume')
+      if (fault === 'provider') route.request.sessionRef.provider = 'codex'
+      if (fault === 'request') route.reply.requestId = 'unrelated-history-request'
+      if (fault === 'reply-session') route.reply.sessionId = route.view.freshAgentSessionId
+      rewriteBrowserExecution(built, invalid)
+      expect(() => validateFreshAgentQualificationReceipt({ repoRoot: built.repoRoot, candidateSha, expectedRuntimeImage: runtimeImage, receipt: built.receipt })).toThrow()
+    }
+  })
+  it.each(['send-session', 'send-provider', 'send-mode', 'ack-session', 'ack-request', 'ui-presentation', 'ui-root', 'ui-soul', 'ui-incarnation', 'ui-observation', 'history-session', 'history-presentation', 'history-soul', 'history-provider', 'history-observation', 'history-incarnation', 'attach-session', 'attach-presentation', 'attach-incarnation', 'decision-session', 'decision-provider', 'decision-mode', 'decision-presentation', 'dispatch-session', 'dispatch-request', 'dispatch-native-request'])('rejects materialized browser %s from reopened originals', fault => {
+    const built = fixture([row()], 'production', 'low', true)
+    const original = readBrowserExecution(built), ui = original.ui
+    const history = original.routes.find((route: any) => route.ingress === 'history-resume')
+    const attach = original.routes.find((route: any) => route.ingress === 'ws-attach')
+    const approval = original.approvals[0], dispatch = approval.events[0].data.payload.event
+    if (fault === 'send-session') ui.request.sessionId = original.allocations[0].view.nativeSessionId
+    if (fault === 'send-provider') ui.request.provider = 'codex'
+    if (fault === 'send-mode') ui.request.sessionType = 'freshcodex'
+    if (fault === 'ack-session') ui.reply.sessionId = original.allocations[0].view.freshAgentSessionId
+    if (fault === 'ack-request') ui.reply.requestId = 'another-command'
+    if (fault === 'ui-presentation') ui.view.freshAgentSessionId = 'another-presentation-of-same-root'
+    if (fault === 'ui-root') ui.view.nativeSessionId = 'another-native-root'
+    if (fault === 'ui-soul') ui.view.soulId = 'another-soul'
+    if (fault === 'ui-incarnation') ui.view.incarnationId = ui.view.nativeIdentityObservation.incarnationId = 'old-incarnation'
+    if (fault === 'ui-observation') ui.view.nativeIdentityObservation.incarnationId = 'old-incarnation'
+    if (fault === 'history-session') history.request.sessionId = original.allocations[1].view.nativeSessionId
+    if (fault === 'history-presentation') history.view.freshAgentSessionId = 'another-presentation-of-same-root'
+    if (fault === 'history-soul') history.view.soulId = 'another-soul'
+    if (fault === 'history-provider') history.request.provider = 'codex'
+    if (fault === 'history-observation') history.view.nativeIdentityObservation.incarnationId = 'old-incarnation'
+    if (fault === 'history-incarnation') history.view.incarnationId = history.view.nativeIdentityObservation.incarnationId = 'old-incarnation'
+    if (fault === 'attach-session') attach.request.sessionId = original.allocations[1].view.nativeSessionId
+    if (fault === 'attach-presentation') attach.view.freshAgentSessionId = 'another-presentation-of-same-root'
+    if (fault === 'attach-incarnation') attach.view.incarnationId = attach.view.nativeIdentityObservation.incarnationId = 'old-incarnation'
+    if (fault === 'decision-session') approval.browserDecision.sessionId = original.allocations[0].view.nativeSessionId
+    if (fault === 'decision-provider') approval.browserDecision.provider = 'codex'
+    if (fault === 'decision-mode') approval.browserDecision.sessionType = 'freshcodex'
+    if (fault === 'decision-presentation') approval.afterView.freshAgentSessionId = approval.recoveryObservation.after.view.freshAgentSessionId = 'another-presentation-of-same-root'
+    if (fault === 'dispatch-session') dispatch.sessionId = approval.afterView.freshAgentSessionId
+    if (fault === 'dispatch-request') dispatch.requestId = 'another-command'
+    if (fault === 'dispatch-native-request') dispatch.nativeRequestId = 'stale-native-request'
+    rewriteBrowserExecution(built, original)
+    expect(() => validateFreshAgentQualificationReceipt({ repoRoot: built.repoRoot, candidateSha, expectedRuntimeImage: runtimeImage, receipt: built.receipt })).toThrow()
+    expect(() => buildFreshAgentQualificationReceipt({ repoRoot: built.repoRoot, evidenceDir: built.evidenceDir, candidateSha, receiptRunId, runtimeImage, selectedModes: ['freshclaude'], rows: built.receipt.rows })).toThrow()
+  })
   it('rejects inventory labels without an executed request and current activation', async () => {
     const module = await import('../../../../scripts/testing/fresh-agent-qualification-receipt.js')
     expect(() => (module as any).deriveFreshBrowserExecution({ mode: 'freshcodex', routes: [], allocations: [], lifecycle: [] }, {})).toThrow(/executed ingress/)
@@ -103,7 +166,122 @@ describe('observed fresh browser execution', () => {
 })
 
 afterEach(() => {
+  vi.restoreAllMocks()
   while (tempRoots.length) fs.rmSync(tempRoots.pop()!, { recursive: true, force: true })
+})
+
+function readBrowserExecution(built: ReturnType<typeof fixture>): any {
+  return JSON.parse(fs.readFileSync(path.join(built.evidenceDir, built.receipt.rows[0]!.executionOriginal!.path), 'utf8'))
+}
+
+function rewriteBrowserExecution(built: ReturnType<typeof fixture>, original: any): void {
+  const current = built.receipt.rows[0]!, filename = path.join(built.evidenceDir, current.executionOriginal!.path)
+  fs.writeFileSync(filename, JSON.stringify(original))
+  current.executionOriginal!.sha256 = createHash('sha256').update(fs.readFileSync(filename)).digest('hex')
+  const assertionsPath = path.join(built.evidenceDir, 'fresh-agent-qualification-assertions.json')
+  const assertions = JSON.parse(fs.readFileSync(assertionsPath, 'utf8')); assertions.rows = built.receipt.rows
+  fs.writeFileSync(assertionsPath, JSON.stringify(assertions))
+  built.receipt.artifacts.assertions.sha256 = createHash('sha256').update(fs.readFileSync(assertionsPath)).digest('hex')
+}
+
+function browserOwnerFixture() {
+  const original = readBrowserExecution(fixture())
+  const owner = new ManagedRuntimeOwner(() => { throw new Error('web I/O is unused') }, process.cwd(), 5)
+  const internal = owner as any
+  const view = structuredClone(original.allocations[1].view)
+  view.freshAgentSessionId = 'presentation-owned-picker-request'
+  view.containerId = 'b'.repeat(64)
+  const handle = { runId: owner.runtime.runId, candidateSha: owner.runtime.candidateSha, soulId: view.soulId,
+    incarnationId: view.incarnationId, containerId: view.containerId, hostBootId: view.hostBootId, nativeSessionId: view.nativeSessionId }
+  // Supply serialized inventory and broker facts; the actual current-handle,
+  // enclosure, send, approval and dispatch consumers execute unchanged.
+  owner.runtime.broker = { receipts: () => [{ ...handle }] } as any
+  vi.spyOn(owner, 'inventory').mockResolvedValue([view])
+  vi.spyOn(owner.runtime, 'recordLifecycle').mockImplementation(() => undefined)
+  const capture = vi.spyOn(internal, 'captureFreshNativeSource').mockResolvedValue({ turns: [{ toolCalls: [] }] })
+  vi.spyOn(internal, 'materializeNativeSource').mockResolvedValue(original.ui.after)
+  internal.freshNativeCollections.set('collection', { mode: 'freshclaude', provider: 'claude' })
+  const challenge = { handle, collectionId: 'collection', provider: 'claude', beforeTurns: 0, prompt: original.ui.request.text, beforeView: structuredClone(view) }
+  internal.freshBrowserChallenges.set('ui-challenge', challenge)
+  const request = { ...original.ui.request, sessionId: view.nativeSessionId }
+  const reply = { ...original.ui.reply, sessionId: view.freshAgentSessionId }
+  const approval = structuredClone(original.approvals[0])
+  approval.soulId = view.soulId
+  approval.beforeView = structuredClone(view)
+  approval.afterView = structuredClone(view)
+  approval.events.unshift({ kind: 'permission_requested', data: approval.beforeCard })
+  internal.freshApprovalChallenges.set('approval-challenge', approval)
+  vi.spyOn(internal, 'freshApprovalEvents').mockResolvedValue(approval.events.at(-1))
+  vi.spyOn(internal, 'freshApprovalEffect').mockResolvedValue(approval.effectCount)
+  vi.spyOn(internal, 'readFreshApprovalEvents').mockResolvedValue({ head: 0, events: [] })
+  approval.cursor = 0
+  const retain = vi.spyOn(internal, 'retainNativeOriginal').mockResolvedValue({ path: 'outcome.json', sha256: 'a'.repeat(64) })
+  return { owner, internal, view, handle, challenge, request, reply, approval, capture, retain }
+}
+
+describe('materialized browser owner consumers', () => {
+  it.each(['history-resume', 'ws-attach'] as const)('records the actual %s native attach on its registered allocation', async ingress => {
+    const { owner, internal, handle, view } = browserOwnerFixture()
+    Object.assign(internal.freshNativeCollections.get('collection'), { soulId: view.soulId, nativeSessionId: view.nativeSessionId })
+    const observation = { ingress, request: { type: 'freshAgent.attach', sessionId: view.nativeSessionId, provider: 'claude', sessionType: 'freshclaude' } }
+    await expect(owner.observeFreshBrowserIngress(handle, 'collection', observation)).resolves.toBeUndefined()
+    expect(internal.freshBrowserCollections.get('collection').routes[0]).toMatchObject({ ...observation, view })
+  })
+  it.each(['wrong-attach-session', 'wrong-attach-provider', 'wrong-attach-mode', 'wrong-attach-allocation', 'stale-attach-observation'])('rejects %s in the actual ingress consumer', async fault => {
+    const { owner, internal, handle, view } = browserOwnerFixture()
+    Object.assign(internal.freshNativeCollections.get('collection'), { soulId: view.soulId, nativeSessionId: view.nativeSessionId })
+    const request = { type: 'freshAgent.attach', sessionId: view.nativeSessionId, provider: 'claude', sessionType: 'freshclaude' }
+    if (fault === 'wrong-attach-session') request.sessionId = 'foreign-native'
+    if (fault === 'wrong-attach-provider') request.provider = 'codex'
+    if (fault === 'wrong-attach-mode') request.sessionType = 'freshcodex'
+    if (fault === 'wrong-attach-allocation') internal.freshNativeCollections.get('collection').soulId = 'another-soul-of-same-root'
+    if (fault === 'stale-attach-observation') view.nativeIdentityObservation.incarnationId = 'old-incarnation'
+    await expect(owner.observeFreshBrowserIngress(handle, 'collection', { ingress: 'history-resume', request })).rejects.toThrow()
+    expect(internal.freshBrowserCollections.get('collection').routes).toEqual([])
+  })
+  it('finishes the actual native send with its presentation acknowledgment and retains both frames', async () => {
+    const { owner, internal, handle, request, reply, challenge } = browserOwnerFixture()
+    await expect(owner.finishFreshBrowserTurn(handle, 'ui-challenge', request, reply)).resolves.toBeUndefined()
+    expect(internal.freshBrowserCollections.get('collection').ui).toMatchObject({ request, reply, view: challenge.beforeView })
+    expect(challenge.finished).toBe(true)
+  })
+  it('finishes the actual native approval response and raw native dispatch', async () => {
+    const { owner, handle, approval, retain } = browserOwnerFixture()
+    await expect(owner.finishFreshApproval(handle, 'approval-challenge', approval.browserDecision)).resolves.toBeUndefined()
+    expect(approval.finished).toBe(true)
+    expect(retain).toHaveBeenCalledWith('fresh-approval-approval-challenge/outcome.json', approval)
+  })
+  it.each(['wrong-send-session', 'wrong-send-provider', 'wrong-send-mode', 'wrong-ack-session', 'wrong-request', 'wrong-presentation', 'wrong-native-root', 'wrong-provider', 'stale-observation', 'stale-incarnation', 'foreign-owner'])('rejects %s before native send collection', async fault => {
+    const { owner, view, handle, request, reply, capture } = browserOwnerFixture()
+    if (fault === 'wrong-send-session') request.sessionId = 'foreign-native'
+    if (fault === 'wrong-send-provider') request.provider = 'codex'
+    if (fault === 'wrong-send-mode') request.sessionType = 'freshcodex'
+    if (fault === 'wrong-ack-session') reply.sessionId = 'foreign-presentation'
+    if (fault === 'wrong-request') reply.requestId = 'foreign-request'
+    if (fault === 'wrong-presentation') view.freshAgentSessionId = 'another-presentation-of-same-root'
+    if (fault === 'wrong-native-root') view.nativeSessionId = 'foreign-native'
+    if (fault === 'wrong-provider') view.provider = 'codex'
+    if (fault === 'stale-observation') view.nativeIdentityObservation.incarnationId = 'old-incarnation'
+    if (fault === 'stale-incarnation') view.incarnationId = 'old-incarnation'
+    if (fault === 'foreign-owner') handle.runId = 'foreign-run'
+    await expect(owner.finishFreshBrowserTurn(handle, 'ui-challenge', request, reply)).rejects.toThrow()
+    expect(capture).not.toHaveBeenCalled()
+  })
+  it.each(['wrong-decision-session', 'wrong-decision-provider', 'wrong-decision-mode', 'wrong-decision-request', 'wrong-presentation', 'wrong-native-root', 'wrong-provider', 'stale-observation', 'stale-incarnation', 'foreign-owner'])('rejects %s before native approval settlement', async fault => {
+    const { owner, view, handle, approval, retain } = browserOwnerFixture()
+    if (fault === 'wrong-decision-session') approval.browserDecision.sessionId = 'foreign-native'
+    if (fault === 'wrong-decision-provider') approval.browserDecision.provider = 'codex'
+    if (fault === 'wrong-decision-mode') approval.browserDecision.sessionType = 'freshcodex'
+    if (fault === 'wrong-decision-request') approval.browserDecision.requestId = 'foreign-request'
+    if (fault === 'wrong-presentation') view.freshAgentSessionId = 'another-presentation-of-same-root'
+    if (fault === 'wrong-native-root') view.nativeSessionId = 'foreign-native'
+    if (fault === 'wrong-provider') view.provider = 'codex'
+    if (fault === 'stale-observation') view.nativeIdentityObservation.incarnationId = 'old-incarnation'
+    if (fault === 'stale-incarnation') view.incarnationId = 'old-incarnation'
+    if (fault === 'foreign-owner') handle.runId = 'foreign-run'
+    await expect(owner.finishFreshApproval(handle, 'approval-challenge', approval.browserDecision)).rejects.toThrow()
+    expect(retain).not.toHaveBeenCalled()
+  })
 })
 
 function row(mode: FreshAgentQualificationRow['mode'] = 'freshclaude'): FreshAgentQualificationRow {
@@ -166,28 +344,29 @@ function row(mode: FreshAgentQualificationRow['mode'] = 'freshclaude'): FreshAge
 }
 
 
-function browserExecutionFixture(current: FreshAgentQualificationRow, stages: any[], evidenceDir: string, write: (name: string, value: any) => { path: string; sha256: string }, prefix: string) {
+function browserExecutionFixture(current: FreshAgentQualificationRow, stages: any[], evidenceDir: string, write: (name: string, value: any) => { path: string; sha256: string }, prefix: string, materialized = false) {
   const read = (reference: any) => JSON.parse(fs.readFileSync(path.join(evidenceDir, reference.path), 'utf8'))
   const stageViews = stages.map(stage => read(stage.launch).response.data.view)
-  const view = { ...stageViews.at(-1), freshAgentSessionType: current.mode, freshAgentSessionId: current.nativeSessionId }
+  const view = { ...stageViews.at(-1), provider: current.mode === 'kilroy' ? 'kilroy' : current.provider, freshAgentSessionType: current.mode, freshAgentSessionId: materialized ? 'presentation-' + current.nativeSessionId : current.nativeSessionId }
   const native = read(read(stages.at(-1).profile).process)
   const allocation = { view, writer: { soulId: current.soulId, incarnationId: view.incarnationId, nativeSessionId: current.nativeSessionId,
     providerStoreId: current.providerStoreId, activeClaimCount: 1, globalConflictingClaimCount: 0 }, volume: { providerVolumeName: 'owned-volume' }, process: native, limits: current.limits }
   const otherRoot = 'other-' + current.nativeSessionId
   const other = structuredClone(allocation)
-  Object.assign(other.view, { soulId: 'other-soul', incarnationId: 'other-inc', containerId: 'other-container', nativeSessionId: otherRoot, freshAgentSessionId: otherRoot,
+  Object.assign(other.view, { soulId: 'other-soul', incarnationId: 'other-inc', containerId: 'other-container', nativeSessionId: otherRoot, freshAgentSessionId: materialized ? 'presentation-' + otherRoot : otherRoot,
     nativeIdentityObservation: { ...view.nativeIdentityObservation, nativeSessionId: otherRoot, incarnationId: 'other-inc' } })
   Object.assign(other.writer, { soulId: other.view.soulId, incarnationId: other.view.incarnationId, nativeSessionId: otherRoot, providerStoreId: 'other-store' })
   other.volume.providerVolumeName = 'other-volume'; other.process.native.launch.incarnationId = other.view.incarnationId
   const routes = FRESH_AGENT_INGRESS_INVENTORY.filter(({ ingress }) => !['startup-restore', 'auto-resume'].includes(ingress)).map(({ ingress }) => {
     const target = ingress === 'browser-split' ? other.view : view
     const requestId = 'create-' + ingress
+    if (materialized && ingress === 'history-resume') return { ingress, view: target, request: { type: 'freshAgent.attach', sessionId: target.nativeSessionId } }
     if (['browser-picker', 'browser-split', 'ws-create', 'history-resume'].includes(ingress)) return { ingress, view: target,
       request: { type: 'freshAgent.create', requestId, sessionType: current.mode, ...(ingress === 'history-resume' ? { sessionRef: { provider: current.provider, sessionId: target.nativeSessionId } } : {}) },
       reply: { type: 'freshAgent.created', requestId, sessionId: target.freshAgentSessionId } }
-    if (ingress === 'ws-attach') return { ingress, view: target, request: { type: 'freshAgent.attach', sessionId: target.freshAgentSessionId } }
+    if (ingress === 'ws-attach') return { ingress, view: target, request: { type: 'freshAgent.attach', sessionId: materialized ? target.nativeSessionId : target.freshAgentSessionId } }
     return { ingress, view: target, writer: structuredClone(allocation.writer), request: { method: 'POST', path: ingress.endsWith('split') ? '/api/panes/actual-pane/split' : '/api/tabs', body: { agent: current.mode, sessionRef: { provider: current.provider, sessionId: target.nativeSessionId } } },
-      reply: { paneId: 'actual-pane', sessionId: target.freshAgentSessionId } }
+      reply: { paneId: 'actual-pane', sessionId: materialized ? target.nativeSessionId : target.freshAgentSessionId } }
   })
   const lifecycle: any[] = [{ event: 'supervisor.runtime_observer.recovery_scheduled', data: { soulId: current.soulId } }]
   for (const index of [1, 2]) {
@@ -215,9 +394,9 @@ function browserExecutionFixture(current: FreshAgentQualificationRow, stages: an
     }
     after = write(prefix + '/ui/' + (current.provider === 'codex' ? 'rollout-' : '') + otherRoot + '.jsonl', rows.map(row => JSON.stringify(row)).join('\n') + '\n')
   }
-  const ui = { provider: current.provider, nativeRoot: otherRoot, beforeTurns: 0, after,
+  const ui = { provider: current.provider, nativeRoot: otherRoot, view: structuredClone(other.view), beforeTurns: 0, after,
     request: { type: 'freshAgent.send', requestId: 'actual-ui-send', sessionId: otherRoot, text: prompt },
-    reply: { type: 'freshAgent.send.accepted', requestId: 'actual-ui-send', sessionId: otherRoot } }
+    reply: { type: 'freshAgent.send.accepted', requestId: 'actual-ui-send', sessionId: other.view.freshAgentSessionId } }
   const approvals: any[] = []
   if (['freshclaude', 'kilroy'].includes(current.mode)) for (const recovery of ['web', 'host', 'provider']) for (const allowed of [true, false]) {
     const decisionId = 'decision-' + current.mode + '-' + recovery + '-' + allowed, toolUseID = 'toolu_' + decisionId
@@ -231,6 +410,7 @@ function browserExecutionFixture(current: FreshAgentQualificationRow, stages: an
     const beforeCard = { decision_id: decisionId, payload: { tool: { name: 'Bash', input: { command } }, toolUseID, nativeCheckpoint: checkpoint,
       nativeRequestId: 'old-' + decisionId, nativeBinding: { nativeRequestId: 'old-' + decisionId, queryGeneration: 1, launch: { incarnationId: 'other-inc', launchNonce: 'old-' + decisionId } } } }
     const currentCard = structuredClone(beforeCard), afterView = { ...structuredClone(other.view), incarnationId: recovery === 'web' ? 'other-inc' : 'recovered-' + decisionId }
+    afterView.nativeIdentityObservation.incarnationId = afterView.incarnationId
     currentCard.payload.nativeBinding.launch.incarnationId = afterView.incarnationId
     if (recovery !== 'web') currentCard.payload.nativeRequestId = 'new-' + decisionId
     currentCard.payload.nativeBinding.nativeRequestId = currentCard.payload.nativeRequestId
@@ -273,6 +453,7 @@ function fixture(
   rows = [row()],
   buildKind: 'production' | 'deterministic_fixture' = 'production',
   nativeEffort: string | null = 'low',
+  materialized = false,
 ): {
   repoRoot: string
   evidenceDir: string
@@ -375,7 +556,7 @@ function fixture(
       writer: { provider: stoppedView.provider, soulId: currentRow.soulId, incarnationId: stoppedView.incarnationId, providerStoreId: currentRow.providerStoreId, nativeSessionId, activeClaimCount: 0, globalConflictingClaimCount: 0 },
       stopCompletedAt: 1_780_000_024_000, stoppedObservedAt: 1_780_000_024_100, writerObservedAt: 1_780_000_024_200,
       readStartedAt: 1_780_000_024_300, readCompletedAt: 1_780_000_024_400, completedTurnCount: 3 })
-    currentRow.executionOriginal = browserExecutionFixture(currentRow, stages, evidenceDir, original, 'browser-' + rowIndex)
+    currentRow.executionOriginal = browserExecutionFixture(currentRow, stages, evidenceDir, original, 'browser-' + rowIndex, materialized)
     return { mode: currentRow.mode, provider: currentRow.provider, soulId: currentRow.soulId, providerStoreId: currentRow.providerStoreId, nativeSessionId, nonce, stages, stopped }
   })
   original('native-recovery-originals.json', { schemaVersion: 1, candidateSha, runId: receiptRunId, runtimeImage, selected: rows.map(current => current.mode), conversations })

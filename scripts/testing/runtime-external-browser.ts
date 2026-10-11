@@ -65,6 +65,24 @@ import { ownedClaudeStartupPreferences } from './runtime-native-feasibility.js'
 
 type OwnedProcessIdentity = { pid: number; startTicks: string; executable: string; cwd: string }
 
+/** Serialized by Playwright into the owned page after its matching allocation. */
+export function observeOwnedFreshBrowserPane(input: {
+  tabId: string; paneId: string; createRequestId: string
+  sessionType: string; provider: string; createdSessionId: string; nativeSessionId: string
+}): { paneId: string; sessionId: string } | null {
+  const state = (globalThis as any).window?.__FRESHELL_TEST_HARNESS__?.getState()
+  const find = (node: any): any => node?.type === 'leaf' ? node.id === input.paneId ? node : null
+    : node?.children?.map(find).find(Boolean) ?? null
+  const leaf = find(state?.panes?.layouts?.[input.tabId]), content = leaf?.content
+  if (content?.kind !== 'fresh-agent' || content.createRequestId !== input.createRequestId
+    || content.sessionType !== input.sessionType || content.provider !== input.provider) return null
+  // Materialization changes conversation identity, never the picker route.
+  // The second allowed ID comes only from this request's exact allocation.
+  if (!content.sessionId || ![input.createdSessionId, input.nativeSessionId].includes(content.sessionId)) return null
+  if (content.sessionRef && (content.sessionRef.provider !== input.provider || content.sessionRef.sessionId !== content.sessionId)) return null
+  return { paneId: leaf.id, sessionId: content.sessionId }
+}
+
 /** Serialized by Playwright into the owned page; uses only its existing harness. */
 export function stageOwnedFreshBrowserProfile(profile: { mode: string; model: string; effort: string }): { tabId: string; paneId: string; createRequestId: string } | null {
   const harness = (globalThis as any).window?.__FRESHELL_TEST_HARNESS__
