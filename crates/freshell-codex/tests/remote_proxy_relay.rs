@@ -342,6 +342,95 @@ async fn thread_start_response_is_relayed_unchanged_and_yields_a_candidate_event
     proxy.close().await;
 }
 
+/// The thread status a `thread/resume` or `thread/start` answer carries is
+/// reported (Codex announces nothing when a client resumes a thread already
+/// loaded, mid-turn or not), and the answers relay byte-identical. An
+/// ephemeral thread's answer and an error answer report nothing (Task 17
+/// review M2).
+#[tokio::test]
+async fn resume_and_start_answers_report_their_threads_status() {
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, false))
+            .await
+            .unwrap();
+    let mut tui = connect_tui(proxy.ws_url()).await;
+    let mut conn = upstream.accept().await;
+    let exchange = |id: i64, method: &str| {
+        json!({"id": id, "method": method, "params": {"threadId": "t-run"}}).to_string()
+    };
+
+    tui.send(Message::Text(exchange(1, "thread/resume")))
+        .await
+        .unwrap();
+    conn.recv_text().await;
+    let resumed = json!({"id": 1, "result": {"thread": {
+        "id": "t-run", "ephemeral": false, "path": "/r/rollout-t-run.jsonl",
+        "status": {"type": "active", "activeFlags": []},
+    }}})
+    .to_string();
+    conn.send_text(resumed.clone());
+    assert_eq!(recv_text(&mut tui).await, resumed, "relayed byte-identical");
+    assert_eq!(
+        recv_events(&mut events, 1).await[0],
+        RemoteProxyEvent::ThreadStatusReported {
+            thread_id: "t-run".to_string(),
+            status: "active".to_string(),
+        }
+    );
+
+    tui.send(Message::Text(exchange(2, "thread/start")))
+        .await
+        .unwrap();
+    conn.recv_text().await;
+    let started = json!({"id": 2, "result": {"thread": {
+        "id": "t-new", "ephemeral": false, "path": "/r/rollout-t-new.jsonl",
+        "status": {"type": "idle"},
+    }}})
+    .to_string();
+    conn.send_text(started.clone());
+    assert_eq!(recv_text(&mut tui).await, started);
+    let reported = recv_events(&mut events, 2).await;
+    assert!(
+        matches!(&reported[0], RemoteProxyEvent::Candidate(c) if c.thread.id == "t-new"),
+        "{reported:?}"
+    );
+    assert_eq!(
+        reported[1],
+        RemoteProxyEvent::ThreadStatusReported {
+            thread_id: "t-new".to_string(),
+            status: "idle".to_string(),
+        }
+    );
+
+    tui.send(Message::Text(exchange(3, "thread/start")))
+        .await
+        .unwrap();
+    conn.recv_text().await;
+    let title = json!({"id": 3, "result": {"thread": {
+        "id": "t-title", "ephemeral": true, "path": null, "status": {"type": "idle"},
+    }}})
+    .to_string();
+    conn.send_text(title.clone());
+    assert_eq!(recv_text(&mut tui).await, title);
+    assert!(
+        matches!(&recv_events(&mut events, 1).await[0], RemoteProxyEvent::Candidate(c) if c.thread.ephemeral),
+        "an ephemeral start answer is only its candidate"
+    );
+
+    tui.send(Message::Text(exchange(4, "thread/resume")))
+        .await
+        .unwrap();
+    conn.recv_text().await;
+    let refused = json!({"id": 4, "error": {"code": -32600, "message": "no rollout found for thread id t-run"}})
+        .to_string();
+    conn.send_text(refused.clone());
+    assert_eq!(recv_text(&mut tui).await, refused);
+    assert_no_event(&mut events).await;
+
+    proxy.close().await;
+}
+
 // ── 4. thread/fork request rewrite + response normalization ────────────────────────
 
 #[tokio::test]

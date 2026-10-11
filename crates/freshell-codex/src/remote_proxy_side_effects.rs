@@ -122,6 +122,17 @@ pub struct FsChangedRepairTrigger {
     pub changed_paths: Vec<String>,
 }
 
+/// The thread object of an answer to `thread/start` or `thread/resume`
+/// (`result.thread`): its id, whether it is ephemeral, and the type of its
+/// current status (`status.type`; Codex reports `active` for a thread
+/// running a turn).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnsweredThreadStatus {
+    pub thread_id: String,
+    pub ephemeral: bool,
+    pub status: String,
+}
+
 /// Pending-request-id options for [`extract_thread_start_response_candidate`], mirroring
 /// `pendingThreadStartRequestIds` (`json-rpc-side-effects.ts:280`).
 pub struct ThreadStartResponseOptions<'a> {
@@ -332,10 +343,8 @@ fn extract_thread(raw: &[u8], thread_entry: &ObjectEntry) -> SideEffectResult<Ex
     })
 }
 
-fn extract_result_thread(
-    raw: &[u8],
-    root_entries: &[ObjectEntry],
-) -> SideEffectResult<ExtractedThread> {
+/// The `result.thread` entry of an answer.
+fn result_thread_entry(raw: &[u8], root_entries: &[ObjectEntry]) -> SideEffectResult<ObjectEntry> {
     let result = find_entry(root_entries, "result").ok_or(SideEffectError::MissingThread)?;
     if result.value_kind != ValueKind::Object {
         return Err(SideEffectError::MissingThread);
@@ -344,9 +353,51 @@ fn extract_result_thread(
     if has_any_duplicate_key(&result_object.entries, &["thread"]) {
         return Err(SideEffectError::UnsafeDuplicateKey);
     }
-    let thread =
-        find_entry(&result_object.entries, "thread").ok_or(SideEffectError::MissingThread)?;
-    extract_thread(raw, thread)
+    find_entry(&result_object.entries, "thread")
+        .cloned()
+        .ok_or(SideEffectError::MissingThread)
+}
+
+fn extract_result_thread(
+    raw: &[u8],
+    root_entries: &[ObjectEntry],
+) -> SideEffectResult<ExtractedThread> {
+    extract_thread(raw, &result_thread_entry(raw, root_entries)?)
+}
+
+/// The id, ephemeral flag and status type of the thread an answer to
+/// `thread/start` or `thread/resume` carries (`result.thread`), byte-scanned
+/// so an answer of any size (a resume answer can carry the conversation's
+/// turns) is read. An error answer, or a thread with no status, is
+/// [`SideEffectError::MissingThread`] / [`SideEffectError::UnsupportedShape`].
+pub fn extract_answer_thread_status(raw: &[u8]) -> SideEffectResult<AnsweredThreadStatus> {
+    let root = scan_root_object(raw)?;
+    if has_any_duplicate_key(&root.entries, &["id", "result"]) {
+        return Err(SideEffectError::UnsafeDuplicateKey);
+    }
+    let thread = result_thread_entry(raw, &root.entries)?;
+    if thread.value_kind != ValueKind::Object {
+        return Err(SideEffectError::MissingThread);
+    }
+    let thread_object = scan_object(raw, thread.value_start, MAX_SCANNED_TOKEN_BYTES)?;
+    if has_any_duplicate_key(&thread_object.entries, &["id", "ephemeral", "status"]) {
+        return Err(SideEffectError::UnsafeDuplicateKey);
+    }
+    let thread_id = extract_required_string(raw, &thread_object.entries, "id")
+        .map_err(|_| SideEffectError::MissingThread)?;
+    let ephemeral =
+        extract_optional_boolean(raw, &thread_object.entries, "ephemeral")?.unwrap_or(false);
+    let status = extract_thread_status(raw, &thread_object.entries)?;
+    let status = status
+        .get("type")
+        .and_then(|kind| kind.as_str())
+        .ok_or(SideEffectError::UnsupportedShape)?
+        .to_string();
+    Ok(AnsweredThreadStatus {
+        thread_id,
+        ephemeral,
+        status,
+    })
 }
 
 // ── extractThreadStartResponseCandidate (json-rpc-side-effects.ts:277-306) ───────────
@@ -1308,6 +1359,72 @@ mod tests {
             }
             other => panic!("expected ThreadStatusChanged, got {other:?}"),
         }
+    }
+
+    /// A `thread/start` / `thread/resume` answer's thread status is read at
+    /// any answer size (a resume answer carries the conversation's turns),
+    /// with the thread's ephemeral flag; an error answer or a thread with no
+    /// status reads nothing (Task 17 review M2).
+    #[test]
+    fn extracts_an_answers_thread_status_at_any_size() {
+        let answer = |thread: serde_json::Value| json!({ "id": 3, "result": { "thread": thread } });
+        let running = answer(json!({
+            "id": "t-run",
+            "ephemeral": false,
+            "status": { "type": "active", "activeFlags": [] },
+            "turns": [{ "id": "turn-1", "status": "inProgress" }],
+        }))
+        .to_string();
+        assert_eq!(
+            extract_answer_thread_status(running.as_bytes()).unwrap(),
+            AnsweredThreadStatus {
+                thread_id: "t-run".into(),
+                ephemeral: false,
+                status: "active".into(),
+            }
+        );
+
+        let history: Vec<serde_json::Value> = (0..40_000)
+            .map(|n| json!({ "id": format!("turn-{n}"), "status": "completed", "items": [] }))
+            .collect();
+        let oversized = answer(json!({
+            "id": "t-long",
+            "turns": history,
+            "status": { "type": "idle" },
+        }))
+        .to_string();
+        assert!(oversized.len() > crate::remote_proxy_envelope::MAX_FULL_PARSE_BYTES);
+        assert_eq!(
+            extract_answer_thread_status(oversized.as_bytes()).unwrap(),
+            AnsweredThreadStatus {
+                thread_id: "t-long".into(),
+                ephemeral: false,
+                status: "idle".into(),
+            },
+            "an answer too big for a full parse is still read"
+        );
+
+        let title =
+            answer(json!({ "id": "t-title", "ephemeral": true, "status": { "type": "idle" } }))
+                .to_string();
+        assert!(
+            extract_answer_thread_status(title.as_bytes())
+                .unwrap()
+                .ephemeral
+        );
+
+        let refused =
+            json!({ "id": 3, "error": { "code": -32600, "message": "no rollout found" } })
+                .to_string();
+        assert_eq!(
+            extract_answer_thread_status(refused.as_bytes()),
+            Err(SideEffectError::MissingThread)
+        );
+        let no_status = answer(json!({ "id": "t-x" })).to_string();
+        assert_eq!(
+            extract_answer_thread_status(no_status.as_bytes()),
+            Err(SideEffectError::UnsupportedShape)
+        );
     }
 
     #[test]

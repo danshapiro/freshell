@@ -449,6 +449,10 @@ function successResult(method, params, ctx = {}) {
     if (typeof behavior.threadResumeEphemeral === 'boolean') {
       thread.ephemeral = behavior.threadResumeEphemeral
     }
+    // Like Codex 0.162 (`resume_running_thread`), the answer carries the
+    // thread's live status: a thread already running a turn answers active.
+    const live = nativeRole?.statusFor(thread.id)
+    if (live) thread.status = live
     return {
       thread,
       cwd: params?.cwd ?? process.cwd(),

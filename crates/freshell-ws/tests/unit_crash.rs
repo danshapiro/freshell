@@ -398,6 +398,78 @@ async fn quitting_codex_while_a_turn_runs_keeps_the_agent_and_restarts_the_scree
     );
 }
 
+/// A turn already running before the pane's TUI attached to it (as in an
+/// app-server a restarted Freshell reclaims mid-turn: no client heard the
+/// turn start, and Codex announces nothing for a resume of a running
+/// thread) is seen through the resume answer's thread status, so a quit
+/// then keeps the agent and restarts the screen instead of ending the unit
+/// (Task 17 review M2).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_running_before_the_tui_attached_keeps_the_agent_when_codex_quits() {
+    let mut h = UnitHarness::start(HarnessOpts {
+        behavior: json!({
+            "preloadedThreads": ["t-mid"],
+            "preloadedTurns": ["t-mid"],
+            "turnCompleteDelayMs": 60000,
+        }),
+        auto_resume: AutoResumeMode::Capture,
+        ..Default::default()
+    })
+    .await;
+    let mut ws = h.connect().await;
+    let tid = h.create_codex(&mut ws, "crq-mid", Some("t-pane")).await;
+    ready(&h, &mut ws, &tid).await;
+    start_settled(&h, &tid).await;
+    let native = h.native_pid(&tid);
+    assert!(
+        !freshell_ws::unit_threads::turn_running(&h.state, &tid),
+        "no client heard the running turn start"
+    );
+
+    // The TUI attaches to the conversation that runs a turn.
+    h.send(
+        &mut ws,
+        json!({"type": "terminal.input", "terminalId": tid, "data": "resume t-mid\r"}),
+    )
+    .await;
+    let shown = ready(&h, &mut ws, &tid).await;
+    assert!(
+        shown["data"]
+            .as_str()
+            .unwrap()
+            .contains("FAKE_TUI_READY thread=t-mid"),
+        "{shown}"
+    );
+    h.send(
+        &mut ws,
+        json!({"type": "terminal.input", "terminalId": tid, "data": "quit\r"}),
+    )
+    .await; // the TUI exits 0
+    let next = h
+        .next_matching(&mut ws, LIMIT, |f| {
+            f["terminalId"] == tid.as_str()
+                && (f["type"] == "terminal.exit"
+                    || (f["type"] == "terminal.output"
+                        && f["data"]
+                            .as_str()
+                            .is_some_and(|d| d.contains("FAKE_TUI_READY"))))
+        })
+        .await
+        .expect("a restarted screen or the pane's exit");
+    assert_eq!(
+        next["type"], "terminal.output",
+        "the quit backgrounded the running turn and restarted the screen: {next}"
+    );
+    assert!(fake_codex::pid_alive(native), "the agent kept running");
+    assert_eq!(h.native_pid(&tid), native);
+    assert!(
+        exit_within(&h, &mut ws, &tid, Duration::from_secs(3))
+            .await
+            .is_none(),
+        "no terminal.exit"
+    );
+}
+
 /// A quit that stops the running turn first (an interrupt, then an
 /// immediate quit) is the user quitting Codex: the TUI exits 0 the moment it
 /// sees its turn end, and the whole unit ends, whether or not the router has

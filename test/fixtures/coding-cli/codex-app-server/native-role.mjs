@@ -368,6 +368,19 @@ export function createNativeRole({ behavior, codexHome, broadcast, hasRollout, m
       // Conversations opened earlier in the pane have had turns: on disk.
       materialize(id)
     }
+    // `preloadedTurns`: preloaded threads already mid-turn (of
+    // turnCompleteDelayMs) when the app-server starts, before any client
+    // connects, as in an app-server a restarted Freshell reclaims: no client
+    // heard the turn start, so only a resume answer's thread status says it
+    // runs. Its end is announced like any turn's.
+    for (const id of behavior.preloadedTurns ?? []) {
+      const turnId = `preloaded-turn-${id}`
+      void turnDelay(id, turnId, Number(behavior.turnCompleteDelayMs ?? 150)).then((status) => {
+        broadcast('thread/status/changed', { threadId: id, status: { type: 'idle' } })
+        broadcast('turn/completed', { threadId: id, turn: { id: turnId, status } })
+        turnEnded(id, turnId)
+      })
+    }
     if (behavior.spawnHelperProcess) spawnOwnGroupHelper()
     if (behavior.mcpChild) spawnMcpChild()
     writeManifest()
