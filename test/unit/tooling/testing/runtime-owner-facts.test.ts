@@ -1516,7 +1516,7 @@ else if(args[0]==='volume'){if(args[1]==='rm'){if(args[2]==='unrelated-volume')p
     } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); await fsp.rm(rig.runtime.testRoot, { recursive: true, force: true }) }
   })
 
-  it.each(['running', 'blocked stopped', 'stopped readonly WAL', 'retained failed Retry'] as const)(
+  it.each(['running', 'blocked stopped', 'stopped readonly WAL', 'retained failed Retry', 'failed before create'] as const)(
     'projects actual current repair SQLite records for %s and refuses absent or foreign operations', async (attempt) => {
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused batch reader web') }, fixtureRepoRoot, 3,
       {}, {}, 'test', { enabledProviders: [] }, undefined, { bootstrapProviders: [] })
@@ -1941,6 +1941,44 @@ os._exit(0)
               recoveryState: String(row.recovery_state), intentRevision: Number(row.intent_revision),
               nativeIdentityObservation: row.incarnation_id === resumed.incarnationId ? resumed.nativeIdentityObservation : undefined }))
         } finally { registry.close() }
+      }
+      if (attempt === 'failed before create') {
+        const failed = new DatabaseSync(database)
+        failed.exec("UPDATE souls SET recovery_state='blocked' WHERE soul_id='soul-0'; UPDATE incarnations SET launch_state='failed',container_id=NULL,host_boot_id=NULL,execution_generation=0; DELETE FROM writer_claims")
+        failed.close()
+        inventory.mockImplementation(async () => persistedInventory())
+        await fsp.writeFile(inspection, JSON.stringify([{ Id: root.containerId, State: { Running: false } }]))
+        read.mockClear()
+        const blockedObservation = await rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')
+        expect(blockedObservation.souls[0]).toMatchObject({ desiredState: 'running', recoveryState: 'blocked', activeWriters: 0 })
+        expect(blockedObservation.nativeObservations[0]).toEqual({ rootSessionId: root.rootSessionId,
+          canonicalSoulId: root.soulId, state: 'unavailable', reason: 'host_unavailable' })
+        expect(blockedObservation.installedStores[0]).toEqual(changedEdges.installedStores[0])
+        expect(read.mock.calls[0]).toEqual([root.containerId, ['inspect', root.containerId]])
+        expect(blockedObservation.faultMarkers.firstResumeObservationFailures).toEqual([])
+        const receipts = rig.runtime.broker.receipts()
+        vi.mocked(rig.runtime.broker.receipts).mockReturnValue(receipts.map(receipt =>
+          receipt.containerId === root.containerId ? { ...receipt, incarnationId: resumed.incarnationId } : receipt))
+        read.mockClear()
+        await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/exact.*receipt/)
+        expect(read).not.toHaveBeenCalled()
+        vi.mocked(rig.runtime.broker.receipts).mockReturnValue(receipts)
+        const failedView = persistedInventory()[0]
+        inventory.mockResolvedValue([{ ...failedView, containerId: resumed.containerId }])
+        await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/current/)
+        inventory.mockImplementation(async () => persistedInventory())
+        const writer = new DatabaseSync(database)
+        writer.prepare('INSERT INTO writer_claims VALUES(?,?,?,?,?,?)').run(root.soulId, 'opencode', root.providerStoreId,
+          root.rootSessionId, resumed.incarnationId, 2)
+        writer.close()
+        read.mockClear()
+        await expect(rig.syntheticStoppedRepairBatchObservation(batch.input.fixtureId, 'repair-current')).rejects.toThrow(/writer/)
+        expect(read).not.toHaveBeenCalled()
+        const retry = new DatabaseSync(database)
+        retry.prepare('UPDATE souls SET recovery_state=? WHERE soul_id=?').run('live', root.soulId)
+        retry.prepare('UPDATE incarnations SET launch_state=?,container_id=?,host_boot_id=?,execution_generation=?').run('running', resumed.containerId, resumed.hostBootId, 2)
+        retry.close()
+        inventory.mockResolvedValue([resumed])
       }
       if (attempt === 'blocked stopped') {
         const blocked = { ...resumed, launchState: 'stopped', recoveryState: 'blocked' }

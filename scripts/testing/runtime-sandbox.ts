@@ -4867,11 +4867,12 @@ export class ManagedRuntimeOwner {
         const current = currentIncarnations.find(current => current.soulId === soul.soulId)
         view = selectCurrentView(currentViews, current)
         if (!view || !current || view.incarnationId !== current.incarnationId
-          || view.containerId !== current.containerId || (view.hostBootId ?? null) !== current.hostBootId
+          || (view.containerId ?? null) !== current.containerId || (view.hostBootId ?? null) !== current.hostBootId
           || view.launchState !== current.launchState || view.executionGeneration !== current.executionGeneration
           || view.provider !== 'opencode' || view.nativeSessionId !== root.rootSessionId
           || view.intentRevision !== soul.intentRevision || view.desiredState !== soul.desiredState
           || view.recoveryState !== soul.recoveryState || soul.activeWriters > 1
+          || (!view.containerId && soul.activeWriters !== 0)
           || (view.launchState === 'stopped' && soul.activeWriters !== 0)
           || soul.writerClaims.some(writer => writer.soulId !== soul.soulId || writer.incarnationId !== current.incarnationId
             || writer.intentRevision !== soul.intentRevision || writer.provider !== 'opencode'
@@ -4969,14 +4970,18 @@ export class ManagedRuntimeOwner {
 
   private async readTask007InstalledStore(batch: Task007PreparedStoppedFixture,
     root: z.infer<typeof Task007RepairRecordsSchema>['roots'][number], view?: ManagedRuntimeView): Promise<SyntheticStoppedRepairBatchObservation['installedStores'][number]> {
+    // A failed pre-create incarnation has no enclosure. Its installed volume
+    // remains bound to the exact historical fixture receipt, independently of
+    // the current failed incarnation selected by the observation above.
+    const readerView = view?.containerId ? view : undefined
     const target = batch.output.targets.find(target => target.soulId === root.canonicalSoulId
       && target.providerStoreId === root.destinationStoreId && target.rootSessionId === root.rootSessionId)
-    const receipt = target && this.runtime.broker.receipts().find(receipt => receipt.containerId === (view?.containerId ?? target.containerId)
-      && receipt.soulId === target.soulId && receipt.incarnationId === (view?.incarnationId ?? target.incarnationId))
+    const receipt = target && this.runtime.broker.receipts().find(receipt => receipt.containerId === (readerView?.containerId ?? target.containerId)
+      && receipt.soulId === target.soulId && receipt.incarnationId === (readerView?.incarnationId ?? target.incarnationId))
     if (!target || !receipt || receipt.providerVolumeName !== target.providerVolumeName
       || receipt.imageRef !== this.runtime.imageRef || receipt.workspacePath !== batch.input.workspacePath
       || receipt.hostBinaryPath !== batch.input.hostBinaryPath) throw new Error('registered stopped store has no exact current-image receipt')
-    const state = z.array(z.object({ Id: z.literal(receipt.containerId), State: z.object({ Running: z.literal(view?.launchState === 'running') }) })).length(1)
+    const state = z.array(z.object({ Id: z.literal(receipt.containerId), State: z.object({ Running: z.literal(readerView?.launchState === 'running') }) })).length(1)
     state.parse(JSON.parse(await this.trackedDockerProbe(receipt.containerId, ['inspect', receipt.containerId])))
     const selected = { providerStoreId: root.destinationStoreId, nativeSessionId: root.rootSessionId,
       imageRef: this.runtime.imageRef, providerHome: '/home/freshell/provider', workspacePath: batch.input.workspacePath,
