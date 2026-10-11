@@ -127,13 +127,12 @@ pub struct PtyTerminal {
     /// [`ProcessStartReader`]) before its waiter thread can reap it, so
     /// `(pid, start)` names exactly the process this PTY spawned.
     start: Option<u64>,
-    /// Set by the waiter thread, under this lock, as it reaps the child:
-    /// while the lock is held and the flag is false the child is unreaped
-    /// (running or a zombie), so its pid cannot name another process.
-    /// (Windows kills through the process handle, which never names
-    /// another process.)
-    #[cfg_attr(not(unix), allow(dead_code))]
-    leader_reaped: Arc<Mutex<bool>>,
+    /// The child's reap, recorded by the waiter thread under this lock as
+    /// it reaps the child: while the lock is held and no exit code is
+    /// recorded the child is unreaped (running or a zombie), so its pid
+    /// cannot name another process. (Windows kills through the process
+    /// handle, which never names another process.)
+    leader: Arc<LeaderExit>,
     /// [`Self::signal_only_while_unreaped`]: `kill` signals the child and
     /// its process group only while the child is unreaped.
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -344,8 +343,8 @@ impl PtyTerminal {
             Arc::new(Mutex::new(Some(pair.master)));
         let waiter_master = Arc::clone(&master);
         let (code_tx, code_rx) = std::sync::mpsc::channel::<i64>();
-        let leader_reaped = Arc::new(Mutex::new(false));
-        let waiter_reaped = Arc::clone(&leader_reaped);
+        let leader = Arc::new(LeaderExit::default());
+        let waiter_leader = Arc::clone(&leader);
         let mut child = child;
         let waiter_thread = std::thread::spawn(move || {
             // The exit is seen without reaping first, so the reap below runs
@@ -355,15 +354,10 @@ impl PtyTerminal {
             if let Some(pid) = pid {
                 wait_exited_unreaped(pid);
             }
-            let code = {
-                let mut reaped = lock_ignoring_poison(&waiter_reaped);
-                let code = match child.wait() {
-                    Ok(status) => status.exit_code() as i64,
-                    Err(_) => 0,
-                };
-                *reaped = true;
-                code
-            };
+            let code = waiter_leader.reap(|| match child.wait() {
+                Ok(status) => status.exit_code() as i64,
+                Err(_) => 0,
+            });
             let _ = code_tx.send(code);
             if cfg!(windows) {
                 waiter_master.lock().expect("master mutex").take();
@@ -390,7 +384,7 @@ impl PtyTerminal {
             reaped: false,
             pid,
             start,
-            leader_reaped,
+            leader,
             pinned_kill: false,
         })
     }
@@ -435,6 +429,14 @@ impl PtyTerminal {
     /// [`mark_naturally_exited`](Self::mark_naturally_exited), like the pid).
     pub fn start_time(&self) -> Option<u64> {
         self.start
+    }
+
+    /// The child's exit code as its waiter thread records it when it reaps
+    /// the child: known as soon as the child is reaped, whether or not the
+    /// PTY stream has ended (a background job the child left can hold the
+    /// terminal open long after the child itself exited).
+    pub fn exit_code(&self) -> ChildExitCode {
+        ChildExitCode(Arc::clone(&self.leader))
     }
 
     pub fn stream_id(&self) -> &str {
@@ -499,9 +501,9 @@ impl PtyTerminal {
         if self.pinned_kill {
             // Held while signalling: the waiter cannot reap the child (and
             // free its pid) between the check and the signals.
-            let leader = Arc::clone(&self.leader_reaped);
-            let reaped = lock_ignoring_poison(&leader);
-            if !*reaped {
+            let leader = Arc::clone(&self.leader);
+            let reaped = lock_ignoring_poison(&leader.code);
+            if reaped.is_none() {
                 self.signal_child_and_group();
             }
             return;
@@ -564,6 +566,49 @@ impl PtyTerminal {
 /// panic too.
 fn lock_ignoring_poison<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A PTY child's reap: its exit code, recorded under the lock a pinned kill
+/// holds while it signals, and a condition variable for those waiting for
+/// it.
+#[derive(Default)]
+struct LeaderExit {
+    code: Mutex<Option<i64>>,
+    reaped: std::sync::Condvar,
+}
+
+impl LeaderExit {
+    /// Reaps the child under the lock (`reap` returns its exit code),
+    /// records the code and wakes every waiter.
+    fn reap(&self, reap: impl FnOnce() -> i64) -> i64 {
+        let code = {
+            let mut slot = lock_ignoring_poison(&self.code);
+            let code = reap();
+            *slot = Some(code);
+            code
+        };
+        self.reaped.notify_all();
+        code
+    }
+}
+
+/// A handle on a PTY child's exit code ([`PtyTerminal::exit_code`]).
+#[derive(Clone)]
+pub struct ChildExitCode(Arc<LeaderExit>);
+
+impl ChildExitCode {
+    /// The exit code once the child is reaped, waiting up to `limit` for
+    /// the reap (`None` if it has not happened by then). Blocks the calling
+    /// thread.
+    pub fn wait(&self, limit: std::time::Duration) -> Option<i64> {
+        let slot = lock_ignoring_poison(&self.0.code);
+        let (slot, _) = self
+            .0
+            .reaped
+            .wait_timeout_while(slot, limit, |code| code.is_none())
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot
+    }
 }
 
 /// Blocks until the child `pid` has exited, leaving it unreaped (`WNOWAIT`):

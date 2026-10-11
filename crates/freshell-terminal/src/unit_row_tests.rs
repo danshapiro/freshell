@@ -387,6 +387,7 @@ fn replace_screen_keeps_the_terminal_id_and_its_subscribers() {
                 main_is_screen: false,
                 ..placement(None)
             },
+            true,
         )
         .unwrap();
     let screen = Own::pin(pid2);
@@ -432,7 +433,13 @@ fn replace_screen_continues_the_output_sequence_at_the_current_geometry() {
         .max()
         .expect("the first screen printed");
     let pid = reg
-        .replace_screen("T6", &bash("stty size; sleep 30"), &env(), placement(None))
+        .replace_screen(
+            "T6",
+            &bash("stty size; sleep 30"),
+            &env(),
+            placement(None),
+            true,
+        )
         .unwrap();
     let _screen = Own::pin(pid);
     wait("second screen output", || {
@@ -472,24 +479,157 @@ fn screen_restarts_are_capped_per_liveness_window() {
     )
     .unwrap();
     wait("screen 0 exits", seen_exits(1));
-    reg.replace_screen("T7", &bash("exit 4"), &env(), placement(None))
+    reg.replace_screen("T7", &bash("exit 4"), &env(), placement(None), true)
         .expect("first quick restart");
     wait("screen 1 exits", seen_exits(2));
-    reg.replace_screen("T7", &bash("sleep 0.3; exit 4"), &env(), placement(None))
-        .expect("second quick restart");
+    reg.replace_screen(
+        "T7",
+        &bash("sleep 0.3; exit 4"),
+        &env(),
+        placement(None),
+        true,
+    )
+    .expect("second quick restart");
     wait("screen 2 exits after living 300 ms", seen_exits(3));
     let err = reg
-        .replace_screen("T7", &bash("exit 4"), &env(), placement(None))
+        .replace_screen("T7", &bash("exit 4"), &env(), placement(None), true)
         .expect_err("a third quick restart is over the cap");
     assert_eq!(err.to_string(), "respawn cap");
     assert!(!reg.respawn_exhausted("crq-cap"));
     reg.set_respawn_liveness_window_ms(100);
-    reg.replace_screen("T7", &bash("exit 4"), &env(), placement(None))
+    reg.replace_screen("T7", &bash("exit 4"), &env(), placement(None), true)
         .expect("a screen that outlived the window resets the count");
     assert!(
         !reg.respawn_exhausted("crq-cap"),
         "screen restarts never spend auto-resume's create-request budget"
     );
+}
+
+/// A restart that does not count (Codex's "quit, run in background": the
+/// agent goes on working, Stage 2: LB-40) neither adds to the quick-restart
+/// count nor meets the cap; counting restarts after it are capped as
+/// before.
+#[test]
+fn a_restart_that_does_not_count_leaves_the_cap_alone() {
+    let reg = TerminalRegistry::new();
+    reg.set_respawn_liveness_window_ms(60_000);
+    reg.set_respawn_generation_cap(1);
+    let got = record_screen_exits(&reg);
+    let seen_exits = |n: usize| {
+        let got = got.clone();
+        move || got.lock().unwrap().len() >= n
+    };
+    reg.create_in_unit(
+        &bash("exit 0"),
+        &env(),
+        "T7b".into(),
+        "S7b".into(),
+        "codex",
+        None,
+        Some("crq-bg"),
+        None,
+        None,
+        placement(None),
+    )
+    .unwrap();
+    wait("screen 0 exits", seen_exits(1));
+    for n in 1..=3 {
+        reg.replace_screen("T7b", &bash("exit 0"), &env(), placement(None), false)
+            .unwrap_or_else(|err| panic!("restart {n} that does not count: {err}"));
+        wait("the restarted screen exits", seen_exits(n + 1));
+    }
+    reg.replace_screen("T7b", &bash("exit 4"), &env(), placement(None), true)
+        .expect("the first counting quick restart is within the cap");
+    wait("the counted screen exits", seen_exits(5));
+    let err = reg
+        .replace_screen("T7b", &bash("exit 4"), &env(), placement(None), true)
+        .expect_err("a second counting quick restart is over the cap");
+    assert_eq!(err.to_string(), "respawn cap");
+}
+
+/// The exit code of a row's screen is known as soon as its process is
+/// reaped, even while a background job it left holds the terminal open, so
+/// the stream (and the screen-exit hook) never ends (Task 11 review M4: an
+/// agent whose screen is its main process).
+#[test]
+fn a_screens_exit_code_is_known_while_a_job_holds_its_terminal_open() {
+    let reg = TerminalRegistry::new();
+    let got = record_screen_exits(&reg);
+    assert_eq!(
+        reg.wait_screen_exit_code("T-none", Duration::from_millis(50)),
+        None,
+        "an unknown row has no screen"
+    );
+    reg.create_in_unit(
+        &bash("sleep 30"),
+        &env(),
+        "T-run".into(),
+        "S-run".into(),
+        "claude",
+        None,
+        None,
+        None,
+        None,
+        placement(None),
+    )
+    .map(Own::pin)
+    .map(|running| {
+        assert_eq!(
+            reg.wait_screen_exit_code("T-run", Duration::from_millis(200)),
+            None,
+            "a running screen has no exit code yet"
+        );
+        drop(running);
+    })
+    .unwrap();
+
+    let pid = reg
+        .create_in_unit(
+            &bash("trap '' HUP; sleep 30 & echo HOLDER=$!; exit 7"),
+            &env(),
+            "T-code".into(),
+            "S-code".into(),
+            "claude",
+            None,
+            None,
+            None,
+            None,
+            placement(None),
+        )
+        .unwrap();
+    let screen_start = stat(pid).map(|(_, start)| start);
+    let seen = attach_collector(&reg, "T-code");
+    wait("holder pid printed", || {
+        output_text(&seen).contains("HOLDER=") && output_text(&seen).ends_with('\n')
+    });
+    let holder_pid: u32 = output_text(&seen)
+        .split("HOLDER=")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse()
+                .ok()
+        })
+        .expect("the holder pid");
+    let holder = Own::pin(holder_pid);
+    wait(
+        "the screen itself exited",
+        || !matches!(stat(pid), Some((state, start)) if Some(start) == screen_start && state != 'Z'),
+    );
+    assert_eq!(
+        reg.wait_screen_exit_code("T-code", Duration::from_secs(5)),
+        Some(7)
+    );
+    assert!(holder.alive(), "the job still holds the terminal open");
+    assert!(
+        got.lock()
+            .unwrap()
+            .iter()
+            .all(|exit| exit.terminal_id != "T-code"),
+        "the stream never ended, so the screen-exit hook never ran"
+    );
+    holder.kill();
 }
 
 #[test]
@@ -597,7 +737,7 @@ fn kill_all_never_publishes_exit_for_unit_rows() {
         "the unit row stays until its unit ends"
     );
     let err = reg
-        .replace_screen("TU", &bash("sleep 30"), &env(), placement(None))
+        .replace_screen("TU", &bash("sleep 30"), &env(), placement(None), true)
         .expect_err("a row that is ending takes no new screen");
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     assert_eq!(reg.pid_of("TU"), None, "no new screen was started");
@@ -626,7 +766,7 @@ fn the_gone_hook_runs_once_at_complete_unit_end_never_at_a_screen_exit() {
     wait("first screen exits", || got.lock().unwrap().len() == 1);
     assert!(gone.lock().unwrap().is_empty(), "a screen exit is not Gone");
     let pid = reg
-        .replace_screen("T10", &bash("sleep 30"), &env(), placement(None))
+        .replace_screen("T10", &bash("sleep 30"), &env(), placement(None), true)
         .unwrap();
     let screen = Own::pin(pid);
     assert!(reg.mark_ending("T10", UnitEnding::AgentExited { exit_code: 5 }));
@@ -727,6 +867,7 @@ fn replacing_a_live_screen_is_refused() {
             &bash("echo SECOND; sleep 30"),
             &env(),
             placement(None),
+            true,
         )
         .expect_err("a live screen is never replaced");
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
@@ -752,6 +893,7 @@ fn replacing_a_live_screen_is_refused() {
             &bash("echo SECOND; sleep 30"),
             &env(),
             placement(None),
+            true,
         )
         .expect("an exited screen is replaced");
     let _second = Own::pin(second);
@@ -779,10 +921,10 @@ fn a_replacement_whose_spawn_failed_can_be_retried() {
     .unwrap();
     wait("first screen exits", || got.lock().unwrap().len() == 1);
     let missing_wrapper = placement(Some(vec!["/nonexistent/freshell-unit-wrapper".into()]));
-    reg.replace_screen("T11b", &bash("sleep 30"), &env(), missing_wrapper)
+    reg.replace_screen("T11b", &bash("sleep 30"), &env(), missing_wrapper, true)
         .expect_err("the wrapper does not exist");
     let pid = reg
-        .replace_screen("T11b", &bash("sleep 30"), &env(), placement(None))
+        .replace_screen("T11b", &bash("sleep 30"), &env(), placement(None), true)
         .expect("a failed spawn left no screen running, so a retry is admitted");
     let screen = Own::pin(pid);
     assert_eq!(reg.pid_of("T11b"), Some(pid));
@@ -812,7 +954,7 @@ fn a_replaced_screens_late_exit_never_touches_the_new_screen() {
     .unwrap();
     wait("first screen exits", || got.lock().unwrap().len() == 1);
     let second = reg
-        .replace_screen("T12", &bash("sleep 30"), &env(), placement(None))
+        .replace_screen("T12", &bash("sleep 30"), &env(), placement(None), true)
         .unwrap();
     let second = Own::pin(second);
     // Defence: the first screen's exit hook delivering again, late, as it
@@ -894,6 +1036,7 @@ fn a_replacement_racing_the_units_end_is_refused_and_its_screen_killed() {
                 &bash("echo $$ > \"$PID_FILE\"; exec sleep 30"),
                 &screen_env,
                 placement(None),
+                true,
             );
             let logs = logs.lock().unwrap().clone();
             (result, logs)
@@ -996,7 +1139,7 @@ fn unit_lifecycle_log_lines_carry_the_unit_keys() {
     wait("first screen exits", || got.lock().unwrap().len() == 1);
     let (logs, _guard) = tracing_capture::capture();
     let pid = reg
-        .replace_screen("T17", &bash("sleep 30"), &env(), placement(None))
+        .replace_screen("T17", &bash("sleep 30"), &env(), placement(None), true)
         .unwrap();
     let screen = Own::pin(pid);
     let replaced = unit_event(&logs, "terminal.screen_replaced");
@@ -1103,7 +1246,7 @@ fn a_new_screen_that_exits_before_it_is_installed_still_reaches_the_hook() {
     REPLACE_SCREEN_INTERLOCK.arm("T14");
     let replacing = reg.clone();
     let replace = std::thread::spawn(move || {
-        replacing.replace_screen("T14", &bash("exit 6"), &env(), placement(None))
+        replacing.replace_screen("T14", &bash("exit 6"), &env(), placement(None), true)
     });
     wait(
         "the replacement parked before installing its screen",

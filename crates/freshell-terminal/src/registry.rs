@@ -4435,6 +4435,30 @@ impl TerminalRegistry {
             .and_then(|p| p.start_time())
     }
 
+    /// The exit code of the row's current screen, as its PTY's waiter
+    /// recorded it when it reaped the screen, waiting up to `limit` for that
+    /// reap. Known as soon as the screen process is reaped, even while a
+    /// background job it left holds the terminal open (so its stream, and
+    /// the screen-exit hook, never end). `None` for an unknown row, a row
+    /// whose screen is no longer held, or a screen not reaped within
+    /// `limit`. Blocks the calling thread (no registry lock is held while it
+    /// waits).
+    pub fn wait_screen_exit_code(
+        &self,
+        terminal_id: &str,
+        limit: std::time::Duration,
+    ) -> Option<i64> {
+        let exit_code = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .get(terminal_id)
+                .and_then(|h| h.pty.as_ref())
+                .map(PtyTerminal::exit_code)
+        }?;
+        exit_code.wait(limit)
+    }
+
     /// The unit a row's screen belongs to; `None` for a plain or unknown row.
     pub fn unit_id_for(&self, terminal_id: &str) -> Option<String> {
         let shared = self.shared_for(terminal_id)?;
@@ -4616,10 +4640,14 @@ impl TerminalRegistry {
     /// taken: the old screen's reader has then reached end of stream, so no
     /// old output can arrive under the sequence numbers the new screen uses.
     ///
-    /// Per-row cap: when the screen being replaced lived at least the
-    /// respawn liveness window the restart count starts again at 1, when it
-    /// died sooner the count grows by 1, and a count above the respawn
-    /// generation cap fails with `respawn cap` without spawning. Auto-resume's
+    /// Per-row cap, for a restart that `counts_toward_cap` (a crash): when
+    /// the screen being replaced lived at least the respawn liveness window
+    /// the restart count starts again at 1, when it died sooner the count
+    /// grows by 1, and a count above the respawn generation cap fails with
+    /// `respawn cap` without spawning. A restart that does not count (the
+    /// agent goes on working after its screen quit, Stage 2: LB-40) leaves
+    /// the count as it is and is never refused by the cap; either way the
+    /// new screen's lifetime is measured from its own start. Auto-resume's
     /// create-request budget ([`Self::respawn_exhausted`]) is never touched.
     /// A replacement whose spawn fails still counts, and leaves the row
     /// ready for another replacement. If the row ends or an ending is marked
@@ -4634,9 +4662,10 @@ impl TerminalRegistry {
         spec: &SpawnSpec,
         env: &BTreeMap<String, String>,
         placement: UnitPlacement,
+        counts_toward_cap: bool,
     ) -> io::Result<u32> {
         let (wrapped, child_env) = wrap_for_unit(spec, env, &placement)?;
-        let (shared, reserved) = self.reserve_screen(terminal_id)?;
+        let (shared, reserved) = self.reserve_screen(terminal_id, counts_toward_cap)?;
         let ScreenReservation {
             stream_id,
             mode,
@@ -4750,12 +4779,13 @@ impl TerminalRegistry {
     }
 
     /// The first half of [`Self::replace_screen`], under the registry and
-    /// row locks: check that the row can take a new screen and the cap, and
-    /// reserve the next screen generation (so the new screen's exit is
-    /// recognised however early it comes).
+    /// row locks: check that the row can take a new screen and (for a
+    /// restart that counts) the cap, and reserve the next screen generation
+    /// (so the new screen's exit is recognised however early it comes).
     fn reserve_screen(
         &self,
         terminal_id: &str,
+        counts_toward_cap: bool,
     ) -> io::Result<(Arc<Mutex<TerminalShared>>, ScreenReservation)> {
         let inner = self.inner.lock().expect("registry lock");
         let handle = inner.terminals.get(terminal_id).ok_or_else(|| {
@@ -4797,16 +4827,21 @@ impl TerminalRegistry {
             return Err(refused("its screen has not exited"));
         }
         let now = now_ms();
-        let window = self.respawn_liveness_window_ms.load(Ordering::Relaxed);
-        let restarts = if now.saturating_sub(unit.screen_started_at) < window {
-            unit.quick_screen_restarts + 1
+        let restarts = if counts_toward_cap {
+            let window = self.respawn_liveness_window_ms.load(Ordering::Relaxed);
+            let restarts = if now.saturating_sub(unit.screen_started_at) < window {
+                unit.quick_screen_restarts + 1
+            } else {
+                1
+            };
+            let cap = self.respawn_generation_cap.load(Ordering::Relaxed).max(1) as u32;
+            if restarts > cap {
+                return Err(io::Error::other("respawn cap"));
+            }
+            restarts
         } else {
-            1
+            unit.quick_screen_restarts
         };
-        let cap = self.respawn_generation_cap.load(Ordering::Relaxed).max(1) as u32;
-        if restarts > cap {
-            return Err(io::Error::other("respawn cap"));
-        }
         unit.screen_generation += 1;
         unit.screen_started_at = now;
         unit.quick_screen_restarts = restarts;
