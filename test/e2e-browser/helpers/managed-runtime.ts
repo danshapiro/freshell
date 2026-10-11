@@ -5,6 +5,33 @@ import { resolveManagedExternalDescriptor } from '../../../scripts/testing/runti
 import { ExternalManagedRuntimeRig } from './external-managed-runtime.js'
 import { expect, type Page } from '@playwright/test'
 
+/** Open the indexed native session through the actual Projects history UI. */
+export async function openFreshHistorySession(page: Page, identity: {
+  repoRoot: string; provider: string; nativeSessionId: string
+}): Promise<void> {
+  const deadline = Date.now() + 60_000
+  const remaining = () => {
+    const timeout = deadline - Date.now()
+    if (timeout <= 0) throw new Error('history opening deadline expired')
+    return timeout
+  }
+  await page.getByRole('button', { name: /^Projects/ }).click({ timeout: remaining() })
+  const refresh = page.getByRole('button', { name: 'Refresh sessions', exact: true })
+  await refresh.click({ timeout: remaining() })
+  // Wait for refresh to finish before looking for the exact history row;
+  // a visible Sidebar row cannot stand in for indexed history.
+  await expect(refresh).toBeEnabled({ timeout: remaining() })
+  const project = page.locator('[data-context="history-project"][data-project-path=' + JSON.stringify(identity.repoRoot) + ']')
+  await expect(project).toBeVisible({ timeout: remaining() })
+  const history = page.locator('[data-context="history-session"][data-provider=' + JSON.stringify(identity.provider)
+    + '][data-session-id=' + JSON.stringify(identity.nativeSessionId) + ']')
+  if (!await history.isVisible()) {
+    await project.click({ timeout: remaining() })
+  }
+  await expect(history).toBeVisible({ timeout: remaining() })
+  await history.getByRole('button', { name: 'Open session', exact: true }).click({ timeout: remaining() })
+}
+
 /** Split the observed fresh pane through the actual browser menu within one finite action budget. */
 export async function splitFreshBrowserPane(page: Page, paneId: string): Promise<void> {
   const deadline = Date.now() + 30_000
