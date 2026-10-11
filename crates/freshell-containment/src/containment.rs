@@ -392,7 +392,11 @@ impl Fallback {
 /// server's own state root is reconciled at boot), so the units it created
 /// that are still recorded are killed first, then the root is removed.
 /// Synchronous and bounded (one sweep per such unit); a panic is contained
-/// here, never unwound into the C runtime. A server's own containment never
+/// here, never unwound into the C runtime. The sweep is unbounded only if a
+/// `/proc` read blocks on a process stuck in the kernel (the same exposure
+/// as the tag backend's in-process kills); it deliberately does not run on
+/// a thread with a deadline, since an exit mid-sweep would leave the
+/// members it had stopped stopped. A server's own containment never
 /// registers it: its running units outlive it by design.
 extern "C" fn stop_fallback_units_and_remove_root() {
     let Some(fallback) = FALLBACK.get() else {
