@@ -88,13 +88,20 @@ struct KnownThread {
 /// What the pane's unit holds of a known thread.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum Hold {
-    /// Nothing as an extra thread: the pane's main conversation, or a
-    /// thread whose extra hold [`release_for_main`] gave up.
+    /// Nothing as an extra thread: the pane's main conversation.
     #[default]
     None,
     /// An extra thread of the unit: its registry hold, unit record key and
     /// sidecar record entry are this table's to release.
     OnUnit,
+    /// Its extra hold was given up by [`release_for_main`] for a claim that
+    /// is to make it the pane's main conversation; the unit record and the
+    /// sidecar record still list it. A refused claim holds it again
+    /// ([`restore_extra`]). Codex unloading it meanwhile drops the entry and
+    /// forgets it from the records, unless the claim made it the pane's main
+    /// conversation. A committed claim leaves the mark, which then counts as
+    /// the main conversation's.
+    Released,
     /// Its extra hold was refused (another pane holds it, or its key was in
     /// a transition): the next announcement of the thread, or the read
     /// before a stop, tries again.
@@ -370,23 +377,40 @@ pub fn drop_thread(state: &WsState, terminal_id: &str, thread_id: &str) {
 }
 
 /// After `known` (the table's entry for `thread_id`, if there was one) left
-/// the table: the lock paths follow, and an extra hold leaves the unit.
+/// the table: the lock paths follow, and an extra hold leaves the unit. A
+/// hold [`release_for_main`] already gave up leaves the records, unless its
+/// claim made the thread the pane's main conversation; the claim's restore
+/// then finds no entry and holds nothing.
 fn forget_known(state: &WsState, terminal_id: &str, thread_id: &str, known: Option<KnownThread>) {
     let Some(known) = known else {
         return;
     };
     refresh_lock_paths(state, terminal_id);
-    if known.hold == Hold::OnUnit {
-        if let Some(entry) = state.units.by_terminal(terminal_id) {
-            release_from_unit(state, &entry, terminal_id, thread_id);
-        }
+    let leave: fn(&WsState, &UnitEntry, &str, &str) = match known.hold {
+        Hold::OnUnit => release_from_unit,
+        Hold::Released if !is_main(state, terminal_id, thread_id) => forget_from_records,
+        _ => return,
+    };
+    if let Some(entry) = state.units.by_terminal(terminal_id) {
+        leave(state, &entry, terminal_id, thread_id);
     }
 }
 
 fn release_from_unit(state: &WsState, entry: &UnitEntry, terminal_id: &str, thread_id: &str) {
+    release_hold(state, entry, thread_id);
+    forget_from_records(state, entry, terminal_id, thread_id);
+}
+
+/// Gives up the unit's extra hold of `thread_id` in the owner registry.
+fn release_hold(state: &WsState, entry: &UnitEntry, thread_id: &str) {
     if let Some(ownership) = state.ownership.as_ref() {
         ownership.release_extra(CODEX, thread_id, entry.unit.id().as_str());
     }
+}
+
+/// Removes `thread_id` from the unit record's conversation keys and from
+/// the sidecar record.
+fn forget_from_records(state: &WsState, entry: &UnitEntry, terminal_id: &str, thread_id: &str) {
     entry.unit.forget_conversation(CODEX, thread_id);
     write_record(state, terminal_id, RecordOp::Forget(thread_id.to_string()));
 }
@@ -661,7 +685,9 @@ impl LockRead {
 /// commits it as the pane's main conversation (a claim on a key the pane
 /// already holds would only adopt it, leaving it an extra hold, and a
 /// rebind would then release the original instead of aliasing it). Returns
-/// whether a hold was released; [`restore_extra`] puts it back when the
+/// whether a hold was released; the thread stays in the table (its lock
+/// stays in the lock paths: the app-server still holds it), marked
+/// [`Hold::Released`], and [`restore_extra`] puts the hold back when the
 /// claim is refused. Only a hold the unit has is touched: a refused hold
 /// stays marked refused, so a refused claim leaves it to be tried again
 /// (its caller restores nothing, since nothing was released).
@@ -669,7 +695,7 @@ pub(crate) fn release_for_main(state: &WsState, terminal_id: &str, thread_id: &s
     let released = with_existing_table(state, terminal_id, |table| {
         match table.threads.get_mut(thread_id) {
             Some(known) if known.hold == Hold::OnUnit => {
-                known.hold = Hold::None;
+                known.hold = Hold::Released;
                 true
             }
             _ => false,
@@ -679,33 +705,73 @@ pub(crate) fn release_for_main(state: &WsState, terminal_id: &str, thread_id: &s
     if !released {
         return false;
     }
-    if let (Some(ownership), Some(entry)) = (
-        state.ownership.as_ref(),
-        state.units.by_terminal(terminal_id),
-    ) {
-        ownership.release_extra(CODEX, thread_id, entry.unit.id().as_str());
+    if let Some(entry) = state.units.by_terminal(terminal_id) {
+        release_hold(state, &entry, thread_id);
     }
     true
 }
 
 /// A claim [`release_for_main`] prepared was refused: the thread, which the
-/// app-server still holds, is held as an extra thread again, keeping the
-/// status it last reported (a turn it runs still counts for
-/// [`turn_running`]). When that is refused too (another pane, or another
-/// transition, took the key in the meantime) the thread is not left unheld
-/// for good: WARN `unit.thread_restore_refused`, and its next announcement,
-/// or the read before a stop, tries again.
+/// app-server still holds, is held as an extra thread again. Only the entry
+/// that release marked is restored, in place, so it keeps the status it last
+/// reported (a turn it runs still counts for [`turn_running`]). When Codex
+/// unloaded the thread while the claim was in flight, its entry was dropped
+/// (and the drop forgot it from the records), so nothing is held again; when
+/// it was announced again since, its new entry already holds what it can.
+/// When the hold is refused (another pane, or another transition, took the
+/// key in the meantime) the thread is not left unheld for good: WARN
+/// `unit.thread_restore_refused`, it is marked refused, and its next
+/// announcement, or the read before a stop, tries again.
 pub(crate) fn restore_extra(state: &WsState, terminal_id: &str, thread_id: &str) {
-    let status = with_existing_table(state, terminal_id, |table| table.threads.remove(thread_id))
-        .flatten()
-        .and_then(|known| known.status);
-    if note_with_status(state, terminal_id, thread_id, status.as_deref()) != Hold::Refused {
+    /// Where the hold taken was settled.
+    enum Restore {
+        /// On the entry [`release_for_main`] marked.
+        Settled,
+        /// Nowhere: the thread was dropped and announced again meanwhile.
+        Replaced,
+        /// Nowhere: the thread was dropped meanwhile.
+        Dropped,
+    }
+    let released = with_existing_table(state, terminal_id, |table| {
+        table
+            .threads
+            .get(thread_id)
+            .is_some_and(|known| known.hold == Hold::Released)
+    });
+    if released != Some(true) {
         return;
     }
-    if let Some(entry) = state.units.by_terminal(terminal_id) {
-        thread_event!(warn, &entry, terminal_id, "unit.thread_restore_refused",
-            thread_id = %thread_id,
-            "a thread the pane's app-server holds could not be held again after a refused claim; its next announcement or the read before a stop tries again");
+    let Some(entry) = state.units.by_terminal(terminal_id) else {
+        return;
+    };
+    let hold = if is_main(state, terminal_id, thread_id) {
+        Hold::None
+    } else {
+        hold_as_extra(state, &entry, terminal_id, thread_id, Attempt::First)
+    };
+    // The hold is settled only on the entry the release marked.
+    let settled = with_existing_table(state, terminal_id, |table| {
+        match table.threads.get_mut(thread_id) {
+            Some(known) if known.hold == Hold::Released => {
+                known.hold = hold;
+                Restore::Settled
+            }
+            Some(_) => Restore::Replaced,
+            None => Restore::Dropped,
+        }
+    })
+    .unwrap_or(Restore::Dropped);
+    match (settled, hold) {
+        (Restore::Settled, Hold::Refused) => {
+            thread_event!(warn, &entry, terminal_id, "unit.thread_restore_refused",
+                thread_id = %thread_id,
+                "a thread the pane's app-server holds could not be held again after a refused claim; its next announcement or the read before a stop tries again")
+        }
+        // Unloaded while it was being held again: the drop forgot it from
+        // the records, and the hold just taken goes too. (A new entry, from
+        // an announcement since, relies on the hold: it is kept.)
+        (Restore::Dropped, Hold::OnUnit) => release_hold(state, &entry, thread_id),
+        _ => {}
     }
 }
 
@@ -1032,6 +1098,73 @@ mod tests {
         assert!(
             turn_running(&state, TERMINAL),
             "the restored thread's running turn still counts"
+        );
+    }
+
+    /// Whether the terminal's table knows `thread_id` (the unit's lock paths
+    /// list every thread it knows).
+    fn known(state: &WsState, thread_id: &str) -> bool {
+        state
+            .units
+            .threads
+            .lock()
+            .get(TERMINAL)
+            .is_some_and(|table| table.threads.contains_key(thread_id))
+    }
+
+    /// Task 14 fix 3: Codex unloads a thread (`notLoaded`, or a title thread
+    /// found ephemeral) while a claim that was to make it the pane's
+    /// conversation is in flight on a disk association lane. The refused
+    /// claim's restore does not hold it again: the unit holds it nowhere (no
+    /// registry hold, no unit record key, no table entry for the lock paths),
+    /// so a reopen of it elsewhere is not sent to this pane.
+    #[tokio::test]
+    async fn a_thread_unloaded_during_a_refused_claim_is_not_held_again() {
+        let (state, containment) = state_with_unit();
+        for (thread_id, unload) in [("t-x", "notLoaded"), ("t-y", "ephemeral")] {
+            observe_status(&state, TERMINAL, thread_id, "active");
+            assert!(held_as_extra(&state, thread_id));
+            assert!(recorded_conversation(&containment, thread_id));
+            assert!(release_for_main(&state, TERMINAL, thread_id));
+            match unload {
+                "notLoaded" => observe_status(&state, TERMINAL, thread_id, NOT_LOADED),
+                _ => note_ephemeral(&state, TERMINAL, thread_id),
+            }
+            restore_extra(&state, TERMINAL, thread_id);
+            assert!(
+                vacant(&state, thread_id),
+                "{thread_id} ({unload}) is not held again after the refused claim"
+            );
+            assert!(
+                !recorded_conversation(&containment, thread_id),
+                "{thread_id} ({unload}) leaves the unit record"
+            );
+            assert!(
+                !known(&state, thread_id),
+                "{thread_id} ({unload}) leaves the table and so the lock paths"
+            );
+        }
+        assert!(
+            !turn_running(&state, TERMINAL),
+            "an unloaded thread's turn no longer counts"
+        );
+    }
+
+    /// Task 14 fix 3: once the claim commits, the released thread is the
+    /// pane's main conversation, and Codex unloading it later leaves its
+    /// unit record key, as it does for any main conversation.
+    #[tokio::test]
+    async fn a_claimed_thread_unloaded_later_keeps_its_main_record() {
+        let (state, containment) = state_with_unit();
+        observe_status(&state, TERMINAL, "t-x", "active");
+        assert!(release_for_main(&state, TERMINAL, "t-x"));
+        state
+            .identity
+            .upsert(TERMINAL, Some(CODEX), Some("t-x"), None, 0);
+        observe_status(&state, TERMINAL, "t-x", NOT_LOADED);
+        assert!(
+            recorded_conversation(&containment, "t-x"),
+            "the pane's main conversation stays in the unit record"
         );
     }
 
