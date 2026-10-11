@@ -15,7 +15,7 @@ import {
 } from '../../../scripts/testing/fresh-agent-qualification-selection.js'
 import { FRESH_AGENT_QUALIFICATION_LIVE_ENV } from '../../../scripts/testing/runtime-fresh-agent-qualification.js'
 import { test } from '../helpers/fixtures.js'
-import { createManagedRuntimeBrowserRig, splitFreshBrowserPane, observeFreshMcpIngress, type ManagedRuntimeView, type ManagedFixtureRig } from '../helpers/managed-runtime.js'
+import { createManagedRuntimeBrowserRig, openFreshHistorySession, splitFreshBrowserPane, observeFreshMcpIngress, type ManagedRuntimeView, type ManagedFixtureRig } from '../helpers/managed-runtime.js'
 import { observeOwnedFreshBrowserPane, stageOwnedFreshBrowserProfile } from '../../../scripts/testing/runtime-external-browser.js'
 import { TestHarness } from '../helpers/test-harness.js'
 
@@ -185,13 +185,7 @@ async function qualify(page: Page, rig: ManagedFixtureRig, definition: Definitio
   }
 
   const historyCursor = wire.sent.length
-  await page.getByRole('button', { name: /^Projects/ }).click()
-  await page.getByRole('button', { name: 'Refresh sessions' }).click()
-  const project = page.locator('[data-project-path]').filter({ hasText: rig.repoRoot }).last()
-  if (!await page.locator('[data-session-id="' + main.nativeSessionId + '"]').isVisible().catch(() => false)) await project.click()
-  const history = page.locator('[data-session-id="' + main.nativeSessionId + '"]')
-  await expect(history).toBeVisible({ timeout: 60_000 })
-  await history.getByRole('button', { name: /^Open session/ }).first().click()
+  await openFreshHistorySession(page, { repoRoot: rig.repoRoot, provider: definition.provider, nativeSessionId: main.nativeSessionId! })
   const historyPane = await paneFor(page, initial.paneObservation)
   const historyRequest = await waitFor('actual history resume route', () => wire.sent.slice(historyCursor).find(frame =>
     frame.type === 'freshAgent.create' && frame.sessionRef?.sessionId === main.nativeSessionId
