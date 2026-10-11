@@ -966,6 +966,60 @@ async function publishControllerPreparation(directory: string, input: Pick<Prepa
 }
 
 describe('fixed indexed publisher broker',()=>{
+  it.each(['exited', 'running', 'foreign-owner', 'changed-image', 'changed-host', 'foreign-capability'] as const)(
+    'qualifies a replacement publication against its retained owner (%s)', async (state) => {
+      await withHttpBroker(async ({ directory, request, forwarded, broker: instance, setRuntimeRunning }) => {
+        const artifact = Buffer.from('replacement owned host artifact')
+        const owner = { ...sourceAuthorization(), hostBinaryPath: path.join(directory, 'freshell-session-host'),
+          binarySha256: createHash('sha256').update(artifact).digest('hex') }
+        await fs.writeFile(owner.hostBinaryPath, artifact)
+        instance.authorizeInitialProviderVolume(owner)
+        const priorRuntime = path.join(directory, 'r/scenario/incarnation-one')
+        const actor = path.join(path.dirname(priorRuntime), 'souls',
+          createHash('sha256').update(`${owner.installationId}\0${owner.soulId}`).digest('hex'), 'actor')
+        const prior = JSON.parse(createBody([
+          `${owner.hostBinaryPath}:/runtime/freshell-session-host:ro`,
+          `${priorRuntime}:/run/freshell:rw`, `${owner.providerVolumeName}:/home/freshell/provider:rw`,
+          '/workspace:/workspace:rw', `${actor}:/run/freshell-host-actor:rw`,
+        ]).toString())
+        prior.Labels['com.freshell.soul-id'] = owner.soulId
+        expect((await request('POST', '/v1.47/containers/create?name=retained-runtime', prior)).status).toBe(201)
+        expect(instance.receipts()).toMatchObject([{ containerId: ownedId, soulId: owner.soulId,
+          incarnationId: 'incarnation-one', providerVolumeName: owner.providerVolumeName }])
+
+        const generationId = 'grant-55555555-5555-4555-8555-555555555555'
+        const input = { ...publisherAuthorization(), soulId: owner.soulId, incarnationId: 'incarnation-two',
+          generationId, hostBinaryPath: owner.hostBinaryPath, providerVolumeName: owner.providerVolumeName,
+          stageRoot: path.join(directory, 'scenarios/scenario/control/provider-roots', generationId),
+          configurationBinds: [], resourceMounts: [], indexedSecretSources: [],
+          indexedFiles: { volumeName: `freshell-inputs-${createHash('sha256').update(`${owner.soulId}\0${generationId}`).digest('hex').slice(0, 24)}`, aliases: [] } }
+        const publication = await publishControllerPreparation(directory, input, '', 'codex')
+        // Replacement producer publications have no initial reservation; their
+        // authority is the exact quiescent retained runtime, not the old tuple.
+        const context = publication.context as Record<string, any>
+        delete context.preparedInputs.initialAuthReservation
+        await fs.writeFile(path.join(publication.metadata, 'prepared-context.json'), JSON.stringify(context))
+        await fs.writeFile(path.join(publication.metadata, 'prepared-result.json'), JSON.stringify({
+          providerLaunchContext: context, providerSecretReferences: [],
+        }))
+        const capabilityPath = path.join(publication.capabilities, `${generationId}.json`)
+        const capability = JSON.parse(await fs.readFile(capabilityPath, 'utf8'))
+        capability.incarnationId = state === 'foreign-capability' ? 'foreign-incarnation' : input.incarnationId
+        await fs.writeFile(capabilityPath, JSON.stringify(capability))
+        setRuntimeRunning(state === 'running')
+        const upstreamPrior = forwarded.find(operation => operation.url.includes('name=retained-runtime'))!.body
+        if (state === 'foreign-owner') upstreamPrior.Labels['com.freshell.soul-id'] = 'foreign'
+        if (state === 'changed-image') upstreamPrior.Image = 'sha256:other-approved-image'
+        if (state === 'changed-host') await fs.writeFile(owner.hostBinaryPath, 'changed artifact')
+        const result = await request('POST', '/v1.47/volumes/create', {
+          Name: input.indexedFiles.volumeName, Driver: 'local', DriverOpts: indexedOptions, Labels: publisherLabels(input),
+        })
+        expect(result.status, JSON.stringify(instance.eventsSnapshot().slice(-3))).toBe(state === 'exited' ? 201 : 403)
+        const published = forwarded.filter(operation => operation.url === '/v1.47/volumes/create')
+        expect(published).toHaveLength(state === 'exited' ? 1 : 0)
+      }, undefined, true)
+    },
+  )
   it('probes actual candidate absence before creation only with a qualified owned publication', async () => {
     await withHttpBroker(async ({ directory, request, forwarded, broker: instance, replaceCandidateVolumeInspection, clearCandidateVolumeInspection }) => {
       const input = candidateAuthorization()
