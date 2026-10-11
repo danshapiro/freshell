@@ -11,6 +11,13 @@ export async function observeManagedEnvironmentNativeIdentity(
   owner: Pick<ManagedRuntimeBrowserRig, 'inventory' | 'runtime' | 'supervisor'>,
   terminalId: string, nativeSessionId: string,
 ) {
+  const current = (await owner.inventory()).find(row => row.terminalId === terminalId
+    && row.launchState === 'running')
+  if (!current) return
+  // Native identity is published by the existing authenticated output reader;
+  // inventory alone only returns the stored registry snapshot.
+  await owner.runtime.adminOk(owner.supervisor,
+    owner.runtime.terminalReadOutputBody(current.soulId, 0, 64 * 1024))
   return (await owner.inventory()).find(row => row.terminalId === terminalId
     && row.nativeSessionId === nativeSessionId && row.launchState === 'running')
 }
