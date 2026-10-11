@@ -30,7 +30,10 @@
 //! `thread/status/changed` is a status (an unseen id's first one announces
 //! it; `notLoaded` unloads it); `thread/closed` drops it. `systemError` never
 //! drops a thread (it is still loaded and holds its lock), and `turn/started`
-//! is not a source.
+//! is not a source. The thread status a `thread/resume` or `thread/start`
+//! answer carries is a status too (Task 17 review M2): Codex announces
+//! nothing when a client resumes a thread already loaded, so a turn already
+//! running when the pane's TUI reattaches is learnt from that answer.
 
 use std::path::Path;
 
@@ -99,6 +102,12 @@ pub(crate) fn thread_change_of(event: &RemoteProxyEvent) -> Option<ThreadChange>
         }
         RemoteProxyEvent::ThreadsReferenced { thread_ids } => {
             Some(ThreadChange::Noted(thread_ids.clone()))
+        }
+        RemoteProxyEvent::ThreadStatusReported { thread_id, status } => {
+            Some(ThreadChange::Status {
+                thread_id: thread_id.clone(),
+                status: status.clone(),
+            })
         }
         _ => None,
     }
@@ -193,7 +202,8 @@ async fn route_event(
         }
         RemoteProxyEvent::ThreadStarted(_)
         | RemoteProxyEvent::ThreadLifecycle(_)
-        | RemoteProxyEvent::ThreadsReferenced { .. } => {
+        | RemoteProxyEvent::ThreadsReferenced { .. }
+        | RemoteProxyEvent::ThreadStatusReported { .. } => {
             // The thread table takes these (`thread_change_of`).
             tracing::debug!(terminal_id = %terminal_id, "codex_proxy_lifecycle_event");
         }
@@ -939,6 +949,55 @@ mod tests {
                 "t-b".to_string()
             ]))
         );
+    }
+
+    /// The thread status a `thread/resume` or `thread/start` answer carries
+    /// reaches the pane's thread table: a turn already running when the
+    /// pane's TUI reattached (Codex announces nothing for a resume of a
+    /// loaded thread) counts for the quit rule (Task 17 review M2).
+    #[tokio::test]
+    async fn an_answered_thread_status_reaches_the_panes_table() {
+        let state = test_state();
+        let unit = state
+            .units
+            .containment
+            .create_unit(
+                freshell_containment::UnitId::mint(),
+                freshell_containment::UnitLabel {
+                    provider: "codex".into(),
+                    session_id: Some("t-pane".into()),
+                    terminal_id: Some("term-answer".into()),
+                    mode: "codex".into(),
+                    create_request_id: None,
+                },
+            )
+            .expect("a unit");
+        state.units.register(freshell_containment::UnitEntry {
+            unit,
+            provider: "codex".into(),
+            mode: "codex".into(),
+            create_request_id: None,
+            terminal_id: Some("term-answer".into()),
+        });
+        let answered = |status: &str| RemoteProxyEvent::ThreadStatusReported {
+            thread_id: "t-run".to_string(),
+            status: status.to_string(),
+        };
+        assert_eq!(
+            thread_change_of(&answered("active")),
+            Some(ThreadChange::Status {
+                thread_id: "t-run".to_string(),
+                status: "active".to_string(),
+            })
+        );
+        assert!(!crate::unit_threads::turn_running(&state, "term-answer"));
+        route_proxy_event(&state, tagged("term-answer", answered("active"))).await;
+        assert!(
+            crate::unit_threads::turn_running(&state, "term-answer"),
+            "the answer says a turn runs"
+        );
+        route_proxy_event(&state, tagged("term-answer", answered("idle"))).await;
+        assert!(!crate::unit_threads::turn_running(&state, "term-answer"));
     }
 
     #[test]

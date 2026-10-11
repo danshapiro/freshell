@@ -61,14 +61,15 @@ use crate::remote_proxy_envelope::{
     MAX_RAW_FORWARD_BYTES,
 };
 use crate::remote_proxy_side_effects::{
-    extract_fork_response_candidate, extract_fs_changed_repair_trigger,
-    extract_initialize_codex_home, extract_spawn_agent_receiver_thread_ids,
-    extract_thread_lifecycle_event, extract_thread_name_set_request,
-    extract_thread_start_response_candidate, extract_thread_started_notification_side_effects,
-    extract_turn_notification_event, extract_upstream_thread_name_updated,
-    normalize_thread_fork_response_for_tui, rewrite_thread_fork_request_exclude_turns,
-    ForkResponseOptions, RemoteProxyCandidate, ThreadLifecycleEvent, ThreadStartResponseOptions,
-    ThreadStartedLifecycle, TurnEvent as SideEffectTurnEvent,
+    extract_answer_thread_status, extract_fork_response_candidate,
+    extract_fs_changed_repair_trigger, extract_initialize_codex_home,
+    extract_spawn_agent_receiver_thread_ids, extract_thread_lifecycle_event,
+    extract_thread_name_set_request, extract_thread_start_response_candidate,
+    extract_thread_started_notification_side_effects, extract_turn_notification_event,
+    extract_upstream_thread_name_updated, normalize_thread_fork_response_for_tui,
+    rewrite_thread_fork_request_exclude_turns, ForkResponseOptions, RemoteProxyCandidate,
+    ThreadLifecycleEvent, ThreadStartResponseOptions, ThreadStartedLifecycle,
+    TurnEvent as SideEffectTurnEvent,
 };
 
 /// Upstream notification methods that get side-effect extraction
@@ -294,6 +295,16 @@ pub enum RemoteProxyEvent {
     WriterConflict {
         thread_id: String,
         message: String,
+    },
+    /// Task 17 review M2: an answer to the TUI's `thread/start` or
+    /// `thread/resume` carried its (non-ephemeral) thread's current status
+    /// type (`result.thread.status.type`). Codex announces nothing when a
+    /// client resumes a thread already loaded (a reattach to an app-server
+    /// mid-turn), so this is how a turn already running is learnt. Emitted
+    /// before the answer is relayed, for an answer of any size.
+    ThreadStatusReported {
+        thread_id: String,
+        status: String,
     },
 }
 
@@ -1340,6 +1351,9 @@ impl Hub {
                 self.handle_thread_start_response(conn_id, data, binary, req_id);
                 return;
             }
+            if method.as_deref() == Some("thread/resume") {
+                self.report_answered_thread_status(&data);
+            }
             if method.as_deref() == Some("thread/fork") || fork_request.is_some() {
                 self.handle_thread_fork_response(
                     conn_id,
@@ -1485,6 +1499,7 @@ impl Hub {
                     self.emit(RemoteProxyEvent::Candidate(candidate));
                 }
             }
+            self.report_answered_thread_status(&data);
             self.send_to_client(conn_id, data, binary);
             return;
         }
@@ -1507,6 +1522,7 @@ impl Hub {
         ) {
             Ok(candidate) => {
                 self.emit(RemoteProxyEvent::Candidate(candidate));
+                self.report_answered_thread_status(&data);
                 self.send_to_client(conn_id, data, binary);
             }
             Err(reason) => {
@@ -1515,6 +1531,21 @@ impl Hub {
                     Some("thread/start"),
                     &format!("{reason:?}"),
                 );
+            }
+        }
+    }
+
+    /// Emits [`RemoteProxyEvent::ThreadStatusReported`] for the
+    /// non-ephemeral thread an answer to `thread/start` or `thread/resume`
+    /// carries with a status; an error answer, or one with no status,
+    /// reports nothing.
+    fn report_answered_thread_status(&self, answer: &[u8]) {
+        if let Ok(answered) = extract_answer_thread_status(answer) {
+            if !answered.ephemeral {
+                self.emit(RemoteProxyEvent::ThreadStatusReported {
+                    thread_id: answered.thread_id,
+                    status: answered.status,
+                });
             }
         }
     }
