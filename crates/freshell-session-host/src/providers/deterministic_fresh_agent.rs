@@ -180,11 +180,18 @@ impl DeterministicFreshAgentTransport {
         .map_err(non_ambiguous)?;
         // The same completed turn is now saved under this native identity.
         // The existing proxy binds previousSessionId to its presentation ID.
+        let (wire_provider, session_type) = match self.provider {
+            FreshProvider::Claude => ("claude", "freshclaude"),
+            FreshProvider::Kilroy => ("claude", "kilroy"),
+            FreshProvider::Codex => ("codex", "freshcodex"),
+            FreshProvider::Opencode => ("opencode", "freshopencode"),
+        };
         self.event_tx
             .send(AgentEvent::Provider {
                 payload: json!({
                     "type":"freshAgent.session.materialized",
-                    "provider":self.provider.as_str(),
+                    "provider":wire_provider,
+                    "sessionType":session_type,
                     "previousSessionId":native_session_id,
                     "sessionId":native_session_id,
                 }),
@@ -916,6 +923,13 @@ mod tests {
             assert_eq!(saved["threadId"], native_id);
             for event in [materialized, assistant, completed] {
                 assert_eq!(provider_events[event]["sessionId"], saved["threadId"]);
+            }
+            assert_eq!(provider_events[materialized]["provider"], saved["provider"]);
+            assert_eq!(
+                provider_events[materialized]["sessionType"],
+                saved["sessionType"]
+            );
+            for event in [assistant, completed] {
                 assert_eq!(provider_events[event]["provider"], provider.as_str());
             }
             assert_eq!(
