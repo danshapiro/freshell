@@ -17,6 +17,7 @@ import { resolvePairedExternalFixture } from './e2e-external-target.js'
 const cloudflaredVersion = '2026.10.0'
 const cloudflaredSha = 'd33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db'
 const scenarios = ['healthy', 'missing-reference', 'startup-before-identity'] as const
+const ordinaryFixtureMode = 'managed-fixture-ordinary'
 const delay = (milliseconds: number) => new Promise(resolve => setTimeout(resolve, milliseconds))
 const digest = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex')
 
@@ -129,6 +130,15 @@ async function configure(root: string, nonce: string, candidateSha: string, runI
   await fs.mkdir(path.join(xdg, 'opencode'), { recursive: true, mode: 0o755 })
   await fs.chmod(home, 0o700)
   await fs.chmod(root, 0o751)
+  // Register a known CLI without a managed adapter through the normal HOME
+  // extension scan. Shell uses the managed facade when a controller is present;
+  // this mode reaches the ordinary registry.create refusal instead.
+  const ordinaryExtension = path.join(home, '.freshell/extensions', ordinaryFixtureMode)
+  await fs.mkdir(ordinaryExtension, { recursive: true, mode: 0o700 })
+  await writeJson(path.join(ordinaryExtension, 'freshell.json'), {
+    name: ordinaryFixtureMode, version: '1.0.0', label: 'Ordinary terminal fixture',
+    description: 'Owned ordinary terminal refusal fixture', category: 'cli', cli: { command: '/bin/false' },
+  })
   await fs.writeFile(path.join(plugin, 'node_modules/managed-fixture-dependency/package.json'), '{"type":"module","exports":"./index.mjs"}')
   await fs.writeFile(path.join(plugin, 'node_modules/managed-fixture-dependency/index.mjs'), `export default ${JSON.stringify(nonce)};`)
   await fs.writeFile(path.join(plugin, 'selected-resource'), nonce, { mode: 0o600 })
@@ -267,7 +277,7 @@ export async function runManagedEnvironmentTarget() {
       assert(JSON.stringify(refused).includes('managed environment fixture denies host PTY'))
     }
     const fallback = await fetch(`${rig.info.baseUrl}/api/tabs`, { method: 'POST', headers: { 'x-auth-token': rig.info.token,
-      'content-type': 'application/json' }, body: JSON.stringify({ mode: 'shell', cwd: selected.workspace }), signal: AbortSignal.timeout(30_000) })
+      'content-type': 'application/json' }, body: JSON.stringify({ mode: ordinaryFixtureMode, cwd: selected.workspace }), signal: AbortSignal.timeout(30_000) })
     assert.equal(fallback.status, 400)
     assert((await fallback.text()).includes('managed environment fixture denies host PTY'))
     assert.deepEqual(await rig.inventory(), before)
@@ -277,7 +287,7 @@ export async function runManagedEnvironmentTarget() {
       const children = await webChildren(rig!)
       return children.length === 0 ? children : undefined
     }, 15_000)
-    proof.hostPtyDenials = { legacy: true, nonNegotiated: true, httpCliMcpFallback: true,
+    proof.hostPtyDenials = { legacy: true, nonNegotiated: true, httpCliMcpFallback: true, httpMode: ordinaryFixtureMode,
       observedRegistryRows: ordinaryRows, observedChildPids: childPids, scratchWeb: rig.web.processEvidence() }
     const preflightRequest = `managed-preflight-${randomUUID()}`
     authorize(preflightRequest)
