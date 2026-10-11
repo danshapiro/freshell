@@ -5,12 +5,17 @@ import os from 'node:os'
 import path from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 
-const fakeDocker = vi.hoisted(() => ({ settled: false, commands: [] as string[][] }))
+const fakeDocker = vi.hoisted(() => ({ settled: false, commands: [] as string[][], supervisorCommands: [] as string[][] }))
 vi.mock('node:child_process', () => {
   const api = {
     spawn: () => { throw new Error('unexpected spawned process in isolated harness fixture') },
     execFileSync: (program: string, args: string[]) => {
       if (program === 'git' && args.join(' ') === 'rev-parse HEAD') return 'cleanup-fixture-commit\n'
+      if (program === 'docker' && args[0] === 'volume' && args[1] === 'create') return `${args[2]}\n`
+      if (program === 'docker' && args[0] === 'run' && args.includes('/var/lib/freshell-supervisor')) {
+        fakeDocker.supervisorCommands.push(args)
+        return `${'f'.repeat(64)}\n`
+      }
       throw new Error('unexpected executable in isolated cleanup fixture')
     },
     spawnSync: (program: string, args: string[]) => {
@@ -193,6 +198,54 @@ it.each(['claude', 'opencode'] as const)('qualifies original isolated HOME alias
 })
 
 describe('closed managed environment fixture inputs', () => {
+  it('dispatches the selected private HOME with workspace and bootstrap into its supervisor', async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'frs-supervisor-input-'))
+    const repository = path.join(directory, 'repository'), home = path.join(directory, 'home')
+    const xdg = path.join(home, 'fixture-xdg'), workspace = path.join(directory, 'workspace')
+    const grant = path.join(directory, 'grant.env'), socket = path.join(directory, 'daemon.sock')
+    const previousDockerHost = process.env.DOCKER_HOST
+    const daemon = http.createServer((_request, response) => response.writeHead(500).end())
+    let harness: RuntimeHarness | undefined
+    try {
+      await fs.mkdir(path.join(repository, 'test/runtime'), { recursive: true })
+      await fs.writeFile(path.join(repository, 'test/runtime/gate-manifest.json'), '{}')
+      await fs.mkdir(path.join(xdg, 'opencode'), { recursive: true })
+      await fs.chmod(home, 0o700)
+      await fs.mkdir(workspace)
+      await fs.writeFile(grant, 'synthetic-closed-grant', { mode: 0o600 })
+      const host = path.join(directory, 'host')
+      await fs.writeFile(host, 'owned fixture host artifact')
+      await new Promise<void>(resolve => daemon.listen(socket, resolve))
+      process.env.DOCKER_HOST = `unix://${socket}`
+      const rig = new ManagedRuntimeBrowserRig(repository, 2, { HOME: home, XDG_CONFIG_HOME: xdg },
+        { HOME: home, XDG_CONFIG_HOME: xdg }, 'test', { enabledProviders: ['opencode'] }, home,
+        { workspaceRoots: [workspace], bootstrapFiles: [grant], defaultCwd: workspace })
+      harness = rig.runtime
+      useOwnedHarnessArtifacts(harness, host)
+      await harness.prepare()
+      fakeDocker.supervisorCommands = []
+      await harness.startSupervisor({ scenarioId: 'closed-home', waitForHealth: false,
+        env: { HOME: home, XDG_CONFIG_HOME: xdg } })
+      expect(fakeDocker.supervisorCommands).toHaveLength(1)
+      const dispatched = fakeDocker.supervisorCommands[0]
+      expect(dispatched).toContain(`${workspace}:${workspace}:ro`)
+      expect(dispatched).toContain(`${grant}:${grant}:ro`)
+      expect(dispatched).toContain(`HOME=${home}`)
+      expect(dispatched).toContain(`XDG_CONFIG_HOME=${xdg}`)
+      expect(dispatched).toContain(`${home}:${home}:ro`)
+      expect(dispatched).not.toContain(`${repository}:${repository}:ro`)
+      expect((await fs.stat(home)).mode & 0o777).toBe(0o700)
+    } finally {
+      await harness?.broker?.close()
+      await new Promise<void>(resolve => daemon.close(() => resolve()))
+      if (previousDockerHost === undefined) delete process.env.DOCKER_HOST
+      else process.env.DOCKER_HOST = previousDockerHost
+      if (harness) await fs.rm(harness.testRoot, { recursive: true, force: true })
+      await fs.rm(directory, { recursive: true, force: true })
+      vi.restoreAllMocks()
+    }
+  })
+
   it.each(['selected-workspace', 'selected-bootstrap', 'ambient-bootstrap'] as const)(
     'routes only the explicitly selected fixture inputs: %s', async selection => {
       const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'frs-input-'))
