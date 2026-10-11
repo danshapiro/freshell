@@ -37,7 +37,7 @@ describe('selected native free access observation', () => {
 function browserExecutionFixture(current: FreshAgentQualificationRow, stages: any[], evidenceDir: string, write: (name: string, value: any) => { path: string; sha256: string }, prefix: string) {
   const read = (reference: any) => JSON.parse(fs.readFileSync(path.join(evidenceDir, reference.path), 'utf8'))
   const stageViews = stages.map(stage => read(stage.launch).response.data.view)
-  const view = { ...stageViews.at(-1), freshAgentSessionType: current.mode, freshAgentSessionId: current.nativeSessionId }
+  const view = { ...stageViews.at(-1), provider: current.mode === 'kilroy' ? 'kilroy' : current.provider, freshAgentSessionType: current.mode, freshAgentSessionId: current.nativeSessionId }
   const native = read(read(stages.at(-1).profile).process)
   const allocation = { view, writer: { soulId: current.soulId, incarnationId: view.incarnationId, nativeSessionId: current.nativeSessionId,
     providerStoreId: current.providerStoreId, activeClaimCount: 1, globalConflictingClaimCount: 0 }, volume: { providerVolumeName: 'owned-volume' }, process: native, limits: current.limits }
@@ -83,7 +83,7 @@ function browserExecutionFixture(current: FreshAgentQualificationRow, stages: an
     }
     after = write(prefix + '/ui/' + (current.provider === 'codex' ? 'rollout-' : '') + otherRoot + '.jsonl', rows.map(row => JSON.stringify(row)).join('\n') + '\n')
   }
-  const ui = { provider: current.provider, nativeRoot: otherRoot, beforeTurns: 0, after,
+  const ui = { provider: current.provider, nativeRoot: otherRoot, view: structuredClone(other.view), beforeTurns: 0, after,
     request: { type: 'freshAgent.send', requestId: 'actual-ui-send', sessionId: otherRoot, text: prompt },
     reply: { type: 'freshAgent.send.accepted', requestId: 'actual-ui-send', sessionId: otherRoot } }
   const approvals: any[] = []
@@ -99,6 +99,7 @@ function browserExecutionFixture(current: FreshAgentQualificationRow, stages: an
     const beforeCard = { decision_id: decisionId, payload: { tool: { name: 'Bash', input: { command } }, toolUseID, nativeCheckpoint: checkpoint,
       nativeRequestId: 'old-' + decisionId, nativeBinding: { nativeRequestId: 'old-' + decisionId, queryGeneration: 1, launch: { incarnationId: 'other-inc', launchNonce: 'old-' + decisionId } } } }
     const currentCard = structuredClone(beforeCard), afterView = { ...structuredClone(other.view), incarnationId: recovery === 'web' ? 'other-inc' : 'recovered-' + decisionId }
+    afterView.nativeIdentityObservation.incarnationId = afterView.incarnationId
     currentCard.payload.nativeBinding.launch.incarnationId = afterView.incarnationId
     if (recovery !== 'web') currentCard.payload.nativeRequestId = 'new-' + decisionId
     currentCard.payload.nativeBinding.nativeRequestId = currentCard.payload.nativeRequestId

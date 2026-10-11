@@ -73,11 +73,34 @@ export type FreshBrowserIngressObservation = {
   reply?: Record<string, any>
 }
 
+/** Outgoing browser frames can retain the create ID until materialization.
+ * Both addresses must belong to this exact launch-bound native observation.
+ * Proxy send acknowledgments use freshAgentSessionId; raw host dispatches use nativeSessionId.
+ */
+export function matchesFreshBrowserFrame(view: any, frame: Record<string, any> | undefined): boolean {
+  const contract = MODE_CONTRACT[view?.freshAgentSessionType as QualifiableFreshAgentMode]
+  return !!contract && view.provider === (view.freshAgentSessionType === 'kilroy' ? 'kilroy' : contract.provider)
+    && view.launchState === 'running' && view.recoveryState === 'live'
+    && typeof view.freshAgentSessionId === 'string' && !!view.freshAgentSessionId
+    && typeof view.nativeSessionId === 'string' && !!view.nativeSessionId
+    && view.nativeIdentityObservation?.nativeSessionId === view.nativeSessionId
+    && view.nativeIdentityObservation.incarnationId === view.incarnationId
+    && !!frame && (frame.sessionId === view.nativeSessionId || frame.sessionId === view.freshAgentSessionId)
+    && (frame.provider === undefined || frame.provider === contract.provider)
+    && (frame.sessionType === undefined || frame.sessionType === view.freshAgentSessionType)
+}
+
+export function sameFreshBrowserActivation(view: Record<string, any>, expected: Record<string, any> | undefined): boolean {
+  return !!expected && ['soulId', 'nativeSessionId', 'freshAgentSessionId', 'freshAgentSessionType', 'provider',
+    'incarnationId', 'containerId', 'hostBootId', 'executionGeneration'].every(field => view[field] === expected[field])
+    && view.nativeIdentityObservation?.launchNonce === expected.nativeIdentityObservation?.launchNonce
+}
+
 export function validateFreshBrowserAlias(route: Record<string, any>, main: { soulId: string; nativeSessionId: string; providerStoreId: string; provider: string }): void {
   const { view, writer, request, reply } = route
   if (request?.body?.sessionRef?.provider !== main.provider || request.body.sessionRef.sessionId !== main.nativeSessionId
     || view?.soulId !== main.soulId || view.nativeSessionId !== main.nativeSessionId
-    || reply?.sessionId !== view.freshAgentSessionId || writer?.providerStoreId !== main.providerStoreId
+    || reply?.sessionId !== main.nativeSessionId || writer?.providerStoreId !== main.providerStoreId
     || writer.soulId !== main.soulId || writer.nativeSessionId !== main.nativeSessionId || writer.incarnationId !== view.incarnationId
     || writer.activeClaimCount !== 1 || writer.globalConflictingClaimCount !== 0) throw new Error('executed alias did not resume the registered main soul/store/root')
 }
@@ -128,8 +151,8 @@ export function validateFreshApprovalDispatch(value: any): void {
   const dispatches = value.events.filter((event: any) => event.kind === 'provider' && event.data.payload.event?.type === 'freshAgent.permission.dispatch')
   const dispatch = dispatches[0]?.data.payload.event
   if (dispatches.length !== 1 || dispatch.ok !== true || String(dispatch.requestId) !== current.decision_id
-    || dispatch.nativeRequestId !== current.payload.nativeRequestId || dispatch.sessionId !== view.freshAgentSessionId
-    || value.browserDecision?.sessionId !== view.freshAgentSessionId) throw new Error('native approval current dispatch differs')
+    || dispatch.nativeRequestId !== current.payload.nativeRequestId || dispatch.sessionId !== view.nativeSessionId
+    || !matchesFreshBrowserFrame(view, value.browserDecision)) throw new Error('native approval current dispatch differs')
 }
 
 function validateFreshWriterReplacement(lifecycle: any[], before: any, after: any, store: string, root: string): void {
@@ -153,7 +176,8 @@ export function validateFreshApprovalRecovery(value: any, identity: { soulId: st
   const { before, after } = recovery
   for (const [allocation, view, native] of [[before, value.beforeView, value.beforeNative], [after, value.afterView, value.currentNative]]) {
     if (allocation.view.soulId !== identity.soulId || allocation.view.nativeSessionId !== identity.nativeSessionId
-      || ['soulId', 'nativeSessionId', 'incarnationId', 'containerId', 'hostBootId'].some(field => allocation.view[field] !== view[field])
+      || ['soulId', 'nativeSessionId', 'freshAgentSessionId', 'freshAgentSessionType', 'provider', 'incarnationId', 'containerId', 'hostBootId'].some(field => allocation.view[field] !== view[field])
+      || view.freshAgentSessionId !== value.beforeView.freshAgentSessionId
       || allocation.writer.providerStoreId !== identity.providerStoreId || allocation.writer.soulId !== identity.soulId
       || allocation.writer.nativeSessionId !== identity.nativeSessionId || allocation.writer.incarnationId !== view.incarnationId
       || allocation.writer.activeClaimCount !== 1 || allocation.writer.globalConflictingClaimCount !== 0
@@ -190,24 +214,36 @@ export function deriveFreshBrowserExecution(original: Record<string, any>, conve
     if (!view || view.launchState !== 'running' || view.recoveryState !== 'live' || view.freshAgentSessionType !== original.mode
       || !view.nativeIdentityObservation || view.nativeSessionId !== view.nativeIdentityObservation.nativeSessionId) throw new Error(`executed ingress ${id} has no current native activation`)
     if (id === 'history-resume' && request?.type === 'freshAgent.attach') {
-      if (request.sessionId !== view.freshAgentSessionId) throw new Error('executed history attach differs')
+      if (!matchesFreshBrowserFrame(view, request)) throw new Error('executed history attach differs')
     } else if (['browser-picker', 'browser-split', 'ws-create', 'history-resume'].includes(id)) {
+      const sessionId = id === 'history-resume' ? view.nativeSessionId : view.freshAgentSessionId
       if (request?.type !== 'freshAgent.create' || request.sessionType !== original.mode || !request.requestId
-        || reply?.type !== 'freshAgent.created' || reply.requestId !== request.requestId || reply.sessionId !== view.freshAgentSessionId) throw new Error(`executed ingress ${id} request/reply differs`)
-      if (id === 'history-resume' && request.sessionRef?.sessionId !== view.nativeSessionId) throw new Error('history resume did not use the actual native root')
+        || reply?.type !== 'freshAgent.created' || reply.requestId !== request.requestId || reply.sessionId !== sessionId) throw new Error(`executed ingress ${id} request/reply differs`)
+      if (id === 'history-resume' && (request.sessionRef?.sessionId !== view.nativeSessionId
+        || request.sessionRef.provider !== MODE_CONTRACT[original.mode as QualifiableFreshAgentMode].provider)) throw new Error('history resume did not use the actual native root')
     } else if (id === 'ws-attach') {
       // Successful attach has no wire acknowledgment. The exact current activation is the observed outcome.
-      if (request?.type !== 'freshAgent.attach' || request.sessionId !== view.freshAgentSessionId) throw new Error('executed ingress ws-attach differs')
+      if (request?.type !== 'freshAgent.attach' || !matchesFreshBrowserFrame(view, request)) throw new Error('executed ingress ws-attach differs')
     } else {
       validateFreshBrowserAlias(matching[0]!, { ...conversation, provider: MODE_CONTRACT[conversation.mode as QualifiableFreshAgentMode].provider })
       const split = id.endsWith('split')
       if (request?.method !== 'POST' || (split ? !/^\/api\/panes\/[^/]+\/split$/.test(request.path) : request.path !== '/api/tabs')
-        || !reply?.paneId || reply.sessionId !== view.freshAgentSessionId) throw new Error(`executed ingress ${id} request/reply differs`)
+        || !reply?.paneId || reply.sessionId !== view.nativeSessionId) throw new Error(`executed ingress ${id} request/reply differs`)
     }
   }
   const allocations = original.allocations ?? []
   if (allocations.length !== 2) throw new Error('two observed native allocations required')
   const [main, other] = allocations
+  for (const route of routes) {
+    const owned = route.ingress === 'browser-split' ? other : main
+    if (['soulId', 'nativeSessionId', 'freshAgentSessionId', 'freshAgentSessionType', 'provider'].some(field => route.view[field] !== owned.view[field])) {
+      throw new Error('executed browser route differs from its owned allocation')
+    }
+    if (['history-resume', 'ws-attach'].includes(route.ingress) && route.request.type === 'freshAgent.attach'
+      && !sameFreshBrowserActivation(route.view, routes.find(value => value.ingress === 'browser-picker')?.view)) {
+      throw new Error('browser attach differs from its original create activation')
+    }
+  }
   for (const allocation of allocations) {
     const { view, writer, process, volume } = allocation
     if (view.freshAgentSessionType !== original.mode || view.launchState !== 'running' || view.recoveryState !== 'live'
@@ -509,14 +545,19 @@ function validateBrowserExecutions(evidenceDir: string, rows: FreshAgentQualific
       return launch.response?.data?.view ?? launch.response?.result?.Ok?.data?.view
     })
     const ui = object(original.ui, 'actual browser native turn')
+    const view = object(ui.view, 'actual browser send activation')
+    const split = original.routes.find((route: any) => route.ingress === 'browser-split')
     const material = (reference: unknown) => nativeMaterial(evidenceDir, { nativeFile: reference }, row.provider, ui.nativeRoot)
     const before = ui.boundary ? material(ui.boundary) : { history: { turns: [] }, inputs: [] }, after = material(ui.after)
     const newInputs = after.inputs.filter(input => !before.inputs.some(prior => prior.id === input.id))
     const last = after.history.turns.at(-1)!, evidence = last?.nativeEvidence
     if (ui.nativeRoot !== original.allocations[1].view.nativeSessionId || ui.request?.type !== 'freshAgent.send'
-      || ui.request.text !== 'Reply ready. Do not use tools.' || ui.request.sessionId !== original.allocations[1].view.freshAgentSessionId
+      || ui.request.text !== 'Reply ready. Do not use tools.' || !matchesFreshBrowserFrame(view, ui.request)
+      || ui.nativeRoot !== view.nativeSessionId || ui.provider !== row.provider
+      || ['soulId', 'nativeSessionId', 'freshAgentSessionId', 'freshAgentSessionType', 'provider'].some(field => view[field] !== original.allocations[1].view[field])
+      || !sameFreshBrowserActivation(view, split?.view)
       || ui.reply?.type !== 'freshAgent.send.accepted' || ui.reply.requestId !== ui.request.requestId
-      || ui.reply.sessionId !== ui.request.sessionId || before.history.turns.length !== ui.beforeTurns || after.history.turns.length !== before.history.turns.length + 1
+      || !ui.request.requestId || ui.reply.sessionId !== view.freshAgentSessionId || before.history.turns.length !== ui.beforeTurns || after.history.turns.length !== before.history.turns.length + 1
       || newInputs.length !== 1 || newInputs[0]!.text !== ui.request.text || evidence?.kind !== 'identified_message'
       || (row.provider === 'codex' ? evidence.turnId !== newInputs[0]!.id : evidence.parentMessageId !== newInputs[0]!.id)
       || last.toolCalls.length || stableJson(after.history.turns.slice(0, before.history.turns.length)) !== stableJson(before.history.turns)) throw new Error('actual browser native no-tool completion differs')

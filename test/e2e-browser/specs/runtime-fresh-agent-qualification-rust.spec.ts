@@ -79,6 +79,17 @@ export async function replacement(rig: ManagedFixtureRig, created: { reply: { se
   })
 }
 
+export async function aliasActivation(rig: ManagedFixtureRig, created: { reply: { sessionId: string }; view: ManagedRuntimeView }, reply: { sessionId: string }): Promise<ManagedRuntimeView> {
+  if (!created.view.nativeSessionId || reply.sessionId !== created.view.nativeSessionId) throw new Error('actual alias reply differs from the original native root')
+  return waitFor('actual alias activation', async () => {
+    const view = await rig.runningViewForFreshSession(created.reply.sessionId)
+    if (!view?.containerId) return null
+    if (['soulId', 'nativeSessionId', 'provider', 'freshAgentSessionType', 'incarnationId', 'containerId', 'hostBootId'].some(field =>
+      view[field as keyof ManagedRuntimeView] !== created.view[field as keyof ManagedRuntimeView])) throw new Error('actual alias activation differs from the original allocation')
+    return view
+  })
+}
+
 type WireObservations = { sent: any[]; received: any[] }
 function observeBrowserWire(page: Page): WireObservations {
   const observed: WireObservations = { sent: [], received: [] }
@@ -183,7 +194,7 @@ async function qualify(page: Page, rig: ManagedFixtureRig, definition: Definitio
     permissionMode: 'default', sessionRef: { provider: definition.provider, sessionId: main.nativeSessionId } }
   for (const [ingress, action] of [['mcp-new-tab', 'new-tab'], ['mcp-split', 'split-pane']] as const) {
     const observed = await observeMcp(action, { ...params, ...(action === 'split-pane' ? { target: auxiliary.paneId, direction: 'horizontal' } : {}) })
-    const view = await waitFor('actual MCP alias activation', () => rig.runningViewForFreshSession(observed.reply.sessionId))
+    const view = await aliasActivation(rig, initial, observed.reply)
     await rig.observeFreshBrowserIngress(rig.exactRuntimeHandle(view), id, { ingress, ...observed })
   }
   for (const [ingress, route] of [['rest-tab', '/api/tabs'], ['rest-split', '/api/panes/' + auxiliary.paneId + '/split']] as const) {
@@ -191,7 +202,7 @@ async function qualify(page: Page, rig: ManagedFixtureRig, definition: Definitio
     const response = await page.request.post(rig.info.baseUrl + route, { headers: { 'X-Auth-Token': rig.info.token }, data: body })
     expect(response.ok()).toBe(true)
     const reply = dataOf(await response.json())
-    const view = await waitFor('actual REST alias activation', () => rig.runningViewForFreshSession(reply.sessionId))
+    const view = await aliasActivation(rig, initial, reply)
     await rig.observeFreshBrowserIngress(rig.exactRuntimeHandle(view), id, { ingress, request: { method: 'POST', path: route, body }, reply })
   }
 

@@ -4523,6 +4523,37 @@ describe('closed external owner control', () => {
 })
 
 describe('external finite fixture client', () => {
+  it('finds a materialized native alias through the actual original presentation lookup', async () => {
+    const { aliasActivation } = await import('../../../e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.js')
+    const original = { soulId: 'owned-soul', incarnationId: 'owned-incarnation', containerId: 'b'.repeat(64),
+      hostBootId: 'owned-boot', nativeSessionId: 'ses_owned_native', freshAgentSessionId: 'freshopencode-owned-create',
+      freshAgentSessionType: 'freshopencode', provider: 'opencode', launchState: 'running', intentRevision: 1 }
+    const unrelated = { ...original, soulId: 'another-soul', freshAgentSessionId: 'another-presentation-of-same-native' }
+    const rows = [unrelated, original]
+    const transport = vi.fn(async (_url: string, init: RequestInit) => {
+      const request = JSON.parse(String(init.body))
+      expect(request.action).toBe('inventory')
+      return new Response(JSON.stringify({ runId: request.runId, candidateSha: request.candidateSha,
+        operationId: request.operationId, result: rows }), { status: 200 })
+    })
+    const rig = new runner.ExternalManagedRuntimeRig(runner.resolveManagedExternalDescriptor(descriptor)!, transport)
+    const created = { reply: { sessionId: original.freshAgentSessionId }, view: original }
+    const aliasReply = { sessionId: original.nativeSessionId }
+    vi.useFakeTimers()
+    try {
+      await expect(rig.runningViewForFreshSession(aliasReply.sessionId)).resolves.toBeNull()
+      const outcome = aliasActivation(rig, created, aliasReply).then(view => ({ view }), error => ({ error: String(error) }))
+      await vi.advanceTimersByTimeAsync(240_000)
+      expect(await outcome).toEqual({ view: original })
+      expect(aliasReply.sessionId).toBe(original.nativeSessionId)
+      await expect(aliasActivation(rig, created, { sessionId: 'another-native-root' })).rejects.toThrow(/alias reply differs/)
+      for (const [field, value] of [['soulId', 'another-soul'], ['nativeSessionId', 'another-native-root'], ['provider', 'claude'],
+        ['freshAgentSessionType', 'freshclaude'], ['incarnationId', 'old-incarnation']]) {
+        rows[1] = { ...original, [field]: value }
+        await expect(aliasActivation(rig, created, aliasReply)).rejects.toThrow(/alias activation differs/)
+      }
+    } finally { vi.useRealTimers() }
+  })
   it.each(['freshopencode', 'freshclaude'])('finds a materialized %s replacement through the actual external lookup', async (mode) => {
     const { replacement } = await import('../../../e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.js')
     const presentationId = mode + '-owned-picker-request', nativeId = 'ses_owned_native'

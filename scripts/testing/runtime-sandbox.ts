@@ -16,7 +16,7 @@ import { ManagedRuntimeInventorySnapshotSchema, ManagedRuntimeMigrationPlanSchem
 import fsp from 'node:fs/promises'
 import { defaultReceiptFileName } from './runtime-receipts.js'
 import { buildProviderQualificationReceipt, type ProviderQualificationReceiptV2, type ProviderQualificationRow } from './provider-qualification-receipt.js'
-import { buildFreshAgentQualificationReceipt, deriveFreshBrowserExecution, validateFreshBrowserAlias, validateFreshApprovalCheckpoint, validateFreshApprovalDispatch, validateFreshApprovalRecovery, nativeCompletedTurnProofs, type FreshBrowserIngressObservation, type FreshAgentQualificationReceiptV1, type FreshAgentQualificationRow } from './fresh-agent-qualification-receipt.js'
+import { buildFreshAgentQualificationReceipt, deriveFreshBrowserExecution, matchesFreshBrowserFrame, sameFreshBrowserActivation, validateFreshBrowserAlias, validateFreshApprovalCheckpoint, validateFreshApprovalDispatch, validateFreshApprovalRecovery, nativeCompletedTurnProofs, type FreshBrowserIngressObservation, type FreshAgentQualificationReceiptV1, type FreshAgentQualificationRow } from './fresh-agent-qualification-receipt.js'
 import { claudeNativeInspection, nativeCheckpointTranscriptRetained, observeNativeSoloBashOutcome, openCodeFreeAccessScript } from './runtime-native-feasibility.js'
 import type { QualifiableTerminalProvider } from './provider-qualification-selection.js'
 import { deriveNativeRecoveryOriginals, NATIVE_RECOVERY_ORIGINALS_FILE, type NativeOriginalReference, type NativeRecoveryStage } from './qualification-observations.js'
@@ -5986,6 +5986,9 @@ export class ManagedRuntimeOwner {
       const view = await this.currentRuntimeEnclosure(handle)
       if (view.freshAgentSessionType !== collection.mode || browser.routes.some(route => route.ingress === observation.ingress)
         || ['startup-restore', 'auto-resume'].includes(observation.ingress)) throw new Error('one executed browser route on the selected mode required')
+      if (['history-resume', 'ws-attach'].includes(observation.ingress) && observation.request.type === 'freshAgent.attach'
+        && (view.soulId !== collection.soulId || view.nativeSessionId !== collection.nativeSessionId
+          || !matchesFreshBrowserFrame(view, observation.request))) throw new Error('browser attach differs from the registered current native allocation')
       const route = { ...FreshBrowserIngressObservationSchema.parse(observation), view, observedAt: Date.now(),
         ...(/^(rest|mcp)-/.test(observation.ingress) ? { writer: await this.writerClaimFacts(handle) } : {}) }
       if (/^(rest|mcp)-/.test(observation.ingress)) validateFreshBrowserAlias(route, collection)
@@ -6004,7 +6007,7 @@ export class ManagedRuntimeOwner {
       const challengeId = randomUUID(), prefix = 'fresh-browser-' + collectionId + '/ui'
       const boundary = await this.materializeNativeSource(prefix + '/boundary', captured)
       browser.auxiliarySoulId = handle.soulId
-      this.freshBrowserChallenges.set(challengeId, { challengeId, collectionId, handle, provider: collection.provider,
+      this.freshBrowserChallenges.set(challengeId, { challengeId, collectionId, handle, provider: collection.provider, beforeView: allocation.view,
         // Keep the raw empty boundary, but completed-turn decoders require
         // at least one completion. The first UI send starts at zero turns.
         boundary: captured.turns.length ? boundary : undefined, beforeTurns: captured.turns.length, prompt: 'Reply ready. Do not use tools.' })
@@ -6018,9 +6021,11 @@ export class ManagedRuntimeOwner {
       if (!challenge || challenge.finished || JSON.stringify(handle) !== JSON.stringify(challenge.handle)
         || request.type !== 'freshAgent.send' || request.text !== challenge.prompt
         || reply.type !== 'freshAgent.send.accepted' || request.requestId !== reply.requestId
-        || request.sessionId !== reply.sessionId) throw new Error('registered actual browser send/ack required')
+        || !request.requestId) throw new Error('registered actual browser send/ack required')
+      await this.assertCurrentHandle(handle)
       const view = await this.currentRuntimeEnclosure(handle)
-      if (view.freshAgentSessionId !== request.sessionId) throw new Error('browser send activation differs')
+      if (!matchesFreshBrowserFrame(view, request) || reply.sessionId !== view.freshAgentSessionId
+        || !sameFreshBrowserActivation(view, challenge.beforeView)) throw new Error('browser send activation differs')
       const deadline = Date.now() + 90_000
       let captured: FreshCapturedNativeHistory | undefined
       while (Date.now() < deadline) {
@@ -6032,7 +6037,7 @@ export class ManagedRuntimeOwner {
       if (!captured || captured.turns.length !== challenge.beforeTurns + 1 || captured.turns.at(-1)!.toolCalls.length) throw new Error('actual browser no-tool native completion differs')
       const after = await this.materializeNativeSource('fresh-browser-' + challenge.collectionId + '/ui/completed', captured)
       this.freshBrowserCollection(challenge.collectionId).browser.ui = { provider: challenge.provider, nativeRoot: handle.nativeSessionId,
-        boundary: challenge.boundary, after, request, reply, beforeTurns: challenge.beforeTurns }
+        boundary: challenge.boundary, after, request, reply, view, beforeTurns: challenge.beforeTurns }
       challenge.finished = true
     })
   }
@@ -6131,7 +6136,9 @@ export class ManagedRuntimeOwner {
       if (!challenge?.currentCard || challenge.finished || challenge.soulId !== handle.soulId || challenge.nativeRoot !== handle.nativeSessionId) throw new Error('captured current native approval required')
       await this.assertCurrentHandle(handle)
       const view = await this.currentRuntimeEnclosure(handle)
-      if (decision.type !== 'freshAgent.approval.respond' || decision.sessionId !== view.freshAgentSessionId || String(decision.requestId) !== challenge.currentCard.decision_id
+      if (decision.type !== 'freshAgent.approval.respond' || !matchesFreshBrowserFrame(view, decision)
+        || !sameFreshBrowserActivation(view, challenge.afterView)
+        || String(decision.requestId) !== challenge.currentCard.decision_id
         || decision.decision?.behavior !== (challenge.allowed ? 'allow' : 'deny')) throw new Error('actual current browser decision differs')
       challenge.browserDecision = decision
       const terminal = await this.freshApprovalEvents(challenge, event => event.kind === 'permission_requested'
