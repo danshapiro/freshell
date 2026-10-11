@@ -12,6 +12,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rusqlite::backup::{Backup, Progress, StepResult};
@@ -1598,8 +1599,15 @@ fn export_exact_session_inner(
             .collect::<Vec<_>>();
         let snapshot_objects = asset_resolver
             .snapshot_objects
-            .values()
-            .cloned()
+            .iter()
+            .map(|((project_id, worktree_sha1, object_id), compressed_hex)| {
+                SerializedSnapshotObject {
+                    project_id: project_id.clone(),
+                    worktree_sha1: worktree_sha1.clone(),
+                    object_id: object_id.clone(),
+                    compressed_hex: compressed_hex.as_ref().clone(),
+                }
+            })
             .collect::<Vec<_>>();
         let native_cleanup_baselines = capture_native_cleanup_baselines(&rows)?;
         let payload_path = extraction.path().join("bundle.json");
@@ -1851,7 +1859,8 @@ struct AssetResolver<'a> {
     snapshot_data_home: Option<PathBuf>,
     snapshot_projects: HashMap<String, String>,
     saved_snapshots: BTreeMap<(String, String), SavedSnapshotReference>,
-    snapshot_objects: BTreeMap<(String, String, String), SerializedSnapshotObject>,
+    snapshot_objects: BTreeMap<(String, String, String), Arc<String>>,
+    object_representations: SnapshotRepresentations,
     source_progress: Option<SourcePhase>,
 }
 
@@ -1868,6 +1877,7 @@ impl<'a> AssetResolver<'a> {
             snapshot_projects: HashMap::new(),
             saved_snapshots: BTreeMap::new(),
             snapshot_objects: BTreeMap::new(),
+            object_representations: SnapshotRepresentations::new(),
             source_progress: None,
         }
     }
@@ -2298,6 +2308,8 @@ impl<'a> AssetResolver<'a> {
                 "saved snapshot is not a SHA1 tree reference".into(),
             ));
         }
+        #[cfg(test)]
+        snapshot_reuse_test_hooks::before_reference();
         let mount = self.workspace_mounts.get(session_id).ok_or_else(|| {
             TransferError::Blocked("saved snapshot lacks an exact qualified workspace".into())
         })?;
@@ -2321,29 +2333,26 @@ impl<'a> AssetResolver<'a> {
             .join(&worktree_sha1);
         let workspace_store = snapshot_workspace_objects(&mount.canonical_root)?;
         let stores = qualified_snapshot_stores(&native_bucket, &workspace_store)?;
-        let closure = read_snapshot_closure_with_reader(tree, |id| {
-            let object = read_snapshot_object(&stores, id);
+        let closure = walk_snapshot_closure(tree, snapshot_closure_bound(), |id, remaining| {
+            // Storage authority and bytes are re-established for every object
+            // occurrence, before any resident computation can be reused.
+            let object = read_snapshot_object_source(&stores, id);
             if let Some(progress) = &mut self.source_progress {
                 progress.progress(progress.event.completed_count + 1, None);
             }
-            object
+            object?
+                .map(|object| self.object_representations.resolve(id, object, remaining))
+                .transpose()
         })?;
         let mut objects = Vec::new();
         if let Some(closure) = closure {
-            for (object_id, compressed) in closure {
-                objects.push(SnapshotObjectMetadata {
-                    object_id: object_id.clone(),
-                    compressed_bytes: compressed.len() as u64,
-                    compressed_sha256: digest(&compressed),
-                });
+            for (object_id, (_, representation)) in closure {
+                objects.push(representation.metadata);
+                // Each native destination keeps its own tuple while sharing
+                // the one validated serialized content allocation.
                 self.snapshot_objects.insert(
-                    (project_id.clone(), worktree_sha1.clone(), object_id.clone()),
-                    SerializedSnapshotObject {
-                        project_id: project_id.clone(),
-                        worktree_sha1: worktree_sha1.clone(),
-                        object_id,
-                        compressed_hex: hex::encode(compressed),
-                    },
+                    (project_id.clone(), worktree_sha1.clone(), object_id),
+                    representation.compressed_hex.clone(),
                 );
             }
         }
@@ -2482,10 +2491,44 @@ fn qualified_snapshot_stores(
     Ok(stores)
 }
 
+enum SnapshotObjectSource {
+    Loose(Vec<u8>),
+    // This body has passed current native framing, bounds, kind and SHA1
+    // validation. It is never retained by the export-local memo.
+    Packed { kind: String, body: Vec<u8> },
+}
+
+impl SnapshotObjectSource {
+    fn compressed(self) -> Result<Vec<u8>, TransferError> {
+        match self {
+            Self::Loose(compressed) => Ok(compressed),
+            Self::Packed { kind, body } => compress_snapshot_object(&kind, &body),
+        }
+    }
+}
+
+fn compress_snapshot_object(kind: &str, body: &[u8]) -> Result<Vec<u8>, TransferError> {
+    #[cfg(test)]
+    snapshot_reuse_test_hooks::count("deflate");
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    write!(encoder, "{kind} {}\0", body.len())?;
+    encoder.write_all(body)?;
+    Ok(encoder.finish()?)
+}
+
 fn read_snapshot_object(
     stores: &[PathBuf],
     object_id: &str,
 ) -> Result<Option<Vec<u8>>, TransferError> {
+    read_snapshot_object_source(stores, object_id)?
+        .map(SnapshotObjectSource::compressed)
+        .transpose()
+}
+
+fn read_snapshot_object_source(
+    stores: &[PathBuf],
+    object_id: &str,
+) -> Result<Option<SnapshotObjectSource>, TransferError> {
     if object_id.len() != 40 || !object_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(TransferError::Blocked(
             "snapshot closure has an invalid object ID".into(),
@@ -2510,7 +2553,7 @@ fn read_snapshot_object(
                     "saved snapshot object exceeds the transfer bound".into(),
                 ))
             }
-            Ok(_) => return Ok(Some(fs::read(path)?)),
+            Ok(_) => return Ok(Some(SnapshotObjectSource::Loose(fs::read(path)?))),
         }
     }
     // Packed objects use the native decoder only after storage confinement;
@@ -2559,14 +2602,38 @@ fn read_snapshot_object(
             else {
                 continue;
             };
-            let mut encoder =
-                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-            write!(encoder, "{kind} {}\0", body.len())?;
-            encoder.write_all(body)?;
-            return Ok(Some(encoder.finish()?));
+            validate_packed_snapshot_identity(object_id, kind, body)?;
+            return Ok(Some(SnapshotObjectSource::Packed {
+                kind: kind.to_string(),
+                body: body.to_vec(),
+            }));
         }
     }
     Ok(None)
+}
+
+fn validate_packed_snapshot_identity(
+    object_id: &str,
+    kind: &str,
+    body: &[u8],
+) -> Result<(), TransferError> {
+    #[cfg(test)]
+    snapshot_reuse_test_hooks::count("packed_validate");
+    let header = format!("{kind} {}\0", body.len());
+    if (header.len() as u64).saturating_add(body.len() as u64) > MAX_BUNDLE_BYTES {
+        return Err(TransferError::Blocked(
+            "snapshot object bytes do not match their content identity".into(),
+        ));
+    }
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(header.as_bytes());
+    hasher.update(body);
+    if hex::encode(hasher.finalize()) != object_id {
+        return Err(TransferError::Blocked(
+            "snapshot object bytes do not match their content identity".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn decode_packed_snapshot_response<'a>(
@@ -2670,6 +2737,8 @@ fn decode_snapshot_object(
     object_id: &str,
     compressed: &[u8],
 ) -> Result<(String, Vec<u8>), TransferError> {
+    #[cfg(test)]
+    snapshot_reuse_test_hooks::count("inflate");
     let mut raw = Vec::new();
     flate2::read::ZlibDecoder::new(compressed)
         .take(MAX_BUNDLE_BYTES + 1)
@@ -2697,6 +2766,8 @@ fn decode_snapshot_object(
 }
 
 fn snapshot_tree_children(bytes: &[u8]) -> Result<Vec<(String, bool)>, TransferError> {
+    #[cfg(test)]
+    snapshot_reuse_test_hooks::count("tree_parse");
     let mut cursor = 0;
     let mut children = Vec::new();
     while cursor < bytes.len() {
@@ -2739,47 +2810,295 @@ fn read_snapshot_closure(
     read_snapshot_closure_with_reader(tree, |id| read_snapshot_object(stores, id))
 }
 
+struct SnapshotEdges {
+    is_tree: bool,
+    children: Vec<(String, bool)>,
+}
+
+fn validated_snapshot_edges(kind: &str, body: &[u8]) -> Result<SnapshotEdges, TransferError> {
+    let is_tree = kind == "tree";
+    Ok(SnapshotEdges {
+        is_tree,
+        children: if is_tree {
+            snapshot_tree_children(body)?
+        } else {
+            Vec::new()
+        },
+    })
+}
+
+trait SnapshotClosureObject {
+    type Retained;
+    fn into_retained(self) -> Self::Retained;
+    fn compressed_bytes(&self) -> u64;
+    fn edges(&self) -> &SnapshotEdges;
+}
+
+struct DecodedSnapshotObject {
+    compressed: Vec<u8>,
+    edges: SnapshotEdges,
+}
+
+impl SnapshotClosureObject for DecodedSnapshotObject {
+    type Retained = Vec<u8>;
+    fn into_retained(self) -> Self::Retained {
+        self.compressed
+    }
+    fn compressed_bytes(&self) -> u64 {
+        self.compressed.len() as u64
+    }
+    fn edges(&self) -> &SnapshotEdges {
+        &self.edges
+    }
+}
+
 fn read_snapshot_closure_with_reader(
     tree: &str,
     mut read_object: impl FnMut(&str) -> Result<Option<Vec<u8>>, TransferError>,
 ) -> Result<Option<BTreeMap<String, Vec<u8>>>, TransferError> {
-    let Some(root) = read_object(tree)? else {
+    Ok(
+        walk_snapshot_closure(tree, MAX_BUNDLE_BYTES / 2, |id, remaining| {
+            read_object(id)?
+                .map(|compressed| {
+                    check_snapshot_closure_bytes(compressed.len() as u64, remaining)?;
+                    let (kind, body) = decode_snapshot_object(id, &compressed)?;
+                    Ok(DecodedSnapshotObject {
+                        compressed,
+                        edges: validated_snapshot_edges(&kind, &body)?,
+                    })
+                })
+                .transpose()
+        })?
+        .map(|closure| {
+            closure
+                .into_iter()
+                .map(|(id, (_, compressed))| (id, compressed))
+                .collect()
+        }),
+    )
+}
+
+type SnapshotClosure<T> = BTreeMap<String, (bool, T)>;
+
+fn walk_snapshot_closure<T: SnapshotClosureObject>(
+    tree: &str,
+    bound: u64,
+    mut read_object: impl FnMut(&str, u64) -> Result<Option<T>, TransferError>,
+) -> Result<Option<SnapshotClosure<T::Retained>>, TransferError> {
+    let Some(root) = read_object(tree, bound)? else {
         return Ok(None);
     };
     let mut pending = vec![(tree.to_string(), true, Some(root))];
-    let mut closure = BTreeMap::new();
+    let mut closure: SnapshotClosure<T::Retained> = BTreeMap::new();
     let mut total = 0u64;
     while let Some((id, is_tree, known)) = pending.pop() {
-        if closure.contains_key(&id) {
+        if let Some((retained_is_tree, _)) = closure.get(&id) {
+            check_snapshot_kind(*retained_is_tree, is_tree)?;
             continue;
         }
-        let compressed = match known {
-            Some(compressed) => Some(compressed),
-            None => read_object(&id)?,
+        let object = match known {
+            Some(object) => Some(object),
+            None => read_object(&id, bound - total)?,
         }
         .ok_or_else(|| {
             TransferError::Blocked("retained snapshot has an incomplete tree closure".into())
         })?;
         total = total
-            .checked_add(compressed.len() as u64)
-            .filter(|size| *size <= MAX_BUNDLE_BYTES / 2)
+            .checked_add(object.compressed_bytes())
+            .filter(|size| *size <= bound)
             .ok_or_else(|| {
                 TransferError::Blocked("snapshot closure exceeds its encoded transfer bound".into())
             })?;
-        let (kind, bytes) = decode_snapshot_object(&id, &compressed)?;
-        if (kind == "tree") != is_tree {
-            return Err(TransferError::Blocked(
-                "snapshot closure object kind differs from its tree edge".into(),
-            ));
+        check_snapshot_kind(object.edges().is_tree, is_tree)?;
+        for (child, is_tree) in &object.edges().children {
+            pending.push((child.clone(), *is_tree, None));
         }
-        if is_tree {
-            for (id, is_tree) in snapshot_tree_children(&bytes)? {
-                pending.push((id, is_tree, None));
-            }
-        }
-        closure.insert(id, compressed);
+        // Adjacency belongs only to the bounded memo/current traversal, not
+        // the retained closure or emitted output for nonresident objects.
+        closure.insert(id, (is_tree, object.into_retained()));
     }
     Ok(Some(closure))
+}
+
+fn check_snapshot_closure_bytes(bytes: u64, remaining: u64) -> Result<(), TransferError> {
+    if bytes > remaining {
+        return Err(TransferError::Blocked(
+            "snapshot closure exceeds its encoded transfer bound".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn check_snapshot_kind(actual_is_tree: bool, expected_is_tree: bool) -> Result<(), TransferError> {
+    if actual_is_tree != expected_is_tree {
+        return Err(TransferError::Blocked(
+            "snapshot closure object kind differs from its tree edge".into(),
+        ));
+    }
+    Ok(())
+}
+
+// Only computation is retained. Current authority/read failures never enter
+// this memo; loose commitments and freshly validated packed bodies remain
+// separate encodings. Clearing changes cost, never export acceptance.
+const SNAPSHOT_REPRESENTATION_BUDGET: usize = 16 * 1024 * 1024;
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum SnapshotEncoding {
+    Loose { bytes: u64, sha256: String },
+    PackedDefault,
+}
+
+struct SavedObjectRepresentation {
+    edges: SnapshotEdges,
+    metadata: SnapshotObjectMetadata,
+    compressed_hex: Arc<String>,
+}
+
+struct RetainedSnapshotObject {
+    metadata: SnapshotObjectMetadata,
+    compressed_hex: Arc<String>,
+}
+
+impl SnapshotClosureObject for Arc<SavedObjectRepresentation> {
+    type Retained = RetainedSnapshotObject;
+    fn into_retained(self) -> Self::Retained {
+        RetainedSnapshotObject {
+            metadata: self.metadata.clone(),
+            compressed_hex: self.compressed_hex.clone(),
+        }
+    }
+    fn compressed_bytes(&self) -> u64 {
+        self.metadata.compressed_bytes
+    }
+    fn edges(&self) -> &SnapshotEdges {
+        &self.edges
+    }
+}
+
+struct SnapshotRepresentations {
+    resident: BTreeMap<(String, SnapshotEncoding), Arc<SavedObjectRepresentation>>,
+    bytes: usize,
+    budget: usize,
+}
+
+impl SnapshotRepresentations {
+    fn new() -> Self {
+        let budget = SNAPSHOT_REPRESENTATION_BUDGET;
+        #[cfg(test)]
+        let budget =
+            snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().budget.unwrap_or(budget));
+        Self {
+            resident: BTreeMap::new(),
+            bytes: 0,
+            budget,
+        }
+    }
+
+    fn resolve(
+        &mut self,
+        id: &str,
+        object: SnapshotObjectSource,
+        remaining: u64,
+    ) -> Result<Arc<SavedObjectRepresentation>, TransferError> {
+        let encoding = match &object {
+            SnapshotObjectSource::Loose(compressed) => {
+                check_snapshot_closure_bytes(compressed.len() as u64, remaining)?;
+                SnapshotEncoding::Loose {
+                    bytes: compressed.len() as u64,
+                    sha256: digest(compressed),
+                }
+            }
+            SnapshotObjectSource::Packed { .. } => SnapshotEncoding::PackedDefault,
+        };
+        let key = (id.to_string(), encoding);
+        if let Some(resident) = self.resident.get(&key) {
+            check_snapshot_closure_bytes(resident.metadata.compressed_bytes, remaining)?;
+            return Ok(resident.clone());
+        }
+        let (kind, body, compressed) = match object {
+            SnapshotObjectSource::Loose(compressed) => {
+                let (kind, body) = decode_snapshot_object(id, &compressed)?;
+                (kind, body, compressed)
+            }
+            SnapshotObjectSource::Packed { kind, body } => {
+                let compressed = compress_snapshot_object(&kind, &body)?;
+                (kind, body, compressed)
+            }
+        };
+        check_snapshot_closure_bytes(compressed.len() as u64, remaining)?;
+        let edges = validated_snapshot_edges(&kind, &body)?;
+        let metadata = SnapshotObjectMetadata {
+            object_id: id.to_string(),
+            compressed_bytes: compressed.len() as u64,
+            compressed_sha256: match &key.1 {
+                SnapshotEncoding::Loose { sha256, .. } => sha256.clone(),
+                SnapshotEncoding::PackedDefault => digest(&compressed),
+            },
+        };
+        #[cfg(test)]
+        snapshot_reuse_test_hooks::count("hex");
+        let representation = Arc::new(SavedObjectRepresentation {
+            edges,
+            metadata,
+            compressed_hex: Arc::new(hex::encode(compressed)),
+        });
+        // Include retained output bytes even though they normally share the
+        // emitted map's allocation; replaced encodings must remain bounded too.
+        let retained_bytes = representation
+            .compressed_hex
+            .len()
+            .saturating_add(representation.edges.children.len().saturating_mul(128))
+            .saturating_add(1024);
+        if retained_bytes <= self.budget {
+            if self.bytes.saturating_add(retained_bytes) > self.budget {
+                self.resident.clear();
+                self.bytes = 0;
+            }
+            self.bytes += retained_bytes;
+            self.resident.insert(key, representation.clone());
+        }
+        Ok(representation)
+    }
+}
+
+fn snapshot_closure_bound() -> u64 {
+    let bound = MAX_BUNDLE_BYTES / 2;
+    #[cfg(test)]
+    let bound = snapshot_reuse_test_hooks::STATE
+        .with(|state| state.borrow().closure_bound.unwrap_or(bound));
+    bound
+}
+
+#[cfg(test)]
+mod snapshot_reuse_test_hooks {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    pub(super) struct State {
+        pub counts: BTreeMap<&'static str, usize>,
+        pub budget: Option<usize>,
+        pub before_reference: Option<Box<dyn FnMut(usize)>>,
+        pub references: usize,
+        pub closure_bound: Option<u64>,
+    }
+    thread_local! {
+        pub(super) static STATE: RefCell<State> = RefCell::new(State::default());
+    }
+    pub(super) fn before_reference() {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.references += 1;
+            let count = state.references;
+            if let Some(callback) = &mut state.before_reference {
+                callback(count);
+            }
+        });
+    }
+    pub(super) fn count(operation: &'static str) {
+        STATE.with(|state| *state.borrow_mut().counts.entry(operation).or_default() += 1);
+    }
 }
 
 #[cfg(test)]
@@ -5326,6 +5645,785 @@ mod online_backup_tests {
 #[cfg(test)]
 mod native_source_inventory_tests {
     use super::*;
+
+    struct ReuseFixture {
+        dir: TempDir,
+        inventory: HostOpenCodeInventory,
+        store: PathBuf,
+        trees: Vec<String>,
+        blob: String,
+    }
+
+    fn reuse_fixture(packed: bool) -> ReuseFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let data_home = dir.path().join("data");
+        fs::create_dir(&data_home).unwrap();
+        let worktree = hex::encode(sha1::Sha1::digest(workspace.to_string_lossy().as_bytes()));
+        let git_dir = data_home.join("snapshot/prj").join(worktree);
+        fs::create_dir_all(&git_dir).unwrap();
+        let git = |args: &[&str], input: Option<&[u8]>| {
+            let mut command = sanitized_git_command();
+            command.arg("--git-dir").arg(&git_dir).args(args);
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = command.spawn().unwrap();
+            if let Some(input) = input {
+                child.stdin.take().unwrap().write_all(input).unwrap();
+            }
+            drop(child.stdin.take());
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{:?}", output);
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "--bare", "-q"], None);
+        let blob = git(
+            &["hash-object", "-w", "--stdin"],
+            Some(b"synthetic overlapping saved blob"),
+        );
+        let subtree = git(
+            &["mktree"],
+            Some(format!("100644 blob {blob}\tnested\n").as_bytes()),
+        );
+        let mut trees = Vec::new();
+        for name in ["first", "second"] {
+            trees.push(git(
+                &["mktree"],
+                Some(
+                    format!("100644 blob {blob}\t{name}\n040000 tree {subtree}\tsubtree\n")
+                        .as_bytes(),
+                ),
+            ));
+        }
+        if packed {
+            for (index, tree) in trees.iter().enumerate() {
+                git(
+                    &["update-ref", &format!("refs/fixture/{index}"), tree],
+                    None,
+                );
+            }
+            git(&["repack", "-a", "-d"], None);
+            git(&["prune-packed"], None);
+            assert!(!git_dir
+                .join("objects")
+                .join(&blob[..2])
+                .join(&blob[2..])
+                .exists());
+        }
+        let path = data_home.join("opencode.db");
+        let db = source(&path);
+        db.execute("INSERT INTO project(id,worktree,time_created,time_updated,sandboxes) VALUES ('prj','/synthetic',1,1,'[]')", []).unwrap();
+        db.execute("INSERT INTO session(id,slug,project_id,directory,title,version,time_created,time_updated,revert) VALUES ('ses_exact','slug','prj','/synthetic','synthetic','1',1,1,?1)", [serde_json::json!({"snapshot":trees[0]}).to_string()]).unwrap();
+        db.execute("INSERT INTO message(id,session_id,time_created,time_updated,data) VALUES ('msg','ses_exact',1,1,'{}')", []).unwrap();
+        for index in 0..6 {
+            db.execute("INSERT INTO part(id,message_id,session_id,time_created,time_updated,data) VALUES (?1,'msg','ses_exact',1,1,?2)", rusqlite::params![format!("part{index}"), serde_json::json!({"type":"snapshot","snapshot":trees[index%2]}).to_string()]).unwrap();
+        }
+        let prompt = serde_json::json!({"parts":[{"type":"snapshot","snapshot":trees[0]}]});
+        db.execute("INSERT INTO session_input(id,session_id,prompt,delivery,admitted_seq,time_created) VALUES ('input','ses_exact',?1,'pending',1,1)", [prompt.to_string()]).unwrap();
+        db.execute("INSERT INTO session_context_epoch(session_id,baseline,snapshot,baseline_seq) VALUES ('ses_exact','{}',?1,0)", [serde_json::json!({"messages":[prompt]}).to_string()]).unwrap();
+        db.execute(
+            "INSERT INTO event_sequence(aggregate_id,seq) VALUES ('ses_exact',1)",
+            [],
+        )
+        .unwrap();
+        db.execute("INSERT INTO event(id,aggregate_id,seq,type,data) VALUES ('event','ses_exact',1,'message.part.updated',?1)", [serde_json::json!({"part":{"type":"snapshot","snapshot":trees[1]}}).to_string()]).unwrap();
+        drop(db);
+        let inventory = HostOpenCodeInventory::new(path).with_trusted_workspace_mount(
+            "prj",
+            None,
+            "/synthetic",
+            workspace,
+        );
+        ReuseFixture {
+            dir,
+            inventory,
+            store: git_dir.join("objects"),
+            trees,
+            blob,
+        }
+    }
+
+    fn reuse_export(
+        fixture: &ReuseFixture,
+        budget: Option<usize>,
+    ) -> (OpenCodeNativeSnapshot, BTreeMap<&'static str, usize>, u64) {
+        snapshot_reuse_test_hooks::STATE.with(|state| {
+            *state.borrow_mut() = snapshot_reuse_test_hooks::State {
+                budget,
+                ..Default::default()
+            };
+        });
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let observed = progress.clone();
+        let exported = export_exact_session(
+            &fixture.inventory,
+            "ses_exact",
+            ExportOptions::new(fixture.dir.path().join("extract")).with_progress_observer(
+                move |event| {
+                    if event.phase == "saved_objects" && event.state == "completed" {
+                        *observed.lock().unwrap() = event.completed_count;
+                    }
+                },
+            ),
+        )
+        .unwrap();
+        let counts = snapshot_reuse_test_hooks::STATE
+            .with(|state| std::mem::take(&mut state.borrow_mut().counts));
+        let reads = *progress.lock().unwrap();
+        (exported, counts, reads)
+    }
+
+    fn assert_reused_export(packed: bool) {
+        let fixture = reuse_fixture(packed);
+        let (plain, plain_counts, plain_reads) = reuse_export(&fixture, Some(0));
+        let (reused, counts, reads) = reuse_export(&fixture, None);
+        assert_eq!(
+            fs::read(&plain.payload_path).unwrap(),
+            fs::read(&reused.payload_path).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(plain.manifest()).unwrap(),
+            serde_json::to_value(reused.manifest()).unwrap()
+        );
+        assert_eq!(
+            source_graph_fingerprint(plain.manifest()).unwrap(),
+            source_graph_fingerprint(reused.manifest()).unwrap()
+        );
+        assert_eq!(reads, plain_reads);
+        assert_eq!(
+            reads, 30,
+            "all ten references traverse their complete three-object closure"
+        );
+        let payload: serde_json::Value =
+            serde_json::from_slice(&fs::read(&reused.payload_path).unwrap()).unwrap();
+        assert_eq!(payload["snapshot_objects"].as_array().unwrap().len(), 4);
+        assert_eq!(reused.manifest().saved_snapshots.len(), 2);
+        assert_eq!(
+            counts["hex"], 4,
+            "unchanged representations must be encoded once per export"
+        );
+        assert_eq!(counts["tree_parse"], 3);
+        assert_eq!(plain_counts["hex"], 30);
+        if packed {
+            assert_eq!(
+                counts["packed_validate"], 30,
+                "every fresh packed body must prove its current SHA1"
+            );
+            assert_eq!(counts["deflate"], 4);
+            assert_eq!(plain_counts["deflate"], 30);
+        } else {
+            assert_eq!(counts["inflate"], 4);
+            assert_eq!(plain_counts["inflate"], 30);
+        }
+    }
+
+    #[test]
+    fn complete_export_reuses_loose_representations_after_every_current_read() {
+        assert_reused_export(false);
+    }
+
+    #[test]
+    fn complete_export_reuses_packed_representations_after_every_current_read() {
+        assert_reused_export(true);
+    }
+
+    fn fixture_object_path(fixture: &ReuseFixture, id: &str) -> PathBuf {
+        fixture.store.join(&id[..2]).join(&id[2..])
+    }
+
+    fn export_after_warm_mutation(
+        fixture: &ReuseFixture,
+        mutate: impl FnMut(usize) + 'static,
+    ) -> Result<OpenCodeNativeSnapshot, TransferError> {
+        snapshot_reuse_test_hooks::STATE.with(|state| {
+            *state.borrow_mut() = snapshot_reuse_test_hooks::State {
+                before_reference: Some(Box::new(mutate)),
+                ..Default::default()
+            };
+        });
+        let result = export_exact_session(
+            &fixture.inventory,
+            "ses_exact",
+            ExportOptions::new(fixture.dir.path().join("extract")),
+        );
+        snapshot_reuse_test_hooks::STATE.with(|state| {
+            let state = state.borrow();
+            assert!(
+                state.references >= 2,
+                "mutation follows a complete warm closure"
+            );
+            assert!(
+                state.counts.get("hex").copied().unwrap_or(0) >= 3,
+                "actual first reference produced a complete representation"
+            );
+        });
+        result
+    }
+
+    #[test]
+    fn complete_export_warm_missing_roots_preserves_unavailable_references() {
+        let fixture = reuse_fixture(false);
+        let roots = fixture
+            .trees
+            .iter()
+            .map(|id| fixture_object_path(&fixture, id))
+            .collect::<Vec<_>>();
+        let exported = export_after_warm_mutation(&fixture, move |count| {
+            if count == 2 {
+                for path in &roots {
+                    fs::remove_file(path).unwrap();
+                }
+            }
+        })
+        .unwrap();
+        assert_eq!(exported.manifest().saved_snapshots.len(), 2);
+        assert!(exported
+            .manifest()
+            .saved_snapshots
+            .iter()
+            .all(|reference| reference.availability
+                == SavedSnapshotAvailability::UnavailableInQualifiedLocations
+                && reference.objects.is_empty()));
+        let payload: serde_json::Value =
+            serde_json::from_slice(&fs::read(&exported.payload_path).unwrap()).unwrap();
+        assert_eq!(
+            payload["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["table"] == "part")
+                .count(),
+            6
+        );
+    }
+
+    #[test]
+    fn complete_export_warm_child_mutations_refuse_without_publication() {
+        for change in [
+            "missing",
+            "corrupt",
+            "wrong_id",
+            "redirected",
+            "disallowed_alternate",
+        ] {
+            let fixture = reuse_fixture(false);
+            let child = fixture_object_path(&fixture, &fixture.blob);
+            let other = fs::read(fixture_object_path(&fixture, &fixture.trees[0])).unwrap();
+            let store = fixture.store.clone();
+            let outside = fixture.dir.path().join("outside");
+            fs::create_dir(&outside).unwrap();
+            let result = export_after_warm_mutation(&fixture, move |count| {
+                if count != 2 {
+                    return;
+                }
+                match change {
+                    "missing" => fs::remove_file(&child).unwrap(),
+                    "corrupt" => {
+                        fs::remove_file(&child).unwrap();
+                        fs::write(&child, b"corrupt zlib").unwrap();
+                    }
+                    "wrong_id" => {
+                        fs::remove_file(&child).unwrap();
+                        fs::write(&child, &other).unwrap();
+                    }
+                    "redirected" => {
+                        let target = outside.join("object");
+                        fs::rename(&child, &target).unwrap();
+                        #[cfg(unix)]
+                        std::os::unix::fs::symlink(&target, &child).unwrap();
+                    }
+                    "disallowed_alternate" => {
+                        fs::create_dir_all(store.join("info")).unwrap();
+                        fs::write(
+                            store.join("info/alternates"),
+                            format!("{}\n", outside.display()),
+                        )
+                        .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+            });
+            assert!(
+                matches!(
+                    result,
+                    Err(TransferError::Blocked(_) | TransferError::Io(_))
+                ),
+                "{change}: {:?}",
+                result.as_ref().err()
+            );
+            assert_eq!(
+                fs::read_dir(fixture.dir.path().join("extract"))
+                    .unwrap()
+                    .count(),
+                0,
+                "refusal must not publish or retain a bundle"
+            );
+        }
+    }
+
+    #[test]
+    fn complete_export_warm_valid_encoding_change_updates_current_commitments() {
+        let fixture = reuse_fixture(false);
+        let child = fixture_object_path(&fixture, &fixture.blob);
+        let original = fs::read(&child).unwrap();
+        let mut raw = Vec::new();
+        flate2::read::ZlibDecoder::new(original.as_slice())
+            .read_to_end(&mut raw)
+            .unwrap();
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::none());
+        encoder.write_all(&raw).unwrap();
+        let changed = encoder.finish().unwrap();
+        assert_ne!(original, changed);
+        let changed_for_callback = changed.clone();
+        let child_for_callback = child.clone();
+        let warmed = export_after_warm_mutation(&fixture, move |count| {
+            if count == 2 {
+                fs::remove_file(&child_for_callback).unwrap();
+                fs::write(&child_for_callback, &changed_for_callback).unwrap();
+            }
+        })
+        .unwrap();
+        let (uncached, _, _) = reuse_export(&fixture, Some(0));
+        assert_eq!(
+            fs::read(&warmed.payload_path).unwrap(),
+            fs::read(&uncached.payload_path).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(warmed.manifest()).unwrap(),
+            serde_json::to_value(uncached.manifest()).unwrap()
+        );
+        for reference in &warmed.manifest().saved_snapshots {
+            let metadata = reference
+                .objects
+                .iter()
+                .find(|object| object.object_id == fixture.blob)
+                .unwrap();
+            assert_eq!(metadata.compressed_sha256, digest(&changed));
+            assert_eq!(metadata.compressed_bytes, changed.len() as u64);
+        }
+    }
+
+    fn with_fixture_resolver(fixture: &ReuseFixture, run: impl FnOnce(&mut AssetResolver<'_>)) {
+        snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+        let db = open_source_read_only(&fixture.inventory.default_database).unwrap();
+        let rows = collect_exact_closure(&db, "ses_exact").unwrap();
+        let mounts =
+            resolve_workspace_mounts(&rows, &fixture.inventory.workspace_mounts, &[]).unwrap();
+        let mut resolver = AssetResolver::new(
+            fixture
+                .inventory
+                .tool_output_directory(&fixture.inventory.default_database),
+            &mounts,
+        );
+        resolver.snapshot_data_home = Some(
+            fixture
+                .inventory
+                .default_database
+                .parent()
+                .unwrap()
+                .to_path_buf(),
+        );
+        resolver
+            .snapshot_projects
+            .insert("ses_exact".into(), "prj".into());
+        run(&mut resolver);
+    }
+
+    #[test]
+    fn warm_hit_closure_enforces_complete_byte_bound_and_current_edge_kind() {
+        let fixture = reuse_fixture(false);
+        with_fixture_resolver(&fixture, |resolver| {
+            resolver
+                .record_saved_snapshot(&fixture.trees[0], "ses_exact")
+                .unwrap();
+            let bytes = resolver.saved_snapshots[&("ses_exact".into(), fixture.trees[0].clone())]
+                .objects
+                .iter()
+                .map(|object| object.compressed_bytes)
+                .sum::<u64>();
+            let counts =
+                snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().counts.clone());
+            snapshot_reuse_test_hooks::STATE
+                .with(|state| state.borrow_mut().closure_bound = Some(bytes - 1));
+            assert!(
+                matches!(resolver.record_saved_snapshot(&fixture.trees[0], "ses_exact"), Err(TransferError::Blocked(reason)) if reason == "snapshot closure exceeds its encoded transfer bound")
+            );
+            assert_eq!(
+                snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().counts.clone()),
+                counts,
+                "bound applies while every object representation is resident"
+            );
+            snapshot_reuse_test_hooks::STATE.with(|state| state.borrow_mut().closure_bound = None);
+            let child_tree = resolver
+                .object_representations
+                .resident
+                .values()
+                .find(|object| {
+                    object.edges.is_tree && object.metadata.object_id != fixture.trees[0]
+                })
+                .unwrap()
+                .metadata
+                .object_id
+                .clone();
+            let mut body = b"100644 wrong-kind\0".to_vec();
+            body.extend_from_slice(&hex::decode(child_tree).unwrap());
+            let mut raw = format!("tree {}\0", body.len()).into_bytes();
+            raw.extend_from_slice(&body);
+            let id = hex::encode(sha1::Sha1::digest(&raw));
+            let compressed = compress_snapshot_object("tree", &body).unwrap();
+            let path = fixture_object_path(&fixture, &id);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, compressed).unwrap();
+            assert!(
+                matches!(resolver.record_saved_snapshot(&id, "ses_exact"), Err(TransferError::Blocked(reason)) if reason == "snapshot closure object kind differs from its tree edge")
+            );
+        });
+    }
+
+    #[test]
+    fn complete_export_warm_packed_store_changes_remain_authoritative() {
+        for change in ["missing", "corrupt", "redirected"] {
+            let fixture = reuse_fixture(true);
+            let pack_directory = fixture.store.join("pack");
+            let pack_files = fs::read_dir(&pack_directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
+            let outside = fixture.dir.path().join("outside-pack");
+            let result = export_after_warm_mutation(&fixture, move |count| {
+                if count != 2 {
+                    return;
+                }
+                match change {
+                    "missing" => {
+                        for path in &pack_files {
+                            fs::remove_file(path).unwrap();
+                        }
+                    }
+                    "corrupt" => {
+                        for path in pack_files.iter().filter(|path| {
+                            path.extension()
+                                .is_some_and(|extension| extension == "pack")
+                        }) {
+                            let mut bytes = fs::read(path).unwrap();
+                            bytes[13] ^= 0xff;
+                            fs::remove_file(path).unwrap();
+                            fs::write(path, bytes).unwrap();
+                        }
+                    }
+                    "redirected" => {
+                        fs::rename(&pack_directory, &outside).unwrap();
+                        #[cfg(unix)]
+                        std::os::unix::fs::symlink(&outside, &pack_directory).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+            });
+            if change == "missing" {
+                let exported = result.unwrap();
+                assert!(exported
+                    .manifest()
+                    .saved_snapshots
+                    .iter()
+                    .all(|reference| reference.availability
+                        == SavedSnapshotAvailability::UnavailableInQualifiedLocations));
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(TransferError::Blocked(_) | TransferError::Io(_))
+                    ),
+                    "{change}: {:?}",
+                    result.as_ref().err()
+                );
+                assert_eq!(
+                    fs::read_dir(fixture.dir.path().join("extract"))
+                        .unwrap()
+                        .count(),
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn warm_loose_encoding_is_distinct_from_current_packed_default_encoding() {
+        let fixture = reuse_fixture(true);
+        let blob_path = fixture_object_path(&fixture, &fixture.blob);
+        let packed = read_snapshot_object(std::slice::from_ref(&fixture.store), &fixture.blob)
+            .unwrap()
+            .unwrap();
+        let (_, body) = decode_snapshot_object(&fixture.blob, &packed).unwrap();
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::none());
+        write!(encoder, "blob {}\0", body.len()).unwrap();
+        encoder.write_all(&body).unwrap();
+        let loose = encoder.finish().unwrap();
+        assert_ne!(loose, packed);
+        fs::create_dir_all(blob_path.parent().unwrap()).unwrap();
+        fs::write(&blob_path, &loose).unwrap();
+        let warmed = export_after_warm_mutation(&fixture, move |count| {
+            if count == 2 {
+                fs::remove_file(&blob_path).unwrap();
+            }
+        })
+        .unwrap();
+        let (plain, _, _) = reuse_export(&fixture, Some(0));
+        assert_eq!(
+            fs::read(&warmed.payload_path).unwrap(),
+            fs::read(&plain.payload_path).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(warmed.manifest()).unwrap(),
+            serde_json::to_value(plain.manifest()).unwrap()
+        );
+        for reference in &warmed.manifest().saved_snapshots {
+            let blob = reference
+                .objects
+                .iter()
+                .find(|object| object.object_id == fixture.blob)
+                .unwrap();
+            assert_eq!(blob.compressed_sha256, digest(&packed));
+            assert_ne!(blob.compressed_sha256, digest(&loose));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_export_warm_unreadable_child_refuses_then_restores_fixture_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = reuse_fixture(false);
+        let path = fixture_object_path(&fixture, &fixture.blob);
+        let callback_path = path.clone();
+        let original_permissions = fs::metadata(&path).unwrap().permissions();
+        let result = export_after_warm_mutation(&fixture, move |count| {
+            if count == 2 {
+                fs::set_permissions(&callback_path, fs::Permissions::from_mode(0o0)).unwrap();
+            }
+        });
+        fs::set_permissions(&path, original_permissions).unwrap();
+        assert!(
+            matches!(result, Err(TransferError::Io(_))),
+            "{:?}",
+            result.as_ref().err()
+        );
+        assert_eq!(
+            fs::read_dir(fixture.dir.path().join("extract"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn warm_resolver_rechecks_another_workspace_and_emits_distinct_native_buckets() {
+        let fixture = reuse_fixture(false);
+        let first_workspace = fixture.dir.path().join("workspace");
+        let second_workspace = fixture.dir.path().join("second-workspace");
+        fs::create_dir(&second_workspace).unwrap();
+        let first_worktree = hex::encode(sha1::Sha1::digest(
+            first_workspace.to_string_lossy().as_bytes(),
+        ));
+        let second_worktree = hex::encode(sha1::Sha1::digest(
+            second_workspace.to_string_lossy().as_bytes(),
+        ));
+        let mounts = HashMap::from([
+            (
+                "ses_exact".to_string(),
+                ResolvedWorkspaceMount {
+                    canonical_root: first_workspace,
+                    identity: WorkspaceIdentity {
+                        project_id: "prj".into(),
+                        workspace_id: None,
+                        directory: "/synthetic".into(),
+                    },
+                },
+            ),
+            (
+                "ses_other".to_string(),
+                ResolvedWorkspaceMount {
+                    canonical_root: second_workspace,
+                    identity: WorkspaceIdentity {
+                        project_id: "prj_other".into(),
+                        workspace_id: None,
+                        directory: "/synthetic/other".into(),
+                    },
+                },
+            ),
+        ]);
+        snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+        let data_home = fixture.inventory.default_database.parent().unwrap();
+        let mut resolver = AssetResolver::new(data_home.join("tool-output"), &mounts);
+        resolver.snapshot_data_home = Some(data_home.to_path_buf());
+        resolver.snapshot_projects = HashMap::from([
+            ("ses_exact".into(), "prj".into()),
+            ("ses_other".into(), "prj_other".into()),
+        ]);
+        resolver
+            .record_saved_snapshot(&fixture.trees[0], "ses_exact")
+            .unwrap();
+        resolver
+            .record_saved_snapshot(&fixture.trees[0], "ses_other")
+            .unwrap();
+        assert_eq!(
+            resolver.saved_snapshots[&("ses_other".into(), fixture.trees[0].clone())].availability,
+            SavedSnapshotAvailability::UnavailableInQualifiedLocations
+        );
+        let second_store = data_home
+            .join("snapshot/prj_other")
+            .join(&second_worktree)
+            .join("objects");
+        for object in
+            &resolver.saved_snapshots[&("ses_exact".into(), fixture.trees[0].clone())].objects
+        {
+            let target = second_store
+                .join(&object.object_id[..2])
+                .join(&object.object_id[2..]);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::copy(fixture_object_path(&fixture, &object.object_id), target).unwrap();
+        }
+        resolver
+            .record_saved_snapshot(&fixture.trees[0], "ses_other")
+            .unwrap();
+        assert_eq!(resolver.snapshot_objects.len(), 6);
+        assert_eq!(
+            snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().counts["hex"]),
+            3
+        );
+        for object in
+            &resolver.saved_snapshots[&("ses_exact".into(), fixture.trees[0].clone())].objects
+        {
+            let first = &resolver.snapshot_objects[&(
+                "prj".into(),
+                first_worktree.clone(),
+                object.object_id.clone(),
+            )];
+            let second = &resolver.snapshot_objects[&(
+                "prj_other".into(),
+                second_worktree.clone(),
+                object.object_id.clone(),
+            )];
+            assert!(
+                Arc::ptr_eq(first, second),
+                "destination tuples share emitted bytes without another hex allocation"
+            );
+        }
+        let destination = fixture.dir.path().join("destination/opencode.db");
+        let rows = vec![SerializedRow {
+            table: "session".into(),
+            key: vec![SerializedSqlValue::Text {
+                value: "ses_exact".into(),
+            }],
+            values: BTreeMap::from([
+                (
+                    "id".into(),
+                    SerializedSqlValue::Text {
+                        value: "ses_exact".into(),
+                    },
+                ),
+                (
+                    "project_id".into(),
+                    SerializedSqlValue::Text {
+                        value: "prj".into(),
+                    },
+                ),
+                ("workspace_id".into(), SerializedSqlValue::Null),
+                (
+                    "directory".into(),
+                    SerializedSqlValue::Text {
+                        value: fixture
+                            .dir
+                            .path()
+                            .join("workspace")
+                            .to_string_lossy()
+                            .into_owned(),
+                    },
+                ),
+            ]),
+        }];
+        let references =
+            vec![resolver.saved_snapshots[&("ses_exact".into(), fixture.trees[0].clone())].clone()];
+        for ((project_id, worktree_sha1, object_id), compressed_hex) in &resolver.snapshot_objects {
+            if project_id != "prj" {
+                continue;
+            }
+            install_snapshot_object(
+                &SerializedSnapshotObject {
+                    project_id: project_id.clone(),
+                    worktree_sha1: worktree_sha1.clone(),
+                    object_id: object_id.clone(),
+                    compressed_hex: compressed_hex.as_ref().clone(),
+                },
+                &references,
+                &destination,
+            )
+            .unwrap();
+        }
+        verify_saved_snapshot_references(
+            &references,
+            &rows,
+            &destination,
+            &fixture.dir.path().join("workspace"),
+        )
+        .unwrap();
+        let removed = references[0]
+            .objects
+            .iter()
+            .find(|object| object.object_id == fixture.blob)
+            .unwrap();
+        fs::remove_file(
+            destination
+                .parent()
+                .unwrap()
+                .join("snapshot/prj")
+                .join(&first_worktree)
+                .join("objects")
+                .join(&removed.object_id[..2])
+                .join(&removed.object_id[2..]),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                verify_saved_snapshot_references(
+                    &references,
+                    &rows,
+                    &destination,
+                    &fixture.dir.path().join("workspace")
+                ),
+                Err(TransferError::Blocked(_))
+            ),
+            "source memo cannot satisfy a changed destination closure"
+        );
+    }
+
+    #[test]
+    fn complete_export_small_budget_falls_back_without_changing_any_output() {
+        for packed in [false, true] {
+            let fixture = reuse_fixture(packed);
+            let (plain, _, reads) = reuse_export(&fixture, Some(0));
+            for budget in [1, 1400, 3000] {
+                let (bounded, counts, bounded_reads) = reuse_export(&fixture, Some(budget));
+                assert!(
+                    counts["hex"] > 4,
+                    "budget exhaustion must execute ordinary conversion fallback"
+                );
+                if budget == 1 {
+                    assert_eq!(counts["hex"], 30);
+                }
+                assert_eq!(reads, bounded_reads);
+                assert_eq!(
+                    fs::read(&plain.payload_path).unwrap(),
+                    fs::read(&bounded.payload_path).unwrap()
+                );
+                assert_eq!(
+                    serde_json::to_value(plain.manifest()).unwrap(),
+                    serde_json::to_value(bounded.manifest()).unwrap()
+                );
+            }
+        }
+    }
 
     #[test]
     fn capture_reports_live_phase_progress_and_safe_failure_without_changing_bundle() {
