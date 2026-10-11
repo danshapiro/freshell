@@ -388,11 +388,13 @@ pub struct FreshCodexState {
     /// Task 13b: cross-kind liveness -- true when a live terminal PTY owns
     /// `(provider, session_id)`. Wired by `main.rs`; defaults to always-false.
     terminal_liveness: crate::TerminalLivenessProbe,
-    /// The session index's disk-history answer for a resume target (the
-    /// same probe the REST create gate uses), wired by `main.rs`: a resume
-    /// Codex refuses with `no rollout found` for a thread the index never
-    /// saw on disk starts a new thread instead (Stage 2: LB-41). Unwired
-    /// (tests): the refusal stays a create failure.
+    /// The session index's disk-history answer for a resume target, wired by
+    /// `main.rs` (`existence::in_memory_resume_probe`): a resume Codex
+    /// refuses with `no rollout found` for a thread the index never saw on
+    /// disk starts a new thread instead (Stage 2: LB-41). It is called on the
+    /// async runtime, so it must answer from memory: never the REST gate's
+    /// probe, which may walk the codex rollouts. Unwired (tests): the refusal
+    /// stays a create failure.
     resume_probe: Arc<std::sync::OnceLock<freshell_platform::resume_gate::ResumeProbeFn>>,
     /// Per-parent-session fork single-flight (delta-review rounds 2+3, D2-F2): the
     /// client leaves the Fork action enabled while a fork is in flight, so a rapid
@@ -869,6 +871,9 @@ impl FreshCodexState {
 
     /// Whether the session index never saw `thread_id` on disk (a
     /// conversation that never had a turn). `false` when no probe is wired.
+    /// Asked only after Codex itself found no rollout, so no walk is needed:
+    /// Codex has just searched its own home, and the index's memory says
+    /// whether a rollout was ever there.
     fn never_on_disk(&self, thread_id: &str) -> bool {
         self.resume_probe
             .get()

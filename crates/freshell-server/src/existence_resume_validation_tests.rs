@@ -453,3 +453,76 @@ fn cold_index_codex_and_opencode_answer_unknown() {
     let _ = std::fs::remove_dir_all(&codex_root);
     let _ = std::fs::remove_dir_all(&opencode_root);
 }
+
+/// A probe over a codex-sourced index whose temp Codex home holds one
+/// rollout, the sanitized fixture whose session id is `session-activity`.
+fn probe_over_a_codex_rollout(tag: &str) -> (IndexExistenceProbe, Arc<SessionIndex>, PathBuf) {
+    use freshell_sessions::directory_index::CodexSource;
+    let codex_home = rv_temp_dir(tag);
+    let day = codex_home.join("sessions/2026/03/01");
+    std::fs::create_dir_all(&day).expect("mkdir codex day folder");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test/fixtures/coding-cli/codex/task-events.sanitized.jsonl");
+    std::fs::copy(&fixture, day.join("rollout-task-events.jsonl")).expect("copy codex fixture");
+    let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
+        vec![Arc::new(CodexSource::new(codex_home.clone())) as Arc<dyn SessionSource>],
+        Duration::from_millis(50),
+        None,
+    ));
+    let probe = IndexExistenceProbe::new(
+        Arc::clone(&index),
+        None,
+        HashMap::from([("codex".to_string(), codex_home.join("sessions"))]),
+    );
+    (probe, index, codex_home)
+}
+
+/// freshcodex consults its resume probe on the async runtime, after Codex
+/// refused a resume with "no rollout found" (Stage 2: LB-41), so the probe
+/// answers from memory: it never runs the codex rollout walk. A conversation
+/// the current index snapshot holds counts as seen on disk even when no probe
+/// read asked about it before; one that never had a turn was never seen.
+/// The spawn doors' gate probe (run on a blocking thread) is the one that
+/// walks.
+#[tokio::test]
+async fn freshcodex_resume_probe_answers_from_memory_and_never_walks() {
+    use std::sync::atomic::AtomicBool;
+    let (probe, index, codex_home) = probe_over_a_codex_rollout("freshcodex-in-memory");
+    let walked = Arc::new(AtomicBool::new(false));
+    let walked_in = Arc::clone(&walked);
+    // The walk of a never-turned conversation finds no rollout.
+    let probe = probe.with_codex_rollout_locator(Arc::new(move |_sid: &str| {
+        walked_in.store(true, TestOrdering::SeqCst);
+        ByIdAnswer::Absent
+    }));
+    index.warm().await;
+    let probe: freshell_ws::existence::SharedExistenceProbe = Arc::new(probe);
+    let freshcodex = in_memory_resume_probe(Arc::clone(&probe));
+
+    let on_disk = freshcodex("codex", "session-activity");
+    assert!(
+        on_disk.ever_observed_on_disk,
+        "a conversation in the current snapshot was seen on disk"
+    );
+    let never = freshcodex("codex", "thread-never-turned");
+    assert!(
+        !never.ever_observed_on_disk,
+        "a conversation that never had a turn was never seen on disk"
+    );
+    assert!(
+        !walked.load(TestOrdering::SeqCst),
+        "freshcodex's probe never walks the codex rollouts (it runs on the async runtime)"
+    );
+
+    let gate = gate_resume_probe(probe)("codex", "thread-never-turned");
+    assert!(
+        walked.load(TestOrdering::SeqCst),
+        "the spawn doors' gate probe walks on a warm-snapshot Absent"
+    );
+    assert!(
+        gate.existence == freshell_platform::resume_gate::ResumeExistence::Absent
+            && !gate.ever_observed_on_disk,
+        "and finds no rollout either"
+    );
+    let _ = std::fs::remove_dir_all(&codex_home);
+}

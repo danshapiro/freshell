@@ -2226,27 +2226,14 @@ async fn async_main() -> ExitCode {
     // create pipeline. The set_spawn_gate/set_identity_sink calls above are
     // unaffected: Arc<OnceLock> cells initialized in new(), shared by every
     // clone including this rebound value.
-    let resume_probe: freshell_platform::resume_gate::ResumeProbeFn = {
-        let probe = session_existence.clone(); // the hoisted Arc'd probe
-        std::sync::Arc::new(move |provider: &str, session_id: &str| {
-            use freshell_platform::resume_gate::{ResumeExistence, ResumeProbeAnswer};
-            use freshell_ws::existence::SessionExistence;
-            let existence = match probe.exists_for_gate(provider, session_id) {
-                SessionExistence::Present => ResumeExistence::Present,
-                SessionExistence::Absent => ResumeExistence::Absent,
-                SessionExistence::Unknown | SessionExistence::ProviderUnavailable => {
-                    ResumeExistence::Unknown
-                }
-            };
-            ResumeProbeAnswer {
-                existence,
-                ever_observed_on_disk: probe.ever_observed_on_disk(provider, session_id),
-            }
-        })
-    };
+    // The REST door's probe may walk the codex rollouts; the door runs it on
+    // a blocking thread.
+    let resume_probe = existence::gate_resume_probe(session_existence.clone());
     // freshcodex: a resume Codex refuses for a thread the index never saw on
-    // disk starts a new thread (Stage 2: LB-41).
-    fresh_codex_state.set_resume_probe(std::sync::Arc::clone(&resume_probe));
+    // disk starts a new thread (Stage 2: LB-41). Its probe runs on the async
+    // runtime, so it answers from memory and never walks.
+    fresh_codex_state
+        .set_resume_probe(existence::in_memory_resume_probe(session_existence.clone()));
     let fresh_agent_state = fresh_agent_state
         .with_resume_probe(resume_probe)
         .with_on_stale_resume({

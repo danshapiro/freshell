@@ -199,6 +199,51 @@ impl IndexExistenceProbe {
     }
 }
 
+/// The resume probe of the spawn doors (the REST create pipeline's resume
+/// gate): [`SessionExistenceProbe::exists_for_gate`], which may walk the codex
+/// rollouts (~1 s on a real store), so its callers run it on a blocking
+/// thread. The disk-history bit is read after it, so a walk hit counts.
+pub fn gate_resume_probe(
+    probe: freshell_ws::existence::SharedExistenceProbe,
+) -> freshell_platform::resume_gate::ResumeProbeFn {
+    resume_probe(probe, |probe, provider, session_id| {
+        probe.exists_for_gate(provider, session_id)
+    })
+}
+
+/// freshcodex's resume probe (Stage 2: LB-41). It is consulted on the async
+/// runtime, after Codex refused a resume with "no rollout found", so it
+/// answers from memory and never walks. [`SessionExistenceProbe::exists`]
+/// reads the current index snapshot, recording every conversation it holds as
+/// seen on disk, and the disk-history bit is read after it.
+pub fn in_memory_resume_probe(
+    probe: freshell_ws::existence::SharedExistenceProbe,
+) -> freshell_platform::resume_gate::ResumeProbeFn {
+    resume_probe(probe, |probe, provider, session_id| {
+        probe.exists(provider, session_id)
+    })
+}
+
+fn resume_probe(
+    probe: freshell_ws::existence::SharedExistenceProbe,
+    existence: fn(&dyn SessionExistenceProbe, &str, &str) -> SessionExistence,
+) -> freshell_platform::resume_gate::ResumeProbeFn {
+    use freshell_platform::resume_gate::{ResumeExistence, ResumeProbeAnswer};
+    Arc::new(move |provider: &str, session_id: &str| {
+        let existence = match existence(probe.as_ref(), provider, session_id) {
+            SessionExistence::Present => ResumeExistence::Present,
+            SessionExistence::Absent => ResumeExistence::Absent,
+            SessionExistence::Unknown | SessionExistence::ProviderUnavailable => {
+                ResumeExistence::Unknown
+            }
+        };
+        ResumeProbeAnswer {
+            existence,
+            ever_observed_on_disk: probe.ever_observed_on_disk(provider, session_id),
+        }
+    })
+}
+
 /// Production opencode locator: by-id check against
 /// `<data_home>/opencode.db` via
 /// `freshell_sessions::parse::session_exists_by_id` — read-only open, 250ms
