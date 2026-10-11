@@ -36,7 +36,7 @@ use freshell_runtime_protocol::{
 };
 use freshell_sessions::opencode_transfer::{
     capture_qualified_batch, export_exact_session, ExportOptions, HostOpenCodeInventory,
-    OpenCodeNativeSnapshot,
+    OpenCodeNativeSnapshot, TransferError,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -46,6 +46,50 @@ use std::{
     sync::Arc,
 };
 use tokio::time::{sleep, Duration, Instant};
+
+fn stopped_repair_transfer_failure(
+    path: &Path,
+    phase: &str,
+    source_database: &Path,
+    roots: &[String],
+    error: &TransferError,
+) -> RuntimeError {
+    // TransferError currently stores strings; retain only a numeric OS code
+    // from std::io's suffix, never the arbitrary nested error text.
+    let errno = match error {
+        TransferError::Blocked(reason) | TransferError::Io(reason) => reason
+            .rsplit_once("(os error ")
+            .and_then(|(_, suffix)| suffix.strip_suffix(')'))
+            .and_then(|number| number.parse::<i32>().ok()),
+        _ => None,
+    };
+    let (class, reason) = match error {
+        TransferError::Blocked(reason) => ("blocked", reason.as_str()),
+        TransferError::Io(_) => ("io", "source transfer I/O failed"),
+        TransferError::Sqlite(_) => ("sqlite", "source transfer SQLite failed"),
+        TransferError::Serialization(_) => {
+            ("serialization", "source transfer serialization failed")
+        }
+    };
+    // Blocked reasons are producer-written context. Details after ':' include
+    // Git stderr, JSON parser output and unrecognized schema names; omit them.
+    // Session-specific workspace failures retain their class without identity
+    // interpolated into the reason (the selected roots are separate metadata).
+    let reason = reason.split(':').next().unwrap_or(reason);
+    let reason = reason.split(" for session ").next().unwrap_or(reason);
+    crate::service::append_event(
+        path,
+        "supervisor.stopped_repair.source_transfer_failed",
+        serde_json::json!({
+            "severity": "error", "phase": phase,
+            "declaredSourceDatabase": source_database, "rootSessionIds": roots,
+            "errorClass": class, "producerReason": reason,
+            "errno": errno,
+            "reasonCode": "source_not_exactly_resolvable",
+        }),
+    );
+    stopped_repair_blocked("source_not_exactly_resolvable")
+}
 
 fn log_stopped_repair_import_failure(
     path: &Path,
@@ -1280,6 +1324,7 @@ impl Supervisor {
                 inventory.with_trusted_mount_for_selected_session(workspace)
             });
         let root = root_session_id.to_string();
+        let source_database = source_inventory.declared_default_database().to_path_buf();
         let snapshot = tokio::task::spawn_blocking(move || {
             export_exact_session(
                 &source_inventory,
@@ -1289,7 +1334,15 @@ impl Supervisor {
         })
         .await
         .map_err(|_| stopped_repair_blocked("source_export_worker_failed"))?
-        .map_err(|_| stopped_repair_blocked("source_not_exactly_resolvable"))?;
+        .map_err(|error| {
+            stopped_repair_transfer_failure(
+                &self.config.lifecycle_log,
+                "export",
+                &source_database,
+                &[root_session_id.to_string()],
+                &error,
+            )
+        })?;
         Ok(snapshot)
     }
 
@@ -1353,6 +1406,8 @@ impl Supervisor {
             inventory = inventory.with_trusted_mount_for_selected_session(workspace);
         }
         let roots = groups.keys().cloned().collect::<Vec<_>>();
+        let selected_roots = roots.clone();
+        let source_database = inventory.declared_default_database().to_path_buf();
         let extraction_root = self
             .config
             .runtime_root
@@ -1363,7 +1418,15 @@ impl Supervisor {
         })
         .await
         .map_err(|_| stopped_repair_blocked("source_capture_worker_failed"))?
-        .map_err(|_| stopped_repair_blocked("source_not_exactly_resolvable"))
+        .map_err(|error| {
+            stopped_repair_transfer_failure(
+                &self.config.lifecycle_log,
+                "capture",
+                &source_database,
+                &selected_roots,
+                &error,
+            )
+        })
     }
 
     async fn preflight_stopped_opencode_root(

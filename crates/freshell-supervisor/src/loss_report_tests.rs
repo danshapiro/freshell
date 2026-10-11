@@ -5774,6 +5774,22 @@ async fn check_persisted_repair_source_failure(failure: &str) {
         .unwrap();
     assert_eq!(incident_after, incident_before);
     let log = std::fs::read_to_string(dir.path().join("lifecycle.jsonl")).unwrap();
+    if failure == "capture" {
+        let diagnostic: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|event: &serde_json::Value| {
+                event["event"] == "supervisor.stopped_repair.source_transfer_failed"
+            })
+            .collect();
+        assert_eq!(diagnostic.len(), 1);
+        assert_eq!(diagnostic[0]["data"]["phase"], "capture");
+        assert_eq!(diagnostic[0]["data"]["errorClass"], "blocked");
+        assert_eq!(
+            diagnostic[0]["data"]["producerReason"],
+            "source database is unavailable"
+        );
+    }
     let events = log
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
@@ -5862,4 +5878,194 @@ async fn durable_souls_persisted_repair_capture_failure() {
 #[tokio::test]
 async fn durable_souls_persisted_repair_source_mismatch() {
     check_persisted_repair_source_failure("mismatch").await;
+}
+
+async fn check_preflight_source_failure_diagnostic(failure: &str, expected_reason: &str) {
+    use freshell_runtime_protocol::{
+        PreflightLostSoulsRequest, RepairBatchSourceSelection, RuntimeErrorCode,
+    };
+    use freshell_sessions::opencode_transfer::{
+        pinned_destination_migration_ids, pinned_destination_schema_sql, HostOpenCodeInventory,
+    };
+    use sha2::{Digest, Sha256};
+
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Registry::open(dir.path(), None).unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let database = dir.path().join("source.sqlite");
+    let source = Connection::open(&database).unwrap();
+    source
+        .execute_batch(pinned_destination_schema_sql())
+        .unwrap();
+    for migration in pinned_destination_migration_ids() {
+        source
+            .execute(
+                "INSERT INTO migration(id,time_completed) VALUES (?1,1)",
+                [migration],
+            )
+            .unwrap();
+    }
+    let root = "ses_fixture_preflight_failure";
+    source.execute("INSERT INTO project(id,worktree,time_created,time_updated,sandboxes) VALUES ('fixture-project',?1,1,1,'[]')", [workspace.to_string_lossy().as_ref()]).unwrap();
+    source.execute("INSERT INTO project_directory(project_id,directory,time_created) VALUES ('fixture-project',?1,1)", [workspace.to_string_lossy().as_ref()]).unwrap();
+    source.execute("INSERT INTO session(id,project_id,slug,directory,title,version,time_created,time_updated) VALUES (?1,'fixture-project','fixture',?2,'synthetic-secret','1.18.21',1,1)", params![root,workspace.to_string_lossy().as_ref()]).unwrap();
+    match failure {
+        "schema" => {
+            source
+                .execute_batch("CREATE TABLE \"synthetic-secret\" (id TEXT)")
+                .unwrap();
+        }
+        "payload" => {
+            source.execute("INSERT INTO message(id,session_id,time_created,time_updated,data) VALUES ('msg-fixture',?1,1,1,?2)", params![root,"synthetic-secret malformed native body"]).unwrap();
+        }
+        _ => {}
+    }
+    drop(source);
+    let target = stopped_legacy_fixture_target(&registry, dir.path(), root).await;
+    let terminal = serde_json::json!({"terminalId":"terminal-preflight-failure","streamId":"stream-preflight-failure","mode":"opencode","program":"opencode","env":{"PRIVATE_CONFIG":"synthetic-secret"},"runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"test-project","workspacePath":workspace,"cwd":workspace});
+    let conn = Connection::open(registry.database_path()).unwrap();
+    conn.execute(
+        "UPDATE incarnations SET terminal_spec=?1 WHERE soul_id=?2",
+        params![terminal.to_string(), target.soul_id.as_str()],
+    )
+    .unwrap();
+    let before = registry
+        .recovery_context(target.soul_id.clone())
+        .await
+        .unwrap();
+    let incident_before: String = conn
+        .query_row(
+            "SELECT certificate_json FROM loss_incidents WHERE incident_id=?1",
+            [target.incident_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let source_before = std::fs::read(&database).unwrap();
+    let source_store_id = format!(
+        "{:x}",
+        Sha256::digest(
+            database
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .as_bytes()
+        )
+    );
+    let inventory = HostOpenCodeInventory::new(if failure == "missing" {
+        dir.path().join("missing.sqlite")
+    } else {
+        database.clone()
+    });
+    let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+    let error = supervisor
+        .preflight_lost_souls_from_inventory(
+            PreflightLostSoulsRequest {
+                source: RepairBatchSourceSelection {
+                    source_store_id,
+                    root_session_ids: vec![root.into()],
+                },
+                expected_control_epoch: Some(registry.control_epoch()),
+            },
+            inventory,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, RuntimeErrorCode::RecoveryBlocked);
+    assert_eq!(
+        error.message,
+        "stopped OpenCode repair is pending (source_not_exactly_resolvable)"
+    );
+    let after = registry
+        .recovery_context(target.soul_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(after.desired_state, before.desired_state);
+    assert_eq!(after.recovery_state, before.recovery_state);
+    assert_eq!(after.intent_revision, before.intent_revision);
+    assert_eq!(after.identity_revision, before.identity_revision);
+    assert_eq!(after.native_import_revision, before.native_import_revision);
+    assert_eq!(
+        after.native_import_authority,
+        before.native_import_authority
+    );
+    let incident_after: String = conn
+        .query_row(
+            "SELECT certificate_json FROM loss_incidents WHERE incident_id=?1",
+            [target.incident_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(incident_after, incident_before);
+    for table in ["stopped_repair_operations", "stopped_repair_root_receipts"] {
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+    assert_eq!(std::fs::read(&database).unwrap(), source_before);
+    let log = std::fs::read_to_string(dir.path().join("lifecycle.jsonl")).unwrap_or_default();
+    let events: Vec<serde_json::Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|event: &serde_json::Value| {
+            event["event"] == "supervisor.stopped_repair.source_transfer_failed"
+        })
+        .collect();
+    assert_eq!(
+        events.len(),
+        1,
+        "actual {failure} refusal must diagnose its producer once"
+    );
+    let data = &events[0]["data"];
+    assert_eq!(data["severity"], "error");
+    assert_eq!(data["phase"], "capture");
+    assert_eq!(data["errorClass"], "blocked");
+    assert_eq!(data["producerReason"], expected_reason);
+    if failure == "missing" {
+        assert_eq!(
+            data["errno"], 2,
+            "retain the actual missing-source cause without printing arbitrary error details"
+        );
+    }
+    assert_eq!(data["rootSessionIds"], serde_json::json!([root]));
+    assert_eq!(
+        data["declaredSourceDatabase"],
+        if failure == "missing" {
+            dir.path().join("missing.sqlite")
+        } else {
+            database
+        }
+        .to_string_lossy()
+        .as_ref()
+    );
+    assert!(
+        !log.contains("synthetic-secret"),
+        "diagnostic must exclude native bodies, titles, config and unrecognized schema names"
+    );
+}
+
+#[tokio::test]
+async fn durable_souls_preflight_source_diagnostic_missing() {
+    check_preflight_source_failure_diagnostic("missing", "source database is unavailable").await;
+}
+
+#[tokio::test]
+async fn durable_souls_preflight_source_diagnostic_schema() {
+    check_preflight_source_failure_diagnostic(
+        "schema",
+        "source schema contains an unrecognized table",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn durable_souls_preflight_source_diagnostic_payload() {
+    check_preflight_source_failure_diagnostic(
+        "payload",
+        "native message.data data is not valid JSON",
+    )
+    .await;
 }
