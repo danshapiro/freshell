@@ -23271,6 +23271,20 @@ pub(crate) mod tests {
     #[cfg(target_os = "linux")]
     impl OutsideHolder {
         fn hold(lock: &std::path::Path) -> Self {
+            Self::hold_with_env(lock, &[])
+        }
+
+        /// The holder started as a member of `unit` (placed by its tag, as
+        /// a pane's app-server is placed in its pane's unit).
+        fn hold_in_unit(lock: &std::path::Path, unit: &freshell_containment::AgentUnit) -> Self {
+            let placement = unit
+                .placement(freshell_containment::MemberRole::Agent)
+                .expect("a placement in the unit");
+            assert!(placement.wrapper.is_none(), "the tag backend places by tag");
+            Self::hold_with_env(lock, &placement.env)
+        }
+
+        fn hold_with_env(lock: &std::path::Path, env: &[(String, String)]) -> Self {
             use std::io::BufRead as _;
             std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
             let mut child = std::process::Command::new("perl")
@@ -23280,6 +23294,7 @@ pub(crate) mod tests {
                      flock($f, LOCK_EX) or die; $| = 1; print \"locked\\n\"; sleep 600",
                 ])
                 .arg(lock)
+                .envs(env.iter().map(|(k, v)| (k, v)))
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .spawn()
@@ -23350,6 +23365,61 @@ pub(crate) mod tests {
         );
         assert_eq!(conflict.fields["holder_name"], "perl", "{conflict:?}");
         assert_eq!(conflict.fields["source"], "preflight", "{conflict:?}");
+        drop(holder);
+    }
+
+    /// Task 16: a freshcodex resume of a conversation a member of a live
+    /// Freshell pane's unit holds (that pane's app-server, which the owner
+    /// registry may not know holds it) is that pane's: the create answers
+    /// `SESSION_RESERVED`, the live-session answer the live-terminal guard
+    /// gives, resumes nothing beside the holder, and never reports it as
+    /// another program.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_resume_of_a_conversation_a_freshell_panes_unit_holds_answers_session_reserved() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let capture = tracing_capture::capture_by_session("thread-held-by-pane");
+        let home = std::env::var_os("CODEX_HOME").expect("the isolated CODEX_HOME");
+        let units = freshell_containment::UnitDirectory::new();
+        let unit = freshell_containment::Containment::tag_backend(Default::default())
+            .create_unit(freshell_containment::UnitId::mint(), Default::default())
+            .expect("a pane's unit");
+        units.register(freshell_containment::UnitEntry {
+            unit: unit.clone(),
+            provider: "codex".to_string(),
+            mode: "codex".to_string(),
+            create_request_id: Some("crq-holding-pane".to_string()),
+            terminal_id: Some("term-holding-pane".to_string()),
+        });
+        let holder = OutsideHolder::hold_in_unit(
+            &freshell_containment::codex_thread_lock_path(
+                std::path::Path::new(&home),
+                "thread-held-by-pane",
+            ),
+            &unit,
+        );
+        let (st, mut rx) = state_with_bus();
+        st.set_unit_directory(units);
+
+        st.handle_create(
+            resume_create("req-held-by-pane", "thread-held-by-pane"),
+            None,
+        )
+        .await;
+        let frame = create_answer(&mut rx).await;
+        assert_eq!(frame["type"], "freshAgent.create.failed", "{frame}");
+        assert_eq!(frame["code"], "SESSION_RESERVED", "{frame}");
+        assert!(
+            !st.sessions.lock().await.contains_key("thread-held-by-pane"),
+            "nothing was resumed beside the holding pane"
+        );
+        assert!(
+            capture.events().iter().all(|e| {
+                e.fields.get("event").map(String::as_str) != Some("unit.writer_conflict")
+            }),
+            "a Freshell pane is never reported as another program"
+        );
         drop(holder);
     }
 

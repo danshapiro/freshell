@@ -223,6 +223,65 @@ async fn every_reopen_door_reports_the_outside_holder() {
     assert!(fake_codex::pid_alive(rest_holder.pid()));
 }
 
+/// An auto-resume (a crashed pane's respawn, which has no client to
+/// answer) of a conversation a process outside Freshell holds is refused:
+/// the refusal names the holder by pid and process name, the conflict is
+/// logged at ERROR, the one attempt's app-server is stopped and never
+/// retried, and the holder is never signalled.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_auto_resume_of_a_conversation_held_outside_freshell_is_refused_and_never_retried() {
+    let _ = captured();
+    let h = UnitHarness::start(HarnessOpts::default()).await;
+    h.seed_rollout("t-auto-out");
+    let holder = fake_codex::OutsideHolder::hold(&h.lock("t-auto-out"));
+    let natives_before: Vec<u32> = h.native_manifests().iter().map(|m| m.pid).collect();
+
+    let refusal = freshell_ws::terminal::respawn_agent_terminal(
+        &h.state,
+        &freshell_ws::terminal::AgentRespawnRequest {
+            mode: "codex".into(),
+            provider: "codex".into(),
+            session_id: "t-auto-out".into(),
+            create_request_id: "crq-auto-out".into(),
+            cwd: Some(h.home.path().display().to_string()),
+        },
+    )
+    .await
+    .expect_err("a respawn beside an outside holder is refused");
+    match refusal {
+        freshell_ws::terminal::RespawnError::LaunchUnresolvable(message) => assert_eq!(
+            message,
+            freshell_protocol::conversation_held_elsewhere_message(holder.pid(), "perl")
+        ),
+        other => panic!("expected the holder refusal, got {other:?}"),
+    }
+    assert_conflict_logged("t-auto-out", holder.pid(), "preflight").await;
+
+    eventually("the attempt's sidecar was stopped", || {
+        h.state.units.by_create_request("crq-auto-out").is_none()
+    })
+    .await;
+    let attempts: Vec<u32> = h
+        .native_manifests()
+        .iter()
+        .map(|m| m.pid)
+        .filter(|pid| !natives_before.contains(pid))
+        .collect();
+    assert_eq!(
+        attempts.len(),
+        1,
+        "one app-server was started and never retried: {attempts:?}"
+    );
+    eventually("the attempt's app-server is gone", || {
+        !fake_codex::pid_alive(attempts[0])
+    })
+    .await;
+    assert!(
+        fake_codex::pid_alive(holder.pid()),
+        "the outside holder is never signalled"
+    );
+}
+
 /// A conversation a live pane's app-server holds without the owner registry
 /// knowing (loaded by another client of that app-server, announced on no
 /// connection) is that pane's: a reopen answers the holding pane, through
@@ -232,26 +291,8 @@ async fn a_reopen_of_a_thread_another_panes_app_server_holds_answers_that_pane()
     let _ = captured();
     let h = UnitHarness::start(HarnessOpts::default()).await;
     let mut ws = h.connect().await;
-    let holder_tid = h.create_codex(&mut ws, "crq-holder", Some("t-shown")).await;
-    output_shows(&h, &mut ws, &holder_tid, "FAKE_TUI_READY").await;
-    let url = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
-        .sidecar_ws_url(&holder_tid)
-        .expect("the app-server's own address");
-    let port: u16 = url
-        .rsplit(':')
-        .next()
-        .and_then(|port| port.trim_end_matches('/').parse().ok())
-        .unwrap_or_else(|| panic!("a port in {url}"));
-    let mut second_client = fake_codex::Rpc::connect(port).await;
-    second_client
-        .call("fixture/loadThread", json!({"threadId": "t-quiet-held"}))
-        .await
-        .expect("the app-server loads the thread");
-    assert!(fake_codex::holds_lock_fd(
-        h.native_pid(&holder_tid),
-        &h.lock("t-quiet-held")
-    ));
-    h.seed_rollout("t-quiet-held");
+    let (holder_tid, _loader) =
+        quietly_holding_pane(&h, &mut ws, "crq-holder", "t-quiet-held").await;
 
     let mut other = h.connect().await;
     h.send(&mut other, reopen("crq-quiet", "t-quiet-held", true))
@@ -284,6 +325,83 @@ async fn a_reopen_of_a_thread_another_panes_app_server_holds_answers_that_pane()
             .is_none(),
         "a Freshell pane is never reported as another program"
     );
+}
+
+/// The interactive reopen (a create with a `sessionRef` and no restore
+/// flag) of a conversation another pane's app-server holds without the
+/// owner registry knowing answers that pane too, and reports no outside
+/// program.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_interactive_reopen_of_a_thread_another_panes_app_server_holds_answers_that_pane() {
+    let _ = captured();
+    let h = UnitHarness::start(HarnessOpts::default()).await;
+    let mut ws = h.connect().await;
+    let (holder_tid, _loader) =
+        quietly_holding_pane(&h, &mut ws, "crq-holder-i", "t-quiet-held-i").await;
+
+    let mut other = h.connect().await;
+    h.send(&mut other, reopen("crq-quiet-i", "t-quiet-held-i", false))
+        .await;
+    let created = answer(&h, &mut other, "crq-quiet-i", Duration::from_secs(10))
+        .await
+        .expect("the interactive reopen is answered");
+    assert_eq!(created["type"], "terminal.created", "{created}");
+    assert_eq!(
+        created["terminalId"],
+        holder_tid.as_str(),
+        "the interactive reopen names the holding pane's terminal"
+    );
+    eventually("the interactive attempt's sidecar was stopped", || {
+        h.state.units.by_create_request("crq-quiet-i").is_none()
+    })
+    .await;
+    assert!(
+        captured()
+            .first(
+                tracing::Level::ERROR,
+                "unit.writer_conflict",
+                &[("thread_id", "t-quiet-held-i")]
+            )
+            .is_none(),
+        "a Freshell pane is never reported as another program"
+    );
+}
+
+/// Creates a Codex pane (`request_id`) whose app-server then loads
+/// `thread_id` for another client of it, announced on no connection: the
+/// pane's native holds that conversation's lock while the owner registry
+/// does not know it. The rollout of `thread_id` is seeded. Returns the
+/// pane's terminal id and the client that made it load the thread (kept for
+/// the test's lifetime).
+async fn quietly_holding_pane(
+    h: &UnitHarness,
+    ws: &mut TestWs,
+    request_id: &str,
+    thread_id: &str,
+) -> (String, fake_codex::Rpc) {
+    let holder_tid = h
+        .create_codex(ws, request_id, Some(&format!("{thread_id}-shown")))
+        .await;
+    output_shows(h, ws, &holder_tid, "FAKE_TUI_READY").await;
+    let url = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+        .sidecar_ws_url(&holder_tid)
+        .expect("the app-server's own address");
+    let port: u16 = url
+        .rsplit(':')
+        .next()
+        .and_then(|port| port.trim_end_matches('/').parse().ok())
+        .unwrap_or_else(|| panic!("a port in {url}"));
+    let mut second_client = fake_codex::Rpc::connect(port).await;
+    second_client
+        .call("fixture/loadThread", json!({"threadId": thread_id}))
+        .await
+        .expect("the app-server loads the thread");
+    assert!(fake_codex::holds_lock_fd(
+        h.native_pid(&holder_tid),
+        &h.lock(thread_id)
+    ));
+    h.seed_rollout(thread_id);
+    (holder_tid, second_client)
 }
 
 /// A holder lookup that cannot finish in time (a hung network mount) is
