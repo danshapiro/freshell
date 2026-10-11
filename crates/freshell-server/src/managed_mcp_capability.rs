@@ -10220,6 +10220,158 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
     }
 
     #[test]
+    fn managed_provider_global_resource_config_references_resolve_at_native_path() {
+        use crate::managed_provider_references::sources::*;
+        use freshell_platform::provider_environment::{
+            copy_environment, CopyLimits, CopySelection,
+        };
+        use freshell_runtime_protocol::*;
+        for config_parent in [".config", "custom-xdg"] {
+            let owned = tempfile::tempdir().unwrap();
+            let home = owned.path().join("home");
+            let workspace = owned.path().join("workspace");
+            let global = home.join(config_parent).join("opencode");
+            std::fs::create_dir_all(&global).unwrap();
+            std::fs::create_dir_all(&workspace).unwrap();
+            let relative_policy = global.join("relative-policy.txt");
+            let absolute_policy = home.join("absolute-policy.txt");
+            let plugin = global.join("selected-plugin.js");
+            std::fs::write(&plugin, "export default {};\n").unwrap();
+            std::fs::write(&relative_policy, "relative-policy-nonce").unwrap();
+            std::fs::write(&absolute_policy, "absolute-policy-nonce").unwrap();
+            let raw = serde_json::json!({"plugin":[format!("file://{}", plugin.display())], "agent":{"probe":{
+                "prompt":"{file:./relative-policy.txt}",
+                "description":format!("{{file:{}}}", absolute_policy.display())
+            }}})
+            .to_string();
+            let configuration = global.join("opencode.jsonc");
+            std::fs::write(&configuration, &raw).unwrap();
+            let discovery = OpencodeDiscovery {
+                home: &home,
+                cwd: &workspace,
+                worktree: &workspace,
+                config_root: &global,
+                env: &|_| None,
+            };
+            let roots = select_opencode_resource_roots(&discovery).unwrap();
+            let plan = plan_opencode_sources(
+                discover_opencode(discovery).unwrap(),
+                &workspace,
+                &home,
+                &|_, _, _| None,
+            )
+            .unwrap();
+            let references = [ProviderConfigReference {
+                root: ProviderConfigRoot::UserProvider,
+                relative_path: "opencode.jsonc".into(),
+                provider_relative_path: ".config/opencode/opencode.jsonc".into(),
+                format: "jsonc".into(),
+            }];
+            let directory = owned.path().join("control/mcp-capabilities");
+            std::fs::create_dir_all(&directory).unwrap();
+            let grant = CapabilityStore::default()
+                .issue(
+                    SoulId::new(),
+                    &directory,
+                    "http://host.docker.internal:4000".into(),
+                    Some(("opencode", &home, &references)),
+                    OpencodeEphemeralInput {
+                        cwd: Some(&workspace),
+                        workspace: Some(&workspace),
+                        config_root: Some(&global),
+                        source_plan: Some(&plan),
+                        resource_roots: Some(&roots),
+                        secret_references: Some(&[]),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            let stage = staged_provider_root_path(&directory, &grant.grant_id).unwrap();
+            let inputs: PreparedProviderInputs = serde_json::from_slice(
+                &std::fs::read(stage.join(".freshell/prepared-inputs.json")).unwrap(),
+            )
+            .unwrap();
+            let guest = owned.path().join("guest-home");
+            let runtime_home = Path::new("/home/freshell/provider");
+            let selections = inputs
+                .resource_mounts
+                .iter()
+                .filter_map(|unit| {
+                    let destination = Path::new(&unit.effective_destination)
+                        .strip_prefix(runtime_home)
+                        .ok()?;
+                    Some(CopySelection {
+                        source: stage.join(&unit.stage_relative_path),
+                        destination_relative: destination.into(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            copy_environment(&selections, &guest, &[], CopyLimits::default()).unwrap();
+            // Model the exact declared file mounts in an owned temporary HOME.
+            // A config bind at a different filename cannot change the native
+            // global file that the consumer subsequently loads.
+            for bind in &inputs.config_binds {
+                let destination = guest.join(
+                    Path::new(&bind.effective_destination)
+                        .strip_prefix(runtime_home)
+                        .unwrap(),
+                );
+                std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+                std::fs::copy(stage.join(&bind.source_relative_path), destination).unwrap();
+            }
+            let manifest: freshell_platform::opencode_recipe::SourceManifest =
+                serde_json::from_slice(
+                    &std::fs::read(stage.join(".freshell/input-manifest.json")).unwrap(),
+                )
+                .unwrap();
+            for file in &manifest.files {
+                let destination = guest.join(format!(".freshell/references/{}", file.source_id));
+                std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+                std::fs::copy(&file.canonical_source, destination).unwrap();
+            }
+            let native = guest.join(".config/opencode/opencode.jsonc");
+            let selected: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&native).unwrap()).unwrap();
+            let consumed = ["prompt", "description"].map(|field| {
+                let token = selected["agent"]["probe"][field].as_str().unwrap();
+                let path = Path::new(
+                    token
+                        .strip_prefix("{file:")
+                        .unwrap()
+                        .strip_suffix('}')
+                        .unwrap(),
+                );
+                let source = if path.is_absolute() {
+                    guest.join(path.strip_prefix(runtime_home).unwrap())
+                } else {
+                    native.parent().unwrap().join(path)
+                };
+                std::fs::read_to_string(source)
+                    .expect("native global config must resolve every selected reference")
+            });
+            assert_eq!(consumed, ["relative-policy-nonce", "absolute-policy-nonce"]);
+            assert_eq!(std::fs::read_to_string(&configuration).unwrap(), raw);
+            std::fs::remove_file(relative_policy).unwrap();
+            assert!(
+                plan_opencode_sources(
+                    vec![SourceOccurrence {
+                        logical_path: configuration.clone(),
+                        canonical_source: configuration,
+                        lane: SourceLane::Main,
+                        role: DiscoveryRole::Global
+                    }],
+                    &workspace,
+                    &home,
+                    &|_, _, _| None,
+                )
+                .is_err(),
+                "a missing selected reference remains an error"
+            );
+        }
+    }
+
+    #[test]
     fn managed_provider_home_workspace_discovery_keeps_project_origins() {
         use crate::managed_provider_references::sources::*;
         use freshell_runtime_protocol::*;

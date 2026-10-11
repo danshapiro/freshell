@@ -1247,7 +1247,26 @@ pub(super) fn describe(
                 let relative = physical
                     .strip_prefix(root)
                     .map_err(|_| "selected global config escaped its owned stage")?;
-                if relative.starts_with(".freshell/resources") {
+                if let Some((unit, suffix)) = resource_mounts.iter().find_map(|unit| {
+                    if !destination.starts_with(&unit.logical_destination) {
+                        return None;
+                    }
+                    let suffix = relative.strip_prefix(&unit.stage_relative_path).ok()?;
+                    if unit.kind == ProviderResourceKind::File && !suffix.as_os_str().is_empty() {
+                        return None;
+                    }
+                    Some((unit, suffix))
+                }) {
+                    // The shared copier can place a global config in its
+                    // already selected resource unit. Its private template
+                    // must cover that unit's native alias, not a new nested
+                    // filename containing the controller's stage path.
+                    if suffix.as_os_str().is_empty() {
+                        Path::new(&unit.effective_destination).to_owned()
+                    } else {
+                        Path::new(&unit.effective_destination).join(suffix)
+                    }
+                } else if relative.starts_with(".freshell/resources") {
                     runtime_home.join(relative)
                 } else {
                     runtime_home.join(".config/opencode").join(relative)
