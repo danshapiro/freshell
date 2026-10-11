@@ -16,7 +16,7 @@ import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import type { AppStore } from '@/store/store'
 import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
 import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
-import { sendSuppressedAwareFreshAgentFrame } from '@/lib/fresh-agent-configure'
+import { isFreshAgentNetworkEffectsSuppressed, sendSuppressedAwareFreshAgentFrame } from '@/lib/fresh-agent-configure'
 import { KILL_ACK_TIMEOUT_MESSAGE, KILL_FAILED_MESSAGE, sendFreshAgentKillAndAwait, sendFreshAgentRecoveryStopAndAwait } from '@/lib/kill-ack'
 import { createLogger } from '@/lib/client-logger'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
@@ -2152,6 +2152,11 @@ export function FreshAgentView({
       && paneContent.status !== 'starting'
       && !paneContent.sessionRef
     ) return
+    // The picker holds effects until its model/effort profile is staged.
+    // Defer the whole create decision: a suppressed send cannot consume
+    // its one-time arm, register a pending create, or capture an owner fence.
+    // Profile staging releases the hold and updates this same pane content.
+    if (isFreshAgentNetworkEffectsSuppressed(paneId)) return
     // Pre-verdict create wait: a reconcile-pending pane defers its mount-time
     // create until its verdict folds (the fold's clearReconcilePendingPane
     // re-fires this effect via the reconcilePendingSince dep), bounded by
