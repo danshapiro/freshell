@@ -19,6 +19,21 @@ pub(crate) async fn context(
     provider: &str,
     dispatched: bool,
 ) -> (Registry, RecoveryContext) {
+    context_with_native_identity(
+        root,
+        provider,
+        dispatched,
+        (provider != "shell").then_some("exact-session"),
+    )
+    .await
+}
+
+pub(crate) async fn context_with_native_identity(
+    root: &std::path::Path,
+    provider: &str,
+    dispatched: bool,
+    native_session_id: Option<&str>,
+) -> (Registry, RecoveryContext) {
     let registry = Registry::open(root.join("registry"), None).unwrap();
     let soul = SoulId::new();
     let prepared = registry
@@ -26,11 +41,7 @@ pub(crate) async fn context(
             soul_id: soul.clone(),
             provider: provider.into(),
             provider_store_id: "store".into(),
-            native_session_id: if provider == "shell" {
-                None
-            } else {
-                Some("exact-session".into())
-            },
+            native_session_id: native_session_id.map(str::to_owned),
             creation_seed_ref: "original-seed".into(),
             request_id: RequestId::new(),
             payload_digest: "fixture".into(),

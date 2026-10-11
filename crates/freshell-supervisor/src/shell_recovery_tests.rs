@@ -1,11 +1,11 @@
-struct ShellBackend(std::sync::Mutex<BackendRuntimeState>);
+struct RecoveryBackend(std::sync::Mutex<BackendRuntimeState>);
 #[async_trait::async_trait]
-impl crate::backend::RuntimeBackend for ShellBackend {
+impl crate::backend::RuntimeBackend for RecoveryBackend {
     async fn create_stopped(
         &self,
         _: &crate::backend::CreateRuntimeSpec,
     ) -> Result<crate::backend::BackendCreated, BackendError> {
-        panic!("no shell replacement permitted after dispatch")
+        panic!("no replacement permitted after dispatch")
     }
     async fn start_host(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
         panic!("no new host")
@@ -59,6 +59,15 @@ async fn shell_supervisor(
     dispatched: bool,
 ) -> (Supervisor, RecoveryContext) {
     let (registry, ctx) = checkpoints::tests::context(root, "shell", dispatched).await;
+    recovery_supervisor(root, registry, ctx, state).await
+}
+
+async fn recovery_supervisor(
+    root: &std::path::Path,
+    registry: crate::registry::Registry,
+    ctx: RecoveryContext,
+    state: BackendRuntimeState,
+) -> (Supervisor, RecoveryContext) {
     registry
         .plan_or_apply_migration(
             freshell_runtime_protocol::MigrationPlanRequest {
@@ -78,7 +87,7 @@ async fn shell_supervisor(
         control_socket_path: root.join("control.sock"),
         host_binary_path: root.join("runtime/host"),
         image_ref: format!("sha256:{}", "b".repeat(64)),
-        test_run_id: "shell-recovery".into(),
+        test_run_id: "recovery-fixture".into(),
         control_secret: "synthetic-control-secret".into(),
         lifecycle_log: root.join("lifecycle.jsonl"),
         admission: crate::admission::AdmissionPolicy::default(),
@@ -86,12 +95,155 @@ async fn shell_supervisor(
     (
         Supervisor::new(
             registry,
-            std::sync::Arc::new(ShellBackend(std::sync::Mutex::new(state))),
+            std::sync::Arc::new(RecoveryBackend(std::sync::Mutex::new(state))),
             config,
         )
         .unwrap(),
         ctx,
     )
+}
+
+async fn offline_coding_provider_without_verified_resume(native_session_id: Option<&str>) {
+    let temp = tempfile::tempdir().unwrap();
+    let (registry, ctx) = checkpoints::tests::context_with_native_identity(
+        temp.path(),
+        "opencode",
+        true,
+        native_session_id,
+    )
+    .await;
+    assert_eq!(ctx.native_session_id.as_deref(), native_session_id);
+    assert!(ctx.resume_spec.is_none());
+    assert_eq!(ctx.checkpoint_revision, 0);
+    assert_eq!(ctx.dispatched_command_count, 1);
+    assert!(!ctx.never_dispatched);
+    let (supervisor, ctx) =
+        recovery_supervisor(temp.path(), registry, ctx, BackendRuntimeState::Exited).await;
+    let output = ctx.prior_handle.runtime_dir().join("retained-output");
+    std::fs::write(&output, b"provider exited before verified identity capture").unwrap();
+    let before = supervisor.registry.inventory().await.unwrap();
+    let connection = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+    let retained_input = || {
+        connection
+            .query_row(
+                "SELECT protected_payload,state,incarnation_id FROM input_commands WHERE soul_id=?1",
+                [ctx.soul_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap()
+    };
+    let input_before = retained_input();
+    assert_eq!(input_before.0, b"synthetic-input");
+    assert_eq!(input_before.1, "dispatching");
+    let result = supervisor
+        .recover(RecoverRequest {
+            soul_id: ctx.soul_id.clone(),
+            trigger: RecoveryTrigger::ProviderExit,
+            expected_intent_revision: None,
+            expected_control_epoch: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result.outcome, RecoveryOutcome::Blocked);
+    let Some(RecoveryProbe::Blocked {
+        path,
+        reason,
+        retry_hint,
+        evidence,
+    }) = result.probe
+    else {
+        panic!(
+            "offline missing metadata must remain unknown: {:?}",
+            result.probe
+        );
+    };
+    assert_eq!(path, RecoveryPath::NativeResume);
+    assert_eq!(reason, RecoveryBlockReason::AmbiguousIdentity);
+    assert!(retry_hint.manual_retry);
+    assert!(retry_hint.automatic_after_ms.is_none());
+    assert!(retry_hint.repair.is_some_and(|repair| !repair.is_empty()));
+    assert!(!evidence.is_empty());
+    assert_eq!(result.view.soul_id, ctx.soul_id);
+    assert_eq!(
+        result.view.incarnation_id,
+        *ctx.prior_handle.incarnation_id()
+    );
+    assert_eq!(result.view.container_id, before[0].container_id);
+    assert_eq!(
+        result.view.execution_generation,
+        before[0].execution_generation
+    );
+    assert_eq!(result.view.native_session_id.as_deref(), native_session_id);
+    assert_eq!(
+        result.view.recovery_state,
+        freshell_runtime_protocol::RecoveryState::Blocked
+    );
+    assert_eq!(
+        result.view.cleanup_state,
+        freshell_runtime_protocol::CleanupState::None
+    );
+    assert!(result.incident_id.is_none());
+    assert!(result.view.incident_id.is_none());
+    assert!(result.attempt_id.is_none());
+    assert!(result.prior_incarnation_id.is_none());
+    assert!(supervisor
+        .registry
+        .unresolved_loss_incident_ids()
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM loss_incidents", [], |row| row
+                .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
+    let after = supervisor.registry.inventory().await.unwrap();
+    assert_eq!(after.len(), 1, "recovery must not create a replacement");
+    assert_eq!(after[0], result.view);
+    let retained = supervisor
+        .registry
+        .recovery_context(ctx.soul_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        retained.prior_handle.incarnation_id(),
+        ctx.prior_handle.incarnation_id()
+    );
+    assert_eq!(
+        retained.prior_handle.container_id(),
+        ctx.prior_handle.container_id()
+    );
+    assert_eq!(
+        retained.prior_handle.runtime_dir(),
+        ctx.prior_handle.runtime_dir()
+    );
+    assert_eq!(retained.dispatched_command_count, 1);
+    assert_eq!(retained.native_session_id.as_deref(), native_session_id);
+    assert!(retained.resume_spec.is_none());
+    assert_eq!(retained_input(), input_before);
+    assert_eq!(
+        std::fs::read(output).unwrap(),
+        b"provider exited before verified identity capture"
+    );
+}
+
+#[tokio::test]
+async fn recovery_offline_dispatched_without_identity_blocks_and_preserves_data() {
+    offline_coding_provider_without_verified_resume(None).await;
+}
+
+#[tokio::test]
+async fn recovery_offline_identity_without_verified_resume_blocks_and_preserves_data() {
+    offline_coding_provider_without_verified_resume(Some("exact-session")).await;
 }
 
 async fn shell_host(
@@ -417,7 +569,7 @@ async fn recovery_inspected_sqlite_absence_certifies_loss_and_preserves_output()
     };
     let supervisor = Supervisor::new(
         registry,
-        std::sync::Arc::new(ShellBackend(std::sync::Mutex::new(
+        std::sync::Arc::new(RecoveryBackend(std::sync::Mutex::new(
             BackendRuntimeState::Running,
         ))),
         config,
