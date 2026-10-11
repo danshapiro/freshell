@@ -1738,7 +1738,7 @@ fn blocks_workspace_file_from_a_different_session_workspace_mapping() {
 }
 
 #[test]
-fn blocks_git_objects_available_only_through_process_environment() {
+fn refuses_git_object_authority_from_process_environment() {
     const FIXTURE_ENV: &str = "FRESHELL_OPENCODE_TEST_EXTERNAL_OBJECT_STORE_FIXTURE";
     if let Some(fixture_path) = std::env::var_os(FIXTURE_ENV) {
         let fixture = PathBuf::from(fixture_path);
@@ -1753,11 +1753,38 @@ fn blocks_git_objects_available_only_through_process_environment() {
             "ses_root",
             ExportOptions::new(extraction_root.clone()),
         );
-        assert!(
-            matches!(result, Err(TransferError::Blocked(_))),
-            "an external object store from GIT_ALTERNATE_OBJECT_DIRECTORIES must not certify the snapshot"
-        );
-        assert_eq!(fs::read_dir(extraction_root).unwrap().count(), 0);
+        let exported =
+            result.expect("ambient Git objects do not block otherwise preserved history");
+        assert_eq!(exported.manifest().row_count(), 19);
+        let [reference] = exported.manifest().saved_snapshots.as_slice() else {
+            panic!("the exact native part keeps its saved reference");
+        };
+        assert_eq!(reference.availability, SavedSnapshotAvailability::UnavailableInQualifiedLocations,
+            "an external object store from GIT_ALTERNATE_OBJECT_DIRECTORIES must not certify the snapshot");
+        assert!(reference.objects.is_empty());
+        assert!(exported.manifest().assets.is_empty());
+        let payload: Value = serde_json::from_reader(exported.open_payload().unwrap()).unwrap();
+        assert!(payload["snapshot_objects"].as_array().unwrap().is_empty());
+        let part = payload["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["table"] == "part" && row["values"]["id"]["value"] == "part_ses_root")
+            .unwrap();
+        let original: String = Connection::open_with_flags(
+            fixture.join("opencode.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap()
+        .query_row(
+            "SELECT data FROM part WHERE id='part_ses_root'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+        assert_eq!(part["values"]["data"]["value"].as_str().unwrap(), original);
+        let decoded: Value = serde_json::from_str(&original).unwrap();
+        assert_eq!(reference.tree, decoded["snapshot"].as_str().unwrap());
         return;
     }
 
@@ -1802,7 +1829,7 @@ fn blocks_git_objects_available_only_through_process_environment() {
     child
         .args([
             "--exact",
-            "blocks_git_objects_available_only_through_process_environment",
+            "refuses_git_object_authority_from_process_environment",
             "--nocapture",
         ])
         .env(FIXTURE_ENV, fixture.path());
@@ -2363,6 +2390,12 @@ fn verifies_a_repeated_git_tree_in_each_selected_session_workspace() {
             [revert],
         )
         .unwrap();
+    source
+        .execute(
+            "UPDATE part SET data=?1 WHERE session_id IN ('ses_root','ses_child')",
+            [serde_json::json!({"type":"step-start","snapshot":tree.trim()}).to_string()],
+        )
+        .unwrap();
     drop(source);
 
     let inventory = HostOpenCodeInventory::new(fixture.path().join("unused.db"))
@@ -2409,7 +2442,7 @@ fn verifies_a_repeated_git_tree_in_each_selected_session_workspace() {
         "the child's own qualified store cannot borrow the root workspace's authority"
     );
     assert_eq!(root.tree, child.tree);
-    assert!(!root.objects.is_empty());
+    assert_eq!(root.objects.len(), 2);
     assert!(child.objects.is_empty());
 }
 
@@ -2505,7 +2538,7 @@ fn blocks_snapshot_objects_available_only_through_a_nested_external_alternate() 
 }
 
 #[test]
-fn verifies_snapshot_trees_through_an_accessible_alternate_store_and_blocks_missing_objects() {
+fn verifies_snapshot_trees_through_accessible_alternates_and_preserves_absent_references() {
     let fixture = TestDir::new("git-snapshot");
     let workspace_mount = fixture.path().join("workspace");
     let alternate = workspace_mount.join(".alternate-objects");
@@ -2625,14 +2658,31 @@ fn verifies_snapshot_trees_through_an_accessible_alternate_store_and_blocks_miss
             [r#"{"type":"snapshot","snapshot":"0000000000000000000000000000000000000000"}"#],
         )
         .unwrap();
-    assert!(matches!(
-        export_exact_session(
-            &inventory,
-            "ses_root",
-            ExportOptions::new(fixture.path().join("missing-tree-extract")),
-        ),
-        Err(TransferError::Blocked(_))
-    ));
+    let absent = export_exact_session(
+        &inventory,
+        "ses_root",
+        ExportOptions::new(fixture.path().join("missing-tree-extract")),
+    )
+    .expect("an absent tree remains saved history without fabricated assets");
+    assert_eq!(absent.manifest().saved_snapshots.len(), 2);
+    let reference = absent
+        .manifest()
+        .saved_snapshots
+        .iter()
+        .find(|reference| reference.tree == "0000000000000000000000000000000000000000")
+        .unwrap();
+    assert_eq!(
+        reference.availability,
+        SavedSnapshotAvailability::UnavailableInQualifiedLocations
+    );
+    assert!(reference.objects.is_empty());
+    assert_eq!(
+        freshell_sessions::opencode_transfer::saved_snapshot_summary(absent.manifest()),
+        freshell_sessions::opencode_transfer::SavedSnapshotSummary::QualifiedReferences {
+            retained_closure_count: 1,
+            unavailable_reference_count: 1,
+        }
+    );
 }
 
 #[test]
@@ -2793,6 +2843,295 @@ fn run_git_command(cwd: &Path, args: &[&str], stdin: Option<&[u8]>) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn blocks_invalid_corrupt_and_incomplete_native_snapshot_parts() {
+    for kind in ["snapshot", "step-start", "step-finish"] {
+        let fixture = TestDir::new("invalid-native-snapshot-parts");
+        let workspace = fixture.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        run_git_command(&workspace, &["init", "-q"], None);
+        let blob = run_git_command(
+            &workspace,
+            &["hash-object", "-w", "--stdin"],
+            Some(b"retained blob"),
+        );
+        let tree = run_git_command(
+            &workspace,
+            &["mktree"],
+            Some(format!("100644 blob {}\tasset.txt\n", blob.trim()).as_bytes()),
+        );
+        let object_path = |id: &str| workspace.join(".git/objects").join(&id[..2]).join(&id[2..]);
+        let blob_path = object_path(blob.trim());
+        let tree_path = object_path(tree.trim());
+        let blob_bytes = fs::read(&blob_path).unwrap();
+        let tree_bytes = fs::read(&tree_path).unwrap();
+        let database = fixture.path().join("opencode.db");
+        let source = create_synthetic_source(&database);
+        let set_reference = |reference: Value| {
+            source
+                .execute(
+                    "UPDATE part SET data=?1 WHERE id='part_ses_root'",
+                    [serde_json::json!({"type":kind,"snapshot":reference}).to_string()],
+                )
+                .unwrap();
+        };
+        set_reference(serde_json::json!(tree.trim()));
+        let inventory =
+            with_selected_workspace_mount(HostOpenCodeInventory::new(database), workspace.clone());
+        let retained = export_exact_session(
+            &inventory,
+            "ses_root",
+            ExportOptions::new(fixture.path().join("retained")),
+        )
+        .unwrap();
+        let [reference] = retained.manifest().saved_snapshots.as_slice() else {
+            panic!("one native snapshot reference has a complete retained closure");
+        };
+        assert_eq!(
+            reference.availability,
+            SavedSnapshotAvailability::RetainedClosure
+        );
+        assert_eq!(reference.objects.len(), 2);
+        for fault in [
+            "invalid-id",
+            "nonstring",
+            "wrong-kind",
+            "corrupt",
+            "incomplete",
+        ] {
+            match fault {
+                "invalid-id" => set_reference(serde_json::json!("not-a-tree-id")),
+                "nonstring" => set_reference(serde_json::json!(false)),
+                "wrong-kind" => set_reference(serde_json::json!(blob.trim())),
+                "corrupt" => {
+                    fs::write(&tree_path, &blob_bytes).unwrap();
+                }
+                "incomplete" => {
+                    fs::remove_file(&blob_path).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let extraction = fixture.path().join(fault);
+            let result = export_exact_session(
+                &inventory,
+                "ses_root",
+                ExportOptions::new(extraction.clone()),
+            );
+            assert!(
+                matches!(result, Err(TransferError::Blocked(_))),
+                "{kind} {fault} must refuse rather than qualify unavailable history"
+            );
+            assert_eq!(fs::read_dir(extraction).unwrap().count(), 0);
+            fs::remove_file(&tree_path).unwrap();
+            fs::write(&tree_path, &tree_bytes).unwrap();
+            if blob_path.exists() {
+                fs::remove_file(&blob_path).unwrap();
+            }
+            fs::write(&blob_path, &blob_bytes).unwrap();
+            set_reference(serde_json::json!(tree.trim()));
+        }
+    }
+}
+
+#[cfg(unix)]
+fn assert_missing_snapshot_with_pack_location(state: &str, blocked: bool) {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestDir::new("missing-snapshot-pack-location");
+    let workspace = fixture.path().join("workspace");
+    let objects = workspace.join(".git/objects");
+    fs::create_dir_all(&objects).unwrap();
+    let pack = objects.join("pack");
+    match state {
+        "absent" => {}
+        "empty" => fs::create_dir(&pack).unwrap(),
+        "dangling-link" => symlink(fixture.path().join("missing-pack"), &pack).unwrap(),
+        "empty-link" => {
+            let target = fixture.path().join("empty-pack");
+            fs::create_dir(&target).unwrap();
+            symlink(target, &pack).unwrap();
+        }
+        _ => unreachable!(),
+    }
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    let part = serde_json::json!({
+        "type":"snapshot", "snapshot":"1234567890abcdef1234567890abcdef12345678"
+    })
+    .to_string();
+    source
+        .execute("UPDATE part SET data=?1 WHERE id='part_ses_root'", [&part])
+        .unwrap();
+    drop(source);
+    let inventory = with_selected_workspace_mount(HostOpenCodeInventory::new(database), workspace);
+    let extraction = fixture.path().join("extract");
+    let result = export_exact_session(
+        &inventory,
+        "ses_root",
+        ExportOptions::new(extraction.clone()),
+    );
+    if blocked {
+        assert!(
+            matches!(result, Err(TransferError::Blocked(_))),
+            "{state} must refuse rather than certify qualified snapshot absence"
+        );
+        assert_eq!(fs::read_dir(extraction).unwrap().count(), 0);
+    } else {
+        let exported = result.expect("an absent snapshot in a valid pack location is preserved");
+        let [reference] = exported.manifest().saved_snapshots.as_slice() else {
+            panic!("one absent snapshot reference is preserved");
+        };
+        assert_eq!(reference.tree, "1234567890abcdef1234567890abcdef12345678");
+        assert_eq!(
+            reference.availability,
+            SavedSnapshotAvailability::UnavailableInQualifiedLocations
+        );
+        assert!(reference.objects.is_empty());
+        assert!(exported.manifest().assets.is_empty());
+        let payload: Value = serde_json::from_reader(exported.open_payload().unwrap()).unwrap();
+        let row = payload["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["table"] == "part")
+            .unwrap();
+        assert_eq!(row["values"]["data"]["value"], part);
+        assert!(payload["snapshot_objects"].as_array().unwrap().is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn blocks_missing_snapshot_with_dangling_redirected_pack() {
+    assert_missing_snapshot_with_pack_location("dangling-link", true);
+}
+
+#[cfg(unix)]
+#[test]
+fn blocks_missing_snapshot_with_empty_redirected_pack() {
+    assert_missing_snapshot_with_pack_location("empty-link", true);
+}
+
+#[cfg(unix)]
+#[test]
+fn preserves_missing_snapshot_with_absent_or_empty_regular_pack() {
+    for state in ["absent", "empty"] {
+        assert_missing_snapshot_with_pack_location(state, false);
+    }
+}
+
+#[test]
+fn preserves_unavailable_snapshot_parts_across_native_history_projections() {
+    for part in [
+        serde_json::json!({"type":"snapshot","snapshot":"1234567890abcdef1234567890abcdef12345678"}),
+        serde_json::json!({"type":"snapshot","tree":"1234567890abcdef1234567890abcdef12345678"}),
+        serde_json::json!({"type":"step-start","snapshot":"1234567890abcdef1234567890abcdef12345678"}),
+        serde_json::json!({"type":"step-finish","snapshot":"1234567890abcdef1234567890abcdef12345678","reason":"stop","cost":0,"tokens":{"input":1,"output":1}}),
+    ] {
+        let fixture = TestDir::new("unavailable-native-snapshot-parts");
+        let workspace = fixture.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let database = fixture.path().join("opencode.db");
+        let source = create_synthetic_source(&database);
+        let part_json = serde_json::to_string_pretty(&part).unwrap();
+        let message_json =
+            serde_json::to_string_pretty(&serde_json::json!({"parts":[part]})).unwrap();
+        let event_json = serde_json::to_string_pretty(&serde_json::json!({"part":part})).unwrap();
+        let context_json =
+            serde_json::to_string_pretty(&serde_json::json!({"messages":[{"parts":[part]}]}))
+                .unwrap();
+        let expected = [
+            (
+                "part",
+                "data",
+                "UPDATE part SET data=?1 WHERE id='part_ses_root'",
+                part_json,
+            ),
+            (
+                "event",
+                "data",
+                "UPDATE event SET type='message.part.updated.1',data=?1 WHERE id='evt_root'",
+                event_json,
+            ),
+            (
+                "session_message",
+                "data",
+                "UPDATE session_message SET data=?1 WHERE id='v2_root'",
+                message_json.clone(),
+            ),
+            (
+                "session_input",
+                "prompt",
+                "UPDATE session_input SET prompt=?1 WHERE id='input_root'",
+                message_json,
+            ),
+            (
+                "session_context_epoch",
+                "snapshot",
+                "UPDATE session_context_epoch SET snapshot=?1 WHERE session_id='ses_root'",
+                context_json,
+            ),
+        ];
+        for (_, _, update, json) in &expected {
+            assert_eq!(source.execute(update, [json]).unwrap(), 1);
+        }
+        drop(source);
+        let inventory =
+            with_selected_workspace_mount(HostOpenCodeInventory::new(database), workspace);
+        let qualified = freshell_sessions::opencode_transfer::capture_qualified_batch(
+            &inventory,
+            &["ses_root".into()],
+            ExportOptions::new(fixture.path().join("qualify")),
+        )
+        .expect("absent undo objects do not prevent source graph qualification");
+        let exported = export_exact_session(
+            &qualified.inventory(),
+            "ses_root",
+            ExportOptions::new(fixture.path().join("extract")),
+        )
+        .expect("native snapshot and step references remain readable history");
+        let manifest = exported.manifest();
+        assert_eq!(manifest.row_count(), 19);
+        let [reference] = manifest.saved_snapshots.as_slice() else {
+            panic!("repeated history projections qualify one exact saved reference");
+        };
+        assert_eq!(reference.session_id, "ses_root");
+        assert_eq!(reference.tree, "1234567890abcdef1234567890abcdef12345678");
+        assert_eq!(
+            reference.availability,
+            SavedSnapshotAvailability::UnavailableInQualifiedLocations
+        );
+        assert!(reference.objects.is_empty());
+        assert!(manifest.assets.is_empty());
+        assert_eq!(
+            freshell_sessions::opencode_transfer::saved_snapshot_summary(manifest),
+            freshell_sessions::opencode_transfer::SavedSnapshotSummary::QualifiedReferences {
+                retained_closure_count: 0,
+                unavailable_reference_count: 1,
+            }
+        );
+        let payload: Value = serde_json::from_reader(exported.open_payload().unwrap()).unwrap();
+        let rows = payload["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 19);
+        assert!(payload["snapshot_objects"].as_array().unwrap().is_empty());
+        for (table, column, _, json) in &expected {
+            let row = rows
+                .iter()
+                .find(|row| {
+                    row["table"] == *table
+                        && (row["values"]["session_id"]["value"] == "ses_root"
+                            || row["values"]["aggregate_id"]["value"] == "ses_root")
+                })
+                .unwrap();
+            assert_eq!(
+                row["values"][column]["value"].as_str().unwrap(),
+                json,
+                "{table}.{column} remains byte exact"
+            );
+        }
+    }
 }
 
 #[test]

@@ -54,6 +54,8 @@ import { FreshAgentSnapshotSchema } from '@shared/fresh-agent-contract'
 import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { isClientPerfLoggingEnabled, setClientPerfEnabled } from '@/lib/perf-logger'
 import { getRebindQueue, resetRebindQueueForTests } from '@/lib/rebind-queue'
+import { installTestHarness } from '@/lib/test-harness'
+import { stageOwnedFreshBrowserProfile } from '../../../../../scripts/testing/runtime-external-browser.js'
 
 const CLAUDE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440000'
 
@@ -648,6 +650,195 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+})
+
+describe('picker profile staging', () => {
+  afterEach(() => {
+    cleanup()
+    vi.useRealTimers()
+    delete window.__FRESHELL_TEST_HARNESS__
+    delete (window as { __FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__?: boolean }).__FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__
+    resetRebindQueueForTests()
+  })
+
+  it.each([false, true])('retries the staged request after a lost acknowledgement and missing negotiated fresh verdict (fresh capability: %s)', async (freshCapability) => {
+    vi.useFakeTimers()
+    const { WsClient, RECONCILE_VERDICT_WAIT_MS } = await vi.importActual<typeof import('@/lib/ws-client')>('@/lib/ws-client')
+    class PickerSocket {
+      static OPEN = 1
+      static instances: PickerSocket[] = []
+      readyState = PickerSocket.OPEN
+      onopen: (() => void) | null = null
+      onmessage: ((event: { data: string }) => void) | null = null
+      onclose: ((event: { code: number; reason: string }) => void) | null = null
+      onerror: (() => void) | null = null
+      frames: Record<string, unknown>[] = []
+      constructor(_url: string) { PickerSocket.instances.push(this) }
+      send(data: string) { this.frames.push(JSON.parse(data)) }
+      close() { this.onclose?.({ code: 1000, reason: '' }) }
+      ready() {
+        this.onopen?.()
+        this.onmessage?.({ data: JSON.stringify({ type: 'ready', capabilities: {
+          paneReconcileV1: true, paneReconcileFreshAgentV1: freshCapability,
+        } }) })
+      }
+    }
+    vi.stubGlobal('WebSocket', PickerSocket)
+    const client = new WsClient('ws://picker.test/ws')
+    wsMock.send.mockImplementation((message) => client.send(message))
+    wsMock.onReconnect.mockImplementation((handler) => client.onReconnect(handler))
+    wsMock.onMessage.mockImplementation((handler) => client.onMessage(handler))
+    const store = createStore()
+    installTestHarness(store as unknown as AppStore, () => 'ready', async () => {}, () => {}, wsMock.send)
+    const harness = window.__FRESHELL_TEST_HARNESS__!
+    harness.setSuppressAllFreshAgentNetworkEffects(true)
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude', status: 'creating',
+      createRequestId: 'lost-picker-ack', initialCwd: '/owned-picker-repo',
+    } }))
+    const creates = (socket: PickerSocket) => socket.frames.filter((frame) => frame.type === 'freshAgent.create')
+    try {
+      const connected = client.connect()
+      PickerSocket.instances[0].ready()
+      await connected
+      client.clearReconcileCreateHold()
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      act(() => { stageOwnedFreshBrowserProfile({ mode: 'freshclaude', model: 'haiku', effort: 'low' }) })
+      expect(creates(PickerSocket.instances[0])).toHaveLength(1)
+      const original = creates(PickerSocket.instances[0])[0]
+      expect(original).toMatchObject({ requestId: 'lost-picker-ack', model: 'haiku', effort: 'low', permissionMode: 'default' })
+      // The server's created reply is lost. The same real client reconnects,
+      // negotiates reconciliation, and receives no fresh-agent verdict.
+      PickerSocket.instances[0].onclose?.({ code: 4009, reason: 'restart' })
+      const reconnected = client.connect()
+      await act(async () => { PickerSocket.instances[1].ready(); await reconnected })
+      expect(creates(PickerSocket.instances[1])).toHaveLength(0)
+      await act(async () => { await vi.advanceTimersByTimeAsync(RECONCILE_VERDICT_WAIT_MS) })
+      expect(creates(PickerSocket.instances[1])).toEqual([original])
+      expect(getFreshAgentPaneContent(store)).toMatchObject({ createRequestId: 'lost-picker-ack',
+        namingHandle: original.namingHandle, model: 'haiku' })
+      expect(getFreshAgentPaneContent(store).sessionId).toBeUndefined()
+    } finally {
+      cleanup()
+      client.disconnect()
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it.each(['global', 'pane'] as const)('defers a hidden queued create when a %s hold arrives before its callback', async (hold) => {
+    vi.useFakeTimers()
+    resetRebindQueueForTests()
+    const store = createStore()
+    installTestHarness(store as unknown as AppStore, () => 'ready', async () => {}, () => {}, wsMock.send)
+    const harness = window.__FRESHELL_TEST_HARNESS__!
+    harness.setSuppressAllFreshAgentNetworkEffects(true)
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude', status: 'creating',
+      createRequestId: 'queued-picker-request', initialCwd: '/owned-picker-repo',
+    } }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden /></Provider>)
+    act(() => { stageOwnedFreshBrowserProfile({ mode: 'freshclaude', model: 'haiku', effort: 'low' }) })
+    expect(getRebindQueue().queuedCount).toBe(1)
+    const staged = getFreshAgentPaneContent(store)
+    if (hold === 'global') harness.setSuppressAllFreshAgentNetworkEffects(true)
+    else harness.setFreshAgentNetworkEffectsSuppressed('pane-1', true)
+    await act(async () => { await vi.advanceTimersByTimeAsync(100) })
+    expect(wsMock.send).not.toHaveBeenCalled()
+    expect(harness.getSentWsMessages?.()).toEqual([])
+    expect(store.getState().freshAgent.pendingCreates).toEqual({})
+    expect(getFreshAgentPaneContent(store)).toEqual(staged)
+    expect(getRebindQueue().queuedCount).toBe(0)
+    expect(getRebindQueue().inFlightCount).toBe(0)
+    act(() => {
+      harness.setSuppressAllFreshAgentNetworkEffects(false)
+      harness.setFreshAgentNetworkEffectsSuppressed('pane-1', false)
+      store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: { ...staged } }))
+    })
+    await act(async () => { await vi.advanceTimersByTimeAsync(100) })
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
+    expect(sentFreshAgentMessages('freshAgent.create')[0]).toMatchObject({ requestId: staged.createRequestId,
+      model: 'haiku', effort: 'low', permissionMode: 'default' })
+    const sent = getFreshAgentPaneContent(store)
+    expect(sent.namingHandle).toBeTruthy()
+    act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: { ...sent } })))
+    await act(async () => { await vi.advanceTimersByTimeAsync(100) })
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
+  })
+
+  describe.each([false, true])('hidden pane: %s', (hidden) => {
+    it.each([
+      ['freshclaude', 'claude', 'haiku', 'low'],
+      ['kilroy', 'claude', 'haiku', 'low'],
+      ['freshcodex', 'codex', 'gpt-5.6-luna', 'low'],
+      ['freshopencode', 'opencode', 'opencode/big-pickle', 'provider-default'],
+    ] as const)('releases exactly one %s create from the mounted picker pane with its staged profile', async (mode, provider, model, effort) => {
+      vi.useFakeTimers()
+      const store = createStore()
+      installTestHarness(store as unknown as AppStore, () => 'ready', async () => {}, () => {}, wsMock.send)
+      const harness = window.__FRESHELL_TEST_HARNESS__!
+      harness.setSuppressAllFreshAgentNetworkEffects(true)
+      const content: FreshAgentPaneContent = { kind: 'fresh-agent', sessionType: mode, provider,
+        createRequestId: 'actual-picker-request', initialCwd: '/owned-picker-repo', status: 'creating' }
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+      const view = render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden={hidden} /></Provider>)
+      // Let the real create effect and its content rerenders settle while held.
+      await act(async () => { await vi.advanceTimersByTimeAsync(100) })
+      expect(wsMock.send).not.toHaveBeenCalled()
+      expect(harness.getSentWsMessages?.()).toEqual([])
+      expect(store.getState().freshAgent.pendingCreates).toEqual({})
+      expect(getFreshAgentPaneContent(store)).toEqual(content)
+      // A mode mismatch must leave the hold and the picker pane untouched.
+      expect(stageOwnedFreshBrowserProfile({ mode: 'wrong-mode', model, effort })).toBeNull()
+      expect(harness.isAllFreshAgentNetworkEffectsSuppressed()).toBe(true)
+      expect(getFreshAgentPaneContent(store)).toEqual(content)
+      let staged: ReturnType<typeof stageOwnedFreshBrowserProfile> = null
+      act(() => { staged = stageOwnedFreshBrowserProfile({ mode, model, effort }) })
+      expect(staged).toEqual({ tabId: 'tab-1', paneId: 'pane-1', createRequestId: content.createRequestId })
+      await act(async () => { await vi.advanceTimersByTimeAsync(100) })
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
+      expect(sentFreshAgentMessages('freshAgent.create')[0]).toMatchObject({ requestId: content.createRequestId,
+        sessionType: mode, provider, cwd: content.initialCwd, model, modelSelection: { kind: 'exact', modelId: model },
+        ...(provider === 'opencode' ? {} : { permissionMode: 'default' }) })
+      expect(sentFreshAgentMessages('freshAgent.create')[0].effort).toBe(effort === 'provider-default' ? undefined : effort)
+      expect(getFreshAgentPaneContent(store)).toMatchObject({ createRequestId: content.createRequestId,
+        model, permissionMode: 'default' })
+      expect(getFreshAgentPaneContent(store).sessionId).toBeUndefined()
+      const namingHandle = getFreshAgentPaneContent(store).namingHandle
+      // A second hold/release and normal rerender must not allocate again.
+      harness.setSuppressAllFreshAgentNetworkEffects(true)
+      act(() => { stageOwnedFreshBrowserProfile({ mode, model, effort }) })
+      view.rerender(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden={hidden} /></Provider>)
+      await act(async () => { await vi.advanceTimersByTimeAsync(100) })
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
+      expect(getFreshAgentPaneContent(store).namingHandle).toBe(namingHandle)
+    })
+  })
+
+  it('keeps the pane hold after profile staging releases the global hold, then sends its original request', async () => {
+    const store = createStore()
+    installTestHarness(store as unknown as AppStore, () => 'ready', async () => {}, () => {}, wsMock.send)
+    const harness = window.__FRESHELL_TEST_HARNESS__!
+    harness.setSuppressAllFreshAgentNetworkEffects(true)
+    harness.setFreshAgentNetworkEffectsSuppressed('pane-1', true)
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude', status: 'creating',
+      createRequestId: 'pane-held-request', initialCwd: '/owned-pane-repo',
+    } }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    act(() => { stageOwnedFreshBrowserProfile({ mode: 'freshclaude', model: 'haiku', effort: 'low' }) })
+    await act(async () => {})
+    expect(wsMock.send).not.toHaveBeenCalled()
+    expect(harness.getSentWsMessages?.()).toEqual([])
+    expect(store.getState().freshAgent.pendingCreates).toEqual({})
+    expect(getFreshAgentPaneContent(store).createRequestId).toBe('pane-held-request')
+    act(() => {
+      harness.setFreshAgentNetworkEffectsSuppressed('pane-1', false)
+      store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: { ...getFreshAgentPaneContent(store) } }))
+    })
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1))
+    expect(sentFreshAgentMessages('freshAgent.create')[0]).toMatchObject({ requestId: 'pane-held-request',
+      sessionType: 'freshclaude', model: 'haiku', effort: 'low', permissionMode: 'default' })
+  })
 })
 
 describe('stopped managed history', () => {
