@@ -1377,13 +1377,14 @@ pub(crate) async fn kill_unit(
         }
     }
 
-    // 3. A kill joining a crash's stop (an agent exit in flight) cancels
-    //    that crash's auto-resume first: the hub reads the cancel by the
-    //    crashed terminal's id when the crash reaches it at Gone (a user
-    //    kill takes the stop over and no crash is sent at all; a stuck
-    //    restart does not, and its own replacement must be the pane's
-    //    only one; Stage 2: LB-36, LB-31).
-    if let Some(terminal_id) = entry.terminal_id.as_deref() {
+    // 3. A stuck restart joining a crash's stop (an agent exit in flight)
+    //    cancels that crash's auto-resume first: it does not take the stop
+    //    over, so the crash still reaches the hub at Gone, which reads the
+    //    cancel by the crashed terminal's id, and the restart's own
+    //    replacement is the pane's only one (Stage 2: LB-36, LB-31). A user
+    //    kill takes the stop over and no crash is sent at all, so it needs
+    //    no cancel.
+    if let Some(terminal_id) = entry.terminal_id.as_deref().filter(|_| stuck_recovery) {
         if entry.unit.stop_in_flight().is_some()
             && matches!(
                 state.registry.ending(terminal_id),
