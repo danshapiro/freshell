@@ -3134,6 +3134,181 @@ fn preserves_unavailable_snapshot_parts_across_native_history_projections() {
     }
 }
 
+fn assert_empty_native_snapshot_result(kind: &str) {
+    let fixture = TestDir::new("empty-native-snapshot-result");
+    let workspace = fixture.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    let values = if kind.starts_with("revert") {
+        let mut revert = serde_json::json!({"messageID":"msg_root","snapshot":""});
+        if kind == "revert-precedence" {
+            revert["tree"] = serde_json::json!("not-a-tree-id");
+        }
+        vec![
+            (
+                "session",
+                "revert",
+                "UPDATE session SET revert=?1 WHERE id='ses_root'",
+                revert.clone(),
+            ),
+            (
+                "event",
+                "data",
+                "UPDATE event SET type='session.updated.1',data=?1 WHERE id='evt_root'",
+                serde_json::json!({"info":{"revert":revert}}),
+            ),
+        ]
+    } else {
+        let part = serde_json::json!({"type":kind,"snapshot":""});
+        vec![
+            (
+                "part",
+                "data",
+                "UPDATE part SET data=?1 WHERE id='part_ses_root'",
+                part.clone(),
+            ),
+            (
+                "event",
+                "data",
+                "UPDATE event SET type='message.part.updated.1',data=?1 WHERE id='evt_root'",
+                serde_json::json!({"part":part}),
+            ),
+            (
+                "session_message",
+                "data",
+                "UPDATE session_message SET data=?1 WHERE id='v2_root'",
+                serde_json::json!({"parts":[part]}),
+            ),
+            (
+                "session_input",
+                "prompt",
+                "UPDATE session_input SET prompt=?1 WHERE id='input_root'",
+                serde_json::json!({"parts":[part]}),
+            ),
+            (
+                "session_context_epoch",
+                "snapshot",
+                "UPDATE session_context_epoch SET snapshot=?1 WHERE session_id='ses_root'",
+                serde_json::json!({"messages":[{"parts":[part]}]}),
+            ),
+        ]
+    };
+    let mut expected = Vec::new();
+    for (table, column, update, value) in values {
+        let exact = serde_json::to_string_pretty(&value).unwrap();
+        assert_eq!(source.execute(update, [&exact]).unwrap(), 1);
+        expected.push((table, column, exact));
+    }
+    drop(source);
+    let inventory = with_selected_workspace_mount(HostOpenCodeInventory::new(database), workspace);
+    let qualified = freshell_sessions::opencode_transfer::capture_qualified_batch(
+        &inventory,
+        &["ses_root".into()],
+        ExportOptions::new(fixture.path().join("qualify")),
+    )
+    .expect("native empty snapshot result preserves the entire qualified graph");
+    let exported = export_exact_session(
+        &qualified.inventory(),
+        "ses_root",
+        ExportOptions::new(fixture.path().join("extract")),
+    )
+    .expect("an empty native result has no Git object to resolve");
+    assert_eq!(exported.manifest().row_count(), 19);
+    assert!(exported.manifest().saved_snapshots.is_empty());
+    assert!(exported.manifest().assets.is_empty());
+    let payload: Value = serde_json::from_reader(exported.open_payload().unwrap()).unwrap();
+    assert!(payload["snapshot_objects"].as_array().unwrap().is_empty());
+    for (table, column, exact) in expected {
+        let row = payload["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| {
+                row["table"] == table
+                    && (row["values"]["session_id"]["value"] == "ses_root"
+                        || row["values"]["aggregate_id"]["value"] == "ses_root"
+                        || row["values"]["id"]["value"] == "ses_root")
+            })
+            .unwrap();
+        assert_eq!(row["values"][column]["value"].as_str().unwrap(), exact);
+    }
+}
+
+#[test]
+fn preserves_empty_native_snapshot_step_start() {
+    assert_empty_native_snapshot_result("step-start");
+}
+
+#[test]
+fn preserves_empty_native_snapshot_step_finish() {
+    assert_empty_native_snapshot_result("step-finish");
+}
+
+#[test]
+fn preserves_empty_native_snapshot_revert() {
+    assert_empty_native_snapshot_result("revert");
+}
+
+#[test]
+fn preserves_empty_native_snapshot_revert_precedence() {
+    assert_empty_native_snapshot_result("revert-precedence");
+}
+
+#[test]
+fn blocks_empty_unproven_snapshot_slots_and_malformed_native_revert_references() {
+    for (kind, value) in [
+        ("snapshot", serde_json::json!("")),
+        ("revert-tree", serde_json::json!("")),
+        ("revert-snapshot", serde_json::json!("not-a-tree-id")),
+        ("revert-snapshot", serde_json::json!(false)),
+    ] {
+        let fixture = TestDir::new("strict-snapshot-result");
+        let workspace = fixture.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let database = fixture.path().join("opencode.db");
+        let source = create_synthetic_source(&database);
+        if kind == "snapshot" {
+            source
+                .execute(
+                    "UPDATE part SET data=?1 WHERE id='part_ses_root'",
+                    [serde_json::json!({"type":"snapshot","snapshot":value}).to_string()],
+                )
+                .unwrap();
+        } else {
+            let field = if kind == "revert-tree" {
+                "tree"
+            } else {
+                "snapshot"
+            };
+            let mut revert = serde_json::json!({"messageID":"msg_root"});
+            revert[field] = value;
+            source
+                .execute(
+                    "UPDATE session SET revert=?1 WHERE id='ses_root'",
+                    [revert.to_string()],
+                )
+                .unwrap();
+        }
+        drop(source);
+        let inventory =
+            with_selected_workspace_mount(HostOpenCodeInventory::new(database), workspace);
+        let extraction = fixture.path().join("extract");
+        assert!(
+            matches!(
+                export_exact_session(
+                    &inventory,
+                    "ses_root",
+                    ExportOptions::new(extraction.clone())
+                ),
+                Err(TransferError::Blocked(_))
+            ),
+            "{kind} must remain strict"
+        );
+        assert_eq!(fs::read_dir(extraction).unwrap().count(), 0);
+    }
+}
+
 #[test]
 fn durable_souls_saved_unavailable_tree_preserves_reference_and_history() {
     let fixture = TestDir::new("saved-unavailable-tree");

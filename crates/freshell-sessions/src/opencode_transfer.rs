@@ -1747,6 +1747,12 @@ impl<'a> AssetResolver<'a> {
             let tree = reference.as_str().ok_or_else(|| {
                 TransferError::Blocked("revert snapshot reference is not a Git object ID".into())
             })?;
+            // Native Snapshot.track can return empty stdout. Revert preserves
+            // that value but has no Undo tree to resolve; the legacy tree alias
+            // remains strict and never overrides the native snapshot field.
+            if tree.is_empty() && value.get("snapshot").is_some() {
+                return Ok(false);
+            }
             self.record_saved_snapshot(tree, session_id)?;
         }
         Ok(false)
@@ -1841,7 +1847,12 @@ impl<'a> AssetResolver<'a> {
                                 "revert snapshot reference is not a Git object ID".into(),
                             )
                         })?;
-                        self.record_git_tree(tree, session_id)?;
+                        // Native step producers preserve an empty track result
+                        // when no tree was produced. Keep those bytes as history
+                        // without inventing an object identity or Undo asset.
+                        if !tree.is_empty() {
+                            self.record_git_tree(tree, session_id)?;
+                        }
                     }
                 }
                 if kind.as_deref() == Some("tool") {

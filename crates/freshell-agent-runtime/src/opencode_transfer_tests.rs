@@ -2983,6 +2983,158 @@ fn durable_souls_rehearsal_pipeline_preserves_unavailable_snapshot_parts() {
     }
 }
 
+fn assert_empty_native_snapshot_roundtrip(kind: &str) {
+    use freshell_sessions::opencode_transfer::SavedSnapshotSummary;
+    let mut fixture = fixture_with_baseline_event();
+    let source = Connection::open(fixture.root.join("source.sqlite")).unwrap();
+    let mut exact = Vec::new();
+    if kind == "revert" {
+        let revert = serde_json::json!({"messageID":"msg_one","snapshot":""});
+        let session_data: String = source
+            .query_row("SELECT data FROM event WHERE id='evt_base'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let mut event: serde_json::Value = serde_json::from_str(&session_data).unwrap();
+        event["info"]["revert"] = revert.clone();
+        let event_json = serde_json::to_string_pretty(&event).unwrap();
+        let revert_json = serde_json::to_string_pretty(&revert).unwrap();
+        source
+            .execute(
+                "UPDATE session SET revert=?1 WHERE id='ses_root'",
+                [&revert_json],
+            )
+            .unwrap();
+        source
+            .execute(
+                "UPDATE event SET type='session.updated.1',data=?1 WHERE id='evt_base'",
+                [&event_json],
+            )
+            .unwrap();
+        exact.push((
+            "SELECT revert FROM session WHERE id='ses_root'",
+            revert_json,
+        ));
+        exact.push(("SELECT data FROM event WHERE id='evt_base'", event_json));
+    } else {
+        let mut part = serde_json::json!({"id":"prt_one","sessionID":"ses_root","messageID":"msg_one","type":kind,"snapshot":""});
+        if kind == "step-finish" {
+            part["reason"] = serde_json::json!("stop");
+            part["cost"] = serde_json::json!(0);
+            part["tokens"] = serde_json::json!({"input":1,"output":1,"reasoning":0,"cache":{"read":0,"write":0}});
+        }
+        let part_json = serde_json::to_string_pretty(&part).unwrap();
+        let event_json = serde_json::to_string_pretty(
+            &serde_json::json!({"sessionID":"ses_root","part":part,"time":1}),
+        )
+        .unwrap();
+        source
+            .execute(
+                "UPDATE part SET id='prt_one',data=?1 WHERE id='part_one'",
+                [&part_json],
+            )
+            .unwrap();
+        source
+            .execute(
+                "UPDATE event SET type='message.part.updated.1',data=?1 WHERE id='evt_base'",
+                [&event_json],
+            )
+            .unwrap();
+        exact.push(("SELECT data FROM part WHERE id='prt_one'", part_json));
+        exact.push(("SELECT data FROM event WHERE id='evt_base'", event_json));
+    }
+    drop(source);
+    reexport_owned_fixture(&mut fixture);
+    let manifest: OpenCodeTransferManifest =
+        serde_json::from_str(&fixture.descriptor.manifest_json).unwrap();
+    assert!(manifest.saved_snapshots.is_empty());
+    // Revert retains the fixture's ordinary file part. That mandatory
+    // asset is independent of the empty snapshot and must still transfer.
+    let asset_count = usize::from(kind == "revert");
+    assert_eq!(manifest.assets.len(), asset_count);
+    assert!(manifest
+        .assets
+        .iter()
+        .all(|asset| asset.kind == "workspace_path_reference"));
+    let expected = SavedSnapshotSummary::QualifiedReferences {
+        retained_closure_count: 0,
+        unavailable_reference_count: 0,
+    };
+    let imported = import_bundle(
+        &fixture.descriptor,
+        &fixture.staged_directory,
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .unwrap();
+    assert_eq!(imported.row_count, 6);
+    assert_eq!(imported.asset_count, u64::try_from(asset_count).unwrap());
+    assert_eq!(imported.saved_snapshot_summary, expected);
+    assert_eq!(
+        verify_current_store(
+            &fixture.descriptor,
+            &fixture.destination_database,
+            &fixture.workspace
+        )
+        .unwrap()
+        .saved_snapshot_summary,
+        expected
+    );
+    let home = fixture.destination_database.ancestors().nth(4).unwrap();
+    let data_home = home.join(".local/share");
+    let config_home = home.join(".config");
+    fs::create_dir_all(&config_home).unwrap();
+    let (uid, gid) = rehearsal_current_identity();
+    let reader = InstalledStoreReaderContext {
+        database_path: &fixture.destination_database,
+        workspace_root: &fixture.workspace,
+        provider_uid: uid,
+        provider_gid: gid,
+        home,
+        xdg_data_home: &data_home,
+        xdg_config_home: &config_home,
+        cwd: &fixture.workspace,
+    };
+    let installed = verify_installed_store(&fixture.descriptor, &reader).unwrap();
+    assert_eq!(installed.row_count, 6);
+    assert_eq!(installed.saved_snapshot_summary, expected);
+    let payload: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.staged_directory.join("entry-0000.bin")).unwrap())
+            .unwrap();
+    assert!(payload["snapshot_objects"].as_array().unwrap().is_empty());
+    assert!(!fixture
+        .destination_database
+        .parent()
+        .unwrap()
+        .join("snapshot")
+        .exists());
+    let db = Connection::open(&fixture.destination_database).unwrap();
+    for expected_row in payload["rows"].as_array().unwrap() {
+        let row: SerializedRow = serde_json::from_value(expected_row.clone()).unwrap();
+        assert_eq!(read_row_by_key(&db, &row.table, &row.key).unwrap(), row);
+    }
+    for (query, expected_json) in exact {
+        let actual: String = db.query_row(query, [], |r| r.get(0)).unwrap();
+        assert_eq!(actual, expected_json);
+        serde_json::from_str::<serde_json::Value>(&actual).unwrap();
+    }
+}
+
+#[test]
+fn durable_souls_rehearsal_pipeline_preserves_empty_native_snapshot_step_start() {
+    assert_empty_native_snapshot_roundtrip("step-start");
+}
+
+#[test]
+fn durable_souls_rehearsal_pipeline_preserves_empty_native_snapshot_step_finish() {
+    assert_empty_native_snapshot_roundtrip("step-finish");
+}
+
+#[test]
+fn durable_souls_rehearsal_pipeline_preserves_empty_native_snapshot_revert() {
+    assert_empty_native_snapshot_roundtrip("revert");
+}
+
 #[test]
 fn durable_souls_rehearsal_pipeline_transfers_exact_native_snapshot_closure() {
     use sha2::Digest;
