@@ -1991,13 +1991,14 @@ impl<'a> AssetResolver<'a> {
         if self
             .saved_snapshots
             .get(&(session_id.to_string(), tree.to_string()))
-            .is_none_or(|reference| {
-                reference.availability != SavedSnapshotAvailability::RetainedClosure
+            .is_some_and(|reference| {
+                reference.availability == SavedSnapshotAvailability::UnavailableInQualifiedLocations
             })
         {
-            return Err(TransferError::Blocked(
-                "native snapshot part lacks its complete retained tree closure".into(),
-            ));
+            // Snapshot and step parts preserve saved history just like revert
+            // references. Missing undo objects do not erase that reference;
+            // corrupt or incomplete retained objects already failed above.
+            return Ok(());
         }
         let mount = self.workspace_mounts.get(session_id).ok_or_else(|| {
             TransferError::Blocked(
@@ -2254,11 +2255,15 @@ fn read_snapshot_object(
     // Packed objects use the native decoder only after storage confinement;
     // ordinary owned loose-object fixtures need no external CLI.
     for store in stores {
-        let pack = store.join("pack");
-        if pack.exists() && fs::read_dir(&pack)?.next().is_some() {
-            let git_dir = store.parent().ok_or_else(|| {
-                TransferError::Blocked("snapshot store lacks native Git directory".into())
-            })?;
+        let git_dir = store.parent().ok_or_else(|| {
+            TransferError::Blocked("snapshot store lacks native Git directory".into())
+        })?;
+        let Some(pack) =
+            checked_git_storage_path(git_dir, &store.join("pack"), "Git pack directory", true)?
+        else {
+            continue;
+        };
+        if fs::read_dir(&pack)?.next().is_some() {
             inspect_git_pack_directory(git_dir, store)?;
             let repository = GitRepository {
                 work_tree: git_dir.to_path_buf(),
