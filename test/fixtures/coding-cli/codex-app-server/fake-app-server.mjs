@@ -707,6 +707,13 @@ if (behavior.spawnDurableWriter) {
   }
 }
 
+// The exit status of a fake whose listen port another socket took. The parent
+// chose the port and released it before this process started, so any socket on
+// the host can bind it first. A dedicated status lets a test tell that race from
+// every other startup failure and retry on a new port, as the product's planner
+// does.
+const LOST_PORT_EXIT_CODE = 98
+
 // Created by listen() at the end of the module (after the native role is ready
 // and any behavior.listenDelayMs has passed).
 let wss = null
@@ -720,6 +727,16 @@ function listen() {
         fs.writeFileSync(portFile, `${address.port}\n`, 'utf8')
       })
     : new WebSocketServer({ host, port })
+  wss.on('error', (error) => {
+    // Any other listen error stays an uncaught error (exit 1), as before.
+    if (error?.code !== 'EADDRINUSE') throw error
+    process.stderr.write(
+      `fake-app-server: listen ${host}:${port} failed: EADDRINUSE (another socket took the port); `
+        + `exiting ${LOST_PORT_EXIT_CODE}\n`,
+    )
+    nativeRole?.noteListenError(error.code)
+    process.exit(LOST_PORT_EXIT_CODE)
+  })
   wss.on('connection', handleConnection)
 }
 const watches = new Map()

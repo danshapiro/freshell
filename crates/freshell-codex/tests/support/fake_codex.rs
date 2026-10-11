@@ -84,6 +84,11 @@ pub struct NativeManifest {
     /// reports), recorded by the native while the pid certainly named that process.
     #[serde(default, rename = "startTimes")]
     pub start_times: BTreeMap<u32, u64>,
+    /// Why the native never listened: `EADDRINUSE` when another socket bound
+    /// its port first (the fake then exits with status 98). `None` for a
+    /// native that listened.
+    #[serde(default, rename = "listenError")]
+    pub listen_error: Option<String>,
 }
 
 impl NativeManifest {

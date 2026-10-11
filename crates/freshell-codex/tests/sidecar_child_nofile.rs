@@ -19,6 +19,9 @@ use std::time::Duration;
 use freshell_codex::launch_lifecycle::{CodexLaunchRuntime, SpawnedCodexAppServerRuntime};
 use freshell_platform::child_nofile;
 
+#[path = "support/lost_port.rs"]
+mod lost_port;
+
 const ORIGINAL_SOFT: u64 = 512;
 
 fn own_limits() -> (u64, u64) {
@@ -74,10 +77,17 @@ async fn the_codex_sidecar_starts_with_the_recorded_soft_limit() {
     )
     .expect("write the recording launcher");
 
-    let runtime = SpawnedCodexAppServerRuntime::with_command(format!("sh {}", script.display()));
-    let ready = tokio::time::timeout(Duration::from_secs(30), runtime.ensure_ready(None))
-        .await
-        .expect("the sidecar must come up in time");
+    // The runtime chooses the sidecar's port and releases it before the
+    // sidecar binds it; a lost port is retried by a new runtime on a new port
+    // (each start records its own soft limit).
+    let (runtime, _ready) = tokio::time::timeout(
+        Duration::from_secs(30),
+        lost_port::ready_retrying_a_lost_port("the sidecar must come up", || {
+            SpawnedCodexAppServerRuntime::with_command(format!("sh {}", script.display()))
+        }),
+    )
+    .await
+    .expect("the sidecar must come up in time");
     let recorded = std::fs::read_to_string(&soft_file);
     let stopped = runtime
         .stop(
@@ -91,7 +101,6 @@ async fn the_codex_sidecar_starts_with_the_recorded_soft_limit() {
         "the seedless sidecar stops to completion"
     );
 
-    ready.expect("the sidecar must come up");
     let recorded = recorded.expect("the launcher must record its soft limit");
     assert_eq!(recorded.trim(), ORIGINAL_SOFT.to_string());
 }

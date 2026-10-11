@@ -94,12 +94,17 @@ export function createNativeRole({ behavior, codexHome, broadcast, hasRollout, m
   let sigtermCount = 0
   let exiting = false
   let helperTurnCounter = 0
+  // Why the app-server never listened (`EADDRINUSE`: another socket took its port).
+  let listenError = null
 
   function writeManifest() {
     if (!manifestDir) return
     fs.mkdirSync(manifestDir, { recursive: true })
     const file = path.join(manifestDir, `native-${process.pid}.json`)
-    fs.writeFileSync(`${file}.tmp`, JSON.stringify({ role: 'native', pid: process.pid, threads: heldThreadIds(), children, startTimes, signals }))
+    fs.writeFileSync(`${file}.tmp`, JSON.stringify({
+      role: 'native', pid: process.pid, threads: heldThreadIds(), children, startTimes, signals,
+      ...(listenError ? { listenError } : {}),
+    }))
     fs.renameSync(`${file}.tmp`, file)
   }
   function pin(pid) {
@@ -502,6 +507,13 @@ export function createNativeRole({ behavior, codexHome, broadcast, hasRollout, m
     }
   }
 
+  // The app-server could not listen (fake-app-server.mjs exits next): recorded,
+  // so a test can tell a native that lost its port from one that served.
+  function noteListenError(code) {
+    listenError = String(code)
+    writeManifest()
+  }
+
   return {
     get draining() { return draining },
     ready,
@@ -512,5 +524,6 @@ export function createNativeRole({ behavior, codexHome, broadcast, hasRollout, m
     turnDelay,
     turnEnded,
     connectionClosed,
+    noteListenError,
   }
 }
