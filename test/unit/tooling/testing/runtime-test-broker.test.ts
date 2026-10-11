@@ -845,18 +845,20 @@ describe('receipt-owned read-only history HTTP routes', () => {
       const body = () => {
         const original = historyHelperBody()
         return { ...original, Entrypoint: ['node'], WorkingDir: '/workspace',
-          Cmd: ['--no-warnings', '--import', '/workspace/node_modules/tsx/dist/loader.mjs',
-            '/workspace/test/e2e-browser/helpers/provider-native-history/probe-cli.ts', 'codex', '/home/freshell/provider/.codex/sessions', 'native-owned'],
+          Cmd: ['--no-warnings', '/workspace/dist/native-history-run-one/probe-cli.mjs',
+            'codex', '/home/freshell/provider/.codex/sessions', 'native-owned'],
           HostConfig: { ...original.HostConfig, Mounts: [original.HostConfig.Mounts[1],
             { Type: 'bind', Source: '/workspace', Target: '/workspace', ReadOnly: true }] } }
       }
       const mutations: ((input: ReturnType<typeof body>) => void)[] = [
         input => { input.Entrypoint = ['/bin/sh'] },
         input => { input.Cmd[0] = '-e' },
-        input => { input.Cmd[2] = '/workspace/other-loader.js' },
-        input => { input.Cmd[3] = '/workspace/other-probe.ts' },
-        input => { input.Cmd[4] = 'foreign-provider' },
-        input => { input.Cmd[5] = '/home/freshell/provider/foreign-source' },
+        input => { input.Cmd[1] = '/workspace/dist/native-history-foreign-run/probe-cli.mjs' },
+        input => { input.Cmd[1] = '/workspace/dist/native-history-run-one/other-probe.mjs' },
+        input => { input.Cmd[2] = 'foreign-provider' },
+        input => { input.Cmd[3] = '/home/freshell/provider/foreign-source' },
+        input => { input.Cmd[4] = '' },
+        input => { input.Cmd.push('unexpected-argument') },
         input => { input.HostConfig.Mounts[0].Source = 'foreign-volume' },
         input => { input.HostConfig.Mounts[1].ReadOnly = false },
         input => { input.HostConfig.Mounts[1].Target = '/other-workspace' },

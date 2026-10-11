@@ -657,12 +657,11 @@ export class RestrictedDockerBroker {
       && typeof cmd[4] === 'string' && /^ses_[A-Za-z0-9_-]{1,252}$/.test(cmd[4])
       && (!semantic || cmd[5] === '/run/freshell-opencode-reader.frame')
       && typeof parsed.Image === 'string' && /^sha256:[a-f0-9]{64}$/.test(parsed.Image)
-    const native = typeof workspace === 'string' && Array.isArray(cmd) && cmd.length === 7
-      && cmd[0] === '--no-warnings' && cmd[1] === '--import'
-      && cmd[2] === path.join(workspace, 'node_modules/tsx/dist/loader.mjs')
-      && cmd[3] === path.join(workspace, 'test/e2e-browser/helpers/provider-native-history/probe-cli.ts')
-      && typeof cmd[4] === 'string' && Object.hasOwn(sources, cmd[4]) && cmd[5] === sources[cmd[4]]
-      && typeof cmd[6] === 'string' && cmd[6].length > 0
+    const native = typeof workspace === 'string' && Array.isArray(cmd) && cmd.length === 5
+      && cmd[0] === '--no-warnings'
+      && cmd[1] === path.join(workspace, 'dist', `native-history-${this.policy.testRunId}`, 'probe-cli.mjs')
+      && typeof cmd[2] === 'string' && Object.hasOwn(sources, cmd[2]) && cmd[3] === sources[cmd[2]]
+      && typeof cmd[4] === 'string' && cmd[4].length > 0
     if ((!batch && !native) || parsed.User !== '65534:0' || parsed.Tty !== !batch || !this.validHistoryHelperHost(host, false)
       || !Array.isArray(parsed.Env) || !same([...parsed.Env].sort(), semantic ? ['HOME=/home/freshell/provider', 'OPENCODE_DB=/home/freshell/provider/.local/share/opencode/opencode.db', 'XDG_CONFIG_HOME=/home/freshell/provider/.config', 'XDG_DATA_HOME=/home/freshell/provider/.local/share'] : ['HOME=/home/freshell/provider'])
       || (semantic && (typeof parsed.WorkingDir !== 'string' || path.normalize(parsed.WorkingDir) !== parsed.WorkingDir

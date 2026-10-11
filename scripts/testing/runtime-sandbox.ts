@@ -2519,6 +2519,7 @@ export class RuntimeHarness {
   readonly testRoot: string
   readonly evidenceDir: string
   readonly buildDir: string
+  readonly nativeHistoryBuildDir: string
   readonly assertionsPath: string
   readonly lifecyclePath: string
   readonly incidentsDir: string
@@ -2560,6 +2561,7 @@ export class RuntimeHarness {
     this.testRoot = path.join(os.tmpdir(), `f${userId}`, runId.slice(0, 12))
     this.evidenceDir = path.join(this.repoRoot, '.runtime-evidence', this.candidateSha, runId)
     this.buildDir = path.join(this.repoRoot, '.runtime-build', this.runId)
+    this.nativeHistoryBuildDir = path.join(this.repoRoot, 'dist', `native-history-${this.runId}`)
     this.assertionsPath = path.join(this.evidenceDir, 'assertions.jsonl')
     this.lifecyclePath = path.join(this.evidenceDir, 'lifecycle.jsonl')
     this.incidentsDir = path.join(this.evidenceDir, 'incidents')
@@ -3307,6 +3309,7 @@ export class RuntimeHarness {
     // has mapped. Remove them only after every receipt-owned runtime stopped.
     if (resourcesAbsent) {
       try { fs.rmSync(this.buildDir, { recursive: true, force: true }) } catch (error) { errors.push(`runtime build dir: ${String(error)}`) }
+      try { fs.rmSync(this.nativeHistoryBuildDir, { recursive: true, force: true }) } catch (error) { errors.push(`native history build dir: ${String(error)}`) }
     }
     const cleanup = {
       ok: errors.length === 0,
@@ -4651,6 +4654,8 @@ export class ManagedRuntimeOwner {
   private readonly freshSupervisorRestarts: any[] = []
   private readonly nativeCaptures = new Set<Promise<unknown>>()
   private readonly nativeCaptureFailures: string[] = []
+  private nativeHistoryTool?: string
+  private nativeHistoryToolFailure?: Error
   private nativeCollectionsClosing = false
   private nativeCollectionsAborted = false
   private readonly providerProbes = new Map<string, { child?: ChildProcess; settlement: Promise<string> }>()
@@ -6141,13 +6146,58 @@ export class ManagedRuntimeOwner {
     return { path: relative, sha256: createHash('sha256').update(bytes).digest('hex') }
   }
 
+  private prepareNativeHistoryTool(): string {
+    if (this.nativeHistoryTool) return this.nativeHistoryTool
+    if (this.nativeHistoryToolFailure) throw this.nativeHistoryToolFailure
+    const directory = this.runtime.nativeHistoryBuildDir
+    const target = path.join(directory, 'probe-cli.mjs')
+    const source = path.join(this.repoRoot, 'test/e2e-browser/helpers/provider-native-history/probe-cli.ts')
+    const args = ['--filter', 'freshell-mcp-runtime', 'exec', 'esbuild', source,
+      '--bundle', '--platform=node', '--format=esm', '--target=node22', `--outfile=${target}`]
+    try {
+      this.runtime.recordLifecycle('native_history.tool_build_started', { severity: 'info', producer: 'pnpm', path: target })
+      // Keep build copies out of private evidence/build parents. Existing
+      // workspace mounts expose this source-only tool to both reader forms.
+      const dist = path.dirname(directory)
+      if (!fs.existsSync(dist)) {
+        fs.mkdirSync(dist, { mode: 0o755 })
+        fs.chmodSync(dist, 0o755)
+      }
+      for (const parent of [this.repoRoot, dist]) {
+        const stat = fs.lstatSync(parent)
+        if (!stat.isDirectory() || stat.isSymbolicLink() || fs.realpathSync(parent) !== parent || (stat.mode & 0o005) !== 0o005) {
+          throw new Error('native history tool parent is not helper-readable')
+        }
+      }
+      fs.mkdirSync(directory, { mode: 0o755 })
+      fs.chmodSync(directory, 0o755)
+      execFileSync('pnpm', args, { cwd: this.repoRoot, encoding: 'utf8', stdio: 'pipe', timeout: 60_000 })
+      fs.chmodSync(target, 0o644)
+      this.runtime.writeArtifact('native-history-tool.json', { producer: 'pnpm', args,
+        path: target, sha256: createHash('sha256').update(fs.readFileSync(target)).digest('hex'),
+        sourceSha256: createHash('sha256').update(fs.readFileSync(source)).digest('hex') })
+      this.nativeHistoryTool = target
+      this.runtime.recordLifecycle('native_history.tool_build_completed', { severity: 'info', path: target })
+      return target
+    } catch (error) {
+      const failure = error as Error & { stdout?: string | Buffer; stderr?: string | Buffer; status?: number; signal?: string }
+      this.runtime.writeArtifact('native-history-tool-failure.json', { producer: 'pnpm', args, path: target,
+        message: failure.message, status: failure.status ?? null, signal: failure.signal ?? null,
+        stdout: String(failure.stdout ?? ''), stderr: String(failure.stderr ?? '') })
+      this.runtime.recordLifecycle('native_history.tool_build_failed', { severity: 'error', path: target, status: failure.status ?? null })
+      this.nativeHistoryToolFailure = new Error('native history tool preparation failed')
+      throw this.nativeHistoryToolFailure
+    }
+  }
+
   private async captureFreshNativeSource(handle: ExactRuntimeHandle, provider: string, boundary = false): Promise<FreshCapturedNativeHistory> {
     const source = provider === 'claude' ? '/home/freshell/provider/.claude/projects'
       : provider === 'codex' ? '/home/freshell/provider/.codex/sessions' : '/home/freshell/provider/.local/share/opencode/opencode.db'
-    const script = "const{captureNativeHistory}=await import(process.argv[1]);process.stdout.write(JSON.stringify(captureNativeHistory(process.argv[2],process.argv[3],process.argv[4],process.argv[5]==='boundary')));"
-    const raw = await this.ownedProviderExec(handle.containerId, ['node', '--no-warnings', '--import',
-      path.join(this.repoRoot, 'node_modules/tsx/dist/loader.mjs'), '--input-type=module', '-e', script,
-      path.join(this.repoRoot, 'test/e2e-browser/helpers/provider-native-history/probe-cli.ts'), provider, source, handle.nativeSessionId,
+    // An imported probe must not see its own filename as argv[1]: the CLI's
+    // normal main guard would otherwise dispatch a second capture.
+    const script = "const{captureNativeHistory}=await import(process.argv[2]);process.stdout.write(JSON.stringify(captureNativeHistory(process.argv[3],process.argv[4],process.argv[5],process.argv[6]==='boundary')));"
+    const raw = await this.ownedProviderExec(handle.containerId, ['node', '--no-warnings', '--input-type=module', '-e', script,
+      'native-history-import', this.prepareNativeHistoryTool(), provider, source, handle.nativeSessionId,
       boundary ? 'boundary' : 'completion'])
     if (Buffer.byteLength(raw) > 8 * 1024 * 1024) throw new Error('native capture exceeds the serialized evidence bound')
     const captured = objectFields(JSON.parse(raw), 'invalid raw native source')
@@ -7017,6 +7067,7 @@ export class ManagedRuntimeOwner {
   }
 
   private async readStoppedNativeHistory(handle: ExactRuntimeHandle, provider: string, receipt: BrokerReceipt): Promise<FreshCapturedNativeHistory> {
+    const nativeHistoryTool = this.prepareNativeHistoryTool()
     const source = provider === 'claude' ? '/home/freshell/provider/.claude/projects'
       : provider === 'codex' ? '/home/freshell/provider/.codex/sessions'
       : provider === 'opencode' ? '/home/freshell/provider/.local/share/opencode/opencode.db' : '/home/freshell/provider/.amplifier/projects'
@@ -7038,8 +7089,7 @@ export class ManagedRuntimeOwner {
         '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=16m', '--env', 'HOME=/home/freshell/provider',
         '--mount', `type=volume,source=${receipt.providerVolumeName},target=/home/freshell/provider,readonly`,
         '--mount', `type=bind,source=${this.repoRoot},target=${this.repoRoot},readonly`, '--workdir', this.repoRoot,
-        '--entrypoint', 'node', this.runtime.imageRef, '--no-warnings', '--import', path.join(this.repoRoot, 'node_modules/tsx/dist/loader.mjs'),
-        path.join(this.repoRoot, 'test/e2e-browser/helpers/provider-native-history/probe-cli.ts'), provider, source, handle.nativeSessionId,
+        '--entrypoint', 'node', this.runtime.imageRef, '--no-warnings', nativeHistoryTool, provider, source, handle.nativeSessionId,
       ])).trim()
       if (!/^[a-f0-9]{64}$/.test(helperId)) throw new Error('native history helper acknowledgement is invalid')
       await probe(['start', helperId])

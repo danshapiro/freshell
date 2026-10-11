@@ -97,6 +97,154 @@ async function nativeOwnerHistory(provider: 'claude' | 'amplifier', nonce: strin
   return readAmplifierNativeHistory(root, sessionId)
 }
 
+async function installNativeToolFixture(): Promise<void> {
+  await fsp.chmod(fixtureRepoRoot, 0o755)
+  await fsp.writeFile(path.join(fixtureRepoRoot, 'package.json'), JSON.stringify({
+    name: 'native-tool-fixture', private: true, type: 'commonjs', packageManager: 'pnpm@10.34.5',
+  }))
+  await fsp.writeFile(path.join(fixtureRepoRoot, 'pnpm-workspace.yaml'), 'packages:\n  - packages/freshell-mcp-runtime\n')
+  const packageRoot = 'packages/freshell-mcp-runtime'
+  await fsp.mkdir(path.join(fixtureRepoRoot, packageRoot), { recursive: true })
+  await fsp.copyFile(path.join(sourceRoot, packageRoot, 'package.json'), path.join(fixtureRepoRoot, packageRoot, 'package.json'))
+  await fsp.symlink(path.join(sourceRoot, packageRoot, 'node_modules'), path.join(fixtureRepoRoot, packageRoot, 'node_modules'))
+  await fsp.cp(path.join(sourceRoot, 'test/e2e-browser/helpers/provider-native-history'),
+    path.join(fixtureRepoRoot, 'test/e2e-browser/helpers/provider-native-history'), { recursive: true })
+  await fsp.mkdir(path.join(fixtureRepoRoot, 'scripts/testing'), { recursive: true })
+  await fsp.copyFile(path.join(sourceRoot, 'scripts/testing/provider-native-history.ts'),
+    path.join(fixtureRepoRoot, 'scripts/testing/provider-native-history.ts'))
+  // A real isolated pnpm loader, with its dependency unavailable to the child.
+  // Docker coverage separately verifies the actual 0600/0700 UID boundary.
+  const virtualStore = path.join(fixtureRepoRoot, 'node_modules/.pnpm/tsx@4.21.0/node_modules')
+  await fsp.mkdir(virtualStore, { recursive: true })
+  await fsp.cp(fs.realpathSync(path.join(sourceRoot, 'node_modules/tsx')), path.join(virtualStore, 'tsx'), { recursive: true })
+  await fsp.symlink('.pnpm/tsx@4.21.0/node_modules/tsx', path.join(fixtureRepoRoot, 'node_modules/tsx'))
+  await fsp.symlink('../../get-tsconfig@unavailable/node_modules/get-tsconfig', path.join(virtualStore, 'get-tsconfig'))
+}
+
+describe('native history tool dependency delivery', () => {
+  it.each([false, true])('removes the owned bundle only after resource absence is verified (uncertain=%s)', async uncertain => {
+    const harness = new owner.RuntimeHarness(fixtureRepoRoot, randomUUID(), 1, { bootstrapProviders: [] })
+    await fsp.mkdir(harness.nativeHistoryBuildDir, { recursive: true })
+    await fsp.writeFile(path.join(harness.nativeHistoryBuildDir, 'probe-cli.mjs'), 'owned synthetic build artifact')
+    const directory = path.join(fixtureRepoRoot, 'fake-cleanup-daemon')
+    await fsp.mkdir(directory)
+    await fsp.writeFile(path.join(directory, 'docker'), `#!${process.execPath}\nconst a=process.argv.slice(2);if(a[0]!=='ps'&&!(a[0]==='volume'&&a[1]==='ls'))process.exitCode=9;\n`, { mode: 0o700 })
+    Object.defineProperty(harness, 'broker', { value: { historyHelperNames: () => [], receipts: () => [], eventsSnapshot: () => [],
+      awaitPendingRequests: async () => uncertain ? [{ reason: 'controlled_unknown_allocation', method: 'POST', url: '/containers/create', allocationUnknown: true }] : [] } })
+    vi.stubEnv('PATH', `${directory}${path.delimiter}${process.env.PATH}`)
+    try {
+      const result = await harness.cleanup()
+      expect(result.ok).toBe(!uncertain)
+      expect(fs.existsSync(harness.nativeHistoryBuildDir)).toBe(uncertain)
+    } finally { vi.unstubAllEnvs() }
+  })
+
+  it.each(['claude', 'amplifier'] as const)('executes the stopped %s capture without helper access to pnpm dependencies', async provider => {
+    await installNativeToolFixture()
+    const expected = await nativeOwnerHistory(provider, 'fictional-loader-marker')
+    const home = path.join(fixtureRepoRoot, 'fake-provider')
+    const source = path.join(home, provider === 'claude' ? '.claude/projects' : '.amplifier/projects')
+    await fsp.cp(path.join(fixtureRepoRoot, 'native-owner-history'), source, { recursive: true })
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused loader web') }, fixtureRepoRoot, 5,
+      {}, {}, 'release', { enabledProviders: [], freshAgentModes: [] }, undefined, { bootstrapProviders: [] })
+    const calls: string[] = []
+    let selected: string[] = [], status = -1, output = ''
+    vi.spyOn(rig as any, 'trackedDockerProbe').mockImplementation(async (_container: string, args: string[]) => {
+      calls.push(args[0]!)
+      if (args[0] === 'create') { selected = args; return 'c'.repeat(64) }
+      if (args[0] === 'start') {
+        const command = selected.slice(selected.indexOf('--entrypoint') + 3).map(value => value.replace('/home/freshell/provider', home))
+        await new Promise<void>(resolve => execFile(process.execPath, command,
+          { cwd: fixtureRepoRoot, env: { PATH: process.env.PATH, HOME: home, TMPDIR: os.tmpdir() }, timeout: 15_000 },
+          (error, stdout, stderr) => { status = typeof error?.code === 'number' ? error.code : error ? -1 : 0; output = stdout + stderr; resolve() }))
+        return ''
+      }
+      if (args[0] === 'wait') return String(status)
+      if (args[0] === 'logs') return output
+      if (args[0] === 'rm') return ''
+      throw new Error('unexpected loader transport action')
+    })
+    const captured = await (rig as any).readStoppedNativeHistory(handle, provider, { providerVolumeName: 'fake-native-volume' })
+    expect(captured.turns).toEqual(expected.turns)
+    expect(captured.rawSource.snapshot.completeEof).toBe(true)
+    expect(captured.rawSource.snapshot.sha256).toBe(createHash('sha256').update(Buffer.from(captured.rawSource.snapshot.bytesBase64, 'base64')).digest('hex'))
+    expect(status).toBe(0)
+    expect(calls).toEqual(['create', 'start', 'wait', 'logs', 'rm'])
+    const tool = selected[selected.indexOf('--entrypoint') + 4]!
+    const originalTool = await fsp.readFile(tool)
+    // The immutable run artifact remains the source after the first build.
+    await fsp.writeFile(path.join(fixtureRepoRoot, 'test/e2e-browser/helpers/provider-native-history/probe-cli.ts'), 'invalid replacement source !@')
+    const again = await (rig as any).readStoppedNativeHistory(handle, provider, { providerVolumeName: 'fake-native-volume' })
+    expect(again.turns).toEqual(expected.turns)
+    expect(await fsp.readFile(tool)).toEqual(originalTool)
+    expect((await fsp.stat(tool)).mode & 0o777).toBe(0o644)
+    vi.restoreAllMocks()
+  })
+
+  it.each(['private-existing-parent', 'failed-producer'] as const)('refuses %s before creating a helper and retains private build diagnostics', async fault => {
+    await installNativeToolFixture()
+    const directory = path.join(fixtureRepoRoot, 'dist')
+    if (fault === 'private-existing-parent') {
+      await fsp.mkdir(directory, { mode: 0o700 })
+      await fsp.chmod(directory, 0o700)
+    } else {
+      await fsp.writeFile(path.join(fixtureRepoRoot, 'test/e2e-browser/helpers/provider-native-history/probe-cli.ts'), 'private-producer-marker !@')
+    }
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused failure web') }, fixtureRepoRoot, 5,
+      {}, {}, 'release', { enabledProviders: [], freshAgentModes: [] }, undefined, { bootstrapProviders: [] })
+    const docker = vi.spyOn(rig as any, 'trackedDockerProbe')
+    await expect((rig as any).readStoppedNativeHistory(handle, 'claude', { providerVolumeName: 'fake-native-volume' }))
+      .rejects.toThrow(/^native history tool preparation failed$/)
+    expect(docker).not.toHaveBeenCalled()
+    const filename = path.join(rig.runtime.evidenceDir, 'native-history-tool-failure.json')
+    const diagnostic = JSON.parse(await fsp.readFile(filename, 'utf8'))
+    expect(diagnostic).toMatchObject({ producer: 'pnpm', path: path.join(rig.runtime.nativeHistoryBuildDir, 'probe-cli.mjs') })
+    expect((await fsp.stat(filename)).mode & 0o777).toBe(0o600)
+    if (fault === 'private-existing-parent') expect((await fsp.stat(directory)).mode & 0o777).toBe(0o700)
+    else {
+      expect(diagnostic.status).toBeGreaterThan(0)
+      expect(diagnostic.stderr.length + diagnostic.stdout.length).toBeGreaterThan(0)
+    }
+    const originalDiagnostic = await fsp.readFile(filename)
+    await fsp.copyFile(path.join(sourceRoot, 'test/e2e-browser/helpers/provider-native-history/probe-cli.ts'),
+      path.join(fixtureRepoRoot, 'test/e2e-browser/helpers/provider-native-history/probe-cli.ts'))
+    await expect((rig as any).readStoppedNativeHistory(handle, 'claude', { providerVolumeName: 'fake-native-volume' }))
+      .rejects.toThrow(/^native history tool preparation failed$/)
+    expect(await fsp.readFile(filename)).toEqual(originalDiagnostic)
+    expect(docker).not.toHaveBeenCalled()
+    vi.restoreAllMocks()
+  })
+
+  it('executes the imported fresh capture and preserves safe CLI validation failures', async () => {
+    await installNativeToolFixture()
+    const expected = await nativeOwnerHistory('claude', 'fictional-fresh-loader-marker')
+    const home = path.join(fixtureRepoRoot, 'fake-provider')
+    const source = path.join(home, '.claude/projects')
+    await fsp.cp(path.join(fixtureRepoRoot, 'native-owner-history'), source, { recursive: true })
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused loader web') }, fixtureRepoRoot, 5,
+      {}, {}, 'release', { enabledProviders: [], freshAgentModes: [] }, undefined, { bootstrapProviders: [] })
+    const provider = vi.spyOn(rig, 'ownedProviderExec').mockImplementation(async (_container, args) => {
+      return new Promise<string>((resolve, reject) => execFile(process.execPath,
+        args.slice(1).map(value => value.replace('/home/freshell/provider', home)),
+        { cwd: fixtureRepoRoot, env: { PATH: process.env.PATH, HOME: home, TMPDIR: os.tmpdir() }, timeout: 15_000 },
+        (error, stdout) => error ? reject(error) : resolve(stdout)))
+    })
+    const captured = await (rig as any).captureFreshNativeSource(handle, 'claude', true)
+    expect(captured.turns).toEqual(expected.turns)
+    const tool = provider.mock.calls[0]![1].at(-5)!
+    await fsp.appendFile(path.join(source, `${handle.nativeSessionId}.jsonl`), 'private-invalid-source-marker')
+    const failure = await new Promise<{ status: number; stdout: string; stderr: string }>(resolve => execFile(process.execPath,
+      ['--no-warnings', tool, 'claude', source, handle.nativeSessionId], { timeout: 15_000, encoding: 'utf8' },
+      (error, stdout, stderr) => resolve({ status: typeof error?.code === 'number' ? error.code : 0, stdout, stderr })))
+    expect(failure.status).toBe(2)
+    expect(failure.stdout).toBe('')
+    expect(JSON.parse(failure.stderr)).toEqual({ severity: 'error', event: 'provider_native_history.refused',
+      stage: 'source_read', reason: 'incomplete_source_eof', code: null })
+    expect(failure.stderr).not.toContain('private-invalid-source-marker')
+    vi.restoreAllMocks()
+  })
+})
+
 describe('Task7 standalone owner cancellation', () => {
   it.each([
     ...(['SIGINT', 'SIGTERM'] as const).flatMap(signal =>
@@ -4333,6 +4481,7 @@ describe('run-scoped owner operation settlement', () => {
 describe('current handle admission before owner mutation', () => {
   it.each(['refused', 'logs-failed', 'cleanup-failed', 'wait-failed'] as const)(
     'retains stopped helper failure evidence before removal (%s)', async fault => {
+      await installNativeToolFixture()
       const root = path.join(fixtureRepoRoot, 'stopped-helper-failure')
       await fsp.mkdir(root, { mode: 0o700 })
       const callsFile = path.join(root, 'calls.jsonl'), evidenceDir = path.join(root, 'evidence')
@@ -4444,6 +4593,7 @@ else if(!['start','rm'].includes(a[0]))process.exitCode=10;
   })
 
   it.each(['codex', 'opencode', 'claude', 'amplifier'] as const)('reads exact recovered stopped history for %s through the tracked helper and returns only the original three proofs', async provider => {
+    await installNativeToolFixture()
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-stopped-proofs-'))
     const nonce = `codename-${'e'.repeat(32)}`
     const historyFile = path.join(root, 'history.json')
@@ -5094,6 +5244,7 @@ describe('finite retained fresh native collection', () => {
   })
 
   it('retains three actual-format raw stages before owned cleanup deletes the source', async () => {
+    await installNativeToolFixture()
     const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'fresh-native-collection-'))
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', {
       enabledProviders: [], freshAgentModes: ['freshclaude'],
@@ -5132,8 +5283,9 @@ describe('finite retained fresh native collection', () => {
     vi.spyOn(rig, 'ownedProviderExec').mockImplementation(async (_container, args) => {
       if (args.includes(owner.FRESH_AGENT_PROCESS_SCRIPT)) return JSON.stringify(launchProcess())
       if (args[0] === 'node') {
-        const { captureNativeHistory } = await import('../../../e2e-browser/helpers/provider-native-history/probe-cli.js')
-        return JSON.stringify(captureNativeHistory('claude', projects, nativeRoot, args.at(-1) === 'boundary'))
+        return new Promise<string>((resolve, reject) => execFile(process.execPath,
+          args.slice(1).map(value => value === '/home/freshell/provider/.claude/projects' ? projects : value),
+          { cwd: fixtureRepoRoot, encoding: 'utf8', timeout: 15_000 }, (error, stdout) => error ? reject(error) : resolve(stdout)))
       }
       return JSON.stringify({ uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true, nativePid: 42, nativeRoot,
         nativeCwd: fixtureRepoRoot, executableSha256: 'd'.repeat(64), profileSha256: 'e'.repeat(64), nativeLaunch: launchProcess().native.launch,
