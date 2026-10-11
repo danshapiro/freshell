@@ -3628,11 +3628,22 @@ impl FreshCodexState {
                 return;
             }
             Err(EnsureAliveError::Reserved) => {
-                // Task 13 (D8): another create/attach holds this sessionRef (or,
-                // Task 16, a live pane holds the conversation) -- the retryable
-                // non-lost error channel; the client re-drive converges. The
-                // send itself was refused, so it is released like every other
-                // refused send (review R2-M1).
+                // Task 13 (D8): the retryable non-lost error channel; the
+                // client re-drive converges. The send itself was refused, so
+                // it is released like every other refused send (review
+                // R2-M1), whichever of the six causes of `Reserved` the
+                // crash recovery met (review R3-n4):
+                // 1. another create/attach holds this sessionRef's lease (or
+                //    the lease's winner bound a session that is gone);
+                // 2. a live Freshell pane holds the conversation (Task 16:
+                //    Codex's own refusal, its holder in a pane's unit);
+                // 3. a live terminal PTY owns the conversation (Task 13b);
+                // 4. the ownership coordinator refused the claim (a stale
+                //    observed fence, a key in handoff, stopping, fenced or
+                //    starting, an owner of the other kind, or an adopt the
+                //    live map cannot confirm);
+                // 5. a prior natural exit's writer is still unconfirmed;
+                // 6. an expired lease whose holder's kill was not confirmed.
                 const RESERVED: &str = "Another resume for this session is in flight";
                 self.send_error(&request_id, "SESSION_RESERVED", RESERVED);
                 self.emit_fresh_agent_error(&session_id, "SESSION_RESERVED", RESERVED);
