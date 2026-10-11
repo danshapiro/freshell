@@ -1125,8 +1125,11 @@ async fn main() -> ExitCode {
     // the registry's kill/exit/confirmed-kill paths release coordinator
     // ownership fenced (release-only integration; the WS/REST/auto-resume
     // lanes claim).
+    let managed_environment_fixture_only =
+        std::env::var("FRESHELL_MANAGED_ENVIRONMENT_FIXTURE_ONLY").as_deref() == Ok("1");
     let registry = freshell_terminal::TerminalRegistry::new()
-        .with_ownership(std::sync::Arc::clone(&ownership));
+        .with_ownership(std::sync::Arc::clone(&ownership))
+        .with_managed_environment_fixture_only(managed_environment_fixture_only);
     #[cfg(feature = "managed-runtime-v1")]
     let (managed_runtime_available, managed_runtime_client, managed_runtime_controller) = {
         let controller = managed_runtime::ServerManagedRuntimeController::from_env()
@@ -1159,6 +1162,11 @@ async fn main() -> ExitCode {
     };
     #[cfg(not(feature = "managed-runtime-v1"))]
     let managed_runtime_available = false;
+    if managed_environment_fixture_only && !managed_runtime_available {
+        tracing::error!("managed_environment_fixture.controller_unavailable");
+        eprintln!("managed environment fixture requires an initialized managed runtime controller");
+        std::process::exit(1);
+    }
     #[cfg(feature = "managed-runtime-v1")]
     let hosted_fresh_gateway = fresh_agent_proxy::HostedFreshAgentProxy::from_opt_in(
         managed_runtime_client.clone(),

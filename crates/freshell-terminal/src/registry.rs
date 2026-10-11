@@ -1239,6 +1239,9 @@ pub type IdentityReadoptPauseHook = std::sync::Arc<
 #[derive(Clone)]
 pub struct TerminalRegistry {
     inner: Arc<Mutex<RegistryInner>>,
+    // Closed scratch acceptance target only. Ordinary construction retains
+    // host terminal creation; managed facade registration never spawns here.
+    managed_environment_fixture_only: bool,
     conn_seq: Arc<AtomicU64>,
     /// DIAG-05: a LIVE count of currently-open `/ws` connections (distinct
     /// from `conn_seq`, which is a monotonic minting counter that never goes
@@ -1629,14 +1632,16 @@ pub trait PaneIdentityBinder: Send + Sync + std::fmt::Debug {
 }
 
 impl TerminalRegistry {
-    /// Construction seam for the closed managed-environment acceptance target.
-    /// The refusal behavior is added after its endpoint regression is observed.
-    pub fn with_managed_environment_fixture_only(self, _fixture_only: bool) -> Self {
+    /// Disable ordinary host PTYs for the closed managed-environment fixture.
+    /// This is an immutable construction input, not a product permission policy.
+    pub fn with_managed_environment_fixture_only(mut self, fixture_only: bool) -> Self {
+        self.managed_environment_fixture_only = fixture_only;
         self
     }
 
     pub fn new() -> Self {
         Self {
+            managed_environment_fixture_only: false,
             inner: Arc::new(Mutex::new(RegistryInner {
                 terminals: HashMap::new(),
                 revision: 0,
@@ -2385,6 +2390,17 @@ impl TerminalRegistry {
         ring_max_bytes: Option<i64>,
         on_exit: Option<crate::pty::ExitHook>,
     ) -> io::Result<()> {
+        if self.managed_environment_fixture_only {
+            tracing::warn!(
+                terminal_id = %terminal_id,
+                mode,
+                "terminal.create.fixture_host_pty_refused"
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "managed environment fixture denies host PTY creation",
+            ));
+        }
         // Duplicate-live-resume enforcement (amplifier identity plan,
         // validated fix F5/V7): the callers' `has_live_resume` pre-check is
         // check-then-act and can race across WS/REST tasks — this registry's
