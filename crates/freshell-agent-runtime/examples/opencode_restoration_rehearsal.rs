@@ -70,6 +70,366 @@ struct SourceRootBinding {
 
 type StageError = Box<dyn std::error::Error>;
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativeValidationRequest {
+    descriptor_file: PathBuf,
+    database_file: PathBuf,
+    root_session_id: String,
+    session_id: String,
+    info_file: PathBuf,
+    page_files: Vec<PathBuf>,
+    export_file: PathBuf,
+}
+
+// This validator consumes one native message at a time. The installed store
+// has already passed the full qualified graph reader; SQL supplies the exact
+// expected projection, never a substitute for native GET/export artifacts.
+struct NativeMessages<'a> {
+    db: &'a rusqlite::Connection,
+    session: &'a str,
+    seen: &'a mut std::collections::BTreeSet<String>,
+}
+impl<'de> serde::de::DeserializeSeed<'de> for NativeMessages<'_> {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+impl<'de> serde::de::Visitor<'de> for NativeMessages<'_> {
+    type Value = ();
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("complete native message array")
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut sequence: A) -> Result<(), A::Error> {
+        while let Some(message) = sequence.next_element::<serde_json::Value>()? {
+            if message.as_object().map(|object| object.len()) != Some(2) {
+                return Err(serde::de::Error::custom("native message envelope differs"));
+            }
+            let id = message["info"]["id"]
+                .as_str()
+                .ok_or_else(|| serde::de::Error::custom("native message ID missing"))?;
+            if !self.seen.insert(id.to_owned()) {
+                return Err(serde::de::Error::custom("duplicate native message ID"));
+            }
+            compare_native_message(self.db, self.session, &message).map_err(|_| {
+                serde::de::Error::custom("complete native message/part projection differs")
+            })?;
+        }
+        Ok(())
+    }
+}
+fn compare_native_message(
+    db: &rusqlite::Connection,
+    session: &str,
+    message: &serde_json::Value,
+) -> Result<(), StageError> {
+    let id = message["info"]["id"]
+        .as_str()
+        .ok_or("native message ID missing")?;
+    let data: String = db.query_row(
+        "SELECT data FROM message WHERE id=?1 AND session_id=?2",
+        rusqlite::params![id, session],
+        |row| row.get(0),
+    )?;
+    let mut expected: serde_json::Value = serde_json::from_str(&data)?;
+    expected["id"] = json!(id);
+    expected["sessionID"] = json!(session);
+    if message["info"] != expected {
+        return Err("native message contents differ".into());
+    }
+    let parts = message["parts"].as_array().ok_or("native parts missing")?;
+    let mut actual = std::collections::BTreeMap::new();
+    for part in parts {
+        let id = part["id"].as_str().ok_or("native part ID missing")?;
+        if actual.insert(id, part).is_some() {
+            return Err("duplicate native part ID".into());
+        }
+    }
+    let mut statement =
+        db.prepare("SELECT id,data FROM part WHERE message_id=?1 AND session_id=?2 ORDER BY id")?;
+    let mut rows = statement.query(rusqlite::params![id, session])?;
+    let mut count = 0;
+    while let Some(row) = rows.next()? {
+        let part_id: String = row.get(0)?;
+        let data: String = row.get(1)?;
+        let mut expected: serde_json::Value = serde_json::from_str(&data)?;
+        expected["id"] = json!(part_id);
+        expected["messageID"] = json!(id);
+        expected["sessionID"] = json!(session);
+        if actual.get(part_id.as_str()).copied() != Some(&expected) {
+            return Err("native part contents differ".into());
+        }
+        count += 1;
+    }
+    if count != actual.len() {
+        return Err("native part closure differs".into());
+    }
+    Ok(())
+}
+struct NativeExport<'a> {
+    messages: NativeMessages<'a>,
+    info: &'a serde_json::Value,
+}
+impl<'de> serde::de::DeserializeSeed<'de> for NativeExport<'_> {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+impl<'de> serde::de::Visitor<'de> for NativeExport<'_> {
+    type Value = ();
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("original native CLI export")
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let mut fields = std::collections::BTreeSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !fields.insert(key.clone()) {
+                return Err(serde::de::Error::custom("duplicate native export field"));
+            }
+            match key.as_str() {
+                "info" => {
+                    if map.next_value::<serde_json::Value>()? != *self.info {
+                        return Err(serde::de::Error::custom(
+                            "native export session metadata differs",
+                        ));
+                    }
+                }
+                "messages" => map.next_value_seed(NativeMessages {
+                    db: self.messages.db,
+                    session: self.messages.session,
+                    seen: self.messages.seen,
+                })?,
+                _ => return Err(serde::de::Error::custom("unexpected native export field")),
+            }
+        }
+        if fields.len() != 2 {
+            return Err(serde::de::Error::custom(
+                "complete native export fields required",
+            ));
+        }
+        Ok(())
+    }
+}
+fn validate_native_artifacts(request: &NativeValidationRequest) -> Result<(), StageError> {
+    use serde::de::DeserializeSeed;
+    use std::io::BufReader;
+    for file in std::iter::once(&request.descriptor_file)
+        .chain(std::iter::once(&request.info_file))
+        .chain(request.page_files.iter())
+        .chain(std::iter::once(&request.export_file))
+    {
+        private_file(file)?;
+        if fs::metadata(file)?.len() > 8 * 1024 * 1024 * 1024 {
+            return Err("native artifact finite byte ceiling exceeded".into());
+        }
+    }
+    if request.page_files.is_empty() {
+        return Err("native page exhaustion missing".into());
+    }
+    let descriptor: serde_json::Value =
+        serde_json::from_reader(File::open(&request.descriptor_file)?)?;
+    let manifest: serde_json::Value = serde_json::from_str(
+        descriptor["manifestJson"]
+            .as_str()
+            .ok_or("native manifest missing")?,
+    )?;
+    if descriptor["rootSessionId"] != request.root_session_id
+        || !manifest["rows"]
+            .as_array()
+            .ok_or("native selection missing")?
+            .iter()
+            .any(|row| row["table"] == "session" && row["key"][0]["value"] == request.session_id)
+    {
+        return Err("native original root/session selection differs".into());
+    }
+    let db = rusqlite::Connection::open_with_flags(
+        &request.database_file,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    db.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; BEGIN")?;
+    // Historical006's largest native message data is 17MB, largest part 230KB.
+    // 128MiB per projected message retains headroom while refusing unsupported
+    // individual records before allocating them. This is not a full-graph cap.
+    let max_record: i64 = db.query_row("SELECT coalesce(max(length(cast(m.data AS blob))+(SELECT coalesce(sum(length(cast(p.data AS blob))),0) FROM part p WHERE p.message_id=m.id AND p.session_id=m.session_id)),0) FROM message m WHERE m.session_id=?1", [&request.session_id], |row| row.get(0))?;
+    if max_record > 128 * 1024 * 1024 {
+        return Err("individual native message exceeds supported validation bound".into());
+    }
+    let info: serde_json::Value = serde_json::from_reader(File::open(&request.info_file)?)?;
+    if info["id"] != request.session_id {
+        return Err("native session ID differs".into());
+    }
+    let revert: Option<String> = db.query_row(
+        "SELECT revert FROM session WHERE id=?1",
+        [&request.session_id],
+        |row| row.get(0),
+    )?;
+    let expected_revert = revert
+        .map(|value| serde_json::from_str::<serde_json::Value>(&value))
+        .transpose()?;
+    if info.get("revert") != expected_revert.as_ref() {
+        return Err("native saved revert/reference differs".into());
+    }
+    let count: usize = db.query_row(
+        "SELECT count(*) FROM message WHERE session_id=?1",
+        [&request.session_id],
+        |row| row.get(0),
+    )?;
+    let mut seen = std::collections::BTreeSet::new();
+    for file in &request.page_files {
+        let mut decoder = serde_json::Deserializer::from_reader(BufReader::new(File::open(file)?));
+        NativeMessages {
+            db: &db,
+            session: &request.session_id,
+            seen: &mut seen,
+        }
+        .deserialize(&mut decoder)?;
+        decoder.end()?;
+    }
+    if seen.len() != count {
+        return Err("native GET page closure incomplete".into());
+    }
+    seen.clear();
+    let mut decoder =
+        serde_json::Deserializer::from_reader(BufReader::new(File::open(&request.export_file)?));
+    NativeExport {
+        messages: NativeMessages {
+            db: &db,
+            session: &request.session_id,
+            seen: &mut seen,
+        },
+        info: &info,
+    }
+    .deserialize(&mut decoder)?;
+    decoder.end()?;
+    if seen.len() != count {
+        return Err("native CLI export closure incomplete".into());
+    }
+    Ok(())
+}
+
+#[test]
+fn native_artifact_validator_compares_full_parts_and_requires_complete_eof() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = directory.path();
+    let database_file = base.join("native.sqlite");
+    let db = rusqlite::Connection::open(&database_file).unwrap();
+    db.execute_batch("CREATE TABLE message(id TEXT,session_id TEXT,data TEXT); CREATE TABLE part(id TEXT,message_id TEXT,session_id TEXT,data TEXT); CREATE TABLE session(id TEXT,revert TEXT);").unwrap();
+    db.execute(
+        "INSERT INTO message VALUES('msg_one','ses_one',?1)",
+        [json!({"role":"user","time":{"created":1}}).to_string()],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO part VALUES('prt_one','msg_one','ses_one',?1)",
+        [json!({"type":"text","text":"original"}).to_string()],
+    )
+    .unwrap();
+    let saved = json!({"messageID":"msg_one","snapshot":"fixture-unavailable-tree"});
+    db.execute(
+        "INSERT INTO session VALUES('ses_one',?1)",
+        [saved.to_string()],
+    )
+    .unwrap();
+    let info = json!({"id":"ses_one","revert":saved});
+    let message = json!({"info":{"id":"msg_one","sessionID":"ses_one","role":"user","time":{"created":1}},"parts":[{"id":"prt_one","messageID":"msg_one","sessionID":"ses_one","type":"text","text":"original"}]});
+    let request = NativeValidationRequest {
+        descriptor_file: base.join("descriptor.json"),
+        database_file,
+        root_session_id: "ses_one".into(),
+        session_id: "ses_one".into(),
+        info_file: base.join("info.json"),
+        page_files: vec![base.join("page.json")],
+        export_file: base.join("export.json"),
+    };
+    write_private(&request.descriptor_file, &serde_json::to_vec(&json!({"rootSessionId":"ses_one","manifestJson":json!({"rows":[{"table":"session","key":[{"value":"ses_one"}]}]}).to_string()})).unwrap()).unwrap();
+    write_private(&request.info_file, &serde_json::to_vec(&info).unwrap()).unwrap();
+    write_private(
+        &request.page_files[0],
+        &serde_json::to_vec(&json!([message.clone()])).unwrap(),
+    )
+    .unwrap();
+    write_private(
+        &request.export_file,
+        &serde_json::to_vec(&json!({"info":info,"messages":[message.clone()]})).unwrap(),
+    )
+    .unwrap();
+    assert!(validate_native_artifacts(&request).is_ok());
+    let omitted_info = json!({"id":"ses_one"});
+    fs::write(
+        &request.info_file,
+        serde_json::to_vec(&omitted_info).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &request.export_file,
+        serde_json::to_vec(&json!({"info":omitted_info,"messages":[message.clone()]})).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        validate_native_artifacts(&request).is_err(),
+        "native decoder cannot omit a saved reference"
+    );
+    fs::write(&request.info_file, serde_json::to_vec(&info).unwrap()).unwrap();
+    let mut changed = message.clone();
+    changed["parts"][0]["text"] = json!("mutated");
+    fs::write(
+        &request.export_file,
+        serde_json::to_vec(&json!({"info":info,"messages":[changed]})).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        validate_native_artifacts(&request).is_err(),
+        "same-count mutated part must refuse"
+    );
+    fs::write(
+        &request.export_file,
+        serde_json::to_vec(&json!({"info":info,"messages":[message]})).unwrap(),
+    )
+    .unwrap();
+    fs::write(&request.page_files[0], b"[]").unwrap();
+    assert!(
+        validate_native_artifacts(&request).is_err(),
+        "omitted native page must refuse"
+    );
+    fs::write(&request.page_files[0], b"[{").unwrap();
+    assert!(
+        validate_native_artifacts(&request).is_err(),
+        "incomplete EOF must refuse"
+    );
+    fs::write(
+        &request.page_files[0],
+        serde_json::to_vec(&json!([message.clone(), message.clone()])).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        validate_native_artifacts(&request).is_err(),
+        "repeated page/message must refuse"
+    );
+    fs::write(
+        &request.page_files[0],
+        serde_json::to_vec(&json!([message.clone()])).unwrap(),
+    )
+    .unwrap();
+    let mut wrong_root = request;
+    wrong_root.root_session_id = "ses_wrong".into();
+    assert!(
+        validate_native_artifacts(&wrong_root).is_err(),
+        "wrong original root must refuse"
+    );
+    wrong_root.root_session_id = "ses_one".into();
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(&wrong_root.export_file)
+        .unwrap();
+    file.write_all(b" {}").unwrap();
+    assert!(
+        validate_native_artifacts(&wrong_root).is_err(),
+        "trailing artifact data must refuse"
+    );
+}
+
 struct ImportCapacityCeiling(u64);
 impl DestinationCapacityProvider for ImportCapacityCeiling {
     fn available_bytes(&self, directory: &Path) -> std::io::Result<u64> {
@@ -121,6 +481,15 @@ fn run_with_arguments(args: &[String]) -> Result<(), StageError> {
         return Err("required fixed stage and private request file".into());
     }
     private_file(Path::new(&args[3]))?;
+    if args[1] == "native" {
+        let request: NativeValidationRequest = serde_json::from_reader(File::open(&args[3])?)?;
+        validate_native_artifacts(&request)?;
+        println!(
+            "{}",
+            json!({"status":"complete","sessionId":request.session_id})
+        );
+        return Ok(());
+    }
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum Requests {

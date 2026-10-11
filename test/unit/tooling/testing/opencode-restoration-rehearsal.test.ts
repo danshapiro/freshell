@@ -1,15 +1,17 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { execFile } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { promisify } from 'node:util'
 import { createServer } from 'node:http'
 import { admitRehearsalManifest, assertPrivateInput, dispatchRehearsalRoots, parseRehearsalArguments, runRealRootRehearsal, readRehearsalPreflight, type RootRehearsalEvidence } from '../../../../scripts/testing/opencode-restoration-rehearsal.js'
+import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 
 const candidate = 'a'.repeat(40)
 const manifest = () => ({
-  kind: 'host-opencode-real-source', candidateSha: candidate, imageDigest: `sha256:${'b'.repeat(64)}`,
+  kind: 'host-opencode-real-source' as const, candidateSha: candidate, imageDigest: `sha256:${'b'.repeat(64)}`,
   sourceIdentity: 'c'.repeat(64), targetScopeDigest: 'd'.repeat(64),
   preflightUrl: 'http://127.0.0.1:3344/api/runtime/soul-loss-repairs/preflight',
   preflightTokenFile: '/private/token', expectedControlEpoch: 4,
@@ -20,6 +22,49 @@ const manifest = () => ({
 })
 
 describe('explicit real-root rehearsal admission', () => {
+  it('joins cleanup after the actual adapter setup fails inside preparation', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'real-driver-setup-'))
+    const snapshot = path.join(directory, 'snapshot.sqlite'), token = path.join(directory, 'token')
+    fs.writeFileSync(snapshot, 'owned fixture snapshot', { mode: 0o600 }); fs.writeFileSync(token, 'fixture', { mode: 0o600 })
+    const input = { ...manifest(), candidateSha: execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
+      snapshotFile: snapshot, canonicalOriginalDatabase: snapshot, originalDefaultDatabase: snapshot, preflightTokenFile: token,
+      snapshotBytes: fs.statSync(snapshot).size, snapshotSha256: createHash('sha256').update(fs.readFileSync(snapshot)).digest('hex') }
+    const scope = { scopeId:input.targetScopeDigest,sourceStoreId:input.sourceIdentity,sourceFingerprint:'e'.repeat(64),
+      roots:input.roots.map(root=>({rootSessionId:root.rootSessionId,graphDigest:root.graphDigest,eligibleOwners:[root.canonicalSoulId],canonicalSoulId:root.canonicalSoulId})),
+      targets:input.roots.map(root=>({target:{soulId:root.canonicalSoulId,incidentId:'incident-'+root.canonicalSoulId,expectedIntentRevision:root.expectedIntentRevision},providerStoreId:root.destinationStoreId,rootSessionId:root.rootSessionId,incidentRevision:1,identityRevision:0,nativeImportRevision:0,evidenceRevision:1})),
+    }
+    const server = createServer((_request,response) => response.end(JSON.stringify(scope)))
+    await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve))
+    const address=server.address(); if(!address||typeof address==='string')throw new Error('owned setup HTTP fixture absent')
+    input.preflightUrl=`http://127.0.0.1:${address.port}/api/runtime/soul-loss-repairs/preflight`
+    const prepare = vi.spyOn(RuntimeHarness.prototype,'prepareTransfer').mockResolvedValue(undefined)
+    const cleanup = vi.spyOn(RuntimeHarness.prototype,'cleanup').mockResolvedValue({ok:true,errors:[]})
+    vi.spyOn(RuntimeHarness.prototype,'verifyTransferCleanup').mockImplementation(()=>{})
+    const file=path.join(directory,'manifest.json'),scratchDir=path.join(directory,'scratch')
+    fs.writeFileSync(file,JSON.stringify(input),{mode:0o600})
+    try {
+      await expect(runRealRootRehearsal({manifestFile:file,scratchDir})).rejects.toThrow()
+      expect(prepare).toHaveBeenCalledOnce(); expect(cleanup).toHaveBeenCalledOnce()
+      expect(JSON.parse(fs.readFileSync(path.join(scratchDir,'stage-failure.json'),'utf8')).stage).toBe('prepare')
+      expect(fs.existsSync(path.join(scratchDir,'rehearsal-receipt.json'))).toBe(false)
+    } finally { vi.restoreAllMocks(); server.closeAllConnections(); await new Promise<void>(resolve=>server.close(()=>resolve())); fs.rmSync(directory,{recursive:true,force:true}) }
+  })
+  it('allows an owned delayed HTTP preflight within its budget and refuses after the budget without assuming server settlement', async () => {
+    const input = manifest()
+    let completed = 0
+    const server = createServer((_request, response) => {
+      setTimeout(() => { completed++; response.end('{}') }, 120)
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    const address = server.address(); if (!address || typeof address === 'string') throw new Error('owned HTTP fixture missing')
+    input.preflightUrl = `http://127.0.0.1:${address.port}/api/runtime/soul-loss-repairs/preflight`
+    try {
+      await expect(readRehearsalPreflight(input, 'fixture', { timeoutMs: 30 })).rejects.toThrow()
+      expect(completed).toBe(0)
+      await new Promise(resolve => setTimeout(resolve, 160))
+      expect(completed).toBe(1)
+    } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())) }
+  })
   it('uses actual HTTP source/epoch/auth shape and refuses substituted destination ownership', async () => {
     const input=manifest()
     const scope={scopeId:input.targetScopeDigest,sourceStoreId:input.sourceIdentity,sourceFingerprint:'e'.repeat(64),
@@ -31,13 +76,13 @@ describe('explicit real-root rehearsal admission', () => {
       const chunks=[];for await (const chunk of request) chunks.push(chunk)
       expect(request.headers['x-auth-token']).toBe('owned-fixture-token')
       expect(JSON.parse(Buffer.concat(chunks).toString())).toEqual({sourceStoreId:input.sourceIdentity,rootSessionIds:input.roots.map(root=>root.rootSessionId),expectedControlEpoch:input.expectedControlEpoch})
-      calls++;response.setHeader('content-type','application/json');response.end(JSON.stringify(scope))
+      calls++;await new Promise(resolve => setTimeout(resolve, 50));response.setHeader('content-type','application/json');response.end(JSON.stringify(scope))
     })
     await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve))
     const address=server.address();if(!address||typeof address==='string')throw new Error('owned HTTP fixture missing')
     input.preflightUrl=`http://127.0.0.1:${address.port}/api/runtime/soul-loss-repairs/preflight`
     try {
-      await expect(readRehearsalPreflight(input,'owned-fixture-token')).resolves.toBeUndefined()
+      await expect(readRehearsalPreflight(input,'owned-fixture-token', { timeoutMs: 1_000 })).resolves.toBeUndefined()
       scope.targets[0]!.providerStoreId='substituted-store'
       await expect(readRehearsalPreflight(input,'owned-fixture-token')).rejects.toThrow('scope differs')
       expect(calls).toBe(2)
