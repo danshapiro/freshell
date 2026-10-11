@@ -987,7 +987,7 @@ impl AutoResumeDriver for WsAutoResumeDriver {
                     false
                 }
                 freshell_freshagent::ownership_lane::TerminalLaneClaim::Unwired => false,
-                freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt => {
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt { .. } => {
                     // b8ke ext r13 F2: resolved ASYNC below (the dead
                     // incumbent's release wait).
                     adopt_resolution_needed = true;
@@ -1120,8 +1120,9 @@ impl AutoResumeDriver for WsAutoResumeDriver {
                                     );
                                 }
                                 freshell_freshagent::ownership_lane::TerminalLaneClaim::Unwired
-                                | freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt => {
-                                }
+                                | freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt {
+                                    ..
+                                } => {}
                             }
                         }
                     }

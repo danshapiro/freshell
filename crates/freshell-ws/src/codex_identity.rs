@@ -173,6 +173,14 @@ pub(crate) async fn rebind_codex_identity(state: &WsState, r: CodexRebind<'_>) -
     // ONE lock scope, the registry's retained claim rekeyed in the same
     // step — never the interval where both keys name the writer). A
     // refusal mutates nothing.
+    // Task 14: the fork's app-server announced the fork (`thread/started`)
+    // before this lane saw its rollout, so the pane's unit may hold it as an
+    // extra thread: that hold is released, so the rebind's claim commits the
+    // fork as the pane's main conversation and aliases the original to it
+    // (claiming a key the pane already holds would only adopt it, and release
+    // the original instead). A refused rebind holds it again.
+    let released_extra =
+        crate::unit_threads::release_for_main(state, r.terminal_id, r.new_session_id);
     let Some(authority) = crate::identity_ownership::coordinator_begin_identity(
         state,
         "codex",
@@ -182,6 +190,9 @@ pub(crate) async fn rebind_codex_identity(state: &WsState, r: CodexRebind<'_>) -
     )
     .await
     else {
+        if released_extra {
+            crate::unit_threads::restore_extra(state, r.terminal_id, r.new_session_id);
+        }
         return false;
     };
     tracing::info!(terminal_id = %r.terminal_id, old = %r.old_session_id, new = %r.new_session_id,
@@ -215,18 +226,8 @@ pub(crate) async fn rebind_codex_identity(state: &WsState, r: CodexRebind<'_>) -
              live forked writer stays the named owner (never a \
              Vacant-with-live-writer)"
         );
-        crate::identity_ownership::coordinator_commit_identity(
-            state,
-            authority,
-            "codex",
-            r.terminal_id,
-            r.new_session_id,
-            Some(r.old_session_id),
-        )
-        .await;
-        return false;
     }
-    crate::identity_ownership::coordinator_commit_identity(
+    let committed = crate::identity_ownership::coordinator_commit_identity(
         state,
         authority,
         "codex",
@@ -234,7 +235,12 @@ pub(crate) async fn rebind_codex_identity(state: &WsState, r: CodexRebind<'_>) -
         r.new_session_id,
         Some(r.old_session_id),
     )
-    .await
+    .await;
+    // Task 14: the app-server holds both threads: the fork is the pane's
+    // conversation now, and the original stays on the unit (and in the
+    // sidecar record) until Codex unloads it.
+    crate::unit_threads::note_rebind(state, r.terminal_id, r.old_session_id, r.new_session_id);
+    applied && committed
 }
 
 /// Shared hijack/misbind guards for BOTH adoption and rebind. `thread_id` is

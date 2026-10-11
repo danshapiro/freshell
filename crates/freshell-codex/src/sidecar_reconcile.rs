@@ -739,13 +739,14 @@ impl CodexLaunchRuntime for ReattachedCodexAppServerRuntime {
         })
     }
 
-    /// Session enrich: rewrite the record (new session id, updated_at);
-    /// `Active` for the same H3a reason as `update_ownership_metadata`.
+    /// Session enrich: rewrite the record (new session id, updated_at; a
+    /// replaced session stays held, Task 14); `Active` for the same H3a
+    /// reason as `update_ownership_metadata`.
     fn note_session_id(&self, session_id: String) -> BoxFuture<'_, Result<(), String>> {
         Box::pin(async move {
             let snapshot = {
                 let mut record = self.record.lock().unwrap();
-                record.session_id = Some(session_id);
+                record.set_session_id(session_id);
                 record.state = SidecarRecordState::Active;
                 record.updated_at = unix_millis();
                 record.clone()
@@ -872,6 +873,40 @@ impl CodexLaunchRuntime for ReattachedCodexAppServerRuntime {
             };
             write_record_loudly(&self.store, &snapshot);
         })
+    }
+
+    fn note_held_threads(&self, ids: Vec<String>) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            self.change_held_threads(|record| record.note_held_threads(&ids));
+        })
+    }
+
+    fn forget_held_thread(&self, id: String) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            self.change_held_threads(|record| record.forget_held_thread(&id));
+        })
+    }
+}
+
+impl ReattachedCodexAppServerRuntime {
+    /// Applies `change` to the record's held threads, rewrites the record
+    /// when it changed, and points the unit's lock paths at every thread it
+    /// now holds (Task 14). The record guard is never held across the write.
+    fn change_held_threads(&self, change: impl FnOnce(&mut CodexSidecarRecord) -> bool) {
+        let (snapshot, changed) = {
+            let mut record = self.record.lock().unwrap();
+            let changed = change(&mut record);
+            if changed {
+                record.updated_at = unix_millis();
+            }
+            (record.clone(), changed)
+        };
+        if changed {
+            write_record_loudly(&self.store, &snapshot);
+        }
+        if let Some(unit) = self.unit.get() {
+            crate::launch_lifecycle::set_unit_lock_paths(unit, &snapshot);
+        }
     }
 }
 

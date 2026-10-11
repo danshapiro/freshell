@@ -3453,6 +3453,91 @@ mod unit_sidecar {
         manager.finish_unit("T-home").await;
     }
 
+    /// Task 14: every thread the app-server holds besides its main
+    /// conversation is merged into the sidecar record (each once), and the
+    /// unit's lock paths name the lock of every recorded thread under the
+    /// home Codex reported (the record's `codex_home`), never the server's
+    /// ambient home (Stage 2: LB-29). A thread Codex unloaded leaves both.
+    /// When the pane's conversation moves (a fork), the superseded thread,
+    /// which the app-server still holds, stays recorded. `sidecar_ws_url` is
+    /// the app-server's own listener, not the proxy the TUI uses.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn held_threads_are_recorded_with_lock_paths_under_the_home_codex_reported() {
+        let home = tempfile::tempdir().unwrap();
+        let codex_a = home.path().join("codex-a");
+        std::fs::create_dir_all(&codex_a).unwrap();
+        let store = Arc::new(CodexSidecarStore::new(home.path().join("records")));
+        let manager = manager_with_realistic_runtime(store.clone(), &codex_a, json!({}));
+        let launch = manager
+            .plan_create_with_retry_uncancellable(
+                &plan_input_with_seed("t-held", tag_seed("t-held")),
+                1,
+                LaunchClass::Interactive,
+            )
+            .await
+            .expect("plan");
+        manager.adopt("T-held", launch, 1).await.expect("adopt");
+        let record = || {
+            store
+                .load_all()
+                .into_iter()
+                .next()
+                .expect("the sidecar record")
+        };
+        let lock = |id: &str| freshell_containment::codex_thread_lock_path(&codex_a, id);
+        let unit = manager.adopted_unit("T-held").expect("the pane's unit");
+
+        manager
+            .note_held_threads(
+                "T-held",
+                vec!["t-help".into(), "t-old".into(), "t-help".into()],
+            )
+            .await;
+        assert_eq!(record().held_thread_ids, ["t-help", "t-old"]);
+        assert_eq!(
+            unit.lock_paths(),
+            [lock("t-held"), lock("t-help"), lock("t-old")],
+            "the main conversation's lock and each held thread's, under the reported home"
+        );
+        manager
+            .note_held_threads("T-held", vec!["t-held".into()])
+            .await;
+        assert_eq!(
+            record().held_thread_ids,
+            ["t-help", "t-old"],
+            "the main conversation is the record's sessionId"
+        );
+
+        manager.forget_held_thread("T-held", "t-help").await;
+        assert_eq!(record().held_thread_ids, ["t-old"]);
+        assert_eq!(unit.lock_paths(), [lock("t-held"), lock("t-old")]);
+
+        // A fork moves the pane's conversation; the original stays held.
+        manager.note_session_id("T-held", "t-fork").await;
+        let moved = record();
+        assert_eq!(moved.session_id.as_deref(), Some("t-fork"));
+        assert!(
+            moved.holds_thread("t-held") && moved.holds_thread("t-old"),
+            "{moved:?}"
+        );
+
+        assert_eq!(manager.sidecar_ws_url("T-held"), Some(record().ws_url));
+        assert_ne!(
+            manager.sidecar_ws_url("T-held"),
+            manager.proxy_ws_url("T-held"),
+            "the app-server's own listener, not the proxy"
+        );
+
+        unit.stop(StopRequest::new(
+            StopMode::Force,
+            StopReason::ShiftX,
+            "test",
+        ))
+        .wait_swept()
+        .await;
+        manager.finish_unit("T-held").await;
+    }
+
     /// Codex forwards the unit tag to its stdio MCP servers, so they and
     /// their children are unit members on the tag backends (Stage 2: LB-44).
     #[tokio::test(flavor = "multi_thread")]

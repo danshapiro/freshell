@@ -20,12 +20,23 @@
 //! `rebind_codex_identity`, D7/A13/A8 guards) owns fork rebinds. The router
 //! registers `watch_fork` after each adoption so managed fresh panes get the
 //! same coverage resume panes get at create (`terminal.rs:2442-2446`).
+//!
+//! HELD THREADS (Task 14; Stage 2: LB-38): the router also feeds the pane
+//! unit's thread table ([`crate::unit_threads`]) from what Codex 0.162 really
+//! announces on the TUI's connection ([`thread_change_of`]): a non-ephemeral
+//! `thread/started` (forks, other clients' starts) and a helper spawn's
+//! `receiverThreadIds` note a thread; an ephemeral `thread/started` or
+//! `thread/start` answer marks a title thread (never held); every
+//! `thread/status/changed` is a status (an unseen id's first one announces
+//! it; `notLoaded` unloads it); `thread/closed` drops it. `systemError` never
+//! drops a thread (it is still loaded and holds its lock), and `turn/started`
+//! is not a source.
 
 use std::path::Path;
 
 use freshell_codex::launch_lifecycle::{CodexTerminalLaunchManager, TerminalProxyEvent};
 use freshell_codex::remote_proxy::RemoteProxyEvent;
-use freshell_codex::remote_proxy_side_effects::CandidateSource;
+use freshell_codex::remote_proxy_side_effects::{CandidateSource, ThreadLifecycleEvent};
 use tokio::sync::mpsc;
 
 use crate::codex_identity::CodexAdoption;
@@ -44,20 +55,101 @@ pub fn spawn_codex_proxy_router(
     })
 }
 
+/// What a proxy event tells the pane unit's thread table (Task 14).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ThreadChange {
+    /// The app-server holds these threads.
+    Noted(Vec<String>),
+    /// An ephemeral thread (the TUI's title threads): never held.
+    Ephemeral(String),
+    /// A `thread/status/changed`, by its status type.
+    Status { thread_id: String, status: String },
+    /// The app-server unloaded the thread.
+    Dropped(String),
+}
+
+/// The thread-table change a proxy event carries, if any (see the module
+/// docs' HELD THREADS rule).
+pub(crate) fn thread_change_of(event: &RemoteProxyEvent) -> Option<ThreadChange> {
+    match event {
+        RemoteProxyEvent::ThreadStarted(started) if started.thread.ephemeral => {
+            Some(ThreadChange::Ephemeral(started.thread.id.clone()))
+        }
+        RemoteProxyEvent::ThreadStarted(started) => {
+            Some(ThreadChange::Noted(vec![started.thread.id.clone()]))
+        }
+        RemoteProxyEvent::Candidate(candidate)
+            if candidate.source == CandidateSource::ThreadStartResponse
+                && candidate.thread.ephemeral =>
+        {
+            Some(ThreadChange::Ephemeral(candidate.thread.id.clone()))
+        }
+        RemoteProxyEvent::ThreadLifecycle(ThreadLifecycleEvent::ThreadStatusChanged {
+            thread_id,
+            status,
+        }) => status
+            .get("type")
+            .and_then(|kind| kind.as_str())
+            .map(|kind| ThreadChange::Status {
+                thread_id: thread_id.clone(),
+                status: kind.to_string(),
+            }),
+        RemoteProxyEvent::ThreadLifecycle(ThreadLifecycleEvent::ThreadClosed { thread_id }) => {
+            Some(ThreadChange::Dropped(thread_id.clone()))
+        }
+        RemoteProxyEvent::ThreadsReferenced { thread_ids } => {
+            Some(ThreadChange::Noted(thread_ids.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn apply_thread_change(state: &WsState, terminal_id: &str, change: ThreadChange) {
+    match change {
+        ThreadChange::Noted(thread_ids) => {
+            for thread_id in &thread_ids {
+                crate::unit_threads::note_thread(state, terminal_id, thread_id);
+            }
+        }
+        ThreadChange::Ephemeral(thread_id) => {
+            crate::unit_threads::note_ephemeral(state, terminal_id, &thread_id);
+        }
+        ThreadChange::Status { thread_id, status } => {
+            crate::unit_threads::observe_status(state, terminal_id, &thread_id, &status);
+        }
+        ThreadChange::Dropped(thread_id) => {
+            crate::unit_threads::drop_thread(state, terminal_id, &thread_id);
+        }
+    }
+}
+
 async fn route_proxy_event(state: &WsState, tagged: TerminalProxyEvent) {
     let TerminalProxyEvent {
         terminal_id,
         cwd,
         event,
     } = tagged;
+    let thread_change = thread_change_of(&event);
+    route_event(state, &terminal_id, cwd, event).await;
+    if let Some(change) = thread_change {
+        apply_thread_change(state, &terminal_id, change);
+    }
+}
+
+async fn route_event(
+    state: &WsState,
+    terminal_id: &str,
+    cwd: Option<String>,
+    event: RemoteProxyEvent,
+) {
     match event {
         RemoteProxyEvent::Candidate(candidate) => {
-            route_candidate(state, &terminal_id, cwd.as_deref(), candidate).await;
+            route_candidate(state, terminal_id, cwd.as_deref(), candidate).await;
         }
         RemoteProxyEvent::TurnStarted(params) => {
             if let Some(hub) = &state.activity {
                 hub.note_codex_proxy_turn(
-                    &terminal_id,
+                    terminal_id,
                     &params.thread_id,
                     params.turn_id.as_deref(),
                     None,
@@ -73,7 +165,7 @@ async fn route_proxy_event(state: &WsState, tagged: TerminalProxyEvent) {
                 // (protocol.rs:316-333).
                 let status = freshell_codex::turn_status(&params.params);
                 hub.note_codex_proxy_turn(
-                    &terminal_id,
+                    terminal_id,
                     &params.thread_id,
                     params.turn_id.as_deref(),
                     status.as_deref(),
@@ -81,7 +173,10 @@ async fn route_proxy_event(state: &WsState, tagged: TerminalProxyEvent) {
                 );
             }
         }
-        RemoteProxyEvent::ThreadStarted(_) | RemoteProxyEvent::ThreadLifecycle(_) => {
+        RemoteProxyEvent::ThreadStarted(_)
+        | RemoteProxyEvent::ThreadLifecycle(_)
+        | RemoteProxyEvent::ThreadsReferenced { .. } => {
+            // The thread table takes these (`thread_change_of`).
             tracing::debug!(terminal_id = %terminal_id, "codex_proxy_lifecycle_event");
         }
         RemoteProxyEvent::ThreadLifecycleLoss(loss) => {
@@ -98,7 +193,7 @@ async fn route_proxy_event(state: &WsState, tagged: TerminalProxyEvent) {
             // attention tracking pauses the pane and arms the idle gate.
             if let Some(hub) = &state.activity {
                 hub.note_codex_approval(
-                    &terminal_id,
+                    terminal_id,
                     params.thread_id.as_deref(),
                     &params.request_id,
                     true,
@@ -107,7 +202,7 @@ async fn route_proxy_event(state: &WsState, tagged: TerminalProxyEvent) {
         }
         RemoteProxyEvent::ApprovalResolved { request_id } => {
             if let Some(hub) = &state.activity {
-                hub.note_codex_approval(&terminal_id, None, &request_id, false);
+                hub.note_codex_approval(terminal_id, None, &request_id, false);
             }
         }
         RemoteProxyEvent::NativeNameObserved { thread_id, name } => {
@@ -120,7 +215,7 @@ async fn route_proxy_event(state: &WsState, tagged: TerminalProxyEvent) {
             let target = state
                 .identity
                 .named_session_ref_of("codex", &thread_id)
-                .or_else(|| state.identity.name_ref_for(&terminal_id));
+                .or_else(|| state.identity.name_ref_for(terminal_id));
             if let Some(target) = target {
                 let _ = freshell_freshagent::naming::observe_native_live(
                     &sink,
@@ -140,7 +235,7 @@ async fn route_proxy_event(state: &WsState, tagged: TerminalProxyEvent) {
             // root BEFORE any candidate can adopt — the naming bind lane's
             // rollout walk and the native-name adapter correlate against this
             // captured home instead of ambient env.
-            state.identity.record_codex_home(&terminal_id, &codex_home);
+            state.identity.record_codex_home(terminal_id, &codex_home);
         }
     }
 }
@@ -190,6 +285,10 @@ async fn route_candidate(
             }
         }
     }
+    // Task 14: a thread the pane's unit already holds as an extra thread
+    // (announced before its candidate) becomes the pane's main conversation.
+    let released_extra =
+        crate::unit_threads::release_for_main(state, terminal_id, &candidate.thread.id);
     let adopted = crate::codex_identity::adopt_codex_identity(
         state,
         CodexAdoption {
@@ -200,6 +299,9 @@ async fn route_candidate(
         },
     )
     .await;
+    if !adopted && released_extra {
+        crate::unit_threads::restore_extra(state, terminal_id, &candidate.thread.id);
+    }
     if adopted {
         // S5.c release: the awaited ledger write inside the tail IS the
         // "persisted" signal (fsync-before-announce). Idempotent on re-adopt.
@@ -248,7 +350,7 @@ mod tests {
     use freshell_codex::launch_lifecycle::TerminalProxyEvent;
     use freshell_codex::remote_proxy::RemoteProxyEvent;
     use freshell_codex::remote_proxy_side_effects::{
-        CandidateSource, CandidateThread, RemoteProxyCandidate,
+        CandidateSource, CandidateThread, RemoteProxyCandidate, ThreadLifecycleEvent,
     };
     use freshell_terminal::ActivityEvent;
     use std::sync::Arc as StdArc;
@@ -691,6 +793,114 @@ mod tests {
             state.identity.get("term-d").and_then(|i| i.session_id),
             Some("sess-first".to_string()),
             "D-03: a later different-id proxy candidate must not re-adopt"
+        );
+    }
+
+    // ── held threads (Task 14): what each proxy event tells the unit ──────
+
+    fn started(id: &str, ephemeral: bool) -> RemoteProxyEvent {
+        RemoteProxyEvent::ThreadStarted(
+            freshell_codex::remote_proxy_side_effects::ThreadStartedLifecycle {
+                thread: CandidateThread {
+                    id: id.to_string(),
+                    path: None,
+                    ephemeral,
+                },
+            },
+        )
+    }
+
+    fn status_changed(id: &str, kind: &str) -> RemoteProxyEvent {
+        let mut status = serde_json::Map::new();
+        status.insert("type".to_string(), serde_json::json!(kind));
+        RemoteProxyEvent::ThreadLifecycle(ThreadLifecycleEvent::ThreadStatusChanged {
+            thread_id: id.to_string(),
+            status,
+        })
+    }
+
+    #[test]
+    fn a_non_ephemeral_thread_started_notes_the_thread() {
+        assert_eq!(
+            thread_change_of(&started("t-fork", false)),
+            Some(ThreadChange::Noted(vec!["t-fork".to_string()]))
+        );
+    }
+
+    #[test]
+    fn an_ephemeral_thread_started_or_start_answer_marks_a_title_thread() {
+        assert_eq!(
+            thread_change_of(&started("t-title", true)),
+            Some(ThreadChange::Ephemeral("t-title".to_string()))
+        );
+        assert_eq!(
+            thread_change_of(&candidate(
+                CandidateSource::ThreadStartResponse,
+                "t-title",
+                None,
+                true
+            )),
+            Some(ThreadChange::Ephemeral("t-title".to_string()))
+        );
+        // A non-ephemeral start answer is the pane's identity candidate,
+        // not a thread change.
+        assert_eq!(
+            thread_change_of(&candidate(
+                CandidateSource::ThreadStartResponse,
+                "t-main",
+                Some("/r/rollout-t-main.jsonl"),
+                false
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn every_status_change_is_a_status_by_its_type() {
+        for kind in ["idle", "active", "systemError", "notLoaded"] {
+            assert_eq!(
+                thread_change_of(&status_changed("t-help", kind)),
+                Some(ThreadChange::Status {
+                    thread_id: "t-help".to_string(),
+                    status: kind.to_string(),
+                }),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn thread_closed_drops_the_thread() {
+        assert_eq!(
+            thread_change_of(&RemoteProxyEvent::ThreadLifecycle(
+                ThreadLifecycleEvent::ThreadClosed {
+                    thread_id: "t-old".to_string()
+                }
+            )),
+            Some(ThreadChange::Dropped("t-old".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_spawn_agents_receivers_are_noted() {
+        assert_eq!(
+            thread_change_of(&RemoteProxyEvent::ThreadsReferenced {
+                thread_ids: vec!["t-a".to_string(), "t-b".to_string()],
+            }),
+            Some(ThreadChange::Noted(vec![
+                "t-a".to_string(),
+                "t-b".to_string()
+            ]))
+        );
+    }
+
+    #[test]
+    fn turn_started_is_not_a_thread_source() {
+        assert_eq!(
+            thread_change_of(&RemoteProxyEvent::TurnStarted(turn_params(
+                "t-help", "turn-1", None
+            ))),
+            None
         );
     }
 

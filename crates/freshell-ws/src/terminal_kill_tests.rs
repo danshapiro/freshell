@@ -687,6 +687,7 @@ async fn a_late_claim_of_a_unit_row_is_stamped_with_its_unit() {
                 state_root: root.path().to_path_buf(),
             },
         ),
+        threads: Default::default(),
     };
     crate::unit_lifecycle::wire(&state, &tokio::runtime::Handle::current());
 

@@ -174,7 +174,7 @@ function getThreadHandle(threadId) {
   }
 }
 
-function ensureDurableArtifact(threadId) {
+function ensureDurableArtifact(threadId, lineage = {}) {
   const thread = getThreadHandle(threadId)
   const codexHome = getCodexHome()
   const now = new Date()
@@ -183,10 +183,11 @@ function ensureDurableArtifact(threadId) {
   // session_meta first line, the shape the real codex rollout writer produces
   // and the Rust indexer parses (parse_codex_session_content requires an id +
   // cwd -- the R10b cwd-less exclusion gate skips files without one).
+  // `lineage` adds a fork's `forked_from_id` / `thread_source`.
   fs.writeFileSync(thread.path, JSON.stringify({
     timestamp: now.toISOString(),
     type: 'session_meta',
-    payload: { id: threadId, cwd: process.cwd(), createdAt: now.toISOString() },
+    payload: { id: threadId, cwd: process.cwd(), createdAt: now.toISOString(), ...lineage },
   }) + '\n', 'utf8')
   return {
     codexHome,
@@ -384,7 +385,9 @@ function successResult(method, params, ctx = {}) {
     // + persisted turns so the CHILD sidecar process can resume it.
     const parentThreadId = params?.threadId
     forkCounter += 1
-    const childThreadId = `thread-fork-${process.pid}-${forkCounter}`
+    // `forkThreadId` pins the child's id (a uuid lets the disk fork lane,
+    // which accepts only uuid-shaped ids, see the fork).
+    const childThreadId = behavior.forkThreadId || `thread-fork-${process.pid}-${forkCounter}`
     const child = makeThread(childThreadId, params)
     if (nativeRole) {
       // The native holds both the original's and the fork's locks; the
@@ -392,7 +395,11 @@ function successResult(method, params, ctx = {}) {
       ctx.pending = nativeRole.noteLoaded(childThreadId, ctx.socket)
       child.forkedFromId = parentThreadId
     }
-    ensureDurableArtifact(childThreadId)
+    // Codex records a TUI fork's lineage in the child's session_meta.
+    ensureDurableArtifact(
+      childThreadId,
+      nativeRole ? { forked_from_id: parentThreadId, thread_source: 'user' } : {},
+    )
     let childTurns = []
     if (behavior.recordTurns) {
       const parentTurns = loadRecordedTurns(parentThreadId)

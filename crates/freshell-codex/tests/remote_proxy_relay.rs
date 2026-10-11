@@ -532,6 +532,80 @@ async fn fs_changed_notification_emits_a_repair_trigger() {
     proxy.close().await;
 }
 
+/// A helper-agent spawn: Codex 0.162 sends no `thread/started` for a helper,
+/// but the parent's `collabAgentToolCall` item names it (Stage 2: LB-38). The
+/// item notification relays verbatim and yields `ThreadsReferenced`.
+#[tokio::test]
+async fn a_spawn_agent_item_names_the_helper_threads_and_relays_verbatim() {
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
+    let mut tui = connect_tui(proxy.ws_url()).await;
+    let conn = upstream.accept().await;
+
+    for method in ["item/started", "item/completed"] {
+        let frame = json!({
+            "method": method,
+            "params": {"threadId": "t-root", "item": {
+                "type": "collabAgentToolCall", "id": "call-1", "tool": "spawnAgent",
+                "receiverThreadIds": ["t-help-a", "t-help-b"],
+                "agentsStates": {"t-help-a": {"status": "pendingInit"}},
+            }},
+        })
+        .to_string();
+        conn.send_text(frame.clone());
+        let received_events = recv_events(&mut events, 1).await;
+        assert_eq!(
+            received_events[0],
+            RemoteProxyEvent::ThreadsReferenced {
+                thread_ids: vec!["t-help-a".to_string(), "t-help-b".to_string()],
+            },
+            "{method}"
+        );
+        assert_eq!(recv_text(&mut tui).await, frame, "{method} relays verbatim");
+    }
+
+    proxy.close().await;
+}
+
+/// Only a `spawnAgent` collab call with receivers names helpers: other
+/// tools, an empty list and other item types yield nothing, and neither does
+/// an oversized frame (the full parse runs on small frames only; the helper's
+/// first status broadcast still announces it). Each frame relays.
+#[tokio::test]
+async fn other_items_and_oversized_frames_name_no_threads() {
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
+    let mut tui = connect_tui(proxy.ws_url()).await;
+    let conn = upstream.accept().await;
+
+    let item = |item: Value| json!({"method": "item/completed", "params": {"threadId": "t-root", "item": item}});
+    let frames = [
+        item(
+            json!({"type": "collabAgentToolCall", "tool": "closeAgent", "receiverThreadIds": ["t-h"]}),
+        ),
+        item(json!({"type": "collabAgentToolCall", "tool": "spawnAgent", "receiverThreadIds": []})),
+        item(json!({"type": "agentMessage", "text": "collabAgentToolCall spawnAgent"})),
+        item(json!({
+            "type": "collabAgentToolCall", "tool": "spawnAgent", "receiverThreadIds": ["t-big"],
+            "padding": huge_string(freshell_codex::remote_proxy_envelope::MAX_FULL_PARSE_BYTES),
+        })),
+    ];
+    for frame in frames {
+        let frame = frame.to_string();
+        conn.send_text(frame.clone());
+        assert_eq!(recv_text(&mut tui).await, frame, "every item relays");
+    }
+    assert_no_event(&mut events).await;
+
+    proxy.close().await;
+}
+
 // ── 6. turn/interrupt short-circuit for an already-completed turn ──────────────────
 
 #[tokio::test]

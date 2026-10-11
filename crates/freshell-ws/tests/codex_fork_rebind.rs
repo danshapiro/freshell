@@ -1134,3 +1134,143 @@ async fn fork_targeting_a_live_owned_session_is_refused() {
     registry.kill(&pane2);
     std::env::remove_var("CODEX_HOME");
 }
+
+#[cfg(target_os = "linux")]
+#[path = "support/unit_harness.rs"]
+mod unit_harness;
+
+/// Restores the process environment variables a [`unit_harness::UnitHarness`]
+/// changes, so the rest of this binary's tests (which pin the plain-CLI
+/// Codex path and their own `CODEX_HOME`) see what they set.
+#[cfg(target_os = "linux")]
+struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+#[cfg(target_os = "linux")]
+impl EnvRestore {
+    fn capture() -> Self {
+        Self(
+            [
+                "CODEX_CMD",
+                "CODEX_HOME",
+                "HOME",
+                "FRESHELL_HOME",
+                "FAKE_CODEX_APP_SERVER_BEHAVIOR",
+                "FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES",
+                "FAKE_CODEX_MANIFEST_DIR",
+                "FAKE_UNIT_RECORD_DIR",
+                "FRESHELL_CODEX_MANAGED_LAUNCH",
+            ]
+            .into_iter()
+            .map(|name| (name, std::env::var_os(name)))
+            .collect(),
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        for (name, value) in &self.0 {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
+/// A managed Codex pane whose TUI forks: the app-server now holds both the
+/// original thread and the fork (it never unloads the original while the
+/// TUI is attached; Stage 2: LB-38, V9 N4). After the disk fork lane moves
+/// the pane to the fork, the sidecar record lists both threads, the fork is
+/// the pane's Live main conversation, and the original is Aliased to it,
+/// never Vacant (a reopen of either finds this pane, never a second
+/// app-server).
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn fork_rebind_keeps_both_threads_on_the_sidecar_record() {
+    const OLD: &str = "019fa60f-aaaa-4bbb-8ccc-0000000000a1";
+    const NEW: &str = "019fa613-dddd-4eee-8fff-0000000000a2";
+
+    let _env = ENV_LOCK.lock().await;
+    let _restore = EnvRestore::capture();
+    // The other tests here pin the plain-CLI Codex path.
+    std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
+    let h = unit_harness::UnitHarness::start(unit_harness::HarnessOpts {
+        behavior: json!({ "forkThreadId": NEW }),
+        codex_locator: true,
+        ..Default::default()
+    })
+    .await;
+    let mut ws = h.connect().await;
+    let tid = h.create_codex(&mut ws, "crq-fork", Some(OLD)).await;
+    h.next_matching(&mut ws, Duration::from_secs(10), |f| {
+        f["type"] == "terminal.output"
+            && f["data"]
+                .as_str()
+                .is_some_and(|d| d.contains("FAKE_TUI_READY"))
+    })
+    .await
+    .expect("the TUI resumed the original");
+
+    // The TUI's /fork, typed and then submitted: the Enter, sent on its
+    // own as a terminal sends it, opens the fork lane's scan window.
+    for data in ["fork", "\r"] {
+        h.send(
+            &mut ws,
+            json!({"type": "terminal.input", "terminalId": tid, "data": data}),
+        )
+        .await;
+    }
+    let rebound = h
+        .next_matching(&mut ws, Duration::from_secs(20), |f| {
+            f["type"] == "terminal.session.associated"
+                && f["terminalId"] == tid.as_str()
+                && f["sessionRef"]["sessionId"] == NEW
+        })
+        .await
+        .expect("the fork lane moves the pane to the fork");
+    assert_eq!(rebound["previousSessionId"], OLD);
+
+    let records = h.home.path().join(".freshell/rust-codex-sidecars");
+    let record = || -> Option<freshell_codex::sidecar_store::CodexSidecarRecord> {
+        std::fs::read_dir(&records)
+            .ok()?
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .find_map(|raw| serde_json::from_str(&raw).ok())
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !record().is_some_and(|r| r.holds_thread(OLD) && r.holds_thread(NEW)) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the sidecar record holds both threads: {:?}",
+            record()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let ownership = h.state.ownership.as_ref().expect("an owner registry");
+    match ownership.observe("codex", NEW).state {
+        freshell_ownership::OwnershipState::Live { owner, .. } => {
+            assert_eq!(owner.terminal_id.as_deref(), Some(tid.as_str()));
+            assert_eq!(
+                owner.hold,
+                freshell_ownership::HoldKind::Main,
+                "the fork is the pane's own conversation, not an extra thread"
+            );
+        }
+        other => panic!("the fork is Live under the pane, got {other:?}"),
+    }
+    let original = ownership.observe("codex", OLD).state;
+    assert!(
+        matches!(original, freshell_ownership::OwnershipState::Aliased { .. }),
+        "the original stays held, Aliased to the fork (not Vacant): {original:?}"
+    );
+    assert!(
+        unit_harness::fake_codex::lock_held(&h.lock(OLD))
+            && unit_harness::fake_codex::lock_held(&h.lock(NEW)),
+        "the app-server holds both locks"
+    );
+}

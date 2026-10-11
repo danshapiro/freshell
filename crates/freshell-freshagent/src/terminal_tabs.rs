@@ -2221,7 +2221,7 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                 });
             }
             crate::ownership_lane::TerminalLaneClaim::Unwired => {}
-            crate::ownership_lane::TerminalLaneClaim::Adopt => {
+            crate::ownership_lane::TerminalLaneClaim::Adopt { .. } => {
                 // b8ke ext r13 F1: Adopt is NOT permission to proceed
                 // unguarded — the create proceeds ONLY under the held
                 // attach guard (the ext-r10 F2 discipline). A guard
@@ -3900,7 +3900,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                     None
                 }
                 crate::ownership_lane::TerminalLaneClaim::Unwired => None,
-                crate::ownership_lane::TerminalLaneClaim::Adopt => {
+                crate::ownership_lane::TerminalLaneClaim::Adopt { .. } => {
                     Some("a live terminal owner holds the key the create settled under".to_string())
                 }
                 crate::ownership_lane::TerminalLaneClaim::Refused(outcome) => Some(format!(

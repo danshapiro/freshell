@@ -1042,6 +1042,7 @@ async fn async_main() -> ExitCode {
     let unit_services = freshell_ws::unit_lifecycle::UnitServices {
         directory: freshell_containment::UnitDirectory::new(),
         containment: unit_containment.clone(),
+        threads: Default::default(),
     };
 
     // Task 2 (AI key cell): process-local mirror of Node's `AI_CONFIG`

@@ -62,7 +62,8 @@ use crate::remote_proxy_envelope::{
 };
 use crate::remote_proxy_side_effects::{
     extract_fork_response_candidate, extract_fs_changed_repair_trigger,
-    extract_initialize_codex_home, extract_thread_lifecycle_event, extract_thread_name_set_request,
+    extract_initialize_codex_home, extract_spawn_agent_receiver_thread_ids,
+    extract_thread_lifecycle_event, extract_thread_name_set_request,
     extract_thread_start_response_candidate, extract_thread_started_notification_side_effects,
     extract_turn_notification_event, extract_upstream_thread_name_updated,
     normalize_thread_fork_response_for_tui, rewrite_thread_fork_request_exclude_turns,
@@ -272,6 +273,16 @@ pub enum RemoteProxyEvent {
     UpstreamInitialized {
         conn_id: u64,
         codex_home: String,
+    },
+    /// Task 14: an upstream `item/started` or `item/completed` whose item is
+    /// a `collabAgentToolCall` spawning helper agents (`tool ==
+    /// "spawnAgent"`) named these threads in `receiverThreadIds`. The
+    /// app-server holds each (Codex announces a helper with no
+    /// `thread/started`; Stage 2: LB-38). Small frames only: an oversized
+    /// frame emits nothing, and the helper's first `thread/status/changed`
+    /// still announces it.
+    ThreadsReferenced {
+        thread_ids: Vec<String>,
     },
 }
 
@@ -1338,6 +1349,15 @@ impl Hub {
                         thread_id: observed.0,
                         name: observed.1,
                     });
+                }
+            }
+            // Task 14: a helper-agent spawn names the helper threads the
+            // app-server now holds. Small frames only; relayed either way.
+            if (method == "item/started" || method == "item/completed")
+                && data.len() <= MAX_FULL_PARSE_BYTES
+            {
+                if let Some(thread_ids) = extract_spawn_agent_receiver_thread_ids(&data) {
+                    self.emit(RemoteProxyEvent::ThreadsReferenced { thread_ids });
                 }
             }
             if method == "serverRequest/resolved" {

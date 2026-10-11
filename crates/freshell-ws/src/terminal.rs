@@ -3229,7 +3229,7 @@ fn claim_late_for_spawned_row(
             Ok(Some(claim))
         }
         freshell_freshagent::ownership_lane::TerminalLaneClaim::Unwired => Ok(None),
-        freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt => {
+        freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt { .. } => {
             Err("a live terminal owner holds the key the create settled under".to_string())
         }
         freshell_freshagent::ownership_lane::TerminalLaneClaim::Refused(outcome) => Err(format!(
@@ -3391,6 +3391,25 @@ async fn discard_respawn_launch(
         (Some(launch), None) => manager.discard(launch).await,
         (None, Some(scope)) => scope.abandon(None),
         (None, None) => {}
+    }
+}
+
+/// Task 14 (Stage 2: LB-51): right after a create adopts its Codex launch,
+/// the threads the app-server already holds (a reattached app-server's
+/// earlier conversations, which no event announces) are held by the pane's
+/// unit: one read of its members' lock files, on the blocking pool.
+async fn reconcile_adopted_threads(state: &WsState, terminal_id: &str) {
+    let state = state.clone();
+    let terminal_id = terminal_id.to_string();
+    if let Err(join_error) = spawn_blocking_in_span(move || {
+        crate::unit_threads::reconcile_loaded(&state, &terminal_id);
+    })
+    .await
+    {
+        tracing::warn!(target: "freshell_unit",
+            event = "unit.threads.reconcile_panicked",
+            error = %join_error,
+            "the post-adopt read of the threads the app-server holds panicked");
     }
 }
 
@@ -3847,7 +3866,7 @@ fn settle_managed_compat_adoption(
                         locator: locator.clone(),
                     });
                 }
-                freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt => {
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt { .. } => {
                     let same_owner = ownership.as_ref().is_some_and(|coordinator| {
                         matches!(
                             coordinator.observe(&locator.provider, &locator.session_id).state,
@@ -5210,7 +5229,29 @@ pub(crate) async fn handle_create(
                     });
                 }
                 freshell_freshagent::ownership_lane::TerminalLaneClaim::Unwired => {}
-                freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt => {
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt { owner } => {
+                    // Task 14 (Decision 1; Stage 2: LB-25): a conversation a
+                    // live pane's unit holds as an EXTRA thread (its
+                    // app-server has it loaded besides the conversation
+                    // that pane shows) is answered with that pane's
+                    // terminal: the client jumps there (or attaches to it),
+                    // and nothing is spawned, released or killed.
+                    if let Some(holder) = extra_thread_holder(state, &owner) {
+                        tracing::info!(target: "freshell_unit",
+                            event = "unit.reopen.holder",
+                            unit_id = %owner.unit_id.as_deref().unwrap_or(""),
+                            provider = %locator.provider,
+                            session_id = %locator.session_id,
+                            terminal_id = %holder,
+                            operation_id = "",
+                            request_id = %create.request_id,
+                            "a reopen of a thread another pane's unit holds answers that pane's terminal");
+                        log_create_settled(conn_id, &create.request_id, &holder, "thread_holder");
+                        return reply_reattach_to_existing(
+                            state, out, &create, &holder, None, None,
+                        )
+                        .await;
+                    }
                     // b8ke ext r13 F1: Adopt is NOT permission to proceed
                     // unguarded — the adopted runtime is this lane's
                     // session (the coordinator keyed it under the wire
@@ -5456,20 +5497,16 @@ pub(crate) async fn handle_create(
                             &terminal_id,
                             "session_ref_attached",
                         );
-                        // Clone before the struct literal moves
-                        // `create.request_id` (same discipline as the main
-                        // spawn path's dedupe locals).
-                        let dedupe_request_id = create.request_id.clone();
                         // b8ke fence-heal (fix c): the created frame rides the
                         // commit's own pair so the attaching pane's queued
-                        // first attach is born fresh. The literal is built
-                        // pre-commit but only SENT post-commit (the commit's
-                        // Err arm below answers an error and never sends it),
-                        // so reading the claim ticket's generation HERE, on
-                        // the immutable ticket, is reading the committed pair
-                        // the frame will ride; None when no claim exists or
-                        // the coordinator is unwired (frozen-client parity —
-                        // Task 1's owner_trio pattern).
+                        // first attach is born fresh. The frame is SENT only
+                        // post-commit (the commit's Err arm below answers an
+                        // error and never sends it), so reading the claim
+                        // ticket's generation HERE, on the immutable ticket,
+                        // is reading the committed pair the frame will ride;
+                        // None when no claim exists or the coordinator is
+                        // unwired (frozen-client parity — Task 1's
+                        // owner_trio pattern).
                         let owner_trio: Option<(&str, u64, u64)> =
                             match (terminal_ownership.as_ref(), state.ownership.as_ref()) {
                                 (Some(claim), Some(ownership)) => Some((
@@ -5479,36 +5516,6 @@ pub(crate) async fn handle_create(
                                 )),
                                 _ => None,
                             };
-                        let created = ServerMessage::TerminalCreated(TerminalCreated {
-                            created_at: now_ms(),
-                            request_id: create.request_id,
-                            terminal_id: terminal_id.clone(),
-                            clear_codex_durability: None,
-                            cwd: state.registry.probe(&terminal_id).and_then(|row| row.cwd),
-                            notice: None,
-                            restore_error: None,
-                            session_ref: state
-                                .identity
-                                .session_ref_for(&terminal_id)
-                                .or(Some(locator)),
-                            // Unified agent names: the winner's retained
-                            // naming binding rides the attach answer.
-                            session_name: state.registry.session_name_of(&terminal_id),
-                            name_ref: state.identity.name_ref_for(&terminal_id),
-                            owner_kind: owner_trio.map(|(kind, _, _)| kind.to_string()),
-                            owner_epoch: owner_trio.map(|(_, epoch, _)| epoch),
-                            owner_generation: owner_trio.map(|(_, _, gen)| gen),
-                        });
-                        // Attaching to the winner IS a successful create for
-                        // this requestId: settle the dedupe entry exactly
-                        // like the §5.4 adopt path above and the main spawn
-                        // path — otherwise the caller's `clear_if_in_flight`
-                        // errors any same-requestId waiters with
-                        // PTY_SPAWN_FAILED despite the success, and a later
-                        // resend on a NON-negotiated connection re-enters
-                        // handle_create and spawns a duplicate PTY for the
-                        // session.
-                        //
                         // kata b8ke Task 4 review M1 (fix): TOTAL coverage
                         // for the ATTACHED terminal. A Granted claim that
                         // attaches through BoundElsewhere names a binding
@@ -5576,25 +5583,23 @@ pub(crate) async fn handle_create(
                                         out,
                                         ErrorCode::InternalError,
                                         "Terminal create lost session ownership during attach; the attached process was killed".to_string(),
-                                        &dedupe_request_id,
+                                        &create.request_id,
                                     )
                                     .await;
                                 }
                             }
                         }
-                        // Settle AFTER the reply's admission (see the main
-                        // spawn path's dedupe-settle note): the sentinel
-                        // must not report the create answered before the
-                        // `terminal.created` frame is in the outbox.
-                        let sent = out.send(&created).await;
-                        state.create_dedupe.settle(
-                            &dedupe_request_id,
+                        // Attaching to the winner IS a successful create
+                        // (the winner's retained naming binding rides it).
+                        return reply_reattach_to_existing(
+                            state,
+                            out,
+                            &create,
                             &terminal_id,
-                            &created,
-                            create.restore,
-                            |tid| state.registry.is_pty_running(tid),
-                        );
-                        return sent;
+                            Some(locator),
+                            owner_trio,
+                        )
+                        .await;
                     }
                     SessionRefClaim::Held { retry_after_ms } => {
                         // kata b8ke Task 4: the loser reply names the
@@ -6178,7 +6183,7 @@ pub(crate) async fn handle_create(
                     });
                 }
                 freshell_freshagent::ownership_lane::TerminalLaneClaim::Unwired => {}
-                freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt => {
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt { .. } => {
                     // b8ke ext r10 F2: Adopt is NOT permission to spawn.
                     // Pre-r10 this arm proceeded WITHOUT a ticket: a live
                     // terminal owner appearing between the ladder's
@@ -7275,6 +7280,7 @@ pub(crate) async fn handle_create(
             return send_create_error(out, ErrorCode::PtySpawnFailed, message, &create.request_id)
                 .await;
         }
+        reconcile_adopted_threads(state, &terminal_id).await;
     }
 
     // Directory metadata (`tr:1614` getModeLabel title + the CLI resume session id).
@@ -8449,6 +8455,7 @@ pub(crate) async fn respawn_agent_terminal_relaying_claim(
             }
             return Err(RespawnError::LaunchUnresolvable(message));
         }
+        reconcile_adopted_threads(state, &terminal_id).await;
     }
     // The replacement started: its start settles once the screen's
     // placement is confirmed.
@@ -8992,6 +8999,66 @@ pub(crate) fn spawn_gate_error_parts(
             "Terminal create cancelled during shutdown",
         ),
     }
+}
+
+/// The answer to a create whose conversation a live terminal already runs:
+/// `terminal.created` naming THAT terminal; nothing is spawned. The client
+/// attaches to it (or, for a user's reopen, jumps to the pane that shows
+/// it). The frame names the terminal's own conversation, else `requested`
+/// (the create's), carries the terminal's retained naming binding, and
+/// `owner` (kind, epoch, generation) when the create committed a claim for
+/// that terminal. Answering IS a successful create for the request id: the
+/// create-dedupe entry settles exactly as after a spawn (otherwise the
+/// caller's `clear_if_in_flight` would fail same-request waiters, and a
+/// later resend on a non-negotiated connection would spawn a duplicate),
+/// and only after the frame is in the outbox.
+pub(crate) async fn reply_reattach_to_existing(
+    state: &WsState,
+    out: &mut crate::create_gate::CreateOutput<'_>,
+    create: &TerminalCreate,
+    terminal_id: &str,
+    requested: Option<SessionLocator>,
+    owner: Option<(&str, u64, u64)>,
+) -> bool {
+    let created = ServerMessage::TerminalCreated(TerminalCreated {
+        created_at: now_ms(),
+        request_id: create.request_id.clone(),
+        terminal_id: terminal_id.to_string(),
+        clear_codex_durability: None,
+        cwd: state.registry.probe(terminal_id).and_then(|row| row.cwd),
+        notice: None,
+        restore_error: None,
+        session_ref: state.identity.session_ref_for(terminal_id).or(requested),
+        session_name: state.registry.session_name_of(terminal_id),
+        name_ref: state.identity.name_ref_for(terminal_id),
+        owner_kind: owner.map(|(kind, _, _)| kind.to_string()),
+        owner_epoch: owner.map(|(_, epoch, _)| epoch),
+        owner_generation: owner.map(|(_, _, generation)| generation),
+    });
+    let sent = out.send(&created).await;
+    state.create_dedupe.settle(
+        &create.request_id,
+        terminal_id,
+        &created,
+        create.restore,
+        |tid| state.registry.is_pty_running(tid),
+    );
+    sent
+}
+
+/// The terminal of a live pane whose unit holds a conversation as an EXTRA
+/// thread (`owner` is the conversation's Live owner): its row runs and its
+/// unit is known. `None` for a main hold or a holder that is gone.
+fn extra_thread_holder(
+    state: &WsState,
+    owner: &freshell_ownership::OwnerIdentity,
+) -> Option<String> {
+    if owner.hold != freshell_ownership::HoldKind::Extra {
+        return None;
+    }
+    let holder = owner.terminal_id.as_deref()?;
+    (state.registry.is_running(holder) && state.units.by_terminal(holder).is_some())
+        .then(|| holder.to_string())
 }
 
 pub(crate) async fn send_create_error(

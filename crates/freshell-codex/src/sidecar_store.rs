@@ -119,6 +119,60 @@ impl CodexSidecarRecord {
         }
         ids
     }
+
+    /// Records threads the app-server holds besides its main conversation
+    /// (Task 14): each id the record does not hold yet is appended once.
+    /// Returns whether the record changed.
+    pub fn note_held_threads(&mut self, ids: &[String]) -> bool {
+        let mut changed = false;
+        for id in ids {
+            if !id.is_empty() && !self.holds_thread(id) {
+                self.held_thread_ids.push(id.clone());
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// The app-server no longer holds `id` besides its main conversation
+    /// (Codex unloaded it). Returns whether the record changed.
+    pub fn forget_held_thread(&mut self, id: &str) -> bool {
+        let before = self.held_thread_ids.len();
+        self.held_thread_ids.retain(|held| held != id);
+        self.held_thread_ids.len() != before
+    }
+
+    /// The pane's main conversation is now `session_id`. A different one it
+    /// replaces stays held: the app-server still holds the thread the pane
+    /// moved away from (the original of a fork, which the TUI never
+    /// unsubscribes; Stage 2: LB-38, V9 N4). The new main conversation is no
+    /// longer listed among the other threads.
+    pub fn set_session_id(&mut self, session_id: String) {
+        if let Some(previous) = self.session_id.take() {
+            if previous != session_id && !self.held_thread_ids.contains(&previous) {
+                self.held_thread_ids.push(previous);
+            }
+        }
+        self.held_thread_ids.retain(|held| *held != session_id);
+        self.session_id = Some(session_id);
+    }
+
+    /// The writer lock of every thread the app-server holds, under the
+    /// Codex home it reported in `initialize` (`codex_home`), never the
+    /// server's own `CODEX_HOME`/`HOME` (Stage 2: LB-29). `None` when no
+    /// absolute home is recorded.
+    pub fn thread_lock_paths(&self) -> Option<Vec<PathBuf>> {
+        let home = Path::new(self.codex_home.as_deref()?);
+        if !home.is_absolute() {
+            return None;
+        }
+        Some(
+            self.all_thread_ids()
+                .iter()
+                .map(|id| freshell_containment::codex_thread_lock_path(home, id))
+                .collect(),
+        )
+    }
 }
 
 /// Lifecycle state of a recorded sidecar: `Active` (owned by a live server

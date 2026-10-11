@@ -728,6 +728,44 @@ pub fn extract_initialize_codex_home(raw: &[u8]) -> SideEffectResult<Option<Stri
     Ok(home.filter(|home| !home.is_empty()))
 }
 
+/// The helper threads a Codex collab-agent spawn names: an upstream
+/// `item/started` or `item/completed` notification whose `params.item` is a
+/// `collabAgentToolCall` with `tool == "spawnAgent"` lists them in
+/// `receiverThreadIds`. Codex 0.162 announces a helper with no
+/// `thread/started` (Stage 2: LB-38; V9 N1), so this is one of the ways the
+/// pane's unit learns it holds one. `None` for any other frame, and for an
+/// empty list. The caller passes only frames small enough for a full parse;
+/// a frame that does not mention the item type is not parsed at all.
+pub fn extract_spawn_agent_receiver_thread_ids(raw: &[u8]) -> Option<Vec<String>> {
+    const ITEM_TYPE: &[u8] = b"collabAgentToolCall";
+    if !raw
+        .windows(ITEM_TYPE.len())
+        .any(|window| window == ITEM_TYPE)
+    {
+        return None;
+    }
+    let frame: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    let method = frame.get("method")?.as_str()?;
+    if method != "item/started" && method != "item/completed" {
+        return None;
+    }
+    let item = frame.pointer("/params/item")?;
+    if item.get("type")?.as_str()? != "collabAgentToolCall"
+        || item.get("tool")?.as_str()? != "spawnAgent"
+    {
+        return None;
+    }
+    let mut ids: Vec<String> = Vec::new();
+    for id in item.get("receiverThreadIds")?.as_array()? {
+        if let Some(id) = id.as_str().filter(|id| !id.is_empty()) {
+            if !ids.iter().any(|known| known == id) {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    (!ids.is_empty()).then_some(ids)
+}
+
 /// Extract an upstream `thread/name/updated` NOTIFICATION frame's
 /// `{threadId, name}` (Task 3 native names). `None` for any other frame;
 /// `Err` for an unsafe/malformed shape.

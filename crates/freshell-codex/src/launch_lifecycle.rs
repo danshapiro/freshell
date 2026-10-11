@@ -169,10 +169,39 @@ pub trait CodexLaunchRuntime: Send + Sync {
         Box::pin(async {})
     }
 
-    /// Record every thread the app-server holds (Task 14).
+    /// Record threads the app-server holds besides its main conversation
+    /// (Task 14): the sidecar record lists each once, and the unit's lock
+    /// paths name every recorded thread's lock under the Codex home the
+    /// record holds (the one Codex reported), never the server's own.
     fn note_held_threads(&self, ids: Vec<String>) -> BoxFuture<'_, ()> {
         let _ = ids;
         Box::pin(async {})
+    }
+
+    /// The app-server no longer holds `id` besides its main conversation
+    /// (Codex unloaded it): it leaves the sidecar record and the unit's lock
+    /// paths.
+    fn forget_held_thread(&self, id: String) -> BoxFuture<'_, ()> {
+        let _ = id;
+        Box::pin(async {})
+    }
+}
+
+/// Points the unit's lock paths at the writer lock of every thread `record`
+/// holds, under the Codex home it recorded (Stage 2: LB-29). With no
+/// recorded home the paths are left as they are and a WARN says so.
+pub(crate) fn set_unit_lock_paths(unit: &AgentUnit, record: &CodexSidecarRecord) {
+    match record.thread_lock_paths() {
+        Some(paths) => unit.set_lock_paths(paths),
+        None => unit_event!(
+            warn,
+            "freshell_unit",
+            unit_log_keys(unit),
+            "unit.lock_paths.unknown_home",
+            ownership_id = %record.ownership_id,
+            "the sidecar recorded no Codex home: its held threads' lock files are not known, \
+             so Gone cannot check them"
+        ),
     }
 }
 
@@ -476,6 +505,9 @@ pub struct CodexTerminalLaunch {
     pub session_id: Option<String>,
     /// The PROXY's ws URL — what `--remote` points the TUI at (spec §1.3 step 3).
     pub remote_ws_url: String,
+    /// The app-server as it reported itself at readiness: its own listen
+    /// URL (not the proxy's) and its Codex home.
+    pub ready: CodexRuntimeReady,
     /// The S3 pure decisions this launch was planned from.
     pub plan: CodexLaunchPlan,
     pub sidecar: Arc<CodexLaunchSidecar>,
@@ -491,6 +523,7 @@ impl std::fmt::Debug for CodexTerminalLaunch {
         f.debug_struct("CodexTerminalLaunch")
             .field("session_id", &self.session_id)
             .field("remote_ws_url", &self.remote_ws_url)
+            .field("ready", &self.ready)
             .field("plan", &self.plan)
             .field(
                 "unit",
@@ -558,27 +591,32 @@ impl CodexLaunchPlanner {
         });
         self.active.lock().unwrap().insert(id, sidecar.clone());
 
-        let started: Result<(CodexRemoteProxy, mpsc::UnboundedReceiver<RemoteProxyEvent>), String> =
-            async {
-                let ready = runtime.ensure_ready(plan.runtime_cwd.clone()).await?;
-                // Task 4: resume launches know their session id at plan time —
-                // note it so the runtime's durable record carries the
-                // restore-time reattach key. Best-effort (the record write
-                // path logs its own failures); never fails the plan.
-                if let Some(sid) = plan.session_id.clone() {
-                    let _ = runtime.note_session_id(sid).await;
-                }
-                CodexRemoteProxy::start(CodexRemoteProxyOptions::new(
-                    ready.ws_url,
-                    plan.require_candidate_persistence,
-                ))
-                .await
-                .map_err(|error| error.to_string())
+        type Started = (
+            CodexRemoteProxy,
+            mpsc::UnboundedReceiver<RemoteProxyEvent>,
+            CodexRuntimeReady,
+        );
+        let started: Result<Started, String> = async {
+            let ready = runtime.ensure_ready(plan.runtime_cwd.clone()).await?;
+            // Task 4: resume launches know their session id at plan time —
+            // note it so the runtime's durable record carries the
+            // restore-time reattach key. Best-effort (the record write
+            // path logs its own failures); never fails the plan.
+            if let Some(sid) = plan.session_id.clone() {
+                let _ = runtime.note_session_id(sid).await;
             }
-            .await;
+            let (proxy, events) = CodexRemoteProxy::start(CodexRemoteProxyOptions::new(
+                ready.ws_url.clone(),
+                plan.require_candidate_persistence,
+            ))
+            .await
+            .map_err(|error| error.to_string())?;
+            Ok((proxy, events, ready))
+        }
+        .await;
 
         match started {
-            Ok((proxy, events)) => {
+            Ok((proxy, events, ready)) => {
                 let remote_ws_url = proxy.ws_url().to_string();
                 sidecar.inner.lock().await.proxy = Some(proxy);
                 if let Err(rejected) = self.assert_accepting_plans() {
@@ -596,6 +634,7 @@ impl CodexLaunchPlanner {
                 Ok(CodexTerminalLaunch {
                     session_id: plan.session_id.clone(),
                     remote_ws_url,
+                    ready,
                     unit: runtime.unit(),
                     plan,
                     sidecar,
@@ -762,6 +801,8 @@ struct AdoptedTerminalLaunch {
     drain: tokio::task::JoinHandle<()>,
     /// The proxy's ws URL (what the TUI's `--remote` points at).
     remote_ws_url: String,
+    /// The app-server as it reported itself at readiness.
+    ready: CodexRuntimeReady,
 }
 
 /// D-C-REVISIT — SUPERSEDED IN PART (2026-07-30, graceful restore/resume S1;
@@ -1047,6 +1088,7 @@ impl CodexTerminalLaunchManager {
                 sidecar: launch.sidecar,
                 drain,
                 remote_ws_url: launch.remote_ws_url,
+                ready: launch.ready,
             },
         );
         Ok(())
@@ -1068,6 +1110,49 @@ impl CodexTerminalLaunchManager {
             .unwrap()
             .get(terminal_id)
             .map(|entry| entry.remote_ws_url.clone())
+    }
+
+    /// The adopted terminal's app-server as it reported itself at readiness:
+    /// its own listen URL and its Codex home.
+    pub fn sidecar_ready(&self, terminal_id: &str) -> Option<CodexRuntimeReady> {
+        self.adopted
+            .lock()
+            .unwrap()
+            .get(terminal_id)
+            .map(|entry| entry.ready.clone())
+    }
+
+    /// The adopted terminal's app-server's own listen URL (not the proxy's):
+    /// a second client of the app-server dials it directly.
+    pub fn sidecar_ws_url(&self, terminal_id: &str) -> Option<String> {
+        self.sidecar_ready(terminal_id).map(|ready| ready.ws_url)
+    }
+
+    /// Task 14: the adopted terminal's app-server holds `ids` besides its
+    /// main conversation; its runtime records them (see
+    /// [`CodexLaunchRuntime::note_held_threads`]). Unknown terminals are a
+    /// silent no-op.
+    pub async fn note_held_threads(&self, terminal_id: &str, ids: Vec<String>) {
+        if let Some(runtime) = self.adopted_runtime(terminal_id) {
+            runtime.note_held_threads(ids).await;
+        }
+    }
+
+    /// Task 14: the adopted terminal's app-server unloaded `id`; its runtime
+    /// forgets it (see [`CodexLaunchRuntime::forget_held_thread`]). Unknown
+    /// terminals are a silent no-op.
+    pub async fn forget_held_thread(&self, terminal_id: &str, id: &str) {
+        if let Some(runtime) = self.adopted_runtime(terminal_id) {
+            runtime.forget_held_thread(id.to_string()).await;
+        }
+    }
+
+    fn adopted_runtime(&self, terminal_id: &str) -> Option<Arc<dyn CodexLaunchRuntime>> {
+        self.adopted
+            .lock()
+            .unwrap()
+            .get(terminal_id)
+            .map(|entry| entry.sidecar.runtime.clone())
     }
 
     /// After the unit's Gone: forget the terminal's launch, close its proxy,
@@ -1913,7 +1998,7 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
             // records against. Untracked spawns (no record) are a no-op.
             let mut state = self.state.lock().await;
             if let Some(record) = state.as_mut().and_then(|s| s.record.as_mut()) {
-                record.session_id = Some(session_id);
+                record.set_session_id(session_id);
                 record.updated_at = unix_millis();
                 if let Err(error) = self.store.write(record) {
                     tracing::error!(
@@ -2059,6 +2144,41 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
                 }
             }
         })
+    }
+
+    fn note_held_threads(&self, ids: Vec<String>) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            self.change_held_threads(|record| record.note_held_threads(&ids))
+                .await;
+        })
+    }
+
+    fn forget_held_thread(&self, id: String) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            self.change_held_threads(|record| record.forget_held_thread(&id))
+                .await;
+        })
+    }
+}
+
+impl SpawnedCodexAppServerRuntime {
+    /// Applies `change` to the sidecar record's held threads under the
+    /// runtime's state lock, writes the record when it changed, and points
+    /// the unit's lock paths at every thread it now holds. A spawn without
+    /// a record (no enabled store, or off Linux, where nothing is retained)
+    /// has nothing to change.
+    async fn change_held_threads(&self, change: impl FnOnce(&mut CodexSidecarRecord) -> bool) {
+        let mut state = self.state.lock().await;
+        let Some(record) = state.as_mut().and_then(|spawned| spawned.record.as_mut()) else {
+            return;
+        };
+        if change(record) {
+            record.updated_at = unix_millis();
+            write_record_loudly(&self.store, record);
+        }
+        if let Some(unit) = self.unit.get() {
+            set_unit_lock_paths(unit, record);
+        }
     }
 }
 

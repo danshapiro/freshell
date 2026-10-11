@@ -54,6 +54,10 @@ pub struct HarnessOpts {
     /// activity observer) and keep it in `WsState.activity`, so turn,
     /// idle and attention edges are produced.
     pub activity_hub: bool,
+    /// Run the Codex rollout locator over `<CODEX_HOME>/sessions` and its
+    /// sweep (100 ms), as `main.rs` does: the disk fork lane rebinds a
+    /// pane whose TUI forked.
+    pub codex_locator: bool,
 }
 
 impl Default for HarnessOpts {
@@ -67,6 +71,7 @@ impl Default for HarnessOpts {
             create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
             rest_identity_binder: None,
             activity_hub: false,
+            codex_locator: false,
         }
     }
 }
@@ -263,7 +268,11 @@ impl UnitHarness {
             create_dedupe: Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
             config_fallback: None,
             opencode_locator: None,
-            codex_locator: None,
+            codex_locator: opts.codex_locator.then(|| {
+                Arc::new(freshell_sessions::codex_locator::CodexLocator::new(
+                    codex_home.join("sessions"),
+                ))
+            }),
             activity,
             session_existence: Arc::new(freshell_ws::existence::NoIndexProbe::default()),
             reconcile_deferral_budget_ms:
@@ -273,10 +282,17 @@ impl UnitHarness {
             units: freshell_ws::unit_lifecycle::UnitServices {
                 directory: freshell_containment::UnitDirectory::new(),
                 containment,
+                threads: Default::default(),
             },
         };
         // As `freshell-server` wires it (Stage 2: LB-01, LB-25).
         freshell_ws::unit_lifecycle::wire(&state, &tokio::runtime::Handle::current());
+        if opts.codex_locator {
+            freshell_ws::codex_association::spawn_codex_locator_sweep(
+                state.clone(),
+                Duration::from_millis(100),
+            );
+        }
 
         // The REST lane over the same registry, owner registry and units
         // (`main.rs`'s `with_units(..)`).

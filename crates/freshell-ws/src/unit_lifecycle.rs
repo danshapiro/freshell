@@ -44,6 +44,8 @@ pub const PLACEMENT_DEADLINE: Duration = freshell_containment::PLACEMENT_DEADLIN
 pub struct UnitServices {
     pub directory: Arc<UnitDirectory>,
     pub containment: Containment,
+    /// The threads each Codex pane's app-server holds (Task 14).
+    pub threads: Arc<crate::unit_threads::ThreadTables>,
 }
 
 impl Default for UnitServices {
@@ -54,6 +56,7 @@ impl Default for UnitServices {
         Self {
             directory: UnitDirectory::new(),
             containment: freshell_containment::global_or_fallback_containment(),
+            threads: Default::default(),
         }
     }
 }
@@ -134,6 +137,11 @@ fn unit_keys(unit: &AgentUnit, operation_id: Option<&str>) -> UnitLogKeys {
 /// Everything up to `unit.stop` runs synchronously, before the handle is
 /// returned:
 ///
+/// 0. a Codex unit whose stop has not begun reads once which thread lock
+///    files its members hold ([`crate::unit_threads::reconcile_loaded`]), so
+///    every thread its app-server holds that no event announced is on the
+///    unit (registry key and unit record) before the first signal
+///    (Stage 2: LB-51, LB-31);
 /// 1. join decision from the owner registry: a key of the unit already
 ///    Stopping makes this call a join under that key's operation;
 /// 2. `begin_unit_stop` and one live `stopping` owner frame per key moved;
@@ -201,6 +209,11 @@ pub(crate) fn start_unit_stop(
     cmd: UnitStopCommand,
 ) -> UnitStop {
     let target = stop_target(state, entry);
+    if entry.provider == "codex" && entry.unit.stop_in_flight().is_none() {
+        if let Some(tid) = target.terminal_id.as_deref() {
+            crate::unit_threads::reconcile_loaded(state, tid);
+        }
+    }
     let operation_id = stop_operation(state, &entry.unit, &cmd.operation_id);
     let moved = move_unit_keys(state, &target, &operation_id, &cmd.initiator);
     launch_unit_stop(state, entry, &target, cmd, operation_id, moved)
@@ -390,7 +403,8 @@ fn release_unit_keys(
 /// d. the Codex launch is finished (proxy closed, sidecar record removed);
 /// e. a settled start's directory entry is removed (an unsettled one goes
 ///    when its owner settles it, after the create released its claim);
-/// f. every key the stop owns is committed Vacant and broadcast;
+/// f. every key the stop owns is committed Vacant and broadcast, and the
+///    terminal's thread table is dropped;
 /// g. an agent exit that stayed an agent exit sends its crash event,
 ///    fenced with the main key's post-commit generation.
 ///
@@ -466,6 +480,9 @@ pub(crate) async fn publish_gone(
                 .as_ref()
                 .map(|ownership| (ownership.boot_epoch(), key.generation));
         }
+    }
+    if let Some(tid) = terminal_id.as_deref() {
+        crate::unit_threads::forget_terminal(&state, tid);
     }
     // g.
     if matches!(ending, UnitEnding::AgentExited { .. }) && report.reason == AGENT_EXITED {

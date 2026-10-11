@@ -151,7 +151,7 @@ pub(crate) async fn coordinator_begin_identity(
         freshell_freshagent::ownership_lane::TerminalLaneClaim::Unwired => {
             IdentityAuthority::Unwired
         }
-        freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt => {
+        freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt { .. } => {
             // The coordinator already holds a live same-kind owner. THIS
             // terminal re-adopting its own live record is the idempotent
             // allow; any other live owner refuses fail-closed (the

@@ -1474,13 +1474,15 @@ pub mod ownership_lane {
     /// the same shape as [`LaneClaim`] but for `RuntimeOwnerKind::Terminal`
     /// — `Granted` wraps the RAII ticket (drop without `disarm()` performs
     /// the typed fail), `Adopt` means a same-kind live terminal runtime
-    /// exists (the registry-lease/D7 attach-or-refuse paths handle it),
-    /// `Unwired` is the legacy no-coordinator behavior, and `Refused` is the
-    /// typed cross-kind/stale outcome the caller maps onto its existing
-    /// refusal frames.
+    /// holds the conversation (`owner`: which one, and whether it holds it
+    /// as its main conversation or as an extra thread; the registry-lease/D7
+    /// attach-or-refuse paths handle a main hold, Task 14 answers an extra
+    /// hold with its holder), `Unwired` is the legacy no-coordinator
+    /// behavior, and `Refused` is the typed cross-kind/stale outcome the
+    /// caller maps onto its existing refusal frames.
     pub enum TerminalLaneClaim {
         Granted(OperationTicket),
-        Adopt,
+        Adopt { owner: OwnerIdentity },
         Unwired,
         Refused(BeginOutcome),
     }
@@ -1590,7 +1592,7 @@ pub mod ownership_lane {
                     initiator,
                 ))
             }
-            BeginOutcome::AdoptLive { .. } => TerminalLaneClaim::Adopt,
+            BeginOutcome::AdoptLive { owner, .. } => TerminalLaneClaim::Adopt { owner },
             outcome => TerminalLaneClaim::Refused(outcome),
         }
     }

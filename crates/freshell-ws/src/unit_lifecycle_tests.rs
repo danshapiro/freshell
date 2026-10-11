@@ -35,6 +35,7 @@ fn unit_state(
             shim: None,
             state_root: root.to_path_buf(),
         }),
+        threads: Default::default(),
     };
     wire(&state, &tokio::runtime::Handle::current());
     (state, rx)

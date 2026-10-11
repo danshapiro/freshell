@@ -512,6 +512,11 @@ impl AgentUnit {
         *lock(&self.inner.lock_paths) = paths;
     }
 
+    /// The lock files [`Self::set_lock_paths`] last set.
+    pub fn lock_paths(&self) -> Vec<PathBuf> {
+        lock(&self.inner.lock_paths).clone()
+    }
+
     /// One-shot: `Ok` when `pid` is placed in this unit (Stage 2: LB-16,
     /// LB-27). Callers run it once at the start's settle point; an error is
     /// a typed start failure (`events::placement_failed`).
@@ -534,6 +539,20 @@ impl AgentUnit {
                     r.conversation_keys.push(key.clone());
                 }
             });
+        }
+    }
+
+    /// Removes one conversation key from the record: the agent no longer
+    /// holds that conversation (Codex unloaded an extra thread), so a
+    /// restart that finishes this unit's stop does not restore it as
+    /// Stopping. Nothing is written when the key is not there.
+    pub fn forget_conversation(&self, provider: &str, session_id: &str) {
+        let key = (provider.to_string(), session_id.to_string());
+        let present = lock(&self.inner.record)
+            .as_ref()
+            .is_some_and(|r| r.conversation_keys.contains(&key));
+        if present {
+            self.update_record(|r| r.conversation_keys.retain(|k| *k != key));
         }
     }
 
@@ -1952,6 +1971,38 @@ mod tests {
         assert_eq!(recorded_roots(&unit), [(11, 110), (42, 7), (43, 8)]);
         observer.roots_changed(&[(42, 7)], &[99]);
         assert_eq!(store.writes() - before, 1, "a batch that changes nothing");
+    }
+
+    fn recorded_conversations(unit: &AgentUnit) -> Vec<(String, String)> {
+        lock(&unit.inner.record)
+            .as_ref()
+            .unwrap()
+            .conversation_keys
+            .clone()
+    }
+
+    /// A thread the agent no longer holds leaves the record (so a restart
+    /// that finishes the unit's stop does not restore it as Stopping);
+    /// forgetting a key the record does not list writes nothing.
+    #[test]
+    fn a_forgotten_conversation_leaves_the_record() {
+        let (unit, store) = unit_with_record(Arc::new(NoProcesses));
+        unit.note_conversation("codex", "t-main");
+        unit.note_conversation("codex", "t-help");
+        let before = store.writes();
+        unit.forget_conversation("codex", "t-help");
+        assert_eq!(store.writes() - before, 1, "one write");
+        assert_eq!(
+            recorded_conversations(&unit),
+            [("codex".to_string(), "t-main".to_string())]
+        );
+        unit.forget_conversation("codex", "t-help");
+        unit.forget_conversation("other", "t-main");
+        assert_eq!(
+            store.writes() - before,
+            1,
+            "nothing to forget, nothing written"
+        );
     }
 
     /// A process of the test, killed through its pin and reaped on drop.
