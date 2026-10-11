@@ -947,12 +947,11 @@ impl FreshCodexState {
 
     /// Logs Codex's own writer refusal of a `thread/resume` of `thread_id`
     /// ("already has an active writer") at ERROR (`unit.writer_conflict`,
-    /// `source: freshcodex`, under `request_id`: the create's requestId, or
-    /// empty for a lane with no request to tie it to), naming the holder one
-    /// bounded lookup finds under the Codex home this sidecar reported (Task
-    /// 16), and returns the answer that tells the user who holds the
-    /// conversation ([`HeldAnswer`]). Other errors log nothing and answer
-    /// `None`.
+    /// `source: freshcodex`, under `request_id`: the create's requestId; the
+    /// other lanes pass an empty one), naming the holder one bounded lookup
+    /// finds under the Codex home this sidecar reported (Task 16), and
+    /// returns the answer that tells the user who holds the conversation
+    /// ([`HeldAnswer`]). Other errors log nothing and answer `None`.
     async fn note_resume_refusal(
         &self,
         client: &CodexAppServerClient,
@@ -5188,6 +5187,7 @@ impl FreshCodexState {
                     &child_id,
                     &parent_id,
                     &reply_sink,
+                    "INTERNAL_ERROR",
                     &err,
                 )
                 .await;
@@ -5210,6 +5210,7 @@ impl FreshCodexState {
                 &child_id,
                 &parent_id,
                 &reply_sink,
+                "INTERNAL_ERROR",
                 &err.to_string(),
             )
             .await;
@@ -5231,13 +5232,29 @@ impl FreshCodexState {
         let resumed = match resumed {
             Ok(resumed) => resumed,
             Err(err) => {
+                // Task 16 (review R2-M3): Codex refusing the child as held is
+                // logged at ERROR naming its holder (looked up while the
+                // child's sidecar still runs) and answered with that holder,
+                // as on every other resume lane.
+                let held = self
+                    .note_resume_refusal(&child_client, &child_id, "", &err)
+                    .await;
                 shut_down_fork_child(&child_client, &mut child_proc, &child_ownership_id).await;
+                let (code, message) = match held {
+                    Some(HeldAnswer::Elsewhere(message)) => (CONVERSATION_HELD_ELSEWHERE, message),
+                    Some(HeldAnswer::Pane) => (
+                        "SESSION_RESERVED",
+                        "Another resume for this session is in flight".to_string(),
+                    ),
+                    None => ("INTERNAL_ERROR", err.to_string()),
+                };
                 self.fail_fork_after_archive(
                     &parent_client,
                     &child_id,
                     &parent_id,
                     &reply_sink,
-                    &err.to_string(),
+                    code,
+                    &message,
                 )
                 .await;
                 return;
@@ -5256,6 +5273,7 @@ impl FreshCodexState {
                 &child_id,
                 &parent_id,
                 &reply_sink,
+                "INTERNAL_ERROR",
                 &message,
             )
             .await;
@@ -5368,19 +5386,20 @@ impl FreshCodexState {
     /// REVIEWED post-archive failure containment (fresh-eyes F6): after the child was
     /// archived on the parent, ANY later failure (child-sidecar spawn, child
     /// unarchive/resume) (a) replies the nested `freshAgent.error` on the requesting
-    /// sink with the failing step's text AND (b) BEST-EFFORT `thread/unarchive`s the
-    /// child on the PARENT client, restoring the child's original visibility. The
-    /// unarchive's own error is IGNORED — the parent may be mid-kill — and the child
-    /// stays recoverable via post-owner-exit resume.
+    /// sink with the failing step's code and text AND (b) BEST-EFFORT
+    /// `thread/unarchive`s the child on the PARENT client, restoring the child's
+    /// original visibility. The unarchive's own error is IGNORED — the parent may be
+    /// mid-kill — and the child stays recoverable via post-owner-exit resume.
     async fn fail_fork_after_archive(
         &self,
         parent_client: &CodexAppServerClient,
         child_id: &str,
         session_id: &str,
         reply_sink: &FrameSink,
+        code: &str,
         message: &str,
     ) {
-        reply_sink(fork_error_frame(session_id, message));
+        reply_sink(fork_error_frame_with_code(session_id, code, message));
         let _ = parent_client.unarchive_thread(child_id).await;
     }
 
@@ -17529,6 +17548,125 @@ pub(crate) mod tests {
             "resume kaput",
         );
         assert!(st.sessions.lock().await.len() == 1, "no child registered");
+    }
+
+    /// Forks `parent-held-fork` (a scripted parent connection) into
+    /// `child_id`, whose resume on the child's own sidecar Codex refuses as
+    /// held (configure the fake first), and returns the frames the fork
+    /// answered on its sink. Asserts the post-archive containment still ran
+    /// (the best-effort parent unarchive) and that no child was registered.
+    async fn fork_whose_child_resume_codex_refuses(
+        st: &FreshCodexState,
+        child_id: &str,
+    ) -> Vec<Value> {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            st,
+            "parent-held-fork",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-fork-held",
+        )
+        .await;
+
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_fork(
+                    fork_msg("parent-held-fork", "fork-req-held", None),
+                    None,
+                    sink,
+                )
+                .await;
+            })
+        };
+
+        answer_initialize(&peer).await;
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/fork");
+        peer.respond(&id, json!({ "thread": { "id": child_id } }));
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/archive");
+        peer.respond(&id, json!({}));
+        // The child sidecar's resume is refused as held → containment.
+        let (id, method, params) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), peer.expect_request())
+                .await
+                .expect("the best-effort parent unarchive arrives");
+        assert_eq!(method, "thread/unarchive");
+        assert_eq!(params["threadId"], json!(child_id));
+        peer.respond(&id, json!({}));
+        driver.await.expect("fork task");
+        assert!(st.sessions.lock().await.len() == 1, "no child registered");
+        captured_frames(&captured)
+    }
+
+    /// Task 16 (review R2-M3): when Codex refuses the fork child's
+    /// `thread/resume` because another program holds the child, the refusal
+    /// is a writer conflict logged at ERROR naming that program, and the
+    /// fork's failure tells the user who holds it, as every other freshcodex
+    /// resume lane does. The containment still runs, and the holder is never
+    /// signalled.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handle_fork_child_resume_codex_refuses_as_held_names_the_program_holding_it() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(&refuse_resume_as_held("child-held-fork"));
+        let capture = tracing_capture::capture_by_session("child-held-fork");
+        let home = std::env::var_os("CODEX_HOME").expect("the isolated CODEX_HOME");
+        let mut holder = OutsideHolder::hold(&freshell_containment::codex_thread_lock_path(
+            std::path::Path::new(&home),
+            "child-held-fork",
+        ));
+        let pid = holder.pid();
+        let (st, _rx_boot) = state_with_bus();
+
+        let frames = fork_whose_child_resume_codex_refuses(&st, "child-held-fork").await;
+        assert_single_fork_error_frame(
+            &frames,
+            "parent-held-fork",
+            CONVERSATION_HELD_ELSEWHERE,
+            &freshell_protocol::conversation_held_elsewhere_message(pid, "perl"),
+        );
+        let conflicts = writer_conflicts_naming(&capture, pid);
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert_eq!(conflicts[0].fields["source"], "freshcodex");
+        assert_eq!(conflicts[0].fields["thread_id"], "child-held-fork");
+        assert!(holder.answers(), "the holder is never signalled");
+    }
+
+    /// Task 16 (review R2-M3): a fork child Codex refuses because a live
+    /// Freshell pane holds it gets the fork's live-session answer
+    /// (`SESSION_RESERVED`), never "another program"; Codex's own refusal is
+    /// still logged at ERROR, and the holding pane is left alive and
+    /// unchanged.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handle_fork_child_resume_a_freshell_pane_holds_answers_session_reserved() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(&refuse_resume_as_held("child-held-by-pane"));
+        let capture = tracing_capture::capture_by_session("child-held-by-pane");
+        let mut pane = HoldingPane::hold("child-held-by-pane");
+        let (st, _rx_boot) = state_with_bus();
+        st.set_unit_directory(Arc::clone(&pane.units));
+
+        let frames = fork_whose_child_resume_codex_refuses(&st, "child-held-by-pane").await;
+        assert_single_fork_error_frame(
+            &frames,
+            "parent-held-fork",
+            "SESSION_RESERVED",
+            "Another resume for this session is in flight",
+        );
+        let conflicts = writer_conflicts_naming(&capture, pane.holder.pid());
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "Codex's own refusal stays an ERROR, naming the pane's process: {conflicts:?}"
+        );
+        pane.assert_alive_and_unchanged().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
