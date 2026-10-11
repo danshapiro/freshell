@@ -9,9 +9,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1861,6 +1861,7 @@ struct AssetResolver<'a> {
     saved_snapshots: BTreeMap<(String, String), SavedSnapshotReference>,
     snapshot_objects: BTreeMap<(String, String, String), Arc<String>>,
     object_representations: SnapshotRepresentations,
+    packed_decoders: SnapshotPackedDecoders,
     source_progress: Option<SourcePhase>,
 }
 
@@ -1878,6 +1879,7 @@ impl<'a> AssetResolver<'a> {
             saved_snapshots: BTreeMap::new(),
             snapshot_objects: BTreeMap::new(),
             object_representations: SnapshotRepresentations::new(),
+            packed_decoders: SnapshotPackedDecoders::default(),
             source_progress: None,
         }
     }
@@ -1888,6 +1890,8 @@ impl<'a> AssetResolver<'a> {
 
     fn resolve_rows(&mut self, rows: &mut [SerializedRow]) -> Result<(), TransferError> {
         let result = self.resolve_rows_inner(rows);
+        let closed = self.packed_decoders.finish();
+        let result = result.and(closed);
         if let Some(progress) = &mut self.source_progress {
             progress.finish(result.as_ref().err());
         }
@@ -2333,10 +2337,12 @@ impl<'a> AssetResolver<'a> {
             .join(&worktree_sha1);
         let workspace_store = snapshot_workspace_objects(&mount.canonical_root)?;
         let stores = qualified_snapshot_stores(&native_bucket, &workspace_store)?;
+        self.packed_decoders
+            .qualify(&native_bucket, &workspace_store, &stores)?;
         let closure = walk_snapshot_closure(tree, snapshot_closure_bound(), |id, remaining| {
             // Storage authority and bytes are re-established for every object
             // occurrence, before any resident computation can be reused.
-            let object = read_snapshot_object_source(&stores, id);
+            let object = self.packed_decoders.read(&stores, id);
             if let Some(progress) = &mut self.source_progress {
                 progress.progress(progress.event.completed_count + 1, None);
             }
@@ -2529,87 +2535,448 @@ fn read_snapshot_object_source(
     stores: &[PathBuf],
     object_id: &str,
 ) -> Result<Option<SnapshotObjectSource>, TransferError> {
-    if object_id.len() != 40 || !object_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(TransferError::Blocked(
-            "snapshot closure has an invalid object ID".into(),
-        ));
-    }
-    for store in stores {
-        let path = store.join(&object_id[..2]).join(&object_id[2..]);
-        match fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
-            Ok(metadata)
-                if !metadata.is_file()
-                    || metadata.file_type().is_symlink()
-                    || path.canonicalize()? != path =>
-            {
-                return Err(TransferError::Blocked(
-                    "saved snapshot object is not an exact regular file".into(),
-                ))
-            }
-            Ok(metadata) if metadata.len() > MAX_BUNDLE_BYTES => {
-                return Err(TransferError::Blocked(
-                    "saved snapshot object exceeds the transfer bound".into(),
-                ))
-            }
-            Ok(_) => return Ok(Some(SnapshotObjectSource::Loose(fs::read(path)?))),
+    // Ordinary destination verification has independent, request-local state.
+    let mut decoders = SnapshotPackedDecoders::default();
+    let result = decoders.read(stores, object_id);
+    let closed = decoders.finish();
+    result.and_then(|object| closed.map(|()| object))
+}
+
+// Alternate count is unbounded; native processes, pipes and drain threads are not.
+const MAX_RESIDENT_SNAPSHOT_DECODERS: usize = 4;
+
+#[derive(Default)]
+struct SnapshotPackedDecoders {
+    context: Option<(PathBuf, PathBuf, Vec<PathBuf>)>,
+    storage: Option<Vec<SnapshotStorageStamp>>,
+    children: BTreeMap<PathBuf, SnapshotPackedDecoder>,
+    #[cfg(test)]
+    residency_limit: Option<usize>,
+}
+
+impl SnapshotPackedDecoders {
+    fn qualify(
+        &mut self,
+        native_bucket: &Path,
+        workspace_store: &Path,
+        stores: &[PathBuf],
+    ) -> Result<(), TransferError> {
+        let context = (
+            native_bucket.to_path_buf(),
+            workspace_store.to_path_buf(),
+            stores.to_vec(),
+        );
+        if self.context.as_ref() != Some(&context) {
+            self.finish()?;
+            self.context = Some(context);
         }
+        Ok(())
     }
-    // Packed objects use the native decoder only after storage confinement;
-    // ordinary owned loose-object fixtures need no external CLI.
+
+    fn finish(&mut self) -> Result<(), TransferError> {
+        self.storage = None;
+        // Join every owned child even when an earlier decoder failed.
+        let mut result = Ok(());
+        for (_, mut decoder) in std::mem::take(&mut self.children) {
+            let closed = decoder.finish();
+            if result.is_ok() {
+                result = closed;
+            }
+        }
+        result
+    }
+
+    fn decoder(&mut self, store: &Path) -> Result<&mut SnapshotPackedDecoder, TransferError> {
+        if !self.children.contains_key(store) {
+            let limit = MAX_RESIDENT_SNAPSHOT_DECODERS;
+            #[cfg(test)]
+            let limit = self.residency_limit.unwrap_or(limit).max(1);
+            if self.children.len() >= limit {
+                // Close stdin, check late output/status, reap and join the
+                // exact evicted child before opening replacement resources.
+                let (_, mut decoder) = self.children.pop_first().unwrap();
+                decoder.finish()?;
+            }
+            self.children
+                .insert(store.to_path_buf(), SnapshotPackedDecoder::spawn(store)?);
+        }
+        Ok(self.children.get_mut(store).unwrap())
+    }
+
+    fn read(
+        &mut self,
+        stores: &[PathBuf],
+        object_id: &str,
+    ) -> Result<Option<SnapshotObjectSource>, TransferError> {
+        if object_id.len() != 40 || !object_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(TransferError::Blocked(
+                "snapshot closure has an invalid object ID".into(),
+            ));
+        }
+        // Current loose objects keep precedence over every packed decoder.
+        for store in stores {
+            let path = store.join(&object_id[..2]).join(&object_id[2..]);
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+                Ok(metadata)
+                    if !metadata.is_file()
+                        || metadata.file_type().is_symlink()
+                        || path.canonicalize()? != path =>
+                {
+                    return Err(TransferError::Blocked(
+                        "saved snapshot object is not an exact regular file".into(),
+                    ))
+                }
+                Ok(metadata) if metadata.len() > MAX_BUNDLE_BYTES => {
+                    return Err(TransferError::Blocked(
+                        "saved snapshot object exceeds the transfer bound".into(),
+                    ))
+                }
+                Ok(_) => return Ok(Some(SnapshotObjectSource::Loose(fs::read(path)?))),
+            }
+        }
+        // Git retains pack descriptors and negative lookup state. Freshly
+        // inspect all ordered stores before EVERY native query, including
+        // directory/file identity, pack metadata and alternate/config bytes.
+        if let Some((native, workspace, qualified)) = &self.context {
+            if qualified_snapshot_stores(native, workspace)? != *qualified {
+                self.finish()?;
+                return Err(TransferError::Blocked(
+                    "packed snapshot source context changed during its current read".into(),
+                ));
+            }
+        }
+        let storage = snapshot_packed_storage(stores)?;
+        if self.storage.as_ref() != Some(&storage) {
+            self.finish()?;
+            self.storage = Some(storage);
+        }
+        for store in stores {
+            let pack = store.join("pack");
+            if !self
+                .storage
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|stamp| stamp.path.parent() == Some(pack.as_path()))
+            {
+                continue;
+            }
+            let result = self.decoder(store)?.read(object_id);
+            match result {
+                Ok(Some(object)) => return Ok(Some(object)),
+                Ok(None) => {}
+                Err(error) => {
+                    // A framing/identity/I/O error never leaves a reusable child.
+                    self.children.remove(store);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct SnapshotStorageStamp {
+    path: PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    created: Option<std::time::SystemTime>,
+    readonly: bool,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64, u32),
+    context_bytes: Option<String>,
+}
+
+fn snapshot_storage_stamp(
+    path: PathBuf,
+    context_bytes: Option<String>,
+) -> Result<SnapshotStorageStamp, TransferError> {
+    let metadata = fs::symlink_metadata(&path)?;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    Ok(SnapshotStorageStamp {
+        path,
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        created: metadata.created().ok(),
+        readonly: metadata.permissions().readonly(),
+        #[cfg(unix)]
+        identity: (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+            metadata.mode(),
+        ),
+        context_bytes,
+    })
+}
+
+fn snapshot_packed_storage(stores: &[PathBuf]) -> Result<Vec<SnapshotStorageStamp>, TransferError> {
+    let mut stamps = Vec::new();
     for store in stores {
         let git_dir = store.parent().ok_or_else(|| {
             TransferError::Blocked("snapshot store lacks native Git directory".into())
         })?;
+        let metadata = fs::symlink_metadata(store)?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || store.canonicalize()? != *store
+        {
+            return Err(TransferError::Blocked(
+                "qualified snapshot store contains a redirected component".into(),
+            ));
+        }
+        stamps.push(snapshot_storage_stamp(git_dir.to_path_buf(), None)?);
+        stamps.push(snapshot_storage_stamp(store.clone(), None)?);
+        for path in [
+            git_dir.join("config"),
+            git_dir.join("commondir"),
+            store.join("info/alternates"),
+        ] {
+            if let Some(bytes) = read_alternates_file(&path)? {
+                stamps.push(snapshot_storage_stamp(path, Some(bytes))?);
+            }
+        }
         let Some(pack) =
             checked_git_storage_path(git_dir, &store.join("pack"), "Git pack directory", true)?
         else {
             continue;
         };
-        if fs::read_dir(&pack)?.next().is_some() {
-            inspect_git_pack_directory(git_dir, store)?;
-            let repository = GitRepository {
-                work_tree: git_dir.to_path_buf(),
-                git_dir: git_dir.to_path_buf(),
-            };
-            let mut command = sanitized_git_command();
-            command
-                .arg("--git-dir")
-                .arg(&repository.git_dir)
-                .arg("--work-tree")
-                .arg(&repository.work_tree)
-                .arg("cat-file")
-                .arg("--batch")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            let mut child = command.spawn()?;
-            child
-                .stdin
-                .take()
-                .ok_or_else(|| {
-                    TransferError::Blocked("packed snapshot decoder input is unavailable".into())
-                })?
-                .write_all(format!("{object_id}\n").as_bytes())?;
-            let output = child.wait_with_output()?;
-            if !output.status.success() {
-                return Err(TransferError::Blocked(
-                    "packed snapshot decoder failed".into(),
-                ));
-            }
-            let Some((kind, body)) = decode_packed_snapshot_response(object_id, &output.stdout)?
-            else {
-                continue;
-            };
-            validate_packed_snapshot_identity(object_id, kind, body)?;
-            return Ok(Some(SnapshotObjectSource::Packed {
-                kind: kind.to_string(),
-                body: body.to_vec(),
-            }));
+        stamps.push(snapshot_storage_stamp(store.join("pack"), None)?);
+        let mut files = fs::read_dir(pack)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()?;
+        files.sort();
+        for path in files {
+            checked_git_storage_path(git_dir, &path, "Git pack file", false)?;
+            stamps.push(snapshot_storage_stamp(path, None)?);
         }
     }
-    Ok(None)
+    Ok(stamps)
+}
+
+struct SnapshotPackedDecoder {
+    child: Child,
+    input: Option<ChildStdin>,
+    output: BufReader<ChildStdout>,
+    stderr: Option<std::thread::JoinHandle<io::Result<Vec<u8>>>>,
+    settled: bool,
+}
+
+impl SnapshotPackedDecoder {
+    fn spawn(store: &Path) -> Result<Self, TransferError> {
+        let git_dir = store.parent().ok_or_else(|| {
+            TransferError::Blocked("snapshot store lacks native Git directory".into())
+        })?;
+        let mut command = sanitized_git_command();
+        command
+            .arg("--git-dir")
+            .arg(git_dir)
+            .arg("--work-tree")
+            .arg(git_dir)
+            .arg("cat-file")
+            .arg("--batch")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        Self::from_command(command)
+    }
+
+    fn from_command(mut command: Command) -> Result<Self, TransferError> {
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn()?;
+        #[cfg(test)]
+        snapshot_reuse_test_hooks::count("packed_spawn");
+        let input = child.stdin.take();
+        // Piped handles are supplied by Command; immediately wrap the child
+        // so every subsequent error owns kill/wait/join cleanup.
+        let output = BufReader::new(child.stdout.take().expect("piped Git stdout"));
+        let mut stderr = child.stderr.take().expect("piped Git stderr");
+        let drain = std::thread::Builder::new()
+            .name("snapshot-git-stderr".into())
+            .spawn(move || {
+                let mut retained = Vec::new();
+                let mut bytes = [0; 8192];
+                loop {
+                    let count = stderr.read(&mut bytes)?;
+                    if count == 0 {
+                        break;
+                    }
+                    let keep = count.min(16 * 1024 - retained.len());
+                    retained.extend_from_slice(&bytes[..keep]);
+                }
+                Ok(retained)
+            });
+        let drain = match drain {
+            Ok(drain) => drain,
+            Err(error) => {
+                drop(input);
+                let _ = child.kill();
+                let _ = child.wait();
+                #[cfg(test)]
+                snapshot_reuse_test_hooks::count("packed_reap");
+                return Err(error.into());
+            }
+        };
+        #[cfg(test)]
+        snapshot_reuse_test_hooks::count("packed_drain_spawn");
+        Ok(Self {
+            child,
+            input,
+            output,
+            stderr: Some(drain),
+            settled: false,
+        })
+    }
+
+    fn read(&mut self, object_id: &str) -> Result<Option<SnapshotObjectSource>, TransferError> {
+        let input = self.input.as_mut().ok_or_else(|| {
+            TransferError::Blocked("packed snapshot decoder input is unavailable".into())
+        })?;
+        writeln!(input, "{object_id}")?;
+        input.flush()?;
+        #[cfg(test)]
+        snapshot_reuse_test_hooks::count("packed_query");
+        let result = read_packed_snapshot_response(object_id, &mut self.output)?;
+        if !self.output.buffer().is_empty() {
+            return Err(TransferError::Blocked(
+                "packed snapshot decoder returned trailing output".into(),
+            ));
+        }
+        Ok(result)
+    }
+
+    fn finish(&mut self) -> Result<(), TransferError> {
+        if self.settled {
+            return Ok(());
+        }
+        self.input.take();
+        // Drain without retaining output; unsolicited bytes remain a refusal.
+        let mut trailing = false;
+        let mut bytes = [0; 8192];
+        loop {
+            let count = self.output.read(&mut bytes)?;
+            if count == 0 {
+                break;
+            }
+            trailing = true;
+        }
+        let status = self.child.wait()?;
+        self.settled = true;
+        #[cfg(test)]
+        snapshot_reuse_test_hooks::count("packed_reap");
+        let stderr = self.stderr.take().unwrap().join();
+        #[cfg(test)]
+        snapshot_reuse_test_hooks::count("packed_drain_join");
+        let stderr = stderr.map_err(|_| {
+            TransferError::Blocked("packed snapshot decoder stderr reader failed".into())
+        })??;
+        if !status.success() || trailing {
+            return Err(TransferError::Blocked(format!(
+                "packed snapshot decoder failed: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SnapshotPackedDecoder {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.input.take();
+            // Only this exact owned native decoder can be stopped here.
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            #[cfg(test)]
+            snapshot_reuse_test_hooks::count("packed_reap");
+        }
+        if let Some(stderr) = self.stderr.take() {
+            let _ = stderr.join();
+            #[cfg(test)]
+            snapshot_reuse_test_hooks::count("packed_drain_join");
+        }
+    }
+}
+
+fn read_packed_snapshot_response(
+    object_id: &str,
+    output: &mut impl BufRead,
+) -> Result<Option<SnapshotObjectSource>, TransferError> {
+    // Read the small protocol header before accepting a declared allocation.
+    let mut header = Vec::new();
+    loop {
+        let mut byte = [0];
+        output.read_exact(&mut byte)?;
+        if byte[0] == b'\n' {
+            break;
+        }
+        if header.len() == 128 {
+            return Err(TransferError::Blocked(
+                "packed snapshot decoder returned an oversized header".into(),
+            ));
+        }
+        header.push(byte[0]);
+    }
+    let header = std::str::from_utf8(&header).map_err(|_| {
+        TransferError::Blocked("packed snapshot decoder returned a nontext header".into())
+    })?;
+    let Some((kind, length)) = packed_snapshot_header(object_id, header)? else {
+        return Ok(None);
+    };
+    let mut body = Vec::new();
+    let mut remaining = length;
+    let mut bytes = [0; 64 * 1024];
+    while remaining > 0 {
+        let count = remaining.min(bytes.len());
+        output.read_exact(&mut bytes[..count])?;
+        body.extend_from_slice(&bytes[..count]);
+        remaining -= count;
+    }
+    let mut newline = [0];
+    output.read_exact(&mut newline)?;
+    if newline != [b'\n'] {
+        return Err(TransferError::Blocked(
+            "packed snapshot decoder returned an incomplete object".into(),
+        ));
+    }
+    validate_packed_snapshot_identity(object_id, kind, &body)?;
+    Ok(Some(SnapshotObjectSource::Packed {
+        kind: kind.to_string(),
+        body,
+    }))
+}
+
+fn packed_snapshot_header<'a>(
+    object_id: &str,
+    header: &'a str,
+) -> Result<Option<(&'a str, usize)>, TransferError> {
+    let fields = header.split(' ').collect::<Vec<_>>();
+    if fields.as_slice() == [object_id, "missing"] {
+        return Ok(None);
+    }
+    if fields.len() != 3 || fields[0] != object_id || !matches!(fields[1], "tree" | "blob") {
+        return Err(TransferError::Blocked(
+            "packed snapshot decoder returned an unsupported object".into(),
+        ));
+    }
+    let length = fields[2].parse::<usize>().map_err(|_| {
+        TransferError::Blocked("packed snapshot decoder returned an invalid size".into())
+    })?;
+    let canonical_header = format!("{} {length}\0", fields[1]);
+    if (length as u64).saturating_add(canonical_header.len() as u64) > MAX_BUNDLE_BYTES {
+        return Err(TransferError::Blocked(
+            "packed snapshot decoder returned an incomplete or oversized object".into(),
+        ));
+    }
+    Ok(Some((fields[1], length)))
 }
 
 fn validate_packed_snapshot_identity(
@@ -2636,6 +3003,7 @@ fn validate_packed_snapshot_identity(
     Ok(())
 }
 
+#[cfg(test)]
 fn decode_packed_snapshot_response<'a>(
     object_id: &str,
     output: &'a [u8],
@@ -2649,32 +3017,112 @@ fn decode_packed_snapshot_response<'a>(
     let header = std::str::from_utf8(&output[..newline]).map_err(|_| {
         TransferError::Blocked("packed snapshot decoder returned a nontext header".into())
     })?;
-    let fields = header.split(' ').collect::<Vec<_>>();
-    if fields.as_slice() == [object_id, "missing"] && output.len() == newline + 1 {
+    let Some((kind, length)) = packed_snapshot_header(object_id, header)? else {
+        if output.len() != newline + 1 {
+            return Err(TransferError::Blocked(
+                "packed snapshot decoder returned trailing output".into(),
+            ));
+        }
         return Ok(None);
-    }
-    if fields.len() != 3 || fields[0] != object_id || !matches!(fields[1], "tree" | "blob") {
-        return Err(TransferError::Blocked(
-            "packed snapshot decoder returned an unsupported object".into(),
-        ));
-    }
-    let length = fields[2].parse::<usize>().map_err(|_| {
-        TransferError::Blocked("packed snapshot decoder returned an invalid size".into())
-    })?;
-    if length as u64 > MAX_BUNDLE_BYTES
-        || output.len().checked_sub(newline + 1) != length.checked_add(1)
+    };
+    if output.len().checked_sub(newline + 1) != length.checked_add(1)
         || output.last() != Some(&b'\n')
     {
         return Err(TransferError::Blocked(
             "packed snapshot decoder returned an incomplete or oversized object".into(),
         ));
     }
-    Ok(Some((fields[1], &output[newline + 1..output.len() - 1])))
+    Ok(Some((kind, &output[newline + 1..output.len() - 1])))
 }
 
 #[cfg(test)]
 mod packed_snapshot_response_tests {
     use super::*;
+
+    #[test]
+    fn packed_stream_validates_before_allocation_and_rejects_current_wrong_bytes() {
+        let id = hex::encode(sha1::Sha1::digest(b"blob 3\0abc"));
+        let valid = format!("{id} blob 3\nabc\n");
+        let Some(SnapshotObjectSource::Packed { kind, body }) =
+            read_packed_snapshot_response(&id, &mut io::Cursor::new(valid.as_bytes())).unwrap()
+        else {
+            panic!("actual valid frame must decode");
+        };
+        assert_eq!(kind, "blob");
+        assert_eq!(body, b"abc");
+        assert!(read_packed_snapshot_response(
+            &id,
+            &mut io::Cursor::new(format!("{id} missing\n"))
+        )
+        .unwrap()
+        .is_none());
+        for invalid in [
+            format!("{id} blob 3\nabx\n"),
+            format!("{id} blob 3\nabc!"),
+            format!("{id} blob 3\nab"),
+            format!("{id} commit 3\nabc\n"),
+            format!("{} blob 3\nabc\n", "f".repeat(40)),
+            format!("{id} blob nope\n"),
+            "x".repeat(130),
+        ] {
+            assert!(
+                read_packed_snapshot_response(&id, &mut io::Cursor::new(&invalid)).is_err(),
+                "{invalid}"
+            );
+        }
+        let header = format!("{id} blob {MAX_BUNDLE_BYTES}\n");
+        let mut oversized = io::Cursor::new(format!("{header}never-read-body"));
+        assert!(
+            matches!(read_packed_snapshot_response(&id, &mut oversized), Err(TransferError::Blocked(reason)) if reason.contains("oversized"))
+        );
+        assert_eq!(
+            oversized.position(),
+            header.len() as u64,
+            "the canonical raw bound is checked before reading or allocating the body"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packed_decoder_drains_bounded_stderr_and_refuses_late_exit_after_valid_body() {
+        snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+        let id = hex::encode(sha1::Sha1::digest(b"blob 3\0abc"));
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(
+                r#"
+            IFS= read -r oid || exit 2
+            i=0
+            while [ "$i" -lt 2000 ]; do
+                printf '%s' 'owned fixture stderr intentionally exceeds pipe capacity........' >&2
+                i=$((i + 1))
+            done
+            printf '%s blob 3\nabc\n' "$1"
+            IFS= read -r ignored
+            exit 9
+        "#,
+            )
+            .arg("owned-packed-decoder-fixture")
+            .arg(&id);
+        let mut decoder = SnapshotPackedDecoder::from_command(command).unwrap();
+        let Some(SnapshotObjectSource::Packed { body, .. }) = decoder.read(&id).unwrap() else {
+            panic!("body precedes late child failure");
+        };
+        assert_eq!(body, b"abc");
+        let failure = decoder.finish().unwrap_err();
+        assert!(
+            matches!(failure, TransferError::Blocked(ref reason) if reason.starts_with("packed snapshot decoder failed:") && reason.len() <= 16 * 1024 + 40)
+        );
+        assert!(!decoder.child.try_wait().unwrap().unwrap().success());
+        drop(decoder);
+        let counts = snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().counts.clone());
+        assert_eq!(counts["packed_spawn"], 1);
+        assert_eq!(
+            counts["packed_reap"], 1,
+            "late refusal joins the exact child once"
+        );
+    }
 
     #[test]
     fn durable_souls_saved_snapshot_uses_qualified_linked_worktree_common_objects() {
@@ -3097,7 +3545,25 @@ mod snapshot_reuse_test_hooks {
         });
     }
     pub(super) fn count(operation: &'static str) {
-        STATE.with(|state| *state.borrow_mut().counts.entry(operation).or_default() += 1);
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let counts = &mut state.counts;
+            *counts.entry(operation).or_default() += 1;
+            for (spawn, settled, peak) in [
+                ("packed_spawn", "packed_reap", "packed_peak"),
+                (
+                    "packed_drain_spawn",
+                    "packed_drain_join",
+                    "packed_drain_peak",
+                ),
+            ] {
+                if operation == spawn {
+                    let live = counts[spawn] - counts.get(settled).copied().unwrap_or(0);
+                    let maximum = counts.entry(peak).or_default();
+                    *maximum = (*maximum).max(live);
+                }
+            }
+        });
     }
 }
 
@@ -5654,6 +6120,23 @@ mod native_source_inventory_tests {
         blob: String,
     }
 
+    fn fixture_git(git_dir: &Path, args: &[&str], input: Option<&[u8]>) -> String {
+        let mut command = sanitized_git_command();
+        command.arg("--git-dir").arg(git_dir).args(args);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        if let Some(input) = input {
+            child.stdin.take().unwrap().write_all(input).unwrap();
+        }
+        drop(child.stdin.take());
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
     fn reuse_fixture(packed: bool) -> ReuseFixture {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
@@ -5663,22 +6146,7 @@ mod native_source_inventory_tests {
         let worktree = hex::encode(sha1::Sha1::digest(workspace.to_string_lossy().as_bytes()));
         let git_dir = data_home.join("snapshot/prj").join(worktree);
         fs::create_dir_all(&git_dir).unwrap();
-        let git = |args: &[&str], input: Option<&[u8]>| {
-            let mut command = sanitized_git_command();
-            command.arg("--git-dir").arg(&git_dir).args(args);
-            command
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            let mut child = command.spawn().unwrap();
-            if let Some(input) = input {
-                child.stdin.take().unwrap().write_all(input).unwrap();
-            }
-            drop(child.stdin.take());
-            let output = child.wait_with_output().unwrap();
-            assert!(output.status.success(), "{:?}", output);
-            String::from_utf8(output.stdout).unwrap().trim().to_string()
-        };
+        let git = |args: &[&str], input: Option<&[u8]>| fixture_git(&git_dir, args, input);
         git(&["init", "--bare", "-q"], None);
         let blob = git(
             &["hash-object", "-w", "--stdin"],
@@ -5814,6 +6282,20 @@ mod native_source_inventory_tests {
             );
             assert_eq!(counts["deflate"], 4);
             assert_eq!(plain_counts["deflate"], 30);
+            assert_eq!(counts["packed_query"], 30);
+            assert_eq!(plain_counts["packed_query"], 30);
+            assert_eq!(
+                counts["packed_spawn"], 1,
+                "one export must reuse its current qualified packed decoder"
+            );
+            assert_eq!(plain_counts["packed_spawn"], 1);
+            assert_eq!(counts["packed_reap"], counts["packed_spawn"]);
+            assert_eq!(plain_counts["packed_reap"], plain_counts["packed_spawn"]);
+            assert_eq!(counts["packed_drain_join"], counts["packed_drain_spawn"]);
+            assert_eq!(
+                plain_counts["packed_drain_join"],
+                plain_counts["packed_drain_spawn"]
+            );
         } else {
             assert_eq!(counts["inflate"], 4);
             assert_eq!(plain_counts["inflate"], 30);
@@ -5851,6 +6333,11 @@ mod native_source_inventory_tests {
         );
         snapshot_reuse_test_hooks::STATE.with(|state| {
             let state = state.borrow();
+            assert_eq!(
+                state.counts.get("packed_spawn"),
+                state.counts.get("packed_reap"),
+                "every complete or refused export must join all its exact decoder children"
+            );
             assert!(
                 state.references >= 2,
                 "mutation follows a complete warm closure"
@@ -6152,6 +6639,453 @@ mod native_source_inventory_tests {
                         .count(),
                     0
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn packed_decoder_residency_bounds_real_alternates_without_changing_hits_or_misses() {
+        let fixture = reuse_fixture(true);
+        let (stores, late_id, late_body) = packed_pressure_stores(&fixture);
+        let absent = hex::encode(sha1::Sha1::digest(
+            b"blob 30\0genuinely absent packed object",
+        ));
+        let mut outputs = Vec::new();
+        let mut measurements = Vec::new();
+        for limit in [Some(stores.len()), None, Some(2)] {
+            snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+            let mut decoders = SnapshotPackedDecoders {
+                residency_limit: limit,
+                ..Default::default()
+            };
+            decoders
+                .qualify(
+                    fixture.store.parent().unwrap(),
+                    &fixture.dir.path().join("workspace/.git/objects"),
+                    &stores,
+                )
+                .unwrap();
+            let mut current = Vec::new();
+            for _ in 0..2 {
+                let Some(SnapshotObjectSource::Packed { kind, body }) =
+                    decoders.read(&stores, &late_id).unwrap()
+                else {
+                    panic!("the later qualified alternate must remain readable under pressure");
+                };
+                assert_eq!(kind, "blob");
+                assert_eq!(body, late_body);
+                current.push(compress_snapshot_object(&kind, &body).unwrap());
+                assert!(decoders.read(&stores, &absent).unwrap().is_none());
+            }
+            decoders.finish().unwrap();
+            let counts =
+                snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().counts.clone());
+            assert_eq!(
+                counts["packed_query"],
+                2 * (stores.len() - 1 + stores.len())
+            );
+            assert_eq!(counts["packed_validate"], 2);
+            assert_eq!(counts["packed_spawn"], counts["packed_reap"]);
+            assert_eq!(counts["packed_drain_spawn"], counts["packed_drain_join"]);
+            outputs.push(current);
+            measurements.push(counts);
+        }
+        assert_eq!(outputs[0], outputs[1]);
+        assert_eq!(outputs[0], outputs[2]);
+        assert_eq!(
+            measurements[0]["packed_query"],
+            measurements[1]["packed_query"]
+        );
+        assert_eq!(
+            measurements[0]["packed_query"],
+            measurements[2]["packed_query"]
+        );
+        eprintln!("actual packed pressure measurements: {measurements:?}");
+        assert!(measurements[1]["packed_peak"] <= MAX_RESIDENT_SNAPSHOT_DECODERS);
+        assert!(measurements[1]["packed_drain_peak"] <= MAX_RESIDENT_SNAPSHOT_DECODERS);
+        assert!(
+            measurements[2]["packed_peak"] <= 2,
+            "live Git processes must be bounded independently of valid alternate count"
+        );
+        assert!(measurements[2]["packed_drain_peak"] <= 2);
+    }
+
+    fn packed_pressure_stores(fixture: &ReuseFixture) -> (Vec<PathBuf>, String, Vec<u8>) {
+        let mut alternates = Vec::new();
+        let mut last = None;
+        for index in 0..5 {
+            let git_dir = fixture
+                .dir
+                .path()
+                .join(format!("workspace/alternate-{index}"));
+            fs::create_dir(&git_dir).unwrap();
+            fixture_git(&git_dir, &["init", "--bare", "-q"], None);
+            let body = format!("owned alternate {index}").into_bytes();
+            let id = fixture_git(&git_dir, &["hash-object", "-w", "--stdin"], Some(&body));
+            fixture_git(&git_dir, &["update-ref", "refs/fixture/object", &id], None);
+            fixture_git(&git_dir, &["repack", "-a", "-d"], None);
+            fixture_git(&git_dir, &["prune-packed"], None);
+            let store = git_dir.join("objects");
+            assert!(!store.join(&id[..2]).join(&id[2..]).exists());
+            alternates.push(store);
+            last = Some((id, body));
+        }
+        fs::write(
+            fixture.store.join("info/alternates"),
+            alternates
+                .iter()
+                .map(|path| format!("{}\n", path.display()))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let stores = qualified_snapshot_stores(
+            fixture.store.parent().unwrap(),
+            &fixture.dir.path().join("workspace/.git/objects"),
+        )
+        .unwrap();
+        assert_eq!(&stores[..5], alternates);
+        assert_eq!(stores.last(), Some(&fixture.store));
+        let (id, body) = last.unwrap();
+        (stores, id, body)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packed_decoder_pressure_refuses_evicted_late_exit_and_joins_every_child() {
+        let fixture = reuse_fixture(true);
+        let (stores, late_id, _) = packed_pressure_stores(&fixture);
+        snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+        let mut decoders = SnapshotPackedDecoders {
+            storage: Some(snapshot_packed_storage(&stores).unwrap()),
+            residency_limit: Some(2),
+            ..Default::default()
+        };
+        // An owned natural-exit fixture supplies a valid miss, then reports a
+        // late decoder failure when eviction closes stdin. No foreign process
+        // or host process-kill suite is involved.
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(
+            r#"while IFS= read -r oid; do printf '%s missing\n' "$oid"; done
+            printf '%s' 'owned pressure fixture late failure' >&2
+            exit 9"#,
+        );
+        let failed = SnapshotPackedDecoder::from_command(command).unwrap();
+        let failed_pid = failed.child.id();
+        decoders.children.insert(stores[0].clone(), failed);
+        let result = decoders.read(&stores, &late_id);
+        assert!(
+            matches!(result, Err(TransferError::Blocked(ref reason)) if reason.contains("owned pressure fixture late failure")),
+            "eviction must refuse the late failure before accepting later valid bytes"
+        );
+        assert!(decoders
+            .children
+            .values()
+            .all(|child| child.child.id() != failed_pid));
+        let counts = snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().counts.clone());
+        assert_eq!(counts["packed_query"], 2);
+        assert_eq!(counts["packed_spawn"], 2);
+        assert_eq!(counts["packed_reap"], 1);
+        assert_eq!(counts["packed_drain_join"], 1);
+        decoders.finish().unwrap();
+        assert!(decoders.children.is_empty());
+        let counts = snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().counts.clone());
+        assert_eq!(counts["packed_reap"], counts["packed_spawn"]);
+        assert_eq!(counts["packed_drain_join"], counts["packed_drain_spawn"]);
+        assert_eq!(counts["packed_peak"], 2);
+        assert_eq!(counts["packed_drain_peak"], 2);
+    }
+
+    #[test]
+    fn packed_decoder_pressure_replaced_pack_cannot_supply_retired_bytes() {
+        let fixture = reuse_fixture(true);
+        let (stores, late_id, late_body) = packed_pressure_stores(&fixture);
+        snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+        let mut decoders = SnapshotPackedDecoders {
+            residency_limit: Some(2),
+            ..Default::default()
+        };
+        let Some(SnapshotObjectSource::Packed { body, .. }) =
+            decoders.read(&stores, &late_id).unwrap()
+        else {
+            panic!("actual late store must be warm before replacement");
+        };
+        assert_eq!(body, late_body);
+        // Retain an open descriptor for the late store while also exhausting
+        // the residency limit with a genuinely absent lookup.
+        let absent = "0".repeat(40);
+        assert!(decoders.read(&stores, &absent).unwrap().is_none());
+        assert!(decoders.children.contains_key(&stores[4]));
+        let replacement_files = fs::read_dir(stores[0].join("pack"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        for original in fs::read_dir(stores[4].join("pack")).unwrap() {
+            let original = original.unwrap().path();
+            let replacement = replacement_files
+                .iter()
+                .find(|path| path.extension() == original.extension())
+                .unwrap();
+            fs::remove_file(&original).unwrap();
+            fs::copy(replacement, original).unwrap();
+        }
+        assert!(
+            decoders.read(&stores, &late_id).unwrap().is_none(),
+            "pressure must not preserve retired pack descriptor authority"
+        );
+        decoders.finish().unwrap();
+        let counts = snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().counts.clone());
+        assert_eq!(counts["packed_query"], stores.len() - 1 + 2 * stores.len());
+        assert_eq!(counts["packed_validate"], 1);
+        assert_eq!(counts["packed_spawn"], counts["packed_reap"]);
+        assert_eq!(counts["packed_drain_spawn"], counts["packed_drain_join"]);
+        assert_eq!(counts["packed_peak"], 2);
+        assert_eq!(counts["packed_drain_peak"], 2);
+    }
+
+    #[test]
+    fn packed_decoder_cold_miss_observes_new_pack_and_reaps_on_drop() {
+        let fixture = reuse_fixture(true);
+        let store = std::slice::from_ref(&fixture.store);
+        snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+        let mut decoders = SnapshotPackedDecoders::default();
+        // The native Git child genuinely queries and misses this object.
+        let body = b"new object after native cold miss";
+        let mut raw = format!("blob {}\0", body.len()).into_bytes();
+        raw.extend_from_slice(body);
+        let id = hex::encode(sha1::Sha1::digest(raw));
+        assert!(decoders.read(store, &id).unwrap().is_none());
+        assert_eq!(
+            fixture_git(
+                fixture.store.parent().unwrap(),
+                &["hash-object", "-w", "--stdin"],
+                Some(body)
+            ),
+            id
+        );
+        fixture_git(
+            fixture.store.parent().unwrap(),
+            &["update-ref", "refs/fixture/new", &id],
+            None,
+        );
+        fixture_git(
+            fixture.store.parent().unwrap(),
+            &["repack", "-a", "-d"],
+            None,
+        );
+        fixture_git(fixture.store.parent().unwrap(), &["prune-packed"], None);
+        assert!(!fixture_object_path(&fixture, &id).exists());
+        let Some(SnapshotObjectSource::Packed { body: current, .. }) =
+            decoders.read(store, &id).unwrap()
+        else {
+            panic!("new pack must supply current native bytes");
+        };
+        assert_eq!(current, body);
+        let counts = snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().counts.clone());
+        assert_eq!(counts["packed_spawn"], 2);
+        assert_eq!(counts["packed_reap"], 1);
+        assert_eq!(counts["packed_query"], 2);
+        drop(decoders);
+        assert_eq!(
+            snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().counts["packed_reap"]),
+            2
+        );
+    }
+
+    #[test]
+    fn packed_decoder_requalifies_native_context_even_when_ordered_store_is_shared() {
+        let fixture = reuse_fixture(true);
+        snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+        let stores = std::slice::from_ref(&fixture.store);
+        let mut decoders = SnapshotPackedDecoders::default();
+        for native in ["absent-native-one", "absent-native-two"] {
+            let bucket = fixture.dir.path().join(native);
+            assert_eq!(
+                qualified_snapshot_stores(&bucket, &fixture.store).unwrap(),
+                stores
+            );
+            decoders.qualify(&bucket, &fixture.store, stores).unwrap();
+            let Some(SnapshotObjectSource::Packed { body, .. }) =
+                decoders.read(stores, &fixture.blob).unwrap()
+            else {
+                panic!("each current context must independently query native bytes");
+            };
+            assert_eq!(body, b"synthetic overlapping saved blob");
+        }
+        decoders.finish().unwrap();
+        let counts = snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().counts.clone());
+        assert_eq!(counts["packed_spawn"], 2);
+        assert_eq!(counts["packed_query"], 2);
+        assert_eq!(counts["packed_validate"], 2);
+        assert_eq!(counts["packed_reap"], 2);
+    }
+
+    #[test]
+    fn complete_export_replaced_pack_cannot_supply_retired_descriptor_bytes() {
+        let fixture = reuse_fixture(true);
+        let replacement = reuse_fixture(true);
+        let git_dir = replacement.store.parent().unwrap();
+        let different = fixture_git(
+            git_dir,
+            &["hash-object", "-w", "--stdin"],
+            Some(b"unrelated replacement packed bytes"),
+        );
+        for index in 0..2 {
+            fixture_git(
+                git_dir,
+                &["update-ref", "-d", &format!("refs/fixture/{index}")],
+                None,
+            );
+        }
+        fixture_git(
+            git_dir,
+            &["update-ref", "refs/fixture/new", &different],
+            None,
+        );
+        fixture_git(git_dir, &["repack", "-a", "-d"], None);
+        let replacement_files = fs::read_dir(replacement.store.join("pack"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        let originals = fs::read_dir(fixture.store.join("pack"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        let packed_dir = fixture.store.join("pack");
+        let exported = export_after_warm_mutation(&fixture, move |count| {
+            if count != 2 {
+                return;
+            }
+            // Replace the exact names: a decoder retaining old descriptors
+            // would resurrect both original root trees despite this new pack.
+            for path in &originals {
+                let source = replacement_files
+                    .iter()
+                    .find(|source| source.extension() == path.extension())
+                    .unwrap();
+                fs::remove_file(path).unwrap();
+                fs::copy(source, path).unwrap();
+            }
+            assert_eq!(fs::read_dir(&packed_dir).unwrap().count(), originals.len());
+        })
+        .unwrap();
+        assert!(exported
+            .manifest()
+            .saved_snapshots
+            .iter()
+            .all(|reference| reference.availability
+                == SavedSnapshotAvailability::UnavailableInQualifiedLocations));
+        let counts = snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().counts.clone());
+        assert_eq!(counts["packed_spawn"], 2);
+        assert_eq!(counts["packed_reap"], 2);
+        assert_eq!(
+            counts["packed_query"], 12,
+            "warm closure and nine fresh unavailable root queries"
+        );
+    }
+
+    #[test]
+    fn complete_export_current_loose_overrides_warm_packed_decoder() {
+        for wrong_identity in [false, true] {
+            let fixture = reuse_fixture(true);
+            let path = fixture_object_path(&fixture, &fixture.blob);
+            let body = if wrong_identity {
+                b"wrong current native content".as_slice()
+            } else {
+                b"synthetic overlapping saved blob".as_slice()
+            };
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::none());
+            write!(encoder, "blob {}\0", body.len()).unwrap();
+            encoder.write_all(body).unwrap();
+            let current = encoder.finish().unwrap();
+            let sha = digest(&current);
+            let result = export_after_warm_mutation(&fixture, move |count| {
+                if count == 2 {
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    fs::write(&path, &current).unwrap();
+                }
+            });
+            if wrong_identity {
+                assert!(
+                    matches!(result, Err(TransferError::Blocked(ref reason)) if reason.contains("content identity"))
+                );
+                assert_eq!(
+                    fs::read_dir(fixture.dir.path().join("extract"))
+                        .unwrap()
+                        .count(),
+                    0
+                );
+            } else {
+                let export = result.unwrap();
+                for reference in &export.manifest().saved_snapshots {
+                    assert_eq!(
+                        reference
+                            .objects
+                            .iter()
+                            .find(|object| object.object_id == fixture.blob)
+                            .unwrap()
+                            .compressed_sha256,
+                        sha
+                    );
+                }
+                let (ordinary, _, _) = reuse_export(&fixture, Some(0));
+                assert_eq!(
+                    fs::read(&export.payload_path).unwrap(),
+                    fs::read(&ordinary.payload_path).unwrap()
+                );
+                assert_eq!(
+                    serde_json::to_value(export.manifest()).unwrap(),
+                    serde_json::to_value(ordinary.manifest()).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn complete_export_warm_packed_alternate_changes_requalify_current_storage() {
+        for outside in [false, true] {
+            let fixture = reuse_fixture(true);
+            let workspace = fixture.dir.path().join("workspace");
+            let alternate = if outside {
+                fixture.dir.path().join("unqualified/objects")
+            } else {
+                workspace.join(".git/alternate")
+            };
+            fs::create_dir_all(&alternate).unwrap();
+            let info = fixture.store.join("info");
+            let exported = export_after_warm_mutation(&fixture, move |count| {
+                if count == 2 {
+                    fs::write(
+                        info.join("alternates"),
+                        format!("{}\n", alternate.display()),
+                    )
+                    .unwrap();
+                }
+            });
+            if outside {
+                assert!(
+                    matches!(exported, Err(TransferError::Blocked(ref reason)) if reason.contains("outside"))
+                );
+                assert_eq!(
+                    fs::read_dir(fixture.dir.path().join("extract"))
+                        .unwrap()
+                        .count(),
+                    0
+                );
+            } else {
+                let exported = exported.unwrap();
+                assert!(exported
+                    .manifest()
+                    .saved_snapshots
+                    .iter()
+                    .all(|reference| reference.availability
+                        == SavedSnapshotAvailability::RetainedClosure));
+                let counts =
+                    snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().counts.clone());
+                assert_eq!(counts["packed_spawn"], 2);
+                assert_eq!(counts["packed_reap"], 2);
+                assert_eq!(counts["packed_query"], 30);
+                assert_eq!(counts["packed_validate"], 30);
             }
         }
     }
