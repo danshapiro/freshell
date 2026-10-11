@@ -4341,7 +4341,7 @@ describe('current handle admission before owner mutation', () => {
     ])).toThrow()
   })
 
-  it.each(['codex', 'opencode', 'claude', 'amplifier'] as const)('reads unchanged stopped history for %s through the tracked helper and returns only the original three proofs', async provider => {
+  it.each(['codex', 'opencode', 'claude', 'amplifier'] as const)('reads exact recovered stopped history for %s through the tracked helper and returns only the original three proofs', async provider => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task008-stopped-proofs-'))
     const nonce = `codename-${'e'.repeat(32)}`
     const historyFile = path.join(root, 'history.json')
@@ -4353,11 +4353,18 @@ describe('current handle admission before owner mutation', () => {
       {}, {}, 'release', { enabledProviders: [provider], freshAgentModes: [] })
     const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
     const row = { ...current, provider, launchState: 'stopped', desiredState: 'stopped', cleanupState: 'verified_empty', intentRevision: 1 }
-    const inventory = vi.spyOn(rig, 'inventory').mockResolvedValue([row])
+    const recoveredInventory = [
+      { ...row, incarnationId: 'incarnation-initial', containerId: 'a'.repeat(64), hostBootId: 'boot-initial' },
+      row,
+      { ...row, incarnationId: 'incarnation-other', containerId: 'd'.repeat(64), hostBootId: 'boot-other' },
+    ]
+    const inventory = vi.spyOn(rig, 'inventory').mockResolvedValue(recoveredInventory)
+    const receipt = { ...current, providerVolumeName: 'freshell-provider-aaaaaaaaaaaaaaaaaaaaaaaa',
+      workspacePath: rig.repoRoot, imageRef: rig.runtime.imageRef }
+    let receiptRows = [receipt]
     Object.defineProperty(rig.runtime, 'broker', { value: { proxySocketPath: path.join(root, 'broker.sock'),
-      receiptIds: () => new Set([current.containerId, helperId]), receipts: () => [{ ...current,
-        providerVolumeName: 'freshell-provider-aaaaaaaaaaaaaaaaaaaaaaaa', workspacePath: rig.repoRoot, imageRef: rig.runtime.imageRef }] } })
-    vi.spyOn(rig, 'ownedContainerState').mockResolvedValue({ present: false, running: false })
+      receiptIds: () => new Set([current.containerId, helperId]), receipts: () => receiptRows } })
+    const containerState = vi.spyOn(rig, 'ownedContainerState').mockResolvedValue({ present: false, running: false })
     const claim = vi.spyOn(rig, 'writerClaimFacts').mockResolvedValue({ provider, providerStoreId: 'owned-store',
       nativeSessionId: current.nativeSessionId, soulId: current.soulId, incarnationId: current.incarnationId,
       activeClaimCount: 0, globalConflictingClaimCount: 0 })
@@ -4388,6 +4395,59 @@ describe('current handle admission before owner mutation', () => {
       const calls = (await fsp.readFile(callsFile, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
       expect(calls.map(call => call.args[0])).toEqual(['create', 'start', 'wait', 'logs', 'rm'])
       expect(calls.every(call => call.host === `unix://${rig.runtime.broker.proxySocketPath}` && call.api === '1.47')).toBe(true)
+      const source = provider === 'claude' ? '/home/freshell/provider/.claude/projects'
+        : provider === 'codex' ? '/home/freshell/provider/.codex/sessions'
+        : provider === 'opencode' ? '/home/freshell/provider/.local/share/opencode/opencode.db' : '/home/freshell/provider/.amplifier/projects'
+      expect(calls[0].args).toContain(`type=volume,source=${receipt.providerVolumeName},target=/home/freshell/provider,readonly`)
+      expect(calls[0].args).toContain(rig.runtime.imageRef)
+      expect(calls[0].args.slice(-3)).toEqual([provider, source, current.nativeSessionId])
+
+      const admittedCalls = await fsp.readFile(callsFile, 'utf8')
+      const changedRows = [
+        { ...row, soulId: 'foreign-soul' },
+        { ...row, incarnationId: 'incarnation-stale' },
+        { ...row, containerId: 'f'.repeat(64) },
+        { ...row, hostBootId: 'foreign-boot' },
+        { ...row, nativeSessionId: 'foreign-root' },
+        { ...row, launchState: 'running' },
+        { ...row, desiredState: 'running' },
+        { ...row, cleanupState: 'pending' },
+        { ...row, provider: 'foreign-provider' },
+        { ...row, provider: undefined },
+        { ...row, freshAgentSessionType: `fresh${provider}` },
+      ]
+      for (const changedRow of changedRows) {
+        inventory.mockResolvedValue([recoveredInventory[0]!, changedRow, recoveredInventory[2]!])
+        await expect(rig.managedTerminalStoppedProofs(current, nonce)).rejects.toThrow(/stopped/)
+        expect(await fsp.readFile(callsFile, 'utf8')).toBe(admittedCalls)
+      }
+      for (const rows of [[recoveredInventory[0]!, recoveredInventory[2]!], [...recoveredInventory, { ...row }]]) {
+        inventory.mockResolvedValue(rows)
+        await expect(rig.managedTerminalStoppedProofs(current, nonce)).rejects.toThrow(/stopped/)
+        expect(await fsp.readFile(callsFile, 'utf8')).toBe(admittedCalls)
+      }
+      inventory.mockResolvedValue(recoveredInventory)
+      for (const changedHandle of [
+        { ...current, runId: 'foreign-run' }, { ...current, candidateSha: 'f'.repeat(40) },
+        { ...current, incarnationId: 'incarnation-unseen' },
+      ]) {
+        await expect(rig.managedTerminalStoppedProofs(changedHandle, nonce)).rejects.toThrow(/stopped/)
+        expect(await fsp.readFile(callsFile, 'utf8')).toBe(admittedCalls)
+      }
+      for (const rows of [[], [receipt, { ...receipt }], ...[
+        { ...receipt, soulId: 'foreign-soul' }, { ...receipt, incarnationId: 'incarnation-stale' },
+        { ...receipt, containerId: 'f'.repeat(64) }, { ...receipt, providerVolumeName: '' },
+        { ...receipt, workspacePath: '/foreign-workspace' }, { ...receipt, imageRef: 'foreign-image' },
+      ].map(changedReceipt => [changedReceipt])]) {
+        receiptRows = rows
+        await expect(rig.managedTerminalStoppedProofs(current, nonce)).rejects.toThrow(/receipt/)
+        expect(await fsp.readFile(callsFile, 'utf8')).toBe(admittedCalls)
+      }
+      receiptRows = [receipt]
+      containerState.mockResolvedValue({ present: true, running: true })
+      await expect(rig.managedTerminalStoppedProofs(current, nonce)).rejects.toThrow(/still running/)
+      expect(await fsp.readFile(callsFile, 'utf8')).toBe(admittedCalls)
+      containerState.mockResolvedValue({ present: false, running: false })
       await fsp.writeFile(historyFile, JSON.stringify({ ...history, nativeSessionId: 'foreign-native-root' }))
       await expect(rig.managedTerminalStoppedProofs(current, nonce)).rejects.toThrow(/identity differs/)
       expect(JSON.parse((await fsp.readFile(callsFile, 'utf8')).trim().split('\n').at(-1) ?? '{}').args[0]).toBe('rm')
