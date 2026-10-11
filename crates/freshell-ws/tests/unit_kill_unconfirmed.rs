@@ -37,6 +37,25 @@ async fn an_unconfirmed_stop_keeps_stopping_logs_an_error_and_acks_when_gone() {
     let h = UnitHarness::start(HarnessOpts::default()).await;
     let mut ws = h.connect().await;
     let tid = h.create_codex(&mut ws, "crq-u", Some("t-u")).await;
+    // The start stops its unused base unit without waiting for it, and the
+    // Gone hold below applies to every stop that has not confirmed yet. So
+    // first wait for each other recorded unit's Gone: then the hold applies
+    // only to the pane's own stop, and its record is the only one left.
+    let pane_unit = h.unit_for(&tid).id().as_str().to_string();
+    for record in unit_records(&h) {
+        let unit_id = record["unit_id"].as_str().expect("a unit id").to_string();
+        if unit_id == pane_unit {
+            continue;
+        }
+        cap.wait_for(
+            tracing::Level::INFO,
+            "unit.stop.gone",
+            &[("unit_id", &unit_id)],
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap_or_else(|| panic!("the start's other unit reaches Gone: {record}"));
+    }
     // Gone is held 8 s past the kill; UNCONFIRMED_AFTER (5 s) is measured
     // from the last signal, so the ERROR comes first.
     let _delay = unit_harness::GoneDelay::set(8000);

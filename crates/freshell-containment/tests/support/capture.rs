@@ -19,8 +19,10 @@ pub struct Event {
     pub at: Instant,
 }
 
+/// The captured events, and a wake-up for each one captured (see
+/// [`Captured::wait_for`]).
 #[derive(Clone, Default)]
-pub struct Captured(pub Arc<Mutex<Vec<Event>>>);
+pub struct Captured(pub Arc<Mutex<Vec<Event>>>, Arc<tokio::sync::Notify>);
 
 #[derive(Default)]
 struct Fields(BTreeMap<String, String>);
@@ -48,6 +50,7 @@ impl<S: tracing::Subscriber> Layer<S> for Captured {
                 fields: fields.0,
                 at,
             });
+            self.1.notify_waiters();
         }
     }
 }
@@ -68,6 +71,30 @@ impl Captured {
     /// `(key, value)` pair given (values as text).
     pub fn has_with(&self, level: tracing::Level, event: &str, fields: &[(&str, &str)]) -> bool {
         self.first(level, event, fields).is_some()
+    }
+
+    /// The first such event (as [`Captured::has_with`] matches them), once
+    /// it is captured: event-driven (woken by each captured event), giving
+    /// up after `limit`.
+    pub async fn wait_for(
+        &self,
+        level: tracing::Level,
+        event: &str,
+        fields: &[(&str, &str)],
+        limit: std::time::Duration,
+    ) -> Option<Event> {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            let captured = self.1.notified();
+            tokio::pin!(captured);
+            // Registered before the check, so an event captured between the
+            // check and the wait still wakes it.
+            captured.as_mut().enable();
+            if let Some(found) = self.first(level, event, fields) {
+                return Some(found);
+            }
+            tokio::time::timeout_at(deadline, captured).await.ok()?;
+        }
     }
 
     /// The first such event (as [`Captured::has_with`] matches them).
