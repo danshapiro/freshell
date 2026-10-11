@@ -5906,6 +5906,7 @@ mod native_source_inventory_tests {
             "missing",
             "corrupt",
             "wrong_id",
+            #[cfg(unix)]
             "redirected",
             "disallowed_alternate",
         ] {
@@ -5929,10 +5930,10 @@ mod native_source_inventory_tests {
                         fs::remove_file(&child).unwrap();
                         fs::write(&child, &other).unwrap();
                     }
+                    #[cfg(unix)]
                     "redirected" => {
                         let target = outside.join("object");
                         fs::rename(&child, &target).unwrap();
-                        #[cfg(unix)]
                         std::os::unix::fs::symlink(&target, &child).unwrap();
                     }
                     "disallowed_alternate" => {
@@ -6085,13 +6086,19 @@ mod native_source_inventory_tests {
 
     #[test]
     fn complete_export_warm_packed_store_changes_remain_authoritative() {
-        for change in ["missing", "corrupt", "redirected"] {
+        for change in [
+            "missing",
+            "corrupt",
+            #[cfg(unix)]
+            "redirected",
+        ] {
             let fixture = reuse_fixture(true);
             let pack_directory = fixture.store.join("pack");
             let pack_files = fs::read_dir(&pack_directory)
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
                 .collect::<Vec<_>>();
+            #[cfg(unix)]
             let outside = fixture.dir.path().join("outside-pack");
             let result = export_after_warm_mutation(&fixture, move |count| {
                 if count != 2 {
@@ -6114,9 +6121,9 @@ mod native_source_inventory_tests {
                             fs::write(path, bytes).unwrap();
                         }
                     }
+                    #[cfg(unix)]
                     "redirected" => {
                         fs::rename(&pack_directory, &outside).unwrap();
-                        #[cfg(unix)]
                         std::os::unix::fs::symlink(&outside, &pack_directory).unwrap();
                     }
                     _ => unreachable!(),
