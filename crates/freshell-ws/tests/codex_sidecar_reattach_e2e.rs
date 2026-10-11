@@ -59,9 +59,9 @@ use freshell_codex::launch_lifecycle::{
     CodexTerminalLaunchManager, SpawnedCodexAppServerRuntime,
 };
 use freshell_codex::{
-    proc_cmdline, proc_starttime, select_codex_runtime, BoxFuture, CodexSidecarRecord,
-    CodexSidecarStore, SidecarReconciler, SidecarRecordState, CODEX_SIDECAR_OWNERSHIP_ENV,
-    SIDECAR_RECORD_VERSION,
+    mint_ownership_id, proc_cmdline, proc_starttime, select_codex_runtime, BoxFuture,
+    CodexSidecarRecord, CodexSidecarStore, SidecarReconciler, SidecarRecordState,
+    CODEX_SIDECAR_OWNERSHIP_ENV, SIDECAR_RECORD_VERSION,
 };
 use freshell_ws::WsState;
 
@@ -1138,7 +1138,11 @@ fn restore_reattaches_tui_to_surviving_sidecar_preserving_in_flight_turn() {
         // The survivor and any app-server the restore might start use the
         // scenario's own Codex home, never the user's ~/.codex.
         let _codex_home = ScenarioCodexHome::with_rollout(session_id);
-        let ownership_id = "codex-sidecar-da920e2e-0001-4aaa-8aaa-aaaaaaaaaaaa";
+        // Minted per run, as the product mints one: the survivor carries it
+        // as its legacy tag, which the reattached unit's stop finds members
+        // by, so a fixed id would let this run's kill reach the survivor of
+        // a concurrent run of this test.
+        let ownership_id = &mint_ownership_id();
         let log_a = std::env::temp_dir().join(format!(
             "freshell-codex-reattach-e2e-oplog-a-{}.jsonl",
             std::process::id()
