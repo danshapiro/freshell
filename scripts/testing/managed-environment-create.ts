@@ -4,6 +4,7 @@ import http from 'node:http'
 import path from 'node:path'
 import { ErrorCode, type ErrorMessage } from '../../shared/ws-protocol.js'
 import { dockerSocketPath } from './runtime-sandbox.js'
+import { providerParityFailureDiagnostics } from '../../test/helpers/provider-parity-environment.js'
 
 export async function readManagedEnvironmentDaemonId(): Promise<string> {
   const dockerHost = process.env.DOCKER_HOST
@@ -26,11 +27,14 @@ export async function readManagedEnvironmentDaemonId(): Promise<string> {
 
 type ManagedCreateOwner = {
   web: { capturedOutput(): { stdout: string; stderr: string } }
-  runtime: { containerLogs(id: string): string; writeIncident(name: string, value: unknown): void }
+  runtime: { containerLogs(id: string): string; writeIncident(name: string, value: unknown): void;
+    broker?: { receiptIds(): Set<string> } }
   supervisor: { containerId: string; runtimeRoot?: string }
 }
 
 const failureReasons = [
+  'OneCLI grant is unavailable',
+  'prepared private source unreadable',
   'initial provider source lost its current prepared reservation',
   'runtime image must be pinned by sha256 id/digest',
   'provider volume name is not installation-scoped',
@@ -75,6 +79,7 @@ const activationStages = ['capability_pending', 'ensure_runtime_directory', 'ens
   'revalidate_initial_provider_source', 'create_stopped_runtime', 'commit_backend_identity',
   'load_owned_handle', 'authenticate_running_host', 'read_running_host_status', 'adopt_running_worker',
   'start_session_host', 'authenticate_started_host', 'commit_execution_grant', 'enable_long_lived_runtime',
+  'deliver_execution_grant',
   'record_native_identity', 'commit_running_state', 'commit_provider_inputs', 'load_running_view']
 
 export function assertManagedTerminalCreated(owner: ManagedCreateOwner,
@@ -97,6 +102,7 @@ export function assertManagedTerminalCreated(owner: ManagedCreateOwner,
     const code = ErrorCode.safeParse(response.code)
     const web = owner.web.capturedOutput()
     let supervisor: Record<string, string> | 'UNKNOWN' = 'UNKNOWN'
+    let sessionHost: Record<string, unknown> | 'UNKNOWN' = 'UNKNOWN'
     try {
       let lifecycle = ''
       if (owner.supervisor.runtimeRoot) {
@@ -106,6 +112,23 @@ export function assertManagedTerminalCreated(owner: ManagedCreateOwner,
         try {
           if (fs.statSync(file).size <= 2 * 1024 * 1024) lifecycle = fs.readFileSync(file, 'utf8').slice(-20_000)
         } catch { /* Missing owning-file evidence remains unknown. */ }
+      }
+      // Host identities come from this supervisor's owned lifecycle file.
+      // A matching broker receipt is required before reading that host's logs.
+      const startedHosts = new Map<string, string>()
+      let failedIncarnation: string | undefined
+      for (const line of lifecycle.split('\n')) {
+        try {
+          const entry = JSON.parse(line)
+          const data = entry.data
+          if (typeof data?.incarnationId !== 'string') continue
+          if (entry.event === 'supervisor.host_started'
+            && typeof data.containerId === 'string' && /^[a-f0-9]{64}$/.test(data.containerId)) {
+            startedHosts.set(data.incarnationId, data.containerId)
+          } else if (entry.event === 'supervisor.activation_failed') {
+            failedIncarnation = data.incarnationId
+          }
+        } catch { /* Invalid owning-file evidence cannot select a host. */ }
       }
       const logs = `${owner.runtime.containerLogs(owner.supervisor.containerId)}\n${lifecycle}`
       for (const line of logs.split('\n')) {
@@ -119,11 +142,16 @@ export function assertManagedTerminalCreated(owner: ManagedCreateOwner,
               'HOST_UNREACHABLE'].includes(data?.errorCode) ? data.errorCode : 'UNKNOWN' }
         } catch { /* Non-JSON owning-process output is not retained. */ }
       }
+      const hostId = failedIncarnation && startedHosts.get(failedIncarnation)
+      if (hostId && owner.runtime.broker?.receiptIds().has(hostId)) {
+        sessionHost = { containerId: hostId,
+          ...providerParityFailureDiagnostics(owner.runtime.containerLogs(hostId)) }
+      }
     } catch { /* An absent owned supervisor leaves its observation unknown. */ }
     owner.runtime.writeIncident('managed-environment-create-failure', {
       severity: 'error', event: 'managed_environment.create_failed', code: code.success ? code.data : 'UNKNOWN', reason, ...(osError === undefined ? {} : { osError }),
       server: { source: 'owned-server-typed-reply',
-        capturedOutputAvailable: Boolean(web.stdout || web.stderr) }, supervisor,
+        capturedOutputAvailable: Boolean(web.stdout || web.stderr) }, supervisor, sessionHost,
     })
   }
   assert.equal(response.type, 'terminal.created')
