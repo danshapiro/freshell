@@ -16,6 +16,39 @@ import { validateProviderQualificationReceipt } from '../../../../scripts/testin
 import { validateFreshAgentQualificationReceipt } from '../../../../scripts/testing/fresh-agent-qualification-receipt.js'
 import { exposeGrantsToHarness, fakeOnecliGrants } from '../../../integration/server/provider-parity-onecli.js'
 
+describe('provider parity suite discovery', () => {
+  it.each([
+    { context: 'local', environment: {}, runtimeSuites: true },
+    { context: 'local Cloud dispatcher', environment: { FRESHELL_VITEST_BACKEND: 'cloud', CI: 'true' }, runtimeSuites: true },
+    { context: 'source-only Cloud Vitest worker', environment: { TEST_MODE: 'vitest' }, runtimeSuites: false },
+    { context: 'other container mode', environment: { TEST_MODE: 'playwright' }, runtimeSuites: true },
+  ])('collects the intended runtime and callback suites in $context', ({ environment, runtimeSuites }) => {
+    const repoRoot = path.resolve(import.meta.dirname, '../../../..')
+    const cache = fs.mkdtempSync(path.join(os.tmpdir(), 'provider-parity-discovery-'))
+    const env: NodeJS.ProcessEnv = { ...process.env, ...environment }
+    if (!('TEST_MODE' in environment)) delete env.TEST_MODE
+    try {
+      // Glob the real default config without importing test modules or running
+      // the runtime suites' beforeAll hooks. Close the collector in the child.
+      const files: string[] = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', `
+        import { createVitest } from 'vitest/node'
+        import path from 'node:path'
+        const collector = await createVitest({ config: 'config/vitest/vitest.config.ts', watch: false }, {
+          configLoader: 'runner', cacheDir: process.argv[1],
+        })
+        try {
+          const specifications = await collector.globTestSpecifications()
+          process.stdout.write(JSON.stringify(specifications.map(specification => path.relative(process.cwd(), specification.moduleId))))
+        } finally { await collector.close() }
+      `, cache], { cwd: repoRoot, env, encoding: 'utf8', timeout: 30_000 }))
+      const paritySuites = ['fresh-agent-parity.test.ts', 'managed-provider-parity.test.ts']
+        .map(file => `test/integration/server/${file}`)
+      expect(files.filter(file => paritySuites.includes(file)).sort()).toEqual(runtimeSuites ? paritySuites : [])
+      expect(files).toContain('test/unit/tooling/testing/provider-parity-receipt.test.ts')
+    } finally { fs.rmSync(cache, { recursive: true, force: true }) }
+  })
+})
+
 describe('fake provider parity grant isolation', () => {
   it.each(['fresh-agent-parity.test.ts', 'managed-provider-parity.test.ts'].flatMap(file =>
     ['stop', 'remove'].map(stage => ({ file, stage }))))(

@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { createHash } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 const { DatabaseSync }: typeof import('node:sqlite') = createRequire(import.meta.url)('node:sqlite')
 import fs from 'node:fs'
@@ -519,9 +520,14 @@ describe('qualification from private native originals', () => {
   )
   it('refuses missing originals through the actual settled owner finalizer without publishing assertions or a receipt', async () => {
     const { input } = fixture()
-    const owner = new ManagedRuntimeOwner(() => { throw new Error('unused native original fixture web') }, path.resolve(import.meta.dirname, '../../../..'), 5,
+    // The source-only Cloud image has no Git checkout. Give the actual owner
+    // an owned fixture repository instead of borrowing host source identity.
+    execFileSync('git', ['init', '--quiet'], { cwd: input.repoRoot, timeout: 10_000 })
+    execFileSync('git', ['-c', 'user.name=Dan Shapiro', '-c', 'user.email=3732858+danshapiro@users.noreply.github.com',
+      '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '--quiet', '-m', 'Owned qualification finalizer fixture'], { cwd: input.repoRoot, timeout: 10_000 })
+    const owner = new ManagedRuntimeOwner(() => { throw new Error('unused native original fixture web') }, input.repoRoot, 5,
       {}, {}, 'release', { enabledProviders: [], freshAgentModes: ['freshcodex'] })
-    Object.assign(owner, { repoRoot: input.repoRoot, stopSettlement: Promise.resolve({ ok: true, errors: [] }) })
+    Object.assign(owner, { stopSettlement: Promise.resolve({ ok: true, errors: [] }) })
     Object.assign(owner.runtime, { evidenceDir: input.evidenceDir, candidateSha, runId: receiptRunId, imageRef: runtimeImage, browserDir: path.join(input.evidenceDir, 'browser') })
     const target = path.join(input.evidenceDir, 'published-receipt.json')
     vi.stubEnv('FRESHELL_RUNTIME_PHASE3_FRESH_AGENT_RECEIPT', target)

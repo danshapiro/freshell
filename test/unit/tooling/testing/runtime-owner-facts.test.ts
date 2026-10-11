@@ -164,7 +164,7 @@ async function nativeOwnerHistory(provider: 'claude' | 'amplifier', nonce: strin
   return readAmplifierNativeHistory(root, sessionId)
 }
 
-async function installNativeToolFixture(): Promise<void> {
+async function installNativeToolFixture(relativeProducerShim = false): Promise<void> {
   await fsp.chmod(fixtureRepoRoot, 0o755)
   await fsp.writeFile(path.join(fixtureRepoRoot, 'package.json'), JSON.stringify({
     name: 'native-tool-fixture', private: true, type: 'commonjs', packageManager: 'pnpm@10.34.5',
@@ -173,7 +173,22 @@ async function installNativeToolFixture(): Promise<void> {
   const packageRoot = 'packages/freshell-mcp-runtime'
   await fsp.mkdir(path.join(fixtureRepoRoot, packageRoot), { recursive: true })
   await fsp.copyFile(path.join(sourceRoot, packageRoot, 'package.json'), path.join(fixtureRepoRoot, packageRoot, 'package.json'))
-  await fsp.symlink(path.join(sourceRoot, packageRoot, 'node_modules'), path.join(fixtureRepoRoot, packageRoot, 'node_modules'))
+  const esbuildVersion = JSON.parse(await fsp.readFile(path.join(fixtureRepoRoot, packageRoot, 'package.json'), 'utf8')).devDependencies.esbuild
+  // Supply the producer's real package for pnpm's relative launcher without
+  // making the isolated consumer's deliberately broken loader usable.
+  const producerStore = path.join(fixtureRepoRoot, `node_modules/.pnpm/esbuild@${esbuildVersion}/node_modules`)
+  await fsp.mkdir(producerStore, { recursive: true })
+  await fsp.symlink(fs.realpathSync(path.join(sourceRoot, packageRoot, 'node_modules/esbuild')),
+    path.join(producerStore, 'esbuild'))
+  if (relativeProducerShim) {
+    // A frozen --ignore-scripts install retains a pnpm shim that resolves
+    // its producer through the workspace root's virtual store.
+    const bin = path.join(fixtureRepoRoot, packageRoot, 'node_modules/.bin/esbuild')
+    await fsp.mkdir(path.dirname(bin), { recursive: true })
+    await fsp.writeFile(bin, `#!/bin/sh\nbasedir=$(dirname "$0")\nexec "$basedir/../../../../node_modules/.pnpm/esbuild@${esbuildVersion}/node_modules/esbuild/bin/esbuild" "$@"\n`, { mode: 0o755 })
+  } else {
+    await fsp.symlink(path.join(sourceRoot, packageRoot, 'node_modules'), path.join(fixtureRepoRoot, packageRoot, 'node_modules'))
+  }
   await fsp.cp(path.join(sourceRoot, 'test/e2e-browser/helpers/provider-native-history'),
     path.join(fixtureRepoRoot, 'test/e2e-browser/helpers/provider-native-history'), { recursive: true })
   await fsp.mkdir(path.join(fixtureRepoRoot, 'scripts/testing'), { recursive: true })
@@ -206,8 +221,10 @@ describe('native history tool dependency delivery', () => {
     } finally { vi.unstubAllEnvs() }
   })
 
-  it.each(['claude', 'amplifier'] as const)('executes the stopped %s capture without helper access to pnpm dependencies', async provider => {
-    await installNativeToolFixture()
+  it.each((['claude', 'amplifier'] as const).flatMap(provider =>
+    [false, true].map(relativeProducerShim => ({ provider, relativeProducerShim }))
+  ))('executes the stopped $provider capture without helper access to pnpm dependencies (relative producer shim=$relativeProducerShim)', async ({ provider, relativeProducerShim }) => {
+    await installNativeToolFixture(relativeProducerShim)
     const expected = await nativeOwnerHistory(provider, 'fictional-loader-marker')
     const home = path.join(fixtureRepoRoot, 'fake-provider')
     const source = path.join(home, provider === 'claude' ? '.claude/projects' : '.amplifier/projects')
