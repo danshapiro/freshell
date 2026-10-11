@@ -97,7 +97,7 @@ it.each(['response', 'disconnect'])('records the actual upstream request and its
     await arrived
     const started = await diagnostics()
     expect(started).toHaveLength(1)
-    expect(started[0]).toMatchObject({ event: 'runtime.broker.request_started', severity: 'info', method: 'GET', url: '/_ping' })
+    expect(started[0]).toMatchObject({ event: 'runtime.broker.request_started', severity: 'info', method: 'GET', route: 'daemon_ping' })
     expect(started[0].requestId).toEqual(expect.any(String))
     expect(instance.eventsSnapshot()).toEqual([])
     const holdStarted = performance.now()
@@ -109,7 +109,7 @@ it.each(['response', 'disconnect'])('records the actual upstream request and its
     const events = await diagnostics()
     expect(events).toHaveLength(2)
     expect(events[1]).toMatchObject({ event: 'runtime.broker.request_completed', requestId: started[0].requestId,
-      severity: settlement === 'response' ? 'info' : 'warn', method: 'GET', url: '/_ping',
+      severity: settlement === 'response' ? 'info' : 'warn', method: 'GET', route: 'daemon_ping',
       ...(settlement === 'response' ? { statusCode: 503 } : { errorCategory: 'upstream_request_failed' }) })
     expect(events[1].durationMs).toEqual(expect.any(Number))
     expect(events[1].durationMs).toBeGreaterThanOrEqual(holdDuration)
@@ -450,6 +450,7 @@ type ForwardedRequest = { method: string; url: string; body: any }
 type BrokerHttpFixture = {
   request(method: string, url: string, body?: unknown, timeoutMs?: number): Promise<{ status: number; body: string }>
   forwarded: ForwardedRequest[]
+  logPath: string
   broker: RestrictedDockerBroker
   loseHelperAck(): void
   returnHelperId(id: string): void
@@ -525,7 +526,7 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
   try {
     await new Promise<void>((resolve) => upstream.listen(socket, resolve))
     await instance.start()
-    await run({ request, forwarded, broker: instance, loseHelperAck: () => { loseAck = true }, returnHelperId: (id) => { helperAckId = id } })
+    await run({ request, forwarded, logPath: path.join(dir, 'broker.jsonl'), broker: instance, loseHelperAck: () => { loseAck = true }, returnHelperId: (id) => { helperAckId = id } })
   } finally {
     upstream.closeAllConnections()
     await instance.close()
@@ -533,6 +534,40 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
     await fs.rm(dir, { recursive: true, force: true })
   }
 }
+
+it('omits private query fields from diagnostics for admitted owned requests', async () => {
+  await withHttpBroker(async ({ request, forwarded, broker, logPath }) => {
+    const privateValue = 'private encoded query/value'
+    const encoded = encodeURIComponent(privateValue)
+    const createUrl = `/v1.47/containers/create?name=owned-runtime&private=${encoded}`
+    expect((await request('POST', createUrl, createBody([...ordinaryBinds, actorBind]))).status).toBe(201)
+    const inspectUrl = `/v1.47/containers/${ownedId}/json?private=${encoded}`
+    expect((await request('GET', inspectUrl)).status).toBe(200)
+    expect(forwarded.map(row => row.url)).toEqual([createUrl, inspectUrl])
+    expect(broker.receipts()).toHaveLength(1)
+    expect(broker.receipts()[0].containerId).toBe(ownedId)
+    expect(broker.eventsSnapshot().map(row => row.url)).toEqual([createUrl, inspectUrl])
+    expect(broker.unsafeAttempts()).toEqual([])
+    const rows = (await fs.readFile(logPath, 'utf8')).trim().split('\n').map(line => JSON.parse(line)).filter(row => row.event)
+    expect(rows).toHaveLength(4)
+    const diagnostics = JSON.stringify(rows)
+    expect(diagnostics).not.toContain(encoded)
+    expect(diagnostics).not.toContain(privateValue)
+    expect(rows[0]).toMatchObject({ route: 'container_create' })
+    expect(rows[2]).toMatchObject({ route: 'container_json', containerId: ownedId })
+    expect(rows[0].requestId).toBe(rows[1].requestId)
+    expect(rows[2].requestId).toBe(rows[3].requestId)
+    const stopUrl = `/v1.47/containers/${ownedId}/stop?t=2&private=${encoded}`
+    expect((await request('POST', stopUrl)).status).toBe(200)
+    const stopRows = (await fs.readFile(logPath, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+      .filter(row => row.event && row.route === 'container_stop')
+    expect(stopRows).toHaveLength(2)
+    expect(stopRows[0]).toMatchObject({ containerId: ownedId, stopGraceSeconds: 2 })
+    expect(stopRows[1]).toMatchObject({ containerId: ownedId, stopGraceSeconds: 2, statusCode: 200 })
+    expect(JSON.stringify(stopRows)).not.toContain(encoded)
+    expect(broker.destructiveRequestsFor(ownedId)).toMatchObject([{ url: stopUrl, decision: 'forward', unsafeAttempt: false }])
+  })
+})
 
 const repairName = 'freshell-opencode-repair-11111111-1111-4111-8111-111111111111'
 const repairStageRoot = '/tmp/owned/r/scenario/x/opencode-transfers'

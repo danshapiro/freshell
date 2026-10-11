@@ -1,9 +1,11 @@
 import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
+import http from 'node:http'
 import path from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
+import { RestrictedDockerBroker } from '../../../../scripts/testing/runtime-test-broker.js'
 
 import {
   PHASE5_LOSS_ASSERTIONS_FILE,
@@ -299,6 +301,56 @@ afterEach(() => {
 })
 
 describe('Phase 5 loss receipt validation', () => {
+  it('builds and validates actual socket broker diagnostics without weakening decisions', async () => {
+    const fx = createFixture()
+    const upstream = http.createServer((request, response) => { request.resume(); response.end('OK') })
+    const socket = path.join(fx.repoRoot, 'up.sock')
+    const proxy = path.join(fx.repoRoot, 'proxy.sock')
+    const logPath = path.join(fx.evidenceDir, 'broker.jsonl')
+    const broker = new RestrictedDockerBroker({ realSocketPath: socket, proxySocketPath: proxy,
+      runtimeRootPrefix: fx.repoRoot, allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set(),
+      testRunId: runId, logPath })
+    try {
+      await new Promise<void>(resolve => upstream.listen(socket, resolve))
+      await broker.start()
+      await new Promise<void>((resolve, reject) => {
+        const request = http.get({ socketPath: proxy, path: '/_ping' }, response => {
+          response.resume(); response.once('end', resolve)
+        })
+        request.once('error', reject)
+      })
+      const bytes = fs.readFileSync(logPath, 'utf8')
+      const rows = bytes.trim().split('\n').map(line => JSON.parse(line))
+      expect(rows.filter(row => row.event)).toHaveLength(2)
+      expect(broker.eventsSnapshot()).toMatchObject([{ decision: 'forward', destructive: false, unsafeAttempt: false }])
+      const build = () => buildPhase5LossReceipt({ ...fx, candidateSha: sha, runtimeImage: runtimeImage, receiptRunId: runId,
+        candidateBefore: fx.receipt.candidateIntegrity.before, candidateAfter: fx.receipt.candidateIntegrity.after })
+      const receipt = build()
+      expect(validatePhase5LossReceipt({ ...fx, candidateSha: sha, runtimeImage: runtimeImage, receipt }).summary).toEqual(fx.receipt.summary)
+      for (const mutation of [
+        (row: any) => { row.event = 'runtime.broker.unknown' },
+        (row: any) => { row.durationMs = -1 },
+        (row: any) => { row.statusCode = 999 },
+        (row: any) => { row.errorCategory = 'private detail' },
+        (row: any) => { delete row.requestId },
+        (row: any) => { row.unsafeAttempt = true },
+        (row: any) => { row.privatePayload = 'unexpected' },
+      ]) {
+        const modified = structuredClone(rows)
+        mutation(modified.find(row => row.event === 'runtime.broker.request_completed'))
+        fs.writeFileSync(logPath, modified.map(row => JSON.stringify(row)).join('\n') + '\n')
+        expect(build).toThrow(/broker/)
+      }
+      fs.writeFileSync(logPath, rows.filter(row => row.event).map(row => JSON.stringify(row)).join('\n') + '\n')
+      expect(build).toThrow(/broker.*decision/)
+
+    } finally {
+      upstream.closeAllConnections()
+      await broker.close()
+      await new Promise<void>(resolve => upstream.close(() => resolve()))
+    }
+  })
+
   it('derives a PASS only from candidate-bound incident, lifecycle, cleanup, broker, and capability evidence', () => {
     const fx = createFixture()
     const validated = validatePhase5LossReceipt({

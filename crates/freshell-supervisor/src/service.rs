@@ -36,6 +36,62 @@ use tokio::{
     time::{sleep, Duration, Instant},
 };
 
+/// Private cause information retained before the public runtime error projection.
+struct ClassifiedFailure {
+    error: RuntimeError,
+    category: &'static str,
+    http_status: Option<u16>,
+}
+
+impl ClassifiedFailure {
+    fn timeout(error: RuntimeError) -> Self {
+        Self {
+            error,
+            category: "timeout",
+            http_status: None,
+        }
+    }
+
+    fn backend(error: BackendError) -> Self {
+        let (category, http_status) = backend_failure_category(&error);
+        Self {
+            error: map_backend(error),
+            category,
+            http_status,
+        }
+    }
+}
+
+impl From<RuntimeError> for ClassifiedFailure {
+    fn from(error: RuntimeError) -> Self {
+        let category = match error.code {
+            RuntimeErrorCode::HostUnreachable | RuntimeErrorCode::BackendUnavailable => {
+                "unavailable"
+            }
+            RuntimeErrorCode::HostAuthenticationFailed => "authentication_failed",
+            RuntimeErrorCode::OwnershipMismatch => "ownership_mismatch",
+            _ => "runtime_error",
+        };
+        Self {
+            error,
+            category,
+            http_status: None,
+        }
+    }
+}
+
+fn backend_failure_category(error: &BackendError) -> (&'static str, Option<u16>) {
+    match error {
+        BackendError::Unavailable(_) => ("unavailable", None),
+        BackendError::OwnershipMismatch(_) => ("ownership_mismatch", None),
+        BackendError::PolicyMismatch(_) => ("policy_mismatch", None),
+        BackendError::DockerHttp { status, .. } => ("docker_http", Some(*status)),
+        BackendError::Malformed(_) => ("malformed_response", None),
+        BackendError::InvalidConfig(_) => ("invalid_config", None),
+        BackendError::StoppedRepair(_) => ("stopped_repair", None),
+    }
+}
+
 #[derive(Clone)]
 pub struct SupervisorConfig {
     pub runtime_root: PathBuf,
@@ -2663,18 +2719,18 @@ impl Supervisor {
             .await
             .map_err(map_registry)?;
         match self
-            .verify_empty_before(handle, Instant::now() + Duration::from_secs(3))
+            .verify_empty_before_classified(handle, Instant::now() + Duration::from_secs(3))
             .await
         {
             Ok(true) => return Ok(StopOutcome::VerifiedEmpty),
             Ok(false) => {}
             Err(error) => {
                 self.stop_runtime_stage_failed(handle, "initial_empty_inspection", &error);
-                return Ok(stop_verification_outcome(error));
+                return Ok(stop_verification_outcome(error.error));
             }
         }
         match self
-            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .authenticate_host_classified(handle.incarnation_id(), handle.runtime_dir())
             .await
         {
             Ok(authenticated) => {
@@ -2683,7 +2739,7 @@ impl Supervisor {
                     .await
                     .map_err(map_registry)?;
                 if let Err(error) = self
-                    .send_host_stop(
+                    .send_host_stop_classified(
                         handle.incarnation_id().clone(),
                         handle.runtime_dir(),
                         &authenticated,
@@ -2720,7 +2776,7 @@ impl Supervisor {
                 .map_err(map_registry)?;
             return Ok(
                 match self
-                    .verify_empty_before(handle, Instant::now() + Duration::from_secs(3))
+                    .verify_empty_before_classified(handle, Instant::now() + Duration::from_secs(3))
                     .await
                 {
                     Ok(true) => StopOutcome::VerifiedEmpty,
@@ -2730,7 +2786,7 @@ impl Supervisor {
                             "graceful_failure_empty_inspection",
                             &inspection_error,
                         );
-                        if inspection_error.code == RuntimeErrorCode::OwnershipMismatch {
+                        if inspection_error.error.code == RuntimeErrorCode::OwnershipMismatch {
                             StopOutcome::BlockedOwnership
                         } else {
                             stop_backend_outcome(error)
@@ -2742,14 +2798,14 @@ impl Supervisor {
         }
         stop_crash_boundary("ordinary_stop_after_graceful");
         match self
-            .verify_empty_with_budget(handle, Duration::from_secs(3))
+            .verify_empty_with_budget_classified(handle, Duration::from_secs(3))
             .await
         {
             Ok(true) => return Ok(StopOutcome::VerifiedEmpty),
             Ok(false) => {}
             Err(error) => {
                 self.stop_runtime_stage_failed(handle, "graceful_empty_inspection", &error);
-                return Ok(stop_verification_outcome(error));
+                return Ok(stop_verification_outcome(error.error));
             }
         }
         self.registry
@@ -2765,7 +2821,7 @@ impl Supervisor {
         }
         Ok(
             match self
-                .verify_empty_with_budget(handle, Duration::from_secs(3))
+                .verify_empty_with_budget_classified(handle, Duration::from_secs(3))
                 .await
             {
                 Ok(true) => StopOutcome::VerifiedEmpty,
@@ -2781,7 +2837,7 @@ impl Supervisor {
                 }
                 Err(error) => {
                     self.stop_runtime_stage_failed(handle, "force_empty_inspection", &error);
-                    stop_verification_outcome(error)
+                    stop_verification_outcome(error.error)
                 }
             },
         )
@@ -2812,9 +2868,15 @@ impl Supervisor {
         &self,
         handle: &crate::registry::OwnedRuntimeHandle,
         stage: &str,
-        error: &RuntimeError,
+        failure: &ClassifiedFailure,
     ) {
-        self.stop_stage_failed(handle, stage, "runtime_error", Some(error.code), None);
+        self.stop_stage_failed(
+            handle,
+            stage,
+            failure.category,
+            Some(failure.error.code),
+            failure.http_status,
+        );
     }
 
     fn stop_request_result(
@@ -2827,15 +2889,7 @@ impl Supervisor {
         match result {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => {
-                let (category, status) = match &error {
-                    BackendError::Unavailable(_) => ("unavailable", None),
-                    BackendError::OwnershipMismatch(_) => ("ownership_mismatch", None),
-                    BackendError::PolicyMismatch(_) => ("policy_mismatch", None),
-                    BackendError::DockerHttp { status, .. } => ("docker_http", Some(*status)),
-                    BackendError::Malformed(_) => ("malformed_response", None),
-                    BackendError::InvalidConfig(_) => ("invalid_config", None),
-                    BackendError::StoppedRepair(_) => ("stopped_repair", None),
-                };
+                let (category, status) = backend_failure_category(&error);
                 self.stop_stage_failed(handle, stage, category, None, status);
                 Err(error)
             }
@@ -2851,9 +2905,22 @@ impl Supervisor {
         handle: &crate::registry::OwnedRuntimeHandle,
         budget: Duration,
     ) -> Result<bool, RuntimeError> {
+        self.verify_empty_with_budget_classified(handle, budget)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    async fn verify_empty_with_budget_classified(
+        &self,
+        handle: &crate::registry::OwnedRuntimeHandle,
+        budget: Duration,
+    ) -> Result<bool, ClassifiedFailure> {
         let deadline = Instant::now() + budget;
         loop {
-            if self.verify_empty_before(handle, deadline).await? {
+            if self
+                .verify_empty_before_classified(handle, deadline)
+                .await?
+            {
                 return Ok(true);
             }
             tokio::time::sleep_until((Instant::now() + Duration::from_millis(100)).min(deadline))
@@ -2864,22 +2931,22 @@ impl Supervisor {
         }
     }
 
-    async fn verify_empty_before(
+    async fn verify_empty_before_classified(
         &self,
         handle: &crate::registry::OwnedRuntimeHandle,
         deadline: Instant,
-    ) -> Result<bool, RuntimeError> {
+    ) -> Result<bool, ClassifiedFailure> {
         // Every observation shares the remaining window. A hung read cannot
         // outlive it, and repeated observations cannot renew the budget.
         tokio::time::timeout_at(deadline, self.backend.verify_empty(handle))
             .await
             .map_err(|_| {
-                RuntimeError::new(
+                ClassifiedFailure::timeout(RuntimeError::new(
                     RuntimeErrorCode::BackendUnavailable,
                     "Stop empty inspection timed out",
-                )
+                ))
             })?
-            .map_err(map_backend)
+            .map_err(ClassifiedFailure::backend)
     }
 
     pub(crate) fn ensure_incarnation_dir(
@@ -2920,6 +2987,16 @@ impl Supervisor {
         incarnation_id: &IncarnationId,
         runtime_dir: &Path,
     ) -> Result<AuthenticatedHost, RuntimeError> {
+        self.authenticate_host_classified(incarnation_id, runtime_dir)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    async fn authenticate_host_classified(
+        &self,
+        incarnation_id: &IncarnationId,
+        runtime_dir: &Path,
+    ) -> Result<AuthenticatedHost, ClassifiedFailure> {
         let socket = runtime_dir.join("host.sock");
         let secret = std::fs::read(runtime_dir.join("secret")).map_err(io_runtime)?;
         let challenge = uuid::Uuid::new_v4().to_string();
@@ -2941,7 +3018,8 @@ impl Supervisor {
                         },
                     );
                     let reply =
-                        exchange_host_frame(&mut stream, &envelope, budget, &socket).await?;
+                        exchange_host_frame_classified(&mut stream, &envelope, budget, &socket)
+                            .await?;
                     match reply.result? {
                         HostResult::Hello {
                             host_boot_id,
@@ -2955,7 +3033,8 @@ impl Supervisor {
                                 return Err(RuntimeError::new(
                                     RuntimeErrorCode::HostAuthenticationFailed,
                                     "session host challenge proof mismatch",
-                                ));
+                                )
+                                .into());
                             }
                             return Ok(AuthenticatedHost {
                                 host_boot_id,
@@ -2968,7 +3047,8 @@ impl Supervisor {
                             return Err(RuntimeError::new(
                                 RuntimeErrorCode::HostAuthenticationFailed,
                                 "unexpected hello reply",
-                            ))
+                            )
+                            .into())
                         }
                     }
                 }
@@ -2977,7 +3057,8 @@ impl Supervisor {
                     return Err(RuntimeError::new(
                         RuntimeErrorCode::HostUnreachable,
                         format!("host socket {} unavailable: {error}", socket.display()),
-                    ))
+                    )
+                    .into())
                 }
             }
         }
@@ -3177,9 +3258,20 @@ impl Supervisor {
         runtime_dir: &Path,
         host: &AuthenticatedHost,
     ) -> Result<(), RuntimeError> {
+        self.send_host_stop_classified(incarnation_id, runtime_dir, host)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    async fn send_host_stop_classified(
+        &self,
+        incarnation_id: IncarnationId,
+        runtime_dir: &Path,
+        host: &AuthenticatedHost,
+    ) -> Result<(), ClassifiedFailure> {
         let view = find_view(&self.registry, &incarnation_id).await?;
         match self
-            .send_authenticated_host_command(
+            .send_authenticated_host_command_classified(
                 incarnation_id.clone(),
                 runtime_dir,
                 host,
@@ -3195,7 +3287,8 @@ impl Supervisor {
             _ => Err(RuntimeError::new(
                 RuntimeErrorCode::HostAuthenticationFailed,
                 "unexpected stop reply",
-            )),
+            )
+            .into()),
         }
     }
 
@@ -3206,6 +3299,18 @@ impl Supervisor {
         host: &AuthenticatedHost,
         command: HostCommand,
     ) -> Result<HostResult, RuntimeError> {
+        self.send_authenticated_host_command_classified(incarnation_id, runtime_dir, host, command)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    async fn send_authenticated_host_command_classified(
+        &self,
+        incarnation_id: IncarnationId,
+        runtime_dir: &Path,
+        host: &AuthenticatedHost,
+        command: HostCommand,
+    ) -> Result<HostResult, ClassifiedFailure> {
         let is_slow_fresh_agent_command = matches!(
             &command,
             HostCommand::FreshAgentSend { .. }
@@ -3232,8 +3337,10 @@ impl Supervisor {
         } else {
             host_command_budget(std::env::var(HOST_COMMAND_TIMEOUT_ENV).ok().as_deref())
         };
-        let reply = request_host_reply(&runtime_dir.join("host.sock"), &envelope, budget).await?;
-        reply.result
+        let reply =
+            request_host_reply_classified(&runtime_dir.join("host.sock"), &envelope, budget)
+                .await?;
+        reply.result.map_err(Into::into)
     }
 
     pub(crate) async fn launch_result_from_status(
@@ -3533,11 +3640,22 @@ fn map_host_frame_error(error: freshell_runtime_protocol::FrameError) -> Runtime
 /// One bounded framed request/reply against a session host's control socket.
 /// Connect, write, and read all share the single budget so a host that accepts
 /// the connection and then goes silent cannot extend the wait.
-pub(crate) async fn request_host_reply(
+#[cfg(test)]
+async fn request_host_reply(
     socket_path: &Path,
     envelope: &Envelope<HostCommand>,
     budget: Duration,
 ) -> Result<HostReply, RuntimeError> {
+    request_host_reply_classified(socket_path, envelope, budget)
+        .await
+        .map_err(|failure| failure.error)
+}
+
+async fn request_host_reply_classified(
+    socket_path: &Path,
+    envelope: &Envelope<HostCommand>,
+    budget: Duration,
+) -> Result<HostReply, ClassifiedFailure> {
     let unreachable =
         |message: String| RuntimeError::new(RuntimeErrorCode::HostUnreachable, message);
     let socket_display = socket_path.display().to_string();
@@ -3557,26 +3675,26 @@ pub(crate) async fn request_host_reply(
             freshell_runtime_protocol::read_frame_with_limit(&mut stream, reply_limit)
                 .await
                 .map_err(map_host_frame_error)?;
-        Ok(reply)
+        Ok::<_, ClassifiedFailure>(reply)
     })
     .await
     .unwrap_or_else(|_| {
-        Err(unreachable(format!(
+        Err(ClassifiedFailure::timeout(unreachable(format!(
             "session host {socket_display} timed out after {}ms",
             budget.as_millis()
-        )))
+        ))))
     })
 }
 
 /// Bounded write/read on an already-connected host stream. Connecting is the
 /// caller's business (the hello handshake retries a not-yet-bound socket);
 /// the conversation itself is bounded exactly like every other host command.
-pub(crate) async fn exchange_host_frame(
+async fn exchange_host_frame_classified(
     stream: &mut UnixStream,
     envelope: &Envelope<HostCommand>,
     budget: Duration,
     socket_path: &Path,
-) -> Result<HostReply, RuntimeError> {
+) -> Result<HostReply, ClassifiedFailure> {
     let unreachable =
         |message: String| RuntimeError::new(RuntimeErrorCode::HostUnreachable, message);
     let socket_display = socket_path.display().to_string();
@@ -3585,14 +3703,14 @@ pub(crate) async fn exchange_host_frame(
             .await
             .map_err(map_host_frame_error)?;
         let reply: HostReply = read_frame(stream).await.map_err(map_host_frame_error)?;
-        Ok(reply)
+        Ok::<_, ClassifiedFailure>(reply)
     })
     .await
     .unwrap_or_else(|_| {
-        Err(unreachable(format!(
+        Err(ClassifiedFailure::timeout(unreachable(format!(
             "session host {socket_display} timed out after {}ms",
             budget.as_millis()
-        )))
+        ))))
     })
 }
 
@@ -5768,6 +5886,21 @@ mod interrupted_transaction_tests {
             .collect()
     }
 
+    async fn assert_pending_stop_custody(supervisor: &Supervisor, root: &Path) {
+        let mut handles = supervisor.registry.pending_stop_handles().await.unwrap();
+        assert_eq!(handles.len(), 1);
+        let handle = handles.remove(0);
+        assert!(
+            !supervisor
+                .registry
+                .stop_progress(&handle)
+                .await
+                .unwrap()
+                .settled
+        );
+        assert_retained(supervisor, root, 2).await;
+    }
+
     struct StopBackend {
         root: PathBuf,
     }
@@ -6265,6 +6398,180 @@ mod interrupted_transaction_tests {
     }
 
     #[tokio::test]
+    async fn ordinary_stop_inspection_origin_diagnostics_preserve_pending_custody() {
+        for category in ["docker_http", "unavailable"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut supervisor = open(dir.path());
+            let id = seed(&supervisor, dir.path(), false).await;
+            let fixture = docker_fixture(&mut supervisor, dir.path(), false).await;
+            fixture.close().await;
+            let mut peer = None;
+            if category == "docker_http" {
+                let path = dir.path().join("docker-stop.sock");
+                std::fs::remove_file(&path).unwrap();
+                let listener = UnixListener::bind(path).unwrap();
+                let view = supervisor.registry.inventory().await.unwrap().remove(0);
+                let handle = supervisor
+                    .registry
+                    .owned_handle(view.incarnation_id)
+                    .await
+                    .unwrap();
+                let daemon_id = handle.daemon_id().to_owned();
+                peer = Some(tokio::spawn(async move {
+                    loop {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        let mut header = Vec::new();
+                        while !header.ends_with(b"\r\n\r\n") {
+                            header.push(stream.read_u8().await.unwrap());
+                        }
+                        let header = String::from_utf8(header).unwrap();
+                        let (status, body) = if header.starts_with("GET /v1.47/info ") {
+                            (200, serde_json::json!({"ID":daemon_id}).to_string())
+                        } else {
+                            assert!(header.contains("/json HTTP/1.1"));
+                            (500, "private inspection failure body".into())
+                        };
+                        stream.write_all(format!("HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                    }
+                }));
+            }
+            let (outcome, view) = supervisor.stop(id, Some(1)).await.unwrap();
+            if let Some(peer) = peer {
+                close(peer).await;
+            }
+            assert_eq!(outcome, StopOutcome::BackendUnavailable);
+            assert_eq!(view.intent_revision, 2);
+            assert_pending_stop_custody(&supervisor, dir.path()).await;
+            let events = stop_failure_events(&supervisor);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["data"]["stage"], "initial_empty_inspection");
+            assert_eq!(events[0]["data"]["errorCategory"], category);
+            assert_eq!(
+                events[0]["data"]["httpStatus"],
+                if category == "docker_http" {
+                    serde_json::json!(500)
+                } else {
+                    serde_json::Value::Null
+                }
+            );
+            assert!(!std::fs::read_to_string(&supervisor.config.lifecycle_log)
+                .unwrap()
+                .contains("private inspection failure body"));
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_stop_host_origin_diagnostics_preserve_fallback_and_pending_custody() {
+        const CHILD: &str = "FRESHELL_STOP_HOST_ORIGIN_CHILD";
+        const NAME: &str = "service::interrupted_transaction_tests::ordinary_stop_host_origin_diagnostics_preserve_fallback_and_pending_custody";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            let output = tokio::task::spawn_blocking(|| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", NAME, "--nocapture"])
+                    .env(CHILD, "1")
+                    .env(HOST_COMMAND_TIMEOUT_ENV, "100")
+                    .env_remove("FRESHELL_RUNTIME_CAPABILITY_DIR")
+                    .output()
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        for stage in ["host_authentication", "host_stop"] {
+            for category in ["timeout", "unavailable"] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut supervisor = open(dir.path());
+                let id = seed(&supervisor, dir.path(), false).await;
+                let fixture = docker_fixture(&mut supervisor, dir.path(), false).await;
+                fixture.state.lock().unwrap().silence = Some("graceful_request");
+                let view = supervisor.registry.inventory().await.unwrap().remove(0);
+                let handle = supervisor
+                    .registry
+                    .owned_handle(view.incarnation_id)
+                    .await
+                    .unwrap();
+                let listener = UnixListener::bind(handle.runtime_dir().join("host.sock")).unwrap();
+                let limits = handle.requested_limits();
+                let peer = tokio::spawn(async move {
+                    let boot = HostBootId::new();
+                    loop {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        let request: Envelope<HostCommand> = read_frame(&mut stream).await.unwrap();
+                        let failing = if stage == "host_authentication" {
+                            matches!(request.body, HostCommand::Hello { .. })
+                        } else {
+                            matches!(request.body, HostCommand::Stop { .. })
+                        };
+                        if failing {
+                            if category == "timeout" {
+                                let mut bytes = vec![];
+                                stream.read_to_end(&mut bytes).await.unwrap();
+                            }
+                            continue;
+                        }
+                        let HostCommand::Hello {
+                            incarnation_id,
+                            challenge,
+                        } = request.body
+                        else {
+                            panic!("unexpected command")
+                        };
+                        write_frame(
+                            &mut stream,
+                            &HostReply {
+                                request_id: request.request_id,
+                                result: Ok(HostResult::Hello {
+                                    host_boot_id: boot.clone(),
+                                    proof: host_proof(
+                                        b"synthetic-secret",
+                                        &challenge,
+                                        &boot,
+                                        &incarnation_id,
+                                    ),
+                                    effective_limits: limits,
+                                    capabilities: vec![],
+                                }),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    }
+                });
+                let (outcome, view) = supervisor.stop(id, Some(1)).await.unwrap();
+                close(peer).await;
+                fixture.close().await;
+                assert_eq!(outcome, StopOutcome::BackendUnavailable);
+                assert_eq!(view.intent_revision, 2);
+                assert_pending_stop_custody(&supervisor, dir.path()).await;
+                let failures = stop_failure_events(&supervisor);
+                let failure = failures
+                    .iter()
+                    .find(|event| event["data"]["stage"] == stage)
+                    .unwrap();
+                assert_eq!(
+                    failure["data"]["errorCategory"], category,
+                    "{stage}: {category}"
+                );
+                assert_eq!(
+                    failure["data"]["errorCode"],
+                    serde_json::json!(RuntimeErrorCode::HostUnreachable)
+                );
+                assert!(failure["data"]["httpStatus"].is_null());
+                assert!(failures
+                    .iter()
+                    .any(|event| event["data"]["stage"] == "graceful_stop"));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn ordinary_stop_docker_grace_includes_http_overhead() {
         let dir = tempfile::tempdir().unwrap();
         let mut supervisor = open(dir.path());
@@ -6510,8 +6817,13 @@ mod interrupted_transaction_tests {
                     .any(|event| event["data"]["stage"] == "graceful_failure_empty_inspection"));
                 assert_eq!(failures[0]["data"]["errorCategory"], "docker_http");
                 assert_eq!(failures[0]["data"]["httpStatus"], 500);
-            } else if point.ends_with("request") {
-                assert_eq!(failures[0]["data"]["errorCategory"], "timeout");
+            } else {
+                let failure = failures
+                    .iter()
+                    .find(|event| event["data"]["stage"] == stage)
+                    .unwrap();
+                assert_eq!(failure["data"]["errorCategory"], "timeout", "{point}");
+                assert!(failure["data"]["httpStatus"].is_null());
             }
             assert_eq!(view.intent_revision, 2);
             assert_eq!(view.cleanup_state, CleanupState::TerminationUnconfirmed);

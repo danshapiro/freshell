@@ -700,7 +700,7 @@ export class RestrictedDockerBroker {
     if (this.drainExpired) return Promise.reject(new Error('broker cleanup deadline expired'))
     const requestId = `${this.policy.testRunId}:${++this.transportSequence}`
     const started = performance.now()
-    const address = { requestId, method: request.method ?? 'GET', url: request.url ?? '/' }
+    const address = { requestId, method: request.method ?? 'GET', ...transportAddress(request.url ?? '/') }
     this.recordTransport('request_started', 'info', address)
     return new Promise((resolve, reject) => {
       let result: DockerResponse | undefined
@@ -746,7 +746,7 @@ export class RestrictedDockerBroker {
 
   /** Transport diagnostics do not enter the ownership/cleanup receipt stream. */
   private recordTransport(phase: 'request_started' | 'request_completed', severity: 'info' | 'warn', fields: {
-    requestId: string; method: string; url: string; durationMs?: number; statusCode?: number; errorCategory?: string
+    requestId: string; method: string; route: string; containerId?: string; stopGraceSeconds?: number; durationMs?: number; statusCode?: number; errorCategory?: string
   }): void {
     const entry = { at: new Date().toISOString(), severity, event: `runtime.broker.${phase}`, ...fields }
     try {
@@ -771,6 +771,22 @@ export class RestrictedDockerBroker {
     fs.appendFileSync(this.policy.logPath, `${JSON.stringify(full)}\n`, { mode: 0o600 })
     fs.chmodSync(this.policy.logPath, 0o600)
   }
+}
+
+/** Only fixed actions, exact container IDs and numeric Stop grace belong in diagnostics. */
+function transportAddress(url: string): { route: string; containerId?: string; stopGraceSeconds?: number } {
+  const parsed = new URL(url, 'http://docker')
+  if (parsed.pathname === '/_ping') return { route: 'daemon_ping' }
+  if (parsed.pathname === `${DOCKER_API_PREFIX}/info`) return { route: 'daemon_info' }
+  if (parsed.pathname === `${DOCKER_API_PREFIX}/containers/create`) return { route: 'container_create' }
+  if (parsed.pathname.startsWith(`${DOCKER_API_PREFIX}/volumes/`)) return { route: 'volume_inspect' }
+  const target = parsed.pathname.match(/^\/v1\.47\/containers\/([^/]+)(?:\/(json|start|stop|kill|unpause|update|wait|logs))?$/)
+  const action = target?.[2] ?? 'remove'
+  const containerId = target && /^[a-f0-9]{64}$/.test(target[1]) ? target[1] : undefined
+  const grace = parsed.searchParams.get('t')
+  const stopGraceSeconds = action === 'stop' && grace !== null && /^\d+$/.test(grace) && Number.isSafeInteger(Number(grace)) ? Number(grace) : undefined
+  return { route: target ? `container_${action}` : 'unknown',
+    ...(containerId ? { containerId } : {}), ...(stopGraceSeconds !== undefined ? { stopGraceSeconds } : {}) }
 }
 
 function parseContainerTarget(url: string): { containerId: string; action: string } | undefined {
