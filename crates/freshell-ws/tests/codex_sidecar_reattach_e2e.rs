@@ -925,8 +925,8 @@ async fn poll_proxy_refused(proxy_url: &str, budget: Duration) -> bool {
 }
 
 /// Kills a pane and waits for its unit's Gone (the managed-launch e2e's
-/// `kill_and_wait_gone`), so no process the pane started, its app-server
-/// included, outlives the scenario. Non-panicking, like the rest of a
+/// `kill_and_wait_gone`), so the pane's screen and app-server are dead
+/// (Gone) before the asserts. Non-panicking, like the rest of a
 /// scenario's cleanup: `Err` (asserted after the cleanup) when the pane has
 /// no unit or its unit did not reach Gone in time.
 async fn kill_and_wait_gone(state: &WsState, terminal_id: &str) -> Result<(), String> {
