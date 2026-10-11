@@ -468,6 +468,15 @@ async fn a_turn_running_before_the_tui_attached_keeps_the_agent_when_codex_quits
             .is_none(),
         "no terminal.exit"
     );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            h.crash_rx.as_mut().unwrap().recv()
+        )
+        .await
+        .is_err(),
+        "no crash event"
+    );
 }
 
 /// A quit that stops the running turn first (an interrupt, then an
