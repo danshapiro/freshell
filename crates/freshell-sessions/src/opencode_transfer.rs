@@ -1827,14 +1827,14 @@ fn export_exact_session_inner<W: Write>(
         let snapshot_objects = asset_resolver
             .snapshot_objects
             .iter()
-            .map(|((project_id, worktree_sha1, object_id), compressed_hex)| {
-                SerializedSnapshotObject {
+            .map(
+                |((project_id, worktree_sha1, object_id), output)| SerializedSnapshotObject {
                     project_id: project_id.clone(),
                     worktree_sha1: worktree_sha1.clone(),
                     object_id: object_id.clone(),
-                    compressed_hex: compressed_hex.as_ref().clone(),
-                }
-            })
+                    compressed_hex: output.compressed_hex.as_ref().clone(),
+                },
+            )
             .collect::<Vec<_>>();
         let native_cleanup_baselines = capture_native_cleanup_baselines(&rows)?;
         let payload_path = extraction.path().join("bundle.json");
@@ -2097,7 +2097,7 @@ struct AssetResolver<'a> {
     snapshot_data_home: Option<PathBuf>,
     snapshot_projects: HashMap<String, String>,
     saved_snapshots: BTreeMap<(String, String), SavedSnapshotReference>,
-    snapshot_objects: BTreeMap<(String, String, String), Arc<String>>,
+    snapshot_objects: BTreeMap<(String, String, String), SnapshotOutput>,
     object_representations: SnapshotRepresentations,
     packed_decoders: SnapshotPackedDecoders,
     source_progress: Option<SourcePhase>,
@@ -2637,6 +2637,11 @@ impl<'a> AssetResolver<'a> {
                             id,
                             object,
                             remaining,
+                            self.snapshot_objects.get(&(
+                                project_id.clone(),
+                                worktree_sha1.clone(),
+                                id.to_string(),
+                            )),
                             &mut self.packed_decoders.costs,
                         )
                     })
@@ -2653,7 +2658,7 @@ impl<'a> AssetResolver<'a> {
                 // the one validated serialized content allocation.
                 self.snapshot_objects.insert(
                     (project_id.clone(), worktree_sha1.clone(), object_id),
-                    representation.compressed_hex.clone(),
+                    representation.output,
                 );
             }
         }
@@ -3558,6 +3563,10 @@ impl SnapshotPackedDecoder {
     }
 
     fn from_command(mut command: Command) -> Result<Self, TransferError> {
+        #[cfg(all(test, unix))]
+        {
+            command = snapshot_reuse_test_hooks::late_owner_command(command);
+        }
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -4168,15 +4177,29 @@ enum SnapshotEncoding {
     PackedDefault,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnapshotOutputProvenance {
+    Loose,
+    PackedDefault,
+}
+
+// Required serialized output retains only its existing allocation and encoding
+// provenance. Current body/adjacency authority stays in the native read/walk.
+struct SnapshotOutput {
+    compressed_hex: Arc<String>,
+    provenance: SnapshotOutputProvenance,
+}
+
 struct SavedObjectRepresentation {
     edges: SnapshotEdges,
     metadata: SnapshotObjectMetadata,
     compressed_hex: Arc<String>,
+    provenance: SnapshotOutputProvenance,
 }
 
 struct RetainedSnapshotObject {
     metadata: SnapshotObjectMetadata,
-    compressed_hex: Arc<String>,
+    output: SnapshotOutput,
 }
 
 impl SnapshotClosureObject for Arc<SavedObjectRepresentation> {
@@ -4184,7 +4207,10 @@ impl SnapshotClosureObject for Arc<SavedObjectRepresentation> {
     fn into_retained(self) -> Self::Retained {
         RetainedSnapshotObject {
             metadata: self.metadata.clone(),
-            compressed_hex: self.compressed_hex.clone(),
+            output: SnapshotOutput {
+                compressed_hex: self.compressed_hex.clone(),
+                provenance: self.provenance,
+            },
         }
     }
     fn compressed_bytes(&self) -> u64 {
@@ -4219,10 +4245,11 @@ impl SnapshotRepresentations {
         id: &str,
         object: SnapshotObjectSource,
         remaining: u64,
+        output: Option<&SnapshotOutput>,
         costs: &mut SourceReaderCosts,
     ) -> Result<Arc<SavedObjectRepresentation>, TransferError> {
         let started = Instant::now();
-        let result = self.resolve_inner(id, object, remaining, costs);
+        let result = self.resolve_inner(id, object, remaining, output, costs);
         costs.representation_us = costs.representation_us.saturating_add(elapsed_us(started));
         result
     }
@@ -4232,6 +4259,7 @@ impl SnapshotRepresentations {
         id: &str,
         object: SnapshotObjectSource,
         remaining: u64,
+        output: Option<&SnapshotOutput>,
         costs: &mut SourceReaderCosts,
     ) -> Result<Arc<SavedObjectRepresentation>, TransferError> {
         let encoding = match &object {
@@ -4251,12 +4279,38 @@ impl SnapshotRepresentations {
             return Ok(resident.clone());
         }
         costs.representation_misses = costs.representation_misses.saturating_add(1);
+        #[cfg(test)]
+        let output = output.filter(|_| {
+            !snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().packed_output_disabled)
+        });
+        let provenance = match &object {
+            SnapshotObjectSource::Loose(_) => SnapshotOutputProvenance::Loose,
+            SnapshotObjectSource::Packed { .. } => SnapshotOutputProvenance::PackedDefault,
+        };
         let (kind, body, compressed) = match object {
             SnapshotObjectSource::Loose(compressed) => {
                 let (kind, body) = decode_snapshot_object(id, &compressed)?;
                 (kind, body, compressed)
             }
             SnapshotObjectSource::Packed { kind, body } => {
+                if let Some(output) = output
+                    .filter(|output| output.provenance == SnapshotOutputProvenance::PackedDefault)
+                {
+                    let (compressed_bytes, compressed_sha256) =
+                        snapshot_output_commitment(&output.compressed_hex)?;
+                    check_snapshot_closure_bytes(compressed_bytes, remaining)?;
+                    let representation = Arc::new(SavedObjectRepresentation {
+                        edges: validated_snapshot_edges(&kind, &body)?,
+                        metadata: SnapshotObjectMetadata {
+                            object_id: id.to_string(),
+                            compressed_bytes,
+                            compressed_sha256,
+                        },
+                        compressed_hex: output.compressed_hex.clone(),
+                        provenance,
+                    });
+                    return Ok(self.admit(key, representation));
+                }
                 let started = Instant::now();
                 let compressed = compress_snapshot_object(&kind, &body);
                 costs.compression_us = costs.compression_us.saturating_add(elapsed_us(started));
@@ -4279,7 +4333,16 @@ impl SnapshotRepresentations {
             edges,
             metadata,
             compressed_hex: Arc::new(hex::encode(compressed)),
+            provenance,
         });
+        Ok(self.admit(key, representation))
+    }
+
+    fn admit(
+        &mut self,
+        key: (String, SnapshotEncoding),
+        representation: Arc<SavedObjectRepresentation>,
+    ) -> Arc<SavedObjectRepresentation> {
         // Include retained output bytes even though they normally share the
         // emitted map's allocation; replaced encodings must remain bounded too.
         let retained_bytes = representation
@@ -4294,9 +4357,27 @@ impl SnapshotRepresentations {
             }
             self.bytes += retained_bytes;
             self.resident.insert(key, representation.clone());
+            #[cfg(test)]
+            snapshot_reuse_test_hooks::count("memo_admit");
         }
-        Ok(representation)
+        representation
     }
+}
+
+fn snapshot_output_commitment(compressed_hex: &str) -> Result<(u64, String), TransferError> {
+    let mut hasher = Sha256::new();
+    let mut scratch = [0u8; 4096];
+    for chunk in compressed_hex.as_bytes().chunks(scratch.len() * 2) {
+        let decoded = &mut scratch[..chunk.len() / 2];
+        hex::decode_to_slice(chunk, decoded).map_err(|_| {
+            TransferError::Blocked("snapshot object has invalid encoded bytes".into())
+        })?;
+        hasher.update(decoded);
+    }
+    Ok((
+        (compressed_hex.len() / 2) as u64,
+        hex::encode(hasher.finalize()),
+    ))
 }
 
 fn snapshot_closure_bound() -> u64 {
@@ -4319,6 +4400,9 @@ mod snapshot_reuse_test_hooks {
         pub counts: BTreeMap<&'static str, usize>,
         pub filesystem_counts: BTreeMap<&'static str, usize>,
         pub budget: Option<usize>,
+        pub packed_output_disabled: bool,
+        #[cfg(unix)]
+        pub packed_late_fault: Option<(i32, bool, std::path::PathBuf)>,
         #[cfg_attr(not(unix), allow(dead_code))]
         pub aggregate_disabled: bool,
         pub before_reference: Option<Box<dyn FnMut(usize)>>,
@@ -4329,6 +4413,32 @@ mod snapshot_reuse_test_hooks {
     }
     thread_local! {
         pub(super) static STATE: RefCell<State> = RefCell::new(State::default());
+    }
+    #[cfg(unix)]
+    pub(super) fn late_owner_command(command: std::process::Command) -> std::process::Command {
+        let fault = STATE.with(|state| state.borrow().packed_late_fault.clone());
+        let Some((status, trailing, pids)) = fault else {
+            return command;
+        };
+        let mut wrapped = std::process::Command::new("python3");
+        wrapped.args(["-c", "import os, pathlib, subprocess, sys\nchild = subprocess.Popen(sys.argv[4:])\npathlib.Path(sys.argv[3]).write_text(str(os.getpid()) + ' ' + str(child.pid))\nresult = child.wait()\nif sys.argv[2] == 'true': sys.stdout.buffer.write(b'late output')\nsys.exit(int(sys.argv[1]) if result == 0 else result)\n"]);
+        wrapped
+            .arg(status.to_string())
+            .arg(trailing.to_string())
+            .arg(pids)
+            .arg(command.get_program())
+            .args(command.get_args());
+        for (key, value) in command.get_envs() {
+            match value {
+                Some(value) => {
+                    wrapped.env(key, value);
+                }
+                None => {
+                    wrapped.env_remove(key);
+                }
+            }
+        }
+        wrapped
     }
     pub(super) fn count_filesystem(operation: &'static str) {
         STATE.with(|state| {
@@ -8261,6 +8371,10 @@ mod native_source_inventory_tests {
     }
 
     fn reuse_fixture(packed: bool) -> ReuseFixture {
+        reuse_fixture_with_blob(packed, b"synthetic overlapping saved blob")
+    }
+
+    fn reuse_fixture_with_blob(packed: bool, body: &[u8]) -> ReuseFixture {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
         fs::create_dir(&workspace).unwrap();
@@ -8271,10 +8385,7 @@ mod native_source_inventory_tests {
         fs::create_dir_all(&git_dir).unwrap();
         let git = |args: &[&str], input: Option<&[u8]>| fixture_git(&git_dir, args, input);
         git(&["init", "--bare", "-q"], None);
-        let blob = git(
-            &["hash-object", "-w", "--stdin"],
-            Some(b"synthetic overlapping saved blob"),
-        );
+        let blob = git(&["hash-object", "-w", "--stdin"], Some(body));
         let subtree = git(
             &["mktree"],
             Some(format!("100644 blob {blob}\tnested\n").as_bytes()),
@@ -8341,14 +8452,27 @@ mod native_source_inventory_tests {
         fixture: &ReuseFixture,
         budget: Option<usize>,
     ) -> (OpenCodeNativeSnapshot, BTreeMap<&'static str, usize>, u64) {
+        // Budget zero is the existing independently executed ordinary producer
+        // control. Explicit policies below also exercise output reuse at zero.
+        reuse_export_policy(fixture, budget, budget != Some(0))
+    }
+
+    fn reuse_export_policy(
+        fixture: &ReuseFixture,
+        budget: Option<usize>,
+        reuse_output: bool,
+    ) -> (OpenCodeNativeSnapshot, BTreeMap<&'static str, usize>, u64) {
         snapshot_reuse_test_hooks::STATE.with(|state| {
             *state.borrow_mut() = snapshot_reuse_test_hooks::State {
                 budget,
+                packed_output_disabled: !reuse_output,
                 ..Default::default()
             };
         });
         let progress = std::sync::Arc::new(std::sync::Mutex::new(0));
         let observed = progress.clone();
+        let reader_costs = Arc::new(std::sync::Mutex::new(None));
+        let observed_costs = reader_costs.clone();
         let exported = export_exact_session(
             &fixture.inventory,
             "ses_exact",
@@ -8356,15 +8480,341 @@ mod native_source_inventory_tests {
                 move |event| {
                     if event.phase == "saved_objects" && event.state == "completed" {
                         *observed.lock().unwrap() = event.completed_count;
+                        *observed_costs.lock().unwrap() = event.reader_costs.clone();
                     }
                 },
             ),
         )
         .unwrap();
-        let counts = snapshot_reuse_test_hooks::STATE
+        let mut counts = snapshot_reuse_test_hooks::STATE
             .with(|state| std::mem::take(&mut state.borrow_mut().counts));
+        counts.insert(
+            "fresh_inspections",
+            reader_costs
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .fresh_inspections as usize,
+        );
         let reads = *progress.lock().unwrap();
         (exported, counts, reads)
+    }
+
+    #[test]
+    fn packed_output_reuse_survives_memo_pressure_with_every_current_native_proof() {
+        let fixture = reuse_fixture(true);
+        for budget in [0, 1, 1400, 3000] {
+            let (old, old_counts, old_reads) = reuse_export_policy(&fixture, Some(budget), false);
+            let (new, new_counts, new_reads) = reuse_export_policy(&fixture, Some(budget), true);
+            assert_eq!(
+                fs::read(&old.payload_path).unwrap(),
+                fs::read(&new.payload_path).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_vec(old.manifest()).unwrap(),
+                serde_json::to_vec(new.manifest()).unwrap()
+            );
+            assert_eq!(
+                source_graph_fingerprint(old.manifest()).unwrap(),
+                source_graph_fingerprint(new.manifest()).unwrap()
+            );
+            assert_eq!((old_reads, new_reads), (30, 30));
+            for counts in [&old_counts, &new_counts] {
+                assert_eq!(counts["fresh_inspections"], 30);
+                assert_eq!(counts["packed_query"], 30);
+                assert_eq!(counts["packed_validate"], 30);
+                assert_eq!(counts["packed_spawn"], 1);
+                assert_eq!(counts["packed_reap"], 1);
+                assert_eq!(counts["packed_drain_spawn"], counts["packed_drain_join"]);
+            }
+            eprintln!("packed output budget={budget}: old={old_counts:?} new={new_counts:?}");
+            assert_eq!(new_counts["deflate"], 4, "completed output eliminates repeat compression even when memo cannot retain the working set");
+            assert_eq!(new_counts["hex"], 4);
+            if budget <= 1 {
+                assert_eq!(old_counts["deflate"], 30);
+                assert_eq!(old_counts["hex"], 30);
+            } else {
+                assert!(old_counts["deflate"] > new_counts["deflate"]);
+                assert!(
+                    old_counts["memo_admit"] > 0,
+                    "objects individually fit the memo but their working set does not"
+                );
+            }
+            assert_exported_snapshot_native_readback(&fixture, &old, &format!("old-{budget}"));
+            assert_exported_snapshot_native_readback(&fixture, &new, &format!("new-{budget}"));
+        }
+    }
+
+    fn assert_exported_snapshot_native_readback(
+        fixture: &ReuseFixture,
+        snapshot: &OpenCodeNativeSnapshot,
+        name: &str,
+    ) {
+        let payload: serde_json::Value =
+            serde_json::from_slice(&fs::read(&snapshot.payload_path).unwrap()).unwrap();
+        let objects: Vec<SerializedSnapshotObject> =
+            serde_json::from_value(payload["snapshot_objects"].clone()).unwrap();
+        let destination = fixture.dir.path().join(name).join("opencode.db");
+        for object in &objects {
+            install_snapshot_object(object, &snapshot.manifest().saved_snapshots, &destination)
+                .unwrap();
+            let bucket = destination
+                .parent()
+                .unwrap()
+                .join("snapshot")
+                .join(&object.project_id)
+                .join(&object.worktree_sha1);
+            let path = bucket
+                .join("objects")
+                .join(&object.object_id[..2])
+                .join(&object.object_id[2..]);
+            let compressed = fs::read(path).unwrap();
+            assert_eq!(compressed, hex::decode(&object.compressed_hex).unwrap());
+            let (kind, body) = decode_snapshot_object(&object.object_id, &compressed).unwrap();
+            let output = Command::new("git")
+                .arg("--git-dir")
+                .arg(&bucket)
+                .args(["cat-file", &kind, &object.object_id])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, body, "full native installed object body");
+        }
+        for reference in &snapshot.manifest().saved_snapshots {
+            let bucket = destination
+                .parent()
+                .unwrap()
+                .join("snapshot")
+                .join(&reference.project_id)
+                .join(&reference.worktree_sha1);
+            let stores = qualified_snapshot_stores(&bucket, &bucket.join("objects")).unwrap();
+            let closure = read_snapshot_closure(&stores, &reference.tree)
+                .unwrap()
+                .unwrap();
+            assert_eq!(closure.len(), reference.objects.len());
+            for object in &reference.objects {
+                let bytes = &closure[&object.object_id];
+                assert_eq!(bytes.len() as u64, object.compressed_bytes);
+                assert_eq!(digest(bytes), object.compressed_sha256);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packed_output_reuse_refuses_actual_late_owner_failure_before_export_publication() {
+        for (status, trailing) in [(9, false), (0, true)] {
+            let fixture = reuse_fixture(true);
+            let pids = fixture.dir.path().join("owned-native-pids");
+            snapshot_reuse_test_hooks::STATE.with(|state| {
+                *state.borrow_mut() = snapshot_reuse_test_hooks::State {
+                    budget: Some(0),
+                    packed_late_fault: Some((status, trailing, pids.clone())),
+                    ..Default::default()
+                };
+            });
+            let result = export_exact_session(
+                &fixture.inventory,
+                "ses_exact",
+                ExportOptions::new(fixture.dir.path().join("extract")),
+            );
+            assert!(
+                result.is_err(),
+                "real late status/output cannot publish a complete warm-hit export"
+            );
+            assert_eq!(
+                fs::read_dir(fixture.dir.path().join("extract"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+            let counts =
+                snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().counts.clone());
+            assert_eq!(
+                counts["deflate"], 4,
+                "late failure occurs after all warm output hits"
+            );
+            assert_eq!(counts["hex"], 4);
+            assert_eq!(counts["packed_query"], 30);
+            assert_eq!(counts["packed_validate"], 30);
+            assert_eq!(counts["packed_reap"], counts["packed_spawn"]);
+            assert_eq!(counts["packed_drain_join"], counts["packed_drain_spawn"]);
+            for pid in fs::read_to_string(pids).unwrap().split_whitespace() {
+                assert!(
+                    !Path::new(&format!("/proc/{pid}")).exists(),
+                    "exact owned native/wrapper child settled"
+                );
+            }
+        }
+        snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+    }
+
+    #[test]
+    fn packed_output_reuse_preserves_current_nondefault_loose_encoding_transitions() {
+        let fixture = reuse_fixture(true);
+        let packed = read_snapshot_object(std::slice::from_ref(&fixture.store), &fixture.blob)
+            .unwrap()
+            .unwrap();
+        let (_, body) = decode_snapshot_object(&fixture.blob, &packed).unwrap();
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::none());
+        write!(encoder, "blob {}\0", body.len()).unwrap();
+        encoder.write_all(&body).unwrap();
+        let loose = encoder.finish().unwrap();
+        assert_ne!(loose, packed);
+        let mut exports = Vec::new();
+        for reuse in [false, true] {
+            let path = fixture_object_path(&fixture, &fixture.blob);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let current_loose = loose.clone();
+            snapshot_reuse_test_hooks::STATE.with(|state| {
+                *state.borrow_mut() = snapshot_reuse_test_hooks::State {
+                    budget: Some(0),
+                    packed_output_disabled: !reuse,
+                    before_reference: Some(Box::new(move |number| {
+                        if number == 2 || number == 4 {
+                            fs::write(&path, &current_loose).unwrap();
+                        }
+                        if number == 3 || number == 5 {
+                            fs::remove_file(&path).unwrap();
+                        }
+                    })),
+                    ..Default::default()
+                };
+            });
+            let exported = export_exact_session(
+                &fixture.inventory,
+                "ses_exact",
+                ExportOptions::new(fixture.dir.path().join("extract")),
+            )
+            .unwrap();
+            assert_exported_snapshot_native_readback(
+                &fixture,
+                &exported,
+                if reuse {
+                    "transitions-new"
+                } else {
+                    "transitions-old"
+                },
+            );
+            exports.push(exported);
+        }
+        assert_eq!(
+            fs::read(&exports[0].payload_path).unwrap(),
+            fs::read(&exports[1].payload_path).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(exports[0].manifest()).unwrap(),
+            serde_json::to_vec(exports[1].manifest()).unwrap()
+        );
+        assert_eq!(
+            source_graph_fingerprint(exports[0].manifest()).unwrap(),
+            source_graph_fingerprint(exports[1].manifest()).unwrap()
+        );
+        for reference in &exports[1].manifest().saved_snapshots {
+            let blob = reference
+                .objects
+                .iter()
+                .find(|object| object.object_id == fixture.blob)
+                .unwrap();
+            assert_eq!(blob.compressed_sha256, digest(&packed));
+            assert_ne!(blob.compressed_sha256, digest(&loose));
+        }
+    }
+
+    #[test]
+    fn packed_output_reuse_hashes_full_multichunk_encoding_and_installs_native_bodies() {
+        let body = (0u64..2048)
+            .map(|index| digest(&index.to_le_bytes()))
+            .collect::<String>();
+        let fixture = reuse_fixture_with_blob(true, body.as_bytes());
+        let (old, old_counts, _) = reuse_export_policy(&fixture, Some(0), false);
+        let (new, new_counts, _) = reuse_export_policy(&fixture, Some(0), true);
+        assert_eq!((old_counts["deflate"], new_counts["deflate"]), (30, 4));
+        assert_eq!((old_counts["hex"], new_counts["hex"]), (30, 4));
+        assert_eq!(
+            fs::read(&old.payload_path).unwrap(),
+            fs::read(&new.payload_path).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(old.manifest()).unwrap(),
+            serde_json::to_vec(new.manifest()).unwrap()
+        );
+        assert_eq!(
+            source_graph_fingerprint(old.manifest()).unwrap(),
+            source_graph_fingerprint(new.manifest()).unwrap()
+        );
+        assert!(new.manifest().saved_snapshots[0]
+            .objects
+            .iter()
+            .any(|object| object.compressed_bytes > 8192));
+        assert_exported_snapshot_native_readback(&fixture, &old, "multichunk-old");
+        assert_exported_snapshot_native_readback(&fixture, &new, "multichunk-new");
+        let actual = read_snapshot_object(std::slice::from_ref(&fixture.store), &fixture.blob)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            snapshot_output_commitment(&hex::encode(&actual)).unwrap(),
+            (actual.len() as u64, digest(&actual))
+        );
+        for invalid in [
+            "0",
+            "xx",
+            &("00".repeat(8192) + "0"),
+            &("00".repeat(8192) + "zz"),
+        ] {
+            assert!(snapshot_output_commitment(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn packed_output_reuse_keeps_native_destination_tuples_distinct() {
+        let mut fixture = reuse_fixture(true);
+        let workspace = fixture.dir.path().join("other-workspace");
+        fs::create_dir(&workspace).unwrap();
+        let worktree = hex::encode(sha1::Sha1::digest(workspace.to_string_lossy().as_bytes()));
+        let bucket = fixture
+            .inventory
+            .default_database
+            .parent()
+            .unwrap()
+            .join("snapshot/prj")
+            .join(worktree);
+        fixture_git(&bucket, &["init", "--bare", "-q"], None);
+        copy_fixture_objects(&fixture.store, &bucket.join("objects"));
+        fixture.inventory = fixture.inventory.with_trusted_workspace_mount(
+            "prj",
+            None,
+            "/synthetic/other",
+            workspace,
+        );
+        let db = Connection::open(&fixture.inventory.default_database).unwrap();
+        db.execute("INSERT INTO session(id,slug,project_id,parent_id,directory,title,version,time_created,time_updated,revert) VALUES ('ses_other','other','prj','ses_exact','/synthetic/other','other','1',1,1,?1)", [serde_json::json!({"snapshot":fixture.trees[0]}).to_string()]).unwrap();
+        drop(db);
+        let (old, old_counts, old_reads) = reuse_export_policy(&fixture, Some(0), false);
+        let (new, new_counts, new_reads) = reuse_export_policy(&fixture, Some(0), true);
+        assert_eq!((old_reads, new_reads), (33, 33));
+        assert_eq!(old_counts["deflate"], 33);
+        assert_eq!(
+            new_counts["deflate"], 7,
+            "a different native bucket must produce its own first encoding"
+        );
+        assert_eq!(new_counts["packed_query"], 33);
+        assert_eq!(new_counts["packed_validate"], 33);
+        assert_eq!(
+            fs::read(&old.payload_path).unwrap(),
+            fs::read(&new.payload_path).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(old.manifest()).unwrap(),
+            serde_json::to_vec(new.manifest()).unwrap()
+        );
+        assert_eq!(
+            source_graph_fingerprint(old.manifest()).unwrap(),
+            source_graph_fingerprint(new.manifest()).unwrap()
+        );
+        assert_exported_snapshot_native_readback(&fixture, &old, "tuples-old");
+        assert_exported_snapshot_native_readback(&fixture, &new, "tuples-new");
     }
 
     fn assert_reused_export(packed: bool) {
@@ -13066,7 +13516,7 @@ mod native_source_inventory_tests {
                 object.object_id.clone(),
             )];
             assert!(
-                Arc::ptr_eq(first, second),
+                Arc::ptr_eq(&first.compressed_hex, &second.compressed_hex),
                 "destination tuples share emitted bytes without another hex allocation"
             );
         }
@@ -13105,7 +13555,7 @@ mod native_source_inventory_tests {
         }];
         let references =
             vec![resolver.saved_snapshots[&("ses_exact".into(), fixture.trees[0].clone())].clone()];
-        for ((project_id, worktree_sha1, object_id), compressed_hex) in &resolver.snapshot_objects {
+        for ((project_id, worktree_sha1, object_id), output) in &resolver.snapshot_objects {
             if project_id != "prj" {
                 continue;
             }
@@ -13114,7 +13564,7 @@ mod native_source_inventory_tests {
                     project_id: project_id.clone(),
                     worktree_sha1: worktree_sha1.clone(),
                     object_id: object_id.clone(),
-                    compressed_hex: compressed_hex.as_ref().clone(),
+                    compressed_hex: output.compressed_hex.as_ref().clone(),
                 },
                 &references,
                 &destination,
@@ -13164,14 +13614,22 @@ mod native_source_inventory_tests {
             let fixture = reuse_fixture(packed);
             let (plain, _, reads) = reuse_export(&fixture, Some(0));
             for budget in [1, 1400, 3000] {
+                let (old, old_counts, old_reads) =
+                    reuse_export_policy(&fixture, Some(budget), false);
                 let (bounded, counts, bounded_reads) = reuse_export(&fixture, Some(budget));
                 assert!(
-                    counts["hex"] > 4,
+                    old_counts["hex"] > 4,
                     "budget exhaustion must execute ordinary conversion fallback"
                 );
                 if budget == 1 {
-                    assert_eq!(counts["hex"], 30);
+                    assert_eq!(old_counts["hex"], 30);
                 }
+                assert_eq!(counts["hex"], if packed { 4 } else { old_counts["hex"] });
+                assert_eq!(old_reads, bounded_reads);
+                assert_eq!(
+                    fs::read(&old.payload_path).unwrap(),
+                    fs::read(&bounded.payload_path).unwrap()
+                );
                 assert_eq!(reads, bounded_reads);
                 assert_eq!(
                     fs::read(&plain.payload_path).unwrap(),
