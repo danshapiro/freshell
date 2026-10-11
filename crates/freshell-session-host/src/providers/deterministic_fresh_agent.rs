@@ -454,6 +454,12 @@ pub(crate) async fn probe_resume(
 }
 
 fn fixture_native_id(profile: &FreshAgentProfile) -> String {
+    if matches!(
+        profile.provider,
+        FreshProvider::Claude | FreshProvider::Kilroy
+    ) {
+        return uuid::Uuid::new_v4().to_string();
+    }
     format!(
         "fixture-native-{}-{}",
         profile.provider.as_str(),
@@ -786,8 +792,8 @@ mod tests {
     use super::*;
     use freshell_runtime_protocol::FreshAgentTurnSettings;
 
-    #[test]
-    fn fixture_native_identity_is_store_and_provider_specific() {
+    #[tokio::test]
+    async fn fixture_native_identity_is_store_and_provider_specific() {
         let profile = FreshAgentProfile {
             provider: FreshProvider::Codex,
             runtime_variant: "codex-app-server".into(),
@@ -808,6 +814,48 @@ mod tests {
         let mut other = profile.clone();
         other.provider_store_id = "soul-b".into();
         assert_ne!(fixture_native_id(&profile), fixture_native_id(&other));
+        for provider in [
+            FreshProvider::Claude,
+            FreshProvider::Kilroy,
+            FreshProvider::Codex,
+            FreshProvider::Opencode,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut saved_profile = profile.clone();
+            saved_profile.provider = provider;
+            let old_id = format!(
+                "fixture-native-{}-preserved",
+                saved_profile.provider.as_str()
+            );
+            let old = FixtureState {
+                schema_version: 1,
+                native_session_id: old_id.clone(),
+                dispatch_count: 7,
+                completion_count: 6,
+                pending_decision_id: Some("pending-preserved".into()),
+                create_profile: Some(saved_profile.clone()),
+            };
+            write_provider_state(root.path(), &old, unsafe { libc::getuid() }, unsafe {
+                libc::getgid()
+            })
+            .await
+            .unwrap();
+            saved_profile.native_session_id = Some(old_id.clone());
+            let reopened = DeterministicFreshAgentTransport::open(
+                root.path(),
+                &saved_profile,
+                unsafe { libc::getuid() },
+                unsafe { libc::getgid() },
+            )
+            .await
+            .unwrap();
+            let preserved = reopened.state.lock().await;
+            assert_eq!(preserved.native_session_id, old_id);
+            assert_eq!(preserved.dispatch_count, 7);
+            assert_eq!(preserved.completion_count, 6);
+            assert_eq!(preserved.pending_decision_id, old.pending_decision_id);
+            assert_eq!(preserved.create_profile, old.create_profile);
+        }
     }
 
     #[test]
@@ -821,6 +869,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_native_completion_crosses_the_durable_actor_once() {
+        let mut native_ids = std::collections::HashSet::new();
         for provider in [
             FreshProvider::Claude,
             FreshProvider::Kilroy,
@@ -854,7 +903,7 @@ mod tests {
             .unwrap();
             let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
                 root.path().join("actor"),
-                profile,
+                profile.clone(),
                 transport.clone(),
             )
             .await
@@ -894,6 +943,34 @@ mod tests {
                 native_id,
             )
             .expect("the actual fixture completion must be saved in its owned native store");
+            assert!(native_ids.insert(native_id.to_owned()));
+            eprintln!(
+                "{}",
+                json!({"severity":"info", "event":"fixture.native_history.identity",
+                    "provider":saved["provider"], "sessionType":saved["sessionType"],
+                    "nativeSessionId":saved["threadId"]})
+            );
+            if matches!(provider, FreshProvider::Claude | FreshProvider::Kilroy) {
+                let canonical = uuid::Uuid::parse_str(native_id)
+                    .expect("actual saved Claude fixture identity must be a canonical native UUID");
+                assert_eq!(canonical.get_version(), Some(uuid::Version::Random));
+                assert_eq!(canonical.get_variant(), uuid::Variant::RFC4122);
+            }
+            let mut resumed_profile = profile.clone();
+            resumed_profile.native_session_id = Some(native_id.to_owned());
+            let reopened = DeterministicFreshAgentTransport::open(
+                root.path().join("provider"),
+                &resumed_profile,
+                unsafe { libc::getuid() },
+                unsafe { libc::getgid() },
+            )
+            .await
+            .unwrap();
+            let reopened_state = reopened.state.lock().await;
+            assert_eq!(reopened_state.native_session_id, native_id);
+            assert_eq!(reopened_state.dispatch_count, 1);
+            assert_eq!(reopened_state.completion_count, 1);
+            drop(reopened_state);
             let provider_events: Vec<_> = events
                 .events
                 .iter()
