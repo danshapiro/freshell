@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { createHash } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
 import { DatabaseSync } from 'node:sqlite'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -185,8 +186,17 @@ function rewriteBrowserExecution(built: ReturnType<typeof fixture>, original: an
 }
 
 function browserOwnerFixture() {
-  const original = readBrowserExecution(fixture())
-  const owner = new ManagedRuntimeOwner(() => { throw new Error('web I/O is unused') }, process.cwd(), 5)
+  const built = fixture()
+  const original = readBrowserExecution(built)
+  // Source-only cloud checkouts lack Git metadata; the owned fixture supplies its actual candidate.
+  const git = (...args: string[]) => execFileSync('git', [
+    '-c', 'user.name=Dan Shapiro', '-c', 'user.email=3732858+danshapiro@users.noreply.github.com',
+    '-c', 'commit.gpgsign=false', ...args,
+  ], { cwd: built.repoRoot, encoding: 'utf8', timeout: 10_000 })
+  git('init', '--quiet')
+  git('add', 'docker', 'crates')
+  git('commit', '--quiet', '-m', 'Owned browser consumer fixture')
+  const owner = new ManagedRuntimeOwner(() => { throw new Error('web I/O is unused') }, built.repoRoot, 5)
   const internal = owner as any
   const view = structuredClone(original.allocations[1].view)
   view.freshAgentSessionId = 'presentation-owned-picker-request'

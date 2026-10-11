@@ -25,6 +25,7 @@ const { DatabaseSync }: typeof import('node:sqlite') = createRequire(import.meta
 
 const sourceRoot = process.cwd()
 let fixtureRepoRoot: string
+let fixtureCandidateSha: string
 
 beforeEach(async () => {
   // Exercise the real Git provenance boundary even in source-only Cloud images.
@@ -39,6 +40,7 @@ beforeEach(async () => {
   git('init', '--quiet')
   git('add', '.')
   git('commit', '--quiet', '-m', 'Owned runtime facts unit fixture')
+  fixtureCandidateSha = git('rev-parse', 'HEAD').trim()
 })
 
 afterEach(async () => {
@@ -5144,23 +5146,24 @@ describe('run-owned workload image build', () => {
     const digest = `sha256:${'c'.repeat(64)}`
     const child = vi.fn<typeof execFileSync>().mockReturnValue('')
       .mockReturnValueOnce('').mockReturnValueOnce(digest).mockReturnValueOnce(`sha256:${'d'.repeat(64)}`)
-    expect(() => owner.buildRunOwnedRuntimeImage(process.cwd(), '7aab49a4-08ed-4ca7-a4b2-6501f4821a63',
-      handle.candidateSha, child)).toThrow(/locally addressable/)
+    expect(() => owner.buildRunOwnedRuntimeImage(fixtureRepoRoot, '7aab49a4-08ed-4ca7-a4b2-6501f4821a63',
+      fixtureCandidateSha, child)).toThrow(/locally addressable/)
   })
 
   it('builds and resolves only the exact run tag instead of the shared runtime tag', () => {
     const runId = '7aab49a4-08ed-4ca7-a4b2-6501f4821a63'
     const child = vi.fn<typeof execFileSync>().mockReturnValue(`sha256:${'c'.repeat(64)}\n`)
-    const result = owner.buildRunOwnedRuntimeImage(process.cwd(), runId, handle.candidateSha, child)
+    const result = owner.buildRunOwnedRuntimeImage(fixtureRepoRoot, runId, fixtureCandidateSha, child)
     expect(result.digest).toBe(`sha256:${'c'.repeat(64)}`)
     expect(result.tag).toContain(runId)
-    expect(child).toHaveBeenNthCalledWith(1, 'docker', expect.arrayContaining(['build', '-t', result.tag]), expect.objectContaining({ cwd: process.cwd() }))
+    expect(child).toHaveBeenNthCalledWith(1, 'docker', expect.arrayContaining(['build', '-t', result.tag,
+      '--label', `com.freshell.runtime-test-candidate=${fixtureCandidateSha}`]), expect.objectContaining({ cwd: fixtureRepoRoot }))
     expect(child).toHaveBeenNthCalledWith(2, 'docker', ['image', 'inspect', result.tag, '--format', '{{.Id}}'], expect.objectContaining({ encoding: 'utf8' }))
     expect(child.mock.calls.flatMap(call => call[1] ?? [])).not.toContain(owner.PHASE2_RUNTIME_IMAGE_TAG)
   })
   it('refuses an invalid observed image digest instead of certifying a tag as an artifact', () => {
     const child = vi.fn<typeof execFileSync>().mockReturnValue('not-a-digest')
-    expect(() => owner.buildRunOwnedRuntimeImage(process.cwd(), '7aab49a4-08ed-4ca7-a4b2-6501f4821a63', handle.candidateSha, child)).toThrow(/pinned|digest/)
+    expect(() => owner.buildRunOwnedRuntimeImage(fixtureRepoRoot, '7aab49a4-08ed-4ca7-a4b2-6501f4821a63', fixtureCandidateSha, child)).toThrow(/pinned|digest/)
   })
   it('admits image deletion only for the actual run tag, labels and immutable digest', () => {
     const context = { tag: 'freshell-managed-runtime:owned-test', runId: handle.runId,
