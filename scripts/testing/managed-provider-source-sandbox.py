@@ -41,6 +41,9 @@ def main():
     expected_directory = Path(__file__).resolve().parents[2] / "target/debug/deps"
     if binary.parent != expected_directory.resolve():
         raise RuntimeError("source fixture test artifact must belong to this worktree")
+    host_artifact = expected_directory.parent / "freshell-session-host"
+    if native_auth_reader and (not host_artifact.is_file() or host_artifact.is_symlink() or host_artifact.resolve() != host_artifact):
+        raise RuntimeError("native auth fixture requires its own physical compiled session host")
     listing = subprocess.run([str(binary), *selection, "--list"],
                              env={"PATH": "/usr/bin:/bin"}, text=True,
                              capture_output=True, timeout=20, check=True)
@@ -59,14 +62,19 @@ def main():
     created = False
     receipt = {"image": IMAGE, "testArtifactSha256": digest, "test": selected_test,
                "runId": name, "rootless": True}
+    if native_auth_reader:
+        with host_artifact.open("rb") as stream:
+            receipt["sessionHostArtifactSha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
     reader = args.provider in ("claude-reader", "native-auth-reader")
     identity_args = ["--cap-add", "CHOWN", "--cap-add", "SETGID", "--cap-add", "SETUID", "--env", "FRESHELL_TEST_RESTRICTED_READER=1"] if reader else []
     test_env = ["--env", "RUST_TEST_THREADS=4", "--env", "TOKIO_WORKER_THREADS=2"] if native_auth_reader else []
+    host_mount = ["--mount", f"type=bind,src={host_artifact},dst=/runtime/freshell-session-host,readonly"] if native_auth_reader else []
     try:
         docker("create", "--name", name, "--label", f"{LABEL}={name}",
                "--network", "none", "--read-only", "--user", "0:0" if reader else "65534:0", "--cap-drop", "ALL", *identity_args, *test_env,
                "--security-opt", "no-new-privileges:true", "--pids-limit", "128", "--memory", "2g",
                "--mount", f"type=bind,src={binary},dst=/runtime/source-consumer-tests,readonly",
+               *host_mount,
                "--tmpfs", "/fixture:rw,exec,nosuid,nodev,size=512m,uid=65534,gid=0,mode=0700",
                "--tmpfs", f"/home/freshell/provider:rw,{'exec' if args.provider == 'codex' else 'noexec'},nosuid,nodev,size=512m,uid=65534,gid=0,mode=0700",
                "--tmpfs", f"/tmp:rw,nosuid,nodev,noexec,size=256m,uid={0 if reader else 65534},gid=0,mode={'1777' if reader else '0700'}",

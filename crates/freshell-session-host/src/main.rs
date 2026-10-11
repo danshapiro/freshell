@@ -1,6 +1,7 @@
 mod claude_source_observation;
 mod command_journal;
 mod control;
+mod native_auth_reader;
 mod output_journal;
 mod provider_input_preparation;
 mod provider_secret_resolution;
@@ -121,6 +122,7 @@ async fn run() -> Result<(), String> {
         Some("serve") => serve(&args[2..]).await,
         Some("worker") => worker(&args[2..]).await,
         Some("observe-claude-sources") if args.len() == 2 => claude_source_observation::serve_stdio(),
+        Some("native-auth-stdio") if args.len() == 2 => native_auth_reader::serve_stdio(),
         Some("observe-claude-sources-private") if args.len() == 2 => {
             verify_private_helper_namespace(
                 Path::new("/home/freshell/provider"),
@@ -954,6 +956,7 @@ async fn grant_execution(
                 launch.mode.as_str(),
                 launch.provider_secret_references.as_slice(),
                 launch.provider_launch_context.as_ref(),
+                (launch.run_as_uid, launch.run_as_gid),
             )
         })
         .or_else(|| {
@@ -962,10 +965,11 @@ async fn grant_execution(
                     launch.provider.native_provider(),
                     launch.provider_secret_references.as_slice(),
                     launch.provider_launch_context.as_ref(),
+                    (launch.run_as_uid, launch.run_as_gid),
                 )
             })
         });
-    let mut prepared_secrets = if let Some((provider, references, context)) = source {
+    let mut prepared_secrets = if let Some((provider, references, context, identity)) = source {
         let mut secrets = provider_secret_resolution::resolve_child_secrets(
             provider,
             references,
@@ -978,7 +982,7 @@ async fn grant_execution(
             )
         })?;
         if matches!(provider, "opencode" | "codex" | "claude" | "amplifier") {
-            let generated = provider_input_preparation::prepare(
+            let generated = provider_input_preparation::prepare_for_identity(
                 context,
                 &mut secrets,
                 &provider_path_inputs,
@@ -987,7 +991,9 @@ async fn grant_execution(
                     .private_mount
                     .join("user-provider"),
                 &state.provider_config_paths.provider_home,
+                identity,
             )
+            .await
             .map_err(|error| {
                 RuntimeError::new(
                     if error.starts_with("configuration reference selection changed") {

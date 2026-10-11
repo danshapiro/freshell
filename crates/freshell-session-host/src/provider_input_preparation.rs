@@ -253,12 +253,13 @@ pub(crate) fn final_claude_source_request(
     Ok(Some((request, plan.observation.clone())))
 }
 
-pub fn prepare(
+pub(crate) async fn prepare_for_identity(
     context: Option<&ProviderLaunchContext>,
     secrets: &mut ResolvedProviderSecrets,
     frozen: &ProviderPathInputs,
     stage: &Path,
     home: &Path,
+    identity: (u32, u32),
 ) -> Result<BTreeMap<String, String>, String> {
     use freshell_platform::opencode_recipe::{GeneratedFileRecipe, SourceLane, SourceManifest};
     use sha2::{Digest, Sha256};
@@ -394,8 +395,7 @@ pub fn prepare(
         )
         .map_err(|error| error.to_string())?
     } else {
-        freshell_platform::native_auth_exchange::read_selected_native_auth(home, &names)
-            .map_err(str::to_string)?
+        crate::native_auth_reader::read_selected(home, &names, identity).await?
     };
     let plan = freshell_platform::opencode_config::OpencodeConfigPlan {
         sources: vec![],
@@ -566,9 +566,27 @@ pub fn prepare(
 mod tests {
     use super::*;
 
+    async fn prepare(
+        context: Option<&ProviderLaunchContext>,
+        secrets: &mut ResolvedProviderSecrets,
+        frozen: &ProviderPathInputs,
+        stage: &Path,
+        home: &Path,
+    ) -> Result<BTreeMap<String, String>, String> {
+        super::prepare_for_identity(
+            context,
+            secrets,
+            frozen,
+            stage,
+            home,
+            (unsafe { libc::geteuid() }, unsafe { libc::getegid() }),
+        )
+        .await
+    }
+
     #[cfg(target_os = "linux")]
-    #[test]
-    fn provider_secret_private_reader_rejects_oversize_before_payload_read() {
+    #[tokio::test]
+    async fn provider_secret_private_reader_rejects_oversize_before_payload_read() {
         use private_read_observation::Observation;
         let owned = tempfile::tempdir().unwrap();
         let private = owned.path().join("metadata");
@@ -616,7 +634,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     #[cfg(target_os = "linux")]
-    fn private_native_auth_case(case: &str, test: &str) {
+    async fn private_native_auth_case(case: &str, test: &str) {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         const CHILD: &str = "FRESHELL_TEST_PRIVATE_NATIVE_AUTH_ROOT";
         let restricted = std::env::var_os("FRESHELL_TEST_RESTRICTED_READER").is_some();
@@ -681,13 +699,20 @@ mod tests {
                 );
             }
             let mut secrets = ResolvedProviderSecrets::default();
-            let result = prepare(
+            let identity = if restricted {
+                (65534, 0)
+            } else {
+                (unsafe { libc::geteuid() }, unsafe { libc::getegid() })
+            };
+            let result = super::prepare_for_identity(
                 Some(&context),
                 &mut secrets,
                 &ProviderPathInputs::default(),
                 &stage,
                 &home,
-            );
+                identity,
+            )
+            .await;
             match case {
                 "selected" => {
                     let generated = result
@@ -827,40 +852,45 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[test]
-    fn provider_secret_native_auth_private_home_selected() {
+    #[tokio::test]
+    async fn provider_secret_native_auth_private_home_selected() {
         private_native_auth_case(
             "selected",
             "provider_input_preparation::tests::provider_secret_native_auth_private_home_selected",
-        );
+        )
+        .await;
     }
     #[cfg(target_os = "linux")]
-    #[test]
-    fn provider_secret_native_auth_private_home_absent() {
+    #[tokio::test]
+    async fn provider_secret_native_auth_private_home_absent() {
         private_native_auth_case(
             "absent",
             "provider_input_preparation::tests::provider_secret_native_auth_private_home_absent",
-        );
+        )
+        .await;
     }
     #[cfg(target_os = "linux")]
-    #[test]
-    fn provider_secret_native_auth_private_home_foreign() {
+    #[tokio::test]
+    async fn provider_secret_native_auth_private_home_foreign() {
         private_native_auth_case(
             "foreign",
             "provider_input_preparation::tests::provider_secret_native_auth_private_home_foreign",
-        );
+        )
+        .await;
     }
     #[cfg(target_os = "linux")]
-    #[test]
-    fn provider_secret_native_auth_private_home_reserved() {
+    #[tokio::test]
+    async fn provider_secret_native_auth_private_home_reserved() {
         private_native_auth_case(
             "reserved",
             "provider_input_preparation::tests::provider_secret_native_auth_private_home_reserved",
-        );
+        )
+        .await;
     }
 
-    #[test]
-    fn provider_secret_repeated_native_source_views_release_live_storage_between_occurrences() {
+    #[tokio::test]
+    async fn provider_secret_repeated_native_source_views_release_live_storage_between_occurrences()
+    {
         let owned = tempfile::tempdir().unwrap();
         let home = owned.path().join("home");
         let stage = owned.path().join("stage");
@@ -924,7 +954,7 @@ mod tests {
             "preparedInputs":{"generationId":generation,"manifest":{"relativePath":".freshell/input-manifest.json","sha256":format!("{:x}",Sha256::digest(&bytes)),"sourceCount":0,"aliasCount":0,"recipeCount":0}}
         })).unwrap();
         let mut secrets = ResolvedProviderSecrets::default();
-        let generated = prepare(Some(&context), &mut secrets, &ProviderPathInputs::default(), &stage, &home)
+        let generated = prepare(Some(&context), &mut secrets, &ProviderPathInputs::default(), &stage, &home).await
             .expect("128 MiB cumulative reads of eight 16 MiB occurrences fit the simultaneous view profile");
         assert!(
             generated.is_empty(),
@@ -950,6 +980,7 @@ mod tests {
             &stage,
             &home,
         )
+        .await
         .unwrap_err();
         assert!(error.contains("byte profile"), "{error}");
         assert!(refused.opencode_plan.is_none());
@@ -987,6 +1018,7 @@ mod tests {
             &stage,
             &home,
         )
+        .await
         .unwrap_err();
         assert!(error.contains("recipe profile limit"), "{error}");
         assert!(refused.opencode_plan.is_none());
@@ -1001,8 +1033,8 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[test]
-    fn provider_secret_actual_merged_profile_reaches_guarded_child() {
+    #[tokio::test]
+    async fn provider_secret_actual_merged_profile_reaches_guarded_child() {
         const GENERATED: &str = "FRESHELL_CONFIG_REFERENCE_0";
         const RECEIPT: &str = "HOST_MERGED_PROFILE=";
         if std::env::var_os(GENERATED).is_some() {
@@ -1149,7 +1181,7 @@ mod tests {
                     "indexedFiles":{"volumeName":indexed_provider_volume_name(&SoulId::new(),&generation),"aliases":[]}}
             })).unwrap();
             let mut secrets = ResolvedProviderSecrets::default();
-            let result = prepare(Some(&context), &mut secrets, &frozen, &stage, &home);
+            let result = prepare(Some(&context), &mut secrets, &frozen, &stage, &home).await;
             if accepted {
                 let environment = result.unwrap();
                 assert_eq!(environment.len(), frozen_count + 1);
@@ -1262,8 +1294,8 @@ mod tests {
         .unwrap()
         .is_none());
     }
-    #[test]
-    fn provider_secret_claude_final_source_request_keeps_enriched_origin_and_frozen_original_selectors(
+    #[tokio::test]
+    async fn provider_secret_claude_final_source_request_keeps_enriched_origin_and_frozen_original_selectors(
     ) {
         use freshell_platform::claude_inputs::{
             observation::observe, AcceptedNativeSourcePlan, ClaudeInputManifest,
@@ -1361,8 +1393,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn provider_secret_claude_inline_settings_consumes_accepted_private_source() {
+    #[tokio::test]
+    async fn provider_secret_claude_inline_settings_consumes_accepted_private_source() {
         use freshell_platform::claude_inputs::{ClaudeInputManifest, INLINE_SETTINGS_SOURCE};
         let owned = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(owned.path().join(".freshell/source-views")).unwrap();
@@ -1419,6 +1451,7 @@ mod tests {
             owned.path(),
             owned.path(),
         )
+        .await
         .unwrap();
         let argument = secrets.claude_settings_argument.as_deref().expect("accepted inline settings must reach the native child argument without a guessed file origin");
         let output = std::process::Command::new("node").args(["-e", "const s=JSON.parse(process.argv[1]);process.stdout.write([s.env.FLAG_NONCE,s.hooks.SessionStart[0].hooks[0].command,s.hooks.SessionStart.length,s.hooks.Stop.length].join(':'))", argument]).output().unwrap();
@@ -1441,6 +1474,7 @@ mod tests {
             owned.path(),
             owned.path(),
         )
+        .await
         .err()
         .unwrap();
         assert!(error.contains("source changed"));
@@ -1459,12 +1493,13 @@ mod tests {
             owned.path(),
             owned.path()
         )
+        .await
         .is_err());
         assert!(oversized.claude_settings_argument.is_none());
     }
 
-    #[test]
-    fn provider_secret_claude_prepared_manifest_validates_without_original_controller_tree() {
+    #[tokio::test]
+    async fn provider_secret_claude_prepared_manifest_validates_without_original_controller_tree() {
         let owned = tempfile::tempdir().unwrap();
         std::fs::create_dir(owned.path().join(".freshell")).unwrap();
         let manifest = freshell_platform::claude_inputs::ClaudeInputManifest {
@@ -1511,7 +1546,7 @@ mod tests {
             mcp_capability: Some(capability),
         };
         let mut secrets = ResolvedProviderSecrets::default();
-        let generated=prepare(Some(&context),&mut secrets,&ProviderPathInputs::default(),owned.path(),owned.path())
+        let generated=prepare(Some(&context),&mut secrets,&ProviderPathInputs::default(),owned.path(),owned.path()).await
             .expect("Claude source origins validate from accepted private metadata, without rescanning controller paths");
         assert!(generated.is_empty());
         assert!(
@@ -1532,6 +1567,7 @@ mod tests {
                 owned.path(),
                 owned.path()
             )
+            .await
             .is_err(),
             "foreign source recipes cannot enter ordinary Claude metadata"
         );
@@ -1554,6 +1590,7 @@ mod tests {
             owned.path(),
             owned.path(),
         )
+        .await
         .err()
         .unwrap();
         assert!(error.contains("declaring origin is unrecorded"));
@@ -1576,15 +1613,16 @@ mod tests {
             });
         std::fs::create_dir(owned.path().join(".freshell/templates")).unwrap();
         std::fs::write(owned.path().join(".freshell/templates/claude-0"), b"{}").unwrap();
-        prepare(Some(&context), &mut secrets, &ProviderPathInputs::default(), owned.path(), owned.path()).expect("a recorded native declaring origin is consumed without reading the unavailable original controller tree");
+        prepare(Some(&context), &mut secrets, &ProviderPathInputs::default(), owned.path(), owned.path()).await.expect("a recorded native declaring origin is consumed without reading the unavailable original controller tree");
         assert_eq!(
             secrets.claude_settings_argument.as_deref(),
             Some("/home/freshell/provider/declaring-settings.json")
         );
     }
 
-    #[test]
-    fn provider_secret_amplifier_prepared_manifest_validates_without_original_controller_tree() {
+    #[tokio::test]
+    async fn provider_secret_amplifier_prepared_manifest_validates_without_original_controller_tree(
+    ) {
         let owned = tempfile::tempdir().unwrap();
         std::fs::create_dir(owned.path().join(".freshell")).unwrap();
         let manifest = freshell_platform::amplifier_inputs::AmplifierInputManifest {
@@ -1624,7 +1662,7 @@ mod tests {
             mcp_capability: Some(capability),
         };
         let mut secrets = ResolvedProviderSecrets::default();
-        let generated=prepare(Some(&context),&mut secrets,&ProviderPathInputs::default(),owned.path(),owned.path())
+        let generated=prepare(Some(&context),&mut secrets,&ProviderPathInputs::default(),owned.path(),owned.path()).await
             .expect("Amplifier source origins validate from accepted private metadata, without rescanning controller paths");
         assert!(generated.is_empty());
         assert!(
@@ -1645,13 +1683,14 @@ mod tests {
                 owned.path(),
                 owned.path()
             )
+            .await
             .is_err(),
             "foreign source recipes cannot enter ordinary Amplifier metadata"
         );
     }
 
-    #[test]
-    fn provider_secret_codex_prepared_manifest_retains_native_home_without_original_tree() {
+    #[tokio::test]
+    async fn provider_secret_codex_prepared_manifest_retains_native_home_without_original_tree() {
         let owned = tempfile::tempdir().unwrap();
         std::fs::create_dir(owned.path().join(".freshell")).unwrap();
         let manifest = freshell_platform::codex_inputs::CodexInputManifest {
@@ -1699,6 +1738,7 @@ mod tests {
             owned.path(),
             owned.path(),
         )
+        .await
         .expect(
             "accepted native Codex inputs must validate without reading original controller paths",
         );
@@ -1718,12 +1758,14 @@ mod tests {
             owned.path(),
             owned.path()
         )
+        .await
         .unwrap_err()
         .contains("changed"));
     }
 
-    #[test]
-    fn provider_secret_prepared_recipe_consumes_private_frozen_inputs_without_original_tree() {
+    #[tokio::test]
+    async fn provider_secret_prepared_recipe_consumes_private_frozen_inputs_without_original_tree()
+    {
         let owned = tempfile::tempdir().unwrap();
         let stage = owned.path().join("stage");
         let home = owned.path().join("home");
@@ -1814,7 +1856,9 @@ mod tests {
         )]))
         .unwrap();
         let mut secrets = ResolvedProviderSecrets::default();
-        let generated = prepare(Some(&context), &mut secrets, &frozen, &stage, &home).unwrap();
+        let generated = prepare(Some(&context), &mut secrets, &frozen, &stage, &home)
+            .await
+            .unwrap();
         assert!(secrets.opencode_plan.is_some(), "the accepted source plan must reach provider preparation without rescanning mounted templates");
         assert!(
             secrets
@@ -1841,6 +1885,7 @@ mod tests {
         context.prepared_inputs.as_mut().unwrap().manifest.sha256 =
             format!("{:x}", Sha256::digest(&bytes));
         let error = prepare(Some(&context), &mut secrets, &frozen, &stage, &home)
+            .await
             .err()
             .unwrap_or_default();
         assert!(
@@ -1859,7 +1904,7 @@ mod tests {
         std::fs::write(stage.join(".freshell/input-manifest.json"), &bytes).unwrap();
         context.prepared_inputs.as_mut().unwrap().manifest.sha256 =
             format!("{:x}", Sha256::digest(&bytes));
-        let original = prepare(Some(&context), &mut secrets, &frozen, &stage, &home)
+        let original = prepare(Some(&context), &mut secrets, &frozen, &stage, &home).await
             .expect("native selection of an approved original-form source cannot require a replacement bind");
         assert_eq!(
             original.get("OPENCODE_CONFIG").map(String::as_str),
@@ -1880,7 +1925,9 @@ mod tests {
             std::fs::write(stage.join(".freshell/input-manifest.json"), &bytes).unwrap();
             context.prepared_inputs.as_mut().unwrap().manifest.sha256 =
                 format!("{:x}", Sha256::digest(&bytes));
-            let error = prepare(Some(&context), &mut secrets, &frozen, &stage, &home).unwrap_err();
+            let error = prepare(Some(&context), &mut secrets, &frozen, &stage, &home)
+                .await
+                .unwrap_err();
             assert!(!error.contains("/unapproved/source.json"));
         }
         manifest.native_source_flags[0] = approved_flag;
@@ -1902,7 +1949,9 @@ mod tests {
         std::fs::write(stage.join(".freshell/input-manifest.json"), &bytes).unwrap();
         context.prepared_inputs.as_mut().unwrap().manifest.sha256 =
             format!("{:x}", Sha256::digest(&bytes));
-        let inline = prepare(Some(&context), &mut secrets, &frozen, &stage, &home).unwrap();
+        let inline = prepare(Some(&context), &mut secrets, &frozen, &stage, &home)
+            .await
+            .unwrap();
         assert_eq!(
             inline.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
             Some(inline_template)
@@ -1913,7 +1962,7 @@ mod tests {
             r#"{"instructions":["{file:/unapproved/private-file}"]}"#,
         )
         .unwrap();
-        assert!(prepare(Some(&context), &mut secrets, &frozen, &stage, &home).is_err(), "changed inline template must fail before an unapproved file can reach the native child");
+        assert!(prepare(Some(&context), &mut secrets, &frozen, &stage, &home).await.is_err(), "changed inline template must fail before an unapproved file can reach the native child");
         manifest.sources[0].lane = SourceLane::Main;
         manifest.sources[0].template_sha256 = None;
         manifest.native_source_flags = native_flags;
@@ -1926,7 +1975,7 @@ mod tests {
             "{file:/different-unapproved/rules}".into(),
         )]))
         .unwrap();
-        assert!(prepare(Some(&context),&mut secrets,&changed,&stage,&home).is_err(),"changed lexical selection must fail without canonicalizing or reading an unavailable original tree");
+        assert!(prepare(Some(&context),&mut secrets,&changed,&stage,&home).await.is_err(),"changed lexical selection must fail without canonicalizing or reading an unavailable original tree");
         assert_eq!(
             std::fs::read_to_string(stage.join(".freshell/source-views/source-0")).unwrap(),
             raw
@@ -1941,6 +1990,7 @@ mod tests {
         context.prepared_inputs.as_mut().unwrap().manifest.sha256 =
             format!("{:x}", Sha256::digest(&bytes));
         let generated = prepare(Some(&context), &mut secrets, &frozen, &stage, &home)
+            .await
             .expect("direct source must use the 16 MiB document profile");
         assert_eq!(generated.len(), 1);
         assert!(generated.contains_key("OPENCODE_CONFIG"));
@@ -1956,14 +2006,20 @@ mod tests {
             format!("{:x}", Sha256::digest(&bytes));
         let at_limit = format!("{}{{}}", " ".repeat(document_limit - 2));
         std::fs::write(stage.join(".freshell/source-views/source-0"), &at_limit).unwrap();
-        assert!(prepare(Some(&context), &mut secrets, &frozen, &stage, &home).is_ok());
+        assert!(
+            prepare(Some(&context), &mut secrets, &frozen, &stage, &home)
+                .await
+                .is_ok()
+        );
         std::fs::write(
             stage.join(".freshell/source-views/source-0"),
             format!(" {at_limit}"),
         )
         .unwrap();
         assert!(
-            prepare(Some(&context), &mut secrets, &frozen, &stage, &home).is_err(),
+            prepare(Some(&context), &mut secrets, &frozen, &stage, &home)
+                .await
+                .is_err(),
             "direct source growth above the 16 MiB profile must fail before dispatch"
         );
         std::fs::write(stage.join(".freshell/source-views/source-0"), &large_raw).unwrap();
@@ -1976,6 +2032,7 @@ mod tests {
             format!("{:x}", Sha256::digest(&bytes));
         assert!(
             prepare(Some(&context), &mut secrets, &frozen, &stage, &home)
+                .await
                 .unwrap_err()
                 .contains("64 KiB"),
             "generated child values retain the declared stricter limit"
@@ -1986,7 +2043,9 @@ mod tests {
         std::fs::write(stage.join(".freshell/input-manifest.json"), &bytes).unwrap();
         context.prepared_inputs.as_mut().unwrap().manifest.sha256 =
             format!("{:x}", Sha256::digest(&bytes));
-        let error = prepare(Some(&context), &mut secrets, &frozen, &stage, &home).unwrap_err();
+        let error = prepare(Some(&context), &mut secrets, &frozen, &stage, &home)
+            .await
+            .unwrap_err();
         assert!(error.contains("approved config bind"));
         assert!(!error.contains("/unapproved/native/config.json"));
     }
