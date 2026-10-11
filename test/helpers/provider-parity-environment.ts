@@ -3,7 +3,10 @@ import path from 'node:path'
 
 /** Select each managed environment scenario's own relative configuration. */
 export function managedEnvironmentOpencodeSelection(): Record<string, string> {
-  return {}
+  return {
+    OPENCODE_DISABLE_PROJECT_CONFIG: '1',
+    OPENCODE_CONFIG: './opencode.json',
+  }
 }
 
 /** Establish selected fixture roots before the harness captures its policy. */
