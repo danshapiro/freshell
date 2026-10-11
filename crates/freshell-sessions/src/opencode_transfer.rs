@@ -4923,6 +4923,10 @@ fn observe_workspace_git(
             &mut observation.loose.bindings,
         )?;
     }
+    // Stable stamps do not qualify a newly present selected path. Reapply the
+    // existing type and containment rules to the current store plan at both
+    // pre-census and post-settlement acceptance, including preexisting fanouts.
+    verify_git_loose_object_paths(mount, &qualified.object_stores, objects)?;
     Ok(Some(observation))
 }
 
@@ -9401,7 +9405,9 @@ mod native_source_inventory_tests {
                     .unwrap()
                     .to_string();
                 let loose_path = git_dir.join("objects").join(&blob[..2]).join(&blob[2..]);
-                if mutation == "loose_add" {
+                // Keep the fanout present before observation, so introducing a
+                // selected symlink cannot hide behind an object-store stamp change.
+                if matches!(mutation, "loose_add" | "loose_redirect") {
                     fs::create_dir_all(loose_path.parent().unwrap()).unwrap();
                 }
                 let loose_bytes = {
@@ -10063,6 +10069,110 @@ mod native_source_inventory_tests {
         assert_eq!(costs.workspace_git_successes, 0);
         assert_eq!(costs.native_queries, 30);
         workspace_metadata_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_metadata_selected_symlink_refusal_preserves_complete_native_bundle() {
+        for phase in ["traversed", "settled"] {
+            let fixture = reuse_fixture(true);
+            let baseline = export_exact_session(
+                &fixture.inventory,
+                "ses_exact",
+                ExportOptions::new(fixture.dir.path().join("extract")),
+            )
+            .unwrap();
+            let workspace = fixture.dir.path().join("workspace");
+            let git_dir = workspace.join(".git");
+            fixture_git(&git_dir, &["init", "-q"], None);
+            copy_fixture_objects(&fixture.store, &git_dir.join("objects"));
+            let loose_path = git_dir
+                .join("objects")
+                .join(&fixture.blob[..2])
+                .join(&fixture.blob[2..]);
+            fs::create_dir_all(loose_path.parent().unwrap()).unwrap();
+            let body = fixture_git(&git_dir, &["cat-file", "blob", &fixture.blob], None);
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            write!(encoder, "blob {}\0{body}", body.len()).unwrap();
+            let parked = fixture.dir.path().join("outside-workspace-loose-object");
+            fs::write(&parked, encoder.finish().unwrap()).unwrap();
+            // Restore the workspace path only before the next independently
+            // guarded native closure read. Each workspace inspection still
+            // sees the redirect through its complete acceptance boundary.
+            let cleanup_path = loose_path.clone();
+            snapshot_reuse_test_hooks::STATE.with(|state| {
+                *state.borrow_mut() = snapshot_reuse_test_hooks::State {
+                    before_reference: Some(Box::new(move |_| {
+                        if cleanup_path.symlink_metadata().is_ok() {
+                            fs::remove_file(&cleanup_path).unwrap();
+                        }
+                    })),
+                    ..Default::default()
+                }
+            });
+            let redirects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let barrier_redirects = redirects.clone();
+            let final_cleanup = loose_path.clone();
+            workspace_metadata_test_hooks::STATE.with(|state| {
+                *state.borrow_mut() = workspace_metadata_test_hooks::State {
+                    barrier: Some(Box::new(move |at, _| {
+                        if at == phase {
+                            barrier_redirects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            std::os::unix::fs::symlink(&parked, &loose_path).unwrap();
+                        }
+                    })),
+                    ..Default::default()
+                }
+            });
+            let costs = Arc::new(std::sync::Mutex::new(None));
+            let completed_costs = costs.clone();
+            let refused = export_exact_session(
+                &fixture.inventory,
+                "ses_exact",
+                ExportOptions::new(fixture.dir.path().join("extract")).with_progress_observer(
+                    move |event| {
+                        if event.phase == "saved_objects" && event.state == "completed" {
+                            *completed_costs.lock().unwrap() = event.reader_costs.clone();
+                        }
+                    },
+                ),
+            )
+            .unwrap();
+            assert_eq!(redirects.load(std::sync::atomic::Ordering::SeqCst), 9);
+            fs::remove_file(final_cleanup).unwrap();
+            assert_eq!(
+                fs::read(&baseline.payload_path).unwrap(),
+                fs::read(&refused.payload_path).unwrap(),
+                "{phase}: no unqualified workspace asset may enter the native payload"
+            );
+            assert_eq!(
+                serde_json::to_value(baseline.manifest()).unwrap(),
+                serde_json::to_value(refused.manifest()).unwrap()
+            );
+            assert_eq!(
+                source_graph_fingerprint(baseline.manifest()).unwrap(),
+                source_graph_fingerprint(refused.manifest()).unwrap()
+            );
+            let costs = costs.lock().unwrap();
+            let costs = costs.as_ref().unwrap();
+            assert_eq!(costs.workspace_git_refusals, 9);
+            assert_eq!(costs.workspace_git_successes, 0);
+            assert_eq!(costs.native_queries, 30);
+            eprintln!("selected redirect {phase}: 9 executed, 9 workspace refusals, 0 successes; complete native payload/manifest/graph preserved");
+            workspace_metadata_test_hooks::STATE.with(|state| {
+                let state = state.borrow();
+                assert!(state.records.is_empty());
+                assert_eq!(state.counts.get("spawn"), state.counts.get("reap"));
+                assert_eq!(
+                    state.counts.get("drain_spawn"),
+                    state.counts.get("drain_join")
+                );
+            });
+            snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+            workspace_metadata_test_hooks::STATE
+                .with(|state| *state.borrow_mut() = Default::default());
+        }
     }
 
     #[cfg(target_os = "linux")]
