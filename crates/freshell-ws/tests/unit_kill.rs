@@ -6,8 +6,9 @@
 //! cancelled, a second kill joins the first, an unknown terminal counts as
 //! killed only when nothing holds a conversation for it, a kill that came
 //! before its create refuses that create, a delayed kill from another device
-//! cannot stop an auto-resumed replacement, and an inventory taken during
-//! the stop reports the row stopping.
+//! cannot stop an auto-resumed replacement (nor cancel its start), one press
+//! carrying only the create-request id cancels a starting replacement, and
+//! an inventory taken during the stop reports the row stopping.
 #![cfg(target_os = "linux")]
 #[path = "support/unit_harness.rs"]
 mod unit_harness;
@@ -450,6 +451,155 @@ async fn a_delayed_kill_from_another_device_cannot_cancel_the_replacements_start
     assert!(
         fake_codex::pid_alive(native),
         "the replacement's app-server still runs"
+    );
+}
+
+/// Shift-X cancels a start in ONE press (Task 13 re-review 2, R2-I2). While
+/// a replacement (a stuck restart, an auto-resume, a reopen) is starting,
+/// the device showing it has not yet seen its owner pair, so a kill that
+/// carries a pair carries an old one and is refused as stale (another
+/// device's delayed kill never cancels the replacement). The kill the
+/// starting pane sends carries only its create-request id and no pair: it
+/// cancels the start at once, is answered `success:true` at Gone (the
+/// replacement's processes are dead by then), and no `terminal.created`
+/// follows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_one_press_kill_of_a_starting_replacement_carries_no_pair_and_cancels_its_start() {
+    let h = UnitHarness::start(HarnessOpts::default()).await;
+    let mut ws = h.connect().await;
+    let ownership = h.state.ownership.clone().expect("an owner registry");
+    let first = h.create_codex(&mut ws, "crq-op", Some("t-one-press")).await;
+    let p0 = match ownership.observe("codex", "t-one-press") {
+        freshell_ownership::OwnershipSnapshot {
+            epoch,
+            state: freshell_ownership::OwnershipState::Live { generation, .. },
+            ..
+        } => (epoch, generation),
+        other => panic!("the pane holds its conversation Live: {other:?}"),
+    };
+    let first_unit = h.unit_for(&first).id().clone();
+
+    let mut stuck = kill(Some(&first), "crq-op", "rk-stuck-op");
+    stuck["reason"] = json!("stuck-recovery");
+    h.send(&mut ws, stuck).await;
+    let killed = h
+        .next_matching(&mut ws, Duration::from_secs(10), |f| {
+            f["type"] == "terminal.killed" && f["requestId"] == "rk-stuck-op"
+        })
+        .await
+        .expect("the stuck restart's kill is answered");
+    assert_eq!(killed["success"], true);
+    let before_respawn: std::collections::BTreeSet<_> = std::fs::read_dir(&h.manifests)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+
+    // The respawn's app-server waits before it listens, so the replacement
+    // stays starting while both kills arrive.
+    std::env::set_var(
+        "FAKE_CODEX_APP_SERVER_BEHAVIOR",
+        json!({"listenDelayMs": 4000}).to_string(),
+    );
+    h.send(
+        &mut ws,
+        json!({"type": "terminal.create", "requestId": "crq-op", "mode": "codex", "shell": "system",
+            "cwd": h.home.path().display().to_string(),
+            "sessionRef": {"provider": "codex", "sessionId": "t-one-press"}, "restore": true}),
+    )
+    .await;
+    let starting = {
+        let state = h.state.clone();
+        let ownership = ownership.clone();
+        let first_unit = first_unit.clone();
+        move || {
+            state
+                .units
+                .by_create_request("crq-op")
+                .is_some_and(|entry| entry.unit.id() != &first_unit)
+                && matches!(
+                    ownership.observe("codex", "t-one-press").state,
+                    freshell_ownership::OwnershipState::Starting { .. }
+                )
+        }
+    };
+    fake_codex::wait_until(
+        "the replacement is starting",
+        Duration::from_secs(10),
+        starting.clone(),
+    )
+    .await;
+    let allocated = h
+        .state
+        .units
+        .by_create_request("crq-op")
+        .and_then(|entry| entry.unit.label().terminal_id)
+        .expect("the replacement's allocated terminal");
+
+    // A kill carrying the pair it saw before the restart: refused as stale.
+    let mut stale = kill(Some(&first), "crq-op", "rk-stale-op");
+    stale["observedEpoch"] = json!(p0.0);
+    stale["observedGeneration"] = json!(p0.1);
+    h.send(&mut ws, stale).await;
+    let refused = h
+        .next_matching(&mut ws, Duration::from_secs(10), |f| {
+            f["type"] == "terminal.killed" && f["requestId"] == "rk-stale-op"
+        })
+        .await
+        .expect("the stale kill is answered");
+    assert_eq!(refused["success"], false, "{refused}");
+    assert!(
+        starting(),
+        "a stale kill cancels nothing: the replacement is still starting"
+    );
+
+    // The one press from the device showing the pane starting: its
+    // create-request id only, no terminal and no pair.
+    h.send(&mut ws, kill(None, "crq-op", "rk-one-press")).await;
+    let created_before_the_answer = std::cell::Cell::new(false);
+    let answered = h
+        .next_matching(&mut ws, Duration::from_secs(10), |f| {
+            if f["type"] == "terminal.created" && f["requestId"] == "crq-op" {
+                created_before_the_answer.set(true);
+            }
+            f["type"] == "terminal.killed" && f["requestId"] == "rk-one-press"
+        })
+        .await
+        .expect("the one-press kill is answered");
+    assert!(
+        !created_before_the_answer.get(),
+        "the cancelled replacement was created"
+    );
+    assert_eq!(answered["success"], true, "{answered}");
+    assert_eq!(
+        answered["terminalId"],
+        allocated.as_str(),
+        "the answer names the replacement's terminal: {answered}"
+    );
+    for path in std::fs::read_dir(&h.manifests)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|path| !before_respawn.contains(path))
+    {
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            !fake_codex::pid_alive(manifest["pid"].as_u64().unwrap() as u32),
+            "the replacement's processes are dead at the answer: {manifest}"
+        );
+    }
+    assert!(
+        h.next_matching(&mut ws, Duration::from_secs(2), |f| f["type"]
+            == "terminal.created"
+            && f["requestId"] == "crq-op")
+            .await
+            .is_none(),
+        "the cancelled replacement never completes its start"
+    );
+    assert_eq!(
+        ownership.observe("codex", "t-one-press").state,
+        freshell_ownership::OwnershipState::Vacant
     );
 }
 
