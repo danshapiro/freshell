@@ -5683,6 +5683,22 @@ async fn durable_souls_server_resolved_scope_rejects_tenth_drift_before_writes()
             );
         }
     }
+    let saved_object_event = &late_events
+        .iter()
+        .find(|event| {
+            event["data"]["phase"] == "saved_objects" && event["data"]["state"] == "completed"
+        })
+        .unwrap()["data"];
+    let reader_costs = saved_object_event["readerCosts"].as_object().unwrap();
+    assert!(
+        reader_costs.values().all(serde_json::Value::is_u64),
+        "actual late reader diagnostics stay numeric and body-free after withdrawal"
+    );
+    assert_eq!(
+        reader_costs["nativeQueries"], 0,
+        "this actual root has no saved native objects"
+    );
+    assert_eq!(reader_costs["freshInspections"], 0);
     let capture_event = &late_events
         .iter()
         .find(|event| event["data"]["phase"] == "capture")
