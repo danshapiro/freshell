@@ -7021,9 +7021,18 @@ export class ManagedRuntimeOwner {
       : provider === 'codex' ? '/home/freshell/provider/.codex/sessions'
       : provider === 'opencode' ? '/home/freshell/provider/.local/share/opencode/opencode.db' : '/home/freshell/provider/.amplifier/projects'
     const helperName = `freshell-history-${randomUUID()}`
+    let helperId: string | null = null
+    let helperExitStatus: string | null = null
+    let refusal: Error | undefined
+    let logsAttempted = false
     let failure: unknown
+    const probe = (args: string[]) => this.trackedDockerProbe(handle.containerId, args, true, { ...handle, provider, helperName })
+    const retain = () => this.runtime.writeArtifact(`stopped-native-history-${helperName}.json`, {
+      ...handle, provider, runtimeImage: this.runtime.imageRef, providerVolumeName: receipt.providerVolumeName,
+      helperName, helperId, helperExitStatus,
+    })
     try {
-      const helperId = (await this.trackedDockerProbe(handle.containerId, ['create', '--name', helperName, '--tty',
+      helperId = (await probe(['create', '--name', helperName, '--tty',
         '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--user', '65534:0',
         '--memory', '256m', '--memory-swap', '256m', '--cpus', '0.5', '--pids-limit', '32',
         '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=16m', '--env', 'HOME=/home/freshell/provider',
@@ -7031,22 +7040,35 @@ export class ManagedRuntimeOwner {
         '--mount', `type=bind,source=${this.repoRoot},target=${this.repoRoot},readonly`, '--workdir', this.repoRoot,
         '--entrypoint', 'node', this.runtime.imageRef, '--no-warnings', '--import', path.join(this.repoRoot, 'node_modules/tsx/dist/loader.mjs'),
         path.join(this.repoRoot, 'test/e2e-browser/helpers/provider-native-history/probe-cli.ts'), provider, source, handle.nativeSessionId,
-      ], true)).trim()
+      ])).trim()
       if (!/^[a-f0-9]{64}$/.test(helperId)) throw new Error('native history helper acknowledgement is invalid')
-      await this.trackedDockerProbe(handle.containerId, ['start', helperId], true)
-      const status = (await this.trackedDockerProbe(handle.containerId, ['wait', helperId], true)).trim()
-      if (status !== '0') throw new Error('native history helper refused the exact stopped source')
-      const raw = await this.trackedDockerProbe(handle.containerId, ['logs', helperId], true)
+      await probe(['start', helperId])
+      helperExitStatus = (await probe(['wait', helperId])).trim()
+      if (helperExitStatus !== '0') refusal = new Error('native history helper refused the exact stopped source')
+      retain()
+      logsAttempted = true
+      const raw = await probe(['logs', helperId])
+      if (refusal) throw refusal
       const history: FreshCapturedNativeHistory = JSON.parse(raw)
       if (history.schemaVersion !== 1 || history.provider !== provider || history.nativeSessionId !== handle.nativeSessionId) {
         throw new Error('stopped native history identity differs')
       }
       return history
     } catch (error) {
-      failure = error
-      throw error
+      failure = refusal && error !== refusal ? new AggregateError([refusal, error],
+        'stopped native history helper refused and evidence collection failed') : error
+      // A failed wait/start transport can still leave useful helper output.
+      // Keep collection bounded to this already acknowledged, owned helper.
+      if (helperId && /^[a-f0-9]{64}$/.test(helperId) && !logsAttempted) {
+        logsAttempted = true
+        try { await probe(['logs', helperId]) }
+        catch (logsError) { failure = new AggregateError([failure, logsError], 'stopped native history read and log collection failed') }
+      }
+      try { retain() }
+      catch (retentionError) { failure = new AggregateError([failure, retentionError], 'stopped native history read and diagnostic retention failed') }
+      throw failure
     } finally {
-      try { await this.trackedDockerProbe(handle.containerId, ['rm', '--force', helperName], true) }
+      try { await probe(['rm', '--force', helperName]) }
       catch (cleanupError) {
         if (failure) throw new AggregateError([failure, cleanupError], 'stopped native history read and helper cleanup failed')
         throw cleanupError
@@ -7437,7 +7459,8 @@ export class ManagedRuntimeOwner {
       'env', 'HOME=/home/freshell/provider', ...args])
   }
 
-  private async trackedDockerProbe(containerId: string, args: string[], historyHelper = false): Promise<string> {
+  private async trackedDockerProbe(containerId: string, args: string[], historyHelper = false,
+    historyDiagnostic?: ExactRuntimeHandle & { provider: string; helperName: string }): Promise<string> {
     if (!this.runtime.broker.receiptIds().has(containerId)
       && !this.runtime.transferOwnedIds().containers.includes(containerId)) throw new Error('exact owned provider probe container required')
     const probeId = randomUUID()
@@ -7457,6 +7480,12 @@ export class ManagedRuntimeOwner {
       }, (error, stdout, stderr) => {
         this.providerProbes.delete(probeId)
         try {
+          if (historyDiagnostic) this.runtime.writeArtifact(`native-history-probe-${probeId}.json`, {
+            ...historyDiagnostic, runtimeImage: this.runtime.imageRef, probeId, containerId, operation: args[0],
+            helperId: args[0] === 'create' ? stdout.trim() : args[0] === 'rm' ? null : args[1],
+            code: error?.code ?? 0, signal: error?.signal ?? null, killed: error?.killed ?? false, stdout, stderr,
+            stdoutBytes: Buffer.byteLength(stdout), stderrBytes: Buffer.byteLength(stderr),
+          })
           this.runtime.recordLifecycle('external.provider_probe_settled', { severity: error ? 'warn' : 'info',
             probeId, containerId, code: error?.code ?? 0, stdoutBytes: Buffer.byteLength(stdout), stderrBytes: Buffer.byteLength(stderr) })
         } catch (evidenceError) {

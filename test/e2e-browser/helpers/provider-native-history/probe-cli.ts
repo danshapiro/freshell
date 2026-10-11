@@ -77,7 +77,7 @@ export function captureNativeHistory(provider: string, source: string, nativeSes
   const eventsSnapshot = provider === 'amplifier' ? snapshot(path.join(path.dirname(filename), 'events.jsonl')) : undefined
   let querySnapshotBase64: string | undefined
   if (provider === 'opencode') {
-    querySnapshotBase64 = execFileSync('python3', ['-c', SQLITE_BACKUP, filename], { encoding: 'utf8', timeout: 30_000,
+    querySnapshotBase64 = execFileSync('python3', ['-c', SQLITE_BACKUP, filename], { encoding: 'utf8', stdio: 'pipe', timeout: 30_000,
       maxBuffer: MAX_CAPTURE_BYTES }).trim()
     if (JSON.stringify(captured.identity) !== JSON.stringify(identity(fs.lstatSync(filename, { bigint: true })))) {
       throw new Error('native database changed during capture')
@@ -112,9 +112,25 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
     const [provider, source, nativeSessionId, ...extra] = process.argv.slice(2)
     if (!provider || !source || !nativeSessionId || extra.length) throw new Error('missing probe arguments')
     process.stdout.write(JSON.stringify(captureNativeHistory(provider, source, nativeSessionId)))
-  } catch {
+  } catch (error) {
     // Never echo parsed content, paths, ids, or exception values from a native store.
-    process.stderr.write('[provider-native-history] BLOCKED: native history validation failed\n')
+    const code = error instanceof Error && 'code' in error && typeof error.code === 'string'
+      && ['ENOENT', 'EACCES', 'EPERM', 'EISDIR', 'ENOTDIR', 'ELOOP'].includes(error.code) ? error.code : null
+    let stage = 'native_capture', reason = 'native_validation_failed'
+    if (code === 'ENOENT') reason = 'filesystem_entry_missing'
+    else if (code === 'EACCES' || code === 'EPERM') reason = 'permission_denied'
+    else if (code) reason = 'filesystem_shape_refused'
+    else if (error instanceof Error) {
+      // Match only fixed local guard messages; all other causes remain unknown.
+      if (error.message === 'native source is absent or ambiguous') {
+        stage = 'source_selection'; reason = 'source_absent_or_ambiguous'
+      } else if (error.message === 'native source has incomplete EOF') {
+        stage = 'source_read'; reason = 'incomplete_source_eof'
+      } else if (error.message === 'missing probe arguments' || error.message === 'unsupported provider') {
+        stage = 'arguments'; reason = 'invalid_arguments'
+      }
+    }
+    process.stderr.write(`${JSON.stringify({ severity: 'error', event: 'provider_native_history.refused', stage, reason, code })}\n`)
     process.exitCode = 2
   }
 }

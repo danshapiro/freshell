@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -17,6 +17,36 @@ import { OPENCODE_NATIVE_HISTORY_SCRIPT } from '../../../e2e-browser/helpers/ope
 import { captureNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/probe-cli.js'
 
 const roots: string[] = []
+
+describe('native history CLI failure diagnostics', () => {
+  it.each(['missing-directory', 'absent-session', 'malformed-source', 'incomplete-eof', 'invalid-database'] as const)(
+    'refuses %s with fixed diagnostics and no private payload', fault => {
+      const source = tempRoot('native-cli-failure')
+      const sessionId = 'private-native-root'
+      const privatePayload = 'private-transcript-and-grant-marker'
+      if (fault === 'malformed-source') fs.writeFileSync(path.join(source, `${sessionId}.jsonl`), `${privatePayload}\n`, { mode: 0o600 })
+      if (fault === 'incomplete-eof') fs.writeFileSync(path.join(source, `${sessionId}.jsonl`), JSON.stringify({ body: privatePayload }), { mode: 0o600 })
+      const database = path.join(source, `${privatePayload}.db`)
+      if (fault === 'invalid-database') fs.writeFileSync(database, privatePayload, { mode: 0o600 })
+      const result = spawnSync(process.execPath, ['--no-warnings', '--import', path.resolve('node_modules/tsx/dist/loader.mjs'),
+        path.resolve('test/e2e-browser/helpers/provider-native-history/probe-cli.ts'), fault === 'invalid-database' ? 'opencode' : 'claude',
+        fault === 'missing-directory' ? path.join(source, privatePayload) : fault === 'invalid-database' ? database : source, sessionId],
+      { encoding: 'utf8', timeout: 10_000 })
+      expect(result.error).toBeUndefined()
+      expect(result.status).toBe(2)
+      expect(result.stdout).toBe('')
+      expect(result.stderr).not.toContain(privatePayload)
+      expect(result.stderr).not.toContain(source)
+      expect(result.stderr).not.toContain(sessionId)
+      const diagnostic = JSON.parse(result.stderr)
+      expect(diagnostic).toEqual({ severity: 'error', event: 'provider_native_history.refused',
+        stage: fault === 'absent-session' ? 'source_selection' : fault === 'incomplete-eof' ? 'source_read' : 'native_capture',
+        reason: fault === 'missing-directory' ? 'filesystem_entry_missing' : fault === 'absent-session' ? 'source_absent_or_ambiguous'
+          : fault === 'incomplete-eof' ? 'incomplete_source_eof' : 'native_validation_failed',
+        code: fault === 'missing-directory' ? 'ENOENT' : null })
+    },
+  )
+})
 
 afterEach(() => {
   while (roots.length) fs.rmSync(roots.pop()!, { recursive: true, force: true })

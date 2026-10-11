@@ -4331,6 +4331,70 @@ describe('run-scoped owner operation settlement', () => {
 })
 
 describe('current handle admission before owner mutation', () => {
+  it.each(['refused', 'logs-failed', 'cleanup-failed', 'wait-failed'] as const)(
+    'retains stopped helper failure evidence before removal (%s)', async fault => {
+      const root = path.join(fixtureRepoRoot, 'stopped-helper-failure')
+      await fsp.mkdir(root, { mode: 0o700 })
+      const callsFile = path.join(root, 'calls.jsonl'), evidenceDir = path.join(root, 'evidence')
+      const helperId = 'c'.repeat(64), marker = 'private-synthetic-helper-failure'
+      await fsp.writeFile(path.join(root, 'docker'), `#!${process.execPath}
+const fs=require('node:fs'),path=require('node:path'),a=process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(callsFile)},JSON.stringify({action:a[0],retained:a[0]==='rm'&&fs.existsSync(${JSON.stringify(evidenceDir)})?fs.readdirSync(${JSON.stringify(evidenceDir)}).map(name=>JSON.parse(fs.readFileSync(path.join(${JSON.stringify(evidenceDir)},name),'utf8'))):[]})+'\\n');
+if(a[0]==='create')process.stdout.write('${helperId}');
+else if(a[0]==='wait'){process.stdout.write('2\\n');if(${JSON.stringify(fault)}==='wait-failed'){process.stderr.write('private-wait-transport');process.exitCode=8}}
+else if(a[0]==='logs'){process.stdout.write('${marker}');process.stderr.write('private-helper-stderr');if(${JSON.stringify(fault)}==='logs-failed')process.exitCode=7}
+else if(a[0]==='rm'&&${JSON.stringify(fault)}==='cleanup-failed'){process.stderr.write('private-cleanup-transport');process.exitCode=9}
+else if(!['start','rm'].includes(a[0]))process.exitCode=10;
+`, { mode: 0o700 })
+      const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused helper-failure web') }, fixtureRepoRoot, 5,
+        {}, {}, 'release', { enabledProviders: ['codex'], freshAgentModes: [] })
+      Object.defineProperty(rig.runtime, 'evidenceDir', { value: evidenceDir })
+      const current = { ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha }
+      const receipt = { ...current, providerVolumeName: 'freshell-provider-aaaaaaaaaaaaaaaaaaaaaaaa',
+        workspacePath: rig.repoRoot, imageRef: rig.runtime.imageRef }
+      Object.defineProperty(rig.runtime, 'broker', { value: { proxySocketPath: path.join(root, 'broker.sock'),
+        receiptIds: () => new Set([current.containerId]), receipts: () => [receipt] } })
+      vi.spyOn(rig, 'inventory').mockResolvedValue([{ ...current, provider: 'codex', launchState: 'stopped',
+        desiredState: 'stopped', cleanupState: 'verified_empty', intentRevision: 1 }])
+      vi.spyOn(rig, 'ownedContainerState').mockResolvedValue({ present: false, running: false })
+      vi.spyOn(rig, 'writerClaimFacts').mockResolvedValue({ provider: 'codex', providerStoreId: 'owned-store',
+        nativeSessionId: current.nativeSessionId, soulId: current.soulId, incarnationId: current.incarnationId,
+        activeClaimCount: 0, globalConflictingClaimCount: 0 })
+      const lifecycle = vi.spyOn(rig.runtime, 'recordLifecycle').mockImplementation(() => undefined)
+      vi.stubEnv('PATH', `${root}${path.delimiter}${process.env.PATH}`)
+      try {
+        const failure = await rig.managedTerminalStoppedProofs(current, `codename-${'e'.repeat(32)}`).catch(error => error)
+        expect(failure).toBeInstanceOf(Error)
+        const calls = (await fsp.readFile(callsFile, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+        expect(calls.map(call => call.action)).toEqual(['create', 'start', 'wait', 'logs', 'rm'])
+        const retained = calls.at(-1).retained
+        expect(retained).toEqual(expect.arrayContaining([expect.objectContaining({
+          ...current, provider: 'codex', helperId, helperExitStatus: fault === 'wait-failed' ? null : '2',
+        })]))
+        expect(retained).toEqual(expect.arrayContaining([expect.objectContaining({
+          operation: 'logs', helperId, stdout: marker, stderr: 'private-helper-stderr', code: fault === 'logs-failed' ? 7 : 0,
+        })]))
+        expect(retained).toEqual(expect.arrayContaining([expect.objectContaining({
+          ...current, provider: 'codex', operation: 'wait', helperId, stdout: '2\n',
+          stderr: fault === 'wait-failed' ? 'private-wait-transport' : '', code: fault === 'wait-failed' ? 8 : 0,
+        })]))
+        const artifacts = await fsp.readdir(evidenceDir)
+        for (const file of artifacts) expect((await fsp.stat(path.join(evidenceDir, file))).mode & 0o777).toBe(0o600)
+        expect((await fsp.stat(evidenceDir)).mode & 0o777).toBe(0o700)
+        expect(JSON.stringify(lifecycle.mock.calls)).not.toContain(marker)
+        expect(JSON.stringify(lifecycle.mock.calls)).not.toContain('private-helper-stderr')
+        if (fault === 'logs-failed' || fault === 'cleanup-failed') {
+          expect(failure).toBeInstanceOf(AggregateError)
+          expect(failure.errors[0].message).toMatch(/refused.*stopped source/)
+        }
+        if (fault === 'cleanup-failed') {
+          const finalArtifacts = await Promise.all(artifacts.map(async file => JSON.parse(await fsp.readFile(path.join(evidenceDir, file), 'utf8'))))
+          expect(finalArtifacts).toEqual(expect.arrayContaining([expect.objectContaining({ operation: 'rm', code: 9, stderr: 'private-cleanup-transport' })]))
+        }
+      } finally { vi.restoreAllMocks(); vi.unstubAllEnvs() }
+    },
+  )
+
   it.each([
     { provider: 'claude', field: 'components', fault: 'not-array' },
     { provider: 'claude', field: 'components', fault: 'empty' },
