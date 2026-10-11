@@ -2874,27 +2874,22 @@ fn durable_souls_rehearsal_pipeline_preserves_unavailable_snapshot_parts() {
                 [&part_json],
             )
             .unwrap();
-        // Snapshot rows are preserved legacy history. The pinned V1 event
-        // schema supports step parts, not a snapshot part event.
-        let event_json = if kind == "snapshot" {
-            source
-                .query_row("SELECT data FROM event WHERE id='evt_base'", [], |row| {
-                    row.get::<_, String>(0)
-                })
-                .unwrap()
-        } else {
-            let json = serde_json::to_string_pretty(&serde_json::json!({
-                "sessionID":"ses_root","part":part,"time":1
-            }))
+        // All three native part variants use the pinned V1 event schema.
+        let event = serde_json::json!({
+            "sessionID":"ses_root","part":part,"time":1
+        });
+        if kind == "snapshot" {
+            let mut invalid_id_event = event.clone();
+            invalid_id_event["part"]["id"] = serde_json::json!("part_one");
+            assert!(validate_v1_event_envelope("message.part.updated", &invalid_id_event).is_err());
+        }
+        let event_json = serde_json::to_string_pretty(&event).unwrap();
+        source
+            .execute(
+                "UPDATE event SET type='message.part.updated.1',data=?1 WHERE id='evt_base'",
+                [&event_json],
+            )
             .unwrap();
-            source
-                .execute(
-                    "UPDATE event SET type='message.part.updated.1',data=?1 WHERE id='evt_base'",
-                    [&json],
-                )
-                .unwrap();
-            json
-        };
         drop(source);
         reexport_owned_fixture(&mut fixture);
         let manifest: OpenCodeTransferManifest =
@@ -2974,17 +2969,17 @@ fn durable_souls_rehearsal_pipeline_preserves_unavailable_snapshot_parts() {
             })
             .unwrap();
         assert_eq!(installed_part, part_json);
-        assert_eq!(
-            installed
-                .query_row("SELECT data FROM event WHERE id='evt_base'", [], |row| {
-                    row.get::<_, String>(0)
-                })
-                .unwrap(),
-            event_json
-        );
+        let installed_event: String = installed
+            .query_row("SELECT data FROM event WHERE id='evt_base'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(installed_event, event_json);
         let decoded: serde_json::Value = serde_json::from_str(&installed_part).unwrap();
         assert_eq!(decoded["type"], kind);
         assert_eq!(decoded["snapshot"], tree);
+        let decoded_event: serde_json::Value = serde_json::from_str(&installed_event).unwrap();
+        assert_eq!(decoded_event["part"], decoded);
     }
 }
 

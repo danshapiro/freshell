@@ -2935,6 +2935,93 @@ fn blocks_invalid_corrupt_and_incomplete_native_snapshot_parts() {
     }
 }
 
+#[cfg(unix)]
+fn assert_missing_snapshot_with_pack_location(state: &str, blocked: bool) {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestDir::new("missing-snapshot-pack-location");
+    let workspace = fixture.path().join("workspace");
+    let objects = workspace.join(".git/objects");
+    fs::create_dir_all(&objects).unwrap();
+    let pack = objects.join("pack");
+    match state {
+        "absent" => {}
+        "empty" => fs::create_dir(&pack).unwrap(),
+        "dangling-link" => symlink(fixture.path().join("missing-pack"), &pack).unwrap(),
+        "empty-link" => {
+            let target = fixture.path().join("empty-pack");
+            fs::create_dir(&target).unwrap();
+            symlink(target, &pack).unwrap();
+        }
+        _ => unreachable!(),
+    }
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    let part = serde_json::json!({
+        "type":"snapshot", "snapshot":"1234567890abcdef1234567890abcdef12345678"
+    })
+    .to_string();
+    source
+        .execute("UPDATE part SET data=?1 WHERE id='part_ses_root'", [&part])
+        .unwrap();
+    drop(source);
+    let inventory = with_selected_workspace_mount(HostOpenCodeInventory::new(database), workspace);
+    let extraction = fixture.path().join("extract");
+    let result = export_exact_session(
+        &inventory,
+        "ses_root",
+        ExportOptions::new(extraction.clone()),
+    );
+    if blocked {
+        assert!(
+            matches!(result, Err(TransferError::Blocked(_))),
+            "{state} must refuse rather than certify qualified snapshot absence"
+        );
+        assert_eq!(fs::read_dir(extraction).unwrap().count(), 0);
+    } else {
+        let exported = result.expect("an absent snapshot in a valid pack location is preserved");
+        let [reference] = exported.manifest().saved_snapshots.as_slice() else {
+            panic!("one absent snapshot reference is preserved");
+        };
+        assert_eq!(reference.tree, "1234567890abcdef1234567890abcdef12345678");
+        assert_eq!(
+            reference.availability,
+            SavedSnapshotAvailability::UnavailableInQualifiedLocations
+        );
+        assert!(reference.objects.is_empty());
+        assert!(exported.manifest().assets.is_empty());
+        let payload: Value = serde_json::from_reader(exported.open_payload().unwrap()).unwrap();
+        let row = payload["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["table"] == "part")
+            .unwrap();
+        assert_eq!(row["values"]["data"]["value"], part);
+        assert!(payload["snapshot_objects"].as_array().unwrap().is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn blocks_missing_snapshot_with_dangling_redirected_pack() {
+    assert_missing_snapshot_with_pack_location("dangling-link", true);
+}
+
+#[cfg(unix)]
+#[test]
+fn blocks_missing_snapshot_with_empty_redirected_pack() {
+    assert_missing_snapshot_with_pack_location("empty-link", true);
+}
+
+#[cfg(unix)]
+#[test]
+fn preserves_missing_snapshot_with_absent_or_empty_regular_pack() {
+    for state in ["absent", "empty"] {
+        assert_missing_snapshot_with_pack_location(state, false);
+    }
+}
+
 #[test]
 fn preserves_unavailable_snapshot_parts_across_native_history_projections() {
     for part in [
