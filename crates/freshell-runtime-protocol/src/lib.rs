@@ -340,6 +340,10 @@ pub enum RecoveryProbe {
         evidence: Vec<String>,
         #[serde(default)]
         store_state: EvidenceStoreState,
+        /// Path-specific negative inspection results. Empty legacy rows are
+        /// intentionally insufficient to authorize loss of a coding session.
+        #[serde(default)]
+        negative_paths: Vec<RecoveryPathEvidence>,
     },
     Blocked {
         path: RecoveryPath,
@@ -4061,6 +4065,34 @@ mod tests {
             serde_json::from_value::<RecoveryProbe>(encoded).unwrap(),
             RecoveryProbe::Blocked { .. }
         ));
+    }
+
+    #[test]
+    fn recovery_negative_wire_preserves_inspected_rows_and_defaults_legacy_unknown() {
+        let legacy = serde_json::json!({"kind":"definitively_unavailable","data":{
+            "path":"native_resume","reason":"old absence","evidence":["store"],"store_state":"missing"
+        }});
+        let mut probe: RecoveryProbe = serde_json::from_value(legacy).unwrap();
+        let RecoveryProbe::DefinitivelyUnavailable { negative_paths, .. } = &mut probe else {
+            panic!("wrong probe")
+        };
+        assert!(
+            negative_paths.is_empty(),
+            "legacy wire must not invent inspection"
+        );
+        negative_paths.push(RecoveryPathEvidence {
+            path: RecoveryPath::CheckpointRestore,
+            verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
+            reason_code: "EXACT_SQLITE_NO_MATCH".into(),
+            evidence_refs: vec!["provider://effective.db/exact-session".into()],
+            store_state: EvidenceStoreState::PresentReadable,
+        });
+        let decoded: RecoveryProbe =
+            serde_json::from_slice(&serde_json::to_vec(&probe).unwrap()).unwrap();
+        assert_eq!(
+            decoded, probe,
+            "typed inspection must survive the host IPC wire"
+        );
     }
 
     #[test]

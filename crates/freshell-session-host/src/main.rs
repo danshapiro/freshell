@@ -36,6 +36,8 @@ struct PersistedHostState {
     max_control_epoch: u64,
     max_execution_generation: u64,
     grant_id: Option<GrantId>,
+    #[serde(default)]
+    provider: Option<String>,
     worker_pid: Option<u32>,
     worker_launch_count: u64,
     fixture_evidence: serde_json::Value,
@@ -225,10 +227,13 @@ async fn serve(args: &[String]) -> Result<(), String> {
         return Err("incarnation secret is too short".into());
     }
     let host_boot_id = HostBootId::new();
-    let persisted = PersistedHostState {
-        host_boot_id: Some(host_boot_id.clone()),
-        ..Default::default()
+    let mut persisted = match std::fs::read(state_dir.join("host-state.json")) {
+        Ok(bytes) => serde_json::from_slice::<PersistedHostState>(&bytes)
+            .map_err(|error| format!("read durable host state: {error}"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => PersistedHostState::default(),
+        Err(error) => return Err(format!("read durable host state: {error}")),
     };
+    persisted.host_boot_id = Some(host_boot_id.clone());
     write_state(&state_dir, &persisted)?;
     append_event_with_secret(
         &state_dir,
@@ -471,6 +476,17 @@ async fn dispatch(
                                         .map(str::to_string)
                                 });
                         }
+                    } else if persisted.grant_id.is_some()
+                        || persisted.worker_pid.is_some()
+                        || persisted.worker_launch_count > 0
+                    {
+                        // After a host boot, persisted initialization/PID
+                        // metadata cannot establish ownership or liveness of
+                        // an in-memory worker. It also cannot prove its end.
+                        return Err(RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            "initialization was recorded but worker liveness is unconfirmed; preserve the incarnation and inspect it before retry",
+                        ));
                     }
                     Ok(HostResult::Status {
                         host_boot_id: state.host_boot_id.clone(),
@@ -743,19 +759,10 @@ async fn dispatch(
                     ensure_incarnation(&incarnation_id, state)?;
                     let probe = match resume_spec {
                         Some(spec) => providers::probe_resume(*spec, run_as_uid, run_as_gid).await,
-                        None if never_dispatched => RecoveryProbe::PristineSeedReady {
-                            seed: creation_seed_ref,
-                            never_dispatched_proof: format!(
-                                "{}:command-journal-empty",
-                                state.incarnation_id
-                            ),
-                        },
-                        None => RecoveryProbe::DefinitivelyUnavailable {
-                            path: RecoveryPath::NativeResume,
-                            reason: "no durable native identity or checkpoint is recorded".into(),
-                            evidence: vec![state.state_dir.display().to_string()],
-                            store_state: freshell_runtime_protocol::EvidenceStoreState::Missing,
-                        },
+                        None => {
+                            probe_without_identity(state, creation_seed_ref, never_dispatched)
+                                .await?
+                        }
                     };
                     Ok(HostResult::RecoveryProbe(probe))
                 }
@@ -763,6 +770,59 @@ async fn dispatch(
             }
         }
     }
+}
+
+async fn probe_without_identity(
+    state: &HostState,
+    seed: String,
+    never_dispatched: bool,
+) -> Result<RecoveryProbe, RuntimeError> {
+    use freshell_runtime_protocol::{EvidenceStoreState, RecoveryBlockReason, RetryHint};
+    let persisted = state.persisted.lock().await.clone();
+    let provider = persisted.provider.as_deref().or_else(|| {
+        persisted
+            .fixture_evidence
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+    });
+    let shell_policy = provider.is_some_and(|provider| {
+        freshell_agent_runtime::recovery_paths(provider)
+            .is_some_and(|paths| !paths.contains(&RecoveryPath::NativeResume))
+    });
+    let initialization_undispatched = persisted.grant_id.is_none()
+        && persisted.worker_launch_count == 0
+        && persisted.worker_pid.is_none();
+    if never_dispatched && (initialization_undispatched || shell_policy) {
+        return Ok(RecoveryProbe::PristineSeedReady {
+            seed,
+            never_dispatched_proof: format!(
+                "{}:input-and-initialization-undispatched",
+                state.incarnation_id
+            ),
+        });
+    }
+    if shell_policy
+        && state
+            .pty
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(HostedPty::exited)
+    {
+        return Ok(RecoveryProbe::DefinitivelyUnavailable {
+            path: RecoveryPath::Reattach,
+            reason: "shell provider process ended after dispatch".into(),
+            evidence: vec![format!("incarnationId={}", state.incarnation_id)],
+            store_state: EvidenceStoreState::NotApplicable,
+            negative_paths: Vec::new(),
+        });
+    }
+    Ok(RecoveryProbe::Blocked {
+        path:if shell_policy {RecoveryPath::Reattach} else {RecoveryPath::NativeResume},
+        reason:RecoveryBlockReason::AmbiguousIdentity,
+        retry_hint:RetryHint {automatic_after_ms:None,manual_retry:true,repair:Some(if shell_policy {"verify the exact shell process has ended, then retry"} else {"capture the exact native identity and inspect its provider stores, then retry"}.into())},
+        evidence:vec![if shell_policy {"shell process termination is unconfirmed"} else {"native identity is unrecorded; required provider-store absence has not been established"}.into()],
+    })
 }
 
 fn unsupported_fresh_agent() -> RuntimeError {
@@ -831,6 +891,24 @@ async fn grant_execution(
         fresh_agent,
         resume_spec,
     } = request;
+    let provider = terminal
+        .as_ref()
+        .map(|terminal| terminal.mode.clone())
+        .or_else(|| {
+            fresh_agent
+                .as_ref()
+                .map(|agent| agent.provider.native_provider().to_string())
+        })
+        .or_else(|| {
+            fixture.map(|fixture| {
+                if fixture == FixtureKind::NativeSession {
+                    "native-session-fixture"
+                } else {
+                    "phase1-fixture"
+                }
+                .to_string()
+            })
+        });
     let mut persisted = state.persisted.lock().await;
     if control_epoch < persisted.max_control_epoch
         || execution_generation < persisted.max_execution_generation
@@ -945,6 +1023,7 @@ async fn grant_execution(
         persisted.max_control_epoch = control_epoch;
         persisted.max_execution_generation = execution_generation;
         persisted.grant_id = Some(grant_id.clone());
+        persisted.provider = provider.clone();
         persisted.worker_pid = None;
         write_state(&state.state_dir, persisted).map_err(registry_like_error)
     };
@@ -3980,6 +4059,8 @@ fn now_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[path = "probe_recovery_tests.rs"]
+    mod probe_recovery;
     fn copy_provider_config_references(
         context: &freshell_runtime_protocol::ProviderLaunchContext,
         provider: &str,
@@ -6539,13 +6620,9 @@ mod tests {
     }
 
     fn tempfile_like_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("freshell-host-test-{}", uuid_like()));
+        let dir = std::env::temp_dir().join(format!("freshell-host-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    fn uuid_like() -> String {
-        format!("{}-{}", std::process::id(), now_millis())
     }
 
     pub(crate) mod created_path_ownership {

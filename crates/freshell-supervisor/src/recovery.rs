@@ -109,6 +109,12 @@ impl Supervisor {
                             .await
                             .map_err(map_registry)?;
                     }
+                    if !status.exited {
+                        return Ok(live_reattach_probe(&context, &status));
+                    }
+                    if context.provider == "shell" {
+                        return Ok(shell_terminal_end_probe(&context));
+                    }
                     let candidate = match resume_catalog::exact_resume_candidate(
                         &context,
                         status.native_session_id.as_deref(),
@@ -141,16 +147,6 @@ impl Supervisor {
                         other => other,
                     };
 
-                    if !status.exited {
-                        return Ok(RecoveryProbe::ReattachReady {
-                            handle: ReattachHandle {
-                                incarnation_id: context.prior_handle.incarnation_id().clone(),
-                                host_boot_id: status.host_boot_id,
-                                container_id: context.prior_handle.container_id().to_string(),
-                            },
-                            protocol_version: CONTROL_PROTOCOL_VERSION,
-                        });
-                    }
                     return Ok(after_native_probe(&context, captured));
                 }
                 Err(_) if context.resume_spec.is_some() => return offline_probe(&context),
@@ -256,6 +252,22 @@ impl Supervisor {
                     attempt_id: None,
                     probe: None,
                     view,
+                });
+            }
+            if view.desired_state == DesiredState::Running
+                && view.recovery_state == freshell_runtime_protocol::RecoveryState::Blocked
+                && matches!(
+                    view.recovery_reason.as_deref(),
+                    Some("RETRY_BUDGET" | "BLOCKED_RETRY_BUDGET")
+                )
+                && request.trigger != RecoveryTrigger::ManualRetry
+            {
+                return Ok(RecoveryResult {
+                    outcome: RecoveryOutcome::Blocked,
+                    probe: Some(blocked(RecoveryPath::NativeResume, RecoveryBlockReason::RetryBudget,
+                        "automatic recovery budget is exhausted; repair the dependency and explicitly retry", None)),
+                    view, prior_incarnation_id: None, attempt_id: None,
+                    expected_native_session_id: None, observed_native_session_id: None, incident_id: None,
                 });
             }
         }
@@ -1305,50 +1317,8 @@ impl Supervisor {
         for path in provider_paths {
             let row = match path {
                 RecoveryPath::Reattach => self.prove_reattach_unavailable(context).await?,
-                RecoveryPath::NativeResume => match native_probe {
-                    RecoveryProbe::DefinitivelyUnavailable {
-                        reason,
-                        evidence,
-                        store_state,
-                        ..
-                    } => {
-                        if matches!(
-                            store_state,
-                            EvidenceStoreState::Unknown | EvidenceStoreState::PresentUnreadable
-                        ) {
-                            return Err(blocked(
-                                RecoveryPath::NativeResume,
-                                RecoveryBlockReason::StoreUnreadable,
-                                "native provider state is not definitively readable or missing",
-                                None,
-                            ));
-                        }
-                        RecoveryPathEvidence {
-                            path: RecoveryPath::NativeResume,
-                            verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
-                            reason_code: reason.clone(),
-                            evidence_refs: evidence.clone(),
-                            store_state: *store_state,
-                        }
-                    }
-                    other => return Err(other.clone()),
-                },
-                RecoveryPath::CheckpointRestore => {
-                    match checkpoints::probe_after_provider(context, native_probe) {
-                        RecoveryProbe::DefinitivelyUnavailable {
-                            reason,
-                            evidence,
-                            store_state,
-                            ..
-                        } => RecoveryPathEvidence {
-                            path: RecoveryPath::CheckpointRestore,
-                            verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
-                            reason_code: reason,
-                            evidence_refs: evidence,
-                            store_state,
-                        },
-                        other => return Err(other),
-                    }
+                RecoveryPath::NativeResume | RecoveryPath::CheckpointRestore => {
+                    checkpoints::inspected_negative(native_probe, *path)?
                 }
                 RecoveryPath::PristineSeed => {
                     if context.never_dispatched {
@@ -1360,6 +1330,10 @@ impl Supervisor {
                             ),
                         });
                     }
+                    if context.dispatched_command_count == 0 {
+                        return Err(blocked(RecoveryPath::PristineSeed, RecoveryBlockReason::AmbiguousIdentity,
+                            "initialization/native identity is uncertain; no durable input dispatch establishes pristine-seed unavailability", None));
+                    }
                     RecoveryPathEvidence {
                         path: RecoveryPath::PristineSeed,
                         verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
@@ -1367,6 +1341,10 @@ impl Supervisor {
                         evidence_refs: vec![
                             format!("acceptedCommandCount={}", context.accepted_command_count),
                             format!("completedCommandCount={}", context.completed_command_count),
+                            format!(
+                                "dispatchedCommandCount={}",
+                                context.dispatched_command_count
+                            ),
                         ],
                         store_state: EvidenceStoreState::NotApplicable,
                     }
@@ -1458,14 +1436,7 @@ impl Supervisor {
                         )
                     })?;
                 if !status.exited {
-                    return Err(RecoveryProbe::ReattachReady {
-                        handle: ReattachHandle {
-                            incarnation_id: context.prior_handle.incarnation_id().clone(),
-                            host_boot_id: status.host_boot_id,
-                            container_id: context.prior_handle.container_id().to_string(),
-                        },
-                        protocol_version: CONTROL_PROTOCOL_VERSION,
-                    });
+                    return Err(live_reattach_probe(context, &status));
                 }
                 Ok(RecoveryPathEvidence {
                     path: RecoveryPath::Reattach,
@@ -1905,95 +1876,94 @@ fn fresh_agent_replay_settings(
 }
 
 fn after_native_probe(context: &RecoveryContext, probe: RecoveryProbe) -> RecoveryProbe {
-    match probe {
-        ready @ RecoveryProbe::ResumeReady { .. }
-        | ready @ RecoveryProbe::Blocked { .. }
-        | ready @ RecoveryProbe::PristineSeedReady { .. }
-        | ready @ RecoveryProbe::ReattachReady { .. } => ready,
-        RecoveryProbe::DefinitivelyUnavailable {
-            reason,
-            mut evidence,
-            store_state,
-            ..
-        } => {
-            if context.never_dispatched {
-                return RecoveryProbe::PristineSeedReady {
-                    seed: context.creation_seed_ref.clone(),
-                    never_dispatched_proof: format!(
-                        "{}:supervisor-and-host-command-journals-empty",
-                        context.soul_id
-                    ),
-                };
-            }
-            match checkpoints::probe_after_provider(
-                context,
-                &RecoveryProbe::DefinitivelyUnavailable {
-                    path: RecoveryPath::NativeResume,
-                    reason: reason.clone(),
-                    evidence: evidence.clone(),
-                    store_state,
-                },
-            ) {
-                blocked @ RecoveryProbe::Blocked { .. } => blocked,
-                RecoveryProbe::DefinitivelyUnavailable {
-                    reason: checkpoint_reason,
-                    evidence: checkpoint_evidence,
-                    ..
-                } => {
-                    evidence.extend(checkpoint_evidence);
-                    RecoveryProbe::DefinitivelyUnavailable {
-                        path: RecoveryPath::NativeResume,
-                        reason: format!(
-                            "native resume unavailable ({reason}); checkpoint unavailable ({checkpoint_reason}); pristine seed forbidden after dispatch"
-                        ),
-                        evidence,
-                        store_state,
-                    }
-                }
-                other => other,
-            }
-        }
+    if !matches!(probe, RecoveryProbe::DefinitivelyUnavailable { .. }) {
+        return probe;
+    }
+    if context.never_dispatched {
+        return RecoveryProbe::PristineSeedReady {
+            seed: context.creation_seed_ref.clone(),
+            never_dispatched_proof: format!(
+                "{}:supervisor-and-host-command-journals-empty",
+                context.soul_id
+            ),
+        };
+    }
+    if let Err(blocked) = checkpoints::inspected_negative(&probe, RecoveryPath::NativeResume) {
+        return blocked;
+    }
+    match checkpoints::probe_after_provider(context, &probe) {
+        RecoveryProbe::DefinitivelyUnavailable { .. } => probe,
+        other => other,
+    }
+}
+
+fn live_reattach_probe(
+    context: &RecoveryContext,
+    status: &crate::service::HostStatus,
+) -> RecoveryProbe {
+    if status.worker_pid.is_none() {
+        return blocked(
+            RecoveryPath::Reattach,
+            RecoveryBlockReason::ProviderUnavailable,
+            "host has no confirmed provider worker; process termination remains unknown",
+            Some(2_000),
+        );
+    }
+    RecoveryProbe::ReattachReady {
+        handle: ReattachHandle {
+            incarnation_id: context.prior_handle.incarnation_id().clone(),
+            host_boot_id: status.host_boot_id.clone(),
+            container_id: context.prior_handle.container_id().to_string(),
+        },
+        protocol_version: CONTROL_PROTOCOL_VERSION,
+    }
+}
+
+/// Called only after authenticated worker exit or an owned ended backend
+/// inspection. Final loss certification independently rechecks that proof.
+fn shell_terminal_end_probe(context: &RecoveryContext) -> RecoveryProbe {
+    if context.never_dispatched {
+        return RecoveryProbe::PristineSeedReady {
+            seed: context.creation_seed_ref.clone(),
+            never_dispatched_proof: format!(
+                "{}:supervisor-input-journal-undispatched",
+                context.soul_id
+            ),
+        };
+    }
+    RecoveryProbe::DefinitivelyUnavailable {
+        path: RecoveryPath::Reattach,
+        reason: "non-resumable shell ended after input dispatch".into(),
+        evidence: vec![format!(
+            "incarnationId={}",
+            context.prior_handle.incarnation_id()
+        )],
+        store_state: EvidenceStoreState::NotApplicable,
+        negative_paths: Vec::new(),
     }
 }
 
 fn offline_probe(context: &RecoveryContext) -> Result<RecoveryProbe, RuntimeError> {
+    if context.provider == "shell" {
+        return Ok(shell_terminal_end_probe(context));
+    }
     if let Some(spec) = context.resume_spec.clone() {
         return Ok(RecoveryProbe::ResumeReady {
             evidence_revision: spec.evidence_revision,
             resume_spec: Box::new(spec),
         });
     }
-    if context.native_session_id.is_some() {
-        return Ok(blocked(
-            RecoveryPath::NativeResume,
-            RecoveryBlockReason::StoreUnreadable,
-            "a native identity was allocated, but no verified durable resume evidence was captured",
-            None,
-        ));
-    }
     if context.never_dispatched {
         return Ok(RecoveryProbe::PristineSeedReady {
             seed: context.creation_seed_ref.clone(),
-            never_dispatched_proof: format!("{}:supervisor-input-journal-empty", context.soul_id),
+            never_dispatched_proof: format!(
+                "{}:supervisor-input-journal-and-initialization-undispatched",
+                context.soul_id
+            ),
         });
     }
-    match checkpoints::probe(context) {
-        blocked_probe @ RecoveryProbe::Blocked { .. } => Ok(blocked_probe),
-        RecoveryProbe::DefinitivelyUnavailable {
-            mut evidence,
-            reason,
-            ..
-        } => {
-            evidence.push("nativeResume=definitively_unavailable".into());
-            Ok(RecoveryProbe::DefinitivelyUnavailable {
-                path: RecoveryPath::NativeResume,
-                reason: format!("native resume unavailable; {reason}"),
-                evidence,
-                store_state: freshell_runtime_protocol::EvidenceStoreState::Missing,
-            })
-        }
-        other => Ok(other),
-    }
+    Ok(blocked(RecoveryPath::NativeResume, RecoveryBlockReason::AmbiguousIdentity,
+        "native identity/resume metadata is unrecorded or unverified; provider store absence has not been established", None))
 }
 
 fn downtime_bucket(elapsed_ms: u64) -> &'static str {
@@ -2293,6 +2263,7 @@ fn map_registry(error: RegistryError) -> RuntimeError {
 
 #[cfg(test)]
 mod tests {
+    include!("shell_recovery_tests.rs");
     use super::*;
     use freshell_runtime_protocol::{FreshAgentLaunchSpec, FreshProvider, IncarnationId};
 
@@ -2396,6 +2367,7 @@ mod tests {
             &RecoveryProbe::DefinitivelyUnavailable {
                 path: RecoveryPath::NativeResume,
                 reason: "structured-negative".into(),
+                negative_paths: Vec::new(),
                 evidence: vec!["digest-only".into()],
                 store_state: EvidenceStoreState::Missing,
             }

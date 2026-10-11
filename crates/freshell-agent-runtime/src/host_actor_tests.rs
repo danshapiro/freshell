@@ -1,6 +1,78 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+struct StartupAcknowledgementGap {
+    directory: PathBuf,
+    starts: AtomicUsize,
+    intent_seen: std::sync::atomic::AtomicBool,
+}
+#[async_trait]
+impl FreshAgentTransport for StartupAcknowledgementGap {
+    async fn start(&self, _: &FreshAgentProfile) -> Result<TransportStart, String> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        let intent = self.directory.join("fresh-agent-state.json");
+        self.intent_seen.store(intent.is_file(), Ordering::SeqCst);
+        fs::write(
+            self.directory.join("provider-conversation"),
+            b"native-created-before-ack",
+        )
+        .unwrap();
+        Err("native identity acknowledgement lost".into())
+    }
+    async fn dispatch(
+        &self,
+        _: &RequestId,
+        _: &str,
+        _: &FreshAgentProfile,
+    ) -> Result<DispatchAck, DispatchFailure> {
+        panic!("no prompt dispatch")
+    }
+    async fn resolve_permission(&self, _: &str, _: Value) -> Result<(), DispatchFailure> {
+        panic!("no decision")
+    }
+    async fn interrupt(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn stop(self: Arc<Self>) -> Result<(), String> {
+        Ok(())
+    }
+    fn take_event_stream(&self) -> Option<tokio::sync::mpsc::Receiver<AgentEvent>> {
+        None
+    }
+}
+#[tokio::test]
+async fn recovery_initialization_identity_ack_loss_never_creates_a_second_conversation() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = Arc::new(StartupAcknowledgementGap {
+        directory: dir.path().into(),
+        starts: AtomicUsize::new(0),
+        intent_seen: std::sync::atomic::AtomicBool::new(false),
+    });
+    assert!(FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Opencode, "init-gap", None),
+        transport.clone()
+    )
+    .await
+    .is_err());
+    assert!(
+        transport.intent_seen.load(Ordering::SeqCst),
+        "initialization intent must be durable before provider creation"
+    );
+    let result = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Opencode, "init-gap", None),
+        transport.clone(),
+    )
+    .await;
+    assert!(matches!(result, Err(ActorError::AmbiguousDispatch)));
+    assert_eq!(transport.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fs::read(dir.path().join("provider-conversation")).unwrap(),
+        b"native-created-before-ack"
+    );
+}
+
 struct SnapshotTransport {
     value: Value,
     live: std::sync::atomic::AtomicBool,

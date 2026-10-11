@@ -659,11 +659,13 @@ pub async fn probe_resume(
             reason,
             evidence,
             store_state,
+            negative_paths,
         }) => RecoveryProbe::DefinitivelyUnavailable {
             path: RecoveryPath::NativeResume,
             reason,
             evidence,
             store_state,
+            negative_paths,
         },
         Ok(ProviderStoreProbe::Blocked {
             reason,

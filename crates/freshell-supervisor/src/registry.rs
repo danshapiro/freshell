@@ -273,6 +273,7 @@ pub struct RecoveryContext {
     pub requested_limits: RuntimeLimits,
     pub accepted_command_count: u64,
     pub completed_command_count: u64,
+    pub dispatched_command_count: u64,
     pub never_dispatched: bool,
     pub recovery_window_started_at: Option<i64>,
     pub successful_recoveries_in_window: u64,
@@ -1475,12 +1476,14 @@ impl Registry {
                 return Err(RegistryError::RecoveryInProgress(soul_id));
             }
             let now = now_millis();
+            let persisted_reason: Option<String> = tx.query_row("SELECT recovery_reason FROM souls WHERE soul_id=?1", [soul_id.as_str()], |row| row.get(0))?;
+            let sticky_budget = matches!(persisted_reason.as_deref(), Some("RETRY_BUDGET" | "BLOCKED_RETRY_BUDGET"));
             let budget_available = freshell_agent_runtime::successful_recovery_budget_available(
                 context.recovery_window_started_at,
                 context.successful_recoveries_in_window,
                 now,
             );
-            if !budget_available && trigger != RecoveryTrigger::ManualRetry {
+            if (!budget_available || sticky_budget) && trigger != RecoveryTrigger::ManualRetry {
                 let reason = "BLOCKED_RETRY_BUDGET";
                 tx.execute(
                     "UPDATE souls SET recovery_state='blocked',recovery_reason=?1,updated_at=?2 WHERE soul_id=?3",
@@ -1492,7 +1495,7 @@ impl Registry {
                     reason: reason.into(),
                 });
             }
-            if !budget_available && trigger == RecoveryTrigger::ManualRetry {
+            if (!budget_available || sticky_budget) && trigger == RecoveryTrigger::ManualRetry {
                 // A deliberate user retry is the explicit rearm operation. It
                 // clears the persisted flap window but keeps identity/history
                 // intact and still runs through the same fenced transaction.
@@ -2671,7 +2674,17 @@ fn load_recovery_context(
         .11
         .map(|value| serde_json::from_str(&value))
         .transpose()?;
-    let never_dispatched = dispatched_count == 0 && row.2.is_none();
+    // Coding providers may create a conversation while handling the initial
+    // execution grant, before an input row or native-ID acknowledgement exists.
+    // Only the existing settled rejection transaction proves an issued grant
+    // was unconsumed. Shell has no implicit provider initialization turn.
+    let requires_native = freshell_agent_runtime::recovery_paths(&row.0)
+        .is_some_and(|paths| paths.contains(&RecoveryPath::NativeResume));
+    let initialization_uncertain: bool = requires_native && conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM incarnations i WHERE i.soul_id=?1 AND i.grant_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM commands c WHERE c.incarnation_id=i.incarnation_id AND c.state='provider_inputs_changed'))",
+        [soul_id.as_str()], |row| row.get(0),
+    )?;
+    let never_dispatched = dispatched_count == 0 && row.2.is_none() && !initialization_uncertain;
     Ok(RecoveryContext {
         soul_id: soul_id.clone(),
         provider: row.0,
@@ -2698,6 +2711,7 @@ fn load_recovery_context(
             .unwrap_or_else(|| prior_handle.requested_limits()),
         accepted_command_count,
         completed_command_count,
+        dispatched_command_count: dispatched_count,
         never_dispatched,
         recovery_window_started_at: row.14,
         successful_recoveries_in_window: row.15,
@@ -2932,6 +2946,146 @@ pub(crate) fn failpoint(_name: &'static str) -> Result<(), RegistryError> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn recovery_initialization_grant_before_identity_is_not_pristine() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        let mut launch = prep(soul.clone(), RequestId::new(), "startup");
+        launch.provider = "opencode".into();
+        let prepared = registry.prepare_launch(launch).await.unwrap();
+        registry
+            .commit_created(
+                prepared.incarnation_id.clone(),
+                BackendCreatedRecord {
+                    daemon_id: DockerDaemonId::new(),
+                    container_id: "a".repeat(64),
+                    image_ref: format!("sha256:{}", "b".repeat(64)),
+                    runtime_dir: dir.path().join("runtime"),
+                    host_binary_path: dir.path().join("host"),
+                    immutable_config_digest: format!("sha256:{}", "c".repeat(64)),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap()
+                .never_dispatched
+        );
+        registry
+            .commit_execution_grant(prepared.incarnation_id, HostBootId::new(), limits())
+            .await
+            .unwrap();
+        let ctx = registry.recovery_context(soul).await.unwrap();
+        assert!(ctx.native_session_id.is_none());
+        assert_eq!(ctx.accepted_command_count, 0);
+        assert!(!ctx.never_dispatched, "an issued initialization grant has uncertain provider execution even before input/native-ID capture");
+    }
+
+    #[tokio::test]
+    async fn recovery_five_natural_successes_exhaust_durable_budget_until_manual_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        materialize_test_runtime(&registry, soul.clone()).await;
+        for expected in 1..=5 {
+            let start = registry
+                .begin_recovery(
+                    soul.clone(),
+                    RecoveryTrigger::ProviderExit,
+                    RecoveryPath::PristineSeed,
+                )
+                .await
+                .unwrap();
+            registry
+                .mark_stop_outcome(
+                    start.context.prior_handle.incarnation_id().clone(),
+                    StopOutcome::VerifiedEmpty,
+                )
+                .await
+                .unwrap();
+            let attempt = start.attempt_id.clone();
+            let replacement = registry
+                .prepare_replacement(start, None, None, None, RecoveryPath::PristineSeed)
+                .await
+                .unwrap();
+            let id = replacement.prepared.incarnation_id.clone();
+            registry
+                .commit_created(
+                    id.clone(),
+                    BackendCreatedRecord {
+                        daemon_id: DockerDaemonId::new(),
+                        container_id: format!("{expected:064x}"),
+                        image_ref: format!("sha256:{}", "b".repeat(64)),
+                        runtime_dir: dir.path().join(format!("runtime-{expected}")),
+                        host_binary_path: dir.path().join("host"),
+                        immutable_config_digest: format!("sha256:{}", "c".repeat(64)),
+                    },
+                )
+                .await
+                .unwrap();
+            registry
+                .commit_execution_grant(id.clone(), HostBootId::new(), limits())
+                .await
+                .unwrap();
+            registry.mark_running(id.clone()).await.unwrap();
+            registry
+                .mark_recovery_success(soul.clone(), id, attempt)
+                .await
+                .unwrap();
+            assert_eq!(
+                registry
+                    .recovery_context(soul.clone())
+                    .await
+                    .unwrap()
+                    .successful_recoveries_in_window,
+                expected
+            );
+        }
+        assert!(matches!(
+            registry
+                .begin_recovery(
+                    soul.clone(),
+                    RecoveryTrigger::ProviderExit,
+                    RecoveryPath::PristineSeed
+                )
+                .await,
+            Err(RegistryError::RecoveryBlocked { .. })
+        ));
+        drop(registry);
+        let cold = Registry::open(dir.path(), None).unwrap();
+        assert!(matches!(
+            cold.begin_recovery(
+                soul.clone(),
+                RecoveryTrigger::StartupReconcile,
+                RecoveryPath::PristineSeed
+            )
+            .await,
+            Err(RegistryError::RecoveryBlocked { .. })
+        ));
+        let manual = cold
+            .begin_recovery(
+                soul,
+                RecoveryTrigger::ManualRetry,
+                RecoveryPath::PristineSeed,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            manual.context.successful_recoveries_in_window, 5,
+            "pre-rearm context preserves history"
+        );
+        assert_eq!(
+            cold.recovery_context(manual.context.soul_id)
+                .await
+                .unwrap()
+                .successful_recoveries_in_window,
+            0
+        );
+    }
     use super::*;
 
     fn limits() -> RuntimeLimits {

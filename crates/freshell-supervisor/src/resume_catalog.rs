@@ -342,6 +342,7 @@ mod tests {
             },
             accepted_command_count: 2,
             completed_command_count: 1,
+            dispatched_command_count: 1,
             never_dispatched: false,
             recovery_window_started_at: None,
             successful_recoveries_in_window: 0,

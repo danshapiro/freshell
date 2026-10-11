@@ -1021,6 +1021,10 @@ fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    mod recovery_budget {
+        include!("tests/managed_recovery_budget_tests.rs");
+    }
 
     #[test]
     fn managed_env_drops_server_and_provider_secrets() {

@@ -386,6 +386,7 @@ pub(crate) async fn probe_resume(
             reason: "deterministic provider state is absent".into(),
             evidence: vec!["fixtureState=missing".into()],
             store_state: EvidenceStoreState::Missing,
+            negative_paths: Vec::new(),
         });
     };
     if state.schema_version != 1 {
@@ -404,6 +405,7 @@ pub(crate) async fn probe_resume(
             reason: "deterministic provider state belongs to another native identity".into(),
             evidence: vec!["fixtureIdentity=wrong".into()],
             store_state: EvidenceStoreState::PresentReadable,
+            negative_paths: Vec::new(),
         });
     }
     Ok(ProviderStoreProbe::Ready {

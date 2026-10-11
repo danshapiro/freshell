@@ -312,6 +312,8 @@ struct PersistedDecision {
 struct PersistedActorState {
     schema_version: u32,
     profile: FreshAgentProfile,
+    #[serde(default)]
+    initialization_state: Option<CommandState>,
     commands: BTreeMap<String, PersistedCommand>,
     #[serde(default)]
     completed_forks: BTreeMap<String, ForkTransition>,
@@ -327,6 +329,7 @@ impl PersistedActorState {
         Self {
             schema_version: 1,
             profile,
+            initialization_state: None,
             commands: BTreeMap::new(),
             completed_forks: BTreeMap::new(),
             decisions: BTreeMap::new(),
@@ -414,58 +417,74 @@ impl FreshAgentHostActor {
         fs::create_dir_all(&state_dir).map_err(persist)?;
         let writer_lock = WriterLock::acquire(&state_dir.join("fresh-agent-writer.lock"))?;
         let state_path = state_dir.join("fresh-agent-state.json");
-        let mut state = if state_path.exists() {
-            let bytes = fs::read(&state_path).map_err(persist)?;
-            let mut loaded: PersistedActorState =
-                serde_json::from_slice(&bytes).map_err(persist)?;
-            let mut expected_profile = profile.clone();
-            if expected_profile.native_session_id.is_none() {
-                expected_profile.native_session_id = loaded.profile.native_session_id.clone();
-            }
-            // The host validates a fresh preparation for each incarnation.
-            // Its grant and resource generation may change while the durable
-            // conversation and every other launch setting remain the same.
-            let current_preparation = expected_profile.provider_launch_context.take();
-            let current_references = expected_profile.provider_secret_references.clone();
-            if current_preparation.is_some() {
-                // Configuration-file references belong to the host-validated
-                // preparation. Legacy OneCLI grants remain durable settings.
-                if !current_references
-                    .iter()
-                    .filter(|reference| !reference.profile.is_configuration_file())
-                    .eq(loaded
-                        .profile
-                        .provider_secret_references
+        let (mut state, newly_initialized) = match fs::read(&state_path) {
+            Ok(bytes) => {
+                let mut loaded: PersistedActorState =
+                    serde_json::from_slice(&bytes).map_err(persist)?;
+                // A successful transport start may still have returned no
+                // identity. Reopening that durable actor must not create a
+                // second conversation from missing metadata alone.
+                if loaded.profile.native_session_id.is_none() {
+                    return Err(ActorError::AmbiguousDispatch);
+                }
+                let mut expected_profile = profile.clone();
+                if expected_profile.native_session_id.is_none() {
+                    expected_profile.native_session_id = loaded.profile.native_session_id.clone();
+                }
+                // The host validates a fresh preparation for each incarnation.
+                // Its grant and resource generation may change while the durable
+                // conversation and every other launch setting remain the same.
+                let current_preparation = expected_profile.provider_launch_context.take();
+                let current_references = expected_profile.provider_secret_references.clone();
+                if current_preparation.is_some() {
+                    // Configuration-file references belong to the host-validated
+                    // preparation. Legacy OneCLI grants remain durable settings.
+                    if !current_references
                         .iter()
-                        .filter(|reference| !reference.profile.is_configuration_file()))
-                {
+                        .filter(|reference| !reference.profile.is_configuration_file())
+                        .eq(loaded
+                            .profile
+                            .provider_secret_references
+                            .iter()
+                            .filter(|reference| !reference.profile.is_configuration_file()))
+                    {
+                        return Err(ActorError::NativeIdentityMismatch);
+                    }
+                    expected_profile.provider_secret_references =
+                        loaded.profile.provider_secret_references.clone();
+                    expected_profile.provider_launch_context =
+                        loaded.profile.provider_launch_context.clone();
+                }
+                if loaded.profile != expected_profile {
                     return Err(ActorError::NativeIdentityMismatch);
                 }
-                expected_profile.provider_secret_references =
-                    loaded.profile.provider_secret_references.clone();
-                expected_profile.provider_launch_context =
-                    loaded.profile.provider_launch_context.clone();
-            }
-            if loaded.profile != expected_profile {
-                return Err(ActorError::NativeIdentityMismatch);
-            }
-            loaded.profile.provider_launch_context = current_preparation;
-            loaded.profile.provider_secret_references = current_references;
-            for command in loaded.commands.values_mut() {
-                if matches!(command.state, CommandState::Dispatching) {
-                    command.state = CommandState::Ambiguous;
+                loaded.profile.provider_launch_context = current_preparation;
+                loaded.profile.provider_secret_references = current_references;
+                for command in loaded.commands.values_mut() {
+                    if matches!(command.state, CommandState::Dispatching) {
+                        command.state = CommandState::Ambiguous;
+                    }
                 }
-            }
-            for decision in loaded.decisions.values_mut() {
-                if matches!(decision.state, DecisionState::Dispatching) {
-                    decision.state = DecisionState::Ambiguous;
+                for decision in loaded.decisions.values_mut() {
+                    if matches!(decision.state, DecisionState::Dispatching) {
+                        decision.state = DecisionState::Ambiguous;
+                    }
                 }
+                (loaded, false)
             }
-            loaded
-        } else {
-            PersistedActorState::new(profile)
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (PersistedActorState::new(profile), true)
+            }
+            Err(error) => return Err(persist(error)),
         };
 
+        if newly_initialized {
+            // Publish intent before the first provider creation. A resumed
+            // actor keeps its accepted preparation until exact identity is
+            // verified below.
+            state.initialization_state = Some(CommandState::Dispatching);
+            write_state(&state_dir, &state)?;
+        }
         let started = transport
             .start(&state.profile)
             .await
@@ -483,6 +502,7 @@ impl FreshAgentHostActor {
                 event_count_cap,
             )?;
         }
+        state.initialization_state = Some(CommandState::Completed);
         write_state(&state_dir, &state)?;
         let actor = Arc::new(Self {
             state_dir,

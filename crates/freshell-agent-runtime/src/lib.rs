@@ -7,8 +7,8 @@
 
 use freshell_runtime_protocol::{
     AllocationState, DurablePosition, EvidenceStoreState, IdentityProvenance, ProviderSessionRef,
-    RecoveryBlockReason, RecoveryPath, ResumeSpec, RetryHint, RuntimeError, RuntimeErrorCode,
-    TerminalLaunchSpec, RESUME_SPEC_SCHEMA_VERSION,
+    RecoveryBlockReason, RecoveryEvidenceVerdict, RecoveryPath, RecoveryPathEvidence, ResumeSpec,
+    RetryHint, RuntimeError, RuntimeErrorCode, TerminalLaunchSpec, RESUME_SPEC_SCHEMA_VERSION,
 };
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -261,6 +261,8 @@ pub enum ProviderStoreProbe {
         reason: String,
         evidence: Vec<String>,
         store_state: EvidenceStoreState,
+        #[serde(default)]
+        negative_paths: Vec<RecoveryPathEvidence>,
     },
     Blocked {
         reason: RecoveryBlockReason,
@@ -598,31 +600,58 @@ fn strip_value_flags(args: &[String], flags: &[&str]) -> Vec<String> {
 }
 
 pub fn probe_provider_store(provider_home: &Path, spec: &ResumeSpec) -> ProviderStoreProbe {
-    if !provider_home.is_dir() {
-        return blocked(
-            RecoveryBlockReason::StoreMissing,
-            "soul provider-state mount is unavailable",
-            vec![provider_home.display().to_string()],
-            Some("restore the soul provider-state volume"),
-        );
+    match fs::metadata(provider_home) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return blocked(
+                RecoveryBlockReason::StoreMissing,
+                "soul provider-state mount is unavailable",
+                vec![provider_home.display().to_string()],
+                Some("restore the soul provider-state volume"),
+            )
+        }
+        _ => {
+            return blocked(
+                RecoveryBlockReason::StoreUnreadable,
+                "soul provider-state mount cannot be inspected",
+                vec![provider_home.display().to_string()],
+                Some("repair the soul provider-state volume"),
+            )
+        }
     }
     let expected = spec.provider_session.native_session_id.as_str();
+    if expected.is_empty() {
+        return blocked(
+            RecoveryBlockReason::AmbiguousIdentity,
+            "native identity is unrecorded",
+            vec![provider_home.display().to_string()],
+            None,
+        );
+    }
     match spec.provider_session.provider.as_str() {
         "phase1-fixture" | "native-session-fixture" => {
             probe_native_fixture(provider_home, expected)
         }
         "claude" => probe_bounded_tree(
-            &provider_home.join(".claude/projects"),
+            &spec
+                .environment
+                .get("CLAUDE_CONFIG_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| provider_home.join(".claude"))
+                .join("projects"),
             expected,
-            ArtifactMatch::FileNameOrJsonText,
         ),
         "codex" => probe_bounded_tree(
-            &provider_home.join(".codex/sessions"),
+            &spec
+                .environment
+                .get("CODEX_HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| provider_home.join(".codex"))
+                .join("sessions"),
             expected,
-            ArtifactMatch::FileNameOrJsonText,
         ),
         "amplifier" => probe_amplifier(provider_home, expected),
-        "opencode" => probe_opencode(provider_home, expected),
+        "opencode" => probe_opencode(provider_home, expected, spec),
         other => blocked(
             RecoveryBlockReason::ImplementationUnavailable,
             &format!("no managed recovery probe for provider {other}"),
@@ -634,6 +663,23 @@ pub fn probe_provider_store(provider_home: &Path, spec: &ResumeSpec) -> Provider
 
 fn probe_native_fixture(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
     let path = provider_home.join("native-session-state.json");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata)
+            if metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.len() <= 1024 * 1024 => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return probe_native_fixture_checkpoint(provider_home, expected, &path)
+        }
+        _ => {
+            return blocked(
+                RecoveryBlockReason::StoreUnreadable,
+                "native fixture state cannot be completely inspected",
+                vec![path.display().to_string()],
+                None,
+            )
+        }
+    }
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -693,18 +739,25 @@ fn probe_native_fixture_checkpoint(
     primary_path: &Path,
 ) -> ProviderStoreProbe {
     let directory = provider_home.join(".freshell/checkpoints/native-session");
-    if !directory.exists() {
-        return ProviderStoreProbe::DefinitivelyUnavailable {
-            reason: "native fixture state and checkpoints are absent".into(),
-            evidence: vec![
-                primary_path.display().to_string(),
-                directory.display().to_string(),
-            ],
-            store_state: EvidenceStoreState::Missing,
-        };
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return native_fixture_absence(primary_path, &directory, EvidenceStoreState::Missing)
+        }
+        _ => {
+            return blocked(
+                RecoveryBlockReason::StoreUnreadable,
+                "native fixture checkpoint directory cannot be inspected",
+                vec![directory.display().to_string()],
+                None,
+            )
+        }
     }
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return native_fixture_absence(primary_path, &directory, EvidenceStoreState::Missing);
+        }
         Err(error) => {
             return blocked(
                 RecoveryBlockReason::StoreUnreadable,
@@ -715,7 +768,15 @@ fn probe_native_fixture_checkpoint(
         }
     };
     let mut candidates = Vec::new();
-    for entry in entries {
+    for (index, entry) in entries.enumerate() {
+        if index >= 50_000 {
+            return blocked(
+                RecoveryBlockReason::StoreUnreadable,
+                "native fixture checkpoint directory exceeds the inspection bound",
+                vec![directory.display().to_string()],
+                None,
+            );
+        }
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
@@ -747,27 +808,32 @@ fn probe_native_fixture_checkpoint(
                 Some("replace checkpoint symlinks with private regular files"),
             );
         }
-        if !metadata.is_file() || metadata.len() > 1024 * 1024 {
-            continue;
-        }
         let revision = path
             .file_stem()
             .and_then(|value| value.to_str())
             .and_then(|value| value.parse::<u64>().ok());
+        if revision.is_some() && (!metadata.is_file() || metadata.len() > 1024 * 1024) {
+            return blocked(
+                RecoveryBlockReason::StoreUnreadable,
+                "native fixture checkpoint cannot be completely inspected",
+                vec![path.display().to_string()],
+                None,
+            );
+        }
+        if !metadata.is_file() {
+            continue;
+        }
         if let Some(revision) = revision {
             candidates.push((revision, path));
         }
     }
     candidates.sort_by_key(|(revision, _)| *revision);
     let Some((revision, path)) = candidates.pop() else {
-        return ProviderStoreProbe::DefinitivelyUnavailable {
-            reason: "native fixture state is absent and no numeric checkpoint exists".into(),
-            evidence: vec![
-                primary_path.display().to_string(),
-                directory.display().to_string(),
-            ],
-            store_state: EvidenceStoreState::Missing,
-        };
+        return native_fixture_absence(
+            primary_path,
+            &directory,
+            EvidenceStoreState::PresentReadable,
+        );
     };
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
@@ -821,14 +887,133 @@ fn probe_native_fixture_checkpoint(
     }
 }
 
-fn probe_opencode(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
-    let path = provider_home.join(".local/share/opencode/opencode.db");
-    if !path.exists() {
-        return ProviderStoreProbe::DefinitivelyUnavailable {
-            reason: "OpenCode session database is absent".into(),
-            evidence: vec![path.display().to_string()],
-            store_state: EvidenceStoreState::Missing,
-        };
+fn inspected_absence(
+    reason: String,
+    evidence: Vec<String>,
+    store_state: EvidenceStoreState,
+    paths: &[RecoveryPath],
+) -> ProviderStoreProbe {
+    let negative_paths = paths
+        .iter()
+        .map(|path| RecoveryPathEvidence {
+            path: *path,
+            verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
+            reason_code: "INSPECTED_PROVIDER_STORE_ABSENCE".into(),
+            evidence_refs: evidence.clone(),
+            store_state,
+        })
+        .collect();
+    ProviderStoreProbe::DefinitivelyUnavailable {
+        reason,
+        evidence,
+        store_state,
+        negative_paths,
+    }
+}
+
+fn native_fixture_absence(
+    primary: &Path,
+    checkpoints: &Path,
+    checkpoint_state: EvidenceStoreState,
+) -> ProviderStoreProbe {
+    let mut result = inspected_absence(
+        "native fixture state and numeric checkpoints are absent".into(),
+        vec![
+            primary.display().to_string(),
+            checkpoints.display().to_string(),
+        ],
+        EvidenceStoreState::Missing,
+        &[RecoveryPath::NativeResume, RecoveryPath::CheckpointRestore],
+    );
+    if let ProviderStoreProbe::DefinitivelyUnavailable { negative_paths, .. } = &mut result {
+        negative_paths[0].evidence_refs = vec![primary.display().to_string()];
+        negative_paths[1].evidence_refs = vec![checkpoints.display().to_string()];
+        negative_paths[1].store_state = checkpoint_state;
+    }
+    result
+}
+
+fn probe_opencode(provider_home: &Path, expected: &str, spec: &ResumeSpec) -> ProviderStoreProbe {
+    // OpenCode v1.18's relative OPENCODE_DB is relative to its XDG data
+    // directory. Channel is compiled into the executable, not an environment
+    // override; an explicit DB or disabled channel DB establishes its authority.
+    let data = spec
+        .environment
+        .get("XDG_DATA_HOME")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| provider_home.join(".local/share"))
+        .join("opencode");
+    let explicit_db = spec
+        .environment
+        .get("OPENCODE_DB")
+        .filter(|value| !value.is_empty());
+    let channel_disabled = spec
+        .environment
+        .get("OPENCODE_DISABLE_CHANNEL_DB")
+        .is_some_and(|value| value == "1" || value == "true");
+    if explicit_db.is_some_and(|value| value == ":memory:") {
+        return blocked(
+            RecoveryBlockReason::AmbiguousIdentity,
+            "OpenCode in-memory database is unavailable for durable inspection",
+            vec!["database=:memory:".into()],
+            None,
+        );
+    }
+    let path = explicit_db
+        .map(|value| {
+            let path = std::path::PathBuf::from(value);
+            if path.is_absolute() {
+                path
+            } else {
+                data.join(path)
+            }
+        })
+        .unwrap_or_else(|| data.join("opencode.db"));
+    let path = if path.is_absolute() {
+        path
+    } else if Path::new(&spec.cwd).is_absolute() {
+        Path::new(&spec.cwd).join(path)
+    } else {
+        return blocked(
+            RecoveryBlockReason::AmbiguousIdentity,
+            "OpenCode relative database root requires a recorded absolute provider cwd",
+            vec!["providerCwd=unestablished".into()],
+            None,
+        );
+    };
+    let authoritative = explicit_db.is_some() || channel_disabled;
+    if !authoritative
+        && spec
+            .provider_version
+            .as_deref()
+            .is_some_and(|version| version.contains('-'))
+    {
+        return blocked(
+            RecoveryBlockReason::AmbiguousIdentity,
+            "OpenCode channel database is unrecorded",
+            vec![data.display().to_string()],
+            None,
+        );
+    }
+    match fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && authoritative => {
+            return inspected_absence(
+                "OpenCode effective session database is absent".into(),
+                vec![path.display().to_string()],
+                EvidenceStoreState::Missing,
+                &[RecoveryPath::NativeResume, RecoveryPath::CheckpointRestore],
+            );
+        }
+        _ => {
+            return blocked(
+                RecoveryBlockReason::StoreUnreadable,
+                "OpenCode effective database cannot be established and inspected",
+                vec![path.display().to_string()],
+                None,
+            )
+        }
     }
     let connection = match Connection::open_with_flags(
         &path,
@@ -855,11 +1040,21 @@ fn probe_opencode(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
         Ok(true) => ProviderStoreProbe::Ready {
             evidence: vec![path.display().to_string(), format!("session.id={expected}")],
         },
-        Ok(false) => ProviderStoreProbe::DefinitivelyUnavailable {
-            reason: format!("OpenCode database has no exact session row {expected}"),
-            evidence: vec![path.display().to_string()],
-            store_state: EvidenceStoreState::PresentReadable,
-        },
+        Ok(false) if authoritative => inspected_absence(
+            format!("OpenCode effective database has no exact session row {expected}"),
+            vec![
+                path.display().to_string(),
+                format!("exactSessionQuery={expected}"),
+            ],
+            EvidenceStoreState::PresentReadable,
+            &[RecoveryPath::NativeResume, RecoveryPath::CheckpointRestore],
+        ),
+        Ok(false) => blocked(
+            RecoveryBlockReason::AmbiguousIdentity,
+            "OpenCode effective channel database is unrecorded; default no-match is not absence",
+            vec![path.display().to_string()],
+            None,
+        ),
         Err(error) => blocked(
             RecoveryBlockReason::UnsupportedProtocol,
             &format!("query OpenCode session database: {error}"),
@@ -871,13 +1066,9 @@ fn probe_opencode(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
 
 fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
     let root = provider_home.join(".amplifier/projects");
-    if !root.exists() {
-        return ProviderStoreProbe::DefinitivelyUnavailable {
-            reason: "Amplifier project store is absent".into(),
-            evidence: vec![root.display().to_string()],
-            store_state: EvidenceStoreState::Missing,
-        };
-    }
+    // This tree alone does not establish all effective Amplifier stores.
+    // Exact readable positives are usable; an unrecorded store is unknown.
+    let mut incomplete = false;
     let mut queue = VecDeque::from([(root.clone(), 0_u8)]);
     let mut matches = Vec::new();
     let mut visited = 0_usize;
@@ -902,7 +1093,11 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
                 )
             }
         };
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        if metadata.file_type().is_symlink() {
+            incomplete = true;
+            continue;
+        }
+        if !metadata.is_dir() {
             continue;
         }
         if path.file_name().is_some_and(|name| name == expected) {
@@ -910,6 +1105,7 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
             continue;
         }
         if depth >= 8 {
+            incomplete = true;
             continue;
         }
         let entries = match fs::read_dir(&path) {
@@ -938,23 +1134,146 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
         }
     }
     match matches.as_slice() {
-        [] => ProviderStoreProbe::DefinitivelyUnavailable {
-            reason: format!("Amplifier store has no exact session {expected}"),
-            evidence: vec![root.display().to_string()],
-            store_state: EvidenceStoreState::PresentReadable,
-        },
-        [session_dir] if freshell_sessions::amplifier_stub::stub_is_unused(session_dir) => {
-            ProviderStoreProbe::DefinitivelyUnavailable {
-                reason: format!(
-                    "Amplifier session {expected} is a pristine launcher stub, not a durable conversation"
-                ),
-                evidence: vec![session_dir.display().to_string(), "turnCount=0".into()],
-                store_state: EvidenceStoreState::PresentReadable,
+        [] => blocked(
+            RecoveryBlockReason::AmbiguousIdentity,
+            "Amplifier native/checkpoint store authority is incomplete",
+            vec![root.display().to_string()],
+            None,
+        ),
+        [session_dir] => {
+            let entries = match fs::read_dir(session_dir) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    return blocked(
+                        RecoveryBlockReason::StoreUnreadable,
+                        &format!("inspect Amplifier session artifacts: {error}"),
+                        vec![session_dir.display().to_string()],
+                        None,
+                    )
+                }
+            };
+            let mut materialized_backup = false;
+            let mut identity_recorded = false;
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        return blocked(
+                            RecoveryBlockReason::StoreUnreadable,
+                            &format!("inspect Amplifier session entry: {error}"),
+                            vec![session_dir.display().to_string()],
+                            None,
+                        )
+                    }
+                };
+                let path = entry.path();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !(name.starts_with("transcript.jsonl")
+                    || name.starts_with("metadata.json")
+                    || name == "events.jsonl")
+                {
+                    continue;
+                }
+                let metadata = match fs::symlink_metadata(&path) {
+                    Ok(metadata)
+                        if metadata.is_file()
+                            && !metadata.file_type().is_symlink()
+                            && metadata.len() <= 1024 * 1024 =>
+                    {
+                        metadata
+                    }
+                    _ => {
+                        return blocked(
+                            RecoveryBlockReason::StoreUnreadable,
+                            "Amplifier session artifact cannot be completely inspected",
+                            vec![path.display().to_string()],
+                            None,
+                        )
+                    }
+                };
+                let bytes = match fs::read(&path) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        return blocked(
+                            RecoveryBlockReason::StoreUnreadable,
+                            &format!("read Amplifier session artifact: {error}"),
+                            vec![path.display().to_string()],
+                            None,
+                        )
+                    }
+                };
+                if name != "transcript.jsonl"
+                    && name.starts_with("transcript.jsonl")
+                    && metadata.len() > 0
+                {
+                    materialized_backup = true;
+                }
+                if name.starts_with("metadata.json") {
+                    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        Ok(value) => {
+                            if let Some(actual) =
+                                value.get("session_id").and_then(serde_json::Value::as_str)
+                            {
+                                if actual != expected {
+                                    return blocked(
+                                        RecoveryBlockReason::WrongNativeIdentity,
+                                        "Amplifier metadata belongs to another native identity",
+                                        vec![path.display().to_string()],
+                                        None,
+                                    );
+                                }
+                                identity_recorded = true;
+                            }
+                            if name != "metadata.json" && value.get("turn_count").is_some() {
+                                materialized_backup = true;
+                            }
+                        }
+                        Err(_) => {
+                            return blocked(
+                                RecoveryBlockReason::StoreUnreadable,
+                                "Amplifier session metadata is malformed",
+                                vec![path.display().to_string()],
+                                None,
+                            )
+                        }
+                    }
+                }
+            }
+            if !identity_recorded {
+                return blocked(
+                    RecoveryBlockReason::AmbiguousIdentity,
+                    "Amplifier native identity is unrecorded in readable metadata",
+                    vec![session_dir.display().to_string()],
+                    None,
+                );
+            }
+            if !materialized_backup
+                && freshell_sessions::amplifier_stub::stub_is_unused(session_dir)
+            {
+                if incomplete {
+                    return blocked(
+                        RecoveryBlockReason::AmbiguousIdentity,
+                        "Amplifier store scan is incomplete",
+                        vec![root.display().to_string()],
+                        None,
+                    );
+                }
+                inspected_absence(
+                    format!("Amplifier session {expected} is an inspected pristine launcher stub"),
+                    vec![session_dir.display().to_string(), "turnCount=0".into()],
+                    EvidenceStoreState::PresentReadable,
+                    &[RecoveryPath::NativeResume],
+                )
+            } else {
+                ProviderStoreProbe::Ready {
+                    evidence: vec![
+                        session_dir.display().to_string(),
+                        format!("sessionId={expected}"),
+                    ],
+                }
             }
         }
-        [session_dir] => ProviderStoreProbe::Ready {
-            evidence: vec![session_dir.display().to_string(), format!("sessionId={expected}")],
-        },
         many => blocked(
             RecoveryBlockReason::AmbiguousIdentity,
             &format!(
@@ -967,19 +1286,7 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum ArtifactMatch {
-    FileNameOrJsonText,
-}
-
-fn probe_bounded_tree(root: &Path, expected: &str, mode: ArtifactMatch) -> ProviderStoreProbe {
-    if !root.exists() {
-        return ProviderStoreProbe::DefinitivelyUnavailable {
-            reason: "provider session root is absent".into(),
-            evidence: vec![root.display().to_string()],
-            store_state: EvidenceStoreState::Missing,
-        };
-    }
+fn probe_bounded_tree(root: &Path, expected: &str) -> ProviderStoreProbe {
     let mut queue = VecDeque::from([(root.to_path_buf(), 0_u8)]);
     let mut visited = 0_usize;
     while let Some((path, depth)) = queue.pop_front() {
@@ -994,14 +1301,9 @@ fn probe_bounded_tree(root: &Path, expected: &str, mode: ArtifactMatch) -> Provi
         }
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
-            Err(error) => {
-                return blocked(
-                    RecoveryBlockReason::StoreUnreadable,
-                    &format!("inspect provider artifact {}: {error}", path.display()),
-                    vec![root.display().to_string()],
-                    Some("repair provider-state volume permissions"),
-                )
-            }
+            // Keep searching for an exact readable positive. No negative is
+            // emitted from this partial tree, including skipped candidates.
+            Err(_) => continue,
         };
         if metadata.file_type().is_symlink() {
             continue;
@@ -1012,56 +1314,38 @@ fn probe_bounded_tree(root: &Path, expected: &str, mode: ArtifactMatch) -> Provi
             }
             let entries = match fs::read_dir(&path) {
                 Ok(entries) => entries,
-                Err(error) => {
-                    return blocked(
-                        RecoveryBlockReason::StoreUnreadable,
-                        &format!("read provider directory {}: {error}", path.display()),
-                        vec![root.display().to_string()],
-                        Some("repair provider-state volume permissions"),
-                    )
-                }
+                Err(_) => continue,
             };
             for entry in entries {
                 match entry {
                     Ok(entry) => queue.push_back((entry.path(), depth + 1)),
-                    Err(error) => {
-                        return blocked(
-                            RecoveryBlockReason::StoreUnreadable,
-                            &format!("read provider directory entry: {error}"),
-                            vec![root.display().to_string()],
-                            Some("repair provider-state volume permissions"),
-                        )
-                    }
+                    Err(_) => continue,
                 }
             }
             continue;
         }
-        if matches!(mode, ArtifactMatch::FileNameOrJsonText) {
-            let filename_match = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.contains(expected));
-            let content_match = if filename_match || metadata.len() > 1024 * 1024 {
-                false
-            } else {
-                fs::read(&path).ok().is_some_and(|bytes| {
-                    bytes
-                        .windows(expected.len())
-                        .any(|w| w == expected.as_bytes())
-                })
+        if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        let filename_match = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains(expected));
+        let content_match = bytes
+            .windows(expected.len())
+            .any(|w| w == expected.as_bytes());
+        if filename_match || content_match {
+            return ProviderStoreProbe::Ready {
+                evidence: vec![path.display().to_string()],
             };
-            if filename_match || content_match {
-                return ProviderStoreProbe::Ready {
-                    evidence: vec![path.display().to_string()],
-                };
-            }
         }
     }
-    ProviderStoreProbe::DefinitivelyUnavailable {
-        reason: format!("no exact provider artifact for {expected}"),
-        evidence: vec![root.display().to_string()],
-        store_state: EvidenceStoreState::PresentReadable,
-    }
+    blocked(RecoveryBlockReason::AmbiguousIdentity,
+        "complete effective provider native/checkpoint stores are unrecorded; tree no-match is not absence",
+        vec![root.display().to_string()], None)
 }
 
 fn blocked(
@@ -1311,6 +1595,234 @@ mod tests {
                 reason: RecoveryBlockReason::WrongNativeIdentity,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn native_fixture_probe_oversized_or_unreadable_checkpoint_cannot_certify_absence() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".freshell/checkpoints/native-session");
+        fs::create_dir_all(&dir).unwrap();
+        let file = fs::File::create(dir.join("7.json")).unwrap();
+        file.set_len(1024 * 1024 + 1).unwrap();
+        assert!(matches!(
+            probe_provider_store(
+                home.path(),
+                &resume_spec_for_test("native-session-fixture", "exact", home.path())
+            ),
+            ProviderStoreProbe::Blocked { .. }
+        ));
+    }
+
+    #[test]
+    fn recovery_store_opencode_relative_data_root_uses_recorded_provider_cwd() {
+        assert_opencode_data_root("relative-data", true);
+    }
+
+    #[test]
+    fn recovery_store_opencode_empty_data_root_uses_provider_home() {
+        assert_opencode_data_root("", false);
+    }
+
+    fn assert_opencode_data_root(data_root: &str, relative: bool) {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = home.path().join("provider-workspace");
+        fs::create_dir(&cwd).unwrap();
+        let mut spec = resume_spec_for_test("opencode", "exact", home.path());
+        spec.cwd = cwd.display().to_string();
+        spec.environment
+            .insert("XDG_DATA_HOME".into(), data_root.into());
+        spec.environment
+            .insert("OPENCODE_DB".into(), "selected.db".into());
+        let data = if relative {
+            cwd.join(data_root)
+        } else {
+            home.path().join(".local/share")
+        };
+        let path = data.join("opencode/selected.db");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let db = Connection::open(&path).unwrap();
+        db.execute("CREATE TABLE session(id TEXT PRIMARY KEY)", [])
+            .unwrap();
+        db.execute("INSERT INTO session(id) VALUES ('exact')", [])
+            .unwrap();
+        assert!(
+            matches!(
+                probe_provider_store(home.path(), &spec),
+                ProviderStoreProbe::Ready { .. }
+            ),
+            "data root {data_root:?}"
+        );
+        db.execute("DELETE FROM session WHERE id='exact'", [])
+            .unwrap();
+        let result = probe_provider_store(home.path(), &spec);
+        let ProviderStoreProbe::DefinitivelyUnavailable {
+            negative_paths,
+            store_state,
+            ..
+        } = result
+        else {
+            panic!("{result:?}");
+        };
+        assert_eq!(store_state, EvidenceStoreState::PresentReadable);
+        assert_eq!(negative_paths.len(), 2);
+        assert!(negative_paths.iter().all(|row| row
+            .evidence_refs
+            .iter()
+            .any(|reference| reference == &path.display().to_string())));
+    }
+
+    #[test]
+    fn recovery_store_opencode_unresolved_relative_data_root_blocks() {
+        let home = tempfile::tempdir().unwrap();
+        let mut spec = resume_spec_for_test("opencode", "exact", home.path());
+        spec.cwd = "unrecorded-relative-cwd".into();
+        spec.environment
+            .insert("XDG_DATA_HOME".into(), "unrecorded-relative-data".into());
+        spec.environment
+            .insert("OPENCODE_DB".into(), "selected.db".into());
+        assert!(
+            matches!(
+                probe_provider_store(home.path(), &spec),
+                ProviderStoreProbe::Blocked { .. }
+            ),
+            "unresolved provider cwd must not authorize probe-cwd absence"
+        );
+        let path = home.path().join("absolute.db");
+        let db = Connection::open(&path).unwrap();
+        db.execute("CREATE TABLE session(id TEXT PRIMARY KEY)", [])
+            .unwrap();
+        db.execute("INSERT INTO session(id) VALUES ('exact')", [])
+            .unwrap();
+        spec.environment
+            .insert("OPENCODE_DB".into(), path.display().to_string());
+        assert!(
+            matches!(
+                probe_provider_store(home.path(), &spec),
+                ProviderStoreProbe::Ready { .. }
+            ),
+            "explicit absolute database remains authoritative"
+        );
+    }
+
+    #[test]
+    fn recovery_store_opencode_resolves_data_and_database_overrides_before_inspection() {
+        let home = tempfile::tempdir().unwrap();
+        for route in ["xdg", "absolute", "relative", "channel-disabled"] {
+            let mut spec = resume_spec_for_test("opencode", "exact", home.path());
+            let path = match route {
+                "xdg" => {
+                    spec.environment.insert(
+                        "XDG_DATA_HOME".into(),
+                        home.path().join("selected-data").display().to_string(),
+                    );
+                    home.path().join("selected-data/opencode/opencode.db")
+                }
+                "absolute" => {
+                    let path = home.path().join("selected.db");
+                    spec.environment
+                        .insert("OPENCODE_DB".into(), path.display().to_string());
+                    path
+                }
+                "relative" => {
+                    spec.environment
+                        .insert("OPENCODE_DB".into(), "relative.db".into());
+                    home.path().join(".local/share/opencode/relative.db")
+                }
+                "channel-disabled" => {
+                    spec.environment
+                        .insert("OPENCODE_DISABLE_CHANNEL_DB".into(), "1".into());
+                    home.path().join(".local/share/opencode/opencode.db")
+                }
+                _ => unreachable!(),
+            };
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let db = Connection::open(path).unwrap();
+            db.execute("CREATE TABLE session(id TEXT PRIMARY KEY)", [])
+                .unwrap();
+            db.execute("INSERT INTO session(id) VALUES ('exact')", [])
+                .unwrap();
+            assert!(
+                matches!(
+                    probe_provider_store(home.path(), &spec),
+                    ProviderStoreProbe::Ready { .. }
+                ),
+                "{route}"
+            );
+        }
+        let mut memory = resume_spec_for_test("opencode", "exact", home.path());
+        memory
+            .environment
+            .insert("OPENCODE_DB".into(), ":memory:".into());
+        assert!(matches!(
+            probe_provider_store(home.path(), &memory),
+            ProviderStoreProbe::Blocked { .. }
+        ));
+        let mut unknown_channel = resume_spec_for_test("opencode", "absent", home.path());
+        unknown_channel.provider_version = Some("0.0.0-preview".into());
+        assert!(
+            matches!(
+                probe_provider_store(home.path(), &unknown_channel),
+                ProviderStoreProbe::Blocked { .. }
+            ),
+            "unrecorded installed channel cannot certify a default-database negative"
+        );
+    }
+
+    #[test]
+    fn recovery_store_incomplete_scan_blocks_but_exact_positive_survives() {
+        let home = tempfile::tempdir().unwrap();
+        for provider in ["claude", "codex"] {
+            let root = home.path().join(if provider == "claude" {
+                ".claude/projects"
+            } else {
+                ".codex/sessions"
+            });
+            fs::create_dir_all(&root).unwrap();
+            let large = fs::File::create(root.join("oversized.jsonl")).unwrap();
+            large.set_len(1024 * 1024 + 1).unwrap();
+            let spec = resume_spec_for_test(provider, "exact", home.path());
+            assert!(
+                matches!(
+                    probe_provider_store(home.path(), &spec),
+                    ProviderStoreProbe::Blocked { .. }
+                ),
+                "{provider}"
+            );
+            fs::write(root.join("exact.jsonl"), br#"{"sessionId":"exact"}"#).unwrap();
+            assert!(
+                matches!(
+                    probe_provider_store(home.path(), &spec),
+                    ProviderStoreProbe::Ready { .. }
+                ),
+                "{provider}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_store_amplifier_backup_transcript_preserves_materialized_session() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = home.path().join("workspace");
+        fs::create_dir(&cwd).unwrap();
+        let session = freshell_sessions::amplifier_stub::ensure_session(
+            &home.path().join(".amplifier"),
+            "exact",
+            cwd.to_str().unwrap(),
+            "terminal",
+        )
+        .unwrap();
+        fs::write(
+            session.session_dir.join("transcript.jsonl.backup"),
+            b"synthetic retained turn",
+        )
+        .unwrap();
+        assert!(matches!(
+            probe_provider_store(
+                home.path(),
+                &resume_spec_for_test("amplifier", "exact", home.path())
+            ),
+            ProviderStoreProbe::Ready { .. }
         ));
     }
 
