@@ -545,3 +545,54 @@ async fn a_switch_to_freshcodex_from_a_pane_in_its_unit_succeeds_on_the_first_at
     );
     h.state.fresh_codex.shutdown().await;
 }
+
+/// A switch to terminal Codex of a freshcodex conversation that never had a
+/// turn cannot move it: Codex wrote no rollout, so there is nothing to
+/// resume, and a handoff moves one exact conversation, so it starts no new
+/// one in its place. The switch is refused for good (not retryable: every
+/// retry would meet the same missing rollout) with a plain message.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_switch_to_the_terminal_of_a_conversation_that_never_had_a_turn_is_refused_for_good() {
+    let h = UnitHarness::start(HarnessOpts::default()).await;
+    h.state.fresh_codex.set_enabled(true);
+    let mut ws = h.connect().await;
+    let cwd = h.home.path().display().to_string();
+    h.send(
+        &mut ws,
+        json!({"type": "freshAgent.create", "requestId": "crq-fc-fresh", "sessionType": "freshcodex",
+            "provider": "codex", "cwd": cwd}),
+    )
+    .await;
+    let created = h
+        .next_matching(&mut ws, Duration::from_secs(30), |f| {
+            f["requestId"] == "crq-fc-fresh"
+                && (f["type"] == "freshAgent.created" || f["type"] == "freshAgent.create.failed")
+        })
+        .await
+        .expect("the freshcodex create is answered");
+    assert_eq!(created["type"], "freshAgent.created", "{created}");
+    let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+    let (status, body) = h
+        .post(
+            "/api/sessions/handoff",
+            json!({"provider": "codex", "sessionId": session_id, "targetKind": "terminal",
+                "mode": "codex", "cwd": cwd, "deviceId": "test-device"}),
+        )
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["ok"], json!(false), "{body}");
+    assert_eq!(body["error"]["code"], "TARGET_SPAWN_FAILED", "{body}");
+    assert_eq!(
+        body["error"]["retryable"],
+        json!(false),
+        "a retry would fail the same way: {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("no messages yet")),
+        "a plain message: {body}"
+    );
+    h.state.fresh_codex.shutdown().await;
+}

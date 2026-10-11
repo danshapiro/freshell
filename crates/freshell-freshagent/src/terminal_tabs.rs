@@ -1606,8 +1606,12 @@ pub(crate) async fn spawn_terminal_pane(
 /// turn: no rollout, so Codex cannot resume it) is started NEW for the same
 /// request, outside a handoff: the claims on the old conversation are given
 /// up, its pane-ledger row is retired and the spawn runs again with no
-/// sessionRef (Stage 2: LB-41). A handoff (which moves that exact
-/// conversation) keeps the typed failure.
+/// sessionRef (Stage 2: LB-41). A handoff moves that exact conversation
+/// (session-id preservation: it never answers success with a runtime that
+/// serves another), so it cannot start a new one in its place; its spawn is
+/// refused with [`TARGET_NEVER_MATERIALIZED`] and a plain message, which the
+/// handoff answers as not retryable (every retry would meet the same missing
+/// rollout).
 pub(crate) async fn spawn_terminal_pane_with_handoff(
     state: &FreshAgentState,
     body: &Value,
@@ -1628,7 +1632,13 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
         return Err(failure);
     };
     if handoff.is_some() {
-        return Err(failure);
+        return Err(crate::fail_json_code(
+            StatusCode::CONFLICT,
+            TARGET_NEVER_MATERIALIZED,
+            "This conversation has no messages yet, so there is nothing to move to the \
+             terminal. Open a new Codex terminal pane instead."
+                .to_string(),
+        ));
     }
     let mode = body
         .get("mode")
@@ -1656,6 +1666,10 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
     ))
     .await
 }
+
+/// The code of a handoff's terminal spawn refused because the conversation
+/// it was to move never materialized ([`spawn_terminal_pane_with_handoff`]).
+pub(crate) const TARGET_NEVER_MATERIALIZED: &str = "TARGET_NEVER_MATERIALIZED";
 
 /// The marker a spawn failure carries when the Codex conversation it was to
 /// resume never materialized ([`spawn_terminal_pane_with_handoff`] restarts

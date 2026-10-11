@@ -1946,7 +1946,10 @@ impl SessionHandoffRunner {
                     "ownership.handoff.done",
                     TransitionLevel::Warn,
                 );
-                typed_failure("TARGET_SPAWN_FAILED", &detail, true, generation)
+                // A conversation that never materialized cannot be moved:
+                // a retry would fail the same way.
+                let retryable = code != crate::terminal_tabs::TARGET_NEVER_MATERIALIZED;
+                typed_failure("TARGET_SPAWN_FAILED", &detail, retryable, generation)
             }
         }
     }
