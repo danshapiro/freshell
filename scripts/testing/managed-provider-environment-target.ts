@@ -7,6 +7,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import WebSocket from 'ws'
+import { WS_PROTOCOL_VERSION, type ClientMessage } from '../../shared/ws-protocol.js'
 import { ManagedRuntimeBrowserRig, type ManagedRuntimeView } from '../../test/e2e-browser/helpers/managed-runtime.js'
 import { authorizeProviderParityRequest, captureProviderParityVolumes, cleanupProviderParityVolumes } from '../../test/helpers/provider-parity-broker.js'
 import { fakeOnecliGrants } from '../../test/integration/server/provider-parity-onecli.js'
@@ -172,7 +173,9 @@ async function socketCreate(rig: ManagedRuntimeBrowserRig, requestId: string, mo
   try {
     await bounded(new Promise<void>((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject) }),
       30_000, 'owned WebSocket open')
-    ws.send(JSON.stringify({ type: 'hello', token: rig.info.token, ...(capabilities ? { capabilities } : {}) }))
+    const hello = { type: 'hello', token: rig.info.token, protocolVersion: WS_PROTOCOL_VERSION,
+      ...(capabilities ? { capabilities } : {}) } satisfies ClientMessage
+    ws.send(JSON.stringify(hello))
     const ready = await poll('authenticated ready', async () => messages.find(message => message.type === 'ready'), 30_000)
     if (capabilities?.managedRuntimeV1) assert.equal(ready.capabilities?.managedRuntimeV1, true)
     ws.send(JSON.stringify({ type: 'terminal.create', requestId, mode, cwd, cols: 100, rows: 30 }))
