@@ -1382,8 +1382,9 @@ pub(crate) async fn kill_unit(
     //    over, so the crash still reaches the hub at Gone, which reads the
     //    cancel by the crashed terminal's id, and the restart's own
     //    replacement is the pane's only one (Stage 2: LB-36, LB-31). A user
-    //    kill takes the stop over and no crash is sent at all, so it needs
-    //    no cancel.
+    //    kill takes the stop over; a crash that still reaches the hub (a
+    //    join after the report was built) is settled `pane_closed` by the
+    //    hub's ledger guard, so it needs no cancel either.
     if let Some(terminal_id) = entry.terminal_id.as_deref().filter(|_| stuck_recovery) {
         if entry.unit.stop_in_flight().is_some()
             && matches!(
