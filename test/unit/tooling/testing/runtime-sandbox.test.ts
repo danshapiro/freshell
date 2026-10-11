@@ -28,7 +28,7 @@ vi.mock('node:child_process', () => {
 import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { RestrictedDockerBroker, type PreparedInputAuthorization } from '../../../../scripts/testing/runtime-test-broker.js'
 import { ManagedRuntimeBrowserRig } from '../../../e2e-browser/helpers/managed-runtime.js'
-import { prepareProviderParityUserRoots } from '../../../integration/server/provider-parity-environment.js'
+import { prepareProviderParityUserRoots } from '../../../helpers/provider-parity-environment.js'
 
 function useOwnedHarnessArtifacts(harness: RuntimeHarness, host: string): void {
   const artifact = harness as unknown as { ensureRuntimeImage(): void; buildBinaries(): void; collectCapabilities(): unknown; collectBuildInfo(): unknown }

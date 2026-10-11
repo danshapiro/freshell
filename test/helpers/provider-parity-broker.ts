@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 
-import type { InitialProviderVolumeAuthorization, RestrictedDockerBroker } from '../../../scripts/testing/runtime-test-broker.js'
+import type { InitialProviderVolumeAuthorization, RestrictedDockerBroker } from '../../scripts/testing/runtime-test-broker.js'
 
 export function authorizeProviderParityRequest(
   broker: RestrictedDockerBroker,
