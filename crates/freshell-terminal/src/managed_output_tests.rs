@@ -94,6 +94,8 @@ fn fixture() -> (TerminalRegistry, Arc<Controller>) {
         calls: AtomicUsize::new(0),
         observed: Mutex::new(Vec::new()),
         response: Mutex::new(ManagedOutputRead {
+            lifecycle: None,
+            completion: None,
             stream_epoch: Some("epoch-new".into()),
             incarnation_id: Some("incarnation-new".into()),
             reset_required: true,
@@ -259,4 +261,105 @@ fn managed_opencode_same_runtime_accepts_a_signaled_session_switch() {
         Some("ses_Switched")
     );
     assert_eq!(registry.managed_output_cursor("terminal-stable"), Some(206));
+}
+
+#[test]
+fn managed_output_shell_terminal_ended_final_tail() {
+    let (registry, controller) = fixture();
+    {
+        let mut inner = registry.inner.lock().unwrap();
+        let handle = inner.terminals.get_mut("terminal-stable").unwrap();
+        handle.managed.as_mut().unwrap().mode = "shell".into();
+        handle.shared.lock().unwrap().mode = "shell".into();
+    }
+    {
+        let mut response = controller.response.lock().unwrap();
+        response.stream_epoch = Some("epoch-old".into());
+        response.incarnation_id = Some("incarnation-old".into());
+        response.reset_required = false;
+        response.retained_from_seq = 206;
+        response.head_seq = 208;
+        response.exit_code = Some(17);
+        response.chunks = vec![ManagedOutputChunk {
+            seq_start: 207,
+            seq_end: 207,
+            data: "x".repeat(65536),
+        }];
+    }
+    immediate(registry.refresh_managed_output("terminal-stable", 65536)).unwrap();
+    assert_eq!(registry.managed_output_cursor("terminal-stable"), Some(207));
+    assert_eq!(registry.inventory()[0].status, TerminalRunStatus::Running);
+    controller.response.lock().unwrap().chunks = vec![ManagedOutputChunk {
+        seq_start: 208,
+        seq_end: 208,
+        data: "final tail".into(),
+    }];
+    immediate(registry.refresh_managed_output("terminal-stable", 65536)).unwrap();
+    registry.finish_managed_exit("terminal-stable", 17);
+    assert_eq!(registry.inventory()[0].status, TerminalRunStatus::Exited);
+    assert!(registry.exists("terminal-stable"));
+    assert_eq!(registry.managed_output_cursor("terminal-stable"), Some(208));
+    assert!(
+        registry
+            .live_managed_owner_for_session("shell", "native-original")
+            .is_some(),
+        "retained managed membership continues to dominate ordinary recreation after exit"
+    );
+    assert!(registry.directory()[0].snapshot.ends_with("final tail"));
+}
+
+#[test]
+fn managed_output_paced_exit_preserves_explicit_code_availability() {
+    for code in [None, Some(-1)] {
+        let (registry, _) = fixture();
+        immediate(registry.refresh_managed_output("terminal-stable", 65536)).unwrap();
+        registry.set_paced_page_max_bytes(0);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = captured.clone();
+        let start = registry
+            .attach(
+                "terminal-stable",
+                77,
+                Arc::new(move |frame| sink.lock().unwrap().push(frame)),
+                Some("explicit-availability".into()),
+                0,
+                false,
+                true,
+                None,
+                None,
+                None,
+                PacedAttachOptions::default(),
+            )
+            .paced
+            .expect("managed retained tail uses paced replay");
+        assert!(registry.finish_managed_completion("terminal-stable", code));
+        let mut cursor = start.session.page_end;
+        loop {
+            match registry.complete_paced_tail(
+                "terminal-stable",
+                77,
+                "explicit-availability",
+                cursor,
+                2,
+                0,
+            ) {
+                PacedTailCompletion::Handoff { end_seq, .. } => cursor = end_seq,
+                PacedTailCompletion::Completed { .. } => break,
+                other => panic!("unexpected completion: {other:?}"),
+            }
+        }
+        let frames = captured.lock().unwrap();
+        let exits: Vec<_> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                ServerMessage::TerminalExit(exit) => Some(exit),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0].managed_retained, Some(true));
+        assert_eq!(exits[0].exit_code_available, Some(code.is_some()));
+        assert_eq!(exits[0].exit_code, code.unwrap_or(-1));
+        assert_eq!(registry.managed_attached_to(77), vec!["terminal-stable"]);
+    }
 }

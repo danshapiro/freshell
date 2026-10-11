@@ -637,6 +637,7 @@ fn terminal_status_exited_settle_frame_roundtrips() {
     // existing terminal.status message, with the typed resumeCycles field
     // (flap-circuit-breaker settles only).
     let msg = ServerMessage::TerminalStatus(TerminalStatus {
+        recovery_summary: None,
         status: RuntimeStatus::Exited,
         terminal_id: "t1".into(),
         attempt: None,

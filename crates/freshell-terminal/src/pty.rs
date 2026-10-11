@@ -448,12 +448,10 @@ pub(crate) fn take_group_kill_log() -> Vec<u32> {
     GROUP_KILL_LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
 }
 
-impl Drop for PtyTerminal {
-    fn drop(&mut self) {
-        // Kill the child, then join the waiter (returns once the child is reaped;
-        // on Windows it also closes the master) and the reader (it exits once the
-        // stream EOFs \u2014 unix: slave EIO; Windows: master closed by the waiter).
-        // Both joins are bounded: kill() guarantees the child is exiting.
+impl PtyTerminal {
+    /// Stop the owned child and settle both output and exit observation before
+    /// the caller publishes a successful stop reply.
+    pub fn stop_and_join_output(&mut self) {
         self.kill();
         if let Some(handle) = self.waiter_thread.take() {
             let _ = handle.join();
@@ -461,6 +459,12 @@ impl Drop for PtyTerminal {
         if let Some(handle) = self.reader_thread.take() {
             let _ = handle.join();
         }
+    }
+}
+
+impl Drop for PtyTerminal {
+    fn drop(&mut self) {
+        self.stop_and_join_output();
     }
 }
 

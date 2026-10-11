@@ -1,21 +1,21 @@
-use freshell_runtime_protocol::{IncarnationId, RuntimeOutputBatch, RuntimeOutputFrame};
-use serde::{Deserialize, Serialize};
+use freshell_runtime_protocol::{
+    terminal_spool::{
+        scan_spool, RetainedOutputPage, TerminalSpoolFrame as SpoolFrame, SPOOL_COMPLETION_FILE,
+        SPOOL_DESCRIPTOR_FILE,
+    },
+    IncarnationId, RuntimeOutputBatch, RuntimeOutputFrame, TerminalExitObservation,
+    TerminalSpoolCompletion, TerminalSpoolDescriptor,
+};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::VecDeque,
     fs::OpenOptions,
-    io::{BufRead, BufReader, Write},
+    io::{BufReader, Write},
     path::{Path, PathBuf},
 };
 
 pub const DEFAULT_RING_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_SPOOL_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_TRANSPORT_CHUNK_BYTES: usize = 64 * 1024;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SpoolFrame {
-    frame: RuntimeOutputFrame,
-}
 
 pub struct OutputJournal {
     incarnation_id: IncarnationId,
@@ -27,6 +27,8 @@ pub struct OutputJournal {
     ring_limit: usize,
     spool_limit: u64,
     next_seq: u64,
+    completion: Option<TerminalSpoolCompletion>,
+    failure: Option<String>,
 }
 
 impl OutputJournal {
@@ -73,9 +75,23 @@ impl OutputJournal {
             ring: VecDeque::new(),
             ring_bytes: 0,
             ring_limit: ring_limit.max(MAX_TRANSPORT_CHUNK_BYTES),
-            spool_limit: spool_limit.max((MAX_TRANSPORT_CHUNK_BYTES * 4) as u64),
+            spool_limit: spool_limit
+                .clamp((MAX_TRANSPORT_CHUNK_BYTES * 4) as u64, DEFAULT_SPOOL_BYTES),
             next_seq: 1,
+            completion: None,
+            failure: None,
         };
+        atomic_json(
+            &journal.state_dir.join(SPOOL_DESCRIPTOR_FILE),
+            &journal.descriptor(),
+        )?;
+        // Create a committed empty source before the PTY output writer exists.
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(journal.current_path())
+            .and_then(|file| file.sync_all())
+            .map_err(|_| "initialize retained spool failed")?;
         journal.seed_sequence_from_spool()?;
         Ok(journal)
     }
@@ -84,7 +100,6 @@ impl OutputJournal {
         let mut written = Vec::new();
         for chunk in split_utf8(data, MAX_TRANSPORT_CHUNK_BYTES) {
             let seq = self.next_seq;
-            self.next_seq = self.next_seq.saturating_add(1);
             let frame = RuntimeOutputFrame {
                 terminal_id: self.terminal_id.clone(),
                 stream_epoch: self.stream_epoch.clone(),
@@ -93,6 +108,10 @@ impl OutputJournal {
                 data: chunk.to_string(),
             };
             self.append_spool(&frame)?;
+            self.next_seq = self
+                .next_seq
+                .checked_add(1)
+                .ok_or("output sequence exhausted")?;
             self.ring_bytes = self.ring_bytes.saturating_add(frame.data.len());
             self.ring.push_back(frame.clone());
             while self.ring_bytes > self.ring_limit {
@@ -106,74 +125,88 @@ impl OutputJournal {
         Ok(written)
     }
 
-    pub fn read(&self, after_seq: u64, max_bytes: u64) -> Result<RuntimeOutputBatch, String> {
-        let budget = max_bytes.clamp(1, MAX_TRANSPORT_CHUNK_BYTES as u64) as usize;
-        let mut by_seq = BTreeMap::<u64, RuntimeOutputFrame>::new();
-        for path in [self.previous_path(), self.current_path()] {
-            if !path.exists() {
-                continue;
-            }
-            let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-            for line in BufReader::new(file).lines() {
-                let line = line.map_err(|e| e.to_string())?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let row: SpoolFrame = serde_json::from_str(&line).map_err(|e| e.to_string())?;
-                if row.frame.stream_epoch == self.stream_epoch {
-                    by_seq.insert(row.frame.seq_start, row.frame);
-                }
-            }
-        }
-        for frame in &self.ring {
-            by_seq.insert(frame.seq_start, frame.clone());
-        }
-        let retained_from_seq = by_seq.keys().next().copied().unwrap_or(self.next_seq);
-        let head_seq = self.next_seq.saturating_sub(1);
-        let reset_required =
-            after_seq > head_seq || after_seq.saturating_add(1) < retained_from_seq;
-        let effective_after = if reset_required {
-            retained_from_seq.saturating_sub(1)
-        } else {
-            after_seq
-        };
-        let mut frames = Vec::new();
-        let mut used = 0usize;
-        let mut more = false;
-        for (_, frame) in by_seq.range((effective_after.saturating_add(1))..) {
-            let cost = frame.data.len().max(1);
-            if !frames.is_empty() && used.saturating_add(cost) > budget {
-                more = true;
-                break;
-            }
-            if cost > budget && frames.is_empty() {
-                // append() already chunks at <=64KiB, but a smaller caller budget
-                // should still make forward progress without emitting an oversized frame.
-                let Some(first) = split_utf8(&frame.data, budget).first().copied() else {
-                    continue;
-                };
-                let mut partial = frame.clone();
-                partial.data = first.to_string();
-                frames.push(partial);
-                more = true;
-                break;
-            }
-            used = used.saturating_add(cost);
-            frames.push(frame.clone());
-        }
-        Ok(RuntimeOutputBatch {
+    fn descriptor(&self) -> TerminalSpoolDescriptor {
+        TerminalSpoolDescriptor {
+            schema_version: 1,
             incarnation_id: self.incarnation_id.clone(),
             terminal_id: self.terminal_id.clone(),
             stream_epoch: self.stream_epoch.clone(),
-            retained_from_seq,
-            head_seq,
-            reset_required,
-            truncated: reset_required || more,
-            exited: false,
-            exit_code: None,
-            native_session_id: None,
-            frames,
-        })
+            segment_limit_bytes: self.spool_limit / 2,
+        }
+    }
+
+    pub fn record_failure(&mut self) {
+        self.failure = Some("retained output writer failed".into());
+    }
+
+    pub fn complete(&mut self, code: i64) -> Result<(), String> {
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
+        let batch = self.read(0, MAX_TRANSPORT_CHUNK_BYTES as u64)?;
+        let completion = TerminalSpoolCompletion {
+            incarnation_id: self.incarnation_id.clone(),
+            terminal_id: self.terminal_id.clone(),
+            stream_epoch: self.stream_epoch.clone(),
+            retained_from_seq: batch.retained_from_seq,
+            head_seq: batch.head_seq,
+            exit: TerminalExitObservation::Known { code },
+        };
+        atomic_json(&self.state_dir.join(SPOOL_COMPLETION_FILE), &completion)?;
+        self.completion = Some(completion);
+        Ok(())
+    }
+
+    fn scan(
+        &self,
+        mut accept: impl FnMut(RuntimeOutputFrame) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        let source = self.descriptor();
+        let mut torn = false;
+        for (path, required) in [(self.previous_path(), false), (self.current_path(), true)] {
+            let file = match std::fs::File::open(path) {
+                Ok(file) => file,
+                Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return Err("retained output spool unavailable".into()),
+            };
+            if file
+                .metadata()
+                .map_err(|_| "retained spool metadata unavailable")?
+                .len()
+                > source.segment_limit_bytes
+            {
+                return Err("retained spool exceeds segment bound".into());
+            }
+            torn |= scan_spool(BufReader::new(file), &source, &mut accept)?;
+        }
+        Ok(torn)
+    }
+
+    pub fn read(&self, after_seq: u64, max_bytes: u64) -> Result<RuntimeOutputBatch, String> {
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
+        // First scan establishes bounds without retaining the spool in memory.
+        let mut first = None;
+        let mut head = 0;
+        self.scan(|frame| {
+            first.get_or_insert(frame.seq_start);
+            head = frame.seq_end;
+            Ok(())
+        })?;
+        let retained = first.unwrap_or(head.saturating_add(1));
+        let reset = after_seq > head || after_seq.saturating_add(1) < retained;
+        let effective = if reset {
+            retained.saturating_sub(1)
+        } else {
+            after_seq
+        };
+        let mut page = RetainedOutputPage::new(self.descriptor(), effective, max_bytes)?;
+        let torn = self.scan(|frame| page.accept(frame))?;
+        let mut batch = page.finish(torn, self.completion.clone())?;
+        batch.reset_required |= reset;
+        batch.truncated |= reset;
+        Ok(batch)
     }
 
     pub fn head_seq(&self) -> u64 {
@@ -195,7 +228,7 @@ impl OutputJournal {
             frame: frame.clone(),
         })
         .map_err(|e| e.to_string())?;
-        let segment_limit = (self.spool_limit / 2).max((MAX_TRANSPORT_CHUNK_BYTES * 2) as u64);
+        let segment_limit = self.spool_limit / 2;
         let current = self.current_path();
         let current_len = current.metadata().map(|m| m.len()).unwrap_or(0);
         if current_len > 0 && current_len.saturating_add(line.len() as u64 + 1) > segment_limit {
@@ -217,22 +250,12 @@ impl OutputJournal {
     }
 
     fn seed_sequence_from_spool(&mut self) -> Result<(), String> {
-        let mut max = 0;
-        for path in [self.previous_path(), self.current_path()] {
-            if !path.exists() {
-                continue;
-            }
-            let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-            for line in BufReader::new(file).lines() {
-                let line = line.map_err(|e| e.to_string())?;
-                if let Ok(row) = serde_json::from_str::<SpoolFrame>(&line) {
-                    if row.frame.stream_epoch == self.stream_epoch {
-                        max = max.max(row.frame.seq_end);
-                    }
-                }
-            }
-        }
-        self.next_seq = max.saturating_add(1).max(1);
+        let mut head = 0;
+        self.scan(|frame| {
+            head = frame.seq_end;
+            Ok(())
+        })?;
+        self.next_seq = head.checked_add(1).ok_or("output sequence exhausted")?;
         Ok(())
     }
 
@@ -242,6 +265,22 @@ impl OutputJournal {
     fn previous_path(&self) -> PathBuf {
         self.state_dir.join("terminal-spool-previous.jsonl")
     }
+}
+
+pub fn atomic_json(path: &Path, value: &impl serde::Serialize) -> Result<(), String> {
+    let temporary = path.with_extension("tmp");
+    let bytes = serde_json::to_vec(value).map_err(|_| "retained metadata encoding failed")?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|_| "retained metadata unavailable")?;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|_| "retained metadata write failed")?;
+    std::fs::rename(temporary, path).map_err(|_| "retained metadata commit failed")?;
+    sync_parent(path)
 }
 
 fn configured_bytes(key: &str, default: u64) -> u64 {
@@ -288,6 +327,66 @@ fn sync_parent(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_output_requires_existing_spool_instead_of_empty_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal =
+            OutputJournal::new(dir.path(), IncarnationId::new(), "t".into(), "e".into()).unwrap();
+        // No append has happened: even an empty stream needs a durable source
+        // association and an existing empty spool before its writer can start.
+        assert!(dir.path().join("terminal-spool-current.jsonl").is_file());
+        std::fs::remove_file(dir.path().join("terminal-spool-current.jsonl")).unwrap();
+        assert!(
+            journal.read(0, 65536).is_err(),
+            "missing spool cannot masquerade as retained empty output"
+        );
+    }
+
+    #[test]
+    fn retained_output_ignores_only_a_torn_final_frame_and_keeps_complete_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal =
+            OutputJournal::new(dir.path(), IncarnationId::new(), "t".into(), "e".into()).unwrap();
+        journal.append("complete diagnostic").unwrap();
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(journal.current_path())
+            .unwrap();
+        file.write_all(b"{\"frame\":{\"data\":\"partial").unwrap();
+        file.sync_data().unwrap();
+        let read = journal
+            .read(0, 65536)
+            .expect("a torn tail preserves complete committed frames");
+        assert_eq!(read.frames.len(), 1);
+        assert_eq!(read.frames[0].data, "complete diagnostic");
+        assert!(read.truncated, "torn tail must be visible");
+    }
+
+    #[test]
+    fn retained_output_rejects_foreign_terminal_frames_in_same_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal =
+            OutputJournal::new(dir.path(), IncarnationId::new(), "t".into(), "e".into()).unwrap();
+        journal.append("owned diagnostic").unwrap();
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(journal.current_path())
+            .unwrap();
+        let foreign = RuntimeOutputFrame {
+            terminal_id: "foreign".into(),
+            stream_epoch: "e".into(),
+            seq_start: 2,
+            seq_end: 2,
+            data: "wrong soul".into(),
+        };
+        serde_json::to_writer(&mut file, &SpoolFrame { frame: foreign }).unwrap();
+        file.write_all(b"\n").unwrap();
+        assert!(
+            journal.read(0, 65536).is_err(),
+            "matching epoch alone does not prove owned terminal"
+        );
+    }
 
     #[test]
     fn bounds_ring_and_returns_explicit_reset_for_expired_cursor() {

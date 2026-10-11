@@ -2026,28 +2026,63 @@ impl Supervisor {
         max_bytes: u64,
         expected_stream_epoch: Option<String>,
     ) -> Result<RuntimeOutputBatch, RuntimeError> {
-        let handle = self
+        let source = self
             .registry
-            .active_handle_for_soul(soul_id.clone())
+            .retained_output_source(soul_id.clone())
             .await
             .map_err(map_registry)?;
-        let host = self
-            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
-            .await?;
-        match self
-            .send_authenticated_host_command(
-                handle.incarnation_id().clone(),
-                handle.runtime_dir(),
+        crate::retained_output::validate_source(&source, &self.config.runtime_root)
+            .map_err(|error| RuntimeError::new(RuntimeErrorCode::OwnershipMismatch, error))?;
+        // This independent capability is used only for exact read-only backend
+        // emptiness verification, never input, kill, or replacement dispatch.
+        let handle = self
+            .registry
+            .owned_handle(source.incarnation_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let live = async {
+            let host = self
+                .authenticate_host(&source.incarnation_id, &source.runtime_dir)
+                .await?;
+            self.send_authenticated_host_command(
+                source.incarnation_id.clone(),
+                &source.runtime_dir,
                 &host,
                 HostCommand::TerminalReadOutput {
-                    incarnation_id: handle.incarnation_id().clone(),
+                    incarnation_id: source.incarnation_id.clone(),
                     after_seq,
                     max_bytes,
-                    expected_stream_epoch,
+                    expected_stream_epoch: expected_stream_epoch.clone(),
                 },
             )
-            .await?
-        {
+            .await
+        }
+        .await;
+        let reply = match live {
+            Ok(reply) => reply,
+            Err(_) => {
+                let verified_empty = self.backend.verify_empty(&handle).await.unwrap_or(false);
+                let output = tokio::task::spawn_blocking(move || {
+                    crate::retained_output::read(
+                        source,
+                        after_seq,
+                        max_bytes,
+                        expected_stream_epoch,
+                        verified_empty,
+                    )
+                })
+                .await
+                .map_err(|_| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::HostUnreachable,
+                        "retained output reader failed",
+                    )
+                })?
+                .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
+                return Ok(output);
+            }
+        };
+        match reply {
             HostResult::TerminalOutput(output) => {
                 if let Some(native_session_id) = output.native_session_id.as_ref() {
                     match self

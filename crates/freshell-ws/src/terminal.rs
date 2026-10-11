@@ -576,11 +576,8 @@ async fn run_loop(
             // The capability gates creation; output follows the row owner.
             _ = managed_output_ticker.tick(), if state.registry.has_managed_controller() => {
                 for terminal_id in state.registry.managed_attached_to(conn_id) {
-                    match refresh_managed_output_and_associate(state, &terminal_id, 64 * 1024).await {
-                        Ok(()) => {}
-                        Err(error) => tracing::warn!(terminal_id = %terminal_id, error = %error,
-                            "managed_runtime.output_refresh_failed"),
-                    }
+                    // The shared registry logs changed classified failures once.
+                    let _ = refresh_managed_output_and_associate(state, &terminal_id, 64 * 1024).await;
                 }
             }
             inbound = ws_rx.next() => {
@@ -7351,6 +7348,7 @@ pub async fn respawn_agent_terminal(
         // registry API surface for no user-visible gain.
         let msg =
             freshell_protocol::ServerMessage::TerminalStatus(freshell_protocol::TerminalStatus {
+                recovery_summary: None,
                 status: freshell_protocol::RuntimeStatus::Recovering,
                 terminal_id: terminal_id.clone(),
                 attempt: None,
@@ -8495,25 +8493,77 @@ async fn refresh_managed_output_and_associate(
     // still binding the native identity.
     let gate = managed_output_gate(terminal_id);
     let _guard = gate.lock().await;
-    if !state.registry.is_live(terminal_id) {
+    if state.registry.managed_descriptor(terminal_id).is_none() {
         return Ok(());
     }
-    // Bound the remote read, but never cancel the subsequent durable identity
-    // transaction mid-write merely because it took longer than the read SLA.
-    let read = tokio::time::timeout(
+    let result = tokio::time::timeout(
         std::time::Duration::from_millis(500),
         state
             .registry
             .refresh_managed_output(terminal_id, max_bytes),
     )
     .await
-    .map_err(|_| "managed output read timed out".to_string())??;
+    .map_err(|_| "managed output read timed out".to_string())
+    .and_then(|read| read);
+    let read = match result {
+        Ok(read) => {
+            state
+                .registry
+                .observe_managed_output_failure(terminal_id, None);
+            read
+        }
+        Err(error) => {
+            let cause = if error.contains("timed out") || error.contains("timeout") {
+                "timeout"
+            } else if error.contains("identity") || error.contains("ownership") {
+                "identity"
+            } else if error.contains("frame")
+                || error.contains("sequence")
+                || error.contains("bounds")
+            {
+                "invalid_output"
+            } else {
+                "transport_unavailable"
+            };
+            state
+                .registry
+                .observe_managed_output_failure(terminal_id, Some(cause));
+            return Err(error);
+        }
+    };
     if let Some(session_id) = read.native_session_id.as_deref() {
         crate::opencode_association::associate_managed_session(state, terminal_id, session_id)
             .await;
     }
-    if let Some(exit_code) = read.exit_code {
-        state.registry.finish_managed_exit(terminal_id, exit_code);
+    state
+        .registry
+        .publish_managed_lifecycle(terminal_id, read.lifecycle);
+    let delivered = state
+        .registry
+        .managed_output_cursor(terminal_id)
+        .unwrap_or(0);
+    if let Some(completion) = read.completion {
+        let descriptor = state
+            .registry
+            .managed_descriptor(terminal_id)
+            .ok_or("managed terminal disappeared")?;
+        if completion.stream_epoch != descriptor.stream_id
+            || completion.incarnation_id != descriptor.incarnation_id
+            || completion.head_seq != read.head_seq
+        {
+            return Err("managed completion source mismatch".into());
+        }
+        if delivered >= completion.head_seq {
+            state
+                .registry
+                .finish_managed_completion(terminal_id, completion.exit_code);
+        }
+    } else if let Some(exit_code) = read.exit_code {
+        // Transport-independent controller fixtures and older compatible
+        // controllers carry a known settled code with their sampled head.
+        if delivered >= read.head_seq {
+            state.registry.finish_managed_exit(terminal_id, exit_code);
+        }
     }
     Ok(())
 }
@@ -12649,7 +12699,9 @@ mod managed_output_order_tests {
         ManagedTerminalDescriptor, ManagedTerminalFuture,
     };
 
-    struct ExitedOpenCodeRead;
+    struct ExitedOpenCodeRead {
+        final_head: i64,
+    }
 
     impl ManagedTerminalController for ExitedOpenCodeRead {
         fn lookup_terminal<'a>(
@@ -12681,7 +12733,7 @@ mod managed_output_order_tests {
             _: u16,
             _: u16,
         ) -> ManagedTerminalFuture<'a, Result<(), String>> {
-            Box::pin(async { Err("unused resize".into()) })
+            Box::pin(async { Ok(()) })
         }
 
         fn stop<'a>(
@@ -12694,24 +12746,34 @@ mod managed_output_order_tests {
         fn read_output<'a>(
             &'a self,
             _: ManagedTerminalDescriptor,
-            _: i64,
+            after: i64,
             _: u64,
         ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
-            Box::pin(async {
+            Box::pin(async move {
                 Ok(ManagedOutputRead {
+                    lifecycle: None,
+                    completion: None,
                     stream_epoch: Some("S-managed-short-lived".into()),
                     incarnation_id: Some("incarnation-short-lived".into()),
                     reset_required: false,
                     truncated: false,
                     retained_from_seq: 1,
-                    head_seq: 1,
+                    head_seq: self.final_head,
                     exit_code: Some(17),
                     native_session_id: Some("ses-short-lived".into()),
-                    chunks: vec![ManagedOutputChunk {
-                        seq_start: 1,
-                        seq_end: 1,
-                        data: "last output\n".into(),
-                    }],
+                    chunks: if after < self.final_head {
+                        vec![ManagedOutputChunk {
+                            seq_start: after + 1,
+                            seq_end: after + 1,
+                            data: if self.final_head == 1 {
+                                "last output\n".into()
+                            } else {
+                                "x".repeat(65536)
+                            },
+                        }]
+                    } else {
+                        vec![]
+                    },
                 })
             })
         }
@@ -12733,7 +12795,7 @@ mod managed_output_order_tests {
         });
         state
             .registry
-            .set_managed_controller(Some(Arc::new(ExitedOpenCodeRead)));
+            .set_managed_controller(Some(Arc::new(ExitedOpenCodeRead { final_head: 1 })));
 
         refresh_managed_output_and_associate(&state, terminal_id, 1024)
             .await
@@ -12756,6 +12818,232 @@ mod managed_output_order_tests {
         assert_eq!(row.status, freshell_protocol::TerminalRunStatus::Exited);
         assert_eq!(row.resume_session_id.as_deref(), Some("ses-short-lived"));
         assert_eq!(row.snapshot, "last output\n");
+    }
+
+    #[tokio::test]
+    async fn managed_final_exit_waits_for_all_retained_pages() {
+        let state = super::pane_reconcile_gate_tests::state();
+        let terminal = "T-managed-short-lived";
+        state.registry.register_managed(ManagedTerminalDescriptor {
+            soul_id: "soul-short-lived".into(),
+            incarnation_id: "incarnation-short-lived".into(),
+            terminal_id: terminal.into(),
+            stream_id: "S-managed-short-lived".into(),
+            mode: "opencode".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: None,
+            create_request_id: Some("req-short-lived".into()),
+        });
+        state
+            .registry
+            .set_managed_controller(Some(Arc::new(ExitedOpenCodeRead { final_head: 3 })));
+        for delivered in 1..=3 {
+            refresh_managed_output_and_associate(&state, terminal, 65536)
+                .await
+                .unwrap();
+            assert_eq!(
+                state.registry.managed_output_cursor(terminal),
+                Some(delivered)
+            );
+            assert_eq!(
+                state.registry.directory()[0].status,
+                if delivered == 3 {
+                    freshell_protocol::TerminalRunStatus::Exited
+                } else {
+                    freshell_protocol::TerminalRunStatus::Running
+                },
+                "exit cannot strand undelivered final pages"
+            );
+        }
+        assert_eq!(state.registry.directory()[0].snapshot.len(), 3 * 65536);
+    }
+
+    include!("managed_retained_socket_tests.rs");
+
+    struct FailedRead(StdMutex<Option<String>>);
+    impl ManagedTerminalController for FailedRead {
+        fn lookup_terminal<'a>(
+            &'a self,
+            _: &'a str,
+            _: Option<String>,
+        ) -> ManagedTerminalFuture<'a, Result<Option<ManagedTerminalDescriptor>, String>> {
+            Box::pin(async { Err("unused".into()) })
+        }
+        fn launch<'a>(
+            &'a self,
+            _: ManagedTerminalLaunch,
+        ) -> ManagedTerminalFuture<'a, Result<ManagedTerminalDescriptor, String>> {
+            Box::pin(async { Err("unused".into()) })
+        }
+        fn input<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+            _: String,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { Err("unused".into()) })
+        }
+        fn resize<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+            _: u16,
+            _: u16,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { Err("unused".into()) })
+        }
+        fn stop<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { Err("unused".into()) })
+        }
+        fn read_output<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+            after: i64,
+            _: u64,
+        ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
+            Box::pin(async move {
+                if let Some(error) = self.0.lock().unwrap().clone() {
+                    return Err(error);
+                }
+                Ok(ManagedOutputRead {
+                    lifecycle: None,
+                    completion: None,
+                    stream_epoch: None,
+                    incarnation_id: None,
+                    reset_required: false,
+                    truncated: false,
+                    retained_from_seq: after,
+                    head_seq: after,
+                    exit_code: None,
+                    native_session_id: None,
+                    chunks: vec![],
+                })
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct CapturedEvents(Arc<StdMutex<Vec<String>>>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedEvents {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Fields(String);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!("{}={value:?};", field.name()));
+                }
+            }
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_output_failure_transitions_are_shared_by_two_readers_and_redacted() {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::prelude::*;
+        let events = Arc::new(StdMutex::new(vec![]));
+        let subscriber = tracing_subscriber::registry().with(CapturedEvents(events.clone()));
+        async {
+            let state = super::pane_reconcile_gate_tests::state();
+            let terminal = "T-managed-failures";
+            state.registry.register_managed(ManagedTerminalDescriptor {
+                soul_id: "soul-failure".into(),
+                incarnation_id: "incarnation-failure".into(),
+                terminal_id: terminal.into(),
+                stream_id: "epoch-failure".into(),
+                mode: "shell".into(),
+                cwd: "/workspace".into(),
+                resume_session_id: None,
+                create_request_id: None,
+            });
+            let controller = Arc::new(FailedRead(StdMutex::new(Some(
+                "transport unavailable secret=synthetic-sensitive".into(),
+            ))));
+            state
+                .registry
+                .set_managed_controller(Some(controller.clone()));
+            for conn in 1..=2 {
+                assert!(
+                    state
+                        .registry
+                        .attach(
+                            terminal,
+                            conn,
+                            Arc::new(|_| {}),
+                            None,
+                            0,
+                            false,
+                            false,
+                            None,
+                            None,
+                            None,
+                            Default::default()
+                        )
+                        .found
+                );
+            }
+            for _ in 0..20 {
+                for conn in 1..=2 {
+                    assert_eq!(state.registry.managed_attached_to(conn), vec![terminal]);
+                    assert!(
+                        refresh_managed_output_and_associate(&state, terminal, 65536)
+                            .await
+                            .is_err()
+                    );
+                }
+            }
+            let first = events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.contains("managed_runtime.output_refresh_failed"))
+                .count();
+            assert_eq!(
+                first, 1,
+                "one shared warning for forty unchanged socket polls"
+            );
+            *controller.0.lock().unwrap() = Some("managed output read timed out".into());
+            assert!(
+                refresh_managed_output_and_associate(&state, terminal, 65536)
+                    .await
+                    .is_err()
+            );
+            *controller.0.lock().unwrap() = None;
+            refresh_managed_output_and_associate(&state, terminal, 65536)
+                .await
+                .unwrap();
+            let captured = events.lock().unwrap();
+            assert_eq!(
+                captured
+                    .iter()
+                    .filter(|e| e.contains("managed_runtime.output_refresh_failed"))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                captured
+                    .iter()
+                    .filter(|e| e.contains("managed_runtime.output_refresh_recovered"))
+                    .count(),
+                1
+            );
+            assert!(
+                captured.iter().all(|e| !e.contains("synthetic-sensitive")),
+                "raw remote error contents must not enter logs"
+            );
+        }
+        .with_subscriber(subscriber)
+        .await;
     }
 }
 #[cfg(test)]

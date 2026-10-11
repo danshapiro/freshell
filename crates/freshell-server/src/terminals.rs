@@ -728,13 +728,31 @@ async fn directory_items(state: &TerminalsState) -> Vec<Value> {
             obj.insert(
                 "status".into(),
                 Value::String(
-                    match e.status {
-                        TerminalRunStatus::Running => "running",
-                        TerminalRunStatus::Exited => "exited",
+                    match e.runtime_status {
+                        Some(freshell_protocol::RuntimeStatus::Blocked) => "blocked",
+                        Some(freshell_protocol::RuntimeStatus::Recovering) => "recovering",
+                        Some(freshell_protocol::RuntimeStatus::Running) => "running",
+                        Some(freshell_protocol::RuntimeStatus::Exited) => "exited",
+                        None => match e.status {
+                            TerminalRunStatus::Running => "running",
+                            TerminalRunStatus::Exited => "exited",
+                        },
                     }
                     .to_string(),
                 ),
             );
+            if let Some(status) = e.runtime_status {
+                obj.insert("runtimeStatus".into(), json!(status));
+            }
+            if let Some(summary) = e.recovery_summary {
+                obj.insert("recoverySummary".into(), json!(summary));
+            }
+            if let Some(soul) = e.soul_id {
+                obj.insert("soulId".into(), json!(soul));
+            }
+            if let Some(incarnation) = e.incarnation_id {
+                obj.insert("incarnationId".into(), json!(incarnation));
+            }
             obj.insert("hasClients".into(), Value::Bool(e.has_clients));
             if resume_target_is_subagent {
                 obj.insert("resumeTargetIsSubagent".into(), Value::Bool(true));

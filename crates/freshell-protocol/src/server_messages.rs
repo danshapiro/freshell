@@ -408,6 +408,7 @@ pub enum SessionRepairEvent {
 pub enum RuntimeStatus {
     Running,
     Recovering,
+    Blocked,
     /// The auto-resume SETTLE frame (kata znhn item 3): broadcast with the
     /// OLD terminal id whenever a planned auto-resume settles without a
     /// replacement (guard-abort, retries exhausted, flap circuit breaker,
@@ -1508,6 +1509,28 @@ pub struct TerminalCreated {
 pub struct TerminalExit {
     pub exit_code: i64,
     pub terminal_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_retained: Option<bool>,
+    /// False explicitly denotes an unavailable exit result; exitCode is -1
+    /// for compatibility with clients that require the existing numeric field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code_available: Option<bool>,
+}
+
+/// Existing managed projection shape, without a runtime-control dependency.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedRecoverySummary {
+    pub desired_state: String,
+    pub recovery_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incident_id: Option<String>,
+    pub durability_state: String,
+    pub allocation_state: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1534,6 +1557,12 @@ pub struct InventoryTerminal {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_status: Option<RuntimeStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soul_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_summary: Option<ManagedRecoverySummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
     /// Unified agent names (Task 1 wire / Task 2 Rust side): canonical
@@ -1674,6 +1703,8 @@ pub struct TerminalSessionAssociated {
 pub struct TerminalStatus {
     pub status: RuntimeStatus,
     pub terminal_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_summary: Option<ManagedRecoverySummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attempt: Option<i64>,
     /// Auto-resume `recovering` frames only: the bounded retry budget. The

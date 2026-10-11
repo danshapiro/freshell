@@ -67,7 +67,14 @@ impl HostedPty {
         let sink = Box::new(move |message: ServerMessage| {
             if let ServerMessage::TerminalOutput(frame) = message {
                 if let Ok(mut journal) = sink_output.lock() {
-                    let _ = journal.append(&frame.data);
+                    if journal.append(&frame.data).is_err() {
+                        journal.record_failure();
+                        tracing::error!(
+                            event = "managed_runtime.output_writer_failed",
+                            cause = "spool_write",
+                            "Retained output writer failed"
+                        );
+                    }
                 }
             }
         });
@@ -79,7 +86,21 @@ impl HostedPty {
             .as_ref()
             .map(|prepared| Arc::clone(&prepared.sidecar));
         let runtime_handle = tokio::runtime::Handle::try_current().ok();
+        let settled_output = Arc::clone(&output);
         let on_exit = Box::new(move |code: i64| {
+            // The PTY reader calls this only after its final framer flush.
+            let settled = settled_output
+                .lock()
+                .map(|mut journal| journal.complete(code).is_ok())
+                .unwrap_or(false);
+            if !settled {
+                tracing::error!(
+                    event = "managed_runtime.output_completion_failed",
+                    cause = "spool_settlement",
+                    "Output completion could not be committed"
+                );
+                return;
+            }
             exit_value.store(code, Ordering::SeqCst);
             exit_flag.store(true, Ordering::SeqCst);
             if let (Some(handle), Some(sidecar)) =
@@ -263,8 +284,6 @@ impl HostedPty {
             batch.reset_required = true;
             batch.truncated = true;
         }
-        batch.exited = self.exited();
-        batch.exit_code = self.exited().then(|| self.exit_code());
         batch.native_session_id = self
             .native_session_id
             .lock()
@@ -274,7 +293,7 @@ impl HostedPty {
     }
 
     pub async fn stop(&mut self) {
-        self.pty.kill();
+        self.pty.stop_and_join_output();
         if let Some(codex) = self.codex.take() {
             codex.event_task.abort();
             let _ = codex.sidecar.shutdown().await;
@@ -449,6 +468,112 @@ fn output_read_position(
 #[cfg(test)]
 mod output_epoch_tests {
     use super::output_read_position;
+
+    async fn retained_pty(
+        root: &std::path::Path,
+        script: &str,
+    ) -> (super::HostedPty, freshell_runtime_protocol::IncarnationId) {
+        let launch:super::TerminalLaunchSpec=serde_json::from_value(serde_json::json!({
+            "terminalId":"retained-pty","streamId":"launch-prefix","mode":"shell","program":"/bin/sh",
+            "args":["-c",script],"env":{"PATH":"/usr/bin:/bin"},"cwd":root,
+            "runAsUid":unsafe {libc::geteuid()},"runAsGid":unsafe {libc::getegid()},
+            "cols":120,"rows":30,"projectKey":"retained-fixture","workspacePath":root
+        })).unwrap();
+        let incarnation = freshell_runtime_protocol::IncarnationId::new();
+        (
+            super::HostedPty::spawn(
+                root,
+                incarnation.clone(),
+                &launch,
+                Default::default(),
+                None,
+                None,
+            )
+            .await
+            .unwrap(),
+            incarnation,
+        )
+    }
+
+    #[tokio::test]
+    async fn retained_output_pty_eof_flushes_final_head_before_completion() {
+        let root = tempfile::tempdir().unwrap();
+        let (hosted, incarnation) = retained_pty(
+            root.path(),
+            "head -c 150000 /dev/zero | tr '\\000' 'x'; printf 'final-tail'; exit 17",
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !hosted.exited() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let completion = std::fs::read(root.path().join("terminal-spool-completion.json"));
+        let mut windows = vec![];
+        let head = hosted.head_seq();
+        for _reader in 0..2 {
+            let mut cursor = 0;
+            let mut window = String::new();
+            while cursor < head {
+                let batch = hosted
+                    .read_output(
+                        incarnation.clone(),
+                        cursor,
+                        65536,
+                        Some(hosted.stream_epoch()),
+                    )
+                    .unwrap();
+                assert!(batch.exited);
+                assert_eq!(batch.head_seq, head);
+                assert_eq!(batch.exit_code, Some(17));
+                for frame in batch.frames {
+                    cursor = frame.seq_end;
+                    window.push_str(&frame.data);
+                }
+            }
+            windows.push(window);
+        }
+        drop(hosted); // actual PTY waiter and reader join before assertions
+        assert_eq!(windows[0], "x".repeat(150000) + "final-tail");
+        assert_eq!(windows[0], windows[1]);
+        let completion: serde_json::Value = serde_json::from_slice(
+            &completion.expect("settled EOF publishes coherent durable completion"),
+        )
+        .unwrap();
+        assert_eq!(completion["headSeq"], head);
+        assert!(completion["streamEpoch"]
+            .as_str()
+            .unwrap()
+            .starts_with("launch-prefix-hostboot-"));
+        assert_eq!(completion["exit"]["code"], 17);
+    }
+
+    #[tokio::test]
+    async fn retained_output_successful_stop_joins_reader_before_reply() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut hosted, _) = retained_pty(root.path(), "printf 'stop-tail'; sleep 300").await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while hosted.head_seq() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        hosted.stop().await;
+        let exited = hosted.exited();
+        let completion = std::fs::read(root.path().join("terminal-spool-completion.json"));
+        drop(hosted);
+        assert!(
+            exited,
+            "successful Stop settles the output reader before returning"
+        );
+        assert!(
+            completion.is_ok(),
+            "successful Stop freezes a retained completion before reply"
+        );
+    }
 
     #[test]
     fn obsolete_source_epoch_forces_one_call_full_replay() {

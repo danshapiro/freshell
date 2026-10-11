@@ -2264,6 +2264,7 @@ fn map_registry(error: RegistryError) -> RuntimeError {
 #[cfg(test)]
 mod tests {
     include!("shell_recovery_tests.rs");
+    include!("retained_output_tests.rs");
     use super::*;
     use freshell_runtime_protocol::{FreshAgentLaunchSpec, FreshProvider, IncarnationId};
 

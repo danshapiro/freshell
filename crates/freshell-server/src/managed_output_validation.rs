@@ -11,6 +11,26 @@ pub(super) fn validate(output: &RuntimeOutputBatch, terminal_id: &str) -> Result
     {
         return Err("managed output has invalid retained sequence bounds".into());
     }
+    if let Some(completion) = &output.completion {
+        let source = freshell_runtime_protocol::TerminalSpoolDescriptor {
+            schema_version: 1,
+            incarnation_id: output.incarnation_id.clone(),
+            terminal_id: output.terminal_id.clone(),
+            stream_epoch: output.stream_epoch.clone(),
+            segment_limit_bytes: freshell_runtime_protocol::terminal_spool::MAX_SPOOL_SEGMENT_BYTES,
+        };
+        completion.validate(&source, output.head_seq)?;
+        let expected_code = match completion.exit {
+            freshell_runtime_protocol::TerminalExitObservation::Known { code } => Some(code),
+            freshell_runtime_protocol::TerminalExitObservation::Unavailable => None,
+        };
+        if !output.exited
+            || completion.retained_from_seq != output.retained_from_seq
+            || output.exit_code != expected_code
+        {
+            return Err("managed output completion disagrees with sampled lifecycle".into());
+        }
+    }
     let mut previous = None;
     for frame in &output.frames {
         if frame.terminal_id != terminal_id || frame.stream_epoch != output.stream_epoch {
@@ -43,6 +63,7 @@ mod tests {
             reset_required: false,
             truncated: false,
             exited: false,
+            completion: None,
             exit_code: None,
             native_session_id: Some("native-owned".into()),
             frames: vec![RuntimeOutputFrame {
@@ -77,6 +98,40 @@ mod tests {
         malformed = batch();
         malformed.stream_epoch.clear();
         assert!(validate(&malformed, "owned").is_err());
+    }
+
+    #[test]
+    fn rejects_completion_from_a_different_source_or_sampled_final_head() {
+        use freshell_runtime_protocol::{TerminalExitObservation, TerminalSpoolCompletion};
+        let mut complete = batch();
+        complete.exited = true;
+        complete.exit_code = Some(7);
+        complete.completion = Some(TerminalSpoolCompletion {
+            incarnation_id: complete.incarnation_id.clone(),
+            terminal_id: complete.terminal_id.clone(),
+            stream_epoch: complete.stream_epoch.clone(),
+            retained_from_seq: 1,
+            head_seq: 2,
+            exit: TerminalExitObservation::Known { code: 7 },
+        });
+        assert!(validate(&complete, "owned").is_ok());
+        for mutation in 0..7 {
+            let mut malformed = complete.clone();
+            let completion = malformed.completion.as_mut().unwrap();
+            match mutation {
+                0 => completion.terminal_id = "foreign".into(),
+                1 => completion.incarnation_id = IncarnationId::new(),
+                2 => completion.stream_epoch = "foreign-epoch".into(),
+                3 => completion.head_seq = 1,
+                4 => completion.retained_from_seq = 3,
+                5 => malformed.exited = false,
+                _ => malformed.exit_code = None,
+            }
+            assert!(
+                validate(&malformed, "owned").is_err(),
+                "completion mismatch {mutation} must not complete a facade"
+            );
+        }
     }
 
     #[test]

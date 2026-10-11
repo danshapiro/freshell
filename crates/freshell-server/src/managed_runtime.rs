@@ -2,18 +2,19 @@
 
 use freshell_runtime_client::{ClientError, RuntimeClient};
 use freshell_runtime_protocol::{
-    DesiredState, LaunchRequest, LaunchState, RecoveryBlockReason, RecoveryOutcome, RecoveryProbe,
-    RecoveryResult, RecoveryTrigger, RequestId, RuntimeErrorCode, RuntimeLimits, RuntimeProfile,
-    RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec, ViewIntentKind, ViewIntentRequest,
-    ViewVisibilityIntent,
+    CleanupState, DesiredState, LaunchRequest, LaunchState, RecoveryBlockReason, RecoveryOutcome,
+    RecoveryProbe, RecoveryResult, RecoveryState, RecoveryTrigger, RequestId, RuntimeErrorCode,
+    RuntimeLimits, RuntimeProfile, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec,
+    ViewIntentKind, ViewIntentRequest, ViewVisibilityIntent,
 };
 use freshell_terminal::registry::{
-    ManagedOutputChunk, ManagedOutputRead, ManagedTerminalController, ManagedTerminalDescriptor,
-    ManagedTerminalFuture, ManagedTerminalLaunch,
+    ManagedLifecycle, ManagedLifecycleState, ManagedOutputChunk, ManagedOutputCompletion,
+    ManagedOutputRead, ManagedTerminalController, ManagedTerminalDescriptor, ManagedTerminalFuture,
+    ManagedTerminalLaunch,
 };
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
@@ -23,12 +24,165 @@ use tokio::sync::Mutex;
 #[path = "managed_output_validation.rs"]
 mod managed_output_validation;
 
+#[derive(Debug, Clone)]
+enum RecoveryPublication {
+    Recovering {
+        previous: Option<Box<RecoveryResult>>,
+    },
+    Finished(Box<RecoveryResult>),
+    Failed {
+        code: RuntimeErrorCode,
+        previous: Option<Box<RecoveryResult>>,
+    },
+}
+impl RecoveryPublication {
+    fn result(&self) -> Option<&RecoveryResult> {
+        match self {
+            Self::Finished(result) => Some(result),
+            Self::Recovering { previous } | Self::Failed { previous, .. } => previous.as_deref(),
+        }
+    }
+}
+#[derive(Debug, Clone)]
+struct SoulRecoverySlot {
+    sequence: u64,
+    task_in_flight: bool,
+    // Durable supervisor generation, independent of the local task sequence.
+    incarnation_id: Option<String>,
+    terminal_id: Option<String>,
+    intent_revision: Option<u64>,
+    evidence_revision: Option<u64>,
+    publication: RecoveryPublication,
+    observed_epoch: Option<String>,
+    observed_exit_code: Option<i64>,
+    observed_completion: Option<ManagedOutputCompletion>,
+}
+struct RecoveryObservation {
+    terminal_id: String,
+    incarnation_id: String,
+    epoch: String,
+    exit_code: Option<i64>,
+    completion: Option<ManagedOutputCompletion>,
+}
+impl SoulRecoverySlot {
+    fn observe(&mut self, observation: RecoveryObservation) {
+        self.terminal_id = Some(observation.terminal_id);
+        self.incarnation_id = Some(observation.incarnation_id);
+        self.observed_epoch = Some(observation.epoch);
+        self.observed_exit_code = observation.exit_code;
+        self.observed_completion = observation.completion;
+    }
+}
 #[derive(Default)]
 struct ManagedRecoveryState {
-    in_flight: Mutex<HashSet<String>>,
-    blocked: Mutex<HashMap<String, String>>,
+    slots: Mutex<HashMap<String, SoulRecoverySlot>>,
 }
 
+fn wire_label(value: &impl serde::Serialize) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+fn recovery_summary(view: &RuntimeView) -> freshell_protocol::ManagedRecoverySummary {
+    freshell_protocol::ManagedRecoverySummary {
+        desired_state: wire_label(&view.desired_state),
+        recovery_state: wire_label(&view.recovery_state),
+        reason: view.recovery_reason.clone(),
+        attempt_id: view.recovery_attempt_id.as_ref().map(ToString::to_string),
+        incident_id: view.incident_id.as_ref().map(ToString::to_string),
+        durability_state: wire_label(&view.durability_state),
+        allocation_state: wire_label(&view.allocation_state),
+    }
+}
+fn lifecycle(publication: &RecoveryPublication) -> ManagedLifecycle {
+    let mut summary = publication
+        .result()
+        .map(|result| recovery_summary(&result.view));
+    if let RecoveryPublication::Failed { code, .. } = publication {
+        let summary = summary.get_or_insert_with(|| freshell_protocol::ManagedRecoverySummary {
+            desired_state: wire_label(&DesiredState::Running),
+            recovery_state: wire_label(&RecoveryState::Blocked),
+            reason: None,
+            attempt_id: None,
+            incident_id: None,
+            durability_state: wire_label(&freshell_runtime_protocol::DurabilityState::Unknown),
+            allocation_state: wire_label(&freshell_runtime_protocol::AllocationState::Allocated),
+        });
+        summary.recovery_state = wire_label(&RecoveryState::Blocked);
+        summary.reason = Some(wire_label(code).to_ascii_lowercase());
+    }
+    let state = match publication {
+        RecoveryPublication::Recovering { .. } => ManagedLifecycleState::Recovering,
+        RecoveryPublication::Failed { .. } => ManagedLifecycleState::Blocked,
+        RecoveryPublication::Finished(result) => match result.outcome {
+            RecoveryOutcome::AlreadyLive
+            | RecoveryOutcome::Reattached
+            | RecoveryOutcome::Replaced => ManagedLifecycleState::Running,
+            RecoveryOutcome::Lost | RecoveryOutcome::Stopped
+                if result.view.cleanup_state == CleanupState::VerifiedEmpty =>
+            {
+                ManagedLifecycleState::Ended
+            }
+            _ => ManagedLifecycleState::Blocked,
+        },
+    };
+    ManagedLifecycle {
+        state,
+        recovery_summary: summary,
+    }
+}
+fn classified_cause(publication: &RecoveryPublication) -> String {
+    match publication {
+        RecoveryPublication::Failed { code, .. } => wire_label(code),
+        RecoveryPublication::Recovering { .. } => "recovering".into(),
+        RecoveryPublication::Finished(result) => result
+            .probe
+            .as_ref()
+            .map(|probe| match probe {
+                RecoveryProbe::Blocked { reason, .. } => wire_label(reason),
+                RecoveryProbe::DefinitivelyUnavailable { .. } => "verified_unavailable".into(),
+                _ => "continuity_verified".into(),
+            })
+            .unwrap_or_else(|| {
+                result.view.recovery_reason.clone().unwrap_or_else(|| {
+                    match result.outcome {
+                        RecoveryOutcome::AlreadyLive
+                        | RecoveryOutcome::Reattached
+                        | RecoveryOutcome::Replaced => "continuity_verified",
+                        RecoveryOutcome::Lost => "verified_unavailable",
+                        RecoveryOutcome::Stopped => "stopped",
+                        RecoveryOutcome::Blocked => "blocked",
+                    }
+                    .into()
+                })
+            }),
+    }
+}
+fn transition(
+    soul: &str,
+    from: Option<&RecoveryPublication>,
+    to: &RecoveryPublication,
+    terminal: Option<&str>,
+    incarnation: Option<&str>,
+) {
+    let old = from.map(lifecycle);
+    let new = lifecycle(to);
+    let cause = classified_cause(to);
+    if old.as_ref().map(|l| &l.state) == Some(&new.state)
+        && from.map(classified_cause).as_deref() == Some(cause.as_str())
+    {
+        return;
+    }
+    let result = to.result();
+    tracing::info!(event="managed_runtime.recovery_transition",soul_id=soul,
+        terminal_id=result.and_then(|r|r.view.terminal_id.as_deref()).or(terminal),
+        incarnation_id=result.map(|r|r.view.incarnation_id.as_str()).or(incarnation),
+        attempt_id=result.and_then(|r|r.attempt_id.as_ref()).map(|id|id.as_str()),
+        incident_id=result.and_then(|r|r.incident_id.as_ref()).map(|id|id.as_str()),
+        from=old.map(|l|format!("{:?}",l.state)).unwrap_or_else(||"unobserved".into()),
+        to=?new.state,outcome=result.map(|r|wire_label(&r.outcome)),cause,"Managed recovery state changed");
+}
 #[derive(Clone)]
 pub struct ServerManagedRuntimeController {
     client: RuntimeClient,
@@ -67,60 +221,259 @@ impl ServerManagedRuntimeController {
     }
 
     async fn recovery_in_flight(&self, soul_id: &str) -> bool {
-        self.recovery.in_flight.lock().await.contains(soul_id)
+        self.recovery
+            .slots
+            .lock()
+            .await
+            .get(soul_id)
+            .is_some_and(|slot| slot.task_in_flight)
     }
 
-    async fn blocked_recovery(&self, soul_id: &str) -> Option<String> {
-        self.recovery.blocked.lock().await.get(soul_id).cloned()
-    }
-
-    async fn schedule_recovery(&self, soul: SoulId, trigger: RecoveryTrigger) {
-        let key = soul.to_string();
-        {
-            let mut in_flight = self.recovery.in_flight.lock().await;
-            if !in_flight.insert(key.clone()) {
-                return;
-            }
+    async fn hydrate(&self, view: RuntimeView) {
+        let mut slots = self.recovery.slots.lock().await;
+        if slots.get(view.soul_id.as_str()).is_some_and(|slot| {
+            slot.task_in_flight
+                || slot
+                    .intent_revision
+                    .is_some_and(|revision| revision > view.intent_revision)
+                || slot
+                    .evidence_revision
+                    .is_some_and(|revision| revision > view.evidence_revision)
+        }) {
+            return;
         }
-        self.recovery.blocked.lock().await.remove(&key);
-        let client = self.client.clone();
-        let state = Arc::clone(&self.recovery);
+        let result = RecoveryResult {
+            outcome: match view.recovery_state {
+                RecoveryState::Live => RecoveryOutcome::AlreadyLive,
+                RecoveryState::Recovering => RecoveryOutcome::Blocked,
+                RecoveryState::Blocked => RecoveryOutcome::Blocked,
+                RecoveryState::Lost => RecoveryOutcome::Lost,
+                RecoveryState::Stopped => RecoveryOutcome::Stopped,
+            },
+            attempt_id: view.recovery_attempt_id.clone(),
+            incident_id: view.incident_id.clone(),
+            prior_incarnation_id: view.prior_incarnation_id.clone(),
+            expected_native_session_id: view.native_session_id.clone(),
+            observed_native_session_id: view.native_session_id.clone(),
+            probe: None,
+            view: view.clone(),
+        };
+        let publication = if view.recovery_state == RecoveryState::Recovering {
+            RecoveryPublication::Recovering {
+                previous: Some(Box::new(result)),
+            }
+        } else {
+            RecoveryPublication::Finished(Box::new(result))
+        };
+        if let Some(slot) = slots.get_mut(view.soul_id.as_str()) {
+            transition(
+                view.soul_id.as_str(),
+                Some(&slot.publication),
+                &publication,
+                view.terminal_id.as_deref(),
+                Some(view.incarnation_id.as_str()),
+            );
+            slot.incarnation_id = Some(view.incarnation_id.to_string());
+            slot.terminal_id = view.terminal_id.clone();
+            slot.intent_revision = Some(view.intent_revision);
+            slot.evidence_revision = Some(view.evidence_revision);
+            slot.publication = publication;
+        } else {
+            transition(
+                view.soul_id.as_str(),
+                None,
+                &publication,
+                view.terminal_id.as_deref(),
+                Some(view.incarnation_id.as_str()),
+            );
+            slots.insert(
+                view.soul_id.to_string(),
+                SoulRecoverySlot {
+                    sequence: 0,
+                    task_in_flight: false,
+                    incarnation_id: Some(view.incarnation_id.to_string()),
+                    terminal_id: view.terminal_id.clone(),
+                    intent_revision: Some(view.intent_revision),
+                    evidence_revision: Some(view.evidence_revision),
+                    publication,
+                    observed_epoch: None,
+                    observed_exit_code: None,
+                    observed_completion: None,
+                },
+            );
+        }
+    }
+
+    async fn begin_recovery(&self, soul: &SoulId, manual: bool) -> Option<u64> {
+        self.begin_recovery_observed(soul, manual, None).await
+    }
+
+    async fn begin_recovery_observed(
+        &self,
+        soul: &SoulId,
+        manual: bool,
+        observation: Option<RecoveryObservation>,
+    ) -> Option<u64> {
+        let mut slots = self.recovery.slots.lock().await;
+        if let Some(slot) = slots.get_mut(soul.as_str()) {
+            if let Some(observation) = observation {
+                slot.observe(observation);
+            }
+            if slot.task_in_flight {
+                return None;
+            }
+            if !manual && lifecycle(&slot.publication).state != ManagedLifecycleState::Running {
+                return None;
+            }
+            let sequence = slot.sequence.checked_add(1)?;
+            let publication = RecoveryPublication::Recovering {
+                previous: slot.publication.result().cloned().map(Box::new),
+            };
+            transition(
+                soul.as_str(),
+                Some(&slot.publication),
+                &publication,
+                slot.terminal_id.as_deref(),
+                slot.incarnation_id.as_deref(),
+            );
+            slot.sequence = sequence;
+            slot.task_in_flight = true;
+            slot.publication = publication;
+            Some(sequence)
+        } else {
+            let publication = RecoveryPublication::Recovering { previous: None };
+            let mut slot = SoulRecoverySlot {
+                sequence: 1,
+                task_in_flight: true,
+                incarnation_id: None,
+                terminal_id: None,
+                intent_revision: None,
+                evidence_revision: None,
+                publication,
+                observed_epoch: None,
+                observed_exit_code: None,
+                observed_completion: None,
+            };
+            if let Some(observation) = observation {
+                slot.observe(observation);
+            }
+            transition(
+                soul.as_str(),
+                None,
+                &slot.publication,
+                slot.terminal_id.as_deref(),
+                slot.incarnation_id.as_deref(),
+            );
+            slots.insert(soul.to_string(), slot);
+            Some(1)
+        }
+    }
+
+    async fn publish_recovery(
+        &self,
+        soul: &SoulId,
+        sequence: u64,
+        result: &Result<RecoveryResult, ClientError>,
+    ) {
+        let mut slots = self.recovery.slots.lock().await;
+        let Some(slot) = slots.get_mut(soul.as_str()) else {
+            return;
+        };
+        if slot.sequence != sequence
+            || !slot.task_in_flight
+            || !matches!(slot.publication, RecoveryPublication::Recovering { .. })
+        {
+            return;
+        }
+        let publication = match result {
+            Ok(result) => RecoveryPublication::Finished(Box::new(result.clone())),
+            Err(error) => RecoveryPublication::Failed {
+                code: error
+                    .runtime_code()
+                    .unwrap_or(RuntimeErrorCode::HostUnreachable),
+                previous: slot.publication.result().cloned().map(Box::new),
+            },
+        };
+        if let Ok(result) = result {
+            slot.incarnation_id = Some(result.view.incarnation_id.to_string());
+            slot.terminal_id = result.view.terminal_id.clone();
+            slot.intent_revision = Some(result.view.intent_revision);
+            slot.evidence_revision = Some(result.view.evidence_revision);
+        }
+        transition(
+            soul.as_str(),
+            Some(&slot.publication),
+            &publication,
+            slot.terminal_id.as_deref(),
+            slot.incarnation_id.as_deref(),
+        );
+        slot.publication = publication;
+        slot.task_in_flight = false;
+    }
+
+    async fn schedule_recovery(
+        &self,
+        soul: SoulId,
+        trigger: RecoveryTrigger,
+        observation: Option<RecoveryObservation>,
+    ) {
+        let Some(sequence) = self
+            .begin_recovery_observed(&soul, false, observation)
+            .await
+        else {
+            return;
+        };
+        let controller = self.clone();
         tokio::spawn(async move {
             if let Some(delay) = managed_recovery_test_delay() {
                 tokio::time::sleep(delay).await;
             }
-            let result = recover_with_policy(&client, soul, trigger).await;
-            match result {
-                Ok(result)
-                    if matches!(
-                        result.outcome,
-                        RecoveryOutcome::Replaced
-                            | RecoveryOutcome::Reattached
-                            | RecoveryOutcome::AlreadyLive
-                    ) =>
-                {
-                    state.blocked.lock().await.remove(&key);
-                }
-                Ok(result) => {
-                    state.blocked.lock().await.insert(
-                        key.clone(),
-                        format!(
-                            "managed soul recovery ended in {:?}: {}",
-                            result.outcome,
-                            recovery_probe_summary(result.probe.as_ref())
-                        ),
-                    );
-                }
-                Err(error) => {
-                    state.blocked.lock().await.insert(key.clone(), error);
-                }
-            }
-            state.in_flight.lock().await.remove(&key);
+            let result = recover_with_policy(&controller.client, soul.clone(), trigger).await;
+            controller.publish_recovery(&soul, sequence, &result).await;
         });
+    }
+
+    pub async fn retry_with_request_id(
+        &self,
+        request: RequestId,
+        soul: SoulId,
+        revision: u64,
+    ) -> Result<RecoveryResult, ClientError> {
+        let sequence = self.begin_recovery(&soul, true).await.ok_or_else(|| {
+            ClientError::Runtime(
+                RuntimeErrorCode::InvalidRequest,
+                "recovery is already in progress".into(),
+            )
+        })?;
+        let result = self
+            .client
+            .recover_expected_with_request_id(
+                request,
+                soul.clone(),
+                RecoveryTrigger::ManualRetry,
+                Some(revision),
+            )
+            .await;
+        self.publish_recovery(&soul, sequence, &result).await;
+        result
     }
 }
 
 impl ManagedTerminalController for ServerManagedRuntimeController {
+    fn lifecycle_observation<'a>(
+        &'a self,
+        terminal: &'a ManagedTerminalDescriptor,
+    ) -> ManagedTerminalFuture<'a, Option<ManagedLifecycle>> {
+        Box::pin(async move {
+            self.recovery
+                .slots
+                .lock()
+                .await
+                .get(&terminal.soul_id)
+                .map(|slot| lifecycle(&slot.publication))
+        })
+    }
+
     fn lookup_terminal<'a>(
         &'a self,
         terminal_id: &'a str,
@@ -132,16 +485,14 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                 .inventory()
                 .await
                 .map_err(|error| error.to_string())?;
-            let Some(view) = views.iter().rev().find(|view| {
-                view.terminal_id.as_deref() == Some(terminal_id)
-                    && view.desired_state == DesiredState::Running
-                    && !matches!(
-                        view.launch_state,
-                        LaunchState::Stopped | LaunchState::Failed
-                    )
-            }) else {
+            let Some(view) = views
+                .iter()
+                .rev()
+                .find(|view| view.terminal_id.as_deref() == Some(terminal_id))
+            else {
                 return Ok(None);
             };
+            self.hydrate(view.clone()).await;
             managed_descriptor_from_view(view, create_request_id).map(Some)
         })
     }
@@ -443,6 +794,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     }
                 }
             };
+            self.hydrate(result.view.clone()).await;
             Ok(ManagedTerminalDescriptor {
                 soul_id: result.view.soul_id.to_string(),
                 incarnation_id: result.view.incarnation_id.to_string(),
@@ -464,40 +816,20 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
         Box::pin(async move {
             let soul_key = terminal.soul_id;
             let soul = SoulId::parse(&soul_key).map_err(|e| e.to_string())?;
-            if self.recovery_in_flight(&soul_key).await {
+            if self
+                .recovery
+                .slots
+                .lock()
+                .await
+                .get(&soul_key)
+                .is_some_and(|slot| {
+                    lifecycle(&slot.publication).state != ManagedLifecycleState::Running
+                })
+            {
                 return Err(
-                    "managed soul recovery is in progress; input was not dispatched".into(),
+                    "managed runtime is not running; input was not dispatched; use explicit retry"
+                        .into(),
                 );
-            }
-            if self.blocked_recovery(&soul_key).await.is_some() {
-                // New user input is an explicit retry/repair signal. Re-arm the
-                // persisted flap ceiling and prove continuity before accepting
-                // any bytes; never substitute a fresh provider session.
-                let recovered = self
-                    .client
-                    .recover(soul.clone(), RecoveryTrigger::ManualRetry)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                match recovered.outcome {
-                    RecoveryOutcome::Reattached
-                    | RecoveryOutcome::Replaced
-                    | RecoveryOutcome::AlreadyLive => {
-                        self.recovery.blocked.lock().await.remove(&soul_key);
-                    }
-                    _ => {
-                        let message = format!(
-                            "managed soul recovery ended in {:?}: {}",
-                            recovered.outcome,
-                            recovery_probe_summary(recovered.probe.as_ref())
-                        );
-                        self.recovery
-                            .blocked
-                            .lock()
-                            .await
-                            .insert(soul_key, message.clone());
-                        return Err(message);
-                    }
-                }
             }
             self.client
                 .input(RequestId::new(), soul, data)
@@ -537,8 +869,18 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             {
                 StopOutcome::VerifiedEmpty => {
                     crate::managed_mcp_capability::revoke_soul_capabilities(&soul)?;
-                    self.recovery.in_flight.lock().await.remove(&soul_key);
-                    self.recovery.blocked.lock().await.remove(&soul_key);
+                    let views = self
+                        .client
+                        .inventory()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if let Some(view) = views
+                        .into_iter()
+                        .rev()
+                        .find(|view| view.soul_id.as_str() == soul_key)
+                    {
+                        self.hydrate(view).await;
+                    }
                     Ok(())
                 }
                 other => Err(format!(
@@ -557,22 +899,6 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
         Box::pin(async move {
             let soul_key = terminal.soul_id.clone();
             let soul = SoulId::parse(&soul_key).map_err(|e| e.to_string())?;
-            if let Some(error) = self.blocked_recovery(&soul_key).await {
-                return Err(error);
-            }
-            if self.recovery_in_flight(&soul_key).await {
-                return Ok(ManagedOutputRead {
-                    stream_epoch: None,
-                    incarnation_id: None,
-                    reset_required: false,
-                    truncated: false,
-                    retained_from_seq: after_seq,
-                    head_seq: after_seq,
-                    exit_code: None,
-                    native_session_id: terminal.resume_session_id,
-                    chunks: Vec::new(),
-                });
-            }
             let output = match self
                 .client
                 .read_output_for_epoch(
@@ -585,31 +911,69 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             {
                 Ok(output) => output,
                 Err(error) if recoverable_host_error(&error) => {
-                    self.schedule_recovery(soul, RecoveryTrigger::HostUnreachable)
+                    self.schedule_recovery(soul, RecoveryTrigger::HostUnreachable, None)
                         .await;
-                    return Ok(ManagedOutputRead {
-                        stream_epoch: None,
-                        incarnation_id: None,
-                        reset_required: false,
-                        truncated: false,
-                        retained_from_seq: after_seq,
-                        head_seq: after_seq,
-                        exit_code: None,
-                        native_session_id: terminal.resume_session_id,
-                        chunks: Vec::new(),
-                    });
+                    return Err("managed retained output unavailable".into());
                 }
                 Err(error) => return Err(error.to_string()),
             };
             managed_output_validation::validate(&output, &terminal.terminal_id)?;
-            if output.exited {
-                // Never hold the WS poll's 500ms timeout across stop/start or
-                // retry backoff. A single per-soul background task owns the
-                // 2s/10s retry policy and leaves the pane attached meanwhile.
-                self.schedule_recovery(soul, RecoveryTrigger::ProviderExit)
-                    .await;
+            let mut observation = self
+                .recovery
+                .slots
+                .lock()
+                .await
+                .get(&soul_key)
+                .map(|slot| lifecycle(&slot.publication));
+            // Keep the actual EOF/epoch before scheduling recovery. Neither a
+            // recovery verdict nor a later flag may change this sampled head.
+            let completion = output.exited.then(|| ManagedOutputCompletion {
+                stream_epoch: output.stream_epoch.clone(),
+                incarnation_id: output.incarnation_id.to_string(),
+                head_seq: output.head_seq as i64,
+                exit_code: output.exit_code,
+            });
+            {
+                let mut slots = self.recovery.slots.lock().await;
+                if let Some(slot) = slots.get_mut(&soul_key) {
+                    slot.observed_epoch = Some(output.stream_epoch.clone());
+                    slot.observed_exit_code = output.exit_code;
+                    slot.observed_completion = completion.clone();
+                }
             }
+            if output.exited
+                && observation
+                    .as_ref()
+                    .is_none_or(|l| l.state == ManagedLifecycleState::Running)
+            {
+                self.schedule_recovery(
+                    soul.clone(),
+                    RecoveryTrigger::ProviderExit,
+                    Some(RecoveryObservation {
+                        terminal_id: terminal.terminal_id.clone(),
+                        incarnation_id: output.incarnation_id.to_string(),
+                        epoch: output.stream_epoch.clone(),
+                        exit_code: output.exit_code,
+                        completion: completion.clone(),
+                    }),
+                )
+                .await;
+                observation = self
+                    .recovery
+                    .slots
+                    .lock()
+                    .await
+                    .get(&soul_key)
+                    .map(|slot| lifecycle(&slot.publication));
+            }
+            let observation = observation.unwrap_or(ManagedLifecycle {
+                state: ManagedLifecycleState::Running,
+                recovery_summary: None,
+            });
+            let ended = observation.state == ManagedLifecycleState::Ended;
             Ok(ManagedOutputRead {
+                lifecycle: Some(observation),
+                completion: ended.then_some(completion).flatten(),
                 stream_epoch: Some(output.stream_epoch.clone()),
                 incarnation_id: Some(output.incarnation_id.to_string()),
                 // Replacement starts a new durable output epoch. Force the
@@ -619,12 +983,10 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                 truncated: output.truncated,
                 retained_from_seq: output.retained_from_seq.min(i64::MAX as u64) as i64,
                 head_seq: output.head_seq.min(i64::MAX as u64) as i64,
-                // Provider exit is observed state, not user stop. Keep the pane
-                // alive while the recovery task runs or reports BLOCKED.
-                exit_code: if output.exited {
-                    None
-                } else {
+                exit_code: if ended && output.exited {
                     output.exit_code
+                } else {
+                    None
                 },
                 native_session_id: output.native_session_id,
                 chunks: output
@@ -672,7 +1034,7 @@ async fn recover_with_policy(
     client: &RuntimeClient,
     soul: SoulId,
     trigger: RecoveryTrigger,
-) -> Result<RecoveryResult, String> {
+) -> Result<RecoveryResult, ClientError> {
     let mut last_result = None;
     let mut last_error = None;
     for attempt in 0..=AUTOMATIC_RECOVERY_RETRY_DELAYS.len() {
@@ -686,16 +1048,13 @@ async fn recover_with_policy(
                 }
                 last_result = Some(result);
             }
-            Err(error) => last_error = Some(error.to_string()),
+            Err(error) => last_error = Some(error),
         }
     }
     if last_result.is_some() {
-        return client
-            .recover(soul, RecoveryTrigger::RetryExhausted)
-            .await
-            .map_err(|error| error.to_string());
+        return client.recover(soul, RecoveryTrigger::RetryExhausted).await;
     }
-    Err(last_error.unwrap_or_else(|| "managed recovery exhausted without a verdict".into()))
+    Err(last_error.unwrap_or(ClientError::UnexpectedResult))
 }
 
 fn automatic_retryable(result: &RecoveryResult) -> bool {
@@ -715,22 +1074,6 @@ fn automatic_retryable(result: &RecoveryResult) -> bool {
             ..
         })
     )
-}
-
-fn recovery_probe_summary(probe: Option<&RecoveryProbe>) -> String {
-    match probe {
-        Some(RecoveryProbe::Blocked {
-            reason, retry_hint, ..
-        }) => retry_hint
-            .repair
-            .clone()
-            .unwrap_or_else(|| format!("{reason:?}")),
-        Some(RecoveryProbe::DefinitivelyUnavailable { reason, .. }) => reason.clone(),
-        Some(RecoveryProbe::PristineSeedReady { .. }) => "pristine seed ready".into(),
-        Some(RecoveryProbe::ResumeReady { .. }) => "native resume ready".into(),
-        Some(RecoveryProbe::ReattachReady { .. }) => "reattach ready".into(),
-        None => "no recovery probe was returned".into(),
-    }
 }
 
 fn managed_descriptor_from_view(
@@ -1021,6 +1364,107 @@ fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    mod lifecycle_directory {
+        include!("tests/managed_runtime_lifecycle_tests.rs");
+    }
+    pub(super) mod transitions {
+        include!("tests/managed_recovery_transition_tests.rs");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_terminal_ended_facade_retains_output() {
+        use freshell_runtime_protocol::*;
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("retained.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let soul = SoulId::new();
+        let incarnation = IncarnationId::new();
+        let view: RuntimeView = serde_json::from_value(serde_json::json!({
+            "soulId":soul,"incarnationId":incarnation,"launchState":"stopped",
+            "cleanupState":"verified_empty","intentRevision":1,"executionGeneration":1,
+            "terminalId":"ended-shell","terminalStreamId":"actual-host-epoch",
+            "terminalMode":"shell","terminalCwd":"/workspace",
+            "desiredState":"running","recoveryState":"lost",
+            "recoveryReason":"non_resumable_terminal_ended",
+            "nativeSessionId":"identity-retained"
+        }))
+        .unwrap();
+        let (shutdown, mut stop) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            loop {
+                let mut peer = tokio::select! {
+                    _ = &mut stop => break,
+                    accepted = listener.accept() => accepted.unwrap().0,
+                };
+                let request: Envelope<AdminCommand> = read_frame(&mut peer).await.unwrap();
+                let result = match request.body {
+                    AdminCommand::Health => AdminResult::Health {
+                        control_epoch: 1,
+                        installation_id: InstallationId::new(),
+                    },
+                    AdminCommand::Inventory => AdminResult::Inventory(vec![view.clone()]),
+                    AdminCommand::TerminalReadOutput(_) => {
+                        AdminResult::TerminalOutput(RuntimeOutputBatch {
+                            incarnation_id: incarnation.clone(),
+                            terminal_id: "ended-shell".into(),
+                            stream_epoch: "actual-host-epoch".into(),
+                            retained_from_seq: 1,
+                            head_seq: 1,
+                            reset_required: false,
+                            truncated: false,
+                            exited: true,
+                            completion: None,
+                            exit_code: Some(17),
+                            native_session_id: Some("identity-retained".into()),
+                            frames: vec![RuntimeOutputFrame {
+                                terminal_id: "ended-shell".into(),
+                                stream_epoch: "actual-host-epoch".into(),
+                                seq_start: 1,
+                                seq_end: 1,
+                                data: "final shell diagnostic".into(),
+                            }],
+                        })
+                    }
+                    other => panic!("read-only reconnect must not recover or launch: {other:?}"),
+                };
+                write_frame(
+                    &mut peer,
+                    &AdminReply {
+                        request_id: request.request_id,
+                        result: Ok(result),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let controller = ServerManagedRuntimeController {
+            client: RuntimeClient::new(&socket, "synthetic-retained"),
+            recovery: Arc::new(ManagedRecoveryState::default()),
+        };
+        let descriptor = controller
+            .lookup_terminal("ended-shell", None)
+            .await
+            .unwrap();
+        let read = if let Some(descriptor) = &descriptor {
+            Some(controller.read_output(descriptor.clone(), 0, 65536).await)
+        } else {
+            None
+        };
+        shutdown.send(()).unwrap();
+        task.await.unwrap();
+        let descriptor =
+            descriptor.expect("verified ended shell keeps its exact facade on cold reconnect");
+        assert_eq!(
+            descriptor.resume_session_id.as_deref(),
+            Some("identity-retained")
+        );
+        let read = read.unwrap().expect("ended shell output remains readable");
+        assert_eq!(read.chunks[0].data, "final shell diagnostic");
+        assert_eq!(read.exit_code, Some(17));
+    }
     #[cfg(unix)]
     mod recovery_budget {
         include!("tests/managed_recovery_budget_tests.rs");

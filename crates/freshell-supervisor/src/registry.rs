@@ -164,6 +164,15 @@ pub struct OwnedRuntimeHandle {
     provider_volume_name: String,
 }
 
+/// Read-only association to the last committed terminal incarnation. This is
+/// deliberately not an OwnedRuntimeHandle and cannot authorize input or stop.
+pub(crate) struct RetainedOutputSource {
+    pub incarnation_id: IncarnationId,
+    pub runtime_dir: PathBuf,
+    pub terminal: TerminalLaunchSpec,
+    pub native_session_id: Option<String>,
+}
+
 impl OwnedRuntimeHandle {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_registry(
@@ -763,6 +772,24 @@ impl Registry {
             load_owned_handle(&conn, installation, &incarnation)
         })
         .await
+    }
+
+    pub(crate) async fn retained_output_source(
+        &self,
+        soul_id: SoulId,
+    ) -> Result<RetainedOutputSource, RegistryError> {
+        // The existing context resolver proves installation ownership and
+        // selects the current committed incarnation (or its committed prior).
+        let context = self.recovery_context(soul_id).await?;
+        let handle = context.prior_handle;
+        Ok(RetainedOutputSource {
+            incarnation_id: handle.incarnation_id().clone(),
+            runtime_dir: handle.runtime_dir().to_path_buf(),
+            terminal: handle.terminal().cloned().ok_or_else(|| {
+                RegistryError::InvalidState("soul has no retained terminal".into())
+            })?,
+            native_session_id: context.native_session_id,
+        })
     }
 
     pub async fn begin_stop(&self, soul_id: SoulId) -> Result<OwnedRuntimeHandle, RegistryError> {

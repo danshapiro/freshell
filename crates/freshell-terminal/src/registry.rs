@@ -580,6 +580,10 @@ struct TerminalShared {
     /// Highest `seqEnd` produced (drives `attach.ready.headSeq`).
     head_seq: i64,
     status: TerminalRunStatus,
+    managed_identity: Option<(String, String)>,
+    managed_lifecycle: Option<ManagedLifecycle>,
+    managed_exit_code_available: Option<bool>,
+    managed_output_failure: Option<String>,
     /// The exit code from the last `terminal.exit` fan-out (kill or natural exit).
     /// `None` while `status == Running`. Kept so a client that attaches AFTER the
     /// terminal already exited (the create-then-instant-exit race) can still be
@@ -741,6 +745,12 @@ impl TerminalShared {
     /// (else `clearDeadTerminals` recreates it, losing scrollback).
     fn inventory(&self) -> InventoryTerminal {
         InventoryTerminal {
+            soul_id: self.managed_identity.as_ref().map(|i| i.0.clone()),
+            incarnation_id: self.managed_identity.as_ref().map(|i| i.1.clone()),
+            recovery_summary: self
+                .managed_lifecycle
+                .as_ref()
+                .and_then(|l| l.recovery_summary.clone()),
             created_at: self.created_at,
             last_activity_at: self.last_activity_at,
             mode: self.mode.clone(),
@@ -750,7 +760,10 @@ impl TerminalShared {
             codex_durability: None,
             cwd: self.cwd.clone(),
             description: self.description.clone(),
-            runtime_status: None,
+            runtime_status: self
+                .managed_lifecycle
+                .as_ref()
+                .map(|l| l.state.runtime_status()),
             session_ref: None,
             session_name: self.session_name.clone(),
             name_ref: self.name_ref.clone(),
@@ -785,6 +798,10 @@ pub struct IdentityProbeRow {
 /// merge, `sessionRef` derivation, and `lastLine` extraction happen in the router).
 #[derive(Debug, Clone)]
 pub struct DirectoryEntry {
+    pub runtime_status: Option<freshell_protocol::RuntimeStatus>,
+    pub recovery_summary: Option<freshell_protocol::ManagedRecoverySummary>,
+    pub soul_id: Option<String>,
+    pub incarnation_id: Option<String>,
     pub terminal_id: String,
     pub title: String,
     pub description: Option<String>,
@@ -856,8 +873,40 @@ pub struct ManagedOutputChunk {
     pub data: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedLifecycleState {
+    Running,
+    Recovering,
+    Blocked,
+    Ended,
+}
+impl ManagedLifecycleState {
+    fn runtime_status(self) -> freshell_protocol::RuntimeStatus {
+        use freshell_protocol::RuntimeStatus;
+        match self {
+            Self::Running => RuntimeStatus::Running,
+            Self::Recovering => RuntimeStatus::Recovering,
+            Self::Blocked => RuntimeStatus::Blocked,
+            Self::Ended => RuntimeStatus::Exited,
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedLifecycle {
+    pub state: ManagedLifecycleState,
+    pub recovery_summary: Option<freshell_protocol::ManagedRecoverySummary>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedOutputCompletion {
+    pub stream_epoch: String,
+    pub incarnation_id: String,
+    pub head_seq: i64,
+    pub exit_code: Option<i64>,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedOutputRead {
+    pub lifecycle: Option<ManagedLifecycle>,
+    pub completion: Option<ManagedOutputCompletion>,
     /// The session host's durable output epoch, not the web's launch-time ID.
     /// None denotes a coalesced/in-flight read with no source observation.
     pub stream_epoch: Option<String>,
@@ -876,6 +925,14 @@ pub struct ManagedOutputRead {
 /// remain the browser-facing replay/fan-out owner while the web server has no PTY,
 /// PID, Docker socket, or direct kill authority for managed rows.
 pub trait ManagedTerminalController: Send + Sync {
+    /// A cached controller verdict remains observable even if replay is unreadable.
+    /// This never supplies output or authority to launch, replace, or stop.
+    fn lifecycle_observation<'a>(
+        &'a self,
+        _terminal: &'a ManagedTerminalDescriptor,
+    ) -> ManagedTerminalFuture<'a, Option<ManagedLifecycle>> {
+        Box::pin(std::future::ready(None))
+    }
     fn lookup_terminal<'a>(
         &'a self,
         terminal_id: &'a str,
@@ -2361,6 +2418,10 @@ impl TerminalRegistry {
 
         let now = now_ms();
         let shared = Arc::new(Mutex::new(TerminalShared {
+            managed_identity: None,
+            managed_lifecycle: None,
+            managed_exit_code_available: None,
+            managed_output_failure: None,
             terminal_id: terminal_id.clone(),
             stream_id: stream_id.clone(),
             replay: VecDeque::new(),
@@ -2833,11 +2894,15 @@ impl TerminalRegistry {
         // like a client that was already attached when the process died.
         if s.status == TerminalRunStatus::Exited {
             let exit = ServerMessage::TerminalExit(TerminalExit {
+                managed_retained: s.managed_identity.as_ref().map(|_| true),
+                exit_code_available: s.managed_exit_code_available,
                 exit_code: s.exit_code.unwrap_or(0),
                 terminal_id: terminal_id.to_string(),
             });
             sink(exit);
-            s.subscribers.remove(&conn_id);
+            if s.managed_identity.is_none() {
+                s.subscribers.remove(&conn_id);
+            }
         }
 
         AttachOutcome {
@@ -3926,6 +3991,8 @@ impl TerminalRegistry {
             s.status = TerminalRunStatus::Exited;
             s.exit_code = Some(0);
             let exit = ServerMessage::TerminalExit(TerminalExit {
+                managed_retained: None,
+                exit_code_available: None,
                 exit_code: 0,
                 terminal_id: terminal_id.to_string(),
             });
@@ -4073,6 +4140,8 @@ impl TerminalRegistry {
         let respawn_key = s.create_request_id.clone();
         let lifetime_ms = now.saturating_sub(s.created_at);
         let exit = ServerMessage::TerminalExit(TerminalExit {
+            managed_retained: None,
+            exit_code_available: None,
             exit_code,
             terminal_id: terminal_id.to_string(),
         });
@@ -4421,6 +4490,16 @@ impl TerminalRegistry {
             .map(|shared| {
                 let s = shared.lock().expect("terminal lock");
                 DirectoryEntry {
+                    runtime_status: s
+                        .managed_lifecycle
+                        .as_ref()
+                        .map(|l| l.state.runtime_status()),
+                    recovery_summary: s
+                        .managed_lifecycle
+                        .as_ref()
+                        .and_then(|l| l.recovery_summary.clone()),
+                    soul_id: s.managed_identity.as_ref().map(|i| i.0.clone()),
+                    incarnation_id: s.managed_identity.as_ref().map(|i| i.1.clone()),
                     terminal_id: s.terminal_id.clone(),
                     title: s.title.clone(),
                     description: s.description.clone(),
@@ -4545,12 +4624,7 @@ impl TerminalRegistry {
             if descriptor.resume_session_id.as_deref() != Some(session_id) {
                 return None;
             }
-            let running = handle
-                .shared
-                .lock()
-                .ok()
-                .is_some_and(|shared| shared.status == TerminalRunStatus::Running);
-            running.then(|| descriptor.clone())
+            Some(descriptor.clone())
         })
     }
 
@@ -4560,6 +4634,13 @@ impl TerminalRegistry {
     pub fn register_managed(&self, descriptor: ManagedTerminalDescriptor) {
         let created_at = now_ms();
         let shared = Arc::new(Mutex::new(TerminalShared {
+            managed_identity: Some((
+                descriptor.soul_id.clone(),
+                descriptor.incarnation_id.clone(),
+            )),
+            managed_lifecycle: None,
+            managed_exit_code_available: None,
+            managed_output_failure: None,
             terminal_id: descriptor.terminal_id.clone(),
             stream_id: descriptor.stream_id.clone(),
             replay: VecDeque::new(),
@@ -4751,6 +4832,8 @@ impl TerminalRegistry {
         };
         let Some(claim) = ManagedReadClaim::acquire(flag) else {
             return Ok(ManagedOutputRead {
+                lifecycle: None,
+                completion: None,
                 stream_epoch: None,
                 incarnation_id: None,
                 reset_required: false,
@@ -4774,9 +4857,19 @@ impl TerminalRegistry {
             .expect("managed controller lock")
             .clone()
             .ok_or_else(|| "managed runtime controller unavailable".to_string())?;
-        let mut read = controller
-            .read_output(terminal, after_seq, max_bytes)
-            .await?;
+        let mut read = match controller
+            .read_output(terminal.clone(), after_seq, max_bytes)
+            .await
+        {
+            Ok(read) => read,
+            Err(error) => {
+                self.publish_managed_lifecycle(
+                    terminal_id,
+                    controller.lifecycle_observation(&terminal).await,
+                );
+                return Err(error);
+            }
+        };
         let mut announcements = Vec::new();
         let mut epoch_changed = false;
         {
@@ -4829,6 +4922,10 @@ impl TerminalRegistry {
                     .incarnation_id
                     .clone_from(read.incarnation_id.as_ref().expect("validated incarnation"));
                 state.stream_id.clone_from(epoch);
+                state.managed_identity = Some((
+                    descriptor.soul_id.clone(),
+                    descriptor.incarnation_id.clone(),
+                ));
                 state.geometry_epoch = state.geometry_epoch.saturating_add(1);
                 for subscriber in state.subscribers.values() {
                     announcements.push((
@@ -4875,7 +4972,76 @@ impl TerminalRegistry {
     /// Managed equivalent of `finish_pty_exit`: the OS process is already
     /// gone and the supervisor-owned enclosure has been stopped; retain the
     /// facade/replay tail but mark it exited and tell attached viewers once.
+    /// Lifecycle publication follows full-page ingest and native association.
+    /// None is no observation and must not reset an existing final verdict.
+    pub fn publish_managed_lifecycle(
+        &self,
+        terminal_id: &str,
+        lifecycle: Option<ManagedLifecycle>,
+    ) {
+        let Some(lifecycle) = lifecycle else {
+            return;
+        };
+        let Some(shared) = self.shared_for(terminal_id) else {
+            return;
+        };
+        let mut state = shared.lock().expect("terminal lock");
+        if state.managed_identity.is_none() || state.managed_lifecycle.as_ref() == Some(&lifecycle)
+        {
+            return;
+        }
+        if lifecycle.state == ManagedLifecycleState::Running {
+            state.status = TerminalRunStatus::Running;
+            state.exit_code = None;
+            state.managed_exit_code_available = None;
+        }
+        let summary = lifecycle.recovery_summary.clone();
+        let message = ServerMessage::TerminalStatus(freshell_protocol::TerminalStatus {
+            terminal_id: terminal_id.into(),
+            status: lifecycle.state.runtime_status(),
+            reason: summary.as_ref().and_then(|s| s.reason.clone()),
+            recovery_summary: summary,
+            attempt: None,
+            max_attempts: None,
+            exit_code: None,
+            resume_cycles: None,
+        });
+        state.managed_lifecycle = Some(lifecycle);
+        for subscriber in state.subscribers.values() {
+            (subscriber.sink)(message.clone());
+        }
+    }
+
+    /// Error cause is classified before storage/logging; shared by every socket.
+    pub fn observe_managed_output_failure(&self, terminal_id: &str, cause: Option<&str>) {
+        let Some(shared) = self.shared_for(terminal_id) else {
+            return;
+        };
+        let mut state = shared.lock().expect("terminal lock");
+        if state.managed_output_failure.as_deref() == cause {
+            return;
+        }
+        let previous = state.managed_output_failure.take();
+        state.managed_output_failure = cause.map(str::to_owned);
+        let Some((soul, incarnation)) = state.managed_identity.as_ref() else {
+            return;
+        };
+        match cause {
+            Some(cause) => {
+                tracing::warn!(event="managed_runtime.output_refresh_failed",terminal_id,soul_id=%soul,incarnation_id=%incarnation,cause,"Managed retained output read failed")
+            }
+            None if previous.is_some() => {
+                tracing::info!(event="managed_runtime.output_refresh_recovered",terminal_id,soul_id=%soul,incarnation_id=%incarnation,cause="read_succeeded","Managed retained output read resumed")
+            }
+            None => {}
+        }
+    }
+
     pub fn finish_managed_exit(&self, terminal_id: &str, exit_code: i64) -> bool {
+        self.finish_managed_completion(terminal_id, Some(exit_code))
+    }
+    pub fn finish_managed_completion(&self, terminal_id: &str, code: Option<i64>) -> bool {
+        let exit_code = code.unwrap_or(-1);
         let shared = {
             let inner = self.inner.lock().expect("registry lock");
             let Some(handle) = inner.terminals.get(terminal_id) else {
@@ -4892,12 +5058,15 @@ impl TerminalRegistry {
         }
         state.status = TerminalRunStatus::Exited;
         state.exit_code = Some(exit_code);
+        state.managed_exit_code_available = Some(code.is_some());
         let now = now_ms();
         state.last_activity_at = now;
         state.last_output_activity_at = now;
         state.last_meaningful_activity_at = now;
         state.last_meaningful_output_at = now;
         let exit = ServerMessage::TerminalExit(TerminalExit {
+            managed_retained: Some(true),
+            exit_code_available: Some(code.is_some()),
             exit_code,
             terminal_id: terminal_id.to_string(),
         });
@@ -4906,7 +5075,6 @@ impl TerminalRegistry {
         // its exit until the replay drain completes, exactly as the local
         // PTY natural-exit path does.
         let mut staged_notify: Vec<PacedExitNotify> = Vec::new();
-        let mut retire_now: Vec<u64> = Vec::new();
         for (conn_id, subscriber) in state.subscribers.iter_mut() {
             if subscriber.paced_deferred {
                 subscriber.paced_exit_pending = Some(exit_code);
@@ -4915,17 +5083,12 @@ impl TerminalRegistry {
                 }
             } else {
                 (subscriber.sink)(exit.clone());
-                retire_now.push(*conn_id);
             }
-        }
-        for conn_id in retire_now {
-            state.subscribers.remove(&conn_id);
         }
         drop(state);
         for notify in staged_notify {
             notify(terminal_id, exit_code);
         }
-        self.release_session_ref_ownership(terminal_id, "registry/managed-exit");
         self.notify_activity(ActivityEvent::Exit {
             terminal_id: terminal_id.to_string(),
             at: now_ms(),
@@ -4968,6 +5131,10 @@ impl TerminalRegistry {
         };
         let create_request_id = opts.create_request_id.clone();
         let shared = Arc::new(Mutex::new(TerminalShared {
+            managed_identity: None,
+            managed_lifecycle: None,
+            managed_exit_code_available: None,
+            managed_output_failure: None,
             terminal_id: opts.terminal_id.clone(),
             stream_id: opts.stream_id,
             replay: VecDeque::new(),
@@ -6352,10 +6519,16 @@ fn deliver_staged_paced_exit(s: &mut TerminalShared, conn_id: u64) -> Option<i64
     let code = s.subscribers.get(&conn_id)?.paced_exit_pending?;
     let sink = Arc::clone(&s.subscribers.get(&conn_id)?.sink);
     sink(ServerMessage::TerminalExit(TerminalExit {
+        managed_retained: s.managed_identity.as_ref().map(|_| true),
+        exit_code_available: s.managed_exit_code_available,
         exit_code: code,
         terminal_id: s.terminal_id.clone(),
     }));
-    s.subscribers.remove(&conn_id);
+    if s.managed_identity.is_some() {
+        s.subscribers.get_mut(&conn_id)?.paced_exit_pending = None;
+    } else {
+        s.subscribers.remove(&conn_id);
+    }
     tracing::info!(
         terminal_id = %s.terminal_id,
         conn_id,

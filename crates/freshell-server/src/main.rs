@@ -1128,7 +1128,7 @@ async fn main() -> ExitCode {
     let registry = freshell_terminal::TerminalRegistry::new()
         .with_ownership(std::sync::Arc::clone(&ownership));
     #[cfg(feature = "managed-runtime-v1")]
-    let (managed_runtime_available, managed_runtime_client) = {
+    let (managed_runtime_available, managed_runtime_client, managed_runtime_controller) = {
         let controller = managed_runtime::ServerManagedRuntimeController::from_env()
             .await
             .map_err(|error| {
@@ -1152,10 +1152,10 @@ async fn main() -> ExitCode {
                 });
             managed_mcp_capability::spawn_renewal_loop(client.clone());
         }
-        registry.set_managed_controller(controller.map(|controller| {
+        registry.set_managed_controller(controller.clone().map(|controller| {
             controller as Arc<dyn freshell_terminal::registry::ManagedTerminalController>
         }));
-        (available, client)
+        (available, client, controller)
     };
     #[cfg(not(feature = "managed-runtime-v1"))]
     let managed_runtime_available = false;
@@ -3056,7 +3056,8 @@ async fn main() -> ExitCode {
         .unwrap_or_else(|error| {
             eprintln!("managed runtime API initialization failed: {error}");
             std::process::exit(1);
-        });
+        })
+        .with_terminal_controller(managed_runtime_controller.clone());
         state.spawn_projector();
         managed_runtime_api::router(state)
     };

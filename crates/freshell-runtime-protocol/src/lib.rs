@@ -20,6 +20,10 @@ pub mod fresh_agent_ops;
 pub use fresh_agent_ops::*;
 pub mod provider_inputs;
 pub use provider_inputs::*;
+pub mod terminal_spool;
+pub use terminal_spool::{
+    TerminalExitObservation, TerminalSpoolCompletion, TerminalSpoolDescriptor,
+};
 
 #[cfg(test)]
 #[path = "fresh_agent_ops_tests.rs"]
@@ -2417,6 +2421,8 @@ pub struct RuntimeOutputBatch {
     pub truncated: bool,
     #[serde(default)]
     pub exited: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<TerminalSpoolCompletion>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i64>,
     /// Provider-native durable conversation id discovered by the session host.
