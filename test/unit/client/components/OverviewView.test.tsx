@@ -7,6 +7,7 @@ import sessionNamesReducer, { receiveSessionNames } from '@/store/sessionNamesSl
 import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import type { SessionNameRecord, SessionNameRef, SessionNameUpdate } from '@shared/session-names'
+import type { ManagedRuntimeRecoverySummary } from '@shared/managed-runtime'
 
 const { mockApiGet, mockApiPatch, mockApiDelete, mockApiPost, wsMessageHandlers } = vi.hoisted(() => ({
   mockApiGet: vi.fn(),
@@ -104,15 +105,18 @@ const retainedCases = [
   { recoveryState: 'stopped', runtimeStatus: 'exited', paneStatus: 'exited', label: 'Stopped' },
 ] as const
 
+const retainedRecoverySummary: ManagedRuntimeRecoverySummary = {
+  desiredState: 'running', recoveryState: 'blocked', reason: 'STORE_UNREADABLE',
+  attemptId: 'attempt-retained', incidentId: 'incident-retained',
+  durabilityState: 'resume_captured', allocationState: 'verified_durable',
+}
+
 function retainedRow({ recoveryState, runtimeStatus }: typeof retainedCases[number]) {
   return scopedRow({
     status: runtimeStatus,
     runtimeStatus,
     soulId: 'soul-retained',
-    recoverySummary: {
-      desiredState: 'running', recoveryState, reason: 'STORE_UNREADABLE',
-      attemptId: 'attempt-retained', incidentId: 'incident-retained',
-    },
+    recoverySummary: { ...retainedRecoverySummary, recoveryState },
   })
 }
 

@@ -9,6 +9,7 @@ import panesReducer from '../../../../src/store/panesSlice'
 import settingsReducer from '../../../../src/store/settingsSlice'
 import terminalDirectoryReducer from '../../../../src/store/terminalDirectorySlice'
 import freshAgentReducer, { applyRuntimeOwner } from '../../../../src/store/freshAgentSlice'
+import type { ManagedRuntimeRecoverySummary } from '@shared/managed-runtime'
 
 const sentMessages: any[] = []
 const mockGetTerminalDirectoryPage = vi.fn()
@@ -55,16 +56,19 @@ const retainedCases = [
   { recoveryState: 'stopped', runtimeStatus: 'exited', paneStatus: 'exited', label: 'Stopped' },
 ] as const
 
+const retainedRecoverySummary: ManagedRuntimeRecoverySummary = {
+  desiredState: 'running', recoveryState: 'blocked', reason: 'STORE_UNREADABLE',
+  attemptId: 'attempt-retained', incidentId: 'incident-retained',
+  durabilityState: 'resume_captured', allocationState: 'verified_durable',
+}
+
 function retainedDirectoryPage({ recoveryState, runtimeStatus }: typeof retainedCases[number]) {
   return {
     items: [{
       terminalId: 'retained-managed', title: 'Retained managed', mode: 'codex',
       status: runtimeStatus, runtimeStatus, soulId: 'soul-retained', hasClients: false,
       createdAt: 1, lastActivityAt: 2,
-      recoverySummary: {
-        desiredState: 'running', recoveryState, reason: 'STORE_UNREADABLE',
-        attemptId: 'attempt-retained', incidentId: 'incident-retained',
-      },
+      recoverySummary: { ...retainedRecoverySummary, recoveryState },
       sessionRef: { provider: 'codex', sessionId: 'native-retained' },
     }],
     nextCursor: null,
