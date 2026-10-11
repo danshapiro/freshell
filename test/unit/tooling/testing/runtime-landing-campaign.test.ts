@@ -13,6 +13,7 @@ import * as chaosEvidence from '../../../../scripts/testing/runtime-phase5-chaos
 import * as soakEvidence from '../../../../scripts/testing/runtime-soak-evidence.js'
 import * as parityEvidence from '../../../../scripts/testing/provider-parity-receipt.js'
 import { runCampaign } from '../../../../scripts/testing/runtime-landing-campaign.js'
+import { defaultReceiptFileName } from '../../../../scripts/testing/runtime-receipts.js'
 
 beforeEach(() => { vi.spyOn(console, 'log').mockImplementation(() => {}); vi.spyOn(console, 'error').mockImplementation(() => {}) })
 const roots: string[] = []
@@ -36,6 +37,19 @@ function fixture() {
         fs.mkdirSync(path.dirname(target), { recursive: true })
         fs.writeFileSync(target, JSON.stringify({ status: 'PASS', candidateSha: candidate.sha }), { mode: 0o600 })
       }
+    }
+    for (const [spec, name] of [['runtime-lost-soul-notice-rust.spec.ts', 'FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT'],
+      ['runtime-chaos-rust.spec.ts', 'FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT']]) {
+      if (!args.some(argument => argument.endsWith(spec))) continue
+      const runId = randomUUID(), runtimeImage = `sha256:${'b'.repeat(64)}`
+      const target = path.join(root, '.runtime-evidence', candidate.sha, runId, 'browser', defaultReceiptFileName(name))
+      fs.mkdirSync(path.dirname(target), { recursive: true })
+      fs.writeFileSync(target, JSON.stringify({ candidateSha: candidate.sha, runtimeImage, receiptRunId: runId, status: 'PASS' }), { mode: 0o600 })
+      fs.writeFileSync(log, JSON.stringify({ event: 'managed_external_browser_passed', counts: {
+        selected: 1, executed: 1, passed: 1, failed: 0, skipped: 0, timedOut: 0,
+      }, originals: [{ candidateSha: candidate.sha, runtimeImage, runId, receiptDigests: {
+        [name]: createHash('sha256').update(fs.readFileSync(target)).digest('hex'),
+      } }] }), { mode: 0o600 })
     }
     if (env.FRESHELL_RUNTIME_GATE_RUN_ID) {
       const landing = args.includes('landing')
@@ -168,6 +182,15 @@ describe('actual campaign dispatch and outcome with fictional children', () => {
 })
 
 describe('actual finalized browser publisher and independently loaded originals', () => {
+  it.each(['FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT', 'FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT'])(
+    'publishes the canonical owner digest for %s without a campaign target or copy', async name => {
+      const f = await browserOriginalFixture()
+      const target = path.join(f.evidenceDir, 'browser', defaultReceiptFileName(name))
+      fs.writeFileSync(target, JSON.stringify({ candidateSha: candidate.sha, receiptRunId: (f.owned as any).descriptor.runId, status: 'PASS' }), { mode: 0o600 })
+      Object.assign(f.owned, { environment: {}, receiptBefore: {} })
+      await f.owned.finish()
+      expect(f.owned.publishOriginals(f.cases, f.executed).receiptDigests[name]).toBe(createHash('sha256').update(fs.readFileSync(target)).digest('hex'))
+    })
   it('refuses early publication and preserves exact current private original references after cleanup', async () => {
     const f = await browserOriginalFixture()
     expect(() => f.owned.publishOriginals(f.cases, f.executed)).toThrow(/cleanup/)
@@ -373,7 +396,9 @@ describe('complete finite campaign composition', () => {
         const runId = browser ? (browser.owned as any).descriptor.runId : randomUUID()
         const receipts: Record<string, any> = {}, environment: NodeJS.ProcessEnv = {}
         for (const name of contract.names) {
-          const receiptPath = `.runtime-evidence/${candidate.sha}/campaigns/${campaignRunId}/receipts/${id}/${name.toLowerCase()}.json`
+          const receiptPath = ['loss-notice', 'chaos'].includes(id)
+            ? `.runtime-evidence/${candidate.sha}/${runId}/browser/${defaultReceiptFileName(name)}`
+            : `.runtime-evidence/${candidate.sha}/campaigns/${campaignRunId}/receipts/${id}/${name.toLowerCase()}.json`
           const receipt = { status: 'PASS', candidateSha: candidate.sha, runtimeImage, receiptRunId: runId,
             providers: (id === 'opencode-qualification' ? ['opencode'] : ['claude', 'codex', 'opencode', 'amplifier']).map(provider => ({ provider })),
             rows: ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'].map(mode => ({ mode })) }
@@ -434,6 +459,28 @@ describe('complete finite campaign composition', () => {
       if (fault === 'wrong image') input.images.browserImage = `sha256:${'f'.repeat(64)}`
       expect(validateProductionCampaignCoverage(input).complete, fault).toBe(false)
     }
+  })
+  it.each(['loss-notice', 'chaos'])('refuses a copied or wrong-owner canonical original for %s', async id => {
+    const f = await completeFixture(), input = f.input, step = input.completedSteps.find(step => step.id === id)!
+    const name = Object.keys(step.receipts)[0], reference = step.receipts[name]
+    const originalPath = reference.path
+    const copied = `.runtime-evidence/${candidate.sha}/campaigns/${input.originals.campaignRunId}/receipts/${id}/${name.toLowerCase()}.json`
+    fs.mkdirSync(path.dirname(path.join(input.originals.repoRoot, copied)), { recursive: true })
+    fs.copyFileSync(path.join(input.originals.repoRoot, originalPath), path.join(input.originals.repoRoot, copied))
+    reference.path = copied
+    expect(validateProductionCampaignCoverage(input).failures).toEqual([expect.stringMatching(new RegExp(`^${id}:.*path`))])
+    reference.path = originalPath
+    const target = path.join(input.originals.repoRoot, originalPath), receipt = JSON.parse(fs.readFileSync(target, 'utf8'))
+    receipt.receiptRunId = randomUUID()
+    const bytes = JSON.stringify(receipt)
+    fs.writeFileSync(target, bytes)
+    reference.digestSha256 = createHash('sha256').update(bytes).digest('hex')
+    const log = path.join(input.originals.repoRoot, step.log), event = JSON.parse(fs.readFileSync(log, 'utf8'))
+    event.originals[0].receiptDigests[name] = reference.digestSha256
+    const logBytes = JSON.stringify(event)
+    fs.writeFileSync(log, logBytes)
+    step.logDigest = createHash('sha256').update(logBytes).digest('hex')
+    expect(validateProductionCampaignCoverage(input).failures).toEqual([expect.stringMatching(new RegExp(`^${id}:.*owner`))])
   })
   it.each([0, 1])('refuses rehydrate coverage missing separately owned case %s with consistent remaining counts', async missing => {
     const f = await completeFixture(), input = f.input

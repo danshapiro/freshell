@@ -4,7 +4,9 @@ import os from 'node:os'
 import http from 'node:http'
 import path from 'node:path'
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { runCampaign } from '../../../../scripts/testing/runtime-landing-campaign.js'
+import { ManagedRuntimeOwner } from '../../../../scripts/testing/runtime-sandbox.js'
 import { RestrictedDockerBroker } from '../../../../scripts/testing/runtime-test-broker.js'
 
 import {
@@ -17,7 +19,7 @@ import {
 
 const sha = 'a'.repeat(40)
 const runtimeImage = `sha256:${'b'.repeat(64)}`
-const runId = 'loss-run-1234'
+const runId = '14700000-0000-4000-8000-000000000001'
 const incidentId = 'incident-11111111-1111-4111-8111-111111111111'
 const soulId = 'soul-11111111-1111-4111-8111-111111111111'
 const incarnationId = 'incarnation-11111111-1111-4111-8111-111111111111'
@@ -301,6 +303,42 @@ afterEach(() => {
 })
 
 describe('Phase 5 loss receipt validation', () => {
+  it('campaign consumes the canonical loss owner original and reopens its actual evidence references', async () => {
+    const fx = createFixture()
+    const canonical = path.join(fx.evidenceDir, 'browser', 'p5-g02-real-opencode-loss.json')
+    const owned = Object.create(ManagedRuntimeOwner.prototype) as ManagedRuntimeOwner
+    Object.assign(owned, { repoRoot: fx.repoRoot, runtime: { browserDir: path.dirname(canonical) } })
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const candidate = { sha, dirty: false, diffHash: 'e'.repeat(64), statusHash: 'e'.repeat(64) }
+    let dispatchTarget: string | undefined
+    try {
+      const exit = await runCampaign(['--only', 'loss-notice'], { repoRoot: fx.repoRoot, captureCandidate: () => candidate,
+        environment: {}, execute: async (_command, _args, environment, logPath) => {
+          dispatchTarget = environment.FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT
+          vi.stubEnv('FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT', dispatchTarget)
+          const target = owned.writePhase5LossReceipt(fx.receipt)
+          expect(target).toBe(canonical)
+          expect(validatePhase5LossReceipt({ ...fx, candidateSha: sha, runtimeImage: runtimeImage, receipt: JSON.parse(fs.readFileSync(target, 'utf8')) }).summary).toEqual(fx.receipt.summary)
+          fs.mkdirSync(path.dirname(logPath), { recursive: true })
+          fs.writeFileSync(logPath, JSON.stringify({ event: 'managed_external_browser_passed', counts: { selected: 1, executed: 1, passed: 1, failed: 0, skipped: 0, timedOut: 0 },
+            originals: [{ candidateSha: sha, runId, runtimeImage: runtimeImage, receiptDigests: { FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT: createHash('sha256').update(fs.readFileSync(target)).digest('hex') } }] }), { mode: 0o600 })
+          return 0
+        } })
+      expect(exit).toBe(0)
+      expect(dispatchTarget).toBeUndefined()
+      const campaigns = path.join(fx.repoRoot, '.runtime-evidence', sha, 'campaigns')
+      const campaign = JSON.parse(fs.readFileSync(path.join(campaigns, fs.readdirSync(campaigns)[0], 'campaign.json'), 'utf8'))
+      const reference = campaign.receipts.FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT
+      expect(path.join(fx.repoRoot, reference.path)).toBe(canonical)
+      expect(campaign.steps[0].outcome).toBe('PASS')
+      vi.stubEnv('FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT', path.join(fx.repoRoot, 'foreign-receipt.json'))
+      expect(() => owned.writePhase5LossReceipt(fx.receipt)).toThrow(/canonical/)
+      fx.rewrite('cleanup.json', row => { row.ok = false; row.errors = ['failed']; })
+      expect(() => validatePhase5LossReceipt({ ...fx, candidateSha: sha, runtimeImage: runtimeImage, receipt: JSON.parse(fs.readFileSync(canonical, 'utf8')) })).toThrow()
+    } finally { log.mockRestore(); error.mockRestore(); vi.unstubAllEnvs() }
+  })
+
   it('builds and validates actual socket broker diagnostics without weakening decisions', async () => {
     const fx = createFixture()
     const upstream = http.createServer((request, response) => { request.resume(); response.end('OK') })

@@ -1,8 +1,8 @@
 /**
  * Candidate-bound Durable Souls qualification campaign.
  *
- * Every invocation owns a UUID-scoped evidence directory. Producer receipt
- * paths are caller-supplied, unique to that invocation and step, and become
+ * Every invocation owns a UUID-scoped evidence directory. Producer receipts
+ * use isolated step targets or their canonical browser owner originals, and become
  * reusable by a later `--only <gate>` run only after provenance validation.
  */
 import { spawn } from 'node:child_process'
@@ -14,6 +14,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import {
   buildReceiptEnvironment,
+  isCanonicalPhase5BrowserReceipt,
+  phase5BrowserReceiptOriginal,
   defineCampaignProducerStep,
   deriveProductionGateExpectation,
   parseCampaignArguments,
@@ -24,6 +26,7 @@ import {
   type CompletedCampaignStep,
   type CampaignGateExpectation,
   type CampaignStepDescriptor,
+  type BrowserOriginalIndex,
 } from './runtime-campaign-policy.js'
 import {
   candidateIntegrityFailures,
@@ -376,6 +379,12 @@ function currentReceiptTargets(step: ProducerStep, campaignRoot: string): Record
   ]))
 }
 
+function canonicalPhase5ReceiptFromLog(root: string, candidateSha: string, name: string, log: string) {
+  const events = log.split(/\r?\n/).filter(line => line.includes('managed_external_browser_passed')).map(line => JSON.parse(line))
+  if (events.length !== 1) throw new Error('canonical receipt requires one completed browser execution')
+  return phase5BrowserReceiptOriginal({ repoRoot: root, candidateSha, name, originals: events[0].originals as BrowserOriginalIndex[] })
+}
+
 function verifiedPriorReceipts(candidateSha: string, campaignsRoot: string, root = repoRoot): Record<string, ReceiptProvenance> {
   if (!fs.existsSync(campaignsRoot)) return {}
   const manifests = fs.readdirSync(campaignsRoot, { withFileTypes: true })
@@ -393,7 +402,17 @@ function verifiedPriorReceipts(candidateSha: string, campaignsRoot: string, root
       if (found[envName] || provenance.candidateSha !== candidateSha || provenance.campaignRunId !== manifest.runId) continue
       const absolute = path.resolve(root, provenance.path)
       const allowedRoot = `${path.resolve(campaignsRoot)}${path.sep}`
-      if (!absolute.startsWith(allowedRoot)) continue
+      if (!absolute.startsWith(allowedRoot)) {
+        if (!isCanonicalPhase5BrowserReceipt(envName)) continue
+        try {
+          const step = manifest.steps?.find((row: StepResult) => row.id === provenance.producerStepId)
+          if (step?.log !== `.runtime-evidence/${candidateSha}/campaigns/${manifest.runId}/logs/${provenance.producerStepId}.log`
+            || createHash('sha256').update(fs.readFileSync(path.resolve(root, step.log))).digest('hex') !== step.logDigest) continue
+          const log = readBoundedLog(path.resolve(root, step.log))
+          const original = canonicalPhase5ReceiptFromLog(root, candidateSha, envName, log)
+          if (original.path !== provenance.path || original.sha256 !== provenance.digestSha256) continue
+        } catch { continue }
+      }
       const snapshot = receiptSnapshot(absolute)
       const value = snapshot.value as any
       if (snapshot.regularFile !== true || snapshot.symbolicLink || snapshot.digestSha256 !== provenance.digestSha256
@@ -543,14 +562,23 @@ export async function runCampaign(args: readonly string[], options: CampaignRunn
         fs.writeFileSync(logPath, `${failures[0]}\n`, { mode: 0o600 })
         exitCode = 1
       } else {
-        exitCode = await step.run({ ...environment, ...receiptEnvironment }, logPath, execute)
+        const producerEnvironment = { ...environment, ...receiptEnvironment }
+        for (const name of step.produces.filter(isCanonicalPhase5BrowserReceipt)) delete producerEnvironment[name]
+        exitCode = await step.run(producerEnvironment, logPath, execute)
+      }
+      const producerLog = readBoundedLog(logPath)
+      for (const name of step.produces.filter(isCanonicalPhase5BrowserReceipt)) {
+        try {
+          const original = canonicalPhase5ReceiptFromLog(root, candidateSha, name, producerLog)
+          targets[name] = path.resolve(root, original.path)
+        } catch (error) { failures.push(`${name}: ${error instanceof Error ? error.message : 'canonical original missing'}`) }
       }
       const after = Object.fromEntries(Object.entries(targets).map(([name, target]) => [name, receiptSnapshot(target)]))
       failures.push(...validateProducerEvidence({
         candidateSha,
         runner: step.runner,
         ...(step.runner === 'playwright' ? { execution: 'managed-external-browser' as const } : {}),
-        log: readBoundedLog(logPath),
+        log: producerLog,
         receipts: step.produces.map((envName) => ({ envName, before: before[envName], after: after[envName] })),
       }))
       if (exitCode !== 0) failures.push(`producer exited ${exitCode}`)

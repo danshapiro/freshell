@@ -62,6 +62,7 @@ import { RetainedFixtureBrowserSession, runTask2RetainedFixture, Task2RetainedBr
   type Task2RetainedBrowserStage } from './task002-retained-fixture.js'
 import { requireAmplifierOnecliBootstrap, readAmplifierQualificationProfile, stageAmplifierQualificationProfile } from './runtime-amplifier-onecli.js'
 import { ownedClaudeStartupPreferences } from './runtime-native-feasibility.js'
+import { defaultReceiptFileName } from './runtime-receipts.js'
 
 type OwnedProcessIdentity = { pid: number; startTicks: string; executable: string; cwd: string }
 
@@ -2408,6 +2409,21 @@ function selectsPhase3Approval(selection: ExternalBrowserSelection, environment:
     && (!selection.grep || new RegExp(selection.grep).test(title))
 }
 
+function qualificationSelections(selection: ExternalBrowserSelection, environment: NodeJS.ProcessEnv, retainedArtifacts: boolean) {
+  const spec = path.basename(selection.spec)
+  let providers = selection.provider ? parseQualificationProviderSelection(selection.provider) : []
+  if (!selection.provider && !selection.mode && !retainedArtifacts && spec === 'runtime-managed-provider-qualification-rust.spec.ts') {
+    requireOptIn(environment, 'FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE')
+    providers = parseQualificationProviderSelection(environment[QUALIFICATION_PROVIDER_SELECTION_ENV] ?? '')
+  }
+  let modes = selection.mode ? parseFreshAgentQualificationModes(selection.mode) : []
+  if (!selection.mode && !selection.provider && !retainedArtifacts && spec === 'runtime-fresh-agent-qualification-rust.spec.ts') {
+    requireOptIn(environment, 'FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE')
+    modes = parseFreshAgentQualificationModes(environment[FRESH_AGENT_QUALIFICATION_MODES_ENV] ?? '')
+  }
+  return { providers, modes }
+}
+
 /** Preserve the existing fixed permission and observable-recovery preset on the owned web. */
 export function createExternalManagedWebFactory(selection: ExternalBrowserSelection, environment: NodeJS.ProcessEnv,
   webFactory: RuntimeWebFactory, retainedArtifacts = false): RuntimeWebFactory {
@@ -2415,10 +2431,14 @@ export function createExternalManagedWebFactory(selection: ExternalBrowserSelect
     FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION: 'ask', FRESHELL_MANAGED_RECOVERY_TEST_DELAY_MS: '7000',
   } : {}
   const spec = path.basename(selection.spec)
+  const selected = qualificationSelections(selection, environment, retainedArtifacts)
+  const freshBootstrap = new Set<string>(selected.modes.filter(mode => mode !== 'freshopencode').map(mode => mode === 'freshcodex' ? 'CODEX' : 'CLAUDE'))
+  const unselectedFreshBootstrap = !retainedArtifacts && spec === 'runtime-fresh-agent-qualification-rust.spec.ts'
+    ? ['CLAUDE', 'CODEX', 'OPENCODE', 'AMPLIFIER'].filter(provider => !freshBootstrap.has(provider)).map(provider => `FRESHELL_MANAGED_${provider}_`) : []
   const claudeStartup = !retainedArtifacts && spec === 'runtime-managed-provider-qualification-rust.spec.ts'
-    && selection.provider === 'claude'
+    && selected.providers.includes('claude')
   const amplifierProfile = !retainedArtifacts && spec === 'runtime-managed-provider-qualification-rust.spec.ts'
-    && selection.provider === 'amplifier'
+    && selected.providers.includes('amplifier')
     ? readAmplifierQualificationProfile(environment) : undefined
   const continuityTitle = 'Phase 2 managed runtime continuity › P2-G04: OpenAI-authenticated OpenCode tool turn survives web replacement in one native session'
   if (spec === 'runtime-opencode-provider-qualification-rust.spec.ts'
@@ -2431,7 +2451,8 @@ export function createExternalManagedWebFactory(selection: ExternalBrowserSelect
       FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: bootstrap.caFile })
   }
   return options => webFactory({ ...options, env: { ...options.env, ...preset },
-    ...(spec === 'runtime-fresh-agent-qualification-rust.spec.ts' && selection.mode === 'freshopencode' && !retainedArtifacts ? { stripEnvPrefixes: [...options.stripEnvPrefixes ?? [],
+    ...(unselectedFreshBootstrap.length ? { stripEnvPrefixes: [...options.stripEnvPrefixes ?? [], ...unselectedFreshBootstrap, 'OPENCODE_API_KEY'] } : {}),
+    ...(spec === 'runtime-fresh-agent-qualification-rust.spec.ts' && selected.modes.length === 1 && selected.modes[0] === 'freshopencode' && !retainedArtifacts ? { stripEnvPrefixes: [...options.stripEnvPrefixes ?? [],
       'ANTHROPIC_', 'CLAUDE_', 'OPENAI_', 'OPENCODE_API_KEY', 'GEMINI_', 'GOOGLE_API_KEY', 'LUNAROUTE_', 'ONECLI_',
       'FRESHELL_MANAGED_CLAUDE_', 'FRESHELL_MANAGED_CODEX_', 'FRESHELL_MANAGED_OPENCODE_', 'FRESHELL_MANAGED_AMPLIFIER_',
       'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
@@ -2474,14 +2495,13 @@ export function createExternalManagedRuntimeOwner(root: string, selection: Exter
   const stoppedRepairBatch = selectsStoppedRepairBatch(selection, environment)
   const deterministic = fixture || smoke || history || interruptedStop || stoppedRepairBatch
   const sourceSelection = selectsSyntheticSource(selection, environment)
-  const modes = fixture ? ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'] : smoke ? ['freshopencode'] : history || interruptedStop ? ['freshcodex'] : selection.mode ? [selection.mode] : []
-  const providers = deterministic || selection.mode ? [] : selection.provider ? [selection.provider] : ['opencode']
-  const qualificationProfile = !retainedArtifacts && !selection.mode
-    && path.basename(selection.spec) === 'runtime-managed-provider-qualification-rust.spec.ts'
-    ? selection.provider === 'claude' ? { model: 'haiku', effort: 'low' }
-      : selection.provider === 'codex' ? { model: 'gpt-5.6-luna', effort: 'low' } : undefined
-    : undefined
-  const phase = deterministic ? 3 : selection.provider || selection.mode ? 5
+  const selected = qualificationSelections(selection, environment, retainedArtifacts)
+  const modes = fixture ? ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'] : smoke ? ['freshopencode'] : history || interruptedStop ? ['freshcodex'] : selected.modes
+  const providers = deterministic || modes.length ? [] : selected.providers.length ? selected.providers : ['opencode']
+  const providerSettings = !retainedArtifacts && path.basename(selection.spec) === 'runtime-managed-provider-qualification-rust.spec.ts'
+    ? { ...(selected.providers.includes('claude') ? { claude: { model: 'haiku', effort: 'low' } } : {}),
+      ...(selected.providers.includes('codex') ? { codex: { model: 'gpt-5.6-luna', effort: 'low' } } : {}) } : {}
+  const phase = deterministic ? 3 : selected.providers.length || modes.length ? 5
     : path.basename(selection.spec).includes('resurrection') ? 3
       : path.basename(selection.spec).includes('rehydrate') ? 4
         : /chaos|lost-soul/.test(selection.spec) ? 5 : 2
@@ -2492,11 +2512,12 @@ export function createExternalManagedRuntimeOwner(root: string, selection: Exter
   if (!deterministic && !retainedArtifacts && providers.includes('amplifier')) requireAmplifierOnecliBootstrap(environment)
   return new ManagedRuntimeOwner(createExternalManagedWebFactory(selection, environment, webFactory, retainedArtifacts), root, phase,
     {}, supervisorEnv, deterministic || tabs || sourceSelection || selectsPhase3Approval(selection, environment) ? 'test' : 'release', { enabledProviders: providers, freshAgentModes: modes,
-      ...(qualificationProfile && selection.provider ? { providerSettings: { [selection.provider]: qualificationProfile } } : {}),
+      providerSettings,
       fixtureFreshAgentModes: deterministic ? modes : [] }, undefined, {
       bootstrapProviders: deterministic || retainedArtifacts ? [] : sourceSelection ? ['opencode']
-        : selection.provider ? [selection.provider] : selection.mode === 'freshopencode' ? []
-          : selection.mode ? [selection.mode === 'freshcodex' ? 'codex' : 'claude'] : ['claude', 'codex', 'opencode', 'amplifier'],
+        : selected.providers.length ? selected.providers : modes.length
+          ? [...new Set(modes.filter(mode => mode !== 'freshopencode').map(mode => mode === 'freshcodex' ? 'codex' as const : 'claude' as const))]
+          : ['claude', 'codex', 'opencode', 'amplifier'],
     })
 }
 
@@ -2660,7 +2681,11 @@ export class ManagedExternalBrowserLifecycle implements ExternalBrowserLifecycle
   }
   private receiptDigests(): Record<string, string> {
     const result: Record<string, string> = {}
-    for (const [name, target] of Object.entries(this.environment)) {
+    const targets = { ...this.environment }
+    if (this.owner) for (const name of ['FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT', 'FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT']) {
+      targets[name] = path.join(this.owner.runtime.evidenceDir, 'browser', defaultReceiptFileName(name))
+    }
+    for (const [name, target] of Object.entries(targets)) {
       if (!name.startsWith('FRESHELL_RUNTIME_') || !name.endsWith('_RECEIPT') || !target) continue
       try {
         const stat = fs.lstatSync(target)
