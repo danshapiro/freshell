@@ -34,6 +34,55 @@ import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
 import { RestrictedDockerBroker, type PreparedInputAuthorization } from '../../../../scripts/testing/runtime-test-broker.js'
 import { ManagedRuntimeBrowserRig } from '../../../e2e-browser/helpers/managed-runtime.js'
 import { prepareProviderParityUserRoots } from '../../../helpers/provider-parity-environment.js'
+import { assertManagedTerminalCreated } from '../../../../scripts/testing/managed-environment-create.js'
+import type { ErrorMessage } from '../../../../shared/ws-protocol.js'
+
+describe('managed environment create failure retention', () => {
+  it.each(['known', 'unknown'] as const)('retains safe %s failure evidence before normal owned cleanup', async kind => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'frs-create-failure-'))
+    const home = path.join(directory, 'home')
+    await fs.mkdir(home)
+    const rig = new ManagedRuntimeBrowserRig(directory, 2, {}, {}, 'release', { enabledProviders: [] }, home)
+    const secretMarkers = ['AUTH_SECRET_MARKER', 'CONFIG_SECRET_MARKER', 'CONVERSATION_SECRET_MARKER']
+    const reason = 'selected workspace input mountpoint is unavailable'
+    const response: ErrorMessage = { type: 'error', code: 'PTY_SPAWN_FAILED', timestamp: new Date().toISOString(),
+      message: kind === 'known' ? `runtime backend configuration rejected: ${reason}; ${secretMarkers.join(' ')}`
+        : secretMarkers.join(' ') }
+    const failureEvent = { event: 'supervisor.activation_failed', data: { stage: 'create_stopped_runtime',
+      errorCode: 'BACKEND_UNAVAILABLE', errorClass: 'runtime_activation_failed', payload: secretMarkers } }
+    const logs = vi.spyOn(rig.runtime, 'containerLogs').mockReturnValue(JSON.stringify(failureEvent))
+    const web = { capturedOutput: vi.fn(() => ({ stdout: JSON.stringify(failureEvent), stderr: secretMarkers.join(' ') })),
+      stop: async () => fs.rm(home, { recursive: true }) }
+    rig.web = web as unknown as typeof rig.web
+    rig.supervisor = { containerId: 'd'.repeat(64) } as typeof rig.supervisor
+    try {
+      expect(() => assertManagedTerminalCreated(rig, response)).toThrow()
+      expect(await rig.stop()).toEqual({ ok: true, errors: [] })
+      await expect(fs.stat(home)).rejects.toMatchObject({ code: 'ENOENT' })
+      const stored = await fs.readFile(path.join(rig.runtime.evidenceDir, 'incidents/managed-environment-create-failure.json'), 'utf8')
+      const incident = JSON.parse(stored)
+      expect(incident).toMatchObject({ severity: 'error', event: 'managed_environment.create_failed',
+        code: 'PTY_SPAWN_FAILED', reason: kind === 'known' ? reason : 'UNKNOWN',
+        supervisor: { event: 'supervisor.activation_failed', stage: 'create_stopped_runtime', errorCode: 'BACKEND_UNAVAILABLE' } })
+      for (const marker of secretMarkers) expect(stored).not.toContain(marker)
+      expect(logs).toHaveBeenCalledWith(rig.supervisor.containerId)
+      expect(web.capturedOutput).toHaveBeenCalledOnce()
+    } finally {
+      await fs.rm(rig.runtime.testRoot, { recursive: true, force: true })
+      await fs.rm(directory, { recursive: true, force: true })
+      vi.restoreAllMocks()
+    }
+  })
+
+  it('accepts a real created response without reading failure logs or writing an incident', () => {
+    const owner = { web: { capturedOutput: vi.fn() }, runtime: { containerLogs: vi.fn(), writeIncident: vi.fn() },
+      supervisor: { containerId: 'd'.repeat(64) } }
+    expect(() => assertManagedTerminalCreated(owner, { type: 'terminal.created' })).not.toThrow()
+    expect(owner.web.capturedOutput).not.toHaveBeenCalled()
+    expect(owner.runtime.containerLogs).not.toHaveBeenCalled()
+    expect(owner.runtime.writeIncident).not.toHaveBeenCalled()
+  })
+})
 
 function useOwnedHarnessArtifacts(harness: RuntimeHarness, host: string): void {
   const artifact = harness as unknown as { ensureRuntimeImage(): void; buildBinaries(): void; collectCapabilities(): unknown; collectBuildInfo(): unknown }

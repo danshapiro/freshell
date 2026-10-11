@@ -13,6 +13,7 @@ import { authorizeProviderParityRequest, captureProviderParityVolumes, cleanupPr
 import { fakeOnecliGrants } from '../../test/integration/server/provider-parity-onecli.js'
 import type { InitialProviderVolumeAuthorization } from './runtime-test-broker.js'
 import { resolvePairedExternalFixture } from './e2e-external-target.js'
+import { assertManagedTerminalCreated } from './managed-environment-create.js'
 
 const cloudflaredVersion = '2026.10.0'
 const cloudflaredSha = 'd33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db'
@@ -293,7 +294,7 @@ export async function runManagedEnvironmentTarget() {
     authorize(preflightRequest)
     const created = await socketCreate(rig, preflightRequest, 'opencode', path.join(selected.workspace, 'preflight'),
       { paneReconcileV1: true, managedRuntimeV1: true })
-    assert.equal(created.type, 'terminal.created')
+    assertManagedTerminalCreated(rig, created)
     const preflightChild = await poll('genuine managed preflight configuration', async () => readJson(path.join(selected.workspace, 'preflight/.managed-fixture/child-receipt.json')))
     assert.equal(preflightChild.terminalId, created.terminalId)
     assert.equal(preflightChild.candidateSha, rig.runtime.candidateSha)
