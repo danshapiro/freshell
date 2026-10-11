@@ -653,7 +653,7 @@ mod tests {
                 config: vec![],
                 mcp_capability: Some(capability.clone()),
                 prepared_inputs: Some(PreparedProviderInputs {
-                    generation_id: capability.grant_id,
+                    generation_id: capability.grant_id.clone(),
                     initial_auth_reservation: None,
                     manifest: ProviderInputManifestReference {
                         relative_path: ".freshell/input-manifest.json".into(),
@@ -664,7 +664,13 @@ mod tests {
                     },
                     config_binds: vec![],
                     resource_mounts: vec![],
-                    indexed_files: None,
+                    indexed_files: Some(IndexedProviderFiles {
+                        volume_name: indexed_provider_volume_name(
+                            &SoulId::new(),
+                            &capability.grant_id,
+                        ),
+                        aliases: vec![],
+                    }),
                 }),
             };
             if restricted {
