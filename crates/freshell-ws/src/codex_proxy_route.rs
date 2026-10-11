@@ -285,10 +285,9 @@ async fn route_candidate(
             }
         }
     }
-    // Task 14: a thread the pane's unit already holds as an extra thread
-    // (announced before its candidate) becomes the pane's main conversation.
-    let released_extra =
-        crate::unit_threads::release_for_main(state, terminal_id, &candidate.thread.id);
+    // A thread the pane's unit already holds as an extra thread (announced
+    // before its candidate) becomes the pane's main conversation inside the
+    // adoption tail (Task 14).
     let adopted = crate::codex_identity::adopt_codex_identity(
         state,
         CodexAdoption {
@@ -299,9 +298,6 @@ async fn route_candidate(
         },
     )
     .await;
-    if !adopted && released_extra {
-        crate::unit_threads::restore_extra(state, terminal_id, &candidate.thread.id);
-    }
     if adopted {
         // S5.c release: the awaited ledger write inside the tail IS the
         // "persisted" signal (fsync-before-announce). Idempotent on re-adopt.
@@ -1103,5 +1099,51 @@ mod tests {
             }
             other => panic!("the CLI codex adoption carries a codex location, got {other:?}"),
         }
+    }
+
+    /// Task 14 review M2: an adoption's guards (which await) run before
+    /// anything changes the pane's hold on the thread, so an adoption they
+    /// refuse leaves the pane's extra hold exactly as it was: never Vacant
+    /// while the guards wait, and not re-taken under a new generation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_adoption_its_guards_refuse_leaves_the_extra_hold_untouched() {
+        let mut state = test_state();
+        let ownership = StdArc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.ownership = Some(StdArc::clone(&ownership));
+        let _containment = crate::unit_threads::register_test_unit(&state, "term-holder");
+        crate::unit_threads::observe_status(&state, "term-holder", "t-extra", "idle");
+        let before = ownership.observe("codex", "t-extra");
+        assert!(
+            matches!(
+                &before.state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.hold == freshell_ownership::HoldKind::Extra
+                        && owner.terminal_id.as_deref() == Some("term-holder")
+            ),
+            "{before:?}"
+        );
+        // Another terminal is bound to the thread: the adoption's guard
+        // refuses it.
+        state
+            .identity
+            .upsert("term-elsewhere", Some("codex"), Some("t-extra"), None, 0);
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-holder",
+                candidate(
+                    CandidateSource::ThreadStartResponse,
+                    "t-extra",
+                    Some("/tmp/sessions/rollout-t-extra.jsonl"),
+                    false,
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(
+            ownership.observe("codex", "t-extra"),
+            before,
+            "the refused adoption left the extra hold as it was"
+        );
     }
 }

@@ -889,24 +889,19 @@ impl CodexLaunchRuntime for ReattachedCodexAppServerRuntime {
 }
 
 impl ReattachedCodexAppServerRuntime {
-    /// Applies `change` to the record's held threads, rewrites the record
-    /// when it changed, and points the unit's lock paths at every thread it
-    /// now holds (Task 14). The record guard is never held across the write.
+    /// Applies `change` to the record's held threads and rewrites the record
+    /// when it changed (Task 14). The record guard is never held across the
+    /// write.
     fn change_held_threads(&self, change: impl FnOnce(&mut CodexSidecarRecord) -> bool) {
-        let (snapshot, changed) = {
+        let snapshot = {
             let mut record = self.record.lock().unwrap();
-            let changed = change(&mut record);
-            if changed {
-                record.updated_at = unix_millis();
+            if !change(&mut record) {
+                return;
             }
-            (record.clone(), changed)
+            record.updated_at = unix_millis();
+            record.clone()
         };
-        if changed {
-            write_record_loudly(&self.store, &snapshot);
-        }
-        if let Some(unit) = self.unit.get() {
-            crate::launch_lifecycle::set_unit_lock_paths(unit, &snapshot);
-        }
+        write_record_loudly(&self.store, &snapshot);
     }
 }
 

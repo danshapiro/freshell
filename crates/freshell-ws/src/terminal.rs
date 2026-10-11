@@ -3397,17 +3397,25 @@ async fn discard_respawn_launch(
 /// Task 14 (Stage 2: LB-51): right after a create adopts its Codex launch,
 /// the threads the app-server already holds (a reattached app-server's
 /// earlier conversations, which no event announces) are held by the pane's
-/// unit: one read of its members' lock files, on the blocking pool.
+/// unit, and its lock paths name them and the pane's own conversation: one
+/// read of its members' lock files, on the blocking pool.
 async fn reconcile_adopted_threads(state: &WsState, terminal_id: &str) {
-    let state = state.clone();
-    let terminal_id = terminal_id.to_string();
+    let reading = state.clone();
+    let read_terminal = terminal_id.to_string();
     if let Err(join_error) = spawn_blocking_in_span(move || {
-        crate::unit_threads::reconcile_loaded(&state, &terminal_id);
+        crate::unit_threads::reconcile_loaded(&reading, &read_terminal);
     })
     .await
     {
+        let entry = state.units.by_terminal(terminal_id);
+        let unit = entry.as_ref().map(|entry| &entry.unit);
         tracing::warn!(target: "freshell_unit",
             event = "unit.threads.reconcile_panicked",
+            unit_id = %unit.map(|unit| unit.id().as_str().to_string()).unwrap_or_default(),
+            provider = %entry.as_ref().map(|entry| entry.provider.as_str()).unwrap_or(""),
+            session_id = %unit.and_then(|unit| unit.label().session_id).unwrap_or_default(),
+            terminal_id = %terminal_id,
+            operation_id = %unit.and_then(|unit| unit.stop_operation()).unwrap_or_default(),
             error = %join_error,
             "the post-adopt read of the threads the app-server holds panicked");
     }

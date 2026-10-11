@@ -967,6 +967,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// Task 14 review M2: every adoption lane — the disk lanes here too, not
+    /// only the proxy's — makes a thread the pane's unit holds as an extra
+    /// thread the pane's own conversation (a Main hold under the pane),
+    /// never an idempotent re-adopt that leaves it an extra hold.
+    #[tokio::test]
+    async fn a_disk_adoption_of_an_extra_thread_makes_it_the_panes_conversation() {
+        const TID: &str = "aaaaaaaa-bbbb-cccc-dddd-000000000e14";
+        let home = unique_temp_dir("extra-adopt");
+        let (mut state, _rx) = state_with_locator(home.clone());
+        let ownership = wire_ownership(&mut state);
+        let spec = freshell_platform::build_spawn_spec(
+            freshell_platform::ShellType::System,
+            freshell_platform::detect::HostOs::Linux,
+            false,
+            Some("/tmp"),
+            &freshell_platform::RealEnv,
+            &freshell_platform::RealFileProbe,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+        );
+        state
+            .registry
+            .create(
+                &spec,
+                &std::collections::BTreeMap::new(),
+                "t1".to_string(),
+                "stream-1".to_string(),
+                "codex",
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("spawn a real shell for the test PTY");
+        let _containment = crate::unit_threads::register_test_unit(&state, "t1");
+        crate::unit_threads::observe_status(&state, "t1", TID, "idle");
+        assert!(matches!(
+            ownership.observe("codex", TID).state,
+            freshell_ownership::OwnershipState::Live { ref owner, .. }
+                if owner.hold == freshell_ownership::HoldKind::Extra
+        ));
+
+        assert!(
+            crate::codex_identity::adopt_codex_identity(
+                &state,
+                crate::codex_identity::CodexAdoption {
+                    terminal_id: "t1",
+                    thread_id: TID,
+                    rollout_path: None,
+                    cwd: Some("/tmp"),
+                },
+            )
+            .await,
+            "the adoption succeeds"
+        );
+        match ownership.observe("codex", TID).state {
+            freshell_ownership::OwnershipState::Live { owner, .. } => {
+                assert_eq!(owner.terminal_id.as_deref(), Some("t1"));
+                assert_eq!(
+                    owner.hold,
+                    freshell_ownership::HoldKind::Main,
+                    "the pane's own conversation, not an extra thread"
+                );
+            }
+            other => panic!("the adopted thread is Live under the pane: {other:?}"),
+        }
+        state.registry.kill("t1");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// b8ke ext r11 F1: the codex fork REBIND moves the coordinator
     /// authority in the SAME step as the identity move — the fork child's
     /// canonical key commits Live{Terminal} AND the superseded old key is

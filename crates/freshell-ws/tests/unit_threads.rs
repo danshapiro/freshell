@@ -12,11 +12,13 @@
 mod unit_harness;
 
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use freshell_codex::launch_lifecycle::CodexTerminalLaunchManager;
 use freshell_ownership::OwnershipState;
 use serde_json::json;
-use unit_harness::{fake_codex, HarnessOpts, UnitHarness};
+use unit_harness::{fake_codex, HarnessOpts, TestWs, UnitHarness};
 
 async fn eventually(what: &str, f: impl Fn() -> bool) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -57,6 +59,29 @@ fn held_thread_ids(h: &UnitHarness) -> Option<BTreeSet<String>> {
 
 fn set(ids: &[&str]) -> BTreeSet<String> {
     ids.iter().map(|id| id.to_string()).collect()
+}
+
+/// The lock files the pane's unit checks at Gone.
+fn lock_paths(h: &UnitHarness, tid: &str) -> BTreeSet<PathBuf> {
+    h.unit_for(tid).lock_paths().into_iter().collect()
+}
+
+/// The writer lock of each thread under `codex_home`.
+fn locks_under(codex_home: &Path, ids: &[&str]) -> BTreeSet<PathBuf> {
+    ids.iter()
+        .map(|id| fake_codex::thread_lock_path(codex_home, id))
+        .collect()
+}
+
+async fn tui_ready(h: &UnitHarness, ws: &mut TestWs) {
+    h.next_matching(ws, Duration::from_secs(10), |f| {
+        f["type"] == "terminal.output"
+            && f["data"]
+                .as_str()
+                .is_some_and(|d| d.contains("FAKE_TUI_READY"))
+    })
+    .await
+    .expect("the TUI is up");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -198,11 +223,21 @@ async fn a_helper_that_closes_is_released_from_the_unit() {
         held_thread_ids(&h).is_some_and(|held| held.contains("t-h2"))
     })
     .await;
+    assert_eq!(
+        lock_paths(&h, &tid),
+        locks_under(&h.codex_home, &["t-main2", "t-h2"]),
+        "the Gone lock check covers the helper's lock and the pane's own"
+    );
     eventually("the closed helper is Vacant", || vacant(&h, "t-h2")).await;
     eventually("the closed helper leaves the sidecar record", || {
         held_thread_ids(&h).is_some_and(|held| !held.contains("t-h2"))
     })
     .await;
+    assert_eq!(
+        lock_paths(&h, &tid),
+        locks_under(&h.codex_home, &["t-main2"]),
+        "the closed helper's lock leaves the Gone lock check"
+    );
     assert!(
         !fake_codex::lock_held(&h.lock("t-h2")),
         "Codex released the closed helper's lock"
@@ -211,4 +246,121 @@ async fn a_helper_that_closes_is_released_from_the_unit() {
         live_under(&h, "t-main2", &tid),
         "the pane's own conversation stays"
     );
+}
+
+/// A pane that never holds an extra thread: its own conversation's lock is
+/// on its unit (the Gone lock check reads it) as soon as the create is
+/// answered, under the Codex home the app-server reported, and the paths
+/// follow the threads the app-server holds. The server's own Codex home
+/// moving afterwards changes nothing (Stage 2: LB-29).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_panes_own_conversation_lock_is_on_its_unit_under_the_home_codex_reported() {
+    let h = UnitHarness::start(HarnessOpts {
+        behavior: json!({"turnCompleteDelayMs": 60000,
+                         "helperThreadOnTurn": {"id": "t-solo-help", "durationMs": 60000}}),
+        ..Default::default()
+    })
+    .await;
+    let mut ws = h.connect().await;
+    let tid = h.create_codex(&mut ws, "crq-solo", Some("t-solo")).await;
+    assert_eq!(
+        lock_paths(&h, &tid),
+        locks_under(&h.codex_home, &["t-solo"]),
+        "the pane's own conversation, before any extra thread"
+    );
+
+    let elsewhere = h.home.path().join("elsewhere");
+    std::env::set_var("CODEX_HOME", &elsewhere);
+    std::env::set_var("HOME", &elsewhere);
+    tui_ready(&h, &mut ws).await;
+    h.send(
+        &mut ws,
+        json!({"type": "terminal.input", "terminalId": tid, "data": "turn go\r"}),
+    )
+    .await;
+    eventually("the helper is held", || live_under(&h, "t-solo-help", &tid)).await;
+    assert_eq!(
+        lock_paths(&h, &tid),
+        locks_under(&h.codex_home, &["t-solo", "t-solo-help"]),
+        "under the home the app-server reported, not the server's own"
+    );
+}
+
+/// A fresh pane learns its conversation when Codex starts it: the adopted
+/// conversation's lock joins the unit's lock paths.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fresh_panes_lock_paths_follow_the_conversation_it_adopts() {
+    let h = UnitHarness::start(HarnessOpts::default()).await;
+    let mut ws = h.connect().await;
+    let tid = h.create_codex(&mut ws, "crq-fresh-locks", None).await;
+    eventually("the pane adopts its conversation", || {
+        h.state.identity.session_ref_for(&tid).is_some()
+    })
+    .await;
+    let main = h
+        .state
+        .identity
+        .session_ref_for(&tid)
+        .expect("adopted")
+        .session_id;
+    eventually("the adopted conversation's lock is on the unit", || {
+        lock_paths(&h, &tid) == locks_under(&h.codex_home, &[main.as_str()])
+    })
+    .await;
+}
+
+/// The read right before a stop's first signal (Stage 2: LB-51): a thread
+/// the app-server loaded after the pane was up, which no event announced,
+/// is on the unit before anything is signalled, so it goes through
+/// Stopping with the pane's own conversation and is Vacant at the answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_thread_loaded_without_an_announcement_goes_through_stopping() {
+    let h = UnitHarness::start(HarnessOpts::default()).await;
+    let mut ws = h.connect().await;
+    let tid = h.create_codex(&mut ws, "crq-quiet", Some("t-loud")).await;
+    tui_ready(&h, &mut ws).await;
+    let url = CodexTerminalLaunchManager::global()
+        .sidecar_ws_url(&tid)
+        .expect("the app-server's own address");
+    let port: u16 = url
+        .rsplit(':')
+        .next()
+        .and_then(|port| port.trim_end_matches('/').parse().ok())
+        .unwrap_or_else(|| panic!("a port in {url}"));
+    let mut second_client = fake_codex::Rpc::connect(port).await;
+    second_client
+        .call("fixture/loadThread", json!({"threadId": "t-quiet"}))
+        .await
+        .expect("the app-server loads the thread");
+    assert!(fake_codex::holds_lock_fd(
+        h.native_pid(&tid),
+        &h.lock("t-quiet")
+    ));
+    assert!(vacant(&h, "t-quiet"), "nothing announced the thread");
+
+    h.send(
+        &mut ws,
+        json!({"type": "terminal.kill", "terminalId": tid, "requestId": "rk-quiet", "createRequestId": "crq-quiet"}),
+    )
+    .await;
+    let stopping = std::cell::Cell::new(false);
+    let killed = h
+        .next_matching(&mut ws, Duration::from_secs(15), |f| {
+            if f["type"] == "session.runtimeOwner"
+                && f["sessionId"] == "t-quiet"
+                && f["transition"] == "stopping"
+            {
+                stopping.set(true);
+            }
+            f["type"] == "terminal.killed" && f["requestId"] == "rk-quiet"
+        })
+        .await
+        .expect("the kill is answered");
+    assert_eq!(killed["success"], true, "{killed}");
+    assert!(
+        stopping.get(),
+        "the unannounced thread went through Stopping with the pane"
+    );
+    assert!(vacant(&h, "t-quiet"));
+    assert!(!fake_codex::lock_held(&h.lock("t-quiet")));
 }

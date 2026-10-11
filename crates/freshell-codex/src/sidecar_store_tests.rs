@@ -492,30 +492,6 @@ fn a_replaced_main_conversation_stays_held() {
     );
 }
 
-/// Lock paths come only from the home Codex reported, and only an absolute
-/// one: anything else is "home unknown", never resolved against the
-/// server's working directory (Stage 2: LB-29).
-#[test]
-fn thread_lock_paths_need_an_absolute_reported_home() {
-    let mut row = CodexSidecarRecord {
-        session_id: Some("t-root".into()),
-        held_thread_ids: vec!["t-help".into()],
-        codex_home: None,
-        ..sample_record("codex-sidecar-home")
-    };
-    assert_eq!(row.thread_lock_paths(), None);
-    row.codex_home = Some("relative/home".into());
-    assert_eq!(row.thread_lock_paths(), None);
-    row.codex_home = Some("/h/codex".into());
-    assert_eq!(
-        row.thread_lock_paths(),
-        Some(vec![
-            PathBuf::from("/h/codex/thread-writer-locks/t-root.lock"),
-            PathBuf::from("/h/codex/thread-writer-locks/t-help.lock"),
-        ])
-    );
-}
-
 /// A v2 row carrying the native main is verified by the native alone: the
 /// launcher (`pid`/`starttime`/`cmdline`) may have exited.
 #[cfg(target_os = "linux")]

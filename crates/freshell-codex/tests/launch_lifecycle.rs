@@ -3454,15 +3454,14 @@ mod unit_sidecar {
     }
 
     /// Task 14: every thread the app-server holds besides its main
-    /// conversation is merged into the sidecar record (each once), and the
-    /// unit's lock paths name the lock of every recorded thread under the
-    /// home Codex reported (the record's `codex_home`), never the server's
-    /// ambient home (Stage 2: LB-29). A thread Codex unloaded leaves both.
-    /// When the pane's conversation moves (a fork), the superseded thread,
-    /// which the app-server still holds, stays recorded. `sidecar_ws_url` is
-    /// the app-server's own listener, not the proxy the TUI uses.
+    /// conversation is merged into the sidecar record (each once), and a
+    /// thread Codex unloaded leaves it. When the pane's conversation moves (a
+    /// fork), the superseded thread, which the app-server still holds, stays
+    /// recorded. `sidecar_ws_url` is the app-server's own listener, not the
+    /// proxy the TUI uses. (The unit's lock paths are the WebSocket layer's
+    /// thread table's: `freshell-ws` `tests/unit_threads.rs`.)
     #[tokio::test(flavor = "multi_thread")]
-    async fn held_threads_are_recorded_with_lock_paths_under_the_home_codex_reported() {
+    async fn held_threads_are_recorded_on_the_sidecar_record() {
         let home = tempfile::tempdir().unwrap();
         let codex_a = home.path().join("codex-a");
         std::fs::create_dir_all(&codex_a).unwrap();
@@ -3484,7 +3483,6 @@ mod unit_sidecar {
                 .next()
                 .expect("the sidecar record")
         };
-        let lock = |id: &str| freshell_containment::codex_thread_lock_path(&codex_a, id);
         let unit = manager.adopted_unit("T-held").expect("the pane's unit");
 
         manager
@@ -3494,11 +3492,6 @@ mod unit_sidecar {
             )
             .await;
         assert_eq!(record().held_thread_ids, ["t-help", "t-old"]);
-        assert_eq!(
-            unit.lock_paths(),
-            [lock("t-held"), lock("t-help"), lock("t-old")],
-            "the main conversation's lock and each held thread's, under the reported home"
-        );
         manager
             .note_held_threads("T-held", vec!["t-held".into()])
             .await;
@@ -3510,7 +3503,6 @@ mod unit_sidecar {
 
         manager.forget_held_thread("T-held", "t-help").await;
         assert_eq!(record().held_thread_ids, ["t-old"]);
-        assert_eq!(unit.lock_paths(), [lock("t-held"), lock("t-old")]);
 
         // A fork moves the pane's conversation; the original stays held.
         manager.note_session_id("T-held", "t-fork").await;

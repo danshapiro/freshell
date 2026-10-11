@@ -170,38 +170,18 @@ pub trait CodexLaunchRuntime: Send + Sync {
     }
 
     /// Record threads the app-server holds besides its main conversation
-    /// (Task 14): the sidecar record lists each once, and the unit's lock
-    /// paths name every recorded thread's lock under the Codex home the
-    /// record holds (the one Codex reported), never the server's own.
+    /// (Task 14): the sidecar record lists each once. (The unit's lock
+    /// paths are the WebSocket layer's thread table's, on every OS.)
     fn note_held_threads(&self, ids: Vec<String>) -> BoxFuture<'_, ()> {
         let _ = ids;
         Box::pin(async {})
     }
 
     /// The app-server no longer holds `id` besides its main conversation
-    /// (Codex unloaded it): it leaves the sidecar record and the unit's lock
-    /// paths.
+    /// (Codex unloaded it): it leaves the sidecar record.
     fn forget_held_thread(&self, id: String) -> BoxFuture<'_, ()> {
         let _ = id;
         Box::pin(async {})
-    }
-}
-
-/// Points the unit's lock paths at the writer lock of every thread `record`
-/// holds, under the Codex home it recorded (Stage 2: LB-29). With no
-/// recorded home the paths are left as they are and a WARN says so.
-pub(crate) fn set_unit_lock_paths(unit: &AgentUnit, record: &CodexSidecarRecord) {
-    match record.thread_lock_paths() {
-        Some(paths) => unit.set_lock_paths(paths),
-        None => unit_event!(
-            warn,
-            "freshell_unit",
-            unit_log_keys(unit),
-            "unit.lock_paths.unknown_home",
-            ownership_id = %record.ownership_id,
-            "the sidecar recorded no Codex home: its held threads' lock files are not known, \
-             so Gone cannot check them"
-        ),
     }
 }
 
@@ -2163,10 +2143,9 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
 
 impl SpawnedCodexAppServerRuntime {
     /// Applies `change` to the sidecar record's held threads under the
-    /// runtime's state lock, writes the record when it changed, and points
-    /// the unit's lock paths at every thread it now holds. A spawn without
-    /// a record (no enabled store, or off Linux, where nothing is retained)
-    /// has nothing to change.
+    /// runtime's state lock and writes the record when it changed. A spawn
+    /// without a record (no enabled store, or off Linux, where nothing is
+    /// retained) has nothing to change.
     async fn change_held_threads(&self, change: impl FnOnce(&mut CodexSidecarRecord) -> bool) {
         let mut state = self.state.lock().await;
         let Some(record) = state.as_mut().and_then(|spawned| spawned.record.as_mut()) else {
@@ -2175,9 +2154,6 @@ impl SpawnedCodexAppServerRuntime {
         if change(record) {
             record.updated_at = unix_millis();
             write_record_loudly(&self.store, record);
-        }
-        if let Some(unit) = self.unit.get() {
-            set_unit_lock_paths(unit, record);
         }
     }
 }

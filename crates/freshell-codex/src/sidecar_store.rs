@@ -156,23 +156,6 @@ impl CodexSidecarRecord {
         self.held_thread_ids.retain(|held| *held != session_id);
         self.session_id = Some(session_id);
     }
-
-    /// The writer lock of every thread the app-server holds, under the
-    /// Codex home it reported in `initialize` (`codex_home`), never the
-    /// server's own `CODEX_HOME`/`HOME` (Stage 2: LB-29). `None` when no
-    /// absolute home is recorded.
-    pub fn thread_lock_paths(&self) -> Option<Vec<PathBuf>> {
-        let home = Path::new(self.codex_home.as_deref()?);
-        if !home.is_absolute() {
-            return None;
-        }
-        Some(
-            self.all_thread_ids()
-                .iter()
-                .map(|id| freshell_containment::codex_thread_lock_path(home, id))
-                .collect(),
-        )
-    }
 }
 
 /// Lifecycle state of a recorded sidecar: `Active` (owned by a live server

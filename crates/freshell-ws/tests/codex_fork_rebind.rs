@@ -1268,9 +1268,20 @@ async fn fork_rebind_keeps_both_threads_on_the_sidecar_record() {
         matches!(original, freshell_ownership::OwnershipState::Aliased { .. }),
         "the original stays held, Aliased to the fork (not Vacant): {original:?}"
     );
+    // Read from the app-server's own descriptors (a one-pass read of
+    // `/proc/locks` can skip a line while other processes take and drop
+    // locks).
+    let native = h.native_pid(&tid);
     assert!(
-        unit_harness::fake_codex::lock_held(&h.lock(OLD))
-            && unit_harness::fake_codex::lock_held(&h.lock(NEW)),
+        unit_harness::fake_codex::holds_lock_fd(native, &h.lock(OLD))
+            && unit_harness::fake_codex::holds_lock_fd(native, &h.lock(NEW)),
         "the app-server holds both locks"
+    );
+    let lock_paths: std::collections::BTreeSet<_> =
+        h.unit_for(&tid).lock_paths().into_iter().collect();
+    assert_eq!(
+        lock_paths,
+        [h.lock(OLD), h.lock(NEW)].into_iter().collect(),
+        "the Gone lock check covers the fork, now the pane's conversation, and the original"
     );
 }

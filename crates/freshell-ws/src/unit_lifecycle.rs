@@ -138,10 +138,13 @@ fn unit_keys(unit: &AgentUnit, operation_id: Option<&str>) -> UnitLogKeys {
 /// returned:
 ///
 /// 0. a Codex unit whose stop has not begun reads once which thread lock
-///    files its members hold ([`crate::unit_threads::reconcile_loaded`]), so
-///    every thread its app-server holds that no event announced is on the
-///    unit (registry key and unit record) before the first signal
-///    (Stage 2: LB-51, LB-31);
+///    files its members hold
+///    ([`crate::unit_threads::reconcile_before_stop`]), so every thread its
+///    app-server holds that no event announced is on the unit (registry key,
+///    unit record and lock paths) before the first signal (Stage 2: LB-51,
+///    LB-31). The read is bounded
+///    ([`crate::unit_threads::STOP_READ_DEADLINE`]): one that does not
+///    finish in time is logged as could-not-check and the stop goes on;
 /// 1. join decision from the owner registry: a key of the unit already
 ///    Stopping makes this call a join under that key's operation;
 /// 2. `begin_unit_stop` and one live `stopping` owner frame per key moved;
@@ -202,18 +205,71 @@ fn stop_target(state: &WsState, entry: &UnitEntry) -> StopTarget {
     }
 }
 
-/// [`stop_terminal_unit`], all six steps.
+/// [`stop_terminal_unit`], all six steps. Before them, a Codex unit whose
+/// stop has not begun gets one bounded read of the threads its app-server
+/// holds ([`crate::unit_threads::reconcile_before_stop`], Stage 2: LB-51),
+/// on the caller's thread: at most
+/// [`crate::unit_threads::STOP_READ_DEADLINE`].
 pub(crate) fn start_unit_stop(
     state: &WsState,
     entry: &UnitEntry,
     cmd: UnitStopCommand,
 ) -> UnitStop {
-    let target = stop_target(state, entry);
-    if entry.provider == "codex" && entry.unit.stop_in_flight().is_none() {
-        if let Some(tid) = target.terminal_id.as_deref() {
-            crate::unit_threads::reconcile_loaded(state, tid);
+    if let Some(terminal_id) = threads_to_read_before_stop(state, entry) {
+        crate::unit_threads::reconcile_before_stop(state, &terminal_id);
+    }
+    start_unit_stop_after_read(state, entry, cmd)
+}
+
+/// [`start_unit_stop`] for a caller on a connection's message loop (a
+/// Shift-X): the bounded read before the first signal runs on a blocking
+/// thread and is awaited there, so the loop's own thread is never blocked
+/// by it.
+pub(crate) async fn start_unit_stop_off_loop(
+    state: &WsState,
+    entry: &UnitEntry,
+    cmd: UnitStopCommand,
+) -> UnitStop {
+    if let Some(terminal_id) = threads_to_read_before_stop(state, entry) {
+        let (reading, unit_entry) = (state.clone(), entry.clone());
+        let read = tokio::task::spawn_blocking(move || {
+            crate::unit_threads::reconcile_before_stop(&reading, &terminal_id);
+        })
+        .await;
+        if let Err(join_error) = read {
+            let keys = unit_keys(&unit_entry.unit, None);
+            tracing::warn!(target: "freshell_unit",
+                event = "unit.threads.reconcile_panicked",
+                unit_id = %keys.unit_id,
+                provider = %keys.provider,
+                session_id = %keys.session_id.as_deref().unwrap_or(""),
+                terminal_id = %unit_entry.terminal_id.as_deref().unwrap_or(""),
+                operation_id = "",
+                error = %join_error,
+                "the read of the threads the app-server holds before the stop panicked; the stop goes on");
         }
     }
+    start_unit_stop_after_read(state, entry, cmd)
+}
+
+/// The terminal whose app-server's threads are read before this stop
+/// signals: a Codex unit's, while its stop has not begun (a joining stop
+/// comes after the first signal, and Shift-X on a Stopping unit stays an
+/// immediate escalation).
+fn threads_to_read_before_stop(state: &WsState, entry: &UnitEntry) -> Option<String> {
+    if entry.provider != "codex" || entry.unit.stop_in_flight().is_some() {
+        return None;
+    }
+    stop_target(state, entry).terminal_id
+}
+
+/// [`start_unit_stop`] without the read before it.
+fn start_unit_stop_after_read(
+    state: &WsState,
+    entry: &UnitEntry,
+    cmd: UnitStopCommand,
+) -> UnitStop {
+    let target = stop_target(state, entry);
     let operation_id = stop_operation(state, &entry.unit, &cmd.operation_id);
     let moved = move_unit_keys(state, &target, &operation_id, &cmd.initiator);
     launch_unit_stop(state, entry, &target, cmd, operation_id, moved)
@@ -1258,7 +1314,9 @@ async fn end_row_of_gone_unit(state: &WsState, unit: &AgentUnit, terminal_id: &s
 /// 2. The durable pane close, unless the kill is a stuck restart (the pane
 ///    stays resumable); a failed close answers failure and stops nothing.
 /// 3. The unit's stop (Force; `ShiftX`, or `StuckRestart`), which cancels a
-///    start and remembers the pane's create-request id as killed.
+///    start and remembers the pane's create-request id as killed. Its
+///    bounded read before the first signal runs on a blocking thread
+///    ([`start_unit_stop_off_loop`]).
 /// 4. With a `requestId`, `terminal.killed{success}` is sent only at Gone,
 ///    after the keys the kill moved are released and the start settled
 ///    (a cancelled start settles once its create released its claims), by
@@ -1327,7 +1385,7 @@ pub(crate) async fn kill_unit(
     } else {
         (StopReason::ShiftX, initiator.to_string())
     };
-    let stop = start_unit_stop(
+    let stop = start_unit_stop_off_loop(
         state,
         &entry,
         UnitStopCommand {
@@ -1337,7 +1395,8 @@ pub(crate) async fn kill_unit(
             operation_id: fresh_operation("term-kill"),
             record_stopped_pane: !stuck_recovery,
         },
-    );
+    )
+    .await;
 
     // 4.
     if reply.has_request_id() {

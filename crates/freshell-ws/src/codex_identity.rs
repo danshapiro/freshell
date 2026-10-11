@@ -61,6 +61,12 @@ pub(crate) async fn adopt_codex_identity(state: &WsState, a: CodexAdoption<'_>) 
     if codex_claim_refused(state, a.terminal_id, a.thread_id).await {
         return false;
     }
+    // Task 14: a thread the pane's unit already holds as an extra thread
+    // (announced before it was adopted) becomes the pane's own
+    // conversation, on every adoption lane: its extra hold is released
+    // right before the claim, with nothing awaited in between (the guards
+    // above awaited before it), and held again when the claim is refused.
+    let released_extra = crate::unit_threads::release_for_main(state, a.terminal_id, a.thread_id);
     // b8ke ext r14 F1: the authority is acquired FIRST and held across
     // the identity homes' writes; the owner commits + broadcasts only
     // AFTER the registry/metadata/durable-binding updates all landed
@@ -77,6 +83,9 @@ pub(crate) async fn adopt_codex_identity(state: &WsState, a: CodexAdoption<'_>) 
     )
     .await
     else {
+        if released_extra {
+            crate::unit_threads::restore_extra(state, a.terminal_id, a.thread_id);
+        }
         return false;
     };
     let applied = apply_codex_identity(
@@ -119,7 +128,7 @@ pub(crate) async fn adopt_codex_identity(state: &WsState, a: CodexAdoption<'_>) 
         .await;
         return false;
     }
-    crate::identity_ownership::coordinator_commit_identity(
+    let committed = crate::identity_ownership::coordinator_commit_identity(
         state,
         authority,
         "codex",
@@ -127,7 +136,15 @@ pub(crate) async fn adopt_codex_identity(state: &WsState, a: CodexAdoption<'_>) 
         a.thread_id,
         None,
     )
-    .await
+    .await;
+    if !committed && released_extra {
+        // The claim did not commit: the thread the app-server holds goes
+        // back to being an extra thread of the pane.
+        crate::unit_threads::restore_extra(state, a.terminal_id, a.thread_id);
+    }
+    // The pane's conversation is known now: its lock joins the unit's.
+    crate::unit_threads::refresh_lock_paths(state, a.terminal_id);
+    committed
 }
 
 /// Move a live pane's codex identity to a fork child. Guards: (1) the pane is
