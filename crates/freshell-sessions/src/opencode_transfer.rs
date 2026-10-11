@@ -415,6 +415,37 @@ struct SnapshotFileIdentity {
 }
 
 impl SnapshotFileIdentity {
+    fn changed_field(&self, current: &Self) -> Option<&'static str> {
+        if self.bytes != current.bytes {
+            return Some("bytes");
+        }
+        #[cfg(unix)]
+        for (index, field) in [
+            "device",
+            "inode",
+            "uid",
+            "mode",
+            "ctime",
+            "ctime_nsec",
+            "gid",
+        ]
+        .iter()
+        .enumerate()
+        {
+            if self.unix_identity[index] != current.unix_identity[index] {
+                return Some(field);
+            }
+        }
+        if self.modified != current.modified {
+            return Some("modified");
+        }
+        #[cfg(not(unix))]
+        if self.created != current.created {
+            return Some("created");
+        }
+        None
+    }
+
     fn read(path: &Path) -> Result<Self, TransferError> {
         let metadata = fs::symlink_metadata(path)?;
         if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -450,6 +481,24 @@ struct SnapshotFiles {
 }
 
 impl SnapshotFiles {
+    fn changed_binding(&self, current: &Self) -> Option<String> {
+        if let Some(field) = self.database.changed_field(&current.database) {
+            return Some(format!("database_{field}"));
+        }
+        for (index, name) in ["wal", "journal"].iter().enumerate() {
+            match (&self.sidecars[index], &current.sidecars[index]) {
+                (Some(before), Some(after)) => {
+                    if let Some(field) = before.changed_field(after) {
+                        return Some(format!("{name}_{field}"));
+                    }
+                }
+                (None, None) => {}
+                _ => return Some(format!("{name}_presence")),
+            }
+        }
+        None
+    }
+
     fn read(path: &Path) -> Result<Self, TransferError> {
         let mut sidecars = Vec::new();
         for suffix in ["-wal", "-journal"] {
@@ -1231,18 +1280,29 @@ pub fn export_exact_session(
 
     let source_path = resolve_exact_source(inventory, root_session_id)?;
     if let Some(qualified) = &inventory.qualified_snapshot {
-        if source_path.canonicalize()? != qualified.path
-            || fs::metadata(&qualified.path)?.len() != qualified.receipt.snapshot_bytes
-            || SnapshotFiles::read(&qualified.path)? != qualified.files
-            || !qualified
-                .receipt
-                .roots
-                .iter()
-                .any(|root| root.root_session_id == root_session_id)
+        let changed = if source_path.canonicalize()? != qualified.path {
+            Some("path".into())
+        } else if fs::metadata(&qualified.path)?.len() != qualified.receipt.snapshot_bytes {
+            Some("bytes".into())
+        } else if let Some(binding) = qualified
+            .files
+            .changed_binding(&SnapshotFiles::read(&qualified.path)?)
         {
-            return Err(TransferError::Blocked(
-                "qualified snapshot bytes, selected root or source binding changed".into(),
-            ));
+            Some(binding)
+        } else if !qualified
+            .receipt
+            .roots
+            .iter()
+            .any(|root| root.root_session_id == root_session_id)
+        {
+            Some("selected_root".into())
+        } else {
+            None
+        };
+        if let Some(changed) = changed {
+            return Err(TransferError::Blocked(format!(
+                "qualified snapshot changed: {changed}"
+            )));
         }
     }
     let source = open_source_read_only(&source_path)?;
@@ -3241,7 +3301,20 @@ fn create_online_backup(source: &Connection, destination: &Path) -> Result<(), T
         .run_to_completion(128, Duration::from_millis(5), None)
         .map_err(|error| {
             TransferError::Blocked(format!("consistent SQLite snapshot failed: {error}"))
-        })
+        })?;
+    drop(backup);
+    // The new private copy must not retain WAL mode: SQLite's root reader
+    // reasserts WAL ownership on open, changing ctime even without a write.
+    // Stabilize only this extraction-owned database before it is qualified;
+    // all later database and sidecar identity fences remain intact.
+    let journal_mode: String =
+        target.query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))?;
+    if journal_mode != "delete" {
+        return Err(TransferError::Blocked(
+            "private SQLite snapshot journal mode could not be stabilized".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn prepare_extraction_root(path: &Path) -> Result<PathBuf, TransferError> {
@@ -4612,6 +4685,183 @@ mod windows_extraction_acl_tests {
 #[cfg(test)]
 mod native_source_inventory_tests {
     use super::*;
+
+    fn qualified_fixture(dir: &Path) -> QualifiedSourceSnapshot {
+        let path = dir.join("source.db");
+        let db = source(&path);
+        db.execute("INSERT INTO project(id,worktree,time_created,time_updated,sandboxes) VALUES ('prj','/synthetic',1,1,'[]')", []).unwrap();
+        db.execute("INSERT INTO session(id,slug,project_id,directory,title,version,time_created,time_updated) VALUES ('ses_exact','slug','prj','/synthetic','synthetic','1',1,1)", []).unwrap();
+        drop(db);
+        capture_qualified_snapshot(
+            &HostOpenCodeInventory::new(path),
+            &["ses_exact".into()],
+            &dir.join("snapshot.db"),
+            ExportOptions::new(dir.join("extract")),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn qualified_wal_capture_exports_all_seven_roots_without_reader_identity_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.db");
+        let db = source(&path);
+        db.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        db.execute("INSERT INTO project(id,worktree,time_created,time_updated,sandboxes) VALUES ('prj','/synthetic',1,1,'[]')", []).unwrap();
+        let roots = (0..7)
+            .map(|index| format!("ses_root_{index}"))
+            .collect::<Vec<_>>();
+        for root in &roots {
+            db.execute("INSERT INTO session(id,slug,project_id,directory,title,version,time_created,time_updated) VALUES (?1,'slug','prj','/synthetic','synthetic','1',1,1)", [root]).unwrap();
+        }
+        let original_hash = hash_file(&path).unwrap();
+        let options = ExportOptions::new(dir.path().join("extract"));
+        let qualified = capture_qualified_batch(
+            &HostOpenCodeInventory::new(path.clone()),
+            &roots,
+            options.clone(),
+        )
+        .unwrap();
+        for root in &roots {
+            let exported =
+                export_exact_session(&qualified.inventory(), root, options.clone()).unwrap();
+            assert_eq!(
+                source_graph_fingerprint(exported.manifest()).unwrap(),
+                qualified
+                    .receipt
+                    .roots
+                    .iter()
+                    .find(|captured| &captured.root_session_id == root)
+                    .unwrap()
+                    .graph_fingerprint
+            );
+        }
+        assert_eq!(hash_file(&path).unwrap(), original_hash);
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM session", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            7
+        );
+    }
+
+    fn assert_qualified_refusal(qualified: &QualifiedSourceSnapshot, dir: &Path, reason: &str) {
+        let result = export_exact_session(
+            &qualified.inventory(),
+            "ses_exact",
+            ExportOptions::new(dir.join("extract")),
+        );
+        let error = result
+            .err()
+            .expect("changed qualified snapshot must refuse export");
+        assert!(
+            matches!(error, TransferError::Blocked(ref actual) if actual == reason),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn qualified_snapshot_guard_classifies_size_and_selected_root_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let qualified = qualified_fixture(dir.path());
+        let mut wrong_size = qualified.clone();
+        wrong_size.receipt.snapshot_bytes += 1;
+        assert_qualified_refusal(&wrong_size, dir.path(), "qualified snapshot changed: bytes");
+        let mut wrong_root = qualified.clone();
+        wrong_root.receipt.roots.clear();
+        assert_qualified_refusal(
+            &wrong_root,
+            dir.path(),
+            "qualified snapshot changed: selected_root",
+        );
+        let mut wrong_path = qualified.clone();
+        wrong_path.path = dir.path().join("extract").join("..").join("snapshot.db");
+        assert_qualified_refusal(&wrong_path, dir.path(), "qualified snapshot changed: path");
+    }
+
+    #[test]
+    fn qualified_snapshot_guard_classifies_actual_sidecar_presence() {
+        for (suffix, reason) in [
+            ("-wal", "qualified snapshot changed: wal_presence"),
+            ("-journal", "qualified snapshot changed: journal_presence"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let qualified = qualified_fixture(dir.path());
+            let sidecar = PathBuf::from(format!("{}{suffix}", qualified.path.display()));
+            fs::write(sidecar, []).unwrap();
+            assert_qualified_refusal(&qualified, dir.path(), reason);
+        }
+    }
+
+    #[test]
+    fn qualified_snapshot_guard_still_refuses_actual_database_writes_and_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let qualified = qualified_fixture(dir.path());
+        let writer = Connection::open(&qualified.path).unwrap();
+        writer
+            .execute(
+                "UPDATE session SET title='changed' WHERE id='ses_exact'",
+                [],
+            )
+            .unwrap();
+        drop(writer);
+        let error = export_exact_session(
+            &qualified.inventory(),
+            "ses_exact",
+            ExportOptions::new(dir.path().join("extract")),
+        )
+        .err()
+        .expect("native content writes must refuse qualified export");
+        assert!(
+            matches!(error, TransferError::Blocked(ref reason) if reason.starts_with("qualified snapshot changed: database_")),
+            "{error:?}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let qualified = qualified_fixture(dir.path());
+        OpenOptions::new()
+            .append(true)
+            .open(&qualified.path)
+            .unwrap()
+            .write_all(&[0; 4096])
+            .unwrap();
+        assert_qualified_refusal(&qualified, dir.path(), "qualified snapshot changed: bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qualified_snapshot_guard_classifies_actual_mode_and_file_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let qualified = qualified_fixture(dir.path());
+        fs::set_permissions(&qualified.path, fs::Permissions::from_mode(0o400)).unwrap();
+        assert_qualified_refusal(
+            &qualified,
+            dir.path(),
+            "qualified snapshot changed: database_mode",
+        );
+        fs::set_permissions(&qualified.path, fs::Permissions::from_mode(0o600)).unwrap();
+        let error = export_exact_session(
+            &qualified.inventory(),
+            "ses_exact",
+            ExportOptions::new(dir.path().join("extract")),
+        )
+        .err()
+        .expect("restored mode must retain changed ctime fence");
+        assert!(
+            matches!(error, TransferError::Blocked(ref reason) if reason == "qualified snapshot changed: database_ctime" || reason == "qualified snapshot changed: database_ctime_nsec")
+        );
+        let mut qualified = qualified;
+        qualified.files = SnapshotFiles::read(&qualified.path).unwrap();
+        let replacement = dir.path().join("replacement.db");
+        fs::copy(&qualified.path, &replacement).unwrap();
+        fs::rename(&replacement, &qualified.path).unwrap();
+        assert_qualified_refusal(
+            &qualified,
+            dir.path(),
+            "qualified snapshot changed: database_inode",
+        );
+    }
 
     fn source(path: &Path) -> Connection {
         let db = Connection::open(path).unwrap();
