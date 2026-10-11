@@ -375,6 +375,8 @@ pub(crate) mod capture {
     #[derive(Debug, Clone, Default)]
     pub struct CapturedEvent {
         pub target: String,
+        /// The event's level (`"ERROR"`, `"WARN"`, ...).
+        pub level: String,
         pub message: String,
         pub fields: BTreeMap<String, String>,
     }
@@ -426,6 +428,7 @@ pub(crate) mod capture {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(CapturedEvent {
                     target: event.metadata().target().to_string(),
+                    level: event.metadata().level().to_string(),
                     message: visitor.message,
                     fields: visitor.fields,
                 });

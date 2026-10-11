@@ -262,6 +262,15 @@ pub enum CodexLaunchError {
     /// [`GONE_WAIT_BOUND`]: no further attempt starts while it may still
     /// hold the conversation lock (attempts never overlap). Never retried.
     Unconfirmed(String),
+    /// The resumed conversation's writer lock is held by another process
+    /// (found by file descriptor under the Codex home the new app-server
+    /// reported, Stage 2: LB-28, LB-29): the attempt's unit was stopped and
+    /// nothing else starts. A decision, never retried: the caller answers
+    /// with the holder (a pane's unit member: that pane; anything else: the
+    /// process by pid and name).
+    ThreadHeld {
+        holder: freshell_containment::LockHolder,
+    },
 }
 
 impl std::fmt::Display for CodexLaunchError {
@@ -278,6 +287,13 @@ impl std::fmt::Display for CodexLaunchError {
                 "codex conversation {session_id} never materialized (no rollout); it cannot be resumed"
             ),
             CodexLaunchError::Unconfirmed(message) => f.write_str(message),
+            CodexLaunchError::ThreadHeld { holder } => write!(
+                f,
+                "codex conversation lock {} is held by process {} ({})",
+                holder.path.display(),
+                holder.pid,
+                holder.name
+            ),
         }
     }
 }
@@ -564,6 +580,28 @@ impl std::fmt::Debug for CodexTerminalLaunch {
 enum StartFailure {
     Failed(String),
     NotMaterialized(String),
+    ThreadHeld(freshell_containment::LockHolder),
+}
+
+/// The process holding the writer lock of the conversation `session_id` a
+/// plan resumes, under the Codex home the new app-server reported
+/// ([`freshell_containment::holder_before_resume`]: bounded; no home or a
+/// lookup that cannot finish in time is "could not check", never "held").
+async fn resume_target_holder(
+    runtime: &dyn CodexLaunchRuntime,
+    ready: &CodexRuntimeReady,
+    session_id: &str,
+) -> Option<freshell_containment::LockHolder> {
+    let keys = runtime
+        .unit()
+        .map(|unit| unit_log_keys(&unit))
+        .unwrap_or_default();
+    freshell_containment::holder_before_resume(
+        &keys,
+        ready.codex_home.as_deref().map(std::path::Path::new),
+        session_id,
+    )
+    .await
 }
 
 /// Whether the conversation `session_id` a plan resumes may have
@@ -694,13 +732,15 @@ impl CodexLaunchPlanner {
                 .ensure_ready(plan.runtime_cwd.clone())
                 .await
                 .map_err(StartFailure::Failed)?;
-            // A new app-server can resume only a conversation that
-            // materialized (Stage 2: LB-41); a reattached survivor already
-            // has its conversation loaded.
-            if let Some(sid) = plan.session_id.as_deref() {
-                if !runtime.reattached()
-                    && !resume_target_materialized(runtime.as_ref(), &ready, sid).await
-                {
+            // A new app-server can resume only a conversation no other
+            // process holds (Stage 2: LB-29) and that materialized (LB-41).
+            // A reattached survivor holds its conversation by design and
+            // already has it loaded.
+            if let Some(sid) = plan.session_id.as_deref().filter(|_| !runtime.reattached()) {
+                if let Some(holder) = resume_target_holder(runtime.as_ref(), &ready, sid).await {
+                    return Err(StartFailure::ThreadHeld(holder));
+                }
+                if !resume_target_materialized(runtime.as_ref(), &ready, sid).await {
                     return Err(StartFailure::NotMaterialized(sid.to_string()));
                 }
             }
@@ -780,6 +820,7 @@ impl CodexLaunchPlanner {
                     StartFailure::NotMaterialized(session_id) => {
                         CodexLaunchError::NotMaterialized { session_id }
                     }
+                    StartFailure::ThreadHeld(holder) => CodexLaunchError::ThreadHeld { holder },
                 })
             }
         }
@@ -820,11 +861,14 @@ impl CodexLaunchPlanner {
                         );
                         return Err(CodexLaunchError::Cancelled);
                     }
-                    // A conversation that never materialized is a decision,
-                    // and an attempt not confirmed Gone forbids another.
+                    // A conversation that never materialized or that another
+                    // process holds is a decision, and an attempt not
+                    // confirmed Gone forbids another.
                     if matches!(
                         error,
-                        CodexLaunchError::NotMaterialized { .. } | CodexLaunchError::Unconfirmed(_)
+                        CodexLaunchError::NotMaterialized { .. }
+                            | CodexLaunchError::ThreadHeld { .. }
+                            | CodexLaunchError::Unconfirmed(_)
                     ) {
                         return Err(error);
                     }

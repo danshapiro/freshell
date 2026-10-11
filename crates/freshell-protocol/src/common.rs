@@ -111,6 +111,11 @@ pub enum ErrorCode {
     /// fresh start is the only new-session path, never an automatic
     /// substitution).
     SessionMissing,
+    /// Task 16: the conversation's writer lock is held by a process outside
+    /// Freshell (a shell `codex`, Codex's own daemon or desktop app, `codex
+    /// exec`): nothing was started, and the frame names the holder by pid
+    /// and process name (`holderPid`, `holderCommand`).
+    ConversationHeldElsewhere,
 }
 
 /// The frozen sessionRef-naming refusal text for the legacy `resumeSessionId`
@@ -121,6 +126,17 @@ pub enum ErrorCode {
 /// (`terminal_tabs.rs`) and `freshell-ws` (`terminal.rs`) reference this const
 /// instead of carrying private duplicates.
 pub const LEGACY_RESUME_IDENTITY_REFUSAL: &str = "Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.";
+
+/// Task 16: what a reopen answers when a process outside Freshell holds the
+/// conversation (`CONVERSATION_HELD_ELSEWHERE`), naming it by pid and process
+/// NAME, never its command line (Stage 2: LB-46). One text for every door
+/// (WebSocket creates, REST, freshcodex).
+pub fn conversation_held_elsewhere_message(pid: u32, name: &str) -> String {
+    format!(
+        "This conversation is open in another program (pid {pid}: {name}). Close it there, \
+         then reopen it here."
+    )
+}
 
 /// The refusal text for a `freshAgent.create` arriving while the shared
 /// `settings.freshAgent.enabled` gate is off: the dispatch must ANSWER with

@@ -1274,6 +1274,8 @@ impl FreshOpencodeState {
             terminal_exit_code: None,
             terminal_id: None,
             live_terminal_id: None,
+            holder_pid: None,
+            holder_command: None,
         }));
     }
 

@@ -91,17 +91,43 @@ pub fn start_waited(k: &UnitLogKeys, entry_point: &str, wait_ms: u64) {
         "unit start waited");
 }
 
-/// Codex refused a writer ("already has an active writer" / "open in another
-/// app"); `holder_name` is the holder's process name, never its command line.
+/// Why a writer conflict names no holder (`reason` of `unit.writer_conflict`).
+pub const HOLDER_OUTSIDE_VIEW: &str = "held by a process outside Freshell's view";
+
+/// Codex refused a writer, or would have ("already has an active writer" /
+/// "open in another app"), which `source` saw (`preflight`, `proxy`,
+/// `freshcodex`, `rest`). Always an ERROR. `holder` is the holder's pid and
+/// process name (never its command line) when one is visible; when none is
+/// (another uid or pid namespace, no known Codex home, a lookup that could
+/// not finish: `detail` says which), `holder_visible` is false and the reason
+/// is [`HOLDER_OUTSIDE_VIEW`]: the lock is never reported as released.
 pub fn writer_conflict(
     k: &UnitLogKeys,
     thread_id: &str,
-    holder_pid: Option<u32>,
-    holder_name: Option<&str>,
+    holder: Option<(u32, &str)>,
     source: &str,
+    detail: &str,
 ) {
-    keyed!(error, k, "unit.writer_conflict", thread_id = %thread_id, holder_pid = holder_pid.unwrap_or(0),
-        holder_name = %holder_name.unwrap_or(""), source = %source, "conversation writer conflict");
+    let (holder_pid, holder_name) = holder.unwrap_or((0, ""));
+    let holder_visible = holder.is_some();
+    let reason = if holder_visible {
+        ""
+    } else {
+        HOLDER_OUTSIDE_VIEW
+    };
+    keyed!(error, k, "unit.writer_conflict", thread_id = %thread_id, holder_pid,
+        holder_name = %holder_name, holder_visible, reason = %reason, source = %source,
+        detail = %detail, "conversation writer conflict");
+}
+
+/// The check for another process holding a conversation before it is
+/// resumed was skipped (`reason`: `no_codex_home`, the app-server reported
+/// no Codex home; `lookup_unchecked`, the lookup could not finish in time,
+/// `detail` says why): nothing is known, so the resume proceeds and Codex's
+/// own lock decides. Never read as "held".
+pub fn resume_preflight_skipped(k: &UnitLogKeys, thread_id: &str, reason: &str, detail: &str) {
+    keyed!(warn, k, "unit.resume_preflight.skipped", thread_id = %thread_id, reason = %reason,
+        detail = %detail, "the check for another holder of the resumed conversation was skipped; the resume proceeds");
 }
 
 /// The listener on the allocated port is not owned by a member of this unit,
@@ -256,8 +282,9 @@ mod tests {
             escalated(&k, "SIGINT", "SIGKILL", 1000);
             unconfirmed(&k, 5000, "main");
             start_waited(&k, "auto-resume", 40);
-            writer_conflict(&k, "t-1", None, None, "resume");
+            writer_conflict(&k, "t-1", None, "proxy", "no holder visible");
             main_discovery_failed(&k, 41000, 4242);
+            resume_preflight_skipped(&k, "t-1", "no_codex_home", "");
         });
         let names: Vec<&str> = events.iter().map(|e| e.str("event")).collect();
         assert_eq!(
@@ -271,6 +298,7 @@ mod tests {
                 "unit.start.waited",
                 "unit.writer_conflict",
                 "unit.main_discovery_failed",
+                "unit.resume_preflight.skipped",
             ]
         );
         for event in &events {
@@ -294,6 +322,7 @@ mod tests {
                 Level::ERROR,
                 Level::INFO,
                 Level::ERROR,
+                Level::WARN,
                 Level::WARN
             ]
         );
@@ -303,8 +332,46 @@ mod tests {
         assert_eq!(events[2].fields["lock_released"], FieldValue::Bool(true));
         assert_eq!(events[6].u64("holder_pid"), 0);
         assert_eq!(events[6].str("holder_name"), "");
+        assert_eq!(events[6].fields["holder_visible"], FieldValue::Bool(false));
         assert_eq!(events[7].u64("port"), 41000);
         assert_eq!(events[7].u64("launcher_pid"), 4242);
+        assert_eq!(events[8].str("thread_id"), "t-1");
+        assert_eq!(events[8].str("reason"), "no_codex_home");
+    }
+
+    /// A writer conflict is an ERROR whether or not its holder is visible,
+    /// names a visible holder by pid and process name only (never a command
+    /// line), and never reports an unseen holder's lock as released.
+    #[test]
+    fn a_writer_conflict_names_its_holder_or_says_it_is_outside_view() {
+        let k = keys();
+        let events = capture(|| {
+            writer_conflict(&k, "t-1", Some((4242, "perl")), "preflight", "");
+            writer_conflict(&k, "t-2", None, "proxy", "no holder visible");
+        });
+        assert_eq!(events.len(), 2);
+        for event in &events {
+            assert_eq!(event.level, tracing::Level::ERROR);
+            assert_eq!(event.str("event"), "unit.writer_conflict");
+            assert!(!event.fields.contains_key("holder_command"));
+            assert!(!event.fields.contains_key("argv"));
+        }
+        let seen = &events[0];
+        assert_eq!(seen.str("thread_id"), "t-1");
+        assert_eq!(seen.u64("holder_pid"), 4242);
+        assert_eq!(seen.str("holder_name"), "perl");
+        assert_eq!(seen.fields["holder_visible"], FieldValue::Bool(true));
+        assert_eq!(seen.str("source"), "preflight");
+        assert_eq!(seen.str("reason"), "");
+        let unseen = &events[1];
+        assert_eq!(unseen.u64("holder_pid"), 0);
+        assert_eq!(unseen.fields["holder_visible"], FieldValue::Bool(false));
+        assert_eq!(
+            unseen.str("reason"),
+            "held by a process outside Freshell's view"
+        );
+        assert_eq!(unseen.str("detail"), "no holder visible");
+        assert_eq!(unseen.str("source"), "proxy");
     }
 
     #[test]

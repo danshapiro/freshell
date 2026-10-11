@@ -3516,6 +3516,99 @@ mod unit_sidecar {
         assert!(store.load_all().is_empty(), "its sidecar record is removed");
     }
 
+    /// Task 16: a resume of a conversation another process holds (a shell
+    /// `codex`, Codex's own daemon, `codex exec`) ends the plan at once as
+    /// `ThreadHeld`, naming the holder by pid and process name: the lock is
+    /// looked up under the Codex home the new app-server reported, right
+    /// after it is ready and before the rollout check (no rollout is seeded
+    /// here), the attempt's unit is Gone before the answer, and no second
+    /// attempt starts (Stage 2: LB-29).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resume_of_a_thread_another_process_holds_is_thread_held_and_never_retried() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(CodexSidecarStore::new(home.path().join("records")));
+        let lifecycle = Arc::new(RecordingLifecycle::default());
+        let holder = fake_codex::OutsideHolder::hold(&fake_codex::thread_lock_path(
+            home.path(),
+            "t-held-out",
+        ));
+        let planner = realistic_planner(home.path(), store.clone(), json!({}));
+        let result = timeout(
+            LIMIT,
+            planner.plan_create_with_retry(
+                &plan_input_with_seed(
+                    "t-held-out",
+                    recording_seed("t-held-out", lifecycle.clone()),
+                ),
+                5,
+                0,
+            ),
+        )
+        .await
+        .expect("the plan settles");
+        match &result {
+            Err(CodexLaunchError::ThreadHeld { holder: found }) => {
+                assert_eq!(found.pid, holder.pid(), "the holder by file descriptor");
+                assert_eq!(found.name, "perl", "named by process name");
+                assert_eq!(
+                    found.path,
+                    fake_codex::thread_lock_path(home.path(), "t-held-out")
+                );
+            }
+            other => panic!("expected ThreadHeld, got {other:?}"),
+        }
+        assert_eq!(lifecycle.attempts().len(), 1, "never retried");
+        let unit = lifecycle.attempts()[0].clone();
+        assert!(
+            unit.stop_in_flight()
+                .is_some_and(|stop| stop.try_report().is_some()),
+            "the attempt's unit is Gone before the answer"
+        );
+        for pid in manifest_pids(&home.path().join("manifests")) {
+            wait_dead(pid).await;
+        }
+        assert!(store.load_all().is_empty(), "its sidecar record is removed");
+        assert!(
+            fake_codex::pid_alive(holder.pid()),
+            "the holder is never signalled"
+        );
+    }
+
+    /// An app-server that reports no Codex home gives no lock path to check:
+    /// the holder check is skipped (WARN) and the resume proceeds, leaving
+    /// Codex's own lock to decide, as when the lookup cannot finish in time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resume_with_no_reported_codex_home_proceeds_without_the_holder_check() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(CodexSidecarStore::new(home.path().join("records")));
+        let _holder = fake_codex::OutsideHolder::hold(&fake_codex::thread_lock_path(
+            home.path(),
+            "t-no-home",
+        ));
+        let planner = realistic_planner(
+            home.path(),
+            store.clone(),
+            json!({"overrides": {"initialize": {"result": {"userAgent": "no-home/1"}}}}),
+        );
+        let launch = timeout(
+            LIMIT,
+            planner.plan_create_with_retry(
+                &plan_input_with_seed("t-no-home", tag_seed("t-no-home")),
+                5,
+                0,
+            ),
+        )
+        .await
+        .expect("the plan settles")
+        .expect("the resume proceeds");
+        assert_eq!(launch.ready.codex_home, None, "no home was reported");
+        launch
+            .sidecar
+            .stop_and_finish(StopMode::Force, StopReason::ShiftX, "test")
+            .await
+            .expect("stopped");
+    }
+
     /// A Codex home whose rollout tree cannot be read proves nothing about
     /// the conversation: the resume proceeds (Codex itself then decides),
     /// never silently becoming a new conversation.

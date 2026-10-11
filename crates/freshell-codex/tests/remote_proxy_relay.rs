@@ -1259,3 +1259,114 @@ async fn close_tears_down_active_connections_and_stops_accepting_new_ones() {
         panic!("expected connecting after close() to fail (listener stopped)");
     }
 }
+
+/// Task 16: Codex's writer refusal answering a pending `thread/resume` is a
+/// writer conflict, naming the thread the REQUEST asked for (kept beside the
+/// pending method), and the refusal still relays verbatim. Other errors and
+/// other methods' refusals are not conflicts.
+#[tokio::test]
+async fn a_writer_refusal_of_a_resume_is_a_writer_conflict_naming_the_requested_thread() {
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, false))
+            .await
+            .unwrap();
+    let mut tui = connect_tui(proxy.ws_url()).await;
+    let mut conn = upstream.accept().await;
+
+    // Not a conflict: another error of a resume, and the refusal text
+    // answering some other method.
+    let requests = [
+        (5, "thread/resume", "t-other"),
+        (6, "turn/start", "t-other"),
+        (7, "thread/resume", "t-held"),
+    ];
+    for (id, method, thread) in requests {
+        tui.send(Message::Text(
+            json!({"id": id, "method": method, "params": {"threadId": thread, "cwd": "/"}})
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+        conn.recv_text().await;
+    }
+    let refusal_text = "thread-store conflict: thread t-held already has an active writer";
+    let answers = [
+        json!({"id": 5, "error": {"code": -32600, "message": "no rollout found for thread id t-other"}}),
+        json!({"id": 6, "error": {"code": -32600, "message": "thread t-other already has an active writer"}}),
+        json!({"id": 7, "error": {"code": -32600, "message": refusal_text}}),
+    ];
+    for answer in &answers {
+        conn.send_text(answer.to_string());
+        assert_eq!(
+            recv_text(&mut tui).await,
+            answer.to_string(),
+            "relayed verbatim"
+        );
+    }
+    assert_eq!(
+        recv_events(&mut events, 1).await[0],
+        RemoteProxyEvent::WriterConflict {
+            thread_id: "t-held".to_string(),
+            message: refusal_text.to_string(),
+        }
+    );
+    assert!(
+        events.try_recv().is_err(),
+        "only the resume's writer refusal is a conflict"
+    );
+
+    proxy.close().await;
+}
+
+/// A resume request that names no thread (or a fork) still yields a
+/// conflict: the thread is taken from Codex's own message
+/// (`thread <id> already has an active writer`) when the request had none.
+#[tokio::test]
+async fn a_writer_refusal_without_a_requested_thread_names_the_thread_in_codexs_message() {
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, false))
+            .await
+            .unwrap();
+    let mut tui = connect_tui(proxy.ws_url()).await;
+    let mut conn = upstream.accept().await;
+
+    tui.send(Message::Text(
+        json!({"id": 11, "method": "thread/resume", "params": {"path": "/r/rollout.jsonl"}})
+            .to_string(),
+    ))
+    .await
+    .unwrap();
+    conn.recv_text().await;
+    let refusal = json!({"id": 11, "error": {"code": -32600,
+        "message": "thread-store conflict: thread t-from-msg already has an active writer"}});
+    conn.send_text(refusal.to_string());
+    assert_eq!(recv_text(&mut tui).await, refusal.to_string());
+    match &recv_events(&mut events, 1).await[0] {
+        RemoteProxyEvent::WriterConflict { thread_id, .. } => assert_eq!(thread_id, "t-from-msg"),
+        other => panic!("expected a writer conflict, got {other:?}"),
+    }
+
+    tui.send(Message::Text(
+        json!({"id": 12, "method": "thread/fork", "params": {"threadId": "t-parent"}}).to_string(),
+    ))
+    .await
+    .unwrap();
+    conn.recv_text().await;
+    conn.send_text(
+        json!({"id": 12, "error": {"code": -32600,
+            "message": "thread t-parent already has an active writer"}})
+        .to_string(),
+    );
+    let fork_conflict = loop {
+        match recv_events(&mut events, 1).await.remove(0) {
+            RemoteProxyEvent::WriterConflict { thread_id, .. } => break thread_id,
+            // The fork lane's own handling of an error answer follows.
+            _ => continue,
+        }
+    };
+    assert_eq!(fork_conflict, "t-parent");
+
+    proxy.close().await;
+}

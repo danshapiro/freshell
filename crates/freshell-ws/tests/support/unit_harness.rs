@@ -217,6 +217,16 @@ impl UnitHarness {
             hub
         });
 
+        // freshcodex claims its conversations in the same owner registry, as
+        // `main.rs` wires it, so a switch away from a freshcodex pane finds
+        // (and stops) it as the conversation's prior owner.
+        let mut fresh_codex = freshell_freshagent::FreshCodexState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            json!({ "freshAgent": { "enabled": false } }),
+        );
+        fresh_codex.set_ownership(Arc::clone(&ownership));
+
         let state = freshell_ws::WsState {
             pane_ledger: Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
             layout: Default::default(),
@@ -232,11 +242,7 @@ impl UnitHarness {
             broadcast_tx: Arc::clone(&broadcast_tx),
             auto_resume_tx,
             auto_resume_cancels: Default::default(),
-            fresh_codex: freshell_freshagent::FreshCodexState::new(
-                Arc::clone(&auth_token),
-                Arc::clone(&broadcast_tx),
-                json!({ "freshAgent": { "enabled": false } }),
-            ),
+            fresh_codex,
             fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
             fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
                 freshell_freshagent::FreshAgentState::new(

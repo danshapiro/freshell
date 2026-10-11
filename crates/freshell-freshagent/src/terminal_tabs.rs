@@ -833,8 +833,63 @@ fn codex_launch_error_response(
         CodexLaunchError::Unconfirmed(_) => StatusCode::INTERNAL_SERVER_ERROR,
         // The spawn starts a new conversation before it gets here.
         CodexLaunchError::NotMaterialized { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        // Answered by `thread_held_response` before it gets here.
+        CodexLaunchError::ThreadHeld { .. } => StatusCode::CONFLICT,
     };
     fail_json(status, error.to_string())
+}
+
+/// The REST answer to a Codex reopen whose conversation `thread_id`
+/// another process holds (`CodexLaunchError::ThreadHeld`, Task 16): a
+/// member of a live pane's unit (`UnitDirectory::entry_with_member`;
+/// membership decides, never an environment tag) is that pane, answered
+/// with today's 409 `RESTORE_UNAVAILABLE` carrying `liveTerminalId`; any
+/// other holder is a program outside Freshell, answered 409
+/// `CONVERSATION_HELD_ELSEWHERE` naming it by pid and process name (never
+/// its command line), with the ERROR `unit.writer_conflict` log. Blocking
+/// (a member read can scan every process).
+fn thread_held_response(
+    units: &freshell_containment::UnitDirectory,
+    thread_id: &str,
+    holder: &freshell_containment::LockHolder,
+) -> Response {
+    match units
+        .entry_with_member(holder.pid)
+        .and_then(|entry| entry.terminal_id)
+    {
+        Some(terminal_id) => fail_json_restore_unavailable(thread_id, Some(&terminal_id), None),
+        None => held_elsewhere_response(thread_id, holder),
+    }
+}
+
+/// 409 `CONVERSATION_HELD_ELSEWHERE` for `holder`, a program outside
+/// Freshell, plus the ERROR `unit.writer_conflict` log.
+fn held_elsewhere_response(thread_id: &str, holder: &freshell_containment::LockHolder) -> Response {
+    freshell_containment::events::writer_conflict(
+        &freshell_containment::events::UnitLogKeys {
+            provider: "codex".to_string(),
+            session_id: Some(thread_id.to_string()),
+            ..Default::default()
+        },
+        thread_id,
+        Some((holder.pid, &holder.name)),
+        "preflight",
+        "",
+    );
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "status": "error",
+            "code": "CONVERSATION_HELD_ELSEWHERE",
+            "message": freshell_protocol::conversation_held_elsewhere_message(
+                holder.pid,
+                &holder.name,
+            ),
+            "holderPid": holder.pid,
+            "holderCommand": holder.name,
+        })),
+    )
+        .into_response()
 }
 
 /// REST mapping of a spawn-gate rejection (WS analogue:
@@ -3113,6 +3168,24 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                                 &mut start_cancellation,
                             )),
                         );
+                    }
+                    // Another process holds the conversation (Task 16).
+                    if let freshell_codex::launch_lifecycle::CodexLaunchError::ThreadHeld {
+                        holder,
+                    } = error
+                    {
+                        let units = state.units.clone();
+                        let thread_id = resume_session_id.clone().unwrap_or_default();
+                        let (fallback_thread, fallback_holder) =
+                            (thread_id.clone(), holder.clone());
+                        // A failed membership read still names the holder.
+                        return Err(tokio::task::spawn_blocking(move || {
+                            thread_held_response(&units, &thread_id, &holder)
+                        })
+                        .await
+                        .unwrap_or_else(|_| {
+                            held_elsewhere_response(&fallback_thread, &fallback_holder)
+                        }));
                     }
                     // A conversation that never materialized: the answer
                     // carries the marker the spawn pipeline restarts on as a

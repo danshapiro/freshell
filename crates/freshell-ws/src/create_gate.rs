@@ -158,6 +158,18 @@ pub(crate) fn spawn_gated_restore_create(
                     state.create_dedupe.clear_if_in_flight(&create.request_id);
                     return;
                 }
+                // Another process holds the conversation (Task 16): the
+                // attempt's app-server was stopped; answer with the holder
+                // (a pane's terminal, or the program by pid and name).
+                Err(crate::terminal::PrepareError::ThreadHeld { thread_id, holder }) => {
+                    let mut out = CreateOutput::Channel(&sink);
+                    let _ = crate::unit_holders::answer_thread_held(
+                        &state, &mut out, &create, &thread_id, &holder,
+                    )
+                    .await;
+                    state.create_dedupe.clear_if_in_flight(&create.request_id);
+                    return;
+                }
                 // (No Reject arm: post-A12, prepare_launch cannot reject — the
                 // claude RESTORE_UNAVAILABLE ladder runs inside handle_create,
                 // after the adopt/D8 arms, exactly as today.)

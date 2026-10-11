@@ -74,6 +74,7 @@ pub(crate) mod tabs_store_migrate;
 pub mod tabs_store_model;
 pub mod terminal;
 pub mod terminal_meta;
+pub mod unit_holders;
 pub mod unit_lifecycle;
 pub mod unit_stopper;
 pub mod unit_threads;
@@ -1093,6 +1094,8 @@ async fn send_error(
         terminal_exit_code: None,
         terminal_id: None,
         live_terminal_id: None,
+        holder_pid: None,
+        holder_command: None,
     });
     match serde_json::to_string(&msg) {
         Ok(json) => socket.send(Message::Text(json.into())).await,

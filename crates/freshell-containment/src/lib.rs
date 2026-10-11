@@ -40,7 +40,10 @@ pub use directory::{
     UnitEntry, UnitLifecycle,
 };
 pub use listener::listening_socket_owner;
-pub use locks::{codex_thread_lock_path, lock_holders, lock_holders_among, LockHolder};
+pub use locks::{
+    codex_thread_lock_path, holder_before_resume, lock_holders, lock_holders_among,
+    lock_holders_within, report_writer_conflict, HolderLookup, LockHolder, HOLDER_LOOKUP_DEADLINE,
+};
 pub use proc_watch::{ProcWatch, Sig};
 pub use process::{identity, is_codex_daemon_family, ProcIdentity};
 pub use record::{UnitRecord, UnitRecordState};

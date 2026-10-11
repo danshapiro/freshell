@@ -56,6 +56,157 @@ pub fn codex_thread_lock_path(codex_home: &Path, thread_id: &str) -> PathBuf {
         .join(format!("{thread_id}.lock"))
 }
 
+/// How long the outside-holder lookup a reopen makes may take (waiting for
+/// an earlier lookup included) before the reopen goes on without it.
+pub const HOLDER_LOOKUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What a deadline-bounded holder lookup ([`lock_holders_within`]) found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HolderLookup {
+    /// The lookup ran to the end: every VISIBLE holder. Empty means none is
+    /// visible, which proves nothing about a holder this server cannot see
+    /// (another uid, another pid namespace) or, on Windows, one a failed
+    /// Restart Manager query hid; never read it as "released".
+    Checked(Vec<LockHolder>),
+    /// The lookup could not be made in time (`reason`): "could not check",
+    /// never "held" and never "free".
+    Unchecked(String),
+}
+
+/// [`lock_holders`] under a deadline, with at most one such lookup in
+/// flight in the process. The lookup runs on a blocking thread because it
+/// can wait on a hung network mount (macOS stats every open file through its
+/// filesystem; on Linux, narrow cases noted on `file_id`). A lookup still
+/// running when another is wanted is neither joined nor run beside: the new
+/// one waits for it within its own deadline, so stuck lookups never pile up
+/// in the blocking pool. Past the deadline the caller gets
+/// [`HolderLookup::Unchecked`] and the stuck lookup is left to finish on its
+/// own.
+pub async fn lock_holders_within(
+    paths: Vec<PathBuf>,
+    deadline: std::time::Duration,
+) -> HolderLookup {
+    static GATE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    let gate = GATE.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)));
+    bounded_lookup(gate, deadline, move || {
+        if let Some(delay) = crate::testing::holder_lookup_delay() {
+            std::thread::sleep(delay);
+        }
+        lock_holders(&paths)
+    })
+    .await
+}
+
+/// The process holding the writer lock of `thread_id`, which a resume is
+/// about to ask an app-server for (Task 16; Stage 2: LB-28, LB-29): one
+/// bounded lookup by file descriptor ([`lock_holders_within`]) of
+/// `<codex_home>/thread-writer-locks/<id>.lock` over every process of this
+/// server's uid, where `codex_home` is the home that app-server reported in
+/// `initialize` (never the server's ambient `CODEX_HOME`/`HOME`). A holder
+/// found by descriptor is alive (a zombie has no descriptors). With no
+/// (absolute) home, or a lookup that cannot finish in time, nothing is
+/// known: WARN `unit.resume_preflight.skipped` and `None`, so the resume
+/// proceeds and Codex's own lock decides; it is never read as "held".
+pub async fn holder_before_resume(
+    keys: &crate::events::UnitLogKeys,
+    codex_home: Option<&Path>,
+    thread_id: &str,
+) -> Option<LockHolder> {
+    let Some(home) = codex_home.filter(|home| home.is_absolute()) else {
+        crate::events::resume_preflight_skipped(keys, thread_id, "no_codex_home", "");
+        return None;
+    };
+    let lock = codex_thread_lock_path(home, thread_id);
+    match lock_holders_within(vec![lock], HOLDER_LOOKUP_DEADLINE).await {
+        HolderLookup::Checked(holders) => holders.into_iter().next(),
+        HolderLookup::Unchecked(detail) => {
+            crate::events::resume_preflight_skipped(keys, thread_id, "lookup_unchecked", &detail);
+            None
+        }
+    }
+}
+
+/// Why a writer conflict names no holder (`detail` of `unit.writer_conflict`):
+/// no Codex home is known for the app-server that hit it.
+pub const CONFLICT_NO_KNOWN_HOME: &str = "no Codex home is known for the app-server";
+/// ... the lookup ran and no process this server can see holds the lock.
+pub const CONFLICT_NO_VISIBLE_HOLDER: &str = "no process this server can see holds the lock";
+
+/// Logs, at ERROR (`unit.writer_conflict`), a writer conflict Codex
+/// reported by itself for `thread_id` (`source`: who saw it), naming the
+/// holder one bounded lookup ([`lock_holders_within`]) finds under
+/// `codex_home`, the home the refusing app-server itself reported (never the
+/// server's ambient one). With no home, no visible holder, or a lookup that
+/// could not finish in time, it still logs at ERROR, `holder_visible=false`
+/// with the reason "held by a process outside Freshell's view"
+/// (`detail` says which); it never reports the lock as released.
+pub async fn report_writer_conflict(
+    keys: &crate::events::UnitLogKeys,
+    codex_home: Option<&Path>,
+    thread_id: &str,
+    source: &str,
+) {
+    let (holder, detail) = match codex_home.filter(|home| home.is_absolute()) {
+        None => (None, CONFLICT_NO_KNOWN_HOME.to_string()),
+        Some(home) => {
+            let lock = codex_thread_lock_path(home, thread_id);
+            match lock_holders_within(vec![lock], HOLDER_LOOKUP_DEADLINE).await {
+                HolderLookup::Checked(holders) => match holders.into_iter().next() {
+                    Some(holder) => (Some(holder), String::new()),
+                    None => (None, CONFLICT_NO_VISIBLE_HOLDER.to_string()),
+                },
+                HolderLookup::Unchecked(reason) => (
+                    None,
+                    format!("the holder lookup could not finish: {reason}"),
+                ),
+            }
+        }
+    };
+    crate::events::writer_conflict(
+        keys,
+        thread_id,
+        holder
+            .as_ref()
+            .map(|holder| (holder.pid, holder.name.as_str())),
+        source,
+        &detail,
+    );
+}
+
+/// [`lock_holders_within`] over its own `gate` and `lookup` (testable).
+async fn bounded_lookup(
+    gate: &std::sync::Arc<tokio::sync::Semaphore>,
+    deadline: std::time::Duration,
+    lookup: impl FnOnce() -> Vec<LockHolder> + Send + 'static,
+) -> HolderLookup {
+    let until = tokio::time::Instant::now() + deadline;
+    let permit =
+        match tokio::time::timeout_at(until, std::sync::Arc::clone(gate).acquire_owned()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(closed)) => return HolderLookup::Unchecked(format!("no lookup slot: {closed}")),
+            Err(_) => {
+                return HolderLookup::Unchecked(format!(
+                    "an earlier lookup is still running after {} ms",
+                    deadline.as_millis()
+                ))
+            }
+        };
+    let task = tokio::task::spawn_blocking(move || {
+        // Held until this lookup ends, however long that takes.
+        let _permit = permit;
+        lookup()
+    });
+    match tokio::time::timeout_at(until, task).await {
+        Ok(Ok(holders)) => HolderLookup::Checked(holders),
+        Ok(Err(failed)) => HolderLookup::Unchecked(format!("the lookup failed: {failed}")),
+        Err(_) => HolderLookup::Unchecked(format!(
+            "the lookup did not finish within {} ms",
+            deadline.as_millis()
+        )),
+    }
+}
+
 /// Every process whose descriptor table this server can read (in practice
 /// its own uid) that currently holds one of `paths`. A missing or unlocked
 /// path yields nothing. An empty answer means no VISIBLE holder: a holder of
@@ -711,5 +862,109 @@ mod macos_tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("dropping the events did not end the blocked wait");
         assert!(pending, "no unlock while the holder runs");
+    }
+}
+
+/// The bounded lookup behind [`lock_holders_within`]: a deadline, and one
+/// lookup in flight at a time (Task 16).
+#[cfg(test)]
+mod bounded_tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    use tokio::sync::Semaphore;
+
+    use super::{bounded_lookup, HolderLookup, LockHolder};
+
+    fn holder() -> LockHolder {
+        LockHolder {
+            pid: 4242,
+            name: "codex".into(),
+            path: PathBuf::from("/h/thread-writer-locks/t.lock"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lookup_that_finishes_in_time_reports_what_it_found() {
+        let gate = Arc::new(Semaphore::new(1));
+        assert_eq!(
+            bounded_lookup(&gate, Duration::from_secs(2), || vec![holder()]).await,
+            HolderLookup::Checked(vec![holder()])
+        );
+        assert_eq!(
+            bounded_lookup(&gate, Duration::from_secs(2), Vec::new).await,
+            HolderLookup::Checked(Vec::new()),
+            "nothing visible is a finished lookup too"
+        );
+    }
+
+    /// A lookup that outlives its deadline (a hung network mount) answers
+    /// "could not check" at the deadline, never "held" and never "free".
+    #[tokio::test]
+    async fn a_lookup_past_its_deadline_could_not_check() {
+        let gate = Arc::new(Semaphore::new(1));
+        let started = tokio::time::Instant::now();
+        let answer = bounded_lookup(&gate, Duration::from_millis(100), || {
+            std::thread::sleep(Duration::from_millis(600));
+            vec![holder()]
+        })
+        .await;
+        assert!(
+            matches!(&answer, HolderLookup::Unchecked(reason) if reason.contains("did not finish")),
+            "{answer:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "answered at the deadline, not when the lookup ended"
+        );
+    }
+
+    /// While one lookup is stuck, a lookup wanted meanwhile neither joins it
+    /// nor runs beside it (stuck threads never pile up): it could not check.
+    /// Once the stuck one ends, lookups run again.
+    #[tokio::test]
+    async fn a_lookup_wanted_while_one_is_stuck_neither_joins_nor_runs_beside_it() {
+        let gate = Arc::new(Semaphore::new(1));
+        let (release, stuck) = mpsc::channel::<()>();
+        let runs = Arc::new(AtomicUsize::new(0));
+
+        let first = bounded_lookup(&gate, Duration::from_millis(100), {
+            let runs = runs.clone();
+            move || {
+                runs.fetch_add(1, Ordering::SeqCst);
+                let _ = stuck.recv();
+                vec![holder()]
+            }
+        })
+        .await;
+        assert!(matches!(first, HolderLookup::Unchecked(_)), "{first:?}");
+
+        let second = bounded_lookup(&gate, Duration::from_millis(100), {
+            let runs = runs.clone();
+            move || {
+                runs.fetch_add(1, Ordering::SeqCst);
+                vec![holder()]
+            }
+        })
+        .await;
+        assert!(
+            matches!(&second, HolderLookup::Unchecked(reason) if reason.contains("still running")),
+            "{second:?}"
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the second never ran");
+
+        release.send(()).expect("the stuck lookup is still waiting");
+        let third = bounded_lookup(&gate, Duration::from_secs(5), {
+            let runs = runs.clone();
+            move || {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Vec::new()
+            }
+        })
+        .await;
+        assert_eq!(third, HolderLookup::Checked(Vec::new()));
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
     }
 }

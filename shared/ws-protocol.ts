@@ -40,6 +40,7 @@ export const ErrorCode = z.enum([
   'FRESH_AGENT_CREATE_FAILED',
   'RECONCILE_NOT_NEGOTIATED',
   'SESSION_MISSING',
+  'CONVERSATION_HELD_ELSEWHERE',
 ])
 
 export type ErrorCode = z.infer<typeof ErrorCode>
@@ -1349,6 +1350,11 @@ export type ErrorMessage = {
   ownerKind?: 'terminal' | 'fresh-agent'
   ownerGeneration?: number
   ownerEpoch?: number
+  /** CONVERSATION_HELD_ELSEWHERE only: the process outside Freshell that
+   *  holds the conversation, by pid and process NAME (never its command
+   *  line). Additive; omitted everywhere else. */
+  holderPid?: number
+  holderCommand?: string
   timestamp: string
 }
 

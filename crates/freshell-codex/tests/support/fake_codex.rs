@@ -449,6 +449,70 @@ pub fn signal_own_child(pid: u32, start_time: u64, sig: i32) -> bool {
     unsafe { libc::kill(raw_pid, sig) == 0 }
 }
 
+/// The script of [`OutsideHolder`]: it takes `flock(LOCK_EX)` on `$ARGV[0]`
+/// itself (no helper process holds it for it), says `locked`, and keeps it.
+const OUTSIDE_HOLDER_SCRIPT: &str = "use Fcntl qw(:flock); \
+     open(my $f, '>>', $ARGV[0]) or die \"open: $!\"; \
+     flock($f, LOCK_EX) or die \"flock: $!\"; \
+     $| = 1; print \"locked\\n\"; sleep 600";
+
+/// A process outside Freshell holding a conversation's writer lock as a shell
+/// `codex` does: one long-lived `perl` that takes `flock(LOCK_EX)` on the
+/// lock file itself, so its own descriptor holds the lock (a `flock -x
+/// <file> <cmd>` holder would leave it on the child). Its pid is the holder
+/// and its process name is `perl`. Killed (by pid and the start time pinned
+/// at spawn) and reaped on drop.
+pub struct OutsideHolder {
+    child: std::process::Child,
+    start: u64,
+}
+
+impl OutsideHolder {
+    /// Spawns the holder of `lock` (creating its directory) and returns
+    /// once it holds the lock.
+    pub fn hold(lock: &Path) -> Self {
+        use std::io::BufRead as _;
+        std::fs::create_dir_all(lock.parent().expect("a lock file's directory"))
+            .expect("the lock directory");
+        let mut child = std::process::Command::new("perl")
+            .args(["-e", OUTSIDE_HOLDER_SCRIPT])
+            .arg(lock)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("perl starts");
+        let start = proc_starttime(child.id()).expect("the holder's start time");
+        let mut said = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("the holder's stdout"))
+            .read_line(&mut said)
+            .expect("read the holder's stdout");
+        assert_eq!(said.trim(), "locked", "the holder took the lock");
+        Self { child, start }
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Every argument of the holder's command line (none may leak into a
+    /// log or an answer).
+    pub fn argv(&self) -> Vec<String> {
+        std::fs::read(format!("/proc/{}/cmdline", self.pid()))
+            .unwrap_or_default()
+            .split(|byte| *byte == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect()
+    }
+}
+
+impl Drop for OutsideHolder {
+    fn drop(&mut self) {
+        signal_own_child(self.child.id(), self.start, libc::SIGKILL);
+        let _ = self.child.wait();
+    }
+}
+
 /// The thread a notification is about: `params.threadId`, else `params.thread.id`.
 pub fn notification_thread(note: &Value) -> Option<&str> {
     note["params"]["threadId"]

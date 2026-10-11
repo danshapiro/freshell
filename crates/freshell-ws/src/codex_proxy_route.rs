@@ -237,6 +237,22 @@ async fn route_event(
             // captured home instead of ambient env.
             state.identity.record_codex_home(terminal_id, &codex_home);
         }
+        RemoteProxyEvent::WriterConflict { thread_id, .. } => {
+            // Task 16: Codex refused the TUI a writer ("open in another
+            // app"). Logged at ERROR with the holder one bounded lock lookup
+            // finds, on its own task so the router never waits on it.
+            let state = state.clone();
+            let terminal_id = terminal_id.to_string();
+            tokio::spawn(async move {
+                crate::unit_holders::log_writer_conflict(
+                    &state,
+                    Some(&terminal_id),
+                    &thread_id,
+                    "proxy",
+                )
+                .await;
+            });
+        }
     }
 }
 

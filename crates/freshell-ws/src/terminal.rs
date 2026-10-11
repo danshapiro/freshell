@@ -1003,6 +1003,8 @@ async fn handle_client_text(
                     terminal_exit_code: None,
                     terminal_id: None,
                     live_terminal_id: None,
+                    holder_pid: None,
+                    holder_command: None,
                 });
                 return send(ws_tx, &reply).await;
             }
@@ -1180,6 +1182,8 @@ async fn dispatch_client_message(
                         retry_after_ms: None,
                         terminal_exit_code: None,
                         live_terminal_id: None,
+                        holder_pid: None,
+                        holder_command: None,
                     }),
                 )
                 .await
@@ -1391,6 +1395,8 @@ async fn dispatch_client_message(
                                     terminal_exit_code: None,
                                     terminal_id: Some(attach.terminal_id.clone()),
                                     live_terminal_id: None,
+                                    holder_pid: None,
+                                    holder_command: None,
                                 }),
                             )
                             .await;
@@ -1456,6 +1462,8 @@ async fn dispatch_client_message(
                                     terminal_exit_code: None,
                                     terminal_id: Some(attach.terminal_id.clone()),
                                     live_terminal_id: None,
+                                    holder_pid: None,
+                                    holder_command: None,
                                 }),
                             )
                             .await;
@@ -1539,6 +1547,8 @@ async fn dispatch_client_message(
                                         terminal_exit_code: None,
                                         terminal_id: Some(attach.terminal_id.clone()),
                                         live_terminal_id,
+                                        holder_pid: None,
+                                        holder_command: None,
                                     }),
                                 )
                                 .await;
@@ -1580,6 +1590,8 @@ async fn dispatch_client_message(
                                         terminal_exit_code: None,
                                         terminal_id: Some(attach.terminal_id.clone()),
                                         live_terminal_id: None,
+                                        holder_pid: None,
+                                        holder_command: None,
                                     }),
                                 )
                                 .await;
@@ -1691,6 +1703,8 @@ async fn dispatch_client_message(
                                     terminal_exit_code: None,
                                     terminal_id: Some(attach.terminal_id.clone()),
                                     live_terminal_id: None,
+                                    holder_pid: None,
+                                    holder_command: None,
                                 }),
                             )
                             .await;
@@ -1740,6 +1754,8 @@ async fn dispatch_client_message(
                                     terminal_exit_code: None,
                                     terminal_id: Some(attach.terminal_id.clone()),
                                     live_terminal_id: None,
+                                    holder_pid: None,
+                                    holder_command: None,
                                 }),
                             )
                             .await;
@@ -2653,6 +2669,8 @@ async fn dispatch_client_message(
                     terminal_exit_code: None,
                     terminal_id: None,
                     live_terminal_id: None,
+                    holder_pid: None,
+                    holder_command: None,
                 }),
             )
             .await;
@@ -3036,6 +3054,13 @@ pub(crate) enum PlanLaunchError {
     /// The resumed conversation never materialized (no rollout; Stage 2:
     /// LB-41): the caller starts a new conversation for the same request.
     NotMaterialized { session_id: String },
+    /// Another process holds the resumed conversation `thread_id` (Task 16):
+    /// the caller answers with that holder
+    /// ([`crate::unit_holders::answer_thread_held`]).
+    ThreadHeld {
+        thread_id: String,
+        holder: freshell_containment::LockHolder,
+    },
 }
 
 impl PlanLaunchError {
@@ -3049,6 +3074,9 @@ impl PlanLaunchError {
             PlanLaunchError::NotMaterialized { session_id } => format!(
                 "codex conversation {session_id} never materialized (no rollout); it cannot be resumed"
             ),
+            PlanLaunchError::ThreadHeld { holder, .. } => {
+                freshell_protocol::conversation_held_elsewhere_message(holder.pid, &holder.name)
+            }
         }
     }
 }
@@ -3117,6 +3145,12 @@ async fn plan_codex_managed_launch(
         freshell_codex::launch_lifecycle::CodexLaunchError::Cancelled => PlanLaunchError::Cancelled,
         freshell_codex::launch_lifecycle::CodexLaunchError::NotMaterialized { session_id } => {
             PlanLaunchError::NotMaterialized { session_id }
+        }
+        freshell_codex::launch_lifecycle::CodexLaunchError::ThreadHeld { holder } => {
+            PlanLaunchError::ThreadHeld {
+                thread_id: resume_session_id.unwrap_or_default().to_string(),
+                holder,
+            }
         }
         other => PlanLaunchError::Failed(other.to_string()),
     })
@@ -3664,6 +3698,8 @@ async fn send_session_reserved(
         terminal_exit_code: None,
         terminal_id: None,
         live_terminal_id: None,
+        holder_pid: None,
+        holder_command: None,
     });
     out.send(&msg).await
 }
@@ -4824,6 +4860,13 @@ pub(crate) enum PrepareError {
     /// The conversation's unit is being stopped: nothing was planned, and
     /// the caller parks the create until that unit is Gone.
     Stopping(SessionLocator),
+    /// Another process holds the conversation `thread_id` (Task 16): the
+    /// attempt's app-server was stopped and the start given up; the caller
+    /// answers with the holder ([`crate::unit_holders::answer_thread_held`]).
+    ThreadHeld {
+        thread_id: String,
+        holder: freshell_containment::LockHolder,
+    },
 }
 
 /// P1's prepare phase: resume-identity derivation + the codex managed plan,
@@ -4957,6 +5000,12 @@ pub(crate) async fn prepare_launch(
                 not_materialized = Some(session_id);
                 None
             }
+            // No claim exists yet: the start is given up on its own, and the
+            // caller answers with the holder.
+            Err(PlanLaunchError::ThreadHeld { thread_id, holder }) => {
+                scope.abandon(None);
+                return Err(PrepareError::ThreadHeld { thread_id, holder });
+            }
             Err(error) => {
                 // No claim exists yet: the start is given up on its own.
                 let killed = state.units.killed_start(&create.request_id);
@@ -4970,8 +5019,9 @@ pub(crate) async fn prepare_launch(
                         freshell_codex::launch_plan::CODEX_START_CANCELLED_MESSAGE.to_string(),
                     ),
                     PlanLaunchError::Failed(message) => PrepareError::PlanFailed(message),
-                    PlanLaunchError::NotMaterialized { .. } => {
-                        unreachable!("handled by the arm above")
+                    PlanLaunchError::NotMaterialized { .. }
+                    | PlanLaunchError::ThreadHeld { .. } => {
+                        unreachable!("handled by the arms above")
                     }
                 });
             }
@@ -6993,6 +7043,23 @@ async fn handle_create_once(
                     *not_materialized = Some(session_id);
                     return true;
                 }
+                // Another process holds the conversation (Task 16): the start
+                // is given up (its claims go after its unit's Gone) and the
+                // create is answered with the holder.
+                Err(PlanLaunchError::ThreadHeld { thread_id, holder }) => {
+                    scope.abandon(Some(take_create_claims(
+                        &mut terminal_ownership,
+                        &mut session_ref_lease,
+                        &mut _terminal_start_cancellation,
+                    )));
+                    if state.units.killed_start(&create.request_id) {
+                        return true;
+                    }
+                    return crate::unit_holders::answer_thread_held(
+                        state, out, &create, &thread_id, &holder,
+                    )
+                    .await;
+                }
                 Err(error) => {
                     let message = match error {
                         PlanLaunchError::Cancelled => {
@@ -8563,6 +8630,14 @@ pub(crate) async fn respawn_agent_terminal_relaying_claim(
             };
             match planned {
                 Ok(launch) => (Some(launch), Some(scope)),
+                // Another process holds the conversation (Task 16): nothing
+                // starts; the refusal names the holder.
+                Err(PlanLaunchError::ThreadHeld { thread_id, holder }) => {
+                    scope.abandon(None);
+                    return Err(RespawnError::LaunchUnresolvable(
+                        crate::unit_holders::respawn_refusal(state, &thread_id, &holder).await,
+                    ));
+                }
                 Err(error) => {
                     scope.abandon(None);
                     return Err(RespawnError::LaunchUnresolvable(match error {
@@ -9499,6 +9574,35 @@ pub(crate) async fn send_create_error(
     send_create_error_with_live_terminal(out, code, message, request_id, None).await
 }
 
+/// The answer to a create whose Codex conversation a program outside
+/// Freshell holds (Task 16): `CONVERSATION_HELD_ELSEWHERE` naming it by pid
+/// and process name (never its command line; Stage 2: LB-46).
+pub(crate) async fn send_create_error_holder(
+    out: &mut crate::create_gate::CreateOutput<'_>,
+    request_id: &str,
+    pid: u32,
+    name: &str,
+) -> bool {
+    let msg = ServerMessage::Error(ErrorMsg {
+        code: ErrorCode::ConversationHeldElsewhere,
+        message: freshell_protocol::conversation_held_elsewhere_message(pid, name),
+        timestamp: crate::now_iso(),
+        actual_session_ref: None,
+        expected_session_ref: None,
+        request_id: Some(request_id.to_string()),
+        retry_after_ms: None,
+        terminal_exit_code: None,
+        terminal_id: None,
+        live_terminal_id: None,
+        owner_kind: None,
+        owner_generation: None,
+        owner_epoch: None,
+        holder_pid: Some(pid),
+        holder_command: Some(name.to_string()),
+    });
+    out.send(&msg).await
+}
+
 /// The answer to a create whose pane a kill already stopped (Stage 2:
 /// LB-16): a device that comes back late (or a create held while its pane
 /// was Shift-X'd) never re-creates the killed pane.
@@ -9584,6 +9688,8 @@ pub(crate) async fn send_create_error_with_owner(
         terminal_exit_code: None,
         terminal_id: None,
         live_terminal_id,
+        holder_pid: None,
+        holder_command: None,
     });
     out.send(&msg).await
 }
@@ -9618,6 +9724,8 @@ pub(crate) async fn send_create_error_with_stale_pair(
         terminal_exit_code: None,
         terminal_id: None,
         live_terminal_id: None,
+        holder_pid: None,
+        holder_command: None,
     });
     out.send(&msg).await
 }
@@ -10027,6 +10135,8 @@ async fn handle_attach(
         terminal_id: Some(attach.terminal_id),
         terminal_exit_code: None,
         live_terminal_id: None,
+        holder_pid: None,
+        holder_command: None,
     })))
 }
 
@@ -10195,6 +10305,8 @@ fn input_session_identity_mismatch_error(
         terminal_exit_code: None,
         terminal_id: Some(terminal_id.to_string()),
         live_terminal_id: None,
+        holder_pid: None,
+        holder_command: None,
     })
 }
 
@@ -10235,6 +10347,8 @@ fn invalid_dims_error(cols: i64, rows: i64) -> ServerMessage {
         terminal_exit_code: None,
         terminal_id: None,
         live_terminal_id: None,
+        holder_pid: None,
+        holder_command: None,
     })
 }
 
@@ -10292,6 +10406,8 @@ fn managed_runtime_error(terminal_id: &str, detail: &str) -> ServerMessage {
         terminal_exit_code: None,
         terminal_id: Some(terminal_id.to_string()),
         live_terminal_id: None,
+        holder_pid: None,
+        holder_command: None,
     })
 }
 
@@ -11135,6 +11251,8 @@ impl KillReply {
                         .then(|| self.terminal_id.clone()),
                     terminal_exit_code: None,
                     live_terminal_id: None,
+                    holder_pid: None,
+                    holder_command: None,
                 })
             }
         };

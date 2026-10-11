@@ -122,7 +122,7 @@ impl UnitStopCommand {
 }
 
 /// The unit's log keys, from its label (the operation when one is known).
-fn unit_keys(unit: &AgentUnit, operation_id: Option<&str>) -> UnitLogKeys {
+pub(crate) fn unit_keys(unit: &AgentUnit, operation_id: Option<&str>) -> UnitLogKeys {
     let label = unit.label();
     UnitLogKeys {
         unit_id: unit.id().as_str().to_string(),
@@ -823,6 +823,11 @@ pub fn wire(state: &WsState, rt: &tokio::runtime::Handle) {
     state
         .units
         .set_lifecycle(lifecycle(state.clone(), rt.clone()));
+    // Task 16: a freshcodex resume tells a pane's app-server holding its
+    // conversation from a program outside Freshell by these units.
+    state
+        .fresh_codex
+        .set_unit_directory(state.units.directory.clone());
 }
 
 /// Who owns a start's settlement.

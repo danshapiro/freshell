@@ -480,4 +480,19 @@ impl UnitDirectory {
             .map(|s| s.entry.clone())
             .collect()
     }
+
+    /// The registered unit whose members include `pid` (the first found),
+    /// by one [`AgentUnit::members`] read per unit, made with no directory
+    /// lock held. Membership decides, never an environment tag alone: an
+    /// inherited or copied tag proves nothing. Blocking (a member read can
+    /// scan every process): async callers run it on a blocking thread. A
+    /// unit whose members cannot be read is skipped.
+    pub fn entry_with_member(&self, pid: u32) -> Option<UnitEntry> {
+        self.all().into_iter().find(|entry| {
+            entry
+                .unit
+                .members()
+                .is_ok_and(|members| members.iter().any(|member| member.pid == pid))
+        })
+    }
 }

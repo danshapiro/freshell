@@ -855,6 +855,17 @@ pub struct ErrorMsg {
     /// omitted everywhere else.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_epoch: Option<u64>,
+    /// Task 16 (`CONVERSATION_HELD_ELSEWHERE` only): the pid of the process
+    /// outside Freshell that holds the conversation. Additive and omitted
+    /// everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holder_pid: Option<u32>,
+    /// Task 16 (`CONVERSATION_HELD_ELSEWHERE` only): that process's NAME
+    /// (`comm`, or the image name on Windows), never its command line,
+    /// which can carry secrets (Stage 2: LB-46). Additive and omitted
+    /// everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holder_command: Option<String>,
 }
 
 // --- extension.* ------------------------------------------------------------
@@ -2230,6 +2241,8 @@ mod tests {
             owner_kind: Some("fresh-agent".into()),
             owner_generation: Some(7),
             owner_epoch: Some(41),
+            holder_pid: None,
+            holder_command: None,
         });
         let json = serde_json::to_string(&msg).expect("serialize");
         assert!(json.contains(r#""ownerKind":"fresh-agent""#), "{json}");
@@ -2253,12 +2266,55 @@ mod tests {
             owner_kind: None,
             owner_generation: None,
             owner_epoch: None,
+            holder_pid: None,
+            holder_command: None,
         });
         let legacy_json = serde_json::to_string(&legacy).expect("serialize");
         assert!(
             !legacy_json.contains("ownerKind"),
             "omit-when-absent keeps legacy error frames byte-identical: {legacy_json}"
         );
+    }
+
+    /// Task 16: a conversation held by a process outside Freshell is
+    /// refused with its own code, naming the holder by pid and process name
+    /// (never its command line); both fields are additive and omitted from
+    /// every other error frame.
+    #[test]
+    fn a_conversation_held_elsewhere_names_its_holder_by_pid_and_process_name() {
+        let msg = ServerMessage::Error(ErrorMsg {
+            code: ErrorCode::ConversationHeldElsewhere,
+            message: "This conversation is open in another program (pid 4242: perl). \
+                      Close it there, then reopen it here."
+                .into(),
+            timestamp: "2026-10-11T00:00:00Z".into(),
+            actual_session_ref: None,
+            expected_session_ref: None,
+            request_id: Some("crq-out".into()),
+            retry_after_ms: None,
+            terminal_exit_code: None,
+            terminal_id: None,
+            live_terminal_id: None,
+            owner_kind: None,
+            owner_generation: None,
+            owner_epoch: None,
+            holder_pid: Some(4242),
+            holder_command: Some("perl".into()),
+        });
+        let json: serde_json::Value = serde_json::to_value(&msg).expect("serialize");
+        assert_eq!(json["code"], "CONVERSATION_HELD_ELSEWHERE", "{json}");
+        assert_eq!(json["holderPid"], 4242, "{json}");
+        assert_eq!(json["holderCommand"], "perl", "{json}");
+        let back: ServerMessage = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back, msg);
+        let ServerMessage::Error(mut legacy) = msg else {
+            unreachable!()
+        };
+        legacy.holder_pid = None;
+        legacy.holder_command = None;
+        let legacy_json = serde_json::to_string(&ServerMessage::Error(legacy)).expect("serialize");
+        assert!(!legacy_json.contains("holderPid"), "{legacy_json}");
+        assert!(!legacy_json.contains("holderCommand"), "{legacy_json}");
     }
 
     #[test]

@@ -3,7 +3,8 @@
 //! CONFIRMATION (not the kill) so the unconfirmed path is testable end to
 //! end; another slows the write of the Stopping record, which every signal
 //! waits for; a third holds up the read of the Codex thread lock files a
-//! unit's members hold (a Codex home on a hung network mount). Plus one
+//! unit's members hold (a Codex home on a hung network mount), and a fourth
+//! the outside-holder lookup a reopen makes. Plus one
 //! read-only view for tests (the unit's emptiness wait) and the cleanup of a
 //! test state root's systemd namespace slice.
 
@@ -27,6 +28,15 @@ pub fn persist_delay() -> Option<std::time::Duration> {
 /// mount, where that read blocks.
 pub fn thread_scan_delay() -> Option<std::time::Duration> {
     hook_delay("FRESHELL_TEST_UNIT_THREAD_SCAN_DELAY_MS")
+}
+
+/// How long the outside-holder lookup a reopen makes
+/// ([`crate::locks::lock_holders_within`]) is held up before it starts,
+/// from `FRESHELL_TEST_UNIT_HOLDER_LOOKUP_DELAY_MS` (only with
+/// `FRESHELL_TEST_HOOKS=1`): a stand-in for a lookup stalled on a hung
+/// network mount.
+pub fn holder_lookup_delay() -> Option<std::time::Duration> {
+    hook_delay("FRESHELL_TEST_UNIT_HOLDER_LOOKUP_DELAY_MS")
 }
 
 /// Test support: the "unit is empty" wait the post-Gone sweep uses, when

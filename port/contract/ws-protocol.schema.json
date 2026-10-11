@@ -3145,7 +3145,8 @@
         "FRESH_AGENT_LOST_SESSION",
         "FRESH_AGENT_CREATE_FAILED",
         "RECONCILE_NOT_NEGOTIATED",
-        "SESSION_MISSING"
+        "SESSION_MISSING",
+        "CONVERSATION_HELD_ELSEWHERE"
       ],
       "type": "string"
     },

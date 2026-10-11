@@ -381,3 +381,42 @@ async fn a_managed_start_in_flight_tells_a_waiting_kill_how_it_ended() {
     );
     assert!(starts.settled("crq-d").is_none());
 }
+
+/// A lock holder is a pane's when it is one of that pane's unit members
+/// (Task 16): membership decides, never an environment tag alone. A
+/// tag-backend unit's spawned child is found by its pid; an unrelated
+/// process belongs to no unit.
+#[cfg(unix)]
+#[tokio::test]
+async fn entry_with_member_finds_the_unit_that_contains_a_pid() {
+    let dir = UnitDirectory::new();
+    let other = unit();
+    dir.register(starting_entry(&other, "crq-other"));
+    let u = unit();
+    dir.register(starting_entry(&u, "crq-member"));
+    let mut member = u
+        .tokio_command("sleep", &["30".to_string()], MemberRole::Agent)
+        .expect("a command placed in the unit")
+        .kill_on_drop(true)
+        .spawn()
+        .expect("the member starts");
+    let mut outsider = tokio::process::Command::new("sleep")
+        .arg("30")
+        .kill_on_drop(true)
+        .spawn()
+        .expect("an unrelated process starts");
+
+    let found = dir
+        .entry_with_member(member.id().expect("running"))
+        .expect("the unit whose members include the child");
+    assert_eq!(found.unit.id(), u.id());
+    assert_eq!(found.create_request_id.as_deref(), Some("crq-member"));
+    assert!(
+        dir.entry_with_member(outsider.id().expect("running"))
+            .is_none(),
+        "a process outside every unit belongs to none"
+    );
+
+    let _ = member.kill().await;
+    let _ = outsider.kill().await;
+}

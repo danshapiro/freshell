@@ -284,6 +284,29 @@ pub enum RemoteProxyEvent {
     ThreadsReferenced {
         thread_ids: Vec<String>,
     },
+    /// Task 16: Codex refused a `thread/resume` or `thread/fork` the TUI
+    /// sent because another process holds the thread's writer lock (an
+    /// upstream error response whose message contains [`WRITER_CONFLICT_TEXT`];
+    /// the TUI shows "This conversation is open in another app"). `thread_id`
+    /// is the request's own `params.threadId`, else the id Codex's message
+    /// names (`thread <id> already has an active writer`), else empty. The
+    /// refusal still relays verbatim.
+    WriterConflict {
+        thread_id: String,
+        message: String,
+    },
+}
+
+/// The text of Codex's writer refusal (codex-rs thread store:
+/// `thread <id> already has an active writer`).
+pub const WRITER_CONFLICT_TEXT: &str = "already has an active writer";
+
+/// A client request still waiting for its answer: its method and, for the
+/// requests whose refusal names a conversation (`thread/resume`,
+/// `thread/fork`), the `params.threadId` it carried (best effort).
+struct PendingRequest {
+    method: String,
+    thread_id: Option<String>,
 }
 
 // ── the proxy handle ─────────────────────────────────────────────────────────────────
@@ -653,7 +676,7 @@ struct ConnState {
     /// registration order, that preserves relative ordering exactly like this FIFO queue
     /// does, drained the instant [`HubMsg::UpstreamConnected`] arrives.
     pending_to_upstream: VecDeque<OutFrame>,
-    pending_methods: HashMap<RequestId, String>,
+    pending_methods: HashMap<RequestId, PendingRequest>,
     pending_fork_requests: HashMap<RequestId, Option<String>>,
     /// Sniffed server→client approval requests still awaiting a resolution (decision 5).
     /// Keyed on the SERVER's id space (never consulted for our own client requests);
@@ -1149,8 +1172,12 @@ impl Hub {
         if let Some(req_id) = id.as_ref().and_then(envelope_id_to_request_id) {
             match method {
                 Some(method) => {
+                    let thread_id = names_a_conversation(&method)
+                        .then(|| extract_params_thread_id(&data))
+                        .flatten();
                     if let Some(conn) = self.connections.get_mut(&conn_id) {
-                        conn.pending_methods.insert(req_id, method);
+                        conn.pending_methods
+                            .insert(req_id, PendingRequest { method, thread_id });
                     }
                 }
                 None => {
@@ -1210,7 +1237,7 @@ impl Hub {
         }
 
         if let Some(req_id) = id.as_ref().and_then(envelope_id_to_request_id) {
-            let parent_thread_id = extract_thread_fork_parent_thread_id(&data);
+            let parent_thread_id = extract_params_thread_id(&data);
             if let Some(conn) = self.connections.get_mut(&conn_id) {
                 conn.pending_fork_requests.insert(req_id, parent_thread_id);
             }
@@ -1285,18 +1312,29 @@ impl Hub {
             }
 
             let req_id = envelope_id_to_request_id(&id);
-            let (method, fork_request) = match self.connections.get_mut(&conn_id) {
+            let (pending, fork_request) = match self.connections.get_mut(&conn_id) {
                 Some(conn) => {
-                    let method = req_id
+                    let pending = req_id
                         .as_ref()
                         .and_then(|rid| conn.pending_methods.remove(rid));
                     let fork_request = req_id
                         .as_ref()
                         .and_then(|rid| conn.pending_fork_requests.get(rid).cloned());
-                    (method, fork_request)
+                    (pending, fork_request)
                 }
                 None => (None, None),
             };
+            // Task 16: Codex's writer refusal of a resume or fork the TUI
+            // sent (the answer itself is handled and relayed as before).
+            if let Some(pending) = pending
+                .as_ref()
+                .filter(|pending| names_a_conversation(&pending.method))
+            {
+                if let Some(conflict) = writer_conflict_of(&data, pending.thread_id.as_deref()) {
+                    self.emit(conflict);
+                }
+            }
+            let method = pending.map(|pending| pending.method);
 
             if method.as_deref() == Some("thread/start") {
                 self.handle_thread_start_response(conn_id, data, binary, req_id);
@@ -1884,7 +1922,44 @@ fn client_envelope_failure_message(reason: JsonRpcEnvelopeScanError) -> String {
 /// (pre-rewrite) client `thread/fork` request's `params.threadId` — the parent thread id
 /// — via a bounded byte scan (not a full parse), so this is safe to call regardless of
 /// frame size.
-fn extract_thread_fork_parent_thread_id(raw: &[u8]) -> Option<String> {
+/// Whether a request's refusal names a conversation the TUI asked to write
+/// (the requests Codex's writer lock can refuse).
+fn names_a_conversation(method: &str) -> bool {
+    matches!(method, "thread/resume" | "thread/fork")
+}
+
+/// [`RemoteProxyEvent::WriterConflict`] when `answer` (an upstream response,
+/// small frames only) is an error carrying Codex's writer refusal; its
+/// thread is `requested`, else the one Codex's message names.
+fn writer_conflict_of(answer: &[u8], requested: Option<&str>) -> Option<RemoteProxyEvent> {
+    if answer.len() > MAX_FULL_PARSE_BYTES {
+        return None;
+    }
+    let parsed: Value = serde_json::from_slice(answer).ok()?;
+    let message = parsed.pointer("/error/message")?.as_str()?;
+    if !message.contains(WRITER_CONFLICT_TEXT) {
+        return None;
+    }
+    let thread_id = requested
+        .map(str::to_string)
+        .or_else(|| thread_named_in_refusal(message))
+        .unwrap_or_default();
+    Some(RemoteProxyEvent::WriterConflict {
+        thread_id,
+        message: message.to_string(),
+    })
+}
+
+/// The id in Codex's `... thread <id> already has an active writer`.
+fn thread_named_in_refusal(message: &str) -> Option<String> {
+    let (before, _) = message.split_once(&format!(" {WRITER_CONFLICT_TEXT}"))?;
+    let (lead, id) = before.rsplit_once(' ')?;
+    (lead.ends_with("thread") && !id.is_empty()).then(|| id.to_string())
+}
+
+/// A request's `params.threadId` (byte scan: any frame size), if non-empty:
+/// the conversation a resume, a fork or a turn names.
+fn extract_params_thread_id(raw: &[u8]) -> Option<String> {
     use crate::json_scan::{
         decode_string_entry, find_entry, scan_object, skip_whitespace, ValueKind, BYTE_OPEN_BRACE,
     };
@@ -1949,7 +2024,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_thread_fork_parent_thread_id_reads_the_original_pre_rewrite_frame() {
+    fn extract_params_thread_id_reads_a_forks_parent_from_the_original_pre_rewrite_frame() {
         let raw = serde_json::json!({
             "id": 1,
             "method": "thread/fork",
@@ -1957,16 +2032,33 @@ mod tests {
         })
         .to_string();
         assert_eq!(
-            extract_thread_fork_parent_thread_id(raw.as_bytes()),
+            extract_params_thread_id(raw.as_bytes()),
             Some("parent-1".to_string())
         );
     }
 
     #[test]
-    fn extract_thread_fork_parent_thread_id_is_none_for_malformed_or_missing_shapes() {
-        assert_eq!(extract_thread_fork_parent_thread_id(b"not json"), None);
+    fn a_writer_refusal_names_only_a_real_thread_id() {
         assert_eq!(
-            extract_thread_fork_parent_thread_id(br#"{"id":1,"method":"thread/fork","params":{}}"#),
+            thread_named_in_refusal(
+                "thread-store conflict: thread 019a-b already has an active writer"
+            )
+            .as_deref(),
+            Some("019a-b")
+        );
+        // A message without an id names none (never the word "thread").
+        assert_eq!(
+            thread_named_in_refusal("thread already has an active writer"),
+            None
+        );
+        assert_eq!(thread_named_in_refusal("no rollout found"), None);
+    }
+
+    #[test]
+    fn extract_params_thread_id_is_none_for_malformed_or_missing_shapes() {
+        assert_eq!(extract_params_thread_id(b"not json"), None);
+        assert_eq!(
+            extract_params_thread_id(br#"{"id":1,"method":"thread/fork","params":{}}"#),
             None
         );
     }
