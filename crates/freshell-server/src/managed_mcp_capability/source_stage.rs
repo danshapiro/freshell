@@ -272,7 +272,7 @@ mod configured_resource_tests {
             for unreadable in [false, true] {
                 if unreadable {
                     std::fs::write(&resource, "resource").unwrap();
-                    std::fs::set_permissions(&resource, std::fs::Permissions::from_mode(0))
+                    std::fs::set_permissions(&resource, std::fs::Permissions::from_mode(0o0))
                         .unwrap();
                 }
                 let raw = serde_json::to_string(&serde_json::json!({field:[resource]})).unwrap();
@@ -630,7 +630,8 @@ mod configured_resource_tests {
                     _ => std::fs::write(&target, "resource").unwrap(),
                 }
                 if case == "unreadable" {
-                    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0)).unwrap();
+                    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o0))
+                        .unwrap();
                 }
                 let raw=if field=="sound" {serde_json::json!({"attention":{"sounds":{"question":target}}})} else {serde_json::json!({"mcp":{"probe":{"type":"local","command":["node","server.cjs"],"cwd":target}}})}.to_string();
                 std::fs::write(&config, &raw).unwrap();
@@ -779,7 +780,7 @@ mod configured_resource_tests {
         let cyclic = owned.path().join("cyclic");
         std::fs::write(&file, "not a directory").unwrap();
         std::fs::create_dir(&unreadable).unwrap();
-        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o0)).unwrap();
         std::os::unix::fs::symlink(&cyclic, &cyclic).unwrap();
         for selected in [&missing, &file, &unreadable, &cyclic] {
             let raw = serde_json::json!({"skills":{"paths":[selected],"urls":["https://example.invalid/skills"]}}).to_string();
@@ -968,7 +969,7 @@ pub(super) fn resource_units(
                 {
                     continue;
                 }
-                let canonical = std::fs::canonicalize(&logical)
+                let canonical = std::fs::canonicalize(logical)
                     .map_err(|_| "selected OpenCode configured resource is unavailable")?;
                 roots.insert((logical.clone(), role), canonical);
             }
@@ -1185,20 +1186,30 @@ pub(super) fn stage(
     write_private_bytes(&root.join(".freshell/input-manifest.json"), &metadata)
 }
 
+pub(super) struct DescriptionRoots<'a> {
+    pub root: &'a Path,
+    pub home: &'a Path,
+    pub config_root: Option<&'a Path>,
+    pub workspace: &'a Path,
+}
+
 pub(super) fn describe(
-    root: &Path,
-    home: &Path,
+    roots: DescriptionRoots<'_>,
     plan: &[PlannedSourceOccurrence],
     soul: &freshell_runtime_protocol::SoulId,
     capability: &freshell_runtime_protocol::McpCapabilityReference,
     initial_auth_reservation: Option<&str>,
-    config_root: Option<&Path>,
-    workspace: &Path,
     secret_references: &[freshell_runtime_protocol::ProviderSecretReference],
 ) -> Result<freshell_runtime_protocol::PreparedProviderInputs, String> {
     use freshell_runtime_protocol::*;
     use sha2::{Digest, Sha256};
     use std::io::Read;
+    let DescriptionRoots {
+        root,
+        home,
+        config_root,
+        workspace,
+    } = roots;
     let runtime_home = Path::new("/home/freshell/provider");
     let default_global = home.join(".config/opencode");
     let global = config_root.unwrap_or(&default_global);

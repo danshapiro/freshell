@@ -1236,7 +1236,7 @@ mod module_source_tests {
             for unreadable in [false, true] {
                 if unreadable {
                     std::fs::write(&selected, "bundle: {name: selected}\n").unwrap();
-                    std::fs::set_permissions(&selected, std::fs::Permissions::from_mode(0))
+                    std::fs::set_permissions(&selected, std::fs::Permissions::from_mode(0o0))
                         .unwrap();
                 }
                 let raw = format!(

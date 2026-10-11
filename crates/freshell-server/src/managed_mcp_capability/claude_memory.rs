@@ -10,6 +10,7 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(test)]
 pub(super) fn imports(
     home: &Path,
     roots: &[PathBuf],
@@ -20,6 +21,8 @@ pub(super) fn imports(
         .map(|(fresh, frozen)| fresh.into_iter().chain(frozen).collect())
 }
 
+type FrozenSource<'a> = dyn Fn(&Path) -> Result<PathBuf, String> + 'a;
+
 pub(super) fn imports_with_frozen(
     home: &Path,
     roots: &[PathBuf],
@@ -27,7 +30,7 @@ pub(super) fn imports_with_frozen(
     frozen_roots: &[PathBuf],
     frozen_rules: &[PathBuf],
     excluded: &[PathBuf],
-    frozen_source: Option<&dyn Fn(&Path) -> Result<PathBuf, String>>,
+    frozen_source: Option<&FrozenSource<'_>>,
 ) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
     let excluded = excluded
         .iter()
@@ -83,7 +86,7 @@ struct ImportGraph<'a> {
     rule_directories: BTreeSet<PathBuf>,
     rule_entries: usize,
     rule_path_bytes: usize,
-    frozen_source: Option<&'a dyn Fn(&Path) -> Result<PathBuf, String>>,
+    frozen_source: Option<&'a FrozenSource<'a>>,
 }
 impl ImportGraph<'_> {
     fn source(&self, logical: &Path, frozen: bool) -> Result<PathBuf, String> {
@@ -443,10 +446,10 @@ mod tests {
         let root = owned.path().join("CLAUDE.md");
         let nested = owned.path().join("nested.md");
         std::fs::write(&root, "@nested.md\n").unwrap();
-        let missing = imports(owned.path(), &[root.clone()], &[], &[]).unwrap_err();
+        let missing = imports(owned.path(), std::slice::from_ref(&root), &[], &[]).unwrap_err();
         assert!(missing.contains("nested.md") && missing.contains("unavailable"));
         std::fs::write(&nested, "@CLAUDE.md\n").unwrap();
-        let cycle = imports(owned.path(), &[root.clone()], &[], &[]).unwrap_err();
+        let cycle = imports(owned.path(), std::slice::from_ref(&root), &[], &[]).unwrap_err();
         assert!(cycle.contains("cyclic"));
         assert_eq!(std::fs::read_to_string(root).unwrap(), "@nested.md\n");
         assert_eq!(std::fs::read_to_string(nested).unwrap(), "@CLAUDE.md\n");

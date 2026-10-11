@@ -15,7 +15,6 @@ pub struct FileSourceOrigin<'a> {
     pub original_home: &'a Path,
 }
 
-#[derive(Debug)]
 pub struct ReferenceError {
     pub operation: &'static str,
     pub field: &'static str,
@@ -23,6 +22,18 @@ pub struct ReferenceError {
     pub declaring_source: PathBuf,
     pub variables: Vec<String>,
     pub cause: &'static str,
+}
+impl std::fmt::Debug for ReferenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReferenceError")
+            .field("operation", &self.operation)
+            .field("field", &self.field)
+            .field("source_ordinal", &self.source_ordinal)
+            .field("declaring_source", &self.declaring_source)
+            .field("variables", &self.variables)
+            .field("cause", &self.cause)
+            .finish()
+    }
 }
 impl std::fmt::Display for ReferenceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -42,7 +53,6 @@ impl std::error::Error for ReferenceError {}
 pub struct FileReferenceSelection {
     pub canonical_source: PathBuf,
     pub runtime_destination: String,
-    pub source_ordinal: usize,
 }
 
 pub use freshell_platform::opencode_recipe::{ApprovedFileOccurrence, GeneratedFileRecipe};
@@ -79,6 +89,7 @@ impl ResolvedFileReferencePlan {
     }
 }
 
+#[cfg(test)]
 pub fn resolve_file_references(
     raw: &str,
     origin: FileSourceOrigin<'_>,
@@ -92,6 +103,7 @@ pub fn resolve_file_references(
     })
 }
 
+#[cfg(test)]
 pub(super) fn resolve_file_references_allocated(
     raw: &str,
     origin: FileSourceOrigin<'_>,
@@ -102,6 +114,7 @@ pub(super) fn resolve_file_references_allocated(
     resolve_file_references_from_view(raw, None, origin, env, recipe_ordinal, allocate)
 }
 
+#[cfg(test)]
 pub(super) fn resolve_file_references_from_view(
     raw: &str,
     source_view: Option<std::sync::Arc<String>>,
@@ -253,7 +266,6 @@ pub(super) fn resolve_file_references_from_view_relocated(
                 selections.push(FileReferenceSelection {
                     canonical_source: canonical,
                     runtime_destination: destination.clone(),
-                    source_ordinal: token.ordinal,
                 });
                 destination
             };
@@ -406,6 +418,7 @@ pub(super) fn resolve_file_references_from_view_relocated(
     })
 }
 
+#[cfg(test)]
 pub fn evaluate_generated_recipe(
     recipe: &GeneratedFileRecipe,
     env: &dyn Fn(&str) -> Option<String>,
@@ -418,6 +431,517 @@ pub fn evaluate_generated_recipe(
         variables: Vec::new(),
         cause,
     })
+}
+
+pub(crate) struct PreparedManagedOpencode {
+    pub context: freshell_runtime_protocol::ProviderLaunchContext,
+    pub references: Vec<freshell_runtime_protocol::ProviderSecretReference>,
+}
+
+/// Terminal, fresh and scoped replacement callers share this one preparation.
+/// The original lookup and decoded grants never enter the returned metadata.
+pub(crate) struct OpencodePreparation<'a> {
+    pub client: &'a freshell_runtime_client::RuntimeClient,
+    pub soul: &'a freshell_runtime_protocol::SoulId,
+    pub creation_seed: &'a str,
+    pub home: &'a Path,
+    pub cwd: &'a Path,
+    pub workspace: &'a Path,
+    pub original: &'a (dyn Fn(&str) -> Option<String> + Sync),
+    pub references: Vec<freshell_runtime_protocol::ProviderSecretReference>,
+    pub auth_authority: Option<&'a str>,
+    pub selected_sources: Option<Vec<sources::SourceOccurrence>>,
+    pub accepted_global_root: Option<PathBuf>,
+    pub selected_resource_roots: Option<Vec<sources::DiscoveryRoot>>,
+    pub native_source_flags: Option<Vec<freshell_platform::opencode_recipe::NativeSourceFlag>>,
+    pub rebind_enabled: Option<bool>,
+    pub inherited_inline: Option<String>,
+    pub inline_edits: Option<freshell_platform::opencode_config::OwnedConfigEdits>,
+}
+
+pub(crate) async fn prepare_managed_opencode(
+    request: OpencodePreparation<'_>,
+) -> Result<PreparedManagedOpencode, String> {
+    prepare_managed_opencode_with_publisher(
+        request,
+        crate::managed_mcp_capability::issue_prepared_opencode_context,
+    )
+    .await
+}
+
+pub(crate) async fn prepare_managed_opencode_with_publisher(
+    request: OpencodePreparation<'_>,
+    publish: impl FnOnce(
+        &freshell_runtime_protocol::SoulId,
+        &Path,
+        &freshell_runtime_protocol::ProviderLaunchContext,
+        crate::managed_mcp_capability::OpencodeEphemeralInput<'_>,
+    ) -> Result<freshell_runtime_protocol::ProviderLaunchContext, String>,
+) -> Result<PreparedManagedOpencode, String> {
+    let OpencodePreparation {
+        client,
+        soul,
+        creation_seed,
+        home,
+        cwd,
+        workspace,
+        original,
+        mut references,
+        auth_authority,
+        selected_sources,
+        accepted_global_root,
+        selected_resource_roots,
+        native_source_flags,
+        rebind_enabled,
+        inherited_inline,
+        inline_edits,
+    } = request;
+    let rebind_enabled = rebind_enabled.unwrap_or_else(|| {
+        !matches!(
+            original("FRESHELL_OPENCODE_REBIND").as_deref(),
+            Some("0" | "false")
+        )
+    });
+    use sources::*;
+    let inherited_inline = inherited_inline
+        .or_else(|| original("OPENCODE_CONFIG_CONTENT"))
+        .filter(|raw| !raw.is_empty());
+    let mut inline_edits = inline_edits.unwrap_or_default();
+    inline_edits.freshell_command = Some(vec!["node".into(), "/opt/freshell-mcp/server.js".into()]);
+    if inline_edits.bash_permission.is_none() {
+        inline_edits.bash_permission = original("FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION")
+            .filter(|value| matches!(value.as_str(), "allow" | "ask" | "deny"));
+    }
+    let config_root = if let Some(root) = accepted_global_root {
+        if !root.is_absolute() || root.file_name() != Some(std::ffi::OsStr::new("opencode")) {
+            return Err(
+                "accepted global configuration root is invalid; retain prior inputs and reprepare"
+                    .into(),
+            );
+        }
+        root
+    } else {
+        let xdg = original("XDG_CONFIG_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"));
+        let xdg = if xdg.is_absolute() {
+            xdg
+        } else {
+            cwd.join(xdg)
+        };
+        xdg.join("opencode")
+    };
+    let xdg = config_root
+        .parent()
+        .ok_or("global configuration root parent unavailable")?;
+    let resource_roots = if let Some(roots) = selected_resource_roots {
+        roots
+    } else {
+        sources::select_opencode_resource_roots(&OpencodeDiscovery {
+            home,
+            cwd,
+            worktree: workspace,
+            config_root: &config_root,
+            env: original,
+        })
+        .map_err(str::to_string)?
+    };
+    let base = crate::managed_provider_bootstrap::provider_launch_context_from_home_at_with_xdg(
+        "opencode",
+        workspace,
+        cwd,
+        home,
+        Some(xdg),
+        None,
+    )?
+    .ok_or("OpenCode provider preparation unavailable")?;
+    let selected = if let Some(sources) = selected_sources {
+        sources
+    } else {
+        discover_opencode(OpencodeDiscovery {
+            home,
+            cwd,
+            worktree: workspace,
+            config_root: &config_root,
+            env: original,
+        })
+        .map_err(str::to_string)?
+    };
+    let mut loaded = read_opencode_sources(selected).map_err(|error| error.to_string())?;
+    if let Some(raw) = inherited_inline {
+        if raw.len() > 16 * 1024 * 1024 {
+            return Err("OpenCode inherited inline source exceeds 16 MiB".into());
+        }
+        let retained = sources::retained_source_view_bytes(&loaded)
+            .map_err(str::to_string)?
+            .checked_add(raw.len())
+            .ok_or("source-view size overflow")?;
+        let remaining = (64 * 1024 * 1024usize)
+            .checked_sub(retained)
+            .ok_or("simultaneous source views exceed 64 MiB")?;
+        let user_owns_freshell_mcp = loaded
+            .iter()
+            .filter(|source| source.source.lane == SourceLane::Main)
+            .try_fold(false, |owned, source| {
+                freshell_platform::opencode_config::source_owns_freshell_mcp(
+                    &source.view,
+                    &source.source.logical_path,
+                    cwd,
+                )
+                .map(|user_owns| owned || user_owns)
+            })
+            .map_err(|error| error.to_string())?;
+        let view = freshell_platform::opencode_config::merge_owned_entries_bounded(
+            Some(&raw),
+            &freshell_platform::opencode_config::OpencodeConfigPlan {
+                sources: vec![],
+                user_owns_freshell_mcp,
+                inline_prepared: false,
+            },
+            &inline_edits,
+            remaining.min(64 * 1024),
+        )
+        .map_err(|error| error.to_string())?;
+        let inline = LoadedSourceOccurrence {
+            requires_config_bind: true,
+            source: SourceOccurrence {
+                logical_path: "OPENCODE_CONFIG_CONTENT".into(),
+                canonical_source: "OPENCODE_CONFIG_CONTENT".into(),
+                lane: SourceLane::Inline,
+                role: freshell_platform::opencode_recipe::DiscoveryRole::Workspace,
+            },
+            view: std::sync::Arc::new(view),
+        };
+        let position = loaded
+            .iter()
+            .position(|source| source.source.lane == SourceLane::Tui)
+            .unwrap_or(loaded.len());
+        loaded.insert(position, inline);
+    }
+    let native_source_flags = if let Some(flags) = native_source_flags {
+        flags
+    } else {
+        let mut flags = Vec::new();
+        for (name, kind) in [
+            (
+                "OPENCODE_CONFIG",
+                freshell_platform::opencode_recipe::NativeSourceFlagKind::Main,
+            ),
+            (
+                "OPENCODE_TUI_CONFIG",
+                freshell_platform::opencode_recipe::NativeSourceFlagKind::Tui,
+            ),
+        ] {
+            if let Some(path) = original(name).filter(|path| !path.is_empty()) {
+                let path = if Path::new(&path).is_absolute() {
+                    PathBuf::from(path)
+                } else {
+                    cwd.join(path)
+                };
+                let source_ordinal = loaded
+                    .iter()
+                    .position(|source| source.source.logical_path == path && source.source.role == DiscoveryRole::Workspace && match kind {
+                        freshell_platform::opencode_recipe::NativeSourceFlagKind::Main => source.source.lane == SourceLane::Main,
+                        freshell_platform::opencode_recipe::NativeSourceFlagKind::Tui => source.source.lane == SourceLane::Tui,
+                        freshell_platform::opencode_recipe::NativeSourceFlagKind::Directory => false,
+                    }).ok_or_else(|| format!("selected {name} source is missing or unavailable; repair it before dispatch"))?;
+                let destination = sources::runtime_config_destination(
+                    home,
+                    &config_root,
+                    &path,
+                    loaded[source_ordinal].source.role,
+                );
+                flags.push(freshell_platform::opencode_recipe::NativeSourceFlag {
+                    kind,
+                    source_ordinal: Some(
+                        u16::try_from(source_ordinal)
+                            .map_err(|_| "native source ordinal overflow")?,
+                    ),
+                    runtime_destination: destination
+                        .to_str()
+                        .ok_or("selected native source destination is not UTF-8")?
+                        .into(),
+                });
+            }
+        }
+        if let Some(path) = original("OPENCODE_CONFIG_DIR").filter(|path| !path.is_empty()) {
+            let path = if Path::new(&path).is_absolute() {
+                PathBuf::from(path)
+            } else {
+                cwd.join(path)
+            };
+            if !resource_roots.iter().any(|root| root.logical_path == path) {
+                return Err(
+                    "selected OPENCODE_CONFIG_DIR root is unavailable before dispatch".into(),
+                );
+            }
+            flags.push(freshell_platform::opencode_recipe::NativeSourceFlag {
+                kind: freshell_platform::opencode_recipe::NativeSourceFlagKind::Directory,
+                source_ordinal: None,
+                runtime_destination: sources::runtime_directory_destination(
+                    home,
+                    &config_root,
+                    &path,
+                    DiscoveryRole::Workspace,
+                )
+                .to_str()
+                .ok_or("selected directory is not UTF-8")?
+                .into(),
+            });
+        }
+        flags
+    };
+    let mut retained_views =
+        sources::retained_source_view_bytes(&loaded).map_err(str::to_string)?;
+    let mut edited = std::collections::BTreeSet::new();
+    for ordinal in 0..loaded.len() {
+        let source = &loaded[ordinal];
+        if rebind_enabled
+            && source.source.lane == SourceLane::Tui
+            && native_source_flags.iter().any(|flag| {
+                flag.kind == freshell_platform::opencode_recipe::NativeSourceFlagKind::Tui
+                    && Path::new(&flag.runtime_destination)
+                        == sources::runtime_config_destination(
+                            home,
+                            &config_root,
+                            &source.source.logical_path,
+                            source.source.role,
+                        )
+            })
+        {
+            let canonical = source.source.canonical_source.clone();
+            if !edited.insert(canonical.clone()) {
+                continue;
+            }
+            let shared = loaded
+                .iter()
+                .filter(|source| source.source.canonical_source == canonical)
+                .count()
+                > 1;
+            let remaining = (64 * 1024 * 1024usize)
+                .checked_sub(retained_views)
+                .ok_or("simultaneous source views exceed 64 MiB")?;
+            let runtime_home = Path::new("/home/freshell/provider");
+            let plugin = if shared {
+                freshell_platform::opencode_plugin::rebind_plugin_package_path(runtime_home)
+            } else {
+                freshell_platform::opencode_plugin::rebind_plugin_path(runtime_home)
+            };
+            let content = freshell_platform::opencode_plugin::selected_tui_content_bounded(
+                &source.view,
+                &plugin,
+                remaining,
+            )
+            .map_err(|_| {
+                format!(
+                    "selected OpenCode TUI source {} has invalid JSONC/plugin list or exceeds the source-view profile",
+                    source.source.logical_path.display()
+                )
+            })?;
+            if content.len() > 16 * 1024 * 1024 {
+                return Err("selected OpenCode effective TUI source exceeds 16 MiB".into());
+            }
+            retained_views = retained_views
+                .checked_add(content.len())
+                .ok_or("source-view byte count overflow")?;
+            let view = std::sync::Arc::new(content);
+            for (index, source) in loaded.iter_mut().enumerate() {
+                if index == ordinal || shared && source.source.canonical_source == canonical {
+                    source.view = view.clone();
+                    source.requires_config_bind = true;
+                }
+            }
+        }
+    }
+    let names = source_environment_names(&loaded).map_err(|error| error.to_string())?;
+    let mut environment = environment::SourceEnvironment::read(names, &references, original)?;
+    // Even a typed auth grant needs explicit ownership of a newly absent soul
+    // volume before its descriptor-owned mountpoints can be constructed.
+    let reservation = if auth_authority.is_none() {
+        Some(
+            client
+                .reserve_provider_inputs(soul.clone(), "opencode".into(), creation_seed.into())
+                .await
+                .map_err(|error| error.to_string())?
+                .reservation_id,
+        )
+    } else {
+        None
+    };
+    if environment.needs_native_auth()
+        && loaded
+            .iter()
+            .any(|source| source.source.lane == SourceLane::Main)
+    {
+        let authority = if let Some(authority) = auth_authority {
+            authority.to_owned()
+        } else {
+            reservation
+                .clone()
+                .ok_or("initial provider input reservation unavailable")?
+        };
+        let values = client
+            .native_auth_lookup(soul.clone(), authority, environment.names().to_vec())
+            .await
+            .map_err(|error| error.to_string())?;
+        environment.set_native_auth(values.0)?;
+    }
+    let plan = environment
+        .plan_sources(loaded, cwd, home)
+        .map_err(|error| error.to_string())?;
+    let frozen = environment.frozen_inputs(&plan)?;
+    let frozen_names = frozen
+        .iter()
+        .map(|(name, _)| name.to_owned())
+        .collect::<Vec<_>>();
+    let mut files = std::collections::BTreeMap::new();
+    for source in &plan {
+        for selection in &source.references.selections {
+            let id = selection
+                .runtime_destination
+                .strip_prefix("/home/freshell/provider/.freshell/references/")
+                .and_then(|value| value.parse::<u16>().ok())
+                .ok_or("invalid prepared source index")?;
+            if files
+                .insert(id, selection.canonical_source.clone())
+                .is_some_and(|prior| prior != selection.canonical_source)
+            {
+                return Err("prepared source changes one selected index".into());
+            }
+        }
+    }
+    for (expected, (id, path)) in files.into_iter().enumerate() {
+        if id as usize != expected {
+            return Err("prepared source indexes are not contiguous".into());
+        }
+        references.push(freshell_runtime_protocol::ProviderSecretReference {
+            source_path: path.to_str().ok_or("selected source is not UTF-8")?.into(),
+            profile: freshell_runtime_protocol::ProviderSecretProfile::OpencodeConfigurationFile,
+            provider_relative_path: Some(format!(".freshell/references/{id}")),
+        });
+    }
+    freshell_runtime_protocol::validate_provider_secrets("opencode", &references)
+        .map_err(|error| error.message)?;
+    let context = publish(
+        soul,
+        home,
+        &base,
+        crate::managed_mcp_capability::OpencodeEphemeralInput {
+            cwd: Some(cwd),
+            workspace: Some(workspace),
+            config_root: Some(&config_root),
+            source_plan: Some(&plan),
+            resource_roots: Some(&resource_roots),
+            initial_auth_reservation: reservation.as_deref(),
+            secret_references: Some(&references),
+            frozen_inputs: Some(&frozen_names),
+            native_source_flags: Some(&native_source_flags),
+            rebind_enabled: Some(rebind_enabled),
+            inline_edits: Some(&inline_edits),
+            ..Default::default()
+        },
+    )?;
+    let capability = context
+        .mcp_capability
+        .as_ref()
+        .ok_or("prepared source capability unavailable")?;
+    if !frozen.is_empty() {
+        if let Err(error) = client
+            .bind_provider_path_inputs(soul.clone(), capability.grant_id.clone(), frozen)
+            .await
+        {
+            let _ = crate::managed_mcp_capability::revoke_mcp_capability(&capability.grant_id);
+            return Err(error.to_string());
+        }
+    }
+    context
+        .prepared_inputs
+        .as_ref()
+        .ok_or("prepared source descriptors unavailable")?
+        .validate_references(&references)
+        .map_err(|error| error.message)?;
+    Ok(PreparedManagedOpencode {
+        context,
+        references,
+    })
+}
+
+/// Rebuild only a positively rejected, never-dispatched initial OpenCode input
+/// generation. Other failures retain their inputs for ownership reconciliation.
+pub(crate) async fn launch_initial_opencode(
+    preparation: OpencodePreparation<'_>,
+    mut request_id: freshell_runtime_protocol::RequestId,
+    mut launch: freshell_runtime_protocol::LaunchRequest,
+) -> Result<freshell_runtime_protocol::LaunchResult, String> {
+    use freshell_runtime_protocol::RuntimeErrorCode;
+    let mut retries = 0;
+    loop {
+        match preparation
+            .client
+            .launch(request_id.clone(), launch.clone())
+            .await
+        {
+            Ok(result) => return Ok(result),
+            Err(error)
+                if error.runtime_code() == Some(RuntimeErrorCode::ProviderInputsChanged)
+                    && launch.native_session_id.is_none() =>
+            {
+                let context = launch
+                    .terminal
+                    .as_ref()
+                    .and_then(|s| s.provider_launch_context.as_ref())
+                    .or_else(|| {
+                        launch
+                            .fresh_agent
+                            .as_ref()
+                            .and_then(|s| s.provider_launch_context.as_ref())
+                    });
+                if let Some(capability) = context.and_then(|c| c.mcp_capability.as_ref()) {
+                    crate::managed_mcp_capability::revoke_mcp_capability(&capability.grant_id)?;
+                }
+                if retries == 2 {
+                    tracing::warn!(event="provider.inputs.initial_replan.exhausted", provider="opencode", soul_id=%launch.soul_id, retries);
+                    return Err("OpenCode configuration reference selection kept changing; two pre-dispatch retries exhausted".into());
+                }
+                retries += 1;
+                tracing::info!(event="provider.inputs.initial_replan", provider="opencode", soul_id=%launch.soul_id, retry=retries);
+                let prepared = prepare_managed_opencode(OpencodePreparation {
+                    client: preparation.client,
+                    soul: preparation.soul,
+                    creation_seed: preparation.creation_seed,
+                    home: preparation.home,
+                    cwd: preparation.cwd,
+                    workspace: preparation.workspace,
+                    original: preparation.original,
+                    references: preparation.references.clone(),
+                    auth_authority: None,
+                    selected_sources: None,
+                    accepted_global_root: None,
+                    selected_resource_roots: None,
+                    native_source_flags: None,
+                    rebind_enabled: None,
+                    inherited_inline: None,
+                    inline_edits: preparation.inline_edits.clone(),
+                })
+                .await?;
+                if let Some(terminal) = launch.terminal.as_mut() {
+                    terminal.provider_secret_references = prepared.references;
+                    terminal.provider_launch_context = Some(prepared.context);
+                } else if let Some(fresh) = launch.fresh_agent.as_mut() {
+                    fresh.provider_secret_references = prepared.references;
+                    fresh.provider_launch_context = Some(prepared.context);
+                } else {
+                    return Err("initial OpenCode workload unavailable".into());
+                }
+                // A new approved generation has a different semantic payload.
+                // Keep the public creation/soul identity and use a fresh control
+                // request identity rather than replaying a rejected digest.
+                request_id = freshell_runtime_protocol::RequestId::new();
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -933,516 +1457,5 @@ process.stdout.write(JSON.stringify(receipts));
             consume(&plan, &temp.path().join("runtime")),
             vec![digest("native-lexical-origin-nonce")]
         );
-    }
-}
-
-pub(crate) struct PreparedManagedOpencode {
-    pub context: freshell_runtime_protocol::ProviderLaunchContext,
-    pub references: Vec<freshell_runtime_protocol::ProviderSecretReference>,
-}
-
-/// Terminal, fresh and scoped replacement callers share this one preparation.
-/// The original lookup and decoded grants never enter the returned metadata.
-pub(crate) struct OpencodePreparation<'a> {
-    pub client: &'a freshell_runtime_client::RuntimeClient,
-    pub soul: &'a freshell_runtime_protocol::SoulId,
-    pub creation_seed: &'a str,
-    pub home: &'a Path,
-    pub cwd: &'a Path,
-    pub workspace: &'a Path,
-    pub original: &'a (dyn Fn(&str) -> Option<String> + Sync),
-    pub references: Vec<freshell_runtime_protocol::ProviderSecretReference>,
-    pub auth_authority: Option<&'a str>,
-    pub selected_sources: Option<Vec<sources::SourceOccurrence>>,
-    pub accepted_global_root: Option<PathBuf>,
-    pub selected_resource_roots: Option<Vec<sources::DiscoveryRoot>>,
-    pub native_source_flags: Option<Vec<freshell_platform::opencode_recipe::NativeSourceFlag>>,
-    pub rebind_enabled: Option<bool>,
-    pub inherited_inline: Option<String>,
-    pub inline_edits: Option<freshell_platform::opencode_config::OwnedConfigEdits>,
-}
-
-pub(crate) async fn prepare_managed_opencode(
-    request: OpencodePreparation<'_>,
-) -> Result<PreparedManagedOpencode, String> {
-    prepare_managed_opencode_with_publisher(
-        request,
-        crate::managed_mcp_capability::issue_prepared_opencode_context,
-    )
-    .await
-}
-
-pub(crate) async fn prepare_managed_opencode_with_publisher(
-    request: OpencodePreparation<'_>,
-    publish: impl FnOnce(
-        &freshell_runtime_protocol::SoulId,
-        &Path,
-        &freshell_runtime_protocol::ProviderLaunchContext,
-        crate::managed_mcp_capability::OpencodeEphemeralInput<'_>,
-    ) -> Result<freshell_runtime_protocol::ProviderLaunchContext, String>,
-) -> Result<PreparedManagedOpencode, String> {
-    let OpencodePreparation {
-        client,
-        soul,
-        creation_seed,
-        home,
-        cwd,
-        workspace,
-        original,
-        mut references,
-        auth_authority,
-        selected_sources,
-        accepted_global_root,
-        selected_resource_roots,
-        native_source_flags,
-        rebind_enabled,
-        inherited_inline,
-        inline_edits,
-    } = request;
-    let rebind_enabled = rebind_enabled.unwrap_or_else(|| {
-        !matches!(
-            original("FRESHELL_OPENCODE_REBIND").as_deref(),
-            Some("0" | "false")
-        )
-    });
-    use sources::*;
-    let inherited_inline = inherited_inline
-        .or_else(|| original("OPENCODE_CONFIG_CONTENT"))
-        .filter(|raw| !raw.is_empty());
-    let mut inline_edits = inline_edits.unwrap_or_default();
-    inline_edits.freshell_command = Some(vec!["node".into(), "/opt/freshell-mcp/server.js".into()]);
-    if inline_edits.bash_permission.is_none() {
-        inline_edits.bash_permission = original("FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION")
-            .filter(|value| matches!(value.as_str(), "allow" | "ask" | "deny"));
-    }
-    let config_root = if let Some(root) = accepted_global_root {
-        if !root.is_absolute() || root.file_name() != Some(std::ffi::OsStr::new("opencode")) {
-            return Err(
-                "accepted global configuration root is invalid; retain prior inputs and reprepare"
-                    .into(),
-            );
-        }
-        root
-    } else {
-        let xdg = original("XDG_CONFIG_HOME")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".config"));
-        let xdg = if xdg.is_absolute() {
-            xdg
-        } else {
-            cwd.join(xdg)
-        };
-        xdg.join("opencode")
-    };
-    let xdg = config_root
-        .parent()
-        .ok_or("global configuration root parent unavailable")?;
-    let resource_roots = if let Some(roots) = selected_resource_roots {
-        roots
-    } else {
-        sources::select_opencode_resource_roots(&OpencodeDiscovery {
-            home,
-            cwd,
-            worktree: workspace,
-            config_root: &config_root,
-            env: original,
-        })
-        .map_err(str::to_string)?
-    };
-    let base = crate::managed_provider_bootstrap::provider_launch_context_from_home_at_with_xdg(
-        "opencode",
-        workspace,
-        cwd,
-        home,
-        Some(xdg),
-        None,
-    )?
-    .ok_or("OpenCode provider preparation unavailable")?;
-    let selected = if let Some(sources) = selected_sources {
-        sources
-    } else {
-        discover_opencode(OpencodeDiscovery {
-            home,
-            cwd,
-            worktree: workspace,
-            config_root: &config_root,
-            env: original,
-        })
-        .map_err(str::to_string)?
-    };
-    let mut loaded = read_opencode_sources(selected).map_err(|error| error.to_string())?;
-    if let Some(raw) = inherited_inline {
-        if raw.len() > 16 * 1024 * 1024 {
-            return Err("OpenCode inherited inline source exceeds 16 MiB".into());
-        }
-        let retained = sources::retained_source_view_bytes(&loaded)
-            .map_err(str::to_string)?
-            .checked_add(raw.len())
-            .ok_or("source-view size overflow")?;
-        let remaining = (64 * 1024 * 1024usize)
-            .checked_sub(retained)
-            .ok_or("simultaneous source views exceed 64 MiB")?;
-        let user_owns_freshell_mcp = loaded
-            .iter()
-            .filter(|source| source.source.lane == SourceLane::Main)
-            .try_fold(false, |owned, source| {
-                freshell_platform::opencode_config::source_owns_freshell_mcp(
-                    &source.view,
-                    &source.source.logical_path,
-                    cwd,
-                )
-                .map(|user_owns| owned || user_owns)
-            })
-            .map_err(|error| error.to_string())?;
-        let view = freshell_platform::opencode_config::merge_owned_entries_bounded(
-            Some(&raw),
-            &freshell_platform::opencode_config::OpencodeConfigPlan {
-                sources: vec![],
-                user_owns_freshell_mcp,
-                inline_prepared: false,
-            },
-            &inline_edits,
-            remaining.min(64 * 1024),
-        )
-        .map_err(|error| error.to_string())?;
-        let inline = LoadedSourceOccurrence {
-            requires_config_bind: true,
-            source: SourceOccurrence {
-                logical_path: "OPENCODE_CONFIG_CONTENT".into(),
-                canonical_source: "OPENCODE_CONFIG_CONTENT".into(),
-                lane: SourceLane::Inline,
-                role: freshell_platform::opencode_recipe::DiscoveryRole::Workspace,
-            },
-            view: std::sync::Arc::new(view),
-        };
-        let position = loaded
-            .iter()
-            .position(|source| source.source.lane == SourceLane::Tui)
-            .unwrap_or(loaded.len());
-        loaded.insert(position, inline);
-    }
-    let native_source_flags = if let Some(flags) = native_source_flags {
-        flags
-    } else {
-        let mut flags = Vec::new();
-        for (name, kind) in [
-            (
-                "OPENCODE_CONFIG",
-                freshell_platform::opencode_recipe::NativeSourceFlagKind::Main,
-            ),
-            (
-                "OPENCODE_TUI_CONFIG",
-                freshell_platform::opencode_recipe::NativeSourceFlagKind::Tui,
-            ),
-        ] {
-            if let Some(path) = original(name).filter(|path| !path.is_empty()) {
-                let path = if Path::new(&path).is_absolute() {
-                    PathBuf::from(path)
-                } else {
-                    cwd.join(path)
-                };
-                let source_ordinal = loaded
-                    .iter()
-                    .position(|source| source.source.logical_path == path && source.source.role == DiscoveryRole::Workspace && match kind {
-                        freshell_platform::opencode_recipe::NativeSourceFlagKind::Main => source.source.lane == SourceLane::Main,
-                        freshell_platform::opencode_recipe::NativeSourceFlagKind::Tui => source.source.lane == SourceLane::Tui,
-                        freshell_platform::opencode_recipe::NativeSourceFlagKind::Directory => false,
-                    }).ok_or_else(|| format!("selected {name} source is missing or unavailable; repair it before dispatch"))?;
-                let destination = sources::runtime_config_destination(
-                    home,
-                    &config_root,
-                    &path,
-                    loaded[source_ordinal].source.role,
-                );
-                flags.push(freshell_platform::opencode_recipe::NativeSourceFlag {
-                    kind,
-                    source_ordinal: Some(
-                        u16::try_from(source_ordinal)
-                            .map_err(|_| "native source ordinal overflow")?,
-                    ),
-                    runtime_destination: destination
-                        .to_str()
-                        .ok_or("selected native source destination is not UTF-8")?
-                        .into(),
-                });
-            }
-        }
-        if let Some(path) = original("OPENCODE_CONFIG_DIR").filter(|path| !path.is_empty()) {
-            let path = if Path::new(&path).is_absolute() {
-                PathBuf::from(path)
-            } else {
-                cwd.join(path)
-            };
-            if !resource_roots.iter().any(|root| root.logical_path == path) {
-                return Err(
-                    "selected OPENCODE_CONFIG_DIR root is unavailable before dispatch".into(),
-                );
-            }
-            flags.push(freshell_platform::opencode_recipe::NativeSourceFlag {
-                kind: freshell_platform::opencode_recipe::NativeSourceFlagKind::Directory,
-                source_ordinal: None,
-                runtime_destination: sources::runtime_directory_destination(
-                    home,
-                    &config_root,
-                    &path,
-                    DiscoveryRole::Workspace,
-                )
-                .to_str()
-                .ok_or("selected directory is not UTF-8")?
-                .into(),
-            });
-        }
-        flags
-    };
-    let mut retained_views =
-        sources::retained_source_view_bytes(&loaded).map_err(str::to_string)?;
-    let mut edited = std::collections::BTreeSet::new();
-    for ordinal in 0..loaded.len() {
-        let source = &loaded[ordinal];
-        if rebind_enabled
-            && source.source.lane == SourceLane::Tui
-            && native_source_flags.iter().any(|flag| {
-                flag.kind == freshell_platform::opencode_recipe::NativeSourceFlagKind::Tui
-                    && Path::new(&flag.runtime_destination)
-                        == sources::runtime_config_destination(
-                            home,
-                            &config_root,
-                            &source.source.logical_path,
-                            source.source.role,
-                        )
-            })
-        {
-            let canonical = source.source.canonical_source.clone();
-            if !edited.insert(canonical.clone()) {
-                continue;
-            }
-            let shared = loaded
-                .iter()
-                .filter(|source| source.source.canonical_source == canonical)
-                .count()
-                > 1;
-            let remaining = (64 * 1024 * 1024usize)
-                .checked_sub(retained_views)
-                .ok_or("simultaneous source views exceed 64 MiB")?;
-            let runtime_home = Path::new("/home/freshell/provider");
-            let plugin = if shared {
-                freshell_platform::opencode_plugin::rebind_plugin_package_path(runtime_home)
-            } else {
-                freshell_platform::opencode_plugin::rebind_plugin_path(runtime_home)
-            };
-            let content = freshell_platform::opencode_plugin::selected_tui_content_bounded(
-                &source.view,
-                &plugin,
-                remaining,
-            )
-            .map_err(|_| {
-                format!(
-                    "selected OpenCode TUI source {} has invalid JSONC/plugin list or exceeds the source-view profile",
-                    source.source.logical_path.display()
-                )
-            })?;
-            if content.len() > 16 * 1024 * 1024 {
-                return Err("selected OpenCode effective TUI source exceeds 16 MiB".into());
-            }
-            retained_views = retained_views
-                .checked_add(content.len())
-                .ok_or("source-view byte count overflow")?;
-            let view = std::sync::Arc::new(content);
-            for (index, source) in loaded.iter_mut().enumerate() {
-                if index == ordinal || shared && source.source.canonical_source == canonical {
-                    source.view = view.clone();
-                    source.requires_config_bind = true;
-                }
-            }
-        }
-    }
-    let names = source_environment_names(&loaded).map_err(|error| error.to_string())?;
-    let mut environment = environment::SourceEnvironment::read(names, &references, original)?;
-    // Even a typed auth grant needs explicit ownership of a newly absent soul
-    // volume before its descriptor-owned mountpoints can be constructed.
-    let reservation = if auth_authority.is_none() {
-        Some(
-            client
-                .reserve_provider_inputs(soul.clone(), "opencode".into(), creation_seed.into())
-                .await
-                .map_err(|error| error.to_string())?
-                .reservation_id,
-        )
-    } else {
-        None
-    };
-    if environment.needs_native_auth()
-        && loaded
-            .iter()
-            .any(|source| source.source.lane == SourceLane::Main)
-    {
-        let authority = if let Some(authority) = auth_authority {
-            authority.to_owned()
-        } else {
-            reservation
-                .clone()
-                .ok_or("initial provider input reservation unavailable")?
-        };
-        let values = client
-            .native_auth_lookup(soul.clone(), authority, environment.names().to_vec())
-            .await
-            .map_err(|error| error.to_string())?;
-        environment.set_native_auth(values.0)?;
-    }
-    let plan = environment
-        .plan_sources(loaded, cwd, home)
-        .map_err(|error| error.to_string())?;
-    let frozen = environment.frozen_inputs(&plan)?;
-    let frozen_names = frozen
-        .iter()
-        .map(|(name, _)| name.to_owned())
-        .collect::<Vec<_>>();
-    let mut files = std::collections::BTreeMap::new();
-    for source in &plan {
-        for selection in &source.references.selections {
-            let id = selection
-                .runtime_destination
-                .strip_prefix("/home/freshell/provider/.freshell/references/")
-                .and_then(|value| value.parse::<u16>().ok())
-                .ok_or("invalid prepared source index")?;
-            if files
-                .insert(id, selection.canonical_source.clone())
-                .is_some_and(|prior| prior != selection.canonical_source)
-            {
-                return Err("prepared source changes one selected index".into());
-            }
-        }
-    }
-    for (expected, (id, path)) in files.into_iter().enumerate() {
-        if id as usize != expected {
-            return Err("prepared source indexes are not contiguous".into());
-        }
-        references.push(freshell_runtime_protocol::ProviderSecretReference {
-            source_path: path.to_str().ok_or("selected source is not UTF-8")?.into(),
-            profile: freshell_runtime_protocol::ProviderSecretProfile::OpencodeConfigurationFile,
-            provider_relative_path: Some(format!(".freshell/references/{id}")),
-        });
-    }
-    freshell_runtime_protocol::validate_provider_secrets("opencode", &references)
-        .map_err(|error| error.message)?;
-    let context = publish(
-        soul,
-        home,
-        &base,
-        crate::managed_mcp_capability::OpencodeEphemeralInput {
-            cwd: Some(cwd),
-            workspace: Some(workspace),
-            config_root: Some(&config_root),
-            source_plan: Some(&plan),
-            resource_roots: Some(&resource_roots),
-            initial_auth_reservation: reservation.as_deref(),
-            secret_references: Some(&references),
-            frozen_inputs: Some(&frozen_names),
-            native_source_flags: Some(&native_source_flags),
-            rebind_enabled: Some(rebind_enabled),
-            inline_edits: Some(&inline_edits),
-            ..Default::default()
-        },
-    )?;
-    let capability = context
-        .mcp_capability
-        .as_ref()
-        .ok_or("prepared source capability unavailable")?;
-    if !frozen.is_empty() {
-        if let Err(error) = client
-            .bind_provider_path_inputs(soul.clone(), capability.grant_id.clone(), frozen)
-            .await
-        {
-            let _ = crate::managed_mcp_capability::revoke_mcp_capability(&capability.grant_id);
-            return Err(error.to_string());
-        }
-    }
-    context
-        .prepared_inputs
-        .as_ref()
-        .ok_or("prepared source descriptors unavailable")?
-        .validate_references(&references)
-        .map_err(|error| error.message)?;
-    Ok(PreparedManagedOpencode {
-        context,
-        references,
-    })
-}
-
-/// Rebuild only a positively rejected, never-dispatched initial OpenCode input
-/// generation. Other failures retain their inputs for ownership reconciliation.
-pub(crate) async fn launch_initial_opencode(
-    preparation: OpencodePreparation<'_>,
-    mut request_id: freshell_runtime_protocol::RequestId,
-    mut launch: freshell_runtime_protocol::LaunchRequest,
-) -> Result<freshell_runtime_protocol::LaunchResult, String> {
-    use freshell_runtime_protocol::RuntimeErrorCode;
-    let mut retries = 0;
-    loop {
-        match preparation
-            .client
-            .launch(request_id.clone(), launch.clone())
-            .await
-        {
-            Ok(result) => return Ok(result),
-            Err(error)
-                if error.runtime_code() == Some(RuntimeErrorCode::ProviderInputsChanged)
-                    && launch.native_session_id.is_none() =>
-            {
-                let context = launch
-                    .terminal
-                    .as_ref()
-                    .and_then(|s| s.provider_launch_context.as_ref())
-                    .or_else(|| {
-                        launch
-                            .fresh_agent
-                            .as_ref()
-                            .and_then(|s| s.provider_launch_context.as_ref())
-                    });
-                if let Some(capability) = context.and_then(|c| c.mcp_capability.as_ref()) {
-                    crate::managed_mcp_capability::revoke_mcp_capability(&capability.grant_id)?;
-                }
-                if retries == 2 {
-                    tracing::warn!(event="provider.inputs.initial_replan.exhausted", provider="opencode", soul_id=%launch.soul_id, retries);
-                    return Err("OpenCode configuration reference selection kept changing; two pre-dispatch retries exhausted".into());
-                }
-                retries += 1;
-                tracing::info!(event="provider.inputs.initial_replan", provider="opencode", soul_id=%launch.soul_id, retry=retries);
-                let prepared = prepare_managed_opencode(OpencodePreparation {
-                    client: preparation.client,
-                    soul: preparation.soul,
-                    creation_seed: preparation.creation_seed,
-                    home: preparation.home,
-                    cwd: preparation.cwd,
-                    workspace: preparation.workspace,
-                    original: preparation.original,
-                    references: preparation.references.clone(),
-                    auth_authority: None,
-                    selected_sources: None,
-                    accepted_global_root: None,
-                    selected_resource_roots: None,
-                    native_source_flags: None,
-                    rebind_enabled: None,
-                    inherited_inline: None,
-                    inline_edits: preparation.inline_edits.clone(),
-                })
-                .await?;
-                if let Some(terminal) = launch.terminal.as_mut() {
-                    terminal.provider_secret_references = prepared.references;
-                    terminal.provider_launch_context = Some(prepared.context);
-                } else if let Some(fresh) = launch.fresh_agent.as_mut() {
-                    fresh.provider_secret_references = prepared.references;
-                    fresh.provider_launch_context = Some(prepared.context);
-                } else {
-                    return Err("initial OpenCode workload unavailable".into());
-                }
-                // A new approved generation has a different semantic payload.
-                // Keep the public creation/soul identity and use a fresh control
-                // request identity rather than replaying a rejected digest.
-                request_id = freshell_runtime_protocol::RequestId::new();
-            }
-            Err(error) => return Err(error.to_string()),
-        }
     }
 }

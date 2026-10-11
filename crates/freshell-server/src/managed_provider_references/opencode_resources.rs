@@ -94,10 +94,9 @@ fn fields(raw: &str) -> Result<Vec<(&'static str, String)>, &'static str> {
 
 // Read only member spans: selected nested schemas never deserialize or rewrite
 // an entire source document, nor interpret command arrays as file selections.
-fn object_members(
-    raw: &str,
-    start: usize,
-) -> Result<Vec<(std::ops::Range<usize>, std::ops::Range<usize>)>, &'static str> {
+type ObjectMember = (std::ops::Range<usize>, std::ops::Range<usize>);
+
+fn object_members(raw: &str, start: usize) -> Result<Vec<ObjectMember>, &'static str> {
     let mut cursor = Cursor { raw, at: start };
     if !matches!(cursor.next(), Some(Token::Punctuation(b'{'))) {
         return Ok(Vec::new());

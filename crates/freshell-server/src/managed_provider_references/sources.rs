@@ -457,6 +457,7 @@ pub fn source_environment_names(
     Ok(names.into_iter().collect())
 }
 
+#[cfg(test)]
 pub fn plan_opencode_sources(
     sources: Vec<SourceOccurrence>,
     cwd: &Path,
@@ -466,6 +467,7 @@ pub fn plan_opencode_sources(
     plan_loaded_opencode_sources(read_opencode_sources(sources)?, cwd, home, lookup)
 }
 
+#[cfg(test)]
 pub fn plan_loaded_opencode_sources(
     sources: Vec<LoadedSourceOccurrence>,
     cwd: &Path,

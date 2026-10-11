@@ -505,7 +505,7 @@ async fn apply_prepared_callback(
             read_prior_manifest_bytes(provider, store, directory, &callback.soul_id, &context)?;
         enum AcceptedOrigins {
             Codex(freshell_platform::codex_inputs::CodexInputManifest),
-            Claude(freshell_platform::claude_inputs::ClaudeInputManifest),
+            Claude(Box<freshell_platform::claude_inputs::ClaudeInputManifest>),
             Amplifier(freshell_platform::amplifier_inputs::AmplifierInputManifest),
         }
         let origins = match provider {
@@ -524,7 +524,7 @@ async fn apply_prepared_callback(
                     manifest.accepted_native_plan = Some(plan.clone());
                 }
                 manifest.validate().map_err(str::to_string)?;
-                AcceptedOrigins::Claude(manifest)
+                AcceptedOrigins::Claude(Box::new(manifest))
             }
             "amplifier" => {
                 let manifest: freshell_platform::amplifier_inputs::AmplifierInputManifest =
@@ -894,12 +894,12 @@ fn read_prior_manifest_bytes(
         .mcp_capability
         .as_ref()
         .ok_or("prior source context lacks generation authority")?;
-    if !store
+    if store
         .grants
         .lock()
         .unwrap()
         .get(&capability.grant_id)
-        .is_some_and(|grant| grant.soul_id == *soul)
+        .is_none_or(|grant| grant.soul_id != *soul)
     {
         return Err("prior provider source context belongs to another owner".into());
     }
@@ -2374,17 +2374,19 @@ impl CapabilityStore {
                 .ok_or("prepared source requires original provider HOME")?
                 .1;
             let prepared = source_stage::describe(
-                root,
-                home,
+                source_stage::DescriptionRoots {
+                    root,
+                    home,
+                    config_root: opencode_input.config_root,
+                    workspace: opencode_input
+                        .workspace
+                        .or(opencode_input.cwd)
+                        .unwrap_or(home),
+                },
                 plan,
                 &soul_id,
                 &reference,
                 opencode_input.initial_auth_reservation,
-                opencode_input.config_root,
-                opencode_input
-                    .workspace
-                    .or(opencode_input.cwd)
-                    .unwrap_or(home),
                 opencode_input.secret_references.unwrap_or(&[]),
             )
             .and_then(|inputs| {
@@ -2597,12 +2599,12 @@ impl CapabilityStore {
         let retained = recoverable_input_path(directory, &soul_id)?;
         let prior_stage = if let Some(recovery) = input.claude_recovery_source {
             recovery.validate().map_err(|error| error.message)?;
-            if !self
+            if self
                 .grants
                 .lock()
                 .unwrap()
                 .get(&recovery.prior_generation_id)
-                .is_some_and(|grant| grant.soul_id == soul_id)
+                .is_none_or(|grant| grant.soul_id != soul_id)
             {
                 return Err("Claude exact prior generation ownership unavailable; retain inputs and reprepare".into());
             }
@@ -2922,7 +2924,7 @@ fn read_prepared_context(
     capability: &McpCapabilityReference,
 ) -> Result<freshell_runtime_protocol::ProviderLaunchContext, String> {
     let result = (|| {
-        let stage = staged_provider_root_path(&directory, &capability.grant_id)?;
+        let stage = staged_provider_root_path(directory, &capability.grant_id)?;
         let bytes = read_prepared_metadata(&stage, ".freshell/prepared-context.json", freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES)
             .map_err(|_| "complete prepared provider context unavailable or exceeds metadata profile; retain inputs and reprepare")?;
         let context: freshell_runtime_protocol::ProviderLaunchContext =
@@ -3043,12 +3045,12 @@ fn bind_claude_candidate_request_and_plan(
     let generation = grant.grant_id.clone();
     let inputs = context.prepared_inputs.as_ref().ok_or_else(blocked)?;
     if inputs.generation_id != generation
-        || !store
+        || store
             .grants
             .lock()
             .unwrap()
             .get(&generation)
-            .is_some_and(|grant| grant.soul_id == request.soul_id)
+            .is_none_or(|grant| grant.soul_id != request.soul_id)
     {
         return Err(blocked());
     }
@@ -7983,8 +7985,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             &client,
         )
         .await
-        .err()
-        .expect(
+        .expect_err(
             "legacy metadata cannot grant current HOME authority for an unrecorded original source",
         );
         assert!(error.contains("original Codex source origins are unrecorded"));
@@ -8872,8 +8873,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                 &client,
             )
             .await
-            .err()
-            .expect("lost selected frozen ordinary source must block another fresh generation");
+            .expect_err("lost selected frozen ordinary source must block another fresh generation");
             assert!(
                 error.contains("frozen selected source unavailable"),
                 "{error}"
