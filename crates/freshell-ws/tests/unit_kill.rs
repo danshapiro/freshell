@@ -261,7 +261,10 @@ async fn shift_x_mid_turn_publishes_exit_and_vacant_only_after_gone() {
     .await;
     let manifest = h.native_manifest(&tid);
     let lock = h.lock("t-k1");
-    assert!(fake_codex::lock_held(&lock));
+    assert!(
+        fake_codex::holds_lock_fd(native, &lock),
+        "the app-server holds the conversation lock mid-turn"
+    );
     h.send(&mut ws, kill(Some(&tid), "crq-k1", "rk1")).await;
     let mut seen = std::collections::BTreeSet::new();
     while seen.len() < 4 {

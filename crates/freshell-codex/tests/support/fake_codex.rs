@@ -308,17 +308,58 @@ pub fn environ_value(pid: u32, key: &str) -> Option<String> {
     })
 }
 
-/// Test-only "is anything locking this inode" (`/proc/locks`).
-pub fn lock_held(path: &Path) -> bool {
+/// `path`'s device-and-inode token as `/proc/locks` prints it: `maj:min:ino`,
+/// the kernel's `%02x:%02x:%lu`. A lock on another device with the same inode
+/// number never matches it.
+///
+/// The device part is `stat`'s, which is the superblock device `/proc/locks`
+/// prints on the file systems these tests run on (ext4 here and on CI, tmpfs in
+/// the sandbox). On a host where the two differ (a btrfs subvolume, say),
+/// `realistic_fake.rs`'s `the_lock_lives_on_the_natives_own_file_descriptor`
+/// fails, since it finds a held lock's row by this token; release checks never
+/// pass unnoticed there.
+pub fn proc_locks_token(path: &Path) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
+    let meta = std::fs::metadata(path).ok()?;
+    Some(format!(
+        "{:02x}:{:02x}:{}",
+        libc::major(meta.dev()),
+        libc::minor(meta.dev()),
+        meta.ino()
+    ))
+}
+
+/// The `FLOCK` rows (holders and waiters) on `path` in ONE read of
+/// `/proc/locks`, matched by its full [`proc_locks_token`].
+///
+/// One read can miss a row of a lock that stays held, but never shows a row
+/// that was not there. The kernel serves the file one page per `read()` call,
+/// each rendered with its lock list locked, and starts the next call at the
+/// next row's position. A lock released between two calls, earlier in the list,
+/// moves every later row back one place, so the row at the boundary is skipped.
+/// So a check that a lock IS held reads the holder's own descriptors
+/// ([`holds_lock_fd`]), or reads again until the row appears (bounded).
+pub fn flock_rows_once(path: &Path) -> Vec<String> {
+    let Some(token) = proc_locks_token(path) else {
+        return Vec::new();
     };
-    let needle = format!(":{} ", meta.ino());
     std::fs::read_to_string("/proc/locks")
         .unwrap_or_default()
         .lines()
-        .any(|l| l.contains("FLOCK") && format!("{l} ").contains(&needle))
+        .filter(|row| {
+            let fields: Vec<&str> = row.split_whitespace().collect();
+            fields.contains(&"FLOCK") && fields.contains(&token.as_str())
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// Test-only "does one read of `/proc/locks` show a lock on this file" (see
+/// [`flock_rows_once`]). Use it only to check that a lock was RELEASED: one
+/// read can miss a held lock's row, but never shows a row that was not there.
+/// To check that a lock is held, use [`holds_lock_fd`].
+pub fn lock_held(path: &Path) -> bool {
+    !flock_rows_once(path).is_empty()
 }
 
 /// True when `pid` holds a lock on `path` through one of its own file descriptors:

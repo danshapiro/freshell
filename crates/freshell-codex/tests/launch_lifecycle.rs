@@ -2572,7 +2572,10 @@ mod unit_sidecar {
             .await
             .unwrap();
         let lock = fake_codex::thread_lock_path(home.path(), "t-shiftx");
-        assert!(fake_codex::lock_held(&lock));
+        assert!(
+            fake_codex::holds_lock_fd(native.pid, &lock),
+            "the native holds the thread lock"
+        );
         unit.set_lock_paths(vec![lock.clone()]);
         let report = unit
             .stop(StopRequest::new(

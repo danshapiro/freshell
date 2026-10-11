@@ -37,18 +37,37 @@ fn status_type(note: &Value) -> &str {
         .unwrap_or_default()
 }
 
-/// The pid column of the `/proc/locks` row for `path`'s inode.
-fn locks_row_pid(path: &Path) -> Option<u32> {
-    use std::os::unix::fs::MetadataExt;
-    let needle = format!(":{} ", std::fs::metadata(path).ok()?.ino());
-    std::fs::read_to_string("/proc/locks")
-        .ok()?
-        .lines()
-        .find(|l| l.contains("FLOCK") && format!("{l} ").contains(&needle))?
-        .split_whitespace()
-        .nth(4)?
-        .parse()
-        .ok()
+/// The pid column of the `/proc/locks` row of the lock held on `path`, reading
+/// the file again until that row appears; the test fails after 5 s without it.
+///
+/// No single read of the whole file is consistent: the kernel serves it one
+/// page per `read()` call, however large the buffer, and a lock released
+/// between two calls can make a read skip a held lock's row (see
+/// [`flock_rows_once`]). Reading again is reliable for a lock that stays held
+/// throughout, as here:
+/// - a read never shows a row that was not there, so a row found is the lock;
+/// - a read misses the row only when another lock, earlier in the list, is
+///   released in the gap between two of that read's few `read()` calls, so the
+///   first read that no such release disturbs finds it. A false failure would
+///   need every one of about 250 reads, spread over 5 s, to be disturbed.
+/// - when no lock is held, no read shows the row, and the test fails.
+async fn locks_row_pid(path: &Path) -> u32 {
+    wait_for_state(
+        "a /proc/locks row for the held lock",
+        Duration::from_secs(5),
+        || {
+            let rows = flock_rows_once(path);
+            rows.iter()
+                // A holder row reads `id: FLOCK ADVISORY WRITE pid maj:min:ino ..`
+                // (a waiter's, `id: -> FLOCK ..`).
+                .find_map(|row| match row.split_whitespace().collect::<Vec<_>>()[..] {
+                    [_, "FLOCK", _, _, pid, ..] => pid.parse().ok(),
+                    _ => None,
+                })
+                .ok_or_else(|| format!("no holder row in this read: {rows:?}"))
+        },
+    )
+    .await
 }
 
 /// How a directly run launcher ended (see [`launcher_exit`]).
@@ -318,7 +337,10 @@ async fn flock_refuses_a_second_writer_and_releases_on_native_exit() {
     rpc_a.initialize().await;
     rpc_a.call("thread/start", json!({})).await.unwrap();
     let lock = thread_lock_path(home.path(), "t-lock");
-    assert!(lock_held(&lock), "native A holds the thread lock");
+    assert!(
+        holds_lock_fd(a.native().await.pid, &lock),
+        "native A holds the thread lock"
+    );
     let b = FakeAppServer::spawn(json!({}), home.path(), &[]).await;
     let mut rpc_b = Rpc::connect(b.port).await;
     rpc_b.initialize().await;
@@ -355,7 +377,7 @@ async fn the_lock_lives_on_the_natives_own_file_descriptor() {
         !holds_lock_fd(fake.launcher_pid(), &lock),
         "the launcher holds no lock"
     );
-    let row_pid = locks_row_pid(&lock).expect("a /proc/locks row for the thread lock");
+    let row_pid = locks_row_pid(&lock).await;
     assert_ne!(
         row_pid, native,
         "the /proc/locks pid column names the exited flock(1), never the holder"
@@ -389,9 +411,13 @@ async fn queue_goal_and_helper_threads_are_reported() {
         .iter()
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
+    let native = fake.native().await.pid;
     for id in ["t-root", "t-helper", "t-earlier"] {
         assert!(ids.contains(&id.to_string()), "{id} loaded");
-        assert!(lock_held(&thread_lock_path(home.path(), id)), "{id} locked");
+        assert!(
+            holds_lock_fd(native, &thread_lock_path(home.path(), id)),
+            "{id} locked"
+        );
     }
     let helper = rpc
         .call("thread/read", json!({"threadId": "t-helper"}))
@@ -501,7 +527,10 @@ async fn thread_loads_are_announced_like_codex() {
         .expect("fork announced");
     assert_eq!(started["params"]["thread"]["forkedFromId"], "t-root");
     assert!(
-        lock_held(&thread_lock_path(home.path(), &child)),
+        holds_lock_fd(
+            second.native().await.pid,
+            &thread_lock_path(home.path(), &child)
+        ),
         "the native holds the fork's lock too"
     );
 }
@@ -556,7 +585,10 @@ async fn unloads_are_announced_and_release_the_lock() {
     let mut driver = connected(fake.port).await;
     driver.call("thread/start", json!({})).await.unwrap();
     let lock = thread_lock_path(home.path(), "t-u");
-    assert!(lock_held(&lock), "t-u is locked while loaded");
+    assert!(
+        holds_lock_fd(fake.native().await.pid, &lock),
+        "t-u is locked while loaded"
+    );
     driver
         .call("thread/unsubscribe", json!({"threadId": "t-u"}))
         .await
