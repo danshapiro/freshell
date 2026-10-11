@@ -1076,7 +1076,14 @@ impl Supervisor {
                     ),
                 })
                 .await
-                .map_err(map_backend)
+                .map_err(|error| {
+                    append_event(
+                        &self.config.lifecycle_log,
+                        "supervisor.activation_backend_failed",
+                        activation_backend_failure_data(&prepared, state, &error),
+                    );
+                    map_backend(error)
+                })
                 .map_err(|error| {
                     self.activation_failure(&prepared, state, "create_stopped_runtime", error)
                 })?;
@@ -4026,6 +4033,181 @@ mod release_scope_tests {
 }
 
 #[cfg(test)]
+mod activation_backend_diagnostic_tests {
+    use super::*;
+    use freshell_runtime_protocol::{LaunchRequest, RuntimeProfile};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_stopped_backend_diagnostic_preserves_real_preflight_refusal() {
+        for missing in ["host", "workspace"] {
+            let dir = tempfile::tempdir().unwrap();
+            let binary = dir.path().join("host");
+            std::fs::write(&binary, b"never executed test host").unwrap();
+            let socket = dir.path().join("docker.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+            let supervisor = Supervisor::new(
+                registry.clone(),
+                Arc::new(DockerEngineBackend::new(&socket)),
+                SupervisorConfig {
+                    runtime_root: dir.path().join("runtime"),
+                    control_socket_path: dir.path().join("control.sock"),
+                    host_binary_path: binary.clone(),
+                    image_ref: format!("sha256:{}", "a".repeat(64)),
+                    test_run_id: "activation-backend-diagnostic".into(),
+                    control_secret: "private-diagnostic-control-secret".into(),
+                    lifecycle_log: dir.path().join("lifecycle.jsonl"),
+                    admission: AdmissionPolicy::default(),
+                },
+            )
+            .unwrap();
+            if missing == "host" {
+                std::fs::remove_file(&binary).unwrap();
+            }
+            let soul = SoulId::new();
+            let workspace = dir.path().join("missing-workspace");
+            let terminal = (missing == "workspace").then(|| {
+                serde_json::from_value(serde_json::json!({
+                    "terminalId":"diagnostic-terminal","streamId":"diagnostic-stream",
+                    "mode":"shell","program":"sh","cwd":workspace,"workspacePath":workspace,
+                    "runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"diagnostic-project"
+                }))
+                .unwrap()
+            });
+            let error = supervisor
+                .launch(
+                    RequestId::new(),
+                    LaunchRequest {
+                        soul_id: soul.clone(),
+                        provider: if terminal.is_some() {
+                            "shell"
+                        } else {
+                            "fixture"
+                        }
+                        .into(),
+                        provider_store_id: "diagnostic-store".into(),
+                        creation_seed_ref: "diagnostic-seed".into(),
+                        limits: RuntimeLimits {
+                            cpu_milli: 500,
+                            memory_bytes: 64 * 1024 * 1024,
+                            swap_bytes: 0,
+                            pids_max: 32,
+                        },
+                        profile: RuntimeProfile::Custom,
+                        project_key: "diagnostic-project".into(),
+                        native_session_id: None,
+                        fixture: terminal.is_none().then_some(FixtureKind::Heartbeat),
+                        terminal,
+                        fresh_agent: None,
+                        view_intent: None,
+                        expected_control_epoch: None,
+                    },
+                )
+                .await
+                .expect_err("real backend preflight must fail before Docker create");
+            assert_eq!(error.code, RuntimeErrorCode::RecoveryBlocked);
+            assert!(error.message.contains(if missing == "host" {
+                "host binary:"
+            } else {
+                "workspace:"
+            }));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                    .await
+                    .is_err()
+            );
+            let views = registry.inventory().await.unwrap();
+            assert_eq!(views.len(), 1);
+            assert!(views[0].container_id.is_none());
+            let text = std::fs::read_to_string(&supervisor.config.lifecycle_log).unwrap();
+            let events: Vec<serde_json::Value> = text
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let backend = events
+                .iter()
+                .find(|event| event["event"] == "supervisor.activation_backend_failed")
+                .expect("the exact preflight cause must survive in the existing lifecycle log");
+            assert_eq!(backend["data"]["severity"], "error");
+            assert_eq!(backend["data"]["soulId"], soul.as_str());
+            assert_eq!(
+                backend["data"]["incarnationId"],
+                views[0].incarnation_id.as_str()
+            );
+            assert_eq!(backend["data"]["intentRevision"], views[0].intent_revision);
+            assert_eq!(backend["data"]["launchState"], "prepared");
+            assert_eq!(backend["data"]["stage"], "create_stopped_runtime");
+            assert_eq!(backend["data"]["backendErrorKind"], "invalid_config");
+            assert_eq!(
+                error.message,
+                format!(
+                    "runtime backend configuration rejected: {}",
+                    backend["data"]["backendFailureReason"].as_str().unwrap()
+                )
+            );
+            assert!(!text.contains(&supervisor.config.control_secret));
+            assert!(events
+                .iter()
+                .any(|event| event["event"] == "supervisor.activation_failed"
+                    && event["data"]["stage"] == "create_stopped_runtime"
+                    && event["data"]["errorCode"] == "RECOVERY_BLOCKED"));
+        }
+    }
+
+    #[test]
+    fn create_stopped_backend_diagnostic_omits_arbitrary_payloads_and_redacts_control_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("diagnostic.jsonl");
+        let control_secret = "private-diagnostic-control-secret";
+        lifecycle_secrets()
+            .lock()
+            .unwrap()
+            .insert(log.clone(), control_secret.into());
+        let prepared = PreparedLaunch {
+            soul_id: SoulId::new(),
+            incarnation_id: IncarnationId::new(),
+            launch_nonce: freshell_runtime_protocol::LaunchNonce::new(),
+            state: LaunchState::Prepared,
+            intent_revision: 7,
+            existing_request: false,
+        };
+        for error in [
+            BackendError::DockerHttp {
+                status: 403,
+                body: "arbitrary-private-provider-response".into(),
+            },
+            BackendError::Malformed("arbitrary-private-parser-payload".into()),
+            BackendError::Unavailable("arbitrary-private-transport-payload".into()),
+            BackendError::InvalidConfig(format!("host binary: {control_secret}")),
+        ] {
+            append_event(
+                &log,
+                "supervisor.activation_backend_failed",
+                activation_backend_failure_data(&prepared, LaunchState::Prepared, &error),
+            );
+        }
+        let text = std::fs::read_to_string(log).unwrap();
+        assert!(!text.contains("arbitrary-private"));
+        assert!(!text.contains(control_secret));
+        let events: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events[0]["data"]["backendErrorKind"], "docker_http");
+        assert_eq!(events[0]["data"]["backendHttpStatus"], 403);
+        assert!(events[..3]
+            .iter()
+            .all(|event| event["data"].get("backendFailureReason").is_none()));
+        assert_eq!(
+            events[3]["data"]["backendFailureReason"],
+            "host binary: ***REDACTED***"
+        );
+        assert!(!text.contains(prepared.launch_nonce.as_str()));
+    }
+}
+
+#[cfg(test)]
 mod stop_intent_order_tests {
     use super::*;
     use crate::{
@@ -5331,6 +5513,40 @@ fn append_event_locked(path: &Path, event: &str, data: serde_json::Value) {
         }
         Err(error) => eprintln!("supervisor lifecycle log unavailable: {error}"),
     }
+}
+
+fn activation_backend_failure_data(
+    prepared: &PreparedLaunch,
+    state: LaunchState,
+    error: &BackendError,
+) -> serde_json::Value {
+    let kind = match error {
+        BackendError::StoppedRepair(_) => "stopped_repair",
+        BackendError::Unavailable(_) => "unavailable",
+        BackendError::OwnershipMismatch(_) => "ownership_mismatch",
+        BackendError::PolicyMismatch(_) => "policy_mismatch",
+        BackendError::DockerHttp { .. } => "docker_http",
+        BackendError::Malformed(_) => "malformed",
+        BackendError::InvalidConfig(_) => "invalid_config",
+    };
+    let mut data = serde_json::json!({
+        "severity": "error",
+        "soulId": prepared.soul_id,
+        "incarnationId": prepared.incarnation_id,
+        "intentRevision": prepared.intent_revision,
+        "launchState": state,
+        "stage": "create_stopped_runtime",
+        "backendErrorKind": kind,
+    });
+    match error {
+        // Create preflight configuration failures contain validation labels and
+        // file references, never provider file contents or response payloads.
+        // The existing lifecycle writer also applies its credential redaction.
+        BackendError::InvalidConfig(reason) => data["backendFailureReason"] = reason.clone().into(),
+        BackendError::DockerHttp { status, .. } => data["backendHttpStatus"] = (*status).into(),
+        _ => {}
+    }
+    data
 }
 
 fn activation_failure_data(
