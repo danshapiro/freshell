@@ -691,6 +691,22 @@ impl UnitHarness {
             .pid()
     }
 
+    /// SIGKILLs the terminal's native app-server, by pid and the start time
+    /// its unit pinned it with: the app-server dies on its own, a crash the
+    /// TUI never exits on (its unit's main-process watch ends the pane).
+    /// Returns its pid.
+    pub fn kill_native(&self, terminal_id: &str) -> u32 {
+        let native = self
+            .unit_for(terminal_id)
+            .main()
+            .expect("the unit's main is the native app-server");
+        assert!(
+            fake_codex::signal_own_child(native.pid(), native.identity().start, libc::SIGKILL),
+            "the native app-server was signalled"
+        );
+        native.pid()
+    }
+
     pub fn native_manifest(&self, terminal_id: &str) -> fake_codex::NativeManifest {
         let pid = self.native_pid(terminal_id);
         let raw = std::fs::read_to_string(self.manifests.join(format!("native-{pid}.json")))

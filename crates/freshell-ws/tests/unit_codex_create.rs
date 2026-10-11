@@ -333,11 +333,8 @@ async fn a_failed_auto_resume_releases_its_conversation_only_at_its_units_gone()
         .expect("hold the only spawn permit");
     let _gone_delay = GoneDelay::set(1500);
 
-    h.send(
-        &mut ws,
-        json!({"type": "terminal.input", "terminalId": tid, "data": "crash\r"}),
-    )
-    .await;
+    // The app-server dies on its own: a crash (the TUI never exits on it).
+    h.kill_native(&tid);
     let settled = h
         .next_matching(&mut ws, Duration::from_secs(30), |f| {
             f["type"] == "terminal.status" && f["terminalId"] == tid && f["status"] == "exited"

@@ -498,11 +498,8 @@ async fn an_auto_resume_of_a_conversation_that_never_had_a_turn_starts_a_new_one
             .is_some_and(|locator| locator.session_id == thread)
     })
     .await;
-    h.send(
-        &mut ws,
-        json!({"type": "terminal.input", "terminalId": tid, "data": "crash\r"}),
-    )
-    .await;
+    // The app-server dies on its own: a crash (the TUI never exits on it).
+    h.kill_native(&tid);
     let replaced = h
         .next_matching(&mut ws, Duration::from_secs(30), |f| {
             f["type"] == "terminal.replaced" && f["oldTerminalId"] == tid.as_str()

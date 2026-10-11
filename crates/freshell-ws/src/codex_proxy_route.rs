@@ -136,6 +136,24 @@ async fn route_proxy_event(state: &WsState, tagged: TerminalProxyEvent) {
     }
 }
 
+/// The pane a proxy line of `terminal_id` names: its unit's id and the
+/// conversation the terminal is bound to (else the one its unit was started
+/// for); empty when unknown.
+fn pane_keys(state: &WsState, terminal_id: &str) -> (String, String) {
+    let entry = state.units.by_terminal(terminal_id);
+    let unit_id = entry
+        .as_ref()
+        .map(|entry| entry.unit.id().to_string())
+        .unwrap_or_default();
+    let session_id = state
+        .identity
+        .session_ref_for(terminal_id)
+        .map(|bound| bound.session_id)
+        .or_else(|| entry.and_then(|entry| entry.unit.label().session_id))
+        .unwrap_or_default();
+    (unit_id, session_id)
+}
+
 async fn route_event(
     state: &WsState,
     terminal_id: &str,
@@ -181,12 +199,28 @@ async fn route_event(
         }
         RemoteProxyEvent::ThreadLifecycleLoss(loss) => {
             // S5.a: minimal by fence — re-plan-on-loss stays deferred; the
-            // auto-resume orchestrator owns recovery.
-            tracing::warn!(terminal_id = %terminal_id, ?loss, "codex_proxy_lifecycle_loss");
+            // auto-resume orchestrator owns recovery. Log only: the
+            // app-server's death is detected by its unit's main-process
+            // watch (Task 17; Stage 2: LB-40).
+            let (unit_id, session_id) = pane_keys(state, terminal_id);
+            tracing::warn!(
+                unit_id = %unit_id,
+                session_id = %session_id,
+                terminal_id = %terminal_id,
+                ?loss,
+                "codex_proxy_lifecycle_loss"
+            );
         }
         RemoteProxyEvent::RepairTrigger(trigger) => {
             // S5.a + D-GATE-SOFT: log only (includes CandidateCaptureTimeout).
-            tracing::warn!(terminal_id = %terminal_id, ?trigger, "codex_proxy_repair_trigger");
+            let (unit_id, session_id) = pane_keys(state, terminal_id);
+            tracing::warn!(
+                unit_id = %unit_id,
+                session_id = %session_id,
+                terminal_id = %terminal_id,
+                ?trigger,
+                "codex_proxy_repair_trigger"
+            );
         }
         RemoteProxyEvent::ApprovalRequested(params) => {
             // Task 7: the app-server is blocked on a human -- the hub's
@@ -915,6 +949,80 @@ mod tests {
             ))),
             None
         );
+    }
+
+    /// A thread-lifecycle loss and a repair trigger stay WARN logs (the
+    /// app-server's death is detected by its unit's main-process watch),
+    /// and each names the pane: its unit, its conversation and its
+    /// terminal (Task 17).
+    #[tokio::test]
+    async fn loss_and_repair_lines_name_the_panes_unit_and_conversation() {
+        let logs = crate::invariants::capture::capture();
+        let state = test_state();
+        let unit = state
+            .units
+            .containment
+            .create_unit(
+                freshell_containment::UnitId::mint(),
+                freshell_containment::UnitLabel {
+                    provider: "codex".into(),
+                    session_id: Some("t-loss".into()),
+                    terminal_id: Some("term-loss".into()),
+                    mode: "codex".into(),
+                    create_request_id: None,
+                },
+            )
+            .expect("a unit");
+        state.units.register(freshell_containment::UnitEntry {
+            unit: unit.clone(),
+            provider: "codex".into(),
+            mode: "codex".into(),
+            create_request_id: None,
+            terminal_id: Some("term-loss".into()),
+        });
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-loss",
+                RemoteProxyEvent::ThreadLifecycleLoss(
+                    freshell_codex::remote_proxy::ThreadLifecycleLossEvent::ThreadClosed {
+                        thread_id: "t-loss".into(),
+                    },
+                ),
+            ),
+        )
+        .await;
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-loss",
+                RemoteProxyEvent::RepairTrigger(
+                    freshell_codex::remote_proxy::RemoteProxyRepairTrigger::ProxyClose,
+                ),
+            ),
+        )
+        .await;
+        let logs = logs.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        for message in ["codex_proxy_lifecycle_loss", "codex_proxy_repair_trigger"] {
+            let line = logs
+                .iter()
+                .find(|e| {
+                    e.message == message
+                        && e.fields.get("terminal_id").map(String::as_str) == Some("term-loss")
+                })
+                .unwrap_or_else(|| panic!("no {message} line for term-loss"));
+            assert_eq!(line.level, "WARN", "{line:?}");
+            assert_eq!(
+                line.fields.get("unit_id").map(String::as_str),
+                Some(unit.id().as_str()),
+                "{line:?}"
+            );
+            assert_eq!(
+                line.fields.get("session_id").map(String::as_str),
+                Some("t-loss"),
+                "{line:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -12,11 +12,15 @@
 //! A start ([`StartScope`]) creates the pane's unit (its record written
 //! first), spawns the screen into it, pins the screen, and is settled only
 //! once its members are bound and their placement is confirmed
-//! ([`PLACEMENT_DEADLINE`]). A screen that exits before that is a typed
-//! start failure, never an agent crash; any later unrequested screen exit
-//! ends the whole unit (`AgentExited`). Nothing here waits for Gone on a
-//! connection loop or a create worker: every such wait runs in a spawned
-//! task.
+//! ([`PLACEMENT_DEADLINE`]). A member that exits before that is a typed
+//! start failure, never an agent crash. Afterwards one decision table
+//! ([`on_member_exit`]) decides every unrequested exit: the main process's
+//! own exit event ([`spawn_main_watcher`], the only detector of an
+//! app-server's death) ends the whole unit as a crash; a screen exit ends
+//! it when the agent ended (or the user quit Codex with no turn running),
+//! and otherwise restarts the screen in the same row against the running
+//! agent ([`respawn_screen`]). Nothing here waits for Gone on a connection
+//! loop or a create worker: every such wait runs in a spawned task.
 
 use std::ops::Deref;
 use std::sync::{Arc, OnceLock};
@@ -130,6 +134,37 @@ pub(crate) fn unit_keys(unit: &AgentUnit, operation_id: Option<&str>) -> UnitLog
         session_id: label.session_id,
         terminal_id: label.terminal_id,
         operation_id: operation_id.map(str::to_string),
+    }
+}
+
+/// A unit lifecycle line (target `freshell_unit`) with the unit's five
+/// keys: its terminal is `$terminal_id`, its operation the unit's stop's
+/// (in flight or finished), if any.
+macro_rules! member_event {
+    ($level:ident, $entry:expr, $terminal_id:expr, $event:literal, $($rest:tt)*) => {{
+        let entry: &UnitEntry = $entry;
+        let keys = unit_keys(&entry.unit, entry.unit.stop_operation().as_deref());
+        tracing::$level!(target: "freshell_unit",
+            event = $event,
+            unit_id = %keys.unit_id,
+            provider = %keys.provider,
+            session_id = %keys.session_id.as_deref().unwrap_or(""),
+            terminal_id = %$terminal_id,
+            operation_id = %keys.operation_id.as_deref().unwrap_or(""),
+            $($rest)*)
+    }};
+}
+
+/// The stop that ends a unit whose agent exited (`exit_code` `None`: a
+/// crash with no code of its own). A clean exit (code 0) is remembered as a
+/// stopped pane (Stage 2: LB-36).
+fn agent_exited(exit_code: Option<i64>, initiator: &'static str) -> UnitStopCommand {
+    UnitStopCommand {
+        mode: StopMode::Force,
+        reason: StopReason::AgentExited { exit_code },
+        initiator: initiator.to_string(),
+        operation_id: fresh_operation("unit-exit"),
+        record_stopped_pane: exit_code == Some(0),
     }
 }
 
@@ -568,82 +603,235 @@ pub(crate) async fn publish_gone(
 }
 
 /// The registry's handler for an unrequested screen exit of a unit row. It
-/// runs on the PTY reader thread and only hands the exit to the runtime.
+/// runs on the PTY reader thread and only hands the exit to the runtime
+/// (never `tokio::spawn` there).
 pub fn screen_exit_hook(
     state: WsState,
     rt: tokio::runtime::Handle,
 ) -> Arc<dyn Fn(UnitScreenExit) + Send + Sync> {
     Arc::new(move |exit: UnitScreenExit| {
         let state = state.clone();
-        rt.spawn(async move { on_screen_exit(&state, exit) });
+        rt.spawn(async move {
+            on_member_exit(
+                &state,
+                &exit.unit_id,
+                &exit.terminal_id,
+                MemberExit::Screen {
+                    exit_code: exit.exit_code,
+                },
+            )
+            .await
+        });
     })
 }
 
-/// An unrequested screen exit: before the start settled it is a typed start
-/// failure (never a crash, never a screen restart); afterwards the whole
-/// unit ends as an agent exit. The entry is found by UNIT id, so an exit
-/// before the bind is not lost.
-fn on_screen_exit(state: &WsState, exit: UnitScreenExit) {
-    let Some(unit_id) = UnitId::parse(&exit.unit_id) else {
-        tracing::warn!(target: "freshell_unit",
-            event = "unit.screen_exit_unmatched",
-            unit_id = %exit.unit_id,
-            terminal_id = %exit.terminal_id,
-            exit_code = exit.exit_code,
-            "a unit row's screen exited under an unparsable unit id");
+/// The directory's bind hook: every unit bound to its terminal, by any
+/// lane, gets its main process watched ([`spawn_main_watcher`]).
+pub fn on_bind_hook(
+    state: WsState,
+    rt: tokio::runtime::Handle,
+) -> Arc<dyn Fn(UnitEntry) + Send + Sync> {
+    Arc::new(move |entry: UnitEntry| {
+        let _runtime = rt.enter();
+        spawn_main_watcher(state.clone(), entry);
+    })
+}
+
+/// How long the main watcher of an agent whose screen IS its main process
+/// waits for the screen's PTY to record the exit code once the process
+/// exited (its waiter reaps it at once).
+const SCREEN_EXIT_CODE_WAIT: Duration = Duration::from_secs(1);
+
+/// Watches the unit's main process for its own exit (pidfd / kqueue /
+/// process handle; no polling) and hands that exit to [`on_member_exit`].
+/// For Codex this is the ONLY detector of the app-server's death: the TUI
+/// never exits when it loses its app-server (Stage 2: LB-40). For an agent
+/// whose screen is its main process (Claude Code, Gemini, Kimi) it is the
+/// screen's own exit, seen even while a background job the agent left holds
+/// the terminal open, so its stream (and the screen-exit hook) never ends
+/// (Task 11 review M4); its exit code is read from the screen's PTY. A unit
+/// with no main yet is left to the screen-exit hook. A watch that cannot be
+/// armed is never taken for an exit (ERROR `unit.main_watch_failed`).
+pub fn spawn_main_watcher(state: WsState, entry: UnitEntry) {
+    let Some(main) = entry.unit.main() else {
         return;
     };
-    let Some(entry) = state.units.get(&unit_id) else {
+    let main_is_screen = entry.unit.main_is_screen();
+    tokio::spawn(async move {
+        let terminal_id = entry.terminal_id.clone().unwrap_or_default();
+        if let Err(error) = main.exited().await {
+            member_event!(error, &entry, terminal_id,
+                "unit.main_watch_failed",
+                pid = main.pid(),
+                error = %error,
+                "the unit's main process cannot be watched for its exit; its death will not end the unit");
+            return;
+        }
+        let exit_code =
+            if main_is_screen {
+                let registry = state.registry.clone();
+                let tid = terminal_id.clone();
+                let code = tokio::task::spawn_blocking(move || {
+                    registry.wait_screen_exit_code(&tid, SCREEN_EXIT_CODE_WAIT)
+                })
+                .await
+                .ok()
+                .flatten();
+                if code.is_none() && entry.unit.stop_in_flight().is_none() {
+                    member_event!(warn, &entry, terminal_id,
+                    "unit.agent_exit_code_unread",
+                    pid = main.pid(),
+                    "the agent's exit code could not be read from its screen; it ends as a crash");
+                }
+                code
+            } else {
+                None
+            };
+        on_member_exit(
+            &state,
+            entry.unit.id().as_str(),
+            &terminal_id,
+            MemberExit::Main {
+                pid: main.pid(),
+                exit_code,
+            },
+        )
+        .await;
+    });
+}
+
+/// An unrequested exit of one of a unit's members.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemberExit {
+    /// The screen's terminal stream ended (the registry's screen-exit hook,
+    /// which runs only after the screen's PTY reached end of stream).
+    Screen { exit_code: i64 },
+    /// The unit's main process exited (its own exit event). Its exit code
+    /// is known only when the main is the screen.
+    Main { pid: u32, exit_code: Option<i64> },
+}
+
+/// THE decision on an unrequested member exit (the only place a unit's end
+/// is decided, Stage 2: LB-40). In order:
+///
+/// 1. a stop in flight, a row whose ending is marked, or a server shutdown
+///    that started: nothing (the stop publishes at Gone; during a shutdown
+///    the exit belongs to the retention path, Stage 2: LB-45);
+/// 2. a start not yet settled: a typed start failure, never a crash;
+/// 3. the main process exited: the whole unit ends as an agent exit (a
+///    crash when its code is unknown or non-zero);
+/// 4. the screen exited, and
+///    - the main is the screen, or there is no separate main: the agent
+///      ended (`AgentExited` with the screen's code);
+///    - the main already exited: a crash;
+///    - code 0 and no turn running on any thread the app-server holds: the
+///      user quit Codex; the whole unit ends (which stops the app-server a
+///      remote TUI only detaches from);
+///    - code 0 with a turn running (Codex's "quit, run in background"): a
+///      new screen against the running agent, not counted toward the cap;
+///    - otherwise (a screen crash, the agent alive): a new screen, counted
+///      toward the respawn cap.
+///
+/// The entry is found by UNIT id, so an exit before the bind is not lost.
+async fn on_member_exit(state: &WsState, unit_id: &str, terminal_id: &str, exit: MemberExit) {
+    let (role, exit_code) = match exit {
+        MemberExit::Screen { exit_code } => ("screen", Some(exit_code)),
+        MemberExit::Main { exit_code, .. } => ("agent", exit_code),
+    };
+    let Some(parsed) = UnitId::parse(unit_id) else {
+        tracing::warn!(target: "freshell_unit",
+            event = "unit.member_exit_unmatched",
+            unit_id = %unit_id,
+            terminal_id = %terminal_id,
+            role = role,
+            exit_code = exit_code.unwrap_or(-1),
+            "a unit's member exited under an unparsable unit id");
+        return;
+    };
+    let Some(entry) = state.units.get(&parsed) else {
         tracing::debug!(target: "freshell_unit",
-            event = "unit.screen_exit_unmatched",
-            unit_id = %exit.unit_id,
-            terminal_id = %exit.terminal_id,
-            exit_code = exit.exit_code,
-            "a unit row's screen exited after its unit left the directory");
+            event = "unit.member_exit_unmatched",
+            unit_id = %unit_id,
+            terminal_id = %terminal_id,
+            role = role,
+            exit_code = exit_code.unwrap_or(-1),
+            "a unit's member exited after its unit left the directory");
         return;
     };
     let entry = UnitEntry {
-        terminal_id: Some(exit.terminal_id.clone()),
+        terminal_id: Some(terminal_id.to_string()),
         ..entry
     };
     if entry.unit.stop_in_flight().is_some() {
-        // The unit's own stop ended the screen (it signals the screen it
-        // pinned): the exit is part of that stop, never a start failure or
-        // a crash. A row whose ending that stop could not mark yet (it began
-        // before the row was known) ends as the requested stop it is.
+        // The unit's own stop ended the member (it signals what it pinned):
+        // the exit is part of that stop, never a start failure, a crash or
+        // a restart. A row whose ending that stop could not mark yet (it
+        // began before the row was known) ends as the requested stop it is.
         state
             .registry
-            .mark_ending(&exit.terminal_id, UnitEnding::Requested);
-        let keys = unit_keys(&entry.unit, entry.unit.stop_operation().as_deref());
-        tracing::debug!(target: "freshell_unit",
-            event = "unit.screen_exit_in_stop",
-            unit_id = %keys.unit_id,
-            provider = %keys.provider,
-            session_id = %keys.session_id.as_deref().unwrap_or(""),
-            terminal_id = %exit.terminal_id,
-            operation_id = %keys.operation_id.as_deref().unwrap_or(""),
-            exit_code = exit.exit_code,
-            "a unit row's screen exited during its unit's stop");
+            .mark_ending(terminal_id, UnitEnding::Requested);
+        match exit {
+            MemberExit::Screen { exit_code } => member_event!(
+                debug,
+                &entry,
+                terminal_id,
+                "unit.screen_exit_in_stop",
+                exit_code = exit_code,
+                "a unit row's screen exited during its unit's stop"
+            ),
+            MemberExit::Main { pid, .. } => member_event!(
+                debug,
+                &entry,
+                terminal_id,
+                "unit.main_exit_in_stop",
+                pid = pid,
+                "a unit's main process exited during its unit's stop"
+            ),
+        }
         return;
     }
-    if !state.units.start_is_settled(&unit_id) {
+    if state.registry.ending(terminal_id).is_some() {
+        member_event!(
+            debug,
+            &entry,
+            terminal_id,
+            "unit.member_exit_while_ending",
+            role = role,
+            exit_code = exit_code.unwrap_or(-1),
+            "a unit's member exited while its row is ending; the ending decides"
+        );
+        return;
+    }
+    if state
+        .shutdown_started
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        member_event!(debug, &entry, terminal_id,
+            "unit.member_exit_in_shutdown",
+            role = role,
+            exit_code = exit_code.unwrap_or(-1),
+            "a unit's member exited during the server shutdown; the shutdown keeps or stops the unit");
+        return;
+    }
+    if !state.units.start_is_settled(&parsed) {
         let operation_id = fresh_operation("unit-placement");
-        let pid = entry.unit.screen().map(|w| w.pid()).unwrap_or(0);
+        let pid = match exit {
+            MemberExit::Main { pid, .. } => pid,
+            MemberExit::Screen { .. } => entry.unit.screen().map(|w| w.pid()).unwrap_or(0),
+        };
         events::placement_failed(
             &unit_keys(&entry.unit, Some(&operation_id)),
-            "screen",
+            role,
             pid,
-            Some(exit.exit_code),
-            "the screen exited before its placement was confirmed",
+            exit_code,
+            &format!("the {role} exited before its placement was confirmed"),
         );
         let _ = stop_terminal_unit(
             state,
             &entry,
             UnitStopCommand {
                 mode: StopMode::Force,
-                reason: StopReason::PlacementFailed {
-                    exit_code: Some(exit.exit_code),
-                },
+                reason: StopReason::PlacementFailed { exit_code },
                 initiator: "unit-placement".to_string(),
                 operation_id,
                 record_stopped_pane: false,
@@ -651,19 +839,210 @@ fn on_screen_exit(state: &WsState, exit: UnitScreenExit) {
         );
         return;
     }
+    let exit_code = match exit {
+        MemberExit::Main { pid, exit_code } => {
+            // An app-server's death (no code of its own) or a non-zero exit
+            // is a crash; an agent that ended cleanly is not.
+            if exit_code == Some(0) {
+                member_event!(
+                    info,
+                    &entry,
+                    terminal_id,
+                    "unit.agent_exited",
+                    pid = pid,
+                    exit_code = 0,
+                    "the unit's main process ended on its own; the whole unit ends"
+                );
+            } else {
+                member_event!(
+                    warn,
+                    &entry,
+                    terminal_id,
+                    "unit.agent_exited",
+                    pid = pid,
+                    exit_code = exit_code.unwrap_or(-1),
+                    "the unit's main process exited on its own; the whole unit ends"
+                );
+            }
+            let _ = stop_terminal_unit(state, &entry, agent_exited(exit_code, "agent-exited"));
+            return;
+        }
+        MemberExit::Screen { exit_code } => exit_code,
+    };
+    let main = entry.unit.main();
+    let ended = match main.as_ref() {
+        None => Some(Some(exit_code)),
+        Some(_) if entry.unit.main_is_screen() => Some(Some(exit_code)),
+        Some(main) if main.has_exited() => Some(None),
+        Some(_) if exit_code == 0 && !crate::unit_threads::turn_running(state, terminal_id) => {
+            Some(Some(0))
+        }
+        Some(_) => None,
+    };
+    match ended {
+        Some(code) => {
+            let _ = stop_terminal_unit(state, &entry, agent_exited(code, "screen-exit"));
+        }
+        None => respawn_screen(state, &entry, exit_code, exit_code != 0).await,
+    }
+}
+
+/// Restarts a unit row's screen whose exit reached the screen-exit hook
+/// while the agent runs (Stage 2: LB-40): the same row and stream get a new
+/// screen from the row's stored spawn inputs, with its `resume` argument
+/// naming the conversation the terminal is bound to now (for the Codex TUI,
+/// whose `--remote` proxy lives as long as the launch, so a new TUI
+/// reattaches to the running app-server and receives a turn in flight; V8
+/// §40e). The new screen starts through the unit's screen placement (the
+/// wrapper either places it or never runs the TUI) and is pinned as the
+/// unit's screen by pid and the start time its row recorded, so every later
+/// stop signals it directly. Emits nothing to clients: no `terminal.exit`,
+/// no crash event and no activity exit, so no idle or turn-complete edge can
+/// fire for it.
+///
+/// `counts_toward_cap` false (the user quit with a turn running) skips the
+/// respawn liveness accounting. Any failure (no stored spawn inputs, a
+/// placement error, the `respawn cap`, a new screen that cannot be pinned)
+/// ends the whole unit as an agent exit with `exit_code` and ERROR
+/// `unit.screen.respawn_failed`, unless the unit's stop already began (that
+/// stop ends it).
+pub async fn respawn_screen(
+    state: &WsState,
+    entry: &UnitEntry,
+    exit_code: i64,
+    counts_toward_cap: bool,
+) {
+    let terminal_id = entry.terminal_id.clone().unwrap_or_default();
+    let replaced = replace_and_pin_screen(state, entry, &terminal_id, counts_toward_cap).await;
+    let screen = match replaced {
+        Ok(Some(screen)) => screen,
+        // The new screen already exited and its exit reached the hook,
+        // which decides again.
+        Ok(None) => return,
+        Err(cause) => {
+            respawn_failed(
+                state,
+                entry,
+                &terminal_id,
+                exit_code,
+                counts_toward_cap,
+                &cause,
+            );
+            return;
+        }
+    };
+    let pid = screen.pid();
+    entry.unit.set_screen(screen);
+    member_event!(
+        info,
+        entry,
+        terminal_id,
+        "unit.screen.respawned",
+        pid = pid,
+        prior_exit_code = exit_code,
+        counts_toward_cap = counts_toward_cap,
+        "a new screen runs in the row against the running agent"
+    );
+}
+
+/// The new screen of [`respawn_screen`], spawned and pinned: `Ok(None)`
+/// when it already exited (its exit was taken by the screen-exit hook
+/// before it could be pinned), `Err` with the cause of a failure.
+async fn replace_and_pin_screen(
+    state: &WsState,
+    entry: &UnitEntry,
+    terminal_id: &str,
+    counts_toward_cap: bool,
+) -> Result<Option<ProcWatch>, String> {
+    let (spec, env) = state
+        .registry
+        .respawn_spec(terminal_id)
+        .ok_or_else(|| "no spawn inputs are recorded for the row".to_string())?;
+    let spec = match state
+        .identity
+        .session_ref_for(terminal_id)
+        .filter(|bound| bound.provider == entry.provider)
+    {
+        Some(bound) => resume_in_spec(spec, &bound.session_id),
+        None => spec,
+    };
+    let placement = entry
+        .unit
+        .placement(freshell_containment::MemberRole::Screen)
+        .map_err(|error| format!("placement: {error}"))?;
+    let placement = freshell_terminal::UnitPlacement {
+        unit_id: entry.unit.id().to_string(),
+        wrapper: placement.wrapper,
+        env: placement.env,
+        main_is_screen: false,
+    };
+    let registry = state.registry.clone();
+    let tid = terminal_id.to_string();
+    let pid = tokio::task::spawn_blocking(move || {
+        registry.replace_screen(&tid, &spec, &env, placement, counts_toward_cap)
+    })
+    .await
+    .map_err(|error| format!("the replacement did not finish: {error}"))?
+    .map_err(|error| error.to_string())?;
+    match pin_screen(state, terminal_id, pid) {
+        Ok(screen) => Ok(Some(screen)),
+        // Not the row's running screen any more: its exit was taken.
+        Err(_) if state.registry.pid_of(terminal_id) != Some(pid) => Ok(None),
+        Err(reason) => Err(format!("the new screen {pid} cannot be pinned: {reason}")),
+    }
+}
+
+/// A screen restart that failed: the whole unit ends as an agent exit with
+/// the exit code of the screen it replaced, unless the unit's stop already
+/// began (that stop ends it).
+fn respawn_failed(
+    state: &WsState,
+    entry: &UnitEntry,
+    terminal_id: &str,
+    exit_code: i64,
+    counts_toward_cap: bool,
+    cause: &str,
+) {
+    if entry.unit.stop_in_flight().is_some() || state.registry.ending(terminal_id).is_some() {
+        member_event!(debug, entry, terminal_id,
+            "unit.screen.respawn_abandoned",
+            cause = %cause,
+            "the screen restart was abandoned: the unit is being stopped");
+        return;
+    }
+    member_event!(error, entry, terminal_id,
+        "unit.screen.respawn_failed",
+        cause = %cause,
+        prior_exit_code = exit_code,
+        counts_toward_cap = counts_toward_cap,
+        "the screen could not be restarted; the whole unit ends");
     let _ = stop_terminal_unit(
         state,
-        &entry,
-        UnitStopCommand {
-            mode: StopMode::Force,
-            reason: StopReason::AgentExited {
-                exit_code: Some(exit.exit_code),
-            },
-            initiator: "unit-screen-exit".to_string(),
-            operation_id: fresh_operation("unit-exit"),
-            record_stopped_pane: false,
-        },
+        entry,
+        agent_exited(Some(exit_code), "screen-respawn-failed"),
     );
+}
+
+/// `spec` with its `resume` argument naming `thread` (the Codex TUI's
+/// `resume <id>`, the last arguments of its spawn; appended when absent).
+/// A Windows shell spawn that runs the CLI from one command string
+/// (`cmd /K <command>`, PowerShell `-Command <command>`) is returned as it
+/// is: the restarted screen runs the stored command.
+fn resume_in_spec(
+    mut spec: freshell_platform::SpawnSpec,
+    thread: &str,
+) -> freshell_platform::SpawnSpec {
+    let command_string = spec.args.first().is_some_and(|arg| arg == "/K")
+        || spec.args.iter().any(|arg| arg == "-Command");
+    if command_string {
+        return spec;
+    }
+    match spec.args.iter().rposition(|arg| arg == "resume") {
+        Some(at) if at + 1 < spec.args.len() => spec.args[at + 1] = thread.to_string(),
+        Some(_) => spec.args.push(thread.to_string()),
+        None => spec.args.extend(["resume".to_string(), thread.to_string()]),
+    }
+    spec
 }
 
 /// The registry's handler for a kill of a unit row (the kill paths not yet
@@ -803,14 +1182,19 @@ impl UnitLifecycle for WsUnitLifecycle {
 
 /// Installs the unit lifecycle on a state's registry (the screen-exit and
 /// kill hooks, and the process start-time reader that lets a start pin its
-/// screen by pid and start time) and directory (the single stop path).
-/// `freshell-server` does this at boot; a start does it for a state built
-/// without it (tests), so a unit row's screen exit is never lost.
-/// Idempotent.
+/// screen by pid and start time) and directory (the single stop path, and
+/// the bind hook that watches every bound unit's main process). Every
+/// server state is wired here: `freshell-server` at boot, the test harness
+/// as `freshell-server` does, and a start for a state built without it, so
+/// neither a unit row's screen exit nor its main process's exit is ever
+/// lost. Idempotent.
 pub fn wire(state: &WsState, rt: &tokio::runtime::Handle) {
     if state.units.lifecycle().is_some() {
         return;
     }
+    state
+        .units
+        .set_on_bind(on_bind_hook(state.clone(), rt.clone()));
     state.registry.set_process_start_reader(Arc::new(|pid| {
         freshell_containment::process::start_time(pid).ok()
     }));

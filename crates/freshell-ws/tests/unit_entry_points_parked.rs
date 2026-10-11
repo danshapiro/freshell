@@ -189,13 +189,10 @@ async fn a_parked_reopen_dies_with_its_connection() {
     assert!(h.state.units.by_create_request("crq-b").is_none());
 }
 
-/// A crash's stop (an agent exit) is in flight when a kill joins it: the kill
-/// takes the stop over and the crash is never auto-resumed (no replacement,
-/// nothing left under the pane's create-request id).
-///
-/// Before Task 17 a crash of the TUI ends the unit as an agent exit (Task 17
-/// makes it a screen restart and detects the app-server's own death; this
-/// test's crash then moves to the native app-server).
+/// A crash's stop (an agent exit: the app-server died on its own) is in
+/// flight when a kill joins it: the kill takes the stop over and the crash
+/// is never auto-resumed (no replacement, nothing left under the pane's
+/// create-request id).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kill_racing_an_app_server_crash_wins_over_auto_resume() {
     let h = UnitHarness::start(HarnessOpts {
@@ -215,11 +212,8 @@ async fn a_kill_racing_an_app_server_crash_wins_over_auto_resume() {
     )
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    h.send(
-        &mut ws,
-        json!({"type": "terminal.input", "terminalId": tid, "data": "crash\r"}),
-    )
-    .await;
+    // The app-server dies on its own: a crash (the TUI never exits on it).
+    h.kill_native(&tid);
     eventually(
         "the crash's stop is in flight",
         Duration::from_secs(10),
@@ -278,11 +272,8 @@ async fn a_stuck_restart_racing_a_crash_cancels_its_auto_resume() {
     let tid = h.create_codex(&mut ws, "crq-sr", Some("t-sr")).await;
     tui_ready(&h, &mut ws).await;
     start_settled(&h, &tid).await;
-    h.send(
-        &mut ws,
-        json!({"type": "terminal.input", "terminalId": tid, "data": "crash\r"}),
-    )
-    .await;
+    // The app-server dies on its own: a crash (the TUI never exits on it).
+    h.kill_native(&tid);
     eventually(
         "the crash's stop is in flight",
         Duration::from_secs(10),

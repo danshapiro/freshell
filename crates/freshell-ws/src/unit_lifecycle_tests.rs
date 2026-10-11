@@ -521,15 +521,13 @@ fn a_screen_its_own_stop_killed_is_not_a_placement_failure() {
             },
         );
         assert_eq!(scope.spawned("T-own", pid), Spawned::Running);
-        on_screen_exit(
+        on_member_exit(
             &state,
-            UnitScreenExit {
-                terminal_id: "T-own".into(),
-                unit_id: unit.id().to_string(),
-                exit_code: 137,
-                screen_generation: 0,
-            },
-        );
+            unit.id().as_str(),
+            "T-own",
+            MemberExit::Screen { exit_code: 137 },
+        )
+        .await;
 
         let report = stop.wait_for(LIMIT).await.expect("Gone");
         assert_eq!(report.reason, "shift-x");
@@ -1111,4 +1109,165 @@ async fn a_start_registered_after_its_pane_was_killed_is_cancelled() {
         StartScope::begin(&state, "codex", "codex", "crq-live", "T-live", None).expect("start");
     assert!(!scope.cancelled());
     scope.abandon(None);
+}
+
+/// The text of every output frame `seen` collected.
+fn output_text(seen: &Arc<Mutex<Vec<ServerMessage>>>) -> String {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter_map(|m| match m {
+            ServerMessage::TerminalOutput(o) => Some(o.data.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A process the test started, killed through its pin if it outlives the
+/// test.
+struct KillOnDrop(ProcWatch);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.signal(Sig::Kill);
+    }
+}
+
+/// An agent whose screen IS its main process (Claude Code, Gemini, Kimi)
+/// that ends on its own while a background job it started still holds the
+/// terminal open: the terminal's stream never ends, so the screen-exit hook
+/// never runs, and only the watch on the main process sees the exit. The
+/// whole unit ends with the agent's own exit code (0: a clean end, no
+/// crash, remembered as a stopped pane) and the job is killed with the unit
+/// (Task 11 review M4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_whose_screen_is_its_main_ends_its_unit_while_a_job_holds_the_terminal() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, mut crashes) = unit_state(root.path());
+    let mut scope =
+        StartScope::begin(&state, "claude", "claude", "crq-m4", "T-m4", None).expect("start");
+    let pid = spawn_screen(
+        &state,
+        &scope,
+        "T-m4",
+        "read -r _; trap '' HUP; sleep 60 & echo JOB=$!; exit 0",
+    )
+    .await;
+    assert_eq!(scope.spawned("T-m4", pid), Spawned::Running);
+    let unit = scope.unit();
+    unit.set_main(unit.screen().expect("the pinned screen"));
+    assert!(unit.main_is_screen());
+    scope.bind();
+    scope.commit();
+    tokio::time::timeout(LIMIT, state.units.start_settled(unit.id()))
+        .await
+        .expect("the placed start settles");
+    let seen = attach_collector(&state, "T-m4");
+
+    assert!(state.registry.input("T-m4", b"go\n").found);
+    eventually("the job's pid is printed", || {
+        let text = output_text(&seen);
+        text.contains("JOB=") && text.trim_end_matches(['\r', '\n']).len() < text.len()
+    })
+    .await;
+    let job_pid: u32 = output_text(&seen)
+        .split("JOB=")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse()
+                .ok()
+        })
+        .expect("the job's pid");
+    let job = KillOnDrop(ProcWatch::open(job_pid).expect("pin the job"));
+
+    let stop = {
+        let watched = unit.clone();
+        eventually("the agent's own exit stops the unit", move || {
+            watched.stop_in_flight().is_some()
+        })
+        .await;
+        unit.stop_in_flight().unwrap()
+    };
+    let report = stop.wait_for(LIMIT).await.expect("Gone");
+    assert_eq!(report.reason, "agent-exited");
+    assert_eq!(
+        exit_codes(&seen),
+        vec![0],
+        "published with the agent's code"
+    );
+    let crash = tokio::time::timeout(LIMIT, crashes.recv())
+        .await
+        .expect("the end reaches auto-resume")
+        .expect("a crash event");
+    assert_eq!(crash.exit_code, 0, "a clean end, which auto-resume settles");
+    assert!(
+        state.units.killed_start("crq-m4"),
+        "a clean end is remembered as a stopped pane"
+    );
+    tokio::time::timeout(LIMIT, stop.wait_swept())
+        .await
+        .expect("the post-Gone sweep ran");
+    assert!(
+        job.0.has_exited(),
+        "the job the agent left was killed with its unit"
+    );
+}
+
+/// A restarted Codex TUI resumes the conversation its terminal is bound to
+/// now: the `resume` argument is rewritten, or appended to a spawn that had
+/// none (a fresh pane); a Windows shell's single command string is kept.
+#[test]
+fn a_restarted_screen_resumes_the_bound_conversation() {
+    let spec = |args: &[&str]| freshell_platform::SpawnSpec {
+        program: "codex".into(),
+        args: args.iter().map(|a| a.to_string()).collect(),
+        env_overrides: Default::default(),
+        cwd: None,
+        cols: 80,
+        rows: 24,
+    };
+    let args = |spec: freshell_platform::SpawnSpec| spec.args;
+    assert_eq!(
+        args(resume_in_spec(
+            spec(&["--remote", "ws://127.0.0.1:1", "resume", "t-old"]),
+            "t-new"
+        )),
+        ["--remote", "ws://127.0.0.1:1", "resume", "t-new"]
+    );
+    assert_eq!(
+        args(resume_in_spec(
+            spec(&["--remote", "ws://127.0.0.1:1"]),
+            "t-new"
+        )),
+        ["--remote", "ws://127.0.0.1:1", "resume", "t-new"]
+    );
+    assert_eq!(
+        args(resume_in_spec(
+            spec(&["--exec", "codex", "--remote", "ws://127.0.0.1:1"]),
+            "t-new"
+        )),
+        [
+            "--exec",
+            "codex",
+            "--remote",
+            "ws://127.0.0.1:1",
+            "resume",
+            "t-new"
+        ],
+        "a WSL relay's CLI arguments follow --exec"
+    );
+    for command_string in [
+        spec(&["/K", "codex --remote ws://127.0.0.1:1 resume t-old"]),
+        spec(&[
+            "-NoLogo",
+            "-NoExit",
+            "-Command",
+            "& 'codex' 'resume' 't-old'",
+        ]),
+    ] {
+        let kept = command_string.args.clone();
+        assert_eq!(args(resume_in_spec(command_string, "t-new")), kept);
+    }
 }
