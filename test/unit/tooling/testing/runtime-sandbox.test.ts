@@ -35,8 +35,39 @@ import { RuntimeHarness, dockerSocketPath } from '../../../../scripts/testing/ru
 import { RestrictedDockerBroker, type PreparedInputAuthorization } from '../../../../scripts/testing/runtime-test-broker.js'
 import { ManagedRuntimeBrowserRig } from '../../../e2e-browser/helpers/managed-runtime.js'
 import { prepareProviderParityUserRoots } from '../../../helpers/provider-parity-environment.js'
-import { assertManagedTerminalCreated, readManagedEnvironmentDaemonId } from '../../../../scripts/testing/managed-environment-create.js'
+import { assertManagedTerminalCreated, observeManagedEnvironmentNativeIdentity, readManagedEnvironmentDaemonId } from '../../../../scripts/testing/managed-environment-create.js'
 import type { ErrorMessage } from '../../../../shared/ws-protocol.js'
+
+describe('managed environment native identity observation', () => {
+  it.each(['expected', 'foreign'] as const)('observes owned output before accepting %s native identity', async kind => {
+    const row = { soulId: 'owned-soul', terminalId: 'owned-terminal', incarnationId: 'owned-incarnation',
+      launchState: 'running', nativeSessionId: undefined as string | undefined }
+    const calls: unknown[] = []
+    const runtime = {
+      terminalReadOutputBody: RuntimeHarness.prototype.terminalReadOutputBody,
+      adminOk: async (_supervisor: unknown, body: unknown) => {
+        calls.push(body)
+        row.nativeSessionId = kind === 'expected' ? 'ses_expected' : 'ses_foreign'
+        return { frames: [{ data: 'private output is discarded' }] }
+      },
+    }
+    const owner = { inventory: async () => [row], runtime, supervisor: {} } as unknown as Parameters<typeof observeManagedEnvironmentNativeIdentity>[0]
+    const observed = await observeManagedEnvironmentNativeIdentity(owner, 'owned-terminal', 'ses_expected')
+    expect.soft(calls).toEqual([{ method: 'terminal_read_output',
+      params: { soulId: 'owned-soul', afterSeq: 0, maxBytes: 64 * 1024 } }])
+    expect.soft(observed).toEqual(kind === 'expected' ? row : undefined)
+  })
+
+  it('leaves other terminals and stopped rows unobserved', async () => {
+    const adminOk = vi.fn()
+    const owner = { inventory: async () => [
+      { soulId: 'foreign-soul', terminalId: 'other-terminal', launchState: 'running', nativeSessionId: 'ses_expected' },
+      { soulId: 'stopped-soul', terminalId: 'owned-terminal', launchState: 'stopped', nativeSessionId: 'ses_expected' },
+    ], runtime: { terminalReadOutputBody: RuntimeHarness.prototype.terminalReadOutputBody, adminOk }, supervisor: {} } as unknown as Parameters<typeof observeManagedEnvironmentNativeIdentity>[0]
+    expect(await observeManagedEnvironmentNativeIdentity(owner, 'owned-terminal', 'ses_expected')).toBeUndefined()
+    expect(adminOk).not.toHaveBeenCalled()
+  })
+})
 
 describe('managed environment daemon identity', () => {
   it('reads the exact configured Unix daemon before registering a source', async () => {

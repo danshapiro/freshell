@@ -13,7 +13,7 @@ import { managedEnvironmentOpencodeSelection } from '../../test/helpers/provider
 import { fakeOnecliGrants } from '../../test/integration/server/provider-parity-onecli.js'
 import type { InitialProviderVolumeAuthorization } from './runtime-test-broker.js'
 import { resolvePairedExternalFixture } from './e2e-external-target.js'
-import { assertManagedTerminalCreated, readManagedEnvironmentDaemonId } from './managed-environment-create.js'
+import { assertManagedTerminalCreated, observeManagedEnvironmentNativeIdentity, readManagedEnvironmentDaemonId } from './managed-environment-create.js'
 
 const cloudflaredVersion = '2026.10.0'
 const cloudflaredSha = 'd33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db'
@@ -286,8 +286,8 @@ export async function runManagedEnvironmentTarget() {
     assert.equal(preflightChild.runId, rig.runtime.runId)
     assert.equal(preflightChild.expectedNonce, nonce)
     assert.equal(preflightChild.bun, true)
-    const preflightView = await poll('genuine managed preflight native identity', async () => (await rig!.inventory())
-      .find(row => row.terminalId === created.terminalId && row.nativeSessionId === preflightChild.nativeSessionId && row.launchState === 'running'))
+    const preflightView = await poll('genuine managed preflight native identity', () =>
+      observeManagedEnvironmentNativeIdentity(rig!, created.terminalId, preflightChild.nativeSessionId))
     assert((await terminalDirectory(rig)).some(row => row.terminalId === created.terminalId))
     assert.deepEqual(await webChildren(rig), [], 'Managed child must belong to the disposable session host, not the host web process')
     proof.preflight = { terminalId: created.terminalId, soulId: preflightView.soulId, incarnationId: preflightView.incarnationId,

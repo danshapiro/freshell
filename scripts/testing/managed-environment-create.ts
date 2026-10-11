@@ -5,6 +5,15 @@ import path from 'node:path'
 import { ErrorCode, type ErrorMessage } from '../../shared/ws-protocol.js'
 import { dockerSocketPath } from './runtime-sandbox.js'
 import { providerParityFailureDiagnostics } from '../../test/helpers/provider-parity-environment.js'
+import type { ManagedRuntimeBrowserRig } from '../../test/e2e-browser/helpers/managed-runtime.js'
+
+export async function observeManagedEnvironmentNativeIdentity(
+  owner: Pick<ManagedRuntimeBrowserRig, 'inventory' | 'runtime' | 'supervisor'>,
+  terminalId: string, nativeSessionId: string,
+) {
+  return (await owner.inventory()).find(row => row.terminalId === terminalId
+    && row.nativeSessionId === nativeSessionId && row.launchState === 'running')
+}
 
 export async function readManagedEnvironmentDaemonId(): Promise<string> {
   const dockerHost = process.env.DOCKER_HOST
