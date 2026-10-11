@@ -149,7 +149,9 @@ pub enum RolloutLookup {
 /// Absence is concluded only from a tree the walk read in full: something
 /// that vanished during the walk (NotFound) is simply not there, but any
 /// other error reading a directory, an entry or a candidate file answers
-/// [`RolloutLookup::Unreadable`] unless the rollout was found anyway.
+/// [`RolloutLookup::Unreadable`] unless the rollout was found anyway. A
+/// compressed candidate (`.jsonl.zst`) cannot be read, so it counts as such
+/// an error.
 fn lookup_rollout(sessions_root: &Path, thread_id: &str) -> RolloutLookup {
     lookup_rollout_observed(sessions_root, thread_id, &mut |_| {})
 }
@@ -282,18 +284,28 @@ fn lookup_rollout_observed(
                 if let Some(hit) = walk(&path, thread_id, depth + 1, error, listed) {
                     return Some(hit);
                 }
-            } else if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with(".jsonl") && n.contains(thread_id))
-            {
-                match owns(&path, thread_id) {
-                    Ok(true) => return Some(path),
-                    Ok(false) => {}
-                    Err(e) if e.kind() == NotFound => {}
-                    Err(e) => {
-                        error.get_or_insert(e);
+            } else {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if !name.contains(thread_id) {
+                    continue;
+                }
+                if name.ends_with(".jsonl") {
+                    match owns(&path, thread_id) {
+                        Ok(true) => return Some(path),
+                        Ok(false) => {}
+                        Err(e) if e.kind() == NotFound => {}
+                        Err(e) => {
+                            error.get_or_insert(e);
+                        }
                     }
+                } else if name.ends_with(".jsonl.zst") {
+                    // A compressed rollout (the server's by-id walker accepts
+                    // them too): this walk cannot read its first line, so the
+                    // thread's absence is not proven.
+                    error.get_or_insert(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        format!("{}: a compressed rollout cannot be read", path.display()),
+                    ));
                 }
             }
         }
@@ -660,6 +672,26 @@ mod tests {
             Some(&dated.path().to_path_buf()),
             "{listed:?}"
         );
+    }
+
+    /// A compressed rollout (`.jsonl.zst`, which the server's by-id walker
+    /// also accepts) is a candidate this walk cannot read: its thread's
+    /// absence is not proven, so a real conversation is never taken for one
+    /// that never materialized.
+    #[test]
+    fn a_compressed_rollout_of_the_thread_is_never_taken_for_its_absence() {
+        let tid = "019df043-f1fd-79d0-85c8-3ae11fb2237d";
+        let home = tempfile::tempdir().expect("tempdir");
+        let day = home.path().join("sessions/2026/05/03");
+        std::fs::create_dir_all(&day).unwrap();
+        // A zstd frame's magic and some bytes: no readable first line.
+        std::fs::write(
+            day.join(format!("rollout-2026-05-03T16-54-38-{tid}.jsonl.zst")),
+            [0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x58, 0x7b, 0x22, 0x0a],
+        )
+        .unwrap();
+        let lookup = lookup_thread_rollout_in_home(home.path(), tid);
+        assert!(matches!(lookup, RolloutLookup::Unreadable(_)), "{lookup:?}");
     }
 
     #[test]
