@@ -43,7 +43,7 @@ async function launch(page: Page, scenario: string) {
   const readiness = await json(page, '/api/runtime/readiness')
   expect(readiness.readiness.initialScanState).toBe('complete')
   expect(await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getReceivedWsMessages?.()
-    .some((message: any) => message.type === 'ready' && message.managedRuntimeV1 === true))).toBe(true)
+    .some((message: any) => message.type === 'ready' && message.capabilities?.managedRuntimeV1 === true))).toBe(true)
 
   const add = page.locator('[data-context="tab-add"]')
   if (await add.isVisible()) await add.click()

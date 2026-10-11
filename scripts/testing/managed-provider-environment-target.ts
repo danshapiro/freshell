@@ -5,7 +5,7 @@ import fs from 'node:fs/promises'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import WebSocket from 'ws'
 import { ManagedRuntimeBrowserRig, type ManagedRuntimeView } from '../../test/e2e-browser/helpers/managed-runtime.js'
 import { authorizeProviderParityRequest, captureProviderParityVolumes, cleanupProviderParityVolumes } from '../../test/helpers/provider-parity-broker.js'
@@ -38,31 +38,71 @@ async function readJson(selected: string): Promise<any | undefined> {
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error }
 }
 
-async function processIdentity(child: ChildProcess) {
+async function processIdentity(child: { pid?: number }) {
   assert(child.pid)
   const raw = await fs.readFile(`/proc/${child.pid}/stat`, 'utf8')
   const fields = raw.slice(raw.lastIndexOf(')') + 2).trim().split(/\s+/)
   return { pid: child.pid, parentPid: Number(fields[1]), birthTicks: fields[19], cwd: await fs.readlink(`/proc/${child.pid}/cwd`) }
 }
 
-function joined(child: ChildProcess): Promise<number> {
+type NativeExit = { code: number | null; signal: NodeJS.Signals | null }
+
+function joined(child: ChildProcess): Promise<NativeExit> {
   return new Promise((resolve, reject) => {
     child.once('error', reject)
-    child.once('exit', (code, signal) => code === null ? reject(new Error(`Owned child exited with ${signal}`)) : resolve(code))
+    child.once('exit', (code, signal) => resolve({ code, signal }))
   })
 }
 
+async function bounded<T>(completion: Promise<T>, milliseconds: number, description: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([completion, new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`Managed environment timed out: ${description}`)), milliseconds)
+    })])
+  } finally { clearTimeout(timer) }
+}
+
 async function stopExact(child: ChildProcess | undefined, identity: Awaited<ReturnType<typeof processIdentity>> | undefined,
-  completion: Promise<number> | undefined) {
-  if (!child || !identity || !completion) return
+  completion: Promise<NativeExit> | undefined) {
+  if (!child || !completion) return
   if (child.exitCode === null && child.signalCode === null) {
     try {
+      assert(identity, 'Live owned child has no captured identity; retain its fixture')
       const current = await processIdentity(child)
       assert.deepEqual(current, identity, 'Owned child identity changed; retain it')
       child.kill('SIGTERM')
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+    try { return await bounded(completion, 15_000, 'owned child graceful join') }
+    catch (error) {
+      if (child.exitCode !== null || child.signalCode !== null) throw error
+      assert.deepEqual(await processIdentity(child), identity, 'Owned child identity changed before escalation; retain it')
+      child.kill('SIGKILL')
+    }
   }
-  await completion.catch(error => { if (!child.signalCode) throw error })
+  return bounded(completion, 15_000, 'owned child final join')
+}
+
+async function terminalDirectory(rig: ManagedRuntimeBrowserRig): Promise<any[]> {
+  const response = await fetch(`${rig.info.baseUrl}/api/terminals`, {
+    headers: { 'x-auth-token': rig.info.token }, signal: AbortSignal.timeout(30_000) })
+  assert(response.ok, 'Owned terminal directory request failed')
+  const rows = await response.json()
+  assert(Array.isArray(rows), 'Owned terminal directory must return its real rows')
+  return rows
+}
+
+async function webChildren(rig: ManagedRuntimeBrowserRig): Promise<number[]> {
+  const { pid } = rig.web.processEvidence()
+  const children = new Set<number>()
+  for (const thread of await fs.readdir(`/proc/${pid}/task`)) {
+    try {
+      const selected = await fs.readFile(`/proc/${pid}/task/${thread}/children`, 'utf8')
+      for (const child of selected.trim().split(/\s+/).filter(Boolean)) children.add(Number(child))
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+  }
+  assert.equal(rig.web.processEvidence().pid, pid, 'Owned scratch web server changed during child observation')
+  return [...children].sort((left, right) => left - right)
 }
 
 async function daemonId(socketPath: string): Promise<string> {
@@ -102,8 +142,8 @@ async function configure(root: string, nonce: string, candidateSha: string, runI
 export default {id:'managed-environment-tui',async tui(api,options){
  const command=new URL('./command',import.meta.url), resource=fs.readFileSync(new URL('./selected-resource',import.meta.url),'utf8');
  const child=Bun.spawn([command.pathname],{stdout:'pipe',stderr:'pipe'});const output=JSON.parse(await new Response(child.stdout).text());if(await child.exited!==0)throw new Error('selected executable failed');
- const cwd=api.state.path.directory;const sessionFlag=process.argv.findIndex(value=>value==='--session'||value==='-s');const resumed=sessionFlag>=0?process.argv[sessionFlag+1]:undefined;const result=resumed?await api.client.session.get({directory:cwd,sessionID:resumed}):await api.client.session.create({directory:cwd,title:'Managed fixture'});if(!result.data?.id||(resumed&&result.data.id!==resumed))throw new Error('native session creation or resume failed');api.route.navigate('session',{sessionID:result.data.id});
- const receipt={...options,terminalId:process.env.FRESHELL_TERMINAL_ID,nativeSessionId:result.data.id,bun:typeof Bun==='object',bunVersion:Bun.version,bunExecutable:process.execPath,opencodeVersion:api.app.version,dependency,resource,absoluteReference:api.state.config.agent.fixtureAbsolute.prompt,relativeReference:api.state.config.agent.fixtureRelative.prompt,executableMode:(fs.statSync(command).mode&511).toString(8).padStart(4,'0'),pid:process.pid,createdAt:new Date().toISOString()};
+ const cwd=process.cwd();const configuration=await api.client.config.get({directory:cwd});if(!configuration.data?.agent)throw new Error('resolved provider configuration was not available');const sessionFlag=process.argv.findIndex(value=>value==='--session'||value==='-s');const resumed=sessionFlag>=0?process.argv[sessionFlag+1]:undefined;const result=resumed?await api.client.session.get({directory:cwd,sessionID:resumed}):await api.client.session.create({directory:cwd,title:'Managed fixture'});if(!result.data?.id||(resumed&&result.data.id!==resumed))throw new Error('native session creation or resume failed');api.route.navigate('session',{sessionID:result.data.id});
+ const receipt={...options,terminalId:process.env.FRESHELL_TERMINAL_ID,nativeSessionId:result.data.id,bun:typeof Bun==='object',bunVersion:Bun.version,bunExecutable:process.execPath,opencodeVersion:api.app.version,dependency,resource,absoluteReference:configuration.data.agent.fixtureAbsolute.prompt,relativeReference:configuration.data.agent.fixtureRelative.prompt,executableMode:(fs.statSync(command).mode&511).toString(8).padStart(4,'0'),pid:process.pid,createdAt:new Date().toISOString()};
  fs.writeFileSync(path.join(cwd,'.managed-fixture/child-receipt.json'),JSON.stringify(receipt));const marker='MANAGED_ENV_OUTPUT '+output.resource;process.stdout.write('\\n'+marker+'\\n');api.ui.toast.show({message:marker,duration:180000});
 }};`)
   const absoluteRule = path.join(resources, 'absolute-rule.txt')
@@ -130,13 +170,19 @@ async function socketCreate(rig: ManagedRuntimeBrowserRig, requestId: string, mo
   const closed = new Promise<void>(resolve => ws.once('close', () => resolve()))
   ws.on('message', bytes => messages.push(JSON.parse(bytes.toString())))
   try {
-    await new Promise<void>((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject) })
+    await bounded(new Promise<void>((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject) }),
+      30_000, 'owned WebSocket open')
     ws.send(JSON.stringify({ type: 'hello', token: rig.info.token, ...(capabilities ? { capabilities } : {}) }))
-    await poll('authenticated ready', async () => messages.find(message => message.type === 'ready'), 30_000)
+    const ready = await poll('authenticated ready', async () => messages.find(message => message.type === 'ready'), 30_000)
+    if (capabilities?.managedRuntimeV1) assert.equal(ready.capabilities?.managedRuntimeV1, true)
     ws.send(JSON.stringify({ type: 'terminal.create', requestId, mode, cwd, cols: 100, rows: 30 }))
     return await poll('terminal create response', async () => messages.find(message =>
-      message.type === 'terminal.created' || message.type === 'terminal.error'), 120_000)
-  } finally { ws.close(); await closed }
+      message.requestId === requestId && (message.type === 'terminal.created' || message.type === 'error')), 120_000)
+  } finally {
+    if (ws.readyState !== WebSocket.CLOSED) ws.close()
+    try { await bounded(closed, 5_000, 'owned WebSocket close') }
+    catch { ws.terminate(); await bounded(closed, 5_000, 'owned WebSocket terminate join') }
+  }
 }
 
 async function stageProof(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView, nonce: string) {
@@ -150,11 +196,17 @@ async function stageProof(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeVie
     const manifest = await fs.readFile(path.join(stageRoot, '.freshell/input-manifest.json'))
     assert.equal(digest(manifest), context.preparedInputs.manifest.sha256)
     const selected: string[] = []
-    async function walk(directory: string) {
+    let entries = 0
+    async function walk(directory: string, depth = 0) {
+      assert(depth <= 64, 'Owned controller-stage observation exceeded its depth bound')
       for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+        assert(++entries <= 100_000, 'Owned controller-stage observation exceeded its entry bound')
         const file = path.join(directory, entry.name)
-        if (entry.isDirectory()) await walk(file)
-        else if (entry.isFile() && entry.name === 'command' && (await fs.readFile(file, 'utf8')).includes(nonce)) selected.push(file)
+        if (entry.isDirectory()) await walk(file, depth + 1)
+        else if (entry.isFile() && entry.name === 'command') {
+          assert((await fs.stat(file)).size <= 4096, 'Synthetic selected command changed beyond its finite fixture size')
+          if ((await fs.readFile(file, 'utf8')).includes(nonce)) selected.push(file)
+        }
       }
     }
     await walk(stageRoot)
@@ -171,13 +223,17 @@ const requireMode = (metadata: { mode: number }) => (metadata.mode & 0o777).toSt
 export async function runManagedEnvironmentTarget() {
   assert.equal(process.env.FRESHELL_E2E_BACKEND, 'cloud', 'Managed acceptance requires configured Cloud')
   assert.equal(process.env.GCLOUD_ROBOT_REQUIRE, '1', 'Managed acceptance requires the robot identity')
+  assert.equal(process.env.GCLOUD_ROBOT_ACCOUNT, 'gcloud-robot@misc-puttering-project.iam.gserviceaccount.com')
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'frs-managed-environment-'))
   const grants = fakeOnecliGrants(['opencode'])
   const nonce = randomUUID()
   let rig: ManagedRuntimeBrowserRig | undefined
-  let tunnel: ChildProcess | undefined, tunnelIdentity: Awaited<ReturnType<typeof processIdentity>> | undefined, tunnelJoin: Promise<number> | undefined
-  let browser: ChildProcess | undefined, browserIdentity: Awaited<ReturnType<typeof processIdentity>> | undefined, browserJoin: Promise<number> | undefined
+  let webIdentity: Awaited<ReturnType<typeof processIdentity>> | undefined
+  let version: ChildProcess | undefined, versionIdentity: Awaited<ReturnType<typeof processIdentity>> | undefined,
+    versionJoin: Promise<NativeExit> | undefined
+  let tunnel: ChildProcess | undefined, tunnelIdentity: Awaited<ReturnType<typeof processIdentity>> | undefined, tunnelJoin: Promise<NativeExit> | undefined
+  let browser: ChildProcess | undefined, browserIdentity: Awaited<ReturnType<typeof processIdentity>> | undefined, browserJoin: Promise<NativeExit> | undefined
   const owners: InitialProviderVolumeAuthorization[] = []
   let capturedVolumes: ReturnType<typeof captureProviderParityVolumes> = []
   const proof: Record<string, unknown> = { expectedNonce: nonce }
@@ -189,6 +245,8 @@ export async function runManagedEnvironmentTarget() {
       { workspaceRoots: [workspace], bootstrapFiles: [grants.grants.opencode], defaultCwd: workspace })
     const selected = await configure(root, nonce, rig.runtime.candidateSha, rig.runtime.runId)
     await rig.start()
+    webIdentity = await processIdentity(rig.web.processEvidence())
+    proof.scratchWeb = webIdentity
     const health = await rig.runtime.adminOk(rig.supervisor, { method: 'health' })
     const dockerHost = process.env.DOCKER_HOST
     assert(!dockerHost || dockerHost.startsWith('unix://'), 'Managed target requires the existing local Unix Docker endpoint')
@@ -197,9 +255,11 @@ export async function runManagedEnvironmentTarget() {
       daemonId: await daemonId(dockerHost?.slice(7) || '/var/run/docker.sock') }
     const authorize = (requestId: string) => owners.push(authorizeProviderParityRequest(rig!.runtime.broker, source, requestId))
     const before = await rig.inventory()
+    assert.deepEqual(before, [])
+    assert.deepEqual(await terminalDirectory(rig), [])
     for (const capabilities of [undefined, { paneReconcileV1: true }] as (Record<string, true> | undefined)[]) {
       const refused = await socketCreate(rig, randomUUID(), 'shell', selected.workspace, capabilities)
-      assert.equal(refused.type, 'terminal.error')
+      assert.equal(refused.type, 'error')
       assert(JSON.stringify(refused).includes('managed environment fixture denies host PTY'))
     }
     const fallback = await fetch(`${rig.info.baseUrl}/api/tabs`, { method: 'POST', headers: { 'x-auth-token': rig.info.token,
@@ -207,14 +267,31 @@ export async function runManagedEnvironmentTarget() {
     assert.equal(fallback.status, 400)
     assert((await fallback.text()).includes('managed environment fixture denies host PTY'))
     assert.deepEqual(await rig.inventory(), before)
-    proof.hostPtyDenials = { legacy: true, nonNegotiated: true, httpCliMcpFallback: true, ordinaryRows: 0 }
+    const ordinaryRows = await terminalDirectory(rig)
+    assert.deepEqual(ordinaryRows, [])
+    const childPids = await poll('absence of owned ordinary PTY child PIDs', async () => {
+      const children = await webChildren(rig!)
+      return children.length === 0 ? children : undefined
+    }, 15_000)
+    proof.hostPtyDenials = { legacy: true, nonNegotiated: true, httpCliMcpFallback: true,
+      observedRegistryRows: ordinaryRows, observedChildPids: childPids, scratchWeb: rig.web.processEvidence() }
     const preflightRequest = `managed-preflight-${randomUUID()}`
     authorize(preflightRequest)
-    const created = await socketCreate(rig, preflightRequest, 'opencode', path.join(selected.workspace, 'preflight'), { managedRuntimeV1: true })
+    const created = await socketCreate(rig, preflightRequest, 'opencode', path.join(selected.workspace, 'preflight'),
+      { paneReconcileV1: true, managedRuntimeV1: true })
     assert.equal(created.type, 'terminal.created')
-    assert.equal(created.managed, true)
-    assert.equal(created.pid, null)
-    await poll('genuine managed preflight configuration', async () => readJson(path.join(selected.workspace, 'preflight/.managed-fixture/child-receipt.json')))
+    const preflightChild = await poll('genuine managed preflight configuration', async () => readJson(path.join(selected.workspace, 'preflight/.managed-fixture/child-receipt.json')))
+    assert.equal(preflightChild.terminalId, created.terminalId)
+    assert.equal(preflightChild.candidateSha, rig.runtime.candidateSha)
+    assert.equal(preflightChild.runId, rig.runtime.runId)
+    assert.equal(preflightChild.expectedNonce, nonce)
+    assert.equal(preflightChild.bun, true)
+    const preflightView = await poll('genuine managed preflight native identity', async () => (await rig!.inventory())
+      .find(row => row.terminalId === created.terminalId && row.nativeSessionId === preflightChild.nativeSessionId && row.launchState === 'running'))
+    assert((await terminalDirectory(rig)).some(row => row.terminalId === created.terminalId))
+    assert.deepEqual(await webChildren(rig), [], 'Managed child must belong to the disposable session host, not the host web process')
+    proof.preflight = { terminalId: created.terminalId, soulId: preflightView.soulId, incarnationId: preflightView.incarnationId,
+      stage: await stageProof(rig, preflightView, nonce), child: preflightChild }
     const toolHome = path.join(root, 'tools')
     await fs.mkdir(toolHome, { mode: 0o700 })
     const tool = path.join(toolHome, 'cloudflared')
@@ -223,12 +300,17 @@ export async function runManagedEnvironmentTarget() {
     const bytes = Buffer.from(await download.arrayBuffer())
     assert.equal(digest(bytes), cloudflaredSha, 'Pinned cloudflared checksum mismatch')
     await fs.writeFile(tool, bytes, { mode: 0o700 })
-    const version = spawn(tool, ['--version'], { cwd: root, env: { ...process.env, HOME: toolHome } })
-    const versionJoin = joined(version), versionIdentity = await processIdentity(version)
-    let versionText = ''; version.stdout.on('data', bytes => { versionText += bytes })
-    assert.equal(await versionJoin, 0)
+    version = spawn(tool, ['--version'], { cwd: root, env: { ...process.env, HOME: toolHome } })
+    versionJoin = joined(version); versionJoin.catch(() => {})
+    versionIdentity = await processIdentity(version).catch(error => {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      return undefined
+    })
+    let versionText = ''; version.stdout!.on('data', bytes => { versionText += bytes })
+    const versionExit = await bounded(versionJoin, 30_000, 'pinned cloudflared version join')
+    assert.equal(versionExit.code, 0)
     assert.match(versionText, /^cloudflared version 2026\.10\.0(?:\s|$)/)
-    proof.cloudflared = { version: cloudflaredVersion, sha256: cloudflaredSha, versionIdentity }
+    proof.cloudflared = { version: cloudflaredVersion, sha256: cloudflaredSha, versionIdentity: versionIdentity ?? 'UNKNOWN', versionExit }
     tunnel = spawn(tool, ['tunnel', '--url', `http://127.0.0.1:${rig.info.port}`],
       { cwd: root, env: { ...process.env, HOME: toolHome, XDG_CONFIG_HOME: toolHome }, stdio: ['ignore', 'pipe', 'pipe'] })
     tunnelJoin = joined(tunnel); tunnelJoin.catch(() => {})
@@ -259,8 +341,11 @@ export async function runManagedEnvironmentTarget() {
     for (const scenario of scenarios) {
       const cwd = path.join(selected.workspace, scenario)
       const request = await poll(`Cloud ${scenario} picker request`, async () => {
+        const request = await readJson(path.join(cwd, '.managed-fixture/request.json'))
+        if (request) return request
         assert.equal(browser!.exitCode, null, 'Cloud browser exited before completing its three cases')
-        return readJson(path.join(cwd, '.managed-fixture/request.json'))
+        assert.equal(browser!.signalCode, null, 'Cloud browser was signaled before completing its three cases')
+        return undefined
       }, 600_000)
       for (const key of ['candidateSha', 'runId', 'remoteWorkspacePath', 'expectedNonce'] as const) assert.equal(request[key], fixture[key])
       assert.equal(request.scenario, scenario)
@@ -281,8 +366,9 @@ export async function runManagedEnvironmentTarget() {
         proof.healthy = receipt
       }
     }
-    assert.equal(await browserJoin, 0, 'Configured Cloud browser acceptance failed')
-    proof.cloudBrowser = { exit: 0, identity: browserIdentity, expectedCases: 3 }
+    const browserExit = await bounded(browserJoin, 120_000, 'configured Cloud browser final join')
+    assert.equal(browserExit.code, 0, 'Configured Cloud browser acceptance failed')
+    proof.cloudBrowser = { actualNativeExit: browserExit, identity: browserIdentity, expectedCases: 3, printedFooter: 'UNKNOWN' }
     const healthy = proof.healthy as any
     const original = (await rig.inventory()).find(row => row.soulId === healthy.soulId)
     assert(original?.containerId)
@@ -294,25 +380,66 @@ export async function runManagedEnvironmentTarget() {
     const replacementStage = await stageProof(rig, replacement, nonce)
     assert.equal(replacement.nativeSessionId, original.nativeSessionId)
     assert.equal(replacementChild.bun, true)
+    assert.equal(replacementChild.terminalId, replacement.terminalId)
+    assert.equal(replacementChild.nativeSessionId, replacement.nativeSessionId)
+    assert.equal(replacementChild.candidateSha, rig.runtime.candidateSha)
+    assert.equal(replacementChild.runId, rig.runtime.runId)
+    assert.equal(replacementChild.expectedNonce, nonce)
+    assert.equal(replacementChild.executableMode, '0711')
     proof.nativeReplacement = { priorIncarnationId: original.incarnationId, incarnationId: replacement.incarnationId,
       soulId: replacement.soulId, nativeSessionId: replacement.nativeSessionId, stage: replacementStage, child: replacementChild }
     await writeJson(path.join(rig.runtime.evidenceDir, 'managed-environment-acceptance.json'), proof)
     console.log(JSON.stringify({ severity: 'info', event: 'managed_environment.acceptance_passed', candidateSha: fixture.candidateSha,
-      runId: fixture.runId, browserCases: 3, receipt: path.join(rig.runtime.evidenceDir, 'managed-environment-acceptance.json') }))
+      runId: fixture.runId, expectedBrowserCases: 3, receipt: path.join(rig.runtime.evidenceDir, 'managed-environment-acceptance.json') }))
   } finally {
-    await stopExact(browser, browserIdentity, browserJoin)
-    await stopExact(tunnel, tunnelIdentity, tunnelJoin)
-    if (rig) {
-      capturedVolumes = captureProviderParityVolumes(owners)
-      await rig.stop()
-      cleanupProviderParityVolumes(capturedVolumes)
+    const errors: Error[] = []
+    const cleanup: Record<string, unknown> = {}
+    const attempt = async (operation: string, action: () => unknown | Promise<unknown>) => {
+      try { cleanup[operation] = await action() }
+      catch (error) { errors.push(new Error(`Owned fixture cleanup failed: ${operation}`, { cause: error })); cleanup[operation] = 'FAILED; retain owned fixture' }
     }
-    await fs.rm(grants.directory, { recursive: true, force: true })
-    await fs.rm(root, { recursive: true, force: true })
+    await attempt('browserJoin', () => stopExact(browser, browserIdentity, browserJoin))
+    await attempt('tunnelJoin', () => stopExact(tunnel, tunnelIdentity, tunnelJoin))
+    await attempt('versionJoin', () => stopExact(version, versionIdentity, versionJoin))
+    if (rig) {
+      if (!webIdentity && rig.web) await attempt('scratchWebIdentity', async () => {
+        try { webIdentity = await processIdentity(rig!.web.processEvidence()) }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT'
+            && (!(error instanceof Error) || error.message !== 'RustServer has no live owned process evidence')) throw error
+          return 'Already absent according to the owning helper'
+        }
+      })
+      for (const owner of owners) await attempt(`capture:${owner.providerVolumeName}`, () => {
+        capturedVolumes.push(...captureProviderParityVolumes([owner]))
+      })
+      let rigSettled = false
+      await attempt('rigStop', async () => {
+        const result = await rig!.stop()
+        assert(result.ok, 'Owned rig cleanup did not settle all workloads')
+        if (webIdentity) {
+          try {
+            const current = await processIdentity({ pid: webIdentity.pid })
+            assert.notEqual(current.birthTicks, webIdentity.birthTicks, 'Owned scratch web process remains live')
+          } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+        }
+        rigSettled = true
+        return result
+      })
+      if (rigSettled) for (const volume of capturedVolumes) await attempt(`remove:${volume.owner.providerVolumeName}`,
+        () => cleanupProviderParityVolumes([volume]))
+    }
+    if (errors.length === 0) {
+      await attempt('grantDirectory', () => fs.rm(grants.directory, { recursive: true, force: true }))
+      await attempt('fixtureDirectory', () => fs.rm(root, { recursive: true, force: true }))
+    }
+    if (rig) await attempt('cleanupReceipt', () => writeJson(path.join(rig!.runtime.evidenceDir, 'managed-environment-cleanup.json'),
+      { cleanup, knownOwnedSettled: errors.length === 0, retainedFixture: errors.length ? root : undefined }))
+    if (errors.length) throw new AggregateError(errors, 'Managed environment owned cleanup remains unsettled')
   }
 }
 
-if (process.argv[1] && import.meta.url === new URL(`file://${path.resolve(process.argv[1])}`).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   runManagedEnvironmentTarget().catch(error => {
     console.error(JSON.stringify({ severity: 'error', event: 'managed_environment.acceptance_failed', error: error instanceof Error ? error.message : 'Unknown fixture failure' }))
     process.exitCode = 1
