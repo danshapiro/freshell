@@ -6,6 +6,404 @@ use freshell_runtime_protocol::{
 };
 use tokio::net::UnixListener;
 
+#[cfg(feature = "managed-fresh-agent-fixtures")]
+mod initial_grant_reference_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use freshell_runtime_protocol::*;
+    use freshell_supervisor::{
+        admission::AdmissionPolicy,
+        backend::{
+            BackendCreated, BackendError, BackendInspection, CreateRuntimeSpec, RuntimeBackend,
+        },
+        registry::{OwnedRuntimeHandle, Registry},
+        service::{serve_control, Supervisor, SupervisorConfig},
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex as StdMutex,
+    };
+
+    // This replaces only the enclosure and host reply. Registry activation,
+    // grant consumption, RuntimeClient, and the server's wire ACK remain real.
+    // Actual host/actor publication has separate session-host grant coverage.
+    #[derive(Default)]
+    struct GrantBackend {
+        allocations: AtomicUsize,
+        grants: Arc<AtomicUsize>,
+        statuses: Arc<AtomicUsize>,
+        host_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+        shutdown: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        native_root: Option<String>,
+    }
+
+    impl GrantBackend {
+        async fn close(&self) {
+            self.shutdown
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(())
+                .unwrap();
+            let task = self.host_task.lock().unwrap().take().unwrap();
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[async_trait]
+    impl RuntimeBackend for GrantBackend {
+        async fn create_stopped(
+            &self,
+            _: &CreateRuntimeSpec,
+        ) -> Result<BackendCreated, BackendError> {
+            self.allocations.fetch_add(1, Ordering::SeqCst);
+            Ok(BackendCreated {
+                daemon_id: DockerDaemonId::new(),
+                container_id: "a".repeat(64),
+                immutable_config_digest: format!("sha256:{}", "c".repeat(64)),
+            })
+        }
+
+        async fn start_host(&self, handle: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            let handle = handle.clone();
+            let listener = UnixListener::bind(handle.runtime_dir().join("host.sock")).unwrap();
+            let secret = std::fs::read(handle.runtime_dir().join("secret")).unwrap();
+            let native_root = self.native_root.clone();
+            let grants = self.grants.clone();
+            let statuses = self.statuses.clone();
+            let (shutdown, mut stopped) = tokio::sync::oneshot::channel();
+            *self.shutdown.lock().unwrap() = Some(shutdown);
+            *self.host_task.lock().unwrap() = Some(tokio::spawn(async move {
+                let boot = HostBootId::new();
+                let mut generation = 0;
+                let mut epoch = 0;
+                loop {
+                    let accepted = tokio::select! {
+                        _ = &mut stopped => break,
+                        accepted = listener.accept() => accepted.unwrap(),
+                    };
+                    let (mut socket, _) = accepted;
+                    let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                    assert_eq!(request.role, ControlRole::Supervisor);
+                    if !matches!(&request.body, HostCommand::Hello { .. }) {
+                        assert_eq!(
+                            request.auth.as_deref(),
+                            Some(
+                                host_proof(&secret, "command-auth", &boot, handle.incarnation_id())
+                                    .as_str()
+                            )
+                        );
+                    }
+                    let result = match request.body {
+                        HostCommand::Hello {
+                            incarnation_id,
+                            challenge,
+                        } => {
+                            assert_eq!(&incarnation_id, handle.incarnation_id());
+                            HostResult::Hello {
+                                proof: host_proof(&secret, &challenge, &boot, &incarnation_id),
+                                host_boot_id: boot.clone(),
+                                capabilities: vec![],
+                                effective_limits: handle.requested_limits(),
+                            }
+                        }
+                        HostCommand::GrantExecution {
+                            incarnation_id,
+                            soul_id,
+                            host_boot_id,
+                            control_epoch,
+                            execution_generation,
+                            fresh_agent,
+                            native_identity_launch,
+                            ..
+                        } => {
+                            assert_eq!(&incarnation_id, handle.incarnation_id());
+                            assert_eq!(&soul_id, handle.soul_id());
+                            assert_eq!(host_boot_id, boot);
+                            assert_eq!(fresh_agent.as_deref(), handle.fresh_agent());
+                            let binding = native_identity_launch.unwrap();
+                            assert_eq!(binding.incarnation_id, incarnation_id);
+                            assert_eq!(binding.launch_nonce, handle.launch_nonce().as_str());
+                            assert_eq!(binding.execution_generation, execution_generation);
+                            assert!(execution_generation > 0 && control_epoch > 0);
+                            generation = execution_generation;
+                            epoch = control_epoch;
+                            grants.fetch_add(1, Ordering::SeqCst);
+                            HostResult::GrantAccepted {
+                                host_boot_id: boot.clone(),
+                                worker_pid: 123,
+                                worker_launch_count: 1,
+                                fixture_evidence: serde_json::json!({}),
+                                native_session_id: native_root.clone(),
+                                native_identity_observation: None,
+                                opencode_transfer_receipt: None,
+                                opencode_adoption: Default::default(),
+                            }
+                        }
+                        HostCommand::FreshAgentReadEvents { incarnation_id, .. } => {
+                            assert_eq!(&incarnation_id, handle.incarnation_id());
+                            // Started never enriches the registry before the first ACK.
+                            HostResult::FreshAgentEvents(AgentEventBatch {
+                                retained_from: 0,
+                                head: 0,
+                                reset_required: false,
+                                events: vec![],
+                            })
+                        }
+                        HostCommand::Status { incarnation_id } => {
+                            assert_eq!(&incarnation_id, handle.incarnation_id());
+                            statuses.fetch_add(1, Ordering::SeqCst);
+                            HostResult::Status {
+                                host_boot_id: boot.clone(),
+                                worker_pid: Some(123),
+                                worker_launch_count: 1,
+                                max_control_epoch: epoch,
+                                max_execution_generation: generation,
+                                fixture_evidence: serde_json::json!({}),
+                                exited: false,
+                                native_session_id: native_root.clone(),
+                                native_identity_observation: None,
+                                opencode_transfer_receipt: None,
+                                opencode_adoption: Default::default(),
+                            }
+                        }
+                        _ => panic!(
+                            "creation must not dispatch input, completion or recovery probes"
+                        ),
+                    };
+                    write_frame(
+                        &mut socket,
+                        &HostReply {
+                            request_id: request.request_id,
+                            result: Ok(result),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            }));
+            Ok(())
+        }
+        async fn inspect(&self, _: &OwnedRuntimeHandle) -> Result<BackendInspection, BackendError> {
+            unreachable!()
+        }
+        async fn request_stop(&self, _: &OwnedRuntimeHandle, _: u64) -> Result<(), BackendError> {
+            unreachable!()
+        }
+        async fn force_stop(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            unreachable!()
+        }
+        async fn verify_empty(&self, _: &OwnedRuntimeHandle) -> Result<bool, BackendError> {
+            unreachable!()
+        }
+        async fn list_known(
+            &self,
+            _: &[OwnedRuntimeHandle],
+        ) -> Result<Vec<(IncarnationId, BackendInspection)>, BackendError> {
+            unreachable!()
+        }
+        async fn read_limits(
+            &self,
+            handle: &OwnedRuntimeHandle,
+        ) -> Result<RuntimeLimits, BackendError> {
+            Ok(handle.requested_limits())
+        }
+        async fn enable_long_lived(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_fixture_grant_reaches_canonical_ack_all_four_modes() {
+        let test = "fresh_agent_proxy::tests::initial_grant_reference_tests::initial_fixture_grant_reaches_canonical_ack_all_four_modes";
+        let cases = [
+            "freshclaude",
+            "kilroy",
+            "freshcodex",
+            "freshopencode",
+            "absent",
+        ];
+        let child_case = std::env::var("FRESHELL_CREATE_FAILURE_TRACE_CHILD").ok();
+        let Some(case) = child_case.as_deref().filter(|case| cases.contains(case)) else {
+            for case in cases {
+                assert!(create_failure_trace_child(case, test));
+                eprintln!("initial-grant child {case}: passed");
+            }
+            return;
+        };
+        let mode = if case == "absent" {
+            "freshclaude"
+        } else {
+            case
+        };
+        let provider = match mode {
+            "kilroy" => "kilroy",
+            "freshcodex" => "codex",
+            "freshopencode" => "opencode",
+            _ => "claude",
+        };
+        let public_provider = if provider == "kilroy" {
+            "claude"
+        } else {
+            provider
+        };
+        let trace = crate::test_trace_capture::captured_trace_events();
+        let root = tempfile::tempdir().unwrap();
+        let registry = Registry::open(root.path().join("registry"), None).unwrap();
+        let socket = root.path().join("control.sock");
+        let secret = root.path().join("control-secret");
+        std::fs::write(&secret, "0123456789abcdef").unwrap();
+        crate::managed_mcp_capability::configure("0.0.0.0", 39483, &socket, &secret).unwrap();
+        crate::managed_mcp_capability::spawn_callback_server()
+            .await
+            .unwrap();
+        let backend = Arc::new(GrantBackend {
+            native_root: (case != "absent").then(|| "owned-current-fixture-root".into()),
+            ..Default::default()
+        });
+        let supervisor = Supervisor::new(
+            registry.clone(),
+            backend.clone(),
+            SupervisorConfig {
+                runtime_root: root.path().join("runtimes"),
+                control_socket_path: socket.clone(),
+                host_binary_path: std::env::current_exe().unwrap(),
+                image_ref: format!("sha256:{}", "b".repeat(64)),
+                test_run_id: "initial-grant-reference".into(),
+                control_secret: "0123456789abcdef".into(),
+                lifecycle_log: root.path().join("lifecycle.jsonl"),
+                admission: AdmissionPolicy::default(),
+            },
+        )
+        .unwrap();
+        let control_socket = socket.clone();
+        let control =
+            tokio::spawn(async move { serve_control(supervisor, &control_socket).await.unwrap() });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !socket.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let unrelated = UnixListener::bind(root.path().join("unrelated.sock")).unwrap();
+        let mut proxy = snapshot_outage_proxy(&socket);
+        Arc::get_mut(&mut proxy)
+            .unwrap()
+            .fixture_modes
+            .insert(mode.into());
+        let mut frames = proxy.broadcast.subscribe();
+        let message = serde_json::json!({"requestId":"initial-grant-reference-owned", "provider":public_provider,
+            "sessionType":mode, "cwd":root.path(), "model":"owned-fixture-model", "effort":"low"});
+        let created = tokio::time::timeout(
+            Duration::from_secs(5),
+            proxy.create(serde_json::from_value(message.clone()).unwrap()),
+        )
+        .await
+        .unwrap();
+        if created.is_err() {
+            control.abort();
+            assert!(control.await.unwrap_err().is_cancelled());
+            let reasons = trace
+                .snapshot()
+                .into_iter()
+                .flat_map(|event| {
+                    [
+                        event.fields.get("reason").cloned(),
+                        event.fields.get("runtime_code").cloned(),
+                    ]
+                })
+                .flatten()
+                .collect::<Vec<_>>();
+            panic!("controlled launch setup failed with finite reasons: {reasons:?}");
+        }
+        let first: serde_json::Value = serde_json::from_str(&frames.try_recv().unwrap()).unwrap();
+        let initial = registry.inventory().await.unwrap().remove(0);
+        let context = registry
+            .recovery_context(initial.soul_id.clone())
+            .await
+            .unwrap();
+        let initial_statuses = backend.statuses.load(Ordering::SeqCst);
+        let replayed = tokio::time::timeout(
+            Duration::from_secs(5),
+            proxy.create(serde_json::from_value(message).unwrap()),
+        )
+        .await
+        .unwrap();
+        let replay: serde_json::Value = serde_json::from_str(&frames.try_recv().unwrap()).unwrap();
+        let replay_view = registry.inventory().await.unwrap().remove(0);
+        // Join only our host/control tasks even on the causal assertion failure.
+        control.abort();
+        assert!(control.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !proxy.pollers.lock().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        backend.close().await;
+        assert!(
+            tokio::net::UnixStream::connect(root.path().join("unrelated.sock"))
+                .await
+                .is_ok()
+        );
+        assert!(tokio::time::timeout(
+            Duration::from_millis(100),
+            tokio::net::UnixStream::connect(context.prior_handle.runtime_dir().join("host.sock"))
+        )
+        .await
+        .unwrap()
+        .is_err());
+        drop(unrelated);
+        created.unwrap();
+        replayed.unwrap();
+        assert_eq!(
+            initial_statuses, 0,
+            "Status must not enrich the initial view"
+        );
+        assert_eq!(first["type"], "freshAgent.created");
+        assert_eq!(first["requestId"], "initial-grant-reference-owned");
+        assert_eq!(first["provider"], public_provider);
+        assert_eq!(first["runtimeProvider"], provider);
+        assert_eq!(first["sessionType"], mode);
+        assert_eq!(
+            first["sessionId"],
+            initial.fresh_agent_session_id.as_deref().unwrap()
+        );
+        let expected = backend
+            .native_root
+            .as_ref()
+            .map(|root| serde_json::json!({"provider":public_provider,"sessionId":root}));
+        assert_eq!(
+            first.get("sessionRef"),
+            expected.as_ref(),
+            "initial canonical ACK must carry the accepted fixture root"
+        );
+        assert_eq!(initial.native_session_id, backend.native_root);
+        assert_eq!(initial.native_identity_observation, None);
+        assert_eq!(initial.provider.as_deref(), Some(provider));
+        assert_eq!(initial.launch_state, LaunchState::Running);
+        assert_eq!(
+            context.fresh_agent.as_ref().unwrap().model.as_deref(),
+            Some("owned-fixture-model")
+        );
+        assert_eq!(
+            context.fresh_agent.as_ref().unwrap().effort.as_deref(),
+            Some("low")
+        );
+        assert_eq!(replay, first);
+        assert_eq!(replay_view.incarnation_id, initial.incarnation_id);
+        assert_eq!(replay_view.native_session_id, initial.native_session_id);
+        assert_eq!(backend.allocations.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.grants.load(Ordering::SeqCst), 1);
+    }
+}
+
 // The MCP controller is process-global. Run these refusal paths in exact
 // isolated test children so their owned HOME/controller cannot affect peers.
 fn create_failure_trace_child(case: &str, test: &str) -> bool {
