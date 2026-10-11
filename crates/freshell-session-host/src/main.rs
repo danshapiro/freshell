@@ -5,6 +5,8 @@ mod provider_secret_resolution;
 mod providers;
 mod pty;
 mod retained_store;
+#[cfg(all(test, feature = "managed-stop-contract-tests"))]
+mod stop_contract_tests;
 
 use freshell_agent_runtime::prepare_terminal_for_resume;
 use freshell_runtime_protocol::{

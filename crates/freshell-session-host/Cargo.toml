@@ -9,6 +9,7 @@ publish.workspace = true
 default = []
 fresh-agent-fixtures = []
 opencode-docker-contract-tests = []
+managed-stop-contract-tests = []
 
 [dependencies]
 freshell-agent-runtime = { path = "../freshell-agent-runtime" }

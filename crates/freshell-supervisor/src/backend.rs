@@ -22,6 +22,7 @@ use tokio::{
 };
 
 const DOCKER_API: &str = "/v1.47";
+const PROVIDER_HOST_CAPABILITIES: [&str; 4] = ["CHOWN", "KILL", "SETGID", "SETUID"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
@@ -461,7 +462,9 @@ fn docker_create_body(
     memory_swap: u64,
 ) -> Value {
     let cap_add: Vec<&str> = if spec.terminal.is_some() || spec.fresh_agent.is_some() {
-        vec!["CHOWN", "SETGID", "SETUID"]
+        // The host stays UID0 while its provider runs as another UID. KILL is
+        // required to terminate that child and finish the PTY waiter/reader.
+        PROVIDER_HOST_CAPABILITIES.to_vec()
     } else {
         Vec::new()
     };
@@ -1384,15 +1387,22 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
                 .collect::<std::collections::BTreeSet<_>>()
         })
         .unwrap_or_default();
-    let expected_cap_add = if handle.terminal().is_some() || handle.fresh_agent().is_some() {
-        ["CHOWN", "SETGID", "SETUID"]
+    let provider_workload = handle.terminal().is_some() || handle.fresh_agent().is_some();
+    let expected_cap_add = if provider_workload {
+        PROVIDER_HOST_CAPABILITIES
             .into_iter()
             .map(str::to_string)
             .collect::<std::collections::BTreeSet<_>>()
     } else {
         std::collections::BTreeSet::new()
     };
-    if actual_cap_add != expected_cap_add {
+    // Existing owned enclosures predate host signal authority. Keep custody
+    // so their pending Stop can still use the exact Docker fallback.
+    let mut legacy_cap_add = expected_cap_add.clone();
+    legacy_cap_add.remove("KILL");
+    if actual_cap_add != expected_cap_add
+        && !(provider_workload && actual_cap_add == legacy_cap_add)
+    {
         return Err(BackendError::OwnershipMismatch(format!(
             "runtime capability set changed: {actual_cap_add:?}"
         )));

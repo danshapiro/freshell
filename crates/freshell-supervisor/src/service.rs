@@ -6572,6 +6572,66 @@ mod interrupted_transaction_tests {
     }
 
     #[tokio::test]
+    async fn ordinary_stop_keeps_legacy_host_custody_and_requires_known_capabilities() {
+        for (caps, expected) in [
+            (
+                vec!["CHOWN", "SETGID", "SETUID"],
+                StopOutcome::VerifiedEmpty,
+            ),
+            (
+                vec!["CHOWN", "KILL", "SETGID", "SETUID"],
+                StopOutcome::VerifiedEmpty,
+            ),
+            (
+                vec!["CHOWN", "KILL", "SETGID", "SETUID", "SYS_ADMIN"],
+                StopOutcome::BlockedOwnership,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut supervisor = open(dir.path());
+            let id = seed(&supervisor, dir.path(), false).await;
+            let fixture = docker_fixture(&mut supervisor, dir.path(), false).await;
+            {
+                let mut state = fixture.state.lock().unwrap();
+                state.inspection["HostConfig"]["CapAdd"] = serde_json::json!(caps);
+                state.stop_response_overhead = Some(Duration::ZERO);
+            }
+            let fixture_host = host(&supervisor, dir.path()).await;
+            let (outcome, view) = supervisor.stop(id, Some(1)).await.unwrap();
+            assert_eq!(outcome, expected);
+            assert_eq!(view.intent_revision, 2);
+            assert_retained(&supervisor, dir.path(), 2).await;
+            let requests = fixture.state.lock().unwrap().requests.clone();
+            let writers: u64 = Connection::open(supervisor.registry.database_path())
+                .unwrap()
+                .query_row("SELECT count(*) FROM writer_claims", [], |r| r.get(0))
+                .unwrap();
+            if expected == StopOutcome::VerifiedEmpty {
+                assert_eq!(writers, 0);
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|request| request.contains("/stop?t=2 "))
+                        .count(),
+                    1
+                );
+                assert!(supervisor
+                    .registry
+                    .pending_stop_handles()
+                    .await
+                    .unwrap()
+                    .is_empty());
+            } else {
+                assert_eq!(writers, 1);
+                assert!(requests.iter().all(|request| request.starts_with("GET ")));
+                assert_pending_stop_custody(&supervisor, dir.path()).await;
+            }
+            close(fixture_host).await;
+            fixture.close().await;
+        }
+    }
+
+    #[tokio::test]
     async fn ordinary_stop_docker_grace_includes_http_overhead() {
         let dir = tempfile::tempdir().unwrap();
         let mut supervisor = open(dir.path());
