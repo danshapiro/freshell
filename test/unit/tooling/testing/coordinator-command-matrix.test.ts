@@ -88,6 +88,10 @@ describe('coordinator command matrix', () => {
     'config/vitest/vitest.server.config.ts',
     'test/server/ws-protocol.test.ts',
     './test/server/ws-protocol.test.ts',
+    'test/unit/server/other.test.ts',
+    'test/unit/server/e2e-cloud-external-target.test.ts.bak',
+    'test/unit/server/e2e-cloud-external-target.test.ts/child',
+    'config\\vitest\\server.config.ts',
   ])('rejects retired server selectors (%s) with a Rust-lane hint', (selector) => {
     const disposition = classifyCommand({
       commandKey: 'test:vitest',
@@ -103,7 +107,10 @@ describe('coordinator command matrix', () => {
     'test/integration/server/managed-provider-parity.test.ts',
     'test/integration/server/fresh-agent-parity.test.ts',
     'test/integration/server/provider-parity-contract.test.ts',
-  ])('allows the Rust-server parity Vitest spec by its exact path only (%s)', spec => {
+    'test/unit/server/e2e-cloud-external-target.test.ts',
+    './test/unit/server/e2e-cloud-external-target.test.ts',
+    'test\\unit\\server\\e2e-cloud-external-target.test.ts',
+  ])('allows the retained tooling or Rust fixture spec by its exact normalized path only (%s)', spec => {
     const args = ['run', spec, '--config', 'config/vitest/vitest.config.ts']
     expectPhase(classifyCommand({ commandKey: 'test:vitest', forwardedArgs: args }), {
       runner: 'vitest', config: 'direct', args,
