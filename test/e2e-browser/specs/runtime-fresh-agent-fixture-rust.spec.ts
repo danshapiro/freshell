@@ -7,6 +7,7 @@
 import { expect } from '@playwright/test'
 
 import { validateFreshAgentIngressInventory } from '../../../scripts/testing/fresh-agent-ingress-inventory.js'
+import { observeOwnedFreshBrowserPane } from '../../../scripts/testing/runtime-external-browser.js'
 import { test } from '../helpers/fixtures.js'
 import { createManagedRuntimeBrowserRig, openFreshHistorySession, type ManagedFixtureRig, type ManagedRuntimeView, type FixtureNativeState } from '../helpers/managed-runtime.js'
 import { TestHarness } from '../helpers/test-harness.js'
@@ -103,7 +104,7 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
           const tabId = state.tabs.activeTabId!
           const leaf = state.panes.layouts[tabId]
           return leaf?.type === 'leaf' && leaf.content.kind === 'fresh-agent' && leaf.content.sessionId
-            ? { tabId, paneId: leaf.id, sessionId: leaf.content.sessionId } : null
+            ? { tabId, paneId: leaf.id, sessionId: leaf.content.sessionId, createRequestId: leaf.content.createRequestId } : null
         })
         const view = await waitFor('owned fixture activation', () => rig.runningViewForFreshSession(created.sessionId))
         const pane = page.locator('[data-context="fresh-agent"][data-pane-id="' + created.paneId + '"]')
@@ -115,17 +116,16 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
           const state = await fixtureState(rig, view)
           return state.dispatchCount === 1 && state.completionCount === 1 ? state : null
         })
-        const nativePane = await waitFor('browser native identity materialization', async () => {
-          const state = await harness.getState()
-          const leaf = state.panes.layouts[created.tabId]
-          return leaf?.type === 'leaf' && leaf.id === created.paneId && leaf.content.kind === 'fresh-agent'
-            && leaf.content.sessionRef?.sessionId === view.nativeSessionId ? leaf.content : null
-        })
+        const wireProvider = definition.provider === 'kilroy' ? 'claude' : definition.provider
+        expect(view.nativeSessionId).toBeTruthy()
+        const paneObservation = { ...created, sessionType: definition.mode, provider: wireProvider,
+          createdSessionId: created.sessionId, nativeSessionId: view.nativeSessionId! }
+        const nativePane = await waitFor('browser pane bound to the actual owned allocation',
+          () => page.evaluate(observeOwnedFreshBrowserPane, paneObservation))
         const tabCount = await harness.getTabCount()
         const layout = await harness.getPaneLayout(created.tabId)
         const soulIds = (await rig.inventory()).map(row => row.soulId).sort()
         const cursor = sent.length
-        const wireProvider = definition.provider === 'kilroy' ? 'claude' : definition.provider
         await openFreshHistorySession(page, { repoRoot: rig.repoRoot, provider: wireProvider, nativeSessionId: view.nativeSessionId! })
         await expect(pane).toBeVisible()
         expect(await harness.getActiveTabId()).toBe(created.tabId)
