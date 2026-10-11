@@ -20,6 +20,7 @@ const managed = [
   "test/integration/server/fresh-agent-parity.test.ts"
 ]
 const runtime = [
+  "test/runtime/managed-fixture-history.ts",
   "scripts/testing/qualification-observations.ts",
   "scripts/testing/task002-retained-fixture.ts",
   "scripts/testing/runtime-external-browser.ts",
