@@ -52,6 +52,7 @@ fn source_transfer_target_context(
     target: &freshell_runtime_protocol::LostSoulRepairTarget,
     context: &RecoveryContext,
 ) -> serde_json::Value {
+    // Source timing callbacks can outlive exact incident withdrawal.
     serde_json::json!({
         "rootSessionId": root, "soulId": target.soul_id,
         "incarnationId": context.prior_handle.incarnation_id(),
@@ -59,7 +60,6 @@ fn source_transfer_target_context(
         "identityRevision": context.identity_revision,
         "nativeImportRevision": context.native_import_revision,
         "evidenceRevision": context.evidence_revision,
-        "incidentId": target.incident_id,
     })
 }
 
@@ -5720,6 +5720,28 @@ pub(crate) mod tests {
     use freshell_runtime_protocol::{
         FreshAgentLaunchSpec, FreshProvider, IncarnationId, RequestId,
     };
+
+    pub(crate) fn stopped_source_options_for_targets(
+        extraction_root: PathBuf,
+        lifecycle_log: PathBuf,
+        targets: &[(
+            String,
+            freshell_runtime_protocol::LostSoulRepairTarget,
+            RecoveryContext,
+        )],
+    ) -> ExportOptions {
+        stopped_source_export_options(
+            extraction_root,
+            lifecycle_log,
+            "capture",
+            targets
+                .iter()
+                .map(|(root, target, context)| {
+                    source_transfer_target_context(root, target, context)
+                })
+                .collect(),
+        )
+    }
 
     fn stopped_payload_fixture(
         directory: &Path,

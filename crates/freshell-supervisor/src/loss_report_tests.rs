@@ -5592,6 +5592,33 @@ async fn durable_souls_server_resolved_scope_rejects_tenth_drift_before_writes()
         7,
         "each independently resolved root is imported and read exactly once"
     );
+    // A concurrent preflight can retain its production observer while this
+    // operation completes the exact receipt-fenced incident withdrawal.
+    let lifecycle = dir.path().join("lifecycle.jsonl");
+    let mut diagnostic_targets = Vec::new();
+    for target in current.targets.iter().chain(std::iter::once(&unrelated)) {
+        let context = registry
+            .recovery_context(target.soul_id.clone())
+            .await
+            .unwrap();
+        diagnostic_targets.push((
+            context.native_session_id.clone().unwrap(),
+            target.clone(),
+            context,
+        ));
+    }
+    let late_options = crate::recovery::tests::stopped_source_options_for_targets(
+        dir.path().join("late-source-extractions"),
+        lifecycle.clone(),
+        &diagnostic_targets,
+    );
+    let unrelated_event =
+        serde_json::json!({"incidentId": unrelated.incident_id, "sentinel": "retained"});
+    crate::service::append_event(
+        &lifecycle,
+        "unrelated.source-observer",
+        unrelated_event.clone(),
+    );
     let result = registry
         .finalize_stopped_repair_batch(
             operation.clone(),
@@ -5605,6 +5632,102 @@ async fn durable_souls_server_resolved_scope_rejects_tenth_drift_before_writes()
     assert_eq!(result.total_target_count, 10);
     assert_eq!(result.repaired_target_count, 10);
     assert_eq!(result.roots.len(), 7);
+    let before_late_progress = std::fs::read_to_string(&lifecycle).unwrap();
+    let conn = Connection::open(registry.database_path()).unwrap();
+    for target in &current.targets {
+        assert!(!before_late_progress.contains(target.incident_id.as_str()));
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM loss_incidents WHERE incident_id=?1",
+                [target.incident_id.as_str()],
+                |row| row.get::<_, u64>(0),
+            )
+            .unwrap(),
+            0,
+        );
+    }
+    drop(conn);
+    let late_capture = freshell_sessions::opencode_transfer::capture_qualified_batch(
+        &HostOpenCodeInventory::new(database.clone())
+            .with_trusted_mount_for_selected_session(workspace.clone()),
+        &[names[0].to_string()],
+        late_options,
+    )
+    .unwrap();
+    drop(late_capture);
+    let after_late_progress = std::fs::read_to_string(&lifecycle).unwrap();
+    for target in &current.targets {
+        assert!(
+            !after_late_progress.contains(target.incident_id.as_str()),
+            "late source progress must not recreate withdrawn incident {}",
+            target.incident_id,
+        );
+    }
+    let late_events = after_late_progress[before_late_progress.len()..]
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(late_events
+        .iter()
+        .all(|event| event["event"] == "supervisor.stopped_repair.source_phase"));
+    for phase in ["backup", "hash", "root_export"] {
+        for state in ["progress", "completed"] {
+            assert!(
+                late_events.iter().any(|event| {
+                    event["data"]["phase"] == phase
+                        && event["data"]["state"] == state
+                        && event["data"]["completedCount"].as_u64().unwrap() > 0
+                        && event["data"]["elapsedMs"].is_u64()
+                }),
+                "late real {phase} {state} diagnostics remain useful"
+            );
+        }
+    }
+    let capture_event = &late_events
+        .iter()
+        .find(|event| event["data"]["phase"] == "capture")
+        .unwrap()["data"];
+    assert_eq!(capture_event["sourceOperation"], "capture");
+    let contexts = capture_event["targetContext"].as_array().unwrap();
+    assert_eq!(contexts.len(), diagnostic_targets.len());
+    for (root, target, context) in &diagnostic_targets {
+        let retained = contexts
+            .iter()
+            .find(|value| value["soulId"] == target.soul_id.as_str())
+            .unwrap();
+        assert_eq!(retained["rootSessionId"], *root);
+        assert_eq!(
+            retained["incarnationId"],
+            context.prior_handle.incarnation_id().as_str()
+        );
+        assert_eq!(retained["intentRevision"], target.expected_intent_revision);
+        assert_eq!(retained["identityRevision"], context.identity_revision);
+        assert_eq!(
+            retained["nativeImportRevision"],
+            context.native_import_revision
+        );
+        assert_eq!(retained["evidenceRevision"], context.evidence_revision);
+    }
+    let root_event = &late_events
+        .iter()
+        .find(|event| {
+            event["data"]["phase"] == "root_export" && event["data"]["state"] == "completed"
+        })
+        .unwrap()["data"];
+    assert_eq!(root_event["rootSessionId"], names[0]);
+    assert_eq!(root_event["countUnit"], "roots");
+    assert_eq!(root_event["completedCount"], 1);
+    assert_eq!(root_event["totalCount"], 1);
+    assert_eq!(root_event["targetContext"].as_array().unwrap().len(), 3);
+    assert!(root_event["targetContext"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|context| context["rootSessionId"] == names[0]));
+    assert!(after_late_progress.lines().any(|line| {
+        let event: serde_json::Value = serde_json::from_str(line).unwrap();
+        event["event"] == "unrelated.source-observer" && event["data"] == unrelated_event
+    }));
     assert_eq!(
         registry
             .finalize_stopped_repair_batch(
