@@ -1,4 +1,24 @@
 import type { ManagedRuntimeProjectionFields } from '../../shared/managed-runtime.js'
+import type { TerminalStatus } from '../store/types.js'
+
+/** A retained process ending does not erase the supervisor's final verdict. */
+export function managedTerminalPaneStatus(terminal: ManagedRuntimeProjectionFields, fallback: TerminalStatus): TerminalStatus {
+  if (!terminal.soulId || !terminal.recoverySummary) return fallback
+  const { recoveryState, desiredState } = terminal.recoverySummary
+  if (recoveryState === 'blocked' || recoveryState === 'lost') return 'error'
+  if (recoveryState === 'stopped' || desiredState === 'stopped') return 'exited'
+  return fallback
+}
+
+export function managedTerminalRecoveryLabel(terminal: ManagedRuntimeProjectionFields): string | undefined {
+  if (!terminal.soulId) return undefined
+  switch (terminal.recoverySummary?.recoveryState) {
+    case 'blocked': return 'Blocked'
+    case 'lost': return 'Lost'
+    case 'stopped': return 'Stopped'
+    default: return undefined
+  }
+}
 
 /** A retained facade remains attachable independently of its process state. */
 export function isRetainedManagedTerminal(terminal: { terminalId?: string; soulId?: string }): boolean {

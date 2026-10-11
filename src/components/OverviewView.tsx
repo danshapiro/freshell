@@ -14,7 +14,8 @@ import { collectTerminalIds } from '@/lib/pane-utils'
 import { cn } from '@/lib/utils'
 import { RefreshCw, Circle, Play, Pencil, Trash2, Sparkles, ExternalLink } from 'lucide-react'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
-import { isRetainedManagedTerminal, managedTerminalProjection } from '@/lib/managed-terminal.js'
+import { isRetainedManagedTerminal, managedTerminalPaneStatus, managedTerminalProjection } from '@/lib/managed-terminal.js'
+import ManagedTerminalRecoveryDetails from './ManagedTerminalRecoveryDetails.js'
 import type { BackgroundTerminal } from '@/store/types'
 
 type TerminalOverview = BackgroundTerminal & {
@@ -156,9 +157,14 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
       dispatch(setActiveTab(existing.id))
     } else {
       const tabId = nanoid()
-      const status = terminal.status === 'exited' ? 'exited' : 'running'
+      const status = managedTerminalPaneStatus(terminal, terminal.status === 'exited' ? 'exited' : 'running')
       const mode = isRetainedManagedTerminal(terminal) ? terminal.mode : 'shell'
-      dispatch(addTab({ id: tabId, title: terminal.title, status, mode }))
+      dispatch(addTab({ id: tabId, title: terminal.title, status, mode,
+        ...(isRetainedManagedTerminal(terminal) ? {
+          initialCwd: terminal.cwd, sessionRef: terminal.sessionRef,
+          ...managedTerminalProjection(terminal),
+        } : {}),
+      }))
       dispatch(initLayout({ tabId, content: {
         kind: 'terminal', mode, terminalId: terminal.terminalId, status,
         ...(isRetainedManagedTerminal(terminal) ? {
@@ -498,6 +504,8 @@ function TerminalCard({
               </span>
             )}
           </div>
+
+          <ManagedTerminalRecoveryDetails terminal={terminal} />
 
           {nativeSyncStatus && nativeSyncStatus.status !== 'synced' ? (
             <div

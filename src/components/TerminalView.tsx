@@ -37,7 +37,7 @@ import { retryManagedConversation } from '@/lib/managed-runtime-retry'
 import { confirmManagedRuntimeStopped } from '@/lib/managed-runtime-stop'
 import { isManagedRuntimeRecoveryDecision, ManagedRuntimeRecoveryCard } from '@/components/ManagedRuntimeRecoveryCard'
 import { isManagedRuntimeRecoveryPending } from '@/lib/managed-runtime-recovery-message'
-import { canReplayManagedTerminal } from '@/lib/managed-terminal.js'
+import { canReplayManagedTerminal, managedTerminalPaneStatus } from '@/lib/managed-terminal.js'
 import { buildReconcileRequestForPanes, foldVerdicts } from '@/lib/pane-reconcile'
 import type { PaneReconcileRequest, SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import {
@@ -5943,12 +5943,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           }
           // Settle frame (znhn item 3): the deterministic end of an
           // auto-resume story — clears the recovering notice on a FRAME,
-          // never a timer. Hard rule (D-1, validated A1/A6): dispatches ONLY
-          // into terminalLifecycleSlice — NEVER pane content/status. Cross-
+          // never a timer. Ordinary settle frames dispatch ONLY into
+          // terminalLifecycleSlice — NEVER pane content/status. Cross-
           // channel ordering vs terminal.exit is unguaranteed (unbiased
           // select!, terminal.rs:325-334); the running|recovering content-
-          // write allowlist below is the load-bearing barrier that keeps an
-          // out-of-order 'exited' frame away from pane content.
+          // write allowlist below keeps an out-of-order ordinary 'exited'
+          // frame away from pane content. An authoritative managed recovery
+          // summary carries its own final verdict and preserves its facade.
           if (statusMine && msg.status === 'exited') {
             dispatch(
               recordAutoResumeSettled({
@@ -5962,17 +5963,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           }
           if (msg.terminalId === tid) {
             if (contentRef.current?.soulId && msg.recoverySummary) {
-              updateContent({ runtimeStatus: msg.status, recoverySummary: msg.recoverySummary })
-            }
-            if (
-              msg.status === 'running'
-              || msg.status === 'recovering'
-            ) {
-              updateContent({ status: msg.status })
+              const status = managedTerminalPaneStatus({
+                ...contentRef.current, recoverySummary: msg.recoverySummary,
+              }, msg.status === 'running' || msg.status === 'recovering' ? msg.status : 'exited')
+              updateContent({ status, runtimeStatus: msg.status, recoverySummary: msg.recoverySummary })
               const statusTab = tabRef.current
-              if (statusTab) {
-                dispatch(updateTab({ id: statusTab.id, updates: { status: msg.status } }))
-              }
+              if (statusTab) dispatch(updateTab({ id: statusTab.id, updates: { status } }))
+            } else if (msg.status === 'running' || msg.status === 'recovering') {
+              const status = managedTerminalPaneStatus(contentRef.current ?? {}, msg.status)
+              updateContent({ status })
+              const statusTab = tabRef.current
+              if (statusTab) dispatch(updateTab({ id: statusTab.id, updates: { status } }))
             }
           }
           return
@@ -6039,9 +6040,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             clearQuarantineRepair()
             dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
             discardPendingInput('terminal_gone')
-            updateContent({ status: 'exited', runtimeStatus: 'exited' })
+            const status = managedTerminalPaneStatus(contentRef.current ?? {}, 'exited')
+            updateContent({ status, runtimeStatus: 'exited' })
             const exitTab = tabRef.current
-            if (exitTab) dispatch(updateTab({ id: exitTab.id, updates: { status: 'exited' } }))
+            if (exitTab) dispatch(updateTab({ id: exitTab.id, updates: { status } }))
             return
           }
 

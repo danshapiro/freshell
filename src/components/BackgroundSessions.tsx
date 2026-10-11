@@ -10,7 +10,8 @@ import { addTab } from '@/store/tabsSlice'
 import { initLayout } from '@/store/panesSlice'
 import { fetchTerminalDirectoryWindow } from '@/store/terminalDirectoryThunks'
 import type { BackgroundTerminal } from '@/store/types'
-import { isRetainedManagedTerminal, managedTerminalProjection } from '@/lib/managed-terminal'
+import { isRetainedManagedTerminal, managedTerminalPaneStatus, managedTerminalProjection } from '@/lib/managed-terminal.js'
+import ManagedTerminalRecoveryDetails from './ManagedTerminalRecoveryDetails.js'
 
 const EMPTY_TERMINALS: BackgroundTerminal[] = []
 
@@ -115,6 +116,7 @@ export default function BackgroundSessions() {
                 >
                   <div className="flex-1 min-w-0">
                     <div className="text-sm font-medium truncate">{t.title}</div>
+                    <ManagedTerminalRecoveryDetails terminal={t} />
                     <div className="text-xs text-muted-foreground truncate">
                       {t.cwd ? t.cwd + ' • ' : ''}idle {formatAge(idleMs)}
                     </div>
@@ -126,10 +128,11 @@ export default function BackgroundSessions() {
                       const tabId = nanoid()
                       const mode = ((t.mode as any) || 'shell') as string
                       const initialCwd = typeof t.cwd === 'string' && t.cwd.trim() ? t.cwd : undefined
+                      const status = managedTerminalPaneStatus(t, t.status === 'exited' ? 'exited' : 'running')
                       dispatch(addTab({
                         id: tabId,
                         title: t.title,
-                        status: t.status === 'exited' ? 'exited' : 'running',
+                        status,
                         ...managedTerminalProjection(t),
                         mode: mode as any,
                         sessionRef: t.sessionRef,
@@ -141,8 +144,8 @@ export default function BackgroundSessions() {
                           kind: 'terminal',
                           mode: mode as any,
                           terminalId: t.terminalId,
-                          status: t.status === 'exited' ? 'exited' : 'running',
-                        ...managedTerminalProjection(t),
+                          status,
+                          ...managedTerminalProjection(t),
                           sessionRef: t.sessionRef,
                           ...(initialCwd ? { initialCwd } : {}),
                         },

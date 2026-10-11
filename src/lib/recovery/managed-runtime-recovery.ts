@@ -1,4 +1,5 @@
 import { resolveFreshAgentRuntimeProvider } from '@shared/fresh-agent'
+import { managedTerminalPaneStatus } from '../managed-terminal.js'
 import type { AppStore, RootState } from '@/store/store'
 import { addTab, updateTab } from '@/store/tabsSlice'
 import { initLayout, updatePaneContent } from '@/store/panesSlice'
@@ -16,6 +17,7 @@ import {
 import type {
   ManagedRuntimeInventorySnapshot,
   ManagedRuntimeProjectionFields,
+  ManagedRuntimeRecoverySummary,
   ManagedRuntimeSoul,
   ManagedRuntimeViewIntent,
 } from '@shared/managed-runtime'
@@ -63,22 +65,37 @@ function latestSoulViews(snapshot: ManagedRuntimeInventorySnapshot): Map<string,
   return latest
 }
 
+function recoverySummary(soul: ManagedRuntimeSoul): ManagedRuntimeRecoverySummary {
+  return {
+    desiredState: soul.desiredState,
+    recoveryState: soul.recoveryState,
+    reason: soul.recoveryReason,
+    attemptId: soul.recoveryAttemptId,
+    incidentId: soul.incidentId,
+    durabilityState: soul.durabilityState,
+    allocationState: soul.allocationState,
+  }
+}
+
 function terminalStatus(soul: ManagedRuntimeSoul): TerminalStatus {
-  if (soul.desiredState === 'stopped' || soul.recoveryState === 'stopped') return 'exited'
-  if (soul.recoveryState === 'recovering' || soul.recoveryState === 'blocked') return 'recovering'
-  if (soul.launchState === 'running' && soul.recoveryState === 'live') return 'running'
-  if (soul.launchState === 'failed' || soul.recoveryState === 'lost') return 'error'
-  return 'creating'
+  const fallback = soul.recoveryState === 'recovering' ? 'recovering'
+    : soul.launchState === 'running' && soul.recoveryState === 'live' ? 'running'
+    : soul.launchState === 'failed' ? 'error' : 'creating'
+  return managedTerminalPaneStatus({ soulId: soul.soulId, recoverySummary: recoverySummary(soul) }, fallback)
 }
 
 export function managedProjectionFields(
   soul: ManagedRuntimeSoul,
   view: ManagedRuntimeViewIntent,
 ): ManagedRuntimeProjectionFields {
+  const status = terminalStatus(soul)
   return {
     soulId: soul.soulId,
     incarnationId: soul.incarnationId,
     runtimeState: soul.launchState,
+    runtimeStatus: soul.recoveryState === 'blocked' ? 'blocked'
+      : status === 'running' || status === 'recovering' ? status
+      : status === 'error' || status === 'exited' ? 'exited' : undefined,
     viewIntentId: view.viewId,
     viewIntentRevision: view.revision,
     soulIntentRevision: soul.intentRevision,
@@ -88,15 +105,7 @@ export function managedProjectionFields(
       configured: soul.configuredLimits,
       effective: soul.effectiveLimits,
     },
-    recoverySummary: {
-      desiredState: soul.desiredState,
-      recoveryState: soul.recoveryState,
-      reason: soul.recoveryReason,
-      attemptId: soul.recoveryAttemptId,
-      incidentId: soul.incidentId,
-      durabilityState: soul.durabilityState,
-      allocationState: soul.allocationState,
-    },
+    recoverySummary: recoverySummary(soul),
   }
 }
 
