@@ -110,6 +110,9 @@ COPY --from=rust-builder /usr/local/rustup /usr/local/rustup
 COPY --from=node-builder /app/dist/client ./dist/client
 COPY --from=node-builder /app/dist/tools ./dist/tools
 COPY --from=node-builder /app/node_modules ./node_modules
+# The native-history producer invokes esbuild from this workspace member.
+# pnpm keeps its executable/dependency links beside the member manifest.
+COPY --from=node-builder /app/packages/freshell-mcp-runtime/node_modules ./packages/freshell-mcp-runtime/node_modules
 
 # Fail the image build if the copied test toolchain cannot execute in this
 # Debian runtime. A container-level test checks the configured runtime user.
