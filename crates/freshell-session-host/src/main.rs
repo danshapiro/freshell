@@ -76,6 +76,14 @@ struct SpawnedTerminalPty {
 
 #[async_trait::async_trait]
 trait GrantExecutionEffects: Sync {
+    fn prepare_fresh_agent_child_environment(
+        &self,
+        launch: &FreshAgentLaunchSpec,
+        environment: &mut std::collections::BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        providers::prepare_fresh_agent_child_environment(launch, environment)
+    }
+
     async fn open_fresh_agent(
         &self,
         state_dir: &Path,
@@ -1161,9 +1169,12 @@ async fn grant_execution(
             if let Some(pid) = persisted.worker_pid {
                 let native_identity_observation =
                     current_native_observation(state, &persisted).await;
-                let native_session_id = native_identity_observation
-                    .as_ref()
-                    .map(|observation| observation.native_session_id.clone());
+                let native_session_id = published_grant_native_session_id(
+                    state,
+                    &persisted,
+                    native_identity_observation.as_ref(),
+                )
+                .await;
                 return Ok(HostResult::GrantAccepted {
                     native_identity_observation,
                     host_boot_id: state.host_boot_id.clone(),
@@ -1249,9 +1260,12 @@ async fn grant_execution(
                     let native_identity_observation =
                         current_native_observation(state, &persisted).await;
                     return Ok(HostResult::GrantAccepted {
-                        native_session_id: native_identity_observation
-                            .as_ref()
-                            .map(|observation| observation.native_session_id.clone()),
+                        native_session_id: published_grant_native_session_id(
+                            state,
+                            &persisted,
+                            native_identity_observation.as_ref(),
+                        )
+                        .await,
                         native_identity_observation,
                         host_boot_id: state.host_boot_id.clone(),
                         worker_pid: pid,
@@ -1564,11 +1578,9 @@ async fn grant_execution(
                     format!("prepare hosted OneCLI provider files: {error}"),
                 )
             })?;
-            providers::prepare_fresh_agent_child_environment(
-                &launch,
-                &mut resolved_secrets.environment,
-            )
-            .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
+            effects
+                .prepare_fresh_agent_child_environment(&launch, &mut resolved_secrets.environment)
+                .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
             if let Some(binding) = persisted.native_identity_launch.as_ref() {
                 resolved_secrets.environment.insert(
                     providers::native_identity::LAUNCH_ENV.into(),
@@ -1623,9 +1635,12 @@ async fn grant_execution(
         .unwrap_or_else(|| adoption_status_for_required(opencode_adoption_required));
     let native_identity_observation = current_native_observation(state, &persisted).await;
     Ok(HostResult::GrantAccepted {
-        native_session_id: native_identity_observation
-            .as_ref()
-            .map(|observation| observation.native_session_id.clone()),
+        native_session_id: published_grant_native_session_id(
+            state,
+            &persisted,
+            native_identity_observation.as_ref(),
+        )
+        .await,
         native_identity_observation,
         host_boot_id: state.host_boot_id.clone(),
         worker_pid: pid,
@@ -1634,6 +1649,26 @@ async fn grant_execution(
         opencode_transfer_receipt: persisted.opencode_transfer_receipt.clone(),
         opencode_adoption,
     })
+}
+
+async fn published_grant_native_session_id(
+    state: &HostState,
+    persisted: &PersistedHostState,
+    observation: Option<&freshell_runtime_protocol::NativeIdentityObservation>,
+) -> Option<String> {
+    if let Some(observation) = observation {
+        return Some(observation.native_session_id.clone());
+    }
+    #[cfg(feature = "fresh-agent-fixtures")]
+    if persisted.fixture_evidence["fixtureTransport"] == "deterministic" {
+        // Match Status's explicit fixture identity contract. A live observed
+        // synthetic root is a presentation reference, never native proof.
+        let actor = state.fresh_agent.lock().await.clone()?;
+        return actor.observed_native_session_id().await;
+    }
+    #[cfg(not(feature = "fresh-agent-fixtures"))]
+    let _ = (state, persisted);
+    None
 }
 
 async fn current_native_observation(
@@ -6680,8 +6715,474 @@ mod tests {
         assert!(state.child.lock().await.is_none());
     }
 
+    #[cfg(feature = "fresh-agent-fixtures")]
+    struct FixtureRootGrantEffects {
+        opens: AtomicUsize,
+    }
+
+    #[cfg(feature = "fresh-agent-fixtures")]
+    #[async_trait]
+    impl GrantExecutionEffects for FixtureRootGrantEffects {
+        fn prepare_fresh_agent_child_environment(
+            &self,
+            launch: &FreshAgentLaunchSpec,
+            environment: &mut std::collections::BTreeMap<String, String>,
+        ) -> Result<(), String> {
+            if launch.provider == FreshProvider::Opencode {
+                assert_eq!(
+                    launch.fixture_transport,
+                    Some(freshell_runtime_protocol::FreshAgentFixtureTransport::Deterministic)
+                );
+                assert!(environment.is_empty());
+                // The native feature worker needs an enclosure filesystem and
+                // executable. This test owns only the deterministic actor/store.
+                Ok(())
+            } else {
+                providers::prepare_fresh_agent_child_environment(launch, environment)
+            }
+        }
+
+        fn run_opencode_provider_helper(
+            &self,
+            _: &TerminalLaunchSpec,
+            _: &OpenCodeTransferDescriptor,
+            _: &Path,
+            _: &Path,
+            _: &str,
+            _: Option<&Path>,
+        ) -> Result<Vec<u8>, String> {
+            panic!("fixture fresh grant must not run a terminal helper")
+        }
+
+        async fn spawn_terminal_pty(
+            &self,
+            _: &Path,
+            _: &IncarnationId,
+            _: &TerminalLaunchSpec,
+            _: std::collections::BTreeMap<String, String>,
+            _: Option<providers::PreparedCodexLaunch>,
+        ) -> Result<SpawnedTerminalPty, RuntimeError> {
+            panic!("fixture fresh grant must not spawn a PTY")
+        }
+
+        async fn open_fresh_agent(
+            &self,
+            state_dir: &Path,
+            launch: FreshAgentLaunchSpec,
+        ) -> Result<Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>, String> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            let profile = FreshAgentProfile {
+                provider: launch.provider,
+                runtime_variant: launch.runtime_variant,
+                cwd: launch.cwd,
+                model: launch.model,
+                effort: launch.effort,
+                permission_mode: launch.permission_mode,
+                sandbox: launch.sandbox,
+                provider_store_id: launch.provider_store_id,
+                native_session_id: launch.native_session_id,
+                plugins: launch.plugins,
+                model_selection: launch.model_selection,
+                session_ref: launch.session_ref,
+                provider_launch_context: launch.provider_launch_context,
+                provider_secret_references: launch.provider_secret_references,
+            };
+            let transport =
+                providers::deterministic_fresh_agent::DeterministicFreshAgentTransport::open(
+                    state_dir.join("fixture-provider"),
+                    &profile,
+                    launch.run_as_uid,
+                    launch.run_as_gid,
+                )
+                .await?;
+            freshell_agent_runtime::host_actor::FreshAgentHostActor::open_deterministic_fixture(
+                state_dir.join("fixture-actor"),
+                profile,
+                transport,
+            )
+            .await
+            .map_err(|error| error.to_string())
+        }
+    }
+
+    #[cfg(feature = "fresh-agent-fixtures")]
+    fn fixture_grant_host(root: &Path) -> Arc<HostState> {
+        let mut state = test_host_state();
+        let host = Arc::get_mut(&mut state).unwrap();
+        // Replace only the empty directory just created by this test helper;
+        // all actual grant/actor/provider files belong to the TempDir owner.
+        std::fs::remove_dir(&host.state_dir).unwrap();
+        host.state_dir = root.join("host");
+        std::fs::create_dir(&host.state_dir).unwrap();
+        host.provider_config_paths.provider_home = root.join("home");
+        std::fs::create_dir(&host.provider_config_paths.provider_home).unwrap();
+        state
+    }
+
+    #[cfg(feature = "fresh-agent-fixtures")]
+    fn fixture_root_grant(
+        state: &HostState,
+        provider: FreshProvider,
+        grant_id: GrantId,
+    ) -> HostCommand {
+        let session_type = match provider {
+            FreshProvider::Claude => "freshclaude",
+            FreshProvider::Kilroy => "kilroy",
+            FreshProvider::Codex => "freshcodex",
+            FreshProvider::Opencode => "freshopencode",
+        };
+        let launch: FreshAgentLaunchSpec = serde_json::from_value(serde_json::json!({
+            "sessionId":"original-fixture-presentation", "provider":provider,
+            "sessionType":session_type, "runtimeVariant":session_type,
+            "providerStoreId":"fixture-grant-store", "cwd":state.state_dir,
+            "workspacePath":state.state_dir, "runAsUid":unsafe { libc::getuid() },
+            "runAsGid":unsafe { libc::getgid() }, "fixtureTransport":"deterministic"
+        }))
+        .unwrap();
+        HostCommand::GrantExecution {
+            native_identity_launch: None,
+            incarnation_id: state.incarnation_id.clone(),
+            soul_id: SoulId::new(),
+            host_boot_id: state.host_boot_id.clone(),
+            control_epoch: 7,
+            execution_generation: 9,
+            grant_id,
+            fixture: None,
+            terminal: None,
+            fresh_agent: Some(Box::new(launch)),
+            resume_spec: None,
+        }
+    }
+
+    #[cfg(feature = "fresh-agent-fixtures")]
+    #[tokio::test]
+    async fn fixture_grant_publishes_actual_root_initial_and_idempotent_all_four() {
+        // A session host installs one immutable child environment per process.
+        // Exercise each allocation in its own process, just like real hosts.
+        const PROVIDER_ENV: &str = "FRESHELL_FIXTURE_GRANT_TEST_PROVIDER";
+        let selected = std::env::var(PROVIDER_ENV).ok();
+        if selected.is_none() {
+            for provider in ["claude", "kilroy", "codex", "opencode"] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "tests::fixture_grant_publishes_actual_root_initial_and_idempotent_all_four", "--nocapture"])
+                    .env(PROVIDER_ENV, provider).status().unwrap();
+                assert!(status.success(), "actual {provider} fixture grant failed");
+            }
+            return;
+        }
+        let mut observations = Vec::new();
+        for provider in [
+            FreshProvider::Claude,
+            FreshProvider::Kilroy,
+            FreshProvider::Codex,
+            FreshProvider::Opencode,
+        ] {
+            if selected.as_deref() != Some(provider.as_str()) {
+                continue;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let state = fixture_grant_host(root.path());
+            let effects = FixtureRootGrantEffects {
+                opens: AtomicUsize::new(0),
+            };
+            let command = fixture_root_grant(&state, provider.clone(), GrantId::new());
+            for invalid_binding in [
+                freshell_runtime_protocol::NativeIdentityLaunch {
+                    incarnation_id: IncarnationId::new(),
+                    launch_nonce: "fixture-grant".into(),
+                    evidence_revision: 0,
+                    execution_generation: 9,
+                    requested_native_session_id: None,
+                },
+                freshell_runtime_protocol::NativeIdentityLaunch {
+                    incarnation_id: state.incarnation_id.clone(),
+                    launch_nonce: "fixture-grant".into(),
+                    evidence_revision: 0,
+                    execution_generation: 8,
+                    requested_native_session_id: None,
+                },
+                freshell_runtime_protocol::NativeIdentityLaunch {
+                    incarnation_id: state.incarnation_id.clone(),
+                    launch_nonce: String::new(),
+                    evidence_revision: 0,
+                    execution_generation: 9,
+                    requested_native_session_id: None,
+                },
+            ] {
+                let mut invalid = command.clone();
+                if let HostCommand::GrantExecution {
+                    native_identity_launch,
+                    ..
+                } = &mut invalid
+                {
+                    *native_identity_launch = Some(invalid_binding);
+                }
+                let error = dispatch_with_effects(
+                    authenticated_host_envelope(&state, invalid),
+                    &state,
+                    &effects,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.code, RuntimeErrorCode::RecoveryWrongIdentity);
+                assert!(state.persisted.lock().await.grant_id.is_none());
+                assert_eq!(effects.opens.load(Ordering::SeqCst), 0);
+            }
+            let initial = dispatch_with_effects(
+                authenticated_host_envelope(&state, command.clone()),
+                &state,
+                &effects,
+            )
+            .await;
+            let actor = state.fresh_agent.lock().await.clone().unwrap_or_else(|| {
+                panic!("actual {provider:?} grant must start the deterministic actor: {initial:?}")
+            });
+            let observed = actor
+                .observed_native_session_id()
+                .await
+                .expect("actual live fixture root");
+            let replay = dispatch_with_effects(
+                authenticated_host_envelope(&state, command.clone()),
+                &state,
+                &effects,
+            )
+            .await;
+            let status = dispatch(
+                authenticated_host_envelope(
+                    &state,
+                    HostCommand::Status {
+                        incarnation_id: state.incarnation_id.clone(),
+                    },
+                ),
+                &state,
+            )
+            .await;
+            let mut refusals = Vec::new();
+            for field in ["epoch", "generation", "grant", "boot", "incarnation"] {
+                let mut invalid = command.clone();
+                if let HostCommand::GrantExecution {
+                    control_epoch,
+                    execution_generation,
+                    grant_id,
+                    host_boot_id,
+                    incarnation_id,
+                    ..
+                } = &mut invalid
+                {
+                    match field {
+                        "epoch" => *control_epoch -= 1,
+                        "generation" => *execution_generation -= 1,
+                        "grant" => *grant_id = GrantId::new(),
+                        "boot" => *host_boot_id = HostBootId::new(),
+                        "incarnation" => *incarnation_id = IncarnationId::new(),
+                        _ => unreachable!(),
+                    }
+                }
+                refusals.push((
+                    field,
+                    dispatch_with_effects(
+                        authenticated_host_envelope(&state, invalid),
+                        &state,
+                        &effects,
+                    )
+                    .await,
+                ));
+            }
+            let same_actor = Arc::ptr_eq(&actor, state.fresh_agent.lock().await.as_ref().unwrap());
+            let replay_root = actor.observed_native_session_id().await;
+            let native_evidence = actor.observed_native_identity_evidence().await;
+            actor.clone().stop().await.unwrap();
+            assert!(
+                !actor.is_live().await,
+                "owned fixture worker must be stopped"
+            );
+            assert!(same_actor);
+            assert_eq!(replay_root.as_ref(), Some(&observed));
+            assert!(native_evidence.is_none());
+            assert!(
+                matches!(status.unwrap(), HostResult::Status { native_session_id: Some(ref native), native_identity_observation: None, .. } if native == &observed),
+                "fixture grant and status must publish the same actual root"
+            );
+            for (field, result) in refusals {
+                assert_eq!(
+                    result.unwrap_err().code,
+                    if field == "incarnation" {
+                        RuntimeErrorCode::OwnershipMismatch
+                    } else {
+                        RuntimeErrorCode::StaleExecutionGrant
+                    }
+                );
+            }
+            let provider_state: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(
+                    state
+                        .state_dir
+                        .join("fixture-provider/provider-native-state.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(provider_state["dispatchCount"], 0);
+            assert_eq!(provider_state["completionCount"], 0);
+            assert_eq!(effects.opens.load(Ordering::SeqCst), 1);
+            assert_eq!(state.persisted.lock().await.worker_launch_count, 1);
+            let stopped = dispatch_with_effects(
+                authenticated_host_envelope(&state, command.clone()),
+                &state,
+                &effects,
+            )
+            .await;
+            state.fresh_agent.lock().await.take();
+            let absent = dispatch_with_effects(
+                authenticated_host_envelope(&state, command),
+                &state,
+                &effects,
+            )
+            .await;
+            observations.push((provider, observed, initial, replay, stopped, absent));
+        }
+        for (provider, observed, initial, replay, stopped, absent) in observations {
+            for result in [initial, replay] {
+                match result.unwrap() {
+                    HostResult::GrantAccepted {
+                        native_session_id,
+                        native_identity_observation,
+                        worker_launch_count,
+                        ..
+                    } => {
+                        assert_eq!(
+                            native_session_id.as_ref(),
+                            Some(&observed),
+                            "grant must publish actual {provider:?} fixture root"
+                        );
+                        assert!(
+                            native_identity_observation.is_none(),
+                            "fixture root cannot certify native identity"
+                        );
+                        assert_eq!(worker_launch_count, 1);
+                    }
+                    other => panic!("unexpected fixture grant result: {other:?}"),
+                }
+            }
+            for result in [stopped, absent] {
+                assert!(matches!(
+                    result.unwrap(),
+                    HostResult::GrantAccepted {
+                        native_session_id: None,
+                        native_identity_observation: None,
+                        worker_launch_count: 1,
+                        ..
+                    }
+                ));
+            }
+        }
+    }
+
+    #[cfg(feature = "fresh-agent-fixtures")]
+    #[tokio::test]
+    async fn fixture_grant_nonfixture_raw_root_does_not_publish_native_authority() {
+        const CHILD_ENV: &str = "FRESHELL_NONFIXTURE_GRANT_TEST_CHILD";
+        let selected = std::env::var(CHILD_ENV).ok();
+        if selected.is_none() {
+            for proof in ["absent", "current", "wrong-root", "wrong-launch"] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "tests::fixture_grant_nonfixture_raw_root_does_not_publish_native_authority", "--nocapture"])
+                    .env(CHILD_ENV, proof).status().unwrap();
+                assert!(
+                    status.success(),
+                    "nonfixture proof boundary failed: {proof}"
+                );
+            }
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let state = fixture_grant_host(root.path());
+        let mut command = fixture_root_grant(&state, FreshProvider::Claude, GrantId::new());
+        let binding = freshell_runtime_protocol::NativeIdentityLaunch {
+            incarnation_id: state.incarnation_id.clone(),
+            launch_nonce: "nonfixture-grant".into(),
+            evidence_revision: 0,
+            execution_generation: 9,
+            requested_native_session_id: None,
+        };
+        if let HostCommand::GrantExecution {
+            fresh_agent,
+            native_identity_launch,
+            ..
+        } = &mut command
+        {
+            fresh_agent.as_mut().unwrap().fixture_transport = None;
+            *native_identity_launch = Some(binding.clone());
+        }
+        let mut native_evidence = serde_json::json!({"launch":binding,"nativeSessionId":"fixture-native-thread","queryGeneration":1});
+        if selected.as_deref() == Some("wrong-root") {
+            native_evidence["nativeSessionId"] = serde_json::json!("another-root");
+        }
+        if selected.as_deref() == Some("wrong-launch") {
+            native_evidence["launch"]["launchNonce"] = serde_json::json!("another-launch");
+        }
+        let expects_proof = selected.as_deref() == Some("current");
+        let effects = ConfigPublicationGrantEffects {
+            opens: AtomicUsize::new(0),
+            native_evidence: (selected.as_deref() != Some("absent")).then_some(native_evidence),
+        };
+        let initial = dispatch_with_effects(
+            authenticated_host_envelope(&state, command.clone()),
+            &state,
+            &effects,
+        )
+        .await;
+        let actor = state.fresh_agent.lock().await.clone().unwrap();
+        let raw = actor.observed_native_session_id().await;
+        let evidence = actor.observed_native_identity_evidence().await;
+        let replay = dispatch_with_effects(
+            authenticated_host_envelope(&state, command),
+            &state,
+            &effects,
+        )
+        .await;
+        actor.clone().stop().await.unwrap();
+        assert!(!actor.is_live().await);
+        state.fresh_agent.lock().await.take();
+        assert_eq!(raw.as_deref(), Some("fixture-native-thread"));
+        assert_eq!(evidence.is_some(), selected.as_deref() != Some("absent"));
+        assert_eq!(effects.opens.load(Ordering::SeqCst), 1);
+        for result in [initial, replay] {
+            match result.unwrap() {
+                HostResult::GrantAccepted {
+                    native_session_id,
+                    native_identity_observation,
+                    worker_launch_count,
+                    ..
+                } => {
+                    assert_eq!(
+                        native_session_id.as_deref(),
+                        expects_proof.then_some("fixture-native-thread")
+                    );
+                    assert_eq!(native_identity_observation.is_some(), expects_proof);
+                    if let Some(observation) = native_identity_observation {
+                        assert!(observation.matches_launch(&binding));
+                    }
+                    assert_eq!(worker_launch_count, 1);
+                }
+                other => panic!("unexpected nonfixture grant result: {other:?}"),
+            }
+        }
+        let journal: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                state
+                    .state_dir
+                    .join("publication-agent/fresh-agent-state.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(journal["commands"], serde_json::json!({}));
+    }
+
     struct ConfigPublicationGrantEffects {
         opens: AtomicUsize,
+        native_evidence: Option<serde_json::Value>,
     }
 
     #[async_trait]
@@ -6716,7 +7217,7 @@ mod tests {
         ) -> Result<Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>, String> {
             self.opens.fetch_add(1, Ordering::SeqCst);
             let transport = Arc::new(RpcFixtureTransport {
-                native_evidence: std::sync::Mutex::new(None),
+                native_evidence: std::sync::Mutex::new(self.native_evidence.clone()),
                 dispatches: AtomicUsize::new(0),
                 decisions: AtomicUsize::new(0),
                 operations: AtomicUsize::new(0),
@@ -6864,6 +7365,7 @@ mod tests {
         let soul = SoulId::new();
         let effects = ConfigPublicationGrantEffects {
             opens: AtomicUsize::new(0),
+            native_evidence: None,
         };
         let hidden = root.path().join("unavailable");
         std::fs::rename(&source, &hidden).unwrap();

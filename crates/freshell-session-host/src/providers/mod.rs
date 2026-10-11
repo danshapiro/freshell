@@ -8,7 +8,7 @@ mod claude;
 mod cli;
 mod codex;
 #[cfg(feature = "fresh-agent-fixtures")]
-mod deterministic_fresh_agent;
+pub(crate) mod deterministic_fresh_agent;
 mod fresh_agent;
 pub(crate) mod native_identity;
 mod opencode;

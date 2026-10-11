@@ -150,7 +150,7 @@ describe('managed History original awaited phase diagnostics', () => {
 })
 
 type HistoryFault = 'unknown' | 'provider' | 'mode' | 'root' | 'misbound-pane' | 'create' | 'create-owner' | 'send' | 'missing-target' | 'new-allocation' | 'resume'
-type StartupFault = 'ack-request' | 'ack-mode' | 'ack-provider' | 'ack-runtime-provider' | 'ack-root' | 'ack-duplicate'
+type StartupFault = 'ack-request' | 'ack-mode' | 'ack-provider' | 'ack-runtime-provider' | 'ack-root' | 'ack-missing-root' | 'ack-duplicate'
   | 'create-tab' | 'pane-request' | 'pane-mode' | 'pane-provider' | 'pane-root' | 'pane-soul' | 'pane-incarnation'
   | 'inventory-missing' | 'inventory-stale' | 'inventory-ambiguous' | 'inventory-other-alias' | 'inventory-profile'
   | 'reply-run' | 'current-soul' | 'current-incarnation' | 'current-root' | 'current-ambiguous'
@@ -184,14 +184,15 @@ async function historyCallback(fault?: HistoryFault, startup: 'presentation' | '
         sessionType: content.sessionType, provider: content.provider }
       if (startupFault === 'create-tab') request.tabId = 'other-tab'
       frame(request)
-      const ack = { type: 'freshAgent.created', requestId: content.createRequestId,
+      const ack: { sessionRef?: { provider: string, sessionId: string } } & Record<string, unknown> = { type: 'freshAgent.created', requestId: content.createRequestId,
         sessionId: item.sessionId, sessionType: content.sessionType, provider: content.provider,
         runtimeProvider: item.view.provider, sessionRef: { provider: content.provider, sessionId: item.view.nativeSessionId } }
       if (startupFault === 'ack-request') ack.requestId = 'other-request'
       if (startupFault === 'ack-mode') ack.sessionType = 'freshopencode'
       if (startupFault === 'ack-provider') ack.provider = 'opencode'
       if (startupFault === 'ack-runtime-provider') ack.runtimeProvider = 'opencode'
-      if (startupFault === 'ack-root') ack.sessionRef.sessionId = 'wrong-ack-root'
+      if (startupFault === 'ack-root') ack.sessionRef!.sessionId = 'wrong-ack-root'
+      if (startupFault === 'ack-missing-root') delete ack.sessionRef
       framereceived({ payload: JSON.stringify(ack) })
       if (startupFault === 'ack-duplicate') framereceived({ payload: JSON.stringify(ack) })
       if (startup === 'native') promote(item)
@@ -355,7 +356,7 @@ describe('managed History startup inventory binding', () => {
     expect(new Set(transport.mock.calls.map(([, init]) => JSON.parse(String(init.body)).operationId)).size).toBe(transport.mock.calls.length)
   })
 
-  it.each<StartupFault>(['ack-request', 'ack-mode', 'ack-provider', 'ack-runtime-provider', 'ack-root', 'ack-duplicate',
+  it.each<StartupFault>(['ack-request', 'ack-mode', 'ack-provider', 'ack-runtime-provider', 'ack-root', 'ack-missing-root', 'ack-duplicate',
     'create-tab', 'pane-request', 'pane-mode', 'pane-provider', 'pane-root', 'pane-soul', 'pane-incarnation',
     'inventory-missing', 'inventory-stale', 'inventory-ambiguous', 'inventory-other-alias', 'inventory-profile', 'reply-run',
     'current-soul', 'current-incarnation', 'current-root', 'current-ambiguous'])(
@@ -373,7 +374,7 @@ describe('managed History startup inventory binding', () => {
       const cause: Record<StartupFault, RegExp> = {
         'ack-request': /timed out waiting for owned fixture activation/,
         'ack-mode': /freshopencode/, 'ack-provider': /opencode/, 'ack-runtime-provider': /opencode/,
-        'ack-root': /wrong-ack-root/, 'ack-duplicate': /Received length: 2/, 'create-tab': /other-tab/,
+        'ack-root': /wrong-ack-root/, 'ack-missing-root': /Received: undefined/, 'ack-duplicate': /Received length: 2/, 'create-tab': /other-tab/,
         'pane-request': /Received length: 0/, 'pane-mode': /freshopencode/, 'pane-provider': /opencode/,
         'pane-root': /wrong-pane-root/, 'pane-soul': /other-pane-soul/, 'pane-incarnation': /stale-pane-incarnation/,
         'inventory-missing': /timed out waiting for owned fixture activation/,
