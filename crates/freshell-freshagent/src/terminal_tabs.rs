@@ -1727,6 +1727,23 @@ where
     let Some(key) = rest_resume_key(&registry, body) else {
         return GoneGate::Proceed;
     };
+    defer_until_gone(registry, key, entry_point, continuation).await
+}
+
+/// [`wait_for_gone_or_defer`] for a known conversation `key` (canonical): a
+/// REST route whose conversation's unit is being stopped waits for its Gone
+/// (at most [`REST_GONE_WAIT`]) or answers the 202 and runs `continuation`
+/// at Gone.
+pub(crate) async fn defer_until_gone<F, Fut>(
+    registry: std::sync::Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+    key: SessionLocator,
+    entry_point: &'static str,
+    continuation: F,
+) -> GoneGate
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Response> + Send + 'static,
+{
     if !matches!(
         registry.observe(&key.provider, &key.session_id).state,
         freshell_ownership::OwnershipState::Stopping { .. }
@@ -1762,7 +1779,7 @@ where
             operation_id = %keys.operation_id.as_deref().unwrap_or(""),
             entry_point,
             status = answered.status().as_u16(),
-            "a REST create that waited past its bound for a Gone ran at Gone");
+            "a REST request that waited past its bound for a Gone ran at Gone");
     });
     GoneGate::Deferred(
         (

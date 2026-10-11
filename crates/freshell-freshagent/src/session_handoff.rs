@@ -170,6 +170,7 @@ impl HandoffAction {
 }
 
 /// The handoff request (the `POST /api/sessions/handoff` body, parsed).
+#[derive(Clone)]
 pub struct HandoffRequest {
     pub action: HandoffAction,
     pub provider: String,
@@ -5116,95 +5117,65 @@ async fn handoff_handler(
     State(runner): State<Arc<SessionHandoffRunner>>,
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
-) -> (StatusCode, Json<Value>) {
-    if !crate::authorized(&headers, &runner.auth_token) {
-        // Round-3 review N-2: the typed code now matches the status (the
-        // plan sketch's "BAD_REQUEST" read oddly for a 401).
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({
-                "ok": false,
-                "error": { "code": "UNAUTHORIZED", "message": "unauthorized", "retryable": false }
-            })),
-        );
-    }
-    let Some(provider) = body
-        .get("provider")
-        .and_then(Value::as_str)
-        .map(String::from)
-    else {
-        return typed_bad_request("body must carry a string `provider`");
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let req = match parse_handoff_request(&runner, &headers, &body) {
+        Ok(req) => req,
+        Err(refusal) => return refusal.into_response(),
     };
-    let Some(session_id) = body
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .map(String::from)
-    else {
-        return typed_bad_request("body must carry a string `sessionId`");
-    };
-    let target_kind = match body.get("targetKind").and_then(Value::as_str) {
-        Some("terminal") => RuntimeOwnerKind::Terminal,
-        Some("fresh-agent") => RuntimeOwnerKind::FreshAgent,
-        _ => {
-            return typed_bad_request("targetKind must be \"terminal\" or \"fresh-agent\"");
+    // A switch that reaches a conversation whose unit is being stopped (a
+    // kill from another device, a cleanup stop) waits for that unit's Gone
+    // like the other REST doors: within Decision 8's bound it then runs;
+    // past it the answer is `202 {"ok":false,"status":"stopping"}` and the
+    // switch runs on its own at Gone. Only a Stopping owner is waited for: a
+    // clear-only request never waits, and a stale observed pair is refused
+    // at once, as before.
+    if req.action != HandoffAction::ClearStaleBookkeeping && !observes_a_stale_pair(&runner, &req) {
+        let key = freshell_protocol::SessionLocator {
+            provider: req.provider.clone(),
+            session_id: runner
+                .ownership
+                .resolve_canonical(&req.provider, &req.session_id),
+        };
+        let (deferred_runner, deferred_req) = (Arc::clone(&runner), req.clone());
+        let gate = crate::terminal_tabs::defer_until_gone(
+            Arc::clone(&runner.ownership),
+            key,
+            "handoff",
+            move || async move {
+                answer_handoff(&deferred_runner, deferred_req)
+                    .await
+                    .into_response()
+            },
+        )
+        .await;
+        if let crate::terminal_tabs::GoneGate::Deferred(answer) = gate {
+            return answer;
         }
-    };
-    let action = match parse_handoff_action(&body) {
-        Ok(action) => action,
-        Err(message) => return typed_bad_request(message),
-    };
-    // b8ke delta review F7: a half-sent observed pair (exactly one of
-    // epoch/generation) is the typed invalid-fence refusal — never a silent
-    // downgrade to the unfenced legacy path. No handoff is spawned.
-    let observed_epoch = body.get("observedEpoch").and_then(Value::as_u64);
-    let observed_generation = body.get("observedGeneration").and_then(Value::as_u64);
-    if let Err(err) = crate::ownership_lane::wire_fence(observed_epoch, observed_generation) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "ok": false,
-                "error": { "code": err.code(), "message": err.message(), "retryable": false }
-            })),
-        );
     }
-    let session_type = body
-        .get("sessionType")
-        .and_then(Value::as_str)
-        .map(String::from);
-    let mode = body.get("mode").and_then(Value::as_str).map(String::from);
-    // b8ke delta review F5: the provider↔target validation, refused
-    // PRE-SPAWN — a sessionType that is not one of the provider's canonical
-    // fresh-agent types (or an ambiguous absent one), or a terminal mode
-    // that does not match the provider, is a typed 400: the prior runtime is
-    // never stopped, the coordinator never touched.
-    if let Err(reason) = validate_handoff_target(
-        &provider,
-        target_kind,
-        session_type.as_deref(),
-        mode.as_deref(),
-        &runner.cli_commands,
-    ) {
-        return typed_bad_request(&reason);
-    }
-    let req = HandoffRequest {
-        action,
-        provider,
-        session_id,
-        target_kind,
-        session_type,
-        mode,
-        cwd: body.get("cwd").and_then(Value::as_str).map(String::from),
-        tab_id: body.get("tabId").and_then(Value::as_str).map(String::from),
-        pane_id: body.get("paneId").and_then(Value::as_str).map(String::from),
-        observed_epoch,
-        observed_generation,
-        device_id: body
-            .get("deviceId")
-            .and_then(Value::as_str)
-            .map(String::from),
+    answer_handoff(&runner, req).await.into_response()
+}
+
+/// Whether the request's observed (epoch, generation) pair is already stale
+/// (the coordinator's own rule): such a request is refused at once.
+fn observes_a_stale_pair(runner: &SessionHandoffRunner, req: &HandoffRequest) -> bool {
+    let (Some(epoch), Some(generation)) = (req.observed_epoch, req.observed_generation) else {
+        return false;
     };
-    // The reply rides the handle's oneshot with a bounded HTTP timeout; the
-    // operation itself is detached and outlives the request.
+    let canonical = runner
+        .ownership
+        .resolve_canonical(&req.provider, &req.session_id);
+    let current = runner.ownership.observe(&req.provider, &canonical);
+    epoch != current.epoch || generation < current.generation
+}
+
+/// Runs the handoff and answers it: the reply rides the handle's oneshot
+/// with a bounded HTTP timeout; the operation itself is detached and
+/// outlives the request.
+async fn answer_handoff(
+    runner: &Arc<SessionHandoffRunner>,
+    req: HandoffRequest,
+) -> (StatusCode, Json<Value>) {
     let handle = runner.spawn_handoff(req);
     let mut completion = handle.completion;
     match tokio::time::timeout(std::time::Duration::from_secs(30), &mut completion).await {
@@ -5231,6 +5202,104 @@ async fn handoff_handler(
             })),
         ),
     }
+}
+
+/// Authorizes, parses and validates a `POST /api/sessions/handoff` body;
+/// `Err` is the typed refusal to answer.
+#[allow(clippy::result_large_err)] // the refusal is the response itself
+fn parse_handoff_request(
+    runner: &SessionHandoffRunner,
+    headers: &axum::http::HeaderMap,
+    body: &Value,
+) -> Result<HandoffRequest, (StatusCode, Json<Value>)> {
+    if !crate::authorized(headers, &runner.auth_token) {
+        // Round-3 review N-2: the typed code now matches the status (the
+        // plan sketch's "BAD_REQUEST" read oddly for a 401).
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "ok": false,
+                "error": { "code": "UNAUTHORIZED", "message": "unauthorized", "retryable": false }
+            })),
+        ));
+    }
+    let Some(provider) = body
+        .get("provider")
+        .and_then(Value::as_str)
+        .map(String::from)
+    else {
+        return Err(typed_bad_request("body must carry a string `provider`"));
+    };
+    let Some(session_id) = body
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .map(String::from)
+    else {
+        return Err(typed_bad_request("body must carry a string `sessionId`"));
+    };
+    let target_kind = match body.get("targetKind").and_then(Value::as_str) {
+        Some("terminal") => RuntimeOwnerKind::Terminal,
+        Some("fresh-agent") => RuntimeOwnerKind::FreshAgent,
+        _ => {
+            return Err(typed_bad_request(
+                "targetKind must be \"terminal\" or \"fresh-agent\"",
+            ));
+        }
+    };
+    let action = match parse_handoff_action(body) {
+        Ok(action) => action,
+        Err(message) => return Err(typed_bad_request(message)),
+    };
+    // b8ke delta review F7: a half-sent observed pair (exactly one of
+    // epoch/generation) is the typed invalid-fence refusal — never a silent
+    // downgrade to the unfenced legacy path. No handoff is spawned.
+    let observed_epoch = body.get("observedEpoch").and_then(Value::as_u64);
+    let observed_generation = body.get("observedGeneration").and_then(Value::as_u64);
+    if let Err(err) = crate::ownership_lane::wire_fence(observed_epoch, observed_generation) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": { "code": err.code(), "message": err.message(), "retryable": false }
+            })),
+        ));
+    }
+    let session_type = body
+        .get("sessionType")
+        .and_then(Value::as_str)
+        .map(String::from);
+    let mode = body.get("mode").and_then(Value::as_str).map(String::from);
+    // b8ke delta review F5: the provider↔target validation, refused
+    // PRE-SPAWN — a sessionType that is not one of the provider's canonical
+    // fresh-agent types (or an ambiguous absent one), or a terminal mode
+    // that does not match the provider, is a typed 400: the prior runtime is
+    // never stopped, the coordinator never touched.
+    if let Err(reason) = validate_handoff_target(
+        &provider,
+        target_kind,
+        session_type.as_deref(),
+        mode.as_deref(),
+        &runner.cli_commands,
+    ) {
+        return Err(typed_bad_request(&reason));
+    }
+    Ok(HandoffRequest {
+        action,
+        provider,
+        session_id,
+        target_kind,
+        session_type,
+        mode,
+        cwd: body.get("cwd").and_then(Value::as_str).map(String::from),
+        tab_id: body.get("tabId").and_then(Value::as_str).map(String::from),
+        pane_id: body.get("paneId").and_then(Value::as_str).map(String::from),
+        observed_epoch,
+        observed_generation,
+        device_id: body
+            .get("deviceId")
+            .and_then(Value::as_str)
+            .map(String::from),
+    })
 }
 
 fn typed_bad_request(message: &str) -> (StatusCode, Json<Value>) {

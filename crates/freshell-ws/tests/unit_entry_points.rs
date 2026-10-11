@@ -596,3 +596,54 @@ async fn a_switch_to_the_terminal_of_a_conversation_that_never_had_a_turn_is_ref
     );
     h.state.fresh_codex.shutdown().await;
 }
+
+/// A switch between terminal Codex and freshcodex that reaches a
+/// conversation whose unit is being stopped (a kill from another device, a
+/// cleanup stop) waits for that unit's Gone, within the REST bound, and then
+/// switches, instead of answering "in progress".
+#[tokio::test(flavor = "multi_thread")]
+async fn a_switch_during_a_stop_waits_for_gone() {
+    let h = UnitHarness::start(HarnessOpts::default()).await;
+    h.state.fresh_codex.set_enabled(true);
+    let _gone = GoneDelay::set(1500);
+    let mut ws = h.connect().await;
+    let old = h
+        .create_codex(&mut ws, "crq-sw-stop", Some("t-sw-stop"))
+        .await;
+    ready(&h, &mut ws).await;
+    start_settled(&h, &old).await;
+    let old_native = h.native_pid(&old);
+    let old_native_start = h.native_manifest(&old).start_time(old_native);
+    h.send(
+        &mut ws,
+        json!({"type": "terminal.kill", "terminalId": old, "requestId": "rk", "createRequestId": "crq-sw-stop"}),
+    )
+    .await;
+    eventually("the conversation is Stopping", || {
+        matches!(
+            h.state
+                .ownership
+                .as_ref()
+                .unwrap()
+                .observe("codex", "t-sw-stop")
+                .state,
+            OwnershipState::Stopping { .. }
+        )
+    })
+    .await;
+    let (status, body) = h
+        .post(
+            "/api/sessions/handoff",
+            json!({"provider": "codex", "sessionId": "t-sw-stop", "targetKind": "fresh-agent",
+                "sessionType": "freshcodex", "cwd": h.home.path().display().to_string(),
+                "deviceId": "test-device"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["ok"], json!(true), "switched after the Gone: {body}");
+    assert!(
+        fake_codex::proc_starttime(old_native) != Some(old_native_start),
+        "the switch ran only after the old app-server was gone"
+    );
+    h.state.fresh_codex.shutdown().await;
+}
