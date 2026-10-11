@@ -16,7 +16,7 @@ import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import type { AppStore } from '@/store/store'
 import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
 import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
-import { sendSuppressedAwareFreshAgentFrame } from '@/lib/fresh-agent-configure'
+import { isFreshAgentNetworkEffectsSuppressed, sendSuppressedAwareFreshAgentFrame } from '@/lib/fresh-agent-configure'
 import { KILL_ACK_TIMEOUT_MESSAGE, KILL_FAILED_MESSAGE, sendFreshAgentKillAndAwait, sendFreshAgentRecoveryStopAndAwait } from '@/lib/kill-ack'
 import { createLogger } from '@/lib/client-logger'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
@@ -2152,6 +2152,11 @@ export function FreshAgentView({
       && paneContent.status !== 'starting'
       && !paneContent.sessionRef
     ) return
+    // The picker holds effects until its model/effort profile is staged.
+    // Defer the whole create decision: a suppressed send cannot consume
+    // its one-time arm, register a pending create, or capture an owner fence.
+    // Profile staging releases the hold and updates this same pane content.
+    if (isFreshAgentNetworkEffectsSuppressed(paneId)) return
     // Pre-verdict create wait: a reconcile-pending pane defers its mount-time
     // create until its verdict folds (the fold's clearReconcilePendingPane
     // re-fires this effect via the reconcilePendingSince dep), bounded by
@@ -2224,6 +2229,14 @@ export function FreshAgentView({
         release?.()
         return
       }
+      // A hold can arrive after a hidden job was queued. Defer before any
+      // pending-create/naming effects and re-arm only this still-current
+      // decision; preserve its request and captured owner fence for release.
+      if (isFreshAgentNetworkEffectsSuppressed(paneId)) {
+        if (lastCreateArmKeyRef.current === createArmKey) createSentRef.current = false
+        release?.()
+        return
+      }
       // kata b8ke pre-send divergence check: a stale callback (rebind-queue
       // run, reconnect resend) must not issue a lifecycle-start for a
       // session the runtime-owner store now shows as owned by the other
@@ -2272,6 +2285,7 @@ export function FreshAgentView({
   }, [
     appStore,
     buildCreateMessage,
+    createArmKey,
     dispatch,
     lifecycleBlocked,
     paneId,
@@ -2286,11 +2300,15 @@ export function FreshAgentView({
   ])
 
   useEffect(() => {
-    if (paneContent.sessionId || !createSentRef.current) return
+    // Subscribe even while the picker holds the initial decision. Its later
+    // profile dispatch can send without changing this effect's dependencies.
+    if (paneContent.sessionId) return
     if (paneContent.status !== 'creating' && paneContent.status !== 'starting') return
     if (typeof ws.onReconnect !== 'function') return
     return ws.onReconnect(() => {
       const current = paneContentRef.current
+      if (!createSentRef.current || isFreshAgentLifecycleBlocked(current)) return
+      if (isFreshAgentNetworkEffectsSuppressed(paneId)) return
       if (current.sessionId) return
       if (current.status !== 'creating' && current.status !== 'starting') return
       const resend = (release?: () => void) => {
@@ -2299,6 +2317,10 @@ export function FreshAgentView({
           return
         }
         const latest = paneContentRef.current
+        if (!createSentRef.current || isFreshAgentNetworkEffectsSuppressed(paneId)) {
+          release?.()
+          return
+        }
         if (isFreshAgentLifecycleBlocked(latest)) {
           release?.()
           return
