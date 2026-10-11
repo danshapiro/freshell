@@ -14,7 +14,6 @@ const playwrightCli = require.resolve('@playwright/test/cli')
 const configLoader = require.resolve('playwright/lib/common/configLoader')
 const playwrightConfig = path.join(browserRoot, 'playwright.config.ts')
 const cloudConfig = path.join(browserRoot, 'playwright.cloud.config.ts')
-const continuityPattern = { kind: 'regexp', source: 'continuity-smoke\\.spec\\.ts$', flags: '' }
 
 interface ResolvedProject {
   name: string
@@ -26,6 +25,9 @@ function cleanEnvironment(overrides: Record<string, string> = {}): NodeJS.Proces
   const env = { ...process.env }
   delete env.CI
   delete env.FRESHELL_SMOKE
+  for (const key of ['FRESHELL_E2E_EXTERNAL_FIXTURE_KIND', 'FRESHELL_MANAGED_ENVIRONMENT_FIXTURE',
+    'FRESHELL_CODE_CHECKPOINT_FIXTURE', 'FRESHELL_E2E_TARGET_URL', 'FRESHELL_E2E_TARGET_WS_URL',
+    'FRESHELL_E2E_TARGET_TOKEN', 'FRESHELL_E2E_TARGET_TIMEOUT_MS']) delete env[key]
   return { ...env, ...overrides }
 }
 
@@ -94,23 +96,36 @@ function listedSpecFiles(output: string): Set<string> {
 }
 
 describe('browser selection non-vacuity', () => {
-  it('resolves only Rust application projects with the exact continuity exclusion', () => {
-    const defaultProjects = resolvedConfig(playwrightConfig, cleanEnvironment())
-    expect(defaultProjects.map((project) => project.name)).toEqual(['chromium'])
-    expect(defaultProjects[0].testIgnore).toEqual([continuityPattern])
+  it('discovers the managed external cases only through their paired dedicated Cloud project', () => {
+    const spec = 'managed-provider-environment-external.spec.ts'
+    const ordinary = listedProjects(cleanEnvironment(), cloudConfig)
+    expect(listedSpecFiles(ordinary.output).has(spec)).toBe(false)
+    expect(listedSpecFiles(ordinary.output).has('code-checkpoint-workspace-external.spec.ts')).toBe(false)
+    const fixture = JSON.stringify({ candidateSha: 'a'.repeat(40), runId: '11111111-1111-4111-8111-111111111111',
+      remoteWorkspacePath: '/tmp/selected-managed-fixture/workspace', expectedNonce: 'selection-fixture-nonce' })
+    const paired = cleanEnvironment({ FRESHELL_E2E_EXTERNAL_FIXTURE_KIND: 'managed-environment',
+      FRESHELL_MANAGED_ENVIRONMENT_FIXTURE: fixture, FRESHELL_E2E_TARGET_URL: 'https://fixture.invalid',
+      FRESHELL_E2E_TARGET_TOKEN: 'synthetic-selection-token' })
+    const selected = listedProjects(paired, cloudConfig, ['--project=chromium-external-target', spec])
+    expect(selected.labels).toEqual(['chromium-external-target'])
+    expect(selected.tests).toBe(3)
+    expect(selected.files).toBe(1)
+    expect([...listedSpecFiles(selected.output)]).toEqual([spec])
+    // The source exists now: ordinary projects still cannot execute it.
+    const ordinaryExplicit = spawnSync(process.execPath, [playwrightCli, 'test', '--config', cloudConfig,
+      '--list', '--project=chromium', spec], { cwd: projectRoot, env: paired, encoding: 'utf8' })
+    expect(ordinaryExplicit.status).toBe(1)
+  }, 90_000)
 
-    const ciProjects = resolvedConfig(playwrightConfig, cleanEnvironment({ CI: '1' }))
-    expect(ciProjects.map((project) => project.name)).toEqual(['chromium', 'firefox', 'webkit'])
-    for (const project of ciProjects) expect(project.testIgnore).toEqual([continuityPattern])
-
-    const continuityProjects = resolvedConfig(playwrightConfig, cleanEnvironment({ FRESHELL_SMOKE: '1' }))
-    expect(continuityProjects.map((project) => project.name)).toEqual(['chromium', 'continuity-smoke'])
-    expect(continuityProjects[0].testIgnore).toEqual([continuityPattern])
-    expect(continuityProjects[1]).toMatchObject({
-      name: 'continuity-smoke',
-      testIgnore: [],
-      testMatch: [continuityPattern],
-    })
+  it.each(['missing', 'mismatched'] as const)('refuses external discovery with a %s fixture pair', pairing => {
+    const env = cleanEnvironment({ FRESHELL_E2E_EXTERNAL_FIXTURE_KIND: 'managed-environment',
+      FRESHELL_E2E_TARGET_URL: 'https://fixture.invalid', FRESHELL_E2E_TARGET_TOKEN: 'synthetic-selection-token',
+      ...(pairing === 'mismatched' ? { FRESHELL_CODE_CHECKPOINT_FIXTURE: '{}' } : {}) })
+    const listed = spawnSync(process.execPath, [playwrightCli, 'test', '--config', cloudConfig, '--list',
+      '--project=chromium-external-target', 'managed-provider-environment-external.spec.ts'],
+      { cwd: projectRoot, env, encoding: 'utf8' })
+    expect(listed.status).toBe(1)
+    expect(`${listed.stdout}\n${listed.stderr}`).toContain('matching fixture pair')
   })
 
   it('selects a non-vacuous Chromium lane and all CI application projects', () => {
@@ -172,10 +187,6 @@ describe('browser selection non-vacuity', () => {
 
     const cloudProjects = resolvedConfig(cloudConfig, cleanEnvironment())
     expect(cloudProjects.map((project) => project.name)).toEqual(['chromium'])
-    expect(cloudProjects[0].testIgnore).toEqual([
-      continuityPattern,
-      ...CLOUD_SKIP_SPECS.map((spec) => ({ kind: 'string' as const, source: `**/${spec}` })),
-    ])
     expect(new Set(CLOUD_SKIP_SPECS).size).toBe(CLOUD_SKIP_SPECS.length)
     for (const localOnly of LOCAL_ONLY_SPECS) expect(CLOUD_SKIP_SPECS).toContain(localOnly.spec)
 
