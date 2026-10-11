@@ -1,7 +1,27 @@
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import http from 'node:http'
 import path from 'node:path'
 import { ErrorCode, type ErrorMessage } from '../../shared/ws-protocol.js'
+
+export async function readManagedEnvironmentDaemonId(): Promise<string> {
+  const dockerHost = process.env.DOCKER_HOST
+  assert(!dockerHost || dockerHost.startsWith('unix://'), 'Managed target requires the existing local Unix Docker endpoint')
+  const socketPath = dockerHost?.slice(7) || '/var/run/docker.sock'
+  return new Promise((resolve, reject) => {
+    const request = http.get({ socketPath, path: '/v1.47/info', timeout: 30_000 }, response => {
+      const chunks: Buffer[] = []
+      let bytes = 0
+      response.on('data', chunk => { bytes += chunk.length; if (bytes > 65536) request.destroy(new Error('Daemon metadata exceeded its bound')); else chunks.push(chunk) })
+      response.once('end', () => {
+        try { assert.equal(response.statusCode, 200); const value = JSON.parse(Buffer.concat(chunks).toString()); assert.equal(typeof value.ID, 'string'); resolve(value.ID) }
+        catch (error) { reject(error) }
+      })
+    })
+    request.once('timeout', () => request.destroy(new Error('Daemon metadata timed out')))
+    request.once('error', reject)
+  })
+}
 
 type ManagedCreateOwner = {
   web: { capturedOutput(): { stdout: string; stderr: string } }

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { EventEmitter } from 'node:events'
 import fs from 'node:fs/promises'
 import http from 'node:http'
 import os from 'node:os'
@@ -30,12 +31,62 @@ vi.mock('node:child_process', () => {
   return { ...api, default: api }
 })
 
-import { RuntimeHarness } from '../../../../scripts/testing/runtime-sandbox.js'
+import { RuntimeHarness, dockerSocketPath } from '../../../../scripts/testing/runtime-sandbox.js'
 import { RestrictedDockerBroker, type PreparedInputAuthorization } from '../../../../scripts/testing/runtime-test-broker.js'
 import { ManagedRuntimeBrowserRig } from '../../../e2e-browser/helpers/managed-runtime.js'
 import { prepareProviderParityUserRoots } from '../../../helpers/provider-parity-environment.js'
-import { assertManagedTerminalCreated } from '../../../../scripts/testing/managed-environment-create.js'
+import { assertManagedTerminalCreated, readManagedEnvironmentDaemonId } from '../../../../scripts/testing/managed-environment-create.js'
 import type { ErrorMessage } from '../../../../shared/ws-protocol.js'
+
+describe('managed environment daemon identity', () => {
+  it('reads the exact configured Unix daemon before registering a source', async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'frs-daemon-'))
+    const socket = path.join(directory, 'daemon.sock')
+    const requests: string[] = []
+    const server = http.createServer((request, response) => {
+      requests.push(request.url!)
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ ID: 'owned-fixture-daemon' }))
+    })
+    const previous = process.env.DOCKER_HOST
+    try {
+      await new Promise<void>(resolve => server.listen(socket, resolve))
+      process.env.DOCKER_HOST = `unix://${socket}`
+      expect(await readManagedEnvironmentDaemonId()).toBe('owned-fixture-daemon')
+      expect(requests).toEqual(['/v1.47/info'])
+    } finally {
+      if (previous === undefined) delete process.env.DOCKER_HOST
+      else process.env.DOCKER_HOST = previous
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+      await fs.rm(directory, { recursive: true })
+    }
+  })
+
+  it('dispatches the default identity lookup to the same rootless socket as the owned runtime', async () => {
+    const previous = process.env.DOCKER_HOST
+    delete process.env.DOCKER_HOST
+    const dispatched: http.RequestOptions[] = []
+    const get = vi.spyOn(http, 'get').mockImplementation(((options: http.RequestOptions,
+      callback: (response: http.IncomingMessage) => void) => {
+      dispatched.push(options)
+      const request = new EventEmitter()
+      queueMicrotask(() => {
+        const response = Object.assign(new EventEmitter(), { statusCode: 200 })
+        callback(response as http.IncomingMessage)
+        response.emit('data', Buffer.from('{"ID":"owned-rootless-daemon"}'))
+        response.emit('end')
+      })
+      return request as http.ClientRequest
+    }) as typeof http.get)
+    try {
+      expect(await readManagedEnvironmentDaemonId()).toBe('owned-rootless-daemon')
+      expect(dispatched).toEqual([{ socketPath: dockerSocketPath(), path: '/v1.47/info', timeout: 30_000 }])
+    } finally {
+      get.mockRestore()
+      if (previous !== undefined) process.env.DOCKER_HOST = previous
+    }
+  })
+})
 
 describe('managed environment create failure retention', () => {
   it.each(['known', 'unknown', 'file-os', 'file-index', 'file-auth', 'file-unknown'] as const)('retains safe %s failure evidence before normal owned cleanup', async kind => {

@@ -2,7 +2,6 @@ import assert from 'node:assert/strict'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import fs from 'node:fs/promises'
-import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -13,7 +12,7 @@ import { authorizeProviderParityRequest, captureProviderParityVolumes, cleanupPr
 import { fakeOnecliGrants } from '../../test/integration/server/provider-parity-onecli.js'
 import type { InitialProviderVolumeAuthorization } from './runtime-test-broker.js'
 import { resolvePairedExternalFixture } from './e2e-external-target.js'
-import { assertManagedTerminalCreated } from './managed-environment-create.js'
+import { assertManagedTerminalCreated, readManagedEnvironmentDaemonId } from './managed-environment-create.js'
 
 const cloudflaredVersion = '2026.10.0'
 const cloudflaredSha = 'd33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db'
@@ -106,22 +105,6 @@ async function webChildren(rig: ManagedRuntimeBrowserRig): Promise<number[]> {
   }
   assert.equal(rig.web.processEvidence().pid, pid, 'Owned scratch web server changed during child observation')
   return [...children].sort((left, right) => left - right)
-}
-
-async function daemonId(socketPath: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const request = http.get({ socketPath, path: '/v1.47/info', timeout: 30_000 }, response => {
-      const chunks: Buffer[] = []
-      let bytes = 0
-      response.on('data', chunk => { bytes += chunk.length; if (bytes > 65536) request.destroy(new Error('Daemon metadata exceeded its bound')); else chunks.push(chunk) })
-      response.once('end', () => {
-        try { assert.equal(response.statusCode, 200); const value = JSON.parse(Buffer.concat(chunks).toString()); assert.equal(typeof value.ID, 'string'); resolve(value.ID) }
-        catch (error) { reject(error) }
-      })
-    })
-    request.once('timeout', () => request.destroy(new Error('Daemon metadata timed out')))
-    request.once('error', reject)
-  })
 }
 
 async function configure(root: string, nonce: string, candidateSha: string, runId: string) {
@@ -266,11 +249,9 @@ export async function runManagedEnvironmentTarget() {
     webIdentity = await processIdentity(rig.web.processEvidence())
     proof.scratchWeb = webIdentity
     const health = await rig.runtime.adminOk(rig.supervisor, { method: 'health' })
-    const dockerHost = process.env.DOCKER_HOST
-    assert(!dockerHost || dockerHost.startsWith('unix://'), 'Managed target requires the existing local Unix Docker endpoint')
     const source = { installationId: health.data.installation_id, imageRef: rig.runtime.imageRef,
       hostBinaryPath: rig.runtime.releaseHostBinary, binarySha256: digest(await fs.readFile(rig.runtime.releaseHostBinary)),
-      daemonId: await daemonId(dockerHost?.slice(7) || '/var/run/docker.sock') }
+      daemonId: await readManagedEnvironmentDaemonId() }
     const authorize = (requestId: string) => owners.push(authorizeProviderParityRequest(rig!.runtime.broker, source, requestId))
     const before = await rig.inventory()
     assert.deepEqual(before, [])
