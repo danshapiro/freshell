@@ -9,7 +9,7 @@ import { readAmplifierNativeHistory } from './amplifier.js'
 import { readClaudeNativeHistory } from './claude.js'
 import { readCodexNativeHistory, readCodexNativeObservation, selectCodexNativeSource } from './codex.js'
 import { readOpenCodeNativeHistory, readOpenCodeNativeObservation } from './opencode.js'
-import { findExactFiles, findExactSessionDirectories, safeOpaqueId, readBoundedJsonl } from './safe-io.js'
+import { findExactFiles, findExactSessionDirectories, isAbsentClaudeProjectsRoot, safeOpaqueId, readBoundedJsonl } from './safe-io.js'
 
 const MAX_RAW_BYTES = 4 * 1024 * 1024
 const MAX_CAPTURE_BYTES = 8 * 1024 * 1024
@@ -64,7 +64,8 @@ function exact(files: string[]): string {
 /** Existing history projection plus a private raw adjunct, with unchanged provider/source/root arguments. */
 export function captureNativeHistory(provider: string, source: string, nativeSessionId: string, allowEmptyBoundary = false) {
   const root = safeOpaqueId(nativeSessionId, 'native root')
-  const claudeFiles = provider === 'claude' ? findExactFiles(source, `${root}.jsonl`) : []
+  const claudeFiles = provider === 'claude' && !(allowEmptyBoundary && isAbsentClaudeProjectsRoot(source))
+    ? findExactFiles(source, `${root}.jsonl`) : []
   if (provider === 'claude' && allowEmptyBoundary && claudeFiles.length === 0) {
     return { schemaVersion: 1 as const, provider: 'claude' as const, nativeSessionId: root, turns: [], rawSource: null }
   }
@@ -107,11 +108,10 @@ export function captureNativeHistory(provider: string, source: string, nativeSes
   } finally { fs.rmSync(retained, { recursive: true, force: true }) }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+/** CLI and imported captures share the same body-free refusal boundary. */
+export function runNativeHistoryProbe(capture: () => unknown): void {
   try {
-    const [provider, source, nativeSessionId, ...extra] = process.argv.slice(2)
-    if (!provider || !source || !nativeSessionId || extra.length) throw new Error('missing probe arguments')
-    process.stdout.write(JSON.stringify(captureNativeHistory(provider, source, nativeSessionId)))
+    process.stdout.write(JSON.stringify(capture()))
   } catch (error) {
     // Never echo parsed content, paths, ids, or exception values from a native store.
     const code = error instanceof Error && 'code' in error && typeof error.code === 'string'
@@ -133,4 +133,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
     process.stderr.write(`${JSON.stringify({ severity: 'error', event: 'provider_native_history.refused', stage, reason, code })}\n`)
     process.exitCode = 2
   }
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  runNativeHistoryProbe(() => {
+    const [provider, source, nativeSessionId, ...extra] = process.argv.slice(2)
+    if (!provider || !source || !nativeSessionId || extra.length) throw new Error('missing probe arguments')
+    return captureNativeHistory(provider, source, nativeSessionId)
+  })
 }
