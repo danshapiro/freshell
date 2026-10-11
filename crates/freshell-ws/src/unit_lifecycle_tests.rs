@@ -1218,6 +1218,104 @@ async fn an_agent_whose_screen_is_its_main_ends_its_unit_while_a_job_holds_the_t
     );
 }
 
+/// A process the test spawned to stand for an agent's main process (one
+/// that is not its screen, like Codex's app-server); killed and reaped if
+/// it outlives the test.
+struct OwnChild(std::process::Child);
+
+impl OwnChild {
+    fn sleeping() -> Self {
+        OwnChild(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("the stand-in main process"),
+        )
+    }
+
+    fn pin(&self) -> ProcWatch {
+        ProcWatch::open(self.0.id()).expect("pin the stand-in main process")
+    }
+}
+
+impl Drop for OwnChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The router applies a thread's status change a few task hops after the
+/// proxy forwarded the same frame to the TUI, so a TUI that ends its turn
+/// and quits at once can exit while the pane's thread table still says the
+/// turn runs. The decision gives the table a bounded wait to take that turn
+/// end: here the table takes it only after the screen's exit reached the
+/// decision, and the quit still ends the whole unit as the user's quit
+/// (Task 17 review M3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quit_right_after_a_turn_ended_waits_for_the_table_to_take_that_end() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, mut crashes) = unit_state(root.path());
+    let entry = running_pane(&state, "T-m3", "crq-m3", "read -r _; exit 0").await;
+    let main = OwnChild::sleeping();
+    entry.unit.set_main(main.pin());
+    // The test runs the decision itself: the screen's exit is recorded.
+    let (exits_tx, mut exits) = tokio::sync::mpsc::unbounded_channel();
+    state
+        .registry
+        .set_unit_screen_exit_hook(Arc::new(move |exit| {
+            let _ = exits_tx.send(exit);
+        }));
+    // The TUI saw its turn start; so did the table.
+    crate::unit_threads::observe_status(&state, "T-m3", "t-m3", "active");
+    assert!(crate::unit_threads::turn_running(&state, "T-m3"));
+
+    // The TUI saw the turn end and quit at once: its screen exits 0 before
+    // the router applied that end to the table.
+    assert!(state.registry.input("T-m3", b"quit\n").found);
+    let exit = tokio::time::timeout(LIMIT, exits.recv())
+        .await
+        .expect("the screen exits")
+        .expect("its exit");
+    assert_eq!(exit.exit_code, 0);
+    let mut decision = std::pin::pin!(on_member_exit(
+        &state,
+        &exit.unit_id,
+        &exit.terminal_id,
+        MemberExit::Screen {
+            exit_code: exit.exit_code,
+            lived: exit.lived,
+        },
+    ));
+    let first = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(decision.as_mut(), cx))
+    })
+    .await;
+    assert!(first.is_pending(), "the decision is under way");
+    // The router applies the turn's end now.
+    crate::unit_threads::observe_status(&state, "T-m3", "t-m3", "idle");
+    decision.await;
+
+    let stop = entry
+        .unit
+        .stop_in_flight()
+        .expect("the quit ends the whole unit, its agent included, instead of a new screen");
+    let report = stop.wait_for(LIMIT).await.expect("Gone");
+    assert_eq!(report.reason, "agent-exited");
+    let crash = tokio::time::timeout(LIMIT, crashes.recv())
+        .await
+        .expect("the end reaches auto-resume")
+        .expect("a crash event");
+    assert_eq!(
+        crash.exit_code, 0,
+        "the user's quit, which auto-resume settles"
+    );
+    assert!(
+        state.units.killed_start("crq-m3"),
+        "a clean quit is remembered as a stopped pane"
+    );
+}
+
 /// A restarted Codex TUI resumes the conversation its terminal is bound to
 /// now: the `resume` argument is rewritten, or appended to a spawn that had
 /// none (a fresh pane); a Windows shell's single command string is kept.

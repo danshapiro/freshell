@@ -398,6 +398,52 @@ async fn quitting_codex_while_a_turn_runs_keeps_the_agent_and_restarts_the_scree
     );
 }
 
+/// A quit that stops the running turn first (an interrupt, then an
+/// immediate quit) is the user quitting Codex: the TUI exits 0 the moment it
+/// sees its turn end, and the whole unit ends, whether or not the router has
+/// applied that end to the pane's thread table yet (Task 17 review M3).
+#[tokio::test(flavor = "multi_thread")]
+async fn stopping_the_turn_and_quitting_at_once_ends_the_unit() {
+    let mut h = UnitHarness::start(HarnessOpts {
+        behavior: json!({"turnCompleteDelayMs": 60000}),
+        auto_resume: AutoResumeMode::Capture,
+        ..Default::default()
+    })
+    .await;
+    let mut ws = h.connect().await;
+    let tid = h.create_codex(&mut ws, "crq-sq", Some("t-sq")).await;
+    ready(&h, &mut ws, &tid).await;
+    start_settled(&h, &tid).await;
+    let native = h.native_pid(&tid);
+    turn_running(&h, &mut ws, &tid).await;
+
+    h.send(
+        &mut ws,
+        json!({"type": "terminal.input", "terminalId": tid, "data": "stop-and-quit\r"}),
+    )
+    .await;
+    let exit = exit_within(&h, &mut ws, &tid, LIMIT)
+        .await
+        .expect("the quit ends the pane");
+    assert_eq!(exit["exitCode"], 0, "{exit}");
+    assert!(
+        !fake_codex::pid_alive(native),
+        "quitting ends the detached app-server too"
+    );
+    let crash = tokio::time::timeout(LIMIT, h.crash_rx.as_mut().unwrap().recv())
+        .await
+        .expect("the exit reaches auto-resume")
+        .expect("a crash event");
+    assert_eq!(
+        crash.exit_code, 0,
+        "auto-resume's decide() settles a clean exit"
+    );
+    assert!(
+        h.state.units.killed_start("crq-sq"),
+        "a clean quit is remembered as a stopped pane"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn quick_screen_crashes_end_the_unit_at_the_respawn_cap() {
     let mut h = UnitHarness::start(HarnessOpts {

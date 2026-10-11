@@ -13,7 +13,9 @@
 // Output lines (each ends with \r\n): FAKE_TUI_READY thread=<id>,
 // FAKE_TUI_TURN_COMPLETED status=<status>, FAKE_TUI_RECONNECTING,
 // FAKE_TUI_ERROR <message>, plus Codex's own conflict / no-session / give-up text.
-// Input lines (CR or LF): quit, crash, fork, resume <id>, turn <text>.
+// Input lines (CR or LF): quit, crash, fork, resume <id>, turn <text>,
+// stop-and-quit (interrupt the displayed thread's running turn, then exit 0 the
+// moment its idle status arrives: a quit that stops the turn first).
 //
 // A TUI started in a working directory that holds `.fake-tui-quit-at-start`
 // exits 0 at once, before it connects (a TUI that quits right after it starts).
@@ -74,6 +76,8 @@ function runTui(remote, startupResume) {
   const pending = new Map() // request id -> { resolve, reject }
   let nextRequestId = 1
   let reconnect = null // { attempt, retryTimer, deadlineTimer, attemptSocket, gaveUp }
+  let runningTurnId = null // the displayed thread's running turn, if any
+  let quitWhenIdle = false
 
   // The TUI keeps running until `quit` even with no connection and no input.
   setInterval(() => undefined, 2 ** 30)
@@ -111,6 +115,17 @@ function runTui(remote, startupResume) {
       return
     }
     if (message.id !== undefined) return // server requests (approvals) are not modeled
+    if (message.method === 'turn/started' && message.params?.threadId === displayedThread) {
+      runningTurnId = message.params?.turn?.id ?? null
+    }
+    if (
+      quitWhenIdle
+      && message.method === 'thread/status/changed'
+      && message.params?.threadId === displayedThread
+      && message.params?.status?.type === 'idle'
+    ) {
+      process.exit(0)
+    }
     if (message.method === 'turn/completed') {
       const threadId = message.params?.threadId
       const status = message.params?.turn?.status
@@ -243,6 +258,9 @@ function runTui(remote, startupResume) {
       void switchThread('thread/resume', { threadId, cwd: process.cwd() })
     } else if (line.startsWith('turn ')) {
       void startTurn(line.slice('turn '.length))
+    } else if (line === 'stop-and-quit') {
+      quitWhenIdle = true
+      request('turn/interrupt', { threadId: displayedThread, turnId: runningTurnId }).catch(() => undefined)
     }
   }
 

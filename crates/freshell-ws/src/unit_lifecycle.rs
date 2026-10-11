@@ -656,6 +656,14 @@ const SCREEN_EXIT_CODE_WAIT: Duration = Duration::from_secs(1);
 /// bounds it like a crash (Task 17 review M1).
 pub const BACKGROUND_QUIT_FLOOR: Duration = Duration::from_secs(1);
 
+/// How long a screen's clean exit with a turn running waits for the pane's
+/// thread table to take a turn end the screen may have seen first: the
+/// proxy router applies a thread's status a few task hops after the proxy
+/// forwarded the same frame to the TUI, so a quit right after the turn ended
+/// (an interrupt, then a quit) can reach the decision first (Task 17 review
+/// M3). A router held up longer than this is not waited for.
+pub const TURN_END_GRACE: Duration = Duration::from_millis(250);
+
 /// Watches the unit's main process for its own exit (pidfd / kqueue /
 /// process handle; no polling) and hands that exit to [`on_member_exit`].
 /// For Codex this is the ONLY detector of the app-server's death: the TUI
@@ -739,9 +747,10 @@ enum MemberExit {
 ///    - the main is the screen, or there is no separate main: the agent
 ///      ended (`AgentExited` with the screen's code);
 ///    - the main already exited: a crash;
-///    - code 0 and no turn running on any thread the app-server holds: the
-///      user quit Codex; the whole unit ends (which stops the app-server a
-///      remote TUI only detaches from);
+///    - code 0 and no turn running on any thread the app-server holds (the
+///      thread table gets up to [`TURN_END_GRACE`] to take a turn end the
+///      screen saw first): the user quit Codex; the whole unit ends (which
+///      stops the app-server a remote TUI only detaches from);
 ///    - code 0 with a turn running (Codex's "quit, run in background"): a
 ///      new screen against the running agent, not counted toward the cap
 ///      unless the screen quit within [`BACKGROUND_QUIT_FLOOR`] of its
@@ -891,8 +900,20 @@ async fn on_member_exit(state: &WsState, unit_id: &str, terminal_id: &str, exit:
         None => Some(Some(exit_code)),
         Some(_) if entry.unit.main_is_screen() => Some(Some(exit_code)),
         Some(main) if main.has_exited() => Some(None),
-        Some(_) if exit_code == 0 && !crate::unit_threads::turn_running(state, terminal_id) => {
-            Some(Some(0))
+        // The user quit Codex, unless a turn runs ("quit, run in
+        // background"). The table gets a moment to take a turn end the
+        // screen saw before it quit.
+        Some(_) if exit_code == 0 => {
+            let seen_running = crate::unit_threads::turn_running(state, terminal_id);
+            let running = seen_running
+                && crate::unit_threads::turn_still_running(state, terminal_id, TURN_END_GRACE)
+                    .await;
+            if seen_running && !running {
+                member_event!(debug, &entry, terminal_id,
+                    "unit.screen_exit.turn_end_late",
+                    "the pane's thread table took its turn's end after the screen quit; the quit ends the unit");
+            }
+            (!running).then_some(Some(0))
         }
         Some(_) => None,
     };

@@ -41,7 +41,7 @@ use std::time::Duration;
 use freshell_codex::launch_lifecycle::CodexTerminalLaunchManager;
 use freshell_containment::UnitEntry;
 use freshell_ownership::{HoldKind, HoldOutcome, OwnerIdentity, OwnershipState, RuntimeOwnerKind};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::WsState;
 
@@ -64,10 +64,22 @@ pub const STOP_READ_DEADLINE: Duration = Duration::from_secs(1);
 
 /// Per terminal: every thread its app-server is known to hold, with the
 /// status type last seen, plus its recent ephemeral thread ids. One mutex,
-/// never held across an await or a file write.
-#[derive(Debug, Default)]
+/// never held across an await or a file write. Every change that can change
+/// [`turn_running`] (a status, a drop, an ephemeral mark, a forgotten
+/// terminal) is signalled, for [`turn_still_running`].
+#[derive(Debug)]
 pub struct ThreadTables {
     terminals: Mutex<HashMap<String, TerminalThreads>>,
+    changes: watch::Sender<u64>,
+}
+
+impl Default for ThreadTables {
+    fn default() -> Self {
+        ThreadTables {
+            terminals: Mutex::default(),
+            changes: watch::channel(0).0,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -173,6 +185,13 @@ enum RecordOp {
 impl ThreadTables {
     fn lock(&self) -> MutexGuard<'_, HashMap<String, TerminalThreads>> {
         self.terminals.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Wakes every [`turn_still_running`] waiter (each checks its own
+    /// terminal again).
+    fn changed(&self) {
+        self.changes
+            .send_modify(|count| *count = count.wrapping_add(1));
     }
 }
 
@@ -398,6 +417,7 @@ fn ownership_state_name(state: &OwnershipState) -> &'static str {
 /// released, its unit record key removed and the sidecar record forgets it.
 pub fn drop_thread(state: &WsState, terminal_id: &str, thread_id: &str) {
     let removed = with_existing_table(state, terminal_id, |table| table.threads.remove(thread_id));
+    state.units.threads.changed();
     forget_known(state, terminal_id, thread_id, removed.flatten());
 }
 
@@ -452,6 +472,7 @@ pub fn note_ephemeral(state: &WsState, terminal_id: &str, thread_id: &str) {
         table.ephemeral.insert(thread_id);
         table.threads.remove(thread_id)
     });
+    state.units.threads.changed();
     forget_known(state, terminal_id, thread_id, removed.flatten());
 }
 
@@ -488,6 +509,7 @@ pub fn observe_status(state: &WsState, terminal_id: &str, thread_id: &str, statu
         }
         _ => {}
     }
+    state.units.threads.changed();
 }
 
 /// Whether any non-ephemeral thread the terminal's app-server holds last
@@ -500,6 +522,32 @@ pub fn turn_running(state: &WsState, terminal_id: &str) -> bool {
             .any(|known| known.status.as_deref() == Some(ACTIVE))
     })
     .unwrap_or(false)
+}
+
+/// Whether a turn still runs in the pane once its table has had up to
+/// `grace` to take a turn's end. The proxy router applies a thread's status
+/// a few task hops after the proxy forwarded the same frame to the TUI, so
+/// a TUI that ended its turn and quit at once can exit before the table
+/// knows the turn ended. Answers at once when no turn runs; otherwise waits
+/// for the table's changes (no polling) until none runs, or `grace` passed.
+pub async fn turn_still_running(state: &WsState, terminal_id: &str, grace: Duration) -> bool {
+    let mut changes = state.units.threads.changes.subscribe();
+    if !turn_running(state, terminal_id) {
+        return false;
+    }
+    let ended = tokio::time::timeout(grace, async {
+        loop {
+            if changes.changed().await.is_err() {
+                // The tables are gone: no change comes before the grace ends.
+                std::future::pending::<()>().await;
+            }
+            if !turn_running(state, terminal_id) {
+                return;
+            }
+        }
+    })
+    .await;
+    ended.is_err()
 }
 
 /// Points the Codex pane unit's lock paths, which the Gone lock check
@@ -835,6 +883,7 @@ pub(crate) fn note_rebind(state: &WsState, terminal_id: &str, old: &str, new: &s
 /// it has applied what was queued).
 pub fn forget_terminal(state: &WsState, terminal_id: &str) {
     state.units.threads.lock().remove(terminal_id);
+    state.units.threads.changed();
 }
 
 /// Queues a sidecar record change on the terminal's writer: one task per
@@ -981,6 +1030,48 @@ mod tests {
         assert!(!turn_running(&state, TERMINAL));
         observe_status(&state, TERMINAL, "t-help", "active");
         assert!(turn_running(&state, TERMINAL), "a helper runs a turn");
+    }
+
+    /// A quit decided while the table says a turn runs gives the table a
+    /// grace to take the turn's end: a pane with no running turn is answered
+    /// at once; a turn end taken while waiting answers "not running" (a
+    /// change of another thread does not); none answers "still running" at
+    /// the grace (Task 17 review M3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_running_turn_is_given_a_grace_to_end() {
+        let (state, _containment) = state_with_unit();
+        let limit = Duration::from_secs(10);
+        let answered = tokio::time::timeout(
+            limit,
+            turn_still_running(&state, TERMINAL, Duration::from_secs(600)),
+        )
+        .await;
+        assert_eq!(answered, Ok(false), "no turn runs: answered at once");
+
+        observe_status(&state, TERMINAL, "t-main", "active");
+        observe_status(&state, TERMINAL, "t-help", "idle");
+        let started = std::time::Instant::now();
+        assert!(turn_still_running(&state, TERMINAL, Duration::from_millis(100)).await);
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "a turn that keeps running is waited for the whole grace"
+        );
+
+        let waiting = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                turn_still_running(&state, TERMINAL, Duration::from_secs(600)).await
+            })
+        };
+        observe_status(&state, TERMINAL, "t-help", "active");
+        observe_status(&state, TERMINAL, "t-help", "idle");
+        assert!(turn_running(&state, TERMINAL));
+        observe_status(&state, TERMINAL, "t-main", "idle");
+        let answered = tokio::time::timeout(limit, waiting)
+            .await
+            .expect("the turn's end is taken while waiting")
+            .expect("the waiter");
+        assert!(!answered, "the turn ended within the grace");
     }
 
     #[tokio::test]
