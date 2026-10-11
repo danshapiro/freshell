@@ -1,3 +1,5 @@
+import type { ManagedRuntimeProjectionFields } from '../../shared/managed-runtime.js'
+import { managedTerminalProjection } from './managed-terminal.js'
 import type { ComponentType } from 'react'
 import { PROVIDER_ICONS, DefaultProviderIcon } from '@/components/icons/provider-icons'
 import { isNonShellMode, getProviderLabel } from '@/lib/coding-cli-utils'
@@ -192,7 +194,7 @@ export function buildResumeContent(opts: {
   liveTerminal?: {
     terminalId: string
     serverInstanceId: string
-  }
+  } & ManagedRuntimeProjectionFields
 }): TerminalPaneInput | FreshAgentPaneInput {
   const freshAgentType = resolveFreshAgentType(opts.sessionType)
   if (freshAgentType) {
@@ -247,7 +249,8 @@ export function buildResumeContent(opts: {
       ? {
           terminalId: opts.liveTerminal.terminalId,
           serverInstanceId: opts.liveTerminal.serverInstanceId,
-          status: 'running' as const,
+          status: opts.liveTerminal.runtimeStatus === 'exited' ? 'exited' as const : 'running' as const,
+          ...managedTerminalProjection(opts.liveTerminal),
         }
       : {}),
     sessionRef: {

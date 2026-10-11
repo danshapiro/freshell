@@ -10,6 +10,7 @@ import { findTabIdForSession, collectSessionRefsFromTabs, liveTerminalRowIdentit
 import { getProviderLabel } from '@/lib/coding-cli-utils'
 import { basenameSegment } from '@shared/path-basename'
 import { buildResumeContent } from '@/lib/session-type-utils'
+import { managedTerminalProjection } from '@/lib/managed-terminal'
 import { getFreshAgentProviderConfig, getFreshAgentProviderLabel } from '@/lib/fresh-agent-provider-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { recordClosedTabSnapshot, pushReopenEntry, popReopenEntry } from './tabRegistrySlice'
@@ -1694,13 +1695,14 @@ export const reopenClosedTab = createAsyncThunk(
 export const openSessionTab = createAsyncThunk(
   'tabs/openSessionTab',
   async (
-    { sessionId, title, cwd, provider, sessionType, terminalId, forceNew, firstUserMessage, isSubagent, isNonInteractive, hasTitle, liveTerminalOnly }: {
+    { sessionId, title, cwd, provider, sessionType, terminalId, managedRuntime, forceNew, firstUserMessage, isSubagent, isNonInteractive, hasTitle, liveTerminalOnly }: {
       sessionId: string
       title?: string
       cwd?: string
       provider?: CodingCliProviderName
       sessionType?: string
       terminalId?: string
+      managedRuntime?: ManagedRuntimeProjectionFields
       forceNew?: boolean
       firstUserMessage?: string
       isSubagent?: boolean
@@ -1821,7 +1823,8 @@ export const openSessionTab = createAsyncThunk(
         id: tabId,
         // Coding agents name by working directory; provider label is the fallback.
         title: title || (cwd ? basenameSegment(cwd) : null) || getProviderLabel(resolvedProvider, extensions),
-        status: 'running',
+        status: managedRuntime?.runtimeStatus === 'exited' ? 'exited' : 'running',
+        ...managedTerminalProjection(managedRuntime),
         mode: resolvedProvider,
         codingCliProvider: resolvedProvider,
         initialCwd: cwd,
@@ -1837,7 +1840,8 @@ export const openSessionTab = createAsyncThunk(
           serverInstanceId: localServerInstanceId,
           sessionRef: liveTerminalOnly ? undefined : desiredResumeContent.sessionRef,
           initialCwd: cwd,
-          status: 'running',
+          status: managedRuntime?.runtimeStatus === 'exited' ? 'exited' : 'running',
+        ...managedTerminalProjection(managedRuntime),
         },
       }))
       return

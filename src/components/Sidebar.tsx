@@ -13,6 +13,7 @@ import { resolveSessionTypeConfig, buildResumeContent } from '@/lib/session-type
 import { getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import type { BackgroundTerminal, CodingCliProviderName } from '@/store/types'
+import { managedTerminalProjection, sameManagedTerminalProjection } from '@/lib/managed-terminal'
 import {
   ALL_AGENTS,
   ALL_REPOS,
@@ -76,6 +77,7 @@ export function areTerminalsEqual(a: BackgroundTerminal[], b: BackgroundTerminal
       ai.createdAt !== bi.createdAt ||
       ai.cwd !== bi.cwd ||
       ai.status !== bi.status ||
+      !sameManagedTerminalProjection(ai, bi) ||
       ai.hasClients !== bi.hasClients ||
       ai.mode !== bi.mode ||
       !sameSessionRef(ai.sessionRef, bi.sessionRef)
@@ -102,6 +104,7 @@ export function areSessionItemsEqual(a: SessionItem[], b: SessionItem[]): boolea
       ai.subtitle !== bi.subtitle ||
       ai.hasTab !== bi.hasTab ||
       ai.isRunning !== bi.isRunning ||
+      !sameManagedTerminalProjection(ai, bi) ||
       ai.runningTerminalId !== bi.runningTerminalId ||
       !areTerminalIdsEqual(ai.runningTerminalIds, bi.runningTerminalIds) ||
       ai.archived !== bi.archived ||
@@ -154,6 +157,7 @@ function isSessionItemEqual(a: SessionItem, b: SessionItem): boolean {
     a.timestamp === b.timestamp &&
     a.hasTab === b.hasTab &&
     a.isRunning === b.isRunning &&
+    sameManagedTerminalProjection(a, b) &&
     a.runningTerminalId === b.runningTerminalId &&
     areTerminalIdsEqual(a.runningTerminalIds, b.runningTerminalIds) &&
     a.archived === b.archived &&
@@ -474,7 +478,7 @@ export default function Sidebar({
     const provider = item.provider as CodingCliProviderName
     const state = store.getState()
     const currentActiveTabId = state.tabs.activeTabId
-    const runningTerminalId = item.isRunning ? item.runningTerminalId : undefined
+    const runningTerminalId = item.isRunning || item.soulId ? item.runningTerminalId : undefined
     const localServerInstanceId = state.connection.serverInstanceId
 
     // 1. Dedup: if session is already open in a pane, focus it
@@ -523,6 +527,7 @@ export default function Sidebar({
         provider,
         sessionType,
         terminalId: runningTerminalId,
+        managedRuntime: managedTerminalProjection(item),
         firstUserMessage: item.firstUserMessage,
         isSubagent: item.isSubagent,
         isNonInteractive: item.isNonInteractive,
@@ -543,6 +548,7 @@ export default function Sidebar({
         provider,
         sessionType,
         terminalId: runningTerminalId,
+        managedRuntime: managedTerminalProjection(item),
         firstUserMessage: item.firstUserMessage,
         isSubagent: item.isSubagent,
         isNonInteractive: item.isNonInteractive,
@@ -561,7 +567,7 @@ export default function Sidebar({
         cwd: item.cwd,
         freshAgentProviderSettings,
         liveTerminal: runningTerminalId && localServerInstanceId
-          ? { terminalId: runningTerminalId, serverInstanceId: localServerInstanceId }
+          ? { terminalId: runningTerminalId, serverInstanceId: localServerInstanceId, ...managedTerminalProjection(item) }
           : undefined,
       }),
     }))
@@ -1105,6 +1111,7 @@ function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps
     a.timestamp === b.timestamp &&
     a.hasTab === b.hasTab &&
     a.isRunning === b.isRunning &&
+    sameManagedTerminalProjection(a, b) &&
     a.runningTerminalId === b.runningTerminalId &&
     areTerminalIdsEqual(a.runningTerminalIds, b.runningTerminalIds) &&
     a.archived === b.archived &&

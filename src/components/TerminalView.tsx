@@ -37,6 +37,7 @@ import { retryManagedConversation } from '@/lib/managed-runtime-retry'
 import { confirmManagedRuntimeStopped } from '@/lib/managed-runtime-stop'
 import { isManagedRuntimeRecoveryDecision, ManagedRuntimeRecoveryCard } from '@/components/ManagedRuntimeRecoveryCard'
 import { isManagedRuntimeRecoveryPending } from '@/lib/managed-runtime-recovery-message'
+import { canReplayManagedTerminal } from '@/lib/managed-terminal.js'
 import { buildReconcileRequestForPanes, foldVerdicts } from '@/lib/pane-reconcile'
 import type { PaneReconcileRequest, SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import {
@@ -902,6 +903,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // Extract terminal-specific fields (safe because we check kind later)
   const isTerminal = paneContent.kind === 'terminal'
   const terminalContent = isTerminal ? paneContent : null
+  const managedReplayAvailable = canReplayManagedTerminal(terminalContent)
 
   // kata b8ke (round-1 review: convergence is bidirectional): a TERMINAL
   // pane observing a FRESH-AGENT owner for its canonical session — the
@@ -3464,7 +3466,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     opts?: AttachTerminalOptions,
   ) => {
     if (suppressNetworkEffects) return
-    if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary)) {
+    if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary) && !canReplayManagedTerminal(contentRef.current)) {
       log.debug('attach gate declined: managed runtime recovery requires an explicit decision', {
         terminalId: tid,
         paneId: paneIdRef.current,
@@ -4082,7 +4084,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   useEffect(() => {
     if (suppressNetworkEffects) return
     if (!isTerminal || !terminalContent) return
-    if (isManagedRuntimeRecoveryDecision(terminalContent.recoverySummary)) return
+    if (isManagedRuntimeRecoveryDecision(terminalContent.recoverySummary) && !managedReplayAvailable) return
     if (shouldWaitForProviderBehavior) return
     const termCandidate = termRef.current
     if (!termCandidate) return
@@ -4647,7 +4649,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       }
 
       unsub = ws.onMessage((msg) => {
-        if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary)) return
+        if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary) && !canReplayManagedTerminal(contentRef.current)) return
         const tid = terminalIdRef.current
         const reqId = requestIdRef.current
 
@@ -5959,6 +5961,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             )
           }
           if (msg.terminalId === tid) {
+            if (contentRef.current?.soulId && msg.recoverySummary) {
+              updateContent({ runtimeStatus: msg.status, recoverySummary: msg.recoverySummary })
+            }
             if (
               msg.status === 'running'
               || msg.status === 'recovering'
@@ -6016,18 +6021,29 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         }
 
         if (msg.type === 'terminal.exit' && msg.terminalId === tid) {
-          // Record on EVERY exit path (including the early-return branches
-          // below): this is the only moment both paneId and the dying
-          // terminalId are simultaneously known — the tail clears
-          // terminalIdRef/terminalId, and subsequent auto-resume frames
-          // (terminal.status 'recovering' / terminal.replaced) carry the old
-          // id and can only be matched via the recorded lastTerminalId.
-          dispatch(recordTerminalExit({
-            paneId: paneIdRef.current,
-            terminalId: msg.terminalId,
-            exitCode: msg.exitCode,
-            at: Date.now(),
-          }))
+          // An unavailable managed code clears stale exit evidence. Known
+          // codes retain the ordinary lifecycle record used by auto-resume.
+          if (msg.managedRetained === true && msg.exitCodeAvailable === false) {
+            dispatch(clearTerminalLifecycle({ paneId: paneIdRef.current }))
+          } else {
+            dispatch(recordTerminalExit({
+              paneId: paneIdRef.current,
+              terminalId: msg.terminalId,
+              exitCode: msg.exitCode,
+              at: Date.now(),
+            }))
+          }
+
+          if (msg.managedRetained === true) {
+            launchAttemptRef.current = null
+            clearQuarantineRepair()
+            dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
+            discardPendingInput('terminal_gone')
+            updateContent({ status: 'exited', runtimeStatus: 'exited' })
+            const exitTab = tabRef.current
+            if (exitTab) dispatch(updateTab({ id: exitTab.id, updates: { status: 'exited' } }))
+            return
+          }
 
           const launchAttempt = launchAttemptRef.current
           const exitedDuringLaunch = launchAttempt?.terminalId === tid && !launchAttempt.attachReady
@@ -7027,6 +7043,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     terminalContent?.reconcileEpoch,
     terminalContent?.recoverySummary?.desiredState,
     terminalContent?.recoverySummary?.recoveryState,
+    // A durable inventory can establish a retained handle after the decision
+    // card mounted. Replay starts then without waiting for an identity change.
+    managedReplayAvailable,
     // reconcilePendingSince: re-run when the pane's pre-verdict wait state
     // changes -- the verdict fold (or the bounded timeout) clears the entry
     // and the deferred mount-create must then proceed (Task 8).
@@ -7206,9 +7225,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   const hasFatalConnectionError = isFatalConnectionErrorCode(connectionErrorCode)
   const managedRecoveryDecision = isManagedRuntimeRecoveryDecision(terminalContent.recoverySummary)
   const managedTerminal = Boolean(terminalContent.soulId || terminalContent.recoverySummary)
-  const managedAutomaticRecovery = (managedTerminal && !terminalContent.recoverySummary)
+  const managedAutomaticRecovery = terminalContent.runtimeStatus !== 'exited' && ((managedTerminal && !terminalContent.recoverySummary)
     || terminalContent.recoverySummary?.recoveryState === 'live'
-    || terminalContent.recoverySummary?.recoveryState === 'recovering'
+    || terminalContent.recoverySummary?.recoveryState === 'recovering')
   // Keep recovery diagnostics in state, but show only actionable failures.
   const visibleNotice = managedTerminal ? null : activeNotice
   const visibleCrashTrace = managedTerminal ? null : terminalContent.crashTrace

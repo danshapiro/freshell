@@ -79,6 +79,23 @@ describe('BackgroundSessions', () => {
     cleanup()
   })
 
+  it.each(['blocked', 'exited'] as const)('attaches a retained managed %s row with its existing identity', async (status) => {
+    mockGetTerminalDirectoryPage.mockResolvedValue({items:[{terminalId:'retained-managed',title:'Retained managed',
+      mode:'codex',status,runtimeStatus:status,soulId:'soul-retained',hasClients:false,createdAt:1,lastActivityAt:2,
+      sessionRef:{provider:'codex',sessionId:'native-retained'}}],nextCursor:null,revision:1})
+    const store=makeStore()
+    const user=userEvent.setup()
+    render(<Provider store={store}><BackgroundSessions /></Provider>)
+    await user.click(await screen.findByRole('button',{name:'Attach'}))
+    const [tab]=store.getState().tabs.tabs
+    const layout=store.getState().panes.layouts[tab.id]
+    expect(layout.type).toBe('leaf')
+    if(layout.type!=='leaf') throw new Error('expected leaf')
+    expect(layout.content).toMatchObject({terminalId:'retained-managed',mode:'codex',soulId:'soul-retained',runtimeStatus:status,
+      sessionRef:{provider:'codex',sessionId:'native-retained'}})
+    expect(layout.content.status).toBe(status==='exited'?'exited':'running')
+  })
+
   it('attaches with the real terminal mode, not hardcoded shell', async () => {
     const store = makeStore()
     const user = userEvent.setup()

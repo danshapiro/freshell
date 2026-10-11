@@ -825,6 +825,24 @@ describe('Sidebar Component - Session-Centric Display', () => {
   })
 
   describe('running session decoration', () => {
+    it.each(['blocked', 'exited'] as const)('clicks the retained managed %s terminal without resuming a new process', async (status) => {
+      const id=sessionId('managed-retained')
+      const projects:ProjectGroup[]=[{projectPath:'/repo',sessions:[{sessionId:id,projectPath:'/repo',lastActivityAt:1,
+        title:'Retained managed session',cwd:'/repo'}]}]
+      const terminal={terminalId:'retained-managed',title:'Retained',mode:'claude',status,runtimeStatus:status,
+        soulId:'soul-retained',hasClients:false,createdAt:1,lastActivityAt:2,sessionRef:{provider:'claude',sessionId:id},cwd:'/repo'} as unknown as BackgroundTerminal
+      const store=createTestStore({projects,serverInstanceId:'srv-local'})
+      renderSidebar(store,[terminal])
+      await act(async()=>{vi.advanceTimersByTime(100)})
+      fireEvent.click(screen.getByText('Retained managed session').closest('button')!)
+      const [tab]=store.getState().tabs.tabs
+      const layout=store.getState().panes.layouts[tab.id]
+      expect(layout.type).toBe('leaf')
+      if(layout.type!=='leaf') throw new Error('expected leaf')
+      expect(layout.content).toMatchObject({terminalId:'retained-managed',soulId:'soul-retained',runtimeStatus:status,
+        sessionRef:{provider:'claude',sessionId:id}})
+    })
+
     it('marks session as running when matching terminal exists', async () => {
       const projects: ProjectGroup[] = [
         {

@@ -984,3 +984,29 @@ test('routine notices stay silent while cleanup failure is a yellow actionable p
   expect(receipts.some((receipt) => receipt.noticeId === 'cleanup-failed' && receipt.state === 'dismissed')).toBe(true)
   expect(receipts.every((receipt) => receipt.profileId.startsWith('profile:'))).toBe(true)
 })
+
+for (const runtimeStatus of ['blocked', 'exited'] as const) {
+  test(`retained managed ${runtimeStatus} terminal attaches for replay without recreating its provider`, async ({ freshellPage, page, terminal, harness }) => {
+    await terminal.waitForTerminal()
+    await installPane(page, 'terminal', runtimeStatus === 'blocked' ? 'blocked' : 'lost')
+    const before = await paneContent(page)
+    if (before.kind !== 'terminal' || !before.terminalId) throw new Error('Expected the existing terminal handle')
+    await harness.clearSentWsMessages()
+    await page.evaluate((runtimeStatus) => {
+      const harness = window.__FRESHELL_TEST_HARNESS__!
+      const state = harness.getState()
+      const tabId = state.tabs.activeTabId!
+      const root = state.panes.layouts[tabId]
+      if (root?.type !== 'leaf') throw new Error('Expected one pane')
+      harness.dispatch({ type: 'panes/updatePaneContent', payload: { tabId, paneId: root.id,
+        content: { ...root.content, runtimeStatus, status: runtimeStatus === 'exited' ? 'exited' : 'running' } } })
+    }, runtimeStatus)
+    await expect.poll(async () => (await harness.getSentWsMessages() as Array<{ type?: string; terminalId?: string }>).
+      some((frame) => frame.type === 'terminal.attach' && frame.terminalId === before.terminalId)).toBe(true)
+    const messages = await harness.getSentWsMessages() as Array<{ type?: string }>
+    expect(messages.filter((frame) => ['terminal.create', 'terminal.input'].includes(frame.type ?? ''))).toEqual([])
+    await expect.poll(() => paneContent(page)).toMatchObject({ terminalId: before.terminalId,
+      createRequestId: before.createRequestId, soulId: SOUL_ID, runtimeStatus })
+    await expect(page.getByTestId('managed-runtime-recovery-card')).toBeVisible()
+  })
+}

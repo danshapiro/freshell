@@ -108,7 +108,9 @@ import { X, Copy, Check, PanelLeft, AlertTriangle } from 'lucide-react'
 import { updateSettingsLocal } from '@/store/settingsSlice'
 
 import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
-import { clearAllReconcilePendingPanes, clearDeadSessionAdjudication, clearDeadTerminals, clearReconcileWarming, clearTerminalLiveHandles, setReconcilePendingPanes } from '@/store/panesSlice'
+import { clearAllReconcilePendingPanes, clearDeadSessionAdjudication, clearDeadTerminals, clearReconcileWarming, clearTerminalLiveHandles, setReconcilePendingPanes, updatePaneContent } from '@/store/panesSlice'
+import { collectPaneEntries } from '@/lib/pane-utils'
+import { isRetainedManagedTerminal, managedTerminalProjection } from '@/lib/managed-terminal.js'
 import { addTerminalFreshRecoveryRequestId, addTerminalRestoreRequestId, setPaneReconcileActive } from '@/lib/terminal-restore'
 import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
 import { foldTerminalInventoryTitles } from '@/lib/terminal-inventory-titles'
@@ -1642,9 +1644,22 @@ export default function App() {
                 sessionRef: terminal.sessionRef,
               })
             }
+            if (isRetainedManagedTerminal(terminal)) {
+              for (const [tabId, layout] of Object.entries(appStore.getState().panes.layouts)) {
+                for (const { paneId, content } of collectPaneEntries(layout)) {
+                  if (content.kind === 'terminal' && content.terminalId === terminal.terminalId) {
+                    dispatch(updatePaneContent({ tabId, paneId, content: {
+                      ...content,
+                      ...managedTerminalProjection(terminal),
+                      ...(terminal.status === 'exited' ? { status: 'exited' } : {}),
+                    } }))
+                  }
+                }
+              }
+            }
           }
           const liveIds = terminals
-            .filter((t: any) => t.status === 'running')
+            .filter((t: any) => t.status === 'running' || isRetainedManagedTerminal(t))
             .map((t: any) => t.terminalId as string)
           dispatch(setLiveTerminalIds(liveIds))
           dispatch(setServerRestarted(false))

@@ -80,6 +80,18 @@ describe('sidebarSelectors running session mapping', () => {
     paneTitles: {},
   } as any
 
+  it.each(['blocked', 'exited'] as const)('retains exact managed %s membership without a running indicator', (status) => {
+    const state = createState()
+    const terminal = {terminalId:'retained-managed',title:'Retained',createdAt:10,lastActivityAt:20,
+      status, runtimeStatus:status,soulId:'soul-retained',hasClients:false,mode:'codex',
+      sessionRef:{provider:'codex',sessionId:'session-1'}} as unknown as BackgroundTerminal
+    const [item] = makeSelectSortedSessionItems()(state,[terminal],'')
+    expect(item.runningTerminalId).toBe('retained-managed')
+    expect(item.isRunning).toBe(false)
+    const synthetic = buildSessionItems([],[],emptyPanes,[{...terminal,sessionRef:undefined}],{},'repo')
+    expect(synthetic[0]).toMatchObject({sessionId:'terminal:retained-managed',runningTerminalId:'retained-managed',isRunning:false})
+  })
+
   it('pins session runningTerminalId to the oldest running terminal when duplicate mappings exist', () => {
     const selector = makeSelectSortedSessionItems()
     const state = createState()

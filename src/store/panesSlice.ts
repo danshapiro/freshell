@@ -57,6 +57,7 @@ function normalizeManagedRuntimeProjection(
     soulId: input.soulId,
     incarnationId: input.incarnationId,
     runtimeState: input.runtimeState,
+    runtimeStatus: input.runtimeStatus,
     viewIntentId: input.viewIntentId,
     viewIntentRevision: input.viewIntentRevision,
     soulIntentRevision: input.soulIntentRevision,

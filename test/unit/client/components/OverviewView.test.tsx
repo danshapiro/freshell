@@ -109,6 +109,19 @@ describe('OverviewView terminal cards — unified agent names', () => {
 
   afterEach(() => cleanup())
 
+  it.each(['blocked', 'exited'] as const)('opens the retained managed %s card without creating a shell replacement', async (status) => {
+    mockApiGet.mockResolvedValue([scopedRow({status,runtimeStatus:status,soulId:'soul-retained'})])
+    const store=buildStore()
+    renderOverview(store)
+    fireEvent.click(await screen.findByRole('button',{name:'Open terminal Row last-known name'}))
+    const [tab]=store.getState().tabs.tabs
+    const layout=store.getState().panes.layouts[tab.id]
+    expect(layout.type).toBe('leaf')
+    if(layout.type!=='leaf') throw new Error('expected leaf')
+    expect(layout.content).toMatchObject({terminalId:'term-1',mode:'claude',soulId:'soul-retained',runtimeStatus:status})
+    expect(mockApiPost).not.toHaveBeenCalled()
+  })
+
   it('resolves a scoped card display through the live canonical cache without a directory refetch', async () => {
     mockApiGet.mockResolvedValue([scopedRow()])
     const store = buildStore()

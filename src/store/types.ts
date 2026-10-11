@@ -80,14 +80,13 @@ export interface Tab extends ManagedRuntimeProjectionFields {
   nameSource?: TabNameSource
 }
 
-export interface BackgroundTerminal {
+export interface BackgroundTerminal extends ManagedRuntimeProjectionFields {
   terminalId: string
   title: string
   createdAt: number
   lastActivityAt: number
   cwd?: string
-  status: 'running' | 'exited'
-  runtimeStatus?: 'running' | 'recovering'
+  status: 'running' | 'recovering' | 'blocked' | 'exited'
   hasClients: boolean
   mode?: TabMode
   sessionRef?: SessionLocator

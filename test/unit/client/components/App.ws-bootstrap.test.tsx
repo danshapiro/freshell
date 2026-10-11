@@ -1046,6 +1046,21 @@ describe('App WS bootstrap recovery', () => {
     })
   })
 
+  it('keeps a verified final managed handle during the inventory census', async () => {
+    const store=createStore({tabs:[{id:'retained-tab',mode:'shell',status:'exited'}],panes:{layouts:{
+      'retained-tab':{type:'leaf',id:'retained-pane',content:{kind:'terminal',mode:'shell',status:'exited',
+        terminalId:'retained-managed',streamId:'retained-epoch',createRequestId:'retained-create',soulId:'soul-retained'}}},
+      activePane:{'retained-tab':'retained-pane'}}})
+    render(<Provider store={store}><App /></Provider>)
+    await waitFor(()=>expect(messageHandler).toBeTypeOf('function'))
+    act(()=>messageHandler?.({type:'terminal.inventory',terminals:[{terminalId:'retained-managed',mode:'shell',status:'exited',
+      runtimeStatus:'exited',soulId:'soul-retained',incarnationId:'inc-retained',title:'Shell',createdAt:1,lastActivityAt:2}]}))
+    const layout=store.getState().panes.layouts['retained-tab']
+    expect(layout.type).toBe('leaf')
+    if(layout.type!=='leaf') throw new Error('expected leaf')
+    expect(layout.content).toMatchObject({terminalId:'retained-managed',streamId:'retained-epoch',createRequestId:'retained-create',status:'exited'})
+  })
+
   it('recovers an OpenCode sessionRef from inventory before clearing a stale live handle', async () => {
     const store = createStore({
       tabs: [{

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act, render, screen, fireEvent, cleanup } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
-import { Provider } from 'react-redux'
+import { Provider, useSelector } from 'react-redux'
 import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
@@ -178,10 +178,21 @@ function paneState(store: ReturnType<typeof makeStore>['store']) {
   return layout.content
 }
 
-async function renderPane(store: any, paneContent: TerminalPaneContent) {
+function StoredTerminalPane() {
+  const content = useSelector((state: ReturnType<ReturnType<typeof makeStore>['store']['getState']>) => {
+    const root = state.panes.layouts[TAB]
+    if (root.type !== 'leaf' || root.content.kind !== 'terminal') {
+      throw new Error('Expected the fixture terminal pane')
+    }
+    return root.content
+  })
+  return <TerminalView tabId={TAB} paneId={PANE} paneContent={content} />
+}
+
+async function renderPane(store: any, _paneContent: TerminalPaneContent) {
   render(
     <Provider store={store}>
-      <TerminalView tabId={TAB} paneId={PANE} paneContent={paneContent} />
+      <StoredTerminalPane />
     </Provider>
   )
   await act(async () => {
@@ -333,6 +344,28 @@ describe('TerminalView exited-pane error banner', () => {
     await renderPane(store, paneContent)
 
     expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('retains managed terminal, stream and restore identity after final exit', async () => {
+    const {store,paneContent}=makeStore({mode:'shell',status:'running',managed:true,withSessionRef:false})
+    act(()=>store.dispatch(updatePaneContent({tabId:TAB,paneId:PANE,content:{...paneContent,
+      terminalId:'retained-managed',streamId:'retained-epoch'}})))
+    await renderPane(store,paneState(store))
+    act(()=>messageHandler!({type:'terminal.exit',terminalId:'retained-managed',exitCode:17,managedRetained:true,exitCodeAvailable:true}))
+    expect(paneState(store)).toMatchObject({terminalId:'retained-managed',streamId:'retained-epoch',createRequestId:REQ,status:'exited',soulId:'managed-soul'})
+  })
+
+  it('does not display a compatibility exit code when managed completion reports it unavailable', async () => {
+    const {store,paneContent}=makeStore({mode:'codex',status:'running',managed:true,
+      lifecycle:{lastTerminalId:'retained-managed',exit:{exitCode:9,at:Date.now()}}})
+    act(()=>store.dispatch(updatePaneContent({tabId:TAB,paneId:PANE,content:{...paneContent,
+      terminalId:'retained-managed',streamId:'retained-epoch'}})))
+    await renderPane(store,paneState(store))
+    act(()=>messageHandler!({type:'terminal.exit',terminalId:'retained-managed',exitCode:-1,
+      managedRetained:true,exitCodeAvailable:false}))
+    expect(selectExitRecordFrom(store.getState().terminalLifecycle,PANE)).toBeUndefined()
+    expect(screen.getByRole('alert')).not.toHaveTextContent('code -1')
+    expect(paneState(store)).toMatchObject({terminalId:'retained-managed',streamId:'retained-epoch',status:'exited'})
   })
 
   it('shows a codeless alert with Relaunch for an exited agent pane with NO exit record (post-reload)', async () => {

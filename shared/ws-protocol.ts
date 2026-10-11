@@ -14,7 +14,7 @@ import { LiveTerminalHandleSchema, SessionRefSchema, type RestoreError } from '.
 import { CodexDurabilityRefSchema, type CodexDurabilityRef } from './codex-durability.js'
 import type { SessionNameRecord, SessionNameRef, SessionNameUpdate } from './session-names.js'
 import { TabNameSourceSchema } from './session-names.js'
-import type { ManagedRuntimeInventoryChangedMessage, ManagedRuntimeViewChangedMessage } from './managed-runtime.js'
+import type { ManagedRuntimeInventoryChangedMessage, ManagedRuntimeViewChangedMessage, ManagedRuntimeRecoverySummary } from './managed-runtime.js'
 
 // ──────────────────────────────────────────────────────────────
 // Shared enums and helpers
@@ -1509,12 +1509,15 @@ export type TerminalExitMessage = {
   type: 'terminal.exit'
   terminalId: string
   exitCode: number
+  managedRetained?: boolean
+  exitCodeAvailable?: boolean
 }
 
 export type TerminalStatusMessage = {
   type: 'terminal.status'
   terminalId: string
-  status: 'running' | 'recovering' | 'exited'
+  status: 'running' | 'recovering' | 'blocked' | 'exited'
+  recoverySummary?: ManagedRuntimeRecoverySummary
   reason?: string
   attempt?: number
   /** Auto-resume 'recovering' frames only: the bounded retry budget. The
@@ -1933,7 +1936,10 @@ export type TerminalInventoryMessage = {
     createdAt: number
     lastActivityAt: number
     status: 'running' | 'exited'
-    runtimeStatus?: 'running' | 'recovering'
+    runtimeStatus?: 'running' | 'recovering' | 'blocked' | 'exited'
+    soulId?: string
+    incarnationId?: string
+    recoverySummary?: ManagedRuntimeRecoverySummary
     cwd?: string
     codexDurability?: CodexDurabilityRef
     /** Server→client only, additive + optional: the terminal's resume target is an opencode subagent (child) session. */

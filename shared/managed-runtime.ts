@@ -180,6 +180,7 @@ export const ManagedRuntimeProjectionFieldsSchema = z.object({
   soulId: NonEmptyIdSchema.optional(),
   incarnationId: NonEmptyIdSchema.optional(),
   runtimeState: ManagedRuntimeLaunchStateSchema.optional(),
+  runtimeStatus: z.enum(['running', 'recovering', 'blocked', 'exited']).optional(),
   viewIntentId: NonEmptyIdSchema.optional(),
   viewIntentRevision: NonNegativeIntSchema.optional(),
   soulIntentRevision: NonNegativeIntSchema.optional(),
