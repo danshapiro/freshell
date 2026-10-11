@@ -343,6 +343,29 @@ struct Fallback {
 static FALLBACK: OnceLock<Fallback> = OnceLock::new();
 
 impl Fallback {
+    /// The fallback containment of process `pid` on the state root `root`:
+    /// the tag backend, whose store takes over, as it opens, the records
+    /// whose locks are free there (a directory an earlier process with the
+    /// same pid left behind). Those are noted as inherited.
+    fn open(pid: u32, root: PathBuf) -> Self {
+        let containment = Containment::tag_backend(SelectOptions {
+            shim: None,
+            state_root: root.clone(),
+        });
+        let inherited = containment
+            .recorded_units()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|record| record.unit_id)
+            .collect();
+        Self {
+            containment,
+            root,
+            pid,
+            inherited,
+        }
+    }
+
     /// Kills every unit this process created that is still recorded (it
     /// never reached Gone: a test that ended early), one after another on
     /// this thread, each as `TagUnit::kill_recorded_now` finds its members:
@@ -398,26 +421,16 @@ pub fn global_or_fallback_containment() -> Containment {
     FALLBACK
         .get_or_init(|| {
             let pid = std::process::id();
-            let root = std::env::temp_dir().join(format!("freshell-units-{pid}"));
-            let containment = Containment::tag_backend(SelectOptions {
-                shim: None,
-                state_root: root.clone(),
-            });
-            let inherited = containment
-                .recorded_units()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|record| record.unit_id)
-                .collect();
-            // SAFETY: registers a plain `extern "C"` function with no
-            // arguments; it only reads a set-once static.
-            unsafe { libc::atexit(stop_fallback_units_and_remove_root) };
-            Fallback {
-                containment,
-                root,
+            let fallback = Fallback::open(
                 pid,
-                inherited,
-            }
+                std::env::temp_dir().join(format!("freshell-units-{pid}")),
+            );
+            // SAFETY: `atexit` only stores the pointer. The handler is a
+            // plain `extern "C"` function with no arguments that lives as
+            // long as the process, and it never unwinds into the C runtime
+            // (its sweep runs under `catch_unwind`).
+            unsafe { libc::atexit(stop_fallback_units_and_remove_root) };
+            fallback
         })
         .containment
         .clone()
@@ -524,6 +537,42 @@ mod tests {
             inherited_root.still_running(),
             "a unit this process did not create was killed"
         );
+    }
+
+    /// The fallback opens its store on a directory an earlier process with
+    /// the same pid may have left behind: the records it takes over there
+    /// (their locks are free) are inherited, so its exit never stops them;
+    /// a unit it creates afterwards is its own.
+    #[test]
+    fn the_fallback_inherits_only_the_records_it_finds_at_open() {
+        let state = tempfile::tempdir().unwrap();
+        let left_behind = record_with_roots(Vec::new());
+        // The earlier process's store, closed: its locks are released.
+        RecordStore::open(state.path()).write(&left_behind).unwrap();
+
+        let fallback = Fallback::open(std::process::id(), state.path().to_path_buf());
+        let created = fallback
+            .containment
+            .create_unit(
+                UnitId::mint(),
+                UnitLabel {
+                    provider: "codex".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(fallback.root, state.path());
+        assert_eq!(fallback.inherited, BTreeSet::from([left_behind.unit_id]));
+        let recorded: Vec<UnitId> = fallback
+            .containment
+            .recorded_units()
+            .unwrap()
+            .into_iter()
+            .map(|record| record.unit_id)
+            .collect();
+        assert!(recorded.contains(created.id()), "{recorded:?}");
+        assert!(!fallback.inherited.contains(created.id()));
     }
 
     /// A pinned process that is not the test's own child, killed through
