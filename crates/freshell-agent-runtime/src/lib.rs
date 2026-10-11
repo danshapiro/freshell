@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, VecDeque},
     fs,
+    io::Read,
     path::Path,
 };
 
@@ -1324,20 +1325,36 @@ fn probe_bounded_tree(root: &Path, expected: &str) -> ProviderStoreProbe {
             }
             continue;
         }
-        if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+        if !metadata.is_file() {
+            continue;
+        }
+        let filename_match = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains(expected));
+        if filename_match {
+            // Exact filename recovery needs readability, not a complete
+            // transcript scan. Keep this check bounded as transcripts grow.
+            if fs::File::open(&path)
+                .and_then(|mut file| file.read(&mut [0_u8; 1]))
+                .is_ok()
+            {
+                return ProviderStoreProbe::Ready {
+                    evidence: vec![path.display().to_string()],
+                };
+            }
+            continue;
+        }
+        if metadata.len() > 1024 * 1024 {
             continue;
         }
         let Ok(bytes) = fs::read(&path) else {
             continue;
         };
-        let filename_match = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.contains(expected));
         let content_match = bytes
             .windows(expected.len())
             .any(|w| w == expected.as_bytes());
-        if filename_match || content_match {
+        if content_match {
             return ProviderStoreProbe::Ready {
                 evidence: vec![path.display().to_string()],
             };
@@ -1767,6 +1784,145 @@ mod tests {
             ),
             "unrecorded installed channel cannot certify a default-database negative"
         );
+    }
+
+    #[test]
+    fn recovery_store_large_exact_claude_transcript_remains_ready() {
+        assert_large_exact_transcript_ready("claude");
+    }
+
+    #[test]
+    fn recovery_store_large_exact_codex_transcript_remains_ready() {
+        assert_large_exact_transcript_ready("codex");
+    }
+
+    fn assert_large_exact_transcript_ready(provider: &str) {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(if provider == "claude" {
+            ".claude/projects"
+        } else {
+            ".codex/sessions"
+        });
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("exact.jsonl");
+        fs::write(&path, br#"{"sessionId":"exact"}"#).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(1024 * 1024 + 1)
+            .unwrap();
+        let result = probe_provider_store(
+            home.path(),
+            &resume_spec_for_test(provider, "exact", home.path()),
+        );
+        match result {
+            ProviderStoreProbe::Ready { evidence } => {
+                assert_eq!(evidence, vec![path.display().to_string()]);
+            }
+            other => panic!("readable large {provider} exact transcript must recover: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_store_exact_symlink_and_directory_candidates_stay_unknown() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().unwrap();
+        let outside = home.path().join("outside.jsonl");
+        fs::write(&outside, br#"{"sessionId":"exact"}"#).unwrap();
+        for provider in ["claude", "codex"] {
+            let root = home.path().join(if provider == "claude" {
+                ".claude/projects"
+            } else {
+                ".codex/sessions"
+            });
+            fs::create_dir_all(root.join("exact-directory")).unwrap();
+            symlink(&outside, root.join("exact.jsonl")).unwrap();
+            assert!(matches!(
+                probe_provider_store(
+                    home.path(),
+                    &resume_spec_for_test(provider, "exact", home.path())
+                ),
+                ProviderStoreProbe::Blocked {
+                    reason: RecoveryBlockReason::AmbiguousIdentity,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn recovery_store_large_nonmatching_transcript_content_stays_unknown() {
+        let home = tempfile::tempdir().unwrap();
+        for provider in ["claude", "codex"] {
+            let root = home.path().join(if provider == "claude" {
+                ".claude/projects"
+            } else {
+                ".codex/sessions"
+            });
+            fs::create_dir_all(&root).unwrap();
+            let path = root.join("different.jsonl");
+            fs::write(&path, br#"{"sessionId":"exact"}"#).unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(1024 * 1024 + 1)
+                .unwrap();
+            assert!(matches!(
+                probe_provider_store(
+                    home.path(),
+                    &resume_spec_for_test(provider, "exact", home.path())
+                ),
+                ProviderStoreProbe::Blocked {
+                    reason: RecoveryBlockReason::AmbiguousIdentity,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_store_unreadable_exact_transcripts_block_without_certifying_absence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        for provider in ["claude", "codex"] {
+            let root = home.path().join(if provider == "claude" {
+                ".claude/projects"
+            } else {
+                ".codex/sessions"
+            });
+            fs::create_dir_all(&root).unwrap();
+            let path = root.join("exact.jsonl");
+            fs::write(&path, br#"{"sessionId":"exact"}"#).unwrap();
+            let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+            for size in [24, 1024 * 1024 + 1] {
+                file.set_len(size).unwrap();
+                assert_eq!(
+                    fs::File::open(&path).unwrap_err().kind(),
+                    std::io::ErrorKind::PermissionDenied,
+                    "synthetic unreadable fixture requires unprivileged execution"
+                );
+                assert!(
+                    matches!(
+                        probe_provider_store(
+                            home.path(),
+                            &resume_spec_for_test(provider, "exact", home.path())
+                        ),
+                        ProviderStoreProbe::Blocked {
+                            reason: RecoveryBlockReason::AmbiguousIdentity,
+                            ..
+                        }
+                    ),
+                    "{provider} unreadable exact transcript of {size} bytes"
+                );
+            }
+        }
     }
 
     #[test]
