@@ -153,38 +153,49 @@ describe('managed environment create failure retention', () => {
   it.each(['owned-credential', 'foreign-preparation', 'owned-unknown'] as const)('retains safe grant delivery evidence for %s before owned cleanup', async kind => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'frs-grant-failure-'))
     const home = path.join(directory, 'home')
-    await fs.mkdir(home)
-    const rig = new ManagedRuntimeBrowserRig(directory, 2, {}, {}, 'release', { enabledProviders: [] }, home)
-    const markers = ['AUTH_SECRET_MARKER', 'CONFIG_SECRET_MARKER', 'CONVERSATION_SECRET_MARKER']
-    const incarnationId = '11111111-1111-4111-8111-111111111111'
-    const hostId = 'a'.repeat(64)
-    const runtimeRoot = path.join(rig.runtime.testRoot, 'r', 'grant-owned', 'x')
-    const lifecycle = path.join(path.dirname(runtimeRoot), 'evidence', 'lifecycle.jsonl')
-    const events = [
-      { event: 'supervisor.host_started', data: { incarnationId, containerId: hostId } },
-      { event: 'supervisor.activation_failed', data: { incarnationId, stage: 'deliver_execution_grant',
-        errorCode: 'HOST_UNREACHABLE', launchState: 'starting', errorClass: 'runtime_activation_failed' } },
-    ]
-    await fs.mkdir(path.dirname(lifecycle), { recursive: true })
-    await fs.writeFile(lifecycle, events.map(event => JSON.stringify(event)).join('\n') + '\n')
-    const reason = kind === 'owned-credential' ? 'OneCLI grant is unavailable'
-      : kind === 'foreign-preparation' ? 'prepared private source unreadable' : 'UNKNOWN'
-    const message = kind === 'owned-credential'
-      ? `resolve managed provider credentials: ${reason}: Permission denied (os error 13)`
-      : kind === 'foreign-preparation' ? reason : markers.join(' ')
-    const response: ErrorMessage = { type: 'error', code: 'PTY_SPAWN_FAILED', timestamp: new Date().toISOString(),
-      message: `managed runtime launch failed: runtime supervisor rejected request: HostUnreachable: ${message}; ${markers.join(' ')}` }
-    const childLogs = kind === 'owned-credential'
-      ? JSON.stringify({ event: 'provider.projection.transaction.failed', stage: 'validate',
-        cause: `provider transaction mounted file /synthetic/owned/path: Permission denied (os error 13); ${markers.join(' ')}` })
-      : JSON.stringify({ event: 'session_host.fatal', error: markers.join(' ') })
-    const logs = vi.spyOn(rig.runtime, 'containerLogs').mockImplementation(id => id === hostId ? childLogs : '')
-    const receipts = vi.spyOn(rig.runtime.broker, 'receiptIds').mockReturnValue(new Set(kind === 'foreign-preparation' ? [] : [hostId]))
-    rig.web = { capturedOutput: () => ({ stdout: '', stderr: markers.join(' ') }),
-      stop: async () => fs.rm(home, { recursive: true }) } as unknown as typeof rig.web
-    rig.supervisor = { containerId: 'd'.repeat(64), runtimeRoot } as typeof rig.supervisor
+    let rig: ManagedRuntimeBrowserRig | undefined
+    let restoreReceipts: (() => void) | undefined
     try {
-      expect(() => assertManagedTerminalCreated(rig, response)).toThrow()
+      await fs.mkdir(home, { mode: 0o700 })
+      await fs.mkdir(path.join(directory, 'test/runtime'), { recursive: true })
+      await fs.writeFile(path.join(directory, 'test/runtime/gate-manifest.json'), '{}')
+      const host = path.join(directory, 'host')
+      await fs.writeFile(host, 'owned fixture host artifact')
+      rig = new ManagedRuntimeBrowserRig(directory, 2, {}, {}, 'release', { enabledProviders: [] }, home,
+        { workspaceRoots: [directory], bootstrapFiles: [], defaultCwd: directory })
+      useOwnedHarnessArtifacts(rig.runtime, host)
+      await rig.runtime.prepare()
+      const markers = ['AUTH_SECRET_MARKER', 'CONFIG_SECRET_MARKER', 'CONVERSATION_SECRET_MARKER']
+      const incarnationId = '11111111-1111-4111-8111-111111111111'
+      const hostId = 'a'.repeat(64)
+      const runtimeRoot = path.join(rig.runtime.testRoot, 'r', 'grant-owned', 'x')
+      const lifecycle = path.join(path.dirname(runtimeRoot), 'evidence', 'lifecycle.jsonl')
+      const events = [
+        { event: 'supervisor.host_started', data: { incarnationId, containerId: hostId } },
+        { event: 'supervisor.activation_failed', data: { incarnationId, stage: 'deliver_execution_grant',
+          errorCode: 'HOST_UNREACHABLE', launchState: 'starting', errorClass: 'runtime_activation_failed' } },
+      ]
+      await fs.mkdir(path.dirname(lifecycle), { recursive: true })
+      await fs.writeFile(lifecycle, events.map(event => JSON.stringify(event)).join('\n') + '\n')
+      const reason = kind === 'owned-credential' ? 'OneCLI grant is unavailable'
+        : kind === 'foreign-preparation' ? 'prepared private source unreadable' : 'UNKNOWN'
+      const message = kind === 'owned-credential'
+        ? `resolve managed provider credentials: ${reason}: Permission denied (os error 13)`
+        : kind === 'foreign-preparation' ? reason : markers.join(' ')
+      const response: ErrorMessage = { type: 'error', code: 'PTY_SPAWN_FAILED', timestamp: new Date().toISOString(),
+        message: `managed runtime launch failed: runtime supervisor rejected request: HostUnreachable: ${message}; ${markers.join(' ')}` }
+      const childLogs = kind === 'owned-credential'
+        ? JSON.stringify({ event: 'provider.projection.transaction.failed', stage: 'validate',
+          cause: `provider transaction mounted file /synthetic/owned/path: Permission denied (os error 13); ${markers.join(' ')}` })
+        : JSON.stringify({ event: 'session_host.fatal', error: markers.join(' ') })
+      const logs = vi.spyOn(rig.runtime, 'containerLogs').mockImplementation(id => id === hostId ? childLogs : '')
+      const receipts = vi.spyOn(rig.runtime.broker, 'receiptIds').mockReturnValue(new Set(kind === 'foreign-preparation' ? [] : [hostId]))
+      restoreReceipts = () => receipts.mockRestore()
+      rig.web = { capturedOutput: () => ({ stdout: '', stderr: markers.join(' ') }),
+        stop: async () => fs.rm(home, { recursive: true }) } as unknown as typeof rig.web
+      rig.supervisor = { containerId: 'd'.repeat(64), runtimeRoot } as typeof rig.supervisor
+      const owner = rig
+      expect(() => assertManagedTerminalCreated(owner, response)).toThrow()
       receipts.mockRestore()
       expect(await rig.stop()).toEqual({ ok: true, errors: [] })
       await expect(fs.stat(home)).rejects.toMatchObject({ code: 'ENOENT' })
@@ -207,7 +218,11 @@ describe('managed environment create failure retention', () => {
       }
       for (const marker of markers) expect.soft(stored).not.toContain(marker)
     } finally {
-      await fs.rm(rig.runtime.testRoot, { recursive: true, force: true })
+      restoreReceipts?.()
+      if (rig) {
+        await rig.stop()
+        await fs.rm(rig.runtime.testRoot, { recursive: true, force: true })
+      }
       await fs.rm(directory, { recursive: true, force: true })
       vi.restoreAllMocks()
     }
