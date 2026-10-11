@@ -38,7 +38,7 @@ import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, docker
   OpencodeQualificationTurnSchema,
   requireOpenCodeOnecliBootstrap, EXCLUDED_SOURCE_SENTINELS } from './runtime-sandbox.js'
 import { createRuntimeEnclosureHandle, type RuntimeEnclosureHandle } from './runtime-sandbox.js'
-import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
+import type { Reporter, TestCase, TestResult, TestStep, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
 import { ManagedRuntimeInventorySnapshotSchema, type ManagedRuntimeInventorySnapshot } from '../../shared/managed-runtime.js'
 import type { RuntimeWriterClaimFacts, ManagedMigrationFacts, ManagedStopResult, ManagedStopCompletionFacts } from './runtime-sandbox.js'
@@ -1984,10 +1984,93 @@ function parseExternalCloudCaseObservations(
   return { status: status.data, cases }
 }
 
+// The prefix keeps these bounded records in Cloud Logging textPayload. The
+// existing launcher retains that display stream in cloud-launcher-output.json.
+const HISTORY_DIAGNOSTIC_PREFIX = 'managed-history-diagnostic '
+const HistoryCallsiteSchema = z.object({
+  file: z.string().regex(/^test\/e2e-browser\/(specs|helpers)\/[a-zA-Z0-9_.-]+\.ts$/),
+  line: z.number().int().positive(), column: z.number().int().positive(),
+})
+const HistoryPhaseSchema = z.enum(['start', 'goto', 'harness', 'connection', 'new-tab', 'picker-visible',
+  'picker-click', 'directory-fill', 'directory-enter', 'pane-observation', 'first-inventory',
+  'composer-enabled', 'composer-fill', 'send', 'completion', 'native-pane', 'tab-count', 'layout',
+  'inventory-before', 'history-open', 'history-pane-visible', 'history-active-tab', 'history-tab-count',
+  'history-layout', 'history-inventory', 'history-wire', 'history-current', 'history-dispatch'])
+const HistoryModeSchema = z.enum(['bootstrap', 'freshclaude', 'kilroy', 'freshcodex', 'freshopencode'])
+const HistoryErrorCategorySchema = z.enum(['timeout', 'interrupted', 'operation-error'])
+const HistoryDiagnosticSchema = z.discriminatedUnion('event', [
+  z.object({ event: z.literal('managed_history_phase'), phase: HistoryPhaseSchema, mode: HistoryModeSchema,
+    state: z.enum(['begin', 'end', 'failed']), callsite: HistoryCallsiteSchema.optional(),
+    errorCategory: HistoryErrorCategorySchema.optional() }),
+  z.object({ event: z.literal('managed_history_navigation'), status: z.number().int().min(100).max(599).optional(),
+    resourceType: z.enum(['document', 'stylesheet', 'image', 'media', 'font', 'script', 'texttrack',
+      'xhr', 'fetch', 'eventsource', 'websocket', 'manifest', 'other']),
+    category: z.enum(['response', 'request-failed', 'page-error']).optional() }),
+  z.object({ event: z.literal('managed_history_failure'), phase: HistoryPhaseSchema.optional(), mode: HistoryModeSchema.optional(),
+    callsite: HistoryCallsiteSchema.optional(), status: z.enum(['failed', 'timedOut', 'interrupted']),
+    errorCategory: HistoryErrorCategorySchema, diagnosticLimitReached: z.boolean() }),
+])
+type HistoryDiagnostic = z.infer<typeof HistoryDiagnosticSchema>
+
+function historyCallsite(location?: { file: string; line: number; column: number }): z.infer<typeof HistoryCallsiteSchema> | undefined {
+  if (!location) return undefined
+  const file = location.file.replaceAll('\\', '/').match(/test\/e2e-browser\/(?:specs|helpers)\/[a-zA-Z0-9_.-]+\.ts$/)?.[0]
+  const parsed = HistoryCallsiteSchema.safeParse({ ...location, file })
+  return parsed.success ? parsed.data : undefined
+}
+
+function historyErrorCategory(error: unknown): z.infer<typeof HistoryErrorCategorySchema> {
+  return error instanceof Error && (error.name === 'TimeoutError' || /timed?\s*out|timeout/i.test(error.message)) ? 'timeout'
+    : error instanceof Error && /closed|interrupted|abort/i.test(error.message) ? 'interrupted' : 'operation-error'
+}
+
+/** Observe original awaits without adding a deadline, cancellation or retry. */
+export class ManagedHistoryAwaitedPhases {
+  private emitted = 0
+  constructor(private readonly emit: (line: string) => void = line => { process.stdout.write(line) }) {}
+  private record(event: HistoryDiagnostic): void {
+    if (this.emitted++ >= 256) return
+    this.emit(`${HISTORY_DIAGNOSTIC_PREFIX}${JSON.stringify(event)}\n`)
+  }
+  async run<T>(phase: z.infer<typeof HistoryPhaseSchema>, mode: z.infer<typeof HistoryModeSchema>, operation: () => T | Promise<T>): Promise<T> {
+    const location = new Error().stack?.split('\n').filter(line => !/\bat phase\b/.test(line))
+      .map(line => line.match(/(test\/e2e-browser\/(?:specs|helpers)\/[a-zA-Z0-9_.-]+\.ts):(\d+):(\d+)/)).find(Boolean)
+    const callsite = location ? historyCallsite({ file: location[1], line: Number(location[2]), column: Number(location[3]) }) : undefined
+    this.record({ event: 'managed_history_phase', phase, mode, state: 'begin', callsite })
+    try {
+      const value = await operation()
+      this.record({ event: 'managed_history_phase', phase, mode, state: 'end', callsite })
+      return value
+    } catch (error) {
+      this.record({ event: 'managed_history_phase', phase, mode, state: 'failed', callsite, errorCategory: historyErrorCategory(error) })
+      throw error
+    }
+  }
+  navigation(facts: Omit<Extract<HistoryDiagnostic, { event: 'managed_history_navigation' }>, 'event'>): void {
+    this.record({ event: 'managed_history_navigation', ...facts })
+  }
+}
+
+/** Parse only the bounded body-free text emitted by the original reporter. */
+export function parseManagedHistoryDiagnosticText(text: string): Array<HistoryDiagnostic & { runId?: string; candidateSha?: string; id?: string }> {
+  const events: Array<HistoryDiagnostic & { runId?: string; candidateSha?: string; id?: string }> = []
+  for (const line of text.split('\n')) {
+    const offset = line.indexOf(HISTORY_DIAGNOSTIC_PREFIX)
+    if (offset < 0 || line.length > 8192) continue
+    try {
+      const parsed = HistoryDiagnosticSchema.and(z.object({ runId: z.string().uuid().optional(),
+        candidateSha: z.string().regex(/^[a-f0-9]{40}$/).optional(), id: z.string().max(256).optional() })).safeParse(JSON.parse(line.slice(offset + HISTORY_DIAGNOSTIC_PREFIX.length)))
+      if (parsed.success) events.push(parsed.data)
+    } catch { /* unrelated or truncated display line */ }
+  }
+  return events
+}
+
 /** Body-free execution observations travel through the exact Cloud execution log. */
 export default class ManagedExternalExecutionReporter implements Reporter {
   private cases = 0
   private readonly descriptor = resolveManagedExternalDescriptor(process.env)
+  private readonly history = new Map<string, { buffer: string; count: number; active?: Extract<HistoryDiagnostic, { event: 'managed_history_phase' }>; callsite?: z.infer<typeof HistoryCallsiteSchema> }>()
 
   printsToStdio(): boolean { return true }
   private emit(event: Record<string, unknown>): void {
@@ -1995,7 +2078,41 @@ export default class ManagedExternalExecutionReporter implements Reporter {
     process.stdout.write(`${JSON.stringify({ severity: 'info', runId: this.descriptor.runId,
       candidateSha: this.descriptor.candidateSha, ...event })}\n`)
   }
+  private emitHistory(test: TestCase, event: HistoryDiagnostic): void {
+    if (!this.descriptor) throw new Error('external execution reporter requires its owned descriptor')
+    process.stdout.write(`${HISTORY_DIAGNOSTIC_PREFIX}${JSON.stringify({ severity: 'info',
+      runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha, id: test.id, ...event })}\n`)
+  }
+  onStdOut(chunk: string | Buffer, test?: TestCase, _result?: TestResult): void {
+    if (!test || path.basename(test.location.file) !== 'runtime-fresh-agent-fixture-rust.spec.ts') return
+    const state = this.history.get(test.id) ?? { buffer: '', count: 0 }
+    this.history.set(test.id, state)
+    state.buffer = (state.buffer + String(chunk)).slice(-8192)
+    const lines = state.buffer.split('\n')
+    state.buffer = lines.pop()!
+    for (const event of parseManagedHistoryDiagnosticText(lines.join('\n'))) {
+      if (state.count++ >= 256) continue
+      if (event.event === 'managed_history_phase') {
+        if (event.state === 'begin') { state.active = event; state.callsite = event.callsite }
+        else if (event.state === 'end' && state.active?.phase === event.phase && state.active.mode === event.mode) state.active = undefined
+        else if (event.state === 'failed' && state.active?.phase === event.phase && state.active.mode === event.mode) state.active = event
+      }
+      this.emitHistory(test, event)
+    }
+  }
+  onStepBegin(test: TestCase, _result: TestResult, step: TestStep): void {
+    const state = this.history.get(test.id)
+    if (state?.active && step.category === 'pw:api') state.callsite = historyCallsite(step.location) ?? state.callsite
+  }
   onTestEnd(test: TestCase, result: TestResult): void {
+    const history = this.history.get(test.id)
+    if (history && ['failed', 'timedOut', 'interrupted'].includes(result.status)) {
+      this.emitHistory(test, { event: 'managed_history_failure', phase: history.active?.phase, mode: history.active?.mode,
+        callsite: history.callsite, status: result.status as 'failed' | 'timedOut' | 'interrupted',
+        errorCategory: result.status === 'timedOut' ? 'timeout' : result.status === 'interrupted' ? 'interrupted'
+          : history.active?.errorCategory ?? 'operation-error', diagnosticLimitReached: history.count >= 256 })
+    }
+    this.history.delete(test.id)
     const file = path.basename(test.location.file)
     const titles = test.titlePath()
     const fileIndex = titles.findIndex(title => path.basename(title) === file)
