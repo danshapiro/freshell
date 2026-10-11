@@ -8983,14 +8983,23 @@ async fn the_replacement_probe_never_confirms_a_terminal_prior_on_a_missing_row(
 /// A test [`crate::PaneUnitStopper`] over the rig's unit directory: records
 /// every call, stops the pane's unit (Force) under the given operation and
 /// resolves at Gone with the unit's report, after ending the row the way
-/// the WebSocket layer's Gone does. With `user_kill_joins`, a Shift-X joins
-/// the stop right after it begins (the report's reason becomes `shift-x`).
+/// the WebSocket layer's Gone does, shaped by its [`StopperOptions`].
 struct RecordingStopper {
     units: Arc<freshell_containment::UnitDirectory>,
     registry: freshell_terminal::TerminalRegistry,
     hooks: Arc<HandoffTestHooks>,
     calls: std::sync::Mutex<Vec<(String, &'static str, Option<String>)>>,
+    options: StopperOptions,
+}
+
+/// How a [`RecordingStopper`] stops.
+#[derive(Clone, Default)]
+struct StopperOptions {
+    /// A Shift-X joins the stop right after it begins (the report's reason
+    /// becomes `shift-x`).
     user_kill_joins: bool,
+    /// The Gone (and so the row's end) waits for the test to notify it.
+    gone_hold: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl RecordingStopper {
@@ -9013,7 +9022,10 @@ impl crate::PaneUnitStopper for RecordingStopper {
         let entry = self.units.by_terminal(&terminal_id);
         let registry = self.registry.clone();
         let hooks = Arc::clone(&self.hooks);
-        let user_kill_joins = self.user_kill_joins;
+        let StopperOptions {
+            user_kill_joins,
+            gone_hold,
+        } = self.options.clone();
         Box::pin(async move {
             let entry = entry?;
             let ended = terminal_id.clone();
@@ -9024,6 +9036,9 @@ impl crate::PaneUnitStopper for RecordingStopper {
             )
             .on_gone(Box::new(move |_| {
                 Box::pin(async move {
+                    if let Some(hold) = gone_hold {
+                        hold.notified().await;
+                    }
                     let _ = tokio::task::spawn_blocking(move || {
                         registry.complete_unit_end(&ended, freshell_terminal::UnitEnding::Requested)
                     })
@@ -9171,6 +9186,22 @@ struct UnitRig {
 }
 
 fn build_unit_rig(sid: &str, hold: freshell_ownership::HoldKind, user_kill_joins: bool) -> UnitRig {
+    build_unit_rig_with(
+        sid,
+        hold,
+        StopperOptions {
+            user_kill_joins,
+            ..StopperOptions::default()
+        },
+    )
+}
+
+/// [`build_unit_rig`] whose stopper stops as `options` say.
+fn build_unit_rig_with(
+    sid: &str,
+    hold: freshell_ownership::HoldKind,
+    options: StopperOptions,
+) -> UnitRig {
     let hooks = Arc::new(HandoffTestHooks::default());
     let mut rig = build_rig(Some(Arc::clone(&hooks)));
     let state_root = tempfile::tempdir().expect("unit state root");
@@ -9185,7 +9216,7 @@ fn build_unit_rig(sid: &str, hold: freshell_ownership::HoldKind, user_kill_joins
         registry: rig.registry.clone(),
         hooks: Arc::clone(&hooks),
         calls: Default::default(),
-        user_kill_joins,
+        options,
     });
     let fresh_agent = rig
         .fresh_agent
@@ -9310,6 +9341,63 @@ async fn a_handoff_never_stops_an_extra_hold() {
             if owner.terminal_id.as_deref() == Some(u.prior.terminal_id.as_str())
     ));
     u.rig.registry.kill(&u.prior.terminal_id);
+}
+
+/// Handoff edge (c): a handoff aborted while its unit prior's stop is in
+/// flight never puts that prior back `Live`. The prior's row stays Running
+/// until its unit's Gone, but a unit whose stop has begun is dying, so the
+/// abort's liveness re-probe answers not live and the key ends Vacant.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handoff_aborted_during_its_unit_priors_stop_never_restores_it_live() {
+    let _guard = ENV_LOCK.lock().await;
+    let sid = format!("aborted-mid-stop-{}", uuid::Uuid::new_v4());
+    let gone_hold = Arc::new(tokio::sync::Notify::new());
+    let u = build_unit_rig_with(
+        &sid,
+        freshell_ownership::HoldKind::Main,
+        StopperOptions {
+            gone_hold: Some(Arc::clone(&gone_hold)),
+            ..StopperOptions::default()
+        },
+    );
+
+    let handle = u
+        .rig
+        .runner
+        .spawn_handoff(handoff_req_fresh("codex", &sid, "freshcodex"));
+    await_cond("the prior's unit stop has begun", || {
+        u.stopper
+            .units
+            .by_terminal(&u.prior.terminal_id)
+            .is_some_and(|entry| entry.unit.stop_in_flight().is_some())
+    })
+    .await;
+    assert!(
+        u.rig
+            .registry
+            .probe(&u.prior.terminal_id)
+            .is_some_and(|row| { row.status == freshell_protocol::TerminalRunStatus::Running }),
+        "precondition: the dying prior's row is still Running"
+    );
+
+    handle.abort();
+    let _ = handle.task.await;
+    await_cond("the abort cleanup settles the key", || {
+        !matches!(
+            u.rig.ownership.observe("codex", &sid).state,
+            OwnershipState::Handoff { .. }
+        )
+    })
+    .await;
+    let state = u.rig.ownership.observe("codex", &sid).state;
+    assert_eq!(
+        state,
+        OwnershipState::Vacant,
+        "the dying prior is never restored Live"
+    );
+
+    gone_hold.notify_one();
+    await_cond("the prior is Gone", || u.prior.screen.has_exited()).await;
 }
 
 /// A user's kill (Shift-X) that joins the handoff's stop of its prior takes
