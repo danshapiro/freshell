@@ -9,6 +9,7 @@ import { validatePhase5ChaosReceipt } from './runtime-phase5-chaos-evidence.js'
 import { loadRuntimeSoakReceipt } from './runtime-soak-evidence.js'
 import { stableJson } from './runtime-phase5-evidence-common.js'
 import { loadProviderParityLocalReceipt } from './provider-parity-receipt.js'
+import { defaultReceiptFileName } from './runtime-receipts.js'
 
 export const TABS_CASE_TITLES = [
   'managed fresh-agent: already-live attach restores stale loss through real hosted HTTP truth',
@@ -30,6 +31,27 @@ export type BrowserOriginalIndex = {
   executed: Array<BrowserCaseIdentity & { status: 'passed' }>
   artifacts: Record<keyof typeof BROWSER_ORIGINAL_FILES, BrowserOriginalReference>
   receiptDigests: Record<string, string>
+}
+
+export function isCanonicalPhase5BrowserReceipt(name: string): boolean {
+  return name === 'FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT' || name === 'FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT'
+}
+
+/** Loss and chaos keep their original owner directory because their artifacts are relative to it. */
+export function phase5BrowserReceiptOriginal(input: {
+  repoRoot: string; candidateSha: string; name: string; originals: BrowserOriginalIndex[]
+}): BrowserOriginalReference {
+  if (!isCanonicalPhase5BrowserReceipt(input.name)) throw new Error('canonical phase-five browser receipt required')
+  const owners = input.originals.filter(original => original.receiptDigests?.[input.name])
+  if (owners.length !== 1) throw new Error('canonical receipt requires exactly one current browser owner')
+  const owner = owners[0]!
+  if (owner.candidateSha !== input.candidateSha || !/^[a-f0-9-]{36}$/.test(owner.runId)) throw new Error('canonical receipt browser owner candidate or run differs')
+  const reference = { path: `.runtime-evidence/${input.candidateSha}/${owner.runId}/browser/${defaultReceiptFileName(input.name)}`,
+    sha256: owner.receiptDigests[input.name]! }
+  const receipt = parseOriginalJson(readCampaignOriginal(input.repoRoot, reference, reference.path))
+  if (receipt.receiptRunId !== owner.runId || receipt.candidateSha !== input.candidateSha
+    || receipt.runtimeImage !== owner.runtimeImage || receipt.status !== 'PASS') throw new Error('canonical receipt belongs to another browser owner or workload')
+  return reference
 }
 
 export type CampaignStepDescriptor = {
@@ -569,7 +591,9 @@ export function validateProductionCampaignCoverage(input: {
       for (const name of required) {
         const reference = step.receipts![name]
         if (reference.candidateSha !== candidateSha || reference.campaignRunId !== runId || reference.producerStepId !== step.id) throw new Error('receipt provenance belongs to another campaign or producer')
-        const expectedPath = `.runtime-evidence/${candidateSha}/campaigns/${runId}/receipts/${step.id}/${name.toLowerCase()}.json`
+        const expectedPath = isCanonicalPhase5BrowserReceipt(name)
+          ? phase5BrowserReceiptOriginal({ repoRoot: root, candidateSha, name, originals: browserOriginals }).path
+          : `.runtime-evidence/${candidateSha}/campaigns/${runId}/receipts/${step.id}/${name.toLowerCase()}.json`
         const bytes = readCampaignOriginal(root, { path: reference.path, sha256: reference.digestSha256 }, expectedPath)
         const receipt = parseOriginalJson(bytes)
         if (receipt.status !== 'PASS' || receipt.candidateSha !== candidateSha) throw new Error('receipt original status or candidate differs')

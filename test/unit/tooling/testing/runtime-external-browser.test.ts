@@ -245,6 +245,94 @@ const descriptor = {
 const smokeSpec = 'test/e2e-browser/specs/runtime-external-target-smoke-rust.spec.ts'
 
 describe('selected production owner registration', () => {
+  it('keeps a combined provider subset limited to its selected bootstrap references', () => {
+    const owned = runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, {
+      spec: 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts',
+    }, { FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE: '1',
+      FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_PROVIDERS: 'claude,codex' }, () => { throw new Error('unused web') })
+    expect(owned.fixtureRegistrationFacts().enabledProviders).toEqual(['claude', 'codex'])
+    expect((owned.runtime as any).ownerIsolation.bootstrapProviders).toEqual(['claude', 'codex'])
+  })
+  it('admits combined supported providers through the actual owner factory and stages each selected profile', async () => {
+    const config = path.join(fixtureRepoRoot, 'amplifier-profile')
+    await fsp.mkdir(path.join(config, 'bundles'), { recursive: true })
+    await fsp.writeFile(path.join(config, 'settings.yaml'), 'bundle:\n  active: default\n')
+    await fsp.writeFile(path.join(config, 'bundles/default.yaml'), 'providers:\n  - module: provider-vllm\n')
+    const grant = path.join(config, 'grant.env')
+    await fsp.writeFile(grant, 'FIXTURE_REFERENCE=owner-only\n', { mode: 0o600 })
+    const environment = { FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE: '1',
+      FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_PROVIDERS: 'claude,codex,opencode,amplifier',
+      FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE: grant, FRESHELL_RUNTIME_AMPLIFIER_CONFIG_HOME: config }
+    let options!: RuntimeWebConstructOptions
+    const owned = runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, {
+      spec: 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts',
+    }, environment, input => { options = input; return { start: async () => ({}) } as any })
+    expect(owned.fixtureRegistrationFacts()).toEqual({ phase: 5,
+      enabledProviders: ['claude', 'codex', 'opencode', 'amplifier'], freshAgentModes: [], fixtureFreshAgentModes: [] })
+    expect((owned.runtime as any).ownerIsolation.bootstrapProviders).toEqual(['claude', 'codex', 'opencode', 'amplifier'])
+    vi.spyOn(owned.runtime, 'prepare').mockResolvedValue(undefined)
+    vi.spyOn(owned as any, 'buildManagedServer').mockReturnValue('/unused/server')
+    vi.spyOn(owned as any, 'buildQualificationSupervisor').mockReturnValue(undefined)
+    vi.spyOn(owned.runtime, 'recordProviderQualificationBuild').mockReturnValue(undefined)
+    vi.spyOn(owned.runtime, 'startSupervisor').mockResolvedValue({ controlSocket: '/unused/socket', controlSecretFile: '/unused/secret' } as SupervisorInstance)
+    try {
+      await owned.start()
+      const home = path.join(fixtureRepoRoot, 'combined-home')
+      await options.setupHome!(home)
+      const settings = JSON.parse(await fsp.readFile(path.join(home, '.freshell/config.json'), 'utf8')).settings
+      expect(settings.codingCli.enabledProviders).toEqual(['claude', 'codex', 'opencode', 'amplifier'])
+      expect(settings.codingCli.providers).toMatchObject({ claude: { model: 'haiku', effort: 'low' }, codex: { model: 'gpt-5.6-luna', effort: 'low' } })
+      expect(await fsp.readFile(path.join(home, '.claude/.claude.json'), 'utf8')).toContain('hasCompletedOnboarding')
+      expect(await fsp.readFile(path.join(home, '.amplifier/settings.yaml'), 'utf8')).toContain('active: default')
+      for (const selected of ['gemini', 'claude,claude', '']) expect(() => runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, {
+        spec: 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts',
+      }, { ...environment, FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_PROVIDERS: selected }, () => { throw new Error('unused') })).toThrow()
+    } finally { vi.restoreAllMocks() }
+  })
+  it('admits combined fresh modes, enables their real server transport and excludes paid OpenCode bootstrap', async () => {
+    let options!: RuntimeWebConstructOptions
+    const selection = { spec: 'test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts' }
+    const environment = { FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE: '1',
+      FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_MODES: 'freshclaude,kilroy,freshcodex,freshopencode' }
+    const owned = runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, selection, environment,
+      input => { options = input; return { start: async () => ({}) } as any })
+    expect(owned.fixtureRegistrationFacts()).toEqual({ phase: 5, enabledProviders: [],
+      freshAgentModes: ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'], fixtureFreshAgentModes: [] })
+    expect((owned.runtime as any).ownerIsolation.bootstrapProviders).toEqual(['claude', 'codex'])
+    const selectedReferences = await Promise.all(['CLAUDE', 'CODEX'].map(async family => {
+      const file = path.join(fixtureRepoRoot, `${family}.env`)
+      await fsp.writeFile(file, 'FIXTURE_REFERENCE=selected\n', { mode: 0o600 })
+      vi.stubEnv(`FRESHELL_MANAGED_${family}_ONECLI_ENV_FILE`, file)
+      vi.stubEnv(`FRESHELL_MANAGED_${family}_ONECLI_AUTH_FILE`, undefined)
+      vi.stubEnv(`FRESHELL_MANAGED_${family}_ONECLI_CA_FILE`, undefined)
+      return file
+    }))
+    vi.stubEnv('FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE', '/unselected/unreadable')
+    vi.stubEnv('FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE', '/unselected/unreadable')
+    vi.spyOn(owned.runtime, 'prepare').mockResolvedValue(undefined)
+    vi.spyOn(owned as any, 'buildManagedServer').mockReturnValue('/unused/server')
+    vi.spyOn(owned as any, 'buildQualificationSupervisor').mockReturnValue(undefined)
+    vi.spyOn(owned.runtime, 'recordProviderQualificationBuild').mockReturnValue(undefined)
+    vi.spyOn(owned.runtime, 'recordFreshAgentQualificationBuild').mockReturnValue(undefined)
+    vi.spyOn(owned.runtime, 'startSupervisor').mockResolvedValue({ controlSocket: '/unused/socket', controlSecretFile: '/unused/secret' } as SupervisorInstance)
+    try {
+      expect((owned.runtime as any).phase2BootstrapFiles()).toEqual(selectedReferences)
+      await owned.start()
+      expect(options.env).toMatchObject({ FRESHELL_MANAGED_RUNTIME_V1: '1', FRESHELL_MANAGED_FRESH_AGENT_V1: '1', KILROY_ENABLED: '1' })
+      expect(options.env).not.toHaveProperty('FRESHELL_MANAGED_FRESH_AGENT_FIXTURE_MODES')
+      const env = { FRESHELL_MANAGED_CLAUDE_ONECLI_ENV_FILE: '/selected/claude', FRESHELL_MANAGED_CODEX_ONECLI_ENV_FILE: '/selected/codex',
+        FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: '/unselected/opencode', FRESHELL_MANAGED_AMPLIFIER_ONECLI_AUTH_FILE: '/unselected/amplifier', OPENCODE_API_KEY: 'paid-sentinel' }
+      stripRuntimeWebEnvironment(env, options)
+      expect(env).toEqual({ FRESHELL_MANAGED_CLAUDE_ONECLI_ENV_FILE: '/selected/claude', FRESHELL_MANAGED_CODEX_ONECLI_ENV_FILE: '/selected/codex' })
+      const home = path.join(fixtureRepoRoot, 'fresh-combined-home')
+      await options.setupHome!(home)
+      expect(JSON.parse(await fsp.readFile(path.join(home, '.freshell/config.json'), 'utf8')).settings.freshAgent.enabled).toBe(true)
+      expect(() => runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, selection,
+        { ...environment, FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_MODES: 'freshgemini' }, () => { throw new Error('unused') })).toThrow()
+      expect(() => runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, selection,
+        { ...environment, FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE: '0' }, () => { throw new Error('unused') })).toThrow(/opt.in|LIVE/)
+    } finally { vi.restoreAllMocks(); vi.unstubAllEnvs() }
+  })
   it.each(['freshopencode', 'freshcodex', 'freshclaude', 'kilroy'] as const)('selects only the required production bootstrap for %s', mode => {
     const owner = runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, {
       spec: 'test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts', mode,

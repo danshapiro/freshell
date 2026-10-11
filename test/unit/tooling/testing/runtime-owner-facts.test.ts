@@ -4962,6 +4962,58 @@ else if(!['start','rm'].includes(a[0]))process.exitCode=10;
 })
 
 describe('run-owned workload image build', () => {
+  it('admits the same clean candidate workload for two independent owners without borrowing image cleanup authority', async () => {
+    const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'campaign-image-daemon-'))
+    const digest = `sha256:${'c'.repeat(64)}`
+    await fsp.writeFile(path.join(fixtureRepoRoot, '.gitignore'), '.runtime-evidence/\n')
+    execFileSync('git', ['add', '.gitignore'], { cwd: fixtureRepoRoot })
+    execFileSync('git', ['-c', 'user.name=Dan Shapiro', '-c', 'user.email=3732858+danshapiro@users.noreply.github.com',
+      '-c', 'commit.gpgsign=false', 'commit', '--quiet', '-m', 'Ignore owned evidence'], { cwd: fixtureRepoRoot })
+    const candidateSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: fixtureRepoRoot, encoding: 'utf8' }).trim()
+    const calls = path.join(directory, 'calls.jsonl')
+    const imageFile = path.join(directory, 'image.json')
+    const image = { Id: digest, RepoTags: ['freshell-managed-runtime:final'], Config: { Labels: {} as Record<string, string> } }
+    const build = vi.fn<typeof execFileSync>().mockImplementation((_command, args) => {
+      if (args?.[0] === 'build') {
+        image.Config.Labels = Object.fromEntries(args.flatMap((argument, index) => argument === '--label' ? [String(args[index + 1]).split('=')] : []))
+        return ''
+      }
+      return digest
+    })
+    const original = owner.buildRunOwnedRuntimeImage(fixtureRepoRoot, randomUUID(), candidateSha, build)
+    expect(original.digest).toBe(digest)
+    await fsp.writeFile(imageFile, JSON.stringify([image]))
+    await fsp.writeFile(path.join(directory, 'docker'), `#!${process.execPath}\nconst fs=require('node:fs'),a=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(a)+'\\n');if(a[0]==='image'&&a[1]==='inspect'){if(a[2]!==${JSON.stringify(digest)})process.exit(9);process.stdout.write(fs.readFileSync(${JSON.stringify(imageFile)}));}else if(a[0]==='ps'||a[0]==='volume')process.stdout.write('');else process.exit(9);\n`, { mode: 0o700 })
+    vi.stubEnv('PATH', `${directory}${path.delimiter}${process.env.PATH}`)
+    vi.stubEnv('FRESHELL_RUNTIME_WORKLOAD_IMAGE_DIGEST', digest)
+    const first = new owner.RuntimeHarness(fixtureRepoRoot, randomUUID(), 5)
+    const second = new owner.RuntimeHarness(fixtureRepoRoot, randomUUID(), 5)
+    try {
+      for (const runtime of [first, second]) {
+        await fsp.mkdir(runtime.evidenceDir, { recursive: true })
+        ;(runtime as any).ensureRuntimeImage()
+        expect(runtime.imageRef).toBe(digest)
+        await expect(runtime.cleanup()).resolves.toEqual({ ok: true, errors: [] })
+      }
+      expect(first.runId).not.toBe(second.runId)
+      expect((await fsp.readFile(calls, 'utf8')).split('\n').filter(Boolean).map(line => JSON.parse(line) as string[])
+        .every(args => !args.includes('build') && !args.includes('rm'))).toBe(true)
+      await fsp.writeFile(imageFile, JSON.stringify([{ ...image, Config: { Labels: { ...image.Config.Labels,
+        'com.freshell.runtime-test-candidate': 'f'.repeat(40) } } }]))
+      expect(() => (second as any).ensureRuntimeImage()).toThrow(/candidate|source/)
+      await fsp.writeFile(imageFile, JSON.stringify([{ ...image, Config: { Labels: { ...image.Config.Labels,
+        'com.freshell.runtime-test-source-state': `${candidateSha}:dirty` } } }]))
+      expect(() => (second as any).ensureRuntimeImage()).toThrow(/candidate|source/)
+      await fsp.writeFile(imageFile, JSON.stringify([{ ...image, Id: `sha256:${'d'.repeat(64)}` }]))
+      expect(() => (second as any).ensureRuntimeImage()).toThrow(/digest|image/)
+      vi.stubEnv('FRESHELL_RUNTIME_WORKLOAD_IMAGE_DIGEST', `sha256:${'e'.repeat(64)}`)
+      expect(() => (second as any).ensureRuntimeImage()).toThrow()
+      vi.stubEnv('FRESHELL_RUNTIME_WORKLOAD_IMAGE_DIGEST', digest)
+      await fsp.writeFile(imageFile, JSON.stringify([image]))
+      await fsp.writeFile(path.join(fixtureRepoRoot, 'unexpected-source'), 'changed')
+      expect(() => (second as any).ensureRuntimeImage()).toThrow(/clean|source/)
+    } finally { vi.unstubAllEnvs(); await fsp.rm(directory, { recursive: true, force: true }) }
+  })
   it.each([2, 3, 4, 5] as const)('uses only its own tag for default phase %i image build and resolution', async phase => {
     const runId = '7aab49a4-08ed-4ca7-a4b2-6501f4821a63'
     const runtime = new owner.RuntimeHarness(fixtureRepoRoot, runId, phase)

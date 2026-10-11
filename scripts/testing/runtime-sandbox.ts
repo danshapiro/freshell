@@ -15,6 +15,7 @@ import { ManagedRuntimeInventorySnapshotSchema, ManagedRuntimeMigrationPlanSchem
 
 import fsp from 'node:fs/promises'
 import { defaultReceiptFileName } from './runtime-receipts.js'
+import { captureRuntimeCandidate } from './runtime-gate-integrity.js'
 import { buildProviderQualificationReceipt, type ProviderQualificationReceiptV2, type ProviderQualificationRow } from './provider-qualification-receipt.js'
 import { buildFreshAgentQualificationReceipt, deriveFreshBrowserExecution, matchesFreshBrowserFrame, sameFreshBrowserActivation, validateFreshBrowserAlias, validateFreshApprovalCheckpoint, validateFreshApprovalDispatch, validateFreshApprovalRecovery, nativeCompletedTurnProofs, type FreshBrowserIngressObservation, type FreshAgentQualificationReceiptV1, type FreshAgentQualificationRow } from './fresh-agent-qualification-receipt.js'
 import { claudeNativeInspection, nativeCheckpointTranscriptRetained, observeNativeSoloBashOutcome, openCodeFreeAccessScript } from './runtime-native-feasibility.js'
@@ -326,8 +327,10 @@ export function buildRunOwnedRuntimeImage(
   repoRoot: string, runId: string, candidateSha: string, execute: typeof execFileSync = execFileSync,
 ): { tag: string; digest: string } {
   const tag = runOwnedRuntimeImageTag(runId, candidateSha)
+  const source = captureRuntimeCandidate(repoRoot)
   execute('docker', ['build', '--pull=false', '--provenance=false', '--sbom=false',
     '--label', `com.freshell.runtime-test-run-id=${runId}`, '--label', `com.freshell.runtime-test-candidate=${candidateSha}`,
+    '--label', `com.freshell.runtime-test-source-state=${source.sha}:${source.dirty ? 'dirty' : 'clean'}`,
     '-f', 'docker/runtime/Dockerfile', '-t', tag, '.'], { cwd: repoRoot, stdio: 'inherit' })
   const digest = String(execute('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8' })).trim()
   if (!/^sha256:[a-f0-9]{64}$/.test(digest)) throw new Error('run-owned runtime image has no pinned digest')
@@ -4322,6 +4325,24 @@ export class RuntimeHarness {
 
   private ensureRuntimeImage(): void {
     if (this.phase >= 2) {
+      const selected = process.env.FRESHELL_RUNTIME_WORKLOAD_IMAGE_DIGEST
+      if (selected !== undefined) {
+        if (!/^sha256:[a-f0-9]{64}$/.test(selected)) throw new Error('selected workload image must be an exact digest')
+        const source = captureRuntimeCandidate(this.repoRoot)
+        if (source.dirty || source.sha !== this.candidateSha) throw new Error('selected workload image requires the current clean candidate source')
+        const inspected = z.array(z.object({ Id: z.literal(selected), Config: z.object({ Labels: z.record(z.string(), z.string()) }) }))
+          .length(1).safeParse(JSON.parse(docker(['image', 'inspect', selected])))
+        if (!inspected.success) throw new Error('selected workload image does not resolve to its exact digest')
+        const labels = inspected.data[0]!.Config.Labels
+        if (labels['com.freshell.runtime-test-candidate'] !== this.candidateSha
+          || labels['com.freshell.runtime-test-source-state'] !== `${this.candidateSha}:clean`) {
+          throw new Error('selected workload image candidate or source differs')
+        }
+        // A selected digest is borrowed. Only the original builder owns its tag.
+        this.imageRef = selected
+        this.recordLifecycle('runtime.workload_image_admitted', { digest: selected })
+        return
+      }
       this.ownedImage = { tag: runOwnedRuntimeImageTag(this.runId, this.candidateSha), runId: this.runId, candidateSha: this.candidateSha }
       const image = buildRunOwnedRuntimeImage(this.repoRoot, this.runId, this.candidateSha)
       this.ownedImage.digest = image.digest
