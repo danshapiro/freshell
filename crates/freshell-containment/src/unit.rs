@@ -8,8 +8,9 @@
 //! (`freshell-ownership`); a unit only runs and joins its in-flight stop and
 //! keeps its persisted record (`record.rs`), where persisted Stopping lives.
 //! Nothing is signalled before Stopping is saved, Gone means the screen, the
-//! main process and every pinned root are confirmed dead and no member holds
-//! a conversation lock, and leftovers are swept (and survivors logged) after
+//! main process and every pinned root are confirmed dead (before a placed
+//! agent's main is adopted: every member) and no member holds a
+//! conversation lock, and leftovers are swept (and survivors logged) after
 //! Gone. Waiting is event-driven throughout (`ProcWatch`, watch channels,
 //! timers armed for a deadline); nothing polls.
 
@@ -264,6 +265,9 @@ struct Members {
     stopping: bool,
     /// Stopping is saved: a member pinned from now on is killed at once.
     saved: bool,
+    /// An agent member was placed: until a main is adopted, the agent main
+    /// process is a member nobody pinned (see `confirm_gone`).
+    agent_placed: bool,
 }
 
 /// The single in-flight stop of a unit.
@@ -378,11 +382,15 @@ impl AgentUnit {
 
     /// How to start the next member. Refused once a stop has begun.
     pub fn placement(&self, role: MemberRole) -> io::Result<Placement> {
-        if lock(&self.inner.members).stopping {
-            return Err(io::Error::other(format!(
-                "unit {} is stopping",
-                self.inner.id
-            )));
+        {
+            let mut m = lock(&self.inner.members);
+            if m.stopping {
+                return Err(io::Error::other(format!(
+                    "unit {} is stopping",
+                    self.inner.id
+                )));
+            }
+            m.agent_placed |= role == MemberRole::Agent;
         }
         let seq = self.inner.seq.fetch_add(1, Ordering::SeqCst);
         self.inner.backend.placement(role, seq)
@@ -1005,6 +1013,12 @@ impl AgentUnit {
     /// non-spared pinned root to exit, then make sure no member holds a
     /// conversation lock. Logs ERROR `unit.stop.unconfirmed` once when this
     /// takes longer than `UNCONFIRMED_AFTER` after the kill, and keeps waiting.
+    ///
+    /// Before its main is adopted, a unit that placed an agent has its agent
+    /// main process among members nobody pinned (Codex adopts the native
+    /// app-server behind its launcher only once it listens), so Gone then
+    /// also waits for every member to exit (`members_exited`). Once a main
+    /// is adopted, the rest of the unit is the post-Gone sweep's.
     async fn confirm_gone(
         &self,
         state: &StopState,
@@ -1013,6 +1027,10 @@ impl AgentUnit {
         snapshot: &[ProcWatch],
         spared: &[ProcIdentity],
     ) -> io::Result<bool> {
+        let awaiting_main = {
+            let m = lock(&self.inner.members);
+            m.agent_placed && m.main.is_none()
+        };
         let confirm = async {
             loop {
                 let pinned: Vec<ProcWatch> = self
@@ -1033,6 +1051,9 @@ impl AgentUnit {
                     break;
                 }
             }
+            if awaiting_main {
+                self.members_exited(spared).await?;
+            }
             if let Some(delay) = testing::gone_delay() {
                 tokio::time::sleep(delay).await;
             }
@@ -1040,14 +1061,44 @@ impl AgentUnit {
         };
         tokio::pin!(confirm);
         let unconfirmed_at = tokio::time::Instant::from_std(killed_at) + UNCONFIRMED_AFTER;
+        let waiting_on = if awaiting_main {
+            "unit members or lock"
+        } else {
+            "screen, main or lock"
+        };
         tokio::select! {
             biased;
             confirmed = &mut confirm => confirmed,
             _ = tokio::time::sleep_until(unconfirmed_at) => {
-                events::unconfirmed(keys, state.elapsed_ms(), "screen, main or lock");
+                events::unconfirmed(keys, state.elapsed_ms(), waiting_on);
                 confirm.await
             }
         }
+    }
+
+    /// Waits (event-driven) until every member has exited: the backend's
+    /// "unit is empty" event, unless the kill spared a process (which keeps
+    /// the container populated) or the backend has none (the tag backends);
+    /// then the exit of every member one read lists (spared processes are
+    /// never members). An error means the unit could not be watched, never
+    /// that it is empty.
+    async fn members_exited(&self, spared: &[ProcIdentity]) -> io::Result<()> {
+        if spared.is_empty() {
+            if let Some(empty) = self.inner.backend.wait_empty() {
+                return empty.await;
+            }
+        }
+        let unit = self.clone();
+        let listed = blocking(move || unit.member_list()).await??.members;
+        for member in listed {
+            match ProcWatch::open_expecting(member.pid, member.start) {
+                Ok(watch) => watch.exited().await?,
+                // Exited (and reaped) since the read.
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
     }
 
     /// The lock check runs after the whole-unit kill (a lock is released at
@@ -2110,6 +2161,225 @@ sleep 600;"#;
             !released,
             "the daemon-family holder still holds its lock file"
         );
+    }
+
+    /// A unit whose members the whole-unit kill reached but which are still
+    /// exiting: its members are the `listed` processes still running, its
+    /// kill signals none of them (the test ends each when it chooses) and
+    /// reports `spared` as spared, and its "unit is empty" event, when it
+    /// has one, fires only once the test sends `true`.
+    #[cfg(unix)]
+    struct Exiting {
+        listed: Vec<ProcWatch>,
+        spared: Vec<ProcIdentity>,
+        empty: Option<watch::Sender<bool>>,
+    }
+
+    #[cfg(unix)]
+    impl UnitBackend for Exiting {
+        fn placement(&self, role: MemberRole, seq: u32) -> io::Result<Placement> {
+            NoProcesses.placement(role, seq)
+        }
+        fn kill_all(
+            self: Arc<Self>,
+            _roots: Vec<(u32, u64)>,
+        ) -> BoxFuture<'static, io::Result<KillSummary>> {
+            let spared = self.spared.clone();
+            Box::pin(async move {
+                Ok(KillSummary {
+                    spared,
+                    ..Default::default()
+                })
+            })
+        }
+        fn members(&self, _roots: &[(u32, u64)]) -> io::Result<MemberList> {
+            Ok(MemberList {
+                members: live_identity_list(&self.listed),
+                withheld: 0,
+            })
+        }
+        fn confirm_placement(&self, pid: u32, roots: &[(u32, u64)]) -> io::Result<()> {
+            NoProcesses.confirm_placement(pid, roots)
+        }
+        fn wait_empty(&self) -> Option<BoxFuture<'static, io::Result<()>>> {
+            let mut emptied = self.empty.as_ref()?.subscribe();
+            Some(Box::pin(async move {
+                emptied
+                    .wait_for(|empty| *empty)
+                    .await
+                    .map(|_| ())
+                    .map_err(io::Error::other)
+            }))
+        }
+        fn remove(&self, emptied: bool) -> io::Result<()> {
+            NoProcesses.remove(emptied)
+        }
+    }
+
+    /// `unit_on` with kernel-tracked membership: its stop takes no
+    /// pre-signal member snapshot, so it never pins (and kills) a member
+    /// the backend lists.
+    #[cfg(unix)]
+    fn unit_on_full(backend: Arc<dyn UnitBackend>) -> AgentUnit {
+        AgentUnit::new(
+            UnitId::mint(),
+            backend,
+            Capability {
+                kind: BackendKind::SystemdScope,
+                full: true,
+                reason: None,
+            },
+            Arc::new(RecordStore::open(std::path::Path::new(""))),
+            UnitLabel::default(),
+            None,
+        )
+    }
+
+    /// The stop a kill of a pane that is still starting sends.
+    #[cfg(unix)]
+    fn start_cancelled() -> StopRequest {
+        StopRequest::new(StopMode::Force, StopReason::StartCancelled, "ws")
+    }
+
+    /// A unit stopped before its main is adopted (Codex adopts the native
+    /// app-server behind its launcher only once it listens) has its agent
+    /// main process among members nobody pinned: Gone waits for the unit to
+    /// be empty (here the backend's emptiness event), not only for the
+    /// pinned launcher. Unconfirmed after 5 s, it logs the ERROR and stays
+    /// Stopping, never Gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_before_the_main_is_adopted_is_gone_only_once_the_unit_is_empty() {
+        let (empty, _) = watch::channel(false);
+        let (unit, _store) = unit_with_record(Arc::new(Exiting {
+            listed: Vec::new(),
+            spared: Vec::new(),
+            empty: Some(empty.clone()),
+        }));
+        let launcher = Spawned::perl_sleep(&[]);
+        let mut report = None;
+        let events = capture_on_runtime(async {
+            unit.placement(MemberRole::Agent).unwrap();
+            unit.add_root(launcher.watch.clone());
+            let handle = unit.stop(start_cancelled());
+            tokio::time::timeout(Duration::from_secs(10), launcher.watch.exited())
+                .await
+                .expect("the pinned launcher was killed")
+                .unwrap();
+            assert!(
+                handle
+                    .wait_for(UNCONFIRMED_AFTER + Duration::from_millis(500))
+                    .await
+                    .is_none(),
+                "Gone before the unit was empty"
+            );
+            assert!(
+                matches!(
+                    lock(&unit.inner.record).as_ref().map(|r| &r.state),
+                    Some(UnitRecordState::Stopping { .. })
+                ),
+                "an unconfirmed stop keeps its record Stopping"
+            );
+            empty.send_replace(true);
+            report = handle.wait_for(Duration::from_secs(5)).await;
+        });
+        assert!(report.is_some(), "Gone once the unit is empty");
+        let unconfirmed = named(&events, "unit.stop.unconfirmed");
+        assert_eq!(unconfirmed.len(), 1, "{events:?}");
+        assert_eq!(unconfirmed[0].level, tracing::Level::ERROR);
+        assert_eq!(unconfirmed[0].str("waiting_on"), "unit members or lock");
+    }
+
+    /// Once the main is adopted, Gone's rule is unchanged: it waits for the
+    /// screen, the main and the pinned roots, never for the unit to empty
+    /// (what else is left is the post-Gone sweep's).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn once_the_main_is_adopted_gone_does_not_wait_for_the_unit_to_empty() {
+        let (empty, _) = watch::channel(false);
+        let unit = unit_on(Arc::new(Exiting {
+            listed: Vec::new(),
+            spared: Vec::new(),
+            empty: Some(empty.clone()),
+        }));
+        let launcher = Spawned::perl_sleep(&[]);
+        let native = Spawned::perl_sleep(&[]);
+        unit.placement(MemberRole::Agent).unwrap();
+        unit.add_root(launcher.watch.clone());
+        unit.set_main(native.watch.clone());
+        let handle = unit.stop(StopRequest::new(StopMode::Force, StopReason::ShiftX, "ws"));
+        assert!(
+            handle.wait_for(Duration::from_secs(5)).await.is_some(),
+            "Gone waited for the unit to empty although its main was adopted"
+        );
+        drop(empty);
+    }
+
+    /// Without an emptiness event (the tag backends), Gone before the main
+    /// is adopted waits for the exit of every member one read after the
+    /// kill lists: here the unpinned native a launcher started.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn without_an_emptiness_event_a_stop_before_the_main_is_adopted_waits_for_every_member() {
+        let launcher = Spawned::perl_sleep(&[]);
+        let native = Spawned::perl_sleep(&[]);
+        let unit = unit_on_full(Arc::new(Exiting {
+            listed: vec![native.watch.clone()],
+            spared: Vec::new(),
+            empty: None,
+        }));
+        unit.placement(MemberRole::Agent).unwrap();
+        unit.add_root(launcher.watch.clone());
+        let handle = unit.stop(start_cancelled());
+        tokio::time::timeout(Duration::from_secs(10), launcher.watch.exited())
+            .await
+            .expect("the pinned launcher was killed")
+            .unwrap();
+        assert!(
+            handle.wait_for(Duration::from_millis(300)).await.is_none(),
+            "Gone while a member still ran"
+        );
+        native.watch.signal(Sig::Kill).unwrap();
+        assert!(
+            handle.wait_for(Duration::from_secs(5)).await.is_some(),
+            "Gone once every member exited"
+        );
+    }
+
+    /// A kill that spared a process (Codex's daemon family) leaves the
+    /// container populated, so its emptiness event never comes: Gone before
+    /// the main is adopted then waits for the members one read lists (the
+    /// spared are never members), never for the spared process.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_that_spared_a_process_waits_for_the_members_not_for_the_unit_to_empty() {
+        let (empty, _) = watch::channel(false);
+        let daemon = Spawned::perl_sleep(&["app-server", "--managed-daemon"]);
+        let launcher = Spawned::perl_sleep(&[]);
+        let native = Spawned::perl_sleep(&[]);
+        let unit = unit_on_full(Arc::new(Exiting {
+            listed: vec![native.watch.clone()],
+            spared: vec![daemon.watch.identity().clone()],
+            empty: Some(empty.clone()),
+        }));
+        unit.placement(MemberRole::Agent).unwrap();
+        unit.add_root(launcher.watch.clone());
+        let handle = unit.stop(start_cancelled());
+        tokio::time::timeout(Duration::from_secs(10), launcher.watch.exited())
+            .await
+            .expect("the pinned launcher was killed")
+            .unwrap();
+        assert!(
+            handle.wait_for(Duration::from_millis(300)).await.is_none(),
+            "Gone while a member still ran"
+        );
+        native.watch.signal(Sig::Kill).unwrap();
+        assert!(
+            handle.wait_for(Duration::from_secs(5)).await.is_some(),
+            "Gone waited for an emptiness event the spared process holds back"
+        );
+        assert!(daemon.untouched(), "the spared process was signalled");
+        drop(empty);
     }
 
     /// macOS: the Gone lock check, on a backend whose members are exactly
