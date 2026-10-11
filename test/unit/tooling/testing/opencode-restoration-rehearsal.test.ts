@@ -24,16 +24,23 @@ const manifest = () => ({
 describe('explicit real-root rehearsal admission', () => {
   it('joins cleanup after the actual adapter setup fails inside preparation', async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'real-driver-setup-'))
+    // Exercise the producer's real Git boundary in an owned checkout, including
+    // when the delivered sources have no repository metadata.
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: directory, encoding: 'utf8', timeout: 10_000 })
+    git('init', '--quiet')
+    git('-c', 'user.name=Dan Shapiro', '-c', 'user.email=3732858+danshapiro@users.noreply.github.com',
+      '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '--quiet', '-m', 'Owned restoration rehearsal fixture')
     const snapshot = path.join(directory, 'snapshot.sqlite'), token = path.join(directory, 'token')
     fs.writeFileSync(snapshot, 'owned fixture snapshot', { mode: 0o600 }); fs.writeFileSync(token, 'fixture', { mode: 0o600 })
-    const input = { ...manifest(), candidateSha: execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
+    const input = { ...manifest(), candidateSha: git('rev-parse', 'HEAD').trim(),
       snapshotFile: snapshot, canonicalOriginalDatabase: snapshot, originalDefaultDatabase: snapshot, preflightTokenFile: token,
       snapshotBytes: fs.statSync(snapshot).size, snapshotSha256: createHash('sha256').update(fs.readFileSync(snapshot)).digest('hex') }
     const scope = { scopeId:input.targetScopeDigest,sourceStoreId:input.sourceIdentity,sourceFingerprint:'e'.repeat(64),
       roots:input.roots.map(root=>({rootSessionId:root.rootSessionId,graphDigest:root.graphDigest,eligibleOwners:[root.canonicalSoulId],canonicalSoulId:root.canonicalSoulId})),
       targets:input.roots.map(root=>({target:{soulId:root.canonicalSoulId,incidentId:'incident-'+root.canonicalSoulId,expectedIntentRevision:root.expectedIntentRevision},providerStoreId:root.destinationStoreId,rootSessionId:root.rootSessionId,incidentRevision:1,identityRevision:0,nativeImportRevision:0,evidenceRevision:1})),
     }
-    const server = createServer((_request,response) => response.end(JSON.stringify(scope)))
+    let preflightCalls = 0
+    const server = createServer((_request,response) => { preflightCalls++; response.end(JSON.stringify(scope)) })
     await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve))
     const address=server.address(); if(!address||typeof address==='string')throw new Error('owned setup HTTP fixture absent')
     input.preflightUrl=`http://127.0.0.1:${address.port}/api/runtime/soul-loss-repairs/preflight`
@@ -41,10 +48,22 @@ describe('explicit real-root rehearsal admission', () => {
     const cleanup = vi.spyOn(RuntimeHarness.prototype,'cleanup').mockResolvedValue({ok:true,errors:[]})
     vi.spyOn(RuntimeHarness.prototype,'verifyTransferCleanup').mockImplementation(()=>{})
     const file=path.join(directory,'manifest.json'),scratchDir=path.join(directory,'scratch')
-    fs.writeFileSync(file,JSON.stringify(input),{mode:0o600})
+    const run = () => runRealRootRehearsal({ manifestFile: file, scratchDir, repoRoot: directory })
     try {
-      await expect(runRealRootRehearsal({manifestFile:file,scratchDir})).rejects.toThrow()
+      fs.writeFileSync(file, JSON.stringify({ ...input, candidateSha: '0'.repeat(40) }), { mode: 0o600 })
+      await expect(run()).rejects.toThrow('exact current candidate')
+      expect(preflightCalls).toBe(0)
+      expect(prepare).not.toHaveBeenCalled()
+      expect(cleanup).not.toHaveBeenCalled()
+      expect(fs.existsSync(scratchDir)).toBe(false)
+
+      fs.writeFileSync(file, JSON.stringify(input), { mode: 0o600 })
+      await expect(run()).rejects.toMatchObject({ code: 'ENOENT',
+        path: path.join(directory, 'target/release/examples/opencode_restoration_rehearsal') })
+      expect(preflightCalls).toBe(1)
       expect(prepare).toHaveBeenCalledOnce(); expect(cleanup).toHaveBeenCalledOnce()
+      expect(prepare.mock.contexts[0]).toMatchObject({repoRoot:directory,candidateSha:input.candidateSha})
+      expect(cleanup.mock.contexts[0]).toBe(prepare.mock.contexts[0])
       expect(JSON.parse(fs.readFileSync(path.join(scratchDir,'stage-failure.json'),'utf8')).stage).toBe('prepare')
       expect(fs.existsSync(path.join(scratchDir,'rehearsal-receipt.json'))).toBe(false)
     } finally { vi.restoreAllMocks(); server.closeAllConnections(); await new Promise<void>(resolve=>server.close(()=>resolve())); fs.rmSync(directory,{recursive:true,force:true}) }

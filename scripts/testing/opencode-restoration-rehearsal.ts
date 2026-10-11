@@ -197,9 +197,9 @@ export async function readRehearsalPreflight(manifest: RehearsalManifest, token:
     })) throw new Error('current external preflight source/member/owner/store scope differs')
 }
 
-export async function runRealRootRehearsal(input: { manifestFile: string; scratchDir: string }): Promise<RehearsalReceipt> {
+export async function runRealRootRehearsal(input: { manifestFile: string; scratchDir: string; repoRoot?: string }): Promise<RehearsalReceipt> {
   assertPrivateInput(input.manifestFile)
-  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
+  const repoRoot = fs.realpathSync(input.repoRoot ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..'))
   const candidateSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot, encoding: 'utf8' }).trim()
   const manifest = admitRehearsalManifest(JSON.parse(fs.readFileSync(input.manifestFile, 'utf8')), candidateSha)
   assertPrivateInput(manifest.snapshotFile); assertPrivateInput(manifest.preflightTokenFile)
