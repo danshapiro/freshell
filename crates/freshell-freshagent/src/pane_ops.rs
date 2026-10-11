@@ -349,6 +349,10 @@ pub(crate) async fn split_pane(
         .attach_pane_content(&tab_id, &new_pane_id, new_content.clone());
 
     let terminal_id = new_content.get("terminalId").cloned();
+    let mut data = json!({ "paneId": new_pane_id, "terminalId": terminal_id });
+    if new_content["kind"] == "fresh-agent" {
+        data["sessionId"] = new_content["sessionId"].clone();
+    }
 
     // `ui.command{pane.split}` payload (`router.ts:1373-1382`): tabId, paneId
     // (the SOURCE pane), direction, newPaneId, newContent.
@@ -368,10 +372,7 @@ pub(crate) async fn split_pane(
     } else {
         "pane split (non-terminal)"
     };
-    ok_json(
-        json!({ "paneId": new_pane_id, "terminalId": terminal_id }),
-        message,
-    )
+    ok_json(data, message)
 }
 
 // ── POST /api/panes/:id/close ──────────────────────────────────────────────
