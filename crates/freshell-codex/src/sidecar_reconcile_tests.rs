@@ -31,6 +31,7 @@ use std::sync::Arc;
 use freshell_containment::{StopMode, StopReason};
 
 use super::*;
+use crate::durability::mint_ownership_id;
 use crate::sidecar_store::{proc_cmdline, proc_starttime, CodexSidecarRecord};
 use crate::sidecar_test_support::{
     record_for_child, spawn_own_fake_app_server, spawn_own_fake_app_server_with_behavior,
@@ -443,7 +444,10 @@ fn count_own_tagged_processes(ownership_id: &str) -> usize {
 async fn reattach_ensure_ready_returns_the_existing_listener() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = store_in(&dir);
-    let ownership_id = "codex-sidecar-a6000001-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    // Minted per run, as the product mints one: the count below searches the
+    // whole host for this tag, so a fixed id would also count the fixture of
+    // a concurrent run of this test.
+    let ownership_id = &mint_ownership_id();
     let (mut child, ws_url) = spawn_own_fake_app_server(ownership_id).await;
     // Record built from the live fixture's REAL /proc evidence + real ws_url.
     let record = CodexSidecarRecord {

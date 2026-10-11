@@ -33,9 +33,10 @@ use freshell_codex::launch_plan::{
     codex_remote_args, plan_codex_launch, CodexLaunchPlanInput, CodexSidecarLaunchContext,
 };
 use freshell_codex::{
-    proc_cmdline, proc_starttime, select_codex_runtime, verify_sidecar_identity, BoxFuture,
-    CodexSidecarRecord, CodexSidecarStore, IdentityVerdict, ReattachedCodexAppServerRuntime,
-    SidecarReconciler, SidecarRecordState, CODEX_SIDECAR_OWNERSHIP_ENV, SIDECAR_RECORD_VERSION,
+    mint_ownership_id, proc_cmdline, proc_starttime, select_codex_runtime, verify_sidecar_identity,
+    BoxFuture, CodexSidecarRecord, CodexSidecarStore, IdentityVerdict,
+    ReattachedCodexAppServerRuntime, SidecarReconciler, SidecarRecordState,
+    CODEX_SIDECAR_OWNERSHIP_ENV, SIDECAR_RECORD_VERSION,
 };
 use freshell_containment::{StopHandle, StopMode, StopReason};
 
@@ -1545,7 +1546,11 @@ async fn plan_retry_spawns_fresh_after_claimed_reattach_ensure_ready_fails() {
     // ephemeral port A (spawn shape copied from
     // `sidecar_reconcile_tests::spawn_own_fake_app_server`; test binaries
     // cannot share code — the repo's copy-with-attribution convention).
-    let survivor_ownership = "codex-sidecar-a7000003-cccc-4ccc-8ccc-cccccccccccc";
+    // Minted per run, as the product mints one: the survivor carries it as its
+    // v1 tag, and every search by that tag (the legacy unit's member finder,
+    // the sweep's empty check) covers the whole host. A fixed id would be
+    // shared with the survivor of a concurrent run of this test.
+    let survivor_ownership = &mint_ownership_id();
     let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs");
     let bind_unused_ws_url = || {

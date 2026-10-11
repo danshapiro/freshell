@@ -22,6 +22,7 @@
 use std::sync::Arc;
 
 use super::*;
+use crate::durability::mint_ownership_id;
 use crate::launch_lifecycle::CodexLaunchRuntime;
 use crate::sidecar_reconcile::{ReattachedCodexAppServerRuntime, SidecarReconciler};
 use crate::sidecar_store::SidecarRecordState;
@@ -90,7 +91,11 @@ fn wait_child_gone(child: &mut std::process::Child, why: &str) {
 async fn sweep_reaps_verified_idle_unclaimed_sidecar() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = store_in(&dir);
-    let ownership_id = "codex-sidecar-a9000001-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    // Minted per run, as the product mints one: the fixture carries it as its
+    // tag, and the sweep's kill counts as Reaped only when no process on the
+    // host still carries that tag, so a fixed id would let a concurrent run
+    // of this test turn this run's Reaped into TerminationUnconfirmed.
+    let ownership_id = &mint_ownership_id();
     // Deliberately loaded-but-idle: pins the `loaded ≠ mid-turn`
     // discriminator (idle threads stay loaded forever, reports/V1.md).
     let (mut child, ws_url) = spawn_own_fake_app_server_with_behavior(
@@ -443,8 +448,11 @@ async fn restart_reconciliation_leaves_no_sidecar_silently_orphaned() {
     child_b.0.kill().expect("kill own child");
     child_b.0.wait().expect("reap own child");
 
-    // (c) A verified idle sidecar (loaded-but-idle fixture) — reaped.
-    let id_c = "codex-sidecar-a9000013-cccc-4ccc-8ccc-cccccccccccc";
+    // (c) A verified idle sidecar (loaded-but-idle fixture) — reaped. Its id
+    //     is minted per run: the fixture carries it as its tag, and the
+    //     sweep's Reaped needs no process on the host to carry that tag, so a
+    //     fixed id would let a concurrent run of this test unconfirm (c).
+    let id_c = &mint_ownership_id();
     let (mut child_c, ws_c) = spawn_own_fake_app_server_with_behavior(
         id_c,
         Some(r#"{"loadedThreadIds": ["t-c"], "threadStatuses": {"t-c": "idle"}}"#),
@@ -507,13 +515,15 @@ async fn restart_reconciliation_leaves_no_sidecar_silently_orphaned() {
 
     let mut outcomes = reconciler.sweep_unclaimed().await;
     outcomes.sort_by(|x, y| x.0.cmp(&y.0));
+    // Sorted by id like the outcomes: (c)'s minted id has no fixed place.
+    let mut expected = vec![
+        (id_c.to_string(), SweepOutcome::Reaped),
+        (id_d.to_string(), SweepOutcome::RetainedMidTurn),
+        (id_e.to_string(), SweepOutcome::Reaped),
+    ];
+    expected.sort_by(|x, y| x.0.cmp(&y.0));
     assert_eq!(
-        outcomes,
-        vec![
-            (id_c.to_string(), SweepOutcome::Reaped),
-            (id_d.to_string(), SweepOutcome::RetainedMidTurn),
-            (id_e.to_string(), SweepOutcome::Reaped),
-        ],
+        outcomes, expected,
         "every unclaimed record is swept to an explicit fate"
     );
 
