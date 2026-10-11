@@ -2668,23 +2668,32 @@ impl Supervisor {
         {
             Ok(true) => return Ok(StopOutcome::VerifiedEmpty),
             Ok(false) => {}
-            Err(error) => return Ok(stop_verification_outcome(error)),
+            Err(error) => {
+                self.stop_runtime_stage_failed(handle, "initial_empty_inspection", &error);
+                return Ok(stop_verification_outcome(error));
+            }
         }
-        if let Ok(authenticated) = self
+        match self
             .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
             .await
         {
-            self.registry
-                .stop_progress(handle)
-                .await
-                .map_err(map_registry)?;
-            let _ = self
-                .send_host_stop(
-                    handle.incarnation_id().clone(),
-                    handle.runtime_dir(),
-                    &authenticated,
-                )
-                .await;
+            Ok(authenticated) => {
+                self.registry
+                    .stop_progress(handle)
+                    .await
+                    .map_err(map_registry)?;
+                if let Err(error) = self
+                    .send_host_stop(
+                        handle.incarnation_id().clone(),
+                        handle.runtime_dir(),
+                        &authenticated,
+                    )
+                    .await
+                {
+                    self.stop_runtime_stage_failed(handle, "host_stop", &error);
+                }
+            }
+            Err(error) => self.stop_runtime_stage_failed(handle, "host_authentication", &error),
         }
         self.registry
             .stop_progress(handle)
@@ -2695,12 +2704,13 @@ impl Supervisor {
         // keeping the whole future finite so silence releases our lock.
         let grace_seconds = 2;
         let request_budget = Duration::from_secs(grace_seconds) + Duration::from_secs(1);
-        if let Err(error) = tokio::time::timeout(
+        let graceful = tokio::time::timeout(
             request_budget,
             self.backend.request_stop(handle, grace_seconds),
         )
-        .await
-        .unwrap_or_else(|_| Err(BackendError::Unavailable("graceful Stop timed out".into())))
+        .await;
+        if let Err(error) =
+            self.stop_request_result(handle, "graceful_stop", graceful, "graceful Stop timed out")
         {
             // A concurrently removed exact enclosure can return 404 to Stop.
             // It still needs the backend's qualified empty observation.
@@ -2714,10 +2724,19 @@ impl Supervisor {
                     .await
                 {
                     Ok(true) => StopOutcome::VerifiedEmpty,
-                    Err(error) if error.code == RuntimeErrorCode::OwnershipMismatch => {
-                        StopOutcome::BlockedOwnership
+                    Err(inspection_error) => {
+                        self.stop_runtime_stage_failed(
+                            handle,
+                            "graceful_failure_empty_inspection",
+                            &inspection_error,
+                        );
+                        if inspection_error.code == RuntimeErrorCode::OwnershipMismatch {
+                            StopOutcome::BlockedOwnership
+                        } else {
+                            stop_backend_outcome(error)
+                        }
                     }
-                    _ => stop_backend_outcome(error),
+                    Ok(false) => stop_backend_outcome(error),
                 },
             );
         }
@@ -2728,16 +2747,19 @@ impl Supervisor {
         {
             Ok(true) => return Ok(StopOutcome::VerifiedEmpty),
             Ok(false) => {}
-            Err(error) => return Ok(stop_verification_outcome(error)),
+            Err(error) => {
+                self.stop_runtime_stage_failed(handle, "graceful_empty_inspection", &error);
+                return Ok(stop_verification_outcome(error));
+            }
         }
         self.registry
             .stop_progress(handle)
             .await
             .map_err(map_registry)?;
+        let forced =
+            tokio::time::timeout(Duration::from_secs(3), self.backend.force_stop(handle)).await;
         if let Err(error) =
-            tokio::time::timeout(Duration::from_secs(3), self.backend.force_stop(handle))
-                .await
-                .unwrap_or_else(|_| Err(BackendError::Unavailable("force Stop timed out".into())))
+            self.stop_request_result(handle, "force_stop", forced, "force Stop timed out")
         {
             return Ok(stop_backend_outcome(error));
         }
@@ -2747,10 +2769,81 @@ impl Supervisor {
                 .await
             {
                 Ok(true) => StopOutcome::VerifiedEmpty,
-                Ok(false) => StopOutcome::TerminationUnconfirmed,
-                Err(error) => stop_verification_outcome(error),
+                Ok(false) => {
+                    self.stop_stage_failed(
+                        handle,
+                        "force_empty_inspection",
+                        "not_empty",
+                        None,
+                        None,
+                    );
+                    StopOutcome::TerminationUnconfirmed
+                }
+                Err(error) => {
+                    self.stop_runtime_stage_failed(handle, "force_empty_inspection", &error);
+                    stop_verification_outcome(error)
+                }
             },
         )
+    }
+
+    fn stop_stage_failed(
+        &self,
+        handle: &crate::registry::OwnedRuntimeHandle,
+        stage: &str,
+        category: &str,
+        code: Option<RuntimeErrorCode>,
+        status: Option<u16>,
+    ) {
+        let fence = handle.stop_fence().ok();
+        append_event(
+            &self.config.lifecycle_log,
+            "supervisor.stop_stage_failed",
+            serde_json::json!({
+                "severity":"warning", "soulId":handle.soul_id(), "incarnationId":handle.incarnation_id(),
+                "intentRevision":fence.map(|f| f.intent_revision), "executionGeneration":fence.map(|f| f.execution_generation),
+                "controlEpoch":self.registry.control_epoch(), "stage":stage, "errorCategory":category,
+                "errorCode":code, "httpStatus":status,
+            }),
+        );
+    }
+
+    fn stop_runtime_stage_failed(
+        &self,
+        handle: &crate::registry::OwnedRuntimeHandle,
+        stage: &str,
+        error: &RuntimeError,
+    ) {
+        self.stop_stage_failed(handle, stage, "runtime_error", Some(error.code), None);
+    }
+
+    fn stop_request_result(
+        &self,
+        handle: &crate::registry::OwnedRuntimeHandle,
+        stage: &str,
+        result: Result<Result<(), BackendError>, tokio::time::error::Elapsed>,
+        timeout_message: &str,
+    ) -> Result<(), BackendError> {
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                let (category, status) = match &error {
+                    BackendError::Unavailable(_) => ("unavailable", None),
+                    BackendError::OwnershipMismatch(_) => ("ownership_mismatch", None),
+                    BackendError::PolicyMismatch(_) => ("policy_mismatch", None),
+                    BackendError::DockerHttp { status, .. } => ("docker_http", Some(*status)),
+                    BackendError::Malformed(_) => ("malformed_response", None),
+                    BackendError::InvalidConfig(_) => ("invalid_config", None),
+                    BackendError::StoppedRepair(_) => ("stopped_repair", None),
+                };
+                self.stop_stage_failed(handle, stage, category, None, status);
+                Err(error)
+            }
+            Err(_) => {
+                self.stop_stage_failed(handle, stage, "timeout", None, None);
+                Err(BackendError::Unavailable(timeout_message.into()))
+            }
+        }
     }
 
     pub(crate) async fn verify_empty_with_budget(
@@ -5666,6 +5759,15 @@ mod interrupted_transaction_tests {
             .count()
     }
 
+    fn stop_failure_events(supervisor: &Supervisor) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(&supervisor.config.lifecycle_log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|event: &serde_json::Value| event["event"] == "supervisor.stop_stage_failed")
+            .collect()
+    }
+
     struct StopBackend {
         root: PathBuf,
     }
@@ -6111,6 +6213,58 @@ mod interrupted_transaction_tests {
     }
 
     #[tokio::test]
+    async fn ordinary_stop_failure_diagnostics_preserve_outcome_and_pending_intent() {
+        for (mode, expected, code) in [
+            (
+                "unavailable",
+                StopOutcome::BackendUnavailable,
+                "BACKEND_UNAVAILABLE",
+            ),
+            (
+                "mismatch",
+                StopOutcome::BlockedOwnership,
+                "OWNERSHIP_MISMATCH",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let supervisor = open(dir.path());
+            let id = seed(&supervisor, dir.path(), false).await;
+            std::fs::write(dir.path().join("mode"), mode).unwrap();
+            let (outcome, view) = supervisor.stop(id, Some(1)).await.unwrap();
+            assert_eq!(outcome, expected);
+            assert_eq!(view.intent_revision, 2);
+            let handle = supervisor
+                .registry
+                .pending_stop_handles()
+                .await
+                .unwrap()
+                .remove(0);
+            assert!(
+                !supervisor
+                    .registry
+                    .stop_progress(&handle)
+                    .await
+                    .unwrap()
+                    .settled
+            );
+            assert_retained(&supervisor, dir.path(), 2).await;
+            let text = std::fs::read_to_string(&supervisor.config.lifecycle_log).unwrap();
+            let events = stop_failure_events(&supervisor);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["data"]["stage"], "initial_empty_inspection");
+            assert_eq!(events[0]["data"]["errorCode"], code);
+            assert_eq!(events[0]["data"]["intentRevision"], 2);
+            assert_eq!(
+                events[0]["data"]["incarnationId"],
+                handle.incarnation_id().as_str()
+            );
+            assert_eq!(events[0]["data"]["severity"], "warning");
+            assert!(!text.contains("synthetic backend offline"));
+            assert!(!text.contains("synthetic labels differ"));
+        }
+    }
+
+    #[tokio::test]
     async fn ordinary_stop_docker_grace_includes_http_overhead() {
         let dir = tempfile::tempdir().unwrap();
         let mut supervisor = open(dir.path());
@@ -6337,6 +6491,28 @@ mod interrupted_transaction_tests {
                 StopOutcome::BackendUnavailable
             };
             assert_eq!(outcome, expected, "{point}");
+            let failures = stop_failure_events(&supervisor);
+            let stage = match point {
+                "initial_inspect" => "initial_empty_inspection",
+                "graceful_request" | "error_observation" => "graceful_stop",
+                "graceful_observation" => "graceful_empty_inspection",
+                "force_request" => "force_stop",
+                "force_observation" => "force_empty_inspection",
+                _ => unreachable!(),
+            };
+            assert!(
+                failures.iter().any(|event| event["data"]["stage"] == stage),
+                "{point}: missing failed stage"
+            );
+            if point == "error_observation" {
+                assert!(failures
+                    .iter()
+                    .any(|event| event["data"]["stage"] == "graceful_failure_empty_inspection"));
+                assert_eq!(failures[0]["data"]["errorCategory"], "docker_http");
+                assert_eq!(failures[0]["data"]["httpStatus"], 500);
+            } else if point.ends_with("request") {
+                assert_eq!(failures[0]["data"]["errorCategory"], "timeout");
+            }
             assert_eq!(view.intent_revision, 2);
             assert_eq!(view.cleanup_state, CleanupState::TerminationUnconfirmed);
             assert!(

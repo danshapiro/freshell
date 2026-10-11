@@ -58,6 +58,72 @@ it('settles an owner request failure with a structured refusal and closes the ex
   }
 })
 
+it.each(['response', 'disconnect'])('records the actual upstream request and its %s settlement without private data', async settlement => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'frs-broker-transport-'))
+  const upstreamSocket = path.join(root, 'upstream.sock')
+  const proxySocket = path.join(root, 'proxy.sock')
+  const logPath = path.join(root, 'broker.jsonl')
+  let release!: () => void
+  const held = new Promise<void>(resolve => { release = resolve })
+  let accepted!: () => void
+  const arrived = new Promise<void>(resolve => { accepted = resolve })
+  const upstream = http.createServer(async (request, response) => {
+    request.resume()
+    accepted()
+    await held
+    if (settlement === 'disconnect') { request.socket.destroy(); return }
+    response.writeHead(503, { 'x-private-diagnostic': 'private-header' })
+    response.end('private-response-body')
+  })
+  const instance = new RestrictedDockerBroker({ realSocketPath: upstreamSocket, proxySocketPath: proxySocket,
+    runtimeRootPrefix: path.join(root, 'r'), allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set(),
+    testRunId: 'transport-only', logPath })
+  const diagnostics = async () => (await fs.readFile(logPath, 'utf8').catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return ''
+    throw error
+  })).trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+    .filter(event => event.event?.startsWith('runtime.broker.request_'))
+  try {
+    await new Promise<void>(resolve => upstream.listen(upstreamSocket, resolve))
+    await instance.start()
+    const response = new Promise<{ status: number; body: string } | { error: string }>(resolve => {
+      const request = http.get({ socketPath: proxySocket, path: '/_ping' }, reply => {
+        const chunks: Buffer[] = []
+        reply.on('data', chunk => chunks.push(Buffer.from(chunk)))
+        reply.once('end', () => resolve({ status: reply.statusCode!, body: Buffer.concat(chunks).toString() }))
+      })
+      request.once('error', (error: NodeJS.ErrnoException) => resolve({ error: error.code! }))
+    })
+    await arrived
+    const started = await diagnostics()
+    expect(started).toHaveLength(1)
+    expect(started[0]).toMatchObject({ event: 'runtime.broker.request_started', severity: 'info', method: 'GET', url: '/_ping' })
+    expect(started[0].requestId).toEqual(expect.any(String))
+    expect(instance.eventsSnapshot()).toEqual([])
+    const holdStarted = performance.now()
+    await new Promise(resolve => setTimeout(resolve, 25))
+    const holdDuration = performance.now() - holdStarted
+    release()
+    const result = await response
+    expect(result).toEqual(settlement === 'response' ? { status: 503, body: 'private-response-body' } : { error: 'ECONNRESET' })
+    const events = await diagnostics()
+    expect(events).toHaveLength(2)
+    expect(events[1]).toMatchObject({ event: 'runtime.broker.request_completed', requestId: started[0].requestId,
+      severity: settlement === 'response' ? 'info' : 'warn', method: 'GET', url: '/_ping',
+      ...(settlement === 'response' ? { statusCode: 503 } : { errorCategory: 'upstream_request_failed' }) })
+    expect(events[1].durationMs).toEqual(expect.any(Number))
+    expect(events[1].durationMs).toBeGreaterThanOrEqual(holdDuration)
+    expect((await fs.readFile(logPath, 'utf8'))).not.toMatch(/private-header|private-response-body/)
+    expect(instance.unsafeAttempts()).toEqual([])
+  } finally {
+    release()
+    upstream.closeAllConnections()
+    await instance.close()
+    await new Promise<void>(resolve => upstream.close(() => resolve()))
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
 const runtimeDir = '/tmp/owned/r/scenario/x/incarnation-one'
 const actorKey = createHash('sha256').update('installation-one\0soul-one').digest('hex')
 const actorDir = `/tmp/owned/r/scenario/x/souls/${actorKey}/actor`

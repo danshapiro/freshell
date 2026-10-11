@@ -81,6 +81,7 @@ export class RestrictedDockerBroker {
   private draining = false
   private drainExpired = false
   private stopFailuresRemaining = 0
+  private transportSequence = 0
 
   constructor(private readonly policy: RestrictedDockerBrokerPolicy) {}
 
@@ -697,6 +698,10 @@ export class RestrictedDockerBroker {
 
   private forward(request: IncomingMessage, body: Buffer): Promise<DockerResponse> {
     if (this.drainExpired) return Promise.reject(new Error('broker cleanup deadline expired'))
+    const requestId = `${this.policy.testRunId}:${++this.transportSequence}`
+    const started = performance.now()
+    const address = { requestId, method: request.method ?? 'GET', url: request.url ?? '/' }
+    this.recordTransport('request_started', 'info', address)
     return new Promise((resolve, reject) => {
       let result: DockerResponse | undefined
       let failure: string | undefined
@@ -718,6 +723,10 @@ export class RestrictedDockerBroker {
       upstream.once('error', () => { failure ??= this.drainExpired ? 'cleanup_deadline' : 'upstream_request_failed' })
       upstream.once('close', () => {
         this.upstreamRequests.delete(upstream)
+        this.recordTransport('request_completed', result && !failure ? 'info' : 'warn', {
+          ...address, durationMs: Math.max(0, performance.now() - started),
+          ...(result && !failure ? { statusCode: result.statusCode } : { errorCategory: failure ?? 'upstream_response_incomplete' }),
+        })
         if (result && !failure) { resolve(result); return }
         const details: BrokerSettlementFailure = { method: request.method ?? 'GET', url: request.url ?? '/',
           reason: failure ?? 'upstream_response_incomplete',
@@ -733,6 +742,20 @@ export class RestrictedDockerBroker {
       if (body.length > 0) upstream.write(body)
       upstream.end()
     })
+  }
+
+  /** Transport diagnostics do not enter the ownership/cleanup receipt stream. */
+  private recordTransport(phase: 'request_started' | 'request_completed', severity: 'info' | 'warn', fields: {
+    requestId: string; method: string; url: string; durationMs?: number; statusCode?: number; errorCategory?: string
+  }): void {
+    const entry = { at: new Date().toISOString(), severity, event: `runtime.broker.${phase}`, ...fields }
+    try {
+      fs.appendFileSync(this.policy.logPath, `${JSON.stringify(entry)}\n`, { mode: 0o600 })
+      fs.chmodSync(this.policy.logPath, 0o600)
+    } catch {
+      process.stderr.write(`${JSON.stringify({ severity: 'error', event: 'runtime.broker.transport_logging_failed',
+        runId: this.policy.testRunId, requestId: fields.requestId, phase })}\n`)
+    }
   }
 
   private block(response: ServerResponse, method: string, url: string, status: number, reason: string, destructive: boolean, containerId?: string): void {
