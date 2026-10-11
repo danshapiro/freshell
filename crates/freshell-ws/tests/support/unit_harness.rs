@@ -717,3 +717,23 @@ impl Drop for GoneDelay {
         std::env::remove_var("FRESHELL_TEST_HOOKS");
     }
 }
+
+/// Holds up by `ms` every read of the Codex thread lock files a unit's
+/// members hold that starts while alive (the containment's env-gated hook:
+/// a Codex home on a hung network mount). Create it after the harness.
+pub struct ThreadReadHeldUp;
+
+impl ThreadReadHeldUp {
+    pub fn set(ms: u64) -> Self {
+        std::env::set_var("FRESHELL_TEST_HOOKS", "1");
+        std::env::set_var("FRESHELL_TEST_UNIT_THREAD_SCAN_DELAY_MS", ms.to_string());
+        ThreadReadHeldUp
+    }
+}
+
+impl Drop for ThreadReadHeldUp {
+    fn drop(&mut self) {
+        std::env::remove_var("FRESHELL_TEST_UNIT_THREAD_SCAN_DELAY_MS");
+        std::env::remove_var("FRESHELL_TEST_HOOKS");
+    }
+}

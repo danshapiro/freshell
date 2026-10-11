@@ -144,7 +144,10 @@ fn unit_keys(unit: &AgentUnit, operation_id: Option<&str>) -> UnitLogKeys {
 ///    unit record and lock paths) before the first signal (Stage 2: LB-51,
 ///    LB-31). The read is bounded
 ///    ([`crate::unit_threads::STOP_READ_DEADLINE`]): one that does not
-///    finish in time is logged as could-not-check and the stop goes on;
+///    finish in time is logged as could-not-check and the stop goes on.
+///    Step 4's silence is armed before the read: nothing after this point
+///    can cancel the stop, so a turn that ends during the read is a turn of
+///    a pane being stopped;
 /// 1. join decision from the owner registry: a key of the unit already
 ///    Stopping makes this call a join under that key's operation;
 /// 2. `begin_unit_stop` and one live `stopping` owner frame per key moved;
@@ -209,13 +212,15 @@ fn stop_target(state: &WsState, entry: &UnitEntry) -> StopTarget {
 /// stop has not begun gets one bounded read of the threads its app-server
 /// holds ([`crate::unit_threads::reconcile_before_stop`], Stage 2: LB-51),
 /// on the caller's thread: at most
-/// [`crate::unit_threads::STOP_READ_DEADLINE`].
+/// [`crate::unit_threads::STOP_READ_DEADLINE`]. The stop is silent from
+/// before that read ([`silence_requested_stop`]).
 pub(crate) fn start_unit_stop(
     state: &WsState,
     entry: &UnitEntry,
     cmd: UnitStopCommand,
 ) -> UnitStop {
     if let Some(terminal_id) = threads_to_read_before_stop(state, entry) {
+        silence_requested_stop(state, &cmd, &terminal_id);
         crate::unit_threads::reconcile_before_stop(state, &terminal_id);
     }
     start_unit_stop_after_read(state, entry, cmd)
@@ -224,13 +229,14 @@ pub(crate) fn start_unit_stop(
 /// [`start_unit_stop`] for a caller on a connection's message loop (a
 /// Shift-X): the bounded read before the first signal runs on a blocking
 /// thread and is awaited there, so the loop's own thread is never blocked
-/// by it.
+/// by it. The stop is silent from before that read.
 pub(crate) async fn start_unit_stop_off_loop(
     state: &WsState,
     entry: &UnitEntry,
     cmd: UnitStopCommand,
 ) -> UnitStop {
     if let Some(terminal_id) = threads_to_read_before_stop(state, entry) {
+        silence_requested_stop(state, &cmd, &terminal_id);
         let (reading, unit_entry) = (state.clone(), entry.clone());
         let read = tokio::task::spawn_blocking(move || {
             crate::unit_threads::reconcile_before_stop(&reading, &terminal_id);
@@ -261,6 +267,20 @@ fn threads_to_read_before_stop(state: &WsState, entry: &UnitEntry) -> Option<Str
         return None;
     }
     stop_target(state, entry).terminal_id
+}
+
+/// Step 4, the stop-start silence (Stage 2: LB-37): from now until its exit
+/// the terminal produces no idle, turn-complete or death-bell edge. Every
+/// requested stop is silent; an agent exit (a crash) never is, and still
+/// rings at its exit. Called where the stop's steps run and, earlier, right
+/// before a read that precedes them; arming it again changes nothing.
+fn silence_requested_stop(state: &WsState, cmd: &UnitStopCommand, terminal_id: &str) {
+    if matches!(cmd.ending(), UnitEnding::AgentExited { .. }) {
+        return;
+    }
+    if let Some(hub) = state.activity.as_ref() {
+        hub.note_stop_requested(terminal_id);
+    }
 }
 
 /// [`start_unit_stop`] without the read before it.
@@ -369,12 +389,10 @@ fn launch_unit_stop(
         state.registry.mark_ending(tid, ending);
     }
 
-    // 4. Stop-start silence (Stage 2: LB-37): a crash is never routed here
-    //    before Gone and still rings at its exit.
-    if !matches!(ending, UnitEnding::AgentExited { .. }) {
-        if let (Some(hub), Some(tid)) = (state.activity.as_ref(), target.terminal_id.as_deref()) {
-            hub.note_stop_requested(tid);
-        }
+    // 4. Stop-start silence: a crash is never routed here before Gone and
+    //    still rings at its exit.
+    if let Some(tid) = target.terminal_id.as_deref() {
+        silence_requested_stop(state, &cmd, tid);
     }
 
     // 5. A stopped start never settles as running.

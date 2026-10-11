@@ -32,7 +32,7 @@ use serde_json::json;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::prelude::*;
-use unit_harness::{fake_codex, GoneDelay, HarnessOpts, UnitHarness};
+use unit_harness::{fake_codex, GoneDelay, HarnessOpts, ThreadReadHeldUp, UnitHarness};
 
 /// How long the hook holds the read up: far past every bound below.
 const HELD_UP_MS: u64 = 30_000;
@@ -152,28 +152,6 @@ sleep 600;"#;
     child
 }
 
-/// Holds up every thread read started while alive (the containment's
-/// env-gated hook). Create it after the harness (which serializes tests).
-struct ReadHeldUp;
-
-impl ReadHeldUp {
-    fn set() -> Self {
-        std::env::set_var("FRESHELL_TEST_HOOKS", "1");
-        std::env::set_var(
-            "FRESHELL_TEST_UNIT_THREAD_SCAN_DELAY_MS",
-            HELD_UP_MS.to_string(),
-        );
-        ReadHeldUp
-    }
-}
-
-impl Drop for ReadHeldUp {
-    fn drop(&mut self) {
-        std::env::remove_var("FRESHELL_TEST_UNIT_THREAD_SCAN_DELAY_MS");
-        std::env::remove_var("FRESHELL_TEST_HOOKS");
-    }
-}
-
 /// The native app-server manifest of process `pid` (readable after it died).
 fn native_manifest(h: &UnitHarness, pid: u32) -> fake_codex::NativeManifest {
     let raw = std::fs::read_to_string(h.manifests.join(format!("native-{pid}.json")))
@@ -288,7 +266,7 @@ async fn shift_x_signals_while_the_thread_read_is_held_up() {
         .await;
     let unit_id = h.unit_for(&tid).id().as_str().to_string();
     let native = h.native_pid(&tid);
-    let _held_up = ReadHeldUp::set();
+    let _held_up = ThreadReadHeldUp::set(HELD_UP_MS);
 
     let asked = Instant::now();
     h.send(
@@ -322,7 +300,7 @@ async fn a_registry_kill_is_not_held_up_by_the_thread_read() {
     let mut ws = h.connect().await;
     let tid = h.create_codex(&mut ws, "crq-reg", Some("t-reg")).await;
     let unit_id = h.unit_for(&tid).id().as_str().to_string();
-    let _held_up = ReadHeldUp::set();
+    let _held_up = ThreadReadHeldUp::set(HELD_UP_MS);
 
     // The registry's kill of a unit row (an idle reap, a handoff) starts the
     // unit's stop synchronously, on the caller's thread.
