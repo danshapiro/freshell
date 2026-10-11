@@ -963,19 +963,7 @@ impl FreshCodexState {
         if !is_codex_writer_conflict(err) {
             return None;
         }
-        let home = client.codex_home().await;
-        let holder = freshell_containment::report_writer_conflict(
-            &freshell_containment::events::UnitLogKeys {
-                provider: PROVIDER.to_string(),
-                session_id: Some(thread_id.to_string()),
-                ..Default::default()
-            },
-            home.as_deref().map(std::path::Path::new),
-            thread_id,
-            request_id,
-            "freshcodex",
-        )
-        .await;
+        let holder = report_codex_writer_conflict(client, thread_id, request_id).await;
         Some(match holder {
             Some(holder) if self.holder_in_a_pane(holder.pid).await => HeldAnswer::Pane,
             Some(holder) => HeldAnswer::Elsewhere(
@@ -5086,6 +5074,20 @@ impl FreshCodexState {
         // it. An archive failure leaves the child attached to the PARENT connection
         // (still usable there; no handoff was attempted), so nothing more happens.
         if let Err(err) = parent_client.archive_thread(&child_id).await {
+            // Task 16 (review R3-m2): Codex refuses the archive as held when
+            // the child is still live on the parent (its shutdown there
+            // outlasted Codex's wait): logged at ERROR naming the holder,
+            // under the fork's request id. The holder is the parent pane's
+            // own `codex`, so the answer stays Codex's text, never "another
+            // program".
+            if is_codex_writer_conflict(&err) {
+                report_codex_writer_conflict(
+                    &parent_client,
+                    &child_id,
+                    msg.request_id.as_deref().unwrap_or_default(),
+                )
+                .await;
+            }
             reply_sink(fork_error_frame(&parent_id, &err.to_string()));
             return;
         }
@@ -9324,6 +9326,32 @@ const CONVERSATION_HELD_ELSEWHERE: &str = "CONVERSATION_HELD_ELSEWHERE";
 fn is_codex_writer_conflict(err: &CodexAppServerError) -> bool {
     err.to_string()
         .contains(freshell_codex::remote_proxy::WRITER_CONFLICT_TEXT)
+}
+
+/// Logs, at ERROR (`unit.writer_conflict`, `source: freshcodex`, under
+/// `request_id`), a writer conflict the app-server of `client` reported for
+/// `thread_id`, naming the holder one bounded lookup finds under the Codex
+/// home that app-server reported (Task 16;
+/// [`freshell_containment::report_writer_conflict`]). Returns the holder it
+/// named (`None`: none visible, no home, or the lookup could not finish).
+async fn report_codex_writer_conflict(
+    client: &CodexAppServerClient,
+    thread_id: &str,
+    request_id: &str,
+) -> Option<freshell_containment::LockHolder> {
+    let home = client.codex_home().await;
+    freshell_containment::report_writer_conflict(
+        &freshell_containment::events::UnitLogKeys {
+            provider: PROVIDER.to_string(),
+            session_id: Some(thread_id.to_string()),
+            ..Default::default()
+        },
+        home.as_deref().map(std::path::Path::new),
+        thread_id,
+        request_id,
+        "freshcodex",
+    )
+    .await
 }
 
 /// The text telling the user that a program this server cannot see holds
@@ -17160,6 +17188,110 @@ pub(crate) mod tests {
             "a failed thread/archive must produce NO unarchive/spawn"
         );
         assert!(st.sessions.lock().await.len() == 1, "no child registered");
+    }
+
+    /// Task 16 (review R3-m2): Codex refuses the parent's `thread/archive`
+    /// of a just-forked child as held when the child is still live on the
+    /// parent (its shutdown there outlasted Codex's wait). That writer
+    /// conflict is logged at ERROR (`source: freshcodex`), under the fork's
+    /// request id, naming the process the lookup under the parent's Codex
+    /// home finds holding the child's lock. The fork still answers Codex's
+    /// own text, never "another program" (the holder is the parent pane's
+    /// own `codex`), and nothing more happens; the holder is never
+    /// signalled.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn handle_fork_archive_codex_refuses_as_held_is_logged_naming_the_holder() {
+        let _guard = ENV_LOCK.lock().await;
+        let home = std::path::PathBuf::from(
+            std::env::var_os("CODEX_HOME").expect("the isolated CODEX_HOME"),
+        );
+        let capture = tracing_capture::capture_by_session("child-arch-held");
+        let mut holder = OutsideHolder::hold(&freshell_containment::codex_thread_lock_path(
+            &home,
+            "child-arch-held",
+        ));
+        let pid = holder.pid();
+        let (st, _rx_boot) = state_with_bus();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "parent-arch-held",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-fork-arch-held",
+        )
+        .await;
+
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_fork(
+                    fork_msg("parent-arch-held", "fork-req-arch-held", None),
+                    None,
+                    sink,
+                )
+                .await;
+            })
+        };
+
+        // The parent reports the Codex home it writes under.
+        let (init_id, init_method, _p) = peer.expect_request().await;
+        assert_eq!(init_method, "initialize");
+        peer.respond(
+            &init_id,
+            json!({
+                "userAgent": "x",
+                "codexHome": home.display().to_string(),
+                "platformFamily": "u",
+                "platformOs": "l",
+            }),
+        );
+        let _ = peer.expect_notification().await; // initialized
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/fork");
+        peer.respond(&id, json!({ "thread": { "id": "child-arch-held" } }));
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/archive");
+        assert_eq!(params["threadId"], json!("child-arch-held"));
+        peer.respond_error(
+            &id,
+            -32600,
+            "thread child-arch-held already has an active writer",
+        );
+        driver.await.expect("fork task");
+
+        let frames = captured_frames(&captured);
+        assert_single_fork_error_frame(
+            &frames,
+            "parent-arch-held",
+            "INTERNAL_ERROR",
+            "thread child-arch-held already has an active writer",
+        );
+        assert!(
+            !frames[0]["event"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("another program"),
+            "the parent pane's own codex is never called another program: {frames:?}"
+        );
+        let conflicts = writer_conflicts_naming(&capture, pid);
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert_eq!(conflicts[0].fields["source"], "freshcodex");
+        assert_eq!(conflicts[0].fields["thread_id"], "child-arch-held");
+        assert_eq!(conflicts[0].fields["request_id"], "fork-req-arch-held");
+        assert_eq!(conflicts[0].fields["holder_name"], "perl");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.next_frame())
+                .await
+                .is_err(),
+            "a refused thread/archive must produce NO unarchive/spawn"
+        );
+        assert!(st.sessions.lock().await.len() == 1, "no child registered");
+        assert!(holder.answers(), "the holder is never signalled");
     }
 
     #[tokio::test]
