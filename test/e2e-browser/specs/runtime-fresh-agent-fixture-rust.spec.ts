@@ -24,6 +24,34 @@ const MODES = [
 
 type Created = { paneId: string; sessionId: string; view: ManagedRuntimeView }
 type ObservedResourceType = Parameters<ManagedHistoryAwaitedPhases['navigation']>[0]['resourceType']
+type OwnedHistoryAllocation = {
+  tabId: string; paneId: string; createRequestId: string; createdSessionId: string
+  sessionType: string; provider: string; nativeSessionId: string
+}
+
+/** Snapshot every existing pane before Projects unmounts and remounts the workspace. */
+function historyPaneOwners(state: any, allocations: OwnedHistoryAllocation[]) {
+  const leaves = (node: any): any[] => node?.type === 'leaf' ? [node]
+    : node?.children?.flatMap(leaves) ?? []
+  const panes = Object.entries(state.panes.layouts).flatMap(([tabId, layout]) => leaves(layout)
+    .filter(leaf => leaf.content.kind === 'fresh-agent').map(leaf => ({ tabId, ...leaf })))
+  expect(panes).toHaveLength(allocations.length)
+  const owners = allocations.map(allocation => {
+    const matches = panes.filter(pane => pane.id === allocation.paneId && pane.tabId === allocation.tabId)
+    expect(matches, 'one existing pane per actual owned allocation').toHaveLength(1)
+    const content = matches[0].content
+    expect(content).toMatchObject({ createRequestId: allocation.createRequestId,
+      sessionType: allocation.sessionType, provider: allocation.provider })
+    expect([allocation.createdSessionId, allocation.nativeSessionId]).toContain(content.sessionId)
+    const sessionRef = content.sessionRef ?? (content.resumeSessionId
+      ? { provider: content.provider, sessionId: content.resumeSessionId } : undefined)
+    if (sessionRef) expect(sessionRef).toEqual({ provider: allocation.provider, sessionId: allocation.nativeSessionId })
+    return { ...allocation, sessionId: content.sessionId as string, sessionRef }
+  })
+  expect(new Set(owners.map(owner => owner.paneId)).size).toBe(owners.length)
+  expect(new Set(owners.map(owner => owner.sessionId)).size).toBe(owners.length)
+  return owners
+}
 
 function unwrap(body: any): any {
   return body?.data ?? body
@@ -82,6 +110,7 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
       providerSettings: Object.fromEntries(MODES.map(({ mode }) => [mode, {}])),
     })
     const sent: any[] = []
+    const allocations: OwnedHistoryAllocation[] = []
     const observation = new ManagedHistoryAwaitedPhases()
     let resourceFailures = 0
     page.on('response', response => {
@@ -138,8 +167,13 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
           createdSessionId: created.sessionId, nativeSessionId: view.nativeSessionId! }
         const nativePane = await phase('native-pane', () => waitFor('browser pane bound to the actual owned allocation',
           () => page.evaluate(observeOwnedFreshBrowserPane, paneObservation)))
+        allocations.push(paneObservation)
         const tabCount = await phase('tab-count', () => harness.getTabCount())
-        const layout = await phase('layout', () => harness.getPaneLayout(created.tabId))
+        const { layout, owners } = await phase('layout', async () => ({
+          layout: await harness.getPaneLayout(created.tabId),
+          owners: historyPaneOwners(await harness.getState(), allocations),
+        }))
+        expect(owners.find(owner => owner.paneId === created.paneId)?.sessionId).toBe(nativePane.sessionId)
         const soulIds = (await phase('inventory-before', () => rig.inventory())).map(row => row.soulId).sort()
         const cursor = sent.length
         await phase('history-open', () => openFreshHistorySession(page, { repoRoot: rig.repoRoot, provider: wireProvider, nativeSessionId: view.nativeSessionId! }))
@@ -155,9 +189,21 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
         expect(historyFrames.filter(frame => frame.type === 'freshAgent.send')).toHaveLength(0)
         expect(historyFrames.length).toBeGreaterThan(0)
         for (const frame of historyFrames) {
-          expect(frame.provider).toBe(wireProvider)
-          if (frame.type === 'freshAgent.create') expect(frame.sessionRef).toMatchObject({ provider: wireProvider, sessionId: view.nativeSessionId })
-          else expect(frame.sessionId).toBe(nativePane.sessionId)
+          if (frame.type === 'freshAgent.create') {
+            expect(frame.provider).toBe(wireProvider)
+            expect(frame.sessionType).toBe(definition.mode)
+            expect(frame.requestId).toBe(created.createRequestId)
+            expect(frame.tabId).toBe(created.tabId)
+            expect(frame.sessionRef).toMatchObject({ provider: wireProvider, sessionId: view.nativeSessionId })
+          } else {
+            // Hidden tabs also reattach. Every frame still needs a unique,
+            // allocation-backed owner; filtering only the target would hide bugs.
+            const matches = owners.filter(owner => owner.sessionId === frame.sessionId)
+            expect(matches, 'History attachment must have one preexisting owned pane').toHaveLength(1)
+            expect(frame.provider).toBe(matches[0].provider)
+            expect(frame.sessionType).toBe(matches[0].sessionType)
+            expect(frame.sessionRef).toEqual(matches[0].sessionRef)
+          }
         }
         const current = await phase('history-current', () => rig.runningViewForFreshSession(created.sessionId))
         expect(current?.soulId).toBe(view.soulId)
