@@ -116,6 +116,10 @@ pub struct UnitScreenExit {
     pub exit_code: i64,
     /// 0 for the row's first screen, +1 for each replacement.
     pub screen_generation: u32,
+    /// How long the exiting screen ran: from its own start (the row's
+    /// spawn, or the reservation of its replacement) to the moment its exit
+    /// was taken.
+    pub lived: std::time::Duration,
 }
 
 /// The unit lifecycle's screen-exit handler. It runs on the PTY reader
@@ -7135,11 +7139,14 @@ fn screen_exited(
             if generation.is_none_or(|exiting| exiting == current) {
                 unit.screen_exit_seen = true;
             }
-            (keys, current)
+            let lived = std::time::Duration::from_millis(
+                u64::try_from(now_ms().saturating_sub(unit.screen_started_at)).unwrap_or(0),
+            );
+            (keys, current, lived)
         });
         (unit, ending)
     };
-    if let (Some((keys, current)), Some(exiting)) = (&unit, generation) {
+    if let (Some((keys, current, _)), Some(exiting)) = (&unit, generation) {
         if exiting != *current {
             drop(inner);
             unit_log!(
@@ -7167,12 +7174,13 @@ fn screen_exited(
     }
     match unit {
         None => ScreenExit::Plain(Arc::clone(&handle.shared)),
-        Some((keys, screen_generation)) => {
+        Some((keys, screen_generation, lived)) => {
             ScreenExit::Unit(ending.is_none().then(|| UnitScreenExit {
                 terminal_id: terminal_id.to_string(),
                 unit_id: keys.unit_id,
                 exit_code,
                 screen_generation,
+                lived,
             }))
         }
     }

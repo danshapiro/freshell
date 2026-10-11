@@ -547,6 +547,47 @@ fn a_restart_that_does_not_count_leaves_the_cap_alone() {
     assert_eq!(err.to_string(), "respawn cap");
 }
 
+/// A screen exit tells the unit lifecycle how long that screen ran, from
+/// its own start (the row's spawn, or its replacement) to the moment its
+/// exit was taken: a screen that quits at once is told apart from one a
+/// person quit (Stage 2: LB-40; Task 17 review M1).
+#[test]
+fn a_screen_exit_says_how_long_that_screen_ran() {
+    let reg = TerminalRegistry::new();
+    let got = record_screen_exits(&reg);
+    let seen_exits = |n: usize| {
+        let got = got.clone();
+        move || got.lock().unwrap().len() >= n
+    };
+    reg.create_in_unit(
+        &bash("sleep 0.5; exit 0"),
+        &env(),
+        "T-lived".into(),
+        "S-lived".into(),
+        "codex",
+        None,
+        None,
+        None,
+        None,
+        placement(None),
+    )
+    .unwrap();
+    wait("screen 0 exits", seen_exits(1));
+    let first = got.lock().unwrap()[0].lived;
+    assert!(
+        first >= Duration::from_millis(500) && first < Duration::from_secs(10),
+        "the first screen ran its half second: {first:?}"
+    );
+    reg.replace_screen("T-lived", &bash("exit 0"), &env(), placement(None), false)
+        .expect("a new screen");
+    wait("screen 1 exits", seen_exits(2));
+    let second = got.lock().unwrap()[1].lived;
+    assert!(
+        second < Duration::from_millis(500),
+        "the new screen's run is measured from its own start: {second:?}"
+    );
+}
+
 /// The exit code of a row's screen is known as soon as its process is
 /// reaped, even while a background job it left holds the terminal open, so
 /// the stream (and the screen-exit hook) never ends (Task 11 review M4: an
