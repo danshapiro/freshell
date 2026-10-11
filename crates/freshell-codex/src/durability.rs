@@ -141,13 +141,76 @@ pub enum RolloutLookup {
 /// equals the thread id — substring matching alone is unsafe (rollouts embed
 /// foreign uuids as fork/resume lineage; the codex_reconcile walk in
 /// freshell-ws uses the same proof). Bounded recursive walk: the tree is
-/// `sessions/YYYY/MM/DD/rollout-*.jsonl` (flat `<id>.jsonl` in tests).
+/// `sessions/YYYY/MM/DD/rollout-*.jsonl` (flat `<id>.jsonl` in tests). The
+/// day folders a time-ordered id dates ([`day_folders_for`]) are looked in
+/// first, so the common case (the rollout exists) reads a few folders, not
+/// the whole tree.
 ///
 /// Absence is concluded only from a tree the walk read in full: something
 /// that vanished during the walk (NotFound) is simply not there, but any
 /// other error reading a directory, an entry or a candidate file answers
 /// [`RolloutLookup::Unreadable`] unless the rollout was found anyway.
 fn lookup_rollout(sessions_root: &Path, thread_id: &str) -> RolloutLookup {
+    lookup_rollout_observed(sessions_root, thread_id, &mut |_| {})
+}
+
+/// The Unix time (ms) a time-ordered thread id carries: Codex thread ids are
+/// UUIDv7 (RFC 9562), whose first 48 bits are the Unix time in ms. `None`
+/// for any other id (a v4 UUID, a test id).
+fn uuid_v7_unix_ms(thread_id: &str) -> Option<u64> {
+    let bytes = thread_id.as_bytes();
+    if !is_codex_thread_id(thread_id)
+        || bytes[14] != b'7'
+        || !matches!(bytes[19].to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b')
+    {
+        return None;
+    }
+    u64::from_str_radix(&format!("{}{}", &thread_id[..8], &thread_id[9..13]), 16).ok()
+}
+
+/// The proleptic Gregorian `(year, month, day)` of a day count since
+/// 1970-01-01 (Howard Hinnant's `civil_from_days`).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153; // March = 0
+    let day = (day_of_year - (153 * month_index + 2) / 5 + 1) as u32;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    } as u32;
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
+/// The `YYYY/MM/DD` day folders (relative to `sessions`) a rollout of
+/// `thread_id` can be in, most likely first. Codex files a rollout under the
+/// LOCAL date its thread was created, the time its UUIDv7 id carries. Local
+/// dates lie within a day of the UTC date (offsets run from -12 h to +14 h),
+/// so the UTC day and the days either side cover every offset. `None` when
+/// the id carries no time.
+fn day_folders_for(thread_id: &str) -> Option<[std::path::PathBuf; 3]> {
+    let day = i64::try_from(uuid_v7_unix_ms(thread_id)? / 86_400_000).ok()?;
+    let folder = |days: i64| {
+        let (year, month, day) = civil_from_days(days);
+        Path::new(&format!("{year:04}"))
+            .join(format!("{month:02}"))
+            .join(format!("{day:02}"))
+    };
+    Some([folder(day), folder(day - 1), folder(day + 1)])
+}
+
+/// [`lookup_rollout`], telling `listed` each directory it lists (tests).
+fn lookup_rollout_observed(
+    sessions_root: &Path,
+    thread_id: &str,
+    listed: &mut dyn FnMut(&Path),
+) -> RolloutLookup {
     use std::io::ErrorKind::NotFound;
     /// Whether the candidate `path` is `thread_id`'s rollout. A file whose
     /// first line is not (yet) a `session_meta` is not; a file that cannot
@@ -174,10 +237,12 @@ fn lookup_rollout(sessions_root: &Path, thread_id: &str) -> RolloutLookup {
         thread_id: &str,
         depth: u8,
         error: &mut Option<std::io::Error>,
+        listed: &mut dyn FnMut(&Path),
     ) -> Option<std::path::PathBuf> {
         if depth > 5 {
             return None;
         }
+        listed(dir);
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == NotFound => return None,
@@ -214,7 +279,7 @@ fn lookup_rollout(sessions_root: &Path, thread_id: &str) -> RolloutLookup {
                 }
             };
             if is_dir {
-                if let Some(hit) = walk(&path, thread_id, depth + 1, error) {
+                if let Some(hit) = walk(&path, thread_id, depth + 1, error, listed) {
                     return Some(hit);
                 }
             } else if path
@@ -234,8 +299,16 @@ fn lookup_rollout(sessions_root: &Path, thread_id: &str) -> RolloutLookup {
         }
         None
     }
+    // The day folders the id dates come first: a hit there needs no walk of
+    // the whole tree. Their read errors are not kept: a miss walks the whole
+    // tree, which meets them again.
+    for day in day_folders_for(thread_id).into_iter().flatten() {
+        if let Some(hit) = walk(&sessions_root.join(day), thread_id, 3, &mut None, listed) {
+            return RolloutLookup::Found(hit);
+        }
+    }
     let mut error = None;
-    match (walk(sessions_root, thread_id, 0, &mut error), error) {
+    match (walk(sessions_root, thread_id, 0, &mut error, listed), error) {
         (Some(hit), _) => RolloutLookup::Found(hit),
         (None, None) => RolloutLookup::Absent,
         (None, Some(error)) => RolloutLookup::Unreadable(error),
@@ -464,6 +537,129 @@ mod tests {
             RolloutLookup::Unreadable(_)
         ));
         assert_eq!(locate_thread_rollout_in_home(other.path(), tid), None);
+    }
+
+    /// A UUIDv7 thread id for the Unix time `ms` (the rest of the id fixed).
+    fn v7_id_at(ms: u64) -> String {
+        let hex = format!("{ms:012x}");
+        format!("{}-{}-7db3-9c47-1c2a3b4c5d6e", &hex[..8], &hex[8..])
+    }
+
+    /// Codex thread ids are time-ordered (UUIDv7): their rollout is filed
+    /// under the local date of their time, which lies within a day of its UTC
+    /// date. Other ids carry no usable time.
+    #[test]
+    fn a_time_ordered_id_dates_the_day_folders_around_its_time() {
+        let folders = |id: &str| {
+            day_folders_for(id).map(|days| {
+                days.iter()
+                    .map(|day| day.to_string_lossy().replace('\\', "/"))
+                    .collect::<Vec<_>>()
+            })
+        };
+        // A real Codex id: 2026-05-03T23:54:37.949Z, filed under 2026/05/03 (UTC-7).
+        assert_eq!(
+            folders("019df043-f1fd-79d0-85c8-3ae11fb2237d"),
+            Some(vec![
+                "2026/05/03".into(),
+                "2026/05/02".into(),
+                "2026/05/04".into()
+            ])
+        );
+        // Across a month and a year: 2026-01-01T00:30:00Z.
+        assert_eq!(
+            folders(&v7_id_at(1_767_227_400_000)),
+            Some(vec![
+                "2026/01/01".into(),
+                "2025/12/31".into(),
+                "2026/01/02".into()
+            ])
+        );
+        // A leap day: 2028-02-29T12:00:00Z.
+        assert_eq!(
+            folders(&v7_id_at(1_835_438_400_000)),
+            Some(vec![
+                "2028/02/29".into(),
+                "2028/02/28".into(),
+                "2028/03/01".into()
+            ])
+        );
+        assert_eq!(
+            folders("b7936c10-4935-441c-837c-c1f33cafec2d"),
+            None,
+            "a v4 id"
+        );
+        assert_eq!(folders("thr-legacy"), None, "not a UUID");
+    }
+
+    /// The rollout of a time-ordered thread id is looked up first in the day
+    /// folders its id dates, and a hit there is found without the full walk:
+    /// the tree's root is never listed, so an unrelated unreadable subtree,
+    /// which a full walk would meet, is never read. A miss there, or an id
+    /// with no time, walks the whole tree, so absence is still proven only
+    /// from a tree read in full.
+    #[test]
+    fn a_rollout_in_the_day_folder_its_id_dates_is_found_without_the_full_walk() {
+        let tid = "019df043-f1fd-79d0-85c8-3ae11fb2237d"; // 2026-05-03T23:54:37.949Z
+        let owned = |root: &Path, dir: &str| {
+            write_rollout(
+                root,
+                dir,
+                &format!("rollout-2026-05-03T16-54-38-{tid}.jsonl"),
+                &format!("\"id\":\"{tid}\""),
+            )
+        };
+        let lookup = |root: &Path, id: &str| {
+            let mut listed = Vec::new();
+            let found =
+                lookup_rollout_observed(root, id, &mut |dir: &Path| listed.push(dir.to_path_buf()));
+            (found, listed)
+        };
+
+        let dated = tempfile::tempdir().expect("tempdir");
+        owned(dated.path(), "2026/05/03");
+        std::fs::create_dir_all(dated.path().join("2025")).unwrap();
+        std::os::unix::fs::symlink("loop", dated.path().join("2025/loop")).expect("symlink loop");
+        let (found, listed) = lookup(dated.path(), tid);
+        assert!(matches!(found, RolloutLookup::Found(_)), "{found:?}");
+        assert!(
+            !listed.contains(&dated.path().to_path_buf()),
+            "found in its day folder, without the full walk: {listed:?}"
+        );
+
+        // Filed under a date its id does not give (its day folder holds
+        // another thread's rollout): the full walk finds it.
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        owned(elsewhere.path(), "2026/08/23");
+        write_rollout(
+            elsewhere.path(),
+            "2026/05/03",
+            "rollout-2026-05-03T10-00-00-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.jsonl",
+            "\"id\":\"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\"",
+        );
+        let (found, listed) = lookup(elsewhere.path(), tid);
+        assert!(matches!(found, RolloutLookup::Found(_)), "{found:?}");
+        assert!(
+            listed.contains(&elsewhere.path().to_path_buf()),
+            "{listed:?}"
+        );
+
+        // Absent: proven by the full walk, after the day folders missed.
+        let (found, listed) = lookup(elsewhere.path(), &v7_id_at(1_777_852_477_949));
+        assert!(matches!(found, RolloutLookup::Absent), "{found:?}");
+        assert!(
+            listed.contains(&elsewhere.path().to_path_buf()),
+            "{listed:?}"
+        );
+
+        // An id with no time: the full walk only.
+        let (found, listed) = lookup(dated.path(), "b7936c10-4935-441c-837c-c1f33cafec2d");
+        assert!(matches!(found, RolloutLookup::Unreadable(_)), "{found:?}");
+        assert_eq!(
+            listed.first(),
+            Some(&dated.path().to_path_buf()),
+            "{listed:?}"
+        );
     }
 
     #[test]
