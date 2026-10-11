@@ -2229,6 +2229,14 @@ export function FreshAgentView({
         release?.()
         return
       }
+      // A hold can arrive after a hidden job was queued. Defer before any
+      // pending-create/naming effects and re-arm only this still-current
+      // decision; preserve its request and captured owner fence for release.
+      if (isFreshAgentNetworkEffectsSuppressed(paneId)) {
+        if (lastCreateArmKeyRef.current === createArmKey) createSentRef.current = false
+        release?.()
+        return
+      }
       // kata b8ke pre-send divergence check: a stale callback (rebind-queue
       // run, reconnect resend) must not issue a lifecycle-start for a
       // session the runtime-owner store now shows as owned by the other
@@ -2277,6 +2285,7 @@ export function FreshAgentView({
   }, [
     appStore,
     buildCreateMessage,
+    createArmKey,
     dispatch,
     lifecycleBlocked,
     paneId,
@@ -2291,11 +2300,15 @@ export function FreshAgentView({
   ])
 
   useEffect(() => {
-    if (paneContent.sessionId || !createSentRef.current) return
+    // Subscribe even while the picker holds the initial decision. Its later
+    // profile dispatch can send without changing this effect's dependencies.
+    if (paneContent.sessionId) return
     if (paneContent.status !== 'creating' && paneContent.status !== 'starting') return
     if (typeof ws.onReconnect !== 'function') return
     return ws.onReconnect(() => {
       const current = paneContentRef.current
+      if (!createSentRef.current || isFreshAgentLifecycleBlocked(current)) return
+      if (isFreshAgentNetworkEffectsSuppressed(paneId)) return
       if (current.sessionId) return
       if (current.status !== 'creating' && current.status !== 'starting') return
       const resend = (release?: () => void) => {
@@ -2304,6 +2317,10 @@ export function FreshAgentView({
           return
         }
         const latest = paneContentRef.current
+        if (!createSentRef.current || isFreshAgentNetworkEffectsSuppressed(paneId)) {
+          release?.()
+          return
+        }
         if (isFreshAgentLifecycleBlocked(latest)) {
           release?.()
           return
