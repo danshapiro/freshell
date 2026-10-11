@@ -11318,7 +11318,7 @@ async fn handle_kill(
             if kill.reason.as_deref() != Some("stuck-recovery") {
                 state.units.remember_killed_start(crq);
             }
-            tracing::info!(target: "freshell_ws::terminal",
+            tracing::info!(target: "freshell_unit",
                 event = "terminal.kill.parked_create_withdrawn",
                 unit_id = %keys.unit_id,
                 provider = %keys.provider,
