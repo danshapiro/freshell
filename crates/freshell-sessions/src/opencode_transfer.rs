@@ -4457,6 +4457,7 @@ struct GitTreeInspection {
     closure_sha256: String,
 }
 
+#[derive(PartialEq, Eq)]
 struct GitRepository {
     work_tree: PathBuf,
     git_dir: PathBuf,
@@ -4480,100 +4481,28 @@ fn inspect_git_tree_with_costs(
     let mount = fs::canonicalize(mount).map_err(|error| {
         TransferError::Blocked(format!("exact workspace mount is unavailable: {error}"))
     })?;
-    let top_level = git_text_in_mount(&mount, &["rev-parse", "--show-toplevel"], &mut costs)?;
-    let top_level = PathBuf::from(top_level.trim());
-    let top_level = fs::canonicalize(top_level).map_err(|error| {
-        TransferError::Blocked(format!("workspace Git root cannot be resolved: {error}"))
-    })?;
-    if top_level != mount {
-        return Err(TransferError::Blocked(
-            "snapshot Git root is not the exact managed workspace mount".into(),
-        ));
-    }
-    let git_dir = git_path_in_mount(&mount, "--absolute-git-dir", &mut costs)?;
-    if !git_dir.starts_with(&mount) {
-        return Err(TransferError::Blocked(
-            "snapshot Git directory is outside the exact managed workspace mount".into(),
-        ));
-    }
-    let repository = GitRepository {
-        work_tree: mount.clone(),
-        git_dir,
-    };
-    let common_dir = git_path_in_repository(&repository, "--git-common-dir", &mut costs)?;
-    let common_dir = if common_dir.is_absolute() {
-        common_dir
+    let qualified = qualify_workspace_git(&mount, &mut costs)?;
+    let repository = &qualified.repository;
+    let object_stores = &qualified.object_stores;
+    let expected_id_length = if qualified.object_format == "sha1" {
+        40
     } else {
-        mount.join(common_dir)
-    };
-    let common_dir = fs::canonicalize(common_dir).map_err(|error| {
-        TransferError::Blocked(format!(
-            "workspace Git common directory is unavailable: {error}"
-        ))
-    })?;
-    if !repository.git_dir.starts_with(&mount) || !common_dir.starts_with(&mount) {
-        return Err(TransferError::Blocked(
-            "snapshot object store is outside the exact managed workspace mount".into(),
-        ));
-    }
-    let object_format = git_text_in_repository(
-        &repository,
-        &["rev-parse", "--show-object-format"],
-        &mut costs,
-    )?
-    .trim()
-    .to_string();
-    let expected_id_length = match object_format.as_str() {
-        "sha1" => 40,
-        "sha256" => 64,
-        _ => {
-            return Err(TransferError::Blocked(
-                "workspace uses an unsupported Git object format".into(),
-            ))
-        }
+        64
     };
     if tree.len() != expected_id_length {
         return Err(TransferError::Blocked(
             "snapshot object ID does not match the workspace Git format".into(),
         ));
     }
-    let objects_dir =
-        checked_git_store_directory(&mount, &common_dir.join("objects"), "Git object directory")?;
-    let mut object_stores = vec![objects_dir.clone()];
-    let mut alternate_identity = Vec::new();
-    if let Some(contents) = read_alternates_file_in_store(&mount, &objects_dir)? {
-        for line in contents.lines().filter(|line| !line.trim().is_empty()) {
-            let candidate = PathBuf::from(line);
-            let candidate = if candidate.is_absolute() {
-                candidate
-            } else {
-                objects_dir.join(candidate)
-            };
-            let candidate =
-                checked_git_store_directory(&mount, &candidate, "alternate Git object store")?;
-            if read_alternates_file_in_store(&mount, &candidate)?
-                .is_some_and(|nested| nested.lines().any(|line| !line.trim().is_empty()))
-            {
-                return Err(TransferError::Blocked(
-                    "nested Git object store alternates are unsupported".into(),
-                ));
-            }
-            let relative = candidate.strip_prefix(&mount).map_err(|_| {
-                TransferError::Blocked(
-                    "alternate Git object store is outside the exact managed workspace mount"
-                        .into(),
-                )
-            })?;
-            alternate_identity.push(relative.to_string_lossy().replace('\\', "/"));
-            object_stores.push(candidate);
-        }
-    }
-    // Git may consult any index in a store's pack directory, so check its
-    // immediate entries once. Loose-object checks below stay limited to IDs
-    // in this snapshot closure instead of walking a potentially large store.
-    for object_store in &object_stores {
-        inspect_git_pack_directory(&mount, object_store)?;
-    }
+    let mut aggregate = workspace_metadata_aggregate();
+    let initial = if aggregate {
+        let observation = observe_workspace_git(&mount, &qualified, &[], &mut costs)?;
+        aggregate = observation.is_some();
+        observation
+    } else {
+        None
+    };
+    workspace_metadata_barrier("qualified", "");
 
     let mut objects = BTreeSet::new();
     let mut pending_trees = vec![tree.to_string()];
@@ -4584,9 +4513,9 @@ fn inspect_git_tree_with_costs(
         if !inspected_trees.insert(current_tree.clone()) {
             continue;
         }
-        verify_git_loose_object_paths(&mount, &object_stores, std::slice::from_ref(&current_tree))?;
+        verify_git_loose_object_paths(&mount, object_stores, std::slice::from_ref(&current_tree))?;
         let object_kind =
-            git_text_in_repository(&repository, &["cat-file", "-t", &current_tree], &mut costs)?;
+            git_text_in_repository(repository, &["cat-file", "-t", &current_tree], &mut costs)?;
         if object_kind.trim() != "tree" {
             return Err(TransferError::Blocked(
                 "snapshot reference does not identify a Git tree object".into(),
@@ -4594,7 +4523,7 @@ fn inspect_git_tree_with_costs(
         }
         objects.insert(current_tree.clone());
         let entries =
-            git_output_in_repository(&repository, &["ls-tree", "-z", &current_tree], &mut costs)?;
+            git_output_in_repository(repository, &["ls-tree", "-z", &current_tree], &mut costs)?;
         for entry in entries
             .stdout
             .split(|byte| *byte == 0)
@@ -4623,36 +4552,848 @@ fn inspect_git_tree_with_costs(
         }
     }
     let referenced_objects = objects.iter().cloned().collect::<Vec<_>>();
-    verify_git_loose_object_paths(&mount, &object_stores, &referenced_objects)?;
-    let mut object_records = Vec::with_capacity(objects.len());
-    let mut closure_bytes = 0_u64;
-    for object in objects {
-        let object_kind =
-            git_text_in_repository(&repository, &["cat-file", "-t", &object], &mut costs)?;
-        let object_size =
-            git_text_in_repository(&repository, &["cat-file", "-s", &object], &mut costs)?
-                .trim()
-                .parse::<u64>()
-                .map_err(|_| TransferError::Blocked("Git object size is invalid".into()))?;
-        closure_bytes = closure_bytes.saturating_add(object_size);
-        object_records.push((object, object_kind.trim().to_string(), object_size));
+    verify_git_loose_object_paths(&mount, object_stores, &referenced_objects)?;
+    workspace_metadata_barrier("traversed", "");
+    let before = if let Some(initial) = &initial {
+        let current = qualify_workspace_git(&mount, &mut costs)?;
+        let observation = observe_workspace_git(&mount, &current, &referenced_objects, &mut costs)?
+            .ok_or_else(workspace_changed)?;
+        if current != qualified
+            || observation.context != initial.context
+            || observation.config != initial.config
+        {
+            return Err(workspace_changed());
+        }
+        Some(observation)
+    } else {
+        None
+    };
+    workspace_metadata_barrier("precensus", "");
+    let object_records =
+        workspace_metadata_records(repository, &referenced_objects, aggregate, &mut costs)?;
+    workspace_metadata_barrier("settled", "");
+    if let Some(before) = before {
+        let current = qualify_workspace_git(&mount, &mut costs)?;
+        let after = observe_workspace_git(&mount, &current, &referenced_objects, &mut costs)?
+            .ok_or_else(workspace_changed)?;
+        if current != qualified || after != before {
+            return Err(workspace_changed());
+        }
     }
+    let closure_bytes = object_records
+        .iter()
+        .fold(0_u64, |total, (_, _, size)| total.saturating_add(*size));
+    #[cfg(test)]
+    workspace_metadata_test_hooks::STATE
+        .with(|state| state.borrow_mut().records = object_records.clone());
     let object_bytes = serde_json::to_vec(&object_records)
         .map_err(|error| TransferError::Serialization(error.to_string()))?;
-    let common_relative = common_dir
+    let common_relative = qualified
+        .common_dir
         .strip_prefix(&mount)
         .map_err(|_| TransferError::Blocked("Git store escaped workspace mount".into()))?
         .to_string_lossy()
         .replace('\\', "/");
     let identity = format!(
-        "git:{object_format}:{common_relative}:{}:{tree}",
-        alternate_identity.join(",")
+        "git:{}:{common_relative}:{}:{tree}",
+        qualified.object_format,
+        qualified.alternate_identity.join(",")
     );
     Ok(GitTreeInspection {
         identity,
         closure_bytes,
         closure_sha256: digest(&object_bytes),
     })
+}
+
+#[derive(PartialEq, Eq)]
+struct QualifiedWorkspaceGit {
+    repository: GitRepository,
+    common_dir: PathBuf,
+    object_format: String,
+    object_stores: Vec<PathBuf>,
+    alternate_identity: Vec<String>,
+}
+
+fn qualify_workspace_git(
+    mount: &Path,
+    costs: &mut Option<&mut SourceReaderCosts>,
+) -> Result<QualifiedWorkspaceGit, TransferError> {
+    let top_level = git_text_in_mount(mount, &["rev-parse", "--show-toplevel"], costs)?;
+    let top_level = PathBuf::from(top_level.trim());
+    let top_level = fs::canonicalize(top_level).map_err(|error| {
+        TransferError::Blocked(format!("workspace Git root cannot be resolved: {error}"))
+    })?;
+    if top_level != mount {
+        return Err(TransferError::Blocked(
+            "snapshot Git root is not the exact managed workspace mount".into(),
+        ));
+    }
+    let git_dir = git_path_in_mount(mount, "--absolute-git-dir", costs)?;
+    if !git_dir.starts_with(mount) {
+        return Err(TransferError::Blocked(
+            "snapshot Git directory is outside the exact managed workspace mount".into(),
+        ));
+    }
+    let repository = GitRepository {
+        work_tree: mount.to_path_buf(),
+        git_dir,
+    };
+    let common_dir = git_path_in_repository(&repository, "--git-common-dir", costs)?;
+    let common_dir = if common_dir.is_absolute() {
+        common_dir
+    } else {
+        mount.join(common_dir)
+    };
+    let common_dir = fs::canonicalize(common_dir).map_err(|error| {
+        TransferError::Blocked(format!(
+            "workspace Git common directory is unavailable: {error}"
+        ))
+    })?;
+    if !repository.git_dir.starts_with(mount) || !common_dir.starts_with(mount) {
+        return Err(TransferError::Blocked(
+            "snapshot object store is outside the exact managed workspace mount".into(),
+        ));
+    }
+    let object_format =
+        git_text_in_repository(&repository, &["rev-parse", "--show-object-format"], costs)?
+            .trim()
+            .to_string();
+    match object_format.as_str() {
+        "sha1" | "sha256" => (),
+        _ => {
+            return Err(TransferError::Blocked(
+                "workspace uses an unsupported Git object format".into(),
+            ))
+        }
+    };
+    let objects_dir =
+        checked_git_store_directory(mount, &common_dir.join("objects"), "Git object directory")?;
+    let mut object_stores = vec![objects_dir.clone()];
+    let mut alternate_identity = Vec::new();
+    if let Some(contents) = read_alternates_file_in_store(mount, &objects_dir)? {
+        for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+            let candidate = PathBuf::from(line);
+            let candidate = if candidate.is_absolute() {
+                candidate
+            } else {
+                objects_dir.join(candidate)
+            };
+            let candidate =
+                checked_git_store_directory(mount, &candidate, "alternate Git object store")?;
+            if read_alternates_file_in_store(mount, &candidate)?
+                .is_some_and(|nested| nested.lines().any(|line| !line.trim().is_empty()))
+            {
+                return Err(TransferError::Blocked(
+                    "nested Git object store alternates are unsupported".into(),
+                ));
+            }
+            let relative = candidate.strip_prefix(mount).map_err(|_| {
+                TransferError::Blocked(
+                    "alternate Git object store is outside the exact managed workspace mount"
+                        .into(),
+                )
+            })?;
+            alternate_identity.push(relative.to_string_lossy().replace('\\', "/"));
+            object_stores.push(candidate);
+        }
+    }
+    // Git may consult any index in a store's pack directory, so check its
+    // immediate entries once. Loose-object checks below stay limited to IDs
+    // in this snapshot closure instead of walking a potentially large store.
+    for object_store in &object_stores {
+        inspect_git_pack_directory(mount, object_store)?;
+    }
+
+    Ok(QualifiedWorkspaceGit {
+        repository,
+        common_dir,
+        object_format,
+        object_stores,
+        alternate_identity,
+    })
+}
+
+fn workspace_changed() -> TransferError {
+    TransferError::Blocked(
+        "workspace Git context or selected storage changed during inspection".into(),
+    )
+}
+
+fn workspace_metadata_aggregate() -> bool {
+    let enabled = cfg!(unix);
+    #[cfg(test)]
+    let enabled = enabled
+        && workspace_metadata_test_hooks::STATE.with(|state| {
+            let state = state.borrow();
+            !state.fusion && !state.legacy
+        });
+    enabled
+}
+
+fn workspace_metadata_barrier(phase: &'static str, object: &str) {
+    #[cfg(test)]
+    workspace_metadata_test_hooks::STATE.with(|state| {
+        if let Some(callback) = &mut state.borrow_mut().barrier {
+            callback(phase, object);
+        }
+    });
+    #[cfg(not(test))]
+    let _ = (phase, object);
+}
+
+// This value belongs to one inspection. Absence and path bindings matter as
+// much as selected files: a new earlier loose copy changes native resolution.
+#[derive(PartialEq, Eq)]
+struct WorkspaceGitObservation {
+    context: WorkspaceGitPaths,
+    loose: WorkspaceGitPaths,
+    config: Vec<u8>,
+}
+
+#[derive(Default, PartialEq, Eq)]
+struct WorkspaceGitPaths {
+    stamps: Vec<SnapshotStorageStamp>,
+    absent: BTreeSet<PathBuf>,
+    bindings: BTreeMap<PathBuf, WorkspaceGitPathBinding>,
+}
+
+#[derive(PartialEq, Eq)]
+struct WorkspaceGitPathBinding {
+    resolved: PathBuf,
+    #[cfg(unix)]
+    identity: (u64, u64, u32),
+}
+
+fn observe_workspace_bindings(
+    path: &Path,
+    bindings: &mut BTreeMap<PathBuf, WorkspaceGitPathBinding>,
+) -> Result<(), TransferError> {
+    for component in path.ancestors() {
+        if bindings.contains_key(component) {
+            break;
+        }
+        let metadata = match fs::symlink_metadata(component) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        #[cfg(not(unix))]
+        let _ = metadata;
+        bindings.insert(
+            component.to_path_buf(),
+            WorkspaceGitPathBinding {
+                resolved: component.canonicalize()?,
+                #[cfg(unix)]
+                identity: (metadata.dev(), metadata.ino(), metadata.mode()),
+            },
+        );
+    }
+    Ok(())
+}
+
+const WORKSPACE_GIT_CONTEXT_BYTES: u64 = 16 * 1024 * 1024;
+
+fn observe_workspace_path(
+    path: &Path,
+    contents: bool,
+    stamps: &mut Vec<SnapshotStorageStamp>,
+    absent: &mut BTreeSet<PathBuf>,
+    bindings: &mut BTreeMap<PathBuf, WorkspaceGitPathBinding>,
+) -> Result<(), TransferError> {
+    observe_workspace_bindings(path, bindings)?;
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            absent.insert(path.to_path_buf());
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+        Ok(_) => (),
+    }
+    let resolved = path.canonicalize()?;
+    let before = snapshot_storage_stamp(path.to_path_buf(), None)?;
+    let bytes = if contents && fs::metadata(path)?.is_file() {
+        let mut bytes = Vec::new();
+        File::open(path)?
+            .take(WORKSPACE_GIT_CONTEXT_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > WORKSPACE_GIT_CONTEXT_BYTES {
+            return Err(TransferError::Blocked(
+                "workspace Git context exceeds bounded observation".into(),
+            ));
+        }
+        Some(
+            String::from_utf8(bytes)
+                .map_err(|_| TransferError::Blocked("workspace Git context is not UTF-8".into()))?,
+        )
+    } else {
+        None
+    };
+    let mut after = snapshot_storage_stamp(path.to_path_buf(), None)?;
+    if before != after || path.canonicalize()? != resolved {
+        return Err(workspace_changed());
+    }
+    after.context_bytes = bytes;
+    stamps.push(after);
+    if resolved != path {
+        stamps.push(snapshot_storage_stamp(resolved, None)?);
+    }
+    Ok(())
+}
+
+fn observe_workspace_git(
+    mount: &Path,
+    qualified: &QualifiedWorkspaceGit,
+    objects: &[String],
+    costs: &mut Option<&mut SourceReaderCosts>,
+) -> Result<Option<WorkspaceGitObservation>, TransferError> {
+    let repository = &qualified.repository;
+    let config = workspace_git_config(repository, costs)?;
+    let mut paths = BTreeMap::new();
+    for path in [
+        mount.to_path_buf(),
+        mount.join(".git"),
+        repository.git_dir.clone(),
+        qualified.common_dir.clone(),
+    ] {
+        paths.insert(path, true);
+    }
+    for dir in [&repository.git_dir, &qualified.common_dir] {
+        for name in ["config", "config.worktree", "commondir"] {
+            paths.insert(dir.join(name), true);
+        }
+    }
+    if !workspace_config_dependencies(&config, mount, &mut paths)? {
+        // The successful native enumeration identified a valid include whose
+        // named-user expansion we cannot completely observe. Only initial
+        // discovery may select fresh per-object children; later discovery is
+        // context drift and callers refuse it without starting another census.
+        return Ok(None);
+    }
+    for store in &qualified.object_stores {
+        for path in [
+            store.clone(),
+            store.join("info"),
+            store.join("info/alternates"),
+            store.join("pack"),
+        ] {
+            paths.insert(path, true);
+        }
+        if store.join("pack").exists() {
+            for entry in fs::read_dir(store.join("pack"))? {
+                paths.insert(entry?.path(), false);
+            }
+        }
+    }
+    let mut observation = WorkspaceGitObservation {
+        context: WorkspaceGitPaths::default(),
+        loose: WorkspaceGitPaths::default(),
+        config,
+    };
+    for (path, contents) in paths {
+        observe_workspace_path(
+            &path,
+            contents,
+            &mut observation.context.stamps,
+            &mut observation.context.absent,
+            &mut observation.context.bindings,
+        )?;
+    }
+    // Config enumeration and its dependent files must describe the same native
+    // context; Git, including its include/conditional-include rules, owns parsing.
+    if workspace_git_config(repository, costs)? != observation.config {
+        return Err(workspace_changed());
+    }
+    let mut loose = BTreeSet::new();
+    for store in &qualified.object_stores {
+        for object in objects {
+            let object = object.to_ascii_lowercase();
+            loose.insert(store.join(&object[..2]));
+            loose.insert(store.join(&object[..2]).join(&object[2..]));
+        }
+    }
+    for path in loose {
+        observe_workspace_path(
+            &path,
+            false,
+            &mut observation.loose.stamps,
+            &mut observation.loose.absent,
+            &mut observation.loose.bindings,
+        )?;
+    }
+    // Stable stamps do not qualify a newly present selected path. Reapply the
+    // existing type and containment rules to the current store plan at both
+    // pre-census and post-settlement acceptance, including preexisting fanouts.
+    verify_git_loose_object_paths(mount, &qualified.object_stores, objects)?;
+    Ok(Some(observation))
+}
+
+fn workspace_config_dependencies(
+    config: &[u8],
+    mount: &Path,
+    paths: &mut BTreeMap<PathBuf, bool>,
+) -> Result<bool, TransferError> {
+    let fields = config.split(|byte| *byte == 0).collect::<Vec<_>>();
+    if fields.last() != Some(&&b""[..]) || (fields.len() - 1) % 2 != 0 {
+        return Err(TransferError::Blocked(
+            "invalid native Git configuration origins".into(),
+        ));
+    }
+    let mut complete = true;
+    for pair in fields[..fields.len() - 1].chunks_exact(2) {
+        let origin = std::str::from_utf8(pair[0])
+            .map_err(|_| TransferError::Blocked("Git configuration origin is not UTF-8".into()))?;
+        let origin = origin.strip_prefix("file:").ok_or_else(|| {
+            TransferError::Blocked("Git configuration origin is not a local file".into())
+        })?;
+        let origin = PathBuf::from(origin);
+        let origin = if origin.is_absolute() {
+            origin
+        } else {
+            mount.join(origin)
+        };
+        paths.insert(origin.clone(), true);
+        let record = std::str::from_utf8(pair[1])
+            .map_err(|_| TransferError::Blocked("Git configuration record is not UTF-8".into()))?;
+        let (key, value) = record.split_once('\n').unwrap_or((record, ""));
+        if key == "include.path" || (key.starts_with("includeif.") && key.ends_with(".path")) {
+            let dependency = if let Some(relative) = value.strip_prefix("~/") {
+                PathBuf::from(std::env::var_os("HOME").ok_or_else(|| {
+                    TransferError::Blocked("Git include home is unavailable".into())
+                })?)
+                .join(relative)
+            } else if value.starts_with('~') {
+                complete = false;
+                continue;
+            } else {
+                let path = PathBuf::from(value);
+                if path.is_absolute() {
+                    path
+                } else {
+                    origin
+                        .parent()
+                        .ok_or_else(|| {
+                            TransferError::Blocked("Git include origin has no parent".into())
+                        })?
+                        .join(path)
+                }
+            };
+            paths.insert(dependency, true);
+        }
+    }
+    Ok(complete)
+}
+
+fn workspace_git_command(repository: &GitRepository, arguments: &[&str]) -> Command {
+    let mut command = sanitized_git_command();
+    command
+        .arg("--git-dir")
+        .arg(&repository.git_dir)
+        .arg("--work-tree")
+        .arg(&repository.work_tree)
+        .args(arguments);
+    command
+}
+
+fn workspace_git_config(
+    repository: &GitRepository,
+    costs: &mut Option<&mut SourceReaderCosts>,
+) -> Result<Vec<u8>, TransferError> {
+    run_workspace_git_child(
+        workspace_git_command(
+            repository,
+            &["config", "--null", "--list", "--show-origin", "--includes"],
+        ),
+        costs,
+        |owner| {
+            owner.input.take();
+            let mut bytes = Vec::new();
+            (&mut owner.output)
+                .take(WORKSPACE_GIT_CONTEXT_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > WORKSPACE_GIT_CONTEXT_BYTES {
+                return Err(TransferError::Blocked(
+                    "workspace Git configuration exceeds bounded observation".into(),
+                ));
+            }
+            owner.finish()?;
+            Ok(bytes)
+        },
+    )
+}
+
+fn workspace_metadata_records(
+    repository: &GitRepository,
+    objects: &[String],
+    aggregate: bool,
+    costs: &mut Option<&mut SourceReaderCosts>,
+) -> Result<Vec<(String, String, u64)>, TransferError> {
+    let mut records = Vec::with_capacity(objects.len());
+    #[cfg(test)]
+    if workspace_metadata_test_hooks::STATE.with(|state| state.borrow().legacy) {
+        for object in objects {
+            let kind = git_text_in_repository(repository, &["cat-file", "-t", object], costs)?;
+            let size = git_text_in_repository(repository, &["cat-file", "-s", object], costs)?
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| workspace_changed())?;
+            records.push((object.clone(), kind.trim().to_string(), size));
+        }
+        return Ok(records);
+    }
+    let width = objects.first().map_or(40, String::len);
+    if aggregate {
+        #[cfg(test)]
+        workspace_metadata_test_hooks::count("census_start");
+        run_workspace_git_child(
+            workspace_git_command(repository, &["cat-file", "--batch-check"]),
+            costs,
+            |owner| {
+                for object in objects {
+                    workspace_metadata_barrier("before_query", object);
+                    let (kind, size) = owner.query(object, width)?;
+                    records.push((object.clone(), kind, size));
+                    workspace_metadata_barrier("after_query", object);
+                }
+                workspace_metadata_barrier(
+                    "last_response",
+                    objects.last().map_or("", String::as_str),
+                );
+                owner.finish()
+            },
+        )?;
+    } else {
+        for object in objects {
+            #[cfg(test)]
+            workspace_metadata_test_hooks::count("fusion_start");
+            let (kind, size) = run_workspace_git_child(
+                workspace_git_command(repository, &["cat-file", "--batch-check"]),
+                costs,
+                |owner| {
+                    workspace_metadata_barrier("before_query", object);
+                    let metadata = owner.query(object, width)?;
+                    workspace_metadata_barrier("after_query", object);
+                    owner.finish()?;
+                    Ok(metadata)
+                },
+            )?;
+            records.push((object.clone(), kind, size));
+        }
+    }
+    Ok(records)
+}
+
+struct WorkspaceGitChild {
+    child: Child,
+    input: Option<ChildStdin>,
+    output: BufReader<ChildStdout>,
+    stderr: Option<std::thread::JoinHandle<io::Result<Vec<u8>>>>,
+    settled: bool,
+}
+
+fn run_workspace_git_child<T>(
+    command: Command,
+    costs: &mut Option<&mut SourceReaderCosts>,
+    read: impl FnOnce(&mut WorkspaceGitChild) -> Result<T, TransferError>,
+) -> Result<T, TransferError> {
+    let started = Instant::now();
+    let result = WorkspaceGitChild::from_command(command).and_then(|mut owner| read(&mut owner));
+    if let Some(costs) = costs.as_deref_mut() {
+        costs.workspace_git_command_starts = costs.workspace_git_command_starts.saturating_add(1);
+        costs.workspace_git_command_us = costs
+            .workspace_git_command_us
+            .saturating_add(elapsed_us(started));
+    }
+    result
+}
+
+impl WorkspaceGitChild {
+    fn from_command(mut command: Command) -> Result<Self, TransferError> {
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn()?;
+        #[cfg(test)]
+        workspace_metadata_test_hooks::spawned(child.id());
+        let input = child.stdin.take();
+        let output = BufReader::new(child.stdout.take().expect("piped workspace Git stdout"));
+        let mut stderr = child.stderr.take().expect("piped workspace Git stderr");
+        #[cfg(not(test))]
+        let (fail_start, fail_read) = (false, false);
+        #[cfg(test)]
+        let (fail_start, fail_read) = workspace_metadata_test_hooks::STATE.with(|state| {
+            let state = state.borrow();
+            (state.fail_drain_spawn, state.fail_drain_read)
+        });
+        #[cfg(all(test, target_os = "linux"))]
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let drain = if fail_start {
+            Err(io::Error::other("injected workspace drainer spawn failure"))
+        } else {
+            std::thread::Builder::new()
+                .name("workspace-git-stderr".into())
+                .spawn(move || {
+                    #[cfg(all(test, target_os = "linux"))]
+                    started_tx
+                        .send(unsafe { libc::syscall(libc::SYS_gettid) as u32 })
+                        .expect("owned test drainer receiver");
+                    let mut retained = Vec::new();
+                    let mut bytes = [0; 8192];
+                    loop {
+                        let count = stderr.read(&mut bytes)?;
+                        if count == 0 {
+                            break;
+                        }
+                        if fail_read {
+                            return Err(io::Error::other(
+                                "injected workspace drainer read failure",
+                            ));
+                        }
+                        let keep = count.min(16 * 1024 - retained.len());
+                        retained.extend_from_slice(&bytes[..keep]);
+                    }
+                    Ok(retained)
+                })
+        };
+        let stderr = match drain {
+            Ok(drain) => drain,
+            Err(error) => {
+                drop(input);
+                let _ = child.kill();
+                let _ = child.wait();
+                #[cfg(test)]
+                workspace_metadata_test_hooks::count("reap");
+                #[cfg(test)]
+                workspace_metadata_test_hooks::count("all_reap");
+                return Err(error.into());
+            }
+        };
+        #[cfg(test)]
+        workspace_metadata_test_hooks::count("drain_spawn");
+        #[cfg(all(test, target_os = "linux"))]
+        workspace_metadata_test_hooks::STATE.with(|state| {
+            state
+                .borrow_mut()
+                .drainer_tids
+                .push(started_rx.recv().expect("actual owned drainer start"))
+        });
+        Ok(Self {
+            child,
+            input,
+            output,
+            stderr: Some(stderr),
+            settled: false,
+        })
+    }
+
+    fn query(&mut self, object: &str, width: usize) -> Result<(String, u64), TransferError> {
+        if object.len() != width
+            || !(width == 40 || width == 64)
+            || !object.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(TransferError::Blocked(
+                "invalid workspace Git metadata request".into(),
+            ));
+        }
+        let input = self.input.as_mut().ok_or_else(|| {
+            TransferError::Blocked("workspace Git metadata input is unavailable".into())
+        })?;
+        writeln!(input, "{object}")?;
+        input.flush()?;
+        let mut header = Vec::new();
+        loop {
+            let mut byte = [0];
+            self.output.read_exact(&mut byte)?;
+            if byte[0] == b'\n' {
+                break;
+            }
+            if header.len() == 256 {
+                return Err(TransferError::Blocked(
+                    "oversized workspace Git metadata header".into(),
+                ));
+            }
+            header.push(byte[0]);
+        }
+        let header = std::str::from_utf8(&header)
+            .map_err(|_| TransferError::Blocked("nontext workspace Git metadata header".into()))?;
+        let fields = header.split(' ').collect::<Vec<_>>();
+        if fields.len() != 3
+            || fields[0].len() != width
+            || !fields[0].bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !fields[0].eq_ignore_ascii_case(object)
+            || !matches!(fields[1], "blob" | "tree" | "commit" | "tag")
+            || fields[2].is_empty()
+            || !fields[2].bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(TransferError::Blocked(
+                "invalid workspace Git metadata response".into(),
+            ));
+        }
+        let size = fields[2]
+            .parse::<u64>()
+            .map_err(|_| TransferError::Blocked("invalid workspace Git object size".into()))?;
+        if !self.output.buffer().is_empty() {
+            return Err(TransferError::Blocked(
+                "unsolicited workspace Git metadata output".into(),
+            ));
+        }
+        Ok((fields[1].to_string(), size))
+    }
+
+    fn finish(&mut self) -> Result<(), TransferError> {
+        self.input.take();
+        let mut trailing = false;
+        let mut bytes = [0; 8192];
+        loop {
+            let count = self.output.read(&mut bytes)?;
+            if count == 0 {
+                break;
+            }
+            trailing = true;
+        }
+        let status = self.child.wait()?;
+        self.settled = true;
+        #[cfg(test)]
+        workspace_metadata_test_hooks::count("reap");
+        #[cfg(test)]
+        workspace_metadata_test_hooks::count("all_reap");
+        let stderr = self
+            .stderr
+            .take()
+            .expect("owned workspace stderr drainer")
+            .join();
+        #[cfg(test)]
+        workspace_metadata_test_hooks::count("drain_join");
+        let _stderr = stderr
+            .map_err(|_| TransferError::Blocked("workspace Git stderr drainer failed".into()))??;
+        #[cfg(test)]
+        workspace_metadata_test_hooks::STATE
+            .with(|state| state.borrow_mut().retained_stderr = _stderr.len());
+        if trailing || !status.success() {
+            return Err(TransferError::Blocked(
+                "workspace Git process returned late output or unsuccessful status".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for WorkspaceGitChild {
+    fn drop(&mut self) {
+        self.input.take();
+        if !self.settled {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            #[cfg(test)]
+            workspace_metadata_test_hooks::count("reap");
+            #[cfg(test)]
+            workspace_metadata_test_hooks::count("all_reap");
+        }
+        if let Some(stderr) = self.stderr.take() {
+            let result = stderr.join();
+            #[cfg(test)]
+            {
+                workspace_metadata_test_hooks::count("drain_join");
+                if let Ok(Ok(bytes)) = result {
+                    workspace_metadata_test_hooks::STATE
+                        .with(|state| state.borrow_mut().retained_stderr = bytes.len());
+                }
+            }
+            #[cfg(not(test))]
+            let _ = result;
+        }
+    }
+}
+
+#[cfg(test)]
+mod workspace_metadata_test_hooks {
+    use super::*;
+    use std::cell::RefCell;
+    type Barrier = Box<dyn FnMut(&'static str, &str)>;
+    #[derive(Default)]
+    pub(super) struct State {
+        pub fusion: bool,
+        pub legacy: bool,
+        pub records: Vec<(String, String, u64)>,
+        pub barrier: Option<Barrier>,
+        pub counts: BTreeMap<&'static str, usize>,
+        pub owned_pids: Vec<u32>,
+        pub retained_stderr: usize,
+        pub fail_drain_spawn: bool,
+        pub fail_drain_read: bool,
+        #[cfg(target_os = "linux")]
+        pub drainer_tids: Vec<u32>,
+    }
+    thread_local! { pub(super) static STATE: RefCell<State> = RefCell::new(State::default()); }
+    pub(super) fn spawned(pid: u32) {
+        STATE.with(|state| state.borrow_mut().owned_pids.push(pid));
+        count("spawn");
+        process_spawned(pid);
+    }
+    pub(super) fn process_spawned(pid: u32) {
+        count("all_spawn");
+        #[cfg(target_os = "linux")]
+        {
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+            let children = fs::read_to_string(format!("/proc/self/task/{tid}/children"))
+                .expect("owned test thread children");
+            let mut workspace = 0;
+            let mut bodies = 0;
+            let mut pipes = 0;
+            for candidate in children
+                .split_whitespace()
+                .map(|value| value.parse::<u32>().unwrap())
+            {
+                let args = fs::read(format!("/proc/{candidate}/cmdline")).unwrap_or_default();
+                let body = args.split(|byte| *byte == 0).any(|arg| arg == b"--batch");
+                if candidate == pid {
+                    workspace += 1;
+                } else if body {
+                    bodies += 1;
+                } else {
+                    continue;
+                }
+                if let Ok(entries) = fs::read_dir(format!("/proc/{candidate}/fd")) {
+                    pipes += entries
+                        .filter_map(Result::ok)
+                        .filter_map(|entry| fs::read_link(entry.path()).ok())
+                        .filter(|target| target.to_string_lossy().starts_with("pipe:"))
+                        .count();
+                }
+            }
+            STATE.with(|state| {
+                let mut state = state.borrow_mut();
+                for (key, measured) in [
+                    ("os_workspace_peak", workspace),
+                    ("os_body_peak", bodies),
+                    ("os_process_peak", workspace + bodies),
+                    ("os_pipe_peak", pipes),
+                ] {
+                    let maximum = state.counts.entry(key).or_default();
+                    *maximum = (*maximum).max(measured);
+                }
+            });
+        }
+    }
+    pub(super) fn count(operation: &'static str) {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            *state.counts.entry(operation).or_default() += 1;
+            for (spawn, reap, peak) in [
+                ("spawn", "reap", "peak"),
+                ("drain_spawn", "drain_join", "drain_peak"),
+                ("all_spawn", "all_reap", "all_peak"),
+            ] {
+                let live = state.counts.get(spawn).copied().unwrap_or(0)
+                    - state.counts.get(reap).copied().unwrap_or(0);
+                let peak = state.counts.entry(peak).or_default();
+                *peak = (*peak).max(live);
+            }
+        });
+    }
 }
 
 fn read_alternates_file(path: &Path) -> Result<Option<String>, TransferError> {
@@ -4871,14 +5612,7 @@ fn git_output_in_repository(
     arguments: &[&str],
     costs: &mut Option<&mut SourceReaderCosts>,
 ) -> Result<Output, TransferError> {
-    let mut command = sanitized_git_command();
-    command
-        .arg("--git-dir")
-        .arg(&repository.git_dir)
-        .arg("--work-tree")
-        .arg(&repository.work_tree)
-        .args(arguments);
-    checked_git_output(command, costs)
+    checked_git_output(workspace_git_command(repository, arguments), costs)
 }
 
 fn sanitized_git_command() -> Command {
@@ -4909,7 +5643,18 @@ fn checked_git_output(
     costs: &mut Option<&mut SourceReaderCosts>,
 ) -> Result<Output, TransferError> {
     let started = Instant::now();
-    let output = command.output();
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = command.spawn().and_then(|child| {
+        #[cfg(test)]
+        workspace_metadata_test_hooks::process_spawned(child.id());
+        let output = child.wait_with_output();
+        #[cfg(test)]
+        workspace_metadata_test_hooks::count("all_reap");
+        output
+    });
     if let Some(costs) = costs.as_deref_mut() {
         // A start is an attempt, including failure to spawn an OS child.
         costs.workspace_git_command_starts = costs.workspace_git_command_starts.saturating_add(1);
@@ -8254,6 +8999,1271 @@ mod native_source_inventory_tests {
             costs.native_spawns, 0,
             "workspace attempts never relabel packed owners"
         );
+    }
+
+    #[test]
+    fn workspace_metadata_census_reduces_actual_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let git_dir = workspace.join(".git");
+        fixture_git(&git_dir, &["init", "-q"], None);
+        let mut entries = String::new();
+        for index in 0..256 {
+            let id = fixture_git(
+                &git_dir,
+                &["hash-object", "-w", "--stdin"],
+                Some(format!("distinct fixture blob {index}").as_bytes()),
+            );
+            entries.push_str(&format!("100644 blob {id}\tfile{index}\n"));
+        }
+        let subtree = fixture_git(&git_dir, &["mktree"], Some(entries.as_bytes()));
+        let tree = fixture_git(
+            &git_dir,
+            &["mktree"],
+            Some(format!("040000 tree {subtree}\tnested\n").as_bytes()),
+        );
+        let mut costs = SourceReaderCosts::default();
+        let inspection = inspect_git_tree_with_costs(&workspace, &tree, Some(&mut costs)).unwrap();
+        assert!(inspection.closure_bytes > 6000);
+        eprintln!(
+            "workspace census actual starts={} T=2 U=258",
+            costs.workspace_git_command_starts
+        );
+        assert_eq!(
+            costs.workspace_git_command_starts,
+            if cfg!(unix) {
+                19 + 2 * 2
+            } else {
+                4 + 2 * 2 + 258
+            },
+            "the complete qualified census must remove measured launches"
+        );
+        assert_eq!(costs.native_spawns, 0);
+    }
+
+    fn copy_fixture_objects(source: &Path, target: &Path) {
+        fs::create_dir_all(target).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let destination = target.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_fixture_objects(&entry.path(), &destination);
+            } else {
+                fs::copy(entry.path(), destination).unwrap();
+            }
+        }
+    }
+
+    fn workspace_metadata_fixture(
+        format: &str,
+        packed: bool,
+        alternates: bool,
+    ) -> (TempDir, PathBuf, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace with spaces");
+        fs::create_dir(&workspace).unwrap();
+        let git_dir = workspace.join(".git");
+        fixture_git(
+            &git_dir,
+            &["init", "-q", &format!("--object-format={format}")],
+            None,
+        );
+        let mut entries = String::new();
+        let mut shared = String::new();
+        for index in 0..32 {
+            let id = fixture_git(
+                &git_dir,
+                &["hash-object", "-w", "--stdin"],
+                Some(format!("current metadata object {index}").as_bytes()),
+            );
+            if index == 0 {
+                shared = id.clone();
+            }
+            entries.push_str(&format!("100644 blob {id}\tfile{index}\n"));
+        }
+        entries.push_str(&format!(
+            "100755 blob {shared}\texecutable\n120000 blob {shared}\tsymlink\n"
+        ));
+        let nested = fixture_git(&git_dir, &["mktree"], Some(entries.as_bytes()));
+        let tree = fixture_git(
+            &git_dir,
+            &["mktree"],
+            Some(
+                format!("040000 tree {nested}\tnested\n100644 blob {shared}\tshared\n").as_bytes(),
+            ),
+        );
+        fixture_git(&git_dir, &["update-ref", "refs/fixture/root", &tree], None);
+        if packed {
+            fixture_git(&git_dir, &["repack", "-a", "-d"], None);
+            fixture_git(&git_dir, &["prune-packed"], None);
+        }
+        if alternates {
+            let mut stores = Vec::new();
+            for name in ["first alternate.git", "second alternate.git"] {
+                let alternate = workspace.join(name);
+                fixture_git(
+                    &alternate,
+                    &["init", "--bare", "-q", &format!("--object-format={format}")],
+                    None,
+                );
+                copy_fixture_objects(&git_dir.join("objects"), &alternate.join("objects"));
+                stores.push(alternate.join("objects"));
+            }
+            fs::write(
+                git_dir.join("objects/info/alternates"),
+                format!("{}\n{}\n", stores[0].display(), stores[1].display()),
+            )
+            .unwrap();
+        }
+        (dir, workspace, tree)
+    }
+
+    #[test]
+    fn workspace_metadata_preserves_full_records_formats_and_ordered_stores() {
+        for format in ["sha1", "sha256"] {
+            for packed in [false, true] {
+                let (_dir, workspace, tree) = workspace_metadata_fixture(format, packed, true);
+                let tree = tree.to_ascii_uppercase();
+                let mut outputs = Vec::new();
+                let mut measurements = Vec::new();
+                for mode in ["legacy", "census", "fusion"] {
+                    workspace_metadata_test_hooks::STATE.with(|state| {
+                        *state.borrow_mut() = workspace_metadata_test_hooks::State {
+                            legacy: mode == "legacy",
+                            fusion: mode == "fusion",
+                            ..Default::default()
+                        }
+                    });
+                    let mut costs = SourceReaderCosts::default();
+                    let inspection =
+                        inspect_git_tree_with_costs(&workspace, &tree, Some(&mut costs)).unwrap();
+                    let records = workspace_metadata_test_hooks::STATE
+                        .with(|state| state.borrow().records.clone());
+                    assert_eq!(records.len(), 34);
+                    assert!(records.iter().any(|record| record.0 == tree));
+                    let bytes = serde_json::to_vec(&records).unwrap();
+                    assert_eq!(inspection.closure_sha256, digest(&bytes));
+                    outputs.push((
+                        inspection.identity,
+                        inspection.closure_bytes,
+                        inspection.closure_sha256,
+                        records,
+                        bytes,
+                    ));
+                    measurements.push(costs.workspace_git_command_starts);
+                }
+                assert_eq!(outputs[0], outputs[1]);
+                assert_eq!(outputs[0], outputs[2]);
+                assert_eq!(measurements[0], 4 + 2 * 2 + 2 * 34);
+                assert_eq!(
+                    measurements[1],
+                    if cfg!(unix) {
+                        19 + 2 * 2
+                    } else {
+                        4 + 2 * 2 + 34
+                    }
+                );
+                assert_eq!(measurements[2], 4 + 2 * 2 + 34);
+                eprintln!("complete workspace tuples {format}/packed={packed}: legacy/census/fusion starts {measurements:?}");
+            }
+        }
+        workspace_metadata_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+    }
+
+    #[test]
+    fn workspace_metadata_preserves_entire_native_exports() {
+        for packed in [false, true] {
+            let fixture = reuse_fixture(packed);
+            let workspace = fixture.dir.path().join("workspace");
+            let git_dir = workspace.join(".git");
+            fixture_git(&git_dir, &["init", "-q"], None);
+            copy_fixture_objects(&fixture.store, &git_dir.join("objects"));
+            let mut outputs = Vec::new();
+            for mode in ["legacy", "census", "fusion"] {
+                workspace_metadata_test_hooks::STATE.with(|state| {
+                    *state.borrow_mut() = workspace_metadata_test_hooks::State {
+                        legacy: mode == "legacy",
+                        fusion: mode == "fusion",
+                        ..Default::default()
+                    }
+                });
+                let exported = export_exact_session(
+                    &fixture.inventory,
+                    "ses_exact",
+                    ExportOptions::new(fixture.dir.path().join("extract")),
+                )
+                .unwrap();
+                assert_eq!(
+                    exported
+                        .manifest()
+                        .assets
+                        .iter()
+                        .filter(|asset| asset.kind == "git_tree_reference")
+                        .count(),
+                    2
+                );
+                outputs.push((
+                    fs::read(&exported.payload_path).unwrap(),
+                    serde_json::to_value(exported.manifest()).unwrap(),
+                    source_graph_fingerprint(exported.manifest()).unwrap(),
+                ));
+            }
+            assert_eq!(outputs[0], outputs[1]);
+            assert_eq!(outputs[0], outputs[2]);
+        }
+        workspace_metadata_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+    }
+
+    #[cfg(unix)]
+    fn named_user_fixture_include(include: &Path) -> String {
+        let user = std::env::var("USER").unwrap();
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert!(home.is_absolute());
+        let depth = home
+            .components()
+            .filter(|part| matches!(part, std::path::Component::Normal(_)))
+            .count();
+        format!(
+            "~{user}/{}{}",
+            "../".repeat(depth),
+            include.strip_prefix("/").unwrap().display()
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_metadata_named_user_include_preselects_fresh_fusion() {
+        let fixture = reuse_fixture(true);
+        let workspace = fixture.dir.path().join("workspace");
+        let git_dir = workspace.join(".git");
+        fixture_git(&git_dir, &["init", "-q"], None);
+        copy_fixture_objects(&fixture.store, &git_dir.join("objects"));
+        let include = fixture.dir.path().join("named-user include");
+        fs::write(&include, "[core]\nignorecase = true\n").unwrap();
+        let named_path = named_user_fixture_include(&include);
+        fixture_git(&git_dir, &["config", "include.path", &named_path], None);
+        assert_eq!(
+            fixture_git(
+                &git_dir,
+                &["config", "--bool", "--get", "core.ignorecase"],
+                None
+            ),
+            "true",
+            "real Git must resolve the valid named-user include"
+        );
+        let mut inspections = Vec::new();
+        let mut exports = Vec::new();
+        for legacy in [true, false] {
+            workspace_metadata_test_hooks::STATE.with(|state| {
+                *state.borrow_mut() = workspace_metadata_test_hooks::State {
+                    legacy,
+                    ..Default::default()
+                }
+            });
+            let tree = fixture.trees[0].to_ascii_uppercase();
+            let mut costs = SourceReaderCosts::default();
+            let inspection =
+                inspect_git_tree_with_costs(&workspace, &tree, Some(&mut costs)).unwrap();
+            let (records, counts) = workspace_metadata_test_hooks::STATE.with(|state| {
+                (
+                    state.borrow().records.clone(),
+                    state.borrow().counts.clone(),
+                )
+            });
+            inspections.push((
+                inspection.identity,
+                inspection.closure_bytes,
+                inspection.closure_sha256,
+                serde_json::to_vec(&records).unwrap(),
+                records.clone(),
+            ));
+            assert_eq!(counts.get("census_start").copied().unwrap_or(0), 0);
+            if !legacy {
+                assert_eq!(counts.get("fusion_start"), Some(&records.len()));
+                assert_eq!(
+                    costs.workspace_git_command_starts,
+                    4 + 1 + 2 * 2 + records.len() as u64
+                );
+            }
+            workspace_metadata_test_hooks::STATE.with(|state| {
+                *state.borrow_mut() = workspace_metadata_test_hooks::State {
+                    legacy,
+                    ..Default::default()
+                }
+            });
+            let exported = export_exact_session(
+                &fixture.inventory,
+                "ses_exact",
+                ExportOptions::new(fixture.dir.path().join("extract")),
+            )
+            .unwrap();
+            assert_eq!(
+                exported
+                    .manifest()
+                    .assets
+                    .iter()
+                    .filter(|asset| asset.kind == "git_tree_reference")
+                    .count(),
+                2
+            );
+            let counts =
+                workspace_metadata_test_hooks::STATE.with(|state| state.borrow().counts.clone());
+            assert_eq!(counts.get("census_start").copied().unwrap_or(0), 0);
+            if !legacy {
+                assert!(counts["fusion_start"] > 0);
+            }
+            exports.push((
+                fs::read(&exported.payload_path).unwrap(),
+                serde_json::to_value(exported.manifest()).unwrap(),
+                source_graph_fingerprint(exported.manifest()).unwrap(),
+            ));
+        }
+        assert_eq!(inspections[0], inspections[1]);
+        assert_eq!(exports[0], exports[1]);
+        workspace_metadata_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+        fs::write(&include, "[broken native configuration\n").unwrap();
+        assert!(inspect_git_tree(&workspace, &fixture.trees[0]).is_err());
+        workspace_metadata_test_hooks::STATE.with(|state| {
+            let state = state.borrow();
+            assert_eq!(state.counts.get("census_start").copied().unwrap_or(0), 0);
+            assert_eq!(state.counts.get("fusion_start").copied().unwrap_or(0), 0);
+        });
+        workspace_metadata_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_metadata_refuses_current_storage_and_context_mutations() {
+        for phase in [
+            "qualified",
+            "traversed",
+            "precensus",
+            "before_query",
+            "after_query",
+            "last_response",
+            "settled",
+        ] {
+            for mutation in [
+                "pack_remove",
+                "index_remove",
+                "pack_replace",
+                "pack_add",
+                "pack_entry_remove",
+                "alternate_order",
+                "alternate_remove",
+                "alternate_add",
+                "loose_add",
+                "loose_remove",
+                "loose_redirect",
+                "config",
+                "include",
+                "include_absent",
+                "include_same_values",
+                "include_absent_empty",
+                "include_named_user",
+                "worktree_config",
+                "format",
+                "git_marker",
+                "common_dir",
+            ] {
+                let (dir, workspace, tree) =
+                    workspace_metadata_fixture("sha1", true, mutation.starts_with("alternate"));
+                let git_dir = workspace.join(".git");
+                let include = dir.path().join("included config with spaces");
+                if mutation.starts_with("include") {
+                    fixture_git(
+                        &git_dir,
+                        &["config", "include.path", include.to_str().unwrap()],
+                        None,
+                    );
+                    if mutation == "include" || mutation == "include_same_values" {
+                        fs::write(&include, "[core]\nignorecase = false\n").unwrap();
+                    }
+                }
+                if mutation == "worktree_config" {
+                    fixture_git(
+                        &git_dir,
+                        &["config", "extensions.worktreeConfig", "true"],
+                        None,
+                    );
+                    fs::write(
+                        git_dir.join("config.worktree"),
+                        "[core]\nignorecase = false\n",
+                    )
+                    .unwrap();
+                }
+                if mutation == "pack_entry_remove" {
+                    fs::write(git_dir.join("objects/pack/fixture.keep"), b"owned fixture").unwrap();
+                }
+                let blob = fixture_git(&git_dir, &["ls-tree", "-r", &tree], None)
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(2)
+                    .unwrap()
+                    .to_string();
+                let loose_path = git_dir.join("objects").join(&blob[..2]).join(&blob[2..]);
+                // Keep the fanout present before observation, so introducing a
+                // selected symlink cannot hide behind an object-store stamp change.
+                if matches!(mutation, "loose_add" | "loose_redirect") {
+                    fs::create_dir_all(loose_path.parent().unwrap()).unwrap();
+                }
+                let loose_bytes = {
+                    let body = fixture_git(&git_dir, &["cat-file", "blob", &blob], None);
+                    let mut encoder =
+                        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+                    write!(encoder, "blob {}\0{body}", body.len()).unwrap();
+                    encoder.finish().unwrap()
+                };
+                if mutation == "loose_remove" {
+                    fs::create_dir_all(loose_path.parent().unwrap()).unwrap();
+                    fs::write(&loose_path, &loose_bytes).unwrap();
+                }
+                let original_config = fixture_git(
+                    &git_dir,
+                    &["config", "--list", "--show-origin", "--includes"],
+                    None,
+                );
+                let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let executed = observed.clone();
+                let owned_workspace = workspace.clone();
+                let owned_git = git_dir.clone();
+                let owned_tree = tree.clone();
+                let parked = dir.path().join("parked-owned-entry");
+                workspace_metadata_test_hooks::STATE.with(|state| {
+                    *state.borrow_mut() = workspace_metadata_test_hooks::State {
+                        barrier: Some(Box::new(move |at, _object| {
+                            if at != phase
+                                || executed.swap(true, std::sync::atomic::Ordering::SeqCst)
+                            {
+                                return;
+                            }
+                            match mutation {
+                                "pack_remove" | "index_remove" | "pack_replace" => {
+                                    let extension = if mutation == "index_remove" {
+                                        "idx"
+                                    } else {
+                                        "pack"
+                                    };
+                                    let selected = fs::read_dir(owned_git.join("objects/pack"))
+                                        .unwrap()
+                                        .map(|entry| entry.unwrap().path())
+                                        .find(|path| {
+                                            path.extension().is_some_and(|value| value == extension)
+                                        })
+                                        .unwrap();
+                                    fs::rename(&selected, &parked).unwrap();
+                                    if mutation == "pack_replace" {
+                                        fs::write(&selected, b"invalid current replacement")
+                                            .unwrap();
+                                    }
+                                    let mut command = workspace_git_command(
+                                        &GitRepository {
+                                            work_tree: owned_workspace.clone(),
+                                            git_dir: owned_git.clone(),
+                                        },
+                                        &["cat-file", "-t", &owned_tree],
+                                    );
+                                    assert!(
+                                        !command.output().unwrap().status.success(),
+                                        "fresh native reference must observe selected storage loss"
+                                    );
+                                }
+                                "pack_add" => {
+                                    fs::write(
+                                        owned_git.join("objects/pack/new-entry.keep"),
+                                        b"owned new entry",
+                                    )
+                                    .unwrap();
+                                }
+                                "pack_entry_remove" => {
+                                    fs::remove_file(owned_git.join("objects/pack/fixture.keep"))
+                                        .unwrap();
+                                }
+                                "alternate_order" => {
+                                    let file = owned_git.join("objects/info/alternates");
+                                    let original = fs::read_to_string(&file).unwrap();
+                                    let mut lines = original.lines().collect::<Vec<_>>();
+                                    lines.reverse();
+                                    fs::write(&file, format!("{}\n", lines.join("\n"))).unwrap();
+                                    assert_ne!(
+                                        read_alternates_file(&file).unwrap().unwrap(),
+                                        original
+                                    );
+                                }
+                                "alternate_remove" => {
+                                    fs::rename(
+                                        owned_workspace.join("first alternate.git/objects"),
+                                        &parked,
+                                    )
+                                    .unwrap();
+                                }
+                                "alternate_add" => {
+                                    let file = owned_git.join("objects/info/alternates");
+                                    let mut contents = fs::read_to_string(&file).unwrap();
+                                    contents.push_str(&format!(
+                                        "{}\n",
+                                        owned_workspace.join("new alternate.git/objects").display()
+                                    ));
+                                    fs::write(file, contents).unwrap();
+                                }
+                                "loose_add" => {
+                                    fs::create_dir_all(loose_path.parent().unwrap()).unwrap();
+                                    fs::write(&loose_path, &loose_bytes).unwrap();
+                                }
+                                "loose_remove" => {
+                                    fs::remove_file(&loose_path).unwrap();
+                                }
+                                "loose_redirect" => {
+                                    fs::create_dir_all(loose_path.parent().unwrap()).unwrap();
+                                    fs::write(&parked, &loose_bytes).unwrap();
+                                    std::os::unix::fs::symlink(&parked, &loose_path).unwrap();
+                                    assert!(verify_git_loose_object_paths(
+                                        &owned_workspace,
+                                        &[owned_git.join("objects")],
+                                        std::slice::from_ref(&blob)
+                                    )
+                                    .is_err());
+                                }
+                                "config" => {
+                                    fixture_git(
+                                        &owned_git,
+                                        &["config", "core.ignorecase", "true"],
+                                        None,
+                                    );
+                                }
+                                "include" | "include_absent" => {
+                                    fs::write(&include, "[core]\nignorecase = true\n").unwrap();
+                                }
+                                "include_same_values" => {
+                                    fs::write(&include, "# changed current dependency\n[core]\nignorecase = false\n").unwrap();
+                                }
+                                "include_absent_empty" => {
+                                    fs::write(&include, "# newly present native include dependency\n").unwrap();
+                                }
+                                "include_named_user" => {
+                                    fs::write(&include, "[core]\nignorecase = true\n").unwrap();
+                                    fixture_git(&owned_git, &["config", "include.path", &named_user_fixture_include(&include)], None);
+                                }
+                                "worktree_config" => {
+                                    fs::write(
+                                        owned_git.join("config.worktree"),
+                                        "[core]\nignorecase = true\n",
+                                    )
+                                    .unwrap();
+                                }
+                                "format" => {
+                                    let mut config =
+                                        fs::read_to_string(owned_git.join("config")).unwrap();
+                                    config.push_str("\n[extensions]\nobjectFormat = sha256\n");
+                                    fs::write(
+                                        owned_git.join("config"),
+                                        config.replace(
+                                            "repositoryformatversion = 0",
+                                            "repositoryformatversion = 1",
+                                        ),
+                                    )
+                                    .unwrap();
+                                }
+                                "git_marker" => {
+                                    let target = owned_workspace.join("redirected.git");
+                                    fs::rename(&owned_git, &target).unwrap();
+                                    fs::write(
+                                        &owned_git,
+                                        format!("gitdir: {}\n", target.display()),
+                                    )
+                                    .unwrap();
+                                }
+                                "common_dir" => {
+                                    fs::write(
+                                        owned_git.join("commondir"),
+                                        "missing-current-common-dir\n",
+                                    )
+                                    .unwrap();
+                                }
+                                _ => unreachable!(),
+                            }
+                            if matches!(
+                                mutation,
+                                "config" | "include" | "include_absent" | "worktree_config"
+                            ) {
+                                assert_ne!(
+                                    fixture_git(
+                                        &owned_git,
+                                        &["config", "--list", "--show-origin", "--includes"],
+                                        None
+                                    ),
+                                    original_config,
+                                    "fresh native effective configuration changed"
+                                );
+                            }
+                        })),
+                        ..Default::default()
+                    }
+                });
+                let result = inspect_git_tree(&workspace, &tree);
+                if let Ok(current) = &result {
+                    assert!(
+                        matches!(phase, "qualified" | "traversed")
+                            && matches!(mutation, "loose_remove" | "loose_add"),
+                        "{phase}/{mutation}: no stale workspace commitment may survive mutation"
+                    );
+                    // A duplicate removed before the selected census is observed
+                    // may succeed only with entirely current native metadata.
+                    workspace_metadata_test_hooks::STATE.with(|state| {
+                        let mut state = state.borrow_mut();
+                        state.barrier = None;
+                        state.legacy = true;
+                    });
+                    let reference = inspect_git_tree(&workspace, &tree).unwrap();
+                    assert_eq!(
+                        (
+                            &current.identity,
+                            current.closure_bytes,
+                            &current.closure_sha256
+                        ),
+                        (
+                            &reference.identity,
+                            reference.closure_bytes,
+                            &reference.closure_sha256
+                        )
+                    );
+                }
+                assert!(
+                    observed.load(std::sync::atomic::Ordering::SeqCst),
+                    "{phase}/{mutation}: mutation barrier executed"
+                );
+                workspace_metadata_test_hooks::STATE.with(|state| {
+                    let state = state.borrow();
+                    assert_eq!(state.records.is_empty(), result.is_err());
+                    assert_eq!(state.counts.get("spawn"), state.counts.get("reap"));
+                    assert_eq!(
+                        state.counts.get("drain_spawn"),
+                        state.counts.get("drain_join")
+                    );
+                });
+            }
+        }
+        workspace_metadata_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+    }
+
+    #[cfg(unix)]
+    fn workspace_protocol_child(
+        header: &[u8],
+        tail: &[u8],
+        stderr: usize,
+        status: u8,
+        immediate: bool,
+    ) -> Command {
+        let mut command = Command::new("python3");
+        command.arg("-c").arg("import sys\nsys.stdin.buffer.readline()\nsys.stderr.buffer.write(b'e'*int(sys.argv[3])); sys.stderr.buffer.flush()\nsys.stdout.buffer.write(bytes.fromhex(sys.argv[1])); sys.stdout.buffer.flush()\nif sys.argv[5] == '0': sys.stdin.buffer.read()\nsys.stdout.buffer.write(bytes.fromhex(sys.argv[2])); sys.stdout.buffer.flush()\nsys.exit(int(sys.argv[4]))")
+            .arg(hex::encode(header)).arg(hex::encode(tail)).arg(stderr.to_string()).arg(status.to_string()).arg(if immediate { "1" } else { "0" });
+        command
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_metadata_owner_rejects_protocol_and_late_settlement_faults() {
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        let valid = format!("{oid} blob 7\n");
+        let mut unrelated = Command::new("python3")
+            .arg("-c")
+            .arg("import time; time.sleep(30)")
+            .spawn()
+            .unwrap();
+        let cases = [
+            (
+                "valid",
+                valid.as_bytes().to_vec(),
+                Vec::new(),
+                0,
+                false,
+                true,
+            ),
+            (
+                "stderr_pressure",
+                valid.as_bytes().to_vec(),
+                Vec::new(),
+                0,
+                false,
+                true,
+            ),
+            (
+                "missing",
+                format!("{oid} missing\n").into_bytes(),
+                Vec::new(),
+                0,
+                false,
+                false,
+            ),
+            (
+                "wrong_oid",
+                format!("{} blob 7\n", "1".repeat(40)).into_bytes(),
+                Vec::new(),
+                0,
+                false,
+                false,
+            ),
+            (
+                "wrong_width",
+                format!("{} blob 7\n", "0".repeat(64)).into_bytes(),
+                Vec::new(),
+                0,
+                false,
+                false,
+            ),
+            (
+                "malformed",
+                format!("{oid} blob 7 extra\n").into_bytes(),
+                Vec::new(),
+                0,
+                false,
+                false,
+            ),
+            ("nontext", vec![255, b'\n'], Vec::new(), 0, false, false),
+            ("oversize", vec![b'x'; 300], Vec::new(), 0, true, false),
+            (
+                "truncated",
+                valid.trim_end().as_bytes().to_vec(),
+                Vec::new(),
+                0,
+                true,
+                false,
+            ),
+            (
+                "invalid_size",
+                format!("{oid} blob -7\n").into_bytes(),
+                Vec::new(),
+                0,
+                false,
+                false,
+            ),
+            (
+                "overflow",
+                format!("{oid} blob 18446744073709551616\n").into_bytes(),
+                Vec::new(),
+                0,
+                false,
+                false,
+            ),
+            (
+                "duplicate",
+                format!("{valid}{valid}").into_bytes(),
+                Vec::new(),
+                0,
+                false,
+                false,
+            ),
+            (
+                "late_output",
+                valid.as_bytes().to_vec(),
+                b"unexpected late stdout".to_vec(),
+                0,
+                false,
+                false,
+            ),
+            (
+                "late_status",
+                valid.as_bytes().to_vec(),
+                Vec::new(),
+                7,
+                false,
+                false,
+            ),
+            ("read_eof", Vec::new(), Vec::new(), 0, true, false),
+        ];
+        for (name, header, tail, status, immediate, success) in cases {
+            workspace_metadata_test_hooks::STATE
+                .with(|state| *state.borrow_mut() = Default::default());
+            let mut costs = SourceReaderCosts::default();
+            let result = run_workspace_git_child(
+                workspace_protocol_child(
+                    &header,
+                    &tail,
+                    if name == "stderr_pressure" {
+                        1024 * 1024
+                    } else {
+                        0
+                    },
+                    status,
+                    immediate,
+                ),
+                &mut Some(&mut costs),
+                |owner| {
+                    let metadata = owner.query(oid, 40)?;
+                    owner.finish()?;
+                    Ok(metadata)
+                },
+            );
+            assert_eq!(result.is_ok(), success, "{name}");
+            assert_eq!(costs.workspace_git_command_starts, 1);
+            assert_eq!(costs.native_spawns, 0);
+            workspace_metadata_test_hooks::STATE.with(|state| {
+                let state = state.borrow();
+                assert_eq!(state.counts["spawn"], 1, "{name}");
+                assert_eq!(state.counts["reap"], 1, "{name}");
+                assert_eq!(state.counts["drain_spawn"], 1, "{name}");
+                assert_eq!(state.counts["drain_join"], 1, "{name}");
+                assert_eq!(state.counts["peak"], 1, "{name}");
+                assert_eq!(state.counts["drain_peak"], 1, "{name}");
+                assert!(state.retained_stderr <= 16 * 1024);
+                if name == "stderr_pressure" {
+                    assert_eq!(state.retained_stderr, 16 * 1024);
+                }
+                for pid in &state.owned_pids {
+                    assert!(
+                        !Path::new(&format!("/proc/{pid}")).exists(),
+                        "{name}: exact child must be reaped"
+                    );
+                }
+            });
+            assert!(
+                unrelated.try_wait().unwrap().is_none(),
+                "{name}: unrelated owned fixture survives"
+            );
+        }
+        unrelated.kill().unwrap();
+        unrelated.wait().unwrap();
+        workspace_metadata_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+    }
+
+    #[test]
+    fn workspace_metadata_missing_native_object_and_owned_input_failures_refuse() {
+        let (_dir, workspace, _tree) = workspace_metadata_fixture("sha1", true, false);
+        let repository = GitRepository {
+            git_dir: workspace.join(".git"),
+            work_tree: workspace,
+        };
+        let absent = "f".repeat(40);
+        workspace_metadata_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+        assert!(run_workspace_git_child(
+            workspace_git_command(&repository, &["cat-file", "--batch-check"]),
+            &mut None,
+            |owner| {
+                owner.query(&absent, 40)?;
+                owner.finish()
+            }
+        )
+        .is_err());
+        assert!(run_workspace_git_child(
+            workspace_git_command(&repository, &["cat-file", "--batch-check"]),
+            &mut None,
+            |owner| {
+                owner.input.take();
+                owner.query(&absent, 40)?;
+                owner.finish()
+            }
+        )
+        .is_err());
+        let fixture = tempfile::tempdir().unwrap();
+        let mut costs = SourceReaderCosts::default();
+        assert!(run_workspace_git_child(
+            Command::new(fixture.path().join("nonexistent-owned-git")),
+            &mut Some(&mut costs),
+            |owner| owner.finish()
+        )
+        .is_err());
+        assert_eq!(costs.workspace_git_command_starts, 1);
+        workspace_metadata_test_hooks::STATE.with(|state| {
+            let state = state.borrow();
+            assert_eq!(state.counts["spawn"], 2);
+            assert_eq!(state.counts["reap"], 2);
+            assert_eq!(state.counts["drain_spawn"], 2);
+            assert_eq!(state.counts["drain_join"], 2);
+        });
+        workspace_metadata_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+    }
+
+    #[test]
+    fn workspace_metadata_native_owner_accepts_all_kinds_and_fresh_inspections() {
+        for format in ["sha1", "sha256"] {
+            let (_dir, workspace, tree) = workspace_metadata_fixture(format, true, false);
+            let git_dir = workspace.join(".git");
+            let commit_body = format!("tree {tree}\nauthor Fixture <fixture@example.invalid> 1 +0000\ncommitter Fixture <fixture@example.invalid> 1 +0000\n\nfixture commit\n");
+            let commit = fixture_git(
+                &git_dir,
+                &["hash-object", "-t", "commit", "-w", "--stdin"],
+                Some(commit_body.as_bytes()),
+            );
+            let tag_body = format!("object {commit}\ntype commit\ntag fixture\ntagger Fixture <fixture@example.invalid> 1 +0000\n\nfixture tag\n");
+            let tag = fixture_git(
+                &git_dir,
+                &["hash-object", "-t", "tag", "-w", "--stdin"],
+                Some(tag_body.as_bytes()),
+            );
+            let blob_body = b"fixture blob";
+            let blob = fixture_git(&git_dir, &["hash-object", "-w", "--stdin"], Some(blob_body));
+            let repository = GitRepository {
+                work_tree: workspace.clone(),
+                git_dir: git_dir.clone(),
+            };
+            let mut actual = Vec::new();
+            run_workspace_git_child(
+                workspace_git_command(&repository, &["cat-file", "--batch-check"]),
+                &mut None,
+                |owner| {
+                    for (id, kind, size) in [
+                        (
+                            &tree,
+                            "tree",
+                            fixture_git(&git_dir, &["cat-file", "-s", &tree], None)
+                                .parse()
+                                .unwrap(),
+                        ),
+                        (&commit, "commit", commit_body.len() as u64),
+                        (&tag, "tag", tag_body.len() as u64),
+                        (&blob, "blob", blob_body.len() as u64),
+                    ] {
+                        let record = owner.query(&id.to_ascii_uppercase(), id.len())?;
+                        assert_eq!(record, (kind.to_string(), size));
+                        actual.push(record);
+                    }
+                    owner.finish()
+                },
+            )
+            .unwrap();
+            assert_eq!(actual.len(), 4);
+            workspace_metadata_test_hooks::STATE
+                .with(|state| *state.borrow_mut() = Default::default());
+            let first = inspect_git_tree(&workspace, &tree).unwrap();
+            fixture_git(&git_dir, &["config", "core.ignorecase", "true"], None);
+            let second = inspect_git_tree(&workspace, &tree).unwrap();
+            assert_eq!(
+                (first.identity, first.closure_bytes, first.closure_sha256),
+                (second.identity, second.closure_bytes, second.closure_sha256)
+            );
+            workspace_metadata_test_hooks::STATE
+                .with(|state| *state.borrow_mut() = Default::default());
+            let selected = fs::read_dir(git_dir.join("objects/pack"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.extension().is_some_and(|value| value == "pack"))
+                .unwrap();
+            fs::remove_file(selected).unwrap();
+            assert!(inspect_git_tree(&workspace, &tree).is_err());
+            workspace_metadata_test_hooks::STATE
+                .with(|state| assert!(state.borrow().records.is_empty()));
+        }
+        workspace_metadata_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_metadata_owner_settles_injected_io_faults() {
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        for fault in ["drain_spawn", "drain_read", "write"] {
+            workspace_metadata_test_hooks::STATE.with(|state| {
+                *state.borrow_mut() = workspace_metadata_test_hooks::State {
+                    fail_drain_spawn: fault == "drain_spawn",
+                    fail_drain_read: fault == "drain_read",
+                    ..Default::default()
+                }
+            });
+            let mut costs = SourceReaderCosts::default();
+            let command = if fault == "write" {
+                let mut command = Command::new("python3");
+                command.arg("-c").arg("pass");
+                command
+            } else {
+                workspace_protocol_child(format!("{oid} blob 7\n").as_bytes(), b"", 4096, 0, false)
+            };
+            let result = run_workspace_git_child(command, &mut Some(&mut costs), |owner| {
+                if fault == "write" {
+                    let started = Instant::now();
+                    while owner.child.try_wait()?.is_none() {
+                        assert!(
+                            started.elapsed() < Duration::from_secs(2),
+                            "finite write-error child must exit"
+                        );
+                        std::thread::yield_now();
+                    }
+                }
+                owner.query(oid, 40)?;
+                owner.finish()
+            });
+            assert!(result.is_err(), "{fault}");
+            assert_eq!(costs.workspace_git_command_starts, 1);
+            workspace_metadata_test_hooks::STATE.with(|state| {
+                let state = state.borrow();
+                assert_eq!(state.counts["spawn"], 1);
+                assert_eq!(state.counts["reap"], 1);
+                assert_eq!(state.counts["all_spawn"], state.counts["all_reap"]);
+                assert_eq!(
+                    state.counts.get("drain_spawn"),
+                    state.counts.get("drain_join")
+                );
+                for pid in &state.owned_pids {
+                    assert!(!Path::new(&format!("/proc/{pid}")).exists());
+                }
+                #[cfg(target_os = "linux")]
+                for tid in &state.drainer_tids {
+                    assert!(!Path::new(&format!("/proc/self/task/{tid}")).exists());
+                }
+            });
+        }
+        workspace_metadata_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_metadata_optional_refusal_preserves_complete_native_bundle() {
+        let fixture = reuse_fixture(true);
+        let baseline = export_exact_session(
+            &fixture.inventory,
+            "ses_exact",
+            ExportOptions::new(fixture.dir.path().join("extract")),
+        )
+        .unwrap();
+        let workspace = fixture.dir.path().join("workspace");
+        let git_dir = workspace.join(".git");
+        fixture_git(&git_dir, &["init", "-q"], None);
+        copy_fixture_objects(&fixture.store, &git_dir.join("objects"));
+        let pack_dir = git_dir.join("objects/pack");
+        let mut refusals = 0;
+        workspace_metadata_test_hooks::STATE.with(|state| {
+            *state.borrow_mut() = workspace_metadata_test_hooks::State {
+                barrier: Some(Box::new(move |phase, _| {
+                    if phase == "settled" {
+                        refusals += 1;
+                        fs::write(
+                            pack_dir.join(format!("owned-mutation-{refusals}.keep")),
+                            b"current fixture entry",
+                        )
+                        .unwrap();
+                    }
+                })),
+                ..Default::default()
+            }
+        });
+        let costs = Arc::new(std::sync::Mutex::new(None));
+        let observed = costs.clone();
+        let refused = export_exact_session(
+            &fixture.inventory,
+            "ses_exact",
+            ExportOptions::new(fixture.dir.path().join("extract")).with_progress_observer(
+                move |event| {
+                    if event.phase == "saved_objects" && event.state == "completed" {
+                        *observed.lock().unwrap() = event.reader_costs.clone();
+                    }
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(&baseline.payload_path).unwrap(),
+            fs::read(&refused.payload_path).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(baseline.manifest()).unwrap(),
+            serde_json::to_value(refused.manifest()).unwrap()
+        );
+        assert_eq!(
+            source_graph_fingerprint(baseline.manifest()).unwrap(),
+            source_graph_fingerprint(refused.manifest()).unwrap()
+        );
+        let costs = costs.lock().unwrap();
+        let costs = costs.as_ref().unwrap();
+        assert_eq!(costs.workspace_git_refusals, 9);
+        assert_eq!(costs.workspace_git_successes, 0);
+        assert_eq!(costs.native_queries, 30);
+        workspace_metadata_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_metadata_selected_symlink_refusal_preserves_complete_native_bundle() {
+        for phase in ["traversed", "settled"] {
+            let fixture = reuse_fixture(true);
+            let baseline = export_exact_session(
+                &fixture.inventory,
+                "ses_exact",
+                ExportOptions::new(fixture.dir.path().join("extract")),
+            )
+            .unwrap();
+            let workspace = fixture.dir.path().join("workspace");
+            let git_dir = workspace.join(".git");
+            fixture_git(&git_dir, &["init", "-q"], None);
+            copy_fixture_objects(&fixture.store, &git_dir.join("objects"));
+            let loose_path = git_dir
+                .join("objects")
+                .join(&fixture.blob[..2])
+                .join(&fixture.blob[2..]);
+            fs::create_dir_all(loose_path.parent().unwrap()).unwrap();
+            let body = fixture_git(&git_dir, &["cat-file", "blob", &fixture.blob], None);
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            write!(encoder, "blob {}\0{body}", body.len()).unwrap();
+            let parked = fixture.dir.path().join("outside-workspace-loose-object");
+            fs::write(&parked, encoder.finish().unwrap()).unwrap();
+            // Restore the workspace path only before the next independently
+            // guarded native closure read. Each workspace inspection still
+            // sees the redirect through its complete acceptance boundary.
+            let cleanup_path = loose_path.clone();
+            snapshot_reuse_test_hooks::STATE.with(|state| {
+                *state.borrow_mut() = snapshot_reuse_test_hooks::State {
+                    before_reference: Some(Box::new(move |_| {
+                        if cleanup_path.symlink_metadata().is_ok() {
+                            fs::remove_file(&cleanup_path).unwrap();
+                        }
+                    })),
+                    ..Default::default()
+                }
+            });
+            let redirects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let barrier_redirects = redirects.clone();
+            let final_cleanup = loose_path.clone();
+            workspace_metadata_test_hooks::STATE.with(|state| {
+                *state.borrow_mut() = workspace_metadata_test_hooks::State {
+                    barrier: Some(Box::new(move |at, _| {
+                        if at == phase {
+                            barrier_redirects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            std::os::unix::fs::symlink(&parked, &loose_path).unwrap();
+                        }
+                    })),
+                    ..Default::default()
+                }
+            });
+            let costs = Arc::new(std::sync::Mutex::new(None));
+            let completed_costs = costs.clone();
+            let refused = export_exact_session(
+                &fixture.inventory,
+                "ses_exact",
+                ExportOptions::new(fixture.dir.path().join("extract")).with_progress_observer(
+                    move |event| {
+                        if event.phase == "saved_objects" && event.state == "completed" {
+                            *completed_costs.lock().unwrap() = event.reader_costs.clone();
+                        }
+                    },
+                ),
+            )
+            .unwrap();
+            assert_eq!(redirects.load(std::sync::atomic::Ordering::SeqCst), 9);
+            fs::remove_file(final_cleanup).unwrap();
+            assert_eq!(
+                fs::read(&baseline.payload_path).unwrap(),
+                fs::read(&refused.payload_path).unwrap(),
+                "{phase}: no unqualified workspace asset may enter the native payload"
+            );
+            assert_eq!(
+                serde_json::to_value(baseline.manifest()).unwrap(),
+                serde_json::to_value(refused.manifest()).unwrap()
+            );
+            assert_eq!(
+                source_graph_fingerprint(baseline.manifest()).unwrap(),
+                source_graph_fingerprint(refused.manifest()).unwrap()
+            );
+            let costs = costs.lock().unwrap();
+            let costs = costs.as_ref().unwrap();
+            assert_eq!(costs.workspace_git_refusals, 9);
+            assert_eq!(costs.workspace_git_successes, 0);
+            assert_eq!(costs.native_queries, 30);
+            eprintln!("selected redirect {phase}: 9 executed, 9 workspace refusals, 0 successes; complete native payload/manifest/graph preserved");
+            workspace_metadata_test_hooks::STATE.with(|state| {
+                let state = state.borrow();
+                assert!(state.records.is_empty());
+                assert_eq!(state.counts.get("spawn"), state.counts.get("reap"));
+                assert_eq!(
+                    state.counts.get("drain_spawn"),
+                    state.counts.get("drain_join")
+                );
+            });
+            snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+            workspace_metadata_test_hooks::STATE
+                .with(|state| *state.borrow_mut() = Default::default());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn workspace_metadata_complete_export_measures_owned_process_pipe_and_drainer_peaks() {
+        let fixture = reuse_fixture(true);
+        packed_pressure_stores(&fixture);
+        let workspace = fixture.dir.path().join("workspace");
+        let git_dir = workspace.join(".git");
+        fixture_git(&git_dir, &["init", "-q"], None);
+        copy_fixture_objects(&fixture.store, &git_dir.join("objects"));
+        let mut exports = Vec::new();
+        let mut peaks = Vec::new();
+        for legacy in [true, false] {
+            snapshot_reuse_test_hooks::STATE.with(|state| {
+                *state.borrow_mut() = snapshot_reuse_test_hooks::State {
+                    aggregate_disabled: true,
+                    ..Default::default()
+                }
+            });
+            let drainer_peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = drainer_peak.clone();
+            workspace_metadata_test_hooks::STATE.with(|state| {
+                *state.borrow_mut() = workspace_metadata_test_hooks::State {
+                    legacy,
+                    barrier: Some(Box::new(move |phase, _| {
+                        if phase == "before_query" {
+                            let actual = fs::read_dir("/proc/self/task")
+                                .unwrap()
+                                .filter_map(Result::ok)
+                                .filter_map(|entry| {
+                                    fs::read_to_string(entry.path().join("comm")).ok()
+                                })
+                                .filter(|name| {
+                                    name.starts_with("snapshot-git-st")
+                                        || name.starts_with("workspace-git-s")
+                                })
+                                .count();
+                            observed.fetch_max(actual, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    })),
+                    ..Default::default()
+                }
+            });
+            let exported = export_exact_session(
+                &fixture.inventory,
+                "ses_exact",
+                ExportOptions::new(fixture.dir.path().join("extract")),
+            )
+            .unwrap();
+            let body_counts =
+                snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().counts.clone());
+            assert_eq!(body_counts["packed_peak"], 4);
+            assert_eq!(body_counts["packed_drain_peak"], 4);
+            assert_eq!(body_counts["packed_spawn"], body_counts["packed_reap"]);
+            assert_eq!(
+                body_counts["packed_drain_spawn"],
+                body_counts["packed_drain_join"]
+            );
+            let counts = workspace_metadata_test_hooks::STATE.with(|state| {
+                let state = state.borrow();
+                assert_eq!(state.counts["all_spawn"], state.counts["all_reap"]);
+                assert_eq!(state.counts["all_peak"], 1);
+                for tid in &state.drainer_tids {
+                    assert!(
+                        !Path::new(&format!("/proc/self/task/{tid}")).exists(),
+                        "exact owned stderr drainer joined"
+                    );
+                }
+                state.counts.clone()
+            });
+            assert_eq!(counts["os_workspace_peak"], 1);
+            assert_eq!(counts["os_body_peak"], 4);
+            assert_eq!(counts["os_process_peak"], 5);
+            if !legacy {
+                assert_eq!(counts["os_pipe_peak"], 15);
+                assert_eq!(counts["drain_peak"], 1);
+                assert!(drainer_peak.load(std::sync::atomic::Ordering::SeqCst) >= 5);
+            }
+            eprintln!("actual OS complete export legacy={legacy} peaks={counts:?}; observed named drainer threads={}", drainer_peak.load(std::sync::atomic::Ordering::SeqCst));
+            exports.push((
+                fs::read(&exported.payload_path).unwrap(),
+                serde_json::to_value(exported.manifest()).unwrap(),
+                source_graph_fingerprint(exported.manifest()).unwrap(),
+            ));
+            peaks.push(counts["os_process_peak"]);
+        }
+        assert_eq!(exports[0], exports[1]);
+        assert_eq!(peaks, [5, 5]);
+        snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+        workspace_metadata_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
     }
 
     #[cfg(unix)]
