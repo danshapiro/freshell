@@ -2589,12 +2589,33 @@ fn verifies_snapshot_trees_through_accessible_alternates_and_preserves_absent_re
             .with_channel_database(database.clone()),
         workspace_mount.clone(),
     );
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = progress.clone();
     let snapshot = export_exact_session(
         &inventory,
         "ses_root",
-        ExportOptions::new(fixture.path().join("extract")),
+        ExportOptions::new(fixture.path().join("extract")).with_progress_observer(move |event| {
+            observed.lock().unwrap().push(event);
+        }),
     )
     .expect("alternate object store under the exact mounted path is available");
+    let events = progress.lock().unwrap();
+    let object_events = events
+        .iter()
+        .filter(|event| event.phase == "saved_objects")
+        .collect::<Vec<_>>();
+    assert_eq!(object_events.first().unwrap().state, "started");
+    let completed = object_events.last().unwrap();
+    assert_eq!(completed.state, "completed");
+    assert_eq!(completed.count_unit, "object_reads");
+    assert!(
+        completed.completed_count >= 4,
+        "both references keep their own qualified root/blob checks"
+    );
+    assert!(object_events
+        .iter()
+        .any(|event| event.state == "progress" && event.completed_count > 0));
+    drop(events);
     let git_assets: Vec<_> = snapshot
         .manifest()
         .assets
@@ -2658,12 +2679,28 @@ fn verifies_snapshot_trees_through_accessible_alternates_and_preserves_absent_re
             [r#"{"type":"snapshot","snapshot":"0000000000000000000000000000000000000000"}"#],
         )
         .unwrap();
+    progress.lock().unwrap().clear();
+    let observed = progress.clone();
     let absent = export_exact_session(
         &inventory,
         "ses_root",
-        ExportOptions::new(fixture.path().join("missing-tree-extract")),
+        ExportOptions::new(fixture.path().join("missing-tree-extract")).with_progress_observer(
+            move |event| {
+                observed.lock().unwrap().push(event);
+            },
+        ),
     )
     .expect("an absent tree remains saved history without fabricated assets");
+    assert!(
+        progress
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.phase == "saved_objects"
+                && event.state == "completed"
+                && event.completed_count >= 3),
+        "diagnostics must count unavailable-root lookups as well as retained objects"
+    );
     assert_eq!(absent.manifest().saved_snapshots.len(), 2);
     let reference = absent
         .manifest()

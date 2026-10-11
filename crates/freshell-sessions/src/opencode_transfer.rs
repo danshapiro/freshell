@@ -552,6 +552,20 @@ pub fn capture_qualified_snapshot(
     snapshot_file: &Path,
     options: ExportOptions,
 ) -> Result<QualifiedSourceSnapshot, TransferError> {
+    options.run_phase("capture", None, "roots", |phase| {
+        let qualified =
+            capture_qualified_snapshot_inner(inventory, roots, snapshot_file, options.clone())?;
+        phase.progress(roots.len() as u64, Some(roots.len() as u64));
+        Ok(qualified)
+    })
+}
+
+fn capture_qualified_snapshot_inner(
+    inventory: &HostOpenCodeInventory,
+    roots: &[String],
+    snapshot_file: &Path,
+    options: ExportOptions,
+) -> Result<QualifiedSourceSnapshot, TransferError> {
     if roots.is_empty()
         || roots.len() > MAX_SOURCE_CANDIDATES
         || roots.iter().collect::<BTreeSet<_>>().len() != roots.len()
@@ -562,14 +576,18 @@ pub fn capture_qualified_snapshot(
             "exact distinct roots and a fresh absolute private snapshot required".into(),
         ));
     }
-    let source_path = resolve_exact_source(inventory, &roots[0])?.canonicalize()?;
-    for root in roots {
-        if resolve_exact_source(inventory, root)?.canonicalize()? != source_path {
-            return Err(TransferError::Blocked(
-                "selected roots do not share one independently resolved source".into(),
-            ));
+    let source_path = options.run_phase("source_resolution", None, "roots", |phase| {
+        let source_path = resolve_exact_source(inventory, &roots[0])?.canonicalize()?;
+        for (index, root) in roots.iter().enumerate() {
+            if resolve_exact_source(inventory, root)?.canonicalize()? != source_path {
+                return Err(TransferError::Blocked(
+                    "selected roots do not share one independently resolved source".into(),
+                ));
+            }
+            phase.progress(index as u64 + 1, Some(roots.len() as u64));
         }
-    }
+        Ok(source_path)
+    })?;
     let source = open_source_read_only(&source_path)?;
     let mut private = OpenOptions::new();
     private.write(true).create_new(true);
@@ -579,12 +597,19 @@ pub fn capture_qualified_snapshot(
         private.mode(0o600);
     }
     private.open(snapshot_file)?.sync_all()?;
-    create_online_backup(&source, snapshot_file)?;
+    create_observed_online_backup(&source, snapshot_file, &options)?;
     let snapshot = Connection::open_with_flags(
         snapshot_file,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    validate_known_schema(&snapshot)?;
+    let (source_schema_fingerprint, migration_journal_fingerprint) =
+        options.run_phase("schema", None, "tables", |_| {
+            validate_known_schema(&snapshot)?;
+            Ok((
+                schema_fingerprint(&snapshot)?,
+                migration_fingerprint(&snapshot)?,
+            ))
+        })?;
     let bytes = fs::metadata(snapshot_file)?.len();
     let mut qualified = QualifiedSourceSnapshot {
         path: snapshot_file.canonicalize()?,
@@ -592,10 +617,10 @@ pub fn capture_qualified_snapshot(
         receipt: QualifiedSnapshotReceipt {
             source_store_id: digest(source_path.to_string_lossy().as_bytes()),
             canonical_source_database: source_path.clone(),
-            snapshot_sha256: hash_file(snapshot_file)?,
+            snapshot_sha256: hash_file_observed(snapshot_file, &options)?,
             snapshot_bytes: bytes,
-            source_schema_fingerprint: schema_fingerprint(&snapshot)?,
-            migration_journal_fingerprint: migration_fingerprint(&snapshot)?,
+            source_schema_fingerprint,
+            migration_journal_fingerprint,
             roots: roots
                 .iter()
                 .map(|root| QualifiedSnapshotRoot {
@@ -714,17 +739,27 @@ pub fn qualify_existing_snapshot(
 }
 
 fn hash_file(path: &Path) -> Result<String, TransferError> {
-    let mut file = File::open(path)?;
-    let mut hash = Sha256::new();
-    let mut buffer = [0; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
+    hash_file_observed(path, &ExportOptions::default())
+}
+
+fn hash_file_observed(path: &Path, options: &ExportOptions) -> Result<String, TransferError> {
+    options.run_phase("hash", None, "bytes", |phase| {
+        let mut file = File::open(path)?;
+        let total = file.metadata()?.len();
+        let mut completed = 0;
+        let mut hash = Sha256::new();
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hash.update(&buffer[..read]);
+            completed += read as u64;
+            phase.progress(completed, Some(total));
         }
-        hash.update(&buffer[..read]);
-    }
-    Ok(hex::encode(hash.finalize()))
+        Ok(hex::encode(hash.finalize()))
+    })
 }
 
 /// Body-free census produced only by reading the complete declared host inventory.
@@ -849,14 +884,174 @@ fn native_history_references_root(db: &Connection, root: &str) -> Result<bool, T
     Ok(false)
 }
 
-#[derive(Debug, Clone)]
+/// Body-free diagnostics from the operation currently reading a source. Counts
+/// describe work performed, not authority, completeness, or recovery readiness.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceTransferProgress {
+    pub severity: &'static str,
+    pub phase: &'static str,
+    pub state: &'static str,
+    pub root_session_id: Option<String>,
+    pub elapsed_ms: u64,
+    pub count_unit: &'static str,
+    pub completed_count: u64,
+    pub total_count: Option<u64>,
+    pub error_class: Option<&'static str>,
+}
+
+type SourceProgressObserver = std::sync::Arc<dyn Fn(SourceTransferProgress) + Send + Sync>;
+
+#[derive(Clone)]
 pub struct ExportOptions {
     extraction_root: PathBuf,
+    progress_observer: Option<SourceProgressObserver>,
+}
+
+impl std::fmt::Debug for ExportOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExportOptions")
+            .field("extraction_root", &self.extraction_root)
+            .field("has_progress_observer", &self.progress_observer.is_some())
+            .finish()
+    }
 }
 
 impl ExportOptions {
     pub fn new(extraction_root: PathBuf) -> Self {
-        Self { extraction_root }
+        Self {
+            extraction_root,
+            progress_observer: None,
+        }
+    }
+
+    /// Attach the owning caller's structured log sink. It receives only safe
+    /// phase metadata, never nested errors, paths, object IDs, or content.
+    pub fn with_progress_observer(
+        mut self,
+        observer: impl Fn(SourceTransferProgress) + Send + Sync + 'static,
+    ) -> Self {
+        self.progress_observer = Some(std::sync::Arc::new(observer));
+        self
+    }
+
+    fn phase(&self, phase: &'static str, root: Option<&str>, unit: &'static str) -> SourcePhase {
+        SourcePhase::new(self.progress_observer.clone(), phase, root, unit)
+    }
+
+    fn run_phase<T>(
+        &self,
+        name: &'static str,
+        root: Option<&str>,
+        unit: &'static str,
+        run: impl FnOnce(&mut SourcePhase) -> Result<T, TransferError>,
+    ) -> Result<T, TransferError> {
+        let mut phase = self.phase(name, root, unit);
+        let result = run(&mut phase);
+        phase.finish(result.as_ref().err());
+        result
+    }
+}
+
+// One phase emits lifecycle events and at most one progress event per five
+// seconds after its first update. Updates retain exact final counts even when
+// they are not logged. No object/reference catalog is kept for diagnostics.
+struct SourcePhase {
+    observer: Option<SourceProgressObserver>,
+    started: Instant,
+    last_progress: Option<Instant>,
+    event: SourceTransferProgress,
+}
+
+impl SourcePhase {
+    fn new(
+        observer: Option<SourceProgressObserver>,
+        phase: &'static str,
+        root: Option<&str>,
+        unit: &'static str,
+    ) -> Self {
+        let mut phase = Self {
+            observer,
+            started: Instant::now(),
+            last_progress: None,
+            event: SourceTransferProgress {
+                severity: "info",
+                phase,
+                state: "started",
+                root_session_id: root.map(str::to_string),
+                elapsed_ms: 0,
+                count_unit: unit,
+                completed_count: 0,
+                total_count: None,
+                error_class: None,
+            },
+        };
+        phase.emit();
+        phase
+    }
+
+    fn emit(&mut self) {
+        self.event.elapsed_ms = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        if let Some(observer) = &self.observer {
+            observer(self.event.clone());
+        } else {
+            let event = &self.event;
+            if event.severity == "error" {
+                tracing::error!(
+                    severity = event.severity,
+                    phase = event.phase,
+                    state = event.state,
+                    root_session_id = event.root_session_id.as_deref(),
+                    elapsed_ms = event.elapsed_ms,
+                    count_unit = event.count_unit,
+                    completed_count = event.completed_count,
+                    total_count = event.total_count,
+                    error_class = event.error_class,
+                    "opencode.source.phase"
+                );
+            } else {
+                tracing::info!(
+                    severity = event.severity,
+                    phase = event.phase,
+                    state = event.state,
+                    root_session_id = event.root_session_id.as_deref(),
+                    elapsed_ms = event.elapsed_ms,
+                    count_unit = event.count_unit,
+                    completed_count = event.completed_count,
+                    total_count = event.total_count,
+                    "opencode.source.phase"
+                );
+            }
+        }
+    }
+
+    fn progress(&mut self, completed: u64, total: Option<u64>) {
+        self.event.completed_count = completed;
+        self.event.total_count = total;
+        if self
+            .last_progress
+            .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
+        {
+            self.event.state = "progress";
+            self.emit();
+            self.last_progress = Some(Instant::now());
+        }
+    }
+
+    fn finish(&mut self, error: Option<&TransferError>) {
+        self.event.state = if error.is_some() {
+            "failed"
+        } else {
+            "completed"
+        };
+        self.event.severity = if error.is_some() { "error" } else { "info" };
+        self.event.error_class = error.map(|error| match error {
+            TransferError::Blocked(_) => "blocked",
+            TransferError::Io(_) => "io",
+            TransferError::Sqlite(_) => "sqlite",
+            TransferError::Serialization(_) => "serialization",
+        });
+        self.emit();
     }
 }
 
@@ -1272,13 +1467,34 @@ pub fn export_exact_session(
     root_session_id: &str,
     options: ExportOptions,
 ) -> Result<OpenCodeNativeSnapshot, TransferError> {
+    options.run_phase("root_export", Some(root_session_id), "roots", |phase| {
+        let exported = export_exact_session_inner(inventory, root_session_id, options.clone())?;
+        phase.progress(1, Some(1));
+        Ok(exported)
+    })
+}
+
+fn export_exact_session_inner(
+    inventory: &HostOpenCodeInventory,
+    root_session_id: &str,
+    options: ExportOptions,
+) -> Result<OpenCodeNativeSnapshot, TransferError> {
     if root_session_id.is_empty() || root_session_id.len() > 256 {
         return Err(TransferError::Blocked(
             "native session ID is empty or over its bound".into(),
         ));
     }
 
-    let source_path = resolve_exact_source(inventory, root_session_id)?;
+    let source_path = options.run_phase(
+        "source_resolution",
+        Some(root_session_id),
+        "roots",
+        |phase| {
+            let path = resolve_exact_source(inventory, root_session_id)?;
+            phase.progress(1, Some(1));
+            Ok(path)
+        },
+    )?;
     if let Some(qualified) = &inventory.qualified_snapshot {
         let changed = if source_path.canonicalize()? != qualified.path {
             Some("path".into())
@@ -1321,7 +1537,7 @@ pub fn export_exact_session(
         source_path.clone()
     };
     if owns_snapshot {
-        create_online_backup(&source, &snapshot_path)?;
+        create_observed_online_backup(&source, &snapshot_path, &options)?;
     }
     if let Some(qualified) = &inventory.qualified_snapshot {
         if SnapshotFiles::read(&qualified.path)? != qualified.files {
@@ -1338,11 +1554,21 @@ pub fn export_exact_session(
         )?;
         snapshot.busy_timeout(Duration::from_secs(5))?;
         snapshot.execute_batch("BEGIN DEFERRED")?;
-        validate_known_schema(&snapshot)?;
-        let source_schema_fingerprint = schema_fingerprint(&snapshot)?;
-        let migration_journal_fingerprint = migration_fingerprint(&snapshot)?;
+        let (source_schema_fingerprint, migration_journal_fingerprint) =
+            options.run_phase("schema", Some(root_session_id), "tables", |_| {
+                validate_known_schema(&snapshot)?;
+                Ok((
+                    schema_fingerprint(&snapshot)?,
+                    migration_fingerprint(&snapshot)?,
+                ))
+            })?;
         let sqlite_version = snapshot.query_row("SELECT sqlite_version()", [], |row| row.get(0))?;
-        let mut rows = collect_exact_closure(&snapshot, root_session_id)?;
+        let mut rows =
+            options.run_phase("row_closure", Some(root_session_id), "rows", |phase| {
+                let rows = collect_exact_closure(&snapshot, root_session_id)?;
+                phase.progress(rows.len() as u64, Some(rows.len() as u64));
+                Ok(rows)
+            })?;
         let workspace_mounts = resolve_workspace_mounts(
             &rows,
             &inventory.workspace_mounts,
@@ -1361,6 +1587,8 @@ pub fn export_exact_session(
             .filter(|row| row.table == "session")
             .map(|row| Ok((required_text(row, "id")?, required_text(row, "project_id")?)))
             .collect::<Result<HashMap<_, _>, TransferError>>()?;
+        asset_resolver.source_progress =
+            Some(options.phase("saved_objects", Some(root_session_id), "object_reads"));
         asset_resolver.resolve_rows(&mut rows)?;
         let assets = asset_resolver.metadata();
         let saved_snapshots = asset_resolver
@@ -1376,45 +1604,51 @@ pub fn export_exact_session(
         let native_cleanup_baselines = capture_native_cleanup_baselines(&rows)?;
         let payload_path = extraction.path().join("bundle.json");
         let mut row_digests = Vec::with_capacity(rows.len());
-        let (payload_bytes, payload_sha256) = {
-            let file = File::create(&payload_path)?;
-            let mut hasher = Sha256::new();
-            let mut writer = HashingWriter::new(file, &mut hasher, MAX_BUNDLE_BYTES);
-            let serialized = serde_json::to_writer(
-                &mut writer,
-                &TransferPayload {
-                    version: EXPORT_VERSION,
-                    root_session_id,
-                    rows: &rows,
-                    assets: &assets,
-                    snapshot_objects: &snapshot_objects,
-                },
-            );
-            if writer.limit_exceeded {
-                return Err(TransferError::Blocked(
-                    "exact-session bundle exceeds 8 GiB".into(),
-                ));
+        let (payload_bytes, payload_sha256) =
+            options.run_phase("serialize", Some(root_session_id), "bytes", |phase| {
+                let file = File::create(&payload_path)?;
+                let mut hasher = Sha256::new();
+                let mut writer = HashingWriter::new(file, &mut hasher, MAX_BUNDLE_BYTES);
+                let serialized = serde_json::to_writer(
+                    &mut writer,
+                    &TransferPayload {
+                        version: EXPORT_VERSION,
+                        root_session_id,
+                        rows: &rows,
+                        assets: &assets,
+                        snapshot_objects: &snapshot_objects,
+                    },
+                );
+                if writer.limit_exceeded {
+                    return Err(TransferError::Blocked(
+                        "exact-session bundle exceeds 8 GiB".into(),
+                    ));
+                }
+                serialized.map_err(|error| TransferError::Serialization(error.to_string()))?;
+                writer.flush()?;
+                let payload_bytes = writer.bytes;
+                drop(writer);
+                phase.progress(payload_bytes, Some(payload_bytes));
+                Ok((payload_bytes, hex::encode(hasher.finalize())))
+            })?;
+        options.run_phase("row_digests", Some(root_session_id), "rows", |phase| {
+            for (index, row) in rows.iter().enumerate() {
+                row_digests.push(RowDigest {
+                    table: row.table.clone(),
+                    key: row.key.clone(),
+                    sha256: digest_serializable(row)?,
+                    column_sha256: serialized_column_digests(row)?,
+                    json_node_sha256: serialized_json_node_digests(row)?,
+                    transition_cursor: match row.table.as_str() {
+                        "event_sequence" => value_integer(row, "seq")?,
+                        "project" => value_integer(row, "time_updated")?,
+                        _ => None,
+                    },
+                });
+                phase.progress(index as u64 + 1, Some(rows.len() as u64));
             }
-            serialized.map_err(|error| TransferError::Serialization(error.to_string()))?;
-            writer.flush()?;
-            let payload_bytes = writer.bytes;
-            drop(writer);
-            (payload_bytes, hex::encode(hasher.finalize()))
-        };
-        for row in &rows {
-            row_digests.push(RowDigest {
-                table: row.table.clone(),
-                key: row.key.clone(),
-                sha256: digest_serializable(row)?,
-                column_sha256: serialized_column_digests(row)?,
-                json_node_sha256: serialized_json_node_digests(row)?,
-                transition_cursor: match row.table.as_str() {
-                    "event_sequence" => value_integer(row, "seq")?,
-                    "project" => value_integer(row, "time_updated")?,
-                    _ => None,
-                },
-            });
-        }
+            Ok(())
+        })?;
         let source_store_id = match &inventory.qualified_snapshot {
             Some(qualified) => qualified.receipt.source_store_id.clone(),
             None => digest(source_path.canonicalize()?.to_string_lossy().as_bytes()),
@@ -1618,6 +1852,7 @@ struct AssetResolver<'a> {
     snapshot_projects: HashMap<String, String>,
     saved_snapshots: BTreeMap<(String, String), SavedSnapshotReference>,
     snapshot_objects: BTreeMap<(String, String, String), SerializedSnapshotObject>,
+    source_progress: Option<SourcePhase>,
 }
 
 impl<'a> AssetResolver<'a> {
@@ -1633,6 +1868,7 @@ impl<'a> AssetResolver<'a> {
             snapshot_projects: HashMap::new(),
             saved_snapshots: BTreeMap::new(),
             snapshot_objects: BTreeMap::new(),
+            source_progress: None,
         }
     }
 
@@ -1641,6 +1877,14 @@ impl<'a> AssetResolver<'a> {
     }
 
     fn resolve_rows(&mut self, rows: &mut [SerializedRow]) -> Result<(), TransferError> {
+        let result = self.resolve_rows_inner(rows);
+        if let Some(progress) = &mut self.source_progress {
+            progress.finish(result.as_ref().err());
+        }
+        result
+    }
+
+    fn resolve_rows_inner(&mut self, rows: &mut [SerializedRow]) -> Result<(), TransferError> {
         for row in rows {
             let columns: &[&str] = match row.table.as_str() {
                 "message" | "part" | "session_message" => &["data"],
@@ -2077,7 +2321,13 @@ impl<'a> AssetResolver<'a> {
             .join(&worktree_sha1);
         let workspace_store = snapshot_workspace_objects(&mount.canonical_root)?;
         let stores = qualified_snapshot_stores(&native_bucket, &workspace_store)?;
-        let closure = read_snapshot_closure(&stores, tree)?;
+        let closure = read_snapshot_closure_with_reader(tree, |id| {
+            let object = read_snapshot_object(&stores, id);
+            if let Some(progress) = &mut self.source_progress {
+                progress.progress(progress.event.completed_count + 1, None);
+            }
+            object
+        })?;
         let mut objects = Vec::new();
         if let Some(closure) = closure {
             for (object_id, compressed) in closure {
@@ -2486,7 +2736,14 @@ fn read_snapshot_closure(
     stores: &[PathBuf],
     tree: &str,
 ) -> Result<Option<BTreeMap<String, Vec<u8>>>, TransferError> {
-    let Some(root) = read_snapshot_object(stores, tree)? else {
+    read_snapshot_closure_with_reader(tree, |id| read_snapshot_object(stores, id))
+}
+
+fn read_snapshot_closure_with_reader(
+    tree: &str,
+    mut read_object: impl FnMut(&str) -> Result<Option<Vec<u8>>, TransferError>,
+) -> Result<Option<BTreeMap<String, Vec<u8>>>, TransferError> {
+    let Some(root) = read_object(tree)? else {
         return Ok(None);
     };
     let mut pending = vec![(tree.to_string(), true, Some(root))];
@@ -2496,11 +2753,13 @@ fn read_snapshot_closure(
         if closure.contains_key(&id) {
             continue;
         }
-        let compressed = known
-            .or(read_snapshot_object(stores, &id)?)
-            .ok_or_else(|| {
-                TransferError::Blocked("retained snapshot has an incomplete tree closure".into())
-            })?;
+        let compressed = match known {
+            Some(compressed) => Some(compressed),
+            None => read_object(&id)?,
+        }
+        .ok_or_else(|| {
+            TransferError::Blocked("retained snapshot has an incomplete tree closure".into())
+        })?;
         total = total
             .checked_add(compressed.len() as u64)
             .filter(|size| *size <= MAX_BUNDLE_BYTES / 2)
@@ -2521,6 +2780,134 @@ fn read_snapshot_closure(
         closure.insert(id, compressed);
     }
     Ok(Some(closure))
+}
+
+#[cfg(test)]
+mod snapshot_closure_reader_tests {
+    use super::*;
+
+    fn object(kind: &str, bytes: &[u8]) -> (String, Vec<u8>) {
+        let mut raw = format!("{kind} {}\0", bytes.len()).into_bytes();
+        raw.extend_from_slice(bytes);
+        let id = hex::encode(sha1::Sha1::digest(&raw));
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&raw).unwrap();
+        (id, encoder.finish().unwrap())
+    }
+
+    fn fixture() -> (String, BTreeMap<String, Vec<u8>>) {
+        let (blob, compressed_blob) = object("blob", b"synthetic saved content");
+        let mut subtree = b"100644 nested\0".to_vec();
+        subtree.extend_from_slice(&hex::decode(&blob).unwrap());
+        let (subtree, compressed_subtree) = object("tree", &subtree);
+        let mut children = Vec::new();
+        for name in ["first", "shared"] {
+            children.extend_from_slice(format!("100644 {name}\0").as_bytes());
+            children.extend_from_slice(&hex::decode(&blob).unwrap());
+        }
+        children.extend_from_slice(b"40000 subtree\0");
+        children.extend_from_slice(&hex::decode(&subtree).unwrap());
+        let (tree, compressed_tree) = object("tree", &children);
+        (
+            tree.clone(),
+            BTreeMap::from([
+                (tree, compressed_tree),
+                (blob, compressed_blob),
+                (subtree, compressed_subtree),
+            ]),
+        )
+    }
+
+    #[test]
+    fn supplied_root_and_each_unique_child_are_read_once() {
+        let (tree, objects) = fixture();
+        let mut reads = BTreeMap::new();
+        let closure = read_snapshot_closure_with_reader(&tree, |id| {
+            let count = reads.entry(id.to_string()).or_insert(0);
+            *count += 1;
+            if *count > 1 {
+                return Err(TransferError::Io("unnecessary second read failed".into()));
+            }
+            Ok(objects.get(id).cloned())
+        })
+        .expect("retained bytes must not depend on a redundant root read")
+        .unwrap();
+        assert_eq!(closure, objects);
+        assert_eq!(reads, objects.keys().map(|id| (id.clone(), 1)).collect());
+    }
+
+    #[test]
+    fn closure_reader_still_refuses_incomplete_corrupt_and_wrong_kind_children() {
+        let (tree, objects) = fixture();
+        let child = objects.keys().find(|id| **id != tree).unwrap();
+        for replacement in [
+            None,
+            Some(b"corrupt compressed bytes".to_vec()),
+            Some(objects[&tree].clone()),
+        ] {
+            let result = read_snapshot_closure_with_reader(&tree, |id| {
+                Ok(if id == child {
+                    replacement.clone()
+                } else {
+                    objects.get(id).cloned()
+                })
+            });
+            assert!(
+                matches!(
+                    result,
+                    Err(TransferError::Blocked(_) | TransferError::Io(_))
+                ),
+                "{result:?}"
+            );
+        }
+        assert!(read_snapshot_closure_with_reader(&tree, |_| Ok(None))
+            .unwrap()
+            .is_none());
+        let (blob_id, blob) = object("blob", b"not a tree");
+        assert!(matches!(
+            read_snapshot_closure_with_reader(&blob_id, |_| Ok(Some(blob.clone()))),
+            Err(TransferError::Blocked(_))
+        ));
+        let (child, compressed_child) = object("tree", &[]);
+        let mut bytes = b"100644 wrong-kind\0".to_vec();
+        bytes.extend_from_slice(&hex::decode(&child).unwrap());
+        let (root, compressed_root) = object("tree", &bytes);
+        let objects = BTreeMap::from([(root.clone(), compressed_root), (child, compressed_child)]);
+        assert!(
+            matches!(read_snapshot_closure_with_reader(&root, |id| Ok(objects.get(id).cloned())), Err(TransferError::Blocked(reason)) if reason == "snapshot closure object kind differs from its tree edge")
+        );
+    }
+
+    #[test]
+    fn progress_is_rate_limited_and_keeps_final_counts() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = events.clone();
+        let options = ExportOptions::default()
+            .with_progress_observer(move |event| observed.lock().unwrap().push(event));
+        let mut phase = options.phase("saved_objects", Some("ses_synthetic"), "object_reads");
+        for count in 1..=100 {
+            phase.progress(count, None);
+        }
+        assert_eq!(
+            events.lock().unwrap().len(),
+            2,
+            "one start plus first live update, without per-reference logs"
+        );
+        phase.last_progress = Some(Instant::now() - Duration::from_secs(6));
+        phase.progress(101, None);
+        phase.progress(102, None);
+        phase.finish(None);
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[2].state, "progress");
+        assert_eq!(events[2].completed_count, 101);
+        assert_eq!(events[3].state, "completed");
+        assert_eq!(events[3].completed_count, 102);
+        assert!(events
+            .windows(2)
+            .all(|pair| pair[0].elapsed_ms <= pair[1].elapsed_ms));
+    }
 }
 
 /// Publish one immutable, content-addressed object. An interrupted database
@@ -3310,8 +3697,25 @@ fn open_source_read_only(path: &Path) -> Result<Connection, TransferError> {
     Ok(connection)
 }
 
+#[cfg(test)]
 fn create_online_backup(source: &Connection, destination: &Path) -> Result<(), TransferError> {
-    create_online_backup_with_progress(source, destination, |_| Ok(()))
+    create_observed_online_backup(source, destination, &ExportOptions::default())
+}
+
+fn create_observed_online_backup(
+    source: &Connection,
+    destination: &Path,
+    options: &ExportOptions,
+) -> Result<(), TransferError> {
+    options.run_phase("backup", None, "pages", |phase| {
+        create_online_backup_with_progress(source, destination, |progress| {
+            phase.progress(
+                progress.pagecount.saturating_sub(progress.remaining).max(0) as u64,
+                Some(progress.pagecount.max(0) as u64),
+            );
+            Ok(())
+        })
+    })
 }
 
 fn create_online_backup_with_progress(
@@ -4922,6 +5326,114 @@ mod online_backup_tests {
 #[cfg(test)]
 mod native_source_inventory_tests {
     use super::*;
+
+    #[test]
+    fn capture_reports_live_phase_progress_and_safe_failure_without_changing_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.db");
+        let db = source(&path);
+        db.execute("INSERT INTO project(id,worktree,time_created,time_updated,sandboxes) VALUES ('prj','/synthetic',1,1,'[]')", []).unwrap();
+        db.execute("INSERT INTO session(id,slug,project_id,directory,title,version,time_created,time_updated) VALUES ('ses_exact','slug','prj','/synthetic','private-body-marker','1',1,1)", []).unwrap();
+        drop(db);
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = events.clone();
+        let snapshot_file = dir.path().join("snapshot.db");
+        let observed_file = snapshot_file.clone();
+        let options =
+            ExportOptions::new(dir.path().join("extract")).with_progress_observer(move |event| {
+                if event.phase == "backup" && event.state == "progress" {
+                    assert!(
+                        observed_file.exists(),
+                        "progress comes from the actual backup"
+                    );
+                    let prior = observed.lock().unwrap();
+                    assert!(
+                        !prior
+                            .iter()
+                            .any(|event: &SourceTransferProgress| event.phase == "backup"
+                                && event.state == "completed"),
+                        "progress must arrive before backup returns"
+                    );
+                }
+                observed.lock().unwrap().push(event);
+            });
+        let qualified = capture_qualified_snapshot(
+            &HostOpenCodeInventory::new(path.clone()),
+            &["ses_exact".into()],
+            &snapshot_file,
+            options.clone(),
+        )
+        .unwrap();
+        let observed_export =
+            export_exact_session(&qualified.inventory(), "ses_exact", options.clone()).unwrap();
+        let plain_export = export_exact_session(
+            &qualified.inventory(),
+            "ses_exact",
+            ExportOptions::new(dir.path().join("extract")),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_vec(observed_export.manifest()).unwrap(),
+            serde_json::to_vec(plain_export.manifest()).unwrap()
+        );
+        assert_eq!(
+            fs::read(&observed_export.payload_path).unwrap(),
+            fs::read(&plain_export.payload_path).unwrap()
+        );
+        let captured = events.lock().unwrap().clone();
+        for phase in [
+            "capture",
+            "backup",
+            "schema",
+            "hash",
+            "root_export",
+            "saved_objects",
+            "serialize",
+            "row_digests",
+        ] {
+            let lifecycle = captured
+                .iter()
+                .filter(|event| event.phase == phase)
+                .collect::<Vec<_>>();
+            assert!(!lifecycle.is_empty(), "missing phase {phase}");
+            assert_eq!(lifecycle.first().unwrap().state, "started");
+            assert_eq!(lifecycle.last().unwrap().state, "completed");
+            assert!(lifecycle
+                .iter()
+                .all(|event| event.severity == "info" && event.error_class.is_none()));
+        }
+        for phase in ["backup", "hash"] {
+            assert!(
+                captured.iter().any(|event| event.phase == phase
+                    && event.state == "progress"
+                    && event.completed_count > 0),
+                "missing actual live progress for {phase}"
+            );
+        }
+        events.lock().unwrap().clear();
+        let changed = Connection::open(&path).unwrap();
+        changed
+            .execute_batch("CREATE TABLE private_body_marker(secret TEXT)")
+            .unwrap();
+        drop(changed);
+        let failure = capture_qualified_snapshot(
+            &HostOpenCodeInventory::new(path),
+            &["ses_exact".into()],
+            &dir.path().join("bad.db"),
+            options,
+        );
+        assert!(matches!(failure, Err(TransferError::Blocked(_))));
+        let failed = events.lock().unwrap();
+        for phase in ["schema", "capture"] {
+            assert!(failed.iter().any(|event| event.phase == phase
+                && event.state == "failed"
+                && event.severity == "error"
+                && event.error_class == Some("blocked")));
+        }
+        assert!(!serde_json::to_string(&*failed)
+            .unwrap()
+            .contains("private_body_marker"));
+    }
 
     fn qualified_fixture(dir: &Path) -> QualifiedSourceSnapshot {
         let path = dir.join("source.db");

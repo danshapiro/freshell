@@ -5433,6 +5433,44 @@ async fn durable_souls_server_resolved_scope_rejects_tenth_drift_before_writes()
         )
         .await
         .expect("independently resolved nine-target preview from one consistent source capture");
+    let source_events = std::fs::read_to_string(dir.path().join("lifecycle.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["event"] == "supervisor.stopped_repair.source_phase")
+        .map(|event| event["data"].clone())
+        .collect::<Vec<_>>();
+    for phase in ["capture", "backup", "hash"] {
+        assert_eq!(
+            source_events
+                .iter()
+                .filter(|event| event["phase"] == phase && event["state"] == "completed")
+                .count(),
+            1,
+            "one complete source capture must report {phase}"
+        );
+    }
+    let exports = source_events
+        .iter()
+        .filter(|event| event["phase"] == "root_export" && event["state"] == "completed")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        exports.len(),
+        14,
+        "qualification and later per-root exports retain separate validation"
+    );
+    for root in names {
+        for operation in ["capture", "export"] {
+            assert_eq!(
+                exports
+                    .iter()
+                    .filter(|event| event["rootSessionId"] == root
+                        && event["sourceOperation"] == operation)
+                    .count(),
+                1
+            );
+        }
+    }
     assert_eq!(scope.targets.len(), 9);
     assert_eq!(scope.roots.len(), 7);
     let old_request = RestoreLostSoulsRequest {
@@ -6007,6 +6045,27 @@ async fn check_preflight_source_failure_diagnostic(failure: &str, expected_reaso
     }
     assert_eq!(std::fs::read(&database).unwrap(), source_before);
     let log = std::fs::read_to_string(dir.path().join("lifecycle.jsonl")).unwrap_or_default();
+    let phases = log
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["event"] == "supervisor.stopped_repair.source_phase")
+        .map(|event| event["data"].clone())
+        .collect::<Vec<_>>();
+    assert!(phases
+        .iter()
+        .any(|event| event["phase"] == "capture" && event["state"] == "started"));
+    let inner_phase = match failure {
+        "missing" => "source_resolution",
+        "schema" => "schema",
+        _ => "saved_objects",
+    };
+    assert!(phases.iter().any(|event| event["phase"] == inner_phase
+        && event["state"] == "failed"
+        && event["severity"] == "error"
+        && event["errorClass"] == "blocked"));
+    assert!(phases
+        .iter()
+        .any(|event| event["phase"] == "capture" && event["state"] == "failed"));
     let events: Vec<serde_json::Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())

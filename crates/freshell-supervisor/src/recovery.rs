@@ -47,6 +47,49 @@ use std::{
 };
 use tokio::time::{sleep, Duration, Instant};
 
+fn source_transfer_target_context(
+    root: &str,
+    target: &freshell_runtime_protocol::LostSoulRepairTarget,
+    context: &RecoveryContext,
+) -> serde_json::Value {
+    serde_json::json!({
+        "rootSessionId": root, "soulId": target.soul_id,
+        "incarnationId": context.prior_handle.incarnation_id(),
+        "intentRevision": target.expected_intent_revision,
+        "identityRevision": context.identity_revision,
+        "nativeImportRevision": context.native_import_revision,
+        "evidenceRevision": context.evidence_revision,
+        "incidentId": target.incident_id,
+    })
+}
+
+fn stopped_source_export_options(
+    extraction_root: PathBuf,
+    lifecycle_log: PathBuf,
+    operation: &'static str,
+    targets: Vec<serde_json::Value>,
+) -> ExportOptions {
+    ExportOptions::new(extraction_root).with_progress_observer(move |progress| {
+        let selected = targets
+            .iter()
+            .filter(|target| {
+                progress
+                    .root_session_id
+                    .as_ref()
+                    .is_none_or(|root| target["rootSessionId"] == *root)
+            })
+            .collect::<Vec<_>>();
+        let mut data = serde_json::to_value(&progress).expect("body-free source progress");
+        data["sourceOperation"] = operation.into();
+        data["targetContext"] = serde_json::json!(selected);
+        crate::service::append_event(
+            &lifecycle_log,
+            "supervisor.stopped_repair.source_phase",
+            data,
+        );
+    })
+}
+
 fn stopped_repair_transfer_failure(
     path: &Path,
     phase: &str,
@@ -1325,12 +1368,19 @@ impl Supervisor {
             });
         let root = root_session_id.to_string();
         let source_database = source_inventory.declared_default_database().to_path_buf();
+        let options = stopped_source_export_options(
+            extraction_root,
+            self.config.lifecycle_log.clone(),
+            "export",
+            target_contexts
+                .iter()
+                .map(|(target, context)| {
+                    source_transfer_target_context(root_session_id, target, context)
+                })
+                .collect(),
+        );
         let snapshot = tokio::task::spawn_blocking(move || {
-            export_exact_session(
-                &source_inventory,
-                &root,
-                ExportOptions::new(extraction_root),
-            )
+            export_exact_session(&source_inventory, &root, options)
         })
         .await
         .map_err(|_| stopped_repair_blocked("source_export_worker_failed"))?
@@ -1412,9 +1462,21 @@ impl Supervisor {
             .config
             .runtime_root
             .join("stopped-opencode-repair-extractions");
+        let options = stopped_source_export_options(
+            extraction_root,
+            self.config.lifecycle_log.clone(),
+            "capture",
+            groups
+                .iter()
+                .flat_map(|(root, contexts)| {
+                    contexts.iter().map(move |(target, context)| {
+                        source_transfer_target_context(root, target, context)
+                    })
+                })
+                .collect(),
+        );
         tokio::task::spawn_blocking(move || {
-            capture_qualified_batch(&inventory, &roots, ExportOptions::new(extraction_root))
-                .map(|capture| capture.inventory())
+            capture_qualified_batch(&inventory, &roots, options).map(|capture| capture.inventory())
         })
         .await
         .map_err(|_| stopped_repair_blocked("source_capture_worker_failed"))?
