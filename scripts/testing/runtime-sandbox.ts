@@ -469,6 +469,10 @@ export class RuntimeHarness {
       '-v', `${volumeName}:/var/lib/freshell-supervisor:rw`,
     ]
     if (this.phase >= 2) {
+      if (this.fixtureInputs && this.providerFixtureHome !== undefined) {
+        const home = validateOwnedFixturePath(this.providerFixtureHome, 'directory', 'provider fixture root')
+        args.push('-v', `${home}:${home}:ro`)
+      }
       for (const root of this.phase2WorkspaceRoots()) {
         if (root === this.testRoot || root === this.buildDir) continue
         args.push('-v', `${root}:${root}:ro`)
