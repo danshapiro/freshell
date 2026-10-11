@@ -383,3 +383,94 @@ async fn a_kill_withdraws_a_parked_reopen() {
         .terminal_for_create_request("crq-b")
         .is_none());
 }
+
+/// A kill that names a running pane is not a withdraw of the pane's parked
+/// create, even when that create waits under the same create-request id:
+/// here a stuck restart's respawn, parked while the restart's own stop runs,
+/// and then a Shift-X of the same pane. The Shift-X stops the pane, and the
+/// parked respawn is still answered at Gone (as stopped), never left without
+/// an answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kill_naming_a_running_pane_leaves_its_parked_create_to_be_answered() {
+    let h = UnitHarness::start(HarnessOpts::default()).await;
+    let _gone = GoneDelay::set(GONE_DELAY_MS);
+    let mut ws = h.connect().await;
+    let tid = h.create_codex(&mut ws, "crq-m1", None).await;
+    let ready = h
+        .next_matching(&mut ws, Duration::from_secs(10), |f| {
+            f["type"] == "terminal.output"
+                && f["data"]
+                    .as_str()
+                    .is_some_and(|d| d.contains("FAKE_TUI_READY thread="))
+        })
+        .await
+        .expect("the TUI is ready");
+    let thread = ready["data"]
+        .as_str()
+        .unwrap()
+        .split("FAKE_TUI_READY thread=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("the TUI names its thread")
+        .to_string();
+    start_settled(&h, &tid).await;
+    let registry = h.state.ownership.clone().expect("an owner registry");
+    eventually(
+        "the pane holds its conversation",
+        Duration::from_secs(10),
+        || {
+            matches!(registry.observe("codex", &thread).state,
+            freshell_ownership::OwnershipState::Live { ref owner, .. }
+                if owner.terminal_id.as_deref() == Some(tid.as_str()))
+        },
+    )
+    .await;
+
+    // The stuck restart: its kill keeps the pane's create-request id, and
+    // its respawn reuses it, parked until the Gone.
+    h.send(
+        &mut ws,
+        json!({"type": "terminal.kill", "terminalId": tid, "requestId": "rk-restart",
+            "createRequestId": "crq-m1", "reason": "stuck-recovery"}),
+    )
+    .await;
+    eventually(
+        "the conversation is Stopping",
+        Duration::from_secs(10),
+        || {
+            matches!(
+                registry.observe("codex", &thread).state,
+                freshell_ownership::OwnershipState::Stopping { .. }
+            )
+        },
+    )
+    .await;
+    h.send(
+        &mut ws,
+        json!({"type": "terminal.create", "requestId": "crq-m1", "mode": "codex", "shell": "system",
+            "restore": true, "cwd": h.home.path().display().to_string(),
+            "sessionRef": {"provider": "codex", "sessionId": thread}}),
+    )
+    .await;
+    eventually("the respawn is parked", Duration::from_secs(5), || {
+        h.state.gone_waits.is_parked("crq-m1")
+    })
+    .await;
+
+    // A Shift-X of the same pane names its running unit.
+    h.send(
+        &mut ws,
+        json!({"type": "terminal.kill", "terminalId": tid, "requestId": "rk-x",
+            "createRequestId": "crq-m1"}),
+    )
+    .await;
+    let answer = h
+        .next_matching(&mut ws, Duration::from_secs(20), |f| {
+            f["requestId"] == "crq-m1" && (f["type"] == "terminal.created" || f["type"] == "error")
+        })
+        .await
+        .expect("the parked respawn is answered");
+    assert_eq!(answer["type"], "error", "the pane was stopped: {answer}");
+    assert_eq!(answer["code"], "INVALID_TERMINAL_ID", "{answer}");
+    assert!(h.state.units.by_create_request("crq-m1").is_none());
+}

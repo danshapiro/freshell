@@ -11297,25 +11297,34 @@ async fn handle_kill(
             "a terminal.kill named neither a terminal nor a create-request id; nothing is stopped");
         return reply.send(KillAnswer::invalid(KILL_NAMES_NO_PANE));
     }
-    // A create of the pane parked until a conversation's Gone is withdrawn
-    // (it will never run). With no unit for the pane, nothing was ever
-    // started for it: the kill is done (and remembered, so a late copy of
-    // the create is answered as stopped).
+    // A kill that names nothing running but a create of the pane parked
+    // until a conversation's Gone withdraws that create (it will never
+    // run): nothing was ever started for the pane, so the kill is done (and
+    // remembered, so a late copy of the create is answered as stopped). A
+    // kill that names a running pane leaves the park alone: the kill goes
+    // on below (it may be refused), and at Gone the parked create is handed
+    // back and answered as stopped if the kill was honoured.
     if let Some(crq) = kill.create_request_id.as_deref() {
-        let names_a_running_pane = || {
-            resolve_kill_unit(state, &kill).is_some()
-                || kill
-                    .terminal_id
-                    .as_deref()
-                    .is_some_and(|tid| state.registry.exists(tid))
-                || state.registry.terminal_for_create_request(crq).is_some()
-        };
-        if state.gone_waits.cancel(crq) && !names_a_running_pane() {
+        let names_a_running_pane = resolve_kill_unit(state, &kill).is_some()
+            || kill
+                .terminal_id
+                .as_deref()
+                .is_some_and(|tid| state.registry.exists(tid))
+            || state.registry.terminal_for_create_request(crq).is_some();
+        if let Some(keys) = (!names_a_running_pane)
+            .then(|| state.gone_waits.withdraw(crq))
+            .flatten()
+        {
             if kill.reason.as_deref() != Some("stuck-recovery") {
                 state.units.remember_killed_start(crq);
             }
             tracing::info!(target: "freshell_ws::terminal",
                 event = "terminal.kill.parked_create_withdrawn",
+                unit_id = %keys.unit_id,
+                provider = %keys.provider,
+                session_id = %keys.session_id.as_deref().unwrap_or(""),
+                terminal_id = %keys.terminal_id.as_deref().unwrap_or(""),
+                operation_id = %keys.operation_id.as_deref().unwrap_or(""),
                 create_request_id = %crq,
                 "a kill withdrew a create parked until a Gone; nothing was started for the pane");
             return reply.send(KillAnswer::done());

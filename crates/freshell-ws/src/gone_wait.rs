@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use freshell_containment::events;
+use freshell_containment::events::{self, UnitLogKeys};
 use freshell_freshagent::ownership_lane::{stopping_log_keys, wait_while_stopping};
 use freshell_ownership::{OwnershipState, RuntimeOwnershipRegistry};
 use freshell_protocol::{ClientMessage, SessionLocator};
@@ -46,6 +46,9 @@ struct Entry {
     token: u64,
     /// The connection the request came from (cancelled with it).
     conn_id: Option<u64>,
+    /// The log keys of the conversation the request waits for (the unit
+    /// being stopped).
+    keys: UnitLogKeys,
     /// Dropping it (or sending) wakes the wait task, which then does
     /// nothing.
     cancel: oneshot::Sender<()>,
@@ -95,6 +98,7 @@ impl GoneWaits {
             Entry {
                 token,
                 conn_id,
+                keys: keys.clone(),
                 cancel,
             },
         );
@@ -136,16 +140,25 @@ impl GoneWaits {
     /// Cancels the request parked under `key`. `true` when one was parked
     /// (it will never run).
     pub fn cancel(&self, key: &str) -> bool {
-        let removed = self.entries.lock().expect("gone waits lock").remove(key);
-        if let Some(entry) = removed {
-            let _ = entry.cancel.send(());
-            tracing::debug!(target: "freshell_unit",
-                event = "unit.start.park_cancelled",
-                request_key = %key,
-                "a parked request was withdrawn");
-            return true;
-        }
-        false
+        self.withdraw(key).is_some()
+    }
+
+    /// [`Self::cancel`], answering the log keys of the conversation the
+    /// withdrawn request waited for.
+    pub fn withdraw(&self, key: &str) -> Option<UnitLogKeys> {
+        let entry = self.entries.lock().expect("gone waits lock").remove(key)?;
+        let _ = entry.cancel.send(());
+        let keys = entry.keys;
+        tracing::debug!(target: "freshell_unit",
+            event = "unit.start.park_cancelled",
+            unit_id = %keys.unit_id,
+            provider = %keys.provider,
+            session_id = %keys.session_id.as_deref().unwrap_or(""),
+            terminal_id = %keys.terminal_id.as_deref().unwrap_or(""),
+            operation_id = %keys.operation_id.as_deref().unwrap_or(""),
+            request_key = %key,
+            "a parked request was withdrawn");
+        Some(keys)
     }
 
     /// Cancels every request the connection parked and forgets its
@@ -169,8 +182,14 @@ impl GoneWaits {
         };
         for (key, entry) in cancelled {
             let _ = entry.cancel.send(());
+            let keys = &entry.keys;
             tracing::debug!(target: "freshell_unit",
                 event = "unit.start.park_cancelled",
+                unit_id = %keys.unit_id,
+                provider = %keys.provider,
+                session_id = %keys.session_id.as_deref().unwrap_or(""),
+                terminal_id = %keys.terminal_id.as_deref().unwrap_or(""),
+                operation_id = %keys.operation_id.as_deref().unwrap_or(""),
                 request_key = %key,
                 connection_id = conn_id,
                 "a parked request died with its connection");
