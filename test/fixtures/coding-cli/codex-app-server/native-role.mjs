@@ -356,6 +356,17 @@ export function createNativeRole({ behavior, codexHome, broadcast, openConnectio
         broadcast('thread/status/changed', { threadId: id, status: { type: 'idle' } })
         return null
       }
+      case 'fixture/loadThread': {
+        // Test control: the native loads and locks a thread and keeps it,
+        // announcing it on no connection (a load Freshell never hears of,
+        // which only a read of the lock files the unit's members hold finds).
+        const id = String(params?.threadId ?? '')
+        if (!id) return { error: { code: -32602, message: 'fixture/loadThread needs a threadId' } }
+        const lockError = await lockOrError(id)
+        if (lockError) return { error: lockError }
+        registerThread(id, { preloaded: true }, [])
+        return { result: { threadId: id } }
+      }
       case 'thread/unsubscribe': {
         const thread = threads.get(threadId)
         if (!thread) return { result: { status: 'notLoaded' } }
