@@ -3301,7 +3301,20 @@ fn create_online_backup(source: &Connection, destination: &Path) -> Result<(), T
         .run_to_completion(128, Duration::from_millis(5), None)
         .map_err(|error| {
             TransferError::Blocked(format!("consistent SQLite snapshot failed: {error}"))
-        })
+        })?;
+    drop(backup);
+    // The new private copy must not retain WAL mode: SQLite's root reader
+    // reasserts WAL ownership on open, changing ctime even without a write.
+    // Stabilize only this extraction-owned database before it is qualified;
+    // all later database and sidecar identity fences remain intact.
+    let journal_mode: String =
+        target.query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))?;
+    if journal_mode != "delete" {
+        return Err(TransferError::Blocked(
+            "private SQLite snapshot journal mode could not be stabilized".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn prepare_extraction_root(path: &Path) -> Result<PathBuf, TransferError> {
@@ -4688,6 +4701,50 @@ mod native_source_inventory_tests {
         .unwrap()
     }
 
+    #[test]
+    fn qualified_wal_capture_exports_all_seven_roots_without_reader_identity_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.db");
+        let db = source(&path);
+        db.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        db.execute("INSERT INTO project(id,worktree,time_created,time_updated,sandboxes) VALUES ('prj','/synthetic',1,1,'[]')", []).unwrap();
+        let roots = (0..7)
+            .map(|index| format!("ses_root_{index}"))
+            .collect::<Vec<_>>();
+        for root in &roots {
+            db.execute("INSERT INTO session(id,slug,project_id,directory,title,version,time_created,time_updated) VALUES (?1,'slug','prj','/synthetic','synthetic','1',1,1)", [root]).unwrap();
+        }
+        let original_hash = hash_file(&path).unwrap();
+        let options = ExportOptions::new(dir.path().join("extract"));
+        let qualified = capture_qualified_batch(
+            &HostOpenCodeInventory::new(path.clone()),
+            &roots,
+            options.clone(),
+        )
+        .unwrap();
+        for root in &roots {
+            let exported =
+                export_exact_session(&qualified.inventory(), root, options.clone()).unwrap();
+            assert_eq!(
+                source_graph_fingerprint(exported.manifest()).unwrap(),
+                qualified
+                    .receipt
+                    .roots
+                    .iter()
+                    .find(|captured| &captured.root_session_id == root)
+                    .unwrap()
+                    .graph_fingerprint
+            );
+        }
+        assert_eq!(hash_file(&path).unwrap(), original_hash);
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM session", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            7
+        );
+    }
+
     fn assert_qualified_refusal(qualified: &QualifiedSourceSnapshot, dir: &Path, reason: &str) {
         let result = export_exact_session(
             &qualified.inventory(),
@@ -4734,6 +4791,41 @@ mod native_source_inventory_tests {
             fs::write(sidecar, []).unwrap();
             assert_qualified_refusal(&qualified, dir.path(), reason);
         }
+    }
+
+    #[test]
+    fn qualified_snapshot_guard_still_refuses_actual_database_writes_and_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let qualified = qualified_fixture(dir.path());
+        let writer = Connection::open(&qualified.path).unwrap();
+        writer
+            .execute(
+                "UPDATE session SET title='changed' WHERE id='ses_exact'",
+                [],
+            )
+            .unwrap();
+        drop(writer);
+        let error = export_exact_session(
+            &qualified.inventory(),
+            "ses_exact",
+            ExportOptions::new(dir.path().join("extract")),
+        )
+        .err()
+        .expect("native content writes must refuse qualified export");
+        assert!(
+            matches!(error, TransferError::Blocked(ref reason) if reason.starts_with("qualified snapshot changed: database_")),
+            "{error:?}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let qualified = qualified_fixture(dir.path());
+        OpenOptions::new()
+            .append(true)
+            .open(&qualified.path)
+            .unwrap()
+            .write_all(&[0; 4096])
+            .unwrap();
+        assert_qualified_refusal(&qualified, dir.path(), "qualified snapshot changed: bytes");
     }
 
     #[cfg(unix)]
