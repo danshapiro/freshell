@@ -619,7 +619,7 @@ Run: `git commit -m "fix(supervisor): finish durable Stop after interruption"`
 - Consumes: nine exact target revisions, seven canonical roots/owners, exact generation-bound structural/readability receipts, immutable saved adoption baseline, stopped batch route and current provider-observed launch evidence.
 - Produces: seven `DataRepairComplete` stopped/resume-ready canonical souls, preserved explicit views, exact nine-incident retraction, and same-soul Resume/failure/retry without losing baseline. Data repair makes no provider-running claim.
 
-- [ ] **Step 1: Write the failing behavioral test**
+- [x] **Step 1: Write the failing behavioral test**
 
 Add `stopped_repair_resume_failure_retry_preserves_baseline`: run the actual synthetic nine-target/seven-root batch through the authenticated server route and real host import/read path, verify no PTY/provider-session process launches; the real authenticated positive path runs in the required owned Docker browser runbook, while the named supervisor test protects persisted baseline continuity with genuine exporter/importer/reader library receipts and actual Resume/Retry transitions; host-process test receipts must never be relabelled as container receipts; record actual setup/import helper starts, leave canonical souls stopped, then explicitly Resume one synthetic soul through UI. Fault the first current launch observation, interrupt/restart supervisor, then Retry; assert same canonical soul/native root/store and complete original imported graph/baseline remain, matching current generation/nonce observation precedes input and LIVE. Run baseline-only host fault matrix for unreadable reader/assets, receipt/root/generation mismatch, stale observation, interrupted pre-PTY gate, Stop cancellation and recovered current tail. Include schema-7 migration with exact verified source/import fences and deliberate choices for both eligible duplicate pairs, native full/part revert active-tail hydration, ordinary native prompt cleanup removing current rows/clearing revert while immutable original evidence remains, V1/V2 empty/load failure and unavailable saved undo-tree preservation. Add pending withdrawal blocking one incident while unrelated exports drain, exact `%`/`_` view prefix behavior, colliding sanitized notice receipts, malformed unclassifiable JSONL and concurrent stale exporter/rotator boundaries. Each test asserts actual filesystem/registry outcome, not just a manifest row count. Define exactly three ignored destructive parents in `loss_report_tests.rs`: `stopped_repair_crash_after_import_publication`, `stopped_repair_crash_after_repair_cas_before_withdrawal`, and `stopped_repair_crash_during_withdrawal_before_ack`. Each interrupts its named actual durable boundary, reopens supervisor/registry and repeats the same operation, verifying exact imported graph/baseline/CAS/retraction progress and unrelated artifacts. Mark these Docker-sandbox-only ignored; run only `stopped_repair_crash_` through documented `scripts/sandbox-test.sh --runtime-suite`, with exactly three selected/executed parents in red and green phases.
 
@@ -633,7 +633,7 @@ When that exact owned supervisor is stopped, a fixed private query-only reader m
 
 Add the browser scenario with exact name `stopped nine-soul restoration runbook` here, before final candidate campaigns. Capture nine targets/seven roots and revisions/store metadata, resolve both deliberate duplicate choices, preflight all roots, submit authenticated idempotent stopped repair, verify seven installed graph digests and provider-identity access receipts, stopped state, explicit view rebind, exact nine retractions and unrelated records. Interrupt and repeat the same operation key at import/publication/withdrawal boundaries; change intent/source revision before apply and assert zero unauthorized correction. Partial import remains an owned recoverable operation without early false-record withdrawal. Exercise recovery against a stale receipt and verify no auto-start or real conversation use. Task 8 migrates and executes this scenario on the configured browser backend; Task 11 reuses its executed behavior and does not add producer source after final qualification.
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [x] **Step 2: Run the test and verify the intended failure**
 
 Run: `cargo test -p freshell-supervisor stopped_repair_resume_failure_retry_preserves_baseline`
 
@@ -643,11 +643,11 @@ Run: `scripts/sandbox-test.sh --runtime-suite "cargo test -p freshell-supervisor
 
 Expected: exactly three destructive parents selected/executed; FAIL for any unimplemented integrated persistence/host transition; source tests previously doing direct registry begin/block do not fulfill this production path. If all current production cases already pass, record existing imported pre-fix failures and current positive execution without manufacturing a new defect.
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 Ensure `registry` loads completed/owned import baseline by immutable receipt authority independent of transient DataRepairComplete/Blocked/Recovering state, and `resume_catalog` upgrades legacy spec environment and baseline atomically. Batch preflights **all seven roots/owners/targets** before any import, validates provider access under actual identity, commits exact captured revision CAS only after all seven independent readability receipts, and never starts providers. Root owner resolution returns typed choices only for real ambiguity. Preserve the cleanup/export coordinator through exact ID generation checks, file rewrite/sync and progress acknowledgement; deferred withdrawal records an error but does not suppress unrelated export drain or make startup entirely unavailable. Exact view projection cleanup parses the numeric revision following the full string prefix, never SQL LIKE matching unrelated IDs. Retraction progress is durable ID/generation/status/artifact metadata only. UI presents Resume for stopped repaired data; failed provider adoption presents same-soul Retry with retained baseline and honest blocker. Update README/mock only if this changes the source UI materially.
 
-- [ ] **Step 4: Run the focused test**
+- [x] **Step 4: Run the focused test**
 
 Run: `cargo test -p freshell-supervisor stopped_repair_resume_failure_retry_preserves_baseline`
 
@@ -659,11 +659,11 @@ Run: `scripts/sandbox-test.sh --runtime-suite "cargo test -p freshell-supervisor
 
 Expected: PASS with exact seven-root import, nine target correction, complete baseline and unrelated records preserved, including all three actually executed destructive parents.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Keep structural verification, installed readability, repair CAS and later provider adoption as separate typed stages. Share exact target/notice/view selection helpers; remove copied historical eight-target logic and direct-state test shortcuts.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Run: `cargo test -p freshell-supervisor -p freshell-session-host -p freshell-server --features freshell-server/managed-runtime-v1`
 
@@ -673,7 +673,7 @@ Run: `scripts/sandbox-test.sh --runtime-suite "cargo test -p freshell-supervisor
 
 Expected: PASS for auth/idempotency/count, exact retraction crash points, true-loss preservation and all relevant baseline-only host faults. Task 7 explicitly retains `FRESHELL_RUNTIME_SYNTHETIC_RESUME=1`, already present in immutable `tracked.patch` at the source-to-soul browser test skip guard. Gate the new `stopped nine-soul restoration runbook` test on that exact flag independently of `FRESHELL_RUNTIME_PHASE3_LIVE`; it uses fictional fixtures, no provider prompts or grants. Unset/other values skip that opt-in test honestly and never publish a qualifying receipt; set value selects and executes it. Task 8 allowlists/forwards this flag to Cloud and validates positive selected/executed counts. Task 8 executes these browser cases through cloud and records actual nonzero counts.
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 Run: `git add crates/freshell-supervisor/src/stopped_repair_cas.rs crates/freshell-supervisor/src/registry.rs crates/freshell-supervisor/src/resume_catalog.rs crates/freshell-supervisor/src/notice_outbox.rs crates/freshell-supervisor/src/loss_report_tests.rs crates/freshell-supervisor/src/recovery.rs crates/freshell-session-host/src/main.rs crates/freshell-server/src/managed_runtime_api.rs test/e2e-browser/specs/runtime-provider-resurrection-rust.spec.ts test/e2e-browser/specs/runtime-lost-soul-notice-rust.spec.ts scripts/testing/runtime-sandbox.ts test/e2e-browser/helpers/managed-runtime.ts`
 
