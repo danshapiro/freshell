@@ -947,14 +947,17 @@ impl FreshCodexState {
 
     /// Logs Codex's own writer refusal of a `thread/resume` of `thread_id`
     /// ("already has an active writer") at ERROR (`unit.writer_conflict`,
-    /// `source: freshcodex`), naming the holder one bounded lookup finds
-    /// under the Codex home this sidecar reported (Task 16), and returns the
-    /// answer that tells the user who holds the conversation ([`HeldAnswer`]).
-    /// Other errors log nothing and answer `None`.
+    /// `source: freshcodex`, under `request_id`: the create's requestId, or
+    /// empty for a lane with no request to tie it to), naming the holder one
+    /// bounded lookup finds under the Codex home this sidecar reported (Task
+    /// 16), and returns the answer that tells the user who holds the
+    /// conversation ([`HeldAnswer`]). Other errors log nothing and answer
+    /// `None`.
     async fn note_resume_refusal(
         &self,
         client: &CodexAppServerClient,
         thread_id: &str,
+        request_id: &str,
         err: &CodexAppServerError,
     ) -> Option<HeldAnswer> {
         if !is_codex_writer_conflict(err) {
@@ -969,6 +972,7 @@ impl FreshCodexState {
             },
             home.as_deref().map(std::path::Path::new),
             thread_id,
+            request_id,
             "freshcodex",
         )
         .await;
@@ -2657,7 +2661,7 @@ impl FreshCodexState {
             .await;
         let held = match &resume_result {
             Err(err) => {
-                self.note_resume_refusal(&client, &resume_session_id, err)
+                self.note_resume_refusal(&client, &resume_session_id, &request_id, err)
                     .await
             }
             Ok(_) => None,
@@ -6835,7 +6839,7 @@ impl FreshCodexState {
         // Task 16: Codex refusing the resume as held is logged once (the
         // first refusal of this recovery) and answered with its holder.
         let mut held = match &first_attempt {
-            Err(err) => self.note_resume_refusal(&client, session_id, err).await,
+            Err(err) => self.note_resume_refusal(&client, session_id, "", err).await,
             Ok(_) => None,
         };
 
@@ -6859,7 +6863,7 @@ impl FreshCodexState {
                     )
                     .await;
                 if let (None, Err(err)) = (&held, &retry) {
-                    held = self.note_resume_refusal(&client, session_id, err).await;
+                    held = self.note_resume_refusal(&client, session_id, "", err).await;
                 }
                 retry
             }
@@ -8678,7 +8682,7 @@ impl FreshCodexState {
             )
             .await;
         let held = match &resume_result {
-            Err(err) => self.note_resume_refusal(&client, thread_id, err).await,
+            Err(err) => self.note_resume_refusal(&client, thread_id, "", err).await,
             Ok(_) => None,
         };
         let started = match resume_result {
@@ -23656,7 +23660,9 @@ pub(crate) mod tests {
     /// writer") is a writer conflict logged at ERROR (`source: freshcodex`);
     /// with no holder this server can see, it is "held by a process outside
     /// Freshell's view", never released, and the create's failure says so in
-    /// plain words (review M3: every resume lane answers alike).
+    /// plain words (review M3: every resume lane answers alike). The ERROR
+    /// carries the create's request id, tying it to its reopen (review
+    /// R2-N1).
     #[tokio::test]
     async fn codex_refusing_a_resume_as_held_is_logged_as_a_writer_conflict() {
         let _guard = ENV_LOCK.lock().await;
@@ -23689,6 +23695,10 @@ pub(crate) mod tests {
             .expect("the conflict is logged");
         assert_eq!(conflict.fields["source"], "freshcodex", "{conflict:?}");
         assert_eq!(conflict.fields["thread_id"], "thread-refused-held");
+        assert_eq!(
+            conflict.fields["request_id"], "req-refused-held",
+            "the refusal is tied to its create: {conflict:?}"
+        );
         assert_eq!(conflict.fields["holder_visible"], "false", "{conflict:?}");
         assert_eq!(
             conflict.fields["reason"],

@@ -183,6 +183,7 @@ pub async fn log_writer_conflict(
         &conflict_keys(state, terminal_id, thread_id),
         home.as_deref().map(std::path::Path::new),
         thread_id,
+        "",
         source,
     )
     .await;
