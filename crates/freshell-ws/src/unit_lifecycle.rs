@@ -144,11 +144,13 @@ pub(crate) fn unit_keys(unit: &AgentUnit, operation_id: Option<&str>) -> UnitLog
 
 /// A unit lifecycle line (target `freshell_unit`) with the unit's five
 /// keys: its terminal is `$terminal_id`, its operation the unit's stop's
-/// (in flight or finished), if any.
+/// (in flight or finished), if any. A line that decides a stop not begun
+/// yet names that stop's operation instead
+/// (`member_event!(level, entry, terminal_id, operation = &cmd.operation_id; "event", ..)`).
 macro_rules! member_event {
-    ($level:ident, $entry:expr, $terminal_id:expr, $event:literal, $($rest:tt)*) => {{
+    (@line $level:ident, $entry:expr, $terminal_id:expr, $operation:expr, $event:literal, $($rest:tt)*) => {{
         let entry: &UnitEntry = $entry;
-        let keys = unit_keys(&entry.unit, entry.unit.stop_operation().as_deref());
+        let keys = unit_keys(&entry.unit, $operation);
         tracing::$level!(target: "freshell_unit",
             event = $event,
             unit_id = %keys.unit_id,
@@ -157,6 +159,15 @@ macro_rules! member_event {
             terminal_id = %$terminal_id,
             operation_id = %keys.operation_id.as_deref().unwrap_or(""),
             $($rest)*)
+    }};
+    ($level:ident, $entry:expr, $terminal_id:expr, operation = $operation:expr; $event:literal, $($rest:tt)*) => {{
+        let operation: &str = $operation;
+        member_event!(@line $level, $entry, $terminal_id, Some(operation), $event, $($rest)*)
+    }};
+    ($level:ident, $entry:expr, $terminal_id:expr, $event:literal, $($rest:tt)*) => {{
+        let entry: &UnitEntry = $entry;
+        let operation = entry.unit.stop_operation();
+        member_event!(@line $level, entry, $terminal_id, operation.as_deref(), $event, $($rest)*)
     }};
 }
 
@@ -867,6 +878,7 @@ async fn on_member_exit(state: &WsState, unit_id: &str, terminal_id: &str, exit:
     }
     let (exit_code, lived) = match exit {
         MemberExit::Main { pid, exit_code } => {
+            let stop = agent_exited(exit_code, "agent-exited");
             // An app-server's death (no code of its own) or a non-zero exit
             // is a crash; an agent that ended cleanly is not.
             if exit_code == Some(0) {
@@ -874,6 +886,7 @@ async fn on_member_exit(state: &WsState, unit_id: &str, terminal_id: &str, exit:
                     info,
                     &entry,
                     terminal_id,
+                    operation = &stop.operation_id;
                     "unit.agent_exited",
                     pid = pid,
                     exit_code = 0,
@@ -884,18 +897,20 @@ async fn on_member_exit(state: &WsState, unit_id: &str, terminal_id: &str, exit:
                     warn,
                     &entry,
                     terminal_id,
+                    operation = &stop.operation_id;
                     "unit.agent_exited",
                     pid = pid,
                     exit_code = exit_code.unwrap_or(-1),
                     "the unit's main process exited on its own; the whole unit ends"
                 );
             }
-            let _ = stop_terminal_unit(state, &entry, agent_exited(exit_code, "agent-exited"));
+            let _ = stop_terminal_unit(state, &entry, stop);
             return;
         }
         MemberExit::Screen { exit_code, lived } => (exit_code, lived),
     };
     let main = entry.unit.main();
+    let mut turn_end_late = false;
     let ended = match main.as_ref() {
         None => Some(Some(exit_code)),
         Some(_) if entry.unit.main_is_screen() => Some(Some(exit_code)),
@@ -908,18 +923,20 @@ async fn on_member_exit(state: &WsState, unit_id: &str, terminal_id: &str, exit:
             let running = seen_running
                 && crate::unit_threads::turn_still_running(state, terminal_id, TURN_END_GRACE)
                     .await;
-            if seen_running && !running {
-                member_event!(debug, &entry, terminal_id,
-                    "unit.screen_exit.turn_end_late",
-                    "the pane's thread table took its turn's end after the screen quit; the quit ends the unit");
-            }
+            turn_end_late = seen_running && !running;
             (!running).then_some(Some(0))
         }
         Some(_) => None,
     };
     match ended {
         Some(code) => {
-            let _ = stop_terminal_unit(state, &entry, agent_exited(code, "screen-exit"));
+            let stop = agent_exited(code, "screen-exit");
+            if turn_end_late {
+                member_event!(debug, &entry, terminal_id, operation = &stop.operation_id;
+                    "unit.screen_exit.turn_end_late",
+                    "the pane's thread table took its turn's end after the screen quit; the quit ends the unit");
+            }
+            let _ = stop_terminal_unit(state, &entry, stop);
         }
         // A person's "quit, run in background" leaves the cap alone; a
         // crash, or a quit faster than any person chooses, counts.
@@ -1058,18 +1075,15 @@ fn respawn_failed(
             "the screen restart was abandoned: the unit is being stopped");
         return;
     }
-    member_event!(error, entry, terminal_id,
+    let stop = agent_exited(Some(exit_code), "screen-respawn-failed");
+    member_event!(error, entry, terminal_id, operation = &stop.operation_id;
         "unit.screen.respawn_failed",
         cause = %cause,
         prior_exit_code = exit_code,
         prior_lived_ms = millis(prior_lived),
         counts_toward_cap = counts_toward_cap,
         "the screen could not be restarted; the whole unit ends");
-    let _ = stop_terminal_unit(
-        state,
-        entry,
-        agent_exited(Some(exit_code), "screen-respawn-failed"),
-    );
+    let _ = stop_terminal_unit(state, entry, stop);
 }
 
 /// `spec` with its `resume` argument naming `thread` (the Codex TUI's
