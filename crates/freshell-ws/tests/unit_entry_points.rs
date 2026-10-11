@@ -9,14 +9,34 @@
 //! holds as an extra thread answers that pane and starts no second
 //! app-server (Stage 2: LB-20, LB-21, LB-25, LB-41).
 #![cfg(target_os = "linux")]
+#[path = "../../freshell-containment/tests/support/capture.rs"]
+#[allow(dead_code)]
+mod capture;
 #[path = "support/unit_harness.rs"]
 mod unit_harness;
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use freshell_ownership::OwnershipState;
 use serde_json::json;
+use tracing_subscriber::prelude::*;
 use unit_harness::{fake_codex, GoneDelay, HarnessOpts, TestWs, ThreadReadHeldUp, UnitHarness};
+
+/// One capture of the `freshell_unit` events for the whole binary (each test
+/// filters by its own conversation).
+fn captured() -> capture::Captured {
+    static CAPTURE: OnceLock<capture::Captured> = OnceLock::new();
+    CAPTURE
+        .get_or_init(|| {
+            let cap = capture::Captured::default();
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::registry().with(cap.clone()),
+            );
+            cap
+        })
+        .clone()
+}
 
 async fn ready(h: &UnitHarness, ws: &mut TestWs) -> String {
     let frame = h
@@ -651,26 +671,18 @@ async fn a_switch_to_the_terminal_of_a_conversation_that_never_had_a_turn_is_ref
     h.state.fresh_codex.shutdown().await;
 }
 
-/// A switch between terminal Codex and freshcodex that reaches a
-/// conversation whose unit is being stopped (a kill from another device, a
-/// cleanup stop) waits for that unit's Gone, within the REST bound, and then
-/// switches, instead of answering "in progress".
-#[tokio::test(flavor = "multi_thread")]
-async fn a_switch_during_a_stop_waits_for_gone() {
-    let h = UnitHarness::start(HarnessOpts::default()).await;
-    h.state.fresh_codex.set_enabled(true);
-    let _gone = GoneDelay::set(1500);
-    let mut ws = h.connect().await;
-    let old = h
-        .create_codex(&mut ws, "crq-sw-stop", Some("t-sw-stop"))
-        .await;
-    ready(&h, &mut ws).await;
-    start_settled(&h, &old).await;
+/// Kills the terminal Codex pane of conversation `sid` (Gone held by the
+/// caller's [`GoneDelay`]) and returns, once the conversation is Stopping,
+/// the old app-server's pid and start time.
+async fn kill_into_stopping(h: &UnitHarness, ws: &mut TestWs, crq: &str, sid: &str) -> (u32, u64) {
+    let old = h.create_codex(ws, crq, Some(sid)).await;
+    ready(h, ws).await;
+    start_settled(h, &old).await;
     let old_native = h.native_pid(&old);
     let old_native_start = h.native_manifest(&old).start_time(old_native);
     h.send(
-        &mut ws,
-        json!({"type": "terminal.kill", "terminalId": old, "requestId": "rk", "createRequestId": "crq-sw-stop"}),
+        ws,
+        json!({"type": "terminal.kill", "terminalId": old, "requestId": "rk", "createRequestId": crq}),
     )
     .await;
     eventually("the conversation is Stopping", || {
@@ -679,22 +691,109 @@ async fn a_switch_during_a_stop_waits_for_gone() {
                 .ownership
                 .as_ref()
                 .unwrap()
-                .observe("codex", "t-sw-stop")
+                .observe("codex", sid)
                 .state,
             OwnershipState::Stopping { .. }
         )
     })
     .await;
-    let (status, body) = h
-        .post(
-            "/api/sessions/handoff",
-            json!({"provider": "codex", "sessionId": "t-sw-stop", "targetKind": "fresh-agent",
-                "sessionType": "freshcodex", "cwd": h.home.path().display().to_string(),
-                "deviceId": "test-device"}),
-        )
-        .await;
+    (old_native, old_native_start)
+}
+
+/// The switch of conversation `sid` to freshcodex.
+async fn switch_to_freshcodex(h: &UnitHarness, sid: &str) -> (u16, serde_json::Value) {
+    h.post(
+        "/api/sessions/handoff",
+        json!({"provider": "codex", "sessionId": sid, "targetKind": "fresh-agent",
+            "sessionType": "freshcodex", "cwd": h.home.path().display().to_string(),
+            "deviceId": "test-device"}),
+    )
+    .await
+}
+
+/// A switch between terminal Codex and freshcodex that reaches a
+/// conversation whose unit is being stopped (a kill from another device, a
+/// cleanup stop) waits for that unit's Gone, within the REST bound, and then
+/// switches, instead of answering "in progress". The request itself waited:
+/// its route logged `unit.start.waited` for the handoff before it answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_switch_during_a_stop_waits_for_gone() {
+    let cap = captured();
+    let h = UnitHarness::start(HarnessOpts::default()).await;
+    h.state.fresh_codex.set_enabled(true);
+    let _gone = GoneDelay::set(1500);
+    let mut ws = h.connect().await;
+    let (old_native, old_native_start) =
+        kill_into_stopping(&h, &mut ws, "crq-sw-stop", "t-sw-stop").await;
+    let (status, body) = switch_to_freshcodex(&h, "t-sw-stop").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["ok"], json!(true), "switched after the Gone: {body}");
+    assert!(
+        fake_codex::proc_starttime(old_native) != Some(old_native_start),
+        "the switch ran only after the old app-server was gone"
+    );
+    let waited = cap.first(
+        tracing::Level::INFO,
+        "unit.start.waited",
+        &[("session_id", "t-sw-stop"), ("entry_point", "handoff")],
+    );
+    assert!(
+        waited.is_some(),
+        "the switch request waited for the Gone (it reached the conversation Stopping)"
+    );
+    h.state.fresh_codex.shutdown().await;
+}
+
+/// A switch whose wait for the Gone runs past the REST bound (5 s) answers
+/// `202 {"ok":false,"status":"stopping"}` and then, at the Gone, switches on
+/// its own: the conversation ends Live in freshcodex, with no second request.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_switch_past_the_rest_bound_answers_202_and_switches_at_gone() {
+    let cap = captured();
+    let h = UnitHarness::start(HarnessOpts::default()).await;
+    h.state.fresh_codex.set_enabled(true);
+    let _gone = GoneDelay::set(7500);
+    let mut ws = h.connect().await;
+    let (old_native, old_native_start) =
+        kill_into_stopping(&h, &mut ws, "crq-sw-defer", "t-sw-defer").await;
+    let (status, body) = switch_to_freshcodex(&h, "t-sw-defer").await;
+    assert_eq!(status, 202, "answered at the bound: {body}");
+    assert_eq!(body, json!({"ok": false, "status": "stopping"}));
+    assert!(
+        matches!(
+            h.state
+                .ownership
+                .as_ref()
+                .unwrap()
+                .observe("codex", "t-sw-defer")
+                .state,
+            OwnershipState::Stopping { .. }
+        ),
+        "precondition: the 202 came before the Gone"
+    );
+
+    let answered = cap
+        .wait_for(
+            tracing::Level::INFO,
+            "unit.start.deferred_answered",
+            &[("session_id", "t-sw-defer"), ("entry_point", "handoff")],
+            Duration::from_secs(20),
+        )
+        .await
+        .expect("the deferred switch ran at the Gone");
+    assert_eq!(
+        answered.fields.get("status").map(String::as_str),
+        Some("200"),
+        "{answered:?}"
+    );
+    assert!(
+        matches!(
+            h.state.ownership.as_ref().unwrap().observe("codex", "t-sw-defer").state,
+            OwnershipState::Live { ref owner, .. }
+                if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+        ),
+        "the conversation is Live in freshcodex"
+    );
     assert!(
         fake_codex::proc_starttime(old_native) != Some(old_native_start),
         "the switch ran only after the old app-server was gone"
