@@ -3516,6 +3516,35 @@ mod unit_sidecar {
         assert!(store.load_all().is_empty(), "its sidecar record is removed");
     }
 
+    /// A Codex home whose rollout tree cannot be read proves nothing about
+    /// the conversation: the resume proceeds (Codex itself then decides),
+    /// never silently becoming a new conversation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resume_whose_rollout_tree_cannot_be_read_proceeds() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(CodexSidecarStore::new(home.path().join("records")));
+        // `sessions` is a file, so the walk cannot list it.
+        std::fs::write(home.path().join("sessions"), "not a directory").unwrap();
+        let planner = realistic_planner(home.path(), store.clone(), json!({}));
+        let launch = timeout(
+            LIMIT,
+            planner.plan_create_with_retry(
+                &plan_input_with_seed("t-unreadable", tag_seed("t-unreadable")),
+                5,
+                0,
+            ),
+        )
+        .await
+        .expect("the plan settles")
+        .expect("the resume proceeds");
+        assert_eq!(launch.session_id.as_deref(), Some("t-unreadable"));
+        launch
+            .sidecar
+            .stop_and_finish(StopMode::Force, StopReason::ShiftX, "test")
+            .await
+            .expect("stopped");
+    }
+
     /// A resume of a conversation that materialized proceeds as before.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_resume_with_a_rollout_proceeds() {

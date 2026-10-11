@@ -566,11 +566,13 @@ enum StartFailure {
     NotMaterialized(String),
 }
 
-/// Whether the conversation `session_id` a plan resumes has a rollout under
-/// the Codex home the new app-server reported (`initialize`'s `codexHome`).
-/// Read on a blocking thread. With no reported home the check is skipped
-/// (WARN `unit.resume.not_materialized_check_skipped`) and the resume
-/// proceeds: Codex itself then decides.
+/// Whether the conversation `session_id` a plan resumes may have
+/// materialized: `false` only when its rollout is proven absent under the
+/// Codex home the new app-server reported (`initialize`'s `codexHome`): the
+/// whole `sessions` tree was read (or it does not exist) and holds none. Read
+/// on a blocking thread. With no reported home, or a tree that could not be
+/// read, the check is skipped (WARN `unit.resume.not_materialized_check_skipped`)
+/// and the resume proceeds: Codex itself then decides.
 async fn resume_target_materialized(
     runtime: &dyn CodexLaunchRuntime,
     ready: &CodexRuntimeReady,
@@ -591,22 +593,37 @@ async fn resume_target_materialized(
             keys,
             "unit.resume.not_materialized_check_skipped",
             thread_id = %session_id,
+            reason = "no_codex_home",
             "the app-server reported no Codex home, so whether the resumed conversation \
              materialized was not checked; the resume proceeds"
         );
         return true;
     };
     let thread_id = session_id.to_string();
-    tokio::task::spawn_blocking(move || {
-        crate::durability::locate_thread_rollout_in_home(
-            std::path::Path::new(&codex_home),
-            &thread_id,
-        )
-        .is_some()
+    let home = codex_home.clone();
+    let lookup = tokio::task::spawn_blocking(move || {
+        crate::durability::lookup_thread_rollout_in_home(std::path::Path::new(&home), &thread_id)
     })
-    .await
-    // A lookup that panicked decides nothing: Codex itself then does.
-    .unwrap_or(true)
+    .await;
+    let error = match lookup {
+        Ok(crate::durability::RolloutLookup::Found(_)) => return true,
+        Ok(crate::durability::RolloutLookup::Absent) => return false,
+        Ok(crate::durability::RolloutLookup::Unreadable(error)) => error.to_string(),
+        Err(join) => format!("the rollout lookup failed: {join}"),
+    };
+    unit_event!(
+        warn,
+        "freshell_unit",
+        keys,
+        "unit.resume.not_materialized_check_skipped",
+        thread_id = %session_id,
+        reason = "rollout_tree_unreadable",
+        codex_home = %codex_home,
+        error = %error,
+        "the Codex home's rollout tree could not be read in full, so whether the resumed \
+         conversation materialized is unknown; the resume proceeds"
+    );
+    true
 }
 
 // ─── the planner (launch-planner.ts:108-201, scoped) ────────────────────────────────────

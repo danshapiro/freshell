@@ -97,13 +97,19 @@ fn codex_sessions_root() -> Option<std::path::PathBuf> {
 /// create→session_meta git-info gap has no readable first line yet and
 /// answers `None`).
 fn first_line(path: &Path) -> Option<String> {
+    read_first_line(path).ok().flatten()
+}
+
+/// [`first_line`], with the read error kept (an empty first line is
+/// `Ok(None)`).
+fn read_first_line(path: &Path) -> std::io::Result<Option<String>> {
     use std::io::{BufRead, Read};
-    let file = std::fs::File::open(path).ok()?;
+    let file = std::fs::File::open(path)?;
     let mut reader = std::io::BufReader::new(file).take(1024 * 1024);
     let mut first = String::new();
-    reader.read_line(&mut first).ok()?;
+    reader.read_line(&mut first)?;
     let trimmed = first.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+    Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
 }
 
 /// Parse a rollout `session_meta` first line into its payload. `None` for any
@@ -116,55 +122,133 @@ fn session_meta_payload(line: &str) -> Option<serde_json::Value> {
     value.get("payload").cloned()
 }
 
-/// Locate the rollout owned by `thread_id` under `sessions_root`. The filename
-/// containment is a cheap PREFILTER; ownership is proven by the first line
-/// being a `session_meta` whose `payload.id`/`payload.session_id` equals the
-/// thread id — substring matching alone is unsafe (rollouts embed foreign
-/// uuids as fork/resume lineage; the codex_reconcile walk in freshell-ws uses
-/// the same proof). Bounded recursive walk: the tree is
+/// What a lookup of a thread's rollout under a `sessions` root found.
+#[derive(Debug)]
+pub enum RolloutLookup {
+    /// The rollout the thread owns.
+    Found(std::path::PathBuf),
+    /// The whole tree was read and holds no rollout of the thread. A missing
+    /// `sessions` root counts: nothing was ever written there.
+    Absent,
+    /// Part of the tree could not be read (a permission error, an I/O
+    /// error, a symlink loop), so the rollout's absence is not proven.
+    Unreadable(std::io::Error),
+}
+
+/// Look up the rollout owned by `thread_id` under `sessions_root`. The
+/// filename containment is a cheap PREFILTER; ownership is proven by the
+/// first line being a `session_meta` whose `payload.id`/`payload.session_id`
+/// equals the thread id — substring matching alone is unsafe (rollouts embed
+/// foreign uuids as fork/resume lineage; the codex_reconcile walk in
+/// freshell-ws uses the same proof). Bounded recursive walk: the tree is
 /// `sessions/YYYY/MM/DD/rollout-*.jsonl` (flat `<id>.jsonl` in tests).
-fn locate_rollout(sessions_root: &Path, thread_id: &str) -> Option<std::path::PathBuf> {
-    fn owns(path: &Path, thread_id: &str) -> bool {
-        let Some(first) = first_line(path) else {
-            return false;
+///
+/// Absence is concluded only from a tree the walk read in full: something
+/// that vanished during the walk (NotFound) is simply not there, but any
+/// other error reading a directory, an entry or a candidate file answers
+/// [`RolloutLookup::Unreadable`] unless the rollout was found anyway.
+fn lookup_rollout(sessions_root: &Path, thread_id: &str) -> RolloutLookup {
+    use std::io::ErrorKind::NotFound;
+    /// Whether the candidate `path` is `thread_id`'s rollout. A file whose
+    /// first line is not (yet) a `session_meta` is not; a file that cannot
+    /// be read is an error.
+    fn owns(path: &Path, thread_id: &str) -> std::io::Result<bool> {
+        let Some(first) = read_first_line(path)? else {
+            return Ok(false);
         };
         let Some(payload) = session_meta_payload(&first) else {
-            return false;
+            return Ok(false);
         };
-        payload.get("id").and_then(serde_json::Value::as_str) == Some(thread_id)
-            || payload
-                .get("session_id")
-                .and_then(serde_json::Value::as_str)
-                == Some(thread_id)
+        Ok(
+            payload.get("id").and_then(serde_json::Value::as_str) == Some(thread_id)
+                || payload
+                    .get("session_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(thread_id),
+        )
     }
-    fn walk(dir: &Path, thread_id: &str, depth: u8, hit: &mut Option<std::path::PathBuf>) {
-        if depth > 5 || hit.is_some() {
-            return;
+    /// Walks `dir`; the first read error (other than NotFound) is kept in
+    /// `error`.
+    fn walk(
+        dir: &Path,
+        thread_id: &str,
+        depth: u8,
+        error: &mut Option<std::io::Error>,
+    ) -> Option<std::path::PathBuf> {
+        if depth > 5 {
+            return None;
         }
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            if hit.is_some() {
-                return;
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == NotFound => return None,
+            Err(e) => {
+                error.get_or_insert(e);
+                return None;
             }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    error.get_or_insert(e);
+                    continue;
+                }
+            };
             let path = entry.path();
-            if path.is_dir() {
-                walk(&path, thread_id, depth + 1, hit);
+            // The entry's type comes with the listing (no extra stat); a
+            // symlink is followed, as before.
+            let is_dir = match entry.file_type() {
+                Ok(kind) if kind.is_symlink() => match std::fs::metadata(&path) {
+                    Ok(meta) => meta.is_dir(),
+                    Err(e) if e.kind() == NotFound => continue, // dangling
+                    Err(e) => {
+                        error.get_or_insert(e);
+                        continue;
+                    }
+                },
+                Ok(kind) => kind.is_dir(),
+                Err(e) if e.kind() == NotFound => continue,
+                Err(e) => {
+                    error.get_or_insert(e);
+                    continue;
+                }
+            };
+            if is_dir {
+                if let Some(hit) = walk(&path, thread_id, depth + 1, error) {
+                    return Some(hit);
+                }
             } else if path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .map(|n| n.ends_with(".jsonl") && n.contains(thread_id))
-                .unwrap_or(false)
-                && owns(&path, thread_id)
+                .is_some_and(|n| n.ends_with(".jsonl") && n.contains(thread_id))
             {
-                *hit = Some(path);
+                match owns(&path, thread_id) {
+                    Ok(true) => return Some(path),
+                    Ok(false) => {}
+                    Err(e) if e.kind() == NotFound => {}
+                    Err(e) => {
+                        error.get_or_insert(e);
+                    }
+                }
             }
         }
+        None
     }
-    let mut hit = None;
-    walk(sessions_root, thread_id, 0, &mut hit);
-    hit
+    let mut error = None;
+    match (walk(sessions_root, thread_id, 0, &mut error), error) {
+        (Some(hit), _) => RolloutLookup::Found(hit),
+        (None, None) => RolloutLookup::Absent,
+        (None, Some(error)) => RolloutLookup::Unreadable(error),
+    }
+}
+
+/// The rollout owned by `thread_id` under `sessions_root`, when the walk
+/// found it ([`lookup_rollout`]; a tree it could not read answers `None`).
+fn locate_rollout(sessions_root: &Path, thread_id: &str) -> Option<std::path::PathBuf> {
+    match lookup_rollout(sessions_root, thread_id) {
+        RolloutLookup::Found(path) => Some(path),
+        RolloutLookup::Absent | RolloutLookup::Unreadable(_) => None,
+    }
 }
 
 /// The thread's DURABLE history mode, read from its rollout's persisted
@@ -194,6 +278,14 @@ pub fn locate_thread_rollout_in_home(
     thread_id: &str,
 ) -> Option<std::path::PathBuf> {
     locate_rollout(&codex_home.join("sessions"), thread_id)
+}
+
+/// [`locate_thread_rollout_in_home`], telling a tree that holds no rollout
+/// of the thread ([`RolloutLookup::Absent`]) from one that could not be read
+/// ([`RolloutLookup::Unreadable`]). The planner decides "never materialized"
+/// only from `Absent`.
+pub fn lookup_thread_rollout_in_home(codex_home: &Path, thread_id: &str) -> RolloutLookup {
+    lookup_rollout(&codex_home.join("sessions"), thread_id)
 }
 
 /// `extractSessionIdFromFilename(filePath)` (`providers/codex.ts:417-421`): the UUID embedded
@@ -320,6 +412,58 @@ mod tests {
             format!("{{\"timestamp\":\"2026-08-23T00:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{{{payload}}}}}\n"),
         )
         .expect("write rollout");
+    }
+
+    /// A thread's rollout is proven absent only from a tree the walk read in
+    /// full; a tree it could not read proves nothing.
+    #[test]
+    fn a_rollout_lookup_tells_an_unreadable_tree_from_an_absent_rollout() {
+        let tid = "019810de-1e5f-7db3-9c47-1c2a3b4c5d6e";
+        let home = tempfile::tempdir().expect("tempdir");
+        let lookup = || lookup_thread_rollout_in_home(home.path(), tid);
+
+        // No `sessions` root: nothing was ever written.
+        assert!(matches!(lookup(), RolloutLookup::Absent), "{:?}", lookup());
+
+        // A readable tree without the thread's rollout.
+        let sessions = home.path().join("sessions");
+        write_rollout(
+            &sessions,
+            "2026/08/23",
+            "rollout-2026-08-23T00-00-00-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.jsonl",
+            "\"id\":\"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\"",
+        );
+        assert!(matches!(lookup(), RolloutLookup::Absent), "{:?}", lookup());
+
+        // A directory entry that cannot be resolved (a symlink loop).
+        std::os::unix::fs::symlink("loop", sessions.join("2026/loop")).expect("symlink loop");
+        assert!(
+            matches!(lookup(), RolloutLookup::Unreadable(_)),
+            "{:?}",
+            lookup()
+        );
+
+        // Found anyway: the unreadable part does not matter.
+        write_rollout(
+            &sessions,
+            "2026/08/24",
+            &format!("rollout-2026-08-24T00-00-00-{tid}.jsonl"),
+            &format!("\"id\":\"{tid}\""),
+        );
+        assert!(
+            matches!(lookup(), RolloutLookup::Found(_)),
+            "{:?}",
+            lookup()
+        );
+
+        // A `sessions` root that is not a directory cannot be listed.
+        let other = tempfile::tempdir().expect("tempdir");
+        std::fs::write(other.path().join("sessions"), "not a directory").unwrap();
+        assert!(matches!(
+            lookup_thread_rollout_in_home(other.path(), tid),
+            RolloutLookup::Unreadable(_)
+        ));
+        assert_eq!(locate_thread_rollout_in_home(other.path(), tid), None);
     }
 
     #[test]
