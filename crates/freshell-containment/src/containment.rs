@@ -345,8 +345,11 @@ static FALLBACK: OnceLock<Fallback> = OnceLock::new();
 impl Fallback {
     /// Kills every unit this process created that is still recorded (it
     /// never reached Gone: a test that ended early), one after another on
-    /// this thread, each as `TagUnit::kill_recorded_now` finds its members
-    /// (Codex's daemon family spared).
+    /// this thread, each as `TagUnit::kill_recorded_now` finds its members:
+    /// its live roots (pid and start time) and their descendants, plus the
+    /// carriers of the unit tag this process minted; never a host-wide
+    /// search for an adopted sidecar's legacy tag, which processes this one
+    /// did not create can carry. Codex's daemon family is spared.
     ///
     /// Windows needs none: the fallback has no shim, so no member can be
     /// placed in its units, and a job kills its members when this process's
@@ -426,8 +429,9 @@ mod tests {
     use crate::proc_watch::Sig;
     use std::time::Duration;
 
-    /// A plain `sleep 600` child of the test (no tag), pinned while it is
-    /// our own unreaped child, killed through that pin and reaped on drop.
+    /// A child of the test (a plain `sleep 600` unless spawned from another
+    /// command), pinned while it is our own unreaped child, killed through
+    /// that pin and reaped on drop.
     struct Sleep {
         child: std::process::Child,
         watch: ProcWatch,
@@ -435,10 +439,11 @@ mod tests {
 
     impl Sleep {
         fn start() -> Self {
-            let child = std::process::Command::new("sleep")
-                .arg("600")
-                .spawn()
-                .unwrap();
+            Self::spawn(std::process::Command::new("sleep").arg("600"))
+        }
+
+        fn spawn(command: &mut std::process::Command) -> Self {
+            let child = command.spawn().unwrap();
             let watch = ProcWatch::open(child.id()).unwrap();
             Self { child, watch }
         }
@@ -518,6 +523,85 @@ mod tests {
         assert!(
             inherited_root.still_running(),
             "a unit this process did not create was killed"
+        );
+    }
+
+    /// A pinned process that is not the test's own child, killed through
+    /// its pin on drop.
+    struct Pinned(ProcWatch);
+
+    impl Drop for Pinned {
+        fn drop(&mut self) {
+            let _ = self.0.signal(Sig::Kill);
+        }
+    }
+
+    /// A legacy unit's tag was not minted by this process: another process
+    /// (a concurrent copy of the same test, adopting a sidecar with the same
+    /// fixed id) can carry it. So the exit sweep reaches a legacy unit only
+    /// through its recorded roots, each verified by pid and start time, and
+    /// their descendants: the root and its child are killed, and a process
+    /// that carries the same tag but is neither a recorded root nor below
+    /// one is never signalled.
+    #[test]
+    fn the_exit_sweep_reaches_a_legacy_unit_only_through_its_roots() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+
+        let state = tempfile::tempdir().unwrap();
+        let containment = Containment::tag_backend(SelectOptions {
+            shim: None,
+            state_root: state.path().to_path_buf(),
+        });
+        // Unique to this run: this test can reach no other run's process.
+        let tag = (
+            crate::LEGACY_CODEX_TAG_ENV.to_string(),
+            format!("codex-sidecar-{}", UnitId::mint().as_str()),
+        );
+        let tagged = |program: &str, args: &[&str]| {
+            let mut command = Command::new(program);
+            command.args(args).env(&tag.0, &tag.1);
+            command
+        };
+        // The adopted sidecar: a recorded root with a child of its own,
+        // which it names once it has started it.
+        let mut root =
+            Sleep::spawn(tagged("sh", &["-c", "sleep 600 & echo $!; wait"]).stdout(Stdio::piped()));
+        let mut line = String::new();
+        std::io::BufReader::new(root.child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let child = Pinned(ProcWatch::open(line.trim().parse().unwrap()).unwrap());
+        // Another run's sidecar: the same tag, never recorded here.
+        let decoy = Sleep::spawn(&mut tagged("sleep", &["600"]));
+        containment
+            .store
+            .write(&UnitRecord {
+                legacy_tag: Some(tag.clone()),
+                ..record_with_roots(vec![root.root()])
+            })
+            .unwrap();
+        let fallback = Fallback {
+            containment,
+            root: state.path().to_path_buf(),
+            pid: std::process::id(),
+            inherited: BTreeSet::new(),
+        };
+
+        fallback.kill_own_units();
+
+        assert!(
+            decoy.still_running(),
+            "a process carrying the legacy tag outside the unit's roots was killed"
+        );
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(root.child.wait().unwrap().signal(), Some(libc::SIGKILL));
+        assert!(
+            child
+                .0
+                .wait_exited_blocking(Duration::from_secs(10))
+                .unwrap(),
+            "the root's child outlived the sweep"
         );
     }
 }

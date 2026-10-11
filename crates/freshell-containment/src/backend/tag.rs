@@ -121,10 +121,13 @@ impl Backend for TagBackend {
 }
 
 /// One unit found by `key=value` in the environment (the unit tag, or the
-/// legacy Codex sidecar tag for v1 records).
+/// legacy Codex sidecar tag for v1 records), its live roots and their
+/// descendants; or, with no tag, by its live roots and their descendants
+/// alone.
 pub(crate) struct TagUnit {
-    key: String,
-    value: String,
+    /// The `(key, value)` its members carry; `None`: no process is looked
+    /// for by a tag.
+    tag: Option<(String, String)>,
     /// The unit id its errors name (a legacy unit's minted id).
     unit_id: String,
     wrapper: Option<Vec<String>>,
@@ -166,8 +169,16 @@ impl TagUnit {
     /// retains one, so it follows no forks).
     pub(crate) fn legacy(key: &str, value: &str, unit_id: &UnitId) -> Self {
         Self {
-            key: key.to_string(),
-            value: value.to_string(),
+            tag: Some((key.to_string(), value.to_string())),
+            ..Self::untagged(unit_id)
+        }
+    }
+
+    /// A unit found only through its recorded roots and their descendants:
+    /// no process is looked for by a tag.
+    fn untagged(unit_id: &UnitId) -> Self {
+        Self {
+            tag: None,
             unit_id: unit_id.as_str().to_string(),
             wrapper: None,
             #[cfg(target_os = "macos")]
@@ -176,32 +187,9 @@ impl TagUnit {
     }
 
     fn carries_tag(&self, pid: u32) -> bool {
-        matches!(process::environ_read(pid, &self.key), EnvRead::Value(v) if v == self.value)
-    }
-
-    /// Whether `pid` is a member by its tag, and whether its environment
-    /// was withheld from the tag read (counted only for this server's uid).
-    #[cfg(not(target_os = "macos"))]
-    fn classify(&self, pid: u32, my_uid: u32) -> Seen {
-        let read = process::environ_read(pid, &self.key);
-        Seen {
-            tagged: matches!(&read, EnvRead::Value(v) if *v == self.value),
-            withheld: read == EnvRead::Withheld && process::real_uid(pid) == Some(my_uid),
-        }
-    }
-
-    /// macOS: the same for a process of this server's uid; another user's
-    /// process is never a member, and its environment is never read.
-    #[cfg(target_os = "macos")]
-    fn classify(&self, pid: u32, my_uid: u32) -> Seen {
-        if !crate::darwin::bsdinfo(pid).is_ok_and(|info| info.pbi_ruid == my_uid) {
-            return Seen::default();
-        }
-        let read = process::environ_read(pid, &self.key);
-        Seen {
-            tagged: matches!(&read, EnvRead::Value(v) if *v == self.value),
-            withheld: read == EnvRead::Withheld,
-        }
+        self.tag.as_ref().is_some_and(|(key, value)| {
+            matches!(process::environ_read(pid, key), EnvRead::Value(v) if v == *value)
+        })
     }
 
     /// Whether the incarnation `(pid, start)` is followed by the unit's
@@ -247,18 +235,20 @@ impl TagUnit {
         let my_uid = unsafe { libc::getuid() };
         let mut candidates = BTreeSet::new();
         let mut withheld = 0;
-        for pid in process::all_pids() {
-            if pid == me {
-                continue;
-            }
-            let seen = self.classify(pid, my_uid);
-            if seen.tagged {
-                candidates.insert(pid);
-            }
-            // A withheld environment is neither tagged nor untagged: such a
-            // process is a member only through the other routes.
-            if seen.withheld && count_withheld {
-                withheld += 1;
+        if let Some((key, value)) = &self.tag {
+            for pid in process::all_pids() {
+                if pid == me {
+                    continue;
+                }
+                let seen = classify(key, value, pid, my_uid);
+                if seen.tagged {
+                    candidates.insert(pid);
+                }
+                // A withheld environment is neither tagged nor untagged: such
+                // a process is a member only through the other routes.
+                if seen.withheld && count_withheld {
+                    withheld += 1;
+                }
             }
         }
         candidates.extend(
@@ -283,20 +273,24 @@ impl TagUnit {
         }
     }
 
-    /// Kills the unit `record` names, found as a reopen finds it (its tag,
-    /// the legacy one for an adopted sidecar; its live recorded roots, each
-    /// verified by pid AND start time; their descendants), with the sweep
+    /// Kills the unit `record` names (for a process exit, where no runtime
+    /// is left to run `kill_all` on): its live recorded roots, each verified
+    /// by pid AND start time, their descendants and, for a unit of this
+    /// process, the processes carrying its tag, with the sweep
     /// [`UnitBackend::kill_all`] runs, Codex's daemon family spared,
-    /// synchronously on the calling thread: for a process exit, where no
-    /// runtime is left to run `kill_all` on. It follows no forks (on macOS
-    /// every process the unit's fork tracker followed is recorded as a
-    /// root).
+    /// synchronously on the calling thread. An adopted sidecar's legacy tag
+    /// is never searched for: its value was not minted by this process, so
+    /// another process (a concurrent copy of the same test, adopting a
+    /// sidecar with the same fixed id) can carry it; that unit is reached
+    /// through its roots, which this process pinned, and their descendants
+    /// only. It follows no forks (on macOS every process the unit's fork
+    /// tracker followed is recorded as a root).
     pub(crate) fn kill_recorded_now(record: &UnitRecord) -> io::Result<KillSummary> {
-        let (key, value) = match &record.legacy_tag {
-            Some((key, value)) => (key.as_str(), value.as_str()),
-            None => (UNIT_ENV, record.unit_id.as_str()),
+        let unit = match &record.legacy_tag {
+            Some(_) => Self::untagged(&record.unit_id),
+            None => Self::legacy(UNIT_ENV, record.unit_id.as_str(), &record.unit_id),
         };
-        Self::legacy(key, value, &record.unit_id).kill_all_now(&record.roots)
+        unit.kill_all_now(&record.roots)
     }
 
     fn kill_all_now(&self, roots: &[(u32, u64)]) -> io::Result<KillSummary> {
@@ -327,7 +321,7 @@ impl UnitBackend for TagUnit {
     fn placement(&self, _role: MemberRole, _seq: u32) -> io::Result<Placement> {
         Ok(Placement {
             wrapper: self.wrapper.clone(),
-            env: vec![(self.key.clone(), self.value.clone())],
+            env: self.tag.iter().cloned().collect(),
         })
     }
 
@@ -425,6 +419,32 @@ impl UnitBackend for TagUnit {
 struct Seen {
     tagged: bool,
     withheld: bool,
+}
+
+/// Whether `pid` is a member by the tag `key=value`, and whether its
+/// environment was withheld from the tag read (counted only for this
+/// server's uid).
+#[cfg(not(target_os = "macos"))]
+fn classify(key: &str, value: &str, pid: u32, my_uid: u32) -> Seen {
+    let read = process::environ_read(pid, key);
+    Seen {
+        tagged: matches!(&read, EnvRead::Value(v) if v == value),
+        withheld: read == EnvRead::Withheld && process::real_uid(pid) == Some(my_uid),
+    }
+}
+
+/// macOS: the same for a process of this server's uid; another user's
+/// process is never a member, and its environment is never read.
+#[cfg(target_os = "macos")]
+fn classify(key: &str, value: &str, pid: u32, my_uid: u32) -> Seen {
+    if !crate::darwin::bsdinfo(pid).is_ok_and(|info| info.pbi_ruid == my_uid) {
+        return Seen::default();
+    }
+    let read = process::environ_read(pid, key);
+    Seen {
+        tagged: matches!(&read, EnvRead::Value(v) if v == value),
+        withheld: read == EnvRead::Withheld,
+    }
 }
 
 /// Whether `pid` is running and is still the incarnation that started at
