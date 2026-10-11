@@ -14,6 +14,23 @@ export type TerminalWriteEvent = {
 const MAX_TERMINAL_WRITE_EVENTS = 1000
 const MAX_TERMINAL_WRITE_EVENT_BYTES = 1024 * 1024
 
+export type TerminalSurfaceSnapshot = {
+  terminalId: string
+  paneId: string
+  streamId: string | null
+  attachStreamId: string | null
+  attachRequestId: string | null
+  nativeSessionId: string | null
+  replayPending: boolean
+  writesPending: boolean
+  highestObservedSeq: number
+  completedSeq: number
+  cols: number
+  rows: number
+  bufferType: 'normal' | 'alternate'
+  text: string
+}
+
 export interface FreshellTestHarness {
   getState: () => ReturnType<typeof appStore.getState>
   dispatch: typeof appStore.dispatch
@@ -30,6 +47,9 @@ export interface FreshellTestHarness {
   setTerminalNetworkEffectsSuppressed: (paneId: string, suppressed: boolean) => void
   isTerminalNetworkEffectsSuppressed: (paneId: string) => boolean
   getTerminalBuffer: (terminalId?: string) => string | null
+  getTerminalSnapshot?: (terminalId: string) => TerminalSurfaceSnapshot | null
+  registerTerminalSnapshot?: (terminalId: string, accessor: () => TerminalSurfaceSnapshot | null) => void
+  unregisterTerminalSnapshot?: (terminalId: string) => void
   getRegisteredTerminalIds: () => string[]
   /**
    * Additive xterm-mode snapshot for replay-sync e2e coverage: returns the
@@ -104,6 +124,7 @@ export function installTestHarness(
   // Registry of terminal buffer accessors, keyed by terminalId.
   // TerminalView registers/unregisters accessors as xterm instances mount/unmount.
   const terminalBuffers = new Map<string, () => string>()
+  const terminalSnapshots = new Map<string, () => TerminalSurfaceSnapshot | null>()
   const terminalModes = new Map<string, () => {
     mouseTrackingMode: 'none' | 'x10' | 'vt200' | 'drag' | 'any'
     bracketedPasteMode: boolean
@@ -147,6 +168,9 @@ export function installTestHarness(
     },
     isAllFreshAgentNetworkEffectsSuppressed: () => suppressAllFreshAgentNetworkEffects,
     getRegisteredTerminalIds: () => [...terminalBuffers.keys()],
+    getTerminalSnapshot: terminalId => terminalSnapshots.get(terminalId)?.() ?? null,
+    registerTerminalSnapshot: (terminalId, accessor) => { terminalSnapshots.set(terminalId, accessor) },
+    unregisterTerminalSnapshot: terminalId => { terminalSnapshots.delete(terminalId) },
     getTerminalBuffer: (terminalId?: string) => {
       if (terminalId) {
         const accessor = terminalBuffers.get(terminalId)

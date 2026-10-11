@@ -41,6 +41,7 @@ import {
 } from '../helpers/managed-runtime.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TestHarness } from '../helpers/test-harness.js'
+import { providerStageResponse, sequenceProviderResponse } from '../helpers/provider-response-sequencing.js'
 
 const LIVE_ENV = 'FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE'
 const AMPLIFIER_MODEL = 'glm-5.3'
@@ -167,14 +168,6 @@ async function waitForValue<T>(
   throw new Error(`timed out waiting for ${description}${suffix}`)
 }
 
-async function terminalBuffer(page: Page, terminalId: string): Promise<string> {
-  return page.evaluate((id) => window.__FRESHELL_TEST_HARNESS__?.getTerminalBuffer?.(id) ?? '', terminalId)
-}
-
-function occurrences(value: string, needle: string): number {
-  return value.split(needle).length - 1
-}
-
 function regexEscape(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
@@ -183,22 +176,63 @@ async function executeAndAwaitNonceOutput(
   page: Page,
   paneId: string,
   terminalId: string,
-  command: string,
   nonce: string,
+  stage: 'initial' | 'after_host' | 'after_provider',
+  priorStreamId?: string,
+  nativeSessionId?: string,
   timeoutMs = 240_000,
-): Promise<void> {
-  const before = occurrences(await terminalBuffer(page, terminalId), nonce)
-  const expectedIncrease = command.includes(nonce) ? 2 : 1
+): Promise<string> {
+  const response = providerStageResponse(nonce, stage, randomBytes(8).toString('hex'), stage === 'initial')
   const terminal = page.locator(`[data-pane-id="${paneId}"] .xterm:visible`).last()
-  await terminal.waitFor({ state: 'visible', timeout: 90_000 })
-  await terminal.click()
-  await page.keyboard.insertText(command)
-  await page.keyboard.press('Enter')
-  // This is only a sequencing signal. The stopped provider-native transcript,
-  // not terminal output or occurrence count, is the qualification authority.
-  await waitForValue('provider response sequencing signal', async () => (
-    occurrences(await terminalBuffer(page, terminalId), nonce) >= before + expectedIncrease ? true : null
-  ), timeoutMs)
+  let diagnostics: unknown = null
+  return sequenceProviderResponse({
+    paneId, terminalId, response, priorStreamId, nativeSessionId, timeoutMs,
+    waitFor: waitForValue,
+    read: async () => {
+      const sampled = await page.evaluate(({ id, nonce, expected }) => {
+        const harness = window.__FRESHELL_TEST_HARNESS__
+        const snapshot = harness?.getTerminalSnapshot?.(id) ?? null
+        const writes = (harness?.getTerminalWriteEvents?.() ?? []).filter(event => event.terminalId === id)
+        const messages = (harness?.getReceivedWsMessages?.() ?? []) as Array<Record<string, unknown>>
+        const count = (text: string, value: string) => text.split(value).length - 1
+        return {
+          snapshot: snapshot && { ...snapshot, wsReady: harness?.getWsReadyState() === 'ready' },
+          diagnostics: {
+            registeredTerminalIds: harness?.getRegisteredTerminalIds().slice(0, 16) ?? [],
+            modes: harness?.getTerminalModes(id) ?? null,
+            nonceCount: count(snapshot?.text ?? '', nonce),
+            expectedCount: count(snapshot?.text ?? '', expected),
+            expectedCountIgnoringLineBreaks: count((snapshot?.text ?? '').replaceAll('\n', ''), expected),
+            writeTotals: ['submitted', 'written'].map(phase => {
+              const events = writes.filter(event => event.phase === phase)
+              return { phase, count: events.length, chars: events.reduce((sum, event) => sum + event.chars, 0),
+                latestAt: events.at(-1)?.at ?? null }
+            }),
+            writes: writes.slice(-8).map(({ phase, chars, at, paneId }) => ({ phase, chars, at, paneId })),
+            received: messages.filter(message => message.terminalId === id).slice(-8).map(message => ({
+              type: message.type, streamId: message.streamId, attachRequestId: message.attachRequestId,
+              seq: message.seq, seqStart: message.seqStart, seqEnd: message.seqEnd,
+            })),
+          },
+        }
+      }, { id: terminalId, nonce, expected: response.expected })
+      diagnostics = sampled.diagnostics
+      return sampled.snapshot
+    },
+    prepare: async command => {
+      await terminal.waitFor({ state: 'visible', timeout: 90_000 })
+      await terminal.click()
+      await page.keyboard.insertText(command)
+    },
+    submit: () => page.keyboard.press('Enter'),
+    report: (phase, snapshot) => {
+      const surface = snapshot && (({ text: _text, ...metadata }) => metadata)(snapshot)
+      // Cloud stdout already survives owner cleanup. Keep one bounded, body-free
+      // record at each boundary; neither record certifies native completion.
+      console.log(JSON.stringify({ severity: phase === 'timeout' ? 'error' : 'info',
+        event: 'provider_browser.response_sequence', stage, phase, paneId, terminalId, surface, diagnostics }))
+    },
+  })
 }
 
 async function paneNativeId(
@@ -288,12 +322,8 @@ async function qualifyProvider(
   expect(exactLimits.swapMax).toBe('0')
 
   const nonce = `codename-${randomBytes(16).toString('hex')}`
-  await executeAndAwaitNonceOutput(
-    page,
-    created.paneId,
-    created.terminalId,
-    `The private project codename for this conversation is ${nonce}. Without using tools or files, what codename did I just give you?`,
-    nonce,
+  const initialStreamId = await executeAndAwaitNonceOutput(
+    page, created.paneId, created.terminalId, nonce, 'initial',
   )
   const nativeSessionId = await waitForValue('exact native session id', async () => (
     await paneNativeId(harness, tabId, created.paneId, definition.provider)
@@ -312,12 +342,8 @@ async function qualifyProvider(
   expect(afterHostLoss.nativeSessionId).toBe(nativeSessionId)
   expect((await rig.ownedContainerState(initialEnclosure)).running).toBe(false)
 
-  await executeAndAwaitNonceOutput(
-    page,
-    created.paneId,
-    created.terminalId,
-    'Without using tools or files, what private project codename did I give you earlier?',
-    nonce,
+  const hostStreamId = await executeAndAwaitNonceOutput(
+    page, created.paneId, created.terminalId, nonce, 'after_host', initialStreamId, nativeSessionId,
   )
 
   if (!afterHostLoss.containerId) throw new Error('host-loss replacement has no owned container')
@@ -333,11 +359,7 @@ async function qualifyProvider(
   expect((await rig.ownedContainerState(hostLossEnclosure)).running).toBe(false)
 
   await executeAndAwaitNonceOutput(
-    page,
-    created.paneId,
-    created.terminalId,
-    'Please remind me of the private project codename from the start of this same conversation. Do not use tools or files.',
-    nonce,
+    page, created.paneId, created.terminalId, nonce, 'after_provider', hostStreamId, nativeSessionId,
   )
 
   const snapshot = await rig.inventorySnapshot()
