@@ -2739,7 +2739,7 @@ fn qualified_snapshot_stores(
         native_bucket.join("objects"),
         workspace_objects.to_path_buf(),
     ] {
-        match fs::symlink_metadata(&path) {
+        match snapshot_symlink_metadata(&path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error.into()),
             Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
@@ -2751,7 +2751,7 @@ fn qualified_snapshot_stores(
         }
         // Every component must resolve as written, so a retained store cannot
         // silently redirect into an unrelated location.
-        if path.canonicalize()? != path {
+        if snapshot_canonicalize(&path)? != path {
             return Err(TransferError::Blocked(
                 "qualified snapshot store contains a redirected component".into(),
             ));
@@ -2770,7 +2770,7 @@ fn qualified_snapshot_stores(
                     .ok_or_else(|| {
                         TransferError::Blocked("snapshot alternate lacks source context".into())
                     })?;
-                let alternate = alternate.canonicalize()?;
+                let alternate = snapshot_canonicalize(&alternate)?;
                 if !alternate.starts_with(qualified_workspace) {
                     return Err(TransferError::Blocked(
                         "saved snapshot alternate is outside its qualified source repository"
@@ -2991,15 +2991,30 @@ impl SnapshotPackedDecoders {
         // directory/file identity, pack metadata and alternate/config bytes.
         let started = Instant::now();
         let inspected = (|| {
+            #[cfg(test)]
+            if snapshot_reuse_test_hooks::STATE.with(|state| state.borrow().legacy_observation) {
+                if let Some((native, workspace, qualified)) = &self.context {
+                    if qualified_snapshot_stores(native, workspace)? != *qualified {
+                        self.finish()?;
+                        return Err(TransferError::Blocked(
+                            "packed snapshot source context changed during its current read".into(),
+                        ));
+                    }
+                }
+                return legacy_snapshot_packed_storage(stores);
+            }
             if let Some((native, workspace, qualified)) = &self.context {
-                if qualified_snapshot_stores(native, workspace)? != *qualified {
+                let (current, stamps) = observe_current_snapshot_sources(native, workspace)?;
+                if current != *qualified {
                     self.finish()?;
                     return Err(TransferError::Blocked(
                         "packed snapshot source context changed during its current read".into(),
                     ));
                 }
+                Ok(stamps)
+            } else {
+                snapshot_packed_storage(stores)
             }
-            snapshot_packed_storage(stores)
         })();
         self.costs.fresh_inspections = self.costs.fresh_inspections.saturating_add(1);
         self.costs.fresh_inspection_us = self
@@ -3090,7 +3105,7 @@ impl SnapshotPackedDecoders {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct SnapshotStorageStamp {
     path: PathBuf,
     len: u64,
@@ -3102,11 +3117,323 @@ struct SnapshotStorageStamp {
     context_bytes: Option<String>,
 }
 
+// These wrappers keep test counts at the actual acquisition boundary. They
+// retain no path, metadata, bytes or absence after the caller's fresh query.
+fn snapshot_symlink_metadata(path: impl AsRef<Path>) -> io::Result<fs::Metadata> {
+    #[cfg(test)]
+    snapshot_reuse_test_hooks::count_filesystem("fs_lstat");
+    fs::symlink_metadata(path)
+}
+
+fn snapshot_canonicalize(path: impl AsRef<Path>) -> io::Result<PathBuf> {
+    #[cfg(test)]
+    snapshot_reuse_test_hooks::count_filesystem("fs_canonicalize");
+    fs::canonicalize(path)
+}
+
+fn snapshot_resolved_metadata(path: impl AsRef<Path>) -> io::Result<fs::Metadata> {
+    #[cfg(test)]
+    snapshot_reuse_test_hooks::count_filesystem("fs_stat");
+    fs::metadata(path)
+}
+
+fn snapshot_read_context(path: impl AsRef<Path>) -> io::Result<String> {
+    #[cfg(test)]
+    snapshot_reuse_test_hooks::count_filesystem("fs_read");
+    fs::read_to_string(path)
+}
+
+fn snapshot_read_directory(path: impl AsRef<Path>) -> io::Result<fs::ReadDir> {
+    #[cfg(test)]
+    snapshot_reuse_test_hooks::count_filesystem("fs_read_dir");
+    fs::read_dir(path)
+}
+
 fn snapshot_storage_stamp(
     path: PathBuf,
     context_bytes: Option<String>,
 ) -> Result<SnapshotStorageStamp, TransferError> {
-    let metadata = fs::symlink_metadata(&path)?;
+    let metadata = snapshot_symlink_metadata(&path)?;
+    Ok(snapshot_storage_stamp_from_metadata(
+        path,
+        &metadata,
+        context_bytes,
+    ))
+}
+
+fn snapshot_storage_stamp_from_metadata(
+    path: PathBuf,
+    metadata: &fs::Metadata,
+    context_bytes: Option<String>,
+) -> SnapshotStorageStamp {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    SnapshotStorageStamp {
+        path,
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        created: metadata.created().ok(),
+        readonly: metadata.permissions().readonly(),
+        #[cfg(unix)]
+        identity: (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+            metadata.mode(),
+        ),
+        context_bytes,
+    }
+}
+
+fn snapshot_metadata_matches(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    snapshot_storage_stamp_from_metadata(PathBuf::new(), left, None)
+        == snapshot_storage_stamp_from_metadata(PathBuf::new(), right, None)
+}
+
+fn snapshot_packed_storage(stores: &[PathBuf]) -> Result<Vec<SnapshotStorageStamp>, TransferError> {
+    let mut stamps = Vec::new();
+    for store in stores {
+        let observed = observe_snapshot_store(store, false)?.unwrap();
+        let alternates = observe_snapshot_context(&store.join("info/alternates"))?;
+        append_snapshot_storage(&observed, &alternates, &mut stamps)?;
+    }
+    Ok(stamps)
+}
+
+// Observations live only through one current query. Previous decoder stamps
+// are comparison targets; they never supply a current binding or file body.
+struct SnapshotObservedPath {
+    path: PathBuf,
+    canonical: PathBuf,
+    metadata: fs::Metadata,
+}
+
+struct SnapshotObservedContext {
+    path: PathBuf,
+    observed: Option<(fs::Metadata, String)>,
+}
+
+fn observe_snapshot_store(
+    path: &Path,
+    allow_absent: bool,
+) -> Result<Option<SnapshotObservedPath>, TransferError> {
+    let metadata = match snapshot_symlink_metadata(path) {
+        Err(error) if allow_absent && error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(metadata) => metadata,
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(TransferError::Blocked(
+            "qualified snapshot object store is not a directory".into(),
+        ));
+    }
+    let canonical = snapshot_canonicalize(path)?;
+    if canonical != path {
+        return Err(TransferError::Blocked(
+            "qualified snapshot store contains a redirected component".into(),
+        ));
+    }
+    #[cfg(test)]
+    snapshot_reuse_test_hooks::observation_barrier("store_binding", path);
+    Ok(Some(SnapshotObservedPath {
+        path: path.to_path_buf(),
+        canonical,
+        metadata,
+    }))
+}
+
+fn observe_snapshot_context(path: &Path) -> Result<SnapshotObservedContext, TransferError> {
+    let metadata = match snapshot_symlink_metadata(path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(TransferError::Blocked(format!(
+                "Git alternate metadata is unavailable: {error}"
+            )))
+        }
+    };
+    let observed = if let Some(metadata) = metadata {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(TransferError::Blocked(
+                "Git alternate metadata is not a regular file".into(),
+            ));
+        }
+        let bytes = snapshot_read_context(path).map_err(|error| {
+            TransferError::Blocked(format!("Git alternate metadata cannot be read: {error}"))
+        })?;
+        Some((metadata, bytes))
+    } else {
+        None
+    };
+    #[cfg(test)]
+    snapshot_reuse_test_hooks::observation_barrier("context_bytes", path);
+    Ok(SnapshotObservedContext {
+        path: path.to_path_buf(),
+        observed,
+    })
+}
+
+fn finish_snapshot_context(
+    observed: &SnapshotObservedContext,
+) -> Result<Option<SnapshotStorageStamp>, TransferError> {
+    let current = match snapshot_symlink_metadata(&observed.path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    match (&observed.observed, current) {
+        (None, None) => Ok(None),
+        (Some((metadata, bytes)), Some(current))
+            if snapshot_metadata_matches(metadata, &current) =>
+        {
+            Ok(Some(snapshot_storage_stamp_from_metadata(
+                observed.path.clone(),
+                &current,
+                Some(bytes.clone()),
+            )))
+        }
+        _ => Err(TransferError::Blocked(
+            "snapshot context changed during its current observation".into(),
+        )),
+    }
+}
+
+fn append_snapshot_storage(
+    store: &SnapshotObservedPath,
+    alternates: &SnapshotObservedContext,
+    stamps: &mut Vec<SnapshotStorageStamp>,
+) -> Result<(), TransferError> {
+    let git_dir = store.path.parent().ok_or_else(|| {
+        TransferError::Blocked("snapshot store lacks native Git directory".into())
+    })?;
+    // Keep the final canonical check followed by current lexical metadata.
+    // This same guarded result supplies the full stamp without another lstat.
+    let canonical = snapshot_canonicalize(&store.path)?;
+    #[cfg(test)]
+    snapshot_reuse_test_hooks::observation_barrier("store_final_binding", &store.path);
+    let current = snapshot_symlink_metadata(&store.path)?;
+    if !current.is_dir()
+        || current.file_type().is_symlink()
+        || canonical != store.canonical
+        || !snapshot_metadata_matches(&store.metadata, &current)
+    {
+        return Err(TransferError::Blocked(
+            "qualified snapshot store changed during its current observation".into(),
+        ));
+    }
+    stamps.push(snapshot_storage_stamp(git_dir.to_path_buf(), None)?);
+    stamps.push(snapshot_storage_stamp_from_metadata(
+        store.path.clone(),
+        &current,
+        None,
+    ));
+    for path in [git_dir.join("config"), git_dir.join("commondir")] {
+        if let Some(stamp) = finish_snapshot_context(&observe_snapshot_context(&path)?)? {
+            stamps.push(stamp);
+        }
+    }
+    if let Some(stamp) = finish_snapshot_context(alternates)? {
+        stamps.push(stamp);
+    }
+    let Some(pack) = observe_git_storage_path(
+        git_dir,
+        &store.path.join("pack"),
+        "Git pack directory",
+        true,
+    )?
+    else {
+        return Ok(());
+    };
+    stamps.push(snapshot_storage_stamp_from_metadata(
+        store.path.join("pack"),
+        &pack.metadata,
+        None,
+    ));
+    let mut files = snapshot_read_directory(&pack.canonical)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()?;
+    files.sort();
+    for path in files {
+        let observed = observe_git_storage_path(git_dir, &path, "Git pack file", false)?;
+        // Enumeration followed by disappearance still refuses, as the old
+        // stamp acquisition did, rather than silently dropping a pack entry.
+        let observed = observed.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "Git pack file is unavailable")
+        })?;
+        stamps.push(snapshot_storage_stamp_from_metadata(
+            path,
+            &observed.metadata,
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn observe_current_snapshot_sources(
+    native_bucket: &Path,
+    workspace_objects: &Path,
+) -> Result<(Vec<PathBuf>, Vec<SnapshotStorageStamp>), TransferError> {
+    let mut stores = Vec::new();
+    let mut stamps = Vec::new();
+    for path in [
+        native_bucket.join("objects"),
+        workspace_objects.to_path_buf(),
+    ] {
+        let Some(primary) = observe_snapshot_store(&path, true)? else {
+            continue;
+        };
+        let alternates = observe_snapshot_context(&path.join("info/alternates"))?;
+        if let Some((_, bytes)) = &alternates.observed {
+            for alternate in bytes.lines().filter(|line| !line.trim().is_empty()) {
+                let alternate = PathBuf::from(alternate);
+                let alternate = if alternate.is_absolute() {
+                    alternate
+                } else {
+                    path.join(alternate)
+                };
+                let qualified_workspace = workspace_objects
+                    .parent()
+                    .and_then(Path::parent)
+                    .ok_or_else(|| {
+                        TransferError::Blocked("snapshot alternate lacks source context".into())
+                    })?;
+                let alternate = snapshot_canonicalize(&alternate)?;
+                if !alternate.starts_with(qualified_workspace) {
+                    return Err(TransferError::Blocked(
+                        "saved snapshot alternate is outside its qualified source repository"
+                            .into(),
+                    ));
+                }
+                let nested = observe_snapshot_context(&alternate.join("info/alternates"))?;
+                if nested
+                    .observed
+                    .as_ref()
+                    .is_some_and(|(_, bytes)| bytes.lines().any(|line| !line.trim().is_empty()))
+                {
+                    return Err(TransferError::Blocked(
+                        "nested saved snapshot alternates are unsupported".into(),
+                    ));
+                }
+                let alternate_observation = observe_snapshot_store(&alternate, false)?.unwrap();
+                append_snapshot_storage(&alternate_observation, &nested, &mut stamps)?;
+                stores.push(alternate);
+            }
+        }
+        append_snapshot_storage(&primary, &alternates, &mut stamps)?;
+        stores.push(path);
+    }
+    Ok((stores, stamps))
+}
+
+// Executed pre-sharing acquisition sequence, retained only as a behavioral
+// reference for complete stamps, exports and actual filesystem-operation cost.
+#[cfg(test)]
+fn legacy_snapshot_storage_stamp(
+    path: PathBuf,
+    context_bytes: Option<String>,
+) -> Result<SnapshotStorageStamp, TransferError> {
+    let metadata = snapshot_symlink_metadata(&path)?;
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
     Ok(SnapshotStorageStamp {
@@ -3127,30 +3454,33 @@ fn snapshot_storage_stamp(
     })
 }
 
-fn snapshot_packed_storage(stores: &[PathBuf]) -> Result<Vec<SnapshotStorageStamp>, TransferError> {
+#[cfg(test)]
+fn legacy_snapshot_packed_storage(
+    stores: &[PathBuf],
+) -> Result<Vec<SnapshotStorageStamp>, TransferError> {
     let mut stamps = Vec::new();
     for store in stores {
         let git_dir = store.parent().ok_or_else(|| {
             TransferError::Blocked("snapshot store lacks native Git directory".into())
         })?;
-        let metadata = fs::symlink_metadata(store)?;
+        let metadata = snapshot_symlink_metadata(store)?;
         if !metadata.is_dir()
             || metadata.file_type().is_symlink()
-            || store.canonicalize()? != *store
+            || snapshot_canonicalize(store)? != *store
         {
             return Err(TransferError::Blocked(
                 "qualified snapshot store contains a redirected component".into(),
             ));
         }
-        stamps.push(snapshot_storage_stamp(git_dir.to_path_buf(), None)?);
-        stamps.push(snapshot_storage_stamp(store.clone(), None)?);
+        stamps.push(legacy_snapshot_storage_stamp(git_dir.to_path_buf(), None)?);
+        stamps.push(legacy_snapshot_storage_stamp(store.clone(), None)?);
         for path in [
             git_dir.join("config"),
             git_dir.join("commondir"),
             store.join("info/alternates"),
         ] {
             if let Some(bytes) = read_alternates_file(&path)? {
-                stamps.push(snapshot_storage_stamp(path, Some(bytes))?);
+                stamps.push(legacy_snapshot_storage_stamp(path, Some(bytes))?);
             }
         }
         let Some(pack) =
@@ -3158,14 +3488,14 @@ fn snapshot_packed_storage(stores: &[PathBuf]) -> Result<Vec<SnapshotStorageStam
         else {
             continue;
         };
-        stamps.push(snapshot_storage_stamp(store.join("pack"), None)?);
-        let mut files = fs::read_dir(pack)?
+        stamps.push(legacy_snapshot_storage_stamp(store.join("pack"), None)?);
+        let mut files = snapshot_read_directory(pack)?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<Result<Vec<_>, _>>()?;
         files.sort();
         for path in files {
             checked_git_storage_path(git_dir, &path, "Git pack file", false)?;
-            stamps.push(snapshot_storage_stamp(path, None)?);
+            stamps.push(legacy_snapshot_storage_stamp(path, None)?);
         }
     }
     Ok(stamps)
@@ -3982,18 +4312,48 @@ mod snapshot_reuse_test_hooks {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
 
+    type ObservationBarrier = Box<dyn FnMut(&str, &std::path::Path)>;
+
     #[derive(Default)]
     pub(super) struct State {
         pub counts: BTreeMap<&'static str, usize>,
+        pub filesystem_counts: BTreeMap<&'static str, usize>,
         pub budget: Option<usize>,
         #[cfg_attr(not(unix), allow(dead_code))]
         pub aggregate_disabled: bool,
         pub before_reference: Option<Box<dyn FnMut(usize)>>,
         pub references: usize,
+        pub legacy_observation: bool,
+        pub observation_barrier: Option<ObservationBarrier>,
         pub closure_bound: Option<u64>,
     }
     thread_local! {
         pub(super) static STATE: RefCell<State> = RefCell::new(State::default());
+    }
+    pub(super) fn count_filesystem(operation: &'static str) {
+        STATE.with(|state| {
+            *state
+                .borrow_mut()
+                .filesystem_counts
+                .entry(operation)
+                .or_default() += 1
+        });
+    }
+    #[cfg(unix)]
+    pub(super) fn take_observation_counts() -> BTreeMap<&'static str, usize> {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let mut counts = std::mem::take(&mut state.counts);
+            counts.append(&mut state.filesystem_counts);
+            counts
+        })
+    }
+    pub(super) fn observation_barrier(phase: &str, path: &std::path::Path) {
+        let callback = STATE.with(|state| state.borrow_mut().observation_barrier.take());
+        if let Some(mut callback) = callback {
+            callback(phase, path);
+            STATE.with(|state| state.borrow_mut().observation_barrier = Some(callback));
+        }
     }
     pub(super) fn before_reference() {
         STATE.with(|state| {
@@ -5397,7 +5757,7 @@ mod workspace_metadata_test_hooks {
 }
 
 fn read_alternates_file(path: &Path) -> Result<Option<String>, TransferError> {
-    let metadata = match fs::symlink_metadata(path) {
+    let metadata = match snapshot_symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -5411,7 +5771,7 @@ fn read_alternates_file(path: &Path) -> Result<Option<String>, TransferError> {
             "Git alternate metadata is not a regular file".into(),
         ));
     }
-    fs::read_to_string(path).map(Some).map_err(|error| {
+    snapshot_read_context(path).map(Some).map_err(|error| {
         TransferError::Blocked(format!("Git alternate metadata cannot be read: {error}"))
     })
 }
@@ -5425,13 +5785,17 @@ fn checked_git_store_directory(
         .ok_or_else(|| TransferError::Blocked(format!("{label} is unavailable")))
 }
 
-fn checked_git_storage_path(
+// Native storage needs both a guarded binding and its lexical stamp. On
+// exact paths the final lstat proves kind and supplies that stamp, so another
+// resolved stat is redundant. Redirected-but-contained components retain the
+// independent resolved-kind check and lexical stamp.
+fn observe_git_storage_path(
     mount: &Path,
     path: &Path,
     label: &str,
     expect_directory: bool,
-) -> Result<Option<PathBuf>, TransferError> {
-    let metadata = match fs::symlink_metadata(path) {
+) -> Result<Option<SnapshotObservedPath>, TransferError> {
+    let metadata = match snapshot_symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -5445,30 +5809,91 @@ fn checked_git_storage_path(
             "{label} is a symbolic link"
         )));
     }
-    let canonical = fs::canonicalize(path)
+    let canonical = snapshot_canonicalize(path)
         .map_err(|error| TransferError::Blocked(format!("{label} cannot be resolved: {error}")))?;
     if !canonical.starts_with(mount) {
         return Err(TransferError::Blocked(format!(
             "{label} is outside the exact managed workspace mount"
         )));
     }
-    let resolved_metadata = fs::metadata(&canonical)
-        .map_err(|error| TransferError::Blocked(format!("{label} is unavailable: {error}")))?;
-    let expected_type_matches = if expect_directory {
-        resolved_metadata.is_dir()
-    } else {
-        resolved_metadata.is_file()
-    };
-    if !expected_type_matches {
+    let resolved =
+        if canonical == path {
+            None
+        } else {
+            Some(snapshot_resolved_metadata(&canonical).map_err(|error| {
+                TransferError::Blocked(format!("{label} is unavailable: {error}"))
+            })?)
+        };
+    #[cfg(test)]
+    snapshot_reuse_test_hooks::observation_barrier("pack_binding", path);
+    let current = snapshot_symlink_metadata(path)?;
+    if !snapshot_metadata_matches(&metadata, &current) {
         return Err(TransferError::Blocked(format!(
-            "{label} is not a {}",
-            if expect_directory {
-                "directory"
-            } else {
-                "regular file"
-            }
+            "{label} changed during its current observation"
         )));
     }
+    let kind_metadata = resolved.as_ref().unwrap_or(&current);
+    check_git_storage_kind(kind_metadata, label, expect_directory)?;
+    Ok(Some(SnapshotObservedPath {
+        path: path.to_path_buf(),
+        canonical,
+        metadata: current,
+    }))
+}
+
+fn check_git_storage_kind(
+    metadata: &fs::Metadata,
+    label: &str,
+    expect_directory: bool,
+) -> Result<(), TransferError> {
+    let expected_type_matches = if expect_directory {
+        metadata.is_dir()
+    } else {
+        metadata.is_file()
+    };
+    if expected_type_matches {
+        return Ok(());
+    }
+    Err(TransferError::Blocked(format!(
+        "{label} is not a {}",
+        if expect_directory {
+            "directory"
+        } else {
+            "regular file"
+        }
+    )))
+}
+
+fn checked_git_storage_path(
+    mount: &Path,
+    path: &Path,
+    label: &str,
+    expect_directory: bool,
+) -> Result<Option<PathBuf>, TransferError> {
+    let metadata = match snapshot_symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(TransferError::Blocked(format!(
+                "{label} is unavailable: {error}"
+            )))
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(TransferError::Blocked(format!(
+            "{label} is a symbolic link"
+        )));
+    }
+    let canonical = snapshot_canonicalize(path)
+        .map_err(|error| TransferError::Blocked(format!("{label} cannot be resolved: {error}")))?;
+    if !canonical.starts_with(mount) {
+        return Err(TransferError::Blocked(format!(
+            "{label} is outside the exact managed workspace mount"
+        )));
+    }
+    let resolved_metadata = snapshot_resolved_metadata(&canonical)
+        .map_err(|error| TransferError::Blocked(format!("{label} is unavailable: {error}")))?;
+    check_git_storage_kind(&resolved_metadata, label, expect_directory)?;
     Ok(Some(canonical))
 }
 
@@ -8111,6 +8536,553 @@ mod native_source_inventory_tests {
                     0
                 );
             }
+        }
+    }
+
+    #[cfg(unix)]
+    fn observation_fixture() -> (ReuseFixture, Vec<PathBuf>, String, Vec<u8>) {
+        let fixture = reuse_fixture(true);
+        let (_, id, body) = packed_pressure_stores(&fixture);
+        let workspace = fixture.dir.path().join("workspace/.git");
+        fs::create_dir(&workspace).unwrap();
+        fixture_git(&workspace, &["init", "--bare", "-q"], None);
+        // An empty pack directory and a missing pack directory both participate
+        // in the complete ordered current plan, including duplicate locations.
+        let empty = fixture.dir.path().join("workspace/empty");
+        fs::create_dir(&empty).unwrap();
+        fixture_git(&empty, &["init", "--bare", "-q"], None);
+        let absent = fixture.dir.path().join("workspace/absent");
+        fs::create_dir(&absent).unwrap();
+        fixture_git(&absent, &["init", "--bare", "-q"], None);
+        fs::remove_dir(absent.join("objects/pack")).unwrap();
+        fs::write(absent.join("objects/info/alternates"), "\n").unwrap();
+        let file = fixture.store.join("info/alternates");
+        let mut alternates = fs::read_to_string(&file).unwrap();
+        alternates.push_str(&format!(
+            "{}\n{}\n{}\n",
+            empty.join("objects").display(),
+            absent.join("objects").display(),
+            empty.join("objects").display()
+        ));
+        fs::write(file, alternates).unwrap();
+        fs::write(fixture.store.parent().unwrap().join("commondir"), ".\n").unwrap();
+        let stores =
+            qualified_snapshot_stores(fixture.store.parent().unwrap(), &workspace.join("objects"))
+                .unwrap();
+        assert_eq!(stores.len(), 10);
+        (fixture, stores, id, body)
+    }
+
+    #[cfg(unix)]
+    fn observation_operation_count(counts: &BTreeMap<&'static str, usize>) -> usize {
+        [
+            "fs_lstat",
+            "fs_canonicalize",
+            "fs_stat",
+            "fs_read",
+            "fs_read_dir",
+        ]
+        .iter()
+        .map(|key| counts.get(key).copied().unwrap_or(0))
+        .sum()
+    }
+
+    #[cfg(unix)]
+    fn observation_reader(
+        fixture: &ReuseFixture,
+        stores: &[PathBuf],
+        id: &str,
+        body: &[u8],
+        legacy: bool,
+    ) -> (Vec<SnapshotStorageStamp>, BTreeMap<&'static str, usize>) {
+        snapshot_reuse_test_hooks::STATE.with(|state| {
+            *state.borrow_mut() = snapshot_reuse_test_hooks::State {
+                legacy_observation: legacy,
+                ..Default::default()
+            }
+        });
+        let mut decoders = SnapshotPackedDecoders::default();
+        decoders
+            .qualify(
+                fixture.store.parent().unwrap(),
+                &fixture.dir.path().join("workspace/.git/objects"),
+                stores,
+            )
+            .unwrap();
+        for _ in 0..4 {
+            let Some(SnapshotObjectSource::Packed { body: current, .. }) =
+                decoders.read(stores, id).unwrap()
+            else {
+                panic!("current real packed object");
+            };
+            assert_eq!(current, body);
+        }
+        assert_eq!(decoders.costs.fresh_inspections, 4);
+        assert_eq!(decoders.costs.native_queries, 4);
+        let storage = decoders.storage.take().unwrap();
+        decoders.finish().unwrap();
+        let counts = snapshot_reuse_test_hooks::take_observation_counts();
+        assert_eq!(counts["packed_validate"], 4);
+        assert_eq!(counts["packed_spawn"], counts["packed_reap"]);
+        assert_eq!(counts["packed_drain_spawn"], counts["packed_drain_join"]);
+        (storage, counts)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_snapshot_observation_shares_actual_filesystem_acquisitions() {
+        let (fixture, stores, id, body) = observation_fixture();
+        let reference_plan = qualified_snapshot_stores(
+            fixture.store.parent().unwrap(),
+            &fixture.dir.path().join("workspace/.git/objects"),
+        )
+        .unwrap();
+        assert_eq!(stores, reference_plan);
+        let reference_stamps = legacy_snapshot_packed_storage(&stores).unwrap();
+        let (fresh_plan, fresh_stamps) = observe_current_snapshot_sources(
+            fixture.store.parent().unwrap(),
+            &fixture.dir.path().join("workspace/.git/objects"),
+        )
+        .unwrap();
+        assert_eq!(fresh_plan, reference_plan);
+        assert_eq!(fresh_stamps, reference_stamps);
+        let (old_stamps, old_counts) = observation_reader(&fixture, &stores, &id, &body, true);
+        let (new_stamps, new_counts) = observation_reader(&fixture, &stores, &id, &body, false);
+        assert_eq!(old_stamps, reference_stamps);
+        assert_eq!(
+            new_stamps, reference_stamps,
+            "all fields, paths, ordering, duplicate locations and context bytes remain current"
+        );
+        for key in [
+            "packed_query",
+            "packed_validate",
+            "packed_spawn",
+            "packed_reap",
+            "packed_drain_spawn",
+            "packed_drain_join",
+        ] {
+            assert_eq!(old_counts[key], new_counts[key], "{key}");
+        }
+        eprintln!("actual observation operations: legacy={old_counts:?} shared={new_counts:?}");
+        assert!(
+            observation_operation_count(&new_counts) < observation_operation_count(&old_counts),
+            "same-query duplicate filesystem acquisitions must decrease"
+        );
+    }
+
+    #[cfg(unix)]
+    fn observation_export(
+        fixture: &ReuseFixture,
+        legacy: bool,
+    ) -> (OpenCodeNativeSnapshot, BTreeMap<&'static str, usize>) {
+        snapshot_reuse_test_hooks::STATE.with(|state| {
+            *state.borrow_mut() = snapshot_reuse_test_hooks::State {
+                legacy_observation: legacy,
+                budget: Some(0),
+                ..Default::default()
+            }
+        });
+        let snapshot = export_exact_session(
+            &fixture.inventory,
+            "ses_exact",
+            ExportOptions::new(fixture.dir.path().join("extract")),
+        )
+        .unwrap();
+        let counts = snapshot_reuse_test_hooks::take_observation_counts();
+        (snapshot, counts)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_snapshot_observation_preserves_complete_native_export() {
+        let (fixture, _, _, _) = observation_fixture();
+        let (old, old_counts) = observation_export(&fixture, true);
+        let (new, new_counts) = observation_export(&fixture, false);
+        assert_eq!(
+            fs::read(&old.payload_path).unwrap(),
+            fs::read(&new.payload_path).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(old.manifest()).unwrap(),
+            serde_json::to_value(new.manifest()).unwrap()
+        );
+        assert_eq!(
+            source_graph_fingerprint(old.manifest()).unwrap(),
+            source_graph_fingerprint(new.manifest()).unwrap()
+        );
+        for key in [
+            "packed_query",
+            "packed_validate",
+            "packed_spawn",
+            "packed_reap",
+            "packed_drain_spawn",
+            "packed_drain_join",
+        ] {
+            assert_eq!(old_counts[key], new_counts[key], "{key}");
+        }
+        assert_eq!(new_counts["packed_query"], 30);
+        eprintln!(
+            "complete export actual observation operations: legacy={} shared={}",
+            observation_operation_count(&old_counts),
+            observation_operation_count(&new_counts)
+        );
+        assert!(
+            observation_operation_count(&new_counts) < observation_operation_count(&old_counts),
+            "full exports must use shared fresh acquisitions without losing native proof"
+        );
+        // Both actual payloads also pass the unchanged production snapshot
+        // installer and current closure reader, and ordinary native Git reads
+        // the installed tree. No fixture decoder substitutes for that read.
+        for (name, snapshot) in [("old", &old), ("new", &new)] {
+            let payload: serde_json::Value =
+                serde_json::from_slice(&fs::read(&snapshot.payload_path).unwrap()).unwrap();
+            let objects: Vec<SerializedSnapshotObject> =
+                serde_json::from_value(payload["snapshot_objects"].clone()).unwrap();
+            let destination = fixture.dir.path().join(name).join("opencode.db");
+            for object in &objects {
+                install_snapshot_object(object, &snapshot.manifest().saved_snapshots, &destination)
+                    .unwrap();
+            }
+            for reference in &snapshot.manifest().saved_snapshots {
+                let bucket = destination
+                    .parent()
+                    .unwrap()
+                    .join("snapshot")
+                    .join(&reference.project_id)
+                    .join(&reference.worktree_sha1);
+                let stores = qualified_snapshot_stores(&bucket, &bucket.join("objects")).unwrap();
+                let closure = read_snapshot_closure(&stores, &reference.tree)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    closure.keys().collect::<BTreeSet<_>>(),
+                    reference
+                        .objects
+                        .iter()
+                        .map(|object| &object.object_id)
+                        .collect::<BTreeSet<_>>()
+                );
+                assert_eq!(
+                    fixture_git(&bucket, &["cat-file", "-p", &reference.tree], None),
+                    fixture_git(
+                        fixture.store.parent().unwrap(),
+                        &["cat-file", "-p", &reference.tree],
+                        None
+                    )
+                );
+            }
+        }
+        assert_settled_native_fixture();
+    }
+
+    #[cfg(unix)]
+    fn observation_handoff_target(
+        fixture: &ReuseFixture,
+        stores: &[PathBuf],
+        mutation: &str,
+    ) -> (&'static str, PathBuf) {
+        match mutation {
+            "store_replace" | "store_redirect" => ("store_binding", fixture.store.clone()),
+            "store_final_permissions" => ("store_final_binding", fixture.store.clone()),
+            "pack_replace" | "pack_redirect" => ("pack_binding", fixture.store.join("pack")),
+            "index_replace" | "index_remove" | "next_pack_remove" => (
+                "pack_binding",
+                packed_file(&fixture.store).with_extension("idx"),
+            ),
+            "pack_file_replace" => ("pack_binding", packed_file(&fixture.store)),
+            "config_bytes" | "config_replace" | "config_remove" => (
+                "context_bytes",
+                fixture.store.parent().unwrap().join("config"),
+            ),
+            "common_absent" => (
+                "context_bytes",
+                stores[0].parent().unwrap().join("commondir"),
+            ),
+            "alternate_bytes" => ("context_bytes", fixture.store.join("info/alternates")),
+            "nested_absent" => ("context_bytes", stores[0].join("info/alternates")),
+            _ => panic!("unknown owned mutation"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn mutate_observation_handoff(path: &Path, mutation: &str) {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        match mutation {
+            "store_final_permissions" => {
+                let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+                fs::set_permissions(
+                    path,
+                    fs::Permissions::from_mode(if mode == 0o700 { 0o750 } else { 0o700 }),
+                )
+                .unwrap();
+            }
+            "store_replace" | "store_redirect" | "pack_replace" | "pack_redirect" => {
+                let original = path.with_extension("owned-original");
+                fs::rename(path, &original).unwrap();
+                if mutation.ends_with("redirect") {
+                    symlink(original, path).unwrap();
+                } else {
+                    fs::create_dir(path).unwrap();
+                }
+            }
+            "config_bytes" | "alternate_bytes" => {
+                let mut bytes = fs::read(path).unwrap();
+                bytes.extend_from_slice(if mutation == "config_bytes" {
+                    b"\n# unchanged effective config\n"
+                } else {
+                    b"\n"
+                });
+                fs::write(path, bytes).unwrap();
+            }
+            "common_absent" => fs::write(path, ".\n").unwrap(),
+            "nested_absent" => fs::write(path, "../outside\n").unwrap(),
+            "next_pack_remove" => fs::remove_file(path.with_extension("pack")).unwrap(),
+            "config_remove" | "index_remove" => fs::remove_file(path).unwrap(),
+            "index_replace" | "pack_file_replace" | "config_replace" => {
+                let replacement = path.with_extension("owned-replacement");
+                fs::copy(path, &replacement).unwrap();
+                fs::rename(replacement, path).unwrap();
+            }
+            _ => panic!("unknown owned mutation"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_snapshot_observation_refuses_binding_and_byte_handoff_mutations() {
+        for mutation in [
+            "store_replace",
+            "store_final_permissions",
+            "store_redirect",
+            "pack_replace",
+            "pack_redirect",
+            "index_replace",
+            "index_remove",
+            "next_pack_remove",
+            "pack_file_replace",
+            "config_bytes",
+            "config_replace",
+            "config_remove",
+            "common_absent",
+            "alternate_bytes",
+            "nested_absent",
+        ] {
+            let (fixture, stores, id, body) = observation_fixture();
+            snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+            let mut decoders = SnapshotPackedDecoders::default();
+            decoders
+                .qualify(
+                    fixture.store.parent().unwrap(),
+                    &fixture.dir.path().join("workspace/.git/objects"),
+                    &stores,
+                )
+                .unwrap();
+            let Some(SnapshotObjectSource::Packed { body: current, .. }) =
+                decoders.read(&stores, &id).unwrap()
+            else {
+                panic!("real warm packed query");
+            };
+            assert_eq!(current, body);
+            let (phase, target) = observation_handoff_target(&fixture, &stores, mutation);
+            let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+            let observed_calls = calls.clone();
+            snapshot_reuse_test_hooks::STATE.with(|state| {
+                state.borrow_mut().observation_barrier =
+                    Some(Box::new(move |current_phase, path| {
+                        if current_phase == phase && path == target && observed_calls.get() == 0 {
+                            observed_calls.set(1);
+                            mutate_observation_handoff(path, mutation);
+                        }
+                    }))
+            });
+            let result = decoders.read(&stores, &id);
+            assert_eq!(
+                calls.get(),
+                1,
+                "{mutation}: actual acquisition handoff executes"
+            );
+            assert!(
+                result.is_err(),
+                "{mutation}: changed binding or context must refuse before another native proof"
+            );
+            if mutation == "next_pack_remove" {
+                assert!(
+                    matches!(result, Err(TransferError::Io(_))),
+                    "an enumerated file that disappears must preserve its I/O refusal class"
+                );
+            }
+            assert_eq!(
+                decoders.costs.fresh_inspections, 2,
+                "{mutation}: still observes this query"
+            );
+            assert_eq!(
+                decoders.costs.native_queries, 1,
+                "{mutation}: no native query may follow a failed current observation"
+            );
+            decoders.finish().unwrap();
+            assert_settled_native_fixture();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_snapshot_observation_handoff_refuses_complete_bundle_publication() {
+        for mutation in [
+            "store_redirect",
+            "pack_file_replace",
+            "config_bytes",
+            "alternate_bytes",
+            "nested_absent",
+        ] {
+            let (fixture, stores, _, _) = observation_fixture();
+            let (phase, target) = observation_handoff_target(&fixture, &stores, mutation);
+            let warm = std::rc::Rc::new(std::cell::Cell::new(false));
+            let warmed = warm.clone();
+            let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+            let observed_calls = calls.clone();
+            snapshot_reuse_test_hooks::STATE.with(|state| {
+                *state.borrow_mut() = snapshot_reuse_test_hooks::State {
+                    before_reference: Some(Box::new(move |number| {
+                        if number == 2 {
+                            warmed.set(true);
+                        }
+                    })),
+                    observation_barrier: Some(Box::new(move |current_phase, path| {
+                        if warm.get()
+                            && current_phase == phase
+                            && path == target
+                            && observed_calls.get() == 0
+                        {
+                            observed_calls.set(1);
+                            mutate_observation_handoff(path, mutation);
+                        }
+                    })),
+                    ..Default::default()
+                }
+            });
+            let result = export_exact_session(
+                &fixture.inventory,
+                "ses_exact",
+                ExportOptions::new(fixture.dir.path().join("extract")),
+            );
+            assert_eq!(calls.get(), 1, "{mutation}");
+            assert!(
+                result.is_err(),
+                "{mutation}: no complete bundle with expired observation"
+            );
+            assert_eq!(
+                fs::read_dir(fixture.dir.path().join("extract"))
+                    .unwrap()
+                    .count(),
+                0,
+                "{mutation}: failed capture cannot publish even a partial bundle"
+            );
+            assert_settled_native_fixture();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_snapshot_observation_observes_warm_ordered_plan_drift_and_loose_precedence() {
+        for mutation in [
+            "store_absent",
+            "parent_redirect",
+            "pack_entry_directory",
+            "alternate_order",
+            "alternate_nested",
+            "alternate_outside",
+            "selected_loose",
+        ] {
+            let (fixture, stores, id, body) = observation_fixture();
+            if mutation == "parent_redirect" {
+                // The selected object lives in an alternate. An absent primary
+                // pack does not exempt that store's exact lexical binding.
+                fs::remove_dir_all(fixture.store.join("pack")).unwrap();
+            }
+            snapshot_reuse_test_hooks::STATE.with(|state| *state.borrow_mut() = Default::default());
+            let mut decoders = SnapshotPackedDecoders::default();
+            decoders
+                .qualify(
+                    fixture.store.parent().unwrap(),
+                    &fixture.dir.path().join("workspace/.git/objects"),
+                    &stores,
+                )
+                .unwrap();
+            let Some(SnapshotObjectSource::Packed { body: current, .. }) =
+                decoders.read(&stores, &id).unwrap()
+            else {
+                panic!("warm query");
+            };
+            assert_eq!(current, body);
+            match mutation {
+                "store_absent" => {
+                    fs::rename(&fixture.store, fixture.store.with_extension("owned-absent"))
+                        .unwrap()
+                }
+                "parent_redirect" => {
+                    let native = fixture.store.parent().unwrap();
+                    let original = native.with_extension("owned-original");
+                    fs::rename(native, &original).unwrap();
+                    std::os::unix::fs::symlink(original, native).unwrap();
+                }
+                "pack_entry_directory" => {
+                    fs::create_dir(fixture.store.join("pack/owned-entry")).unwrap()
+                }
+                "alternate_order" => {
+                    let file = fixture.store.join("info/alternates");
+                    let bytes = fs::read_to_string(&file).unwrap();
+                    fs::write(
+                        file,
+                        bytes
+                            .lines()
+                            .rev()
+                            .map(|line| format!("{line}\n"))
+                            .collect::<String>(),
+                    )
+                    .unwrap();
+                }
+                "alternate_nested" => fs::write(
+                    stores[0].join("info/alternates"),
+                    format!("{}\n", stores[1].display()),
+                )
+                .unwrap(),
+                "alternate_outside" => fs::write(
+                    fixture.store.join("info/alternates"),
+                    format!("{}\n", fixture.store.display()),
+                )
+                .unwrap(),
+                "selected_loose" => {
+                    let path = stores[0].join(&id[..2]).join(&id[2..]);
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    fs::write(
+                        path,
+                        compress_snapshot_object("blob", b"current wrong loose duplicate").unwrap(),
+                    )
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let result = decoders.read(&stores, &id);
+            if mutation == "selected_loose" {
+                let Some(SnapshotObjectSource::Loose(bytes)) = result.unwrap() else {
+                    panic!("current loose must precede warm pack");
+                };
+                assert!(
+                    decode_snapshot_object(&id, &bytes).is_err(),
+                    "wrong current loose body must fail native identity proof"
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "{mutation}: all current locations/context remain mandatory"
+                );
+            }
+            assert_eq!(
+                decoders.costs.native_queries, 1,
+                "{mutation}: no warm packed proof can bypass current state"
+            );
+            decoders.finish().unwrap();
+            assert_settled_native_fixture();
         }
     }
 
