@@ -9,11 +9,12 @@ import path from 'node:path'
 import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { createServer } from 'node:net'
 import { createServer as createHttpServer } from 'node:http'
+import tls from 'node:tls'
 import { DatabaseSync } from 'node:sqlite'
 import WebSocket, { WebSocketServer } from 'ws'
 import { RustServer } from '../../../e2e-browser/helpers/rust-server.js'
 import { RuntimeHarness, seedManagedOpenCodeSource, type SyntheticSource } from '../../../../scripts/testing/runtime-sandbox.js'
-import { dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
+import { openCodeFreeAccessScript, dispatchNativeFeasibility, nativeFeasibilityCases, parseNativeFeasibilityArguments,
   prepareOwnedOpenCodeTuiSource,
   openCodeTuiDisposalObserver,
   openCodeTuiSignalMetadata,
@@ -26,6 +27,12 @@ const imageDigest = `sha256:${'a'.repeat(64)}`
 const candidateSha = 'b'.repeat(40)
 const ownerId = 'unit-finite-child'
 const selection: NativeSelection = { mode: 'freshclaude', case: 'startup' }
+
+function receiverAccess(mode: string) {
+  return { tlsVerifyMode: 2, tlsCheckHostname: true, httpsStatus: mode === 'freshopencode' ? null : 200,
+    ...(mode === 'freshopencode' ? { freeModelAccess: { source: 'native-config-providers', providerId: 'opencode', modelId: 'big-pickle',
+      endpoint: 'https://unit-free.invalid/v1', ca: 'system-default', peerCertificateSha256: 'a'.repeat(64) } } : {}) }
+}
 
 describe('shared observed native solo Bash outcome', () => {
   it.each([true, false])('derives the actual result and effect after a browser decision (allow=%s)', async allowed => {
@@ -71,7 +78,47 @@ function createFixtureCheckout(directory: string): string {
 }
 
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
-  it.each(['codex', 'opencode', 'freshcodex', 'freshopencode'] as const)('routes actual current native turns through seed, replacement, recall and original capture (%s; controlled fixtures)', async mode => {
+  it.each(['valid', 'missing-api', 'wrong-provider', 'wrong-model', 'http-endpoint', 'credential-endpoint', 'grant-leak', 'credential-leak', 'ca-leak', 'proxy-leak', 'untrusted-tls'])('executes free native selected catalog/system-CA TLS access and refuses %s without a model request', async fault => {
+    const fixtureTls = path.join(process.cwd(), 'test/e2e-browser/fixtures/tls')
+    let handshakes = 0, modelPayloadBytes = 0
+    const upstream = tls.createServer({ key: fs.readFileSync(path.join(fixtureTls, fault === 'untrusted-tls' ? 'untrusted.key.pem' : 'localhost.key.pem')),
+      cert: fs.readFileSync(path.join(fixtureTls, fault === 'untrusted-tls' ? 'untrusted.cert.pem' : 'localhost.cert.pem')) }, socket => {
+      handshakes++; socket.on('data', bytes => { modelPayloadBytes += bytes.length }); socket.end()
+    })
+    upstream.on('tlsClientError', () => {})
+    await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve))
+    const endpoint = `${fault === 'http-endpoint' ? 'http' : 'https'}://${fault === 'credential-endpoint' ? 'private@' : ''}localhost:${(upstream.address() as { port: number }).port}/v1`
+    const requests: string[] = []
+    const catalog = createHttpServer((request, response) => {
+      requests.push(request.url!); expect(request.headers.authorization).toBeUndefined()
+      response.end(JSON.stringify({ providers: [{ id: 'opencode', models: { 'big-pickle': {
+        id: fault === 'wrong-model' ? 'paid-model' : 'big-pickle', providerID: fault === 'wrong-provider' ? 'openai' : 'opencode',
+        ...(fault === 'missing-api' ? {} : { api: { url: endpoint } }),
+      } } }] }))
+    })
+    await new Promise<void>(resolve => catalog.listen(0, '127.0.0.1', resolve))
+    const env = fault === 'grant-leak' ? { FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: '/unreadable/private' }
+      : fault === 'credential-leak' ? { OPENAI_API_KEY: 'unit-sentinel' } : fault === 'ca-leak' ? { NODE_EXTRA_CA_CERTS: '/unreadable/private' }
+        : fault === 'proxy-leak' ? { HTTPS_PROXY: 'http://unit.invalid' } : {}
+    // Substitute only this fixture's trust store; production always selects system CA.
+    const script = `import ssl,json,urllib.request,urllib.parse\n${openCodeFreeAccessScript().replace("ssl.create_default_context(cafile='/etc/ssl/certs/ca-certificates.crt')", `ssl.create_default_context(cafile=${JSON.stringify(path.join(fixtureTls, 'ca.cert.pem'))})`)}\ncontext,access=probe_free_opencode_access(urllib.request.build_opener(urllib.request.ProxyHandler({})),${(catalog.address() as { port: number }).port},'/owned/workspace',${JSON.stringify(env)})\nprint(json.dumps(dict(httpsStatus=None,tlsVerifyMode=context.verify_mode.value,tlsCheckHostname=context.check_hostname,freeModelAccess=access)))`
+    try {
+      const run = promisify(execFile)('python3', ['-c', script], { timeout: 5_000 })
+      if (fault === 'valid') {
+        const observed = JSON.parse((await run).stdout)
+        expect(observed).toMatchObject({ httpsStatus: null, tlsVerifyMode: 2, tlsCheckHostname: true,
+          freeModelAccess: { source: 'native-config-providers', endpoint, providerId: 'opencode', modelId: 'big-pickle', ca: 'system-default' } })
+        expect(observed.freeModelAccess.peerCertificateSha256).toMatch(/^[a-f0-9]{64}$/)
+        expect(handshakes).toBe(1)
+      } else await expect(run).rejects.toThrow()
+      expect(modelPayloadBytes).toBe(0)
+      expect(requests).toHaveLength(fault.endsWith('leak') ? 0 : 1)
+    } finally { await Promise.all([new Promise<void>(resolve => catalog.close(() => resolve())), new Promise<void>(resolve => upstream.close(() => resolve()))]) }
+  })
+  it.each([
+    ...(['codex', 'opencode', 'freshcodex', 'freshopencode'] as const).map(mode => [mode, 'valid'] as const),
+    ...(['wrong-provider', 'wrong-model', 'tool'] as const).map(fault => ['freshopencode', fault] as const),
+  ])('routes actual current native turns through seed, replacement, recall and original capture (%s, %s; controlled fixtures)', async (mode, fault) => {
     const terminal = mode === 'codex' || mode === 'opencode', provider = mode === 'codex' || mode === 'freshcodex' ? 'codex' : 'opencode'
     const directory = path.join('/tmp/frs', randomUUID().slice(0, 12)), evidenceDir = path.join(directory, 'evidence')
     fs.mkdirSync(evidenceDir, { recursive: true, mode: 0o700 })
@@ -92,8 +139,9 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       else {
         const db = new DatabaseSync(database), user = `user-${turnNumber}`
         db.prepare('INSERT INTO message(id,session_id,time_created,time_updated,data) VALUES (?,?,?,?,?)').run(user, root, completedAt, completedAt, JSON.stringify({ role: 'user' }))
-        db.prepare('INSERT INTO message(id,session_id,time_created,time_updated,data) VALUES (?,?,?,?,?)').run(messageId, root, completedAt + 1, completedAt + 1, JSON.stringify({ role: 'assistant', parentID: user, providerID: 'openai', modelID: 'gpt-5.6-luna', time: { completed: completedAt } }))
+        db.prepare('INSERT INTO message(id,session_id,time_created,time_updated,data) VALUES (?,?,?,?,?)').run(messageId, root, completedAt + 1, completedAt + 1, JSON.stringify({ role: 'assistant', parentID: user, providerID: fault === 'wrong-provider' ? 'openai' : mode === 'freshopencode' ? 'opencode' : 'openai', modelID: fault === 'wrong-model' ? 'paid-model' : mode === 'freshopencode' ? 'big-pickle' : 'gpt-5.6-luna', time: { completed: completedAt } }))
         for (const [id, content] of [[user, prompt], [messageId, response]]) db.prepare('INSERT INTO part(id,session_id,message_id,time_created,time_updated,data) VALUES (?,?,?,?,?,?)').run('part-' + id, root, id, completedAt, completedAt, JSON.stringify({ type: 'text', text: content }))
+        if (fault === 'tool') db.prepare('INSERT INTO part(id,session_id,message_id,time_created,time_updated,data) VALUES (?,?,?,?,?,?)').run('tool-' + messageId, root, messageId, completedAt, completedAt, JSON.stringify({ type: 'tool', tool: 'read', state: { status: 'completed', input: {}, output: 'fixture-only' } }))
         db.close()
       }
       return { data: { ...(provider === 'codex' ? { submittedTurnId: turnId } : {}) } }
@@ -144,15 +192,27 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
           return JSON.stringify({ nativeRoot: provider === 'codex' ? root : null, path: '/home/freshell/provider/owned-native-store', identity: ['1', '2', String(bytes.length)], sha256: createHash('sha256').update(bytes).digest('hex'), completeEof: true, bytesBase64: provider === 'codex' ? bytes.toString('base64') : null, querySnapshotBase64: provider === 'opencode' ? bytes.toString('base64') : null, querySnapshotSha256: createHash('sha256').update(bytes).digest('hex') })
         }
         if (args[2]?.includes('opencode-adoption-diagnostics')) return JSON.stringify({ current: { stage: 'publication_succeeded', registeredSlotCount: 2 } })
-        return JSON.stringify({ uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true, httpsStatus: 200, tlsVerifyMode: 2, tlsCheckHostname: true, nativeCwd: launchRequest.params.terminal?.cwd ?? launchRequest.params.freshAgent.cwd, nativePid: 55, nativeProcessCwd: launchRequest.params.terminal?.cwd, nativeVersion: provider === 'codex' ? 'codex-cli 0.147.0' : '1.18.21', nativeRoot: provider === 'codex' ? null : root, nativeMessageCount: sourceIds.length + turnNumber * 2, activeMessageIds: sourceIds, activeNativeProcesses: 1, executableSha256: provider === 'opencode' ? 'c9485f62576606dbde6404647405df2401fada964b7f669f799dc125dbbeff99' : 'e'.repeat(64), profileSha256: 'd'.repeat(64), nativeLaunch: { incarnationId: view().incarnationId, launchNonce: view().nativeIdentityObservation.launchNonce, evidenceRevision: view().nativeIdentityObservation.evidenceRevision, executionGeneration: view().executionGeneration } })
+        return JSON.stringify({ uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true,
+          ...receiverAccess(mode), nativeCwd: launchRequest.params.terminal?.cwd ?? launchRequest.params.freshAgent.cwd, nativePid: 55, nativeProcessCwd: launchRequest.params.terminal?.cwd, nativeVersion: provider === 'codex' ? 'codex-cli 0.147.0' : '1.18.21', nativeRoot: provider === 'codex' ? null : root, nativeMessageCount: sourceIds.length + turnNumber * 2, activeMessageIds: sourceIds, activeNativeProcesses: 1, executableSha256: provider === 'opencode' ? 'c9485f62576606dbde6404647405df2401fada964b7f669f799dc125dbbeff99' : 'e'.repeat(64), profileSha256: 'd'.repeat(64), nativeLaunch: { incarnationId: view().incarnationId, launchNonce: view().nativeIdentityObservation.launchNonce, evidenceRevision: view().nativeIdentityObservation.evidenceRevision, executionGeneration: view().executionGeneration } })
       },
     } as unknown as RuntimeHarness
     try {
-      const sources = ['env_file', 'auth_file', 'ca_file'].map(suffix => ({ name: `${provider}/grants/${suffix}`, path: serverPath, sha256: 'd'.repeat(64) }))
+      const sources = (mode === 'freshopencode' ? [] : ['env_file', 'auth_file', 'ca_file']).map(suffix => ({ name: `${provider}/grants/${suffix}`, path: serverPath, sha256: 'd'.repeat(64) }))
       if (mode === 'opencode') sources.push({ name: 'opencode/native-preparation/transfer-stage.bin', path: serverPath, sha256: 'd'.repeat(64) })
-      const result = await executeManagedNativeCase(harness, sources, terminal ? { provider, case: 'native-turn' } : { mode, case: 'native-turn' }, 'current-native-turn', terminal ? serverPath : undefined)
+      const run = executeManagedNativeCase(harness, sources, terminal ? { provider, case: 'native-turn' } : { mode: mode as 'freshcodex' | 'freshopencode', case: 'native-turn' }, 'current-native-turn', terminal ? serverPath : undefined)
+      if (fault !== 'valid') {
+        await expect(run).rejects.toThrow('native no-tool completion/profile/recall differs')
+        expect(submitted).toHaveLength(1); expect(recovered).toBe(false)
+        return
+      }
+      const result = await run
       expect(commands.filter(command => command !== 'capture' && command !== 'prepare-controller')).toEqual(['launch', 'seed', 'probe', 'kill', 'exit', 'recover', 'recall'])
       expect(result.assertions.every(assertion => assertion.pass)).toBe(true)
+      if (mode === 'freshopencode') {
+        expect(launchRequest.params.freshAgent.model).toBe('opencode/big-pickle')
+        expect(launchRequest.params.freshAgent.providerSecretReferences).toEqual([])
+        expect(launchRequest.params.freshAgent.effort).toBeUndefined()
+      }
       expect(submitted).toHaveLength(2); expect(submitted[1]).not.toContain(submitted[0]!.match(/owned-memory-[A-Za-z0-9-]+/)![0])
       expect(result.artifactReferences.some(reference => reference.includes('native-recovery-originals'))).toBe(true)
       expect(commands.at(-1)).toBe('capture')
@@ -1356,13 +1416,13 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
           }
           setTimeout(() => settle(refusal), 10)
           return JSON.stringify({ uid: fault === 'wrong-uid' ? 0 : 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true,
-            httpsStatus: 200, tlsVerifyMode: 2, tlsCheckHostname: true, nativeCwd: cwd,
+            ...receiverAccess(mode!), nativeCwd: cwd,
             nativeRoot: root, nativeMessageCount: 0, nativeVersion: provider === 'codex' ? 'codex-cli 0.147.0' : '1.18.21',
             activeNativeProcesses: 1, executableSha256: 'e'.repeat(64), profileSha256: 'd'.repeat(64),
             nativeLaunch: { incarnationId: incarnation, launchNonce: nonce, requestedNativeSessionId: expected } })
         },
       } as unknown as RuntimeHarness
-      const sources = ['env_file', 'auth_file', 'ca_file'].map(suffix => ({ name: provider + '/grants/' + suffix, path: '/owned/' + suffix, sha256: 'e'.repeat(64) }))
+      const sources = (mode === 'freshopencode' ? [] : ['env_file', 'auth_file', 'ca_file']).map(suffix => ({ name: provider + '/grants/' + suffix, path: '/owned/' + suffix, sha256: 'e'.repeat(64) }))
       sources.push({ name: provider + '/native-fault/receiver-load.json', path: faultSource, sha256: createHash('sha256').update(fs.readFileSync(faultSource)).digest('hex') })
       try {
         const run = executeManagedNativeCase(harness, sources, { mode: mode as 'freshcodex' | 'freshopencode', case: 'startup' }, caseId!)
@@ -1389,7 +1449,7 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
     const databasePath=path.join(directory,'controlled-native.db'),database=new DatabaseSync(databasePath)
     database.exec('CREATE TABLE session(id TEXT); CREATE TABLE message(id TEXT,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE part(id TEXT,session_id TEXT,message_id TEXT,time_created INTEGER,data TEXT);')
     database.prepare('INSERT INTO session VALUES (?)').run(root)
-    database.prepare('INSERT INTO message VALUES (?,?,?,?)').run('msg-owned',root,1,JSON.stringify({role:'assistant',time:{completed:1},providerID:'openai',modelID:'gpt-5.6-luna'}))
+    database.prepare('INSERT INTO message VALUES (?,?,?,?)').run('msg-owned',root,1,JSON.stringify({role:'assistant',time:{completed:1},providerID:mode==='freshopencode'?'opencode':'openai',modelID:mode==='freshopencode'?'big-pickle':'gpt-5.6-luna'}))
     database.prepare('INSERT INTO part VALUES (?,?,?,?,?)').run('part-owned',root,'msg-owned',1,JSON.stringify({type:'text',text:'stored'}));database.close()
     const querySnapshot=fs.readFileSync(databasePath)
     let capabilityIssued=false
@@ -1425,7 +1485,7 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
         throw new Error('unexpected receiver command')
       },
       execOwnedContainerAsExact:async(id:string,_uid:string,argv:string[])=>{
-        if(argv[2]===receiverNativeNamespace)return JSON.stringify({uid:65534,gid:0,caps:'0000000000000000',readOnlyRoot:true,httpsStatus:200,tlsVerifyMode:2,tlsCheckHostname:true,
+        if(argv[2]===receiverNativeNamespace)return JSON.stringify({uid:65534,gid:0,caps:'0000000000000000',readOnlyRoot:true,...receiverAccess(mode!),
           nativeCwd:path.join(directory,`${mode}-exact-resume-workspace`),nativeVersion:provider==='codex'?'codex-cli 0.147.0':'1.18.21',
           executableSha256:'e'.repeat(64),profileSha256:dead&&fault==='profile-changed'?'f'.repeat(64):'d'.repeat(64),nativeRoot:root,nativeMessageCount:seeded?2:0,activeNativeProcesses:1})
         expect(seeded).toBe(true)
@@ -1434,7 +1494,7 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
           querySnapshotBase64:querySnapshot.toString('base64'),querySnapshotSha256:createHash('sha256').update(querySnapshot).digest('hex'),completeEof:true})
       },
     } as unknown as RuntimeHarness
-    const sources=['env_file','auth_file','ca_file'].map(suffix=>({name:`${provider}/grants/${suffix}`,path:'/owned/'+suffix,sha256:'e'.repeat(64)}))
+    const sources=(mode==='freshopencode'?[]:['env_file','auth_file','ca_file']).map(suffix=>({name:`${provider}/grants/${suffix}`,path:'/owned/'+suffix,sha256:'e'.repeat(64)}))
     try{
       const run=executeManagedNativeCase(harness,sources,mode==='codex'?{provider:'codex',case:'startup'}:{mode:mode as 'freshcodex'|'freshopencode',case:'startup'},'exact-resume',mode==='codex'?serverPath:undefined)
       if(fault==='valid'){const original=await run;expect(original.assertions.every(row=>row.pass)).toBe(true);expect(original.assertions.some(row=>row.name==='original-owned-volume-transcript-continuity')).toBe(true)}
@@ -1487,12 +1547,13 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
   it.each(['freshcodex', 'freshopencode'].flatMap(mode => ['valid', 'missing-observation', 'wrong-root', 'wrong-incarnation', 'wrong-source', 'wrong-version', 'wrong-uid', 'wrong-tls', 'wrong-native-api-root', 'nonempty-before-input'].map(fault => [mode, fault])))('executes managed pre-input native create and refuses incomplete evidence (%s, %s; orchestration only)', async (mode, fault) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-receiver-create-'))
     const provider = mode === 'freshcodex' ? 'codex' : 'opencode', root = provider === 'codex' ? randomUUID() : 'ses_nativeOwned'
-    const sources = ['env_file', 'auth_file', 'ca_file'].map(suffix => ({ name: `${provider}/grants/${suffix}`, path: '/owned/' + suffix, sha256: 'e'.repeat(64) }))
+    const sources = (mode === 'freshopencode' ? [] : ['env_file', 'auth_file', 'ca_file']).map(suffix => ({ name: `${provider}/grants/${suffix}`, path: '/owned/' + suffix, sha256: 'e'.repeat(64) }))
     const launch = vi.fn(async (_supervisor: unknown, request: any) => {
       expect(request.method).toBe('launch'); expect(request.params.provider).toBe(provider)
       expect(request.params.freshAgent.sessionType).toBe(mode)
-      expect(request.params.freshAgent.providerSecretReferences.map((reference: any) => reference.profile)).toEqual([
+      expect(request.params.freshAgent.providerSecretReferences.map((reference: any) => reference.profile)).toEqual(mode === 'freshopencode' ? [] : [
         `${provider}_onecli_environment`, `${provider}_onecli_auth_file`, `${provider}_onecli_ca_file`])
+      expect(request.params.freshAgent.model).toBe(mode === 'freshopencode' ? 'opencode/big-pickle' : 'gpt-5.6-luna')
       expect(request.params.freshAgent.nativeSessionId).toBeUndefined()
       if (provider === 'codex') {
         expect(request.params.freshAgent.permissionMode).toBe('on-request')
@@ -1506,7 +1567,7 @@ const file='native-tui-fault-result.json';console.log(JSON.stringify({calls,acti
     const capture = vi.fn(async (_container: string, uid: string) => {
       expect(uid).toBe('65534:0')
       return JSON.stringify({ uid: fault === 'wrong-uid' ? 0 : 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true,
-        httpsStatus: fault === 'wrong-tls' ? 0 : 200, tlsVerifyMode: 2, tlsCheckHostname: true,
+        ...receiverAccess(mode!), ...(fault === 'wrong-tls' ? { tlsVerifyMode: 0 } : {}),
         nativeCwd: path.join(directory, `${mode}-create-workspace`), nativeVersion: fault === 'wrong-version' ? 'unqualified' : provider === 'codex' ? 'codex-cli 0.147.0' : '1.18.21',
         executableSha256: 'e'.repeat(64), profileSha256: 'd'.repeat(64), nativeRoot: fault === 'wrong-native-api-root' ? 'other' : root,
         nativeMessageCount: fault === 'nonempty-before-input' ? 1 : 0, activeNativeProcesses: 1 })

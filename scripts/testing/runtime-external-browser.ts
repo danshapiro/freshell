@@ -2413,6 +2413,11 @@ export function createExternalManagedWebFactory(selection: ExternalBrowserSelect
       FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: bootstrap.caFile })
   }
   return options => webFactory({ ...options, env: { ...options.env, ...preset },
+    ...(spec === 'runtime-fresh-agent-qualification-rust.spec.ts' && selection.mode === 'freshopencode' && !retainedArtifacts ? { stripEnvPrefixes: [...options.stripEnvPrefixes ?? [],
+      'ANTHROPIC_', 'CLAUDE_', 'OPENAI_', 'OPENCODE_API_KEY', 'GEMINI_', 'GOOGLE_API_KEY', 'LUNAROUTE_', 'ONECLI_',
+      'FRESHELL_MANAGED_CLAUDE_', 'FRESHELL_MANAGED_CODEX_', 'FRESHELL_MANAGED_OPENCODE_', 'FRESHELL_MANAGED_AMPLIFIER_',
+      'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
+    ] } : {}),
     ...(amplifierProfile || claudeStartup ? { setupHome: async (home: string) => {
       await options.setupHome?.(home)
       if (amplifierProfile) stageAmplifierQualificationProfile(amplifierProfile, home)
@@ -2472,7 +2477,8 @@ export function createExternalManagedRuntimeOwner(root: string, selection: Exter
       ...(qualificationProfile && selection.provider ? { providerSettings: { [selection.provider]: qualificationProfile } } : {}),
       fixtureFreshAgentModes: deterministic ? modes : [] }, undefined, {
       bootstrapProviders: deterministic || retainedArtifacts ? [] : sourceSelection ? ['opencode']
-        : selection.provider ? [selection.provider] : ['claude', 'codex', 'opencode', 'amplifier'],
+        : selection.provider ? [selection.provider] : selection.mode === 'freshopencode' ? []
+          : selection.mode ? [selection.mode === 'freshcodex' ? 'codex' : 'claude'] : ['claude', 'codex', 'opencode', 'amplifier'],
     })
 }
 

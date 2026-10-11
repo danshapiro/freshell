@@ -5243,22 +5243,27 @@ describe('finite retained fresh native collection', () => {
     }
   })
 
-  it('retains three actual-format raw stages before owned cleanup deletes the source', async () => {
+  it.each(['freshclaude', 'freshopencode'] as const)('retains three actual-format %s raw stages before owned cleanup deletes the source', async mode => {
+    const provider = mode === 'freshopencode' ? 'opencode' : 'claude'
     await installNativeToolFixture()
     const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'fresh-native-collection-'))
     const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot, 5, {}, {}, 'release', {
-      enabledProviders: [], freshAgentModes: ['freshclaude'],
+      enabledProviders: [], freshAgentModes: [mode],
     })
     const nonce = `codename-${'a'.repeat(32)}`, nativeRoot = 'owned-native-root'
     const projects = path.join(directory, 'projects'); await fsp.mkdir(projects)
-    const nativeFile = path.join(projects, `${nativeRoot}.jsonl`)
-    await fsp.writeFile(nativeFile, JSON.stringify({ type: 'system', sessionId: nativeRoot, subtype: 'init' }) + '\n')
+    const nativeFile = path.join(projects, provider === 'opencode' ? 'opencode.db' : `${nativeRoot}.jsonl`)
+    if (provider === 'opencode') {
+      const db = new DatabaseSync(nativeFile)
+      db.exec('CREATE TABLE session(id TEXT PRIMARY KEY); CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE part(id TEXT PRIMARY KEY,session_id TEXT,message_id TEXT,time_created INTEGER,data TEXT);')
+      db.prepare('INSERT INTO session VALUES (?)').run(nativeRoot); db.close()
+    } else await fsp.writeFile(nativeFile, JSON.stringify({ type: 'system', sessionId: nativeRoot, subtype: 'init' }) + '\n')
     const sdkPackage = Buffer.from(JSON.stringify({ name: '@anthropic-ai/claude-agent-sdk', version: '0.3.237', claudeCodeVersion: '2.1.237' }))
     const sdkModule = Buffer.from('export const query = () => undefined'), sidecarEntry = Buffer.from('import {query} from "@anthropic-ai/claude-agent-sdk"')
     let generation = 1, stopped = false, sent = 0
     const current = () => ({ ...handle, runId: rig.runtime.runId, candidateSha: rig.runtime.candidateSha,
       incarnationId: `inc-${generation}`, containerId: String(generation).repeat(64), hostBootId: `boot-${generation}`,
-      nativeSessionId: nativeRoot, provider: 'claude', freshAgentSessionType: 'freshclaude', freshAgentRuntimeVariant: 'claude-agent-sdk',
+      nativeSessionId: nativeRoot, provider, freshAgentSessionType: mode, freshAgentRuntimeVariant: provider === 'opencode' ? 'opencode-per-soul-http' : 'claude-agent-sdk',
       launchState: stopped ? 'stopped' : 'running', desiredState: stopped ? 'stopped' : 'running', recoveryState: 'live', cleanupState: stopped ? 'verified_empty' : 'none',
       executionGeneration: generation, intentRevision: 1,
       nativeIdentityObservation: { nativeSessionId: nativeRoot, incarnationId: `inc-${generation}`, launchNonce: `launch-${generation}`,
@@ -5274,29 +5279,31 @@ describe('finite retained fresh native collection', () => {
       ...current(), incarnationId: `inc-${index + 1}`, containerId: String(index + 1).repeat(64), providerVolumeName: 'owned-native-volume',
       imageRef: rig.runtime.imageRef, workspacePath: rig.repoRoot, runtimeDir: directory, createdAt: new Date().toISOString(), requestDigest: 'd'.repeat(64),
     })))
-    const launchProcess = () => ({ provider: 'claude', version: '2.1.237', native: { pid: 42, parentPid: 41, startTicks: `100${generation}`, uid: 65534,
-      executable: '/owned/claude', executableSha256: 'd'.repeat(64), profileSha256: 'e'.repeat(64), cwd: fixtureRepoRoot,
-      configuredModel: 'haiku', configuredEffort: 'low', launch: { incarnationId: `inc-${generation}`, launchNonce: `launch-${generation}`,
-        executionGeneration: generation, evidenceRevision: generation } }, sdk: { version: '0.3.237', declaredNativeVersion: '2.1.237', selection: 'sidecar-selected-module-resolution',
+    const launchProcess = () => ({ provider, version: provider === 'opencode' ? '1.18.21' : '2.1.237', native: { pid: 42, parentPid: 41, startTicks: `100${generation}`, uid: 65534,
+      executable: `/owned/${provider}`, executableSha256: 'd'.repeat(64), profileSha256: 'e'.repeat(64), cwd: fixtureRepoRoot,
+      configuredModel: provider === 'claude' ? 'haiku' : null, configuredEffort: provider === 'claude' ? 'low' : null, launch: { incarnationId: `inc-${generation}`, launchNonce: `launch-${generation}`,
+        executionGeneration: generation, evidenceRevision: generation } }, sdk: provider === 'opencode' ? null : { version: '0.3.237', declaredNativeVersion: '2.1.237', selection: 'sidecar-selected-module-resolution',
         packageBytesBase64: sdkPackage.toString('base64'), moduleBytesBase64: sdkModule.toString('base64'), entryBytesBase64: sidecarEntry.toString('base64'),
         moduleSha256: createHash('sha256').update(sdkModule).digest('hex'), entrySha256: createHash('sha256').update(sidecarEntry).digest('hex') } })
     vi.spyOn(rig, 'ownedProviderExec').mockImplementation(async (_container, args) => {
       if (args.includes(owner.FRESH_AGENT_PROCESS_SCRIPT)) return JSON.stringify(launchProcess())
       if (args[0] === 'node') {
         return new Promise<string>((resolve, reject) => execFile(process.execPath,
-          args.slice(1).map(value => value === '/home/freshell/provider/.claude/projects' ? projects : value),
+          args.slice(1).map(value => value === '/home/freshell/provider/.claude/projects' ? projects : value === '/home/freshell/provider/.local/share/opencode/opencode.db' ? nativeFile : value),
           { cwd: fixtureRepoRoot, encoding: 'utf8', timeout: 15_000 }, (error, stdout) => error ? reject(error) : resolve(stdout)))
       }
+      expect(args).toContain(owner.FRESH_NATIVE_NAMESPACE_SCRIPT); expect(args.at(-1)).toBe(mode)
       return JSON.stringify({ uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true, nativePid: 42, nativeRoot,
         nativeCwd: fixtureRepoRoot, executableSha256: 'd'.repeat(64), profileSha256: 'e'.repeat(64), nativeLaunch: launchProcess().native.launch,
-        tlsVerifyMode: 2, tlsCheckHostname: true, httpsStatus: 200 })
+        tlsVerifyMode: 2, tlsCheckHostname: true, httpsStatus: provider === 'opencode' ? null : 200,
+        ...(provider === 'opencode' ? { freeModelAccess: { source: 'native-config-providers', providerId: 'opencode', modelId: 'big-pickle', endpoint: 'https://unit-free.invalid/v1', ca: 'system-default', peerCertificateSha256: 'a'.repeat(64) } } : {}) })
     })
     vi.spyOn(rig as any, 'ownedDockerProbe').mockImplementation(async () => JSON.stringify({ source: 'registry-current-incarnation', soulId: handle.soulId,
       incarnationId: `inc-${generation}`, containerId: String(generation).repeat(64), hostBootId: `boot-${generation}`, launchNonce: `launch-${generation}`,
       executionGeneration: generation, providerStoreId: 'owned-native-store', nativeSessionId: nativeRoot,
-      spec: { sessionType: 'freshclaude', provider: 'claude', runtimeVariant: 'claude-agent-sdk', providerStoreId: 'owned-native-store',
-        nativeSessionId: nativeRoot, cwd: fixtureRepoRoot, model: 'haiku', effort: 'low' } }))
-    vi.spyOn(rig, 'writerClaimFacts').mockImplementation(async () => ({ provider: 'claude', providerStoreId: 'owned-native-store', nativeSessionId: nativeRoot,
+      spec: { sessionType: mode, provider, runtimeVariant: provider === 'opencode' ? 'opencode-per-soul-http' : 'claude-agent-sdk', providerStoreId: 'owned-native-store',
+        nativeSessionId: nativeRoot, cwd: fixtureRepoRoot, model: provider === 'opencode' ? 'opencode/big-pickle' : 'haiku', effort: provider === 'opencode' ? null : 'low', providerSecretReferences: [] } }))
+    vi.spyOn(rig, 'writerClaimFacts').mockImplementation(async () => ({ provider, providerStoreId: 'owned-native-store', nativeSessionId: nativeRoot,
       soulId: handle.soulId, incarnationId: `inc-${generation}`, activeClaimCount: stopped ? 0 : 1, globalConflictingClaimCount: 0 }))
     const completions: Promise<void>[] = []
     vi.spyOn(rig.runtime, 'adminRaw').mockImplementation(async (_supervisor, body, options) => {
@@ -5304,9 +5311,17 @@ describe('finite retained fresh native collection', () => {
       sent += 1
       const text = sent === 1 ? 'stored' : nonce
       const turn = sent
-      await fsp.appendFile(nativeFile, JSON.stringify({ type: 'user', uuid: `user-${turn}`, sessionId: nativeRoot, message: { role: 'user', content: body.params.text } }) + '\n')
+      if (provider === 'opencode') {
+        const db = new DatabaseSync(nativeFile), now = Date.now()
+        db.prepare('INSERT INTO message VALUES (?,?,?,?)').run(`user-${turn}`, nativeRoot, now, JSON.stringify({ role: 'user' }))
+        db.prepare('INSERT INTO part VALUES (?,?,?,?,?)').run(`input-${turn}`, nativeRoot, `user-${turn}`, now, JSON.stringify({ type: 'text', text: body.params.text })); db.close()
+      } else await fsp.appendFile(nativeFile, JSON.stringify({ type: 'user', uuid: `user-${turn}`, sessionId: nativeRoot, message: { role: 'user', content: body.params.text } }) + '\n')
       completions.push(new Promise<void>(resolve => setTimeout(resolve, 25)).then(async () => {
-        await fsp.appendFile(nativeFile, JSON.stringify({ type: 'assistant', uuid: `assistant-${turn}`, parentUuid: `user-${turn}`, sessionId: nativeRoot, timestamp: new Date().toISOString(),
+        if (provider === 'opencode') {
+          const db = new DatabaseSync(nativeFile), now = Date.now()
+          db.prepare('INSERT INTO message VALUES (?,?,?,?)').run(`assistant-${turn}`, nativeRoot, now, JSON.stringify({ role: 'assistant', parentID: `user-${turn}`, providerID: 'opencode', modelID: 'big-pickle', time: { completed: now } }))
+          db.prepare('INSERT INTO part VALUES (?,?,?,?,?)').run(`output-${turn}`, nativeRoot, `assistant-${turn}`, now, JSON.stringify({ type: 'text', text })); db.close()
+        } else await fsp.appendFile(nativeFile, JSON.stringify({ type: 'assistant', uuid: `assistant-${turn}`, parentUuid: `user-${turn}`, sessionId: nativeRoot, timestamp: new Date().toISOString(),
           message: { id: `turn-${turn}`, role: 'assistant', model: 'claude-haiku-4-5-20251001', stop_reason: 'end_turn', content: [{ type: 'text', text }] } }) + '\n')
       }))
       return { requestId: options?.requestId, result: { Ok: { data: {} } } } as any
@@ -5321,7 +5336,7 @@ describe('finite retained fresh native collection', () => {
     Object.assign(rig, { readStoppedNativeHistory: async () => {
       expect(stopped).toBe(true)
       const { captureNativeHistory } = await import('../../../e2e-browser/helpers/provider-native-history/probe-cli.js')
-      return captureNativeHistory('claude', projects, nativeRoot)
+      return captureNativeHistory(provider, provider === 'opencode' ? nativeFile : projects, nativeRoot)
     } })
     vi.spyOn(rig.runtime, 'cleanup').mockImplementation(async () => { await fsp.rm(projects, { recursive: true }); return { ok: true, errors: [] } })
     try {
@@ -5334,7 +5349,7 @@ describe('finite retained fresh native collection', () => {
         if (index < 2) { generation++; previousExited = false }
       }
       await expect(rig.finishFreshNativeCollection({ ...rig.runtimeEnclosureHandle(current()), nativeSessionId: nativeRoot }, registered.collectionId)).resolves.toMatchObject({ completedStages: 3, closed: true,
-        providerStoreId: 'owned-native-store', completedNativeTurns: [1, 2, 3].map(index => ({ turnId: `turn-${index}`, assistantMessageId: `assistant-${index}`, completionKind: 'provider_native_completed' })) })
+        providerStoreId: 'owned-native-store', completedNativeTurns: [1, 2, 3].map(index => ({ turnId: `${provider === 'opencode' ? 'assistant' : 'turn'}-${index}`, assistantMessageId: `assistant-${index}`, completionKind: 'provider_native_completed' })) })
       const manifest = JSON.parse(await fsp.readFile(path.join(rig.runtime.evidenceDir, 'native-recovery-originals.json'), 'utf8'))
       const stoppedRead = JSON.parse(await fsp.readFile(path.join(rig.runtime.evidenceDir, manifest.conversations[0].stopped.path), 'utf8'))
       expect(stoppedRead).toMatchObject({ stopResult: { outcome: 'verified_empty', view: { soulId: handle.soulId, incarnationId: 'inc-3', launchState: 'stopped' } },
@@ -5346,7 +5361,7 @@ describe('finite retained fresh native collection', () => {
       expect(fs.existsSync(projects)).toBe(false)
       const { deriveNativeRecoveryOriginals } = await import('../../../../scripts/testing/qualification-observations.js')
       const observed = deriveNativeRecoveryOriginals({ evidenceDir: rig.runtime.evidenceDir, candidateSha: rig.runtime.candidateSha,
-        runId: rig.runtime.runId, runtimeImage: rig.runtime.imageRef, selected: ['freshclaude'] })
+        runId: rig.runtime.runId, runtimeImage: rig.runtime.imageRef, selected: [mode] })
       expect(observed[0]!.stages.map(stage => [stage.recalledNonce, stage.profile.effort])).toEqual([[false, null], [true, null], [true, null]])
       expect(sent).toBe(3)
       await expect(rig.captureFreshNativeStage({ ...rig.runtimeEnclosureHandle(current()), nativeSessionId: nativeRoot }, registered.collectionId)).rejects.toThrow(/finished|closed/)

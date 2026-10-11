@@ -111,7 +111,7 @@ function row(mode: FreshAgentQualificationRow['mode'] = 'freshclaude'): FreshAge
     freshclaude: { provider: 'claude', version: '2.1.237', model: 'haiku', effort: 'low', variant: 'claude-agent-sdk', pending: true },
     kilroy: { provider: 'claude', version: '2.1.237', model: 'haiku', effort: 'low', variant: 'kilroy-claude-agent-sdk', pending: true },
     freshcodex: { provider: 'codex', version: '0.147.0', model: 'gpt-5.6-luna', effort: 'low', variant: 'codex-app-server', pending: false },
-    freshopencode: { provider: 'opencode', version: '1.18.21', model: 'openai/gpt-5.6-luna', effort: 'provider-default', variant: 'opencode-per-soul-http', pending: false },
+    freshopencode: { provider: 'opencode', version: '1.18.21', model: 'opencode/big-pickle', effort: 'provider-default', variant: 'opencode-per-soul-http', pending: false },
   } as const
   const definition = definitions[mode]
   return {
@@ -335,7 +335,7 @@ function fixture(
         const db = new DatabaseSync(filename)
         db.exec('CREATE TABLE session(id TEXT PRIMARY KEY); CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE part(id TEXT PRIMARY KEY,session_id TEXT,message_id TEXT,time_created INTEGER,data TEXT);')
         db.prepare('INSERT INTO session VALUES (?)').run(nativeSessionId)
-        nativeRows.push({ id: userId, at: base + 2_000, data: { role: 'user' }, text: prompt }, { id: messageId, at: base + 3_000, data: { role: 'assistant', parentID: userId, providerID: 'openai', modelID: 'gpt-5.6-luna', time: { completed: base + 3_000 } }, text: response })
+        nativeRows.push({ id: userId, at: base + 2_000, data: { role: 'user' }, text: prompt }, { id: messageId, at: base + 3_000, data: { role: 'assistant', parentID: userId, providerID: 'opencode', modelID: 'big-pickle', time: { completed: base + 3_000 } }, text: response })
         for (const value of nativeRows as any[]) {
           db.prepare('INSERT INTO message VALUES (?,?,?,?)').run(value.id, nativeSessionId, value.at, JSON.stringify(value.data))
           db.prepare('INSERT INTO part VALUES (?,?,?,?,?)').run('part-' + value.id, nativeSessionId, value.id, value.at, JSON.stringify({ type: 'text', text: value.text }))
@@ -350,7 +350,10 @@ function fixture(
       const launch = original(`${prefix}/launch.json`, { capturedAt: base + 1_000, response: { data: { view: { soulId: currentRow.soulId, providerStoreId: currentRow.providerStoreId, nativeSessionId, incarnationId: `inc-${index}`, containerId: `container-${index}`, hostBootId: `boot-${index}`, executionGeneration: index + 1, launchState: 'running', recoveryState: 'live', nativeIdentityObservation: { nativeSessionId, incarnationId: `inc-${index}`, launchNonce: `launch-${index}`, evidenceRevision: index, evidenceDigest: 'c'.repeat(64) } } } } })
       const request = original(`${prefix}/request.json`, { requestId: `request-${index}`, sentAt: base + 2_000, request: { method: 'fresh_agent_send', params: { soulId: currentRow.soulId, text: prompt } }, reply: { data: {} } })
       const crash = index ? original(`${prefix}/crash.json`, { kind: index === 1 ? 'session_host_exit' : 'provider_process_exit', containerId: `container-${index - 1}`, incarnationId: `inc-${index - 1}`, requestedAt: base - 2_000, exitedAt: base - 1_000 }) : undefined
-      const namespace = original(`${prefix}/namespace.json`, { uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true, httpsStatus: 200, tlsVerifyMode: 2, tlsCheckHostname: true, nativeRoot: nativeSessionId, nativeCwd: '/owned/workspace', nativePid: 55 + index, ownedProbe: { containerId: `container-${index}`, nativePid: 55 + index, capturedAt: base + 1_500 }, executableSha256: 'd'.repeat(64), profileSha256: 'e'.repeat(64) })
+      const namespace = original(`${prefix}/namespace.json`, { uid: 65534, gid: 0, caps: '0000000000000000', readOnlyRoot: true,
+        httpsStatus: currentRow.mode === 'freshopencode' ? null : 200,
+        ...(currentRow.mode === 'freshopencode' ? { freeModelAccess: { source: 'native-config-providers', providerId: 'opencode', modelId: 'big-pickle', endpoint: 'https://unit-free.invalid/v1', ca: 'system-default', peerCertificateSha256: 'a'.repeat(64) } } : {}),
+        tlsVerifyMode: 2, tlsCheckHostname: true, nativeRoot: nativeSessionId, nativeCwd: '/owned/workspace', nativePid: 55 + index, ownedProbe: { containerId: `container-${index}`, nativePid: 55 + index, capturedAt: base + 1_500 }, executableSha256: 'd'.repeat(64), profileSha256: 'e'.repeat(64) })
       const bytes = fs.readFileSync(path.join(evidenceDir, nativeFile.path))
       const store = original(`${prefix}/store.json`, { containerId: `container-${index}`, providerVolumeName: 'owned-volume', snapshot: { path: '/owned/native-store', identity: ['1', '2'], completeEof: true, bytesBase64: bytes.toString('base64'), sha256: createHash('sha256').update(bytes).digest('hex') } })
       const packageSource = original(`${prefix}/sdk-package.json`, JSON.stringify({ name: '@anthropic-ai/claude-agent-sdk', version: '0.3.237', claudeCodeVersion: '2.1.237' }))
@@ -360,7 +363,7 @@ function fixture(
         native: { pid: 55 + index, parentPid: 54 + index, uid: 65534, startTicks: String(100 + index), executable: `/owned/${currentRow.provider}`, executableSha256: 'd'.repeat(64), profileSha256: 'e'.repeat(64), cwd: '/owned/workspace', configuredModel: currentRow.provider === 'claude' ? 'haiku' : null, configuredEffort: currentRow.provider === 'claude' ? 'low' : null, launch: { incarnationId: `inc-${index}`, launchNonce: `launch-${index}`, executionGeneration: index + 1, evidenceRevision: index } },
         sdk: currentRow.provider === 'claude' ? { version: '0.3.237', declaredNativeVersion: '2.1.237', selection: 'sidecar-selected-module-resolution', packageSource, moduleSource, entrySource, moduleSha256: moduleSource.sha256, entrySha256: entrySource.sha256 } : null })
       const accepted = original(`${prefix}/accepted.json`, { source: 'registry-current-incarnation', soulId: currentRow.soulId, incarnationId: `inc-${index}`, containerId: `container-${index}`, hostBootId: `boot-${index}`, launchNonce: `launch-${index}`, executionGeneration: index + 1, providerStoreId: currentRow.providerStoreId, nativeSessionId,
-        spec: { sessionType: currentRow.mode, provider: currentRow.mode === 'kilroy' ? 'kilroy' : currentRow.provider, runtimeVariant: currentRow.runtimeVariant, providerStoreId: currentRow.providerStoreId, nativeSessionId, cwd: '/owned/workspace', model: currentRow.model, effort: currentRow.effort === 'provider-default' ? null : currentRow.effort } })
+        spec: { sessionType: currentRow.mode, provider: currentRow.mode === 'kilroy' ? 'kilroy' : currentRow.provider, runtimeVariant: currentRow.runtimeVariant, providerStoreId: currentRow.providerStoreId, nativeSessionId, cwd: '/owned/workspace', model: currentRow.model, effort: currentRow.effort === 'provider-default' ? null : currentRow.effort, providerSecretReferences: [] } })
       const profile = original(`${prefix}/profile.json`, { mode: currentRow.mode, process, accepted })
       return { stage, launch, request, nativeFile, namespace, store, profile, ...(crash ? { crash } : {}) }
     })
@@ -548,6 +551,50 @@ describe('fresh-agent qualification receipt v1', () => {
     'accepts a truthful independent %s row',
     (mode) => expect(fixture([row(mode)]).receipt.selectedModes).toEqual([mode]),
   )
+
+  it('validates grant-free FreshOpenCode with actual free native completed messages and unknown effort', () => {
+    const built = fixture([row('freshopencode')])
+    expect(validateFreshAgentQualificationReceipt({ repoRoot: built.repoRoot, candidateSha, expectedRuntimeImage: runtimeImage, receipt: built.receipt }).rows[0]).toMatchObject({ model: 'opencode/big-pickle', effort: 'provider-default' })
+  })
+
+  it.each(['requested-model', 'accepted-model', 'accepted-grant', 'native-provider', 'native-model', 'access-provider', 'access-model', 'access-ca', 'access-tls', 'access-missing', 'fabricated-http-status'])('reopens free native originals and refuses %s in builder and validator', fault => {
+    const built = fixture([row('freshopencode')]), current = built.receipt.rows[0]!
+    const manifestFile = path.join(built.evidenceDir, 'native-recovery-originals.json')
+    const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8')), stage = manifest.conversations[0].stages[0]
+    const update = (reference: any, mutate: (value: any) => void) => {
+      const filename = path.join(built.evidenceDir, reference.path), value = JSON.parse(fs.readFileSync(filename, 'utf8'))
+      mutate(value); fs.writeFileSync(filename, JSON.stringify(value)); reference.sha256 = createHash('sha256').update(fs.readFileSync(filename)).digest('hex')
+    }
+    if (fault === 'requested-model') current.model = 'openai/gpt-5.6-luna'
+    if (fault.startsWith('accepted-')) {
+      const profile = JSON.parse(fs.readFileSync(path.join(built.evidenceDir, stage.profile.path), 'utf8'))
+      update(profile.accepted, value => { if (fault === 'accepted-model') value.spec.model = 'openai/gpt-5.6-luna'; else value.spec.providerSecretReferences = [{ profile: 'opencode_onecli_environment', sourcePath: '/unit/unreadable' }] })
+      update(stage.profile, value => { value.accepted = profile.accepted })
+    }
+    if (fault.startsWith('native-')) {
+      const filename = path.join(built.evidenceDir, stage.nativeFile.path), db = new DatabaseSync(filename)
+      const assistant = db.prepare("SELECT id,data FROM message WHERE json_extract(data,'$.role')='assistant'").get() as { id: string; data: string }
+      const data = JSON.parse(assistant.data); data[fault === 'native-provider' ? 'providerID' : 'modelID'] = fault === 'native-provider' ? 'openai' : 'paid-model'
+      db.prepare('UPDATE message SET data=? WHERE id=?').run(JSON.stringify(data), assistant.id); db.close()
+      const bytes = fs.readFileSync(filename); stage.nativeFile.sha256 = createHash('sha256').update(bytes).digest('hex')
+      update(stage.store, value => { value.snapshot.bytesBase64 = bytes.toString('base64'); value.snapshot.sha256 = stage.nativeFile.sha256 })
+    }
+    if (fault.startsWith('access-') || fault === 'fabricated-http-status') update(stage.namespace, value => {
+      if (fault === 'access-provider') value.freeModelAccess.providerId = 'openai'
+      if (fault === 'access-model') value.freeModelAccess.modelId = 'paid-model'
+      if (fault === 'access-ca') value.freeModelAccess.ca = 'onecli-managed'
+      if (fault === 'access-tls') value.tlsVerifyMode = 0
+      if (fault === 'access-missing') delete value.freeModelAccess
+      if (fault === 'fabricated-http-status') value.httpsStatus = 200
+    })
+    fs.writeFileSync(manifestFile, JSON.stringify(manifest))
+    built.receipt.artifacts.nativeOriginals.sha256 = createHash('sha256').update(fs.readFileSync(manifestFile)).digest('hex')
+    const assertionsFile = path.join(built.evidenceDir, 'fresh-agent-qualification-assertions.json')
+    const assertions = JSON.parse(fs.readFileSync(assertionsFile, 'utf8')); assertions.rows = built.receipt.rows
+    fs.writeFileSync(assertionsFile, JSON.stringify(assertions)); built.receipt.artifacts.assertions.sha256 = createHash('sha256').update(fs.readFileSync(assertionsFile)).digest('hex')
+    expect(() => buildFreshAgentQualificationReceipt({ repoRoot: built.repoRoot, evidenceDir: built.evidenceDir, candidateSha, receiptRunId, runtimeImage, selectedModes: ['freshopencode'], rows: built.receipt.rows })).toThrow()
+    expect(() => validateFreshAgentQualificationReceipt({ repoRoot: built.repoRoot, candidateSha, expectedRuntimeImage: runtimeImage, receipt: built.receipt })).toThrow()
+  })
 
   it('requires retained current profile originals even with valid recomputed summary hashes', () => {
     const built = fixture()

@@ -30,6 +30,19 @@ type JsonObject = Record<string, any>
 type NativeInput = { id: string; text: string; appendPosition?: { recordIndex: number; byteStart: number; byteEnd: number } }
 const MODE_PROVIDER: Readonly<Record<string, string>> = { claude: 'claude', freshclaude: 'claude', kilroy: 'claude', codex: 'codex', freshcodex: 'codex', opencode: 'opencode', freshopencode: 'opencode', amplifier: 'amplifier' }
 const sha256 = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex')
+
+/** Free TLS access and paid authenticated HTTP access are separate observations. */
+export function nativeNamespaceAccessMatches(namespace: JsonObject, mode: string): boolean {
+  if (namespace.tlsVerifyMode !== 2 || namespace.tlsCheckHostname !== true) return false
+  if (mode !== 'freshopencode') return namespace.httpsStatus === 200 && !namespace.freeModelAccess
+  const access = namespace.freeModelAccess
+  if (namespace.httpsStatus !== null || access?.source !== 'native-config-providers' || access.providerId !== 'opencode'
+    || access.modelId !== 'big-pickle' || access.ca !== 'system-default' || !/^[a-f0-9]{64}$/.test(access.peerCertificateSha256 ?? '')) return false
+  try {
+    const endpoint = new URL(access.endpoint)
+    return endpoint.protocol === 'https:' && Boolean(endpoint.hostname) && !endpoint.username && !endpoint.password && !endpoint.search && !endpoint.hash
+  } catch { return false }
+}
 const object = (value: unknown, label: string): JsonObject => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label} must be a native evidence object`)
   return value as JsonObject
@@ -183,7 +196,7 @@ export function deriveNativeRecoveryOriginals(input: {
       if (!Number.isSafeInteger(namespace.nativePid) || namespace.nativePid < 1) throw new Error('native namespace probe lacks an actual provider PID')
       equal(probe.nativePid, namespace.nativePid, 'native namespace probe process')
       const namespaceAt = timestamp(probe.capturedAt, 'native namespace probe capture')
-      if (namespace.uid !== 65534 || namespace.gid !== 0 || namespace.caps !== '0000000000000000' || namespace.readOnlyRoot !== true || namespace.httpsStatus !== 200 || namespace.tlsVerifyMode !== 2 || namespace.tlsCheckHostname !== true) throw new Error('native namespace UID/profile/TLS boundary differs')
+      if (namespace.uid !== 65534 || namespace.gid !== 0 || namespace.caps !== '0000000000000000' || namespace.readOnlyRoot !== true || !nativeNamespaceAccessMatches(namespace, conversation.mode)) throw new Error('native namespace UID/profile/TLS boundary differs')
       // The Codex process probe has no thread-load RPC producer; its null
       // telemetry cannot replace the launch observation and exact rollout.
       if (provider !== 'codex' || namespace.nativeRoot !== null) equal(namespace.nativeRoot, root, 'native namespace root')

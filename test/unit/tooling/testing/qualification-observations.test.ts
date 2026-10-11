@@ -8,13 +8,29 @@ import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { buildFreshAgentQualificationReceipt, validateFreshAgentQualificationReceipt, type FreshAgentQualificationRow } from '../../../../scripts/testing/fresh-agent-qualification-receipt.js'
 import { FRESH_AGENT_INGRESS_INVENTORY } from '../../../../scripts/testing/fresh-agent-ingress-inventory.js'
-import { deriveNativeRecoveryOriginals, type NativeRecoveryStage } from '../../../../scripts/testing/qualification-observations.js'
+import { deriveNativeRecoveryOriginals, nativeNamespaceAccessMatches, type NativeRecoveryStage } from '../../../../scripts/testing/qualification-observations.js'
 import { ManagedRuntimeOwner } from '../../../../scripts/testing/runtime-sandbox.js'
 
 const roots: string[] = []
 afterEach(() => { vi.unstubAllEnvs(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }) })
 const candidateSha = 'a'.repeat(40), runtimeImage = `sha256:${'b'.repeat(64)}`, receiptRunId = 'native-originals-001'
 const digest = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex')
+
+describe('selected native free access observation', () => {
+  it('keeps authenticated paid access and free selected system-CA TLS separate', () => {
+    const paid = { httpsStatus: 200, tlsVerifyMode: 2, tlsCheckHostname: true }
+    const free = { ...paid, httpsStatus: null, freeModelAccess: { source: 'native-config-providers', providerId: 'opencode', modelId: 'big-pickle',
+      endpoint: 'https://unit-free.invalid/v1', ca: 'system-default', peerCertificateSha256: 'a'.repeat(64) } }
+    expect(nativeNamespaceAccessMatches(paid, 'opencode')).toBe(true)
+    expect(nativeNamespaceAccessMatches(paid, 'freshcodex')).toBe(true)
+    expect(nativeNamespaceAccessMatches(free, 'freshopencode')).toBe(true)
+    expect(nativeNamespaceAccessMatches(paid, 'freshopencode')).toBe(false)
+    expect(nativeNamespaceAccessMatches(free, 'opencode')).toBe(false)
+    for (const endpoint of ['http://unit.invalid', 'https://private@unit.invalid', 'https://unit.invalid/?token=private', 'https://unit.invalid/#private', 'unknown']) {
+      expect(nativeNamespaceAccessMatches({ ...free, freeModelAccess: { ...free.freeModelAccess, endpoint } }, 'freshopencode')).toBe(false)
+    }
+  })
+})
 
 
 function browserExecutionFixture(current: FreshAgentQualificationRow, stages: any[], evidenceDir: string, write: (name: string, value: any) => { path: string; sha256: string }, prefix: string) {
