@@ -1066,6 +1066,8 @@ fn probe_opencode(provider_home: &Path, expected: &str, spec: &ResumeSpec) -> Pr
 }
 
 fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
+    const MAX_INSPECTED_METADATA_BYTES: u64 = 1024 * 1024;
+
     let root = provider_home.join(".amplifier/projects");
     // This tree alone does not establish all effective Amplifier stores.
     // Exact readable positives are usable; an unrecorded store is unknown.
@@ -1153,7 +1155,8 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
                     )
                 }
             };
-            let mut materialized_backup = false;
+            let mut materialized = false;
+            let mut events_scan_incomplete = false;
             let mut identity_recorded = false;
             for entry in entries {
                 let entry = match entry {
@@ -1177,11 +1180,7 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
                     continue;
                 }
                 let metadata = match fs::symlink_metadata(&path) {
-                    Ok(metadata)
-                        if metadata.is_file()
-                            && !metadata.file_type().is_symlink()
-                            && metadata.len() <= 1024 * 1024 =>
-                    {
+                    Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
                         metadata
                     }
                     _ => {
@@ -1193,7 +1192,30 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
                         )
                     }
                 };
-                let bytes = match fs::read(&path) {
+                // Exact materialized history needs readability, not a whole-file
+                // parse. Only metadata carries the bounded identity document.
+                let inspection = if name.starts_with("metadata.json") {
+                    if metadata.len() > MAX_INSPECTED_METADATA_BYTES {
+                        return blocked(
+                            RecoveryBlockReason::StoreUnreadable,
+                            "Amplifier session metadata exceeds the bounded identity probe",
+                            vec![path.display().to_string()],
+                            None,
+                        );
+                    }
+                    let mut bytes = Vec::new();
+                    fs::File::open(&path)
+                        .and_then(|file| {
+                            file.take(MAX_INSPECTED_METADATA_BYTES + 1)
+                                .read_to_end(&mut bytes)
+                        })
+                        .map(|_| bytes)
+                } else {
+                    fs::File::open(&path)
+                        .and_then(|mut file| file.read(&mut [0_u8; 1]))
+                        .map(|_| Vec::new())
+                };
+                let bytes = match inspection {
                     Ok(bytes) => bytes,
                     Err(error) => {
                         return blocked(
@@ -1204,13 +1226,21 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
                         )
                     }
                 };
-                if name != "transcript.jsonl"
-                    && name.starts_with("transcript.jsonl")
-                    && metadata.len() > 0
-                {
-                    materialized_backup = true;
+                if name.starts_with("transcript.jsonl") && metadata.len() > 0 {
+                    materialized = true;
+                }
+                if name == "events.jsonl" && metadata.len() > MAX_INSPECTED_METADATA_BYTES {
+                    events_scan_incomplete = true;
                 }
                 if name.starts_with("metadata.json") {
+                    if bytes.len() as u64 > MAX_INSPECTED_METADATA_BYTES {
+                        return blocked(
+                            RecoveryBlockReason::StoreUnreadable,
+                            "Amplifier session metadata exceeds the bounded identity probe",
+                            vec![path.display().to_string()],
+                            None,
+                        );
+                    }
                     match serde_json::from_slice::<serde_json::Value>(&bytes) {
                         Ok(value) => {
                             if let Some(actual) =
@@ -1226,8 +1256,8 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
                                 }
                                 identity_recorded = true;
                             }
-                            if name != "metadata.json" && value.get("turn_count").is_some() {
-                                materialized_backup = true;
+                            if value.get("turn_count").is_some() {
+                                materialized = true;
                             }
                         }
                         Err(_) => {
@@ -1249,9 +1279,18 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
                     None,
                 );
             }
-            if !materialized_backup
-                && freshell_sessions::amplifier_stub::stub_is_unused(session_dir)
-            {
+            // The stub predicate scans events for prompt:submit only when no
+            // recorded turn or transcript has already established materialization.
+            // An oversized unscanned event log cannot prove a pristine stub.
+            if !materialized && events_scan_incomplete {
+                return blocked(
+                    RecoveryBlockReason::AmbiguousIdentity,
+                    "Amplifier event history exceeds the bounded pristine-stub inspection",
+                    vec![session_dir.join("events.jsonl").display().to_string()],
+                    None,
+                );
+            }
+            if !materialized && freshell_sessions::amplifier_stub::stub_is_unused(session_dir) {
                 if incomplete {
                     return blocked(
                         RecoveryBlockReason::AmbiguousIdentity,
@@ -1953,6 +1992,183 @@ mod tests {
                 ),
                 "{provider}"
             );
+        }
+    }
+
+    #[test]
+    fn recovery_store_amplifier_large_primary_transcript_remains_ready() {
+        for recorded_turn in [false, true] {
+            assert_large_amplifier_artifact_ready("transcript.jsonl", recorded_turn);
+        }
+    }
+
+    #[test]
+    fn recovery_store_amplifier_large_events_with_recorded_turn_remain_ready() {
+        assert_large_amplifier_artifact_ready("events.jsonl", true);
+    }
+
+    #[test]
+    fn recovery_store_amplifier_large_backup_transcripts_remain_ready() {
+        for name in ["transcript.jsonl.backup", "transcript.jsonl.bak"] {
+            assert_large_amplifier_artifact_ready(name, false);
+        }
+    }
+
+    fn amplifier_session_fixture(home: &Path, recorded_turn: bool) -> std::path::PathBuf {
+        let session = home.join(".amplifier/projects/project/sessions/exact");
+        fs::create_dir_all(&session).unwrap();
+        let metadata = if recorded_turn {
+            br#"{"session_id":"exact","turn_count":1}"#.as_slice()
+        } else {
+            br#"{"session_id":"exact"}"#.as_slice()
+        };
+        fs::write(session.join("metadata.json"), metadata).unwrap();
+        fs::write(session.join("transcript.jsonl"), b"").unwrap();
+        fs::write(session.join("events.jsonl"), b"").unwrap();
+        session
+    }
+
+    fn assert_large_amplifier_artifact_ready(name: &str, recorded_turn: bool) {
+        let home = tempfile::tempdir().unwrap();
+        let session = amplifier_session_fixture(home.path(), recorded_turn);
+        let path = session.join(name);
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(1024 * 1024 + 1).unwrap();
+        let result = probe_provider_store(
+            home.path(),
+            &resume_spec_for_test("amplifier", "exact", home.path()),
+        );
+        match result {
+            ProviderStoreProbe::Ready { evidence } => {
+                assert_eq!(
+                    evidence,
+                    vec![session.display().to_string(), "sessionId=exact".into()]
+                );
+            }
+            other => panic!("readable large Amplifier {name} must recover: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_store_amplifier_unreadable_artifacts_block_without_absence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for name in [
+            "transcript.jsonl",
+            "events.jsonl",
+            "transcript.jsonl.backup",
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let session = amplifier_session_fixture(home.path(), true);
+            let path = session.join(name);
+            let file = fs::File::create(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+            for size in [24, 1024 * 1024 + 1] {
+                file.set_len(size).unwrap();
+                assert_eq!(
+                    fs::File::open(&path).unwrap_err().kind(),
+                    std::io::ErrorKind::PermissionDenied,
+                    "synthetic unreadable fixture requires unprivileged execution"
+                );
+                assert!(
+                    matches!(
+                        probe_provider_store(
+                            home.path(),
+                            &resume_spec_for_test("amplifier", "exact", home.path())
+                        ),
+                        ProviderStoreProbe::Blocked {
+                            reason: RecoveryBlockReason::StoreUnreadable,
+                            ..
+                        }
+                    ),
+                    "unreadable {name} of {size} bytes cannot certify readiness or absence"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_store_amplifier_incomplete_identity_and_events_stay_unknown() {
+        for artifact in ["metadata.json", "metadata.json.backup", "events.jsonl"] {
+            let home = tempfile::tempdir().unwrap();
+            let session = amplifier_session_fixture(home.path(), artifact != "events.jsonl");
+            let path = session.join(artifact);
+            fs::File::create(&path)
+                .unwrap()
+                .set_len(1024 * 1024 + 1)
+                .unwrap();
+            assert!(
+                matches!(
+                    probe_provider_store(
+                        home.path(),
+                        &resume_spec_for_test("amplifier", "exact", home.path())
+                    ),
+                    ProviderStoreProbe::Blocked { .. }
+                ),
+                "incomplete {artifact} inspection cannot certify readiness or absence"
+            );
+        }
+        for metadata in [
+            br#"{"session_id":"wrong","turn_count":1}"#.as_slice(),
+            b"{}",
+            b"invalid",
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let session = amplifier_session_fixture(home.path(), true);
+            fs::write(session.join("metadata.json"), metadata).unwrap();
+            fs::File::create(session.join("transcript.jsonl"))
+                .unwrap()
+                .set_len(1024 * 1024 + 1)
+                .unwrap();
+            assert!(
+                matches!(
+                    probe_provider_store(
+                        home.path(),
+                        &resume_spec_for_test("amplifier", "exact", home.path())
+                    ),
+                    ProviderStoreProbe::Blocked { .. }
+                ),
+                "large readable history does not establish metadata identity"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_store_amplifier_symlink_and_nonregular_artifacts_stay_unknown() {
+        use std::os::unix::fs::symlink;
+
+        for name in [
+            "events.jsonl",
+            "transcript.jsonl.backup",
+            "metadata.json.backup",
+        ] {
+            for linked in [false, true] {
+                let home = tempfile::tempdir().unwrap();
+                let session = amplifier_session_fixture(home.path(), true);
+                let path = session.join(name);
+                if name == "events.jsonl" {
+                    fs::remove_file(&path).unwrap();
+                }
+                if linked {
+                    let outside = home.path().join("outside");
+                    fs::write(&outside, br#"{"session_id":"exact","turn_count":1}"#).unwrap();
+                    symlink(&outside, &path).unwrap();
+                } else {
+                    fs::create_dir(&path).unwrap();
+                }
+                assert!(matches!(
+                    probe_provider_store(
+                        home.path(),
+                        &resume_spec_for_test("amplifier", "exact", home.path())
+                    ),
+                    ProviderStoreProbe::Blocked {
+                        reason: RecoveryBlockReason::StoreUnreadable,
+                        ..
+                    }
+                ));
+            }
         }
     }
 
