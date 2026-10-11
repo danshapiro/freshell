@@ -207,6 +207,7 @@ import {
 import { nanoid } from 'nanoid'
 import { cn } from '@/lib/utils'
 import { Terminal, type ILogger } from '@xterm/xterm'
+import { terminalBufferText } from '@/lib/terminal-buffer-text.js'
 import { Loader2 } from 'lucide-react'
 import { ConfirmModal } from '@/components/ui/confirm-modal'
 import type { PaneContent, PaneContentInput, PaneRefreshRequest, TerminalPaneContent } from '@/store/paneTypes'
@@ -1718,15 +1719,31 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       () => {
         const t = termRef.current
         if (!t) return ''
-        const buf = t.buffer.active
-        const lines: string[] = []
-        for (let y = 0; y < buf.length; y++) {
-          const line = buf.getLine(y)
-          if (line) lines.push(line.translateToString(true))
-        }
-        return lines.join('\n')
+        return terminalBufferText(t.buffer.active)
       },
     )
+    window.__FRESHELL_TEST_HARNESS__.registerTerminalSnapshot?.(tid, () => {
+      const t = termRef.current
+      if (!t || terminalIdRef.current !== tid) return null
+      const attach = currentAttachRef.current
+      const seq = seqStateRef.current
+      return {
+        terminalId: tid,
+        paneId: paneIdRef.current,
+        streamId: contentRef.current?.streamId ?? null,
+        attachStreamId: attach?.terminalId === tid ? attach.streamId ?? null : null,
+        attachRequestId: attach?.requestId ?? null,
+        nativeSessionId: contentRef.current?.sessionRef?.sessionId ?? null,
+        replayPending: seq.awaitingFreshSequence || seq.pendingReplay !== null,
+        writesPending: writeQueueRef.current?.hasInFlightWrites() === true,
+        highestObservedSeq: seq.highestObservedSeq,
+        completedSeq: surfaceCoverageSeqRef.current,
+        cols: t.cols,
+        rows: t.rows,
+        bufferType: t.buffer.active.type,
+        text: terminalBufferText(t.buffer.active),
+      }
+    })
     window.__FRESHELL_TEST_HARNESS__.registerTerminalModes(tid, () => {
       const t = termRef.current
       if (!t) {
@@ -1747,6 +1764,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
 
     return () => {
       window.__FRESHELL_TEST_HARNESS__?.unregisterTerminalBuffer(tid)
+      window.__FRESHELL_TEST_HARNESS__?.unregisterTerminalSnapshot?.(tid)
       window.__FRESHELL_TEST_HARNESS__?.unregisterTerminalModes(tid)
     }
   }, [terminalContent?.terminalId])

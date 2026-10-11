@@ -36,6 +36,7 @@ import { getHydrationQueue, resetHydrationQueueForTests } from '@/lib/hydration-
 import { getTerminalActions } from '@/lib/pane-action-registry'
 import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { TERMINAL_CURSOR_STORAGE_KEY } from '@/store/storage-keys'
+import { installTestHarness } from '@/lib/test-harness'
 import {
   composeResolvedSettings,
   createDefaultServerSettings,
@@ -586,6 +587,38 @@ describe('TerminalView lifecycle updates', () => {
     const content = getLeafTerminalContent(store, tabId)
     expect(content.terminalId).toBe('term-theme')
     expect(content.status).toBe('running')
+  })
+
+  it('exposes the current actual emulator logical buffer through the registered harness accessors', async () => {
+    const actual = await vi.importActual<typeof import('@xterm/xterm')>('@xterm/xterm')
+    const emulator = new actual.Terminal({ cols: 13, rows: 12, allowProposedApi: true })
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal({
+      terminalId: 'term-accessor', streamId: 'stream-current', status: 'running',
+      sessionRef: { provider: 'claude', sessionId: 'native-root' },
+    })
+    installTestHarness(store as never, () => 'ready', async () => {}, () => {}, () => {})
+    const harness = window.__FRESHELL_TEST_HARNESS__!
+    const view = render(<Provider store={store}>
+      <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+    </Provider>)
+    const term = terminalInstances.at(-1)!
+    term.buffer = emulator.buffer
+    try {
+      const response = 'codename-public-test/after-host-current'
+      await new Promise<void>(done => emulator.write(`${response}\r\nHARD-LINE`, done))
+      expect(harness.getTerminalBuffer('term-accessor')).toContain(`${response}\nHARD-LINE`)
+      expect(harness.getTerminalSnapshot?.('term-accessor')).toMatchObject({
+        terminalId: 'term-accessor', paneId, streamId: 'stream-current', nativeSessionId: 'native-root',
+        writesPending: false, bufferType: 'normal',
+      })
+      expect(harness.getTerminalSnapshot?.('term-accessor')?.text).toContain(`${response}\nHARD-LINE`)
+      view.unmount()
+      expect(harness.getTerminalSnapshot?.('term-accessor')).toBeNull()
+      expect(harness.getTerminalBuffer('term-accessor')).toBeNull()
+    } finally {
+      view.unmount()
+      emulator.dispose()
+    }
   })
 
   it('skips terminal create when the e2e harness suppresses terminal network effects for the pane', () => {
