@@ -525,7 +525,10 @@ fn a_screen_its_own_stop_killed_is_not_a_placement_failure() {
             &state,
             unit.id().as_str(),
             "T-own",
-            MemberExit::Screen { exit_code: 137 },
+            MemberExit::Screen {
+                exit_code: 137,
+                lived: Duration::from_millis(10),
+            },
         )
         .await;
 

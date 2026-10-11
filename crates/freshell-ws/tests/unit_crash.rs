@@ -472,6 +472,9 @@ async fn a_quit_during_a_backgrounded_restart_does_not_count_toward_the_cap() {
 
     for quit in 1..=4 {
         let before = screen_pid(&h, &tid);
+        // A person reads Codex's quit prompt before choosing: no quit comes
+        // within the floor of its screen's start.
+        tokio::time::sleep(freshell_ws::unit_lifecycle::BACKGROUND_QUIT_FLOOR).await;
         h.send(
             &mut ws,
             json!({"type": "terminal.input", "terminalId": tid, "data": "quit\r"}),
@@ -507,6 +510,53 @@ async fn a_quit_during_a_backgrounded_restart_does_not_count_toward_the_cap() {
         .await
         .is_err(),
         "no crash event"
+    );
+}
+
+/// A screen that quits (exit 0) as it starts while a turn runs is not a
+/// person choosing "run in background" (no one chooses that faster than the
+/// floor): such restarts count toward the respawn cap, so a TUI that keeps
+/// quitting as it starts ends the unit instead of restarting until the turn
+/// ends (Task 17 review M1).
+#[tokio::test(flavor = "multi_thread")]
+async fn screens_that_quit_as_they_start_while_a_turn_runs_end_the_unit_at_the_respawn_cap() {
+    let mut h = UnitHarness::start(HarnessOpts {
+        behavior: json!({"turnCompleteDelayMs": 60000}),
+        auto_resume: AutoResumeMode::Capture,
+        ..Default::default()
+    })
+    .await;
+    let mut ws = h.connect().await;
+    let tid = h.create_codex(&mut ws, "crq-qs", Some("t-qs")).await;
+    ready(&h, &mut ws, &tid).await;
+    start_settled(&h, &tid).await;
+    let native = h.native_pid(&tid);
+    turn_running(&h, &mut ws, &tid).await;
+
+    // Every screen started from now on quits as it starts (exit 0).
+    std::fs::write(h.home.path().join(".fake-tui-quit-at-start"), "").expect("the marker");
+    h.send(
+        &mut ws,
+        json!({"type": "terminal.input", "terminalId": tid, "data": "quit\r"}),
+    )
+    .await;
+
+    let exit = exit_within(&h, &mut ws, &tid, LIMIT)
+        .await
+        .expect("screens that quit as they start end the unit at the respawn cap");
+    assert_eq!(exit["exitCode"], 0, "the screens' own code: {exit}");
+    assert!(
+        !fake_codex::pid_alive(native),
+        "the whole unit ended, its app-server included"
+    );
+    let crash = tokio::time::timeout(LIMIT, h.crash_rx.as_mut().unwrap().recv())
+        .await
+        .expect("the end reaches auto-resume")
+        .expect("a crash event");
+    assert_eq!(crash.terminal_id, tid);
+    assert_eq!(
+        crash.exit_code, 0,
+        "auto-resume's decide() settles a clean exit"
     );
 }
 

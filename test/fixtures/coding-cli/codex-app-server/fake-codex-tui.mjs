@@ -14,6 +14,10 @@
 // FAKE_TUI_TURN_COMPLETED status=<status>, FAKE_TUI_RECONNECTING,
 // FAKE_TUI_ERROR <message>, plus Codex's own conflict / no-session / give-up text.
 // Input lines (CR or LF): quit, crash, fork, resume <id>, turn <text>.
+//
+// A TUI started in a working directory that holds `.fake-tui-quit-at-start`
+// exits 0 at once, before it connects (a TUI that quits right after it starts).
+import fs from 'node:fs'
 import WebSocket from 'ws'
 
 const CONFLICT_LINE = 'This conversation is open in another app. Close it there and press R to continue here.'
@@ -54,7 +58,9 @@ function isValidRemote(raw) {
 }
 
 const args = parseArgs(process.argv.slice(2))
-if (!args.remote || !isValidRemote(args.remote)) {
+if (fs.existsSync('.fake-tui-quit-at-start')) {
+  process.exit(0)
+} else if (!args.remote || !isValidRemote(args.remote)) {
   exitAfterOutput(1, `Error: invalid remote address '${args.remote ?? ''}'; expected 'ws://host:port', 'wss://host:port', 'unix://', or 'unix://PATH'`)
 } else {
   runTui(args.remote, args.resume)

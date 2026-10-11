@@ -90,6 +90,11 @@ fn is_user_kill(reason: &str) -> bool {
     reason == StopReason::ShiftX.as_str() || reason == StopReason::KillCommand.as_str()
 }
 
+/// A duration as whole milliseconds, for a log field.
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn fresh_operation(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4())
 }
@@ -618,6 +623,7 @@ pub fn screen_exit_hook(
                 &exit.terminal_id,
                 MemberExit::Screen {
                     exit_code: exit.exit_code,
+                    lived: exit.lived,
                 },
             )
             .await
@@ -641,6 +647,14 @@ pub fn on_bind_hook(
 /// waits for the screen's PTY to record the exit code once the process
 /// exited (its waiter reaps it at once).
 const SCREEN_EXIT_CODE_WAIT: Duration = Duration::from_secs(1);
+
+/// The shortest run of a Codex screen whose clean quit with a turn running
+/// is taken as a person's "quit, run in background" (a restart that does
+/// not count toward the respawn cap). No one reads Codex's quit prompt and
+/// chooses faster; a screen that quits sooner (a TUI that exits 0 as it
+/// starts, or a turn status no event clears) restarts counted, so the cap
+/// bounds it like a crash (Task 17 review M1).
+pub const BACKGROUND_QUIT_FLOOR: Duration = Duration::from_secs(1);
 
 /// Watches the unit's main process for its own exit (pidfd / kqueue /
 /// process handle; no polling) and hands that exit to [`on_member_exit`].
@@ -704,8 +718,9 @@ pub fn spawn_main_watcher(state: WsState, entry: UnitEntry) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MemberExit {
     /// The screen's terminal stream ended (the registry's screen-exit hook,
-    /// which runs only after the screen's PTY reached end of stream).
-    Screen { exit_code: i64 },
+    /// which runs only after the screen's PTY reached end of stream), after
+    /// the screen ran for `lived`.
+    Screen { exit_code: i64, lived: Duration },
     /// The unit's main process exited (its own exit event). Its exit code
     /// is known only when the main is the screen.
     Main { pid: u32, exit_code: Option<i64> },
@@ -728,14 +743,16 @@ enum MemberExit {
 ///      user quit Codex; the whole unit ends (which stops the app-server a
 ///      remote TUI only detaches from);
 ///    - code 0 with a turn running (Codex's "quit, run in background"): a
-///      new screen against the running agent, not counted toward the cap;
+///      new screen against the running agent, not counted toward the cap
+///      unless the screen quit within [`BACKGROUND_QUIT_FLOOR`] of its
+///      start (faster than any person chooses);
 ///    - otherwise (a screen crash, the agent alive): a new screen, counted
 ///      toward the respawn cap.
 ///
 /// The entry is found by UNIT id, so an exit before the bind is not lost.
 async fn on_member_exit(state: &WsState, unit_id: &str, terminal_id: &str, exit: MemberExit) {
     let (role, exit_code) = match exit {
-        MemberExit::Screen { exit_code } => ("screen", Some(exit_code)),
+        MemberExit::Screen { exit_code, .. } => ("screen", Some(exit_code)),
         MemberExit::Main { exit_code, .. } => ("agent", exit_code),
     };
     let Some(parsed) = UnitId::parse(unit_id) else {
@@ -771,7 +788,7 @@ async fn on_member_exit(state: &WsState, unit_id: &str, terminal_id: &str, exit:
             .registry
             .mark_ending(terminal_id, UnitEnding::Requested);
         match exit {
-            MemberExit::Screen { exit_code } => member_event!(
+            MemberExit::Screen { exit_code, .. } => member_event!(
                 debug,
                 &entry,
                 terminal_id,
@@ -839,7 +856,7 @@ async fn on_member_exit(state: &WsState, unit_id: &str, terminal_id: &str, exit:
         );
         return;
     }
-    let exit_code = match exit {
+    let (exit_code, lived) = match exit {
         MemberExit::Main { pid, exit_code } => {
             // An app-server's death (no code of its own) or a non-zero exit
             // is a crash; an agent that ended cleanly is not.
@@ -867,7 +884,7 @@ async fn on_member_exit(state: &WsState, unit_id: &str, terminal_id: &str, exit:
             let _ = stop_terminal_unit(state, &entry, agent_exited(exit_code, "agent-exited"));
             return;
         }
-        MemberExit::Screen { exit_code } => exit_code,
+        MemberExit::Screen { exit_code, lived } => (exit_code, lived),
     };
     let main = entry.unit.main();
     let ended = match main.as_ref() {
@@ -883,7 +900,12 @@ async fn on_member_exit(state: &WsState, unit_id: &str, terminal_id: &str, exit:
         Some(code) => {
             let _ = stop_terminal_unit(state, &entry, agent_exited(code, "screen-exit"));
         }
-        None => respawn_screen(state, &entry, exit_code, exit_code != 0).await,
+        // A person's "quit, run in background" leaves the cap alone; a
+        // crash, or a quit faster than any person chooses, counts.
+        None => {
+            let counts_toward_cap = exit_code != 0 || lived < BACKGROUND_QUIT_FLOOR;
+            respawn_screen(state, &entry, exit_code, lived, counts_toward_cap).await
+        }
     }
 }
 
@@ -901,7 +923,8 @@ async fn on_member_exit(state: &WsState, unit_id: &str, terminal_id: &str, exit:
 /// fire for it.
 ///
 /// `counts_toward_cap` false (the user quit with a turn running) skips the
-/// respawn liveness accounting. Any failure (no stored spawn inputs, a
+/// respawn liveness accounting. `prior_lived` is how long the exited screen
+/// ran (logged). Any failure (no stored spawn inputs, a
 /// placement error, the `respawn cap`, a new screen that cannot be pinned)
 /// ends the whole unit as an agent exit with `exit_code` and ERROR
 /// `unit.screen.respawn_failed`, unless the unit's stop already began (that
@@ -910,6 +933,7 @@ pub async fn respawn_screen(
     state: &WsState,
     entry: &UnitEntry,
     exit_code: i64,
+    prior_lived: Duration,
     counts_toward_cap: bool,
 ) {
     let terminal_id = entry.terminal_id.clone().unwrap_or_default();
@@ -925,6 +949,7 @@ pub async fn respawn_screen(
                 entry,
                 &terminal_id,
                 exit_code,
+                prior_lived,
                 counts_toward_cap,
                 &cause,
             );
@@ -940,6 +965,7 @@ pub async fn respawn_screen(
         "unit.screen.respawned",
         pid = pid,
         prior_exit_code = exit_code,
+        prior_lived_ms = millis(prior_lived),
         counts_toward_cap = counts_toward_cap,
         "a new screen runs in the row against the running agent"
     );
@@ -1000,6 +1026,7 @@ fn respawn_failed(
     entry: &UnitEntry,
     terminal_id: &str,
     exit_code: i64,
+    prior_lived: Duration,
     counts_toward_cap: bool,
     cause: &str,
 ) {
@@ -1014,6 +1041,7 @@ fn respawn_failed(
         "unit.screen.respawn_failed",
         cause = %cause,
         prior_exit_code = exit_code,
+        prior_lived_ms = millis(prior_lived),
         counts_toward_cap = counts_toward_cap,
         "the screen could not be restarted; the whole unit ends");
     let _ = stop_terminal_unit(
