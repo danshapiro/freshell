@@ -520,15 +520,19 @@ mod tests {
         );
         assert!(matches!(lookup(), RolloutLookup::Absent), "{:?}", lookup());
 
-        // A directory entry that cannot be resolved (a symlink loop).
-        std::os::unix::fs::symlink("loop", sessions.join("2026/loop")).expect("symlink loop");
-        assert!(
-            matches!(lookup(), RolloutLookup::Unreadable(_)),
-            "{:?}",
-            lookup()
-        );
+        // A directory entry that cannot be resolved (a symlink loop). Unix
+        // only: a symlink on Windows needs a privilege a test cannot assume.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("loop", sessions.join("2026/loop")).expect("symlink loop");
+            assert!(
+                matches!(lookup(), RolloutLookup::Unreadable(_)),
+                "{:?}",
+                lookup()
+            );
+        }
 
-        // Found anyway: the unreadable part does not matter.
+        // Found anyway: an unreadable part (the loop, on Unix) does not matter.
         write_rollout(
             &sessions,
             "2026/08/24",
@@ -631,6 +635,9 @@ mod tests {
         let dated = tempfile::tempdir().expect("tempdir");
         owned(dated.path(), "2026/05/03");
         std::fs::create_dir_all(dated.path().join("2025")).unwrap();
+        // The unreadable subtree: a symlink loop, Unix only (a symlink on
+        // Windows needs a privilege a test cannot assume).
+        #[cfg(unix)]
         std::os::unix::fs::symlink("loop", dated.path().join("2025/loop")).expect("symlink loop");
         let (found, listed) = lookup(dated.path(), tid);
         assert!(matches!(found, RolloutLookup::Found(_)), "{found:?}");
@@ -664,9 +671,13 @@ mod tests {
             "{listed:?}"
         );
 
-        // An id with no time: the full walk only.
+        // An id with no time: the full walk only, which meets the loop on
+        // Unix and reads the whole tree elsewhere.
         let (found, listed) = lookup(dated.path(), "b7936c10-4935-441c-837c-c1f33cafec2d");
+        #[cfg(unix)]
         assert!(matches!(found, RolloutLookup::Unreadable(_)), "{found:?}");
+        #[cfg(not(unix))]
+        assert!(matches!(found, RolloutLookup::Absent), "{found:?}");
         assert_eq!(
             listed.first(),
             Some(&dated.path().to_path_buf()),
