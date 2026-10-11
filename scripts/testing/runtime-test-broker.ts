@@ -408,7 +408,7 @@ export class RestrictedDockerBroker {
 
     if (method === 'POST' && (url === `${DOCKER_API_PREFIX}/volumes/create`
       || url.startsWith(`${DOCKER_API_PREFIX}/containers/create?`))) {
-      this.registerPublishedFixtureInputs(body, url)
+      await this.registerPublishedFixtureInputs(body, url)
     }
 
     if (method === 'GET' && url === '/_ping') {
@@ -1240,7 +1240,7 @@ export class RestrictedDockerBroker {
     return phase
   }
 
-  private registerPublishedFixtureInputs(body: Buffer, url: string): void {
+  private async registerPublishedFixtureInputs(body: Buffer, url: string): Promise<void> {
     let phase = 'owner'
     try {
       const request = JSON.parse(body.toString())
@@ -1257,7 +1257,36 @@ export class RestrictedDockerBroker {
         && input.soulId === owner.soulId && input.incarnationId === incarnationId
         && (generation === undefined || generation === input.generationId))) return
       const reservation = this.initialReservations.get(owner.providerVolumeName)
-      if (!candidate && (!reservation || reservation.incarnationId !== incarnationId)) return
+      const initial = reservation?.incarnationId === incarnationId
+      if (!candidate && !initial) {
+        // A replacement has no initial reservation. Qualify the latest owned
+        // runtime for this soul, never an earlier quiescent incarnation while
+        // its successor is live or has changed ownership.
+        const prior = this.receipts().filter(receipt => receipt.installationId === owner.installationId
+          && receipt.soulId === owner.soulId).at(-1)
+        if (!prior || !incarnationId || prior.incarnationId === incarnationId
+          || prior.providerVolumeName !== owner.providerVolumeName || prior.imageRef !== owner.imageRef
+          || prior.hostBinaryPath !== owner.hostBinaryPath) return
+        phase = 'retained_owner'
+        const inspected = await this.forward({ method: 'GET',
+          url: `${DOCKER_API_PREFIX}/containers/${prior.containerId}/json`, headers: {} } as IncomingMessage, Buffer.alloc(0))
+        if (this.receipts().filter(receipt => receipt.installationId === owner.installationId
+          && receipt.soulId === owner.soulId).at(-1) !== prior) return
+        let actual: Record<string, any> = {}
+        try { actual = JSON.parse(inspected.body.toString()) } catch {}
+        const expectedLabels = { project: 'freshell', 'com.freshell.managed': 'true',
+          'com.freshell.installation-id': prior.installationId, 'com.freshell.soul-id': prior.soulId,
+          'com.freshell.incarnation-id': prior.incarnationId, 'com.freshell.runtime-test-run-id': this.policy.testRunId }
+        const binaryBind = `${owner.hostBinaryPath}:/runtime/freshell-session-host:ro`
+        const sameBinary = actual.HostConfig?.Binds?.includes(binaryBind)
+          || actual.HostConfig?.Mounts?.some((mount: Record<string, any>) => mount.Type === 'bind'
+            && mount.Source === owner.hostBinaryPath && mount.Target === '/runtime/freshell-session-host'
+            && mount.ReadOnly === true)
+        if (inspected.statusCode !== 404 && (inspected.statusCode !== 200 || actual.Id !== prior.containerId
+          || actual.Config?.Image !== prior.imageRef || !ownedHelperLabels(actual.Config?.Labels, expectedLabels)
+          || !sameBinary || actual.State?.Running !== false || actual.State?.Paused === true
+          || actual.State?.Restarting === true || !['created', 'exited', 'dead'].includes(actual.State?.Status))) return
+      }
       const root = path.dirname(this.policy.runtimeRootPrefix)
       phase = 'physical_directories'
       const scenarios = this.fixtureDirectories(path.join(root, 'scenarios'), 32)
@@ -1306,7 +1335,8 @@ export class RestrictedDockerBroker {
               resourceMounts: inputs.resourceMounts ?? [],
             })
           } else {
-            if (inputs.initialAuthReservation !== reservation!.reservationId) continue
+            if (initial ? inputs.initialAuthReservation !== reservation!.reservationId
+              : inputs.initialAuthReservation != null) continue
             const indexedSecretSources: { grantIndex: number; sourceId: number }[] = []
             result.providerSecretReferences.forEach((reference: Record<string, any>, grantIndex: number) => {
               if (!['claude_configuration_file', 'codex_configuration_file', 'opencode_configuration_file', 'amplifier_configuration_file'].includes(reference.profile)) return
