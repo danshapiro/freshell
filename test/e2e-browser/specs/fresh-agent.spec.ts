@@ -1,5 +1,6 @@
 import { test, expect } from '../helpers/fixtures.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { splitFreshBrowserPane } from '../helpers/managed-runtime.js'
 
 // The browser-preferences persist path debounces localStorage writes by
 // 500ms; wait past it before reading the blob.
@@ -370,6 +371,31 @@ async function seedIndexedClaudeContextUsage(
 }
 
 test.describe('Fresh Agent', () => {
+  test('splits the observed fresh pane horizontally into a second pane and picker', async ({ freshellPage, page, terminal, harness }) => {
+    await terminal.waitForTerminal()
+    const sessionId = '63333000-0000-4333-8333-000000000165'
+    await stubFreshclaudeThread(page, sessionId)
+    await installFreshclaudeStripPane(page, sessionId)
+    const { tabId, paneId } = await getActiveLeaf(harness)
+    const freshPane = page.locator('[data-context="fresh-agent"][data-pane-id="' + paneId + '"]')
+    await expect(freshPane).toBeVisible()
+    await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.setSuppressAllFreshAgentNetworkEffects(true))
+
+    await splitFreshBrowserPane(page, paneId)
+
+    const layout = await harness.getPaneLayout(tabId)
+    expect(layout?.type).toBe('split')
+    expect(layout?.direction).toBe('horizontal')
+    expect(layout?.children).toHaveLength(2)
+    expect(layout?.children[0]).toMatchObject({ type: 'leaf', id: paneId, content: { kind: 'fresh-agent', sessionId } })
+    expect(layout?.children[1]).toMatchObject({ type: 'leaf', content: { kind: 'picker' } })
+    expect(layout?.children[1].id).not.toBe(paneId)
+    await expect(freshPane).toBeVisible()
+    await expect(page.locator('[data-context="pane-header"]')).toHaveCount(2)
+    await expect(page.getByRole('toolbar', { name: /pane type picker/i })).toHaveCount(1)
+    await expect(page.locator('[data-context="pane-picker"][data-pane-id="' + layout?.children[1].id + '"]')).toBeVisible()
+  })
+
   test('preserves queued follow-ups after exit and lets users review and cancel them', async ({ freshellPage, page, terminal }) => {
     await terminal.waitForTerminal()
     const sessionId = '63333000-0000-4333-8333-000000000099'

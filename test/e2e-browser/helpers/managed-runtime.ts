@@ -3,6 +3,21 @@ import { RustServer } from './rust-server.js'
 import type { E2eServerInfo } from './server-fixture-support.js'
 import { resolveManagedExternalDescriptor } from '../../../scripts/testing/runtime-external-browser.js'
 import { ExternalManagedRuntimeRig } from './external-managed-runtime.js'
+import { expect, type Page } from '@playwright/test'
+
+/** Split the observed fresh pane through the actual browser menu within one finite action budget. */
+export async function splitFreshBrowserPane(page: Page, paneId: string): Promise<void> {
+  const deadline = Date.now() + 30_000
+  const remaining = () => {
+    const timeout = deadline - Date.now()
+    if (timeout <= 0) throw new Error(`browser split deadline expired for pane ${paneId}`)
+    return timeout
+  }
+  await page.locator('[data-context="pane-header"]').and(page.locator('[data-pane-id="' + paneId + '"]'))
+    .click({ button: 'right', timeout: remaining() })
+  await page.getByRole('menuitem', { name: 'Split right', exact: true }).click({ timeout: remaining() })
+  await expect(page.getByRole('toolbar', { name: /pane type picker/i }).last()).toBeVisible({ timeout: remaining() })
+}
 
 export {
   P2_OPENCODE_VERSION, P2_OPENCODE_MODEL,
