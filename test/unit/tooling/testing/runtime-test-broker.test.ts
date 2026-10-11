@@ -966,6 +966,52 @@ async function publishControllerPreparation(directory: string, input: Pick<Prepa
 }
 
 describe('fixed indexed publisher broker',()=>{
+  it.each(['/outside/selected-plugin', '/home/freshell/provider-sibling/config', '/home/freshell/provider/.codex/sessions'])(
+    'retains the actual rejected preparation destination without widening authority (%s)', async destination => {
+      await withHttpBroker(async ({ request, forwarded, broker: instance, directory }) => {
+        const binary = Buffer.from('owned publication artifact')
+        const owner = { ...sourceAuthorization(), hostBinaryPath: path.join(directory, 'freshell-session-host'),
+          binarySha256: createHash('sha256').update(binary).digest('hex') }
+        await fs.writeFile(owner.hostBinaryPath, binary)
+        instance.authorizeInitialProviderVolume(owner)
+        const generationId = 'grant-66666666-6666-4666-8666-666666666666'
+        const input = { ...publisherAuthorization(), soulId: owner.soulId, generationId,
+          hostBinaryPath: owner.hostBinaryPath, providerVolumeName: owner.providerVolumeName,
+          stageRoot: path.join(directory, 'scenarios/scenario/control/provider-roots', generationId),
+          configurationBinds: [{ sourceRelativePath: '.freshell/templates/codex-0', effectiveDestination: destination }],
+          resourceMounts: [], indexedSecretSources: [],
+          indexedFiles: { volumeName: `freshell-inputs-${createHash('sha256').update(`${owner.soulId}\0${generationId}`).digest('hex').slice(0, 24)}`, aliases: [] } }
+        const publication = await publishControllerPreparation(directory, input, '11111111-1111-4111-8111-111111111111', 'codex')
+        const capabilityPath = path.join(publication.capabilities, `${generationId}.json`)
+        const capability = JSON.parse(await fs.readFile(capabilityPath, 'utf8'))
+        capability.scope = 'PRIVATE_SCOPE_CONTENT_SENTINEL'
+        await fs.writeFile(capabilityPath, JSON.stringify(capability))
+        await fs.mkdir(path.join(publication.metadata, 'templates'))
+        await fs.writeFile(path.join(publication.metadata, 'templates/codex-0'), 'PRIVATE_CONFIG_CONTENT_SENTINEL')
+        const initial = { Name: owner.providerVolumeName, Driver: 'local', Labels: {
+          'com.freshell.installation-id': owner.installationId, 'com.freshell.soul-id': owner.soulId,
+          'freshell.input.reservation': publication.context.preparedInputs.initialAuthReservation,
+          'freshell.input.incarnation': input.incarnationId, 'freshell.input.intent': '1',
+          'freshell.input.daemon': owner.daemonId, 'freshell.input.image': owner.imageRef,
+          'freshell.input.binary-sha256': owner.binarySha256,
+        } }
+        expect((await request('POST', '/v1.47/volumes/create', initial)).status).toBe(201)
+        const before = forwarded.length
+        const denied = await request('POST', '/v1.47/volumes/create', {
+          Name: input.indexedFiles.volumeName, Driver: 'local', DriverOpts: indexedOptions, Labels: publisherLabels(input),
+        })
+        expect(denied.status).toBe(403)
+        expect(forwarded).toHaveLength(before)
+        const diagnostic = instance.eventsSnapshot().find(event => event.reason === 'fixture publication unavailable at prepared_authorization: target_root')
+        expect(diagnostic).toMatchObject({ targetPath: destination, preparationStageRoot: input.stageRoot,
+          selectedWorkspaceRoots: ['/workspace'] })
+        const events = JSON.stringify(instance.eventsSnapshot())
+        expect(events).not.toContain('PRIVATE_SCOPE_CONTENT_SENTINEL')
+        expect(events).not.toContain('PRIVATE_CONFIG_CONTENT_SENTINEL')
+        expect(instance.receipts()).toEqual([])
+      }, undefined, true)
+    },
+  )
   it.each(['exited', 'running', 'foreign-owner', 'changed-image', 'changed-host', 'foreign-capability'] as const)(
     'qualifies a replacement publication against its retained owner (%s)', async (state) => {
       await withHttpBroker(async ({ directory, request, forwarded, broker: instance, setRuntimeRunning }) => {
