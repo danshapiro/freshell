@@ -2215,7 +2215,7 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
         let roots = observed.roots.unwrap();
         assert_eq!(roots.checkout, workspace);
         assert_eq!(roots.canonical, workspace);
-        assert_eq!(observed.local_settings, [local.clone()]);
+        assert_eq!(observed.local_settings, std::slice::from_ref(&local));
         assert_eq!(std::fs::read(&local).unwrap(), b"{}");
         println!(
             "provider_source_observer {}",
@@ -4062,7 +4062,7 @@ export default {{id:'closed-directory-discovery',async server(){{
         for unreadable in [false, true] {
             let hidden = selected.with_extension("closed-unavailable");
             if unreadable {
-                std::fs::set_permissions(&selected, std::fs::Permissions::from_mode(0)).unwrap();
+                std::fs::set_permissions(&selected, std::fs::Permissions::from_mode(0o0)).unwrap();
             } else {
                 std::fs::rename(&selected, &hidden).unwrap();
             }
@@ -4076,9 +4076,8 @@ export default {{id:'closed-directory-discovery',async server(){{
             } else {
                 std::fs::rename(&hidden, &selected).unwrap();
             }
-            let error = failed
-                .err()
-                .expect("selected unavailable resource must block the actual launch");
+            let error =
+                failed.expect_err("selected unavailable resource must block the actual launch");
             assert!(
                 error.contains(field)
                     && error.contains(if unreadable { "unreadable" } else { "missing" })

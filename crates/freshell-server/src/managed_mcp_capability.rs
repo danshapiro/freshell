@@ -6576,7 +6576,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
                 .map(|(path, _)| (path.clone(), std::fs::read(path).unwrap()))
                 .collect::<Vec<_>>();
             if case == "unreadable-marker" {
-                std::fs::set_permissions(checkout.join(".git"), std::fs::Permissions::from_mode(0))
+                std::fs::set_permissions(checkout.join(".git"), std::fs::Permissions::from_mode(0o0))
                     .unwrap();
             }
             let sources = match case {
