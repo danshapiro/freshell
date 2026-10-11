@@ -8,6 +8,17 @@ const DOCKER_API_PREFIX = '/v1.47'
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024
 const INDEXED_TMPFS_OPTIONS = 'size=64m,mode=0700,uid=65534,gid=0,nr_inodes=1024,nosuid,nodev,noexec'
 
+class PreparedInputTargetError extends Error {
+  constructor(readonly targetPath: string, readonly preparationStageRoot: string) {
+    super('prepared input target is outside selected fixture roots')
+  }
+}
+
+function diagnosticPath(value: string): string | undefined {
+  return value.length <= 4096 && path.isAbsolute(value) && path.normalize(value) === value
+    && !/[\x00-\x1f\x7f]/.test(value) ? value : undefined
+}
+
 function indexedLabels(input: PreparedInputAuthorization): Record<string, string> {
   return {
     'com.freshell.managed-inputs': 'true',
@@ -116,6 +127,9 @@ export type BrokerEvent = {
   helperName?: string
   requestDigest?: string
   providerVolumeName?: string
+  targetPath?: string
+  preparationStageRoot?: string
+  selectedWorkspaceRoots?: string[]
   destructive: boolean
   unsafeAttempt: boolean
 }
@@ -307,7 +321,7 @@ export class RestrictedDockerBroker {
         || [...this.policy.allowedProviderUserRoots ?? []].some((root) => value === root || isStrictDescendant(value, root)))
     const targets = new Set<string>()
     const claim = (value: string) => {
-      if (!destination(value)) throw new Error('prepared input target is outside selected fixture roots')
+      if (!destination(value)) throw new PreparedInputTargetError(value, input.stageRoot)
       if (targets.has(value)) throw new Error('prepared input target is duplicated')
       targets.add(value)
     }
@@ -1359,8 +1373,8 @@ export class RestrictedDockerBroker {
       }
       this.record({ method: 'POST', url, decision: 'block', reason: `fixture publication unavailable at ${phase}`, destructive: false, unsafeAttempt: false })
     } catch (error) {
-      // Only fixed validator categories are observable. Discard all other
-      // exception messages, which may include filesystem or input details.
+      // Keep fixed categories and the rejected pathname, never input contents
+      // or arbitrary exception messages.
       const categories: Record<string, string> = {
         'prepared input owner/stage is outside this fixture run': 'owner_or_stage',
         'prepared input metadata exceeds control profile': 'metadata_limit',
@@ -1375,7 +1389,14 @@ export class RestrictedDockerBroker {
         'prepared input generation changed; reconcile before replacement': 'changed_generation',
       }
       const category = error instanceof Error ? categories[error.message] ?? 'unclassified' : 'unclassified'
-      this.record({ method: 'POST', url, decision: 'block', reason: `fixture publication unavailable at ${phase}: ${category}`, destructive: false, unsafeAttempt: false })
+      const target = error instanceof PreparedInputTargetError ? {
+        targetPath: diagnosticPath(error.targetPath),
+        preparationStageRoot: diagnosticPath(error.preparationStageRoot),
+        selectedWorkspaceRoots: [...this.policy.allowedWorkspaceRoots ?? []]
+          .filter(root => diagnosticPath(root) !== undefined),
+      } : {}
+      this.record({ method: 'POST', url, decision: 'block', reason: `fixture publication unavailable at ${phase}: ${category}`,
+        ...target, destructive: false, unsafeAttempt: false })
     }
   }
 
