@@ -1671,6 +1671,34 @@ function objectFields(value: unknown, reason: string): Record<string, unknown> {
   return value as Record<string, unknown>
 }
 
+type NativeHistoryDiagnostic = { stage: string; reason: string; code: string | null }
+const nativeHistoryDiagnosticTuples = new Set([
+  ['native_capture', 'filesystem_entry_missing', 'ENOENT'],
+  ...['EACCES', 'EPERM'].map(code => ['native_capture', 'permission_denied', code]),
+  ...['EISDIR', 'ENOTDIR', 'ELOOP'].map(code => ['native_capture', 'filesystem_shape_refused', code]),
+  ['native_capture', 'native_validation_failed', null],
+  ['source_selection', 'source_absent_or_ambiguous', null],
+  ['source_read', 'incomplete_source_eof', null],
+  ['arguments', 'invalid_arguments', null],
+].map(tuple => JSON.stringify(tuple)))
+const NativeHistoryRefusalSchema = z.object({ severity: z.literal('error'), event: z.literal('provider_native_history.refused'),
+  stage: z.string(), reason: z.string(), code: z.string().nullable(),
+}).strict().refine(value => nativeHistoryDiagnosticTuples.has(JSON.stringify([value.stage, value.reason, value.code])))
+
+function readNativeHistoryDiagnostic(exitCode: unknown, stdout: string, stderr: string): NativeHistoryDiagnostic {
+  if (exitCode === 2 && !stdout && Buffer.byteLength(stderr) <= 1_024) {
+    try {
+      const { stage, reason, code } = NativeHistoryRefusalSchema.parse(JSON.parse(stderr))
+      return { stage, reason, code }
+    } catch { /* Unclassified startup failures and invalid output remain unknown. */ }
+  }
+  return { stage: 'unknown', reason: 'unknown', code: null }
+}
+
+class NativeHistoryProbeFailure extends Error {
+  constructor(readonly diagnostic: NativeHistoryDiagnostic) { super('owned native history probe failed') }
+}
+
 function nonnegativeInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
 }
@@ -5977,7 +6005,8 @@ export class ManagedRuntimeOwner {
     }, error => {
       this.nativeCaptures.delete(result)
       this.nativeCaptureFailures.push('native original capture failed')
-      this.runtime.recordLifecycle('external.native_collection_failed', { severity: 'warn' })
+      this.runtime.recordLifecycle('external.native_collection_failed', { severity: 'warn',
+        ...(error instanceof NativeHistoryProbeFailure ? { nativeHistoryDiagnostic: error.diagnostic } : {}) })
       throw error
     })
     this.nativeCaptures.add(result)
@@ -6305,7 +6334,7 @@ export class ManagedRuntimeOwner {
       : provider === 'codex' ? '/home/freshell/provider/.codex/sessions' : '/home/freshell/provider/.local/share/opencode/opencode.db'
     // An imported probe must not see its own filename as argv[1]: the CLI's
     // normal main guard would otherwise dispatch a second capture.
-    const script = "const{captureNativeHistory}=await import(process.argv[2]);process.stdout.write(JSON.stringify(captureNativeHistory(process.argv[3],process.argv[4],process.argv[5],process.argv[6]==='boundary')));"
+    const script = "const{captureNativeHistory,runNativeHistoryProbe}=await import(process.argv[2]);runNativeHistoryProbe(()=>captureNativeHistory(process.argv[3],process.argv[4],process.argv[5],process.argv[6]==='boundary'));"
     const raw = await this.ownedProviderExec(handle.containerId, ['node', '--no-warnings', '--input-type=module', '-e', script,
       'native-history-import', this.prepareNativeHistoryTool(), provider, source, handle.nativeSessionId,
       boundary ? 'boundary' : 'completion'])
@@ -7639,6 +7668,8 @@ export class ManagedRuntimeOwner {
         ...(historyHelper ? { env: { ...process.env, DOCKER_HOST: `unix://${this.runtime.broker.proxySocketPath}`, DOCKER_API_VERSION: '1.47' } } : {}),
       }, (error, stdout, stderr) => {
         this.providerProbes.delete(probeId)
+        const nativeHistoryDiagnostic = error && args.includes('native-history-import')
+          ? readNativeHistoryDiagnostic(error.code, stdout, stderr) : undefined
         try {
           if (historyDiagnostic) this.runtime.writeArtifact(`native-history-probe-${probeId}.json`, {
             ...historyDiagnostic, runtimeImage: this.runtime.imageRef, probeId, containerId, operation: args[0],
@@ -7647,12 +7678,14 @@ export class ManagedRuntimeOwner {
             stdoutBytes: Buffer.byteLength(stdout), stderrBytes: Buffer.byteLength(stderr),
           })
           this.runtime.recordLifecycle('external.provider_probe_settled', { severity: error ? 'warn' : 'info',
-            probeId, containerId, code: error?.code ?? 0, stdoutBytes: Buffer.byteLength(stdout), stderrBytes: Buffer.byteLength(stderr) })
+            probeId, containerId, code: error?.code ?? 0, stdoutBytes: Buffer.byteLength(stdout), stderrBytes: Buffer.byteLength(stderr),
+            ...(nativeHistoryDiagnostic ? { nativeHistoryDiagnostic } : {}) })
         } catch (evidenceError) {
           reject(new Error('owned provider probe settlement evidence failed', { cause: evidenceError }))
           return
         }
-        if (error) reject(new Error('owned provider probe failed or timed out', { cause: error }))
+        if (nativeHistoryDiagnostic) reject(new NativeHistoryProbeFailure(nativeHistoryDiagnostic))
+        else if (error) reject(new Error('owned provider probe failed or timed out', { cause: error }))
         else resolve(stdout)
       })
     } catch (error) {

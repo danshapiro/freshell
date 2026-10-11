@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { readAmplifierNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/amplifier.js'
 import { readClaudeNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/claude.js'
@@ -65,6 +65,62 @@ function writeJsonl(filePath: string, rows: unknown[]): void {
 
 describe('Claude native history proof', () => {
   const sessionId = '11111111-1111-4111-8111-111111111111'
+
+  it('captures only the legitimate absent fresh projects root as an empty boundary', () => {
+    const home = path.join(tempRoot('claude-fresh-absent'), 'provider')
+    const source = path.join(home, '.claude/projects')
+    fs.mkdirSync(path.dirname(source), { recursive: true, mode: 0o700 })
+    expect(captureNativeHistory('claude', source, sessionId, true)).toEqual({
+      schemaVersion: 1, provider: 'claude', nativeSessionId: sessionId, turns: [], rawSource: null,
+    })
+    expect(() => captureNativeHistory('claude', source, sessionId)).toThrow()
+  })
+
+  it.each(['missing-parent', 'wrong-parent', 'redirected-parent', 'redirected-root', 'root-file', 'permission', 'malformed', 'partial', 'ambiguous', 'wrong-native'] as const)(
+    'refuses an invalid fresh empty boundary (%s)', fault => {
+      const home = path.join(tempRoot('claude-fresh-invalid'), 'provider')
+      let source = path.join(home, '.claude/projects')
+      fs.mkdirSync(home, { mode: 0o700 })
+      if (fault === 'wrong-parent') source = path.join(home, 'other/projects')
+      const parent = path.dirname(source)
+      if (fault !== 'missing-parent') fs.mkdirSync(parent, { mode: 0o700 })
+      if (fault === 'redirected-parent') {
+        fs.rmdirSync(parent)
+        fs.symlinkSync(tempRoot('claude-parent-outside'), parent)
+      } else if (fault === 'redirected-root') fs.symlinkSync(tempRoot('claude-root-outside'), source)
+      else if (fault === 'root-file') fs.writeFileSync(source, 'private-shape-marker')
+      else if (fault === 'permission') fs.chmodSync(parent, 0o000)
+      else if (['malformed', 'partial', 'ambiguous', 'wrong-native'].includes(fault)) {
+        const file = path.join(source, `${sessionId}.jsonl`)
+        const rows = [
+          { type: 'user', uuid: 'input', sessionId, message: { role: 'user', content: 'private-input-marker' } },
+          { type: 'assistant', uuid: 'reply', parentUuid: 'input', sessionId: fault === 'wrong-native' ? 'wrong-native' : sessionId,
+            timestamp: '2026-09-01T00:00:01.000Z', message: { id: 'msg', role: 'assistant', model: 'haiku',
+              stop_reason: 'end_turn', content: [{ type: 'text', text: 'private-output-marker' }] } },
+        ]
+        writeJsonl(file, rows)
+        if (fault === 'malformed') fs.writeFileSync(file, 'private-corrupt-marker\n')
+        if (fault === 'partial') fs.writeFileSync(file, JSON.stringify({ private: 'partial-marker' }))
+        if (fault === 'ambiguous') writeJsonl(path.join(source, 'other', `${sessionId}.jsonl`), rows)
+      }
+      try { expect(() => captureNativeHistory('claude', source, sessionId, true)).toThrow() }
+      finally { if (fault === 'permission') fs.chmodSync(parent, 0o700) }
+    },
+  )
+
+  it('refuses a child that disappears during a present fresh projects walk', () => {
+    const source = path.join(tempRoot('claude-disappearing-child'), 'provider/.claude/projects')
+    const file = path.join(source, `${sessionId}.jsonl`)
+    writeJsonl(file, [{ type: 'attachment', sessionId }])
+    const readdir = fs.readdirSync
+    const walk = vi.spyOn(fs, 'readdirSync').mockImplementation(((directory: fs.PathLike, options: any) => {
+      const entries = readdir(directory, options)
+      if (directory === source) fs.unlinkSync(file)
+      return entries
+    }) as typeof fs.readdirSync)
+    try { expect(() => captureNativeHistory('claude', source, sessionId, true)).toThrow(/ENOENT/) }
+    finally { walk.mockRestore() }
+  })
 
   function splitReply() {
     return [

@@ -25,6 +25,7 @@ const { DatabaseSync }: typeof import('node:sqlite') = createRequire(import.meta
 
 const sourceRoot = process.cwd()
 let fixtureRepoRoot: string
+let fixtureCandidateSha: string
 
 beforeEach(async () => {
   // Exercise the real Git provenance boundary even in source-only Cloud images.
@@ -39,6 +40,7 @@ beforeEach(async () => {
   git('init', '--quiet')
   git('add', '.')
   git('commit', '--quiet', '-m', 'Owned runtime facts unit fixture')
+  fixtureCandidateSha = git('rev-parse', 'HEAD').trim()
 })
 
 afterEach(async () => {
@@ -204,6 +206,107 @@ async function installNativeToolFixture(relativeProducerShim = false): Promise<v
 }
 
 describe('native history tool dependency delivery', () => {
+  it('executes the bundled imported fresh reader against an absent canonical projects root', async () => {
+    await installNativeToolFixture()
+    const home = path.join(fixtureRepoRoot, 'provider')
+    await fsp.mkdir(path.join(home, '.claude'), { recursive: true, mode: 0o700 })
+    const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused synthetic web') }, fixtureRepoRoot, 5,
+      {}, {}, 'release', { enabledProviders: [], freshAgentModes: [] }, undefined, { bootstrapProviders: [] })
+    vi.spyOn(rig, 'ownedProviderExec').mockImplementation(async (_container, args) => new Promise<string>((resolve, reject) =>
+      execFile(process.execPath, args.slice(1).map(value => value.replace('/home/freshell/provider', home)),
+        { cwd: fixtureRepoRoot, timeout: 15_000 }, (error, stdout) => error ? reject(error) : resolve(stdout))))
+    try {
+      await expect((rig as any).captureFreshNativeSource(handle, 'claude', true)).resolves.toEqual({
+        schemaVersion: 1, provider: 'claude', nativeSessionId: handle.nativeSessionId, turns: [], rawSource: null,
+      })
+      await expect((rig as any).captureFreshNativeSource(handle, 'claude')).rejects.toThrow()
+    } finally { vi.restoreAllMocks() }
+  })
+
+  it.each(['missing', 'permission', 'shape', 'corrupt', 'partial', 'unknown', 'module-startup', 'invalid-diagnostic', 'inconsistent-diagnostic', 'private-diagnostic'] as const)(
+    'retains only validated bundled imported reader diagnostics in the actual owner consumer (%s)', async fault => {
+      await installNativeToolFixture()
+      const directory = path.join(fixtureRepoRoot, 'synthetic-docker-boundary')
+      const home = path.join(directory, 'provider'), source = path.join(home, '.claude/projects')
+      await fsp.mkdir(path.dirname(source), { recursive: true, mode: 0o700 })
+      const marker = 'private-native-body-and-grant-marker'
+      if (fault === 'permission') await fsp.chmod(path.dirname(source), 0o000)
+      else if (fault === 'shape') await fsp.writeFile(source, marker)
+      else if (fault !== 'missing') {
+        await fsp.mkdir(source)
+        await fsp.writeFile(path.join(source, `${handle.nativeSessionId}.jsonl`),
+          fault === 'partial' ? JSON.stringify({ body: marker }) : `${marker}\n`, { mode: 0o600 })
+        if (fault === 'unknown') {
+          await fsp.rename(path.join(source, `${handle.nativeSessionId}.jsonl`), path.join(directory, 'outside.jsonl'))
+          await fsp.symlink(path.join(directory, 'outside.jsonl'), path.join(source, `${handle.nativeSessionId}.jsonl`))
+        }
+      }
+      const childOutput = path.join(directory, 'child-output.json')
+      await fsp.writeFile(path.join(directory, 'docker'), `#!${process.execPath}
+const fs = require('node:fs'), {spawnSync} = require('node:child_process');
+const transport = process.argv.slice(2), fault = ${JSON.stringify(fault)};
+const args = transport.slice(transport.indexOf('node') + 1).map(value => value.replace('/home/freshell/provider', ${JSON.stringify(home)}));
+if (fault === 'module-startup') args[args.indexOf('native-history-import') + 1] += '.missing';
+const result = spawnSync(process.execPath, args, {encoding: 'utf8', timeout: 10000});
+let stderr = result.stderr;
+if (fault.endsWith('-diagnostic')) {
+  const diagnostic = {severity: 'error', event: 'provider_native_history.refused', stage: 'source_read', reason: 'permission_denied', code: 'EACCES'};
+  if (fault === 'invalid-diagnostic') diagnostic.private = ${JSON.stringify(marker)};
+  if (fault === 'private-diagnostic') diagnostic.stage = ${JSON.stringify(marker)};
+  stderr = JSON.stringify(diagnostic);
+}
+fs.writeFileSync(${JSON.stringify(childOutput)}, JSON.stringify({status: result.status, stdout: result.stdout, stderr}), {mode: 0o600});
+process.stdout.write(result.stdout || ''); process.stderr.write(stderr || ''); process.exitCode = result.status || 1;
+`, { mode: 0o700 })
+      const rig = new owner.ManagedRuntimeOwner(() => { throw new Error('unused synthetic web') }, fixtureRepoRoot, 5,
+        {}, {}, 'release', { enabledProviders: [], freshAgentModes: [] }, undefined, { bootstrapProviders: [] })
+      rig.runtime.broker = new RestrictedDockerBroker({ realSocketPath: '/controlled-unused',
+        proxySocketPath: path.join(directory, 'unused.sock'), runtimeRootPrefix: directory,
+        allowedHostBinaryPaths: new Set(), allowedImageRefs: new Set(), testRunId: rig.runtime.runId,
+        logPath: path.join(directory, 'unused-broker.jsonl') })
+      vi.spyOn(rig.runtime.broker, 'receiptIds').mockReturnValue(new Set([handle.containerId]))
+      vi.stubEnv('PATH', `${directory}${path.delimiter}${process.env.PATH}`)
+      try {
+        await expect((rig as any).trackNativeCapture(() => (rig as any).captureFreshNativeSource(handle, 'claude'))).rejects.toThrow()
+        const child = JSON.parse(await fsp.readFile(childOutput, 'utf8'))
+        expect(child.status).toBeGreaterThan(0)
+        expect(child.stdout).toBe('')
+        const fallback = fault === 'module-startup' || fault.endsWith('-diagnostic')
+        if (!fallback) {
+          expect(child.status).toBe(2)
+          expect(child.stderr).not.toContain(marker)
+          expect(child.stderr).not.toContain(home)
+          expect(child.stderr).not.toContain(handle.nativeSessionId)
+          const tool = path.join(rig.runtime.nativeHistoryBuildDir, 'probe-cli.mjs')
+          const cli = await new Promise<string>(resolve => execFile(process.execPath,
+            ['--no-warnings', tool, 'claude', source, handle.nativeSessionId], { timeout: 10_000 },
+            (_error, _stdout, stderr) => resolve(stderr)))
+          expect(JSON.parse(child.stderr)).toEqual(JSON.parse(cli))
+        }
+        const events = (await fsp.readFile(rig.runtime.lifecyclePath, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+        const settled = events.find(event => event.event === 'external.provider_probe_settled')
+        const failed = events.find(event => event.event === 'external.native_collection_failed')
+        const expected = fallback ? { stage: 'unknown', reason: 'unknown', code: null }
+          : fault === 'missing' ? { stage: 'native_capture', reason: 'filesystem_entry_missing', code: 'ENOENT' }
+            : fault === 'permission' ? { stage: 'native_capture', reason: 'permission_denied', code: 'EACCES' }
+              : fault === 'shape' ? { stage: 'native_capture', reason: 'native_validation_failed', code: null }
+                : fault === 'partial' ? { stage: 'source_read', reason: 'incomplete_source_eof', code: null }
+                  : { stage: 'native_capture', reason: 'native_validation_failed', code: null }
+        expect(settled.data.nativeHistoryDiagnostic).toEqual(expected)
+        expect(failed.data.nativeHistoryDiagnostic).toEqual(expected)
+        const diagnostics = JSON.stringify([settled, failed])
+        expect(diagnostics).not.toContain(marker)
+        expect(diagnostics).not.toContain(home)
+        expect(diagnostics).not.toContain(handle.nativeSessionId)
+        expect((rig as any).providerProbes.size).toBe(0)
+        expect((rig as any).nativeCaptures.size).toBe(0)
+      } finally {
+        if (fault === 'permission') await fsp.chmod(path.dirname(source), 0o700)
+        vi.restoreAllMocks(); vi.unstubAllEnvs()
+      }
+    },
+  )
+
   it.each([false, true])('removes the owned bundle only after resource absence is verified (uncertain=%s)', async uncertain => {
     const harness = new owner.RuntimeHarness(fixtureRepoRoot, randomUUID(), 1, { bootstrapProviders: [] })
     await fsp.mkdir(harness.nativeHistoryBuildDir, { recursive: true })
@@ -5043,23 +5146,24 @@ describe('run-owned workload image build', () => {
     const digest = `sha256:${'c'.repeat(64)}`
     const child = vi.fn<typeof execFileSync>().mockReturnValue('')
       .mockReturnValueOnce('').mockReturnValueOnce(digest).mockReturnValueOnce(`sha256:${'d'.repeat(64)}`)
-    expect(() => owner.buildRunOwnedRuntimeImage(process.cwd(), '7aab49a4-08ed-4ca7-a4b2-6501f4821a63',
-      handle.candidateSha, child)).toThrow(/locally addressable/)
+    expect(() => owner.buildRunOwnedRuntimeImage(fixtureRepoRoot, '7aab49a4-08ed-4ca7-a4b2-6501f4821a63',
+      fixtureCandidateSha, child)).toThrow(/locally addressable/)
   })
 
   it('builds and resolves only the exact run tag instead of the shared runtime tag', () => {
     const runId = '7aab49a4-08ed-4ca7-a4b2-6501f4821a63'
     const child = vi.fn<typeof execFileSync>().mockReturnValue(`sha256:${'c'.repeat(64)}\n`)
-    const result = owner.buildRunOwnedRuntimeImage(process.cwd(), runId, handle.candidateSha, child)
+    const result = owner.buildRunOwnedRuntimeImage(fixtureRepoRoot, runId, fixtureCandidateSha, child)
     expect(result.digest).toBe(`sha256:${'c'.repeat(64)}`)
     expect(result.tag).toContain(runId)
-    expect(child).toHaveBeenNthCalledWith(1, 'docker', expect.arrayContaining(['build', '-t', result.tag]), expect.objectContaining({ cwd: process.cwd() }))
+    expect(child).toHaveBeenNthCalledWith(1, 'docker', expect.arrayContaining(['build', '-t', result.tag,
+      '--label', `com.freshell.runtime-test-candidate=${fixtureCandidateSha}`]), expect.objectContaining({ cwd: fixtureRepoRoot }))
     expect(child).toHaveBeenNthCalledWith(2, 'docker', ['image', 'inspect', result.tag, '--format', '{{.Id}}'], expect.objectContaining({ encoding: 'utf8' }))
     expect(child.mock.calls.flatMap(call => call[1] ?? [])).not.toContain(owner.PHASE2_RUNTIME_IMAGE_TAG)
   })
   it('refuses an invalid observed image digest instead of certifying a tag as an artifact', () => {
     const child = vi.fn<typeof execFileSync>().mockReturnValue('not-a-digest')
-    expect(() => owner.buildRunOwnedRuntimeImage(process.cwd(), '7aab49a4-08ed-4ca7-a4b2-6501f4821a63', handle.candidateSha, child)).toThrow(/pinned|digest/)
+    expect(() => owner.buildRunOwnedRuntimeImage(fixtureRepoRoot, '7aab49a4-08ed-4ca7-a4b2-6501f4821a63', fixtureCandidateSha, child)).toThrow(/pinned|digest/)
   })
   it('admits image deletion only for the actual run tag, labels and immutable digest', () => {
     const context = { tag: 'freshell-managed-runtime:owned-test', runId: handle.runId,
