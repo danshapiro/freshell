@@ -200,6 +200,51 @@ describe('finite native experiment dispatch (fixtures do not qualify providers)'
       } finally { database.close() }
     } finally { fs.rmSync(root, { recursive: true, force: true }) }
   })
+  it('prepares the actual stopped fixture workspace for provider access under a private umask', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'task007-workspace-access-'))
+    const checkout = path.join(directory, 'checkout'), ownerRoot = path.join(directory, 'owner')
+    fs.mkdirSync(checkout)
+    createFixtureCheckout(checkout)
+    const schema = 'crates/freshell-sessions/src/opencode_schema_v1_18_21.sql'
+    fs.mkdirSync(path.dirname(path.join(checkout, schema)), { recursive: true })
+    fs.copyFileSync(path.join(process.cwd(), schema), path.join(checkout, schema))
+    const source = path.resolve('scripts/testing/runtime-sandbox.ts')
+    // Keep the real workspace, Git and seeder operations. Only the daemon and
+    // compiled-artifact boundaries are controlled; no container is started.
+    const code = `import fs from 'node:fs';import path from 'node:path';
+      import childProcess from 'node:child_process';import {syncBuiltinESMExports} from 'node:module';
+      import {RuntimeHarness} from ${JSON.stringify(source)};
+      const [checkout,ownerRoot]=process.argv.slice(1);
+      const originalExec=childProcess.execFileSync;
+      childProcess.execFileSync=(file,args,options)=>file==='docker'?JSON.stringify(['name=rootless']):originalExec(file,args,options);
+      syncBuiltinESMExports();process.umask(0o077);
+      fs.mkdirSync(ownerRoot,{mode:0o700});
+      const host=path.join(ownerRoot,'fixture-host');fs.writeFileSync(host,'controlled fixture host');
+      const harness=new RuntimeHarness(checkout,'task007-workspace-access',3,{bootstrapProviders:[]});
+      Object.assign(harness,{testRoot:ownerRoot,brokerStarted:true,task007Artifact:Promise.resolve({}),
+        testHostBinary:host,broker:{proxySocketPath:path.join(ownerRoot,'unused.sock')},imageRef:'sha256:'+'a'.repeat(64)});
+      harness.task007Docker=async()=>{throw new Error('controlled pre-container boundary')};
+      try {await harness.prepareTask007StoppedFixture('browser');throw new Error('fixture unexpectedly reached Docker')}
+      catch(error){if(error.message!=='controlled pre-container boundary')throw error}
+      const workspace=path.join(ownerRoot,'task007-browser-workspace');
+      const directories=[workspace,path.join(workspace,'.git'),path.join(workspace,'.git/refs'),path.join(workspace,'.git/objects')];
+      const files=['HEAD','config','description'].map(file=>path.join(workspace,'.git',file));
+      process.stdout.write(JSON.stringify({
+        providerCanTraverse:directories.every(file=>(fs.statSync(file).mode&0o005)===0o005),
+        providerCanReadGit:files.every(file=>!!(fs.statSync(file).mode&0o004)),
+        gitRoot:originalExec('git',['-C',workspace,'rev-parse','--show-toplevel'],{encoding:'utf8'}).trim(),
+        head:fs.readFileSync(files[0],'utf8').startsWith('ref: refs/heads/'),
+        ownerPrivate:(fs.statSync(ownerRoot).mode&0o077)===0,
+        sourcePrivate:(fs.statSync(path.join(ownerRoot,'task007-browser-source.db')).mode&0o077)===0,
+        workspace}));`
+    try {
+      const actual = JSON.parse(execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', code, checkout, ownerRoot],
+        { encoding: 'utf8', timeout: 15_000, stdio: 'pipe' }))
+      expect(actual).toEqual({ providerCanTraverse: true, providerCanReadGit: true,
+        gitRoot: path.join(ownerRoot, 'task007-browser-workspace'), head: true,
+        ownerPrivate: true, sourcePrivate: true, workspace: path.join(ownerRoot, 'task007-browser-workspace') })
+    } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+  })
   it.each(['root-load-error', 'history-load-error'])('damages only the owned exact native %s source while preserving the sealed source (controlled UID driver only)', fault => {
     const ownedRoot = path.join('/tmp/frs', randomUUID().slice(0, 12))
     fs.mkdirSync(ownedRoot, { recursive: true, mode: 0o700 })
