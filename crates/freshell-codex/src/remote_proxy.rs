@@ -1918,10 +1918,6 @@ fn client_envelope_failure_message(reason: JsonRpcEnvelopeScanError) -> String {
     }
 }
 
-/// `extractThreadForkParentThreadId` (`remote-proxy.ts:1197-1213`): reads the ORIGINAL
-/// (pre-rewrite) client `thread/fork` request's `params.threadId` — the parent thread id
-/// — via a bounded byte scan (not a full parse), so this is safe to call regardless of
-/// frame size.
 /// Whether a request's refusal names a conversation the TUI asked to write
 /// (the requests Codex's writer lock can refuse).
 fn names_a_conversation(method: &str) -> bool {
@@ -1957,8 +1953,12 @@ fn thread_named_in_refusal(message: &str) -> Option<String> {
     (lead.ends_with("thread") && !id.is_empty()).then(|| id.to_string())
 }
 
-/// A request's `params.threadId` (byte scan: any frame size), if non-empty:
-/// the conversation a resume, a fork or a turn names.
+/// A request's `params.threadId`, if non-empty: the conversation a resume, a
+/// fork or a turn names. For a `thread/fork` it is the parent thread id, read
+/// from the ORIGINAL (pre-rewrite) client request as
+/// `extractThreadForkParentThreadId` (`remote-proxy.ts:1197-1213`) reads it:
+/// a bounded byte scan (not a full parse), so this is safe to call regardless
+/// of frame size.
 fn extract_params_thread_id(raw: &[u8]) -> Option<String> {
     use crate::json_scan::{
         decode_string_entry, find_entry, scan_object, skip_whitespace, ValueKind, BYTE_OPEN_BRACE,
