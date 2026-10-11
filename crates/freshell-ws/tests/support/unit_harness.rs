@@ -661,7 +661,9 @@ impl UnitHarness {
         .expect("attached");
     }
 
-    /// Every native app-server manifest the fake wrote.
+    /// Every native app-server manifest the fake wrote, except those of
+    /// natives that lost their listen port (another socket bound it first):
+    /// such a native never served, and the planner retried its start.
     pub fn native_manifests(&self) -> Vec<fake_codex::NativeManifest> {
         std::fs::read_dir(&self.manifests)
             .into_iter()
@@ -674,7 +676,8 @@ impl UnitHarness {
                     .is_some_and(|name| name.starts_with("native-") && name.ends_with(".json"))
             })
             .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
-            .filter_map(|raw| serde_json::from_str(&raw).ok())
+            .filter_map(|raw| serde_json::from_str::<fake_codex::NativeManifest>(&raw).ok())
+            .filter(|native| native.listen_error.is_none())
             .collect()
     }
 
