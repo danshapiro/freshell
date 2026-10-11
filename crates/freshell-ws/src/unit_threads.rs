@@ -104,8 +104,33 @@ enum Hold {
     Released,
     /// Its extra hold was refused (another pane holds it, or its key was in
     /// a transition): the next announcement of the thread, or the read
-    /// before a stop, tries again.
-    Refused,
+    /// before a stop, tries again. `recorded`: the unit record and the
+    /// sidecar record still list it (its hold was given up by
+    /// [`release_for_main`] and [`restore_extra`] was refused), so Codex
+    /// unloading it forgets it from them, unless it has become the pane's
+    /// main conversation since. A retry refused again keeps the mark.
+    Refused { recorded: bool },
+}
+
+impl Hold {
+    /// This hold, for a thread the unit record and the sidecar record
+    /// already list: a refusal is marked `recorded`.
+    fn listed(self) -> Hold {
+        match self {
+            Hold::Refused { .. } => Hold::Refused { recorded: true },
+            held => held,
+        }
+    }
+
+    /// The hold just attempted for a known thread, as it settles over the
+    /// thread's current mark `was`: a refusal keeps knowing that the
+    /// records list the thread.
+    fn settled_over(self, was: Hold) -> Hold {
+        match was {
+            Hold::Refused { recorded: true } => self.listed(),
+            _ => self,
+        }
+    }
 }
 
 /// The most recent ids, the oldest forgotten first (at most
@@ -223,7 +248,7 @@ fn note_with_status(
             return Seen::Ignored;
         }
         match table.threads.get(thread_id) {
-            Some(known) if known.hold == Hold::Refused => Seen::Retry,
+            Some(known) if matches!(known.hold, Hold::Refused { .. }) => Seen::Retry,
             Some(_) => Seen::Ignored,
             None => {
                 table.threads.insert(
@@ -260,7 +285,7 @@ fn note_with_status(
         table
             .threads
             .get_mut(thread_id)
-            .map(|known| known.hold = hold)
+            .map(|known| known.hold = hold.settled_over(known.hold))
             .is_some()
     });
     match (entry, hold) {
@@ -344,14 +369,14 @@ fn hold_as_extra(
                     holder_unit_id = %holder_unit_id,
                     "another pane still holds the thread Live; it is still not held for this pane"),
             }
-            Hold::Refused
+            Hold::Refused { recorded: false }
         }
         HoldOutcome::Skipped { state: key_state } => {
             thread_event!(debug, entry, terminal_id, "unit.thread_hold_skipped",
                 thread_id = %thread_id,
                 key_state = %ownership_state_name(&key_state),
                 "the thread is not held for the pane (its unit is stopping or gone, or the key is in another transition)");
-            Hold::Refused
+            Hold::Refused { recorded: false }
         }
     }
 }
@@ -378,9 +403,10 @@ pub fn drop_thread(state: &WsState, terminal_id: &str, thread_id: &str) {
 
 /// After `known` (the table's entry for `thread_id`, if there was one) left
 /// the table: the lock paths follow, and an extra hold leaves the unit. A
-/// hold [`release_for_main`] already gave up leaves the records, unless its
-/// claim made the thread the pane's main conversation; the claim's restore
-/// then finds no entry and holds nothing.
+/// thread the records still list without a registry hold (a hold
+/// [`release_for_main`] gave up, whose claim is in flight or whose restore
+/// was refused) leaves the records, unless it has become the pane's main
+/// conversation; a claim's restore then finds no entry and holds nothing.
 fn forget_known(state: &WsState, terminal_id: &str, thread_id: &str, known: Option<KnownThread>) {
     let Some(known) = known else {
         return;
@@ -388,7 +414,11 @@ fn forget_known(state: &WsState, terminal_id: &str, thread_id: &str, known: Opti
     refresh_lock_paths(state, terminal_id);
     let leave: fn(&WsState, &UnitEntry, &str, &str) = match known.hold {
         Hold::OnUnit => release_from_unit,
-        Hold::Released if !is_main(state, terminal_id, thread_id) => forget_from_records,
+        Hold::Released | Hold::Refused { recorded: true }
+            if !is_main(state, terminal_id, thread_id) =>
+        {
+            forget_from_records
+        }
         _ => return,
     };
     if let Some(entry) = state.units.by_terminal(terminal_id) {
@@ -443,7 +473,7 @@ pub fn observe_status(state: &WsState, terminal_id: &str, thread_id: &str, statu
         } else if let Some(known) = table.threads.get_mut(thread_id) {
             known.status = Some(status.to_string());
             Seen::Known {
-                refused: known.hold == Hold::Refused,
+                refused: matches!(known.hold, Hold::Refused { .. }),
             }
         } else {
             Seen::New
@@ -720,8 +750,10 @@ pub(crate) fn release_for_main(state: &WsState, terminal_id: &str, thread_id: &s
 /// it was announced again since, its new entry already holds what it can.
 /// When the hold is refused (another pane, or another transition, took the
 /// key in the meantime) the thread is not left unheld for good: WARN
-/// `unit.thread_restore_refused`, it is marked refused, and its next
-/// announcement, or the read before a stop, tries again.
+/// `unit.thread_restore_refused`, it is marked refused (as listed by the
+/// records, which the release left as they were, so Codex unloading it
+/// forgets it from them), and its next announcement, or the read before a
+/// stop, tries again.
 pub(crate) fn restore_extra(state: &WsState, terminal_id: &str, thread_id: &str) {
     /// Where the hold taken was settled.
     enum Restore {
@@ -753,7 +785,8 @@ pub(crate) fn restore_extra(state: &WsState, terminal_id: &str, thread_id: &str)
     let settled = with_existing_table(state, terminal_id, |table| {
         match table.threads.get_mut(thread_id) {
             Some(known) if known.hold == Hold::Released => {
-                known.hold = hold;
+                // The release left the records listing it.
+                known.hold = hold.listed();
                 Restore::Settled
             }
             Some(_) => Restore::Replaced,
@@ -762,7 +795,7 @@ pub(crate) fn restore_extra(state: &WsState, terminal_id: &str, thread_id: &str)
     })
     .unwrap_or(Restore::Dropped);
     match (settled, hold) {
-        (Restore::Settled, Hold::Refused) => {
+        (Restore::Settled, Hold::Refused { .. }) => {
             thread_event!(warn, &entry, terminal_id, "unit.thread_restore_refused",
                 thread_id = %thread_id,
                 "a thread the pane's app-server holds could not be held again after a refused claim; its next announcement or the read before a stop tries again")
@@ -1165,6 +1198,94 @@ mod tests {
         assert!(
             recorded_conversation(&containment, "t-x"),
             "the pane's main conversation stays in the unit record"
+        );
+    }
+
+    /// The sidecar record changes queued for [`TERMINAL`] from now on (they
+    /// go here instead of to its record writer).
+    fn sidecar_record_ops(state: &WsState) -> mpsc::UnboundedReceiver<RecordOp> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        with_table(state, TERMINAL, |table| table.record_writer = Some(tx))
+            .expect("the terminal runs in a unit");
+        rx
+    }
+
+    /// The thread ids the sidecar record was told to forget since the last
+    /// call.
+    fn forgotten(ops: &mut mpsc::UnboundedReceiver<RecordOp>) -> Vec<String> {
+        std::iter::from_fn(|| ops.try_recv().ok())
+            .filter_map(|op| match op {
+                RecordOp::Forget(thread_id) => Some(thread_id),
+                RecordOp::Note(_) => None,
+            })
+            .collect()
+    }
+
+    /// Task 14 re-review R3-M1: after a refused claim, a thread whose hold
+    /// could not be restored (another pane took it meanwhile) is still
+    /// listed by the unit record and the sidecar record, which the release
+    /// left as they were. While the app-server holds it, that is right, and
+    /// a retry refused again keeps it so. Once Codex unloads it, it leaves
+    /// both records, as any extra thread does, unless it has become the
+    /// pane's main conversation since.
+    #[tokio::test]
+    async fn an_unloaded_thread_whose_restore_was_refused_leaves_the_records() {
+        let (state, containment) = state_with_unit();
+        let ownership = state.ownership.clone().expect("an owner registry");
+        let mut record_ops = sidecar_record_ops(&state);
+        for thread_id in ["t-x", "t-main"] {
+            observe_status(&state, TERMINAL, thread_id, "active");
+            assert!(held_as_extra(&state, thread_id));
+            assert!(release_for_main(&state, TERMINAL, thread_id));
+            let other = OwnerIdentity {
+                kind: RuntimeOwnerKind::Terminal,
+                terminal_id: Some("term-other".into()),
+                unit_id: Some("unit-other".into()),
+                hold: HoldKind::Extra,
+                ..Default::default()
+            };
+            assert!(matches!(
+                ownership.hold_extra(CODEX, thread_id, other, "test", now_ms()),
+                HoldOutcome::Held { .. }
+            ));
+            restore_extra(&state, TERMINAL, thread_id);
+            // A retry, refused again: the other pane still holds it.
+            observe_status(&state, TERMINAL, thread_id, "idle");
+            assert!(
+                !held_as_extra(&state, thread_id),
+                "the other pane holds {thread_id}"
+            );
+            assert!(
+                recorded_conversation(&containment, thread_id),
+                "the app-server still holds {thread_id}: the unit record lists it"
+            );
+        }
+        // `t-main`'s other holder lets it go, and a later claim makes it
+        // the pane's main conversation.
+        ownership.release_extra(CODEX, "t-main", "unit-other");
+        state
+            .identity
+            .upsert(TERMINAL, Some(CODEX), Some("t-main"), None, 0);
+        assert!(forgotten(&mut record_ops).is_empty());
+
+        observe_status(&state, TERMINAL, "t-x", NOT_LOADED);
+        observe_status(&state, TERMINAL, "t-main", NOT_LOADED);
+        assert!(
+            !recorded_conversation(&containment, "t-x"),
+            "an unloaded t-x leaves the unit record"
+        );
+        assert_eq!(
+            forgotten(&mut record_ops),
+            vec!["t-x".to_string()],
+            "an unloaded t-x leaves the sidecar record; the main conversation stays"
+        );
+        assert!(
+            recorded_conversation(&containment, "t-main"),
+            "the pane's main conversation stays in the unit record"
+        );
+        assert!(
+            !held_as_extra(&state, "t-x") && !vacant(&state, "t-x"),
+            "the other pane's hold is not touched"
         );
     }
 
