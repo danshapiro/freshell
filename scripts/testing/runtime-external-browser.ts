@@ -21,7 +21,7 @@ import type { RuntimeWebConstructOptions, RuntimeWebFactory, RuntimeWebHandle, R
 import type { SyntheticStoppedRepairBatchFacts, SyntheticStoppedRepairBatchObservation, SyntheticStoppedRepairFault } from './runtime-sandbox.js'
 import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, dockerSocketPath, stripRuntimeWebEnvironment,
   SyntheticStoppedRepairBatchFactsSchema, SyntheticStoppedRepairBatchObservationSchema,
-  ManagedMigrationFactsSchema, ManagedStopResultSchema, SyntheticOpenCodeSourceFactsSchema,
+  ManagedMigrationFactsSchema, ManagedStopResultSchema, ManagedStopCompletionFactsSchema, SyntheticOpenCodeSourceFactsSchema,
   SyntheticOpenCodeHistoryFactsSchema, ManagedOpenCodeAdoptionStatusSchema, Phase3BrowserObservationSchema, Phase4BrowserObservationSchema,
   FreshCodexSavedHistoryPreservationSchema, FreshCodexSavedHistoryMeasurementSchema, FreshCodexControllerReattachmentSchema, FreshCodexHistoryMeasurementFinishSchema, FreshCodexHistoryMeasurementStartSchema, FreshCodexSavedHistoryOwnershipFactsSchema, FreshCodexControllerStartupFactsSchema, FreshCodexRetainedSnapshotFactsSchema, FreshAgentLaunchFactsSchema, FreshNativeCollectionResultSchema, OwnedContainerStateSchema, RuntimeHostProcessStateSchema, RuntimeHandleMismatchFieldsSchema, RuntimeWebProcessFactsSchema,
   RuntimeChaosWebOutputFactsSchema, RuntimeSupervisorProcessFactsSchema, RuntimeCandidateIntegritySchema,
@@ -41,7 +41,7 @@ import { createRuntimeEnclosureHandle, type RuntimeEnclosureHandle } from './run
 import type { Reporter, TestCase, TestResult, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
 import { ManagedRuntimeInventorySnapshotSchema, type ManagedRuntimeInventorySnapshot } from '../../shared/managed-runtime.js'
-import type { RuntimeWriterClaimFacts, ManagedMigrationFacts, ManagedStopResult } from './runtime-sandbox.js'
+import type { RuntimeWriterClaimFacts, ManagedMigrationFacts, ManagedStopResult, ManagedStopCompletionFacts } from './runtime-sandbox.js'
 import { pathToFileURL } from 'node:url'
 import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
@@ -992,6 +992,14 @@ export class ExternalManagedRuntimeRig {
       && result.view.incarnationId === handle.incarnationId, 'Stop result differs from the exact address'),
     { handle, expectedControlEpoch, expectedIntentRevision })
   }
+  async stopCompletionFacts(handle: ExactRuntimeHandle, expectedIntentRevision: number,
+    executionGeneration: number): Promise<ManagedStopCompletionFacts> {
+    return this.rpc('stop-completion-facts', ManagedStopCompletionFactsSchema.refine(result => (
+      (['soulId', 'incarnationId', 'containerId', 'hostBootId', 'nativeSessionId'] as const)
+        .every(field => result[field] === handle[field])
+      && result.intentRevision === expectedIntentRevision && result.executionGeneration === executionGeneration
+    ), 'Stop completion differs from the captured transaction'), { handle, expectedIntentRevision, generation: executionGeneration })
+  }
   async runningViewForTerminal(terminalId: string): Promise<ManagedRuntimeView | null> {
     return (await this.inventory()).find(row => row.terminalId === terminalId && row.launchState === 'running') ?? null
   }
@@ -1617,6 +1625,12 @@ export function createExternalRuntimeControl(
           throw new Error('exact Stop controller epoch and intent revision required')
         }
         result = await owner.stopRuntimeSoul(handle(), request.expectedControlEpoch, request.expectedIntentRevision)
+        break
+      case 'stop-completion-facts':
+        if (request.expectedIntentRevision === undefined || request.generation === undefined) {
+          throw new Error('captured Stop intent and execution generation required')
+        }
+        result = await owner.stopCompletionFacts(handle(), request.expectedIntentRevision, request.generation)
         break
       case 'retained-start':
         if (!retained || (request.challengeId !== 'config' && request.challengeId !== 'legacy')) throw new Error('registered retained fixture required')

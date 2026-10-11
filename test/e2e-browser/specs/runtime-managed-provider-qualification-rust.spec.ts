@@ -34,7 +34,7 @@ import { ExternalManagedRuntimeRig, resolveManagedExternalDescriptor } from '../
 import { task2RetainedPublicContext, type Task2RetainedPublicContext } from '../../../scripts/testing/task002-retained-fixture.js'
 import { managedRecoveryBlockedMessage } from '../../../src/lib/managed-runtime-recovery-message.js'
 import {
-  createManagedRuntimeBrowserRig, stopManagedRuntimeSoul, type ManagedFixtureRig,
+  createManagedRuntimeBrowserRig, completeManagedRuntimeStop, type ManagedFixtureRig,
   P2_OPENCODE_MODEL,
   P2_OPENCODE_VERSION,
   type ManagedRuntimeView,
@@ -374,7 +374,10 @@ async function qualifyProvider(
   expect(writerClaim.globalConflictingClaimCount).toBe(0)
   const lostNoticeCount = await rig.managedProviderPendingNoticeCount(writerHandle)
   expect(lostNoticeCount).toBe(0)
-  const stopped = await stopManagedRuntimeSoul(rig, created.view.soulId)
+  const { initial: initialStop, completion: stopped } = await completeManagedRuntimeStop(rig, created.view.soulId)
+  console.info(JSON.stringify({ severity: 'info', event: 'provider_qualification.stop_completed',
+    soulId: stopped.soulId, intentRevision: stopped.intentRevision, executionGeneration: stopped.executionGeneration,
+    initialOutcome: initialStop.outcome, outcome: stopped.outcome }))
   expect(stopped.outcome).toBe('verified_empty')
   if (stopped.outcome !== 'verified_empty') throw new Error('provider qualification Stop did not verify empty')
   const claimAfterStop = await rig.writerClaimFacts(writerHandle)

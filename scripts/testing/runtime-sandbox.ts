@@ -1516,7 +1516,7 @@ const RuntimeOwnerOperationRequestSchema = z.object({
     'replace-web', 'replace-web-graceful', 'replace-supervisor', 'replace-supervisor-abrupt', 'web-process-facts', 'supervisor-process-facts',
     'managed-opt-in', 'opencode-version', 'opencode-continuity-startup', 'opencode-continuity-first-turn', 'opencode-continuity-effect-count', 'opencode-continuity-follow-up', 'opencode-continuity-long-tool', 'loss-credential', 'loss-diagnostic', 'loss-absence', 'loss-remove-storage', 'loss-recover', 'loss-container-running', 'loss-incident', 'loss-assertions', 'loss-receipt', 'fresh-agent-ingresses', 'fresh-agent-receipt', 'provider-receipt', 'fresh-agent-launch-facts', 'fresh-native-register', 'fresh-native-stage', 'fresh-native-finish', 'fresh-browser-ingress', 'fresh-browser-turn-register', 'fresh-browser-turn-finish', 'fresh-browser-row', 'fresh-approval-register', 'fresh-approval-checkpoint', 'fresh-approval-finish', 'container-state', 'host-process-state', 'phase3-effect-reset', 'phase3-effect-count', 'crash-provider-worker',
     'crash-host', 'crash-provider', 'hold-host', 'release-host',
-    'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'finish', 'abort', 'incident-matches-soul',
+    'native-tool-evidence', 'native-follow-up-ids', 'stop-soul', 'stop-completion-facts', 'finish', 'abort', 'incident-matches-soul',
     'native-challenge-register', 'native-effect-count', 'native-effect-reset', 'chaos-web-output', 'chaos-long-tool-running', 'chaos-logs', 'chaos-evidence', 'chaos-receipt',
     'synthetic-history-challenge',
     'synthetic-source-facts',
@@ -1589,6 +1589,25 @@ export const ManagedStopResultSchema = z.object({
   view: ManagedRuntimeSoulSchema,
 }).strict()
 export type ManagedStopResult = z.infer<typeof ManagedStopResultSchema>
+
+/** Read-only evidence of the captured ordinary Stop, including revoke settlement. */
+export const ManagedStopCompletionFactsSchema = z.object({
+  soulId: z.string().min(1), incarnationId: z.string().min(1), containerId: z.string().regex(/^[a-f0-9]{64}$/),
+  hostBootId: z.string().min(1), nativeSessionId: z.string().min(1), providerStoreId: z.string().min(1),
+  intentRevision: z.number().int().nonnegative(), executionGeneration: z.number().int().nonnegative(),
+  outcome: ManagedStopResultSchema.shape.outcome.nullable(), settled: z.boolean(), revokePending: z.boolean(),
+  view: ManagedRuntimeSoulSchema,
+}).strict()
+export type ManagedStopCompletionFacts = z.infer<typeof ManagedStopCompletionFactsSchema>
+
+const ORDINARY_STOP_COMPLETION_SCRIPT = String.raw`
+import json,sqlite3,sys
+c=sqlite3.connect('file:/var/lib/freshell-supervisor/runtime.sqlite3?mode=ro',uri=True,timeout=1)
+c.row_factory=sqlite3.Row;c.execute('PRAGMA query_only=ON');c.execute('PRAGMA trusted_schema=OFF');c.execute('BEGIN')
+rows=c.execute('SELECT s.soul_id AS soulId,i.incarnation_id AS incarnationId,i.container_id AS containerId,i.host_boot_id AS hostBootId,s.native_session_id AS nativeSessionId,s.provider_store_id AS providerStoreId,p.intent_revision AS intentRevision,p.execution_generation AS executionGeneration,p.outcome,p.settled,p.revoke_pending AS revokePending FROM ordinary_stops p JOIN souls s ON s.soul_id=p.soul_id JOIN incarnations i ON i.incarnation_id=p.incarnation_id AND i.soul_id=s.soul_id WHERE p.soul_id=? AND p.incarnation_id=? AND p.intent_revision=? AND p.execution_generation=? AND s.intent_revision=p.intent_revision AND s.desired_state=\'stopped\' AND i.execution_generation=p.execution_generation',sys.argv[1:]).fetchall()
+if len(rows)!=1: raise RuntimeError('current exact Stop transaction is absent or changed')
+value=dict(rows[0]);value['settled']=bool(value['settled']);value['revokePending']=bool(value['revokePending']);print(json.dumps(value));c.close()
+`
 
 /** A run keeps operation settlements until teardown so a lost reply cannot repeat a mutation. */
 export class RuntimeOwnerOperationQueue {
@@ -5685,6 +5704,44 @@ export class ManagedRuntimeOwner {
     const result = await this.runtime.adminOk(this.supervisor,
       this.runtime.stopBody(handle.soulId, expectedControlEpoch, expectedIntentRevision))
     return ManagedStopResultSchema.parse(this.dataOf(result, 'stop'))
+  }
+
+  async stopCompletionFacts(handle: ExactRuntimeHandle, expectedIntentRevision: number,
+    executionGeneration: number): Promise<ManagedStopCompletionFacts> {
+    const receipts = this.runtime.broker.receipts().filter(receipt => receipt.soulId === handle.soulId
+      && receipt.incarnationId === handle.incarnationId && receipt.containerId === handle.containerId)
+    if (handle.runId !== this.runtime.runId || handle.candidateSha !== this.runtime.candidateSha || receipts.length !== 1) {
+      throw new Error('Stop completion requires the exact owned receipt')
+    }
+    const currentView = async () => {
+      const rows = (await this.inventory()).filter(row => row.soulId === handle.soulId)
+      const matching = rows.filter(row => row.incarnationId === handle.incarnationId)
+      const view = matching[0]
+      if (matching.length !== 1 || rows.some(row => row.incarnationId !== handle.incarnationId && row.launchState !== 'stopped')
+        || view.containerId !== handle.containerId || view.hostBootId !== handle.hostBootId
+        || view.nativeSessionId !== handle.nativeSessionId || view.intentRevision !== expectedIntentRevision
+        || view.executionGeneration !== executionGeneration || view.desiredState !== 'stopped') {
+        throw new Error('current Stop completion identity or transaction changed')
+      }
+      return view
+    }
+    await currentView()
+    const host = z.object({ hostBootId: z.literal(handle.hostBootId) }).passthrough()
+      .safeParse(JSON.parse(await fsp.readFile(path.join(receipts[0].runtimeDir, 'host-state.json'), 'utf8')))
+    if (!host.success) throw new Error('Stop completion owned host boot changed')
+    // Async scoped IO remains in providerProbes until it settles, even if the
+    // browser's fixed observation deadline expires first. Cleanup joins it.
+    const raw = JSON.parse(await this.trackedDockerProbe(this.supervisor.containerId, ['exec', this.supervisor.containerId,
+      'python3', '-c', ORDINARY_STOP_COMPLETION_SCRIPT, handle.soulId, handle.incarnationId,
+      String(expectedIntentRevision), String(executionGeneration)]))
+    // Completion may occur during the IO above. Recheck the current fence and
+    // read its view afterward instead of pairing a final transaction with an
+    // earlier "stopping" view.
+    const facts = ManagedStopCompletionFactsSchema.parse({ ...raw, view: await currentView() })
+    if ((['soulId', 'incarnationId', 'containerId', 'hostBootId', 'nativeSessionId'] as const)
+      .some(field => facts[field] !== handle[field]) || facts.intentRevision !== expectedIntentRevision
+      || facts.executionGeneration !== executionGeneration) throw new Error('recorded Stop completion identity changed')
+    return facts
   }
 
   async stop(): Promise<{ ok: boolean; errors: string[] }> {
