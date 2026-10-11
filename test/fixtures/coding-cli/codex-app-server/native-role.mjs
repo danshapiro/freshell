@@ -9,14 +9,65 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { acquireThreadLock, heldThreadIds, releaseThreadLock } from './fake-lock.mjs'
+
+function isSameOrInside(parent, child) {
+  const relative = path.relative(parent, child)
+  return !(relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))
+}
+
+// `target` with its nearest existing ancestor resolved through every symlink
+// (the rest appended as written), so a symlink cannot hide where it leads.
+function resolvedThroughSymlinks(target) {
+  const rest = []
+  let current = path.resolve(target)
+  for (;;) {
+    try {
+      return path.join(fs.realpathSync(current), ...rest)
+    } catch {
+      const parent = path.dirname(current)
+      if (parent === current) return path.resolve(target)
+      rest.unshift(path.basename(current))
+      current = parent
+    }
+  }
+}
+
+// The real user's ~/.codex (home from the password database, so no HOME setting
+// hides it) when `codexHome` is that folder or lies inside it, else null. The
+// paths as written are compared first, so a home inside the real ~/.codex is
+// refused before any file system call reaches it; then the paths resolved
+// through symlinks. fake-app-server.mjs applies the same rule before it loads
+// this role.
+function realUsersCodexHomeHolding(codexHome) {
+  let realHome
+  try {
+    realHome = path.resolve(os.userInfo().homedir)
+  } catch {
+    return null // no password-database entry: there is no real user home to protect
+  }
+  const home = path.resolve(codexHome)
+  const realCodexHome = path.join(realHome, '.codex')
+  if (isSameOrInside(realCodexHome, home)) return realCodexHome
+  const resolvedRealCodexHome = path.join(resolvedThroughSymlinks(realHome), '.codex')
+  return isSameOrInside(resolvedRealCodexHome, resolvedThroughSymlinks(home)) ? resolvedRealCodexHome : null
+}
 
 export function createNativeRole({ behavior, codexHome, broadcast, hasRollout, materialize, openConnections, sendTo }) {
   // The native creates, locks and deletes real thread lock files, so it never falls
   // back to the user's own ~/.codex: an unset or empty CODEX_HOME is a startup error.
   if (!codexHome) {
     process.stderr.write('FAKE_CODEX_ROLE=native requires an explicit CODEX_HOME (it never uses the real ~/.codex)\n')
+    process.exit(1)
+  }
+  const realCodexHome = realUsersCodexHomeHolding(codexHome)
+  if (realCodexHome) {
+    process.stderr.write(
+      `FAKE_CODEX_ROLE=native: the Codex home ${codexHome} is the real user's Codex home or inside it `
+        + `(${realCodexHome}); set CODEX_HOME to the test's own directory. It never uses the real ~/.codex.\n`,
+    )
     process.exit(1)
   }
   if (process.platform !== 'linux' && !process.env.FAKE_CODEX_LOCK_HOLDER) {

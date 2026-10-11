@@ -85,29 +85,67 @@ function hasExplicitCodexHome() {
   return typeof process.env.CODEX_HOME === 'string' && process.env.CODEX_HOME.trim().length > 0
 }
 
+function isSameOrInside(parent, child) {
+  const relative = path.relative(parent, child)
+  return !(relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))
+}
+
+// `target` with its nearest existing ancestor resolved through every symlink
+// (the rest appended as written), so a symlink cannot hide where it leads.
+function resolvedThroughSymlinks(target) {
+  const rest = []
+  let current = path.resolve(target)
+  for (;;) {
+    try {
+      return path.join(fs.realpathSync(current), ...rest)
+    } catch {
+      const parent = path.dirname(current)
+      if (parent === current) return path.resolve(target)
+      rest.unshift(path.basename(current))
+      current = parent
+    }
+  }
+}
+
 // Tests never reach the user's real Codex home. Freshell reads (and walks) the
 // home this fake reports in `initialize`, and without an explicit CODEX_HOME the
-// fake falls back to <HOME>/.codex, as real Codex does. So when CODEX_HOME is
-// unset and that fallback lies inside the real user's home directory (from the
-// password database, so an unset or overridden HOME cannot hide it), the fake
-// refuses to start, before it reads or writes anything: a test must set
-// CODEX_HOME or an isolated HOME. The native role has the same rule.
+// fake falls back to <HOME>/.codex, as real Codex does. The real user's home comes
+// from the password database, so an unset or overridden HOME cannot hide it. The
+// fake refuses to start, before it reads or writes anything, when:
+// - CODEX_HOME is unset and the fallback lies inside the real user's home (a test
+//   must set CODEX_HOME or an isolated HOME);
+// - the Codex home, explicit (or inherited, say from a shell profile) or the
+//   fallback, is the real ~/.codex or lies inside it.
+// Both are checked on the paths as written first, so a home inside the real
+// ~/.codex is refused before any file system call reaches it, and then on the
+// paths resolved through symlinks (a symlinked HOME or CODEX_HOME). The native
+// role keeps the second rule on its own (native-role.mjs); this file stays
+// self-contained, so it still runs when copied alone.
 function refuseTheRealUsersCodexHome() {
-  if (hasExplicitCodexHome()) return
   let realHome
   try {
     realHome = path.resolve(os.userInfo().homedir)
   } catch {
     return // no password-database entry: there is no real user home to protect
   }
-  const fallback = path.resolve(os.homedir(), '.codex')
-  const relative = path.relative(realHome, fallback)
-  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return
-  process.stderr.write(
-    `fake-app-server: CODEX_HOME is unset and the fallback Codex home ${fallback} is inside the `
-      + `real user's home ${realHome}; set CODEX_HOME (or an isolated HOME). The fake never uses `
-      + 'the real ~/.codex.\n',
-  )
+  const explicit = hasExplicitCodexHome()
+  const codexHome = path.resolve(getCodexHome())
+  const refusal = (home, userHome) => {
+    if (!explicit && isSameOrInside(userHome, home)) {
+      return `CODEX_HOME is unset and the fallback Codex home ${home} is inside the real user's `
+        + `home ${userHome}; set CODEX_HOME (or an isolated HOME).`
+    }
+    const realCodexHome = path.join(userHome, '.codex')
+    if (isSameOrInside(realCodexHome, home)) {
+      return `the Codex home ${home} (CODEX_HOME=${process.env.CODEX_HOME}) is the real user's `
+        + `Codex home or inside it (${realCodexHome}); set CODEX_HOME to the test's own directory.`
+    }
+    return null
+  }
+  const reason = refusal(codexHome, realHome)
+    ?? refusal(resolvedThroughSymlinks(codexHome), resolvedThroughSymlinks(realHome))
+  if (!reason) return
+  process.stderr.write(`fake-app-server: ${reason} The fake never uses the real ~/.codex.\n`)
   process.exit(1)
 }
 

@@ -1378,6 +1378,170 @@ async fn the_single_process_fake_refuses_the_real_users_codex_home() {
     isolated.kill().await.expect("stop this test's own fake");
 }
 
+/// The real user's home directory as the fakes see it: Node's password-database
+/// entry (`os.userInfo().homedir`), which no `HOME` setting changes.
+fn real_users_home() -> std::path::PathBuf {
+    let out = std::process::Command::new("node")
+        .args([
+            "-e",
+            "process.stdout.write(require('node:os').userInfo().homedir)",
+        ])
+        .output()
+        .expect("run node");
+    assert!(out.status.success(), "node: {out:?}");
+    std::path::PathBuf::from(String::from_utf8(out.stdout).expect("utf-8 home"))
+}
+
+/// A path inside the real user's `~/.codex` that no one creates: the guard must
+/// refuse it from its text alone, so no file system call ever reaches it.
+fn a_path_inside_the_real_users_codex_home() -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    real_users_home()
+        .join(".codex")
+        .join(format!(
+            "freshell-fixture-guard-{}-{nanos}",
+            std::process::id()
+        ))
+        .join("home")
+}
+
+/// The single-process fake (stderr piped) under `home`, with `CODEX_HOME` set only
+/// when given.
+fn single_process_fake(home: &Path, codex_home: Option<&Path>) -> tokio::process::Child {
+    let mut cmd = tokio::process::Command::new("node");
+    cmd.arg(fixture_path("fake-app-server.mjs"))
+        .args([
+            "--listen",
+            &format!("ws://127.0.0.1:{}", unique_free_port()),
+        ])
+        .env("HOME", home)
+        .env_remove("CODEX_HOME")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(codex_home) = codex_home {
+        cmd.env("CODEX_HOME", codex_home);
+    }
+    cmd.spawn().expect("spawn the single-process fake")
+}
+
+/// Waits up to 5 s for `child` to exit and returns its exit code (`None`: still
+/// running, killed by `kill_on_drop`) with everything it wrote to stderr.
+async fn exit_and_stderr(mut child: tokio::process::Child) -> (Option<i32>, String) {
+    use tokio::io::AsyncReadExt;
+    let mut stderr = child.stderr.take().expect("the child's stderr");
+    match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+        Ok(status) => {
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text).await;
+            (status.expect("wait for the child").code(), text)
+        }
+        Err(_) => (None, String::new()),
+    }
+}
+
+/// An explicit (or inherited) `CODEX_HOME` inside the real user's `~/.codex` is
+/// refused too, not only the unset-`CODEX_HOME` fallback: the fake exits 1 at
+/// startup and says why, with a throwaway `HOME` so only `CODEX_HOME` points at
+/// the real store.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_single_process_fake_refuses_an_explicit_codex_home_inside_the_real_one() {
+    let home = tempfile::tempdir().unwrap();
+    let inside = a_path_inside_the_real_users_codex_home();
+    let child = single_process_fake(home.path(), Some(&inside));
+    let (code, stderr) = exit_and_stderr(child).await;
+    assert_eq!(code, Some(1), "the fake refuses at once: {stderr}");
+    assert!(
+        stderr.contains("is the real user's Codex home or inside it")
+            && stderr.contains("never uses the real ~/.codex"),
+        "{stderr}"
+    );
+}
+
+/// The native role keeps the same rule on its own (it creates, locks and
+/// deletes real thread lock files under its Codex home).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_native_role_refuses_a_codex_home_inside_the_real_one() {
+    let inside = a_path_inside_the_real_users_codex_home();
+    let script = format!(
+        "const {{ createNativeRole }} = await import({native});\n\
+         createNativeRole({{ behavior: {{}}, codexHome: process.argv[1], broadcast() {{}},\n\
+           hasRollout: () => false, materialize() {{}}, openConnections: () => [], sendTo() {{}} }})\n\
+         process.stderr.write('the native role started\\n')\n",
+        native = serde_json::to_string(
+            &url_of(&fixture_path("native-role.mjs"))
+        )
+        .unwrap()
+    );
+    let child = tokio::process::Command::new("node")
+        .args(["--input-type=module", "-e", &script])
+        .arg(&inside)
+        .env_remove("CODEX_HOME")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn node with the native role");
+    let (code, stderr) = exit_and_stderr(child).await;
+    assert_eq!(code, Some(1), "the native role refuses at once: {stderr}");
+    assert!(
+        stderr.contains("is the real user's Codex home or inside it")
+            && stderr.contains("never uses the real ~/.codex")
+            && !stderr.contains("the native role started"),
+        "{stderr}"
+    );
+}
+
+/// `file://` URL of an absolute path, for a dynamic `import()`.
+fn url_of(path: &Path) -> String {
+    format!("file://{}", path.display())
+}
+
+/// The home check compares real paths, not text: a `HOME` that is a symlink
+/// to a directory inside the real user's home is refused like that directory
+/// itself (`CODEX_HOME` unset, so the fallback would be `<real home>/…/.codex`).
+/// The symlink's target is this test's own directory, never `~/.codex`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_single_process_fake_refuses_a_symlinked_home_into_the_real_one() {
+    let real_home = real_users_home();
+    let real_home_resolved = real_home.canonicalize().expect("the real home exists");
+    // A directory of this test's own inside the real home: Cargo's per-target
+    // temp dir when it lies there (the usual checkout), else a temp dir directly
+    // in the real home. Removed when the test ends.
+    let cargo_tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let target = if cargo_tmp
+        .canonicalize()
+        .is_ok_and(|dir| dir.starts_with(&real_home_resolved))
+    {
+        tempfile::tempdir_in(cargo_tmp).unwrap()
+    } else {
+        tempfile::Builder::new()
+            .prefix(".freshell-fixture-guard-")
+            .tempdir_in(&real_home)
+            .unwrap()
+    };
+    let link_parent = tempfile::tempdir_in("/tmp").unwrap();
+    let link = link_parent.path().join("home");
+    std::os::unix::fs::symlink(target.path(), &link).unwrap();
+    assert!(
+        !link.starts_with(&real_home) && !link.starts_with(&real_home_resolved),
+        "precondition: the symlinked HOME {} is outside the real home by its text",
+        link.display()
+    );
+    let child = single_process_fake(&link, None);
+    let (code, stderr) = exit_and_stderr(child).await;
+    assert_eq!(code, Some(1), "the fake refuses at once: {stderr}");
+    assert!(
+        stderr.contains("CODEX_HOME is unset") && stderr.contains("never uses the real ~/.codex"),
+        "{stderr}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_start_or_resume_holds_no_lock() {
     // (1) Error overrides: real Codex holds nothing for a start or resume it refused.
