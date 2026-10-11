@@ -73,6 +73,7 @@ vi.mock('@/lib/api', () => ({
     hasMore: false,
   }),
   searchSessions: vi.fn().mockResolvedValue({ results: [] }),
+  getTerminalDirectoryPage: vi.fn().mockResolvedValue({ items: [], nextCursor: null, revision: 1 }),
 }))
 
 // Mock lucide-react icons
@@ -166,10 +167,11 @@ import {
 } from '@shared/settings'
 
 // Import the mocked api to get access to the mocks
-import { api, fetchSidebarSessionsSnapshot, searchSessions } from '@/lib/api'
+import { api, fetchSidebarSessionsSnapshot, getTerminalDirectoryPage, searchSessions } from '@/lib/api'
 const mockApiTyped = vi.mocked(api)
 const mockFetchSidebarSessionsSnapshot = vi.mocked(fetchSidebarSessionsSnapshot)
 const mockSearchSessions = vi.mocked(searchSessions)
+const mockGetTerminalDirectoryPage = vi.mocked(getTerminalDirectoryPage)
 
 // ============================================================================
 // Test Utilities
@@ -234,10 +236,6 @@ function createTestStore(state: TestStoreState = {}) {
         expandedProjects: new Set<string>(),
         ...state.sessions,
       },
-      panes: {
-        layouts: {},
-        activePane: {},
-      },
       terminalDirectory: {
         windows: {},
         searches: {},
@@ -294,6 +292,7 @@ describe('Component Edge Cases', () => {
       hasMore: false,
     })
     mockSearchSessions.mockResolvedValue({ results: [] })
+    mockGetTerminalDirectoryPage.mockResolvedValue({ items: [], nextCursor: null, revision: 1 })
   })
 
   afterEach(() => {
@@ -668,13 +667,48 @@ describe('Component Edge Cases', () => {
     })
 
     describe('BackgroundSessions', () => {
-      it('shows empty state message when no detached terminals', () => {
-        const store = createTestStore()
+      it.each(['blocked', 'exited'] as const)(
+        'refreshes an empty directory and attaches a retained %s detached terminal', async (runtimeStatus) => {
+          const store = createTestStore()
+          await act(async () => {
+            renderWithStore(<BackgroundSessions />, store)
+          })
 
-        renderWithStore(<BackgroundSessions />, store)
+          expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled()
+          expect(screen.queryByRole('button', { name: 'Attach' })).not.toBeInTheDocument()
+          expect(screen.queryByRole('button', { name: 'Kill' })).not.toBeInTheDocument()
 
-        expect(screen.getByText(/No detached running terminals/)).toBeInTheDocument()
-      })
+          mockGetTerminalDirectoryPage.mockResolvedValueOnce({
+            items: [{
+              terminalId: 'retained-terminal',
+              soulId: 'retained-soul',
+              title: 'Retained conversation',
+              mode: 'codex',
+              createdAt: Date.now(),
+              lastActivityAt: Date.now(),
+              status: 'exited',
+              runtimeStatus,
+              hasClients: false,
+            }],
+            nextCursor: null,
+            revision: 2,
+          })
+          await act(async () => {
+            fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+          })
+
+          expect(screen.getByRole('button', { name: 'Attach' })).toBeEnabled()
+          expect(screen.getByRole('button', { name: 'Kill' })).toBeEnabled()
+          fireEvent.click(screen.getByRole('button', { name: 'Attach' }))
+          const [tab] = store.getState().tabs.tabs
+          expect(tab).toMatchObject({ soulId: 'retained-soul', mode: 'codex', status: 'exited' })
+          expect(store.getState().tabs.activeTabId).toBe(tab.id)
+          expect(store.getState().panes.layouts[tab.id]).toMatchObject({
+            type: 'leaf',
+            content: { terminalId: 'retained-terminal', soulId: 'retained-soul', status: 'exited', runtimeStatus },
+          })
+        },
+      )
     })
   })
 
