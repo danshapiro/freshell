@@ -204,6 +204,7 @@ pub(crate) fn final_claude_source_request(
 > {
     use freshell_platform::claude_inputs::{observation::ObservationRequest, ClaudeInputManifest};
     use sha2::{Digest, Sha256};
+
     let Some(context) = context.filter(|context| context.preparation.provider() == "claude") else {
         return Ok(None);
     };
@@ -613,6 +614,228 @@ mod tests {
     use freshell_platform::opencode_recipe::*;
     use freshell_runtime_protocol::*;
     use sha2::{Digest, Sha256};
+
+    #[cfg(target_os = "linux")]
+    fn private_native_auth_case(case: &str, test: &str) {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        const CHILD: &str = "FRESHELL_TEST_PRIVATE_NATIVE_AUTH_ROOT";
+        if let Some(root) = std::env::var_os(CHILD) {
+            assert_eq!(unsafe { libc::geteuid() }, 0);
+            let status = std::fs::read_to_string("/proc/self/status").unwrap();
+            let capabilities = status
+                .lines()
+                .find_map(|line| line.strip_prefix("CapEff:\t"))
+                .unwrap();
+            assert_eq!(
+                u64::from_str_radix(capabilities, 16).unwrap(),
+                (1 << 0) | (1 << 6) | (1 << 7)
+            );
+            let root = std::path::PathBuf::from(root);
+            let home = root.join("home");
+            let stage = root.join("stage");
+            let bytes = std::fs::read(stage.join(".freshell/input-manifest.json")).unwrap();
+            let capability = McpCapabilityReference {
+                grant_id: format!("grant-{}", uuid::Uuid::new_v4()),
+                endpoint: "http://host.docker.internal:4000".into(),
+                provider_relative_path: ".freshell/mcp-capability.json".into(),
+                host_gateway_address: None,
+            };
+            let context = ProviderLaunchContext {
+                preparation: ProviderPreparation::Opencode {
+                    project_config: vec![],
+                    tui_config: None,
+                    tui_source: None,
+                    inline_config: false,
+                },
+                config: vec![],
+                mcp_capability: Some(capability.clone()),
+                prepared_inputs: Some(PreparedProviderInputs {
+                    generation_id: capability.grant_id,
+                    initial_auth_reservation: None,
+                    manifest: ProviderInputManifestReference {
+                        relative_path: ".freshell/input-manifest.json".into(),
+                        sha256: format!("{:x}", Sha256::digest(&bytes)),
+                        source_count: 1,
+                        alias_count: 0,
+                        recipe_count: 1,
+                    },
+                    config_binds: vec![],
+                    resource_mounts: vec![],
+                    indexed_files: None,
+                }),
+            };
+            // The deployed controller cannot traverse this private provider HOME.
+            assert!(
+                freshell_platform::native_auth_exchange::read_selected_native_auth(&home, &[])
+                    .is_err()
+            );
+            let mut secrets = ResolvedProviderSecrets::default();
+            let result = prepare(
+                Some(&context),
+                &mut secrets,
+                &ProviderPathInputs::default(),
+                &stage,
+                &home,
+            );
+            match case {
+                "selected" => {
+                    let generated = result
+                        .expect("private native auth must be read under the provider identity");
+                    assert!(
+                        generated["FRESHELL_CONFIG_REFERENCE_0"].contains("selected-native-nonce")
+                    );
+                    assert!(!generated
+                        .values()
+                        .any(|value| value.contains("unrequested-native-marker")));
+                }
+                "absent" => {
+                    result.expect("a provider-readable absent auth store must remain optional");
+                }
+                "foreign" => assert!(result
+                    .expect_err("foreign native auth must be refused")
+                    .contains("escaped owned HOME")),
+                "reserved" => assert!(result
+                    .expect_err(
+                        "reserved native keys must remain invalid even with no selected keys"
+                    )
+                    .contains("native auth file cannot be decoded")),
+                _ => unreachable!(),
+            }
+            return;
+        }
+        assert_eq!(
+            unsafe { libc::geteuid() },
+            0,
+            "this process/identity test requires the documented disposable sandbox"
+        );
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let stage = owned.path().join("stage");
+        std::fs::set_permissions(owned.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir_all(stage.join(".freshell/source-views")).unwrap();
+        std::fs::create_dir_all(home.join(".local/share/opencode")).unwrap();
+        let auth = home.join(".local/share/opencode/auth.json");
+        match case {
+            "selected" => std::fs::write(&auth, r#"{"selected":{"type":"wellknown","key":"AUTH_NONCE","token":"selected-native-nonce"},"other":{"type":"wellknown","key":"OTHER_NONCE","token":"unrequested-native-marker"}}"#).unwrap(),
+            "reserved" => std::fs::write(&auth, r#"{"shadow":{"type":"wellknown","key":"FRESHELL_CONFIG_REFERENCE_0","token":"reserved-native-marker"}}"#).unwrap(),
+            "foreign" => {
+                let outside = owned.path().join("outside-auth");
+                std::fs::write(&outside, "outside-native-marker").unwrap();
+                std::os::unix::fs::symlink(outside, &auth).unwrap();
+            }
+            "absent" => {}, _ => unreachable!(),
+        }
+        for directory in [
+            &home,
+            &home.join(".local"),
+            &home.join(".local/share"),
+            &home.join(".local/share/opencode"),
+        ] {
+            crate::set_owner(directory, 65534, 0).unwrap();
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        if matches!(case, "selected" | "reserved") {
+            crate::set_owner(&auth, 65534, 0).unwrap();
+            std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let source = if case == "selected" {
+            r#"{"fixture":"{env:AUTH_NONCE}"}"#
+        } else {
+            "{}"
+        };
+        std::fs::write(stage.join(".freshell/source-views/source-0"), source).unwrap();
+        let manifest = SourceManifest {
+            version: 1,
+            cwd: owned.path().to_owned(),
+            original_home: home.clone(),
+            global_config_root: None,
+            sources: vec![SourceView {
+                discovery_role: DiscoveryRole::Workspace,
+                logical_path: owned.path().join("opencode.json"),
+                native_destination: None,
+                lane: SourceLane::Main,
+                unexpanded_relative_path: ".freshell/source-views/source-0".into(),
+                template_relative_path: ".freshell/templates/source-0".into(),
+                template_sha256: None,
+                generated_name: Some("FRESHELL_CONFIG_REFERENCE_0".into()),
+                occurrences: vec![],
+                referenced_variables: if case == "selected" {
+                    vec!["AUTH_NONCE".into()]
+                } else {
+                    vec![]
+                },
+                path_variables: vec![],
+                original_form: false,
+            }],
+            files: vec![],
+            frozen_inputs: vec![],
+            user_owns_freshell_mcp: true,
+            inline_edits: Default::default(),
+            rebind_enabled: true,
+            native_source_flags: vec![],
+            resource_roots: vec![],
+        };
+        std::fs::write(
+            stage.join(".freshell/input-manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let before = std::fs::metadata(&home).unwrap();
+        let joined = std::process::Command::new("/usr/bin/setpriv")
+            .args([
+                "--bounding-set=-all,+chown,+setuid,+setgid",
+                "--inh-caps=-all",
+                "--ambient-caps=-all",
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, owned.path())
+            .status()
+            .unwrap();
+        let after = std::fs::metadata(&home).unwrap();
+        assert_eq!(
+            (before.uid(), before.gid(), before.mode()),
+            (after.uid(), after.gid(), after.mode())
+        );
+        assert_eq!(after.mode() & 0o777, 0o700);
+        assert!(
+            joined.success(),
+            "the joined controller-capability child must preserve the private native auth contract"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn provider_secret_native_auth_private_home_selected() {
+        private_native_auth_case(
+            "selected",
+            "provider_input_preparation::tests::provider_secret_native_auth_private_home_selected",
+        );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn provider_secret_native_auth_private_home_absent() {
+        private_native_auth_case(
+            "absent",
+            "provider_input_preparation::tests::provider_secret_native_auth_private_home_absent",
+        );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn provider_secret_native_auth_private_home_foreign() {
+        private_native_auth_case(
+            "foreign",
+            "provider_input_preparation::tests::provider_secret_native_auth_private_home_foreign",
+        );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn provider_secret_native_auth_private_home_reserved() {
+        private_native_auth_case(
+            "reserved",
+            "provider_input_preparation::tests::provider_secret_native_auth_private_home_reserved",
+        );
+    }
 
     #[test]
     fn provider_secret_repeated_native_source_views_release_live_storage_between_occurrences() {
