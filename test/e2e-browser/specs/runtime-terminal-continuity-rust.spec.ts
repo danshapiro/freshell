@@ -581,9 +581,21 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       await expect(pane).toBeVisible()
       const contentAfterRestart = (await harness.getPaneLayout(created.tabId)).content
       expect(contentAfterRestart).toMatchObject(canonical)
-      const postStopHistoryResponses = historyResponses.slice(postStopRestartResponseStart)
+      const waitForPostStopHistoryResponse = () => waitForValue('read-only stopped history response', async () => {
+        await Promise.all(historyResponseReads.slice(postStopRestartResponseStart))
+        return historyResponses.slice(postStopRestartResponseStart).find((response) => response.route === 'managed'
+          && response.status === 200 && response.threadId === nativeId
+          && response.turnCount === retained.turns.length && response.canSend === false) ?? null
+      }, 60_000)
+      let historyResponseWaitFailure: string | undefined
+      try {
+        await waitForPostStopHistoryResponse()
+      } catch (error) {
+        historyResponseWaitFailure = error instanceof Error ? error.message : String(error)
+      }
       await Promise.all(historyResponseReads.slice(postStopRestartResponseStart))
-      const snapshotRequests = (await harness.getPerfAuditSnapshot())?.perfEvents
+      const postStopHistoryResponses = historyResponses.slice(postStopRestartResponseStart)
+      const readSnapshotRequests = async () => (await harness.getPerfAuditSnapshot())?.perfEvents
         .filter((event) => event.event === 'fresh_agent.snapshot_request')
         .slice(-12)
         .map(({ view, stage, reason, requestSerial, readGeneration, check, stale, fence, outcome, ran,
@@ -597,6 +609,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
           ownerChanged, providerChanged, typeChanged, threadChanged, paneSessionChanged, recoveryChanged,
           live, vacant, rows, previousRows, accepted,
         })) ?? []
+      const snapshotRequests = await readSnapshotRequests()
       const contentFacts = {
         status: contentAfterRestart.status,
         hasSessionId: Boolean(contentAfterRestart.sessionId),
@@ -607,19 +620,23 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
           recoveryState: contentAfterRestart.recoverySummary.recoveryState,
         } : null,
       }
-      expect(postStopHistoryResponses, `the reloaded stopped pane must request saved history; pane=${JSON.stringify(contentFacts)}; snapshotRequests=${JSON.stringify(snapshotRequests)}`)
-        .not.toHaveLength(0)
-      expect(postStopHistoryResponses.some((response) => response.status === 200
-        && response.threadId === nativeId && response.turnCount === retained.turns.length && response.canSend === false),
-      `stopped history response did not contain the retained read-only transcript: ${JSON.stringify(postStopHistoryResponses)}`)
-        .toBe(true)
+      expect(historyResponseWaitFailure,
+        `the reloaded stopped pane must return saved read-only history; pane=${JSON.stringify(contentFacts)}; responses=${JSON.stringify(postStopHistoryResponses)}; snapshotRequests=${JSON.stringify(snapshotRequests)}`)
+        .toBeUndefined()
       const afterHistory = await history()
       expect(afterHistory.threadId).toBe(nativeId)
       expect(afterHistory.turns).toEqual(retained.turns)
       expect(afterHistory.capabilities.send).toBe(false)
-      await expect(pane.getByText('Synthetic saved answer 2', { exact: true }),
-        `history responses=${JSON.stringify(postStopHistoryResponses)}; snapshotRequests=${JSON.stringify(snapshotRequests)}`)
-        .toBeVisible({ timeout: 60_000 })
+      let transcriptWaitFailure: string | undefined
+      try {
+        await expect(pane.getByText('Synthetic saved answer 2', { exact: true })).toBeVisible({ timeout: 60_000 })
+      } catch (error) {
+        transcriptWaitFailure = error instanceof Error ? error.message : String(error)
+      }
+      const finalSnapshotRequests = await readSnapshotRequests()
+      expect(transcriptWaitFailure,
+        `the retained stopped transcript response did not appear in the pane; responses=${JSON.stringify(postStopHistoryResponses)}; snapshotRequests=${JSON.stringify(finalSnapshotRequests)}`)
+        .toBeUndefined()
       await expect(pane.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
       const afterFacts = await rig.interruptedOrdinaryStopFacts(handle)
       const after = afterFacts.durable
