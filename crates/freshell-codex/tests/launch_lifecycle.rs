@@ -1475,13 +1475,16 @@ async fn plan_retry_falls_back_to_fresh_spawn_after_reattach_failure() {
                         as Arc<dyn CodexLaunchRuntime>;
                 }
             }
-            Arc::new(
+            // Judged by its own fake's record: a start whose port another
+            // app-server took (and answered on) fails, and the planner
+            // retries it, instead of passing against that other app-server.
+            ListenChecked::build(context, |context| {
                 SpawnedCodexAppServerRuntime::with_command_store_and_context(
                     fake_app_server_command(),
                     store,
                     context,
-                ),
-            ) as Arc<dyn CodexLaunchRuntime>
+                )
+            }) as Arc<dyn CodexLaunchRuntime>
         })
     }));
 
