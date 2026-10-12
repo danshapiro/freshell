@@ -177,6 +177,15 @@ for (const scenario of ['missing-reference', 'startup-before-identity']) {
       const retained = { mode: 'opencode', status: 'error', createRequestId: pane.createRequestId,
         launchFailure: { code: 'LAUNCH_FAILED', providerPreparationFailure: preparationFailure } }
       expect(pane.content).toMatchObject(retained)
+      expect(await page.evaluate(requestId => window.__FRESHELL_TEST_HARNESS__!.getReceivedWsMessages?.()
+        .filter((message: any) => message.type === 'error' && message.requestId === requestId)
+        .map((message: any) => ({ code: message.code, requestId: message.requestId,
+          providerPreparationFailure: message.providerPreparationFailure })), pane.createRequestId)).toContainEqual({
+        code: 'PTY_SPAWN_FAILED', requestId: pane.createRequestId, providerPreparationFailure: preparationFailure,
+      })
+      expect(await page.evaluate(requestId => window.__FRESHELL_TEST_HARNESS__!.getReceivedWsMessages?.()
+        .filter((message: any) => message.type === 'terminal.created' && message.requestId === requestId).length,
+      pane.createRequestId)).toBe(0)
       const assertNoHandle = async () => {
         const current = (await activePane(page)).content
         if (current.kind !== 'terminal') throw new Error('Expected the real failed request pane')
@@ -195,7 +204,9 @@ for (const scenario of ['missing-reference', 'startup-before-identity']) {
       await assertNoHandle()
       const creates = await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
         .filter((message: any) => message.type === 'terminal.create').length)
-      expect(creates).toBe(1)
+      expect(await page.evaluate(requestId => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
+        .filter((message: any) => message.type === 'terminal.create' && message.requestId === requestId).length,
+      pane.createRequestId)).toBe(1)
       await new TestHarness(page).forceDisconnect()
       await new TestHarness(page).waitForConnection(120_000)
       expect((await activePane(page)).content).toMatchObject(retained)
@@ -206,8 +217,9 @@ for (const scenario of ['missing-reference', 'startup-before-identity']) {
       await page.waitForFunction(() => Boolean(window.__FRESHELL_TEST_HARNESS__), undefined, { timeout: 60_000 })
       await new TestHarness(page).waitForConnection(120_000)
       expect((await activePane(page)).content).toMatchObject(retained)
-      expect(await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
-        .filter((message: any) => message.type === 'terminal.create').length)).toBe(0)
+      expect(await page.evaluate(requestId => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
+        .filter((message: any) => message.type === 'terminal.create' && message.requestId === requestId).length,
+      pane.createRequestId)).toBe(0)
       await expect(diagnostic).toContainText(selectedPath)
       await expect(diagnostic).toContainText(/not found/i)
       await assertNoHandle()
