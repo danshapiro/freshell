@@ -50,6 +50,13 @@ impl std::fmt::Display for ReferenceError {
 }
 impl std::error::Error for ReferenceError {}
 
+// Preserve the existing generic error until the typed producer behavior is implemented.
+impl From<ReferenceError> for freshell_terminal::registry::ManagedTerminalLaunchError {
+    fn from(error: ReferenceError) -> Self {
+        error.to_string().into()
+    }
+}
+
 pub struct FileReferenceSelection {
     pub canonical_source: PathBuf,
     pub runtime_destination: String,
@@ -1265,6 +1272,78 @@ process.stdout.write(JSON.stringify(receipts));
         assert_eq!(plan.referenced_variables, vec!["NODE_EXTRA_CA_CERTS"]);
         assert!(!plan.template.contains("private-path-ref"));
     }
+    #[test]
+    fn managed_provider_references_literal_missing_path_is_actionable_without_reading_payloads() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("opencode.json");
+        let selected = temp.path().join("missing-selected.txt");
+        std::fs::write(
+            &source,
+            r#"{"agent":{"fixture":{"prompt":"{file:./missing-selected.txt}"}}}"#,
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(&source).unwrap();
+        let err = resolve_file_references(
+            &raw,
+            FileSourceOrigin {
+                declaring_config: &source,
+                cwd: temp.path(),
+                original_home: temp.path(),
+            },
+            &|_| None,
+        )
+        .err()
+        .expect("an explicit missing selection must block before dispatch");
+        assert_eq!(err.operation, "resolve");
+        assert_eq!(
+            err.cause,
+            "referenced file is missing, inaccessible or cyclic"
+        );
+        assert!(err.variables.is_empty());
+        assert!(err.to_string().contains(source.to_str().unwrap()));
+        assert!(err.to_string().contains(selected.to_str().unwrap()));
+        assert!(!selected.exists());
+    }
+
+    #[test]
+    fn managed_provider_references_literal_missing_path_keeps_typed_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("opencode.json");
+        let selected = temp.path().join("missing-selected.txt");
+        std::fs::write(
+            &source,
+            r#"{"agent":{"fixture":{"prompt":"{file:./missing-selected.txt}"}}}"#,
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(&source).unwrap();
+        let err = resolve_file_references(
+            &raw,
+            FileSourceOrigin {
+                declaring_config: &source,
+                cwd: temp.path(),
+                original_home: temp.path(),
+            },
+            &|_| None,
+        )
+        .err()
+        .expect("an explicit missing selection must block before dispatch");
+        let launch_error: freshell_terminal::registry::ManagedTerminalLaunchError = err.into();
+        let failure = launch_error
+            .provider_preparation_failure
+            .expect("the real selected-reference failure keeps safe typed metadata");
+        assert_eq!(
+            failure.code,
+            freshell_protocol::ProviderPreparationFailureCode::SelectedReferenceUnavailable
+        );
+        assert_eq!(
+            failure.cause,
+            freshell_protocol::ProviderPreparationFailureCause::NotFound
+        );
+        assert_eq!(failure.selected_path.as_deref(), selected.to_str());
+        assert_eq!(failure.declaring_config, source.to_string_lossy());
+        assert_eq!(failure.workspace, temp.path().to_string_lossy());
+    }
+
     #[test]
     fn managed_provider_references_missing_and_cyclic_targets_fail_without_echoing_candidate_values(
     ) {

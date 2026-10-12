@@ -93,6 +93,7 @@ export type { CrashTrace }
  * by persistMiddleware, never persisted.
  */
 export type LaunchFailure = {
+  providerPreparationFailure?: import('@shared/ws-protocol').ProviderPreparationFailure
   code: 'SESSION_RESERVED' | 'RESTORE_UNAVAILABLE' | 'HANDOFF_IN_PROGRESS' | 'REAP_TIMEOUT'
     | 'TARGET_SPAWN_FAILED' | 'STALE_GENERATION' | 'LAUNCH_FAILED' | 'SESSION_MISSING'
   message: string

@@ -34,6 +34,7 @@ const wsMocks = vi.hoisted(() => ({
   connect: vi.fn().mockResolvedValue(undefined),
   onMessage: vi.fn(),
   onReconnect: vi.fn().mockReturnValue(() => {}),
+  getServerCapabilities: vi.fn(() => ({} as { managedRuntimeV1?: boolean })),
 }))
 
 const terminalThemeMocks = vi.hoisted(() => ({
@@ -60,6 +61,7 @@ vi.mock('@/lib/ws-client', () => ({
     connect: wsMocks.connect,
     onMessage: wsMocks.onMessage,
     onReconnect: wsMocks.onReconnect,
+    getServerCapabilities: wsMocks.getServerCapabilities,
   }),
 }))
 
@@ -185,7 +187,7 @@ function latestAttachRequestIdForTerminal(terminalId: string | undefined): strin
   return typeof attach?.attachRequestId === 'string' ? attach.attachRequestId : undefined
 }
 
-function withCurrentAttachRequestId<T extends { type?: string; terminalId?: string; attachRequestId?: string }>(
+function withCurrentAttachRequestId<T extends { type?: string; terminalId?: string; attachRequestId?: string; streamId?: string }>(
   msg: T & { __preserveMissingAttachRequestId?: boolean; __preserveMissingStreamId?: boolean },
 ): T {
   const isStreamPayload = msg.type === 'terminal.attach.ready'
@@ -255,13 +257,14 @@ function createSettingsState() {
   }
 }
 
-function makeStore() {
+function makeStore(overrides: Partial<TerminalPaneContent> = {}) {
   const paneContent: TerminalPaneContent = {
     kind: 'terminal',
     createRequestId: REQ,
     status: 'creating',
     mode: 'shell',
     shell: 'system',
+    ...overrides,
   }
   const root: PaneNode = { type: 'leaf', id: PANE, content: paneContent }
   const store = configureStore({
@@ -273,15 +276,16 @@ function makeStore() {
     },
     preloadedState: {
       tabs: {
+        ...tabsReducer(undefined, { type: '@@INIT' }),
         tabs: [{
-          id: TAB, mode: 'shell', status: 'running', title: 'Shell',
-          titleSetByUser: false, createRequestId: REQ,
+          id: TAB, mode: 'shell' as const, status: 'running' as const, title: 'Shell',
+          titleSetByUser: false, createRequestId: REQ, createdAt: 1,
         }],
         activeTabId: TAB,
       },
-      panes: { layouts: { [TAB]: root }, activePane: { [TAB]: PANE }, paneTitles: {} },
+      panes: { ...panesReducer(undefined, { type: '@@INIT' }), layouts: { [TAB]: root }, activePane: { [TAB]: PANE }, paneTitles: {} },
       settings: createSettingsState(),
-      connection: { status: 'connected', error: null },
+      connection: { ...connectionReducer(undefined, { type: '@@INIT' }), status: 'connected' as const },
     },
   })
   return { store, paneContent }
@@ -297,7 +301,7 @@ function paneStatus(store: ReturnType<typeof makeStore>['store']) {
 }
 
 async function renderPane(store: any, paneContent: TerminalPaneContent) {
-  render(
+  const view = render(
     <Provider store={store}>
       <TerminalView tabId={TAB} paneId={PANE} paneContent={paneContent} />
     </Provider>
@@ -307,6 +311,7 @@ async function renderPane(store: any, paneContent: TerminalPaneContent) {
     await Promise.resolve()
   })
   expect(messageHandler).not.toBeNull()
+  return view
 }
 
 /** Anchor the launch: server acks the create, launchAttempt gets terminalId. */
@@ -342,6 +347,7 @@ describe('launch-time INVALID_TERMINAL_ID bounded retry', () => {
     latestAttachRequestIdByTerminal.clear()
     latestStreamIdByTerminal.clear()
     wsMocks.send.mockClear()
+    wsMocks.getServerCapabilities.mockReturnValue({})
     wsMocks.send.mockImplementation((msg: any) => {
       if (
         msg?.type === 'terminal.attach'
@@ -393,6 +399,89 @@ describe('launch-time INVALID_TERMINAL_ID bounded retry', () => {
     lastMessageCallback = null
     installPerfAuditBridge(null)
   })
+
+  it('keeps the real managed preparation failure on its request through reconnect without fabricating a terminal', async () => {
+    wsMocks.getServerCapabilities.mockReturnValue({ managedRuntimeV1: true })
+    const { store, paneContent } = makeStore({ mode: 'opencode', initialCwd: '/workspace/missing-reference' })
+    await renderPane(store, paneContent)
+    const before = sentCreates().length
+    expect(before).toBeGreaterThan(0)
+    await act(async () => messageHandler!({ type: 'error', code: 'PTY_SPAWN_FAILED', requestId: REQ,
+      message: 'arbitrary-private-config-marker',
+      providerPreparationFailure: { code: 'SELECTED_REFERENCE_UNAVAILABLE' as const, stage: 'configuration' as const, operation: 'resolve' as const, workspace: '/workspace', declaringConfig: '/workspace/opencode.json',
+        selectedPath: '/workspace/missing-reference/missing-selected.txt',
+        cause: 'not_found' as const },
+    }))
+    const content = (store.getState().panes.layouts[TAB] as { content: TerminalPaneContent }).content
+    expect(content).toMatchObject({ createRequestId: REQ, status: 'error', launchFailure: {
+      code: 'LAUNCH_FAILED', retryable: true,
+      providerPreparationFailure: { code: 'SELECTED_REFERENCE_UNAVAILABLE' as const, stage: 'configuration' as const, operation: 'resolve' as const, workspace: '/workspace', declaringConfig: '/workspace/opencode.json',
+        selectedPath: '/workspace/missing-reference/missing-selected.txt',
+        cause: 'not_found' as const },
+    } })
+    expect(content.terminalId).toBeUndefined()
+    expect(content.soulId).toBeUndefined()
+    expect(content).not.toHaveProperty('incarnationId')
+    expect(content.sessionRef).toBeUndefined()
+    expect(JSON.stringify(content.launchFailure)).not.toContain('arbitrary-private-config-marker')
+    await act(async () => reconnectHandler!())
+    expect(sentCreates()).toHaveLength(before)
+  })
+
+  it('keeps a saved managed preparation failure on remount and retries only after the existing explicit action', async () => {
+    wsMocks.getServerCapabilities.mockReturnValue({ managedRuntimeV1: true })
+    const failure = Object.assign({ code: 'LAUNCH_FAILED' as const, retryable: true,
+      message: 'Configuration blocked: /workspace/missing-reference/missing-selected.txt: referenced file was not found' }, {
+      providerPreparationFailure: { code: 'SELECTED_REFERENCE_UNAVAILABLE' as const, stage: 'configuration' as const, operation: 'resolve' as const, workspace: '/workspace', declaringConfig: '/workspace/opencode.json',
+        selectedPath: '/workspace/missing-reference/missing-selected.txt',
+        cause: 'not_found' as const },
+    })
+    const { store, paneContent } = makeStore({ mode: 'opencode', status: 'error', launchFailure: failure })
+    const view = await renderPane(store, paneContent)
+    expect(sentCreates()).toHaveLength(0)
+    expect(screen.getByTestId('terminal-launch-failure-card')).toHaveTextContent('missing-selected.txt')
+    expect(screen.queryByRole('button', { name: 'Attach to running session' })).not.toBeInTheDocument()
+    await act(async () => reconnectHandler!())
+    expect(sentCreates()).toHaveLength(0)
+    fireEvent.click(screen.getByRole('button', { name: 'Retry launch' }))
+    const next = (store.getState().panes.layouts[TAB] as { content: TerminalPaneContent }).content
+    view.rerender(<Provider store={store}><TerminalView tabId={TAB} paneId={PANE} paneContent={next} /></Provider>)
+    await act(async () => { await Promise.resolve() })
+    expect(sentCreates()).toHaveLength(1)
+    expect(sentCreates()[0].requestId).toBe(REQ)
+    expect(next.launchFailure).toBeUndefined()
+    expect(next.terminalId).toBeUndefined()
+    expect(next.sessionRef).toBeUndefined()
+  })
+
+  it('keeps ordinary untyped create failures on their existing notice-only path', async () => {
+    const { store, paneContent } = makeStore()
+    await renderPane(store, paneContent)
+    await act(async () => messageHandler!({ type: 'error', code: 'PTY_SPAWN_FAILED', requestId: REQ,
+      message: 'ordinary launch failed' }))
+    expect(paneStatus(store)).toBe('error')
+    expect((store.getState().panes.layouts[TAB] as { content: TerminalPaneContent }).content.launchFailure).toBeUndefined()
+    expect(screen.queryByTestId('terminal-launch-failure-card')).not.toBeInTheDocument()
+  })
+
+  it.each(['ordinary-mode', 'no-managed-capability', 'different-request'] as const)(
+    'does not retain preparation metadata outside its active managed request: %s', async (control) => {
+      wsMocks.getServerCapabilities.mockReturnValue({ managedRuntimeV1: control !== 'no-managed-capability' })
+      const { store, paneContent } = makeStore({ mode: control === 'ordinary-mode' ? 'shell' : 'opencode' })
+      await renderPane(store, paneContent)
+      await act(async () => messageHandler!({ type: 'error', code: 'PTY_SPAWN_FAILED',
+        requestId: control === 'different-request' ? 'another-request' : REQ, message: 'unrelated failure',
+        providerPreparationFailure: { code: 'SELECTED_REFERENCE_UNAVAILABLE', stage: 'configuration',
+          operation: 'resolve', cause: 'not_found', workspace: '/workspace',
+          declaringConfig: '/workspace/opencode.json', selectedPath: '/workspace/missing-selected.txt' },
+      }))
+      const content = (store.getState().panes.layouts[TAB] as { content: TerminalPaneContent }).content
+      expect(content.createRequestId).toBe(REQ)
+      expect(content.launchFailure).toBeUndefined()
+      expect(content.terminalId).toBeUndefined()
+      expect(screen.queryByTestId('terminal-launch-failure-card')).not.toBeInTheDocument()
+    },
+  )
 
   it('retries terminal.create with the SAME requestId and restore:true after a launch-time INVALID_TERMINAL_ID', async () => {
     vi.useFakeTimers()
@@ -669,7 +758,7 @@ describe('launch-time INVALID_TERMINAL_ID bounded retry', () => {
     render(<Provider store={store}><TerminalView tabId={TAB} paneId={PANE} paneContent={content} /></Provider>)
     expect(screen.getAllByRole('alert')).toHaveLength(1)
     expect(screen.queryByTestId('terminal-launch-failure-card')).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Retry', exact: true })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^Retry$/ })).not.toBeInTheDocument()
   })
 
   it('clears prior managed retry feedback when a different terminal conversation occupies the pane', async () => {

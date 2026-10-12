@@ -7123,7 +7123,10 @@ if (args.includes('app-server')) {{
             _: freshell_terminal::registry::ManagedTerminalLaunch,
         ) -> freshell_terminal::registry::ManagedTerminalFuture<
             'a,
-            Result<freshell_terminal::registry::ManagedTerminalDescriptor, String>,
+            Result<
+                freshell_terminal::registry::ManagedTerminalDescriptor,
+                freshell_terminal::registry::ManagedTerminalLaunchError,
+            >,
         > {
             Box::pin(async { Err("unexpected managed launch".into()) })
         }

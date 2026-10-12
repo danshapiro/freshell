@@ -31,7 +31,8 @@ impl ManagedTerminalController for Controller {
     fn launch<'a>(
         &'a self,
         _: ManagedTerminalLaunch,
-    ) -> ManagedTerminalFuture<'a, Result<ManagedTerminalDescriptor, String>> {
+    ) -> ManagedTerminalFuture<'a, Result<ManagedTerminalDescriptor, ManagedTerminalLaunchError>>
+    {
         panic!("output recovery must not launch a provider")
     }
     fn input<'a>(

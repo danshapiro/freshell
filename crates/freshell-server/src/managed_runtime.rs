@@ -501,7 +501,10 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
     fn launch<'a>(
         &'a self,
         request: ManagedTerminalLaunch,
-    ) -> ManagedTerminalFuture<'a, Result<ManagedTerminalDescriptor, String>> {
+    ) -> ManagedTerminalFuture<
+        'a,
+        Result<ManagedTerminalDescriptor, freshell_terminal::registry::ManagedTerminalLaunchError>,
+    > {
         Box::pin(async move {
             let create_key = request
                 .create_request_id
@@ -791,7 +794,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                             grant_id=mcp_capability.as_ref().map(|c|c.grant_id.as_str()),
                             stage="controller",operation="launch",%error,
                             "Retain provider inputs until dispatch outcome is confirmed");
-                        return Err(error.to_string());
+                        return Err(error.to_string().into());
                     }
                 }
             };

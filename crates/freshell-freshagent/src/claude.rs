@@ -7336,6 +7336,7 @@ impl FreshClaudeState {
 
     fn send_error(&self, request_id: &Option<String>, code: &str, message: &str) {
         self.broadcast(&ServerMessage::Error(ErrorMsg {
+            provider_preparation_failure: None,
             owner_kind: None,
             owner_generation: None,
             owner_epoch: None,

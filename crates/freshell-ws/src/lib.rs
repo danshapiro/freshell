@@ -1065,6 +1065,7 @@ async fn send_error(
     message: &str,
 ) -> Result<(), axum::Error> {
     let msg = ServerMessage::Error(ErrorMsg {
+        provider_preparation_failure: None,
         owner_kind: None,
         owner_generation: None,
         owner_epoch: None,

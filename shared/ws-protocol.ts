@@ -1322,7 +1322,18 @@ export type PongMessage = {
   timestamp: string
 }
 
+export type ProviderPreparationFailure = {
+  code: 'SELECTED_REFERENCE_UNAVAILABLE'
+  stage: 'configuration'
+  operation: 'resolve'
+  cause: 'not_found' | 'permission_denied' | 'cyclic' | 'unknown'
+  workspace: string
+  declaringConfig: string
+  selectedPath?: string
+}
+
 export type ErrorMessage = {
+  providerPreparationFailure?: ProviderPreparationFailure
   type: 'error'
   code: ErrorCode
   message: string

@@ -949,6 +949,7 @@ async fn handle_client_text(
         match value.get("type").and_then(|t| t.as_str()) {
             Some("terminal.create") => {
                 let reply = ServerMessage::Error(ErrorMsg {
+                    provider_preparation_failure: None,
                     owner_kind: None,
                     owner_generation: None,
                     owner_epoch: None,
@@ -1083,6 +1084,7 @@ async fn handle_client_text(
                 send(
                     ws_tx,
                     &ServerMessage::Error(ErrorMsg {
+                        provider_preparation_failure: None,
                         owner_kind: None,
                         owner_generation: None,
                         owner_epoch: None,
@@ -1279,6 +1281,7 @@ async fn handle_client_text(
                             return send(
                                 ws_tx,
                                 &ServerMessage::Error(ErrorMsg {
+                                    provider_preparation_failure: None,
                                     owner_kind: None,
                                     owner_generation: None,
                                     owner_epoch: None,
@@ -1327,6 +1330,7 @@ async fn handle_client_text(
                             return send(
                                 ws_tx,
                                 &ServerMessage::Error(ErrorMsg {
+                                    provider_preparation_failure: None,
                                     owner_kind: None,
                                     owner_generation: Some(snap.generation),
                                     owner_epoch: Some(snap.epoch),
@@ -1410,6 +1414,7 @@ async fn handle_client_text(
                                 return send(
                                     ws_tx,
                                     &ServerMessage::Error(ErrorMsg {
+                                        provider_preparation_failure: None,
                                         owner_kind: Some(owner_kind_str.to_string()),
                                         owner_generation: Some(snap.generation),
                                         owner_epoch: Some(snap.epoch),
@@ -1447,6 +1452,7 @@ async fn handle_client_text(
                                 return send(
                                     ws_tx,
                                     &ServerMessage::Error(ErrorMsg {
+                                        provider_preparation_failure: None,
                                         owner_kind: None,
                                         owner_generation: Some(snap.generation),
                                         owner_epoch: Some(snap.epoch),
@@ -1556,6 +1562,7 @@ async fn handle_client_text(
                             return send(
                                 ws_tx,
                                 &ServerMessage::Error(ErrorMsg {
+                                    provider_preparation_failure: None,
                                     owner_kind: None,
                                     owner_generation: Some(current_generation),
                                     owner_epoch: Some(current_epoch),
@@ -1592,6 +1599,7 @@ async fn handle_client_text(
                             return send(
                                 ws_tx,
                                 &ServerMessage::Error(ErrorMsg {
+                                    provider_preparation_failure: None,
                                     owner_kind: None,
                                     owner_generation: Some(generation),
                                     owner_epoch: Some(ownership.boot_epoch()),
@@ -2480,6 +2488,7 @@ async fn handle_client_text(
             send(
                 ws_tx,
                 &ServerMessage::Error(ErrorMsg {
+                    provider_preparation_failure: None,
                     owner_kind: None,
                     owner_generation: None,
                     owner_epoch: None,
@@ -3134,6 +3143,7 @@ async fn send_session_reserved(
     owner: Option<&freshell_freshagent::ownership_lane::TerminalOwnerFields>,
 ) -> bool {
     let msg = ServerMessage::Error(ErrorMsg {
+        provider_preparation_failure: None,
         owner_kind: owner.map(|o| o.owner_kind.to_string()),
         owner_generation: owner.map(|o| o.owner_generation),
         owner_epoch: owner.map(|o| o.owner_epoch),
@@ -3580,7 +3590,13 @@ mod managed_runtime_id_tests {
         fn launch<'a>(
             &'a self,
             _request: ManagedTerminalLaunch,
-        ) -> ManagedTerminalFuture<'a, Result<ManagedTerminalDescriptor, String>> {
+        ) -> ManagedTerminalFuture<
+            'a,
+            Result<
+                ManagedTerminalDescriptor,
+                freshell_terminal::registry::ManagedTerminalLaunchError,
+            >,
+        > {
             Box::pin(async { Err("launch must not run during compatibility adoption".into()) })
         }
 
@@ -4288,6 +4304,170 @@ mod managed_resume_gate_tests {
     use std::sync::Mutex;
 
     struct FixedProbe(SessionExistence);
+
+    struct MissingSelectedReference {
+        root: std::path::PathBuf,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl freshell_terminal::registry::ManagedTerminalController for MissingSelectedReference {
+        fn lookup_terminal<'a>(
+            &'a self,
+            _: &'a str,
+            _: Option<String>,
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<
+            'a,
+            Result<Option<freshell_terminal::registry::ManagedTerminalDescriptor>, String>,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+        fn launch<'a>(
+            &'a self,
+            request: freshell_terminal::registry::ManagedTerminalLaunch,
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<
+            'a,
+            Result<
+                freshell_terminal::registry::ManagedTerminalDescriptor,
+                freshell_terminal::registry::ManagedTerminalLaunchError,
+            >,
+        > {
+            Box::pin(async move {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let selected = self.root.join("missing-selected.txt");
+                let io_error = std::fs::canonicalize(&selected).unwrap_err();
+                assert_eq!(io_error.kind(), std::io::ErrorKind::NotFound);
+                assert_eq!(request.mode, "opencode");
+                Err(freshell_terminal::registry::ManagedTerminalLaunchError {
+                    message: "selected configuration reference is unavailable".into(),
+                    provider_preparation_failure: Some(freshell_protocol::ProviderPreparationFailure {
+                        code: freshell_protocol::ProviderPreparationFailureCode::SelectedReferenceUnavailable,
+                        stage: freshell_protocol::ProviderPreparationFailureStage::Configuration,
+                        operation: freshell_protocol::ProviderPreparationFailureOperation::Resolve,
+                        cause: freshell_protocol::ProviderPreparationFailureCause::NotFound,
+                        workspace: self.root.to_string_lossy().into_owned(),
+                        declaring_config: self.root.join("opencode.json").to_string_lossy().into_owned(),
+                        selected_path: Some(selected.to_string_lossy().into_owned()),
+                    }),
+                })
+            })
+        }
+        fn input<'a>(
+            &'a self,
+            _: freshell_terminal::registry::ManagedTerminalDescriptor,
+            _: String,
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<'a, Result<(), String>> {
+            panic!("a failed request has no input target")
+        }
+        fn resize<'a>(
+            &'a self,
+            _: freshell_terminal::registry::ManagedTerminalDescriptor,
+            _: u16,
+            _: u16,
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<'a, Result<(), String>> {
+            panic!("a failed request has no resize target")
+        }
+        fn stop<'a>(
+            &'a self,
+            _: freshell_terminal::registry::ManagedTerminalDescriptor,
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<'a, Result<(), String>> {
+            panic!("a failed request has no process")
+        }
+        fn read_output<'a>(
+            &'a self,
+            _: freshell_terminal::registry::ManagedTerminalDescriptor,
+            _: i64,
+            _: u64,
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<
+            'a,
+            Result<freshell_terminal::registry::ManagedOutputRead, String>,
+        > {
+            panic!("a failed request has no output target")
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_preparation_failure_keeps_typed_missing_reference_on_the_create_request() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = super::pane_reconcile_gate_tests::state();
+        state.registry =
+            freshell_terminal::TerminalRegistry::new().with_managed_environment_fixture_only(true);
+        state.cli_commands = Arc::new(vec![freshell_platform::CliCommandSpec {
+            name: "opencode".into(),
+            label: "OpenCode".into(),
+            default_cmd: "opencode".into(),
+            ..Default::default()
+        }]);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        state
+            .registry
+            .set_managed_controller(Some(Arc::new(MissingSelectedReference {
+                root: root.path().into(),
+                calls: Arc::clone(&calls),
+            })));
+        let conn_id = 19;
+        state.registry.set_managed_runtime_connection(conn_id, true);
+        let (mut ws_tx, mut client) =
+            super::pane_reconcile_gate_tests::loopback_sink_and_client().await;
+        let mut output = crate::create_gate::CreateOutput::Socket(&mut ws_tx);
+        let create: TerminalCreate = serde_json::from_value(serde_json::json!({
+            "requestId": "managed-reference-failed-request", "mode": "opencode", "shell": "system",
+            "cwd": root.path(),
+        }))
+        .unwrap();
+        let mut limiter = crate::create_limit::CreateRateLimiter::new(100, 1000);
+        assert!(
+            handle_create(
+                create,
+                None,
+                &mut output,
+                &state,
+                conn_id,
+                false,
+                &mut limiter,
+                &ConnectionIdentity::default(),
+                now_ms()
+            )
+            .await
+        );
+        drop(output);
+        let wire = super::pane_reconcile_gate_tests::next_text_frame(&mut client).await;
+        let frame: ServerMessage = serde_json::from_value(wire)
+            .expect("actual WS frame uses the additive serialized contract");
+        client.close(None).await.unwrap();
+        let ServerMessage::Error(error) = frame else {
+            panic!("failed request must not create a backend terminal")
+        };
+        assert_eq!(error.code, ErrorCode::PtySpawnFailed);
+        assert_eq!(
+            error.request_id.as_deref(),
+            Some("managed-reference-failed-request")
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the actual create reached the missing-file producer"
+        );
+        assert!(
+            state.registry.directory().is_empty(),
+            "no backend or ordinary PTY is registered after refusal"
+        );
+        let metadata = error
+            .provider_preparation_failure
+            .as_ref()
+            .expect("WS must retain the producer's typed failure");
+        assert_eq!(
+            metadata.selected_path.as_deref(),
+            root.path().join("missing-selected.txt").to_str()
+        );
+        assert_eq!(
+            metadata.cause,
+            freshell_protocol::ProviderPreparationFailureCause::NotFound
+        );
+        assert!(
+            state.registry.directory().is_empty(),
+            "no backend or ordinary PTY may be fabricated for the failed request"
+        );
+    }
 
     impl SessionExistenceProbe for FixedProbe {
         fn exists(&self, _: &str, _: &str) -> SessionExistence {
@@ -8419,6 +8599,7 @@ pub(crate) async fn send_create_error_with_owner(
     owner: Option<&freshell_freshagent::ownership_lane::TerminalOwnerFields>,
 ) -> bool {
     let msg = ServerMessage::Error(ErrorMsg {
+        provider_preparation_failure: None,
         owner_kind: owner.map(|o| o.owner_kind.to_string()),
         owner_generation: owner.map(|o| o.owner_generation),
         owner_epoch: owner.map(|o| o.owner_epoch),
@@ -8453,6 +8634,7 @@ pub(crate) async fn send_create_error_with_stale_pair(
     current_generation: u64,
 ) -> bool {
     let msg = ServerMessage::Error(ErrorMsg {
+        provider_preparation_failure: None,
         owner_kind: None,
         owner_generation: Some(current_generation),
         owner_epoch: Some(current_epoch),
@@ -8914,6 +9096,7 @@ async fn handle_attach(
     // never colliding with createRequestIds — see ws-client's
     // clearTrackedCreate-on-error behavior).
     AttachReply::Error(Box::new(ServerMessage::Error(ErrorMsg {
+        provider_preparation_failure: None,
         owner_kind: None,
         owner_generation: None,
         owner_epoch: None,
@@ -9082,6 +9265,7 @@ fn input_session_identity_mismatch_error(
     actual: Option<SessionLocator>,
 ) -> ServerMessage {
     ServerMessage::Error(ErrorMsg {
+        provider_preparation_failure: None,
         owner_kind: None,
         owner_generation: None,
         owner_epoch: None,
@@ -9120,6 +9304,7 @@ pub(crate) fn terminal_dims_in_range(cols: i64, rows: i64) -> bool {
 /// a `requestId` field.
 fn invalid_dims_error(cols: i64, rows: i64) -> ServerMessage {
     ServerMessage::Error(ErrorMsg {
+        provider_preparation_failure: None,
         owner_kind: None,
         owner_generation: None,
         owner_epoch: None,
@@ -9179,6 +9364,7 @@ fn managed_runtime_input_blocked(
 
 fn managed_runtime_error(terminal_id: &str, detail: &str) -> ServerMessage {
     ServerMessage::Error(ErrorMsg {
+        provider_preparation_failure: None,
         owner_kind: None,
         owner_generation: None,
         owner_epoch: None,
@@ -9745,6 +9931,7 @@ async fn handle_kill(
 ) -> bool {
     let unknown_terminal_error = |terminal_id: String| {
         ServerMessage::Error(ErrorMsg {
+            provider_preparation_failure: None,
             owner_kind: None,
             owner_generation: None,
             owner_epoch: None,
@@ -9871,6 +10058,7 @@ async fn handle_kill(
                     return send(ws_tx, &msg).await;
                 }
                 let msg = ServerMessage::Error(ErrorMsg {
+                    provider_preparation_failure: None,
                     owner_kind: None,
                     owner_generation: None,
                     owner_epoch: None,
@@ -9996,6 +10184,7 @@ async fn handle_kill(
                 return send(ws_tx, &msg).await;
             }
             let msg = ServerMessage::Error(ErrorMsg {
+                provider_preparation_failure: None,
                 owner_kind: refused_owner_kind,
                 owner_generation: refused_owner_generation,
                 owner_epoch: refused_owner_epoch,
@@ -10105,6 +10294,7 @@ async fn handle_kill(
                 return send(ws_tx, &msg).await;
             }
             let msg = ServerMessage::Error(ErrorMsg {
+                provider_preparation_failure: None,
                 owner_kind: None,
                 owner_generation: None,
                 owner_epoch: None,
@@ -10173,6 +10363,7 @@ async fn handle_kill(
                 return send(
                     ws_tx,
                     &ServerMessage::Error(ErrorMsg {
+                        provider_preparation_failure: None,
                         owner_kind: None,
                         owner_generation: None,
                         owner_epoch: None,
@@ -10214,6 +10405,7 @@ async fn handle_kill(
     if existed {
         if persisted_despite_error {
             let msg = ServerMessage::Error(ErrorMsg {
+                provider_preparation_failure: None,
                 owner_kind: None,
                 owner_generation: None,
                 owner_epoch: None,
@@ -12568,7 +12760,7 @@ mod pane_reconcile_gate_tests {
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >;
 
-    async fn loopback_sink_and_client() -> (WsSink, TestClient) {
+    pub(super) async fn loopback_sink_and_client() -> (WsSink, TestClient) {
         let (sink_tx, sink_rx) = tokio::sync::oneshot::channel::<WsSink>();
         let sink_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(sink_tx)));
         let router = axum::Router::new().route(
@@ -12614,7 +12806,7 @@ mod pane_reconcile_gate_tests {
         (sink, client)
     }
 
-    async fn next_text_frame(client: &mut TestClient) -> serde_json::Value {
+    pub(super) async fn next_text_frame(client: &mut TestClient) -> serde_json::Value {
         let msg = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
             .await
             .expect("frame within timeout")
@@ -12884,7 +13076,13 @@ mod managed_output_order_tests {
         fn launch<'a>(
             &'a self,
             _: ManagedTerminalLaunch,
-        ) -> ManagedTerminalFuture<'a, Result<ManagedTerminalDescriptor, String>> {
+        ) -> ManagedTerminalFuture<
+            'a,
+            Result<
+                ManagedTerminalDescriptor,
+                freshell_terminal::registry::ManagedTerminalLaunchError,
+            >,
+        > {
             Box::pin(async { Err("unused launch".into()) })
         }
 
@@ -13041,7 +13239,13 @@ mod managed_output_order_tests {
         fn launch<'a>(
             &'a self,
             _: ManagedTerminalLaunch,
-        ) -> ManagedTerminalFuture<'a, Result<ManagedTerminalDescriptor, String>> {
+        ) -> ManagedTerminalFuture<
+            'a,
+            Result<
+                ManagedTerminalDescriptor,
+                freshell_terminal::registry::ManagedTerminalLaunchError,
+            >,
+        > {
             Box::pin(async { Err("unused".into()) })
         }
         fn input<'a>(
@@ -13396,7 +13600,7 @@ mod host_stats_dispatch_tests {
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >;
 
-    async fn loopback_sink_and_client() -> (WsSink, TestClient) {
+    pub(super) async fn loopback_sink_and_client() -> (WsSink, TestClient) {
         let (sink_tx, sink_rx) = tokio::sync::oneshot::channel::<WsSink>();
         let sink_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(sink_tx)));
         let router = axum::Router::new().route(
@@ -13439,7 +13643,7 @@ mod host_stats_dispatch_tests {
         (sink, client)
     }
 
-    async fn next_text_frame(client: &mut TestClient) -> serde_json::Value {
+    pub(super) async fn next_text_frame(client: &mut TestClient) -> serde_json::Value {
         let msg = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
             .await
             .expect("frame within timeout")

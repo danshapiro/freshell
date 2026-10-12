@@ -414,6 +414,7 @@ mod uncertain_launch {
                 })
                 .await
                 .map(|_| ())
+                .map_err(|error| error.to_string())
         };
         assert!(
             result.is_err(),
@@ -714,7 +715,7 @@ fn managed_provider_initial_opencode_callers_replan_changed_selection_with_two_r
                 let result=if fresh_route {
                     fresh.clone().create_agent(HostedRestCreate {request_id:seed.clone(),provider:"opencode".into(),session_type:"freshopencode".into(),cwd:Some(workspace.to_string_lossy().into_owned()),model:None,effort:None,native_session_id:None,plugins:None,model_selection:None,permission_mode:None,sandbox:None}).await.map(|_|()).map_err(|_|"fresh refusal".to_string())
                 } else {
-                    controller.launch(ManagedTerminalLaunch {spec:freshell_platform::SpawnSpec {program:"opencode".into(),args:vec![],env_overrides:BTreeMap::new(),cwd:Some(workspace.to_string_lossy().into_owned()),cols:80,rows:24},env:BTreeMap::new(),terminal_id:seed.clone(),stream_id:seed.clone(),mode:"opencode".into(),resume_session_id:None,provider_model:None,provider_reasoning_effort:None,provider_sandbox:None,provider_permission_mode:None,view_tab_id:None,view_pane_id:None,create_request_id:Some(seed.clone())}).await.map(|_|())
+                    controller.launch(ManagedTerminalLaunch {spec:freshell_platform::SpawnSpec {program:"opencode".into(),args:vec![],env_overrides:BTreeMap::new(),cwd:Some(workspace.to_string_lossy().into_owned()),cols:80,rows:24},env:BTreeMap::new(),terminal_id:seed.clone(),stream_id:seed.clone(),mode:"opencode".into(),resume_session_id:None,provider_model:None,provider_reasoning_effort:None,provider_sandbox:None,provider_permission_mode:None,view_tab_id:None,view_pane_id:None,create_request_id:Some(seed.clone())}).await.map(|_|()).map_err(|error| error.to_string())
                 };
                 assert_eq!(result.is_ok(),!changing && !uncertain,"actual initial caller fresh={fresh_route} changing={changing}: {result:?}");
                 assert_eq!(attempts.lock().await[&seed],if uncertain {1} else if changing {3} else {2});

@@ -812,8 +812,51 @@ pub struct ConfigFallback {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProviderPreparationFailureCode {
+    SelectedReferenceUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderPreparationFailureStage {
+    Configuration,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderPreparationFailureOperation {
+    Resolve,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderPreparationFailureCause {
+    NotFound,
+    PermissionDenied,
+    Cyclic,
+    Unknown,
+}
+
+/// Selected-reference metadata only. No configuration or credential payloads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderPreparationFailure {
+    pub code: ProviderPreparationFailureCode,
+    pub stage: ProviderPreparationFailureStage,
+    pub operation: ProviderPreparationFailureOperation,
+    pub cause: ProviderPreparationFailureCause,
+    pub workspace: String,
+    pub declaring_config: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ErrorMsg {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_preparation_failure: Option<ProviderPreparationFailure>,
     pub code: ErrorCode,
     pub message: String,
     pub timestamp: String,
@@ -2241,6 +2284,7 @@ mod tests {
         // (round-1 review: the earlier `Error` sketch did not compile
         // against the repo type).
         let msg = ServerMessage::Error(ErrorMsg {
+            provider_preparation_failure: None,
             code: ErrorCode::RestoreUnavailable,
             message: "Session 01a0828d is still running on the server.".into(),
             timestamp: "2026-09-09T00:00:00Z".into(),
@@ -2264,6 +2308,7 @@ mod tests {
         // Additive-optional: a legacy error frame with no owner fields stays
         // byte-identical on the wire (the frozen refusal surface).
         let legacy = ServerMessage::Error(ErrorMsg {
+            provider_preparation_failure: None,
             code: ErrorCode::InternalError,
             message: "unrelated".into(),
             timestamp: "2026-09-09T00:00:00Z".into(),

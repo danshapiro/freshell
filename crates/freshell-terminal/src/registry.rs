@@ -866,6 +866,35 @@ pub struct ManagedTerminalLaunch {
 
 pub type ManagedTerminalFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+#[derive(Debug)]
+pub struct ManagedTerminalLaunchError {
+    pub message: String,
+    pub provider_preparation_failure: Option<freshell_protocol::ProviderPreparationFailure>,
+}
+
+impl std::fmt::Display for ManagedTerminalLaunchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ManagedTerminalLaunchError {}
+
+impl From<String> for ManagedTerminalLaunchError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            provider_preparation_failure: None,
+        }
+    }
+}
+
+impl From<&str> for ManagedTerminalLaunchError {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedOutputChunk {
     pub seq_start: i64,
@@ -941,7 +970,7 @@ pub trait ManagedTerminalController: Send + Sync {
     fn launch<'a>(
         &'a self,
         request: ManagedTerminalLaunch,
-    ) -> ManagedTerminalFuture<'a, Result<ManagedTerminalDescriptor, String>>;
+    ) -> ManagedTerminalFuture<'a, Result<ManagedTerminalDescriptor, ManagedTerminalLaunchError>>;
     fn input<'a>(
         &'a self,
         terminal: ManagedTerminalDescriptor,
@@ -4773,7 +4802,7 @@ impl TerminalRegistry {
     pub async fn launch_managed(
         &self,
         request: ManagedTerminalLaunch,
-    ) -> Result<ManagedTerminalDescriptor, String> {
+    ) -> Result<ManagedTerminalDescriptor, ManagedTerminalLaunchError> {
         let controller = self
             .managed_controller
             .read()

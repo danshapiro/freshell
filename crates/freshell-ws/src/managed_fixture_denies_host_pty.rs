@@ -24,7 +24,10 @@ impl ManagedTerminalController for SyntheticConfiguration {
     fn launch<'a>(
         &'a self,
         request: ManagedTerminalLaunch,
-    ) -> ManagedTerminalFuture<'a, Result<ManagedTerminalDescriptor, String>> {
+    ) -> ManagedTerminalFuture<
+        'a,
+        Result<ManagedTerminalDescriptor, freshell_terminal::registry::ManagedTerminalLaunchError>,
+    > {
         Box::pin(async move {
             if request.mode != "opencode" {
                 return Err("unexpected provider".into());
