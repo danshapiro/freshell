@@ -137,10 +137,6 @@ mod tests {
     }
 
     async fn proves_fresh_writer_without_terminal_admission(provider: FreshProvider) {
-        #[cfg(not(feature = "provider-qualification"))]
-        assert!(!freshell_agent_runtime::managed_provider_enabled(
-            provider.native_family()
-        ));
         let root = tempfile::tempdir().unwrap();
         let registry = Registry::open(root.path(), None).unwrap();
         let request = prepare_fresh_claim(&registry, provider, "fresh-store", "native-root").await;

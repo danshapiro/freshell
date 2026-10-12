@@ -8053,6 +8053,70 @@ mod native_observation_ipc_tests {
     use super::*;
     use rusqlite::{params, Connection};
 
+    async fn run_native_observation_test_child(test_name: &'static str) -> bool {
+        const CHILD_ENV: &str = "FRESHELL_NATIVE_OBSERVATION_IPC_TEST_CHILD";
+        if std::env::var(CHILD_ENV).as_deref() == Ok(test_name) {
+            return false;
+        }
+        let output = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(CHILD_ENV, test_name)
+                .env_remove("FRESHELL_RUNTIME_CAPABILITY_DIR")
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_probe_fixture_is_independent_of_foreign_registry_logging() {
+        // Keep the deliberately held process-wide lock out of other tests.
+        if run_native_observation_test_child(
+            "service::native_observation_ipc_tests::status_probe_fixture_is_independent_of_foreign_registry_logging",
+        )
+        .await
+        {
+            return;
+        }
+        let foreign = tempfile::tempdir().unwrap();
+        let foreign_registry = Registry::open(foreign.path().join("registry"), None).unwrap();
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _registry = foreign_registry;
+            let _coordinator = crate::loss_report::incident_file_coordinator();
+            held_tx.send(()).unwrap();
+            matches!(
+                release_rx.recv_timeout(Duration::from_secs(30)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            )
+        });
+        held_rx.await.unwrap();
+        let mut fixture = tokio::spawn(run_status_probe_fence_test());
+        let result = tokio::time::timeout(Duration::from_secs(15), &mut fixture).await;
+        drop(release_tx);
+        assert!(
+            holder.join().unwrap(),
+            "foreign coordinator must remain held until the fixture completes"
+        );
+        if result.is_err() {
+            // Release the owned lock and join the pending fixture before failing.
+            let _ = fixture.await;
+        }
+        result
+            .expect("foreign registry logging consumed the native IPC fixture's deadline")
+            .expect("native IPC fixture failed");
+    }
+
     #[tokio::test]
     async fn pending_terminal_output_io_does_not_block_replacement_and_refuses_late_output() {
         for stall_hello in [false, true] {
@@ -8581,9 +8645,23 @@ mod native_observation_ipc_tests {
 
     #[tokio::test]
     async fn status_id_prevents_seed_and_late_probe_cannot_authorize_reattach() {
+        run_status_probe_fence_test().await;
+    }
+
+    async fn run_status_probe_fence_test() {
         use freshell_runtime_protocol::{
             RecoverRequest, RecoveryPath, RecoveryProbe, RecoveryTrigger,
         };
+
+        // These IPC deadlines measure this registry's host exchange, not
+        // process-wide incident logging held by a different test registry.
+        if run_native_observation_test_child(
+            "service::native_observation_ipc_tests::status_id_prevents_seed_and_late_probe_cannot_authorize_reattach",
+        )
+        .await
+        {
+            return;
+        }
         for delayed_reattach in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let registry = Registry::open(dir.path().join("registry"), None).unwrap();
@@ -8601,6 +8679,7 @@ mod native_observation_ipc_tests {
             )
             .unwrap();
             conn.execute("UPDATE incarnations SET runtime_dir=?1,fixture_kind='native_session' WHERE incarnation_id=?2", params![runtime.to_string_lossy(), launch.incarnation_id.as_str()]).unwrap();
+            drop(conn);
             let supervisor = crate::recovery::tests::supervisor_with_runtime_state(
                 &dir,
                 registry.clone(),
@@ -8609,43 +8688,88 @@ mod native_observation_ipc_tests {
             let listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
             let captured = registry.recovery_context(soul.clone()).await.unwrap();
             assert!(captured.never_dispatched);
+            let initial_import_revision = captured.native_import_revision;
+            let expected_incarnation = launch.incarnation_id.clone();
+            let (pending_tx, pending_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
             let responder = tokio::spawn(async move {
                 let boot = HostBootId::new();
+                let mut pending_tx = Some(pending_tx);
+                let mut release_rx = Some(release_rx);
                 for step in 0..3 {
                     let (mut socket, _) = listener.accept().await.unwrap();
                     let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                    assert_eq!(request.role, ControlRole::Supervisor);
+                    assert_eq!(request.protocol_version, CONTROL_PROTOCOL_VERSION);
+                    if step > 0 {
+                        assert_eq!(
+                            request.auth,
+                            Some(host_proof(
+                                b"synthetic-secret",
+                                "command-auth",
+                                &boot,
+                                &expected_incarnation,
+                            ))
+                        );
+                    }
                     let result = match request.body {
                         HostCommand::Hello {
                             incarnation_id,
                             challenge,
-                        } if step == 0 => HostResult::Hello {
-                            proof: host_proof(
-                                b"synthetic-secret",
-                                &challenge,
-                                &boot,
-                                &incarnation_id,
-                            ),
-                            host_boot_id: boot.clone(),
-                            capabilities: vec![],
-                            effective_limits: captured.requested_limits,
-                        },
-                        HostCommand::Status { .. } if step == 1 => HostResult::Status {
-                            native_identity_observation: None,
-                            host_boot_id: boot.clone(),
-                            worker_pid: Some(123),
-                            worker_launch_count: 1,
-                            max_control_epoch: 1,
-                            max_execution_generation: 1,
-                            fixture_evidence: serde_json::json!({}),
-                            exited: !delayed_reattach,
-                            native_session_id: Some("ses_from_status".into()),
-                            opencode_transfer_receipt: None,
-                            opencode_adoption: Default::default(),
-                        },
-                        HostCommand::ProbeRecovery { .. } if step == 2 => {
-                            if delayed_reattach {
-                                Connection::open(&db_path).unwrap().execute("UPDATE souls SET native_import_revision=native_import_revision+1,recovery_state='blocked' WHERE soul_id=?1", params![captured.soul_id.as_str()]).unwrap();
+                        } if step == 0 => {
+                            assert_eq!(incarnation_id, expected_incarnation);
+                            HostResult::Hello {
+                                proof: host_proof(
+                                    b"synthetic-secret",
+                                    &challenge,
+                                    &boot,
+                                    &incarnation_id,
+                                ),
+                                host_boot_id: boot.clone(),
+                                capabilities: vec![],
+                                effective_limits: captured.requested_limits,
                             }
+                        }
+                        HostCommand::Status { incarnation_id } if step == 1 => {
+                            assert_eq!(incarnation_id, expected_incarnation);
+                            HostResult::Status {
+                                native_identity_observation: None,
+                                host_boot_id: boot.clone(),
+                                worker_pid: Some(123),
+                                worker_launch_count: 1,
+                                max_control_epoch: 1,
+                                max_execution_generation: 1,
+                                fixture_evidence: serde_json::json!({}),
+                                exited: !delayed_reattach,
+                                native_session_id: Some("ses_from_status".into()),
+                                opencode_transfer_receipt: None,
+                                opencode_adoption: Default::default(),
+                            }
+                        }
+                        HostCommand::ProbeRecovery {
+                            incarnation_id,
+                            resume_spec,
+                            creation_seed_ref,
+                            never_dispatched,
+                            run_as_uid,
+                            run_as_gid,
+                        } if step == 2 => {
+                            assert_eq!(incarnation_id, expected_incarnation);
+                            assert_eq!(creation_seed_ref, captured.creation_seed_ref);
+                            assert_eq!(never_dispatched, captured.never_dispatched);
+                            assert_eq!((run_as_uid, run_as_gid), (0, 0));
+                            let native = resume_spec.expect("status identity must bind the probe");
+                            assert_eq!(native.provider_session.provider, captured.provider);
+                            assert_eq!(
+                                native.provider_session.provider_store_id,
+                                captured.provider_store_id
+                            );
+                            assert_eq!(
+                                native.provider_session.native_session_id,
+                                "ses_from_status"
+                            );
+                            pending_tx.take().unwrap().send(()).unwrap();
+                            release_rx.take().unwrap().await.unwrap();
                             HostResult::RecoveryProbe(crate::recovery::tests::absent_native_probe())
                         }
                         _ => panic!("unexpected recovery protocol step"),
@@ -8661,50 +8785,94 @@ mod native_observation_ipc_tests {
                     .unwrap();
                 }
             });
-            if delayed_reattach {
-                let result = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    supervisor.recover(RecoverRequest {
-                        soul_id: soul.clone(),
-                        trigger: RecoveryTrigger::ProviderExit,
-                        expected_intent_revision: None,
-                        expected_control_epoch: None,
-                    }),
-                )
-                .await
-                .unwrap();
-                assert!(
-                    result.is_err(),
-                    "late probe cannot reattach using newer registry revisions"
-                );
-                assert_eq!(
-                    registry
-                        .recovery_context(soul.clone())
+            let operation = {
+                let supervisor = supervisor.clone();
+                let soul = soul.clone();
+                tokio::spawn(async move {
+                    if delayed_reattach {
+                        let result = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            supervisor.recover(RecoverRequest {
+                                soul_id: soul.clone(),
+                                trigger: RecoveryTrigger::ProviderExit,
+                                expected_intent_revision: None,
+                                expected_control_epoch: None,
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                        let error = result.expect_err(
+                            "late probe cannot reattach using newer registry revisions",
+                        );
+                        assert_eq!(error.code, RuntimeErrorCode::RegistryFailure);
+                        assert!(error.message.contains("stale recovery write fence"));
+                    } else {
+                        let result = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            supervisor.probe_recovery(soul),
+                        )
                         .await
                         .unwrap()
-                        .recovery_state,
+                        .unwrap();
+                        assert!(
+                            matches!(
+                                result,
+                                RecoveryProbe::DefinitivelyUnavailable {
+                                    path: RecoveryPath::NativeResume,
+                                    ..
+                                }
+                            ),
+                            "status materialization must defeat stale seed readiness: {result:?}"
+                        );
+                    }
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(5), pending_rx)
+                .await
+                .expect("host must receive the native-store probe")
+                .unwrap();
+            let pending = registry.recovery_context(soul.clone()).await.unwrap();
+            assert_eq!(
+                pending.native_session_id.as_deref(),
+                Some("ses_from_status")
+            );
+            assert_eq!(pending.native_import_revision, initial_import_revision);
+            assert!(!pending.never_dispatched);
+            assert!(
+                !operation.is_finished(),
+                "the probe response is still withheld"
+            );
+            if delayed_reattach {
+                let soul = soul.clone();
+                registry
+                    .run_blocking(move |conn| {
+                        assert_eq!(
+                            conn.execute(
+                                "UPDATE souls SET native_import_revision=native_import_revision+1,recovery_state='blocked' WHERE soul_id=?1",
+                                params![soul.as_str()],
+                            )?,
+                            1
+                        );
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+            }
+            release_tx.send(()).unwrap();
+            operation.await.unwrap();
+            responder.await.unwrap();
+            if delayed_reattach {
+                let current = registry.recovery_context(soul.clone()).await.unwrap();
+                assert_eq!(
+                    current.recovery_state,
                     freshell_runtime_protocol::RecoveryState::Blocked
                 );
-            } else {
-                let result = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    supervisor.probe_recovery(soul.clone()),
-                )
-                .await
-                .unwrap()
-                .unwrap();
-                assert!(
-                    matches!(
-                        result,
-                        RecoveryProbe::DefinitivelyUnavailable {
-                            path: RecoveryPath::NativeResume,
-                            ..
-                        }
-                    ),
-                    "status materialization must defeat stale seed readiness: {result:?}"
+                assert_eq!(current.native_import_revision, initial_import_revision + 1);
+                assert_eq!(
+                    current.prior_handle.incarnation_id(),
+                    &launch.incarnation_id
                 );
             }
-            responder.await.unwrap();
             assert_eq!(
                 registry
                     .recovery_context(soul)
