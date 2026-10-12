@@ -3,14 +3,53 @@ import { resolvePairedExternalFixture } from '../../../scripts/testing/e2e-exter
 import { test, expect } from '../helpers/fixtures.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TestHarness } from '../helpers/test-harness.js'
+import type { ProviderPreparationFailure } from '../../../shared/ws-protocol.js'
 
 const paired = resolvePairedExternalFixture(process.env, true)
 if (paired?.kind !== 'managed-environment') throw new Error('Managed environment requires its paired owned target')
 const fixture = paired.fixture
 const headers = { 'x-auth-token': paired.targetToken }
+const healthyTitle = 'executes selected resources with Bun in both managed stages and retains identity on reconnect'
+const caseScenarios: Record<string, string> = {
+  [healthyTitle]: 'healthy',
+  'missing-reference retains an actionable blocked result without a replacement conversation': 'missing-reference',
+  'startup-before-identity retains an actionable blocked result without a replacement conversation': 'startup-before-identity',
+}
+
+test.afterEach(async ({ page }, info) => {
+  const scenario = caseScenarios[info.title]
+  if (!scenario) throw new Error('Unknown managed environment case')
+  const cwd = `${fixture.remoteWorkspacePath}/${scenario}`
+  const request = await readReceipt(page, `${cwd}/.managed-fixture/request.json`)
+  if (info.status !== info.expectedStatus) {
+    const pane = await activePane(page).catch(() => null)
+    const diagnostic = await page.evaluate(({ terminalId, marker }) => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      const buffer = terminalId && harness ? harness.getTerminalBuffer(terminalId) : null
+      return { harnessPresent: Boolean(harness), bufferType: typeof buffer, bufferNull: buffer === null,
+        bufferLength: typeof buffer === 'string' ? buffer.length : null,
+        markerPresent: typeof buffer === 'string' ? buffer.includes(marker) : false }
+    }, { terminalId: pane?.content.kind === 'terminal' ? pane.content.terminalId : undefined,
+      marker: `MANAGED_ENV_OUTPUT ${fixture.expectedNonce}` }).catch(() => ({ observation: 'UNKNOWN' }))
+    console.error(JSON.stringify({ severity: 'error', event: 'managed_environment.browser_attempt_failed',
+      scenario, attempt: info.retry, status: info.status,
+      stage: info.annotations.filter(value => value.type === 'managed-stage').at(-1)?.description ?? 'UNKNOWN',
+      terminalPresent: pane?.content.kind === 'terminal' && Boolean(pane.content.terminalId),
+      soulPresent: pane?.content.kind === 'terminal' && Boolean(pane.content.soulId),
+      nativeIdentityPresent: pane?.content.kind === 'terminal' && Boolean(pane.content.sessionRef),
+      diagnostic }))
+  }
+  const response = await page.request.post(`${paired!.targetUrl}/api/files/write`, { headers, timeout: 30_000,
+    data: { path: `${cwd}/.managed-fixture/completion.json`, content: JSON.stringify({ ...fixture, scenario,
+      attempt: info.retry, status: info.status, willRetry: info.status !== info.expectedStatus && info.retry < info.project.retries,
+      ...(request?.attempt === info.retry ? { createRequestId: request.createRequestId } : {}) }) } })
+  expect(response.ok()).toBe(true)
+})
 
 async function json(page: Page, route: string) {
   const response = await page.request.get(`${paired!.targetUrl}${route}`, { headers, timeout: 30_000 })
+  if (!response.ok()) console.error(JSON.stringify({ severity: 'error', event: 'managed_environment.browser_http_failed',
+    route, status: response.status() }))
   expect(response.ok()).toBe(true)
   return response.json()
 }
@@ -32,7 +71,7 @@ async function activePane(page: Page) {
   })
 }
 
-async function launch(page: Page, scenario: string) {
+async function launch(page: Page, scenario: string, attempt: number) {
   await page.goto(`${paired!.targetUrl}/?token=${encodeURIComponent(paired!.targetToken)}&e2e=1`)
   await page.waitForFunction(() => Boolean(window.__FRESHELL_TEST_HARNESS__), undefined, { timeout: 60_000 })
   await new TestHarness(page).waitForConnection(120_000)
@@ -63,13 +102,13 @@ async function launch(page: Page, scenario: string) {
   expect(selected.paneId).toBe(before.paneId)
   expect(selected.content.mode).toBe('opencode')
   expect(selected.content.createRequestId).toBeTruthy()
-  const request = { ...fixture, scenario, createRequestId: selected.content.createRequestId, paneId: selected.paneId }
+  const request = { ...fixture, scenario, attempt, createRequestId: selected.content.createRequestId, paneId: selected.paneId }
   const written = await page.request.post(`${paired!.targetUrl}/api/files/write`, { headers,
     data: { path: `${cwd}/.managed-fixture/request.json`, content: JSON.stringify(request) } })
   expect(written.ok()).toBe(true)
   await expect.poll(async () => readReceipt(page, `${cwd}/.managed-fixture/authorized.json`),
     { timeout: 120_000 }).toMatchObject({ candidateSha: fixture.candidateSha, runId: fixture.runId,
-      expectedNonce: fixture.expectedNonce, createRequestId: selected.content.createRequestId })
+      expectedNonce: fixture.expectedNonce, attempt, createRequestId: selected.content.createRequestId })
   await page.evaluate(id => {
     const harness = window.__FRESHELL_TEST_HARNESS__!
     harness.setTerminalNetworkEffectsSuppressed(id, false)
@@ -81,17 +120,21 @@ async function launch(page: Page, scenario: string) {
   }, selected.paneId)
   await expect.poll(async () => {
     const pane = await activePane(page)
-    return pane.content.kind === 'terminal' ? pane.content.terminalId : null
+    return pane.content.kind === 'terminal'
+      ? scenario === 'missing-reference' ? pane.content.launchFailure?.providerPreparationFailure : pane.content.terminalId
+      : null
   }, { timeout: 120_000 }).toBeTruthy()
   return { ...(await activePane(page)), cwd, createRequestId: selected.content.createRequestId }
 }
 
-test('executes selected resources with Bun in both managed stages and retains identity on reconnect', async ({ page }) => {
+test(healthyTitle, async ({ page }, info) => {
   test.setTimeout(360_000)
-  const pane = await launch(page, 'healthy')
+  info.annotations.push({ type: 'managed-stage', description: 'healthy-launch' })
+  const pane = await launch(page, 'healthy', info.retry)
   if (pane.content.kind !== 'terminal') throw new Error('Expected the real OpenCode terminal')
   const terminalId = pane.content.terminalId!
   const marker = `MANAGED_ENV_OUTPUT ${fixture.expectedNonce}`
+  info.annotations.push({ type: 'managed-stage', description: 'healthy-initial-output' })
   await expect.poll(() => page.evaluate(id => window.__FRESHELL_TEST_HARNESS__!.getTerminalBuffer(id), terminalId),
     { timeout: 120_000 }).toContain(marker)
   let receipt: any
@@ -112,6 +155,7 @@ test('executes selected resources with Bun in both managed stages and retains id
   await new TestHarness(page).waitForConnection(120_000)
   await expect.poll(async () => (await activePane(page)).content).toMatchObject({ terminalId,
     sessionRef: { provider: 'opencode', sessionId: receipt.nativeSessionId } })
+  info.annotations.push({ type: 'managed-stage', description: 'healthy-post-reconnect-output' })
   await expect.poll(() => page.evaluate(id => window.__FRESHELL_TEST_HARNESS__!.getTerminalBuffer(id), terminalId)).toContain(marker)
   expect(await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
     .filter((message: any) => message.type === 'terminal.create').length)).toBe(beforeCreates)
@@ -121,12 +165,57 @@ test('executes selected resources with Bun in both managed stages and retains id
 })
 
 for (const scenario of ['missing-reference', 'startup-before-identity']) {
-  test(`${scenario} retains an actionable blocked result without a replacement conversation`, async ({ page }) => {
+  test(`${scenario} retains an actionable blocked result without a replacement conversation`, async ({ page }, info) => {
     test.setTimeout(300_000)
-    const pane = await launch(page, scenario)
+    info.annotations.push({ type: 'managed-stage', description: `${scenario}-launch` })
+    const pane = await launch(page, scenario, info.retry)
     if (pane.content.kind !== 'terminal') throw new Error('Expected the retained managed terminal')
+    if (scenario === 'missing-reference') {
+      const selectedPath = `${pane.cwd}/missing-selected.txt`
+      const preparationFailure = { code: 'SELECTED_REFERENCE_UNAVAILABLE', stage: 'configuration', operation: 'resolve',
+        cause: 'not_found', workspace: pane.cwd, declaringConfig: `${pane.cwd}/opencode.json`, selectedPath } satisfies ProviderPreparationFailure
+      const retained = { mode: 'opencode', status: 'error', createRequestId: pane.createRequestId,
+        launchFailure: { code: 'LAUNCH_FAILED', providerPreparationFailure: preparationFailure } }
+      expect(pane.content).toMatchObject(retained)
+      const assertNoHandle = async () => {
+        const current = (await activePane(page)).content
+        if (current.kind !== 'terminal') throw new Error('Expected the real failed request pane')
+        expect(current.terminalId).toBeUndefined()
+        expect(current.soulId).toBeUndefined()
+        expect(current.sessionRef).toBeUndefined()
+        expect(current.resumeSessionId).toBeUndefined()
+        expect((await json(page, '/api/terminals')).filter((item: any) => item.cwd === pane.cwd)).toHaveLength(0)
+        expect(await readReceipt(page, `${pane.cwd}/.managed-fixture/child-receipt.json`)).toBeNull()
+      }
+      const diagnostic = page.locator('[data-testid="terminal-work-area"]')
+      await expect(diagnostic).toContainText(selectedPath)
+      await expect(diagnostic).toContainText(/not found/i)
+      await expect(diagnostic.getByRole('button', { name: 'Retry launch' })).toBeVisible()
+      await expect(diagnostic.getByRole('button', { name: /^Attach/ })).toHaveCount(0)
+      await assertNoHandle()
+      const creates = await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
+        .filter((message: any) => message.type === 'terminal.create').length)
+      expect(creates).toBe(1)
+      await new TestHarness(page).forceDisconnect()
+      await new TestHarness(page).waitForConnection(120_000)
+      expect((await activePane(page)).content).toMatchObject(retained)
+      expect(await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
+        .filter((message: any) => message.type === 'terminal.create').length)).toBe(creates)
+      await assertNoHandle()
+      await page.reload()
+      await page.waitForFunction(() => Boolean(window.__FRESHELL_TEST_HARNESS__), undefined, { timeout: 60_000 })
+      await new TestHarness(page).waitForConnection(120_000)
+      expect((await activePane(page)).content).toMatchObject(retained)
+      expect(await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
+        .filter((message: any) => message.type === 'terminal.create').length)).toBe(0)
+      await expect(diagnostic).toContainText(selectedPath)
+      await expect(diagnostic).toContainText(/not found/i)
+      await assertNoHandle()
+      return
+    }
     const terminalId = pane.content.terminalId!
     let row: any
+    info.annotations.push({ type: 'managed-stage', description: 'startup-before-identity-blocked-directory' })
     await expect.poll(async () => {
       row = (await json(page, '/api/terminals')).find((item: any) => item.terminalId === terminalId)
       return row
