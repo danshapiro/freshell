@@ -20,6 +20,7 @@ struct Daemon {
     host_tasks: Vec<tokio::task::JoinHandle<()>>,
     reject_inputs: bool,
     consumed_rejection: bool,
+    recovery_probes: Vec<String>,
 }
 struct Backend(Arc<Mutex<Daemon>>, std::path::PathBuf);
 
@@ -211,10 +212,17 @@ impl RuntimeBackend for Backend {
                     HostCommand::ProbeRecovery {
                         resume_spec: Some(spec),
                         ..
-                    } => HostResult::RecoveryProbe(RecoveryProbe::ResumeReady {
-                        evidence_revision: spec.evidence_revision,
-                        resume_spec: spec,
-                    }),
+                    } => {
+                        state
+                            .lock()
+                            .unwrap()
+                            .recovery_probes
+                            .push(spec.provider_session.native_session_id.clone());
+                        HostResult::RecoveryProbe(RecoveryProbe::ResumeReady {
+                            evidence_revision: spec.evidence_revision,
+                            resume_spec: spec,
+                        })
+                    }
                     command => panic!("unexpected synthetic host command {command:?}"),
                 };
                 write_frame(
@@ -370,6 +378,131 @@ async fn control_listener(supervisor: &Supervisor) -> tokio::task::JoinHandle<()
     .await
     .unwrap();
     task
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_opencode_probe_persists_resume_evidence_before_enclosure_exit() {
+    let temp = tempfile::tempdir().unwrap();
+    let registry_root = temp.path().join("registry");
+    let registry = Registry::open(&registry_root, None).unwrap();
+    let soul = SoulId::new();
+    let daemon = Arc::new(Mutex::new(Daemon::default()));
+    let runtime_root = temp.path().join("runtime");
+    let host_binary_path = temp.path().join("synthetic-host");
+    std::fs::create_dir_all(&runtime_root).unwrap();
+    std::fs::write(&host_binary_path, "synthetic-host-artifact").unwrap();
+
+    let config = SupervisorConfig {
+        runtime_root: runtime_root.clone(),
+        control_socket_path: temp.path().join("control.sock"),
+        host_binary_path: host_binary_path.clone(),
+        image_ref: format!("sha256:{}", "a".repeat(64)),
+        test_run_id: "live-resume-capture".into(),
+        control_secret: "synthetic-control-secret".into(),
+        lifecycle_log: temp.path().join("lifecycle.jsonl"),
+        admission: crate::admission::AdmissionPolicy::default(),
+    };
+    let backend = Arc::new(Backend(daemon.clone(), registry_root));
+    let supervisor = Supervisor::new(registry.clone(), backend.clone(), config).unwrap();
+    let terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+        "terminalId":"terminal-live-resume",
+        "streamId":"stream-live-resume",
+        "mode":"opencode",
+        "program":"opencode",
+        "args":[],
+        "env":{"HOME":"/home/freshell/provider"},
+        "cwd":temp.path(),
+        "runAsUid":65534,
+        "runAsGid":0,
+        "cols":80,
+        "rows":24,
+        "projectKey":"project-live-resume",
+        "workspacePath":temp.path(),
+        "providerLaunchContext":context(&soul, 1),
+        "providerSecretReferences":references()
+    }))
+    .unwrap();
+    let prepared = registry
+        .prepare_launch(crate::registry::LaunchPreparation {
+            soul_id: soul.clone(),
+            provider: "opencode".into(),
+            provider_store_id: "store-exact".into(),
+            native_session_id: None,
+            creation_seed_ref: "seed-live-resume".into(),
+            request_id: RequestId::new(),
+            payload_digest: "live-resume-capture".into(),
+            requested_limits: limits(),
+            profile: RuntimeProfile::Custom,
+            project_key: "project-live-resume".into(),
+            fixture: None,
+            terminal: Some(terminal),
+            fresh_agent: None,
+            view_intent: None,
+            admission: crate::admission::AdmissionPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let incarnation_id = prepared.incarnation_id.clone();
+    let runtime_dir = runtime_root.join(incarnation_id.as_str());
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::write(runtime_dir.join("secret"), b"synthetic-host-secret").unwrap();
+    registry
+        .commit_created(
+            incarnation_id.clone(),
+            crate::registry::BackendCreatedRecord {
+                daemon_id: DockerDaemonId::parse("synthetic-daemon").unwrap(),
+                container_id: "d".repeat(64),
+                image_ref: format!("sha256:{}", "a".repeat(64)),
+                runtime_dir: runtime_dir.clone(),
+                host_binary_path,
+                immutable_config_digest: "e".repeat(64),
+            },
+        )
+        .await
+        .unwrap();
+    let boot = HostBootId::new();
+    registry
+        .commit_execution_grant(incarnation_id.clone(), boot, limits())
+        .await
+        .unwrap();
+    registry.mark_running(incarnation_id.clone()).await.unwrap();
+    registry
+        .record_native_session(soul.clone(), incarnation_id.clone(), "ses_exact".into())
+        .await
+        .unwrap();
+    let handle = registry.owned_handle(incarnation_id).await.unwrap();
+    backend.start_host(&handle).await.unwrap();
+
+    let live = supervisor.probe_recovery(soul.clone()).await.unwrap();
+    assert!(matches!(live, RecoveryProbe::ReattachReady { .. }));
+    let durable = registry.recovery_context(soul.clone()).await.unwrap();
+    assert_eq!(
+        durable
+            .resume_spec
+            .as_ref()
+            .map(|spec| spec.provider_session.native_session_id.as_str()),
+        Some("ses_exact"),
+        "a healthy live probe must capture exact provider-store evidence before the enclosure can disappear"
+    );
+    assert_eq!(daemon.lock().unwrap().recovery_probes, ["ses_exact"]);
+
+    daemon
+        .lock()
+        .unwrap()
+        .running
+        .remove(durable.prior_handle.incarnation_id());
+    let after_exit = supervisor.probe_recovery(soul).await.unwrap();
+    assert!(matches!(
+        after_exit,
+        RecoveryProbe::ResumeReady { resume_spec, .. }
+            if resume_spec.provider_session.native_session_id == "ses_exact"
+    ));
+
+    let tasks = std::mem::take(&mut daemon.lock().unwrap().host_tasks);
+    for task in tasks {
+        task.abort();
+        let _ = task.await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

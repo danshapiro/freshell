@@ -59,7 +59,7 @@ impl Supervisor {
                     RecoveryBlockReason::OldRuntimeNotEmpty,
                     &message,
                     None,
-                ))
+                ));
             }
             Err(error) => {
                 return Ok(blocked(
@@ -67,7 +67,7 @@ impl Supervisor {
                     RecoveryBlockReason::ProviderUnavailable,
                     &error.to_string(),
                     Some(2_000),
-                ))
+                ));
             }
         };
 
@@ -110,6 +110,10 @@ impl Supervisor {
                             .map_err(map_registry)?;
                     }
                     if !status.exited {
+                        if context.provider != "shell" && context.resume_spec.is_none() {
+                            self.capture_live_resume_evidence(&context, &host, &status)
+                                .await;
+                        }
                         return Ok(live_reattach_probe(&context, &status));
                     }
                     if context.provider == "shell" {
@@ -156,7 +160,7 @@ impl Supervisor {
                         RecoveryBlockReason::ProviderUnavailable,
                         &error.message,
                         Some(2_000),
-                    ))
+                    ));
                 }
             }
         }
@@ -177,6 +181,67 @@ impl Supervisor {
             ),
             Some(2_000),
         ))
+    }
+
+    /// Capture a verified exact-session resume proof while the provider store
+    /// is still reachable. A live process remains reattachable even when the
+    /// provider cannot produce a proof yet; the lifecycle event records that
+    /// gap so an eventual whole-enclosure exit does not look like a mystery.
+    async fn capture_live_resume_evidence(
+        &self,
+        context: &RecoveryContext,
+        host: &crate::service::AuthenticatedHost,
+        status: &crate::service::HostStatus,
+    ) {
+        let capture = match resume_catalog::exact_resume_candidate(
+            context,
+            status.native_session_id.as_deref(),
+        ) {
+            Ok(Some(candidate)) => {
+                match self.probe_host_store(context, host, Some(candidate)).await {
+                    Ok(RecoveryProbe::ResumeReady { resume_spec, .. }) => {
+                        match self
+                            .registry
+                            .store_verified_resume_spec(context.soul_id.clone(), *resume_spec)
+                            .await
+                        {
+                            Ok(stored) => serde_json::json!({
+                                "result": "captured",
+                                "evidenceRevision": stored.evidence_revision,
+                            }),
+                            Err(error) => serde_json::json!({
+                                "result": "persist_failed",
+                                "error": error.to_string(),
+                            }),
+                        }
+                    }
+                    Ok(probe) => serde_json::json!({
+                        "result": "not_verified",
+                        "probe": probe,
+                    }),
+                    Err(error) => serde_json::json!({
+                        "result": "probe_failed",
+                        "errorCode": error.code,
+                        "error": error.message,
+                    }),
+                }
+            }
+            Ok(None) => serde_json::json!({ "result": "identity_unavailable" }),
+            Err(probe) => serde_json::json!({
+                "result": "candidate_blocked",
+                "probe": probe,
+            }),
+        };
+        crate::service::append_event(
+            &self.config.lifecycle_log,
+            "supervisor.recovery.live_resume_evidence",
+            serde_json::json!({
+                "soulId": context.soul_id,
+                "incarnationId": context.prior_handle.incarnation_id(),
+                "provider": context.provider,
+                "capture": capture,
+            }),
+        );
     }
 
     async fn probe_host_store(
@@ -264,10 +329,18 @@ impl Supervisor {
             {
                 return Ok(RecoveryResult {
                     outcome: RecoveryOutcome::Blocked,
-                    probe: Some(blocked(RecoveryPath::NativeResume, RecoveryBlockReason::RetryBudget,
-                        "automatic recovery budget is exhausted; repair the dependency and explicitly retry", None)),
-                    view, prior_incarnation_id: None, attempt_id: None,
-                    expected_native_session_id: None, observed_native_session_id: None, incident_id: None,
+                    probe: Some(blocked(
+                        RecoveryPath::NativeResume,
+                        RecoveryBlockReason::RetryBudget,
+                        "automatic recovery budget is exhausted; repair the dependency and explicitly retry",
+                        None,
+                    )),
+                    view,
+                    prior_incarnation_id: None,
+                    attempt_id: None,
+                    expected_native_session_id: None,
+                    observed_native_session_id: None,
+                    incident_id: None,
                 });
             }
         }
@@ -958,7 +1031,7 @@ impl Supervisor {
                 return Err(RuntimeError::new(
                     RuntimeErrorCode::InvalidRequest,
                     "legacy loss preservation requires a definitive-negative probe",
-                ))
+                ));
             }
         };
         let (_, mut preserved_evidence) =
@@ -1331,8 +1404,12 @@ impl Supervisor {
                         });
                     }
                     if context.dispatched_command_count == 0 {
-                        return Err(blocked(RecoveryPath::PristineSeed, RecoveryBlockReason::AmbiguousIdentity,
-                            "initialization/native identity is uncertain; no durable input dispatch establishes pristine-seed unavailability", None));
+                        return Err(blocked(
+                            RecoveryPath::PristineSeed,
+                            RecoveryBlockReason::AmbiguousIdentity,
+                            "initialization/native identity is uncertain; no durable input dispatch establishes pristine-seed unavailability",
+                            None,
+                        ));
                     }
                     RecoveryPathEvidence {
                         path: RecoveryPath::PristineSeed,
@@ -1962,8 +2039,12 @@ fn offline_probe(context: &RecoveryContext) -> Result<RecoveryProbe, RuntimeErro
             ),
         });
     }
-    Ok(blocked(RecoveryPath::NativeResume, RecoveryBlockReason::AmbiguousIdentity,
-        "native identity/resume metadata is unrecorded or unverified; provider store absence has not been established", None))
+    Ok(blocked(
+        RecoveryPath::NativeResume,
+        RecoveryBlockReason::AmbiguousIdentity,
+        "native identity/resume metadata is unrecorded or unverified; provider store absence has not been established",
+        None,
+    ))
 }
 
 fn downtime_bucket(elapsed_ms: u64) -> &'static str {
@@ -2092,7 +2173,7 @@ fn install_prepared_provider_context(
             return Err(RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
                 "complete provider replacement requires exactly one workload",
-            ))
+            ));
         }
     }
     Ok(())
