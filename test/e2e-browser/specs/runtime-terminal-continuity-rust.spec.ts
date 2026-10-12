@@ -565,9 +565,28 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       await harness.waitForHarness()
       await harness.waitForConnection()
       await expect(pane).toBeVisible()
-      expect((await harness.getPaneLayout(created.tabId)).content).toMatchObject(canonical)
+      const contentAfterRestart = (await harness.getPaneLayout(created.tabId)).content
+      expect(contentAfterRestart).toMatchObject(canonical)
       const postStopHistoryResponses = historyResponses.slice(postStopRestartResponseStart)
-      expect(postStopHistoryResponses, 'the reloaded stopped pane must request saved history')
+      const snapshotRequests = (await harness.getPerfAuditSnapshot())?.perfEvents
+        .filter((event) => event.event === 'fresh_agent.snapshot_request')
+        .slice(-12)
+        .map(({ stage, reason, requestReadOnly, hasSoul, createChanged, soulChanged, revisionChanged, bootChanged,
+          ownerChanged, providerChanged, typeChanged, threadChanged, paneSessionChanged, recoveryChanged }) => ({
+          stage, reason, requestReadOnly, hasSoul, createChanged, soulChanged, revisionChanged, bootChanged,
+          ownerChanged, providerChanged, typeChanged, threadChanged, paneSessionChanged, recoveryChanged,
+        })) ?? []
+      const contentFacts = {
+        status: contentAfterRestart.status,
+        hasSessionId: Boolean(contentAfterRestart.sessionId),
+        hasSessionRef: Boolean(contentAfterRestart.sessionRef?.sessionId),
+        pendingReconcile: contentAfterRestart.pendingReconcile,
+        recovery: contentAfterRestart.recoverySummary ? {
+          desiredState: contentAfterRestart.recoverySummary.desiredState,
+          recoveryState: contentAfterRestart.recoverySummary.recoveryState,
+        } : null,
+      }
+      expect(postStopHistoryResponses, `the reloaded stopped pane must request saved history; pane=${JSON.stringify(contentFacts)}; snapshotRequests=${JSON.stringify(snapshotRequests)}`)
         .not.toHaveLength(0)
       expect(postStopHistoryResponses.some((response) => response.status === 200),
         `stopped history requests failed: ${JSON.stringify(postStopHistoryResponses)}`).toBe(true)
