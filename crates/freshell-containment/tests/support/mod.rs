@@ -652,6 +652,17 @@ impl StartedCommand {
         }
     }
 
+    /// The process a helper mode reported in `line` (`<mode> <pid>`), pinned
+    /// and verified as the test's own ([`StartedCommand::verify`]).
+    pub fn verify_report(&mut self, line: &str, mode: &str) -> ProcWatch {
+        let pid: u32 = line
+            .strip_prefix(mode)
+            .and_then(|rest| rest.strip_prefix(' '))
+            .and_then(|p| p.trim().parse().ok())
+            .unwrap_or_else(|| panic!("unexpected {mode} helper line {line:?}"));
+        self.verify(pid)
+    }
+
     /// Pins `pid` and checks that it is the test's own: the child itself or
     /// the child's child (under a placement wrapper such as the reaper
     /// shim). The check runs after the pin, and the pin has not exited after
@@ -728,11 +739,8 @@ impl LeaderExited {
     /// `started`, once verified as the test's own and running with its main
     /// thread exited.
     pub fn reported(mut started: StartedCommand, line: &str) -> Self {
-        let pid: u32 = line
-            .strip_prefix("leader-exits ")
-            .and_then(|p| p.trim().parse().ok())
-            .unwrap_or_else(|| panic!("unexpected helper line {line:?}"));
-        let pin = started.verify(pid);
+        let pin = started.verify_report(line, "leader-exits");
+        let pid = pin.pid();
         let leader_exited = stat_state(pid).as_deref() == Some("Z");
         assert!(
             leader_exited && !pin.has_exited(),
@@ -766,5 +774,63 @@ impl LeaderExited {
             tokio::time::timeout(limit, self.pin.exited()).await,
             Ok(Ok(()))
         )
+    }
+}
+
+/// Linux: a running process that made itself non-dumpable
+/// (`freshell-test-helper non-dumpable`, which ignores the soft signals), so
+/// this test (another process of the same user) cannot read its descriptor
+/// table. It is verified as the test's own before anything can signal it.
+/// On drop it is killed through its pin with the rest of what the test
+/// started ([`StartedCommand`]), and then the systemd unit slice holding it
+/// (if any) is stopped.
+#[cfg(target_os = "linux")]
+pub struct NonDumpable {
+    /// The non-dumpable process.
+    pub pin: ProcWatch,
+    /// Kills the helper and the rest of what the test started when dropped.
+    started: StartedCommand,
+    /// The unit slice holding the verified helper, stopped after the kills
+    /// above (fields drop in order).
+    _slice: StopSliceOnDrop,
+}
+
+#[cfg(target_os = "linux")]
+impl NonDumpable {
+    /// The helper that reported in `line` (`non-dumpable <pid>`), printed by
+    /// `started`, once verified as the test's own and running with a
+    /// descriptor table this test cannot read (unless the test runs as
+    /// root, which reads every table).
+    pub fn reported(mut started: StartedCommand, line: &str) -> Self {
+        let pin = started.verify_report(line, "non-dumpable");
+        let pid = pin.pid();
+        assert!(!pin.has_exited(), "the helper {pid} does not run");
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            let table = std::fs::read_dir(format!("/proc/{pid}/fd"));
+            assert!(
+                matches!(&table, Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied),
+                "the helper {pid}'s descriptor table is readable: {table:?}"
+            );
+        }
+        Self {
+            _slice: StopSliceOnDrop::holding(pid),
+            pin,
+            started,
+        }
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.pin.pid()
+    }
+
+    /// The pinned incarnation's start time.
+    pub fn start_time(&self) -> u64 {
+        self.pin.identity().start
+    }
+
+    /// Whether the helper still runs as the pinned incarnation.
+    pub fn runs(&self) -> bool {
+        !self.pin.has_exited()
     }
 }

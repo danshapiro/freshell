@@ -329,7 +329,7 @@ pub(crate) fn start_time_checked(pid: u32) -> io::Result<Option<u64>> {
 /// process (or the thread read) is gone: no such entry (ENOENT), or its
 /// task went away during the read (ESRCH).
 #[cfg(target_os = "linux")]
-fn is_gone(err: &io::Error) -> bool {
+pub(crate) fn is_gone(err: &io::Error) -> bool {
     matches!(err.raw_os_error(), Some(libc::ENOENT | libc::ESRCH))
 }
 
@@ -1094,8 +1094,8 @@ pub(crate) fn child_listing(pid: u32) -> Listing {
 /// `hidepid=invisible` (ENOENT), descriptor exhaustion (EMFILE) or a
 /// non-dumpable process (EACCES) answers them, so a unit test can give a
 /// reader that answer about a live process of its own. Files: `stat`,
-/// `cmdline`, `environ`, and `fd` (the descriptor table the lock lookup
-/// reads).
+/// `cmdline`, `environ`, and `fd` and `fdinfo` (the descriptor table and a
+/// descriptor's lock information the lock lookup reads).
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod test_reads {
     use std::sync::{Mutex, PoisonError};
@@ -1134,6 +1134,17 @@ pub(crate) mod test_reads {
             Some((_, _, errno)) => Err(std::io::Error::from_raw_os_error(*errno)),
             None => Ok(()),
         }
+    }
+
+    /// [`check`] for a read of `file` under `dir`: a process's
+    /// `/proc/<pid>` directory, or one of its `task/<tid>` ones.
+    pub(crate) fn check_under(dir: &std::path::Path, file: &str) -> std::io::Result<()> {
+        let pid = dir
+            .strip_prefix("/proc")
+            .ok()
+            .and_then(|rest| rest.components().next())
+            .and_then(|pid| pid.as_os_str().to_str()?.parse().ok());
+        pid.map_or(Ok(()), |pid| check(pid, file))
     }
 }
 

@@ -228,6 +228,29 @@ pub fn lock_holders(paths: &[PathBuf]) -> Vec<LockHolder> {
 /// (pid, path).
 #[cfg(target_os = "linux")]
 pub fn lock_holders_among(paths: &[PathBuf], pids: &[u32]) -> Vec<LockHolder> {
+    scan_among(paths, pids).holders
+}
+
+/// One descriptor scan of `pids` for `paths`: the visible holders, and the
+/// pids whose descriptors could not be read although they may hold one of
+/// `paths` ("could not check"; never "not a holder").
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Default)]
+pub(crate) struct LockScan {
+    pub holders: Vec<LockHolder>,
+    pub unreadable: Vec<u32>,
+}
+
+/// Linux: one descriptor scan. A process is `unreadable` when its
+/// descriptor table cannot be read (a same-uid process that made itself
+/// non-dumpable, no descriptor or memory left in this server), or one of
+/// its descriptors that names a file cannot be checked for a lock or
+/// identified while it is locked, for a reason other than the process or
+/// the descriptor being gone. A process another uid owns is unreadable
+/// too: callers that scan every process (`lock_holders`) report only the
+/// visible holders.
+#[cfg(target_os = "linux")]
+pub(crate) fn scan_among(paths: &[PathBuf], pids: &[u32]) -> LockScan {
     let mut wanted: Vec<(&PathBuf, FileId)> = Vec::new();
     for path in paths {
         if wanted.iter().any(|(p, _)| *p == path) {
@@ -237,33 +260,42 @@ pub fn lock_holders_among(paths: &[PathBuf], pids: &[u32]) -> Vec<LockHolder> {
             wanted.push((path, id));
         }
     }
+    let mut scan = LockScan::default();
     if wanted.is_empty() {
-        return Vec::new();
+        return scan;
     }
     let ids: Vec<FileId> = wanted.iter().map(|(_, id)| *id).collect();
 
-    let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for &pid in pids {
         if !seen.insert(pid) {
             continue;
         }
-        let Some((dir, fds)) = descriptors(pid) else {
-            continue; // gone, or another uid's descriptor table
+        let table = match descriptors(pid) {
+            Ok(Some(table)) => table,
+            Ok(None) => continue, // gone
+            Err(_) => {
+                scan.unreadable.push(pid);
+                continue;
+            }
         };
         let mut held: Vec<FileId> = Vec::new();
-        for fd in &fds {
-            if let Some(id) = fd_holds_lock(&dir, fd, &ids) {
-                if !held.contains(&id) {
-                    held.push(id);
-                }
+        let mut unread = false;
+        for fd in &table.fds {
+            match fd_lock(&table, fd, &ids) {
+                Ok(Some(id)) if !held.contains(&id) => held.push(id),
+                Ok(_) => {}
+                Err(_) => unread = true,
             }
+        }
+        if unread {
+            scan.unreadable.push(pid);
         }
         if held.is_empty() {
             continue;
         }
         let name = crate::process::name(pid).unwrap_or_default();
-        out.extend(
+        scan.holders.extend(
             wanted
                 .iter()
                 .filter(|(_, id)| held.contains(id))
@@ -274,34 +306,59 @@ pub fn lock_holders_among(paths: &[PathBuf], pids: &[u32]) -> Vec<LockHolder> {
                 }),
         );
     }
-    out
+    scan
 }
 
 /// A file's (device, inode), as `stat` reports them.
 #[cfg(target_os = "linux")]
 type FileId = (u64, u64);
 
-/// `pid`'s descriptor table as `/proc` shows it: the directory whose `fd/`
-/// and `fdinfo/` list it, and the descriptor numbers listed there. Once the
-/// main thread has exited, the leader's own `fd/` is root-only and its
-/// `fdinfo/` empty, although the process keeps every descriptor (and every
-/// lock on them); the table is then read through a running thread, which
-/// shares it (`process::through_a_running_thread`). `None` when it cannot be
-/// read (gone, or another uid's).
+/// One process's descriptor table as `/proc` shows it.
 #[cfg(target_os = "linux")]
-fn descriptors(pid: u32) -> Option<(PathBuf, Vec<String>)> {
-    crate::process::through_a_running_thread(
+struct Table {
+    /// The directory whose `fd/` and `fdinfo/` list it.
+    dir: PathBuf,
+    /// The descriptor numbers listed there.
+    fds: Vec<String>,
+}
+
+/// `pid`'s descriptor table. Once the main thread has exited, the leader's
+/// own `fd/` is root-only and its `fdinfo/` empty, although the process
+/// keeps every descriptor (and every lock on them); the table is then read
+/// through a running thread, which shares it
+/// (`process::through_a_running_thread`). `None` when the process is gone
+/// or a zombie (whose `fd/` is root-only too, with no descriptor left);
+/// `Err` when the table of a running process cannot be read ("could not
+/// check").
+#[cfg(target_os = "linux")]
+fn descriptors(pid: u32) -> std::io::Result<Option<Table>> {
+    match read_table(pid) {
+        Ok(table) => Ok(Some(table)),
+        Err(err) if crate::process::is_gone(&err) => Ok(None),
+        Err(err) => match crate::process::is_running_checked(pid) {
+            Ok(false) => Ok(None),
+            Ok(true) | Err(_) => Err(err),
+        },
+    }
+}
+
+/// One read of `pid`'s descriptor table (see [`descriptors`]).
+#[cfg(target_os = "linux")]
+fn read_table(pid: u32) -> std::io::Result<Table> {
+    #[cfg(test)]
+    crate::process::test_reads::check(pid, "fd")?;
+    let (dir, fds) = crate::process::through_a_running_thread(
         pid,
         |dir| {
-            let fds = std::fs::read_dir(dir.join("fd"))?
-                .flatten()
-                .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
-                .collect();
+            let mut fds = Vec::new();
+            for entry in std::fs::read_dir(dir.join("fd"))? {
+                fds.extend(entry?.file_name().to_str().map(str::to_string));
+            }
             Ok((dir.to_path_buf(), fds))
         },
         |(_, fds): &(PathBuf, Vec<String>)| fds.is_empty(),
-    )
-    .ok()
+    )?;
+    Ok(Table { dir, fds })
 }
 
 /// The (device, inode) of the file `path` names (following symlinks, so a
@@ -319,12 +376,24 @@ fn descriptors(pid: u32) -> Option<(PathBuf, Vec<String>)> {
 /// emulation rejects `AT_STATX_DONT_SYNC` with EINVAL; a seccomp filter may
 /// answer ENOSYS or EPERM), the identity is read with a plain `stat`
 /// instead, which may ask a network server: a holder must never be missed.
+/// `None` when the file is missing or unreadable: no file to match.
 #[cfg(target_os = "linux")]
 fn file_id(path: &Path) -> Option<FileId> {
+    file_id_checked(path).ok().flatten()
+}
+
+/// [`file_id`], telling a missing file (`Ok(None)`, as for a path no file
+/// can have or a file with no inode number) from one whose identity could
+/// not be read (`Err`, "could not check").
+#[cfg(target_os = "linux")]
+fn file_id_checked(path: &Path) -> std::io::Result<Option<FileId>> {
+    use crate::process::is_gone;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
 
-    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return Ok(None);
+    };
     let mut buf = std::mem::MaybeUninit::<libc::statx>::zeroed();
     // SAFETY: a NUL-terminated path and a writable, correctly sized buffer.
     let rc = unsafe {
@@ -337,45 +406,66 @@ fn file_id(path: &Path) -> Option<FileId> {
         )
     };
     if rc != 0 {
-        return match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::ENOSYS | libc::EPERM | libc::EINVAL) => std::fs::metadata(path)
-                .ok()
-                .map(|meta| (meta.dev(), meta.ino())),
-            _ => None, // missing or unreadable: no file to match
+        let err = std::io::Error::last_os_error();
+        return match err.raw_os_error() {
+            Some(libc::ENOSYS | libc::EPERM | libc::EINVAL) => match std::fs::metadata(path) {
+                Ok(meta) => Ok(Some((meta.dev(), meta.ino()))),
+                Err(err) if is_gone(&err) => Ok(None),
+                Err(err) => Err(err),
+            },
+            _ if is_gone(&err) => Ok(None),
+            _ => Err(err),
         };
     }
     // SAFETY: statx succeeded, so it filled the (already zeroed) buffer.
     let stx = unsafe { buf.assume_init() };
     if stx.stx_mask & libc::STATX_INO == 0 {
-        return None; // no inode number: the file cannot be matched
+        return Ok(None); // no inode number: the file cannot be matched
     }
-    Some((
+    Ok(Some((
         libc::makedev(stx.stx_dev_major, stx.stx_dev_minor),
         stx.stx_ino,
-    ))
+    )))
 }
 
-/// The wanted file that descriptor `fd` of the table `dir` shows
-/// ([`descriptors`]) refers to, when the kernel lists a lock on that
-/// descriptor. The checks run cheapest first: the link
-/// target (sockets, pipes and anonymous inodes are never lock files), then
-/// the fdinfo `lock:` line (both are kernel bookkeeping and never reach the
-/// file's filesystem), and only then the identity of the open file, read
-/// without a server round trip (except as noted on [`file_id`]). A full scan
-/// passes thousands of other processes' open files, so it reads the identity
-/// of locked ones only.
+/// The wanted file that descriptor `fd` of `table` ([`descriptors`]) refers
+/// to, when the kernel lists a lock on that descriptor. The checks run
+/// cheapest first: the link target (sockets, pipes and anonymous inodes are
+/// never lock files), then the fdinfo `lock:` line (both are kernel
+/// bookkeeping and never reach the file's filesystem), and only then the
+/// identity of the open file, read without a server round trip (except as
+/// noted on [`file_id`]). A full scan passes thousands of other processes'
+/// open files, so it reads the identity of locked ones only. `Ok(None)`
+/// also when the descriptor (or the process) is gone; `Err` when one of
+/// those reads failed for another reason ("could not check").
 #[cfg(target_os = "linux")]
-fn fd_holds_lock(dir: &Path, fd: &str, wanted: &[FileId]) -> Option<FileId> {
-    let link = dir.join("fd").join(fd);
-    if !std::fs::read_link(&link).ok()?.is_absolute() {
-        return None;
+fn fd_lock(table: &Table, fd: &str, wanted: &[FileId]) -> std::io::Result<Option<FileId>> {
+    use crate::process::is_gone;
+    let link = table.dir.join("fd").join(fd);
+    match std::fs::read_link(&link) {
+        Ok(target) if target.is_absolute() => {}
+        Ok(_) => return Ok(None),
+        Err(err) if is_gone(&err) => return Ok(None),
+        Err(err) => return Err(err),
     }
-    let fdinfo = std::fs::read_to_string(dir.join("fdinfo").join(fd)).ok()?;
+    let fdinfo = match read_fdinfo(table, fd) {
+        Ok(fdinfo) => fdinfo,
+        Err(err) if is_gone(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    };
     if !fdinfo_has_lock(&fdinfo) {
-        return None;
+        return Ok(None);
     }
-    let id = file_id(&link)?; // follows to the open file
-    wanted.contains(&id).then_some(id)
+    // Follows the link to the open file.
+    Ok(file_id_checked(&link)?.filter(|id| wanted.contains(id)))
+}
+
+/// One read of descriptor `fd`'s `fdinfo` in `table`.
+#[cfg(target_os = "linux")]
+fn read_fdinfo(table: &Table, fd: &str) -> std::io::Result<String> {
+    #[cfg(test)]
+    crate::process::test_reads::check_under(&table.dir, "fdinfo")?;
+    std::fs::read_to_string(table.dir.join("fdinfo").join(fd))
 }
 
 /// True when an fdinfo text has a `lock:` line. In `/proc/<pid>/fdinfo/<fd>`
@@ -589,16 +679,9 @@ pub fn lock_holders_among(paths: &[PathBuf], pids: &[u32]) -> Vec<LockHolder> {
     scan_among(paths, pids).holders
 }
 
-/// One macOS descriptor scan: the visible holders, and the pids whose
-/// descriptors could not be read although the process still runs (it has
-/// begun exiting, so it may still hold a lock it no longer shows).
-#[cfg(target_os = "macos")]
-#[derive(Debug, Default)]
-pub(crate) struct LockScan {
-    pub holders: Vec<LockHolder>,
-    pub unreadable: Vec<u32>,
-}
-
+/// One macOS descriptor scan ([`LockScan`]): the pids whose descriptors
+/// could not be read although the process still runs have begun exiting,
+/// so they may still hold a lock they no longer show.
 #[cfg(target_os = "macos")]
 pub(crate) fn scan_among(paths: &[PathBuf], pids: &[u32]) -> LockScan {
     use crate::darwin;
@@ -794,6 +877,44 @@ mod tests {
     fn an_fdinfo_without_a_lock_line_holds_nothing() {
         let unlocked = "pos:\t0\nflags:\t02102001\nmnt_id:\t31\n";
         assert!(!fdinfo_has_lock(unlocked));
+    }
+
+    /// A zombie (killed, not yet reaped) has closed every descriptor. Its
+    /// `fd/` is root's once its memory is gone, so the read is refused like
+    /// a non-dumpable process's, but that refusal is no "could not check":
+    /// it is neither a holder nor unreadable.
+    #[test]
+    fn a_zombie_is_neither_a_holder_nor_unreadable() {
+        use crate::proc_watch::{ProcWatch, Sig};
+        use std::process::Stdio;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("thread.lock");
+        std::fs::write(&lock, "").unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("600")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // The test's own unreaped child: its pid names it until the wait
+        // below, so the scan reads it as a zombie.
+        let killed = ProcWatch::open(child.id()).and_then(|pin| {
+            pin.signal(Sig::Kill)?;
+            pin.wait_exited_blocking(Duration::from_secs(5))
+        });
+        let scan = super::scan_among(std::slice::from_ref(&lock), &[child.id()]);
+        let _ = child.kill();
+        child.wait().unwrap();
+        assert!(
+            matches!(killed, Ok(true)),
+            "the child became a zombie: {killed:?}"
+        );
+        assert!(
+            scan.holders.is_empty() && scan.unreadable.is_empty(),
+            "{scan:?}"
+        );
     }
 }
 

@@ -29,6 +29,15 @@
 //!   `/proc/<pid>/stat` state is Z), prints `leader-exits <pid>` and sleeps
 //!   until killed; it exits 1 when the main thread is not seen exited in
 //!   time.
+//! - `non-dumpable [--lock <path>] [args...]` (Linux only): a running
+//!   process that made itself non-dumpable (`PR_SET_DUMPABLE` 0), as a
+//!   program guarding its memory does, so another process of the same user
+//!   can no longer read its descriptor table (`/proc/<pid>/fd` and `fdinfo`
+//!   are then root's). With `--lock <path>` it first takes the lock on
+//!   `<path>` exactly as `hold-lock` does (exits 3 when it is held
+//!   elsewhere) and keeps it. It ignores its other arguments and the soft
+//!   signals, as `leader-exits` does, prints `non-dumpable <pid>` and sleeps
+//!   until killed.
 //! - `job-child` (Windows only): runs an `until-eof` copy of itself in a
 //!   nested kill-on-close job of its own that has its own completion port,
 //!   as a program that watches the jobs it runs commands in does (prints
@@ -70,12 +79,13 @@ fn main() {
         Some("idle") => idle(),
         Some("until-eof") => until_eof(),
         Some("leader-exits") => leader_exits(&args[1..]),
+        Some("non-dumpable") => non_dumpable(&args[1..]),
         Some("job-child") => job_child(),
         Some("breakaway-daemon") => breakaway_daemon(),
         Some("disclaim-exec") => disclaim_exec(&args[1..]),
         _ => {
             eprintln!(
-                "usage: freshell-test-helper hold-lock <path> [--threads N] [--child] | idle [args...] | until-eof | leader-exits [--lock <path>] [args...] | job-child | breakaway-daemon | disclaim-exec -- <command> [args...]"
+                "usage: freshell-test-helper hold-lock <path> [--threads N] [--child] | idle [args...] | until-eof | leader-exits [--lock <path>] [args...] | non-dumpable [--lock <path>] [args...] | job-child | breakaway-daemon | disclaim-exec -- <command> [args...]"
             );
             USAGE_EXIT
         }
@@ -177,25 +187,37 @@ fn until_eof() -> i32 {
     0
 }
 
+/// The lock a `[--lock <path>] [args...]` mode takes first, as `hold-lock`
+/// takes it (`None` without `--lock`). `Err` is the exit code.
 #[cfg(target_os = "linux")]
-fn leader_exits(args: &[String]) -> i32 {
-    let lock = match args {
-        [flag, path, ..] if flag == "--lock" => match take_lock("leader-exits", path) {
-            Ok(file) => Some(file),
-            Err(code) => return code,
-        },
+fn lock_option(mode: &str, args: &[String]) -> Result<Option<std::fs::File>, i32> {
+    match args {
+        [flag, path, ..] if flag == "--lock" => take_lock(mode, path).map(Some),
         [flag] if flag == "--lock" => {
-            eprintln!("freshell-test-helper leader-exits: --lock needs a path");
-            return USAGE_EXIT;
+            eprintln!("freshell-test-helper {mode}: --lock needs a path");
+            Err(USAGE_EXIT)
         }
-        _ => None,
-    };
-    // Only a kill ends it: a soft stop's signal (forwarded by the reaper
-    // shim) is ignored, as a stubborn agent ignores it.
+        _ => Ok(None),
+    }
+}
+
+/// Only a kill ends the process: a soft stop's signal (forwarded by the
+/// reaper shim) is ignored, as a stubborn agent ignores it.
+#[cfg(target_os = "linux")]
+fn ignore_soft_signals() {
     for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
         // SAFETY: setting a standard signal's disposition to SIG_IGN.
         unsafe { libc::signal(sig, libc::SIG_IGN) };
     }
+}
+
+#[cfg(target_os = "linux")]
+fn leader_exits(args: &[String]) -> i32 {
+    let lock = match lock_option("leader-exits", args) {
+        Ok(lock) => lock,
+        Err(code) => return code,
+    };
+    ignore_soft_signals();
     let pid = std::process::id();
     let worker = std::thread::Builder::new()
         .name("leader-exits".into())
@@ -245,6 +267,34 @@ fn leader_is_zombie(pid: u32) -> bool {
 #[cfg(not(target_os = "linux"))]
 fn leader_exits(_args: &[String]) -> i32 {
     eprintln!("freshell-test-helper leader-exits: Linux only");
+    USAGE_EXIT
+}
+
+#[cfg(target_os = "linux")]
+fn non_dumpable(args: &[String]) -> i32 {
+    let lock = match lock_option("non-dumpable", args) {
+        Ok(lock) => lock,
+        Err(code) => return code,
+    };
+    ignore_soft_signals();
+    // SAFETY: prctl with integer arguments only.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        eprintln!(
+            "freshell-test-helper non-dumpable: PR_SET_DUMPABLE: {}",
+            std::io::Error::last_os_error()
+        );
+        return 1;
+    }
+    println!("non-dumpable {}", std::process::id());
+    let _ = std::io::stdout().flush();
+    // Kept until the process is killed.
+    let _lock = lock;
+    park_forever()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn non_dumpable(_args: &[String]) -> i32 {
+    eprintln!("freshell-test-helper non-dumpable: Linux only");
     USAGE_EXIT
 }
 

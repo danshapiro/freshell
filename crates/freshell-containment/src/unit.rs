@@ -1189,7 +1189,8 @@ impl AgentUnit {
 
     /// The lock check runs after the whole-unit kill (a lock is released at
     /// the main's exit only when no other live process shares its open file
-    /// description): every member still holding a lock path is killed
+    /// description): every member still holding a lock path, or (Linux)
+    /// whose descriptors cannot be read, so that it may hold one, is killed
     /// through a pinned watch, then the holders are checked once more. A
     /// holder whose own argv is Codex's daemon family (a snapshot member
     /// that exec'd into it after the snapshot) is neither signalled nor
@@ -1225,7 +1226,9 @@ impl AgentUnit {
         Ok(snapshot.complete())
     }
 
-    /// The unit members (and live snapshot members) holding any of `paths`.
+    /// The unit members (and live snapshot members) holding any of `paths`,
+    /// and those whose descriptors could not be read (Linux: they may hold
+    /// one, "could not check").
     #[cfg(not(target_os = "macos"))]
     async fn member_lock_holders(
         &self,
@@ -1238,11 +1241,7 @@ impl AgentUnit {
         blocking(move || {
             let members = unit.members_and(snapshot)?;
             let pids: Vec<u32> = members.iter().map(|m| m.pid).collect();
-            let holders = locks::lock_holders_among(&paths, &pids);
-            Ok(members
-                .into_iter()
-                .filter(|m| holders.iter().any(|h| h.pid == m.pid))
-                .collect())
+            Ok(member_holders(members, &paths, &pids))
         })
         .await?
     }
@@ -1634,6 +1633,37 @@ fn live_identity_list(watches: &[ProcWatch]) -> Vec<ProcIdentity> {
 struct MemberLockScan {
     holders: Vec<(ProcIdentity, PathBuf)>,
     unreadable: Vec<ProcIdentity>,
+}
+
+/// The `members` (with their pids, `pids`) that hold one of `paths`, and
+/// on Linux also those whose descriptors could not be read: such a member
+/// may hold one ("could not check", never "not a holder").
+#[cfg(target_os = "linux")]
+fn member_holders(
+    members: Vec<ProcIdentity>,
+    paths: &[PathBuf],
+    pids: &[u32],
+) -> Vec<ProcIdentity> {
+    let scan = locks::scan_among(paths, pids);
+    members
+        .into_iter()
+        .filter(|m| scan.holders.iter().any(|h| h.pid == m.pid) || scan.unreadable.contains(&m.pid))
+        .collect()
+}
+
+/// Windows: the `members` (with their pids, `pids`) that hold one of
+/// `paths` as the Restart Manager reports them.
+#[cfg(windows)]
+fn member_holders(
+    members: Vec<ProcIdentity>,
+    paths: &[PathBuf],
+    pids: &[u32],
+) -> Vec<ProcIdentity> {
+    let holders = locks::lock_holders_among(paths, pids);
+    members
+        .into_iter()
+        .filter(|m| holders.iter().any(|h| h.pid == m.pid))
+        .collect()
 }
 
 /// The not-yet-exited `watches` as sorted, distinct `(pid, start time)`.
@@ -2346,6 +2376,69 @@ sleep 600;"#;
             !released,
             "the daemon-family holder still holds its lock file"
         );
+    }
+
+    /// The Gone lock check never reads "could not check" as "not a holder":
+    /// a member whose descriptor table (here refused, as for a process that
+    /// made itself non-dumpable) or whose descriptors' lock information
+    /// (here for want of a descriptor) cannot be read may hold a unit lock
+    /// file. Shown with a holder only the snapshot shows, of Codex's daemon
+    /// family by the check (one that exec'd into it after the snapshot):
+    /// the check neither signals it nor waits for it, and the lock counts
+    /// as still held.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_lock_check_counts_a_member_it_cannot_read_as_a_holder() {
+        let mut wrong = Vec::new();
+        for (file, errno) in [("fd", libc::EACCES), ("fdinfo", libc::EMFILE)] {
+            let dir = tempfile::tempdir().unwrap();
+            let lock_path = dir.path().join("thread.lock");
+            let holder = Spawned::perl_lock(&lock_path, &["app-server", "--managed-daemon"]);
+            let unit = unit_on(Arc::new(NoProcesses));
+            unit.set_lock_paths(vec![lock_path]);
+            let snapshot = Snapshot::whole(vec![holder.watch.clone()]);
+            let unreadable = process::test_reads::fail(holder.watch.pid(), file, errno);
+            let released =
+                tokio::time::timeout(Duration::from_secs(10), unit.check_locks(&snapshot))
+                    .await
+                    .expect("the check ended without waiting for the daemon-family holder")
+                    .unwrap();
+            drop(unreadable);
+            if released {
+                wrong.push(format!(
+                    "{file}: a member whose lock files could not be read was taken for no holder"
+                ));
+            }
+            if !holder.untouched() {
+                wrong.push(format!("{file}: the daemon-family holder was signalled"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A member the Gone lock check cannot read that is not of Codex's
+    /// daemon family is treated as the holder it may be: killed through its
+    /// pin and awaited, so the lock is then known to be released.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_lock_check_kills_a_member_it_cannot_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("thread.lock");
+        let holder = Spawned::perl_lock(&lock_path, &[]);
+        let unit = unit_on(Arc::new(NoProcesses));
+        unit.set_lock_paths(vec![lock_path]);
+        let snapshot = Snapshot::whole(vec![holder.watch.clone()]);
+        let unreadable = process::test_reads::fail(holder.watch.pid(), "fd", libc::EACCES);
+        let released = tokio::time::timeout(Duration::from_secs(10), unit.check_locks(&snapshot))
+            .await
+            .expect("the check ended")
+            .unwrap();
+        drop(unreadable);
+        assert!(
+            holder.watch.has_exited(),
+            "a member whose descriptors could not be read was left holding the lock"
+        );
+        assert!(released, "its lock was released by its exit");
     }
 
     /// A unit whose members cannot be read ("could not check", as the tag
