@@ -92,9 +92,23 @@ const timer=setInterval(()=>{
         })+'\n',{mode:0o600})
       })
     }
-  } catch {
+  } catch (error) {
     clearInterval(timer)
-    fs.writeFileSync(path.join(root,'broker-failure'),'closed fixture authorization failed',{mode:0o600})
+    const cause=error instanceof Error?error.message:String(error)
+    const failurePath=path.join(root,'broker-failure')
+    fs.writeFileSync(failurePath,cause,{mode:0o600})
+    try {
+      const detail:Record<string,string>={cause}
+      if (error && typeof error==='object') {
+        const rejected=error as {targetPath?:unknown;preparationStageRoot?:unknown}
+        if (typeof rejected.targetPath==='string') detail.targetPath=diagnosticPath(rejected.targetPath)??'<invalid>'
+        if (typeof rejected.preparationStageRoot==='string') detail.preparationStageRoot=diagnosticPath(rejected.preparationStageRoot)??'<invalid>'
+      }
+      fs.writeFileSync(failurePath,JSON.stringify(detail),{mode:0o600})
+    } catch {
+      // Preserve the fixed cause even if optional path diagnostics cannot be
+      // serialized; the outer sandbox records the broker's state and logs.
+    }
     void broker.close()
     process.exitCode=1
   }

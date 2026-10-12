@@ -3,6 +3,8 @@
 use super::sources::PlannedSourceOccurrence;
 use std::path::{Path, PathBuf};
 
+const FRESHELL_IMAGE_MCP_SERVER_PATH: &str = "/opt/freshell-mcp/server.js";
+
 #[derive(Clone, Copy)]
 enum Token {
     String(usize, usize),
@@ -93,7 +95,7 @@ fn fields(raw: &str) -> Result<Vec<(&'static str, String)>, &'static str> {
 }
 
 // Read only member spans: selected nested schemas never deserialize or rewrite
-// an entire source document, nor interpret command arrays as file selections.
+// an entire source document, nor interpret unrelated command arguments as paths.
 type ObjectMember = (std::ops::Range<usize>, std::ops::Range<usize>);
 
 fn object_members(raw: &str, start: usize) -> Result<Vec<ObjectMember>, &'static str> {
@@ -203,12 +205,12 @@ fn nested_fields(raw: &str, tui: bool) -> Result<Vec<(&'static str, String)>, &'
         for (name, range) in object_members(mcp, 0)?.into_iter().rev() {
             let name = serde_json::from_str::<String>(&mcp[name])
                 .map_err(|_| "invalid selected MCP server name")?;
-            if names.insert(name) {
-                winners.push(range);
+            if names.insert(name.clone()) {
+                winners.push((name, range));
             }
         }
         drop(names);
-        for range in winners.into_iter().rev() {
+        for (name, range) in winners.into_iter().rev() {
             let entry = &mcp[range];
             let entries = object_members(entry, 0)?;
             if member(entry, &entries, "type")
@@ -219,14 +221,126 @@ fn nested_fields(raw: &str, tui: bool) -> Result<Vec<(&'static str, String)>, &'
             {
                 continue;
             }
+            // Keep each server's cwd adjacent to its command references so a
+            // different server's cwd cannot accidentally satisfy a missing path.
+            result.push(("OpenCode mcp.entry", String::new()));
             if let Some(value) = member(entry, &entries, "cwd") {
                 if let Some(path) = selected_string(value)? {
                     result.push(("OpenCode mcp.cwd", path));
                 }
             }
+            if let Some(value) = member(entry, &entries, "command") {
+                let command = string_array(value)?;
+                // Freshell's exact server command is supplied by the managed
+                // runtime image. Its /opt path is not a host resource to copy.
+                let image_command = name == "freshell"
+                    && command.len() == 2
+                    && command[0] == "node"
+                    && command[1] == FRESHELL_IMAGE_MCP_SERVER_PATH;
+                if !image_command {
+                    for (index, argument) in command.iter().enumerate() {
+                        if (index == 0 && is_explicit_command_path(argument))
+                            || is_script_path(argument)
+                        {
+                            result.push(("OpenCode mcp.command", argument.clone()));
+                        }
+                    }
+                    let inline_code = command.iter().any(|argument| {
+                        matches!(argument.as_str(), "-e" | "-c" | "--eval" | "--print")
+                    });
+                    let bare_script_arguments = command
+                        .iter()
+                        .skip(1)
+                        .filter(|argument| !argument.starts_with('-') && !argument.is_empty())
+                        .collect::<Vec<_>>();
+                    if command_uses_script_runtime(command.first().map(String::as_str))
+                        && !inline_code
+                        && bare_script_arguments.len() == 1
+                        && !is_script_path(bare_script_arguments[0])
+                    {
+                        result.push(("OpenCode mcp.command", bare_script_arguments[0].clone()));
+                    }
+                }
+            }
         }
     }
     Ok(result)
+}
+
+fn string_array(raw: &str) -> Result<Vec<String>, &'static str> {
+    let mut cursor = Cursor { raw, at: 0 };
+    if !matches!(cursor.next(), Some(Token::Punctuation(b'['))) {
+        return Ok(Vec::new());
+    }
+    let mut depth = 1usize;
+    let mut result = Vec::new();
+    while depth != 0 {
+        match cursor.next().ok_or("incomplete selected command array")? {
+            Token::Punctuation(b'[' | b'{') => {
+                depth += 1;
+                if depth > 64 {
+                    return Err("selected command exceeds shared depth profile");
+                }
+            }
+            Token::Punctuation(b']' | b'}') => depth -= 1,
+            Token::String(start, end) if depth == 1 => {
+                if result.len() >= 100_000 || end - start > 64 * 1024 {
+                    return Err("configured resource selection profile exceeded");
+                }
+                result.push(
+                    serde_json::from_str(&cursor.raw[start..end])
+                        .map_err(|_| "invalid selected command argument")?,
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(result)
+}
+
+fn is_explicit_command_path(argument: &str) -> bool {
+    !argument.starts_with('-')
+        && (Path::new(argument).is_absolute()
+            || argument.starts_with("./")
+            || argument.starts_with("../"))
+}
+
+fn is_script_path(argument: &str) -> bool {
+    if argument.starts_with('-') || argument.starts_with('@') {
+        return false;
+    }
+    Path::new(argument).extension().is_some_and(|extension| {
+        matches!(
+            extension.to_string_lossy().to_ascii_lowercase().as_str(),
+            "js" | "mjs" | "cjs" | "ts" | "mts" | "cts" | "py" | "sh" | "rb"
+        )
+    })
+}
+
+fn command_uses_script_runtime(executable: Option<&str>) -> bool {
+    let Some(executable) = executable.and_then(|executable| Path::new(executable).file_name())
+    else {
+        return false;
+    };
+    let executable = executable.to_string_lossy().to_ascii_lowercase();
+    let executable = executable.strip_suffix(".exe").unwrap_or(&executable);
+    matches!(
+        executable,
+        "node"
+            | "nodejs"
+            | "bun"
+            | "deno"
+            | "tsx"
+            | "ts-node"
+            | "python"
+            | "python3"
+            | "ruby"
+            | "bash"
+            | "sh"
+            | "zsh"
+            | "pwsh"
+            | "powershell"
+    )
 }
 
 fn resource_array(
@@ -332,7 +446,12 @@ pub fn select(
         nested_fields(raw, source.source.lane == super::sources::SourceLane::Tui)
             .map_err(|cause| fail("OpenCode resource", cause))?,
     );
+    let mut current_mcp_working_dir: Option<PathBuf> = None;
     for (field, spelling) in selections {
+        if field == "OpenCode mcp.entry" {
+            current_mcp_working_dir = None;
+            continue;
+        }
         // Private file-token payloads already use the accepted grant plan.
         if spelling.contains("{file:") {
             continue;
@@ -392,7 +511,7 @@ pub fn select(
             } else {
                 continue;
             } // Native package identity remains native.
-        } else if field == "OpenCode mcp.cwd" {
+        } else if field == "OpenCode mcp.cwd" || field == "OpenCode mcp.command" {
             // Native path.resolve(instance cwd, raw): no HOME or URL expansion.
             PathBuf::from(&spelling)
         } else {
@@ -463,6 +582,17 @@ pub fn select(
                     .join(path);
             } else if field == "OpenCode skills.paths" || field == "OpenCode mcp.cwd" {
                 path = source.instance_cwd.join(path);
+            } else if field == "OpenCode mcp.command" {
+                path = if let Some(working_dir) = &current_mcp_working_dir {
+                    working_dir.join(path)
+                } else {
+                    source
+                        .instance_cwd
+                        .ancestors()
+                        .map(|base| base.join(&path))
+                        .find(|candidate| std::fs::symlink_metadata(candidate).is_ok())
+                        .unwrap_or_else(|| source.instance_cwd.join(path))
+                };
             } else {
                 path = source
                     .instance_cwd
@@ -474,7 +604,10 @@ pub fn select(
         }
         if matches!(
             field,
-            "OpenCode skills.paths" | "OpenCode mcp.cwd" | "OpenCode attention.sounds"
+            "OpenCode skills.paths"
+                | "OpenCode mcp.cwd"
+                | "OpenCode mcp.command"
+                | "OpenCode attention.sounds"
         ) {
             // Native resolution resolution normalizes .. before deciding
             // whether the selected resource is supplied by the workspace.
@@ -489,12 +622,37 @@ pub fn select(
             insert(path, field)?;
             continue;
         }
+        if field == "OpenCode mcp.command" {
+            if !canonical.is_file() {
+                return Err(fail(
+                    field,
+                    "selected command resource is not a regular file",
+                ));
+            }
+            // The server's selected cwd is already copied as a directory.
+            // Avoid an overlapping file/package mount for a script it contains;
+            // besides being redundant, that shape cannot be authorized by the
+            // closed launch fixture. Canonical resolution keeps symlinks that
+            // escape the cwd on the explicit-resource path below.
+            if current_mcp_working_dir
+                .as_ref()
+                .is_some_and(|working_dir| canonical.starts_with(working_dir))
+            {
+                continue;
+            }
+            // Retain the exact executable/script path as well as its bounded
+            // package closure below when it belongs to an installed package.
+            insert(canonical.clone(), field)?;
+        }
         if field == "OpenCode skills.paths" || field == "OpenCode mcp.cwd" {
             if !canonical.is_dir() {
                 return Err(fail(
                     field,
                     "selected directory resource is not a directory",
                 ));
+            }
+            if field == "OpenCode mcp.cwd" {
+                current_mcp_working_dir = Some(canonical);
             }
             insert(path, field)?;
             continue;
@@ -506,7 +664,12 @@ pub fn select(
         if global.is_some_and(|global| path.starts_with(global.join("plugins"))) {
             continue;
         }
-        let mut scope = if canonical.is_dir() {
+        let mut scope = if field == "OpenCode mcp.command" {
+            canonical
+                .parent()
+                .ok_or_else(|| fail(field, "command has no containing scope"))?
+                .to_owned()
+        } else if canonical.is_dir() {
             path.clone()
         } else {
             path.parent()
@@ -525,6 +688,9 @@ pub fn select(
             }
         }
         if scope == home || scope == Path::new("/") {
+            if field == "OpenCode mcp.command" {
+                continue;
+            }
             return Err(fail(field, "select a bounded plugin or package directory"));
         }
         insert(scope.clone(), field)?;

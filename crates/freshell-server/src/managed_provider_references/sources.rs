@@ -1113,4 +1113,186 @@ mod tests {
             "generated child names cannot shadow user or source-specific auth values"
         );
     }
+
+    #[test]
+    fn review_r6_local_mcp_command_file_arguments_are_selected() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let tools = owned.path().join("outside-tools");
+        let absolute_script = tools.join("absolute-mcp.js");
+        let relative_script = workspace.join("scripts/relative-mcp.js");
+        let env_script = tools.join("env-mcp.js");
+        let symlink_target = tools.join("symlink-target.js");
+        let workspace_symlink = workspace.join("scripts/symlinked-mcp.js");
+        let cwd_script = workspace.join("mcp-cwd/cwd-mcp.js");
+        let extensionless_script = tools.join("extensionless-mcp");
+        let missing_disabled_script = tools.join("missing-disabled.js");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::create_dir_all(relative_script.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(cwd_script.parent().unwrap()).unwrap();
+        for script in [
+            &absolute_script,
+            &relative_script,
+            &env_script,
+            &symlink_target,
+            &cwd_script,
+            &extensionless_script,
+        ] {
+            std::fs::write(script, "process.stdout.write('mcp fixture')\n").unwrap();
+        }
+        std::os::unix::fs::symlink(&symlink_target, &workspace_symlink).unwrap();
+        let config = workspace.join("opencode.json");
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "mcp": {
+                    "absolute": {
+                        "type": "local",
+                        "command": ["node", absolute_script],
+                        "enabled": true,
+                    },
+                    "relative": {
+                        "type": "local",
+                        "command": ["node", "scripts/relative-mcp.js"],
+                        "enabled": true,
+                    },
+                    "workspace-symlink": {
+                        "type": "local",
+                        "command": ["node", "scripts/symlinked-mcp.js"],
+                        "enabled": true,
+                    },
+                    "env": {
+                        "type": "local",
+                        "command": ["node", "{env:MCP_SERVER_PATH}"],
+                        "enabled": true,
+                    },
+                    "cwd": {
+                        "type": "local",
+                        "cwd": "mcp-cwd",
+                        "command": ["node", "cwd-mcp.js"],
+                        "enabled": true,
+                    },
+                    "extensionless": {
+                        "type": "local",
+                        "command": ["node", extensionless_script],
+                        "enabled": true,
+                    },
+                    "package": {
+                        "type": "local",
+                        "command": ["npx", "-y", "@example/mcp-server"],
+                        "enabled": true,
+                    },
+                    "disabled": {
+                        "type": "local",
+                        "command": ["node", missing_disabled_script],
+                        "enabled": false,
+                    },
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config,
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Workspace,
+            }],
+            &workspace,
+            &home,
+            &|_, _, name| {
+                (name == "MCP_SERVER_PATH").then(|| env_script.to_string_lossy().into_owned())
+            },
+        )
+        .unwrap();
+        let selected = &plan[0].configured_resources;
+
+        for script in [
+            &absolute_script,
+            &relative_script,
+            &symlink_target,
+            &env_script,
+            &extensionless_script,
+        ] {
+            assert!(
+                selected.contains(&script.canonicalize().unwrap()),
+                "enabled local MCP command file must be available to the managed child: {}",
+                script.display()
+            );
+        }
+        assert!(
+            selected.contains(&cwd_script.parent().unwrap().canonicalize().unwrap()),
+            "the selected local MCP cwd carries scripts below it"
+        );
+        assert!(
+            !selected.contains(&cwd_script.canonicalize().unwrap()),
+            "scripts already carried by the selected cwd do not get overlapping mounts"
+        );
+        assert!(!selected.contains(&missing_disabled_script));
+        assert!(
+            plan[0]
+                .references
+                .path_variables
+                .contains(&"MCP_SERVER_PATH".to_string()),
+            "command path environment references are resolved through the planned source"
+        );
+    }
+
+    #[test]
+    fn freshell_image_mcp_command_is_not_selected_as_a_host_resource() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let external = owned.path().join("external");
+        let local_script = external.join("user-mcp.js");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(&local_script, "process.stdout.write('user mcp')\n").unwrap();
+        let config = workspace.join("opencode.json");
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "mcp": {
+                    "freshell": {
+                        "type": "local",
+                        "command": ["node", "/opt/freshell-mcp/server.js"],
+                    },
+                    "user": {
+                        "type": "local",
+                        "command": ["node", local_script],
+                    },
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config,
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Workspace,
+            }],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .expect("the image-provided Freshell MCP is not a host path reference");
+
+        assert!(plan[0]
+            .configured_resources
+            .contains(&local_script.canonicalize().unwrap()));
+        assert!(!plan[0]
+            .configured_resources
+            .iter()
+            .any(|path| path.starts_with("/opt/freshell-mcp")
+                || path == Path::new("/opt/package.json")));
+    }
 }

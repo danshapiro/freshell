@@ -228,6 +228,19 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
             exit_code=int(waited.stdout.strip())
             outcome=docker("logs",controller,check=False)
             receipt["exitCode"]=exit_code
+            broker_state=docker("container","inspect",broker_name,check=False)
+            if broker_state.returncode==0:
+                state=json.loads(broker_state.stdout)[0]["State"]
+                broker_logs=docker("logs",broker_name,check=False)
+                receipt["brokerDiagnostics"]={
+                    "containerStatus":state.get("Status"),
+                    "containerExitCode":state.get("ExitCode"),
+                    "containerError":state.get("Error"),
+                    "logTail":(broker_logs.stdout+broker_logs.stderr)[-4096:],
+                    "handoffFiles":sorted(path.name for path in (root/"handoff").iterdir()),
+                    "brokerFailure":(root/"broker-failure").read_text() if (root/"broker-failure").is_file() else None,
+                    "brokerSocketExists":(root/"broker.sock").exists(),
+                }
             if args.provider=="claude":
                 receipt["claudeFlavor"]=args.claude_flavor
                 receipt["claudeSettingsForm"]=args.claude_settings_form
@@ -274,6 +287,10 @@ export default {id:'closed-native-fixture',async server(input,options){return {a
                     if not 2<=len(candidates)<=6 or len(authorized)!=len(candidates) or observed!=authorized or len(observers)!=len(candidates) or any(value.get("uid")!=65534 or value.get("gid")!=0 or value.get("backendCompleteAfterCleanup") is not True for value in observers):
                         receipt["exitCode"]=2;receipt["failureClass"]="candidate_observer_count_mismatch"
             else:
+                broker_failure=root/"broker-failure"
+                if broker_failure.is_file():
+                    receipt["brokerFailure"]=broker_failure.read_text()
+                    print(f"closed fixture broker failure: {receipt['brokerFailure']}",flush=True)
                 receipt["exitCode"]=2;receipt["failureClass"]="broker_receipt_unavailable"
         finally:
             # Get only this run's objects, then inspect exact labels and use
