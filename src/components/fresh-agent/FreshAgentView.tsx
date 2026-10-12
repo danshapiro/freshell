@@ -1676,6 +1676,7 @@ export function FreshAgentView({
       // D8 (restore-open-sessions-only): the server composes the ledger row's
       // tabKey as `deviceId:tabId` from the connection identity + this field.
       tabId,
+      paneId,
       ...(namingHandle ? { namingHandle } : {}),
       // kata b8ke delayed-request fence (round-2 review: the fence is the
       // (epoch, generation) PAIR from the runtime-owner record observed when
@@ -1685,7 +1686,7 @@ export function FreshAgentView({
         ? { observedEpoch: observedFence.epoch, observedGeneration: observedFence.generation }
         : {}),
     } as const
-  }, [providerDefaults, tabId])
+  }, [paneId, providerDefaults, tabId])
 
   const startNewConversation = useCallback(async () => {
     const current = paneContentRef.current
