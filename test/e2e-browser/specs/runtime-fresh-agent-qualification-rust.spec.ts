@@ -273,3 +273,75 @@ test.describe.serial('authentic fresh-agent qualification', () => {
     console.log(`[fresh-agent-qualification] receipts: ${finalized.artifactRefs.join(', ')}`)
   })
 })
+
+test.describe.serial('ordinary fresh-agent use', () => {
+  test('each selected fresh-agent mode completes one ordinary turn', async ({ page }) => {
+    test.skip(
+      process.env[FRESH_AGENT_QUALIFICATION_LIVE_ENV] !== '1',
+      `set ${FRESH_AGENT_QUALIFICATION_LIVE_ENV}=1 explicitly for an ordinary live-provider smoke`,
+    )
+    test.setTimeout(3_600_000)
+    const definitions = selectedDefinitions()
+    expect(definitions.map((definition) => definition.mode).sort()).toEqual([
+      'freshclaude', 'freshcodex', 'freshopencode',
+    ])
+    const rig = createManagedRuntimeBrowserRig(process.cwd(), 5, {}, {
+      FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '750',
+    }, 'release', {
+      enabledProviders: [],
+      freshAgentModes: definitions.map(({ mode }) => mode),
+      providerSettings: Object.fromEntries(definitions.map((row) => [row.mode, {
+        model: row.model,
+        modelSelection: { kind: 'exact', modelId: row.model },
+        defaultPermissionMode: 'default',
+        effort: row.effort === 'provider-default' ? undefined : row.effort,
+      }])),
+    })
+    const wire = observeBrowserWire(page)
+    try {
+      const info = await rig.start()
+      process.env.FRESHELL_URL = info.baseUrl
+      process.env.FRESHELL_TOKEN = info.token
+      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+      await new TestHarness(page).waitForConnection()
+
+      for (const definition of definitions) {
+        const created = await actualCreate(page, rig, definition, wire)
+        const marker = `FRESHELL-${randomBytes(12).toString('hex')}`
+        const allocationSessionIds = new Set([
+          created.reply.sessionId,
+          created.sessionId,
+          created.view.nativeSessionId,
+        ])
+        const sendCursor = wire.sent.length
+        const receivedCursor = wire.received.length
+        await sendBrowserNoToolTurn(
+          page,
+          created.paneId,
+          `Without using tools, reply with exactly this text and no other words: ${marker}`,
+        )
+        const sent = await waitFor('actual fresh-agent composer send', () => wire.sent
+          .slice(sendCursor)
+          .find((frame) => frame.type === 'freshAgent.send' && allocationSessionIds.has(frame.sessionId)) ?? null)
+        if (!allocationSessionIds.has(sent.sessionId)) {
+          throw new Error('fresh-agent send was not associated with the selected allocation')
+        }
+        await waitFor(`${definition.mode} completed answer`, async () => {
+          const completed = wire.received.slice(receivedCursor).some((frame) => (
+            frame.type === 'freshAgent.event'
+            && allocationSessionIds.has(frame.sessionId)
+            && frame.event?.type === 'freshAgent.turn.complete'
+          ))
+          const visibleAnswer = await page.locator(`[data-pane-id="${created.paneId}"] [data-turn-role="assistant"]`)
+            .evaluateAll((turns, expectedMarker) => turns.some((turn) => turn.textContent?.includes(expectedMarker)), marker)
+          return completed && visibleAnswer ? true : null
+        }, 240_000)
+        console.info(JSON.stringify({ severity: 'info', event: 'durable_souls.ordinary_turn_completed',
+          lane: 'fresh-agent', mode: definition.mode }))
+      }
+    } finally {
+      const cleanup = await rig.stop()
+      expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
+    }
+  })
+})

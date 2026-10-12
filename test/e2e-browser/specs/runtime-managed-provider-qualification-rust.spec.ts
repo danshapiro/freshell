@@ -498,6 +498,59 @@ test.describe.serial('selectable managed-provider qualification', () => {
   })
 })
 
+test.describe.serial('ordinary managed-provider use', () => {
+  test('each selected terminal provider completes one ordinary turn', async ({ page }) => {
+    test.skip(
+      process.env[LIVE_ENV] !== '1',
+      `set ${LIVE_ENV}=1 explicitly for an ordinary live-provider smoke`,
+    )
+    test.setTimeout(3_600_000)
+    const definitions = providerDefinitions()
+    expect(definitions.map((definition) => definition.provider).sort()).toEqual([
+      'claude', 'codex', 'opencode',
+    ])
+    const rig = createManagedRuntimeBrowserRig(
+      process.cwd(),
+      5,
+      {},
+      { FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '750' },
+      'release',
+      {
+        enabledProviders: definitions.map((definition) => definition.provider),
+        providerSettings: Object.fromEntries(definitions.map((definition) => [
+          definition.provider,
+          { model: definition.model, effort: definition.reasoningEffort },
+        ])),
+      },
+    )
+    try {
+      const info = await rig.start()
+      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+      const harness = new TestHarness(page)
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+      const tabId = await harness.getActiveTabId()
+      if (!tabId) throw new Error('ordinary provider smoke has no active tab')
+
+      for (const definition of definitions) {
+        const created = await createProviderPane(page, harness, rig, tabId, definition)
+        await executeAndAwaitNonceOutput(
+          page,
+          created.paneId,
+          created.terminalId,
+          `freshell-${randomBytes(12).toString('hex')}`,
+          'initial',
+        )
+        console.info(JSON.stringify({ severity: 'info', event: 'durable_souls.ordinary_turn_completed',
+          lane: 'terminal', provider: definition.provider }))
+      }
+    } finally {
+      const cleanup = await rig.stop()
+      expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
+    }
+  })
+})
+
 // Append outside the live-provider describe. These cases exercise real owned
 // publication/enclosure/store transactions with synthetic history and no prompts.
 // They do not emit ProviderQualificationRow or certify provider-observed LIVE.
