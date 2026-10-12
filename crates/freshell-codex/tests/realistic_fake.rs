@@ -362,15 +362,23 @@ async fn every_fake_records_whether_it_listened_or_lost_its_port() {
     drop(holder);
 }
 
-/// A fake that listens writes its listen record first, then its port file
-/// (port-file mode), then its manifest's `listening` mark (the native), all
-/// before it answers anyone. So whoever sees the port file or the mark finds
-/// the record, and whoever sees the mark finds the port file
-/// ([`FakeAppServer::listened`], [`lost_port::spawn_on_its_own_port`] and the
-/// test above read them in that order). Each write is made to fail in turn:
-/// the fake dies at that write, and none of the later ones exists.
+/// A fake writes how its listen went in a fixed order, and each write is made
+/// to fail in turn: the fake dies at that write, and none of the later ones
+/// exists.
+///
+/// - One that listens writes its listen record first, then its port file
+///   (port-file mode), then its manifest's `listening` mark (the native), all
+///   before it answers anyone. So whoever sees the port file or the mark
+///   finds the record, and whoever sees the mark finds the port file
+///   ([`FakeAppServer::listened`], [`lost_port::spawn_on_its_own_port`] and
+///   the test above read them in that order).
+/// - One that lost its port marks its manifest's `listenError` first, then
+///   writes its record. A planner may stop the attempt as soon as it sees the
+///   record, so every native whose record says it lost its port is already
+///   marked in its manifest, where the tests that count attempts leave lost
+///   ports out.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_listening_fake_writes_its_record_then_its_port_file_then_its_mark() {
+async fn a_fake_writes_how_its_listen_went_in_a_fixed_order() {
     // The record cannot be written: its directory would be under a file.
     let home = tempfile::tempdir().unwrap();
     let not_a_directory = home.path().join("not-a-directory");
@@ -432,6 +440,47 @@ async fn a_listening_fake_writes_its_record_then_its_port_file_then_its_mark() {
     assert_eq!(record["listening"], true, "the record before the port file");
     assert_ne!(record["port"], 0, "the port the kernel gave it: {record}");
     assert!(!native.listening, "no listening mark before the port file");
+
+    // Another socket holds the port, and the record cannot be written: its
+    // directory would be under a file. The fake dies at the record (status
+    // 1, not 98), after its manifest says it lost the port.
+    let home = tempfile::tempdir().unwrap();
+    let not_a_directory = home.path().join("not-a-directory");
+    std::fs::write(&not_a_directory, "").unwrap();
+    let record_dir = not_a_directory.join("records");
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a loopback port");
+    let taken = holder.local_addr().expect("the held port").port();
+    let run = launcher_exit_with_env(
+        &format!("ws://127.0.0.1:{taken}"),
+        json!({}),
+        home.path(),
+        Some(home.path().to_str().unwrap()),
+        &[(
+            lost_port::LISTEN_RECORD_DIR_ENV,
+            record_dir.to_str().unwrap(),
+        )],
+    )
+    .await;
+    drop(holder);
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
+    assert!(
+        run.stderr
+            .contains(&format!("listen 127.0.0.1:{taken} failed: EADDRINUSE")),
+        "it lost the port: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("ENOTDIR") && run.stderr.contains(record_dir.to_str().unwrap()),
+        "it dies writing its record: {}",
+        run.stderr
+    );
+    let native = run.native.expect("the native's manifest");
+    assert_eq!(
+        native.listen_error.as_deref(),
+        Some("EADDRINUSE"),
+        "the manifest marks the lost port before the record"
+    );
+    assert!(!native.listening, "it never claims to listen");
 }
 
 #[tokio::test(flavor = "multi_thread")]
