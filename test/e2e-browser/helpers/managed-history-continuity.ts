@@ -18,7 +18,7 @@ function leaves(node: PaneNode): Extract<PaneNode, { type: 'leaf' }>[] {
 
 function ownerIdentity(soul: ManagedRuntimeSoul) {
   return {
-    soulId: soul.soulId, incarnationId: soul.incarnationId, nativeSessionId: soul.nativeSessionId,
+    soulId: soul.soulId, incarnationId: soul.incarnationId,
     provider: soul.provider, profile: soul.profile, freshAgentSessionId: soul.freshAgentSessionId,
     freshAgentSessionType: soul.freshAgentSessionType, freshAgentCreateRequestId: soul.freshAgentCreateRequestId,
     freshAgentRuntimeVariant: soul.freshAgentRuntimeVariant, containerId: soul.containerId,
@@ -53,7 +53,7 @@ export function assertManagedHistoryContinuity(before: HistoryState, after: Hist
           || soul.freshAgentSessionId === allocation.createdSessionId))
       expect(souls, 'unique authoritative History soul').toHaveLength(1)
       const soul = souls[0]
-      expect(soul).toMatchObject({ soulId: allocation.soulId, incarnationId: allocation.incarnationId, nativeSessionId: allocation.nativeSessionId,
+      expect(soul).toMatchObject({ soulId: allocation.soulId, incarnationId: allocation.incarnationId,
         provider: runtimeProvider, profile: 'default_agent',
         containerId: allocation.containerId, hostBootId: allocation.hostBootId, intentRevision: allocation.intentRevision,
         freshAgentSessionId: allocation.createdSessionId, freshAgentSessionType: allocation.sessionType,
@@ -84,10 +84,18 @@ export function assertManagedHistoryContinuity(before: HistoryState, after: Hist
           allocationState: soul.allocationState, durabilityState: soul.durabilityState })
       const pair = [content.recoverySummary?.allocationState, content.recoverySummary?.durabilityState]
       expect([['materializing', 'unknown'], ['verified_durable', 'resume_captured']]).toContainEqual(pair)
+      // Native materialization can reach the pane before the supervisor saves
+      // that identity. Only the exact pending capture state admits absence;
+      // the pane and allocation above still require the established native ID.
+      if (soul.nativeSessionId === undefined) expect(pair).toEqual(['materializing', 'unknown'])
+      else expect(soul.nativeSessionId).toBe(allocation.nativeSessionId)
       return { content, soul, view, pair }
     }
     const prior = bind(before), current = bind(after)
     expect(ownerIdentity(current.soul), 'History must retain the exact allocated runtime owner').toEqual(ownerIdentity(prior.soul))
+    if (prior.soul.nativeSessionId !== undefined) {
+      expect(current.soul.nativeSessionId, 'History cannot forget an established authoritative native identity').toBe(prior.soul.nativeSessionId)
+    }
     expect(current.view, 'History must retain the exact view intent').toStrictEqual(prior.view)
     if (prior.pair[0] !== current.pair[0] || prior.pair[1] !== current.pair[1]) {
       expect(prior.pair).toEqual(['materializing', 'unknown'])
