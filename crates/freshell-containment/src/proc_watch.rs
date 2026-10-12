@@ -346,19 +346,15 @@ fn not_a_process(id: u32, process: u32) -> io::Error {
 }
 
 /// What a failed read of a pinned process's identity means: "process gone"
-/// only when it is, that is when the read found no such process (ENOENT,
-/// ESRCH: it was reaped) or `exited` (its pinning handle) says it exited;
-/// any other failure (EMFILE, ENFILE, ENOMEM, a malformed read, ...) is
-/// passed through, so no caller that skips a gone process can skip a live
-/// one.
+/// only when `exited` (its pinning handle) proves the exit: a Linux pidfd
+/// is readable once the process has exited, reaped or not; a Windows
+/// handle is signalled. Any other failure is passed through, also one that
+/// names no such process (Linux ENOENT, ESRCH, which a `/proc` hiding a
+/// live process answers too), so no caller that skips a gone process can
+/// skip a live one.
 #[cfg(any(target_os = "linux", windows))]
 fn identity_unread(err: io::Error, exited: impl FnOnce() -> bool) -> io::Error {
-    #[cfg(target_os = "linux")]
-    let reaped = matches!(err.raw_os_error(), Some(libc::ENOENT | libc::ESRCH));
-    // Windows reads through the handle, which keeps the process object.
-    #[cfg(windows)]
-    let reaped = false;
-    if reaped || exited() {
+    if exited() {
         process_gone()
     } else {
         err
@@ -1071,16 +1067,21 @@ mod linux_tests {
     use super::*;
 
     /// A failed read of a pinned process's identity is "process gone" only
-    /// when the read found no such process (ENOENT, ESRCH) or the pidfd
-    /// says it exited; every other failure passes through unchanged.
+    /// when the pidfd says the process exited. Every failure passes through
+    /// unchanged while it does not: ENOENT and ESRCH too, which a `/proc`
+    /// mounted `hidepid=invisible`, or of another pid namespace, answers for
+    /// a live process.
     #[test]
-    fn a_failed_identity_read_is_process_gone_only_when_the_process_is() {
+    fn a_failed_identity_read_is_process_gone_only_with_the_pidfds_proof() {
         let os = io::Error::from_raw_os_error;
-        for errno in [libc::ENOENT, libc::ESRCH] {
-            let err = identity_unread(os(errno), || false);
-            assert!(is_process_gone(&err), "errno {errno}: {err}");
-        }
-        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOMEM, libc::EACCES] {
+        for errno in [
+            libc::ENOENT,
+            libc::ESRCH,
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOMEM,
+            libc::EACCES,
+        ] {
             let err = identity_unread(os(errno), || false);
             assert!(!is_process_gone(&err), "errno {errno}: {err}");
             assert_eq!(err.raw_os_error(), Some(errno));
@@ -1090,6 +1091,25 @@ mod linux_tests {
         let err = identity_unread(io::Error::other("no starttime"), || false);
         assert!(!is_process_gone(&err), "{err}");
         assert_eq!(err.to_string(), "no starttime");
+    }
+
+    /// The proof covers a reaped process: the pidfd of a process that has
+    /// exited and been reaped is readable, so an identity read that then
+    /// finds no such process answers "process gone".
+    #[test]
+    fn a_reaped_processs_failed_identity_read_is_process_gone() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .unwrap();
+        // The test's own unreaped child: its pid names it.
+        let watch = ProcWatch::open(child.id()).unwrap();
+        watch.signal(Sig::Kill).unwrap();
+        child.wait().unwrap();
+        let err = identity_unread(io::Error::from_raw_os_error(libc::ENOENT), || {
+            pidfd_readable(&watch.inner.fd)
+        });
+        assert!(is_process_gone(&err), "{err}");
     }
 }
 
