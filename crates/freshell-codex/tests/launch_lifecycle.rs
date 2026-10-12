@@ -1558,7 +1558,7 @@ async fn plan_retry_falls_back_to_fresh_spawn_after_reattach_failure() {
 /// Task 7 review follow-up: the TRUE retry path. The claim SUCCEEDS (the
 /// survivor's /proc evidence verifies) but the minted
 /// [`ReattachedCodexAppServerRuntime`]'s `ensure_ready` FAILS (the record's
-/// ws_url points at a port where nothing listens), which reaps the
+/// ws_url points at a reserved port where nothing listens), which reaps the
 /// verified-but-unusable survivor's tree (the test's OWN fixture child) and
 /// removes its record; `plan_create`'s cleanup-on-plan-failure tears the
 /// sidecar down and the retry loop's SECOND factory invocation finds
@@ -1578,12 +1578,13 @@ async fn plan_retry_spawns_fresh_after_claimed_reattach_ensure_ready_fails() {
     let survivor_ownership = &mint_ownership_id();
     let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs");
-    let bind_unused_ws_url = || {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-        let port = listener.local_addr().expect("local_addr").port();
-        drop(listener);
-        format!("ws://127.0.0.1:{port}")
-    };
+    // Port B, where nothing listens: a reservation held to the end of the
+    // test ([`lost_port::ReservedPort`]). The reattach probe is only a
+    // WebSocket handshake, so any server listening there would pass it. A
+    // port bound and released could be given to another test's app-server or
+    // proxy before the probe; nothing else on the host is given a reserved
+    // port, and the reserving socket never listens, so the probe is refused.
+    let dead = lost_port::ReservedPort::new();
     // On a port the kernel gives it as it binds (no other socket can take it
     // first). It reports the port once it listens: by then exec has long
     // completed, so the /proc evidence captured below is really the
@@ -1600,15 +1601,15 @@ async fn plan_retry_spawns_fresh_after_claimed_reattach_ensure_ready_fails() {
     let survivor_pid = survivor.id().expect("live fixture pid");
 
     // The record: the fixture's REAL /proc evidence (claim-time
-    // re-verification: Verified) BUT a ws_url on ephemeral port B where
-    // NOTHING listens (bind-then-drop) — the reattach probe fails fast.
+    // re-verification: Verified) BUT a ws_url on the reserved port B where
+    // NOTHING listens — the reattach probe fails fast.
     let survivor_record = CodexSidecarRecord {
         record_version: SIDECAR_RECORD_VERSION,
         ownership_id: survivor_ownership.to_string(),
         pid: survivor_pid,
         starttime: proc_starttime(survivor_pid as i32).expect("live fixture has a starttime"),
         cmdline: proc_cmdline(survivor_pid as i32).expect("live fixture has a cmdline"),
-        ws_url: bind_unused_ws_url(),
+        ws_url: format!("ws://127.0.0.1:{}", dead.port()),
         session_id: Some("s-1".to_string()),
         terminal_id: None,
         server_instance_id: "srv-prev".to_string(),
@@ -1622,6 +1623,17 @@ async fn plan_retry_spawns_fresh_after_claimed_reattach_ensure_ready_fails() {
         main_starttime: None,
         codex_home: None,
     };
+    let dialled = survivor_record
+        .ws_url
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .expect("the record's port");
+    assert!(
+        !lost_port::ephemeral_port_range().contains(&dialled),
+        "the reattach probe dials a reserved port, outside the kernel's \
+         ephemeral range {:?}: {dialled}",
+        lost_port::ephemeral_port_range()
+    );
     store
         .write(&survivor_record)
         .expect("write survivor record");
@@ -1723,6 +1735,8 @@ async fn plan_retry_spawns_fresh_after_claimed_reattach_ensure_ready_fails() {
         store.load_all().is_empty(),
         "teardown scrubs the fresh spawn's record"
     );
+    // Held to here: nothing else was given port B while the probe ran.
+    drop(dead);
 }
 
 // ────── S5.c persistence plumbing (mark_candidate_persisted, fail_candidate_capture) ──────
