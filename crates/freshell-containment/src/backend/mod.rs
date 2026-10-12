@@ -116,6 +116,27 @@ pub(crate) struct MemberList {
     pub withheld: u64,
 }
 
+/// One one-shot reading of a unit's members as far as it could be made:
+/// the members it read, and the first read it could not make ("could not
+/// check": `list` may then lack members).
+#[derive(Debug, Default)]
+pub(crate) struct MemberRead {
+    pub list: MemberList,
+    pub unread: Option<io::Error>,
+}
+
+impl MemberRead {
+    /// The members, when every read was made; else the read that could not
+    /// be (never a list without the members it could not read).
+    #[cfg(unix)]
+    pub(crate) fn complete(self) -> io::Result<MemberList> {
+        match self.unread {
+            Some(err) => Err(err),
+            None => Ok(self.list),
+        }
+    }
+}
+
 /// What a backend reports back to its unit, which owns the unit record. A
 /// backend whose container no longer ends its members when the server dies
 /// (Windows: kill-on-close cleared; macOS: there is no container, so every
@@ -168,8 +189,23 @@ pub(crate) trait UnitBackend: Send + Sync {
         self: Arc<Self>,
         roots: Vec<(u32, u64)>,
     ) -> BoxFuture<'static, io::Result<KillSummary>>;
-    /// The live, non-spared members right now (one-shot reads).
+    /// The live, non-spared members right now (one-shot reads). An error
+    /// means they could not all be read ("could not check").
     fn members(&self, roots: &[(u32, u64)]) -> io::Result<MemberList>;
+    /// [`members`](Self::members) as far as they could be read, for the
+    /// pre-signal snapshot, which pins what it found even when part of the
+    /// reading failed. A backend that can read part of its members answers
+    /// those; the default, for backends whose reading fails as a whole,
+    /// answers none with the error.
+    fn members_read(&self, roots: &[(u32, u64)]) -> MemberRead {
+        match self.members(roots) {
+            Ok(list) => MemberRead { list, unread: None },
+            Err(err) => MemberRead {
+                list: MemberList::default(),
+                unread: Some(err),
+            },
+        }
+    }
     /// One-shot: `Ok` when `pid` is in the unit, `ErrorKind::NotFound` when
     /// it is gone, another error when it lives outside the unit.
     fn confirm_placement(&self, pid: u32, roots: &[(u32, u64)]) -> io::Result<()>;

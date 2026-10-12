@@ -35,7 +35,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
 
-use super::{Backend, BackendKind, Capability, KillSummary, MemberList, UnitBackend};
+use super::{Backend, BackendKind, Capability, KillSummary, MemberList, MemberRead, UnitBackend};
 use crate::proc_watch::ProcWatch;
 use crate::process::{self, is_codex_daemon_family, EnvRead};
 use crate::record::UnitRecord;
@@ -397,22 +397,32 @@ impl UnitBackend for TagUnit {
     }
 
     fn members(&self, roots: &[(u32, u64)]) -> io::Result<MemberList> {
+        self.members_read(roots).complete()
+    }
+
+    /// Every member the scan found whose identity could be read, and the
+    /// first read that could not be made: the scan's, or a member's
+    /// identity.
+    fn members_read(&self, roots: &[(u32, u64)]) -> MemberRead {
         let scan = self.scan(roots, true);
-        if let Some(err) = scan.unread {
-            return Err(self.unread(err));
-        }
+        let mut unread = scan.unread;
         let mut members = Vec::new();
         for pid in scan.candidates.difference(&scan.spared) {
             match process::identity_checked(*pid) {
                 Ok(Some(member)) => members.push(member),
                 Ok(None) => {} // exited since
-                Err(err) => return Err(self.unread(err)),
+                Err(err) => {
+                    unread.get_or_insert(err);
+                }
             }
         }
-        Ok(MemberList {
-            members,
-            withheld: scan.withheld,
-        })
+        MemberRead {
+            list: MemberList {
+                members,
+                withheld: scan.withheld,
+            },
+            unread: unread.map(|err| self.unread(err)),
+        }
     }
 
     fn confirm_placement(&self, pid: u32, roots: &[(u32, u64)]) -> io::Result<()> {

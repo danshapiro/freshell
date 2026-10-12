@@ -774,12 +774,12 @@ impl AgentUnit {
         let keys = self.log_keys(state.operation_id());
         self.persist(&state, &keys).await;
         let snapshot = if self.inner.capability.full {
-            Vec::new()
+            Snapshot::default()
         } else {
             self.snapshot(&keys).await?
         };
         let escalated = self.soft_phase(&state, mode, &keys).await;
-        let spared = self.kill_unit(&keys, &snapshot).await;
+        let spared = self.kill_unit(&keys, &snapshot.watches).await;
         let lock_released = self
             .confirm_gone(&state, &keys, Instant::now(), &snapshot, &spared)
             .await?;
@@ -893,21 +893,37 @@ impl AgentUnit {
 
     /// Step b (non-full backends): pin every current member before the soft
     /// signal, so one that loses both its tag and its parent link during the
-    /// grace is still killed (Stage 2: LB-44).
-    async fn snapshot(&self, keys: &UnitLogKeys) -> io::Result<Vec<ProcWatch>> {
+    /// grace is still killed (Stage 2: LB-44). A reading that could not be
+    /// made in full keeps the members it found and marks the snapshot
+    /// "could not check" (WARN `unit.stop.snapshot_incomplete`), as does a
+    /// member that cannot be pinned for a reason other than having exited:
+    /// failing the stop here would stop the kill altogether.
+    async fn snapshot(&self, keys: &UnitLogKeys) -> io::Result<Snapshot> {
         let unit = self.clone();
-        let (watches, withheld) = blocking(move || {
-            let list = unit.member_list().unwrap_or_default();
-            let watches: Vec<ProcWatch> = list
-                .members
-                .into_iter()
-                .filter_map(|p| ProcWatch::open_expecting(p.pid, p.start).ok())
-                .collect();
-            (watches, list.withheld)
+        let (snapshot, withheld) = blocking(move || {
+            let read = unit.inner.backend.members_read(&unit.live_roots());
+            let mut unread = read.unread.map(|err| err.to_string());
+            let mut watches = Vec::with_capacity(read.list.members.len());
+            for member in read.list.members {
+                match ProcWatch::open_expecting(member.pid, member.start) {
+                    Ok(watch) => watches.push(watch),
+                    // Exited since the read.
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        unread.get_or_insert_with(|| {
+                            format!("member {} cannot be pinned: {err}", member.pid)
+                        });
+                    }
+                }
+            }
+            (Snapshot { watches, unread }, read.list.withheld)
         })
         .await?;
         self.note_withheld(keys, withheld);
-        Ok(watches)
+        if let Some(error) = &snapshot.unread {
+            events::snapshot_incomplete(keys, error);
+        }
+        Ok(snapshot)
     }
 
     /// Step c: the soft signal and its grace. Returns whether the stop
@@ -1053,7 +1069,7 @@ impl AgentUnit {
         state: &StopState,
         keys: &UnitLogKeys,
         killed_at: Instant,
-        snapshot: &[ProcWatch],
+        snapshot: &Snapshot,
         spared: &[ProcIdentity],
     ) -> io::Result<bool> {
         let awaiting_main = {
@@ -1177,27 +1193,36 @@ impl AgentUnit {
     /// through a pinned watch, then the holders are checked once more. A
     /// holder whose own argv is Codex's daemon family (a snapshot member
     /// that exec'd into it after the snapshot) is neither signalled nor
-    /// waited for, so its lock still counts as held.
+    /// waited for, so its lock still counts as held. After a snapshot that
+    /// could not read every member, the lock never counts as released: a
+    /// holder only the snapshot shows (one that exec'd into the daemon
+    /// family since, so no longer a member) may be missing from it.
     #[cfg(not(target_os = "macos"))]
-    async fn check_locks(&self, snapshot: &[ProcWatch]) -> io::Result<bool> {
+    async fn check_locks(&self, snapshot: &Snapshot) -> io::Result<bool> {
         let paths = lock(&self.inner.lock_paths).clone();
         if paths.is_empty() {
             return Ok(true);
         }
-        let first = self.member_lock_holders(&paths, snapshot).await?;
-        if first.is_empty() {
-            return Ok(true);
-        }
-        for holder in first {
-            if let Ok(watch) = ProcWatch::open_expecting(holder.pid, holder.start) {
-                if own_argv_is_daemon_family(watch.pid()) {
-                    continue;
+        let first = self.member_lock_holders(&paths, &snapshot.watches).await?;
+        if !first.is_empty() {
+            for holder in first {
+                if let Ok(watch) = ProcWatch::open_expecting(holder.pid, holder.start) {
+                    if own_argv_is_daemon_family(watch.pid()) {
+                        continue;
+                    }
+                    let _ = watch.signal(Sig::Kill);
+                    watch.exited().await?;
                 }
-                let _ = watch.signal(Sig::Kill);
-                watch.exited().await?;
+            }
+            if !self
+                .member_lock_holders(&paths, &snapshot.watches)
+                .await?
+                .is_empty()
+            {
+                return Ok(false);
             }
         }
-        Ok(self.member_lock_holders(&paths, snapshot).await?.is_empty())
+        Ok(snapshot.complete())
     }
 
     /// The unit members (and live snapshot members) holding any of `paths`.
@@ -1236,9 +1261,13 @@ impl AgentUnit {
     /// found it) is awaited. Then the holders are checked once more. A
     /// holder or member whose own argv is Codex's daemon family (a snapshot
     /// member that exec'd into it after the snapshot) is neither signalled
-    /// nor waited for, so its lock still counts as held.
+    /// nor waited for, so its lock still counts as held. After a snapshot
+    /// that could not read every member, the lock never counts as released
+    /// (as on Linux).
     #[cfg(target_os = "macos")]
-    async fn check_locks(&self, snapshot: &[ProcWatch]) -> io::Result<bool> {
+    async fn check_locks(&self, snapshot: &Snapshot) -> io::Result<bool> {
+        let complete = snapshot.complete();
+        let snapshot = snapshot.watches.as_slice();
         let paths = lock(&self.inner.lock_paths).clone();
         if paths.is_empty() {
             return Ok(true);
@@ -1314,7 +1343,8 @@ impl AgentUnit {
             .member_lock_scan(&paths, snapshot)
             .await?
             .holders
-            .is_empty())
+            .is_empty()
+            && complete)
     }
 
     /// macOS: one descriptor scan of the unit members (and live snapshot
@@ -1559,6 +1589,32 @@ impl UnitObserver for RecordRoots {
                 }
             });
         }
+    }
+}
+
+/// The pre-signal snapshot (stop step b): the members one reading found,
+/// each pinned. `unread` says why that reading, or a pin, could not be made
+/// in full ("could not check"): a member may be missing from it. Empty and
+/// complete when none is taken (a kernel-tracked unit).
+#[derive(Default)]
+struct Snapshot {
+    watches: Vec<ProcWatch>,
+    unread: Option<String>,
+}
+
+impl Snapshot {
+    /// Test support: a snapshot that read and pinned every member.
+    #[cfg(all(test, unix))]
+    fn whole(watches: Vec<ProcWatch>) -> Self {
+        Self {
+            watches,
+            unread: None,
+        }
+    }
+
+    /// Whether the reading missed no member.
+    fn complete(&self) -> bool {
+        self.unread.is_none()
     }
 }
 
@@ -2276,7 +2332,7 @@ sleep 600;"#;
         let plain = Spawned::perl_lock(&plain_lock, &[]);
         let unit = unit_on(Arc::new(NoProcesses));
         unit.set_lock_paths(vec![daemon_lock, plain_lock]);
-        let snapshot = [daemon.watch.clone(), plain.watch.clone()];
+        let snapshot = Snapshot::whole(vec![daemon.watch.clone(), plain.watch.clone()]);
         let released = tokio::time::timeout(Duration::from_secs(10), unit.check_locks(&snapshot))
             .await
             .expect("the check ended without waiting for the daemon-family holder")
@@ -2337,9 +2393,12 @@ sleep 600;"#;
         let dir = tempfile::tempdir().unwrap();
         let unit = unit_on(Arc::new(Unreadable::default()));
         unit.set_lock_paths(vec![dir.path().join("thread.lock")]);
-        let checked = tokio::time::timeout(Duration::from_secs(10), unit.check_locks(&[]))
-            .await
-            .expect("the check answers");
+        let checked = tokio::time::timeout(
+            Duration::from_secs(10),
+            unit.check_locks(&Snapshot::default()),
+        )
+        .await
+        .expect("the check answers");
         assert!(
             checked.is_err(),
             "members that could not be read were checked: {checked:?}"
@@ -2374,6 +2433,126 @@ sleep 600;"#;
             Some(false),
             "a sweep that could not read the members called the unit emptied"
         );
+    }
+
+    /// A unit whose first member reading (the pre-signal snapshot's) could
+    /// read only part of its members: it lists `first` and answers that it
+    /// could not read the rest (EMFILE); every later reading lists the
+    /// `later` processes still running, in full. Its kill signals nothing.
+    #[cfg(unix)]
+    struct ReadInPart {
+        first: Mutex<Option<Vec<ProcIdentity>>>,
+        later: Vec<ProcWatch>,
+    }
+
+    #[cfg(unix)]
+    impl ReadInPart {
+        fn new(first: Vec<ProcIdentity>, later: Vec<ProcWatch>) -> Self {
+            Self {
+                first: Mutex::new(Some(first)),
+                later,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl UnitBackend for ReadInPart {
+        fn placement(&self, role: MemberRole, seq: u32) -> io::Result<Placement> {
+            NoProcesses.placement(role, seq)
+        }
+        fn kill_all(
+            self: Arc<Self>,
+            _roots: Vec<(u32, u64)>,
+        ) -> BoxFuture<'static, io::Result<KillSummary>> {
+            Box::pin(async { Ok(KillSummary::default()) })
+        }
+        fn members(&self, roots: &[(u32, u64)]) -> io::Result<MemberList> {
+            self.members_read(roots).complete()
+        }
+        fn members_read(&self, _roots: &[(u32, u64)]) -> crate::backend::MemberRead {
+            match lock(&self.first).take() {
+                Some(first) => crate::backend::MemberRead {
+                    list: MemberList {
+                        members: first,
+                        withheld: 0,
+                    },
+                    unread: Some(io::Error::from_raw_os_error(libc::EMFILE)),
+                },
+                None => crate::backend::MemberRead {
+                    list: MemberList {
+                        members: live_identity_list(&self.later),
+                        withheld: 0,
+                    },
+                    unread: None,
+                },
+            }
+        }
+        fn confirm_placement(&self, pid: u32, roots: &[(u32, u64)]) -> io::Result<()> {
+            NoProcesses.confirm_placement(pid, roots)
+        }
+        fn wait_empty(&self) -> Option<BoxFuture<'static, io::Result<()>>> {
+            None
+        }
+        fn remove(&self, emptied: bool) -> io::Result<()> {
+            NoProcesses.remove(emptied)
+        }
+    }
+
+    /// The pre-signal snapshot pins every member its reading found, also
+    /// when part of that reading failed, so a member that then loses its
+    /// tag and parent link is still killed (Stage 2: LB-44); and it says,
+    /// with the unit's keys, that it could not read every member.
+    #[cfg(unix)]
+    #[test]
+    fn a_snapshot_that_could_not_read_every_member_keeps_and_kills_what_it_read() {
+        let read = Spawned::perl_sleep(&[]);
+        let unit = unit_on(Arc::new(ReadInPart::new(
+            vec![read.watch.identity().clone()],
+            Vec::new(),
+        )));
+        let events = capture_on_runtime(async {
+            let handle = unit.stop(
+                StopRequest::new(StopMode::Force, StopReason::ShiftX, "ws").operation("op-1"),
+            );
+            tokio::time::timeout(Duration::from_secs(10), handle.wait_swept())
+                .await
+                .expect("Gone and swept");
+            tokio::time::timeout(Duration::from_secs(5), read.watch.exited())
+                .await
+                .expect("the member the snapshot read was not killed")
+                .unwrap();
+        });
+        let incomplete = named(&events, "unit.stop.snapshot_incomplete");
+        assert_eq!(incomplete.len(), 1, "{events:?}");
+        assert_eq!(incomplete[0].level, tracing::Level::WARN);
+        assert_unit_keys(incomplete[0], &unit, "op-1");
+    }
+
+    /// The same failed snapshot reading in the shape the Gone lock check
+    /// relies on the snapshot for (re-review 2, R2-M2): the process it
+    /// could not read holds a unit lock file and is of Codex's daemon family
+    /// by the check (as one that exec'd into it after the snapshot), so no
+    /// later member reading lists it. Gone then never says the lock is
+    /// released, and the holder is never signalled.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn after_a_snapshot_that_could_not_read_every_member_gone_never_says_the_lock_is_released(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("thread.lock");
+        let holder = Spawned::perl_lock(&lock_path, &["app-server", "--managed-daemon"]);
+        let unit = unit_on(Arc::new(ReadInPart::new(Vec::new(), Vec::new())));
+        unit.set_lock_paths(vec![lock_path]);
+        let report = unit
+            .stop(StopRequest::new(StopMode::Force, StopReason::ShiftX, "ws"))
+            .wait_for(Duration::from_secs(10))
+            .await
+            .expect("Gone");
+        assert!(
+            !report.lock_released,
+            "Gone said the lock is released after a snapshot that could not read every member"
+        );
+        assert!(holder.untouched(), "the daemon-family holder was signalled");
     }
 
     /// A unit whose members the whole-unit kill reached but which are still
@@ -3052,7 +3231,7 @@ sleep 600;"#;
             unit.set_lock_paths(vec![lock.clone()]);
             let check = tokio::spawn({
                 let unit = unit.clone();
-                async move { unit.check_locks(&[]).await }
+                async move { unit.check_locks(&Snapshot::default()).await }
             });
             tokio::time::timeout(Duration::from_secs(5), holder_pin.exited())
                 .await
@@ -3098,7 +3277,7 @@ sleep 600;"#;
                 let unit = unit.clone();
                 let pin = pin.clone();
                 async move {
-                    let released = unit.check_locks(&[]).await;
+                    let released = unit.check_locks(&Snapshot::default()).await;
                     (released, pin.has_exited())
                 }
             });
@@ -3232,7 +3411,7 @@ sleep 600;"#;
                 let unit = unit.clone();
                 let pin = exiting.pin.clone();
                 async move {
-                    let released = unit.check_locks(&[]).await;
+                    let released = unit.check_locks(&Snapshot::default()).await;
                     (released, pin.has_exited())
                 }
             });

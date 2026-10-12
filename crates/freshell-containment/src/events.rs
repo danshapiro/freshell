@@ -192,6 +192,15 @@ pub fn freeze_timeout(k: &UnitLogKeys, detail: &str) {
         "unit kill went ahead without a frozen cgroup");
 }
 
+/// The member snapshot taken before the soft signal could not read every
+/// member (`error`: the first read, or pin, that failed). It keeps the
+/// members it did read, and the Gone lock check then never reports the
+/// lock released ("could not check").
+pub fn snapshot_incomplete(k: &UnitLogKeys, error: &str) {
+    keyed!(warn, k, "unit.stop.snapshot_incomplete", error = %error,
+        "unit stop snapshot could not read every member");
+}
+
 /// The whole-unit kill failed (the pinned roots are still killed directly).
 pub fn kill_all_failed(k: &UnitLogKeys, error: &str) {
     keyed!(error, k, "unit.stop.kill_all_failed", error = %error,
