@@ -304,8 +304,16 @@ test.describe.serial('ordinary fresh-agent use', () => {
 
       const failedModes: string[] = []
       for (const definition of definitions) {
+        const progress = {
+          createCompleted: false,
+          composerSubmitted: false,
+          sendObserved: false,
+          turnCompleteObserved: false,
+          markerVisible: false,
+        }
         try {
           const created = await actualCreate(page, rig, definition, wire)
+          progress.createCompleted = true
           const marker = `FRESHELL-${randomBytes(12).toString('hex')}`
           const allocationSessionIds = new Set([
             created.reply.sessionId,
@@ -319,9 +327,11 @@ test.describe.serial('ordinary fresh-agent use', () => {
             created.paneId,
             `Without using tools, reply with exactly this text and no other words: ${marker}`,
           )
+          progress.composerSubmitted = true
           const sent = await waitFor('actual fresh-agent composer send', () => wire.sent
             .slice(sendCursor)
             .find((frame) => frame.type === 'freshAgent.send' && allocationSessionIds.has(frame.sessionId)) ?? null)
+          progress.sendObserved = true
           if (!allocationSessionIds.has(sent.sessionId)) {
             throw new Error('fresh-agent send was not associated with the selected allocation')
           }
@@ -331,8 +341,10 @@ test.describe.serial('ordinary fresh-agent use', () => {
               && allocationSessionIds.has(frame.sessionId)
               && frame.event?.type === 'freshAgent.turn.complete'
             ))
+            if (completed) progress.turnCompleteObserved = true
             const visibleAnswer = await page.locator(`[data-pane-id="${created.paneId}"] [data-turn-role="assistant"]`)
               .evaluateAll((turns, expectedMarker) => turns.some((turn) => turn.textContent?.includes(expectedMarker)), marker)
+            if (visibleAnswer) progress.markerVisible = true
             return completed && visibleAnswer ? true : null
           }, 240_000)
           console.info(JSON.stringify({ severity: 'info', event: 'durable_souls.ordinary_turn_completed',
@@ -341,7 +353,8 @@ test.describe.serial('ordinary fresh-agent use', () => {
           failedModes.push(definition.mode)
           console.error(JSON.stringify({ severity: 'error', event: 'durable_souls.ordinary_turn_failed',
             lane: 'fresh-agent', mode: definition.mode,
-            errorName: error instanceof Error ? error.name : 'UnknownError' }))
+            errorName: error instanceof Error ? error.name : 'UnknownError',
+            ...progress }))
         }
       }
       expect(failedModes, `ordinary fresh-agent turn failed for: ${failedModes.join(', ')}`).toEqual([])
