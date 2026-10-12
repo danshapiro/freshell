@@ -20,7 +20,8 @@ The trusted session-host starts as container UID 0, but terminal containers use
 `CapDrop=ALL` and add back only `CHOWN`, `SETUID`, and `SETGID`. Before spawning
 the PTY it prepares the soul-owned provider volume, then launches the actual
 shell/coding CLI through `setpriv` as UID `65534`, GID `0` (unchanged), with
-`no-new-privileges`. Neither UID has a passwd entry — same as today. The
+`no-new-privileges`. The provider UID `65534` has no passwd entry — same as
+today. The
 provider process has zero effective/permitted/inheritable/ambient capabilities.
 Under the supported **rootless Docker** backend, the host user's bind-mounted
 workspace maps to container group 0; the repository's group-write permissions

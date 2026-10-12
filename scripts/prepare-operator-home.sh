@@ -22,11 +22,13 @@ fi
 # runc cannot mount a tmpfs mask over a missing directory in the read-only bind;
 # a soul created while a destination is absent gets that mask filtered for its
 # whole lifetime. Creating them here means every home-bound incarnation mounts
-# the full mask set. Run this at deploy, before new incarnations.
+# the full mask set. Run this at deploy, before new incarnations. Destinations
+# WE create are control-plane: keep them owner-only regardless of umask.
 for dir in "$home/.freshell" "$home/.amplifier/onecli" "$home/.config/gcloud"; do
   if [ ! -d "$dir" ]; then
     mkdir -p "$dir"
-    echo "mkdir -p $dir"
+    chmod 0700 "$dir"
+    echo "mkdir -p $dir (mode 0700)"
   fi
 done
 
@@ -39,10 +41,21 @@ for dir in "$home" "$home/.local" "$home/.config" "$home/.local/share"; do
   fi
 done
 
-# Whole-tree group read for the secret-bearing root: dirs traversable, files
-# readable (covers keys under ~/.amplifier regardless of naming).
-find "$home/.amplifier" -type d -exec chmod g+rx {} +
-find "$home/.amplifier" -type f -exec chmod g+r {} +
-echo "chmod g+rx dirs and g+r files under $home/.amplifier"
+# Group read for the secret-bearing root: dirs traversable, files readable
+# (covers keys under ~/.amplifier regardless of naming) — EXCEPT the masked
+# control-plane subtree. .amplifier/onecli is tmpfs-masked in souls and must
+# NEVER gain group bits: a soul created before onecli existed has that mask
+# filtered for its lifetime, so group-readable onecli content would be exposed
+# to it through the live bind. The prune keeps the re-run from ever granting
+# bits there, and the revoke below strips any bits an earlier prep (or a
+# permissive umask) left behind, so a re-run can never expose a running soul.
+find "$home/.amplifier" -path "$home/.amplifier/onecli" -prune -o -type d -exec chmod g+rx {} +
+find "$home/.amplifier" -path "$home/.amplifier/onecli" -prune -o -type f -exec chmod g+r {} +
+echo "chmod g+rx dirs and g+r files under $home/.amplifier (excluding .amplifier/onecli)"
+if [ -d "$home/.amplifier/onecli" ]; then
+  find "$home/.amplifier/onecli" -type d -exec chmod g-rx {} +
+  find "$home/.amplifier/onecli" -type f -exec chmod g-r {} +
+  echo "chmod g-rx dirs and g-r files under $home/.amplifier/onecli (control-plane stays owner-only)"
+fi
 
 echo "note: Amplifier must write keys 0640 and ~/.amplifier 0750 going forward so rotation preserves this (tracked upstream item)."

@@ -72,15 +72,23 @@ test.describe.serial('freshopencode operator-home {file:} references', () => {
       // so EVERY directory the 65534:0 child must traverse gets an explicit
       // mode, including the harness-created testRoot ancestors. The
       // `.freshell` mask destination and its config.json canary come from the
-      // rig's own web-home writes; their modes are fixed up so the canary cat
-      // failures below are attributable ONLY to the tmpfs masks.
+      // rig's own web-home writes; their modes are fixed up — like the key and
+      // the canary files, which get explicit fsp.chmod because Node applies
+      // the process umask (0077) to writeFileSync's mode, leaving requested
+      // 0640 files at 0600, where a canary `cat` would throw for the WRONG
+      // reason (EACCES, not mask-absence) and the canaries would not test the
+      // control-plane boundary. The chmods keep every canary genuinely
+      // readable, so the failures below are attributable ONLY to the tmpfs
+      // masks.
       await fsp.mkdir(path.join(home, '.amplifier', 'onecli'), { recursive: true })
       await fsp.mkdir(path.join(home, '.config', 'gcloud'), { recursive: true })
       await fsp.mkdir(path.join(home, '.config', 'opencode'), { recursive: true })
       await fsp.writeFile(path.join(home, '.amplifier', 'ms-runpod.key'), 'e2e-key-not-real', { mode: 0o640 })
       await fsp.chmod(path.join(home, '.amplifier', 'ms-runpod.key'), 0o640)
       await fsp.writeFile(path.join(home, '.amplifier', 'onecli', 'canary'), 'canary', { mode: 0o640 })
+      await fsp.chmod(path.join(home, '.amplifier', 'onecli', 'canary'), 0o640)
       await fsp.writeFile(path.join(home, '.config', 'gcloud', 'canary'), 'canary', { mode: 0o640 })
+      await fsp.chmod(path.join(home, '.config', 'gcloud', 'canary'), 0o640)
       await fsp.writeFile(path.join(home, '.config', 'opencode', 'opencode.json'), `${JSON.stringify({
         $schema: 'https://opencode.ai/config.json',
         provider: {

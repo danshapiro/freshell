@@ -380,8 +380,10 @@ continues unaffected. When a `{file:}` reference fails, read that event first:
 `home_root_traversable_by_child: false` means the home root is not
 group-traversable and the prep step below has not run. On a rootful daemon
 group 0 is not the operator's group, so the feature degrades to legacy
-readability — observed via the same event, never gated: launch never refuses
-over the home mount.
+readability — observable there as the mount's absence: no marker env, no
+readiness event, and exactly the pre-feature behavior (a root supervisor's
+explicit flag is still owner-guarded, and an unowned or rootful-bound home is
+declined). Launch never refuses over the home mount in any of these paths.
 
 ### Operator home prep
 
@@ -416,13 +418,18 @@ machine carries the operator's group.
    incarnation. Primary protection is those paths' own owner-only modes
    (gcloud/onecli create `0700` dirs), and every new incarnation re-derives
    the masks from the filesystem. The prep/filter invariant pair closes the
-   exposure window: the prep creates every mask destination at deploy, so on a
-   prepared host each home-bound soul mounts the FULL mask set for its
-   lifetime and a prep re-run cannot expose a running soul; on an unprepared
-   host the filter can fire, but unprepared content is owner-only
-   (`0700`/`0600`), so the unmasked paths expose nothing a child can read.
-   Exposure would require simultaneously group-readable content AND a missing
-   mask destination — the prep creates exactly the opposite pairing; manual
+   exposure window, in both halves: (a) the prep creates every mask
+   destination at deploy, so on a prepared host each home-bound soul mounts
+   the FULL mask set for its lifetime; (b) the prep NEVER grants group bits
+   under the masked control-plane subtree — its group-read pass is pruned
+   away from `~/.amplifier/onecli` and it actively revokes any group bits
+   found there — so a prep re-run after onecli (or any control-plane path)
+   appears cannot make its content readable to a soul whose mask was
+   filtered at creation. On an unprepared host the filter can fire, but
+   unprepared content is owner-only (`0700`/`0600`), so the unmasked paths
+   expose nothing a child can read. Exposure would require simultaneously
+   group-readable control-plane content AND a missing mask destination — the
+   prep step creates exactly the opposite pairing on both sides; manual
    partial prep is out of model.
 
 Managed providers retain ordinary provider capabilities: configured MCP servers,

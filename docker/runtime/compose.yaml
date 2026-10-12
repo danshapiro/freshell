@@ -69,8 +69,16 @@ services:
       FRESHELL_RUNTIME_CONTROL_SOCKET: /run/freshell-supervisor/supervisor.sock
       FRESHELL_RUNTIME_CONTROL_SECRET_FILE: /run/freshell-supervisor/secret
       FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE: ${FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE:-}
+      # The web server stages the operator's global provider config (the file
+      # that CONTAINS the {file:} references) from its HOME — the same
+      # canonical home the supervisor mounts into souls. Without this bind +
+      # HOME, compose webs stage nothing and the referenced key path arrives
+      # with no config referencing it (managed_provider_bootstrap.rs reads
+      # HOME, falling back to XDG_CONFIG_HOME when set in the image).
+      HOME: ${FRESHELL_OPERATOR_HOME:?set the operator home path}
     volumes:
       - ${FRESHELL_RUNTIME_CONTROL_DIR:?set runtime control dir}:/run/freshell-supervisor:ro
+      - ${FRESHELL_OPERATOR_HOME:?set the operator home}:${FRESHELL_OPERATOR_HOME:?set the operator home}:ro
       - ${FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE:-/dev/null}:${FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE:-/run/freshell-no-claude-credential}:ro
 
 volumes:
