@@ -16,6 +16,65 @@ const caseScenarios: Record<string, string> = {
   'startup-before-identity retains an actionable blocked result without a replacement conversation': 'startup-before-identity',
 }
 
+async function terminalDiagnostic(page: Page, terminalId?: string) {
+  return page.evaluate(({ terminalId, marker }) => {
+    const harness = window.__FRESHELL_TEST_HARNESS__
+    const buffer = terminalId && harness ? harness.getTerminalBuffer(terminalId) : null
+    const received = (harness?.getReceivedWsMessages?.() ?? []) as any[]
+    const sent = (harness?.getSentWsMessages?.() ?? []) as any[]
+    const writes = (harness?.getTerminalWriteEvents?.() ?? []).filter(event => event.terminalId === terminalId)
+    const output = received.filter(message => message.terminalId === terminalId
+      && ['terminal.output', 'terminal.output.batch'].includes(message.type))
+    const classify = (chunks: string[]) => {
+      let tail = '', markerPresent = false, reset = false, alternateEntered = false, alternateExited = false
+      for (const chunk of chunks) {
+        const current = tail + chunk
+        markerPresent ||= current.includes(marker)
+        reset ||= current.includes('\x1bc') || current.includes('\x1b[2J')
+        alternateEntered ||= /\x1b\[\?(?:47|1047|1049)h/.test(current)
+        alternateExited ||= /\x1b\[\?(?:47|1047|1049)l/.test(current)
+        tail = current.slice(-Math.max(marker.length - 1, 16))
+      }
+      return { chunks: chunks.length, markerPresent, reset, alternateEntered, alternateExited }
+    }
+    const attachRequests = new Set(sent.filter(message => message.terminalId === terminalId
+      && message.type === 'terminal.attach').map(message => message.attachRequestId))
+    const attachErrors = received.filter(message => message.type === 'error'
+      && (message.terminalId === terminalId || typeof message.requestId === 'string' && attachRequests.has(message.requestId)))
+      .slice(-16).map(message => ({ type: 'error', code: ['INVALID_REQUEST', 'TERMINAL_NOT_FOUND', 'PTY_SPAWN_FAILED',
+        'SESSION_RESERVED', 'INTERNAL_ERROR', 'AUTH_FAILED'].includes(message.code) ? message.code : 'UNKNOWN' }))
+    const metadata = (messages: any[]) => messages.filter(message => message.terminalId === terminalId && [
+      'terminal.attach', 'terminal.replay.credit', 'terminal.attach.ready', 'terminal.output.gap',
+      'terminal.stream.changed', 'terminal.modes.sync', 'terminal.turn.complete',
+    ].includes(message.type)).slice(-32).map(message => {
+      const value: Record<string, string | number | boolean> = { type: message.type }
+      for (const key of ['sinceSeq', 'requestedSinceSeq', 'effectiveSinceSeq', 'oldestRetainedSeq', 'headSeq',
+        'replayFromSeq', 'replayToSeq', 'consumedSeq', 'fromSeq', 'toSeq', 'geometryEpoch']) {
+        if (Number.isSafeInteger(message[key]) && message[key] >= 0) value[key] = message[key]
+      }
+      for (const key of ['attachRequestId', 'streamId']) {
+        if (typeof message[key] === 'string' && /^[a-zA-Z0-9._:-]{1,512}$/.test(message[key])) value[key] = message[key]
+      }
+      if (typeof message.surfaceReset === 'boolean') value.surfaceReset = message.surfaceReset
+      if (['viewport_hydrate', 'transport_reconnect', 'keepalive_delta'].includes(message.intent)) value.intent = message.intent
+      if (['geometry_authority_unknown', 'retention_lost'].includes(message.replayResetReason)) value.replayResetReason = message.replayResetReason
+      if (['queue_overflow', 'replay_window_exceeded', 'replay_budget_exceeded', 'handoff_boundary_reached',
+        'new_pty_session', 'codex_pty_recovery', 'retention_lost', 'server_restart_incompatible_retention'].includes(message.reason)) value.reason = message.reason
+      return value
+    })
+    return { harnessPresent: Boolean(harness), bufferType: typeof buffer, bufferNull: buffer === null,
+      bufferLength: typeof buffer === 'string' ? buffer.length : null,
+      markerPresent: typeof buffer === 'string' ? buffer.includes(marker) : false,
+      xtermBufferType: terminalId && harness ? harness.getTerminalModes(terminalId)?.bufferType ?? 'UNKNOWN' : 'UNKNOWN',
+      receivedOutput: classify(output.map(message => message.data).filter(value => typeof value === 'string')),
+      submittedWrites: classify(writes.filter(event => event.phase === 'submitted').map(event => event.data)),
+      completedWrites: classify(writes.filter(event => event.phase === 'written').map(event => event.data)),
+      sentMetadata: metadata(sent), receivedMetadata: metadata(received), attachErrors,
+      // These getters retain bounded history, not a complete transport trace.
+      receivedHistoryAtBound: received.length >= 500, writeHistoryAtBound: writes.length >= 1000 }
+  }, { terminalId, marker: `MANAGED_ENV_OUTPUT ${fixture.expectedNonce}` }).catch(() => ({ observation: 'UNKNOWN' }))
+}
+
 test.afterEach(async ({ page }, info) => {
   const scenario = caseScenarios[info.title]
   if (!scenario) throw new Error('Unknown managed environment case')
@@ -23,14 +82,7 @@ test.afterEach(async ({ page }, info) => {
   const request = await readReceipt(page, `${cwd}/.managed-fixture/request.json`)
   if (info.status !== info.expectedStatus) {
     const pane = await activePane(page).catch(() => null)
-    const diagnostic = await page.evaluate(({ terminalId, marker }) => {
-      const harness = window.__FRESHELL_TEST_HARNESS__
-      const buffer = terminalId && harness ? harness.getTerminalBuffer(terminalId) : null
-      return { harnessPresent: Boolean(harness), bufferType: typeof buffer, bufferNull: buffer === null,
-        bufferLength: typeof buffer === 'string' ? buffer.length : null,
-        markerPresent: typeof buffer === 'string' ? buffer.includes(marker) : false }
-    }, { terminalId: pane?.content.kind === 'terminal' ? pane.content.terminalId : undefined,
-      marker: `MANAGED_ENV_OUTPUT ${fixture.expectedNonce}` }).catch(() => ({ observation: 'UNKNOWN' }))
+    const diagnostic = await terminalDiagnostic(page, pane?.content.kind === 'terminal' ? pane.content.terminalId : undefined)
     console.error(JSON.stringify({ severity: 'error', event: 'managed_environment.browser_attempt_failed',
       scenario, attempt: info.retry, status: info.status,
       stage: info.annotations.filter(value => value.type === 'managed-stage').at(-1)?.description ?? 'UNKNOWN',
@@ -151,6 +203,8 @@ test(healthyTitle, async ({ page }, info) => {
   expect(receipt.nativeSessionId).toBeTruthy()
   const beforeCreates = await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
     .filter((message: any) => message.type === 'terminal.create').length)
+  console.log(JSON.stringify({ severity: 'info', event: 'managed_environment.browser_before_reconnect',
+    scenario: 'healthy', attempt: info.retry, diagnostic: await terminalDiagnostic(page, terminalId) }))
   await new TestHarness(page).forceDisconnect()
   await new TestHarness(page).waitForConnection(120_000)
   await expect.poll(async () => (await activePane(page)).content).toMatchObject({ terminalId,

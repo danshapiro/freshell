@@ -24,10 +24,16 @@ export async function serviceManagedEnvironmentCases(
   operations: (scenario: 'healthy' | 'missing-reference' | 'startup-before-identity') => Parameters<typeof serviceManagedEnvironmentScenario>[2],
   joinBrowser: () => Promise<void>,
 ) {
-  for (const scenario of ['healthy', 'missing-reference', 'startup-before-identity'] as const) {
-    await serviceManagedEnvironmentScenario(fixture, scenario, operations(scenario))
-  }
-  await joinBrowser()
+  const cases = ['healthy', 'missing-reference', 'startup-before-identity'] as const
+  const results = await Promise.allSettled(cases.map(async scenario =>
+    serviceManagedEnvironmentScenario(fixture, scenario, operations(scenario))))
+  // A failed service cannot tear down the target while another case or the
+  // actual configured Cloud worker still owns its attempt.
+  let joinFailure: unknown
+  try { await joinBrowser() } catch (error) { joinFailure = error }
+  const failure = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+  if (failure) throw failure.reason
+  if (joinFailure !== undefined) throw joinFailure
 }
 
 export async function serviceManagedEnvironmentScenario(
