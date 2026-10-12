@@ -562,15 +562,20 @@ async function externalTargetWrite(baseUrl: string, token: string, selected: str
 function runCheckpointControl(containerId: string, identity: { uid: number; gid: number }, action: 'eligible' | 'ignored', requestId: string): void {
   try {
     execFileSync('docker', ['exec', '--user', `${identity.uid}:${identity.gid}`, containerId,
-      '/usr/bin/node', '/checkpoint-target/control.mjs', action, requestId, String(identity.uid)],
-    { stdio: ['ignore', 'ignore', 'pipe'], timeout: 15_000 })
+      '/usr/local/bin/node', '/checkpoint-target/control.mjs', action, requestId, String(identity.uid)],
+    { stdio: ['ignore', 'pipe', 'pipe'], timeout: 15_000 })
   } catch (error) {
-    const commandError = error as NodeJS.ErrnoException & { status?: number | null; signal?: NodeJS.Signals | null; stderr?: Buffer | string }
+    const commandError = error as NodeJS.ErrnoException & {
+      status?: number | null; signal?: NodeJS.Signals | null; stderr?: Buffer | string; stdout?: Buffer | string
+    }
     const stderr = Buffer.isBuffer(commandError.stderr) ? commandError.stderr.toString('utf8') : commandError.stderr
+    const stdout = Buffer.isBuffer(commandError.stdout) ? commandError.stdout.toString('utf8') : commandError.stdout
     const details = [
       commandError.status === null || commandError.status === undefined ? undefined : `exit=${commandError.status}`,
       commandError.signal ? `signal=${commandError.signal}` : undefined,
       stderr?.trim() ? `stderr=${stderr.trim().slice(-2048)}` : undefined,
+      stdout?.trim() ? `stdout=${stdout.trim().slice(-1024)}` : undefined,
+      !stderr?.trim() && !stdout?.trim() ? commandError.message : undefined,
     ].filter(Boolean).join('; ')
     throw new Error(`Restricted checkpoint control ${requestId} (${action}) failed${details ? `: ${details}` : ''}`, { cause: error })
   }
@@ -741,7 +746,7 @@ export async function runCodeCheckpointTarget() {
       '--env-file', dockerEnvPath, '--entrypoint', '/checkpoint-target/sandbox-entrypoint.sh',
       checkpointImage, '/usr/local/bin/node', '/checkpoint-target/launch.mjs',
     ]
-    dockerRun = spawn('docker', dockerArgs, { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] })
+    dockerRun = spawn('docker', dockerArgs, { cwd: root, stdio: ['ignore', 'pipe', 'pipe'], detached: true })
     dockerRunJoin = joinedAfterOutput(dockerRun); dockerRunJoin.catch(() => {})
     dockerRun.stdout!.on('data', (chunk: Buffer) => {
       dockerStdout = (dockerStdout + chunk.toString()).slice(-262_144)
@@ -834,7 +839,7 @@ export async function runCodeCheckpointTarget() {
     assert.match(versionText, /^cloudflared version 2026\.10\.0(?:\s|$)/)
     tunnel = spawn(tool, ['tunnel', '--url', baseUrl], {
       cwd: root, env: { PATH: process.env.PATH ?? '', HOME: toolHome, XDG_CONFIG_HOME: toolHome },
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['ignore', 'pipe', 'pipe'], detached: true,
     })
     tunnelJoin = joined(tunnel); tunnelJoin.catch(() => {})
     tunnelIdentity = await processIdentity(tunnel)
@@ -904,7 +909,7 @@ export async function runCodeCheckpointTarget() {
       await attempt('cloudExecution', () => cancelOwnedCloudExecution(cloudExecution.executionName as string, candidateSha))
     }
     await attempt('browserJoin', () => stopExact(browser, browserIdentity, browserJoin, true))
-    await attempt('tunnelJoin', () => stopExact(tunnel, tunnelIdentity, tunnelJoin))
+    await attempt('tunnelJoin', () => stopExact(tunnel, tunnelIdentity, tunnelJoin, true))
     if (forwarderContainerId) await attempt('forwarderContainer', async () => {
       const matching = docker(['ps', '-aq', '--no-trunc', '--filter', `id=${forwarderContainerId}`]).split('\n').filter(Boolean)
       if (matching.length) {
@@ -935,7 +940,7 @@ export async function runCodeCheckpointTarget() {
       const named = docker(['ps', '-aq', '--no-trunc', '--filter', `name=^/${containerName}$`]).split('\n').filter(Boolean)
       assert.deepEqual(named, [], 'Container without a published owned ID remains unknown; retain its fixture')
     })
-    await attempt('dockerRunJoin', () => stopExact(dockerRun, dockerRunIdentity, dockerRunJoin))
+    await attempt('dockerRunJoin', () => stopExact(dockerRun, dockerRunIdentity, dockerRunJoin, true))
     if (networkId) await attempt('network', async () => {
       const matching = docker(['network', 'ls', '-q', '--no-trunc', '--filter', `id=${networkId}`]).split('\n').filter(Boolean)
       if (matching.length) {
