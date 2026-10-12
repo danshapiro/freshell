@@ -6,6 +6,39 @@ import { ErrorCode, type ErrorMessage } from '../../shared/ws-protocol.js'
 import { dockerSocketPath } from './runtime-sandbox.js'
 import { providerParityFailureDiagnostics } from '../../test/helpers/provider-parity-environment.js'
 import type { ManagedRuntimeBrowserRig } from '../../test/e2e-browser/helpers/managed-runtime.js'
+import type { ManagedEnvironmentFixture } from './e2e-external-target.js'
+
+export type ManagedEnvironmentAttempt = ManagedEnvironmentFixture & {
+  scenario: string
+  attempt: number
+  createRequestId?: string
+}
+
+export type ManagedEnvironmentCompletion = ManagedEnvironmentAttempt & {
+  status: string
+  willRetry: boolean
+}
+
+export async function serviceManagedEnvironmentScenario(
+  fixture: ManagedEnvironmentFixture, scenario: string,
+  operations: {
+    nextAttempt(attempt: number): Promise<{ request?: ManagedEnvironmentAttempt; completion?: ManagedEnvironmentCompletion }>
+    authorize(requestId: string): void
+    publishAuthorization(request: ManagedEnvironmentAttempt): Promise<void>
+    onAuthorized(request: ManagedEnvironmentAttempt): Promise<void>
+    waitForCompletion(request: ManagedEnvironmentAttempt): Promise<ManagedEnvironmentCompletion>
+  },
+) {
+  const { request } = await operations.nextAttempt(0)
+  assert(request, 'Cloud picker request is unavailable')
+  for (const key of ['candidateSha', 'runId', 'remoteWorkspacePath', 'expectedNonce'] as const) assert.equal(request[key], fixture[key])
+  assert.equal(request.scenario, scenario)
+  assert.equal(typeof request.createRequestId, 'string')
+  assert(request.createRequestId!.length > 0)
+  operations.authorize(request.createRequestId!)
+  await operations.publishAuthorization(request)
+  await operations.onAuthorized(request)
+}
 
 export async function observeManagedEnvironmentNativeIdentity(
   owner: Pick<ManagedRuntimeBrowserRig, 'inventory' | 'runtime' | 'supervisor'>,

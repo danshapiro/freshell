@@ -13,7 +13,7 @@ import { managedEnvironmentOpencodeSelection } from '../../test/helpers/provider
 import { fakeOnecliGrants } from '../../test/integration/server/provider-parity-onecli.js'
 import type { InitialProviderVolumeAuthorization } from './runtime-test-broker.js'
 import { resolvePairedExternalFixture } from './e2e-external-target.js'
-import { assertManagedTerminalCreated, observeManagedEnvironmentNativeIdentity, readManagedEnvironmentDaemonId } from './managed-environment-create.js'
+import { assertManagedTerminalCreated, observeManagedEnvironmentNativeIdentity, readManagedEnvironmentDaemonId, serviceManagedEnvironmentScenario } from './managed-environment-create.js'
 
 const cloudflaredVersion = '2026.10.0'
 const cloudflaredSha = 'd33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db'
@@ -340,31 +340,30 @@ export async function runManagedEnvironmentTarget() {
     browserIdentity = await processIdentity(browser)
     for (const scenario of scenarios) {
       const cwd = path.join(selected.workspace, scenario)
-      const request = await poll(`Cloud ${scenario} picker request`, async () => {
+      await serviceManagedEnvironmentScenario(fixture, scenario, {
+      nextAttempt: async () => ({ request: await poll(`Cloud ${scenario} picker request`, async () => {
         const request = await readJson(path.join(cwd, '.managed-fixture/request.json'))
         if (request) return request
         assert.equal(browser!.exitCode, null, 'Cloud browser exited before completing its three cases')
         assert.equal(browser!.signalCode, null, 'Cloud browser was signaled before completing its three cases')
         return undefined
-      }, 600_000)
-      for (const key of ['candidateSha', 'runId', 'remoteWorkspacePath', 'expectedNonce'] as const) assert.equal(request[key], fixture[key])
-      assert.equal(request.scenario, scenario)
-      assert.equal(typeof request.createRequestId, 'string')
-      assert(request.createRequestId.length > 0)
-      authorize(request.createRequestId)
-      await writeJson(path.join(cwd, '.managed-fixture/authorized.json'), request)
-      if (scenario === 'healthy') {
+      }, 600_000) }),
+      authorize,
+      publishAuthorization: request => writeJson(path.join(cwd, '.managed-fixture/authorized.json'), request),
+      waitForCompletion: async () => { throw new Error('Attempt completion is not yet consumed') },
+      onAuthorized: async () => { if (scenario === 'healthy') {
         const child = await poll('actual selected Bun child', async () => readJson(path.join(cwd, '.managed-fixture/child-receipt.json')))
         assert.equal(child.expectedNonce, nonce); assert.equal(child.candidateSha, fixture.candidateSha); assert.equal(child.runId, fixture.runId)
         assert.equal(child.bun, true); assert.equal(child.opencodeVersion, '1.18.21'); assert.match(child.bunExecutable, /opencode/)
         assert.equal(child.executableMode, '0711')
         const view = await poll('created managed native identity', async () => (await rig!.inventory()).find(row => row.terminalId === child.terminalId && row.nativeSessionId === child.nativeSessionId && row.launchState === 'running'))
-        const stage = await stageProof(rig, view, nonce)
+        const stage = await stageProof(rig!, view, nonce)
         const receipt = { ...fixture, terminalId: view.terminalId, soulId: view.soulId, incarnationId: view.incarnationId,
           nativeSessionId: view.nativeSessionId, stage, child }
         await writeJson(path.join(cwd, '.managed-fixture/target-receipt.json'), receipt)
         proof.healthy = receipt
-      }
+      } },
+      })
     }
     const browserExit = await bounded(browserJoin, 120_000, 'configured Cloud browser final join')
     assert.equal(browserExit.code, 0, 'Configured Cloud browser acceptance failed')

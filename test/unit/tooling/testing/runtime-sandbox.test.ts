@@ -35,8 +35,81 @@ import { RuntimeHarness, dockerSocketPath } from '../../../../scripts/testing/ru
 import { RestrictedDockerBroker, type PreparedInputAuthorization } from '../../../../scripts/testing/runtime-test-broker.js'
 import { ManagedRuntimeBrowserRig } from '../../../e2e-browser/helpers/managed-runtime.js'
 import { prepareProviderParityUserRoots } from '../../../helpers/provider-parity-environment.js'
-import { assertManagedTerminalCreated, observeManagedEnvironmentNativeIdentity, readManagedEnvironmentDaemonId } from '../../../../scripts/testing/managed-environment-create.js'
+import { assertManagedTerminalCreated, observeManagedEnvironmentNativeIdentity, readManagedEnvironmentDaemonId, serviceManagedEnvironmentScenario, type ManagedEnvironmentAttempt, type ManagedEnvironmentCompletion } from '../../../../scripts/testing/managed-environment-create.js'
 import type { ErrorMessage } from '../../../../shared/ws-protocol.js'
+
+describe('managed environment browser attempt lifetime', () => {
+  const fixture = { candidateSha: 'a'.repeat(40), runId: 'owned-run', remoteWorkspacePath: '/owned/workspace', expectedNonce: 'owned-nonce' }
+  const scenario = 'healthy'
+  const request = (attempt: number): ManagedEnvironmentAttempt => ({ ...fixture, scenario, attempt, createRequestId: `actual-ui-${attempt}` })
+  const completion = (attempt: number, willRetry: boolean): ManagedEnvironmentCompletion => ({ ...request(attempt), status: willRetry ? 'failed' : 'passed', willRetry })
+
+  async function ownedFixture(body: (directory: string) => Promise<void>) {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'frs-browser-attempt-'))
+    try { await body(directory) } finally { await fs.rm(directory, { recursive: true, force: true }) }
+  }
+
+  it('authorizes each real retry request and waits for its matching completion', async () => {
+    await ownedFixture(async directory => {
+      for (const attempt of [0, 1]) {
+        await fs.writeFile(path.join(directory, `request-${attempt}.json`), JSON.stringify(request(attempt)))
+        await fs.writeFile(path.join(directory, `completion-${attempt}.json`), JSON.stringify(completion(attempt, attempt === 0)))
+      }
+      const authorized: string[] = [], published: ManagedEnvironmentAttempt[] = [], completed: number[] = []
+      await serviceManagedEnvironmentScenario(fixture, scenario, {
+        nextAttempt: async attempt => ({ request: JSON.parse(await fs.readFile(path.join(directory, `request-${attempt}.json`), 'utf8')) }),
+        authorize: id => { authorized.push(id) },
+        publishAuthorization: async value => { published.push(value) },
+        onAuthorized: async () => {},
+        waitForCompletion: async value => { completed.push(value.attempt); return JSON.parse(await fs.readFile(path.join(directory, `completion-${value.attempt}.json`), 'utf8')) },
+      })
+      expect.soft(authorized).toEqual(['actual-ui-0', 'actual-ui-1'])
+      expect.soft(published).toEqual([request(0), request(1)])
+      expect(completed).toEqual([0, 1])
+    })
+  })
+
+  it('keeps the owned target alive until the browser reports attempt completion', async () => {
+    await ownedFixture(async directory => {
+      await fs.writeFile(path.join(directory, 'request.json'), JSON.stringify(request(0)))
+      let finish!: (value: ManagedEnvironmentCompletion) => void
+      const pending = new Promise<ManagedEnvironmentCompletion>(resolve => { finish = resolve })
+      let entered!: () => void
+      const authorized = new Promise<void>(resolve => { entered = resolve })
+      let returned = false
+      const run = serviceManagedEnvironmentScenario(fixture, scenario, {
+        nextAttempt: async () => ({ request: JSON.parse(await fs.readFile(path.join(directory, 'request.json'), 'utf8')) }),
+        authorize: () => {}, publishAuthorization: async () => {}, onAuthorized: async () => { entered() }, waitForCompletion: () => pending,
+      }).then(() => { returned = true })
+      try {
+        await authorized
+        await new Promise<void>(resolve => setImmediate(resolve))
+        expect.soft(returned).toBe(false)
+      } finally { finish(completion(0, false)); await run }
+      expect(returned).toBe(true)
+    })
+  })
+
+  it('rejects a foreign request without granting or publishing authority', async () => {
+    const authorize = vi.fn(), publishAuthorization = vi.fn()
+    await expect(serviceManagedEnvironmentScenario(fixture, scenario, {
+      nextAttempt: async () => ({ request: { ...request(0), runId: 'foreign-run' } }),
+      authorize, publishAuthorization, onAuthorized: async () => {}, waitForCompletion: async () => completion(0, false),
+    })).rejects.toThrow()
+    expect(authorize).not.toHaveBeenCalled()
+    expect(publishAuthorization).not.toHaveBeenCalled()
+  })
+
+  it('accepts a failed-before-picker completion without inventing a create request', async () => {
+    const authorize = vi.fn(), publishAuthorization = vi.fn()
+    await expect(serviceManagedEnvironmentScenario(fixture, scenario, {
+      nextAttempt: async () => ({ completion: { ...fixture, scenario, attempt: 0, status: 'failed', willRetry: false } }),
+      authorize, publishAuthorization, onAuthorized: async () => {}, waitForCompletion: async () => { throw new Error('No request exists') },
+    })).resolves.toBeUndefined()
+    expect(authorize).not.toHaveBeenCalled()
+    expect(publishAuthorization).not.toHaveBeenCalled()
+  })
+})
 
 describe('managed environment native identity observation', () => {
   it.each(['expected', 'foreign'] as const)('observes owned output before accepting %s native identity', async kind => {
