@@ -135,6 +135,13 @@ Reopening a session in another mode keeps the same provider session and conversa
 
 **Stop and reopen** is available only when freshell can confirm the old writer and its owned child processes have stopped. The new mode starts only after that confirmation. On platforms where freshell cannot establish that proof, the request is refused before changing the session, and the existing session remains usable. The current atomic handoff implementation supports this operation when the Freshell server runs on Linux; Windows and macOS receive the explicit refusal and can still use clear-only bookkeeping repair.
 
+The managed-runtime repair is being prepared for Claude, Codex, and OpenCode
+in terminal and fresh-agent modes; qualification and installation are still
+pending. Its upgrade procedure preserves existing session stores and requires
+a verified backup before opening them with the new version. It does not
+automatically import existing sessions. Managed Amplifier and Kilroy remain
+unqualified and disabled; ordinary legacy CLI integrations remain available.
+
 ## Stream Deck
 
 Freshell can drive an Elgato Stream Deck straight from the browser. Each key shows a tab — by default the **Status icons** style: title on top, centered repo icons, and a status background (green for tabs that want attention), with keys sorted so attention-seeking tabs come first. Press a key to focus that tab; long-press (500 ms) to open an action layer with BACK / APPROVE / STOP keys (it closes itself after 10 s). When you have more tabs than keys, the last key pages through them (wrapping around). On a Stream Deck +, the dials cycle tabs and flip pages and the touch strip shows the active tab plus busy/waiting counts (waiting = tabs that finished a turn or are waiting for approval). The deck dims after a configurable idle timeout and wakes on activity.
@@ -233,8 +240,9 @@ OpenCode permissions are controlled by the OpenCode configuration for the OS use
 
 Amplifier loads the freshell MCP only if its bundle mounts `tool-mcp` (the default `anchors` bundle does not). Add `tool-mcp` to your Amplifier bundle to enable orchestration.
 
-Managed Amplifier sessions use the configured bundle, provider, model, and
-plugins. If the provider needs a secret, give Freshell a private OneCLI grant
+The unreleased managed Amplifier adapter uses the configured bundle, provider,
+model, and plugins. For a separately authorized qualification, supply a private
+OneCLI grant
 through `FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE` or
 `FRESHELL_MANAGED_AMPLIFIER_ONECLI_AUTH_FILE`. Freshell resolves the grant for
 the provider child when the session starts.
