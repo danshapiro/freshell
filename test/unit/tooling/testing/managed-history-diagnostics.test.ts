@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { TestCase, TestResult } from '@playwright/test/reporter'
 import * as external from '../../../../scripts/testing/runtime-external-browser.js'
 import { buildManagedRuntimeMergePlan } from '../../../../src/lib/recovery/managed-runtime-recovery.js'
+import { EventEmitter } from 'node:events'
 
 const original = vi.hoisted(() => ({
   cases: new Map<string, (context: any) => Promise<void>>(),
@@ -156,7 +157,8 @@ type StartupFault = 'ack-request' | 'ack-mode' | 'ack-provider' | 'ack-runtime-p
   | 'reply-run' | 'current-soul' | 'current-incarnation' | 'current-root' | 'current-ambiguous'
 
 /** Execute the registered browser case, including its actual global collector and finally. */
-async function historyCallback(fault?: HistoryFault, startup: 'presentation' | 'native' = 'presentation', startupFault?: StartupFault) {
+async function historyCallback(fault?: HistoryFault, startup: 'presentation' | 'native' = 'presentation', startupFault?: StartupFault,
+  actualHistoryHelper?: (...args: any[]) => Promise<void>) {
   await import('../../../e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.js')
   vi.stubEnv('FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST', '1')
   const definitions = [
@@ -206,6 +208,7 @@ async function historyCallback(fault?: HistoryFault, startup: 'presentation' | '
     },
   }
   const page: any = {
+    off: vi.fn(),
     on: (event: string, callback: any) => {
       if (event === 'websocket') callback({ on: (kind: string, listener: any) => {
         if (kind === 'framesent') framesent = listener
@@ -302,7 +305,8 @@ async function historyCallback(fault?: HistoryFault, startup: 'presentation' | '
     fixtureNativeState: async () => ({ dispatchCount: 1, completionCount: 1 }),
     inventory: externalRig.inventory.bind(externalRig),
   }
-  original.history.mockClear().mockImplementation(async () => {
+  original.history.mockClear().mockImplementation(async (...args: any[]) => {
+    if (actualHistoryHelper) return actualHistoryHelper(...args)
     const index = allocated.length - 1
     const attach = (item: any) => ({ type: 'freshAgent.attach', ...state.panes.layouts[item.tabId].content })
     const messages = allocated.map(attach)
@@ -336,7 +340,7 @@ async function historyCallback(fault?: HistoryFault, startup: 'presentation' | '
   })
   const run = original.cases.get('completed owned native fixture history opens its existing browser pane')!({ page })
   void run.catch(() => {}) // Controlled clocks may settle refusal before the caller awaits it.
-  return { run, allocated, lookups, transport, promotions, observedStartupIds, sends: () => sendCount }
+  return { run, allocated, lookups, transport, promotions, observedStartupIds, page, sends: () => sendCount }
 }
 
 describe('managed History startup inventory binding', () => {
@@ -433,4 +437,213 @@ describe('managed History original wire ownership', () => {
       expect(original.stop).toHaveBeenCalledOnce()
     },
   )
+})
+
+const historyIdentity = { repoRoot: '/private-owned-checkout', provider: 'claude', nativeSessionId: 'private-native-root' }
+const directoryPage = () => ({ items: [{ provider: 'claude', sessionId: historyIdentity.nativeSessionId,
+  projectPath: historyIdentity.repoRoot, cwd: historyIdentity.repoRoot, checkoutPath: historyIdentity.repoRoot,
+  title: 'PRIVATE-BODY', firstUserMessage: 'PRIVATE-PROMPT', lastActivityAt: 1, isRunning: false }],
+  nextCursor: null, revision: 1, snapshotSeq: 7, partial: false })
+const directoryRequest = (query = '?query=PRIVATE-QUERY&tier=fullText&limit=50&includeKeys=PRIVATE-KEY,OTHER-PRIVATE-KEY') => ({
+  url: () => 'https://private.invalid/api/session-directory' + query,
+  method: () => 'GET', failure: () => ({ errorText: 'PRIVATE-ERROR net::ERR_ABORTED' }),
+})
+
+describe('managed History passive directory and window diagnostics', () => {
+  it('correlates overlapping actual responses and emits only validated safe facts through the reporter', async () => {
+    const { retained, emit } = reporterPath()
+    const observation = new external.ManagedHistoryAwaitedPhases(emit)
+    const page = new EventEmitter()
+    const observer = new external.ManagedHistoryDirectoryResponses(page as any, observation, 'freshclaude', historyIdentity)
+    observer.begin(Date.now() + 60_000)
+    const first = directoryRequest(), second = directoryRequest('?limit=50&includeEmpty=1')
+    page.emit('request', first); page.emit('request', second)
+    page.emit('response', { request: () => second, status: () => 200, body: async () => Buffer.from(JSON.stringify(directoryPage())) })
+    page.emit('response', { request: () => first, status: () => 200, body: async () => Buffer.from(JSON.stringify({ ...directoryPage(),
+      items: [{ ...directoryPage().items[0], lastActivityAt: 'PRIVATE-SCHEMA-VALUE' }] })) })
+    await observer.settle()
+    await observer.close()
+    const events = external.parseManagedHistoryDiagnosticText(retained.join('')).filter(event => event.event === 'managed_history_directory') as any[]
+    expect(events.map(event => [event.requestSeq, event.stage, event.order])).toEqual([
+      [1, 'request', 1], [2, 'request', 2], [2, 'response', 3], [1, 'response', 4], [2, 'body', 5], [1, 'body', 6],
+    ])
+    expect(events[0]).toMatchObject({ method: 'GET', route: 'session-directory', query: { queryEmpty: false, tier: 'other', limit: 50, includeKeysCount: 2 } })
+    expect(events[1]).toMatchObject({ query: { queryEmpty: true, tier: 'title', includeEmpty: true } })
+    expect(events[4]).toMatchObject({ status: 200, parseSuccess: true, itemCount: 1, exactIdentityCount: 1,
+      nextCursorPresent: false, partial: false, integrity: 'none', snapshotSeq: 7,
+      ownedContext: [{ projectMatches: true, cwdMatches: true, checkoutMatches: true }] })
+    expect(events[5]).toMatchObject({ status: 200, parseSuccess: false, issues: [{ code: 'invalid_type', path: ['items', 'index', 'field'] }] })
+    expect(events.every(event => event.runId === owned.FRESHELL_RUNTIME_EXTERNAL_RUN_ID)).toBe(true)
+    for (const value of ['PRIVATE', 'private.invalid', historyIdentity.repoRoot, historyIdentity.nativeSessionId]) expect(retained.join('')).not.toContain(value)
+    expect(page.eventNames()).toEqual([])
+  })
+
+  it('keeps non-ok, aborted, transport and unavailable body facts distinct without inventing status', async () => {
+    const { retained, emit } = reporterPath()
+    const page = new EventEmitter()
+    const observer = new external.ManagedHistoryDirectoryResponses(page as any, new external.ManagedHistoryAwaitedPhases(emit), 'kilroy', historyIdentity)
+    observer.begin(Date.now() + 60_000)
+    const requests = Array.from({ length: 5 }, () => directoryRequest())
+    requests.forEach(request => page.emit('request', request))
+    const unread = vi.fn()
+    page.emit('response', { request: () => requests[0], status: () => 503, body: unread })
+    page.emit('requestfailed', requests[1])
+    requests[2].failure = () => ({ errorText: 'PRIVATE-TRANSPORT-ERROR' })
+    // Same request object is the actual transport correlation key.
+    page.emit('requestfailed', requests[2])
+    page.emit('response', { request: () => requests[3], status: () => 200, body: async () => { throw new Error('PRIVATE-BODY-ERROR') } })
+    await observer.settle()
+    page.emit('response', { request: () => requests[4], status: () => 200, body: () => new Promise(() => {}) })
+    await observer.close()
+    const events = external.parseManagedHistoryDiagnosticText(retained.join('')).filter(event => event.event === 'managed_history_directory') as any[]
+    expect(events.find(event => event.requestSeq === 1 && event.stage === 'response')).toMatchObject({ status: 503, category: 'http-error' })
+    expect(events.find(event => event.requestSeq === 2 && event.stage === 'failed')).toMatchObject({ category: 'aborted' })
+    expect(events.find(event => event.requestSeq === 3 && event.stage === 'failed')).toMatchObject({ category: 'transport-failed' })
+    expect(events.filter(event => event.stage === 'failed').every(event => event.status === undefined)).toBe(true)
+    expect(events.find(event => event.requestSeq === 4 && event.stage === 'body')).toMatchObject({ category: 'body-unavailable', status: 200 })
+    expect(events.find(event => event.requestSeq === 5 && event.stage === 'body')).toMatchObject({ category: 'unknown', status: 200 })
+    expect(unread).not.toHaveBeenCalled()
+    expect(retained.join('')).not.toContain('PRIVATE')
+    expect(page.eventNames()).toEqual([])
+  })
+
+  it('executes the real projector over zero, committed and removed History windows', async () => {
+    const helper = await vi.importActual<any>('../../../e2e-browser/helpers/managed-runtime.js')
+    const { retained, emit } = reporterPath()
+    const page = new EventEmitter()
+    const observer = new external.ManagedHistoryDirectoryResponses(page as any, new external.ManagedHistoryAwaitedPhases(emit), 'freshcodex', historyIdentity)
+    observer.begin(Date.now() + 60_000)
+    const sessions: any = { activeSurface: 'history', projects: [], windows: { history: { projects: [], query: '', appliedQuery: '',
+      searchTier: 'title', appliedSearchTier: 'title', resultVersion: 0, loading: true, loadingKind: 'initial', error: 'PRIVATE-ERROR' }, sidebar: { projects: [] } } }
+    const project = { projectPath: historyIdentity.repoRoot, sessions: directoryPage().items }
+    const read = () => {
+      vi.stubGlobal('window', { __FRESHELL_TEST_HARNESS__: { getState: () => ({ sessions }) } })
+      try { return helper.observeManagedHistoryWindow(historyIdentity) } finally { vi.unstubAllGlobals() }
+    }
+    observer.window('before-projects', read().facts)
+    sessions.windows.history = { ...sessions.windows.history, projects: [project], resultVersion: 1, loading: false, lastLoadedAt: 4 }
+    sessions.projects = [project]; sessions.windows.sidebar.projects = [project]
+    const indexed = read()
+    expect(indexed.indexed).toEqual([{ projectPath: historyIdentity.repoRoot, cwd: historyIdentity.repoRoot, checkoutPath: historyIdentity.repoRoot }])
+    observer.window('indexed', indexed.facts)
+    sessions.windows.history.projects = []
+    observer.window('failed', read().facts)
+    await observer.close()
+    const events = external.parseManagedHistoryDiagnosticText(retained.join('')).filter(event => event.event === 'managed_history_window') as any[]
+    expect(events.map(event => event.facts.exactIdentityCount)).toEqual([0, 1, 0])
+    expect(events[0].facts).toMatchObject({ resultVersion: 0, loading: true, loadingKind: 'initial', errorPresent: true, lastLoadedAtPresent: false })
+    expect(events[1].facts).toMatchObject({ resultVersion: 1, lastLoadedAtPresent: true, sidebarExactIdentityCount: 1, topLevelExactIdentityCount: 1,
+      requestedQueryEmpty: true, appliedQueryEmpty: true, requestedTier: 'title', appliedTier: 'title', activeSurface: 'history' })
+    expect(events[2].facts.resultVersion).toBe(1)
+    expect(retained.join('')).not.toContain('PRIVATE')
+    expect(retained.join('')).not.toContain(historyIdentity.repoRoot)
+  })
+
+  it('bounds request and read work at the original action deadline and removes only its listeners', async () => {
+    vi.useFakeTimers()
+    const { retained, emit } = reporterPath()
+    const page = new EventEmitter()
+    const foreign = vi.fn()
+    page.on('response', foreign)
+    const fetch = vi.spyOn(globalThis, 'fetch')
+    const observer = new external.ManagedHistoryDirectoryResponses(page as any, new external.ManagedHistoryAwaitedPhases(emit), 'freshopencode', historyIdentity)
+    const reads = Array.from({ length: 20 }, () => vi.fn(() => new Promise<Buffer>(() => {})))
+    observer.begin(Date.now() + 60_000)
+    const requests = reads.map(() => directoryRequest())
+    requests.forEach(request => page.emit('request', request))
+    reads.forEach((body, index) => page.emit('response', { request: () => requests[index], status: () => 200, body }))
+    observer.captureWindow('before-projects', () => new Promise(() => {}))
+    observer.captureWindow('before-refresh', async () => { throw new Error('PRIVATE-READ-ERROR') })
+    await vi.advanceTimersByTimeAsync(60_000)
+    await observer.close()
+    const events = external.parseManagedHistoryDiagnosticText(retained.join('')) as any[]
+    expect(events.filter(event => event.stage === 'request')).toHaveLength(8)
+    expect(events.filter(event => event.stage === 'body' && event.category === 'unknown')).toHaveLength(8)
+    expect(events.filter(event => event.event === 'managed_history_window').map(event => event.facts)).toEqual([{ available: false }, { available: false }])
+    expect(reads.slice(0, 8).every(read => read.mock.calls.length === 1)).toBe(true)
+    expect(reads.slice(8).every(read => read.mock.calls.length === 0)).toBe(true)
+    expect(page.listeners('response')).toEqual([foreign])
+    expect(page.listenerCount('request')).toBe(0)
+    expect(page.listenerCount('requestfailed')).toBe(0)
+    expect(fetch).not.toHaveBeenCalled()
+    expect(retained.join('')).not.toContain('PRIVATE')
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('preserves the original helper assertion, action order and exact state read while diagnostics observe', async () => {
+    const helper = await vi.importActual<any>('../../../e2e-browser/helpers/managed-runtime.js')
+    const { retained, emit } = reporterPath()
+    const calls: string[] = []
+    const state: any = { sessions: { activeSurface: 'history', windows: { history: { projects: [] }, sidebar: { projects: [] } }, projects: [] } }
+    const page: any = new EventEmitter()
+    const locator: any = {
+      constructor: { name: 'Locator' }, _expect: async () => ({ matches: true, received: '', log: [] }),
+      getByRole: () => locator, isVisible: async () => true,
+      click: async () => { calls.push('open'); },
+    }
+    page.getByRole = (_role: string, options: any) => ({ ...locator, click: async () => {
+      calls.push(options.name === 'Refresh sessions' ? 'refresh' : 'projects')
+    } })
+    page.locator = () => locator
+    page.evaluate = async (operation: any, argument: any) => {
+      vi.stubGlobal('window', { __FRESHELL_TEST_HARNESS__: { getState: () => state } })
+      try { return operation(argument) } finally { vi.unstubAllGlobals() }
+    }
+    const observer = new external.ManagedHistoryDirectoryResponses(page, new external.ManagedHistoryAwaitedPhases(emit), 'freshclaude', historyIdentity)
+    let failure: unknown
+    const cleanup = vi.fn()
+    try { await helper.openFreshHistorySession(page, historyIdentity, observer) } catch (error) { failure = error } finally {
+      await observer.close(); cleanup()
+    }
+    expect(failure).toBeInstanceOf(Error)
+    expect((failure as Error).message).toMatch(/Expected length: 1/)
+    expect((failure as Error).message).toMatch(/Received length: 0/)
+    expect(calls).toEqual(['projects', 'refresh'])
+    expect(cleanup).toHaveBeenCalledOnce()
+    const events = external.parseManagedHistoryDiagnosticText(retained.join('')).filter(event => event.event === 'managed_history_window') as any[]
+    expect(events.map(event => event.stage)).toEqual(['before-projects', 'before-refresh', 'indexed', 'failed'])
+    expect(events.find(event => event.stage === 'indexed').facts.exactIdentityCount).toBe(0)
+    expect(page.eventNames()).toEqual([])
+
+    // The same helper reaches Open exactly once when the actual indexed row exists.
+    state.sessions.windows.history.projects = [{ projectPath: historyIdentity.repoRoot, sessions: directoryPage().items }]
+    const observe = new external.ManagedHistoryDirectoryResponses(page, new external.ManagedHistoryAwaitedPhases(emit), 'freshclaude', historyIdentity)
+    await helper.openFreshHistorySession(page, historyIdentity, observe)
+    await observe.close()
+    expect(calls).toEqual(['projects', 'refresh', 'projects', 'refresh', 'open'])
+    expect(page.eventNames()).toEqual([])
+  })
+
+  it('rethrows an identical helper operation error when diagnostic callbacks themselves fail', async () => {
+    const helper = await vi.importActual<any>('../../../e2e-browser/helpers/managed-runtime.js')
+    const error = new Error('PRIVATE-ORIGINAL-ERROR')
+    const diagnosticError = new Error('PRIVATE-DIAGNOSTIC-ERROR')
+    const cleanup = vi.fn()
+    const observation = { begin: () => { throw diagnosticError }, captureWindow: () => { throw diagnosticError }, window: () => { throw diagnosticError } }
+    const page: any = { getByRole: () => ({ click: async () => { throw error } }) }
+    const run = async () => { try { await helper.openFreshHistorySession(page, historyIdentity, observation) } finally { cleanup() } }
+    await expect(run()).rejects.toBe(error)
+    expect(cleanup).toHaveBeenCalledOnce()
+  })
+
+  it('propagates the real helper indexed failure through the original browser callback and its actual rig cleanup', async () => {
+    const helper = await vi.importActual<any>('../../../e2e-browser/helpers/managed-runtime.js')
+    vi.spyOn(process.stdout, 'write').mockReturnValue(true)
+    const { run, allocated, page, sends } = await historyCallback(undefined, 'native', undefined, helper.openFreshHistorySession)
+    await expect(run).rejects.toThrow(/Received length: 0/)
+    expect(allocated).toHaveLength(1)
+    expect(sends()).toBe(1)
+    expect(original.history).toHaveBeenCalledOnce()
+    expect(original.stop).toHaveBeenCalledOnce()
+    expect(page.off.mock.calls.map(([event]: [string]) => event)).toEqual(['request', 'response', 'requestfailed'])
+  })
+
+  it('keeps the existing stream and line limits while accepting safe diagnostics', () => {
+    const { retained, emit } = reporterPath()
+    const observation = new external.ManagedHistoryAwaitedPhases(emit)
+    for (let index = 0; index < 300; index++) observation.window('freshclaude', 'indexed', { available: true, exactIdentityCount: index })
+    expect(external.parseManagedHistoryDiagnosticText(retained.join(''))).toHaveLength(256)
+    const tooLong = retained[0].trimEnd() + ' '.repeat(8192)
+    expect(external.parseManagedHistoryDiagnosticText(tooLong)).toEqual([])
+  })
 })

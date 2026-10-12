@@ -7,7 +7,7 @@
 import { expect } from '@playwright/test'
 
 import { validateFreshAgentIngressInventory } from '../../../scripts/testing/fresh-agent-ingress-inventory.js'
-import { ManagedHistoryAwaitedPhases, observeOwnedFreshBrowserPane } from '../../../scripts/testing/runtime-external-browser.js'
+import { ManagedHistoryAwaitedPhases, ManagedHistoryDirectoryResponses, observeOwnedFreshBrowserPane } from '../../../scripts/testing/runtime-external-browser.js'
 import { test } from '../helpers/fixtures.js'
 import { createManagedRuntimeBrowserRig, openFreshHistorySession, type ManagedFixtureRig, type ManagedRuntimeView, type FixtureNativeState } from '../helpers/managed-runtime.js'
 import { TestHarness } from '../helpers/test-harness.js'
@@ -122,6 +122,7 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
     const createdReplies: any[] = []
     const allocations: OwnedHistoryAllocation[] = []
     const observation = new ManagedHistoryAwaitedPhases()
+    let historyDiagnostics: ManagedHistoryDirectoryResponses | undefined
     let resourceFailures = 0
     page.on('response', response => {
       if (response.status() >= 400 && resourceFailures++ < 32) observation.navigation({
@@ -221,7 +222,9 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
         expect(owners.find(owner => owner.paneId === created.paneId)?.sessionId).toBe(nativePane.sessionId)
         const soulIds = (await phase('inventory-before', () => rig.inventory())).map(row => row.soulId).sort()
         const cursor = sent.length
-        await phase('history-open', () => openFreshHistorySession(page, { repoRoot: rig.repoRoot, provider: wireProvider, nativeSessionId: view.nativeSessionId! }))
+        const historyIdentity = { repoRoot: rig.repoRoot, provider: wireProvider, nativeSessionId: view.nativeSessionId! }
+        historyDiagnostics = new ManagedHistoryDirectoryResponses(page, observation, definition.mode, historyIdentity)
+        await phase('history-open', () => openFreshHistorySession(page, historyIdentity, historyDiagnostics))
         await phase('history-pane-visible', () => expect(pane).toBeVisible())
         await phase('history-active-tab', async () => expect(await harness.getActiveTabId()).toBe(created.tabId))
         await phase('history-tab-count', async () => expect(await harness.getTabCount()).toBe(tabCount))
@@ -260,8 +263,11 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
           expect(rig.exactRuntimeHandle(current!)).toEqual(rig.exactRuntimeHandle(view))
         })
         await phase('history-dispatch', async () => expect((await fixtureState(rig, view)).dispatchCount).toBe(1))
+        await historyDiagnostics.close()
+        historyDiagnostics = undefined
       }
     } finally {
+      try { await historyDiagnostics?.close() } catch { /* diagnostics cannot replace the original result or cleanup */ }
       const cleanup = await rig.stop()
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
     }

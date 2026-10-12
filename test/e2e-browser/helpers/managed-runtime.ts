@@ -1,7 +1,7 @@
 import { ManagedRuntimeOwner, requireOpenCodeOnecliBootstrap } from '../../../scripts/testing/runtime-sandbox.js'
 import { RustServer } from './rust-server.js'
 import type { E2eServerInfo } from './server-fixture-support.js'
-import { resolveManagedExternalDescriptor } from '../../../scripts/testing/runtime-external-browser.js'
+import { resolveManagedExternalDescriptor, type ManagedHistoryWindowFacts, type ManagedHistoryWindowStage } from '../../../scripts/testing/runtime-external-browser.js'
 import { ExternalManagedRuntimeRig } from './external-managed-runtime.js'
 import { expect, type Page } from '@playwright/test'
 import { executeAction } from '../../../tools/freshell-mcp/freshell-tool.js'
@@ -46,42 +46,83 @@ export async function observeFreshMcpIngress(action: string, params: Record<stri
   } finally { globalThis.fetch = prior }
 }
 
+/** Runs inside the browser; indexed rows and diagnostics describe one state read. */
+export function observeManagedHistoryWindow({ provider, nativeSessionId }: { provider: string; nativeSessionId: string }) {
+  const sessions = window.__FRESHELL_TEST_HARNESS__?.getState().sessions
+  const history = sessions?.windows?.history
+  const projects = history?.projects ?? []
+  const indexed = projects.flatMap(project => project.sessions
+    .filter(session => session.provider === provider && session.sessionId === nativeSessionId)
+    .map(session => ({ projectPath: project.projectPath, cwd: session.cwd, checkoutPath: session.checkoutPath })))
+  const count = (groups: typeof projects | undefined) => groups?.reduce((total, project) => total + project.sessions
+    .filter(session => session.provider === provider && session.sessionId === nativeSessionId).length, 0)
+  if (!history) return { indexed, facts: { available: false, exactIdentityCount: indexed.length,
+    sidebarExactIdentityCount: count(sessions?.windows?.sidebar?.projects), topLevelExactIdentityCount: count(sessions?.projects) } as ManagedHistoryWindowFacts }
+  const tier = (value: string | undefined): 'absent' | 'title' | 'other' => value === undefined ? 'absent' : value === 'title' ? 'title' : 'other'
+  const facts: ManagedHistoryWindowFacts = { available: Boolean(history), exactIdentityCount: indexed.length,
+    resultVersion: typeof history?.resultVersion === 'number' && Number.isSafeInteger(history.resultVersion) && history.resultVersion >= 0
+      ? history.resultVersion : undefined,
+    lastLoadedAtPresent: typeof history?.lastLoadedAt === 'number', loading: history?.loading,
+    loadingKind: history?.loadingKind === undefined ? 'absent'
+      : ['initial', 'search', 'background', 'pagination'].includes(history.loadingKind) ? history.loadingKind : 'other',
+    errorPresent: Boolean(history?.error), requestedQueryEmpty: !(history?.query ?? '').trim(), appliedQueryEmpty: !(history?.appliedQuery ?? '').trim(),
+    requestedTier: tier(history?.searchTier), appliedTier: tier(history?.appliedSearchTier), partial: history?.partial,
+    integrity: !history ? 'unknown' : !history.integrityError ? 'none' : history.integrityError.kind === 'identity_collision' ? 'identity_collision' : 'other',
+    activeSurface: sessions?.activeSurface === undefined ? 'absent' : sessions.activeSurface === 'history' ? 'history' : sessions.activeSurface === 'sidebar' ? 'sidebar' : 'other',
+    sidebarExactIdentityCount: count(sessions?.windows?.sidebar?.projects), topLevelExactIdentityCount: count(sessions?.projects) }
+  return { indexed, facts }
+}
+
+export interface ManagedHistoryWindowObservation {
+  begin(deadline: number): void
+  captureWindow(stage: ManagedHistoryWindowStage, read: () => Promise<ManagedHistoryWindowFacts>): void
+  window(stage: ManagedHistoryWindowStage, facts: ManagedHistoryWindowFacts): void
+}
+
 /** Open the indexed native session through the actual Projects history UI. */
 export async function openFreshHistorySession(page: Page, identity: {
   repoRoot: string; provider: string; nativeSessionId: string
-}): Promise<void> {
+}, observation?: ManagedHistoryWindowObservation): Promise<void> {
   const deadline = Date.now() + 60_000
+  const capture = (stage: ManagedHistoryWindowStage) => {
+    try { observation?.captureWindow(stage, async () => (await page.evaluate(observeManagedHistoryWindow, identity)).facts) } catch { /* diagnostics preserve the original action */ }
+  }
+  try { observation?.begin(deadline) } catch { /* diagnostic setup cannot replace an assertion */ }
   const remaining = () => {
     const timeout = deadline - Date.now()
     if (timeout <= 0) throw new Error('history opening deadline expired')
     return timeout
   }
-  await page.getByRole('button', { name: /^Projects/ }).click({ timeout: remaining() })
-  const refresh = page.getByRole('button', { name: 'Refresh sessions', exact: true })
-  await refresh.click({ timeout: remaining() })
-  // Wait for refresh to finish before looking for the exact history row;
-  // a visible Sidebar row cannot stand in for indexed history.
-  await expect(refresh).toBeEnabled({ timeout: remaining() })
-  // The actual indexed row owns its project group. A linked checkout can
-  // group under its common repository while retaining a different cwd.
-  const indexed = await page.evaluate(({ provider, nativeSessionId }) => {
-    const projects = window.__FRESHELL_TEST_HARNESS__?.getState().sessions.windows?.history.projects ?? []
-    return projects.flatMap(project => project.sessions
-      .filter(session => session.provider === provider && session.sessionId === nativeSessionId)
-      .map(session => ({ projectPath: project.projectPath, cwd: session.cwd, checkoutPath: session.checkoutPath })))
-  }, identity)
-  expect(indexed, 'exact provider/native root must have one indexed History group').toHaveLength(1)
-  const checkout = indexed[0].checkoutPath ?? indexed[0].cwd
-  if (checkout) expect(checkout, 'indexed host checkout must match the owned launch').toBe(identity.repoRoot)
-  const project = page.locator('[data-context="history-project"][data-project-path=' + JSON.stringify(indexed[0].projectPath) + ']')
-  await expect(project).toBeVisible({ timeout: remaining() })
-  const history = page.locator('[data-context="history-session"][data-provider=' + JSON.stringify(identity.provider)
-    + '][data-session-id=' + JSON.stringify(identity.nativeSessionId) + ']')
-  if (!await history.isVisible()) {
-    await project.click({ timeout: remaining() })
+  try {
+    capture('before-projects')
+    await page.getByRole('button', { name: /^Projects/ }).click({ timeout: remaining() })
+    const refresh = page.getByRole('button', { name: 'Refresh sessions', exact: true })
+    capture('before-refresh')
+    await refresh.click({ timeout: remaining() })
+    // Wait for refresh to finish before looking for the exact history row;
+    // a visible Sidebar row cannot stand in for indexed history.
+    await expect(refresh).toBeEnabled({ timeout: remaining() })
+    // The actual indexed row owns its project group. A linked checkout can
+    // group under its common repository while retaining a different cwd.
+    const { indexed, facts } = await page.evaluate(observeManagedHistoryWindow, identity)
+    try { observation?.window('indexed', facts) } catch { /* keep the exact indexed assertion */ }
+    expect(indexed, 'exact provider/native root must have one indexed History group').toHaveLength(1)
+    const checkout = indexed[0].checkoutPath ?? indexed[0].cwd
+    if (checkout) expect(checkout, 'indexed host checkout must match the owned launch').toBe(identity.repoRoot)
+    const project = page.locator('[data-context="history-project"][data-project-path=' + JSON.stringify(indexed[0].projectPath) + ']')
+    await expect(project).toBeVisible({ timeout: remaining() })
+    const history = page.locator('[data-context="history-session"][data-provider=' + JSON.stringify(identity.provider)
+      + '][data-session-id=' + JSON.stringify(identity.nativeSessionId) + ']')
+    if (!await history.isVisible()) {
+      await project.click({ timeout: remaining() })
+    }
+    await expect(history).toBeVisible({ timeout: remaining() })
+    await history.getByRole('button', { name: 'Open session', exact: true }).click({ timeout: remaining() })
+    capture('complete')
+  } catch (error) {
+    capture('failed')
+    throw error
   }
-  await expect(history).toBeVisible({ timeout: remaining() })
-  await history.getByRole('button', { name: 'Open session', exact: true }).click({ timeout: remaining() })
 }
 
 /** Split the observed fresh pane through the actual browser menu within one finite action budget. */
