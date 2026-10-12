@@ -471,7 +471,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         body: JSON.stringify({ codingCli: { enabledProviders: ['codex'] } }),
       })
       expect(settings.ok).toBe(true)
-      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1&perfAudit=1`)
       const harness = new TestHarness(page)
       await harness.waitForHarness()
       await harness.waitForConnection()
