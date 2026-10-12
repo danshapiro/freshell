@@ -545,6 +545,7 @@ export async function runCodeCheckpointTarget() {
   let browser: ChildProcess | undefined, browserIdentity: Awaited<ReturnType<typeof processIdentity>> | undefined,
     browserJoin: Promise<NativeExit> | undefined
   let dockerStdout = '', dockerStderr = ''
+  let primaryFailure: unknown
   const browserSummaryCapture = new ManagedEnvironmentBrowserSummaryCapture()
   try {
     await stageCheckpointTarget(stage, repoRoot)
@@ -624,13 +625,16 @@ export async function runCodeCheckpointTarget() {
     }, 120_000)
     const initialization = await poll('fixed restricted-UID initializer proof', () =>
       externalTargetRead(baseUrl, token, `${checkpointFixtureRoot}/control/initialization.json`), 30_000)
+    proof.initialization = initialization
     assert.deepEqual(initialization, { restrictedUid: identity.uid, effectiveCapabilities: '0000000000000000',
       privateFileDenied: true, privateDirectoryDenied: true, privateFileUid: 0, privateFileMode: '0600',
       privateDirectoryUid: 0, privateDirectoryMode: '0700', sameParentRenameVerified: true,
       nonGitWorkspace: fixture.nonGitWorkspacePath })
     const serverInfoResponse = await fetch(`${baseUrl}/api/server-info`, { headers: { 'x-auth-token': token }, signal: AbortSignal.timeout(15_000) })
+    proof.serverInfoStatus = serverInfoResponse.status
     assert(serverInfoResponse.ok)
     const serverInfo = await serverInfoResponse.json() as { commit?: unknown; buildDirty?: unknown; runtime?: unknown }
+    proof.serverInfo = serverInfo
     assert.equal(serverInfo.runtime, 'rust')
     assert.equal(serverInfo.commit, candidateSha)
     assert.equal(serverInfo.buildDirty, false)
@@ -705,6 +709,9 @@ export async function runCodeCheckpointTarget() {
     await writeJson(receiptPath, proof)
     console.log(JSON.stringify({ severity: 'info', event: 'code_checkpoint.acceptance_passed', candidateSha, runId,
       executedBrowserCases: browserSummary.executedCases, passedBrowserCases: browserSummary.passedCases, receipt: receiptPath }))
+  } catch (error) {
+    primaryFailure = error
+    throw error
   } finally {
     const errors: Error[] = []
     const cleanup: Record<string, unknown> = {}
@@ -747,6 +754,13 @@ export async function runCodeCheckpointTarget() {
     proof.cleanup = cleanup
     proof.knownOwnedSettled = errors.length === 0
     if (errors.length) proof.retainedFixture = root
+    if (primaryFailure !== undefined) {
+      const message = primaryFailure instanceof Error ? primaryFailure.message : String(primaryFailure)
+      proof.primaryFailure = {
+        name: primaryFailure instanceof Error ? primaryFailure.name : 'UnknownError',
+        message: message.replaceAll(token, '[redacted]'),
+      }
+    }
     await attempt('cleanupReceipt', async () => {
       proof.targetOutput = {
         stdoutTail: dockerStdout.replaceAll(token, '[redacted]').slice(-8192),
@@ -755,7 +769,13 @@ export async function runCodeCheckpointTarget() {
       await fs.mkdir(evidenceDir, { recursive: true, mode: 0o700 })
       await writeJson(path.join(evidenceDir, 'code-checkpoint-cleanup.json'), proof)
     })
-    if (errors.length) throw new AggregateError(errors, 'Checkpoint target cleanup remains unsettled')
+    if (errors.length) {
+      const primaryMessage = primaryFailure === undefined
+        ? ''
+        : `: ${primaryFailure instanceof Error ? primaryFailure.message : String(primaryFailure)}`
+      const failures = primaryFailure === undefined ? errors : [primaryFailure, ...errors]
+      throw new AggregateError(failures, `Checkpoint target failed${primaryMessage}; cleanup remains unsettled`)
+    }
   }
 }
 
