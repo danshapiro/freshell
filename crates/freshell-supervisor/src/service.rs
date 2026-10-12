@@ -3668,7 +3668,9 @@ fn map_host_frame_error(error: freshell_runtime_protocol::FrameError) -> Runtime
         freshell_runtime_protocol::FrameError::Io(_) => RuntimeErrorCode::HostUnreachable,
         _ => RuntimeErrorCode::HostAuthenticationFailed,
     };
-    RuntimeError::new(code, error.to_string())
+    RuntimeError::new(code, error.to_string()).with_diagnostic_code(
+        freshell_runtime_protocol::RuntimeDiagnosticCode::HostCommandFrameFailed,
+    )
 }
 
 /// One bounded framed request/reply against a session host's control socket.
@@ -3690,8 +3692,11 @@ async fn request_host_reply_classified(
     envelope: &Envelope<HostCommand>,
     budget: Duration,
 ) -> Result<HostReply, ClassifiedFailure> {
-    let unreachable =
-        |message: String| RuntimeError::new(RuntimeErrorCode::HostUnreachable, message);
+    let unreachable = |message: String| {
+        RuntimeError::new(RuntimeErrorCode::HostUnreachable, message).with_diagnostic_code(
+            freshell_runtime_protocol::RuntimeDiagnosticCode::HostSocketConnectFailed,
+        )
+    };
     let socket_display = socket_path.display().to_string();
     tokio::time::timeout(budget, async {
         let mut stream = UnixStream::connect(socket_path)
@@ -3713,10 +3718,18 @@ async fn request_host_reply_classified(
     })
     .await
     .unwrap_or_else(|_| {
-        Err(ClassifiedFailure::timeout(unreachable(format!(
-            "session host {socket_display} timed out after {}ms",
-            budget.as_millis()
-        ))))
+        Err(ClassifiedFailure::timeout(
+            RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                format!(
+                    "session host {socket_display} timed out after {}ms",
+                    budget.as_millis()
+                ),
+            )
+            .with_diagnostic_code(
+                freshell_runtime_protocol::RuntimeDiagnosticCode::HostCommandTimeout,
+            ),
+        ))
     })
 }
 
@@ -3729,8 +3742,6 @@ async fn exchange_host_frame_classified(
     budget: Duration,
     socket_path: &Path,
 ) -> Result<HostReply, ClassifiedFailure> {
-    let unreachable =
-        |message: String| RuntimeError::new(RuntimeErrorCode::HostUnreachable, message);
     let socket_display = socket_path.display().to_string();
     tokio::time::timeout(budget, async {
         write_frame(stream, envelope)
@@ -3741,10 +3752,18 @@ async fn exchange_host_frame_classified(
     })
     .await
     .unwrap_or_else(|_| {
-        Err(ClassifiedFailure::timeout(unreachable(format!(
-            "session host {socket_display} timed out after {}ms",
-            budget.as_millis()
-        ))))
+        Err(ClassifiedFailure::timeout(
+            RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                format!(
+                    "session host {socket_display} timed out after {}ms",
+                    budget.as_millis()
+                ),
+            )
+            .with_diagnostic_code(
+                freshell_runtime_protocol::RuntimeDiagnosticCode::HostCommandTimeout,
+            ),
+        ))
     })
 }
 
@@ -4682,6 +4701,9 @@ mod release_scope_tests {
         let error = RuntimeError::new(
             RuntimeErrorCode::HostUnreachable,
             format!("prepare provider bootstrap failed: {secret}"),
+        )
+        .with_diagnostic_code(
+            freshell_runtime_protocol::RuntimeDiagnosticCode::ProviderStatePrepareFailed,
         );
 
         append_event(
@@ -4703,6 +4725,10 @@ mod release_scope_tests {
         assert_eq!(event["data"]["launchState"], "starting");
         assert_eq!(event["data"]["errorCode"], "HOST_UNREACHABLE");
         assert_eq!(event["data"]["errorClass"], "runtime_activation_failed");
+        assert_eq!(
+            event["data"]["failureReason"],
+            "PROVIDER_STATE_PREPARE_FAILED"
+        );
         assert!(event["data"].get("errorMessage").is_none());
         assert!(!contents.contains("prepare provider bootstrap failed"));
     }
@@ -6231,7 +6257,7 @@ fn activation_failure_data(
     stage: &'static str,
     error: &RuntimeError,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut data = serde_json::json!({
         "soulId": prepared.soul_id,
         "incarnationId": prepared.incarnation_id,
         "intentRevision": prepared.intent_revision,
@@ -6239,7 +6265,11 @@ fn activation_failure_data(
         "stage": stage,
         "errorCode": error.code,
         "errorClass": "runtime_activation_failed",
-    })
+    });
+    if let Some(reason) = error.diagnostic_code {
+        data["failureReason"] = serde_json::json!(reason);
+    }
+    data
 }
 
 fn set_mode(path: &Path, mode: u32) -> Result<(), String> {

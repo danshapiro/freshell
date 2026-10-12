@@ -102,6 +102,7 @@ function observeBrowserWire(page: Page): WireObservations {
 function ordinaryFreshAgentEventFacts(frames: readonly any[]) {
   const counts = { created: 0, createFailed: 0, assistant: 0, stream: 0, error: 0,
     snapshot: 0, changed: 0, turnComplete: 0, result: 0 }
+  const turnOutcomes: Record<string, number> = {}
   const createFailureCodes = new Set<string>()
   let errorCodePresent = false
   let errorMessagePresent = false
@@ -137,12 +138,18 @@ function ordinaryFreshAgentEventFacts(frames: readonly any[]) {
         break
       case 'freshAgent.session.snapshot': counts.snapshot++; break
       case 'freshAgent.session.changed': counts.changed++; break
-      case 'freshAgent.turn.complete': counts.turnComplete++; break
+      case 'freshAgent.turn.complete': {
+        counts.turnComplete++
+        if (typeof event.outcome === 'string' && /^[a-z_]{1,32}$/.test(event.outcome)) {
+          turnOutcomes[event.outcome] = (turnOutcomes[event.outcome] ?? 0) + 1
+        }
+        break
+      }
       case 'freshAgent.result': counts.result++; break
     }
   }
   return { counts, createFailureCodes: [...createFailureCodes].sort(), errorCodePresent, errorMessagePresent,
-    assistantTextCharacters, streamedTextCharacters }
+    assistantTextCharacters, streamedTextCharacters, turnOutcomes }
 }
 
 async function paneFor(page: Page, observation: Parameters<typeof observeOwnedFreshBrowserPane>[0]) {

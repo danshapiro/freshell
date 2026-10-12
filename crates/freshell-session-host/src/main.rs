@@ -1402,7 +1402,11 @@ async fn grant_execution(
             // provider-owned helper to refresh only that projection. Docker's
             // ownership proof pins the same soul-scoped volume on replacement.
             if !exact_resume && terminal.opencode_transfer.is_none() {
-                prepare_provider_state_for_fresh_launch(&mut terminal)?;
+                prepare_provider_state_for_fresh_launch(&mut terminal).map_err(|error| {
+                    error.with_diagnostic_code(
+                        freshell_runtime_protocol::RuntimeDiagnosticCode::ProviderStatePrepareFailed,
+                    )
+                })?;
             } else if exact_resume {
                 refresh_provider_context(
                     terminal.provider_launch_context.as_ref(),
@@ -1434,6 +1438,9 @@ async fn grant_execution(
                     RuntimeErrorCode::HostUnreachable,
                     format!("resolve managed provider credentials: {error}"),
                 )
+                .with_diagnostic_code(
+                    freshell_runtime_protocol::RuntimeDiagnosticCode::ProviderSecretResolutionFailed,
+                )
             })?;
             prepare_provider_files(
                 &terminal.mode,
@@ -1446,6 +1453,9 @@ async fn grant_execution(
                     RuntimeErrorCode::HostUnreachable,
                     format!("prepare OneCLI provider files: {error}"),
                 )
+                .with_diagnostic_code(
+                    freshell_runtime_protocol::RuntimeDiagnosticCode::ProviderFilesPrepareFailed,
+                )
             })?;
             let mut prepared = providers::prepare_terminal(terminal, &resolved_secrets.environment)
                 .await
@@ -1453,6 +1463,9 @@ async fn grant_execution(
                     RuntimeError::new(
                         RuntimeErrorCode::HostUnreachable,
                         format!("prepare managed provider: {error}"),
+                    )
+                    .with_diagnostic_code(
+                        freshell_runtime_protocol::RuntimeDiagnosticCode::ProviderLaunchPrepareFailed,
                     )
                 })?;
             if let Some(binding) = persisted.native_identity_launch.as_ref() {
@@ -1474,7 +1487,11 @@ async fn grant_execution(
             };
             let launched = match transfer_phase_gate.as_mut() {
                 Some(gate) => run_opencode_transfer_pty_spawn(gate, spawn).await?,
-                None => spawn().await?,
+                None => spawn().await.map_err(|error| {
+                    error.with_diagnostic_code(
+                        freshell_runtime_protocol::RuntimeDiagnosticCode::ProviderProcessSpawnFailed,
+                    )
+                })?,
             };
             let pid = launched.pid;
             if let Some(transfer) = terminal.opencode_transfer.as_ref() {
@@ -1535,6 +1552,9 @@ async fn grant_execution(
                         RuntimeErrorCode::HostUnreachable,
                         format!("prepare hosted provider state: {error}"),
                     )
+                    .with_diagnostic_code(
+                        freshell_runtime_protocol::RuntimeDiagnosticCode::ProviderStatePrepareFailed,
+                    )
                 })?;
             } else {
                 refresh_provider_context(
@@ -1564,6 +1584,9 @@ async fn grant_execution(
                             RuntimeErrorCode::HostUnreachable,
                             format!("resolve hosted OneCLI grant: {error}"),
                         )
+                        .with_diagnostic_code(
+                            freshell_runtime_protocol::RuntimeDiagnosticCode::ProviderSecretResolutionFailed,
+                        )
                     },
                 )?;
             prepare_provider_files(
@@ -1577,10 +1600,17 @@ async fn grant_execution(
                     RuntimeErrorCode::HostUnreachable,
                     format!("prepare hosted OneCLI provider files: {error}"),
                 )
+                .with_diagnostic_code(
+                    freshell_runtime_protocol::RuntimeDiagnosticCode::ProviderFilesPrepareFailed,
+                )
             })?;
             effects
                 .prepare_fresh_agent_child_environment(&launch, &mut resolved_secrets.environment)
-                .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
+                .map_err(|error| {
+                    RuntimeError::new(RuntimeErrorCode::HostUnreachable, error).with_diagnostic_code(
+                        freshell_runtime_protocol::RuntimeDiagnosticCode::ProviderChildEnvironmentPrepareFailed,
+                    )
+                })?;
             if let Some(binding) = persisted.native_identity_launch.as_ref() {
                 resolved_secrets.environment.insert(
                     providers::native_identity::LAUNCH_ENV.into(),
@@ -1589,7 +1619,11 @@ async fn grant_execution(
                 );
             }
             freshell_platform::managed_child_secrets::install(resolved_secrets.environment)
-                .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
+                .map_err(|error| {
+                    RuntimeError::new(RuntimeErrorCode::HostUnreachable, error).with_diagnostic_code(
+                        freshell_runtime_protocol::RuntimeDiagnosticCode::ProviderChildEnvironmentInstallFailed,
+                    )
+                })?;
             let actor = effects
                 .open_fresh_agent(&state.state_dir, launch.clone())
                 .await
@@ -1597,6 +1631,9 @@ async fn grant_execution(
                     RuntimeError::new(
                         RuntimeErrorCode::HostUnreachable,
                         format!("hosted fresh-agent provider failed to start: {error}"),
+                    )
+                    .with_diagnostic_code(
+                        freshell_runtime_protocol::RuntimeDiagnosticCode::FreshAgentOpenFailed,
                     )
                 })?;
             let profile = actor.profile().await;

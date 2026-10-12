@@ -1166,6 +1166,25 @@ pub enum RuntimeErrorCode {
     RecoveryStopUnconfirmed,
 }
 
+/// Stable, body-free context for diagnosing a host activation failure.
+/// This is optional so older supervisors and session hosts keep the existing
+/// wire shape and newer ones can still read replies from older peers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RuntimeDiagnosticCode {
+    HostSocketConnectFailed,
+    HostCommandFrameFailed,
+    HostCommandTimeout,
+    ProviderStatePrepareFailed,
+    ProviderSecretResolutionFailed,
+    ProviderFilesPrepareFailed,
+    ProviderLaunchPrepareFailed,
+    ProviderChildEnvironmentPrepareFailed,
+    ProviderChildEnvironmentInstallFailed,
+    ProviderProcessSpawnFailed,
+    FreshAgentOpenFailed,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeLimits {
@@ -3072,6 +3091,8 @@ pub struct RuntimeMetricsRequest {
 pub struct RuntimeError {
     pub code: RuntimeErrorCode,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic_code: Option<RuntimeDiagnosticCode>,
 }
 
 impl RuntimeError {
@@ -3079,7 +3100,13 @@ impl RuntimeError {
         Self {
             code,
             message: message.into(),
+            diagnostic_code: None,
         }
+    }
+
+    pub fn with_diagnostic_code(mut self, diagnostic_code: RuntimeDiagnosticCode) -> Self {
+        self.diagnostic_code = Some(diagnostic_code);
+        self
     }
 }
 
@@ -4438,6 +4465,31 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_errors_keep_optional_body_free_diagnostic_codes_compatible() {
+        let error = RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            "private detail must remain outside lifecycle diagnostics",
+        )
+        .with_diagnostic_code(RuntimeDiagnosticCode::ProviderStatePrepareFailed);
+        let encoded = serde_json::to_value(&error).unwrap();
+        assert_eq!(encoded["diagnosticCode"], "PROVIDER_STATE_PREPARE_FAILED");
+
+        let old_payload = serde_json::json!({
+            "code": "HOST_UNREACHABLE",
+            "message": "legacy host error",
+        });
+        let decoded: RuntimeError = serde_json::from_value(old_payload).unwrap();
+        assert_eq!(decoded.diagnostic_code, None);
+
+        let undecorated = serde_json::to_value(RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            "legacy host error",
+        ))
+        .unwrap();
+        assert!(undecorated.get("diagnosticCode").is_none());
+    }
 
     #[test]
     fn durable_terminal_argument_recipe_preserves_provider_options_and_legacy_modes() {

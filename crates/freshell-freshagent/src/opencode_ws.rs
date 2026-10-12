@@ -2751,6 +2751,7 @@ impl FreshOpencodeState {
             drop(released_at_dispatch);
             drop(op_guard.take()); // never-dispatched paths (errors, aborts)
             let result = turn_result;
+            let outcome = classify_turn_outcome(&result, turn_errored.load(Ordering::SeqCst));
             match &result {
                 // The idle edge was observed (or the daemon itself is gone —
                 // nothing runs daemon-side): the accepted turn is settled.
@@ -2768,10 +2769,9 @@ impl FreshOpencodeState {
             settle_turn_outcome(
                 &fresh_agent,
                 &real_id,
-                result.is_ok(),
                 &turn_aborted,
-                &turn_errored,
                 &last_turn_complete_at,
+                outcome,
             );
             // send-during-compact queue: FIFO one-at-a-time — after this
             // send settles, drive the next queued entry (no-op when the
@@ -4721,7 +4721,12 @@ impl FreshOpencodeState {
                                     session.killed.load(Ordering::SeqCst)
                                 };
                                 if !session_gone {
-                                    mint_turn_complete_edge(&self.fresh_agent, &real_id, &clock);
+                                    mint_turn_complete_edge(
+                                        &self.fresh_agent,
+                                        &real_id,
+                                        &clock,
+                                        None,
+                                    );
                                     tracing::debug!(
                                         provider = PROVIDER,
                                         session_id = %real_id,
@@ -5378,14 +5383,13 @@ impl FreshOpencodeState {
                 }
                 Err(_) => {}
             }
-            let succeeded = result.is_ok();
+            let outcome = classify_turn_outcome(&result, turn_errored.load(Ordering::SeqCst));
             settle_turn_outcome(
                 &fresh_agent,
                 &compact_id,
-                succeeded,
                 &turn_aborted,
-                &turn_errored,
                 &last_turn_complete_at,
+                outcome,
             );
             if let Err(err) = result {
                 // Server-side observability (the 2026-09-11 compact incident's
@@ -8694,8 +8698,46 @@ fn error_event(session_id: &str, message: &str) -> Value {
 /// unified turn-end attention edge — emitted for ANY turn end except a
 /// user-initiated interrupt, deliberately diverging from the legacy
 /// status-guarded positive-completion chime of adapter.ts:377-381).
-fn turn_complete_event(session_id: &str, at: i64) -> Value {
-    json!({ "type": "freshAgent.turn.complete", "sessionId": session_id, "at": at })
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnOutcome {
+    Completed,
+    ProviderError,
+    IdleTimeout,
+    SidecarLost,
+    RequestFailed,
+}
+
+impl TurnOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::ProviderError => "provider_error",
+            Self::IdleTimeout => "idle_timeout",
+            Self::SidecarLost => "sidecar_lost",
+            Self::RequestFailed => "request_failed",
+        }
+    }
+}
+
+fn classify_turn_outcome(result: &Result<(), ServeError>, provider_errored: bool) -> TurnOutcome {
+    if provider_errored {
+        return TurnOutcome::ProviderError;
+    }
+    match result {
+        Ok(()) => TurnOutcome::Completed,
+        Err(ServeError::IdleTimeout { .. }) => TurnOutcome::IdleTimeout,
+        Err(ServeError::SidecarLost { .. }) => TurnOutcome::SidecarLost,
+        Err(_) => TurnOutcome::RequestFailed,
+    }
+}
+
+fn turn_complete_event(session_id: &str, at: i64, outcome: Option<TurnOutcome>) -> Value {
+    let mut event =
+        json!({ "type": "freshAgent.turn.complete", "sessionId": session_id, "at": at });
+    if let Some(outcome) = outcome {
+        event["outcome"] = json!(outcome.as_str());
+    }
+    event
 }
 
 /// Stamp the session's strictly-monotonic turn-complete clock and broadcast the
@@ -8706,6 +8748,7 @@ fn mint_turn_complete_edge(
     fresh_agent: &FreshAgentState,
     real_id: &str,
     last_turn_complete_at: &StdMutex<Option<i64>>,
+    outcome: Option<TurnOutcome>,
 ) {
     let at = {
         let mut guard = last_turn_complete_at
@@ -8715,7 +8758,10 @@ fn mint_turn_complete_edge(
         *guard = Some(at);
         at
     };
-    fresh_agent.broadcast(&event_frame(real_id, turn_complete_event(real_id, at)));
+    fresh_agent.broadcast(&event_frame(
+        real_id,
+        turn_complete_event(real_id, at, outcome),
+    ));
 }
 
 /// The shared settle tail of a turn-scoped opencode pipeline (a send turn, a compact):
@@ -8725,29 +8771,27 @@ fn mint_turn_complete_edge(
 /// "the user did not interrupt" (`!turn_aborted`). A clean finish, a
 /// `session.error` turn (`turn_errored`), and a failed settle (`succeeded=false`:
 /// prompt-POST failure, `IdleTimeout`, `SidecarLost`) all ended a turn the user
-/// may not have been watching — one identical edge, no outcome on the wire —
-/// stamped by the session's monotonic turn-complete clock.
+/// may not have been watching. The edge carries a finite outcome category, never
+/// provider error text, and is stamped by the session's monotonic clock.
 fn settle_turn_outcome(
     fresh_agent: &FreshAgentState,
     real_id: &str,
-    succeeded: bool,
     turn_aborted: &AtomicBool,
-    turn_errored: &AtomicBool,
     last_turn_complete_at: &StdMutex<Option<i64>>,
+    outcome: TurnOutcome,
 ) {
     fresh_agent.broadcast(&event_frame(real_id, snapshot_event(real_id, "idle")));
     // Unified "needs attention": ANY turn end rings except a user-initiated
     // interrupt (turn_aborted). A clean finish, a session.error turn
-    // (turn_errored), and a failed settle (succeeded=false: prompt-POST
-    // failure, IdleTimeout, SidecarLost) all ended a turn the user may not
-    // have been watching — one identical edge, no outcome on the wire.
+    // (turn_errored), and a failed settle all ended a turn the user may not
+    // have been watching. The event's outcome is a fixed category, not raw detail.
     if turn_aborted.load(Ordering::SeqCst) {
         return;
     }
-    if !succeeded || turn_errored.load(Ordering::SeqCst) {
+    if outcome != TurnOutcome::Completed {
         tracing::debug!(provider = PROVIDER, session_id = %real_id, "turn.settled_non_clean_unified_edge");
     }
-    mint_turn_complete_edge(fresh_agent, real_id, last_turn_complete_at);
+    mint_turn_complete_edge(fresh_agent, real_id, last_turn_complete_at, Some(outcome));
 }
 
 /// `freshAgent.session.materialized` (legacy reference: server/ws-handler.ts's
@@ -16190,7 +16234,7 @@ mod tests {
         // the pending RPC window — the tail's own mint, which nothing can
         // un-ring. The injection runs the real mint helper (the same
         // clock-stamped broadcast the tail's mint segment performs).
-        mint_turn_complete_edge(&st.fresh_agent, "ses_1", &clock);
+        mint_turn_complete_edge(&st.fresh_agent, "ses_1", &clock, None);
 
         // The tail completes inside the window (a finished drive observed
         // its end), then the abort RPC fails and the Err arm runs — with the
@@ -20760,11 +20804,52 @@ mod tests {
         assert_eq!(error["event"]["message"], "boom");
 
         let complete = serde_json::from_str::<serde_json::Value>(
-            &serde_json::to_string(&event_frame("s-1", turn_complete_event("s-1", 42))).unwrap(),
+            &serde_json::to_string(&event_frame(
+                "s-1",
+                turn_complete_event("s-1", 42, Some(TurnOutcome::IdleTimeout)),
+            ))
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(complete["event"]["type"], "freshAgent.turn.complete");
         assert_eq!(complete["event"]["at"], 42);
+        assert_eq!(complete["event"]["outcome"], "idle_timeout");
+        assert!(complete["event"].get("message").is_none());
+
+        let legacy_complete = turn_complete_event("s-1", 43, None);
+        assert!(legacy_complete.get("outcome").is_none());
+    }
+
+    #[test]
+    fn turn_outcome_reports_only_bounded_settlement_categories() {
+        let idle_timeout = Err(ServeError::IdleTimeout {
+            session_id: "private-session-detail".into(),
+            timeout_ms: 10,
+        });
+        assert_eq!(
+            classify_turn_outcome(&idle_timeout, false),
+            TurnOutcome::IdleTimeout
+        );
+        let sidecar_lost = Err(ServeError::SidecarLost {
+            session_id: "private-session-detail".into(),
+        });
+        assert_eq!(
+            classify_turn_outcome(&sidecar_lost, false),
+            TurnOutcome::SidecarLost
+        );
+        assert_eq!(
+            classify_turn_outcome(&Ok(()), true),
+            TurnOutcome::ProviderError
+        );
+        assert_eq!(
+            classify_turn_outcome(&Ok(()), false),
+            TurnOutcome::Completed
+        );
+        let failed_request = Err(ServeError::Transport("private transport detail".into()));
+        assert_eq!(
+            classify_turn_outcome(&failed_request, false),
+            TurnOutcome::RequestFailed
+        );
     }
 
     #[test]
