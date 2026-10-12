@@ -11840,7 +11840,7 @@ async fn stop_managed_row(
                     }),
                     descriptor.as_ref().map(|d| d.mode.clone()),
                     descriptor.and_then(|d| d.resume_session_id),
-                    freshell_containment::StopReason::ShiftX.as_str(),
+                    crate::pane_ledger::STOPPED_REASON_KILL,
                     now_ms(),
                 );
                 let keys = crate::unit_lifecycle::stopped_record_keys(
@@ -11918,7 +11918,7 @@ async fn kill_not_found(
                             Some(crq),
                             None,
                             None,
-                            freshell_containment::StopReason::ShiftX.as_str(),
+                            crate::pane_ledger::STOPPED_REASON_KILL,
                             now_ms(),
                         );
                         let keys = crate::unit_lifecycle::stopped_record_keys(&record, None);
