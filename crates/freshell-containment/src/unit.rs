@@ -571,15 +571,17 @@ impl AgentUnit {
         self.inner.backend.members(&self.live_roots())
     }
 
-    /// The members plus every `extra` process they do not include.
-    fn members_and(&self, extra: Vec<ProcIdentity>) -> Vec<ProcIdentity> {
-        let mut members = self.member_list().unwrap_or_default().members;
+    /// The members plus every `extra` process they do not include. Members
+    /// that cannot be read are an error ("could not check"), never only
+    /// the `extra` ones.
+    fn members_and(&self, extra: Vec<ProcIdentity>) -> io::Result<Vec<ProcIdentity>> {
+        let mut members = self.member_list()?.members;
         for process in extra {
             if !members.iter().any(|m| m.pid == process.pid) {
                 members.push(process);
             }
         }
-        members
+        Ok(members)
     }
 
     /// Logs the same-uid processes a member scan could not read, with the
@@ -1209,15 +1211,15 @@ impl AgentUnit {
         let paths = paths.to_vec();
         let snapshot = live_identity_list(snapshot);
         blocking(move || {
-            let members = unit.members_and(snapshot);
+            let members = unit.members_and(snapshot)?;
             let pids: Vec<u32> = members.iter().map(|m| m.pid).collect();
             let holders = locks::lock_holders_among(&paths, &pids);
-            members
+            Ok(members
                 .into_iter()
                 .filter(|m| holders.iter().any(|h| h.pid == m.pid))
-                .collect()
+                .collect())
         })
-        .await
+        .await?
     }
 
     /// macOS: a process that has begun exiting no longer shows its
@@ -1327,20 +1329,20 @@ impl AgentUnit {
         let paths = paths.to_vec();
         let snapshot = live_identity_list(snapshot);
         blocking(move || {
-            let members = unit.members_and(snapshot);
+            let members = unit.members_and(snapshot)?;
             let pids: Vec<u32> = members.iter().map(|m| m.pid).collect();
             let scan = locks::scan_among(&paths, &pids);
             let member = |pid: u32| members.iter().find(|m| m.pid == pid).cloned();
-            MemberLockScan {
+            Ok(MemberLockScan {
                 holders: scan
                     .holders
                     .into_iter()
                     .filter_map(|h| member(h.pid).map(|m| (m, h.path)))
                     .collect(),
                 unreadable: scan.unreadable.into_iter().filter_map(member).collect(),
-            }
+            })
         })
-        .await
+        .await?
     }
 
     /// Step f: Gone. The report, `on_gone`, the record's deletion, then the
@@ -1400,7 +1402,10 @@ impl AgentUnit {
 
     /// After Gone: kill anything that appeared since, wait (event-driven,
     /// bounded by `POST_GONE_EMPTY_WAIT`) for the unit to empty, log the
-    /// survivors, release the unit's container.
+    /// survivors, release the unit's container. Members that cannot be
+    /// read leave the survivors unknown: that is logged
+    /// (`unit.release_failed`), and without an emptiness event the unit is
+    /// then never taken for emptied.
     async fn sweep(&self, keys: &UnitLogKeys) -> Vec<ProcIdentity> {
         self.kill_whole_unit(keys, &[]).await;
         let (emptied, survivors) = match self.inner.backend.wait_empty() {
@@ -1418,26 +1423,18 @@ impl AgentUnit {
                     }
                     Err(_) => false,
                 };
-                let unit = self.clone();
-                let survivors = blocking(move || unit.member_list().unwrap_or_default().members)
-                    .await
-                    .unwrap_or_default();
+                let survivors = self.members_after_gone(keys).await.unwrap_or_default();
                 (emptied, survivors)
             }
             None => {
                 // No emptiness event: wait for the exit of whatever is
                 // still a member, under the same bound.
-                let unit = self.clone();
-                let left: Vec<ProcWatch> = blocking(move || {
-                    unit.member_list()
-                        .unwrap_or_default()
-                        .members
-                        .into_iter()
-                        .filter_map(|p| ProcWatch::open_expecting(p.pid, p.start).ok())
-                        .collect()
-                })
-                .await
-                .unwrap_or_default();
+                let listed = self.members_after_gone(keys).await;
+                let left: Vec<ProcWatch> = listed
+                    .iter()
+                    .flatten()
+                    .filter_map(|p| ProcWatch::open_expecting(p.pid, p.start).ok())
+                    .collect();
                 let deadline = tokio::time::Instant::now() + POST_GONE_EMPTY_WAIT;
                 for watch in &left {
                     let _ = tokio::time::timeout_at(deadline, watch.exited()).await;
@@ -1447,7 +1444,7 @@ impl AgentUnit {
                     .filter(|w| !w.has_exited())
                     .map(|w| w.identity().clone())
                     .collect();
-                (survivors.is_empty(), survivors)
+                (listed.is_some() && survivors.is_empty(), survivors)
             }
         };
         events::descendants_survived(keys, &survivors);
@@ -1460,6 +1457,27 @@ impl AgentUnit {
             events::release_failed(keys, &err.to_string());
         }
         survivors
+    }
+
+    /// One member read after Gone; `None` when the members cannot be read
+    /// (the survivors are unknown), which is logged (`unit.release_failed`).
+    async fn members_after_gone(&self, keys: &UnitLogKeys) -> Option<Vec<ProcIdentity>> {
+        let unit = self.clone();
+        match blocking(move || unit.member_list())
+            .await
+            .and_then(|read| read)
+        {
+            Ok(list) => Some(list.members),
+            Err(err) => {
+                events::release_failed(
+                    keys,
+                    &format!(
+                        "the unit's members cannot be read after Gone, so its survivors are unknown: {err}"
+                    ),
+                );
+                None
+            }
+        }
     }
 
     /// The screen, the main and every extra root.
@@ -2271,6 +2289,90 @@ sleep 600;"#;
         assert!(
             !released,
             "the daemon-family holder still holds its lock file"
+        );
+    }
+
+    /// A unit whose members cannot be read ("could not check", as the tag
+    /// backend answers when a `/proc` read fails, here for want of a file
+    /// descriptor). Its kill has nothing to report, it has no emptiness
+    /// event, and it keeps the `emptied` its release is given.
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct Unreadable {
+        released: Mutex<Option<bool>>,
+    }
+
+    #[cfg(unix)]
+    impl UnitBackend for Unreadable {
+        fn placement(&self, role: MemberRole, seq: u32) -> io::Result<Placement> {
+            NoProcesses.placement(role, seq)
+        }
+        fn kill_all(
+            self: Arc<Self>,
+            _roots: Vec<(u32, u64)>,
+        ) -> BoxFuture<'static, io::Result<KillSummary>> {
+            Box::pin(async { Ok(KillSummary::default()) })
+        }
+        fn members(&self, _roots: &[(u32, u64)]) -> io::Result<MemberList> {
+            Err(io::Error::from_raw_os_error(libc::EMFILE))
+        }
+        fn confirm_placement(&self, pid: u32, roots: &[(u32, u64)]) -> io::Result<()> {
+            NoProcesses.confirm_placement(pid, roots)
+        }
+        fn wait_empty(&self) -> Option<BoxFuture<'static, io::Result<()>>> {
+            None
+        }
+        fn remove(&self, emptied: bool) -> io::Result<()> {
+            *lock(&self.released) = Some(emptied);
+            Ok(())
+        }
+    }
+
+    /// The Gone lock check looks for holders among the unit's members: when
+    /// they cannot be read it could not check, which is an error (the stop
+    /// attempt fails), never "the lock is released".
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lock_check_that_cannot_read_the_members_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = unit_on(Arc::new(Unreadable::default()));
+        unit.set_lock_paths(vec![dir.path().join("thread.lock")]);
+        let checked = tokio::time::timeout(Duration::from_secs(10), unit.check_locks(&[]))
+            .await
+            .expect("the check answers");
+        assert!(
+            checked.is_err(),
+            "members that could not be read were checked: {checked:?}"
+        );
+    }
+
+    /// The post-Gone sweep lists the unit's survivors with one member read:
+    /// when that read fails it says so (`unit.release_failed`) and never
+    /// calls the unit emptied, instead of reporting no survivors.
+    #[cfg(unix)]
+    #[test]
+    fn a_sweep_that_cannot_read_the_members_says_its_survivors_are_unknown() {
+        let backend = Arc::new(Unreadable::default());
+        let unit = unit_on(backend.clone());
+        let main = Spawned::perl_sleep(&[]);
+        unit.set_main(main.watch.clone());
+        let events = capture_on_runtime(async {
+            let handle = unit.stop(StopRequest::new(StopMode::Force, StopReason::ShiftX, "ws"));
+            tokio::time::timeout(Duration::from_secs(10), handle.wait_swept())
+                .await
+                .expect("Gone and swept");
+        });
+        let release_failed = named(&events, "unit.release_failed");
+        assert_eq!(
+            release_failed.len(),
+            1,
+            "the sweep says its survivors are unknown: {events:?}"
+        );
+        assert_unit_keys(release_failed[0], &unit, "");
+        assert_eq!(
+            *lock(&backend.released),
+            Some(false),
+            "a sweep that could not read the members called the unit emptied"
         );
     }
 

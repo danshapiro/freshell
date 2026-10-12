@@ -6,6 +6,12 @@
 //! `KERN_PROCARGS2`.
 //! A process's arguments (argv) are read only for [`is_codex_daemon_family`]
 //! and are never logged or sent anywhere: argv can carry secrets.
+//!
+//! The plain reads answer a read that failed as if the process were gone.
+//! The tag backend's member scan reads through the `_checked` and
+//! `_listing` variants instead, which tell the two apart: on Linux a read
+//! that failed for any reason but the process being gone (ENOENT, ESRCH) is
+//! "could not check" (`Err`, or a listing's `unread`), never "not a member".
 
 use std::io;
 
@@ -39,15 +45,31 @@ fn env_lookup<'a>(entries: impl IntoIterator<Item = &'a [u8]>, key: &str) -> Env
 
 /// Linux: `/proc/<pid>/environ` (through a running thread once the main
 /// thread has exited, see [`read_memory_file`]); a permission error (another
-/// uid, a non-dumpable process) is `Withheld`, any other error (gone)
-/// `Absent`.
+/// uid, a non-dumpable process) is `Withheld`, any other error (gone, or a
+/// read that could not be made) `Absent`.
 #[cfg(target_os = "linux")]
 pub fn environ_read(pid: u32, key: &str) -> EnvRead {
+    environ_read_checked(pid, key).unwrap_or(EnvRead::Absent)
+}
+
+/// Linux: [`environ_read`], except that a read that failed for a reason
+/// other than permission or the process being gone is `Err` ("could not
+/// check"), never `Absent`.
+#[cfg(target_os = "linux")]
+pub(crate) fn environ_read_checked(pid: u32, key: &str) -> io::Result<EnvRead> {
     match read_memory_file(pid, "environ") {
-        Ok(raw) => env_lookup(raw.split(|b| *b == 0), key),
-        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => EnvRead::Withheld,
-        Err(_) => EnvRead::Absent,
+        Ok(raw) => Ok(env_lookup(raw.split(|b| *b == 0), key)),
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => Ok(EnvRead::Withheld),
+        Err(err) if is_gone(&err) => Ok(EnvRead::Absent),
+        Err(err) => Err(err),
     }
+}
+
+/// macOS: [`environ_read`] (a failed lookup is not told from a gone
+/// process there).
+#[cfg(target_os = "macos")]
+pub(crate) fn environ_read_checked(pid: u32, key: &str) -> io::Result<EnvRead> {
+    Ok(environ_read(pid, key))
 }
 
 /// macOS: `Withheld` when the program is restricted (`CS_RESTRICT`) or the
@@ -168,6 +190,18 @@ pub fn identity(pid: u32) -> io::Result<ProcIdentity> {
     })
 }
 
+/// [`identity`], `None` when the process is gone; a start time that could
+/// not be read for another reason is `Err` ("could not check", see
+/// [`start_time_checked`]).
+#[cfg(unix)]
+pub(crate) fn identity_checked(pid: u32) -> io::Result<Option<ProcIdentity>> {
+    Ok(start_time_checked(pid)?.map(|start| ProcIdentity {
+        pid,
+        start,
+        name: name(pid).unwrap_or_default(),
+    }))
+}
+
 /// True when `argv` (ONE process's own arguments) belongs to Codex's own
 /// managed app-server daemon family, which Freshell must never signal.
 ///
@@ -271,6 +305,32 @@ pub fn start_time(pid: u32) -> io::Result<u64> {
     crate::darwin::bsdinfo(pid).map(|info| crate::darwin::start_of(&info))
 }
 
+/// Linux: [`start_time`], `None` when the process is gone; a read that
+/// failed for another reason is `Err` ("could not check").
+#[cfg(target_os = "linux")]
+pub(crate) fn start_time_checked(pid: u32) -> io::Result<Option<u64>> {
+    match start_time(pid) {
+        Ok(start) => Ok(Some(start)),
+        Err(err) if is_gone(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// macOS: [`start_time`], `None` when it cannot be read (a failed lookup is
+/// not told from a gone process there).
+#[cfg(target_os = "macos")]
+pub(crate) fn start_time_checked(pid: u32) -> io::Result<Option<u64>> {
+    Ok(start_time(pid).ok())
+}
+
+/// Linux: whether a failed read of a `/proc/<pid>/` file means that the
+/// process (or the thread read) is gone: no such entry (ENOENT), or its
+/// task went away during the read (ESRCH).
+#[cfg(target_os = "linux")]
+fn is_gone(err: &io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::ENOENT | libc::ESRCH))
+}
+
 /// The process name. Linux: `/proc/<pid>/comm` without its trailing newline.
 #[cfg(target_os = "linux")]
 pub fn name(pid: u32) -> io::Result<String> {
@@ -297,45 +357,81 @@ pub fn argv(pid: u32) -> io::Result<Vec<String>> {
         .collect())
 }
 
-/// Linux: true while the process runs, that is while any thread of it runs.
-/// `/proc/<pid>/stat` shows the thread-group leader's own state: Z once the
-/// main thread has exited, also while other threads run on (a main thread
-/// that called `pthread_exit`), so a Z leader counts as running while other
-/// threads remain ([`main_thread_exited`]). A zombie counts only its
-/// unreaped leader.
+/// Linux: true while the process runs, that is while any thread of it runs:
+/// also while its main thread has exited and other threads run on (a main
+/// thread that called `pthread_exit`; [`main_thread_exited`]), never for a
+/// zombie. False also when its state cannot be read
+/// ([`is_running_checked`] tells that apart).
 #[cfg(target_os = "linux")]
 pub fn is_running(pid: u32) -> bool {
-    match leader_state(pid).as_deref() {
-        Some("Z") => thread_count(pid).is_some_and(|n| n > 1),
-        Some("X") | None => false,
-        Some(_) => true,
-    }
+    is_running_checked(pid).unwrap_or(false)
+}
+
+/// Linux: [`is_running`], except that a read that failed for a reason
+/// other than the process being gone is `Err` ("could not check").
+#[cfg(target_os = "linux")]
+pub(crate) fn is_running_checked(pid: u32) -> io::Result<bool> {
+    liveness(pid).map(|now| matches!(now, Liveness::Running | Liveness::MainThreadExited))
 }
 
 /// Linux: whether `pid` runs on although its main thread has exited (its
 /// thread-group leader is Z while other threads remain).
 #[cfg(target_os = "linux")]
 pub(crate) fn main_thread_exited(pid: u32) -> bool {
-    leader_state(pid).as_deref() == Some("Z") && thread_count(pid).is_some_and(|n| n > 1)
+    liveness(pid).is_ok_and(|now| now == Liveness::MainThreadExited)
 }
 
-/// Linux: the state letter of `/proc/<pid>/stat` (the thread-group leader's).
+/// Linux: where a process is between running and gone, as `/proc` shows it.
 #[cfg(target_os = "linux")]
-fn leader_state(pid: u32) -> Option<String> {
-    stat_fields(pid).ok()?.into_iter().next()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Liveness {
+    /// It runs, its main thread included.
+    Running,
+    /// Its main thread has exited while other threads run on: it runs.
+    MainThreadExited,
+    /// A zombie: only its unreaped leader is left.
+    Zombie,
+    /// No such process.
+    Gone,
 }
 
-/// Linux: the `Threads:` count of `/proc/<pid>/status`: the threads not yet
-/// released, so a zombie counts 1 (its leader) until it is reaped.
+/// Linux: `pid`'s [`Liveness`], from the state letter of `/proc/<pid>/stat`
+/// (the thread-group leader's own state: Z once the main thread has exited,
+/// also while other threads run on) and, for a Z leader, the `Threads:`
+/// count of `/proc/<pid>/status` (the threads not yet released: a zombie
+/// counts 1, its leader). A read that failed for a reason other than the
+/// process being gone is `Err` ("could not check").
 #[cfg(target_os = "linux")]
-fn thread_count(pid: u32) -> Option<u32> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+fn liveness(pid: u32) -> io::Result<Liveness> {
+    let state = match stat_fields(pid) {
+        Ok(fields) => fields
+            .into_iter()
+            .next()
+            .ok_or_else(|| io::Error::other("malformed stat"))?,
+        Err(err) if is_gone(&err) => return Ok(Liveness::Gone),
+        Err(err) => return Err(err),
+    };
+    Ok(match state.as_str() {
+        "X" => Liveness::Gone,
+        "Z" => match thread_count(pid) {
+            Ok(threads) if threads > 1 => Liveness::MainThreadExited,
+            Ok(_) => Liveness::Zombie,
+            Err(err) if is_gone(&err) => Liveness::Gone,
+            Err(err) => return Err(err),
+        },
+        _ => Liveness::Running,
+    })
+}
+
+/// Linux: the `Threads:` count of `/proc/<pid>/status`.
+#[cfg(target_os = "linux")]
+fn thread_count(pid: u32) -> io::Result<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
     status
         .lines()
-        .find_map(|line| line.strip_prefix("Threads:"))?
-        .trim()
-        .parse()
-        .ok()
+        .find_map(|line| line.strip_prefix("Threads:"))
+        .and_then(|threads| threads.trim().parse().ok())
+        .ok_or_else(|| io::Error::other("no thread count"))
 }
 
 /// Linux: one of the `/proc/<pid>/` files read from the process's memory
@@ -353,7 +449,11 @@ fn read_memory_file(pid: u32, file: &str) -> io::Result<Vec<u8>> {
 /// shows of them reads empty or is refused, although the process runs on
 /// in its other threads. Then `read` is made of those threads' directories
 /// (`/proc/<pid>/task/<tid>`), which show the process's own: the first
-/// answer that is not `empty`, else an empty one, else the leader's.
+/// answer that is not `empty`; else, when a thread's read failed for a
+/// reason other than the thread being gone, that error (the running
+/// thread's answer is unknown); else an empty answer; else the leader's.
+/// When whether the main thread has exited cannot be read, after an empty
+/// or refused answer, that error is the answer ("could not check").
 #[cfg(target_os = "linux")]
 pub(crate) fn through_a_running_thread<T>(
     pid: u32,
@@ -362,15 +462,29 @@ pub(crate) fn through_a_running_thread<T>(
 ) -> io::Result<T> {
     let own = std::path::PathBuf::from(format!("/proc/{pid}"));
     let leader = read(&own);
-    if matches!(&leader, Ok(found) if !empty(found)) || !main_thread_exited(pid) {
+    if matches!(&leader, Ok(found) if !empty(found)) {
         return leader;
     }
-    let Ok(tasks) = std::fs::read_dir(own.join("task")) else {
-        return leader;
+    match liveness(pid)? {
+        Liveness::MainThreadExited => {}
+        Liveness::Running | Liveness::Zombie | Liveness::Gone => return leader,
+    }
+    let tasks = match std::fs::read_dir(own.join("task")) {
+        Ok(tasks) => tasks,
+        Err(err) if is_gone(&err) => return leader,
+        Err(err) => return Err(err),
     };
     let leader_tid = pid.to_string();
     let mut empty_read = None;
-    for task in tasks.flatten() {
+    let mut unread = None;
+    for task in tasks {
+        let task = match task {
+            Ok(task) => task,
+            Err(err) => {
+                unread.get_or_insert(err);
+                continue;
+            }
+        };
         if task.file_name().to_str() == Some(leader_tid.as_str()) {
             continue;
         }
@@ -379,10 +493,17 @@ pub(crate) fn through_a_running_thread<T>(
             Ok(found) => {
                 empty_read.get_or_insert(found);
             }
-            Err(_) => {}
+            Err(err) if is_gone(&err) => {}
+            Err(err) => {
+                unread.get_or_insert(err);
+            }
         }
     }
-    empty_read.map_or(leader, Ok)
+    match (unread, empty_read) {
+        (Some(err), _) => Err(err),
+        (None, Some(found)) => Ok(found),
+        (None, None) => leader,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -391,29 +512,79 @@ pub fn parent(pid: u32) -> Option<u32> {
 }
 
 /// Linux: the direct children of every thread of `pid`
-/// (`/proc/<pid>/task/*/children`).
+/// (`/proc/<pid>/task/*/children`), as far as they can be read.
 #[cfg(target_os = "linux")]
 pub fn children(pid: u32) -> Vec<u32> {
-    let mut out = Vec::new();
-    if let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) {
-        for task in tasks.flatten() {
-            if let Ok(raw) = std::fs::read_to_string(task.path().join("children")) {
-                out.extend(raw.split_whitespace().filter_map(|p| p.parse::<u32>().ok()));
+    child_listing(pid).found
+}
+
+/// Linux: every process `/proc` lists, as far as it can be read.
+#[cfg(target_os = "linux")]
+pub fn all_pids() -> Vec<u32> {
+    pid_listing().found
+}
+
+/// One one-shot listing of processes, and the first read it could not make
+/// ("could not check"; a process found gone is no failure): `found` is
+/// complete only when `unread` is `None`.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+pub(crate) struct Listing {
+    pub(crate) found: Vec<u32>,
+    pub(crate) unread: Option<io::Error>,
+}
+
+/// Linux: [`all_pids`], with what could not be read.
+#[cfg(target_os = "linux")]
+pub(crate) fn pid_listing() -> Listing {
+    let mut listing = Listing::default();
+    match std::fs::read_dir("/proc") {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(entry) => listing.found.extend(
+                        entry
+                            .file_name()
+                            .to_str()
+                            .and_then(|n| n.parse::<u32>().ok()),
+                    ),
+                    Err(err) => {
+                        listing.unread.get_or_insert(err);
+                    }
+                }
+            }
+        }
+        Err(err) => listing.unread = Some(err),
+    }
+    listing
+}
+
+/// Linux: [`children`], with what could not be read (a thread, or `pid`
+/// itself, found gone has no children to list).
+#[cfg(target_os = "linux")]
+pub(crate) fn child_listing(pid: u32) -> Listing {
+    let mut listing = Listing::default();
+    let tasks = match std::fs::read_dir(format!("/proc/{pid}/task")) {
+        Ok(tasks) => tasks,
+        Err(err) => {
+            if !is_gone(&err) {
+                listing.unread = Some(err);
+            }
+            return listing;
+        }
+    };
+    for task in tasks {
+        match task.and_then(|task| std::fs::read_to_string(task.path().join("children"))) {
+            Ok(raw) => listing
+                .found
+                .extend(raw.split_whitespace().filter_map(|p| p.parse::<u32>().ok())),
+            Err(err) if is_gone(&err) => {}
+            Err(err) => {
+                listing.unread.get_or_insert(err);
             }
         }
     }
-    out
-}
-
-#[cfg(target_os = "linux")]
-pub fn all_pids() -> Vec<u32> {
-    std::fs::read_dir("/proc")
-        .map(|it| {
-            it.flatten()
-                .filter_map(|e| e.file_name().to_str()?.parse().ok())
-                .collect()
-        })
-        .unwrap_or_default()
+    listing
 }
 
 /// Linux: the real uid of `pid` (`/proc/<pid>/status`), readable even for
@@ -868,6 +1039,13 @@ pub fn is_running(pid: u32) -> bool {
     crate::darwin::bsdinfo(pid).is_ok_and(|info| !crate::darwin::is_zombie(&info))
 }
 
+/// macOS: [`is_running`] (a failed lookup is not told from a gone process
+/// there).
+#[cfg(target_os = "macos")]
+pub(crate) fn is_running_checked(pid: u32) -> io::Result<bool> {
+    Ok(is_running(pid))
+}
+
 #[cfg(target_os = "macos")]
 pub fn parent(pid: u32) -> Option<u32> {
     crate::darwin::bsdinfo(pid).ok().map(|info| info.pbi_ppid)
@@ -886,6 +1064,25 @@ pub fn children(pid: u32) -> Vec<u32> {
 #[cfg(target_os = "macos")]
 pub fn all_pids() -> Vec<u32> {
     crate::darwin::all_pids()
+}
+
+/// macOS: [`all_pids`] as a listing (libproc's list; a failed lookup is not
+/// told from a gone process there).
+#[cfg(target_os = "macos")]
+pub(crate) fn pid_listing() -> Listing {
+    Listing {
+        found: all_pids(),
+        unread: None,
+    }
+}
+
+/// macOS: [`children`] as a listing (see [`pid_listing`]).
+#[cfg(target_os = "macos")]
+pub(crate) fn child_listing(pid: u32) -> Listing {
+    Listing {
+        found: children(pid),
+        unread: None,
+    }
 }
 
 #[cfg(test)]

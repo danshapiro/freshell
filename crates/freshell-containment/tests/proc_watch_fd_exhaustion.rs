@@ -12,7 +12,9 @@
 
 use std::time::Duration;
 
-use freshell_containment::{is_process_gone, ProcWatch, Sig};
+use freshell_containment::{
+    is_process_gone, Containment, ProcWatch, SelectOptions, Sig, UnitId, UnitLabel, UNIT_ENV,
+};
 
 /// Held by each test while it lowers the limit, so no other test's thread
 /// opens a descriptor meanwhile (a tokio lock: one test holds it across
@@ -131,4 +133,54 @@ fn a_live_process_whose_start_time_cannot_be_read_is_not_process_gone() {
     );
     assert_eq!(err.raw_os_error(), Some(libc::EMFILE), "{err}");
     assert!(!guard.0.has_exited(), "the process still runs");
+}
+
+/// The tag backend finds a unit's members with one-shot `/proc` reads (the
+/// process listing, then each process's environment, state and children).
+/// A read that fails for any reason but the process being gone (here: no
+/// descriptor left) is "could not check": the member list is an error,
+/// never a list without the members it could not read, which would let a
+/// stop's Gone wait and its lock check pass while a member runs.
+#[test]
+fn a_tag_units_member_list_that_cannot_be_read_is_an_error() {
+    let _limit = LIMIT.blocking_lock();
+    let unit = Containment::tag_backend(SelectOptions::default())
+        .create_unit(UnitId::mint(), UnitLabel::default())
+        .unwrap();
+    let mut member = std::process::Command::new("sleep")
+        .arg("600")
+        .env(UNIT_ENV, unit.id().as_str())
+        .spawn()
+        .expect("spawn the member");
+    // The test's own unreaped child: its pid names it.
+    let guard = KillOnDrop(ProcWatch::open(member.id()).expect("pin the member"));
+    let pid = member.id();
+    let listed =
+        |members: &[freshell_containment::ProcIdentity]| members.iter().any(|m| m.pid == pid);
+    assert!(listed(&unit.members().unwrap()), "the member is listed");
+
+    let original = own_limits();
+    let free = lowest_free_fd();
+    // None left: `/proc` cannot be listed. One left: the listing and each
+    // process's own files are read one descriptor at a time, but the
+    // member's descendants cannot be listed (its thread list holds the
+    // descriptor while each thread's `children` file is read).
+    for left in [0, 1] {
+        let starved = libc::rlimit {
+            rlim_cur: (free + left) as libc::rlim_t,
+            rlim_max: original.rlim_max,
+        };
+        set_own_limits(&starved);
+        let read = unit.members();
+        set_own_limits(&original);
+        if let Ok(members) = read {
+            panic!("{left} descriptor(s) left: a member list that could not be read was answered {members:?}");
+        }
+    }
+    assert!(
+        listed(&unit.members().unwrap()),
+        "listed again once descriptors are available"
+    );
+    drop(guard);
+    member.wait().expect("reap the member");
 }

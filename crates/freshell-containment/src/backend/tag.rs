@@ -6,7 +6,10 @@
 //! from one-shot reads (`/proc` on Linux, libproc on macOS), never by
 //! polling. A process whose environment the kernel withholds is neither
 //! tagged nor untagged: it is a member only through those other routes, and
-//! the scan counts it.
+//! the scan counts it. A read that fails for any reason but the process
+//! being gone is "could not check": the member list is then an error, never
+//! a list without the members it could not read, and the kill still kills
+//! every candidate found but then answers that error.
 //!
 //! On Linux every member the unit spawns starts under the `__unit-exec
 //! --reaper` shim (`crate::reaper`), a child subreaper: the kernel reparents
@@ -139,12 +142,16 @@ pub(crate) struct TagUnit {
 
 /// One one-shot reading of a unit's processes.
 struct Scan {
-    /// Tag carriers, live roots and every descendant of those.
+    /// Tag carriers, live roots and every descendant of those (kept also
+    /// when their state could not be read).
     candidates: BTreeSet<u32>,
     /// Daemon-family candidates and every descendant of them.
     spared: BTreeSet<u32>,
-    /// Same-uid processes whose environment could not be read.
+    /// Same-uid processes whose environment the kernel withholds.
     withheld: u64,
+    /// The first read that failed for a reason other than the process being
+    /// gone ("could not check"): `candidates` may lack members.
+    unread: Option<io::Error>,
 }
 
 impl TagUnit {
@@ -235,12 +242,23 @@ impl TagUnit {
         let my_uid = unsafe { libc::getuid() };
         let mut candidates = BTreeSet::new();
         let mut withheld = 0;
+        let mut unread: Option<io::Error> = None;
         if let Some((key, value)) = &self.tag {
-            for pid in process::all_pids() {
+            let listing = process::pid_listing();
+            if let Some(err) = listing.unread {
+                unread.get_or_insert(err);
+            }
+            for pid in listing.found {
                 if pid == me {
                     continue;
                 }
-                let seen = classify(key, value, pid, my_uid);
+                let seen = match classify(key, value, pid, my_uid) {
+                    Ok(seen) => seen,
+                    Err(err) => {
+                        unread.get_or_insert(err);
+                        continue;
+                    }
+                };
                 if seen.tagged {
                     candidates.insert(pid);
                 }
@@ -251,26 +269,58 @@ impl TagUnit {
                 }
             }
         }
-        candidates.extend(
-            roots
-                .iter()
-                .filter(|(pid, start)| *pid != me && is_live_root(*pid, *start))
-                .map(|(pid, _)| *pid),
-        );
+        for &(pid, start) in roots {
+            if pid == me {
+                continue;
+            }
+            match is_live_root_checked(pid, start) {
+                Ok(true) => {
+                    candidates.insert(pid);
+                }
+                Ok(false) => {}
+                // Not known to be the recorded incarnation, so neither it
+                // nor what its pid's process started is a candidate.
+                Err(err) => {
+                    unread.get_or_insert(err);
+                }
+            }
+        }
         candidates.extend(
             self.kernel_tracked_pids()
                 .into_iter()
                 .filter(|pid| *pid != me),
         );
-        let mut candidates = with_descendants(candidates, me);
-        // A zombie can be neither signalled nor a parent any more.
-        candidates.retain(|pid| process::is_running(*pid));
+        let (mut candidates, descendants_unread) = with_descendants_checked(candidates, me);
+        if let Some(err) = descendants_unread {
+            unread.get_or_insert(err);
+        }
+        // A zombie can be neither signalled nor a parent any more; a process
+        // whose state cannot be read is kept.
+        candidates.retain(|pid| match process::is_running_checked(*pid) {
+            Ok(running) => running,
+            Err(err) => {
+                unread.get_or_insert(err);
+                true
+            }
+        });
         let spared = daemon_family_within(&candidates);
         Scan {
             candidates,
             spared,
             withheld,
+            unread,
         }
+    }
+
+    /// "Could not check": the unit's members could not all be read.
+    fn unread(&self, err: io::Error) -> io::Error {
+        io::Error::new(
+            err.kind(),
+            format!(
+                "the members of unit {} could not be read: {err}",
+                self.unit_id
+            ),
+        )
     }
 
     /// Kills the unit `record` names (for a process exit, where no runtime
@@ -293,12 +343,19 @@ impl TagUnit {
         unit.kill_all_now(&record.roots)
     }
 
+    /// Every candidate the sweep finds is killed; when a reading could not
+    /// be made in full, the kill then answers that error (it may have
+    /// missed a member).
     fn kill_all_now(&self, roots: &[(u32, u64)]) -> io::Result<KillSummary> {
         let mut withheld = None;
+        let mut unread = None;
         let summary = stop_the_world(
             || {
                 let scan = self.scan(roots, withheld.is_none());
                 withheld.get_or_insert(scan.withheld);
+                if let Some(err) = scan.unread {
+                    unread.get_or_insert(err);
+                }
                 (scan.candidates, scan.spared)
             },
             |watch, candidates| {
@@ -310,6 +367,9 @@ impl TagUnit {
                     || process::parent(pid).is_some_and(|pp| candidates.contains(&pp))
             },
         )?;
+        if let Some(err) = unread {
+            return Err(self.unread(err));
+        }
         Ok(KillSummary {
             withheld: withheld.unwrap_or(0),
             ..summary
@@ -338,12 +398,19 @@ impl UnitBackend for TagUnit {
 
     fn members(&self, roots: &[(u32, u64)]) -> io::Result<MemberList> {
         let scan = self.scan(roots, true);
+        if let Some(err) = scan.unread {
+            return Err(self.unread(err));
+        }
+        let mut members = Vec::new();
+        for pid in scan.candidates.difference(&scan.spared) {
+            match process::identity_checked(*pid) {
+                Ok(Some(member)) => members.push(member),
+                Ok(None) => {} // exited since
+                Err(err) => return Err(self.unread(err)),
+            }
+        }
         Ok(MemberList {
-            members: scan
-                .candidates
-                .difference(&scan.spared)
-                .filter_map(|pid| process::identity(*pid).ok())
-                .collect(),
+            members,
             withheld: scan.withheld,
         })
     }
@@ -423,48 +490,71 @@ struct Seen {
 
 /// Whether `pid` is a member by the tag `key=value`, and whether its
 /// environment was withheld from the tag read (counted only for this
-/// server's uid).
+/// server's uid). `Err`: its environment could not be read ("could not
+/// check").
 #[cfg(not(target_os = "macos"))]
-fn classify(key: &str, value: &str, pid: u32, my_uid: u32) -> Seen {
-    let read = process::environ_read(pid, key);
-    Seen {
+fn classify(key: &str, value: &str, pid: u32, my_uid: u32) -> io::Result<Seen> {
+    let read = process::environ_read_checked(pid, key)?;
+    Ok(Seen {
         tagged: matches!(&read, EnvRead::Value(v) if v == value),
         withheld: read == EnvRead::Withheld && process::real_uid(pid) == Some(my_uid),
-    }
+    })
 }
 
 /// macOS: the same for a process of this server's uid; another user's
 /// process is never a member, and its environment is never read.
 #[cfg(target_os = "macos")]
-fn classify(key: &str, value: &str, pid: u32, my_uid: u32) -> Seen {
+fn classify(key: &str, value: &str, pid: u32, my_uid: u32) -> io::Result<Seen> {
     if !crate::darwin::bsdinfo(pid).is_ok_and(|info| info.pbi_ruid == my_uid) {
-        return Seen::default();
+        return Ok(Seen::default());
     }
-    let read = process::environ_read(pid, key);
-    Seen {
+    let read = process::environ_read_checked(pid, key)?;
+    Ok(Seen {
         tagged: matches!(&read, EnvRead::Value(v) if v == value),
         withheld: read == EnvRead::Withheld,
-    }
+    })
 }
 
 /// Whether `pid` is running and is still the incarnation that started at
 /// `start` (a root that exited and whose pid was reused is not).
 fn is_live_root(pid: u32, start: u64) -> bool {
-    process::is_running(pid) && process::start_time(pid).is_ok_and(|now| now == start)
+    is_live_root_checked(pid, start).unwrap_or(false)
+}
+
+/// [`is_live_root`], except that a read that failed for a reason other
+/// than the process being gone is `Err` ("could not check").
+fn is_live_root_checked(pid: u32, start: u64) -> io::Result<bool> {
+    Ok(process::is_running_checked(pid)?
+        && process::start_time_checked(pid)?.is_some_and(|now| now == start))
 }
 
 /// `set` plus every descendant of its processes (one-shot child reads),
 /// never including `exclude` (the caller itself).
-pub(crate) fn with_descendants(mut set: BTreeSet<u32>, exclude: u32) -> BTreeSet<u32> {
+pub(crate) fn with_descendants(set: BTreeSet<u32>, exclude: u32) -> BTreeSet<u32> {
+    with_descendants_checked(set, exclude).0
+}
+
+/// [`with_descendants`], with the first child read that failed for a reason
+/// other than the process being gone ("could not check": descendants may
+/// be missing).
+fn with_descendants_checked(
+    mut set: BTreeSet<u32>,
+    exclude: u32,
+) -> (BTreeSet<u32>, Option<io::Error>) {
+    let mut unread = None;
     let mut frontier: Vec<u32> = set.iter().copied().collect();
     while let Some(pid) = frontier.pop() {
-        for child in process::children(pid) {
+        let listing = process::child_listing(pid);
+        if let Some(err) = listing.unread {
+            unread.get_or_insert(err);
+        }
+        for child in listing.found {
             if child != exclude && set.insert(child) {
                 frontier.push(child);
             }
         }
     }
-    set
+    (set, unread)
 }
 
 /// The processes in `set` whose OWN argv is Codex's daemon family, plus every
