@@ -4355,10 +4355,13 @@ mod unit_sidecar {
             "-c".to_string(),
             format!("mcp_servers.freshell.env_vars=[{names}]"),
         ];
+        // An enabled store: a failed start leaves its launcher running, so a
+        // fake that lost its port can say so and the start is retried.
+        let store = Arc::new(CodexSidecarStore::new(home.path().join("records")));
         let (runtime, _) = ready_retrying_a_lost_port("ready", |records| {
             SpawnedCodexAppServerRuntime::with_command_store_context_and_seed(
                 fake_codex::launcher_command(),
-                Arc::new(CodexSidecarStore::disabled()),
+                store.clone(),
                 records.context(context.clone()),
                 tag_seed("t-mcp"),
             )
