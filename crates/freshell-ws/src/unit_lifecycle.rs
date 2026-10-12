@@ -666,7 +666,11 @@ const SCREEN_EXIT_CODE_WAIT: Duration = Duration::from_secs(1);
 /// starts, or a turn status no event clears) restarts counted, so the cap
 /// bounds it like a crash (Task 17 review M1). The run is timed from the
 /// moment the screen's spawn returned (the registry's `UnitScreenExit::lived`),
-/// so a slow spawn never lifts a quick quit over the floor (re-review R2-m2).
+/// so the time a slow spawn call takes never lifts a quick quit over the floor
+/// (re-review R2-m2). The screen's placement and start-up after its spawn
+/// returned (the placement wrapper placing itself, then the TUI starting)
+/// still count as run time: a screen whose placement and start-up take
+/// longer than the floor and that then quits restarts uncounted.
 pub const BACKGROUND_QUIT_FLOOR: Duration = Duration::from_secs(1);
 
 /// How long a screen's clean exit with a turn running waits for the pane's

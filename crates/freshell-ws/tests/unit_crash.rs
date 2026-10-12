@@ -6,15 +6,35 @@
 //! is restarted in the same terminal row against it, unless the user quit
 //! Codex with no turn running (then the whole unit ends).
 #![cfg(target_os = "linux")]
+#[path = "../../freshell-containment/tests/support/capture.rs"]
+#[allow(dead_code)]
+mod capture;
 #[path = "support/unit_harness.rs"]
 mod unit_harness;
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde_json::json;
+use tracing_subscriber::prelude::*;
 use unit_harness::{fake_codex, AutoResumeMode, HarnessOpts, TestWs, UnitHarness};
 
 const LIMIT: Duration = Duration::from_secs(15);
+
+/// One capture of the `freshell_unit` events for the whole binary (each test
+/// asserts only on events about its own terminal).
+fn captured() -> capture::Captured {
+    static CAPTURE: OnceLock<capture::Captured> = OnceLock::new();
+    CAPTURE
+        .get_or_init(|| {
+            let cap = capture::Captured::default();
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::registry().with(cap.clone()),
+            );
+            cap
+        })
+        .clone()
+}
 
 /// The terminal's output frames seen so far: the highest `seqEnd` and the
 /// stream id, so a test can check that a replacement screen continues the
@@ -664,22 +684,26 @@ async fn screens_slow_to_spawn_that_quit_at_once_end_the_unit_at_the_respawn_cap
 }
 
 /// A pane with a turn running whose screens, from its first quit on, quit
-/// (exit 0) as they start: the unit ends at the respawn cap with the
-/// screens' code, its app-server included, and auto-resume hears a clean
-/// exit, within `limit` of the first quit. With `spawn_takes`, every screen
-/// spawn after the first takes that long before it returns (its process
-/// already exists).
+/// (exit 0) as they start: the row's counted screen restarts reach the
+/// respawn cap, the restart past the cap is refused, and that refusal ends
+/// the unit with the screens' code, its app-server included, and auto-resume
+/// hears a clean exit, within `limit` of the first quit. With `spawn_takes`,
+/// every screen spawn after the first takes that long before it returns (its
+/// process already exists).
 async fn screens_that_quit_as_they_start_end_the_unit_at_the_cap(
     name: &str,
     spawn_takes: Option<Duration>,
     limit: Duration,
 ) {
+    let log = captured();
     let mut h = UnitHarness::start(HarnessOpts {
         behavior: json!({"turnCompleteDelayMs": 60000}),
         auto_resume: AutoResumeMode::Capture,
         ..Default::default()
     })
     .await;
+    let cap = 3;
+    h.state.registry.set_respawn_generation_cap(cap);
     let mut ws = h.connect().await;
     let (request_id, thread_id) = (format!("crq-{name}"), format!("t-{name}"));
     let tid = h
@@ -723,6 +747,69 @@ async fn screens_that_quit_as_they_start_end_the_unit_at_the_cap(
         crash.exit_code, 0,
         "auto-resume's decide() settles a clean exit"
     );
+
+    // What ended the unit: the restart past the cap, refused by the registry
+    // (any other failed restart, or an end at a quit, logs no such refusal).
+    let refused = log
+        .wait_for(
+            tracing::Level::ERROR,
+            "unit.screen.respawn_failed",
+            &[("terminal_id", tid.as_str()), ("cause", "respawn cap")],
+            LIMIT,
+        )
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "the unit ended because its next screen restart was past the respawn cap; \
+                 the row's unit events: {:#?}",
+                unit_events_of(&log, &tid)
+            )
+        });
+    // Before it, the row's counted restarts reached the cap: the last screen
+    // it installed was its `cap`-th quick restart in a row.
+    let counts = quick_restart_counts(&log, &tid, refused.at);
+    assert_eq!(
+        counts.last().copied(),
+        Some(cap as u32),
+        "the screens restarted counted up to the cap before the unit ended \
+         (the row's quick-restart count at each screen it installed: {counts:?})"
+    );
+}
+
+/// The `quick_screen_restarts` count of every screen the row `terminal_id`
+/// installed (`terminal.screen_replaced`) up to `until`, in order.
+fn quick_restart_counts(
+    log: &capture::Captured,
+    terminal_id: &str,
+    until: std::time::Instant,
+) -> Vec<u32> {
+    log.0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| {
+            e.event == "terminal.screen_replaced"
+                && e.fields.get("terminal_id").map(String::as_str) == Some(terminal_id)
+                && e.at <= until
+        })
+        .map(|e| {
+            e.fields["quick_screen_restarts"]
+                .parse()
+                .expect("a numeric quick_screen_restarts")
+        })
+        .collect()
+}
+
+/// Every captured unit event of the row `terminal_id` (name and fields), for
+/// a failure message.
+fn unit_events_of(log: &capture::Captured, terminal_id: &str) -> Vec<String> {
+    log.0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e.fields.get("terminal_id").map(String::as_str) == Some(terminal_id))
+        .map(|e| format!("{} {} {:?}", e.level, e.event, e.fields))
+        .collect()
 }
 
 /// During a server shutdown a screen's exit belongs to the retention path,

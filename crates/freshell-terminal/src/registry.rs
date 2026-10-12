@@ -119,7 +119,9 @@ pub struct UnitScreenExit {
     /// How long the exiting screen ran: from the moment its spawn returned
     /// (a replacement's, as the replacement installed it) to the moment its
     /// exit was taken; zero when its exit was taken before its replacement
-    /// installed it. The time a spawn takes is never counted.
+    /// installed it. The time the spawn call takes is never counted; the
+    /// screen's placement and start-up after its spawn returned (the
+    /// placement wrapper placing itself, then the TUI starting) still count.
     pub lived: std::time::Duration,
 }
 
