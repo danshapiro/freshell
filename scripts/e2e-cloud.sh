@@ -156,28 +156,7 @@ account_flag() {
 }
 
 cloud_duration_seconds() {
-  local remaining="$1" total=0 amount unit numeric_amount
-  if [[ "$remaining" =~ ^[0-9]+$ ]]; then
-    printf '%s' "$remaining"
-    return 0
-  fi
-  while [[ -n "$remaining" ]]; do
-    if [[ "$remaining" =~ ^([0-9]+)(s|m|h|d)(.*)$ ]]; then
-      amount="${BASH_REMATCH[1]}"
-      unit="${BASH_REMATCH[2]}"
-      remaining="${BASH_REMATCH[3]}"
-      numeric_amount=$((10#$amount))
-      case "$unit" in
-        s) total=$((total + numeric_amount)) ;;
-        m) total=$((total + numeric_amount * 60)) ;;
-        h) total=$((total + numeric_amount * 3600)) ;;
-        d) total=$((total + numeric_amount * 86400)) ;;
-      esac
-    else
-      return 1
-    fi
-  done
-  printf '%s' "$total"
+  node "$ROOT/scripts/e2e-cloud-duration.mjs" "$1"
 }
 
 write_cloud_dispatch_receipt() {
@@ -201,11 +180,7 @@ write_cloud_dispatch_receipt() {
 }
 
 wait_for_cloud_execution_completion() {
-  local task_timeout="$1" timeout_seconds completion_time deadline describe_failures=0
-  if ! timeout_seconds=$(cloud_duration_seconds "$task_timeout") || [ "$timeout_seconds" -le 0 ]; then
-    echo "[e2e-cloud] ERROR: unsupported Cloud Run task timeout duration '$task_timeout'." >&2
-    return 1
-  fi
+  local timeout_seconds="$1" task_timeout="$2" completion_time deadline describe_failures=0
   # Allow five minutes for Cloud Run's terminal status to settle after the
   # configured per-task deadline.
   deadline=$((SECONDS + timeout_seconds + 300))
@@ -455,6 +430,7 @@ cmd_run() {
   local local_build_flag=false
   local shards=1
   local timeout="60m"
+  local timeout_seconds
   local -a pw_args=()
 
   while [[ $# -gt 0 ]]; do
@@ -598,6 +574,15 @@ cmd_run() {
     exec pnpm exec playwright test \
       --config test/e2e-browser/playwright.config.ts \
       "${pw_args[@]}"
+  fi
+
+  # Parse and bound the completion-wait budget before any Cloud API call or
+  # job creation. Cloud Run accepts decimal and ISO-8601 duration forms; a
+  # post-dispatch parse failure would otherwise leave an accepted execution
+  # without a valid local wait deadline.
+  if ! timeout_seconds=$(cloud_duration_seconds "$timeout"); then
+    echo "[e2e-cloud] ERROR: unsupported Cloud Run task timeout duration '$timeout'." >&2
+    exit 1
   fi
 
   # Identity ladder (run lane): resolve before the image describe / build /
@@ -803,7 +788,7 @@ cmd_run() {
     exit 1
   fi
   echo "[e2e-cloud] Cloud Run execution accepted: $execution_id"
-  if ! wait_for_cloud_execution_completion "$timeout"; then
+  if ! wait_for_cloud_execution_completion "$timeout_seconds" "$timeout"; then
     exit 1
   fi
 

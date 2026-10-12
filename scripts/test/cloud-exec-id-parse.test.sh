@@ -47,10 +47,10 @@ cat > "$FAKE_DIR/gcloud" << 'FAKE'
 #!/usr/bin/env bash
 echo "FAKE_GCLOUD: $@" >> "$FAKE_LOG"
 # Mimic gcloud's accepted execution output with literal brackets and ANSI
-# SGR codes around the name (observed gcloud output 2026-08-18).
+# SGR codes around the name (gcloud 581.0.0).
 if [[ "$*" == *"run jobs execute"* ]]; then
   if [[ "$*" == *" --async"* ]]; then
-    printf 'Creating execution...\nExecution [\033[1mtest-exec-123\033[m] has successfully started running.\n'
+    printf 'Execution [\033[1mtest-exec-123\033[m] is being started asynchronously.\n'
   else
     printf 'Creating execution...\nExecution [\033[1mtest-exec-123\033[m] has successfully completed.\n'
   fi
@@ -120,6 +120,47 @@ check "e2e execution uses asynchronous acceptance before its bounded completion 
   bash -c "grep -q 'run jobs execute .* --async' '$FAKE_LOG' && grep -q 'dispatch receipt available before completion wait' '$FAKE_LOG'"
 check "e2e wrapper records the exact accepted Cloud Run execution" \
   bash -c "jq -e '.jobName and .executionName == \"test-exec-123\" and (.acceptedAt | test(\"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$\"))' '$FRESHELL_E2E_CLOUD_DISPATCH_RECEIPT' >/dev/null"
+
+check_duration() {
+  local input="$1" expected="$2" actual
+  actual=$(node "$ROOT/scripts/e2e-cloud-duration.mjs" "$input" 2>/dev/null) || return 1
+  [[ "$actual" == "$expected" ]]
+}
+
+check "cloud timeout parser accepts decimal hours" check_duration "1.5h" "5400"
+check "cloud timeout parser rounds a fractional mixed duration up to whole seconds" \
+  check_duration "1m30.5s" "91"
+check "cloud timeout parser accepts ISO time durations" check_duration "PT1H" "3600"
+check "cloud timeout parser accepts ISO day and time durations" check_duration "P1DT2H" "93600"
+check "cloud timeout parser treats a bare integer as seconds" check_duration "60" "60"
+
+check_rejected_timeout_before_job() {
+  local duration="$1" output
+  : > "$FAKE_LOG"
+  if output=$(bash "$ROOT/scripts/e2e-cloud.sh" run --cloud --shards=1 "--timeout=$duration" 2>&1); then
+    return 1
+  fi
+  ! grep -q 'FAKE_GCLOUD: run jobs create' "$FAKE_LOG" \
+    && ! grep -q 'FAKE_GCLOUD: run jobs execute' "$FAKE_LOG" \
+    && grep -q 'unsupported Cloud Run task timeout duration' <<< "$output"
+}
+
+check "cloud timeout parser rejects malformed durations before creating a job" \
+  check_rejected_timeout_before_job "1hbanana"
+check "cloud timeout parser rejects zero seconds before creating a job" \
+  check_rejected_timeout_before_job "0"
+check "cloud timeout parser rejects zero ISO duration before creating a job" \
+  check_rejected_timeout_before_job "PT0S"
+check "cloud timeout parser rejects values below gcloud's one-second minimum before creating a job" \
+  check_rejected_timeout_before_job "0.5s"
+check "cloud timeout parser rejects durations beyond the safe wait bound before creating a job" \
+  check_rejected_timeout_before_job "999999999999999999999999999999999999999s"
+
+: > "$FAKE_LOG"
+VALID_DECIMAL_OUT=$(bash "$ROOT/scripts/e2e-cloud.sh" run --cloud --shards=1 --timeout=1.5h 2>&1) && VALID_DECIMAL_RC=0 || VALID_DECIMAL_RC=$?
+check "e2e wrapper accepts a decimal Cloud Run timeout" bash -c "[ $VALID_DECIMAL_RC -eq 0 ]"
+check "e2e wrapper passes the accepted decimal timeout to Cloud Run" \
+  grep -q 'run jobs create .* --task-timeout=1.5h' "$FAKE_LOG"
 
 echo ""
 if [ "$FAILURES" -eq 0 ]; then
