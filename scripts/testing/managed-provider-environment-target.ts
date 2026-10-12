@@ -24,12 +24,44 @@ const scenarios = ['healthy', 'missing-reference', 'startup-before-identity'] as
 const ordinaryFixtureMode = 'managed-fixture-ordinary'
 const checkpointImage = 'freshell-sandbox:latest'
 const checkpointContainerPort = 3477
+const checkpointForwarderPort = 3478
 const checkpointFixtureRoot = '/tmp/freshell-checkpoint-fixture'
 const checkpointControlRequest = `${checkpointFixtureRoot}/control/request.json`
 const checkpointControlAck = (id: string) => `${checkpointFixtureRoot}/control/ack-${id}.json`
 export type ManagedProviderEnvironmentTargetMode = 'managed-environment' | 'code-checkpoint'
 const delay = (milliseconds: number) => new Promise(resolve => setTimeout(resolve, milliseconds))
 const digest = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex')
+
+export const checkpointTcpForwarderSource = String.raw`
+const net = require('node:net')
+const listenHost = process.env.FRESHELL_CHECKPOINT_FORWARDER_HOST
+const listenPort = Number(process.env.FRESHELL_CHECKPOINT_FORWARDER_PORT)
+const upstreamHost = process.env.FRESHELL_CHECKPOINT_UPSTREAM_HOST
+const upstreamPort = Number(process.env.FRESHELL_CHECKPOINT_UPSTREAM_PORT)
+if (!listenHost || !Number.isSafeInteger(listenPort) || listenPort < 1 || listenPort > 65535 ||
+    !upstreamHost || !Number.isSafeInteger(upstreamPort) || upstreamPort < 1 || upstreamPort > 65535) {
+  console.error(JSON.stringify({ severity: 'error', event: 'code_checkpoint.forwarder_config_invalid' }))
+  process.exit(2)
+}
+const server = net.createServer(client => {
+  const upstream = net.createConnection({ host: upstreamHost, port: upstreamPort })
+  client.pipe(upstream)
+  upstream.pipe(client)
+  client.once('error', () => upstream.destroy())
+  upstream.once('error', error => {
+    console.error(JSON.stringify({ severity: 'warn', event: 'code_checkpoint.forwarder_upstream_failed', code: error.code ?? 'unknown' }))
+    client.destroy()
+  })
+  client.once('close', () => upstream.destroy())
+})
+server.once('error', error => {
+  console.error(JSON.stringify({ severity: 'error', event: 'code_checkpoint.forwarder_listen_failed', code: error.code ?? 'unknown' }))
+  process.exitCode = 1
+})
+server.listen(listenPort, listenHost, () => {
+  console.log(JSON.stringify({ severity: 'info', event: 'code_checkpoint.forwarder_listening', listenHost, listenPort, upstreamHost, upstreamPort }))
+})
+`
 
 export function resolveManagedProviderEnvironmentTargetMode(args: string[]): ManagedProviderEnvironmentTargetMode {
   if (args.length === 0) return 'managed-environment'
@@ -372,6 +404,33 @@ function dockerMaybe(args: string[], timeout = 10_000): string | undefined {
   return result.stdout.trim()
 }
 
+function assertDirectEgressBlocked(containerId: string, subject: string): Record<string, unknown> {
+  const probe = String.raw`
+const net = require('node:net')
+let settled = false
+const socket = net.createConnection({ host: '1.1.1.1', port: 443 })
+const blocked = reason => {
+  if (settled) return
+  settled = true
+  console.log(JSON.stringify({ blocked: true, reason }))
+  socket.destroy()
+}
+socket.setTimeout(1500)
+socket.once('connect', () => {
+  settled = true
+  console.error(JSON.stringify({ blocked: false }))
+  socket.destroy()
+  process.exitCode = 1
+})
+socket.once('error', error => blocked(error.code ?? 'connection-failed'))
+socket.once('timeout', () => blocked('timeout'))
+`
+  const result = docker(['exec', containerId, '/usr/local/bin/node', '-e', probe], 5_000)
+  const evidence = JSON.parse(result) as Record<string, unknown>
+  assert.equal(evidence.blocked, true, `${subject} unexpectedly reached the external egress probe`)
+  return evidence
+}
+
 async function makeStageTreeReadable(directory: string): Promise<void> {
   await fs.chmod(directory, 0o755)
   for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
@@ -530,14 +589,18 @@ export async function runCodeCheckpointTarget() {
   }
   const proof: Record<string, unknown> = { candidateSha, runId, fixture, image: checkpointImage }
   const networkName = `freshell-checkpoint-${runId.slice(0, 8)}`
+  const forwarderNetworkName = `freshell-checkpoint-forwarder-${runId.slice(0, 8)}`
   const containerName = `freshell-checkpoint-${runId.slice(0, 8)}`
+  const forwarderContainerName = `freshell-checkpoint-forwarder-${runId.slice(0, 8)}`
   const containerIdPath = path.join(root, 'container.id')
   const dockerEnvPath = path.join(root, 'target.env')
   const cloudDispatchReceiptPath = path.join(root, 'cloud-execution-dispatch.json')
   const evidenceDir = path.join(repoRoot, '.runtime-evidence', candidateSha, runId)
   const receiptPath = path.join(evidenceDir, 'code-checkpoint-acceptance.json')
   let networkId: string | undefined
+  let forwarderNetworkId: string | undefined
   let containerId: string | undefined
+  let forwarderContainerId: string | undefined
   let dockerRun: ChildProcess | undefined, dockerRunIdentity: Awaited<ReturnType<typeof processIdentity>> | undefined,
     dockerRunJoin: Promise<NativeExit> | undefined
   let tunnel: ChildProcess | undefined, tunnelIdentity: Awaited<ReturnType<typeof processIdentity>> | undefined,
@@ -576,11 +639,19 @@ export async function runCodeCheckpointTarget() {
     assert.match(networkId, /^[a-f0-9]{64}$/)
     const networkDetails = docker(['network', 'inspect', '--format', '{{.Id}} {{index .Labels "freshell.run-id"}} {{.Internal}}', networkId])
     assert.equal(networkDetails, `${networkId} ${runId} true`, 'Checkpoint network must be internally isolated and owned by this run')
+    forwarderNetworkId = docker(['network', 'create', '--driver', 'bridge',
+      '--opt', 'com.docker.network.bridge.enable_ip_masquerade=false',
+      '--label', 'freshell.owner=checkpoint-acceptance', '--label', `freshell.run-id=${runId}`, forwarderNetworkName])
+    assert.match(forwarderNetworkId, /^[a-f0-9]{64}$/)
+    const forwarderNetworkDetails = docker(['network', 'inspect', '--format',
+      '{{.Id}} {{index .Labels "freshell.run-id"}} {{.Internal}} {{index .Options "com.docker.network.bridge.enable_ip_masquerade"}}', forwarderNetworkId])
+    assert.equal(forwarderNetworkDetails, `${forwarderNetworkId} ${runId} false false`,
+      'Loopback forwarder network must disable outbound masquerading and be owned by this run')
 
     const dockerArgs = [
       'run', '--rm', '--init', '--name', containerName, '--cidfile', containerIdPath,
       '--label', 'freshell.owner=checkpoint-acceptance', '--label', `freshell.run-id=${runId}`,
-      '--network', networkId, '--publish', `127.0.0.1::${checkpointContainerPort}/tcp`,
+      '--network', networkId,
       '--pids-limit', '512', '--memory', '4g', '--read-only', '--security-opt', 'no-new-privileges',
       '--tmpfs', '/tmp:rw,nosuid,nodev,size=512m', '--tmpfs', '/workspace:rw,nosuid,nodev,size=64m',
       '--tmpfs', '/usr/local/cargo:rw,nosuid,nodev,size=256m',
@@ -610,11 +681,33 @@ export async function runCodeCheckpointTarget() {
     assert.match(containerId, /^[a-f0-9]{64}$/)
     const containerDetails = docker(['container', 'inspect', '--format', '{{.Id}} {{index .Config.Labels "freshell.run-id"}}', containerId])
     assert.equal(containerDetails, `${containerId} ${runId}`, 'Checkpoint container ownership labels did not match this run')
+    const targetAddress = docker(['container', 'inspect', '--format', `{{(index .NetworkSettings.Networks "${networkName}").IPAddress}}`, containerId])
+    assert.match(targetAddress, /^(?:\d{1,3}\.){3}\d{1,3}$/, 'Restricted checkpoint target did not receive an IPv4 address')
+    const targetEgress = assertDirectEgressBlocked(containerId, 'Restricted checkpoint target')
+
+    const forwarderArgs = [
+      'run', '--detach', '--rm', '--init', '--name', forwarderContainerName,
+      '--label', 'freshell.owner=checkpoint-acceptance', '--label', `freshell.run-id=${runId}`,
+      '--network', forwarderNetworkId, '--publish', `127.0.0.1::${checkpointForwarderPort}/tcp`,
+      '--pids-limit', '128', '--memory', '128m', '--read-only', '--security-opt', 'no-new-privileges', '--cap-drop', 'ALL',
+      '--env', 'FRESHELL_CHECKPOINT_FORWARDER_HOST=0.0.0.0',
+      '--env', `FRESHELL_CHECKPOINT_FORWARDER_PORT=${checkpointForwarderPort}`,
+      '--env', `FRESHELL_CHECKPOINT_UPSTREAM_HOST=${targetAddress}`,
+      '--env', `FRESHELL_CHECKPOINT_UPSTREAM_PORT=${checkpointContainerPort}`,
+      '--entrypoint', '/usr/local/bin/node', checkpointImage, '-e', checkpointTcpForwarderSource,
+    ]
+    forwarderContainerId = docker(forwarderArgs)
+    assert.match(forwarderContainerId, /^[a-f0-9]{64}$/, 'Loopback forwarder did not publish its owned container identity')
+    const forwarderDetails = docker(['container', 'inspect', '--format', '{{.Id}} {{index .Config.Labels "freshell.run-id"}}', forwarderContainerId])
+    assert.equal(forwarderDetails, `${forwarderContainerId} ${runId}`, 'Loopback forwarder ownership labels did not match this run')
+    docker(['network', 'connect', networkId, forwarderContainerId])
+    const forwarderEgress = assertDirectEgressBlocked(forwarderContainerId, 'Loopback forwarder')
+
     const mapping = await poll('loopback-only ephemeral checkpoint target port', async () => {
-      const value = dockerMaybe(['port', containerId!, `${checkpointContainerPort}/tcp`])
+      const value = dockerMaybe(['port', forwarderContainerId!, `${checkpointForwarderPort}/tcp`])
       if (!value) return undefined
       const match = value.match(/^127\.0\.0\.1:(\d+)$/m)
-      if (!match) throw new Error('Checkpoint target port was not published on host loopback only')
+      if (!match) throw new Error('Checkpoint target forwarder port was not published on host loopback only')
       return Number(match[1])
     }, 60_000)
     assert(Number.isSafeInteger(mapping) && mapping > 0 && mapping <= 65535)
@@ -639,7 +732,8 @@ export async function runCodeCheckpointTarget() {
     assert.equal(serverInfo.commit, candidateSha)
     assert.equal(serverInfo.buildDirty, false)
     proof.target = { containerId, containerName, networkId, networkName, networkInternal: true, restrictedIdentity: identity,
-      hostLoopbackPort: mapping, serverInfo, initialization }
+      targetAddress, targetEgress, forwarderContainerId, forwarderContainerName, forwarderNetworkId, forwarderNetworkName,
+      forwarderNetworkMasquerade: false, forwarderEgress, hostLoopbackPort: mapping, serverInfo, initialization }
 
     const toolHome = path.join(root, 'cloudflared-home')
     await fs.mkdir(toolHome, { mode: 0o700 })
@@ -721,6 +815,19 @@ export async function runCodeCheckpointTarget() {
     }
     await attempt('browserJoin', () => stopExact(browser, browserIdentity, browserJoin))
     await attempt('tunnelJoin', () => stopExact(tunnel, tunnelIdentity, tunnelJoin))
+    if (forwarderContainerId) await attempt('forwarderContainer', async () => {
+      const matching = docker(['ps', '-aq', '--no-trunc', '--filter', `id=${forwarderContainerId}`]).split('\n').filter(Boolean)
+      if (matching.length) {
+        assert.deepEqual(matching, [forwarderContainerId], 'Only the exact owned checkpoint forwarder may be stopped')
+        const details = docker(['container', 'inspect', '--format', '{{.Id}} {{index .Config.Labels "freshell.run-id"}}', forwarderContainerId])
+        assert.equal(details, `${forwarderContainerId} ${runId}`, 'Refusing to clean up an unowned checkpoint forwarder')
+        docker(['container', 'stop', '--timeout', '10', forwarderContainerId], 20_000)
+      }
+      const remaining = docker(['ps', '-aq', '--no-trunc', '--filter', `id=${forwarderContainerId}`]).split('\n').filter(Boolean)
+      if (remaining.length) docker(['container', 'rm', '--force', forwarderContainerId], 20_000)
+      assert.deepEqual(docker(['ps', '-aq', '--no-trunc', '--filter', `id=${forwarderContainerId}`]).split('\n').filter(Boolean), [])
+      return { containerId: forwarderContainerId, settled: true }
+    })
     if (containerId) await attempt('container', async () => {
       const matching = docker(['ps', '-aq', '--no-trunc', '--filter', `id=${containerId}`]).split('\n').filter(Boolean)
       if (matching.length) {
@@ -749,6 +856,17 @@ export async function runCodeCheckpointTarget() {
       }
       assert.deepEqual(docker(['network', 'ls', '-q', '--no-trunc', '--filter', `id=${networkId}`]).split('\n').filter(Boolean), [])
       return { networkId, settled: true }
+    })
+    if (forwarderNetworkId) await attempt('forwarderNetwork', async () => {
+      const matching = docker(['network', 'ls', '-q', '--no-trunc', '--filter', `id=${forwarderNetworkId}`]).split('\n').filter(Boolean)
+      if (matching.length) {
+        assert.deepEqual(matching, [forwarderNetworkId], 'Only the exact owned checkpoint forwarder network may be removed')
+        const details = docker(['network', 'inspect', '--format', '{{.Id}} {{index .Labels "freshell.run-id"}}', forwarderNetworkId])
+        assert.equal(details, `${forwarderNetworkId} ${runId}`, 'Refusing to remove an unowned checkpoint forwarder network')
+        docker(['network', 'rm', forwarderNetworkId])
+      }
+      assert.deepEqual(docker(['network', 'ls', '-q', '--no-trunc', '--filter', `id=${forwarderNetworkId}`]).split('\n').filter(Boolean), [])
+      return { networkId: forwarderNetworkId, settled: true }
     })
     if (errors.length === 0) await attempt('fixtureDirectory', () => fs.rm(root, { recursive: true, force: true }))
     proof.cleanup = cleanup
