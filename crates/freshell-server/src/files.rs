@@ -200,12 +200,10 @@ async fn validate_dir(
                 .unwrap_or(false)
         })
         .unwrap_or(false);
-    let checkpoint_workspace_eligible = is_dir
-        && resolved
-            .fs_path
-            .as_deref()
-            .and_then(|path| std::fs::canonicalize(path).ok())
-            .is_some_and(|path| !crate::checkpoints::is_os_account_home(&path));
+    // This flag answers whether an explicit directory-picker selection can
+    // define a snapshot scope. Automatic capture still rejects an unselected
+    // account home in the checkpoint workspace resolver.
+    let checkpoint_workspace_eligible = is_dir;
 
     Json(json!({
         "valid": is_dir,
@@ -1421,7 +1419,7 @@ mod tests {
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn validate_dir_marks_account_home_as_launch_only() {
+    async fn review_r6_validate_dir_allows_explicit_account_home_scope() {
         let _guard = env_lock();
         let home = std::env::var("HOME").expect("test environment has HOME");
         let response = validate_dir(
@@ -1433,7 +1431,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let value = body_json(response).await;
         assert_eq!(value["valid"], true);
-        assert_eq!(value["checkpointWorkspaceEligible"], false);
+        assert_eq!(value["checkpointWorkspaceEligible"], true);
     }
 
     /// Node's `normalizeUserPath` runs `path.posix.resolve` on POSIX inputs

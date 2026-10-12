@@ -184,11 +184,11 @@ describe('DirectoryPicker', () => {
     })
   })
 
-  it('keeps account home as launch cwd without selecting it for checkpoints', async () => {
+  it('passes explicit account-home selection through as checkpoint scope', async () => {
     mockApiPost.mockResolvedValueOnce({
       valid: true,
       resolvedPath: '/home/user',
-      checkpointWorkspaceEligible: false,
+      checkpointWorkspaceEligible: true,
     })
     const { onConfirm } = renderDirectoryPicker({ defaultCwd: '' })
     const input = screen.getByLabelText('Starting directory for Claude')
@@ -196,7 +196,10 @@ describe('DirectoryPicker', () => {
     fireEvent.change(input, { target: { value: '/home/user' } })
     fireEvent.keyDown(input, { key: 'Enter' })
 
-    await waitFor(() => expect(onConfirm).toHaveBeenCalledWith('/home/user'))
+    await waitFor(() => expect(onConfirm).toHaveBeenCalledWith('/home/user', {
+      path: '/home/user',
+      provenance: 'directory-picker',
+    }))
     expect(onConfirm).toHaveBeenCalledTimes(1)
   })
 

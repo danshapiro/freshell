@@ -1654,6 +1654,14 @@ impl CheckpointService {
                 .map(|workspace| workspace.path.as_str())
         });
         let Some(workspace_anchor) = workspace_anchor else {
+            log_automatic_checkpoint_failure(
+                Some(request_id),
+                "workspace_unavailable",
+                "workspace-resolution",
+                "resolve-workspace",
+                None,
+                "No selected code workspace is available for a snapshot",
+            );
             return self.new_record(
                 send,
                 logical_attempt_id,
@@ -1669,11 +1677,16 @@ impl CheckpointService {
         let resolve_control_for_task = Arc::clone(&resolve_control);
         let home = Arc::clone(&self.home);
         let workspace_anchor = workspace_anchor.to_string();
+        let workspace_anchor_for_task = workspace_anchor.clone();
         let mut resolve_task = tokio::spawn(CHECKPOINT_CAPTURE_CONTEXT.scope(
             resolve_control_for_task,
             async move {
-                resolve_checkpoint_workspace(&home, Path::new(&workspace_anchor), intent.as_ref())
-                    .await
+                resolve_checkpoint_workspace(
+                    &home,
+                    Path::new(&workspace_anchor_for_task),
+                    intent.as_ref(),
+                )
+                .await
             },
         ));
         let remaining = CHECKPOINT_AUTO_BUDGET.saturating_sub(started_at.elapsed());
@@ -1693,6 +1706,14 @@ impl CheckpointService {
                 );
             }
             Ok(Err(error)) => {
+                log_automatic_checkpoint_failure(
+                    Some(request_id),
+                    "workspace_resolution_failed",
+                    "workspace-resolution",
+                    "resolve-workspace",
+                    Some(Path::new(&workspace_anchor)),
+                    &error.to_string(),
+                );
                 return self.new_record(
                     send,
                     logical_attempt_id,
@@ -1707,6 +1728,24 @@ impl CheckpointService {
             Err(_) => {
                 let settlement =
                     cancel_and_settle_capture_task(&resolve_control, &mut resolve_task).await;
+                let (failure_code, cause) = match &settlement {
+                    Ok(()) => (
+                        "workspace_resolution_timeout",
+                        "Workspace resolution exceeded the automatic snapshot budget".to_string(),
+                    ),
+                    Err(cause) => (
+                        "workspace_resolution_unsettled",
+                        format!("Workspace resolution timed out and its child process could not be confirmed settled: {cause}"),
+                    ),
+                };
+                log_automatic_checkpoint_failure(
+                    Some(request_id),
+                    failure_code,
+                    "workspace-resolution",
+                    "resolve-workspace",
+                    Some(Path::new(&workspace_anchor)),
+                    &cause,
+                );
                 let mut record = self.new_record(
                     send,
                     logical_attempt_id,
@@ -1728,6 +1767,17 @@ impl CheckpointService {
             }
         };
         if let Some(remaining) = self.active_cooldown(&workspace.path) {
+            log_automatic_checkpoint_failure(
+                Some(request_id),
+                "capture_timeout_cooldown",
+                "capture",
+                "automatic-pre-turn-snapshot",
+                Some(&workspace.path),
+                &format!(
+                    "capture is paused for {} seconds after a timeout",
+                    remaining.as_secs()
+                ),
+            );
             return self.new_record(
                 send,
                 logical_attempt_id,
@@ -1742,6 +1792,14 @@ impl CheckpointService {
 
         let remaining = CHECKPOINT_AUTO_BUDGET.saturating_sub(started_at.elapsed());
         if remaining.is_zero() {
+            log_automatic_checkpoint_failure(
+                Some(request_id),
+                "workspace_resolution_timeout",
+                "workspace-resolution",
+                "resolve-workspace",
+                Some(&workspace.path),
+                "Workspace resolution used the available snapshot time",
+            );
             return self.new_record(
                 send,
                 logical_attempt_id,
@@ -1753,6 +1811,14 @@ impl CheckpointService {
         let lock = match self.lock_workspace(&workspace.path, remaining).await {
             Ok(lock) => lock,
             Err(()) => {
+                log_automatic_checkpoint_failure(
+                    Some(request_id),
+                    "workspace_lock_timeout",
+                    "capture",
+                    "lock-workspace",
+                    Some(&workspace.path),
+                    "Workspace lock was not available before the snapshot budget expired",
+                );
                 return self.new_record(
                     send,
                     logical_attempt_id,
@@ -1765,6 +1831,14 @@ impl CheckpointService {
         let remaining = CHECKPOINT_AUTO_BUDGET.saturating_sub(started_at.elapsed());
         if remaining.is_zero() {
             drop(lock);
+            log_automatic_checkpoint_failure(
+                Some(request_id),
+                "workspace_lock_timeout",
+                "capture",
+                "lock-workspace",
+                Some(&workspace.path),
+                "Workspace lock acquisition used the available snapshot time",
+            );
             return self.new_record(
                 send,
                 logical_attempt_id,
@@ -1808,6 +1882,14 @@ impl CheckpointService {
                         Ok(checkpoint_id),
                     )
                 } else {
+                    log_automatic_checkpoint_failure(
+                        Some(request_id),
+                        "capture_timeout",
+                        "capture",
+                        "automatic-pre-turn-snapshot",
+                        Some(&workspace.path),
+                        "Code snapshot capture exceeded its automatic budget",
+                    );
                     self.new_record(
                         send,
                         logical_attempt_id,
@@ -1832,6 +1914,14 @@ impl CheckpointService {
                         Ok(checkpoint_id),
                     )
                 } else {
+                    log_automatic_checkpoint_failure(
+                        Some(request_id),
+                        "capture_cancelled",
+                        "capture",
+                        "automatic-pre-turn-snapshot",
+                        Some(&workspace.path),
+                        "Code snapshot capture was cancelled before publishing a checkpoint",
+                    );
                     self.new_record(
                         send,
                         logical_attempt_id,
@@ -1860,6 +1950,7 @@ impl CheckpointService {
                     )),
                 );
                 record.capture_settled = false;
+                let capture_failure_cause = error.clone();
                 let quarantine = self.quarantine_workspace(
                     workspace.path.clone(),
                     lock,
@@ -1902,6 +1993,27 @@ impl CheckpointService {
                         ));
                     }
                 }
+                let failure_cause = if record.outcome.code.as_deref() == Some("capture_failed") {
+                    capture_failure_cause.as_str()
+                } else {
+                    record
+                        .outcome
+                        .reason
+                        .as_deref()
+                        .unwrap_or(capture_failure_cause.as_str())
+                };
+                log_automatic_checkpoint_failure(
+                    Some(request_id),
+                    record
+                        .outcome
+                        .code
+                        .as_deref()
+                        .unwrap_or("capture_unsettled"),
+                    "capture",
+                    "automatic-pre-turn-snapshot",
+                    Some(&workspace.path),
+                    failure_cause,
+                );
                 record
             }
             CaptureAttempt::Failed(error) => {
@@ -2823,6 +2935,31 @@ fn safe_send_request_id(request_id: Option<&str>) -> Option<&str> {
     })
 }
 
+fn log_automatic_checkpoint_failure(
+    send_request_id: Option<&str>,
+    failure_code: &str,
+    stage: &'static str,
+    operation: &'static str,
+    workspace: Option<&Path>,
+    cause: &str,
+) {
+    let workspace = workspace
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    tracing::warn!(
+        target: "freshell_server::checkpoints",
+        event = "code_checkpoint.failed",
+        send_request_id = %safe_send_request_id(send_request_id).unwrap_or(""),
+        stage,
+        operation,
+        failure_code,
+        workspace = %workspace,
+        path = %workspace,
+        cause = %bounded_log_detail(cause),
+        "automatic code checkpoint unavailable"
+    );
+}
+
 fn log_workspace_unavailable(candidate: &str, cause: &str, send_request_id: Option<&str>) {
     tracing::warn!(
         target: "freshell_server::checkpoints",
@@ -2870,13 +3007,6 @@ fn recognized_account_homes(server_home: Option<&Path>) -> Vec<PathBuf> {
         add_existing(&PathBuf::from(drive).join(path));
     }
     homes
-}
-
-pub fn is_os_account_home(candidate: &Path) -> bool {
-    let Ok(candidate) = std::fs::canonicalize(candidate) else {
-        return false;
-    };
-    is_recognized_account_home(&candidate, &recognized_account_homes(None))
 }
 
 fn is_recognized_account_home(path: &Path, homes: &[PathBuf]) -> bool {
@@ -2934,7 +3064,8 @@ async fn resolve_checkpoint_workspace(
                 candidate: candidate.clone(),
                 reason,
             })?;
-        if is_recognized_account_home(&selected, &homes) {
+        let explicitly_selected_home = provenance == "directory-picker";
+        if is_recognized_account_home(&selected, &homes) && !explicitly_selected_home {
             return Err(CheckpointWorkspaceUnavailable {
                 candidate,
                 reason: "account home cannot be used as a code checkpoint workspace".to_string(),
@@ -2945,7 +3076,7 @@ async fn resolve_checkpoint_workspace(
         } else {
             git_checkout_root(&selected).await.unwrap_or(selected)
         };
-        if is_recognized_account_home(&path, &homes) {
+        if is_recognized_account_home(&path, &homes) && !explicitly_selected_home {
             return Err(CheckpointWorkspaceUnavailable {
                 candidate,
                 reason: "account home cannot be used as an inferred code checkpoint workspace"
@@ -3167,6 +3298,10 @@ async fn create_checkpoint(
     let git_dir = ensure_checkpoint_repo(home, cwd).await?;
     let git_dir_arg = format!("--git-dir={}", git_dir.display());
     let work_tree_arg = format!("--work-tree={}", cwd.display());
+    let excluded_checkpoint_storage = checkpoint_storage_exclusion(&git_dir, cwd)?;
+    let excluded_storage_pathspec = excluded_checkpoint_storage
+        .as_deref()
+        .map(|path| format!(":(exclude,top,literal){}", path.display()));
 
     let index_path = git_dir.join("index");
     let request_index = git_dir.join(format!("index.tmp-{}", uuid::Uuid::new_v4()));
@@ -3215,16 +3350,37 @@ async fn create_checkpoint(
 
     let capture = async {
         let stage_started_at = Instant::now();
-        verify_readable_directories(&git_dir, cwd).await?;
+        if let Some(path) = excluded_checkpoint_storage.as_deref() {
+            // A user may explicitly select the server's own account home. Its
+            // checkpoint database is runtime state nested under that directory,
+            // not part of the selected workspace snapshot.
+            let pathspec = format!(":(top,literal){}", path.display());
+            run_git_with_index(
+                &[
+                    &git_dir_arg,
+                    &work_tree_arg,
+                    "rm",
+                    "--cached",
+                    "-r",
+                    "-f",
+                    "--ignore-unmatch",
+                    "--",
+                    &pathspec,
+                ],
+                Some(cwd),
+                &request_index,
+            )
+            .await?;
+        }
+        verify_readable_directories(&git_dir, cwd, excluded_checkpoint_storage.as_deref()).await?;
         stage_ms.insert("readability", stage_started_at.elapsed().as_millis() as u64);
 
         let stage_started_at = Instant::now();
-        run_git_with_index(
-            &[&git_dir_arg, &work_tree_arg, "add", "-A", "--", "."],
-            Some(cwd),
-            &request_index,
-        )
-        .await?;
+        let mut add_arguments = vec![&git_dir_arg, &work_tree_arg, "add", "-A", "--", "."];
+        if let Some(pathspec) = excluded_storage_pathspec.as_deref() {
+            add_arguments.push(pathspec);
+        }
+        run_git_with_index(&add_arguments, Some(cwd), &request_index).await?;
         stage_ms.insert("git_add", stage_started_at.elapsed().as_millis() as u64);
 
         let stage_started_at = Instant::now();
@@ -3235,7 +3391,13 @@ async fn create_checkpoint(
         );
 
         let stage_started_at = Instant::now();
-        let eligible_file_count = verify_checkpoint_index(&git_dir, cwd, &request_index).await?;
+        let eligible_file_count = verify_checkpoint_index(
+            &git_dir,
+            cwd,
+            &request_index,
+            excluded_checkpoint_storage.as_deref(),
+        )
+        .await?;
         stage_ms.insert(
             "index_validation",
             stage_started_at.elapsed().as_millis() as u64,
@@ -3389,6 +3551,29 @@ fn checkpoint_git_dir(home: &Path, cwd: &Path) -> PathBuf {
     home.join(".freshell")
         .join("checkpoints")
         .join(format!("{short}.git"))
+}
+
+fn checkpoint_storage_exclusion(
+    git_dir: &Path,
+    work_tree: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let storage = git_dir.parent().ok_or_else(|| {
+        "checkpoint operation resolve-storage failed: storage path has no parent".to_string()
+    })?;
+    if work_tree.starts_with(storage) {
+        return Err(
+            "checkpoint operation resolve-storage failed: workspace overlaps Freshell checkpoint storage"
+                .to_string(),
+        );
+    }
+    match storage.strip_prefix(work_tree) {
+        Ok(relative) if relative.as_os_str().is_empty() => Err(
+            "checkpoint operation resolve-storage failed: workspace is Freshell checkpoint storage"
+                .to_string(),
+        ),
+        Ok(relative) => Ok(Some(relative.to_owned())),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Lexical (no symlink-following) equivalent of Node's `path.resolve(cwd)`: an
@@ -3571,7 +3756,11 @@ fn display_relative_path(path: &Path) -> String {
     }
 }
 
-async fn verify_readable_directories(git_dir: &Path, work_tree: &Path) -> Result<(), String> {
+async fn verify_readable_directories(
+    git_dir: &Path,
+    work_tree: &Path,
+    excluded_checkpoint_storage: Option<&Path>,
+) -> Result<(), String> {
     let mut pending = vec![PathBuf::new()];
     while let Some(relative_parent) = pending.pop() {
         let absolute_parent = work_tree.join(&relative_parent);
@@ -3604,6 +3793,9 @@ async fn verify_readable_directories(git_dir: &Path, work_tree: &Path) -> Result
                 continue;
             }
             let relative = relative_parent.join(entry.file_name());
+            if excluded_checkpoint_storage.is_some_and(|excluded| relative.starts_with(excluded)) {
+                continue;
+            }
             let mut ignore_path = git_path_bytes(&relative);
             ignore_path.push(b'/');
             candidates.push((relative, ignore_path));
@@ -4053,6 +4245,7 @@ async fn verify_checkpoint_index(
     git_dir: &Path,
     work_tree: &Path,
     index: &Path,
+    excluded_checkpoint_storage: Option<&Path>,
 ) -> Result<usize, String> {
     let staged = checkpoint_index_entries(git_dir, index).await?;
     for entry in &staged {
@@ -4073,7 +4266,13 @@ async fn verify_checkpoint_index(
                 String::from_utf8_lossy(&entry.path)
             ));
         }
-        let absolute = work_tree.join(path);
+        let absolute = work_tree.join(&path);
+        if excluded_checkpoint_storage.is_some_and(|excluded| path.starts_with(excluded)) {
+            return Err(format!(
+                "checkpoint operation inspect-index failed: internal checkpoint storage was staged at {}",
+                String::from_utf8_lossy(&entry.path)
+            ));
+        }
         let metadata = tokio::fs::symlink_metadata(&absolute)
             .await
             .map_err(|error| {
@@ -4690,6 +4889,66 @@ async fn post_checkpoint_restore(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct ReviewR6CaptureLogs(
+        Arc<std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>>>,
+    );
+
+    #[derive(Default)]
+    struct ReviewR6Fields(std::collections::BTreeMap<String, String>);
+
+    impl tracing::field::Visit for ReviewR6Fields {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ReviewR6CaptureLogs {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != "freshell_server::checkpoints" {
+                return;
+            }
+            let mut fields = ReviewR6Fields::default();
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+
+    fn review_r6_send(
+        cwd: Option<String>,
+        workspace: Option<&Path>,
+        request_id: &str,
+    ) -> FreshAgentSend {
+        FreshAgentSend {
+            provider: AgentProvider::Opencode,
+            session_id: "review-r6-session".to_string(),
+            session_type: SessionType::Freshopencode,
+            text: "private prompt marker must not enter checkpoint logs".to_string(),
+            cwd,
+            images: None,
+            request_id: Some(request_id.to_string()),
+            settings: None,
+            observed_epoch: None,
+            observed_generation: None,
+            checkpoint_intent: Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: "review-r6-attempt".to_string(),
+                workspace: workspace.map(|path| FreshAgentCheckpointWorkspace {
+                    path: path.to_string_lossy().into_owned(),
+                    provenance: CheckpointWorkspaceProvenance::DirectoryPicker,
+                }),
+            }),
+        }
+    }
 
     fn headers_with_token(token: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -6387,6 +6646,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn review_r6_explicit_picker_account_home_is_a_valid_scope() {
+        let home = tempfile::tempdir().unwrap();
+        let intent = json!({
+            "path": home.path(),
+            "provenance": "directory-picker",
+        });
+
+        let resolved = resolve_checkpoint_workspace(home.path(), home.path(), Some(&intent))
+            .await
+            .expect("explicit directory-picker selection defines the account-home scope");
+
+        assert_eq!(resolved.path, home.path().canonicalize().unwrap());
+        assert_eq!(resolved.provenance, "directory-picker");
+    }
+
+    #[tokio::test]
+    async fn review_r6_automatic_checkpoint_missing_workspace_is_logged() {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::prelude::*;
+
+        let home = tempfile::tempdir().unwrap();
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(8);
+        let service =
+            CheckpointService::new(Arc::new(home.path().to_path_buf()), Arc::new(broadcast_tx));
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(ReviewR6CaptureLogs(events.clone()));
+        let send = review_r6_send(None, None, "review-r6-no-workspace");
+
+        let outcome = service
+            .capture_automatic(&send, "review-r6-no-workspace", "review-r6-attempt")
+            .with_subscriber(subscriber)
+            .await;
+
+        assert_eq!(
+            outcome.outcome.status,
+            FreshAgentCheckpointStatus::Unavailable
+        );
+        let events = events.lock().unwrap();
+        let failure = events
+            .iter()
+            .find(|event| {
+                event
+                    .get("event")
+                    .is_some_and(|value| value == "code_checkpoint.failed")
+            })
+            .expect("automatic unavailable outcome must emit one structured failure event");
+        assert_eq!(failure["send_request_id"], "review-r6-no-workspace");
+        assert_eq!(failure["stage"], "workspace-resolution");
+        assert_eq!(failure["operation"], "resolve-workspace");
+        assert_eq!(failure["failure_code"], "workspace_unavailable");
+        assert!(!serde_json::to_string(&*events)
+            .unwrap()
+            .contains("private prompt marker"));
+    }
+
+    #[tokio::test]
+    async fn review_r6_automatic_checkpoint_cooldown_is_logged() {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::prelude::*;
+
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(8);
+        let service =
+            CheckpointService::new(Arc::new(home.path().to_path_buf()), Arc::new(broadcast_tx));
+        service.establish_cooldown(workspace.path());
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(ReviewR6CaptureLogs(events.clone()));
+        let send = review_r6_send(
+            Some(workspace.path().to_string_lossy().into_owned()),
+            Some(workspace.path()),
+            "review-r6-cooldown",
+        );
+
+        let outcome = service
+            .capture_automatic(&send, "review-r6-cooldown", "review-r6-attempt")
+            .with_subscriber(subscriber)
+            .await;
+
+        assert_eq!(
+            outcome.outcome.status,
+            FreshAgentCheckpointStatus::Unavailable
+        );
+        let events = events.lock().unwrap();
+        let failure = events
+            .iter()
+            .find(|event| {
+                event
+                    .get("failure_code")
+                    .is_some_and(|value| value == "capture_timeout_cooldown")
+            })
+            .expect("cooldown unavailable outcome must emit a structured failure event");
+        assert_eq!(failure["send_request_id"], "review-r6-cooldown");
+        assert_eq!(failure["stage"], "capture");
+        assert_eq!(failure["operation"], "automatic-pre-turn-snapshot");
+        assert_eq!(
+            failure["workspace"],
+            workspace.path().to_string_lossy().as_ref()
+        );
+        assert!(!serde_json::to_string(&*events)
+            .unwrap()
+            .contains("private prompt marker"));
+    }
+
+    #[tokio::test]
     async fn home_launch_without_workspace_does_not_publish_checkpoint() {
         let home_dir = tempfile::tempdir().unwrap();
         tokio::fs::write(home_dir.path().join("private.txt"), "private")
@@ -6469,7 +6833,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn picker_home_is_launch_only() {
+    async fn explicit_picker_home_is_snapshotted_without_the_internal_store() {
         let home_dir = tempfile::tempdir().unwrap();
         tokio::fs::write(home_dir.path().join("private.txt"), "private")
             .await
@@ -6488,14 +6852,21 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let error = body_json(response).await;
-        assert_eq!(error["code"], json!("workspace_unavailable"));
-        assert!(
-            !tokio::fs::try_exists(home_dir.path().join(".freshell/checkpoints"))
-                .await
-                .unwrap()
-        );
+        let status = response.status();
+        let entry = body_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{entry}");
+        assert_eq!(entry["workspace"]["path"], json!(home_dir.path()));
+        assert_eq!(entry["workspace"]["provenance"], json!("directory-picker"));
+
+        let git_dir = checkpoint_git_dir(home_dir.path(), home_dir.path());
+        let index = checkpoint_index_entries(&git_dir, &git_dir.join("index"))
+            .await
+            .expect("published picker-home checkpoint index is readable");
+        assert!(index.iter().any(|entry| entry.path == b"private.txt"));
+        assert!(!index.iter().any(|entry| {
+            entry.path.starts_with(b".freshell/checkpoints/")
+                || entry.path == b".freshell/checkpoints"
+        }));
     }
 
     #[tokio::test]
