@@ -303,12 +303,14 @@ describe('finite transfer ownership', () => {
     await fsp.mkdir(directory)
     const calls = path.join(directory, 'calls.jsonl')
     const blocked = path.join(directory, 'blocked')
-    await fsp.writeFile(path.join(directory, 'docker'), `#!${process.execPath}\nconst fs=require('node:fs'),a=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(a)+'\\n');if(fs.existsSync(${JSON.stringify(blocked)})){setTimeout(()=>process.exit(9),900)}else if(a[0]==='info')process.stdout.write('["rootless"]');else if(a[0]==='image')process.stdout.write('sha256:${'b'.repeat(64)}');else if(a[0]==='volume'&&a[1]==='create')process.stdout.write(a.at(-1));else if(['create','run'].includes(a[0]))process.stdout.write('${'a'.repeat(64)}');else if(a[0]==='inspect')process.stdout.write('0');\n`, { mode: 0o700 })
+    const cleanupBudgetMs = 1_000
+    const stalledTransportMs = cleanupBudgetMs * 2 + 500
+    await fsp.writeFile(path.join(directory, 'docker'), `#!${process.execPath}\nconst fs=require('node:fs'),a=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(a)+'\\n');if(fs.existsSync(${JSON.stringify(blocked)})){setTimeout(()=>process.exit(9),${stalledTransportMs})}else if(a[0]==='info')process.stdout.write('["rootless"]');else if(a[0]==='image')process.stdout.write('sha256:${'b'.repeat(64)}');else if(a[0]==='volume'&&a[1]==='create')process.stdout.write(a.at(-1));else if(['create','run'].includes(a[0]))process.stdout.write('${'a'.repeat(64)}');else if(a[0]==='inspect')process.stdout.write('0');\n`, { mode: 0o700 })
     const h = new owner.RuntimeHarness(fixtureRepoRoot, randomUUID(), 2)
     const migration = path.join(directory, 'migrations.json'); await fsp.writeFile(migration, '[]')
     vi.stubEnv('PATH', `${directory}${path.delimiter}${process.env.PATH}`)
     try {
-      await h.prepareTransfer(`sha256:${'b'.repeat(64)}`, { operationTimeoutMs: 250, cleanupTimeoutMs: 250, lifecycleMs: 1_000, memoryBytes: 1024 ** 3 })
+      await h.prepareTransfer(`sha256:${'b'.repeat(64)}`, { operationTimeoutMs: 250, cleanupTimeoutMs: cleanupBudgetMs, lifecycleMs: cleanupBudgetMs, memoryBytes: 1024 ** 3 })
       h.startTransferProvider(process.execPath, path.join(fixtureRepoRoot, 'crates/freshell-sessions/src/opencode_schema_v1_18_21.sql'), migration)
       const original = h.transferOwnedIds()
       await fsp.writeFile(blocked, 'stall')
