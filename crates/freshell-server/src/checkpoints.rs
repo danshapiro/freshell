@@ -313,13 +313,13 @@ impl CheckpointCaptureControl {
                     std::io::Error::other("checkpoint child process has no process group id")
                 })?;
             groups.insert(group);
-            return Ok(CheckpointChild {
+            Ok(CheckpointChild {
                 child: Some(child),
                 control: Some(Arc::clone(self)),
                 process_group: Some(group),
                 #[cfg(windows)]
                 job: None,
-            });
+            })
         }
         #[cfg(windows)]
         {
@@ -2639,8 +2639,7 @@ impl CheckpointFailure {
         if let Some(after_prefix) = detail.strip_prefix("Git operation ") {
             if let Some((name, after_name)) = after_prefix.split_once(" failed") {
                 operation = name.to_string();
-                cause =
-                    after_name.trim_start_matches(|character| character == ' ' || character == ':');
+                cause = after_name.trim_start_matches([' ', ':']);
             }
         } else if detail.starts_with("git index update failed") {
             operation = "git-index-update".to_string();
@@ -4901,7 +4900,7 @@ mod tests {
             .await;
 
         assert_eq!(dispatches.load(Ordering::SeqCst), 1);
-        let key = format!("\"opencode\":\"freshopencode\":session-1:logical-attempt-1");
+        let key = "\"opencode\":\"freshopencode\":session-1:logical-attempt-1".to_string();
         let record = service.find_outcome(&key).await.unwrap().unwrap();
         assert!(record.dispatch_started);
         assert_eq!(record.submitted_turn_id.as_deref(), Some("provider-turn-1"));
@@ -5875,9 +5874,7 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("message will still be sent"));
-        let key = format!(
-            "\"opencode\":\"freshopencode\":session-quarantine-settlement:attempt-quarantine-settlement"
-        );
+        let key = "\"opencode\":\"freshopencode\":session-quarantine-settlement:attempt-quarantine-settlement".to_string();
         let saved = service.find_outcome(&key).await.unwrap().unwrap();
         assert!(saved.capture_settled);
         assert!(saved.dispatch_started);
