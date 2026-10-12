@@ -28,6 +28,8 @@ const checkpointForwarderPort = 3478
 const checkpointFixtureRoot = '/tmp/freshell-checkpoint-fixture'
 const checkpointControlRequest = `${checkpointFixtureRoot}/control/request.json`
 const checkpointControlAck = (id: string) => `${checkpointFixtureRoot}/control/ack-${id}.json`
+const checkpointControlPollIntervalMs = 1_000
+const targetReadRateLimitRetries = 3
 export type ManagedProviderEnvironmentTargetMode = 'managed-environment' | 'code-checkpoint'
 const delay = (milliseconds: number) => new Promise(resolve => setTimeout(resolve, milliseconds))
 const digest = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex')
@@ -551,15 +553,32 @@ function restrictedIdentity(): { uid: number; gid: number } {
   return { uid, gid }
 }
 
-async function externalTargetRead(baseUrl: string, token: string, selected: string): Promise<any | undefined> {
-  const response = await fetch(`${baseUrl}/api/files/read?path=${encodeURIComponent(selected)}`, {
-    headers: { 'x-auth-token': token }, signal: AbortSignal.timeout(15_000),
-  })
-  if (response.status === 404) return undefined
-  assert(response.ok, `Owned checkpoint target control read failed with HTTP ${response.status}`)
-  const body = await response.json() as { content?: unknown }
-  assert(typeof body.content === 'string')
-  return JSON.parse(body.content)
+export async function externalTargetRead(
+  baseUrl: string,
+  token: string,
+  selected: string,
+  dependencies: { fetcher?: typeof fetch; wait?: (milliseconds: number) => Promise<void> } = {},
+): Promise<any | undefined> {
+  const fetchTarget = dependencies.fetcher ?? fetch
+  const wait = dependencies.wait ?? delay
+  let retries = 0
+  while (true) {
+    const response = await fetchTarget(`${baseUrl}/api/files/read?path=${encodeURIComponent(selected)}`, {
+      headers: { 'x-auth-token': token }, signal: AbortSignal.timeout(15_000),
+    })
+    if (response.status === 429 && retries < targetReadRateLimitRetries) {
+      const retryAfterSeconds = Number(response.headers.get('retry-after'))
+      await response.body?.cancel()
+      await wait(Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0 ? retryAfterSeconds * 1_000 : 1_000)
+      retries += 1
+      continue
+    }
+    if (response.status === 404) return undefined
+    assert(response.ok, `Owned checkpoint target control read failed with HTTP ${response.status}`)
+    const body = await response.json() as { content?: unknown }
+    assert(typeof body.content === 'string')
+    return JSON.parse(body.content)
+  }
 }
 
 async function externalTargetWrite(baseUrl: string, token: string, selected: string, content: string): Promise<void> {
@@ -641,7 +660,9 @@ async function serveCheckpointControls(
       controls.push({ requestId: request.requestId, action: request.action, restrictedUid: identity.uid,
         privateFileDenied: true, effectiveCapabilities: ack.effectiveCapabilities })
     }
-    await delay(150)
+    // Each read consumes the target's authenticated API budget shared with
+    // browser traffic. Keep fixture-control polling below that request rate.
+    await delay(checkpointControlPollIntervalMs)
   }
 }
 

@@ -4,6 +4,7 @@ import { createConnection, createServer, type AddressInfo } from 'node:net'
 import { describe, expect, it } from 'vitest'
 import {
   checkpointTcpForwarderSource,
+  externalTargetRead,
   processIdentity,
   resolveManagedProviderEnvironmentTargetMode,
   runManagedProviderEnvironmentTarget,
@@ -19,6 +20,28 @@ async function listenOnLoopback(server: ReturnType<typeof createServer>): Promis
 }
 
 describe('managed provider environment target mode', () => {
+  it('waits for the target Retry-After before retrying a rate-limited control read', async () => {
+    const responses = [
+      new Response('rate limited', { status: 429, headers: { 'retry-after': '2' } }),
+      new Response(JSON.stringify({ content: JSON.stringify({ requestId: 'request-1' }) }), { status: 200 }),
+    ]
+    const waits: number[] = []
+    let calls = 0
+    const fetcher: typeof fetch = async () => {
+      calls += 1
+      return responses.shift()!
+    }
+
+    const result = await externalTargetRead('http://127.0.0.1:1234', 'token', '/control/request.json', {
+      fetcher,
+      wait: async milliseconds => { waits.push(milliseconds) },
+    })
+
+    expect(result).toEqual({ requestId: 'request-1' })
+    expect(calls).toBe(2)
+    expect(waits).toEqual([2_000])
+  })
+
   it('keeps the existing managed target as the default and selects checkpoint only explicitly', () => {
     expect(resolveManagedProviderEnvironmentTargetMode([])).toBe('managed-environment')
     expect(resolveManagedProviderEnvironmentTargetMode(['--checkpoint'])).toBe('code-checkpoint')
