@@ -87,6 +87,11 @@ const SESSION_TYPE: &str = "freshopencode";
 const PROVIDER: &str = "opencode";
 /// `DEFAULT_TURN_TIMEOUT_MS` (`adapter.ts:35`).
 const DEFAULT_TURN_TIMEOUT: Duration = Duration::from_millis(600_000);
+/// OpenCode may publish a prompt response before `/session/:id/message` reflects it.
+/// Keep reconciliation to one initial read plus three short retries.
+const CHECKPOINT_IDENTITY_HISTORY_ATTEMPTS: usize = 4;
+const CHECKPOINT_IDENTITY_HISTORY_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+const CHECKPOINT_IDENTITY_HISTORY_RETRY_DELAY: Duration = Duration::from_millis(75);
 
 #[derive(Clone, Debug)]
 struct CheckpointTurnIdentity {
@@ -119,6 +124,57 @@ fn checkpoint_turn_identity(send: &FreshAgentSend) -> Option<CheckpointTurnIdent
             uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, logical_attempt_id.as_bytes()).simple()
         ),
     })
+}
+
+/// Observe the native user row for a checkpointed OpenCode send. History reads are
+/// read-only and no session lock is held here; cancelling this future drops only the
+/// current GET or retry delay. No receipt is emitted unless one bounded read confirms
+/// the exact native id on exactly one role=user row.
+async fn observe_checkpoint_turn_identity(
+    manager: &OpencodeServeManager,
+    session_id: &str,
+    route: &Option<String>,
+    identity: &CheckpointTurnIdentity,
+) -> Option<String> {
+    let mut last_failure = None;
+    for attempt in 1..=CHECKPOINT_IDENTITY_HISTORY_ATTEMPTS {
+        let read = tokio::time::timeout(
+            CHECKPOINT_IDENTITY_HISTORY_REQUEST_TIMEOUT,
+            manager.list_messages(session_id, route),
+        )
+        .await;
+        match read {
+            Ok(Ok(messages)) => {
+                if let Some(native_id) = freshell_opencode::observed_user_message_id(
+                    &messages,
+                    &identity.native_message_id,
+                ) {
+                    return Some(native_id);
+                }
+                last_failure = Some("matching role=user row is not visible yet".to_string());
+            }
+            Ok(Err(error)) => last_failure = Some(error.to_string()),
+            Err(_) => {
+                last_failure = Some(format!(
+                    "message-history read exceeded {}ms",
+                    CHECKPOINT_IDENTITY_HISTORY_REQUEST_TIMEOUT.as_millis()
+                ));
+            }
+        }
+
+        if attempt < CHECKPOINT_IDENTITY_HISTORY_ATTEMPTS {
+            tokio::time::sleep(CHECKPOINT_IDENTITY_HISTORY_RETRY_DELAY).await;
+        }
+    }
+
+    tracing::warn!(target: "freshell_freshagent::opencode",
+        session_id,
+        request_id = %identity.request_id,
+        logical_attempt_id = %identity.logical_attempt_id,
+        attempts = CHECKPOINT_IDENTITY_HISTORY_ATTEMPTS,
+        error = last_failure.as_deref().unwrap_or("history row was not observed"),
+        "checkpoint_turn_identity_unobserved");
+    None
 }
 
 /// Shared, cheaply-cloneable freshopencode WS state (mergeable into `WsState`).
@@ -2744,37 +2800,20 @@ impl FreshOpencodeState {
             // ID on a role=user row. Observe after dispatch; never join by text/order.
             if prompt_dispatched.load(Ordering::SeqCst) {
                 if let Some(identity) = checkpoint_identity.as_ref() {
-                    match manager.list_messages(&real_id, &route).await {
-                        Ok(messages) => {
-                            if let Some(native_id) = freshell_opencode::observed_user_message_id(
-                                &messages,
-                                &identity.native_message_id,
-                            ) {
-                                this.broadcast(&event_frame(
-                                    &real_id,
-                                    json!({
-                                        "type": "checkpointTurnIdentity",
-                                        "logicalAttemptId": identity.logical_attempt_id,
-                                        "requestId": identity.request_id,
-                                        "sessionId": real_id,
-                                        "nativeTurnId": native_id,
-                                        "displayTurnId": identity.native_message_id,
-                                    }),
-                                ));
-                            } else {
-                                tracing::warn!(target: "freshell_freshagent::opencode",
-                                    session_id = %real_id,
-                                    request_id = %identity.request_id,
-                                    logical_attempt_id = %identity.logical_attempt_id,
-                                    "checkpoint_turn_identity_unobserved");
-                            }
-                        }
-                        Err(error) => tracing::warn!(target: "freshell_freshagent::opencode",
-                            session_id = %real_id,
-                            request_id = %identity.request_id,
-                            logical_attempt_id = %identity.logical_attempt_id,
-                            error = %error,
-                            "checkpoint_turn_identity_history_read_failed"),
+                    if let Some(native_id) =
+                        observe_checkpoint_turn_identity(&manager, &real_id, &route, identity).await
+                    {
+                        this.broadcast(&event_frame(
+                            &real_id,
+                            json!({
+                                "type": "checkpointTurnIdentity",
+                                "logicalAttemptId": identity.logical_attempt_id,
+                                "requestId": identity.request_id,
+                                "sessionId": real_id,
+                                "nativeTurnId": native_id,
+                                "displayTurnId": identity.native_message_id,
+                            }),
+                        ));
                     }
                 }
             }
@@ -16814,6 +16853,10 @@ mod tests {
         requests: StdMutex<Vec<RecordedRequest>>,
         busy_budget: StdMutex<std::collections::HashMap<String, usize>>,
         persisted_message_history: StdMutex<std::collections::HashMap<String, Vec<Value>>>,
+        message_history_misses: StdMutex<usize>,
+        message_history_errors: StdMutex<usize>,
+        message_history_reads: AtomicUsize,
+        message_history_gate: StdMutex<Option<Arc<tokio::sync::Notify>>>,
         summarize_outcome: SummarizeOutcome,
         config_body: Vec<u8>,
         bus_probe: StdMutex<tokio::sync::broadcast::Receiver<String>>,
@@ -16893,6 +16936,10 @@ mod tests {
                 requests: StdMutex::new(Vec::new()),
                 busy_budget: StdMutex::new(std::collections::HashMap::new()),
                 persisted_message_history: StdMutex::new(std::collections::HashMap::new()),
+                message_history_misses: StdMutex::new(0),
+                message_history_errors: StdMutex::new(0),
+                message_history_reads: AtomicUsize::new(0),
+                message_history_gate: StdMutex::new(None),
                 summarize_outcome,
                 config_body,
                 bus_probe: StdMutex::new(bus_probe),
@@ -16912,6 +16959,15 @@ mod tests {
 
         fn recorded(&self) -> Vec<RecordedRequest> {
             self.requests.lock().expect("requests mutex").clone()
+        }
+
+        fn arm_message_history_gate(&self) -> Arc<tokio::sync::Notify> {
+            let gate = Arc::new(tokio::sync::Notify::new());
+            *self
+                .message_history_gate
+                .lock()
+                .expect("message history gate mutex") = Some(gate.clone());
+            gate
         }
 
         /// send-during-compact queue (Task 3): arm the one-shot prompt
@@ -17255,6 +17311,43 @@ mod tests {
                 });
             }
             if method == "GET" && req.url.contains("/message") {
+                self.message_history_reads.fetch_add(1, Ordering::SeqCst);
+                let history_missing = {
+                    let mut remaining = self
+                        .message_history_misses
+                        .lock()
+                        .expect("message history misses mutex");
+                    if *remaining == 0 {
+                        false
+                    } else {
+                        *remaining -= 1;
+                        true
+                    }
+                };
+                if history_missing {
+                    return Box::pin(
+                        async move { Ok(ServeHttpResponse::new(200, b"[]".to_vec())) },
+                    );
+                }
+                let history_error = {
+                    let mut remaining = self
+                        .message_history_errors
+                        .lock()
+                        .expect("message history errors mutex");
+                    if *remaining == 0 {
+                        false
+                    } else {
+                        *remaining -= 1;
+                        true
+                    }
+                };
+                if history_error {
+                    return Box::pin(async move {
+                        Err(ServeHttpError::Ambiguous(
+                            "transient message-history read failure by the test knob".to_string(),
+                        ))
+                    });
+                }
                 let id = req
                     .url
                     .split("/session/")
@@ -17269,7 +17362,15 @@ mod tests {
                     .get(&id)
                     .cloned()
                     .unwrap_or_default();
+                let history_gate = self
+                    .message_history_gate
+                    .lock()
+                    .expect("message history gate mutex")
+                    .take();
                 return Box::pin(async move {
+                    if let Some(gate) = history_gate {
+                        gate.notified().await;
+                    }
                     Ok(ServeHttpResponse::new(
                         200,
                         serde_json::to_vec(&messages).expect("history encodes as JSON"),
@@ -25062,6 +25163,14 @@ mod tests {
         )
         .await;
         insert_compact_session(&st, "ses_checkpoint_queue", Some("prov/model")).await;
+        *http
+            .message_history_misses
+            .lock()
+            .expect("message history misses mutex") = 1;
+        *http
+            .message_history_errors
+            .lock()
+            .expect("message history errors mutex") = 1;
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
             st.handle_compact(compact_msg("ses_checkpoint_queue")),
@@ -25108,13 +25217,25 @@ mod tests {
             })
             .expect("queued prompt drains through the provider transport");
         assert_eq!(prompt.body.unwrap()["messageID"], expected_message_id);
-
-        let receipt_frames = frames_until(&mut rx, |frame| {
+        // The compact that was already in flight has its own completion edge;
+        // drain it before waiting for the queued send's completion and identity.
+        let _compact_frames = frames_until(&mut rx, |frame| {
             frame["type"] == "freshAgent.event"
-                && frame["event"]["type"] == "checkpointTurnIdentity"
+                && frame["event"]["type"] == "freshAgent.turn.complete"
         })
         .await;
-        let receipt = receipt_frames
+        let settled_frames = frames_until(&mut rx, |frame| {
+            frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        assert_eq!(
+            http.message_history_reads.load(Ordering::SeqCst),
+            3,
+            "identity reconciliation retries both an initially absent row and a transient history error before settling"
+        );
+
+        let receipt = settled_frames
             .iter()
             .find(|frame| {
                 frame["type"] == "freshAgent.event"
@@ -25128,6 +25249,84 @@ mod tests {
         assert_eq!(receipt["event"]["displayTurnId"], expected_message_id);
         assert!(receipt["event"].get("text").is_none());
         st.fresh_agent.ensure_manager().await.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_turn_identity_opencode_history_retry_cancels_without_leaking_reads() {
+        let (st, http, mut rx) =
+            compact_state(r#"{"model":null}"#, SummarizeOutcome::OkAnswered).await;
+        let manager = st.fresh_agent.ensure_manager().await;
+        let _history_gate = http.arm_message_history_gate();
+        let identity = CheckpointTurnIdentity {
+            logical_attempt_id: "attempt-cancel".into(),
+            request_id: "request-cancel".into(),
+            native_message_id: "msg_0123456789abcdef0123456789abcdef".into(),
+        };
+        let route = None;
+        let task_manager = manager.clone();
+        let task = tokio::spawn(async move {
+            observe_checkpoint_turn_identity(
+                &task_manager,
+                "ses_checkpoint_cancel",
+                &route,
+                &identity,
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while http.message_history_reads.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the bounded history read starts");
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("the aborted reconciliation task settles")
+                .is_cancelled(),
+            "cancellation drops the in-flight read instead of leaving a retry task behind"
+        );
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(http.message_history_reads.load(Ordering::SeqCst), 1);
+        assert!(drain_frames(&mut rx).iter().all(|frame| {
+            frame["type"] != "freshAgent.event"
+                || frame["event"]["type"] != "checkpointTurnIdentity"
+        }));
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_turn_identity_opencode_history_retry_stops_at_attempt_limit() {
+        let (st, http, _rx) =
+            compact_state(r#"{"model":null}"#, SummarizeOutcome::OkAnswered).await;
+        let manager = st.fresh_agent.ensure_manager().await;
+        *http
+            .message_history_errors
+            .lock()
+            .expect("message history errors mutex") = CHECKPOINT_IDENTITY_HISTORY_ATTEMPTS;
+        let identity = CheckpointTurnIdentity {
+            logical_attempt_id: "attempt-bounded".into(),
+            request_id: "request-bounded".into(),
+            native_message_id: "msg_0123456789abcdef0123456789abcdef".into(),
+        };
+
+        let observed =
+            observe_checkpoint_turn_identity(&manager, "ses_checkpoint_bounded", &None, &identity)
+                .await;
+
+        assert_eq!(
+            observed, None,
+            "failed history reads never bind a candidate id"
+        );
+        assert_eq!(
+            http.message_history_reads.load(Ordering::SeqCst),
+            CHECKPOINT_IDENTITY_HISTORY_ATTEMPTS,
+            "history reconciliation performs one initial read and only the configured retries"
+        );
+        manager.shutdown().await;
     }
 
     // ── merged from the send-during-compact-queue branch ──
