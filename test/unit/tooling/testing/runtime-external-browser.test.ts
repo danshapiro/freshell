@@ -2244,10 +2244,15 @@ describe('interrupted ordinary Stop owner transport', () => {
       if (result.status !== 0) throw new Error(result.stderr)
       return result.stdout
     })
-    const transcriptPath = path.join(directory, 'rollout.jsonl')
+    const providerHome = path.join(directory, 'provider')
+    const canonicalTranscriptPath = path.join(providerHome, '.codex/sessions', `rollout-fixture-${handle.nativeSessionId}.jsonl`)
+    const datedTranscriptPath = path.join(providerHome, '.codex/sessions/2026/03/01', `rollout-${handle.nativeSessionId}.jsonl`)
+    await fsp.mkdir(path.dirname(canonicalTranscriptPath), { recursive: true })
+    await fsp.writeFile(canonicalTranscriptPath, '')
     const provider = vi.spyOn(owned, 'ownedProviderExec').mockImplementation(async (containerId, args) => {
       expect(containerId).toBe(handle.containerId)
-      const result = spawnSync(args[0], [...args.slice(1, 4), transcriptPath, ...args.slice(5)], { encoding: 'utf8' })
+      const providerPath = path.relative('/home/freshell/provider', args[4]!)
+      const result = spawnSync(args[0], [...args.slice(1, 4), path.join(providerHome, providerPath), ...args.slice(5)], { encoding: 'utf8' })
       if (result.status !== 0) throw new Error(result.stderr)
       return result.stdout
     })
@@ -2271,7 +2276,8 @@ describe('interrupted ordinary Stop owner transport', () => {
     })
     const request = { runId: context.runId, candidateSha: context.candidateSha, scenarioId: 'browser-managed-runtime',
       operationId: 'stop-operation', action: 'interrupted-stop-facts', handle }
-    return { owned, rig, handle, row, inventory, directory, db, registry, provider, transcriptPath, hostState, lifecycle,
+    return { owned, rig, handle, row, inventory, directory, db, registry, provider, canonicalTranscriptPath,
+      datedTranscriptPath, hostState, lifecycle,
       stop, remove, start, running, logs, inspect, control, request, wire,
       close: async () => { db.close(); vi.restoreAllMocks(); await fsp.rm(directory, { recursive: true, force: true }) } }
   }
@@ -2295,12 +2301,13 @@ describe('interrupted ordinary Stop owner transport', () => {
     const f = await fixture()
     try {
       await f.rig.prepareInterruptedOrdinaryStopHistory(f.handle)
-      const transcript = (await fsp.readFile(f.transcriptPath, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+      const transcript = (await fsp.readFile(f.canonicalTranscriptPath, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
       expect(transcript[0].payload.id).toBe(f.handle.nativeSessionId)
       expect(transcript.filter(row => row.payload.type === 'user_message').map(row => row.payload.message))
         .toEqual([0, 1, 2].map(index => `Synthetic saved prompt ${index}`))
       expect(transcript.filter(row => row.payload.type === 'task_complete').map(row => row.payload.last_agent_message))
         .toEqual([0, 1, 2].map(index => `Synthetic saved answer ${index}`))
+      await expect(fsp.access(f.datedTranscriptPath)).rejects.toThrow()
       const previous = f.owned.supervisor
       let release!: () => void
       const pending = new Promise<void>(resolve => { release = resolve })

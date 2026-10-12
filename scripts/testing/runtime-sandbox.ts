@@ -7372,7 +7372,7 @@ export class ManagedRuntimeOwner {
     ].map((row) => JSON.stringify(row)).join('\n') + '\n'
     await this.ownedProviderExec(handle.containerId, ['node', '--input-type=module', '-e',
       'import fs from "node:fs"; import path from "node:path"; fs.mkdirSync(path.dirname(process.argv[1]), {recursive:true}); fs.writeFileSync(process.argv[1],process.argv[2]);',
-      `/home/freshell/provider/.codex/sessions/2026/03/01/rollout-${handle.nativeSessionId}.jsonl`, transcript])
+      `/home/freshell/provider/.codex/sessions/rollout-fixture-${handle.nativeSessionId}.jsonl`, transcript])
     this.interruptedStop = { handle: { ...handle }, volumeName: this.supervisor.volumeName,
       runtimeRoot: this.supervisor.runtimeRoot, scenarioId: this.supervisor.scenarioId, countersInstalled: false }
     this.runtime.recordLifecycle('external.interrupted_stop_history_prepared', { severity: 'info', ...handle })
