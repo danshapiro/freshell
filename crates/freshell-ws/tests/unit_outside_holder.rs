@@ -279,7 +279,7 @@ async fn an_auto_resume_of_a_conversation_held_outside_freshell_is_refused_and_n
     })
     .await;
     let attempts: Vec<u32> = h
-        .native_manifests()
+        .native_manifests_without_lost_ports()
         .iter()
         .map(|m| m.pid)
         .filter(|pid| !natives_before.contains(pid))

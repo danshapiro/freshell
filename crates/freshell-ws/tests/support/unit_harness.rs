@@ -661,9 +661,7 @@ impl UnitHarness {
         .expect("attached");
     }
 
-    /// Every native app-server manifest the fake wrote, except those of
-    /// natives that lost their listen port (another socket bound it first):
-    /// such a native never served, and the planner retried its start.
+    /// Every native app-server manifest the fake wrote.
     pub fn native_manifests(&self) -> Vec<fake_codex::NativeManifest> {
         std::fs::read_dir(&self.manifests)
             .into_iter()
@@ -677,6 +675,16 @@ impl UnitHarness {
             })
             .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
             .filter_map(|raw| serde_json::from_str::<fake_codex::NativeManifest>(&raw).ok())
+            .collect()
+    }
+
+    /// The native app-server manifests a plan's app-server count includes:
+    /// every one except those of natives that lost their listen port
+    /// (another socket bound it first, `listenError`). Such a native never
+    /// served, and the planner retried its start.
+    pub fn native_manifests_without_lost_ports(&self) -> Vec<fake_codex::NativeManifest> {
+        self.native_manifests()
+            .into_iter()
             .filter(|native| native.listen_error.is_none())
             .collect()
     }

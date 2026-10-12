@@ -258,7 +258,7 @@ async fn a_restore_create_that_gives_up_early_releases_its_conversation_only_at_
         .await
         .expect("an answer to the create");
     assert_eq!(answer["type"], "error", "{answer}");
-    let natives = h.native_manifests();
+    let natives = h.native_manifests_without_lost_ports();
     assert_eq!(natives.len(), 1, "the restore planned its app-server first");
     let entry = h
         .state
@@ -342,7 +342,7 @@ async fn a_failed_auto_resume_releases_its_conversation_only_at_its_units_gone()
         .await
         .expect("the hub settles the auto-resume");
     assert_eq!(settled["reason"], "respawn_failed", "{settled}");
-    let natives = h.native_manifests();
+    let natives = h.native_manifests_without_lost_ports();
     assert_eq!(
         natives.len(),
         2,

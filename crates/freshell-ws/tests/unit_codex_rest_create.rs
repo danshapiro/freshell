@@ -188,7 +188,7 @@ async fn a_rest_codex_spawn_failure_stops_its_unit_and_releases_the_conversation
     let _gone_delay = GoneDelay::set(1500);
     let (status, body) = h.rest_create_codex(Some("t-nospawn")).await;
     assert_eq!(status, 400, "{body}");
-    let natives = h.native_manifests();
+    let natives = h.native_manifests_without_lost_ports();
     assert_eq!(natives.len(), 1, "the plan started one app-server");
     assert!(
         !is_vacant(&h, "t-nospawn"),
@@ -257,7 +257,7 @@ async fn a_stop_that_reaches_gone_before_a_rest_start_commits_ends_the_start() {
         .into_iter()
         .next()
         .expect("the starting entry");
-    let natives = h.native_manifests();
+    let natives = h.native_manifests_without_lost_ports();
     assert_eq!(natives.len(), 1, "the plan started one app-server");
 
     let stop = h
