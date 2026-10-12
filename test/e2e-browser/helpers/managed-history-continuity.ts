@@ -97,6 +97,16 @@ export function assertManagedHistoryContinuity(before: HistoryState, after: Hist
       expect(current.soul.nativeSessionId, 'History cannot forget an established authoritative native identity').toBe(prior.soul.nativeSessionId)
     }
     expect(current.view, 'History must retain the exact view intent').toStrictEqual(prior.view)
+    if (prior.content.status !== current.content.status) {
+      // The fixture has completed its turn. Its final provider activity event
+      // may settle while History is opening; that does not change the saved
+      // pane or its runtime owner. Admit only the busy-to-idle completion edge.
+      expect(prior.content.status, 'Only a completed pane may settle during History').toBe('running')
+      expect(current.content.status, 'A completed pane must settle to idle').toBe('idle')
+      const leaf = leaves(expected[allocation.tabId]).find(candidate => candidate.id === allocation.paneId)!
+      if (leaf.content.kind !== 'fresh-agent') throw new Error('baseline fresh-agent History leaf required')
+      leaf.content.status = current.content.status
+    }
     if (prior.pair[0] !== current.pair[0] || prior.pair[1] !== current.pair[1]) {
       expect(prior.pair).toEqual(['materializing', 'unknown'])
       expect(current.pair).toEqual(['verified_durable', 'resume_captured'])
