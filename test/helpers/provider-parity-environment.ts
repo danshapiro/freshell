@@ -6,6 +6,8 @@ export function managedEnvironmentOpencodeSelection(): Record<string, string> {
   return {
     OPENCODE_DISABLE_PROJECT_CONFIG: '1',
     OPENCODE_CONFIG: './opencode.json',
+    // Keep OpenCode's update dialog from taking over the alternate screen.
+    OPENCODE_DISABLE_AUTOUPDATE: '1',
   }
 }
 
