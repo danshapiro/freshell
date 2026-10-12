@@ -396,6 +396,9 @@ async function runPaneSessionHandoffInternal(
         sessionType: handoff.owner.sessionType,
         sessionId: committedSessionId,
         cwd: resolvedCwd,
+        ...(latest.content.kind === 'fresh-agent' && latest.content.checkpointWorkspace
+          ? { checkpointWorkspace: latest.content.checkpointWorkspace }
+          : {}),
         freshAgentProviderSettings: latest.providerSettings,
       }),
   }))

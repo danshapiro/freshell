@@ -1,6 +1,7 @@
 import { findPaneForSession } from '@/lib/session-utils'
 import { openSessionTab, setActiveTab } from '@/store/tabsSlice'
 import { setActivePane } from '@/store/panesSlice'
+import type { FreshAgentCheckpointWorkspace } from '@/store/paneTypes'
 import type { AppDispatch, RootState } from '@/store/store'
 
 export interface ResumeTarget {
@@ -10,6 +11,7 @@ export interface ResumeTarget {
   sessionType?: string
   title?: string
   firstUserMessage?: string
+  checkpointWorkspace?: FreshAgentCheckpointWorkspace
 }
 
 /**
@@ -44,6 +46,7 @@ export function resumeSessionInTab(
       cwd: target.cwd,
       title: target.title,
       firstUserMessage: target.firstUserMessage,
+      ...(target.checkpointWorkspace ? { checkpointWorkspace: target.checkpointWorkspace } : {}),
     }),
   )
   onNavigate?.('terminal')

@@ -4279,8 +4279,9 @@ describe('Sidebar Component - Session-Centric Display', () => {
       }
     })
 
-    it('focuses existing pane when clicking a session already open in another tab', async () => {
+    it('focuses the existing fresh-agent pane with its checkpoint workspace when clicking its session', async () => {
       const targetSessionId = sessionId('session-already-in-pane')
+      const checkpointWorkspace = { path: '/selected/project', provenance: 'directory-picker' as const }
 
       const projects: ProjectGroup[] = [
         {
@@ -4292,6 +4293,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
               lastActivityAt: Date.now(),
               title: 'Already in pane',
               cwd: '/home/user/project',
+              sessionType: 'freshclaude',
             },
           ],
         },
@@ -4318,11 +4320,14 @@ describe('Sidebar Component - Session-Centric Display', () => {
             type: 'leaf',
             id: 'pane-2',
             content: {
-              kind: 'terminal',
-              mode: 'claude',
+              kind: 'fresh-agent',
+              sessionType: 'freshclaude',
+              provider: 'claude',
               createRequestId: 'req-2',
-              status: 'running',
+              status: 'idle',
               resumeSessionId: targetSessionId,
+              sessionRef: { provider: 'claude', sessionId: targetSessionId },
+              checkpointWorkspace,
             },
           },
         },
@@ -4350,6 +4355,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(state.tabs.tabs).toHaveLength(2)
       expect(state.tabs.activeTabId).toBe('tab-2')
       expect(state.panes.activePane['tab-2']).toBe('pane-2')
+      expect(state.panes.layouts['tab-2']).toMatchObject({
+        type: 'leaf',
+        content: { kind: 'fresh-agent', checkpointWorkspace },
+      })
     })
 
     it('does not hijack a foreign copied pane when opening the local session', async () => {
