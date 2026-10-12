@@ -85,6 +85,7 @@ use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySi
 mod controls;
 mod metadata;
 pub(crate) mod native_history;
+mod sidecar_port;
 
 /// Unified agent names (Task 2): the ambient `CODEX_HOME` fallback for the
 /// durability-driven pending bind when the app-server's own initialize
@@ -188,6 +189,15 @@ fn locate_thread_rollout(
 const SESSION_TYPE: &str = "freshcodex";
 /// The runtime provider (`AGENT_SESSION_TYPES.codex.provider`).
 const PROVIDER: &str = "codex";
+
+/// A started app-server sidecar ([`FreshCodexState::spawn_sidecar`]): the
+/// client, its notification stream, the ownership tag, and the owned child.
+type SpawnedSidecarParts = (
+    Arc<CodexAppServerClient>,
+    tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
+    String,
+    tokio::process::Child,
+);
 
 enum CodexStopMode {
     Close,
@@ -454,6 +464,11 @@ pub struct FreshCodexState {
     /// stale by definition). `None` in production.
     snapshot_pause_after_capture: Arc<StdMutex<Option<SnapshotPauseHook>>>,
     controls: controls::ControlRegistry,
+    /// Tests: the listen ports the next sidecar start attempts use, in order,
+    /// instead of allocating one (a port the test holds; the planner's
+    /// `with_forced_listen_port`). Interior-shared like the other test seams.
+    #[cfg(test)]
+    forced_listen_ports: Arc<StdMutex<std::collections::VecDeque<u16>>>,
 }
 
 /// kata b8ke Task 5 (round-1 review shape, round-3 F10 placement): the
@@ -816,6 +831,8 @@ impl FreshCodexState {
             snapshot_pause: Arc::new(StdMutex::new(None)),
             snapshot_pause_after_capture: Arc::new(StdMutex::new(None)),
             controls: Default::default(),
+            #[cfg(test)]
+            forced_listen_ports: Arc::default(),
         }
     }
 
@@ -834,6 +851,26 @@ impl FreshCodexState {
     #[cfg(test)]
     pub(crate) fn set_codex_quiet_window_ms_for_tests(&self, ms: u64) {
         self.codex_quiet_window_ms.store(ms, Ordering::SeqCst);
+    }
+
+    /// Tests: the next sidecar start attempts listen on `ports`, one each and
+    /// in order; attempts after them allocate a port as usual.
+    #[cfg(test)]
+    pub(crate) fn force_sidecar_listen_ports_for_tests(
+        &self,
+        ports: impl IntoIterator<Item = u16>,
+    ) {
+        self.forced_listen_ports.lock().unwrap().extend(ports);
+    }
+
+    /// The listen port of one sidecar start attempt: a loopback port picked by
+    /// binding port 0 and released (or, in tests, the next forced port).
+    fn sidecar_listen_port(&self) -> Result<u16, String> {
+        #[cfg(test)]
+        if let Some(port) = self.forced_listen_ports.lock().unwrap().pop_front() {
+            return Ok(port);
+        }
+        allocate_loopback_port()
     }
 
     /// kata b8ke Task 5: install the snapshot-GET pause hook (Task 7's
@@ -7574,19 +7611,7 @@ impl FreshCodexState {
     /// codex authenticates from + writes under `<isolatedHOME>/.codex`). Connect the WS with
     /// retry, then `initialize`. Returns the client, its notification stream, the ownership
     /// tag, and the owned child.
-    #[allow(clippy::type_complexity)]
-    async fn spawn_sidecar(
-        &self,
-        cwd: Option<&str>,
-    ) -> Result<
-        (
-            Arc<CodexAppServerClient>,
-            tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
-            String,
-            tokio::process::Child,
-        ),
-        String,
-    > {
+    async fn spawn_sidecar(&self, cwd: Option<&str>) -> Result<SpawnedSidecarParts, String> {
         self.spawn_sidecar_notifying(cwd, None).await
     }
 
@@ -7601,24 +7626,47 @@ impl FreshCodexState {
     /// the partial-runtime re-registration with the REAL pid. A slow
     /// startup swept at 30s is then cancellable-and-confirmable, never a
     /// registration-ignored StaleStart fence.
+    ///
+    /// An attempt that loses its listen port to another socket is stopped
+    /// and the start retries on a new port, with the terminal planner's
+    /// budget and backoff ([`sidecar_port`]); each attempt calls the hook
+    /// with its own child's pid. Every other failure fails the start at once.
     async fn spawn_sidecar_notifying(
         &self,
         cwd: Option<&str>,
         on_spawned: Option<&(dyn Fn(u32) + Send + Sync)>,
-    ) -> Result<
-        (
-            Arc<CodexAppServerClient>,
-            tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
-            String,
-            tokio::process::Child,
-        ),
-        String,
-    > {
+    ) -> Result<SpawnedSidecarParts, String> {
+        let mut number = 0;
+        loop {
+            number += 1;
+            let ownership_id = mint_ownership_id();
+            let attempt = sidecar_port::Attempt {
+                number,
+                port: self.sidecar_listen_port()?,
+                ownership_id: &ownership_id,
+            };
+            let failure = match self.spawn_sidecar_attempt(cwd, on_spawned, &attempt).await {
+                Ok(parts) => return Ok(parts),
+                Err(failure) => failure,
+            };
+            tokio::time::sleep(sidecar_port::after_failed_attempt(&attempt, failure)?).await;
+        }
+    }
+
+    /// One start attempt of [`Self::spawn_sidecar_notifying`], on the
+    /// attempt's own port and ownership tag.
+    async fn spawn_sidecar_attempt(
+        &self,
+        cwd: Option<&str>,
+        on_spawned: Option<&(dyn Fn(u32) + Send + Sync)>,
+        attempt: &sidecar_port::Attempt<'_>,
+    ) -> Result<SpawnedSidecarParts, sidecar_port::AttemptFailure> {
+        use sidecar_port::AttemptFailure;
         use std::process::Stdio;
 
-        let port = allocate_loopback_port()?;
+        let port = attempt.port;
         let ws_url = format!("ws://127.0.0.1:{port}");
-        let ownership_id = mint_ownership_id();
+        let ownership_id = attempt.ownership_id.to_string();
         // The canonical argv + env: `-c features.apps=false app-server --listen <ws_url>`
         // plus the ownership tag the /proc reaper keys on (S5.d.1 unification).
         let spec = codex_sidecar_spawn_spec(&ws_url, &ownership_id, &self.sidecar_launch_context);
@@ -7652,17 +7700,21 @@ impl FreshCodexState {
             .stderr(Stdio::piped());
         cmd.kill_on_drop(true);
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("codex app-server spawn failed ({codex_cmd}): {e}"))?;
-        freshell_platform::child_nofile::restore_after_spawn(child.id(), codex_program);
+        let mut child = cmd.spawn().map_err(|e| {
+            AttemptFailure::failed(
+                format!("codex app-server spawn failed ({codex_cmd}): {e}"),
+                None,
+            )
+        })?;
+        let spawned_pid = child.id();
+        freshell_platform::child_nofile::restore_after_spawn(spawned_pid, codex_program);
         // Drain child stdio so verbose app-server/MCP logs can never fill the pipe and stall it.
         drain_child_io(&mut child);
 
         // wfah: durable tracking BEFORE the handshake — the record must exist
         // even while this sidecar's 45s startup budget is still running, or an
         // unclean server death would leave the child untracked.
-        if let Some(pid) = child.id() {
+        if let Some(pid) = spawned_pid {
             crate::codex_sidecar_tracking::record_spawned_sidecar(&ownership_id, pid, &ws_url)
                 .await;
             // b8ke focused episode-2 round-2 F4: arm the watchdog's
@@ -7680,21 +7732,50 @@ impl FreshCodexState {
                 Ok(transport) => break Arc::new(transport),
                 Err(err) => {
                     if let Ok(Some(status)) = child.try_wait() {
+                        let exited = format!("codex app-server exited before listening: {status}");
+                        // Another socket holds its port: it lost the port.
+                        if sidecar_port::loopback_port_taken(port) {
+                            return Err(sidecar_port::stop_lost_attempt(
+                                &mut child,
+                                spawned_pid,
+                                &ownership_id,
+                                format!("{exited}; another socket holds port {port}"),
+                            )
+                            .await);
+                        }
                         crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-                        return Err(format!(
-                            "codex app-server exited before listening: {status}"
-                        ));
+                        return Err(AttemptFailure::failed(exited, spawned_pid));
                     }
                     if Instant::now() >= deadline {
                         let _ = child.start_kill();
                         reap_owned_codex_sidecars(&ownership_id);
                         crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-                        return Err(format!("codex app-server WS never came up: {err}"));
+                        return Err(AttemptFailure::failed(
+                            format!("codex app-server WS never came up: {err}"),
+                            spawned_pid,
+                        ));
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
         };
+
+        // The listener that answered must be this attempt's own app-server
+        // (Stage 2: LB-30): one another process put on the port is never
+        // taken for it.
+        if !sidecar_port::listener_is_the_attempts(port, spawned_pid).await {
+            drop(transport);
+            return Err(sidecar_port::stop_lost_attempt(
+                &mut child,
+                spawned_pid,
+                &ownership_id,
+                format!(
+                    "codex app-server listener on port {port} is not this sidecar's: \
+                     another process took the port"
+                ),
+            )
+            .await);
+        }
 
         let (client, notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
@@ -7710,7 +7791,10 @@ impl FreshCodexState {
                         let _ = child.start_kill();
                         reap_owned_codex_sidecars(&ownership_id);
                         crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-                        return Err(format!("codex app-server initialize failed: {err}"));
+                        return Err(AttemptFailure::failed(
+                            format!("codex app-server initialize failed: {err}"),
+                            spawned_pid,
+                        ));
                     }
                     tokio::time::sleep(Duration::from_millis(150)).await;
                 }
