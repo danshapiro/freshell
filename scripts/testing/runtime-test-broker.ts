@@ -416,8 +416,12 @@ export class RestrictedDockerBroker {
     if (host.Privileged === true) return { ok: false, reason: 'privileged runtime forbidden' }
     if (!Array.isArray(host.CapDrop) || !host.CapDrop.includes('ALL')) return { ok: false, reason: 'all capabilities must be dropped before explicit host additions' }
     const capAdd = Array.isArray(host.CapAdd) ? [...host.CapAdd].sort() : []
-    const expectedCapAdd = terminalWorkload ? ['CHOWN', 'KILL', 'SETGID', 'SETUID'] : []
-    if (JSON.stringify(capAdd) !== JSON.stringify(expectedCapAdd)) return { ok: false, reason: `unexpected host capability additions: ${capAdd.join(',')}` }
+    const allowedCapAdd = terminalWorkload
+      ? [['CHOWN', 'KILL', 'SETGID', 'SETUID'], ['CHOWN', 'SETGID', 'SETUID']]
+      : [[]]
+    if (!allowedCapAdd.some((capabilities) => JSON.stringify(capAdd) === JSON.stringify(capabilities))) {
+      return { ok: false, reason: `unexpected host capability additions: ${capAdd.join(',')}` }
+    }
     if (!Array.isArray(host.SecurityOpt) || !host.SecurityOpt.includes('no-new-privileges:true')) return { ok: false, reason: 'no-new-privileges is required' }
     if (host.RestartPolicy?.Name !== 'no') return { ok: false, reason: 'staging container must start with restart=no' }
     if (!(Number(host.NanoCpus) > 0) || !(Number(host.Memory) > 0) || !(Number(host.PidsLimit) > 0)) {
