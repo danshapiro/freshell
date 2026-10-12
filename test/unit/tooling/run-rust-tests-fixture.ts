@@ -83,4 +83,3 @@ export function fixture() {
     cleanup() { rmSync(root, { recursive: true, force: true }); rmSync(artifacts, { recursive: true, force: true }) },
   }
 }
-
