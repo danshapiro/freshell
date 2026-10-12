@@ -2,7 +2,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `pnpm run contract:generate`. Each entry in `schemas` is a self-contained JSON Schema for one exported Zod schema. The wire contract is frozen for the Rust port — changing it is out of scope.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "schemaCount": 85,
+  "schemaCount": 88,
   "schemas": {
     "AmplifierActivityListResponseSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2055,6 +2055,43 @@
         {
           "additionalProperties": false,
           "properties": {
+            "checkpointIntent": {
+              "additionalProperties": false,
+              "properties": {
+                "logicalAttemptId": {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "workspace": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "path": {
+                      "maxLength": 4096,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "provenance": {
+                      "enum": [
+                        "directory-picker",
+                        "resolved-project",
+                        "legacy-checkpoint"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "path",
+                    "provenance"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "logicalAttemptId"
+              ],
+              "type": "object"
+            },
             "cwd": {
               "type": "string"
             },
@@ -3285,6 +3322,102 @@
       ],
       "type": "object"
     },
+    "FreshAgentCheckpointOutcomeSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "checkpointId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "code": {
+          "type": "string"
+        },
+        "displayTurnId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "logicalAttemptId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "nativeTurnId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "provider": {
+          "enum": [
+            "claude",
+            "codex",
+            "opencode"
+          ],
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "requestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sessionId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sessionType": {
+          "enum": [
+            "freshclaude",
+            "freshcodex",
+            "kilroy",
+            "freshopencode"
+          ],
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "available",
+            "unavailable"
+          ],
+          "type": "string"
+        },
+        "type": {
+          "const": "freshAgent.checkpoint.outcome",
+          "type": "string"
+        },
+        "workspace": {
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "provenance": {
+              "enum": [
+                "directory-picker",
+                "resolved-project",
+                "legacy-checkpoint"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "provenance"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "type",
+        "logicalAttemptId",
+        "requestId",
+        "provider",
+        "sessionId",
+        "sessionType",
+        "status"
+      ],
+      "type": "object"
+    },
     "FreshAgentClientMessageSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "oneOf": [
@@ -3505,6 +3638,43 @@
         {
           "additionalProperties": false,
           "properties": {
+            "checkpointIntent": {
+              "additionalProperties": false,
+              "properties": {
+                "logicalAttemptId": {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "workspace": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "path": {
+                      "maxLength": 4096,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "provenance": {
+                      "enum": [
+                        "directory-picker",
+                        "resolved-project",
+                        "legacy-checkpoint"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "path",
+                    "provenance"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "logicalAttemptId"
+              ],
+              "type": "object"
+            },
             "cwd": {
               "type": "string"
             },
@@ -4660,6 +4830,94 @@
       ],
       "type": "object"
     },
+    "FreshAgentRecoveryStopSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "observedEpoch": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "observedGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "provider": {
+          "const": "codex",
+          "type": "string"
+        },
+        "requestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sessionId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sessionType": {
+          "const": "freshcodex",
+          "type": "string"
+        },
+        "type": {
+          "const": "freshAgent.recovery.stop",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "requestId",
+        "sessionId",
+        "sessionType",
+        "provider"
+      ],
+      "type": "object"
+    },
+    "FreshAgentRecoveryStoppedSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "provider": {
+          "const": "codex",
+          "type": "string"
+        },
+        "requestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sessionId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sessionType": {
+          "const": "freshcodex",
+          "type": "string"
+        },
+        "success": {
+          "type": "boolean"
+        },
+        "type": {
+          "const": "freshAgent.recovery.stopped",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "requestId",
+        "sessionId",
+        "sessionType",
+        "provider",
+        "success"
+      ],
+      "type": "object"
+    },
     "FreshAgentRedoSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -4731,6 +4989,43 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
+        "checkpointIntent": {
+          "additionalProperties": false,
+          "properties": {
+            "logicalAttemptId": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "workspace": {
+              "additionalProperties": false,
+              "properties": {
+                "path": {
+                  "maxLength": 4096,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "provenance": {
+                  "enum": [
+                    "directory-picker",
+                    "resolved-project",
+                    "legacy-checkpoint"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "provenance"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "logicalAttemptId"
+          ],
+          "type": "object"
+        },
         "cwd": {
           "type": "string"
         },

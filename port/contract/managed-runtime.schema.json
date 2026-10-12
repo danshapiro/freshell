@@ -438,6 +438,18 @@
                 "minimum": 0,
                 "type": "integer"
               },
+              "freshAgentCreateRequestId": {
+                "type": "string"
+              },
+              "freshAgentRuntimeVariant": {
+                "type": "string"
+              },
+              "freshAgentSessionId": {
+                "type": "string"
+              },
+              "freshAgentSessionType": {
+                "type": "string"
+              },
               "hostBootId": {
                 "type": "string"
               },
@@ -1372,6 +1384,15 @@
           ],
           "type": "string"
         },
+        "runtimeStatus": {
+          "enum": [
+            "running",
+            "recovering",
+            "blocked",
+            "exited"
+          ],
+          "type": "string"
+        },
         "soulId": {
           "maxLength": 160,
           "minLength": 1,
@@ -1989,6 +2010,18 @@
               "minimum": 0,
               "type": "integer"
             },
+            "freshAgentCreateRequestId": {
+              "type": "string"
+            },
+            "freshAgentRuntimeVariant": {
+              "type": "string"
+            },
+            "freshAgentSessionId": {
+              "type": "string"
+            },
+            "freshAgentSessionType": {
+              "type": "string"
+            },
             "hostBootId": {
               "type": "string"
             },
@@ -2324,6 +2357,18 @@
           "minimum": 0,
           "type": "integer"
         },
+        "freshAgentCreateRequestId": {
+          "type": "string"
+        },
+        "freshAgentRuntimeVariant": {
+          "type": "string"
+        },
+        "freshAgentSessionId": {
+          "type": "string"
+        },
+        "freshAgentSessionType": {
+          "type": "string"
+        },
         "hostBootId": {
           "type": "string"
         },
@@ -2630,6 +2675,18 @@
               "maximum": 9007199254740991,
               "minimum": 0,
               "type": "integer"
+            },
+            "freshAgentCreateRequestId": {
+              "type": "string"
+            },
+            "freshAgentRuntimeVariant": {
+              "type": "string"
+            },
+            "freshAgentSessionId": {
+              "type": "string"
+            },
+            "freshAgentSessionType": {
+              "type": "string"
             },
             "hostBootId": {
               "type": "string"
