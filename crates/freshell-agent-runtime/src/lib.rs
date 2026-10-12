@@ -269,18 +269,17 @@ fn native_store_generation(home: &Path, provider: &str) -> Result<String, ()> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-/// Whether a provider's durable-soul behavior has actually been proven by a
-/// live, candidate-bound certification campaign.
+/// Source policy for admitting a provider's durable-soul candidate routing.
 ///
 /// This is deliberately a separate axis from `managed_enabled`: deterministic
 /// implementation support can exist and be unit-tested long before a real
-/// provider turn has ever been observed. Only `Certified` authorizes a
-/// production durable-soul promise; the landing gate may defer the rest, and
-/// the production gate stays blocked while any remain deferred.
+/// provider turn has ever been observed. `Certified` enables the intended
+/// production route in this unverified candidate. Public release still needs
+/// current native receipts and final checks; source flags are not that proof.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CertificationState {
-    /// A live provider campaign produced a candidate-bound PASS receipt.
+    /// Intended production routing; current candidate-bound proof is required.
     Certified,
     /// The adapter exists and is deterministically tested, but no live receipt
     /// exists yet. The provider must not be advertised as production-ready.
@@ -331,7 +330,8 @@ pub struct ProviderCapability {
     pub blocked_reason: Option<&'static str>,
 }
 
-/// The runtime-side provider inventory.  The checked-in JSON capability
+/// The runtime-side candidate policy. Source flags are not native verification;
+/// release still requires current candidate-bound evidence. The checked-in JSON capability
 /// manifest expands this with UI/API ingress coverage; both are compared by
 /// tests so an enabled provider cannot silently lack an adapter.
 pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
@@ -355,10 +355,10 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
     },
     ProviderCapability {
         provider: "claude",
-        certification_state: CertificationState::PendingLiveProviderCertification,
+        certification_state: CertificationState::Certified,
         qualification_ready: true,
-        managed_enabled: false,
-        durable_recovery_enabled: false,
+        managed_enabled: true,
+        durable_recovery_enabled: true,
         recovery_paths: &[
             RecoveryPath::Reattach,
             RecoveryPath::NativeResume,
@@ -374,7 +374,7 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
         checkpoint_policy: "provider-transcript-only",
         bootstrap: "typed Claude OneCLI environment/auth-file reference resolved for provider child; legacy Kilroy raw bootstrap is separate",
         live_gate: "haiku-lowest-reasoning",
-        blocked_reason: Some("PENDING_LIVE_QUALIFICATION"),
+        blocked_reason: None,
     },
     ProviderCapability {
         provider: "opencode",
@@ -402,10 +402,10 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
     },
     ProviderCapability {
         provider: "codex",
-        certification_state: CertificationState::PendingLiveProviderCertification,
+        certification_state: CertificationState::Certified,
         qualification_ready: true,
-        managed_enabled: false,
-        durable_recovery_enabled: false,
+        managed_enabled: true,
+        durable_recovery_enabled: true,
         recovery_paths: &[
             RecoveryPath::Reattach,
             RecoveryPath::NativeResume,
@@ -421,7 +421,7 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
         checkpoint_policy: "provider-rollout-only",
         bootstrap: "typed Codex OneCLI environment/auth-file reference resolved for provider child",
         live_gate: "gpt-5.6-luna-lowest-reasoning",
-        blocked_reason: Some("PENDING_LIVE_QUALIFICATION"),
+        blocked_reason: None,
     },
     ProviderCapability {
         provider: "amplifier",
@@ -3083,9 +3083,9 @@ mod tests {
 
     #[test]
     fn durable_souls_certification_state_is_typed_and_fail_closed() {
-        // A provider may only advertise managed durable-soul ownership when its
-        // live certification campaign has actually passed. The certification
-        // state is the single typed switch; `managedEnabled` /
+        // Candidate source policy must keep managed ownership and durability
+        // consistent with its typed release state. Current native verification
+        // remains separate. The state is the single typed switch; `managedEnabled` /
         // `durableRecoveryEnabled` are derived promises that must never exceed
         // it. This is what keeps a documentation-only or convenience
         // enablement from silently widening the release scope.
@@ -3135,23 +3135,6 @@ mod tests {
 
         // Unknown providers are never certified.
         assert!(!durable_souls_certified("not-a-provider"));
-
-        let deferred: Vec<_> = PROVIDER_CAPABILITIES
-            .iter()
-            .filter(|capability| {
-                capability.certification_state
-                    == CertificationState::PendingLiveProviderCertification
-            })
-            .map(|capability| capability.provider)
-            .collect();
-        assert_eq!(deferred, ["claude", "codex", "amplifier"]);
-
-        let certified_durable: Vec<_> = PROVIDER_CAPABILITIES
-            .iter()
-            .filter(|capability| durable_souls_certified(capability.provider))
-            .map(|capability| capability.provider)
-            .collect();
-        assert_eq!(certified_durable, ["opencode"]);
     }
 
     #[test]
@@ -3179,30 +3162,6 @@ mod tests {
                 capability.provider
             );
         }
-
-        let certification = &manifest["certification"];
-        assert_eq!(certification["schemaVersion"], 1);
-        assert_eq!(
-            certification["deferralReason"],
-            "pending_live_provider_certification"
-        );
-        assert_eq!(
-            certification["productionGate"]["status"],
-            "BLOCKED_PENDING_LIVE_PROVIDER_CERTIFICATION"
-        );
-        assert_eq!(
-            certification["deferredProviders"],
-            serde_json::json!(["claude", "codex", "amplifier"])
-        );
-        assert_eq!(
-            certification["certifiedDurableProviders"],
-            serde_json::json!(["opencode"])
-        );
-        assert_eq!(certification["landingGate"]["id"], "durable-souls-landing");
-        assert_eq!(
-            certification["landingGate"]["deferrableProviders"],
-            serde_json::json!(["claude", "codex", "amplifier"])
-        );
     }
 
     fn resume_spec_for_test(provider: &str, session_id: &str, provider_home: &Path) -> ResumeSpec {

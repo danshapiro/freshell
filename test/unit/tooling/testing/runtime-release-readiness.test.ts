@@ -4,6 +4,8 @@ import { describe, expect, it } from 'vitest'
 
 import {
   capabilityClaimViolations,
+  certifiedDurableProviders,
+  deferredProviders,
   classifyProviderCertificationCase,
   DEFERRED_CASE_STATUS,
   loadCapabilityManifest,
@@ -152,7 +154,27 @@ describe('release-scope audit covers the advertised provider set', () => {
 
   it.each(['claude', 'codex', 'amplifier'])('allows disabled pending provider %s to remain omitted without claiming release or PASS', (provider) => {
     const manifest = loadCapabilityManifest(repoRoot)
-    manifest.certification.productionGate.requiredCertifiedProviders = ['shell', 'opencode']
+    const pending = manifest.providers.find(row => row.provider === provider)!
+    Object.assign(pending, { certificationState: PENDING_LIVE_PROVIDER_CERTIFICATION,
+      managedEnabled: false, durableRecoveryEnabled: false, blockedReason: 'PENDING_LIVE_QUALIFICATION' })
+    manifest.certification.deferredProviders = deferredProviders(manifest)
+    manifest.certification.landingGate.deferrableProviders = deferredProviders(manifest)
+    manifest.certification.certifiedDurableProviders = certifiedDurableProviders(manifest)
+    manifest.releaseScope!.managedTerminalProviders = manifest.releaseScope!.managedTerminalProviders!
+      .filter(name => name !== provider)
+    for (const row of manifest.freshAgentModes) if (row.provider === provider) {
+      Object.assign(row, { enabledInReleaseScope: false, certified: false,
+        liveQualificationStatus: 'pending_authentic_receipt', releaseDeferralReason: PENDING_LIVE_PROVIDER_CERTIFICATION })
+      Object.assign(manifest.doorways.find(doorway => doorway.id === `rest-${row.mode}-create`)!,
+        { policy: 'blocked', enabledInReleaseScope: false })
+    }
+    manifest.releaseScope!.disabledFreshAgentModes = manifest.freshAgentModes
+      .filter(row => !row.enabledInReleaseScope).map(row => row.mode)
+    for (const doorway of manifest.doorways) if (doorway.policy === 'managed') {
+      doorway.providers = doorway.providers.filter(name => name !== provider)
+    }
+    manifest.certification.productionGate.requiredCertifiedProviders = manifest.providers
+      .filter(row => row.managedEnabled).map(row => row.provider)
     expect(capabilityClaimViolations(manifest)).toEqual([])
     expect(productionCertificationStatus(manifest).status).toBe('ELIGIBLE')
     const row = manifest.providers.find((candidate) => candidate.provider === provider)!

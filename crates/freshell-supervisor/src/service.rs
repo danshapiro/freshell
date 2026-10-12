@@ -4496,9 +4496,10 @@ mod release_scope_tests {
 
     #[test]
     fn direct_terminal_launch_cannot_bypass_live_qualification_scope() {
-        assert!(release_qualified_workload("shell", false, true, None));
-        assert!(release_qualified_workload("opencode", false, true, None));
-        for provider in ["claude", "codex", "amplifier", "gemini", "kimi"] {
+        for provider in ["shell", "claude", "codex", "opencode"] {
+            assert!(release_qualified_workload(provider, false, true, None));
+        }
+        for provider in ["amplifier", "gemini", "kimi"] {
             assert!(
                 !release_qualified_workload(provider, false, true, None),
                 "{provider}"
@@ -4549,6 +4550,58 @@ mod release_scope_tests {
                 Some(&agent)
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn release_qualified_workload_candidate_uses_normal_launch_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::registry::Registry::open(dir.path().join("registry"), None).unwrap();
+        let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+        for (provider, mode) in [
+            ("shell", None),
+            ("claude", None),
+            ("codex", None),
+            ("opencode", None),
+            ("claude", Some("freshclaude")),
+            ("codex", Some("freshcodex")),
+            ("opencode", Some("freshopencode")),
+            ("amplifier", None),
+            ("kilroy", Some("kilroy")),
+        ] {
+            let mut value = serde_json::json!({
+                "soulId":format!("soul-candidate-{}", mode.unwrap_or(provider)), "provider":provider,
+                "providerStoreId":"synthetic-store", "creationSeedRef":"synthetic-seed",
+                "profile":"default_agent",
+                "limits":{"cpuMilli":2000,"memoryBytes":1073741824,"swapBytes":0,"pidsMax":512}
+            });
+            if let Some(mode) = mode {
+                value["freshAgent"] = serde_json::json!({"sessionId":"synthetic-public", "provider":provider,
+                    "sessionType":mode, "runtimeVariant":"synthetic-runtime", "providerStoreId":"synthetic-store",
+                    "cwd":"/workspace", "workspacePath":"/workspace", "runAsUid":65534,"runAsGid":0});
+            } else {
+                value["terminal"] = serde_json::json!({"terminalId":"synthetic-terminal", "streamId":"synthetic-stream",
+                    "mode":provider, "program":provider, "cwd":"/workspace", "workspacePath":"/workspace",
+                    "runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"synthetic"});
+            }
+            let request = serde_json::from_value(value).unwrap();
+            let error = supervisor
+                .launch(freshell_runtime_protocol::RequestId::new(), request)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.code,
+                if ["amplifier", "kilroy"].contains(&provider) {
+                    RuntimeErrorCode::UnsupportedWorkload
+                } else {
+                    // An admitted route must reach normal resource-profile validation.
+                    // The deliberate mismatch avoids starting any provider or backend.
+                    RuntimeErrorCode::InvalidRuntimeLimits
+                },
+                "{provider}/{mode:?}: {}",
+                error.message
+            );
+        }
+        assert!(registry.inventory().await.unwrap().is_empty());
     }
 
     #[tokio::test]

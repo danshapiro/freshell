@@ -45,8 +45,10 @@ describe('managed builders copy the actual Cargo target artifacts', () => {
     const repo = path.join(directory, 'repo')
     fs.mkdirSync(repo)
     fs.mkdirSync(path.join(repo, 'docs/development'), { recursive: true })
-    fs.copyFileSync(path.join(root, 'docs/development/runtime-provider-capabilities.json'),
-      path.join(repo, 'docs/development/runtime-provider-capabilities.json'))
+    const manifest = JSON.parse(fs.readFileSync(path.join(root, 'docs/development/runtime-provider-capabilities.json'), 'utf8'))
+    Object.assign(manifest.providers.find((row: { provider: string }) => row.provider === 'claude'),
+      { certificationState: 'pending_live_provider_certification', managedEnabled: false })
+    fs.writeFileSync(path.join(repo, 'docs/development/runtime-provider-capabilities.json'), JSON.stringify(manifest))
     execFileSync('git', ['init', '--quiet'], { cwd: repo })
     execFileSync('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
       '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '--quiet', '-m', 'fixture'], { cwd: repo })
@@ -111,13 +113,15 @@ describe('managed builders copy the actual Cargo target artifacts', () => {
     }
   })
 
-  it.each(['pending', 'promoted', 'not-ready', 'fixture'] as const)('dispatches %s builds from current requested capabilities', kind => {
+  it.each(['pending', 'promoted', 'not-ready', 'fixture', 'candidate'] as const)('dispatches %s builds from current requested capabilities', kind => {
     directory = fs.mkdtempSync(path.join(os.tmpdir(), 'runtime-build-policy-'))
     const repo = path.join(directory, 'repo')
     fs.mkdirSync(path.join(repo, 'docs/development'), { recursive: true })
     const manifest = JSON.parse(fs.readFileSync(path.join(root, 'docs/development/runtime-provider-capabilities.json'), 'utf8'))
     for (const row of manifest.providers) if (['claude', 'codex'].includes(row.provider)) {
       if (kind === 'promoted') Object.assign(row, { certificationState: 'certified', managedEnabled: true })
+      if (kind === 'pending' || kind === 'not-ready') Object.assign(row,
+        { certificationState: 'pending_live_provider_certification', managedEnabled: false })
       if (kind === 'not-ready') row.qualificationReady = false
     }
     fs.writeFileSync(path.join(repo, 'docs/development/runtime-provider-capabilities.json'), JSON.stringify(manifest))

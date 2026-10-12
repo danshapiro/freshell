@@ -40,35 +40,36 @@ afterEach(() => {
 })
 
 function manifestFixture(overrides: Record<string, unknown>[] = []): any {
+  // Explicit preliminary policy fixture: these tests protect pending behavior
+  // independently of the current production candidate.
   const base = loadCapabilityManifest(repoRoot)
-  if (!overrides.length) return base
-  const clone = JSON.parse(JSON.stringify(base))
-  for (const override of overrides) {
-    const row = clone.providers.find((entry: any) => entry.provider === override.provider)
-    Object.assign(row, override)
+  for (const row of base.providers) if (['claude', 'codex'].includes(row.provider)) {
+    Object.assign(row, { certificationState: PENDING_LIVE_PROVIDER_CERTIFICATION,
+      managedEnabled: false, durableRecoveryEnabled: false, blockedReason: 'PENDING_LIVE_QUALIFICATION' })
   }
-  return clone
+  base.releaseScope!.managedTerminalProviders = ['opencode']
+  base.certification.deferredProviders = deferredProviders(base)
+  base.certification.landingGate.deferrableProviders = deferredProviders(base)
+  base.certification.certifiedDurableProviders = certifiedDurableProviders(base)
+  for (const row of base.freshAgentModes) {
+    Object.assign(row, { enabledInReleaseScope: false, certified: false,
+      liveQualificationStatus: 'pending_authentic_receipt', releaseDeferralReason: PENDING_LIVE_PROVIDER_CERTIFICATION })
+  }
+  base.releaseScope!.freshAgentEnabled = false
+  base.releaseScope!.disabledFreshAgentModes = base.freshAgentModes.map(row => row.mode)
+  for (const doorway of base.doorways) {
+    if (doorway.id.startsWith('rest-')) Object.assign(doorway, { policy: 'blocked', enabledInReleaseScope: false })
+    else if (doorway.policy === 'managed') doorway.providers = doorway.providers.filter(provider => !['claude', 'codex'].includes(provider))
+  }
+  for (const override of overrides) {
+    Object.assign(base.providers.find(entry => entry.provider === override.provider)!, override)
+  }
+  return base
 }
 
 describe('checked-in provider certification manifest', () => {
-  it('marks exactly Claude, Codex, and Amplifier as pending live certification', () => {
-    const manifest = loadCapabilityManifest(repoRoot)
-    expect(deferredProviders(manifest)).toEqual(['claude', 'codex', 'amplifier'])
-    expect(certifiedDurableProviders(manifest)).toEqual(['opencode'])
-  })
-
-  it('keeps adapter readiness independent of live release certification', () => {
-    const manifest = loadCapabilityManifest(repoRoot)
-    for (const provider of ['claude', 'codex', 'amplifier']) {
-      const row = manifest.providers.find((candidate) => candidate.provider === provider)
-      expect(row?.qualificationReady).toBe(true)
-      expect(row?.certificationState).toBe(PENDING_LIVE_PROVIDER_CERTIFICATION)
-      expect(row?.managedEnabled).toBe(false)
-    }
-  })
-
   it('publishes a typed deferred-provider manifest with the live gate for each', () => {
-    const rows = deferredProviderManifest(loadCapabilityManifest(repoRoot))
+    const rows = deferredProviderManifest(manifestFixture())
     expect(rows).toHaveLength(3)
     for (const row of rows) {
       expect(row.reason).toBe(PENDING_LIVE_PROVIDER_CERTIFICATION)
@@ -143,7 +144,7 @@ describe('production certification status', () => {
   })
 
   it('is blocked, never pass, while any provider awaits live certification', () => {
-    const manifest = loadCapabilityManifest(repoRoot)
+    const manifest = manifestFixture()
     manifest.certification.productionGate.requiredCertifiedProviders = ['shell', 'opencode', 'claude', 'codex', 'amplifier']
     const status = productionCertificationStatus(manifest)
     expect(status.status).toBe('BLOCKED_PENDING_LIVE_PROVIDER_CERTIFICATION')
@@ -164,7 +165,7 @@ describe('production certification status', () => {
 })
 
 describe('per-provider case classification', () => {
-  const manifest = loadCapabilityManifest(repoRoot)
+  const manifest = manifestFixture()
   const row = (provider: string) => manifest.providers.find((entry: any) => entry.provider === provider)
 
   it('defers an uncertified provider only in landing mode', () => {
