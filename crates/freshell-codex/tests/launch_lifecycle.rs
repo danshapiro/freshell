@@ -44,7 +44,7 @@ use freshell_containment::{StopHandle, StopMode, StopReason};
 mod lost_port;
 use lost_port::{
     plan_retrying_a_lost_port, ready_attempt, ready_retrying_a_lost_port, retrying_a_lost_port,
-    spawn_on_its_own_port, LOST_PORT, LOST_PORT_ATTEMPTS,
+    spawn_on_its_own_port, ListenChecked, ListenRecords, LOST_PORT, LOST_PORT_ATTEMPTS,
 };
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1163,6 +1163,13 @@ fn fake_app_server_command() -> String {
     format!("sh {}", wrapper.display())
 }
 
+/// The store [`SpawnedCodexAppServerRuntime::with_command`] resolves: the
+/// process-global one, else a disabled store.
+fn default_store() -> Arc<CodexSidecarStore> {
+    freshell_codex::sidecar_store::codex_sidecar_store()
+        .unwrap_or_else(|| Arc::new(CodexSidecarStore::disabled()))
+}
+
 /// A Codex home of the test's own (never the user's ~/.codex) holding
 /// `thread_id`'s rollout, as Codex writes it at a conversation's first turn,
 /// and the spawn context that points the fake app-server at it: a resume of
@@ -1246,15 +1253,15 @@ async fn spawned_runtime_receives_context_but_reattached_runtime_does_not() {
     // No reattach candidate: the production selector must construct a spawned
     // runtime from the plan's context. The fixture sees its real child argv/env.
     let spawned_log = dir.path().join("spawned.json");
-    let spawned_context = sidecar_context(&spawned_log);
+    let records = &ListenRecords::new();
     let spawned_plan = plan_codex_launch(&CodexLaunchPlanInput {
-        sidecar_context: spawned_context,
+        sidecar_context: records.context(sidecar_context(&spawned_log)),
         ..Default::default()
     })
     .expect("valid spawned plan");
     let plan = &spawned_plan;
     let (spawned, _) = retrying_a_lost_port("spawned runtime becomes ready", move || async move {
-        ready_attempt(select_codex_runtime(None, None, plan).await).await
+        ready_attempt(select_codex_runtime(None, None, plan).await, records).await
     })
     .await;
     assert_captured_spawn_context(&wait_for_arg_log(&spawned_log).await);
@@ -1264,13 +1271,15 @@ async fn spawned_runtime_receives_context_but_reattached_runtime_does_not() {
     // plan an observation path that only a wrongly-created replacement child
     // could write, then prove selection reattaches instead.
     let (_store_dir, store) = temp_sidecar_store();
-    let (survivor, survivor_ready) = ready_retrying_a_lost_port("spawn survivor fixture", || {
-        SpawnedCodexAppServerRuntime::with_command_and_store(
-            fake_app_server_command(),
-            store.clone(),
-        )
-    })
-    .await;
+    let (survivor, survivor_ready) =
+        ready_retrying_a_lost_port("spawn survivor fixture", |records| {
+            SpawnedCodexAppServerRuntime::with_command_store_and_context(
+                fake_app_server_command(),
+                store.clone(),
+                records.context(Default::default()),
+            )
+        })
+        .await;
     survivor
         .note_session_id("survivor-session".to_string())
         .await
@@ -1311,12 +1320,16 @@ async fn spawned_runtime_receives_context_but_reattached_runtime_does_not() {
 async fn spawned_runtime_launches_the_app_server_and_relays_through_the_proxy() {
     let tmp = std::env::temp_dir().join(format!("freshell-codex-s4-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
-    let runtime = Arc::new(SpawnedCodexAppServerRuntime::with_command(
-        fake_app_server_command(),
-    ));
-    let spawn_runtime = runtime.clone();
+    let checked = ListenChecked::build(Default::default(), |context| {
+        SpawnedCodexAppServerRuntime::with_command_store_and_context(
+            fake_app_server_command(),
+            default_store(),
+            context,
+        )
+    });
+    let runtime = checked.spawned().clone();
     let planner = CodexLaunchPlanner::new(Box::new(move |_plan| {
-        let rt = spawn_runtime.clone() as Arc<dyn CodexLaunchRuntime>;
+        let rt = checked.clone() as Arc<dyn CodexLaunchRuntime>;
         Box::pin(async move { rt })
     }));
 
@@ -1633,13 +1646,13 @@ async fn plan_retry_spawns_fresh_after_claimed_reattach_ensure_ready_fails() {
                         as Arc<dyn CodexLaunchRuntime>;
                 }
             }
-            Arc::new(
+            ListenChecked::build(context, |context| {
                 SpawnedCodexAppServerRuntime::with_command_store_and_context(
                     fake_app_server_command(),
                     store,
                     context,
-                ),
-            ) as Arc<dyn CodexLaunchRuntime>
+                )
+            }) as Arc<dyn CodexLaunchRuntime>
         })
     }));
 
@@ -1821,10 +1834,11 @@ async fn wait_pid_gone(pid: u32) {
 #[tokio::test]
 async fn ensure_ready_persists_a_verified_sidecar_record() {
     let (_dir, store) = temp_sidecar_store();
-    let (runtime, ready) = ready_retrying_a_lost_port("ensure_ready", || {
-        SpawnedCodexAppServerRuntime::with_command_and_store(
+    let (runtime, ready) = ready_retrying_a_lost_port("ensure_ready", |records| {
+        SpawnedCodexAppServerRuntime::with_command_store_and_context(
             fake_app_server_command(),
             store.clone(),
+            records.context(Default::default()),
         )
     })
     .await;
@@ -1851,10 +1865,11 @@ async fn ensure_ready_persists_a_verified_sidecar_record() {
 #[tokio::test]
 async fn runtime_shutdown_removes_the_sidecar_record() {
     let (_dir, store) = temp_sidecar_store();
-    let (runtime, _) = ready_retrying_a_lost_port("ensure_ready", || {
-        SpawnedCodexAppServerRuntime::with_command_and_store(
+    let (runtime, _) = ready_retrying_a_lost_port("ensure_ready", |records| {
+        SpawnedCodexAppServerRuntime::with_command_store_and_context(
             fake_app_server_command(),
             store.clone(),
+            records.context(Default::default()),
         )
     })
     .await;
@@ -1873,10 +1888,11 @@ async fn runtime_shutdown_removes_the_sidecar_record() {
 #[tokio::test]
 async fn update_ownership_metadata_enriches_the_record() {
     let (_dir, store) = temp_sidecar_store();
-    let (runtime, _) = ready_retrying_a_lost_port("ensure_ready", || {
-        SpawnedCodexAppServerRuntime::with_command_and_store(
+    let (runtime, _) = ready_retrying_a_lost_port("ensure_ready", |records| {
+        SpawnedCodexAppServerRuntime::with_command_store_and_context(
             fake_app_server_command(),
             store.clone(),
+            records.context(Default::default()),
         )
     })
     .await;
@@ -1902,10 +1918,11 @@ async fn update_ownership_metadata_enriches_the_record() {
 #[tokio::test]
 async fn spawned_runtime_note_session_id_enriches_the_record() {
     let (_dir, store) = temp_sidecar_store();
-    let (runtime, _) = ready_retrying_a_lost_port("ensure_ready", || {
-        SpawnedCodexAppServerRuntime::with_command_and_store(
+    let (runtime, _) = ready_retrying_a_lost_port("ensure_ready", |records| {
+        SpawnedCodexAppServerRuntime::with_command_store_and_context(
             fake_app_server_command(),
             store.clone(),
+            records.context(Default::default()),
         )
     })
     .await;
@@ -1929,10 +1946,11 @@ async fn spawned_runtime_note_session_id_enriches_the_record() {
 #[tokio::test]
 async fn spawned_sidecar_survives_runtime_drop_without_shutdown() {
     let (_dir, store) = temp_sidecar_store();
-    let (runtime, _) = ready_retrying_a_lost_port("ensure_ready", || {
-        SpawnedCodexAppServerRuntime::with_command_and_store(
+    let (runtime, _) = ready_retrying_a_lost_port("ensure_ready", |records| {
+        SpawnedCodexAppServerRuntime::with_command_store_and_context(
             fake_app_server_command(),
             store.clone(),
+            records.context(Default::default()),
         )
     })
     .await;
@@ -1975,10 +1993,11 @@ async fn spawned_sidecar_survives_runtime_drop_without_shutdown() {
 
 #[tokio::test]
 async fn drop_without_shutdown_with_disabled_store_keeps_the_kill_on_drop_backstop() {
-    let (runtime, _) = ready_retrying_a_lost_port("ensure_ready", || {
-        SpawnedCodexAppServerRuntime::with_command_and_store(
+    let (runtime, _) = ready_retrying_a_lost_port("ensure_ready", |records| {
+        SpawnedCodexAppServerRuntime::with_command_store_and_context(
             fake_app_server_command(),
             Arc::new(CodexSidecarStore::disabled()),
+            records.context(Default::default()),
         )
     })
     .await;
@@ -2001,9 +2020,21 @@ async fn drop_without_shutdown_with_disabled_store_keeps_the_kill_on_drop_backst
 // torn down exactly as today — retaining a record-less sidecar would orphan
 // it silently with no reconcile path (the ynfn hole).
 
-/// Manager over a single pre-built spawned runtime (the Task 3 test shape:
-/// per-instance store injection, never the process-global handle).
-fn manager_over(runtime: Arc<SpawnedCodexAppServerRuntime>) -> CodexTerminalLaunchManager {
+/// A seedless runtime over the single-process fake (per-instance store
+/// injection, never the process-global handle), its starts judged by the
+/// fake's own listen records (`lost_port`).
+fn checked_fake_runtime(store: Arc<CodexSidecarStore>) -> Arc<ListenChecked> {
+    ListenChecked::build(Default::default(), |context| {
+        SpawnedCodexAppServerRuntime::with_command_store_and_context(
+            fake_app_server_command(),
+            store,
+            context,
+        )
+    })
+}
+
+/// Manager over a single pre-built spawned runtime (the Task 3 test shape).
+fn manager_over(runtime: Arc<ListenChecked>) -> CodexTerminalLaunchManager {
     CodexTerminalLaunchManager::new(Box::new(move |_plan| {
         let rt = runtime.clone() as Arc<dyn CodexLaunchRuntime>;
         Box::pin(async move { rt })
@@ -2013,11 +2044,9 @@ fn manager_over(runtime: Arc<SpawnedCodexAppServerRuntime>) -> CodexTerminalLaun
 #[tokio::test]
 async fn shutdown_retention_retains_adopted_sidecars_and_records_reason() {
     let (_dir, store) = temp_sidecar_store();
-    let runtime = Arc::new(SpawnedCodexAppServerRuntime::with_command_and_store(
-        fake_app_server_command(),
-        store.clone(),
-    ));
-    let manager = manager_over(runtime.clone());
+    let checked = checked_fake_runtime(store.clone());
+    let runtime = checked.spawned().clone();
+    let manager = manager_over(checked);
 
     let launch =
         plan_retrying_a_lost_port("plan", &manager, &CodexLaunchPlanInput::default()).await;
@@ -2105,11 +2134,9 @@ async fn retain_failure_still_blocks_a_later_shutdown_kill() {
 #[tokio::test]
 async fn shutdown_still_tears_down_unadopted_planner_sidecars() {
     let (_dir, store) = temp_sidecar_store();
-    let runtime = Arc::new(SpawnedCodexAppServerRuntime::with_command_and_store(
-        fake_app_server_command(),
-        store.clone(),
-    ));
-    let manager = manager_over(runtime.clone());
+    let checked = checked_fake_runtime(store.clone());
+    let runtime = checked.spawned().clone();
+    let manager = manager_over(checked);
 
     // Plan WITHOUT adopt: a mid-plan sidecar has no pane to reattach to (and
     // a fresh-plan proxy may hold the candidate timer) — still torn down.
@@ -2132,11 +2159,9 @@ async fn retention_with_disabled_store_tears_down_as_today() {
     // Task 3's conditional detach: disabled store ⇒ kill_on_drop(true), NO
     // record. The retention gate says record-less sidecars are NEVER
     // retained — "retaining" one would orphan it silently (the ynfn hole).
-    let runtime = Arc::new(SpawnedCodexAppServerRuntime::with_command_and_store(
-        fake_app_server_command(),
-        Arc::new(CodexSidecarStore::disabled()),
-    ));
-    let manager = manager_over(runtime.clone());
+    let checked = checked_fake_runtime(Arc::new(CodexSidecarStore::disabled()));
+    let runtime = checked.spawned().clone();
+    let manager = manager_over(checked);
 
     let launch =
         plan_retrying_a_lost_port("plan", &manager, &CodexLaunchPlanInput::default()).await;
@@ -2163,12 +2188,12 @@ async fn notify_terminal_exit_retains_under_retention_flag() {
     let factory_store = store.clone();
     let factory_spawned = spawned.clone();
     let manager = CodexTerminalLaunchManager::new(Box::new(move |_plan| {
-        let runtime = Arc::new(SpawnedCodexAppServerRuntime::with_command_and_store(
-            fake_app_server_command(),
-            factory_store.clone(),
-        ));
-        factory_spawned.lock().unwrap().push(runtime.clone());
-        let rt = runtime as Arc<dyn CodexLaunchRuntime>;
+        let checked = checked_fake_runtime(factory_store.clone());
+        factory_spawned
+            .lock()
+            .unwrap()
+            .push(checked.spawned().clone());
+        let rt = checked as Arc<dyn CodexLaunchRuntime>;
         Box::pin(async move { rt })
     }));
 
@@ -2473,11 +2498,11 @@ mod unit_sidecar {
         store: Arc<CodexSidecarStore>,
         seed: UnitSeed,
     ) -> (SpawnedCodexAppServerRuntime, CodexRuntimeReady) {
-        ready_retrying_a_lost_port("ready", || {
+        ready_retrying_a_lost_port("ready", |records| {
             SpawnedCodexAppServerRuntime::with_command_store_context_and_seed(
                 fake_codex::launcher_command(),
                 store.clone(),
-                fake_context(behavior.clone(), home),
+                records.context(fake_context(behavior.clone(), home)),
                 seed.clone(),
             )
         })
@@ -2571,14 +2596,14 @@ mod unit_sidecar {
     ) -> CodexTerminalLaunchManager {
         let home = home.to_path_buf();
         CodexTerminalLaunchManager::new(Box::new(move |plan| {
-            let runtime = Arc::new(
+            let runtime = ListenChecked::build(fake_context(behavior.clone(), &home), |context| {
                 SpawnedCodexAppServerRuntime::with_command_store_context_and_seed(
                     fake_codex::launcher_command(),
                     store.clone(),
-                    fake_context(behavior.clone(), &home),
+                    context,
                     plan.unit_seed.clone().expect("a seeded plan"),
-                ),
-            ) as Arc<dyn CodexLaunchRuntime>;
+                )
+            }) as Arc<dyn CodexLaunchRuntime>;
             Box::pin(async move { runtime })
         }))
     }
@@ -2966,16 +2991,16 @@ mod unit_sidecar {
 
         // Before the upgrade: a unit-less sidecar with a v1-shaped record,
         // retained across the restart.
-        let (legacy, ready) = ready_retrying_a_lost_port("legacy ready", || {
+        let (legacy, ready) = ready_retrying_a_lost_port("legacy ready", |records| {
             SpawnedCodexAppServerRuntime::with_command_store_and_context(
                 fake_codex::launcher_command(),
                 store.clone(),
-                fake_context(
+                records.context(fake_context(
                     json!({"threadStartThreadId": "t-leg", "turnCompleteDelayMs": 60000,
                         "spawnHelperProcess": true, "turnSpawnsShellCommand": true,
                         "detachedJobOnTurn": true}),
                     home.path(),
-                ),
+                )),
             )
         })
         .await;
@@ -3298,18 +3323,26 @@ mod unit_sidecar {
             } else {
                 json!({"threadStartThreadId": "t-b"})
             };
-            let mut runtime = SpawnedCodexAppServerRuntime::with_command_store_context_and_seed(
-                fake_codex::launcher_command(),
-                factory_store.clone(),
-                fake_context(behavior, &factory_home),
-                plan.unit_seed.clone().expect("seeded plan"),
-            );
-            if first {
-                runtime = runtime.with_forced_listen_port(taken);
-            }
-            let runtime = Arc::new(runtime);
-            built.push(runtime.clone());
-            let runtime = runtime as Arc<dyn CodexLaunchRuntime>;
+            let build = |context| {
+                SpawnedCodexAppServerRuntime::with_command_store_context_and_seed(
+                    fake_codex::launcher_command(),
+                    factory_store.clone(),
+                    context,
+                    plan.unit_seed.clone().expect("seeded plan"),
+                )
+            };
+            let context = fake_context(behavior, &factory_home);
+            // Attempt 1's port is the one under test; a later attempt's own
+            // fake says whether it kept the port the runtime chose.
+            let runtime = if first {
+                let runtime = Arc::new(build(context).with_forced_listen_port(taken));
+                built.push(runtime.clone());
+                runtime as Arc<dyn CodexLaunchRuntime>
+            } else {
+                let checked = ListenChecked::build(context, build);
+                built.push(checked.spawned().clone());
+                checked as Arc<dyn CodexLaunchRuntime>
+            };
             Box::pin(async move { runtime })
         }));
         let plan = tokio::spawn(async move {
@@ -3449,14 +3482,17 @@ mod unit_sidecar {
         let lifecycle = Arc::new(RecordingLifecycle::default());
         let seed = recording_seed("t-lost-port", lifecycle.clone());
         let mut builds = 0;
-        let (runtime, ready) = ready_retrying_a_lost_port("ready", || {
+        let (runtime, ready) = ready_retrying_a_lost_port("ready", |records| {
             builds += 1;
             let runtime = SpawnedCodexAppServerRuntime::with_command_store_context_and_seed(
                 fake_codex::launcher_command(),
                 store.clone(),
                 // The helper process starts before the native listens, so
                 // the lost attempt leaves a member to stop.
-                fake_context(json!({"spawnHelperProcess": true}), home.path()),
+                records.context(fake_context(
+                    json!({"spawnHelperProcess": true}),
+                    home.path(),
+                )),
                 seed.clone(),
             );
             if builds == 1 {
@@ -3518,7 +3554,7 @@ mod unit_sidecar {
     }
 
     /// A port lost on every attempt fails the start after the last attempt,
-    /// with the fake's own status.
+    /// with the fake's own record and the start's own failure (status 98).
     #[tokio::test(flavor = "multi_thread")]
     async fn a_port_lost_on_every_attempt_fails_the_start_after_the_last_attempt() {
         let (holders, taken): (Vec<_>, Vec<_>) = (0..LOST_PORT_ATTEMPTS)
@@ -3528,11 +3564,12 @@ mod unit_sidecar {
         let start = tokio::spawn({
             let builds = builds.clone();
             async move {
-                ready_retrying_a_lost_port("ready", || {
+                ready_retrying_a_lost_port("ready", |records| {
                     let attempt = builds.fetch_add(1, Ordering::SeqCst) as usize;
-                    SpawnedCodexAppServerRuntime::with_command_and_store(
+                    SpawnedCodexAppServerRuntime::with_command_store_and_context(
                         fake_app_server_command(),
                         Arc::new(CodexSidecarStore::disabled()),
+                        records.context(Default::default()),
                     )
                     .with_forced_listen_port(*taken.get(attempt).expect("no attempt past the last"))
                 })
@@ -3543,7 +3580,10 @@ mod unit_sidecar {
             panic!("the start fails");
         };
         let message = panic_message(failed);
-        assert!(message.contains(LOST_PORT), "{message}");
+        assert!(
+            message.contains(LOST_PORT) && message.contains("exit status: 98"),
+            "{message}"
+        );
         assert_eq!(builds.load(Ordering::SeqCst), LOST_PORT_ATTEMPTS);
         drop(holders);
     }
@@ -3563,12 +3603,15 @@ mod unit_sidecar {
             let builds = builds.clone();
             let home = home.path().to_path_buf();
             async move {
-                ready_retrying_a_lost_port("ready", || {
+                ready_retrying_a_lost_port("ready", |records| {
                     builds.fetch_add(1, Ordering::SeqCst);
                     SpawnedCodexAppServerRuntime::with_command_store_and_context(
                         fake_codex::launcher_command(),
                         Arc::new(CodexSidecarStore::disabled()),
-                        fake_context(json!({"preloadedThreads": ["t-preheld"]}), &home),
+                        records.context(fake_context(
+                            json!({"preloadedThreads": ["t-preheld"]}),
+                            &home,
+                        )),
                     )
                 })
                 .await
@@ -3583,6 +3626,196 @@ mod unit_sidecar {
             "{message}"
         );
         assert_eq!(builds.load(Ordering::SeqCst), 1, "never retried");
+    }
+
+    /// An app-server of its own (another pane's, as far as the attempts
+    /// below can tell) listening on a port the kernel gave it, which it
+    /// answers on like any app-server.
+    async fn an_answering_app_server() -> (tempfile::TempDir, fake_codex::FakeAppServer) {
+        let home = tempfile::tempdir().unwrap();
+        let fake = fake_codex::FakeAppServer::spawn(json!({}), home.path(), &[]).await;
+        (home, fake)
+    }
+
+    /// The app-server `holder` was never signalled and still runs.
+    async fn assert_untouched(holder: &fake_codex::FakeAppServer) {
+        let native = holder.native().await;
+        assert!(fake_codex::pid_alive(native.pid), "the holder still runs");
+        assert!(native.signals.is_empty(), "the holder was never signalled");
+    }
+
+    /// Whoever took the port may answer the readiness probe: here another
+    /// app-server holds it, so the seeded start fails as "not a member of
+    /// this unit" while its own native has yet to try the port. The native's
+    /// own record (it lost the port) decides: the attempt's unit is stopped
+    /// and Gone, and a new runtime starts in a new unit on a new port.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_start_whose_port_an_answering_app_server_took_is_retried_in_a_new_unit() {
+        let (_holder_home, holder) = an_answering_app_server().await;
+        let taken = holder.port;
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(CodexSidecarStore::new(home.path().join("records")));
+        let lifecycle = Arc::new(RecordingLifecycle::default());
+        let seed = recording_seed("t-answered", lifecycle.clone());
+        let mut builds = 0;
+        let (runtime, ready) = ready_retrying_a_lost_port("ready", |records| {
+            builds += 1;
+            let runtime = SpawnedCodexAppServerRuntime::with_command_store_context_and_seed(
+                fake_codex::launcher_command(),
+                store.clone(),
+                records.context(fake_context(json!({}), home.path())),
+                seed.clone(),
+            );
+            if builds == 1 {
+                runtime.with_forced_listen_port(taken)
+            } else {
+                runtime
+            }
+        })
+        .await;
+        assert_eq!(builds, 2, "one new runtime after the lost port");
+        assert_ne!(port_of(&ready.ws_url), taken, "the retry listens elsewhere");
+
+        let attempts = lifecycle.attempts();
+        assert_eq!(attempts.len(), 2, "one unit per attempt");
+        let lost = attempts[0]
+            .stop_in_flight()
+            .expect("the lost attempt's unit was stopped");
+        assert!(lost.try_report().is_some(), "Gone before the retry");
+        assert!(lost.wait_swept().await.is_empty(), "nothing of it survived");
+        let manifests = home.path().join("manifests");
+        assert_eq!(
+            lost_port_natives(&manifests).len(),
+            1,
+            "the lost attempt's native recorded why it never listened"
+        );
+        let unit = runtime.unit().expect("the retry's unit");
+        assert_eq!(unit.id(), attempts[1].id());
+        assert_eq!(
+            unit.main().map(|main| main.pid()),
+            Some(native_manifest_in(&manifests).pid),
+            "the main is the native that listened"
+        );
+        assert_eq!(store.load_all().len(), 1, "only the retry is recorded");
+        assert_untouched(&holder).await;
+
+        unit.stop(StopRequest::new(
+            StopMode::Force,
+            StopReason::ShiftX,
+            "test",
+        ))
+        .wait_swept()
+        .await;
+    }
+
+    /// Without a unit nothing checks who answered: the start "succeeds"
+    /// against the app-server that took its port while its own fake is about
+    /// to lose the port. That fake's own record rejects the start, which is
+    /// stopped and retried, and the start that stands is served by its own
+    /// fake.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_seedless_start_answered_on_its_taken_port_is_rejected_and_retried() {
+        let (holder_home, holder) = an_answering_app_server().await;
+        let taken = holder.port;
+        let mut builds = 0;
+        let (runtime, ready) = ready_retrying_a_lost_port("ready", |records| {
+            builds += 1;
+            let runtime = SpawnedCodexAppServerRuntime::with_command_store_and_context(
+                fake_app_server_command(),
+                Arc::new(CodexSidecarStore::disabled()),
+                records.context(Default::default()),
+            );
+            if builds == 1 {
+                runtime.with_forced_listen_port(taken)
+            } else {
+                runtime
+            }
+        })
+        .await;
+        assert_eq!(builds, 2, "the start answered on a taken port is retried");
+        let port = port_of(&ready.ws_url);
+        assert_ne!(port, taken, "the retry listens elsewhere");
+        assert_ne!(
+            ready.codex_home.as_deref().map(Path::new),
+            Some(holder_home.path()),
+            "the holder's answer was not taken"
+        );
+        let child = runtime.child_pid().await.expect("the retry's child");
+        assert_eq!(
+            freshell_containment::listening_socket_owner(port, &[child]),
+            Some(child),
+            "the runtime's own fake serves its port"
+        );
+        assert_untouched(&holder).await;
+        stop_seedless(&runtime).await;
+    }
+
+    /// A planner stops a failed attempt at once, before its fake may have
+    /// tried the port. A planned start whose port an answering app-server
+    /// took still ends with its native's record, so the plan is planned
+    /// again on a new port.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_planned_start_whose_port_an_answering_app_server_took_is_planned_again() {
+        let (_holder_home, holder) = an_answering_app_server().await;
+        let taken = holder.port;
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(CodexSidecarStore::new(home.path().join("records")));
+        seed_rollout(home.path(), "t-planned");
+        let lifecycle = Arc::new(RecordingLifecycle::default());
+        let factory_home = home.path().to_path_buf();
+        let factory_store = store.clone();
+        let builds = Arc::new(AtomicU32::new(0));
+        let factory_builds = builds.clone();
+        let manager = CodexTerminalLaunchManager::new(Box::new(move |plan| {
+            let first = factory_builds.fetch_add(1, Ordering::SeqCst) == 0;
+            let runtime = ListenChecked::build(fake_context(json!({}), &factory_home), |context| {
+                let runtime = SpawnedCodexAppServerRuntime::with_command_store_context_and_seed(
+                    fake_codex::launcher_command(),
+                    factory_store.clone(),
+                    context,
+                    plan.unit_seed.clone().expect("a seeded plan"),
+                );
+                if first {
+                    runtime.with_forced_listen_port(taken)
+                } else {
+                    runtime
+                }
+            }) as Arc<dyn CodexLaunchRuntime>;
+            Box::pin(async move { runtime })
+        }));
+        let launch = plan_retrying_a_lost_port(
+            "plan",
+            &manager,
+            &plan_input_with_seed("t-planned", recording_seed("t-planned", lifecycle.clone())),
+        )
+        .await;
+        assert_eq!(builds.load(Ordering::SeqCst), 2, "planned again once");
+        assert_ne!(port_of(&launch.ready.ws_url), taken, "on a new port");
+        let attempts = lifecycle.attempts();
+        assert_eq!(attempts.len(), 2, "one unit per attempt");
+        let lost = attempts[0]
+            .stop_in_flight()
+            .expect("the planner stopped the lost attempt");
+        assert!(lost.try_report().is_some(), "Gone before the next plan");
+        lost.wait_swept().await;
+        assert_eq!(
+            lost_port_natives(&home.path().join("manifests")).len(),
+            1,
+            "the lost attempt's native recorded why it never listened"
+        );
+        let unit = launch.unit.clone().expect("the launch's unit");
+        assert_eq!(unit.id(), attempts[1].id());
+        assert_untouched(&holder).await;
+
+        manager.adopt("T-planned", launch, 1).await.expect("adopt");
+        unit.stop(StopRequest::new(
+            StopMode::Force,
+            StopReason::ShiftX,
+            "test",
+        ))
+        .wait_swept()
+        .await;
+        manager.finish_unit("T-planned").await;
     }
 
     /// A start killed while its first attempt is starting returns Cancelled
@@ -3659,14 +3892,14 @@ mod unit_sidecar {
     ) -> CodexLaunchPlanner {
         let home = home.to_path_buf();
         CodexLaunchPlanner::new(Box::new(move |plan| {
-            let runtime = Arc::new(
+            let runtime = ListenChecked::build(fake_context(behavior.clone(), &home), |context| {
                 SpawnedCodexAppServerRuntime::with_command_store_context_and_seed(
                     fake_codex::launcher_command(),
                     store.clone(),
-                    fake_context(behavior.clone(), &home),
+                    context,
                     plan.unit_seed.clone().expect("seeded plan"),
-                ),
-            ) as Arc<dyn CodexLaunchRuntime>;
+                )
+            }) as Arc<dyn CodexLaunchRuntime>;
             Box::pin(async move { runtime })
         }))
     }
@@ -4122,11 +4355,11 @@ mod unit_sidecar {
             "-c".to_string(),
             format!("mcp_servers.freshell.env_vars=[{names}]"),
         ];
-        let (runtime, _) = ready_retrying_a_lost_port("ready", || {
+        let (runtime, _) = ready_retrying_a_lost_port("ready", |records| {
             SpawnedCodexAppServerRuntime::with_command_store_context_and_seed(
                 fake_codex::launcher_command(),
                 Arc::new(CodexSidecarStore::disabled()),
-                context.clone(),
+                records.context(context.clone()),
                 tag_seed("t-mcp"),
             )
         })

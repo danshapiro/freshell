@@ -718,6 +718,19 @@ if (behavior.spawnDurableWriter) {
 // does.
 const LOST_PORT_EXIT_CODE = 98
 
+// FAKE_CODEX_LISTEN_RECORD_DIR (tests): this process records there whether it
+// listened or lost its port (`listen-<pid>.json`), before it answers anyone or
+// exits. Whoever else took the port may answer the starter's readiness probe,
+// so only this record says how this fake's own start went.
+const listenRecordDir = process.env.FAKE_CODEX_LISTEN_RECORD_DIR
+function recordListen(outcome) {
+  if (!listenRecordDir) return
+  fs.mkdirSync(listenRecordDir, { recursive: true })
+  const file = path.join(listenRecordDir, `listen-${process.pid}.json`)
+  fs.writeFileSync(`${file}.tmp`, JSON.stringify({ pid: process.pid, ...outcome }))
+  fs.renameSync(`${file}.tmp`, file)
+}
+
 // The URL this fake serves on, as the thread operation log names it: the
 // --listen URL, or in port-file mode the one with the port the kernel gave it.
 let servedListenUrl = listenUrl
@@ -744,9 +757,13 @@ function listen() {
         + `exiting ${LOST_PORT_EXIT_CODE}\n`,
     )
     nativeRole?.noteListenError(error.code)
+    recordListen({ port, listenError: error.code })
     process.exit(LOST_PORT_EXIT_CODE)
   })
-  wss.on('listening', () => nativeRole?.noteListening())
+  wss.on('listening', () => {
+    nativeRole?.noteListening()
+    recordListen({ port: wss.address().port, listening: true })
+  })
   wss.on('connection', handleConnection)
 }
 const watches = new Map()

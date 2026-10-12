@@ -247,6 +247,104 @@ async fn a_native_whose_port_is_taken_exits_98_and_says_why() {
     );
 }
 
+/// The listen records (`listen-<pid>.json` under `dir`), by pid.
+fn listen_records(dir: &Path) -> std::collections::BTreeMap<u64, Value> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("listen-") && name.ends_with(".json"))
+        })
+        .map(|entry| {
+            let record: Value =
+                serde_json::from_str(&std::fs::read_to_string(entry.path()).unwrap()).unwrap();
+            (
+                record["pid"].as_u64().expect("the record names its pid"),
+                record,
+            )
+        })
+        .collect()
+}
+
+/// Every fake, single-process or native, records under
+/// `FAKE_CODEX_LISTEN_RECORD_DIR` whether it listened or lost its port,
+/// before it answers anyone or exits: whoever started it learns how its own
+/// start went even when another app-server answers on the port.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_fake_records_whether_it_listened_or_lost_its_port() {
+    let home = tempfile::tempdir().unwrap();
+    let records = tempfile::tempdir().unwrap();
+    let record_env = [(
+        lost_port::LISTEN_RECORD_DIR_ENV,
+        records.path().to_str().unwrap(),
+    )];
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a loopback port");
+    let taken = holder.local_addr().expect("the held port").port();
+    let single = || {
+        let mut cmd = tokio::process::Command::new("node");
+        cmd.arg(fixture_path("fake-app-server.mjs"))
+            .env("CODEX_HOME", home.path())
+            .env(record_env[0].0, record_env[0].1)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        cmd
+    };
+
+    // The single-process fake on the taken port.
+    let mut lost = single()
+        .args(["--listen", &format!("ws://127.0.0.1:{taken}")])
+        .spawn()
+        .expect("spawn the single-process fake");
+    let lost_pid = u64::from(lost.id().expect("its pid"));
+    let status = tokio::time::timeout(Duration::from_secs(10), lost.wait())
+        .await
+        .expect("it exits")
+        .expect("wait for it");
+    assert_eq!(status.code(), Some(98));
+    assert_eq!(
+        listen_records(records.path())[&lost_pid],
+        json!({"pid": lost_pid, "port": taken, "listenError": "EADDRINUSE"})
+    );
+
+    // The single-process fake that listens.
+    let (_listening, port) = lost_port::spawn_on_its_own_port(single()).await;
+    let pid = listen_records(records.path())
+        .into_iter()
+        .find_map(|(pid, record)| (record["listening"] == true).then_some(pid))
+        .expect("its record");
+    assert_eq!(
+        listen_records(records.path())[&pid],
+        json!({"pid": pid, "port": port, "listening": true})
+    );
+
+    // The native behind the launcher, on the taken port and then listening.
+    let mut native_lost =
+        FakeAppServer::spawn_on_port(taken, json!({}), home.path(), &record_env).await;
+    let lost_native = u64::from(native_lost.native().await.pid);
+    let exit = native_lost
+        .listened()
+        .await
+        .expect_err("the native loses the port");
+    assert!(exit.contains("exit status: 98"), "{exit}");
+    assert_eq!(
+        listen_records(records.path())[&lost_native]["listenError"],
+        "EADDRINUSE"
+    );
+    let native = FakeAppServer::spawn(json!({}), home.path(), &record_env).await;
+    let listening_native = u64::from(native.native().await.pid);
+    assert_eq!(
+        listen_records(records.path())[&listening_native],
+        json!({"pid": listening_native, "port": native.port, "listening": true})
+    );
+    drop(holder);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn launcher_forwards_only_the_first_signal() {
     let home = tempfile::tempdir().unwrap();

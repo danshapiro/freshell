@@ -14,9 +14,11 @@
 #![cfg(all(feature = "real-transport", target_os = "linux"))]
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use freshell_codex::launch_lifecycle::{CodexLaunchRuntime, SpawnedCodexAppServerRuntime};
+use freshell_codex::CodexSidecarStore;
 use freshell_platform::child_nofile;
 
 #[path = "support/lost_port.rs"]
@@ -78,12 +80,18 @@ async fn the_codex_sidecar_starts_with_the_recorded_soft_limit() {
     .expect("write the recording launcher");
 
     // The runtime chooses the sidecar's port and releases it before the
-    // sidecar binds it; a lost port is retried by a new runtime on a new port
-    // (each start records its own soft limit).
+    // sidecar binds it; a port the sidecar's own record says it lost is
+    // retried by a new runtime on a new port (each start records its own soft
+    // limit). The store is the one `with_command` resolves.
     let (runtime, _ready) = tokio::time::timeout(
         Duration::from_secs(30),
-        lost_port::ready_retrying_a_lost_port("the sidecar must come up", || {
-            SpawnedCodexAppServerRuntime::with_command(format!("sh {}", script.display()))
+        lost_port::ready_retrying_a_lost_port("the sidecar must come up", |records| {
+            SpawnedCodexAppServerRuntime::with_command_store_and_context(
+                format!("sh {}", script.display()),
+                freshell_codex::sidecar_store::codex_sidecar_store()
+                    .unwrap_or_else(|| Arc::new(CodexSidecarStore::disabled())),
+                records.context(Default::default()),
+            )
         }),
     )
     .await
