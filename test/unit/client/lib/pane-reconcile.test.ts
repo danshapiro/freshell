@@ -178,6 +178,36 @@ describe('buildReconcileRequest', () => {
     expect(buildReconcileRequest(emptyState())).toBeNull()
   })
 
+  it('does not reconcile a persisted managed preparation failure as a fresh create', () => {
+    let state = emptyPanesState()
+    state = addTerminalPane(state, 'tab1', 'blocked', {
+      mode: 'opencode',
+      status: 'error',
+      createRequestId: 'failed-managed-create',
+      launchFailure: {
+        code: 'LAUNCH_FAILED',
+        message: 'Configuration blocked: /workspace/missing.txt: referenced file was not found',
+        retryable: true,
+        providerPreparationFailure: {
+          code: 'SELECTED_REFERENCE_UNAVAILABLE',
+          stage: 'configuration',
+          operation: 'resolve',
+          cause: 'not_found',
+          workspace: '/workspace',
+          declaringConfig: '/workspace/opencode.json',
+          selectedPath: '/workspace/missing.txt',
+        },
+      },
+    })
+    state = addTerminalPane(state, 'tab2', 'healthy', {
+      mode: 'opencode', status: 'running', terminalId: 'terminal-healthy',
+    })
+
+    const request = buildReconcileRequest(asRootState(state))
+    expect(request?.panes.map(pane => pane.paneKey)).toEqual(['tab2:healthy'])
+    expect(buildReconcileRequestForPanes(asRootState(state), [{ tabId: 'tab1', paneId: 'blocked' }])).toBeNull()
+  })
+
   it('caps at 200 panes with a console.error breadcrumb', () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
     let panes = emptyPanesState()

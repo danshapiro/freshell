@@ -75,6 +75,20 @@ async function terminalDiagnostic(page: Page, terminalId?: string) {
   }, { terminalId, marker: `MANAGED_ENV_OUTPUT ${fixture.expectedNonce}` }).catch(() => ({ observation: 'UNKNOWN' }))
 }
 
+async function hasCompletedOutputWrite(page: Page, terminalId: string, marker: string, after = 0) {
+  return page.evaluate(({ terminalId, marker, after }) => {
+    const events = window.__FRESHELL_TEST_HARNESS__?.getTerminalWriteEvents?.() ?? []
+    let tail = ''
+    for (const event of events) {
+      if (event.terminalId !== terminalId || event.phase !== 'written' || event.at < after) continue
+      const current = tail + event.data
+      if (current.includes(marker)) return true
+      tail = current.slice(-Math.max(marker.length - 1, 16))
+    }
+    return false
+  }, { terminalId, marker, after })
+}
+
 test.afterEach(async ({ page }, info) => {
   const scenario = caseScenarios[info.title]
   if (!scenario) throw new Error('Unknown managed environment case')
@@ -187,8 +201,8 @@ test(healthyTitle, async ({ page }, info) => {
   const terminalId = pane.content.terminalId!
   const marker = `MANAGED_ENV_OUTPUT ${fixture.expectedNonce}`
   info.annotations.push({ type: 'managed-stage', description: 'healthy-initial-output' })
-  await expect.poll(() => page.evaluate(id => window.__FRESHELL_TEST_HARNESS__!.getTerminalBuffer(id), terminalId),
-    { timeout: 120_000 }).toContain(marker)
+  await expect.poll(() => hasCompletedOutputWrite(page, terminalId, marker),
+    { timeout: 120_000 }).toBe(true)
   let receipt: any
   await expect.poll(async () => {
     receipt = await readReceipt(page, `${pane.cwd}/.managed-fixture/target-receipt.json`)
@@ -205,12 +219,14 @@ test(healthyTitle, async ({ page }, info) => {
     .filter((message: any) => message.type === 'terminal.create').length)
   console.log(JSON.stringify({ severity: 'info', event: 'managed_environment.browser_before_reconnect',
     scenario: 'healthy', attempt: info.retry, diagnostic: await terminalDiagnostic(page, terminalId) }))
+  const reconnectStartedAt = await page.evaluate(() => performance.now())
   await new TestHarness(page).forceDisconnect()
   await new TestHarness(page).waitForConnection(120_000)
   await expect.poll(async () => (await activePane(page)).content).toMatchObject({ terminalId,
     sessionRef: { provider: 'opencode', sessionId: receipt.nativeSessionId } })
   info.annotations.push({ type: 'managed-stage', description: 'healthy-post-reconnect-output' })
-  await expect.poll(() => page.evaluate(id => window.__FRESHELL_TEST_HARNESS__!.getTerminalBuffer(id), terminalId)).toContain(marker)
+  await expect.poll(() => hasCompletedOutputWrite(page, terminalId, marker, reconnectStartedAt),
+    { timeout: 120_000 }).toBe(true)
   expect(await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
     .filter((message: any) => message.type === 'terminal.create').length)).toBe(beforeCreates)
   const rows = await json(page, '/api/terminals')

@@ -37,6 +37,7 @@ import {
   setPaneRestoreError,
   setReconcileWarming,
 } from '@/store/panesSlice'
+import { retainedManagedPreparationFailure } from '@/store/paneTypes'
 import { clearSessionLost } from '@/store/freshAgentSlice'
 import type { PaneOwnerDivergence } from '@/store/selectors/runtimeOwner'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
@@ -147,6 +148,10 @@ function effectiveReconcileSessionRef(
 function toReconcilePane(tabId: string, paneId: string, content: TerminalPaneContent): ReconcilePane | null {
   // Panes without a createRequestId cannot be reconciled — skip.
   if (!content.createRequestId) return null
+  // A failed managed preparation never registered a backend terminal. Its
+  // retained error is the durable result; asking the server to reconcile the
+  // same createRequestId would classify it as fresh and silently retry it.
+  if (retainedManagedPreparationFailure(content)) return null
   const sessionRef = effectiveReconcileSessionRef(content.sessionRef, content.resumeSessionId, content.mode)
   return {
     paneKey: paneKeyFor(tabId, paneId),
