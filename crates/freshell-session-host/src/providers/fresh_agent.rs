@@ -3572,6 +3572,244 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claude_native_worker_exit_ends_host_liveness_without_another_send() {
+        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let keys = [
+            "HOME",
+            "CLAUDE_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "FRESHELL_CLAUDE_SIDECAR",
+            "FRESHELL_CLAUDE_SDK_QUERY_MODULE",
+        ];
+        let _restore = SnapshotProviderEnv(
+            keys.iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        );
+        let module = root.path().join("native-query.mjs");
+        // The production bridge consumes a controlled SDK iterator backed by a
+        // real native protocol process. Kill only this exact recorded child.
+        std::fs::write(&module, r#"
+import { spawn } from 'node:child_process'
+import { appendFileSync } from 'node:fs'
+import { createInterface } from 'node:readline'
+import { join } from 'node:path'
+export function query({ prompt, options }) {
+  const native = options.resume ?? 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+  const worker = spawn(process.execPath, ['-e', `
+    const readline = require('node:readline');
+    const native = process.argv[1];
+    const emit = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+    emit({type:'system',subtype:'init',session_id:native,tools:[]});
+    readline.createInterface({input:process.stdin}).on('line', (line) => {
+      if (JSON.parse(line).message.content[0].text === '__end_native_query__') process.exit(0);
+      emit({type:'result',subtype:'success',session_id:native,is_error:false});
+    });
+  `, native], { cwd: options.cwd, signal: options.abortController.signal, stdio: ['pipe', 'pipe', 'pipe'] })
+  worker.on('error', () => {})
+  appendFileSync(join(options.cwd, 'native-launches.jsonl'), JSON.stringify({pid:worker.pid,bridgePid:process.pid,resume:options.resume ?? null}) + '\n')
+  const exit = new Promise(resolve => worker.once('exit', (code, signal) => resolve({code,signal})))
+  const lines = createInterface({input:worker.stdout})
+  const iterator = (async function* () {
+    for await (const line of lines) yield JSON.parse(line)
+    const result = await exit
+    if (result.signal || result.code) throw new Error('controlled native worker exited')
+  })()
+  void (async () => {
+    for await (const message of prompt) {
+      process.stdout.write(JSON.stringify({type:'sdk.session.closed',sessionId:'previous-sidecar-session',queryGeneration:1,reason:'stream_error'}) + '\n')
+      appendFileSync(join(options.cwd, 'native-inputs.jsonl'), JSON.stringify({pid:worker.pid}) + '\n')
+      if (!worker.stdin.destroyed) worker.stdin.write(JSON.stringify(message) + '\n')
+    }
+  })()
+  return Object.assign(iterator, {
+    initializationResult: async () => ({}), supportedCommands: async () => [],
+    close: () => worker.kill(), interrupt: async () => {},
+  })
+}
+"#).unwrap();
+        for (key, value) in [
+            ("HOME", root.path().to_path_buf()),
+            ("CLAUDE_HOME", root.path().join(".claude")),
+            ("CLAUDE_CONFIG_DIR", root.path().join(".claude")),
+            (
+                "FRESHELL_CLAUDE_SIDECAR",
+                repo.join("crates/freshell-claude-sidecar/index.mjs"),
+            ),
+            ("FRESHELL_CLAUDE_SDK_QUERY_MODULE", module),
+        ] {
+            std::env::set_var(key, value);
+        }
+        let mut profile = parity_profile(FreshProvider::Claude);
+        profile.cwd = root.path().to_string_lossy().into();
+        profile.native_session_id = Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into());
+        profile.session_ref = None;
+        profile.provider_launch_context = None;
+        profile.provider_secret_references.clear();
+        profile.plugins = None;
+        let transport = HostedTransport::new(FreshProvider::Claude).await;
+        let actor_dir = root.path().join("actor");
+        let actor = FreshAgentHostActor::open(&actor_dir, profile.clone(), transport.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            actor.profile().await.native_session_id,
+            profile.native_session_id
+        );
+        let host = Arc::new(crate::HostState {
+            incarnation_id: freshell_runtime_protocol::IncarnationId::new(),
+            host_boot_id: freshell_runtime_protocol::HostBootId::new(),
+            state_dir: root.path().to_path_buf(),
+            secret: b"owned-lifecycle-test".to_vec(),
+            requested_limits: freshell_runtime_protocol::RuntimeLimits {
+                cpu_milli: 500,
+                memory_bytes: 128 * 1024 * 1024,
+                swap_bytes: 0,
+                pids_max: 32,
+            },
+            persisted: Mutex::new(crate::PersistedHostState::default()),
+            child: Mutex::new(None),
+            pty: Mutex::new(None),
+            fresh_agent: Mutex::new(Some(actor.clone())),
+            fresh_native_command: Mutex::new(()),
+            provider_config_paths: crate::ProviderConfigPaths::default(),
+            opencode_transfer_mount: root.path().join("transfer"),
+            bootstrap_root: root.path().join("bootstrap"),
+        });
+        let status = || {
+            crate::dispatch(
+                freshell_runtime_protocol::Envelope {
+                    protocol_version: freshell_runtime_protocol::CONTROL_PROTOCOL_VERSION,
+                    request_id: RequestId::new(),
+                    role: freshell_runtime_protocol::ControlRole::Supervisor,
+                    auth: Some(freshell_runtime_protocol::host_proof(
+                        &host.secret,
+                        "command-auth",
+                        &host.host_boot_id,
+                        &host.incarnation_id,
+                    )),
+                    body: freshell_runtime_protocol::HostCommand::Status {
+                        incarnation_id: host.incarnation_id.clone(),
+                    },
+                },
+                &host,
+            )
+        };
+        actor
+            .dispatch(RequestId::new(), "controlled ordinary turn".into(), None)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if actor.read_events(0, 64).await.events.iter().any(|entry|
+                    matches!(entry.event, AgentEvent::Provider { ref payload } if payload["event"]["type"] == "freshAgent.result")) { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        assert!(
+            matches!(
+                status().await.unwrap(),
+                freshell_runtime_protocol::HostResult::Status { exited: false, .. }
+            ),
+            "a completed idle turn must retain the native query"
+        );
+        let launches = || {
+            std::fs::read_to_string(root.path().join("native-launches.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let before = launches();
+        assert_eq!(before.len(), 1);
+        let pid = before[0]["pid"].as_i64().unwrap() as i32;
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+        let detected = tokio::time::timeout(Duration::from_secs(3), async {
+            while actor.is_live().await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        let crashed_status = status().await.unwrap();
+        let bridge_still_live =
+            unsafe { libc::kill(before[0]["bridgePid"].as_i64().unwrap() as i32, 0) } == 0;
+        let after = launches();
+        let input_count = std::fs::read_to_string(root.path().join("native-inputs.jsonl"))
+            .unwrap()
+            .lines()
+            .count();
+        host.fresh_agent
+            .lock()
+            .await
+            .take()
+            .unwrap()
+            .stop()
+            .await
+            .unwrap();
+        drop(actor);
+        assert!(
+            detected,
+            "native SDK worker death must reach host liveness while its bridge stdout remains open"
+        );
+        assert!(
+            bridge_still_live,
+            "native death detection must not kill the healthy Node bridge"
+        );
+        assert!(
+            matches!(
+                crashed_status,
+                freshell_runtime_protocol::HostResult::Status { exited: true, .. }
+            ),
+            "the actual host Status contract must reject reattachment to the ended query"
+        );
+        assert_eq!(
+            after, before,
+            "death detection must not create a session or replay input"
+        );
+        assert_eq!(input_count, 1);
+        let resumed = HostedTransport::new(FreshProvider::Claude).await;
+        let recovered = FreshAgentHostActor::open(&actor_dir, profile.clone(), resumed.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered.profile().await.native_session_id,
+            profile.native_session_id
+        );
+        assert!(recovered.is_live().await);
+        assert_eq!(
+            launches()[1]["resume"],
+            profile.native_session_id.clone().unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("native-inputs.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "exact native resume does not replay the accepted prompt"
+        );
+        recovered
+            .dispatch(RequestId::new(), "__end_native_query__".into(), None)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while recovered.is_live().await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("ordinary native EOF also ends the query lifetime");
+        recovered.clone().stop().await.unwrap();
+        assert!(
+            !recovered.is_live().await,
+            "ordinary Stop remains authoritative"
+        );
+    }
+
+    #[tokio::test]
     async fn normalized_claude_init_reaches_current_host_native_receiver() {
         let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
         let root = tempfile::tempdir().unwrap();
@@ -3870,6 +4108,8 @@ mod tests {
             .await
             .unwrap();
             let checkpoint = old_card["nativeCheckpoint"].clone();
+            assert!(actor.is_live().await,
+                "the ended query preceding native checkpoint continuation must not close its current replacement");
             profile = actor.profile().await;
             assert_eq!(profile.native_session_id.as_deref(), Some(native));
             if let ProviderState::Claude(state) = &original.state {

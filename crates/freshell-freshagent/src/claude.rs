@@ -980,6 +980,8 @@ struct ClaudeSession {
     /// the hardcoded "idle" that used to wedge stale-busy/stale-idle panes.
     /// Starts "idle" — a fresh/just-resumed session has announced nothing else.
     last_status: Arc<std::sync::Mutex<String>>,
+    // Native query lifetime is independent of the long-lived Node bridge.
+    native_query_live: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The sidecar's signed answer to a `rollback.quiesce` probe (ep4-r3). All
@@ -2839,6 +2841,7 @@ impl FreshClaudeState {
         let turn_lock = Arc::new(TokioMutex::new(()));
         // Fresh session: nothing announced yet; the consumer's status fold owns it.
         let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
+        let native_query_live = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let consumer = self.spawn_consumer(
             reader,
             created.clone(),
@@ -2848,6 +2851,7 @@ impl FreshClaudeState {
             Arc::clone(&broadcast_id),
             Arc::clone(&pending),
             Arc::clone(&last_status),
+            Arc::clone(&native_query_live),
             Arc::clone(&in_turn),
             Arc::clone(&turn_tracker),
             Arc::clone(&result_idle_pair_pending),
@@ -2911,6 +2915,7 @@ impl FreshClaudeState {
                 turn_lock,
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status,
+                native_query_live,
             },
         );
 
@@ -5685,13 +5690,18 @@ impl FreshClaudeState {
 
     /// Reconcile liveness probe (campaign §4.3, Task 13): resolve the DURABLE
     /// claude UUID through [`Self::cli_index`] to its sessions-map key, then
-    /// check the map. The sessions map is read UNFILTERED — no session_type
-    /// filter, so kilroy sessions count for free (V2 N-A17-1).
+    /// check that its native query is still usable. A surviving Node bridge
+    /// alone is insufficient. No session_type filter is applied, so kilroy
+    /// uses the same lifecycle check (V2 N-A17-1).
     pub async fn has_live_session(&self, session_id: &str) -> bool {
         let Some(key) = self.cli_index.lock().await.get(session_id).cloned() else {
             return false;
         };
-        self.sessions.lock().await.contains_key(&key)
+        self.sessions.lock().await.get(&key).is_some_and(|session| {
+            session
+                .native_query_live
+                .load(std::sync::atomic::Ordering::SeqCst)
+        })
     }
 
     pub(crate) async fn local_snapshot_owner(
@@ -7021,6 +7031,7 @@ impl FreshClaudeState {
         // The respawn is fresh: nothing announced yet; the consumer's status
         // fold owns the tracked status from here.
         let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
+        let native_query_live = Arc::new(std::sync::atomic::AtomicBool::new(true));
         // Task 5: the fork CARRIES the pre-rollback session's death-mint
         // clock (extracted with the other carried handles above) — the fork
         // continues the same logical session lifetime, so its Rust-minted
@@ -7034,6 +7045,7 @@ impl FreshClaudeState {
             Arc::clone(&broadcast_id),
             Arc::clone(&pending),
             Arc::clone(&last_status),
+            Arc::clone(&native_query_live),
             in_turn.clone(),
             turn_tracker.clone(),
             result_idle_pair_pending.clone(),
@@ -7075,6 +7087,7 @@ impl FreshClaudeState {
                 turn_lock: turn_lock.clone(),
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status,
+                native_query_live,
             },
         );
 
@@ -7895,6 +7908,7 @@ impl FreshClaudeState {
         // Freshly resumed session: the tracked status starts "idle" (truthful — no
         // turn can be in flight before the client sends).
         let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
+        let native_query_live = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let consumer = self.spawn_consumer(
             reader,
             msg.session_id.clone(),
@@ -7904,6 +7918,7 @@ impl FreshClaudeState {
             Arc::clone(&broadcast_id),
             Arc::clone(&pending),
             Arc::clone(&last_status),
+            Arc::clone(&native_query_live),
             Arc::clone(&in_turn),
             Arc::clone(&turn_tracker),
             Arc::clone(&result_idle_pair_pending),
@@ -7937,6 +7952,7 @@ impl FreshClaudeState {
                 turn_lock,
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status,
+                native_query_live,
             },
         );
         self.cli_index
@@ -8949,6 +8965,7 @@ impl FreshClaudeState {
         broadcast_id: Arc<std::sync::Mutex<String>>,
         pending: Arc<std::sync::Mutex<ClaudePending>>,
         last_status: Arc<std::sync::Mutex<String>>,
+        native_query_live: Arc<std::sync::atomic::AtomicBool>,
         // kata 1wxv Task 4: the session's shared busy truth — cleared by the
         // EXACTLY-four contract edges (`sdk.result` any subtype, `sdk.status`
         // idle, EOF/death below, completed handle_interrupt at the write site).
@@ -9050,6 +9067,20 @@ impl FreshClaudeState {
                 let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
                     continue;
                 };
+                if value["type"] == "sdk.session.closed"
+                    && value["sessionId"].as_str() == Some(&sidecar_session_id)
+                {
+                    // The sidecar emits this only for its current query. Keep
+                    // enclosure ownership until Stop confirms the old writer
+                    // empty; a completed/idle turn never closes this lifetime.
+                    native_query_live.store(false, std::sync::atomic::Ordering::SeqCst);
+                    tracing::warn!(provider = PROVIDER, session_id = %session_id,
+                        native_session_id = value["nativeSessionId"].as_str(),
+                        query_generation = value["queryGeneration"].as_u64(),
+                        reason = value["reason"].as_str().unwrap_or("unknown"),
+                        "freshagent.claude.native_query_ended");
+                    continue;
+                }
                 // kata 1wxv Task 4 busy-truth clear edges — IN-STREAM arms (a) and
                 // (b): `sdk.result` with ANY subtype ends the turn (r2: the earlier
                 // success-only wording is void), and `sdk.status:idle`. NO other
@@ -10871,6 +10902,7 @@ pub(crate) mod tests {
                 turn_lock: Arc::new(TokioMutex::new(())),
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status: Arc::new(std::sync::Mutex::new("idle".to_string())),
+                native_query_live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             },
         );
     }
@@ -19395,6 +19427,7 @@ rl.on('line', (line) => {
                 turn_lock: Arc::new(TokioMutex::new(())),
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status: Arc::new(std::sync::Mutex::new("idle".to_string())),
+                native_query_live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             },
         );
     }
@@ -19978,6 +20011,7 @@ rl.on('line', (line) => {
             Arc::new(std::sync::Mutex::new("fold-session".to_string())),
             Arc::clone(&pending),
             Arc::new(std::sync::Mutex::new("idle".to_string())),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(TurnTracker::default())),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -21298,6 +21332,7 @@ rl.on('line', (line) => {
         let last_synthesized_complete_at = Arc::new(std::sync::Mutex::new(None));
         let turn_lock = Arc::new(TokioMutex::new(()));
         let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
+        let native_query_live = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let broadcast_id = Arc::new(std::sync::Mutex::new(map_key.to_string()));
         let consumer = st.spawn_consumer(
             reader,
@@ -21308,6 +21343,7 @@ rl.on('line', (line) => {
             Arc::clone(&broadcast_id),
             Arc::clone(&pending),
             Arc::clone(&last_status),
+            Arc::clone(&native_query_live),
             Arc::clone(&in_turn),
             Arc::clone(&turn_tracker),
             Arc::clone(&result_idle_pair_pending),
@@ -21336,6 +21372,7 @@ rl.on('line', (line) => {
                 turn_lock,
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status,
+                native_query_live,
             },
         );
         st.cli_index
@@ -21387,6 +21424,7 @@ rl.on('line', (line) => {
                 turn_lock: Arc::new(TokioMutex::new(())),
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status: Arc::new(std::sync::Mutex::new("idle".to_string())),
+                native_query_live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             },
         );
         st.cli_index
@@ -21446,6 +21484,7 @@ rl.on('line', (line) => {
         let last_synthesized_complete_at = Arc::new(std::sync::Mutex::new(None));
         let turn_lock = Arc::new(TokioMutex::new(()));
         let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
+        let native_query_live = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let broadcast_id = Arc::new(std::sync::Mutex::new(map_key.to_string()));
         let consumer = st.spawn_consumer(
             reader,
@@ -21456,6 +21495,7 @@ rl.on('line', (line) => {
             Arc::clone(&broadcast_id),
             Arc::clone(&pending),
             Arc::clone(&last_status),
+            Arc::clone(&native_query_live),
             Arc::clone(&in_turn),
             Arc::clone(&turn_tracker),
             Arc::clone(&result_idle_pair_pending),
@@ -21484,6 +21524,7 @@ rl.on('line', (line) => {
                 turn_lock,
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status,
+                native_query_live,
             },
         );
         st.cli_index
