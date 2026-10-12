@@ -171,7 +171,7 @@ pub(super) fn resolve_file_references_from_view_relocated(
     projection: ReferenceProjection<'_>,
 ) -> Result<ResolvedFileReferencePlan, ReferenceError> {
     use freshell_platform::opencode_config::{
-        file_reference_path, inspect_file_tokens, TokenTransformError,
+        file_reference_path, inspect_file_tokens, lexical_path, TokenTransformError,
     };
     let mut selections: Vec<FileReferenceSelection> = Vec::new();
     let mut rewritten = Vec::new();
@@ -217,7 +217,9 @@ pub(super) fn resolve_file_references_from_view_relocated(
             operation: ProviderPreparationFailureOperation::Resolve,
             cause,
             workspace: origin.cwd.to_string_lossy().into_owned(),
-            declaring_config: origin.declaring_config.to_string_lossy().into_owned(),
+            declaring_config: lexical_path(origin.declaring_config)
+                .to_string_lossy()
+                .into_owned(),
             selected_path,
         }));
         failure
@@ -1408,6 +1410,39 @@ process.stdout.write(JSON.stringify(receipts));
             failure.cause,
             freshell_protocol::ProviderPreparationFailureCause::NotFound
         );
+        assert_eq!(failure.selected_path.as_deref(), selected.to_str());
+        assert_eq!(failure.declaring_config, source.to_string_lossy());
+        assert_eq!(failure.workspace, temp.path().to_string_lossy());
+    }
+
+    #[test]
+    fn managed_provider_references_missing_path_normalizes_declaring_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("opencode.json");
+        let selected = temp.path().join("missing-selected.txt");
+        std::fs::write(
+            &source,
+            r#"{"agent":{"fixture":{"prompt":"{file:./missing-selected.txt}"}}}"#,
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(&source).unwrap();
+        let declaring_config = PathBuf::from(format!("{}/./opencode.json", temp.path().display()));
+        let err = resolve_file_references(
+            &raw,
+            FileSourceOrigin {
+                declaring_config: &declaring_config,
+                cwd: temp.path(),
+                original_home: temp.path(),
+            },
+            &|_| None,
+        )
+        .err()
+        .expect("an explicit missing selection must block before dispatch");
+        let launch_error: freshell_terminal::registry::ManagedTerminalLaunchError = err.into();
+        let failure = launch_error
+            .provider_preparation_failure
+            .expect("the real selected-reference failure keeps safe typed metadata");
+
         assert_eq!(failure.selected_path.as_deref(), selected.to_str());
         assert_eq!(failure.declaring_config, source.to_string_lossy());
         assert_eq!(failure.workspace, temp.path().to_string_lossy());
