@@ -6,6 +6,8 @@ use std::time::Instant;
 
 #[cfg(unix)]
 use freshell_containment::identity;
+#[cfg(target_os = "linux")]
+use freshell_containment::is_process_gone;
 use freshell_containment::{is_codex_daemon_family, ProcWatch, Sig, UnitId};
 
 #[test]
@@ -164,6 +166,57 @@ fn open_expecting_refuses_a_different_incarnation() {
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     let ok = ProcWatch::open_expecting(pid, real.start).unwrap();
     ok.signal(Sig::Kill).unwrap();
+}
+
+/// A process that exited and was reaped is reported gone (`NotFound`,
+/// [`is_process_gone`]), also when its pid still names a process group or
+/// session another process lives on in (a PTY screen's shell leaves a job
+/// behind; the kernel then answers `pidfd_open` with `EINVAL`, not `ESRCH`).
+/// A different incarnation under a pid is refused, but is not "gone".
+#[cfg(target_os = "linux")]
+#[test]
+fn a_reaped_process_is_gone_even_while_its_group_lives_on() {
+    use std::io::BufRead;
+    use std::os::unix::process::CommandExt;
+
+    // Alone: nothing else names its pid once it is reaped.
+    let mut alone = std::process::Command::new("true").spawn().unwrap();
+    let pid = alone.id();
+    alone.wait().unwrap();
+    let err = ProcWatch::open(pid).expect_err("a reaped process cannot be watched");
+    assert!(is_process_gone(&err), "{err}");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+
+    // Its own process group's leader, with a job (which ignores the hangup)
+    // still in the group when it is reaped.
+    let mut leader = std::process::Command::new("bash")
+        .args(["-c", "trap '' HUP; sleep 30 & echo $!; exit 0"])
+        .stdout(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(leader.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let job = ProcWatch::open(line.trim().parse().unwrap()).expect("the job runs");
+    let pid = leader.id();
+    leader.wait().unwrap();
+    let opened = ProcWatch::open(pid);
+    job.signal(Sig::Kill).unwrap();
+    let err = opened.expect_err("a reaped leader cannot be watched");
+    assert!(is_process_gone(&err), "{err}");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+
+    // A running process under another start time: refused, not gone.
+    let pid = spawn_grandchild("600");
+    let real = identity(pid).unwrap();
+    let err = ProcWatch::open_expecting(pid, real.start + 1).expect_err("mismatch refused");
+    assert!(!is_process_gone(&err), "{err}");
+    ProcWatch::open_expecting(pid, real.start)
+        .unwrap()
+        .signal(Sig::Kill)
+        .unwrap();
 }
 
 #[cfg(target_os = "linux")]

@@ -47,6 +47,36 @@ pub enum Sig {
     Kill,
 }
 
+/// The error a watch's open answers when no process has the pid any more:
+/// it exited and was reaped. Its kind is `NotFound` and its text "process
+/// gone"; [`is_process_gone`] tells it from every other open failure (a
+/// different incarnation under the pid, which is also `NotFound`, or an
+/// error of the OS call).
+#[derive(Debug)]
+struct ProcessGone;
+
+impl std::fmt::Display for ProcessGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("process gone")
+    }
+}
+
+impl std::error::Error for ProcessGone {}
+
+/// [`ProcessGone`] as an `io::Error`.
+pub(crate) fn process_gone() -> io::Error {
+    io::Error::new(io::ErrorKind::NotFound, ProcessGone)
+}
+
+/// Whether `error` is a watch's open finding no process with its pid any
+/// more (the process exited and was reaped), as opposed to a different
+/// incarnation under the pid or a failed OS call.
+pub fn is_process_gone(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<ProcessGone>())
+}
+
 #[derive(Clone)]
 pub struct ProcWatch {
     inner: Arc<Inner>,
@@ -123,18 +153,22 @@ impl ProcWatch {
         let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
         if raw < 0 {
             let err = io::Error::last_os_error();
-            return Err(if err.raw_os_error() == Some(libc::ESRCH) {
-                io::Error::new(io::ErrorKind::NotFound, "process gone")
-            } else {
-                err
-            });
+            // No process has the pid: ESRCH when nothing names it any more;
+            // EINVAL (for a positive pid and no flags) when it still names
+            // something other than a process, such as the process group or
+            // session of a reaped leader whose job lives on.
+            let gone = match err.raw_os_error() {
+                Some(libc::ESRCH) => true,
+                Some(libc::EINVAL) => libc::pid_t::try_from(pid).is_ok_and(|pid| pid > 0),
+                _ => false,
+            };
+            return Err(if gone { process_gone() } else { err });
         }
         // SAFETY: `raw` is a fresh pidfd this call owns exclusively.
         let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) };
         // Identity is read AFTER the pidfd pins the incarnation: a pid recycled
         // before pidfd_open shows a different start time and is refused.
-        let identity = crate::process::identity(pid)
-            .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "process gone"))?;
+        let identity = crate::process::identity(pid).map_err(|_| process_gone())?;
         if expect_start.is_some_and(|s| s != identity.start) {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -285,13 +319,21 @@ impl ProcWatch {
         use windows_sys::Win32::System::Threading::{
             PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
         };
+        // `NotFound` from the open: no process has the pid.
         let handle = crate::process::open_process(
             pid,
             PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
-        )?;
+        )
+        .map_err(|err| {
+            if err.kind() == io::ErrorKind::NotFound {
+                process_gone()
+            } else {
+                err
+            }
+        })?;
         // Read from the handle itself, which pins the incarnation.
-        let start = crate::process::start_time_of(handle.as_raw_handle())
-            .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "process gone"))?;
+        let start =
+            crate::process::start_time_of(handle.as_raw_handle()).map_err(|_| process_gone())?;
         if expect_start.is_some_and(|s| s != start) {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -459,7 +501,7 @@ unsafe extern "system" fn on_process_exit(
 impl ProcWatch {
     fn open_inner(pid: u32, expect_start: Option<u64>) -> io::Result<Self> {
         use crate::darwin::{self, Kqueue};
-        let gone = || io::Error::new(io::ErrorKind::NotFound, "process gone");
+        let gone = process_gone;
         let kq = Kqueue::new()?;
         let registered = kq.change(
             pid as usize,
