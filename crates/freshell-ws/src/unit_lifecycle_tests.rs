@@ -1005,18 +1005,38 @@ async fn a_key_stamped_after_its_units_gone_is_released_by_the_stop_that_moves_i
             ..Default::default()
         },
     );
-    // The create gives its start up: its stop joins the finished one.
+    let mut frames = state.broadcast_tx.subscribe();
+    // The create gives its start up: its stop joins the finished one. The
+    // unit is already Gone, so the release may land before this test looks
+    // at the registry: the key's path is read from the owner frames, which
+    // every device sees in order.
     let moving = start_unit_stop(&state, &entry, command("op-give-up"));
-    assert!(matches!(
-        ownership.observe("codex", "s-w1").state,
-        freshell_ownership::OwnershipState::Stopping { .. }
-    ));
     tokio::time::timeout(LIMIT, moving.released())
         .await
         .expect("the moved key is released once the unit is Gone");
     assert_eq!(
         ownership.observe("codex", "s-w1").state,
         freshell_ownership::OwnershipState::Vacant
+    );
+    let mut owner_frames = Vec::new();
+    while let Ok(frame) = frames.try_recv() {
+        let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        if value["type"] == "session.runtimeOwner" && value["sessionId"] == "s-w1" {
+            owner_frames.push(value);
+        }
+    }
+    let transitions: Vec<_> = owner_frames
+        .iter()
+        .map(|f| f["transition"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        transitions,
+        vec!["stopping".to_string(), "released".to_string()],
+        "the stop moved the key to Stopping, then released it at Gone: {owner_frames:?}"
+    );
+    assert_eq!(
+        owner_frames[0]["operationId"], owner_frames[1]["operationId"],
+        "the key is released under the operation it was moved under: {owner_frames:?}"
     );
 }
 
