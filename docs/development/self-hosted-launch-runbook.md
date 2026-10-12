@@ -57,6 +57,23 @@ launches the Rust binary directly — its `ExecStart` is the
 no dependency preparation; prepare the checkout once on that machine as
 above, and the service restores the server after restarts.
 
+## Prepare the operator home (managed-runtime souls)
+
+Managed-runtime souls mount the operator home read-only so config `{file:}`
+references under it (for example an opencode API key reference) resolve
+in-soul. After deploying, run the host prep once as the operator:
+
+```bash
+scripts/prepare-operator-home.sh
+```
+
+The script is idempotent and safe to re-run at any time. Re-run it after any
+Amplifier key rotation: rotation recreates keys at `0600`, which would
+otherwise restore the original unreadable-reference failure. This one-command
+re-run is the ratified tradeoff, not a gap — the failing provider's error
+names the exact path. The session host's `operator_home_readiness` event
+confirms the home root's group traversal afterward.
+
 ## Launch the native Windows client
 
 Run this in a native Windows PowerShell terminal:

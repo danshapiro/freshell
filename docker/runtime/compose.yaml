@@ -6,6 +6,33 @@ services:
   supervisor:
     image: ${FRESHELL_SUPERVISOR_IMAGE:?set a pinned supervisor image}
     restart: unless-stopped
+    # The supervisor image's default command is /bin/bash; this block mirrors
+    # the documented launch (installers/systemd/freshell-supervisor.service)
+    # with compose topology paths: registry on the named volume, control
+    # socket/secret inside the control-dir bind (the web service expects those
+    # exact paths), the daemon-host docker socket, the shared runtime root at
+    # itself, and the pinned workload image from managed-runtime.env.
+    command:
+      - freshell-supervisor
+      - serve
+      - --registry-root
+      - /var/lib/freshell-supervisor
+      - --control-socket
+      - /run/freshell-supervisor/supervisor.sock
+      - --control-secret-file
+      - /run/freshell-supervisor/secret
+      - --docker-socket
+      - /var/run/docker.sock
+      - --runtime-root
+      - ${FRESHELL_RUNTIME_ROOT:?set shared runtime root}
+      - --host-binary
+      - ${FRESHELL_SESSION_HOST_BINARY:?set the daemon-host session-host binary}
+      - --image-ref
+      - ${FRESHELL_RUNTIME_IMAGE:?set the pinned workload image}
+      - --test-run-id
+      - managed-runtime
+      - --operator-home
+      - ${FRESHELL_OPERATOR_HOME:?set the operator home}
     volumes:
       - supervisor-registry:/var/lib/freshell-supervisor
       - ${FRESHELL_RUNTIME_CONTROL_DIR:?set runtime control dir}:/run/freshell-supervisor
@@ -13,6 +40,13 @@ services:
       # supervisor must see incarnation and per-soul actor paths unchanged.
       - ${FRESHELL_RUNTIME_ROOT:?set shared runtime root}:${FRESHELL_RUNTIME_ROOT:?set shared runtime root}:rw
       - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+      # Operator home, read-only at its canonical host path: souls bind it so
+      # in-home config `{file:}` references resolve. The same canonical path on
+      # both sides (the daemon resolves the source on the daemon host) and in
+      # --operator-home above, whose st_uid appears as container 0 under the
+      # rootless mapping — matching the root supervisor's euid and passing the
+      # owner guard. Prepare the home with scripts/prepare-operator-home.sh.
+      - ${FRESHELL_OPERATOR_HOME:?set the operator home}:${FRESHELL_OPERATOR_HOME:?set the operator home}:ro
       # Optional real-Claude bootstrap. Same canonical host path on both
       # controller services; unset falls back to a harmless non-credential
       # device/path pair and is never forwarded to a workload.

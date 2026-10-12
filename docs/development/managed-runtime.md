@@ -218,11 +218,13 @@ Both require:
 - explicit CPU, memory, swap, and PID limits;
 - the read-only host binary and one incarnation control directory;
 - for terminals only, canonical same-path workspace/Git-common-dir mounts plus
-  one named provider-home volume per soul;
+  one named provider-home volume per soul, and a read-only operator-home mount
+  at its canonical path with tmpfs masks over the control-plane subtrees
+  (see [Operator home mounts](#operator-home-mounts) below);
 - optional provider bootstrap files mounted read-only by exact canonical file
   reference and copied atomically into the provider volume with mode `0600`;
-- no Docker socket, supervisor registry, admin socket, unrelated home, or
-  production port exposure.
+- no Docker socket, supervisor registry, admin socket, or production port
+  exposure.
 
 The live test runner owns the real rootless Docker socket. The SUT supervisor
 sees only a restricted Unix-socket proxy. The proxy forwards create/inspect/
@@ -326,16 +328,102 @@ bootstrap path. That exception does not apply to fresh Claude, Codex, or
 OpenCode. OneCLI secret transport does not change ordinary MCP, configuration,
 plugin, root, or operation behavior.
 
+### Operator home mounts
+
 The supported Phase 2 backend is rootless Docker. Its bind-mount ownership maps
-the host user's workspace to container uid/gid 0. Freshell therefore keeps the
-trusted host at uid 0 with only the three privilege-dropping/home-preparation
-capabilities above, and runs the provider as uid `65534`, gid `0`. The mapped
+the host user's workspace to container uid/gid 0, and the operator's home files
+appear container-0-owned. Freshell therefore keeps the trusted host at uid 0
+with only the three privilege-dropping/home-preparation capabilities above, and
+runs the provider as uid `65534`, gid `0` — unchanged. Under the rootless
+production daemon the child's gid 0 is the operator's group, so group-readable
+reference targets (`0750` directories, `0640` key files) resolve with no
+identity change: every soul mounts the operator home read-only at its canonical
+host path, and absolute `{file:}` config references under it (for example
+`{file:/home/dan/.amplifier/ms-runpod.key}`) resolve in-soul. The mapped
 workspace remains group-writable without changing host modes, while the
 root-owned `0600` incarnation secret and `host.sock` are not readable or
-connectable by the provider. P2-G09 executes the permission/capability probe from
-inside the provider PTY and fails if that boundary changes. Git receives an
-ephemeral process-local `safe.directory` for the already-approved workspace; no
-global git config is modified.
+connectable by the provider. P2-G09 executes the permission/capability probe
+from inside the provider PTY and fails if that boundary changes. Git receives
+an ephemeral process-local `safe.directory` for the already-approved workspace;
+no global git config is modified.
+
+Inside the mounted home, three control-plane subtrees are tmpfs-masked so the
+provider child can never read authorization material through the mount:
+`~/.freshell` (incarnation secrets, MCP capability grants, and server config
+secrets — the Freshell control plane), `~/.amplifier/onecli` (OneCLI's own
+authorization material, distinct from the provider key files configs
+reference), and `~/.config/gcloud` (gcloud robot infrastructure credentials).
+Each entry is control-plane or infrastructure authorization material; the
+provider key files that configs deliberately reference live outside the mask
+set and are served by the group-read contract below.
+
+The mount derives from the supervisor's `--operator-home <path>` flag, or from
+the `HOME` env fallback only for a non-root host supervisor whose `HOME`
+canonicalizes and is owned by the supervisor's own euid. The flag path applies
+the same owner guard; containerized supervisors — the test rig and compose
+deployments — pass the flag explicitly, because a root or containerized
+supervisor's `HOME` is not the operator's host home and never mounts.
+`docker/runtime/compose.yaml` wires the read-only bind and the flag with the
+same canonical host path on both sides.
+
+A mounted home stamps two additive env markers into the soul:
+`FRESHELL_OPERATOR_HOME_MOUNT=1` and `FRESHELL_OPERATOR_HOME=<canonical path>`.
+Pre-upgrade running containers lack them and keep their legacy mounts until
+natural incarnation replacement; the marker is what gates verification's
+home-mount assertions.
+
+At startup the session host emits exactly one `operator_home_readiness` JSONL
+event scoped to the home root: `path`, `present`, `uid`, `gid`, `mode` (octal
+string), and `home_root_traversable_by_child` computed for the `65534:0` child;
+a home that cannot even be stat'd reports `present: false` and startup
+continues unaffected. When a `{file:}` reference fails, read that event first:
+`home_root_traversable_by_child: false` means the home root is not
+group-traversable and the prep step below has not run. On a rootful daemon
+group 0 is not the operator's group, so the feature degrades to legacy
+readability — observed via the same event, never gated: launch never refuses
+over the home mount.
+
+### Operator home prep
+
+`scripts/prepare-operator-home.sh` is the owned, idempotent host-prep step; run
+it once as the operator after deploying, and re-run it after any Amplifier key
+rotation. It creates every mask destination that is absent (`~/.freshell`,
+`~/.amplifier/onecli`, `~/.config/gcloud`), makes the home root and the known
+config ancestors group-traversable (`g+rx` on the home root, `~/.local`,
+`~/.config`, `~/.local/share`), and grants whole-tree group read under
+`~/.amplifier` (directories `g+rx`, files `g+r`), covering keys regardless of
+naming. A tracked upstream item asks Amplifier to write keys `0640` and
+`~/.amplifier` `0750` going forward so rotation preserves this by itself. The
+reasoning: under the rootless mapping, group access is effectively "processes
+running as the operator" on this single-user host — no other identity on the
+machine carries the operator's group.
+
+### Accepted residuals of the operator-home mount
+
+1. Boundary of the ratified mechanism, stated so the result and the tradeoff do
+   not contradict each other: a config value referencing an in-home file the
+   operator deliberately keeps owner-only (0600 file / 0700 subtree outside the
+   prep-covered roots) — or a key freshly rotated at 0600 before the prep
+   re-run — does not resolve until the operator extends the one-line prep (or
+   re-runs it). The provider CLI's own error names the exact path. This
+   mode-based boundary is the tradeoff the user accepted with the group-read
+   ratification, not an uncovered defect: under the rootless mapping group bits
+   grant exactly "processes running as the operator", which no other mechanism
+   can express without the rejected scanner/copy machinery.
+
+2. The mask set is computed at container creation: a control-plane path created
+   after a soul is running is unmasked for that soul until its next
+   incarnation. Primary protection is those paths' own owner-only modes
+   (gcloud/onecli create `0700` dirs), and every new incarnation re-derives
+   the masks from the filesystem. The prep/filter invariant pair closes the
+   exposure window: the prep creates every mask destination at deploy, so on a
+   prepared host each home-bound soul mounts the FULL mask set for its
+   lifetime and a prep re-run cannot expose a running soul; on an unprepared
+   host the filter can fire, but unprepared content is owner-only
+   (`0700`/`0600`), so the unmasked paths expose nothing a child can read.
+   Exposure would require simultaneously group-readable content AND a missing
+   mask destination — the prep creates exactly the opposite pairing; manual
+   partial prep is out of model.
 
 Managed providers retain ordinary provider capabilities: configured MCP servers,
 provider config files (including `opencode.json` and `opencode.jsonc`), plugins,
