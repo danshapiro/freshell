@@ -21,14 +21,15 @@
 //!
 //! The whole-unit kill freezes the slice, then either `cgroup.kill`s it or,
 //! when Codex's own daemon family runs in it (or the freeze cannot be
-//! confirmed), SIGKILLs every other member through a pidfd and thaws it: the
-//! daemon family is spared in place and never moved or signalled (Stage 2:
-//! LB-49). The thaw is armed as soon as the freeze is written, so a kill
-//! dropped mid-way still thaws the slice. Every wait watches the unit
-//! SLICE's `cgroup.events` (never a scope directory, which systemd can
-//! remove before its notification fires) and has a deadline (Stage 2:
-//! LB-05); a wait that cannot watch it never counts as frozen or empty, and
-//! a slice is stopped only when it reads empty.
+//! confirmed, or a member runs on with its main thread exited), SIGKILLs
+//! every other member through a pidfd and thaws it: the daemon family is
+//! spared in place and never moved or signalled (Stage 2: LB-49). The thaw
+//! is armed as soon as the freeze is written, so a kill dropped mid-way
+//! still thaws the slice. Every wait watches the unit SLICE's
+//! `cgroup.events` (never a scope directory, which systemd can remove before
+//! its notification fires) and has a deadline (Stage 2: LB-05); a wait that
+//! cannot watch it never counts as frozen or empty, and a slice is stopped
+//! only when it reads empty.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -378,23 +379,30 @@ impl SystemdUnit {
     ///
     /// Only a slice confirmed `frozen` with nothing spared is killed whole by
     /// the kernel (`cgroup.kill`, race-free against forks; else `systemctl
-    /// --user kill`). A slice that may still be running can start a
+    /// --user kill`), and only when no member runs on with its main thread
+    /// exited: `cgroup.kill` signals each process through its thread-group
+    /// leader alone, which takes no signal once it has exited, so such a
+    /// process survives it (seen on Linux 6.8), while a pidfd signal reaches
+    /// the whole process. A slice that may still be running can start a
     /// daemon-family process after the snapshot, which a whole-slice kill
-    /// would kill too; so then, as when processes are spared, each other pid
-    /// is pinned and re-checked before its SIGKILL: still a slice member (no
-    /// recycled pid is ever signalled) and, by its own argv, still not of the
-    /// daemon family. Frozen tasks cannot fork, exit or exec, and a fatal
-    /// signal still kills them; what an unfrozen slice forks after the
-    /// snapshot is left to the post-Gone sweep. A pid that cannot be pinned
-    /// for another reason than being gone (for example, no descriptor left)
-    /// fails the kill after the others.
+    /// would kill too; so then, as when processes are spared or a main
+    /// thread has exited, each other pid is pinned and re-checked before its
+    /// SIGKILL: still a slice member (no recycled pid is ever signalled) and,
+    /// by its own argv, still not of the daemon family. Frozen tasks cannot
+    /// fork, exit or exec, and a fatal signal still kills them; what an
+    /// unfrozen slice forks after the snapshot is left to the post-Gone
+    /// sweep. A pid that cannot be pinned for another reason than being gone
+    /// (for example, no descriptor left) fails the kill after the others.
     fn kill_all_but(
         &self,
         pids: &BTreeSet<u32>,
         spared: &BTreeSet<u32>,
         frozen: bool,
     ) -> io::Result<usize> {
-        if !spared.is_empty() || !frozen {
+        let whole = frozen
+            && spared.is_empty()
+            && !pids.iter().any(|pid| process::main_thread_exited(*pid));
+        if !whole {
             let mut killed = 0;
             let mut pin_error = None;
             for pid in pids.difference(spared) {

@@ -542,6 +542,140 @@ async fn a_detached_job_that_clears_its_environment_after_its_parent_exits_is_ki
     }
 }
 
+/// The stop on a unit holding `helper` (a member whose main thread exited),
+/// whose main is not adopted (as Codex's is not until its app-server
+/// listens), so Gone waits on the unit's members. The unit lists the helper
+/// (the read the stop's kill, its Gone wait and the post-Gone sweep act on);
+/// the stop's kill ends it, so Gone needs no second kill at the unconfirmed
+/// mark; on the systemd backend Gone (the slice's emptiness) comes only once
+/// it has exited; and once the stop is done it has exited and is not
+/// reported as a survivor.
+#[cfg(target_os = "linux")]
+async fn assert_listed_and_killed(
+    cap: &capture::Captured,
+    name: &str,
+    unit: &AgentUnit,
+    helper: &LeaderExited,
+) {
+    let member = (helper.pid(), helper.start_time());
+    let listed = unit.members().unwrap();
+    assert!(
+        listed.iter().any(|m| (m.pid, m.start) == member),
+        "{name}: the member whose main thread exited is not listed: {listed:?}"
+    );
+    unit.stop(StopRequest::new(
+        StopMode::Force,
+        StopReason::ShiftX,
+        "test",
+    ))
+    .wait()
+    .await;
+    if name == "selected" {
+        assert!(
+            helper.pin.has_exited(),
+            "{name}: Gone came while the member whose main thread exited ran"
+        );
+    }
+    let survivors = unit.stop_in_flight().unwrap().wait_swept().await;
+    assert!(
+        helper.exited_within(Duration::from_secs(10)).await,
+        "{name}: the member whose main thread exited survived the stop (survivors {survivors:?})"
+    );
+    assert!(
+        survivors.iter().all(|s| s.pid != helper.pid()),
+        "{name}: {survivors:?}"
+    );
+    assert!(
+        !cap.has_with(
+            tracing::Level::ERROR,
+            "unit.stop.unconfirmed",
+            &[("unit_id", unit.id().as_str())]
+        ),
+        "{name}: the stop's kill missed the member whose main thread exited"
+    );
+}
+
+/// A member whose main thread exited while another thread runs on (a main
+/// thread that called `pthread_exit`) is a running member, though its
+/// `/proc/<pid>/stat` state is Z: the stop lists it, kills it and does not
+/// end with it running.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "current_thread")]
+async fn a_member_whose_main_thread_exited_is_listed_and_killed() {
+    let (cap, _guard) = capture::install();
+    for (name, c) in backends() {
+        let unit = c.create_unit(UnitId::mint(), label()).unwrap();
+        let cmd = unit
+            .tokio_command(HELPER, &["leader-exits".into()], MemberRole::Agent)
+            .unwrap();
+        let helper = LeaderExited::start(cmd).await;
+        assert_listed_and_killed(&cap, name, &unit, &helper).await;
+    }
+}
+
+/// The tag backend: a member reached only through the unit tag (no root and
+/// no parent link to one) whose main thread exited is still found by its
+/// tag, which the kernel then shows only through a live thread: the stop
+/// lists it and kills it.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "current_thread")]
+async fn a_tagged_member_whose_main_thread_exited_is_found_by_its_tag_and_killed() {
+    let (cap, _guard) = capture::install();
+    let unit = tag_only().create_unit(UnitId::mint(), label()).unwrap();
+    // An agent was placed, so Gone waits on the unit's members.
+    unit.placement(MemberRole::Agent).unwrap();
+    let mut cmd = tokio::process::Command::new(HELPER);
+    cmd.arg("leader-exits").env(UNIT_ENV, unit.id().as_str());
+    let helper = LeaderExited::start(cmd).await;
+    assert_listed_and_killed(&cap, "tag", &unit, &helper).await;
+}
+
+/// A Codex daemon-family process is judged by its own arguments, which the
+/// kernel shows only through a live thread once its main thread has exited:
+/// such a member is spared, never signalled, on every backend.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_daemon_family_member_whose_main_thread_exited_is_never_signalled() {
+    for (name, c) in backends() {
+        let unit = c.create_unit(UnitId::mint(), label()).unwrap();
+        // Through a shell that execs it, so only the helper's own arguments
+        // (never a parent's, such as the reaper shim's command line) are of
+        // the daemon family.
+        let script = r#"exec "$0" leader-exits app-server --managed-daemon"#;
+        let args = ["-c", script, HELPER].map(String::from);
+        let cmd = unit
+            .tokio_command("bash", &args, MemberRole::Agent)
+            .unwrap();
+        let helper = LeaderExited::start(cmd).await;
+        // On the systemd backend, the slice whose thaw is checked after the stop.
+        let slice_dir = (name == "selected").then(|| {
+            unit_slice_of(helper.pid())
+                .unwrap_or_else(|| panic!("{name}: the helper is not in a unit slice"))
+                .1
+        });
+        unit.stop(StopRequest::new(
+            StopMode::Force,
+            StopReason::ShiftX,
+            "test",
+        ))
+        .wait()
+        .await;
+        let survivors = unit.stop_in_flight().unwrap().wait_swept().await;
+        assert!(
+            !helper.exited_within(Duration::from_millis(300)).await
+                && process::start_time(helper.pid()).ok() == Some(helper.start_time()),
+            "{name}: the daemon-family member whose main thread exited was killed"
+        );
+        assert!(
+            survivors.iter().all(|s| s.pid != helper.pid()),
+            "{name}: a spared process is not a survivor: {survivors:?}"
+        );
+        if let Some(dir) = &slice_dir {
+            assert_thawed(dir, &format!("{name}: the spared member's slice"));
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_user_kill_joining_a_weaker_stop_wins_its_reason() {
     for (name, c) in backends() {

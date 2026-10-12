@@ -1,5 +1,8 @@
 //! ProcWatch is the event-driven, pid-reuse-safe exit watch every Gone
 //! decision rests on. Every process signalled here was spawned by the test.
+#[cfg(target_os = "linux")]
+mod support;
+
 use std::time::Duration;
 #[cfg(unix)]
 use std::time::Instant;
@@ -217,6 +220,49 @@ fn a_reaped_process_is_gone_even_while_its_group_lives_on() {
         .unwrap()
         .signal(Sig::Kill)
         .unwrap();
+}
+
+/// A process whose main thread exited while another thread runs on (a main
+/// thread that called `pthread_exit`) is alive: `/proc/<pid>/stat` shows its
+/// thread-group leader Z, yet it runs until its last thread exits, and its
+/// pidfd stays unreadable until then. Every per-process fact a stop reads
+/// sees it as the running process it is: running, its own arguments (the
+/// Codex daemon-family judgment) and its environment (the unit tag), which
+/// the kernel then shows only through a live thread. Killed (and not yet
+/// reaped) it is a zombie, and no longer running.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_process_whose_main_thread_exited_runs_until_its_last_thread_exits() {
+    use freshell_containment::process;
+    const KEY: &str = "FRESHELL_TEST_LEADER_EXITS_TAG";
+    let mut cmd = tokio::process::Command::new(support::HELPER);
+    cmd.args(["leader-exits", "app-server", "--managed-daemon"])
+        .env(KEY, "leader-exited-value");
+    let helper = support::LeaderExited::start(cmd).await;
+    let pid = helper.pid();
+    assert!(
+        process::is_running(pid),
+        "a process whose main thread exited was taken for exited"
+    );
+    assert_eq!(
+        process::environ_value(pid, KEY).as_deref(),
+        Some("leader-exited-value"),
+        "its environment (the unit tag) is unreadable"
+    );
+    let argv = process::argv(pid).unwrap();
+    assert!(
+        is_codex_daemon_family(&argv),
+        "its own arguments are unreadable: {argv:?}"
+    );
+    assert_eq!(identity(pid).unwrap().start, helper.start_time());
+    assert!(helper.runs());
+
+    // The test's own unreaped child: killed, it is a zombie with only its
+    // leader left, and not running.
+    helper.pin.signal(Sig::Kill).unwrap();
+    assert!(helper.exited_within(Duration::from_secs(5)).await);
+    assert_eq!(support::stat_state(pid).as_deref(), Some("Z"));
+    assert!(!process::is_running(pid), "a zombie was taken for running");
 }
 
 #[cfg(target_os = "linux")]

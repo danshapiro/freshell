@@ -580,3 +580,115 @@ impl Drop for StateRoot {
         }
     }
 }
+
+/// The containment suites' helper binary (`src/bin/freshell-test-helper.rs`).
+pub const HELPER: &str = env!("CARGO_BIN_EXE_freshell-test-helper");
+
+/// Linux: `/proc/<pid>/stat`'s state letter (the thread-group leader's own
+/// state: Z once the main thread has exited, also while other threads run).
+#[cfg(target_os = "linux")]
+pub fn stat_state(pid: u32) -> Option<String> {
+    let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close = raw.rfind(')')?;
+    Some(raw.get(close + 2..)?.split_whitespace().next()?.to_string())
+}
+
+/// Linux: a running process whose main thread has exited while its other
+/// thread runs on (`freshell-test-helper leader-exits`, which ignores the
+/// soft signals): `/proc/<pid>/stat` shows it Z. It is the test's own child
+/// or that child's child (under the tag backend's reaper shim), pinned while
+/// it is certainly that process; on drop it is killed through its pin, the
+/// test's child through its own, and then the systemd unit slice holding it
+/// (if any) is stopped.
+#[cfg(target_os = "linux")]
+pub struct LeaderExited {
+    /// The process whose main thread exited.
+    pub pin: ProcWatch,
+    /// The test's own child (the helper itself, or the shim above it),
+    /// pinned while unreaped.
+    child_pin: ProcWatch,
+    _child: tokio::process::Child,
+    _stdout: tokio::io::BufReader<tokio::process::ChildStdout>,
+    /// Dropped after the kills above (`Drop::drop` runs before the fields
+    /// drop): systemd stops a slice by SIGTERM first, which the helper
+    /// ignores.
+    _slice: StopSliceOnDrop,
+}
+
+#[cfg(target_os = "linux")]
+impl LeaderExited {
+    /// Starts `cmd` (a command running `freshell-test-helper leader-exits
+    /// [args...]`, directly or through a placement wrapper) and returns once
+    /// the helper reports that its main thread has exited.
+    pub async fn start(mut cmd: tokio::process::Command) -> Self {
+        use tokio::io::AsyncBufReadExt;
+        cmd.kill_on_drop(false)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        // The test's own unreaped child: its pid names it.
+        let child_pin = ProcWatch::open(child.id().unwrap()).unwrap();
+        let mut stdout = tokio::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        let read = tokio::time::timeout(Duration::from_secs(15), stdout.read_line(&mut line)).await;
+        if !matches!(read, Ok(Ok(n)) if n > 0) {
+            let _ = child_pin.signal(Sig::Kill);
+            panic!("the helper never reported that its main thread exited: {read:?} {line:?}");
+        }
+        let pid: u32 = line
+            .trim()
+            .strip_prefix("leader-exits ")
+            .and_then(|p| p.parse().ok())
+            .unwrap_or_else(|| panic!("unexpected helper line {line:?}"));
+        let pin = ProcWatch::open(pid)
+            .unwrap_or_else(|e| panic!("the helper {pid} cannot be pinned: {e}"));
+        // The pinned process is the helper only while it is the child itself
+        // or the child's child; checked after the pin, which has not exited
+        // since, so the check refers to the pinned incarnation.
+        let ours = pid == child_pin.pid() || process::parent(pid) == Some(child_pin.pid());
+        let leader_exited = stat_state(pid).as_deref() == Some("Z");
+        let this = Self {
+            _slice: StopSliceOnDrop::holding(pid),
+            pin,
+            child_pin,
+            _child: child,
+            _stdout: stdout,
+        };
+        assert!(
+            ours && !this.pin.has_exited() && leader_exited,
+            "process {pid} is not the running helper this test started with its main thread exited"
+        );
+        this
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.pin.pid()
+    }
+
+    /// The pinned incarnation's start time.
+    pub fn start_time(&self) -> u64 {
+        self.pin.identity().start
+    }
+
+    /// Whether the helper still runs as the pinned incarnation (its pidfd is
+    /// not readable while any thread of it runs).
+    pub fn runs(&self) -> bool {
+        !self.pin.has_exited()
+    }
+
+    /// Waits (event-driven, bounded) for the helper to exit.
+    pub async fn exited_within(&self, limit: Duration) -> bool {
+        matches!(
+            tokio::time::timeout(limit, self.pin.exited()).await,
+            Ok(Ok(()))
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LeaderExited {
+    fn drop(&mut self) {
+        let _ = self.pin.signal(Sig::Kill);
+        let _ = self.child_pin.signal(Sig::Kill);
+    }
+}

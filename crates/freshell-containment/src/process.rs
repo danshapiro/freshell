@@ -37,11 +37,13 @@ fn env_lookup<'a>(entries: impl IntoIterator<Item = &'a [u8]>, key: &str) -> Env
         })
 }
 
-/// Linux: `/proc/<pid>/environ`; a permission error (another uid, a
-/// non-dumpable process) is `Withheld`, any other error (gone) `Absent`.
+/// Linux: `/proc/<pid>/environ` (through a running thread once the main
+/// thread has exited, see [`read_memory_file`]); a permission error (another
+/// uid, a non-dumpable process) is `Withheld`, any other error (gone)
+/// `Absent`.
 #[cfg(target_os = "linux")]
 pub fn environ_read(pid: u32, key: &str) -> EnvRead {
-    match std::fs::read(format!("/proc/{pid}/environ")) {
+    match read_memory_file(pid, "environ") {
         Ok(raw) => env_lookup(raw.split(|b| *b == 0), key),
         Err(err) if err.kind() == io::ErrorKind::PermissionDenied => EnvRead::Withheld,
         Err(_) => EnvRead::Absent,
@@ -282,11 +284,12 @@ pub fn name(pid: u32) -> io::Result<String> {
     crate::darwin::bsdinfo(pid).map(|info| crate::darwin::name_of(&info))
 }
 
-/// Linux: the process's arguments. Only [`is_codex_daemon_family`] callers
-/// read this, and never log it.
+/// Linux: the process's arguments (through a running thread once the main
+/// thread has exited, see [`read_memory_file`]). Only
+/// [`is_codex_daemon_family`] callers read this, and never log it.
 #[cfg(target_os = "linux")]
 pub fn argv(pid: u32) -> io::Result<Vec<String>> {
-    let raw = std::fs::read(format!("/proc/{pid}/cmdline"))?;
+    let raw = read_memory_file(pid, "cmdline")?;
     Ok(raw
         .split(|b| *b == 0)
         .filter(|s| !s.is_empty())
@@ -294,10 +297,78 @@ pub fn argv(pid: u32) -> io::Result<Vec<String>> {
         .collect())
 }
 
-/// Linux: true for a live (non-zombie) process.
+/// Linux: true while the process runs, that is while any thread of it runs.
+/// `/proc/<pid>/stat` shows the thread-group leader's own state: Z once the
+/// main thread has exited, also while other threads run on (a main thread
+/// that called `pthread_exit`), so a Z leader counts as running while other
+/// threads remain ([`main_thread_exited`]). A zombie counts only its
+/// unreaped leader.
 #[cfg(target_os = "linux")]
 pub fn is_running(pid: u32) -> bool {
-    stat_fields(pid).is_ok_and(|f| f.first().is_some_and(|s| s != "Z" && s != "X"))
+    match leader_state(pid).as_deref() {
+        Some("Z") => thread_count(pid).is_some_and(|n| n > 1),
+        Some("X") | None => false,
+        Some(_) => true,
+    }
+}
+
+/// Linux: whether `pid` runs on although its main thread has exited (its
+/// thread-group leader is Z while other threads remain).
+#[cfg(target_os = "linux")]
+pub(crate) fn main_thread_exited(pid: u32) -> bool {
+    leader_state(pid).as_deref() == Some("Z") && thread_count(pid).is_some_and(|n| n > 1)
+}
+
+/// Linux: the state letter of `/proc/<pid>/stat` (the thread-group leader's).
+#[cfg(target_os = "linux")]
+fn leader_state(pid: u32) -> Option<String> {
+    stat_fields(pid).ok()?.into_iter().next()
+}
+
+/// Linux: the `Threads:` count of `/proc/<pid>/status`: the threads not yet
+/// released, so a zombie counts 1 (its leader) until it is reaped.
+#[cfg(target_os = "linux")]
+fn thread_count(pid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Threads:"))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Linux: one of the `/proc/<pid>/` files read from the process's memory
+/// (`cmdline`, `environ`). The kernel answers them for the thread-group
+/// leader's own task, which has no memory once the main thread has exited
+/// (`cmdline` reads empty, `environ` is owned by root) although the process
+/// runs on in its other threads. Then they are read through one of those
+/// (`/proc/<pid>/task/<tid>/`), which shows the process's own: the first
+/// non-empty read, else an empty one, else the leader's answer.
+#[cfg(target_os = "linux")]
+fn read_memory_file(pid: u32, file: &str) -> io::Result<Vec<u8>> {
+    let leader = std::fs::read(format!("/proc/{pid}/{file}"));
+    if matches!(&leader, Ok(raw) if !raw.is_empty()) || !main_thread_exited(pid) {
+        return leader;
+    }
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return leader;
+    };
+    let leader_tid = pid.to_string();
+    let mut empty = None;
+    for task in tasks.flatten() {
+        if task.file_name().to_str() == Some(leader_tid.as_str()) {
+            continue;
+        }
+        match std::fs::read(task.path().join(file)) {
+            Ok(raw) if !raw.is_empty() => return Ok(raw),
+            Ok(raw) => {
+                empty.get_or_insert(raw);
+            }
+            Err(_) => {}
+        }
+    }
+    empty.map_or(leader, Ok)
 }
 
 #[cfg(target_os = "linux")]

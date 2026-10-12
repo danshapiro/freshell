@@ -15,6 +15,15 @@
 //!   Codex daemon-family process (`is_codex_daemon_family` judges argv).
 //! - `until-eof`: prints `until-eof <pid>` and exits normally when its stdin
 //!   reaches end of file.
+//! - `leader-exits` (Linux only): a running process whose main thread has
+//!   exited, as one whose main thread calls `pthread_exit` while another
+//!   thread works on. It ignores SIGINT, SIGTERM, SIGHUP and SIGQUIT (only a
+//!   kill ends it), starts a second thread and ends its main thread alone
+//!   (the `exit` system call, not `exit_group`). The second thread waits
+//!   (bounded) until the kernel shows the main thread exited (its
+//!   `/proc/<pid>/stat` state is Z), prints `leader-exits <pid>` and sleeps
+//!   until killed; it exits 1 when the main thread is not seen exited in
+//!   time.
 //! - `job-child` (Windows only): runs an `until-eof` copy of itself in a
 //!   nested kill-on-close job of its own that has its own completion port,
 //!   as a program that watches the jobs it runs commands in does (prints
@@ -55,12 +64,13 @@ fn main() {
         Some("hold-lock") => hold_lock(&args[1..]),
         Some("idle") => idle(),
         Some("until-eof") => until_eof(),
+        Some("leader-exits") => leader_exits(),
         Some("job-child") => job_child(),
         Some("breakaway-daemon") => breakaway_daemon(),
         Some("disclaim-exec") => disclaim_exec(&args[1..]),
         _ => {
             eprintln!(
-                "usage: freshell-test-helper hold-lock <path> [--threads N] [--child] | idle [args...] | until-eof | job-child | breakaway-daemon | disclaim-exec -- <command> [args...]"
+                "usage: freshell-test-helper hold-lock <path> [--threads N] [--child] | idle [args...] | until-eof | leader-exits | job-child | breakaway-daemon | disclaim-exec -- <command> [args...]"
             );
             USAGE_EXIT
         }
@@ -153,6 +163,63 @@ fn until_eof() -> i32 {
     let _ = std::io::stdout().flush();
     let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
     0
+}
+
+#[cfg(target_os = "linux")]
+fn leader_exits() -> i32 {
+    // Only a kill ends it: a soft stop's signal (forwarded by the reaper
+    // shim) is ignored, as a stubborn agent ignores it.
+    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+        // SAFETY: setting a standard signal's disposition to SIG_IGN.
+        unsafe { libc::signal(sig, libc::SIG_IGN) };
+    }
+    let pid = std::process::id();
+    let worker = std::thread::Builder::new()
+        .name("leader-exits".into())
+        .spawn(move || {
+            // The kernel shows the thread-group leader's own state in
+            // `/proc/<pid>/stat`: Z once the main thread has exited. A
+            // bounded wait (a test helper), then the report.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !leader_is_zombie(pid) {
+                if std::time::Instant::now() >= deadline {
+                    eprintln!("freshell-test-helper leader-exits: the main thread never exited");
+                    std::process::exit(1);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            println!("leader-exits {pid}");
+            let _ = std::io::stdout().flush();
+            park_forever()
+        });
+    if let Err(err) = worker {
+        eprintln!("freshell-test-helper leader-exits: cannot start the thread: {err}");
+        return 1;
+    }
+    // Ends the main thread only (the `exit` system call; `exit_group` would
+    // end the process), as `pthread_exit` does after its cleanup. Nothing is
+    // held here: no lock, no stdout buffer.
+    // SAFETY: the calling thread exits without unwinding; no Rust frame
+    // above it runs again, and the worker owns everything it uses.
+    unsafe { libc::syscall(libc::SYS_exit, 0) };
+    unreachable!("the exit system call returned")
+}
+
+/// Whether `/proc/<pid>/stat` shows state Z (the field after `(comm) `).
+#[cfg(target_os = "linux")]
+fn leader_is_zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|raw| {
+        raw.rfind(')')
+            .and_then(|close| raw.get(close + 2..))
+            .and_then(|rest| rest.split_whitespace().next())
+            == Some("Z")
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn leader_exits() -> i32 {
+    eprintln!("freshell-test-helper leader-exits: Linux only");
+    USAGE_EXIT
 }
 
 #[cfg(windows)]
