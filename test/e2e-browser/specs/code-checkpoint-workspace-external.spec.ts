@@ -80,6 +80,19 @@ async function verifyTarget(page: import('@playwright/test').Page): Promise<void
   expect(response.ok()).toBe(true)
   const info = await response.json() as { runtime?: unknown; commit?: unknown; buildDirty?: unknown }
   expect(info).toMatchObject({ runtime: 'rust', commit: fixture.candidateSha, buildDirty: false })
+
+  const platformResponse = await page.request.get(`${paired!.targetUrl}/api/platform`, { headers, timeout: 30_000 })
+  expect(platformResponse.ok()).toBe(true)
+  const platform = await platformResponse.json() as { availableClis?: Record<string, boolean> }
+  expect(platform.availableClis?.codex,
+    'The synthetic target must expose Codex so Freshcodex is selectable in the pane picker').toBe(true)
+
+  const extensionsResponse = await page.request.get(`${paired!.targetUrl}/api/extensions`, { headers, timeout: 30_000 })
+  expect(extensionsResponse.ok()).toBe(true)
+  const extensions = await extensionsResponse.json() as Array<{ name?: unknown; category?: unknown }>
+  expect(extensions).toEqual(expect.arrayContaining([
+    expect.objectContaining({ name: 'codex', category: 'cli' }),
+  ]))
 }
 
 async function launchCodex(page: import('@playwright/test').Page, workspace: string) {
@@ -90,7 +103,10 @@ async function launchCodex(page: import('@playwright/test').Page, workspace: str
   await verifyTarget(page)
 
   const picker = await openPanePicker(page)
-  await picker.getByRole('button', { name: /^Freshcodex$/i }).click({ force: true })
+  const freshcodex = picker.getByRole('button', { name: /^Freshcodex$/i })
+  await expect(freshcodex,
+    'The enabled Codex runtime must have a visible Freshcodex option before launch').toBeVisible({ timeout: 10_000 })
+  await freshcodex.click({ force: true })
   const directoryInput = page.getByRole('combobox', { name: 'Starting directory for Freshcodex' })
   await expect(directoryInput).toBeVisible({ timeout: 15_000 })
   await directoryInput.fill(workspace)

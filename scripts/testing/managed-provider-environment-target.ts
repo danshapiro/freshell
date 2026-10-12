@@ -503,6 +503,13 @@ async function stageCheckpointTarget(stage: string, repoRoot: string): Promise<v
   await fs.chmod(path.join(stage, 'freshell-server'), 0o555)
   await fs.cp(client, path.join(stage, 'client'), { recursive: true, dereference: true, preserveTimestamps: false })
   await makeStageTreeReadable(path.join(stage, 'client'))
+  // The restricted server runs outside the repository cwd, so stage the real
+  // Codex CLI manifest that makes the provider visible to the pane picker.
+  const codexExtension = path.join(stage, 'extensions', 'codex-cli')
+  await fs.mkdir(path.dirname(codexExtension), { recursive: true, mode: 0o755 })
+  await fs.cp(path.join(repoRoot, 'extensions', 'codex-cli'), codexExtension,
+    { recursive: true, dereference: true, preserveTimestamps: false })
+  await makeStageTreeReadable(path.join(stage, 'extensions'))
   await fs.copyFile(path.resolve(repoRoot, 'docker/sandbox/entrypoint.sh'), path.join(stage, 'sandbox-entrypoint.sh'))
   await fs.chmod(path.join(stage, 'sandbox-entrypoint.sh'), 0o555)
   const launcher = path.join(stage, 'launch.mjs')
@@ -514,6 +521,12 @@ async function stageCheckpointTarget(stage: string, repoRoot: string): Promise<v
   const fake = path.resolve(repoRoot, 'test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs')
   await fs.copyFile(fake, path.join(stage, 'fake-app-server.mjs'))
   await fs.chmod(path.join(stage, 'fake-app-server.mjs'), 0o444)
+  // CLI discovery runs `which` on CODEX_CMD, so expose the multi-argument fake
+  // app-server command through a discoverable single-word executable.
+  const fakeCodex = path.join(stage, 'fake-codex')
+  await fs.writeFile(fakeCodex,
+    '#!/bin/sh\nexec /usr/local/bin/node /checkpoint-target/fake-app-server.mjs "$@"\n', { mode: 0o555 })
+  await fs.chmod(fakeCodex, 0o555)
   const require = createRequire(import.meta.url)
   const wsRoot = path.dirname(require.resolve('ws'))
   const nodeModules = path.join(stage, 'node_modules')
@@ -739,12 +752,13 @@ export async function runCodeCheckpointTarget() {
       'FRESHELL_BIND_HOST=0.0.0.0',
       'FRESHELL_DISABLE_WSL_PORT_FORWARD=1',
       'HIDE_STARTUP_TOKEN=true',
+      'FRESHELL_EXTENSIONS_DIR=/checkpoint-target/extensions',
       `FRESHELL_HOME=${fixture.syntheticHomePath}`,
       `HOME=${fixture.syntheticHomePath}`,
       `CODEX_HOME=${fixture.syntheticHomePath}/.codex`,
       `FRESHELL_LOG_DIR=${checkpointFixtureRoot}/storage/logs`,
       'FRESHELL_CLIENT_DIR=/checkpoint-target/client',
-      'CODEX_CMD=node /checkpoint-target/fake-app-server.mjs',
+      'CODEX_CMD=/checkpoint-target/fake-codex',
       'FAKE_CODEX_APP_SERVER_BEHAVIOR={"recordTurns":true,"uniqueThreadIds":true}',
       'FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES=1',
       `FRESHELL_CHECKPOINT_FIXTURE_ROOT=${checkpointFixtureRoot}`,
