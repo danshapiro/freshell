@@ -40,6 +40,8 @@ import { RuntimeOwnerOperationQueue, ManagedRuntimeOwner, RuntimeHarness, docker
 import { createRuntimeEnclosureHandle, type RuntimeEnclosureHandle } from './runtime-sandbox.js'
 import type { Reporter, TestCase, TestResult, TestStep, FullResult } from '@playwright/test/reporter'
 import { z } from 'zod'
+import type { Page, Request, Response as BrowserResponse } from '@playwright/test'
+import { SessionDirectoryPageSchema } from '../../shared/read-models.js'
 import { ManagedRuntimeInventorySnapshotSchema, type ManagedRuntimeInventorySnapshot } from '../../shared/managed-runtime.js'
 import type { RuntimeWriterClaimFacts, ManagedMigrationFacts, ManagedStopResult, ManagedStopCompletionFacts } from './runtime-sandbox.js'
 import { pathToFileURL } from 'node:url'
@@ -1998,6 +2000,38 @@ const HistoryPhaseSchema = z.enum(['start', 'goto', 'harness', 'connection', 'ne
   'history-layout', 'history-inventory', 'history-wire', 'history-current', 'history-dispatch'])
 const HistoryModeSchema = z.enum(['bootstrap', 'freshclaude', 'kilroy', 'freshcodex', 'freshopencode'])
 const HistoryErrorCategorySchema = z.enum(['timeout', 'interrupted', 'operation-error'])
+const HistoryWindowStageSchema = z.enum(['before-projects', 'before-refresh', 'indexed', 'complete', 'failed'])
+const HistoryIntegritySchema = z.enum(['none', 'identity_collision', 'other', 'unknown'])
+const HistoryIssueCodeSchema = z.enum(['invalid_type', 'invalid_enum_value', 'too_small', 'too_big',
+  'unrecognized_keys', 'invalid_string', 'custom', 'other'])
+const HistoryWindowFactsSchema = z.object({
+  available: z.boolean(), exactIdentityCount: z.number().int().nonnegative().optional(),
+  resultVersion: z.number().int().nonnegative().optional(), lastLoadedAtPresent: z.boolean().optional(),
+  loading: z.boolean().optional(), loadingKind: z.enum(['initial', 'search', 'background', 'pagination', 'other', 'absent']).optional(),
+  errorPresent: z.boolean().optional(), requestedQueryEmpty: z.boolean().optional(), appliedQueryEmpty: z.boolean().optional(),
+  requestedTier: z.enum(['title', 'other', 'absent']).optional(), appliedTier: z.enum(['title', 'other', 'absent']).optional(),
+  partial: z.boolean().optional(), integrity: HistoryIntegritySchema.optional(),
+  activeSurface: z.enum(['history', 'sidebar', 'other', 'absent']).optional(),
+  sidebarExactIdentityCount: z.number().int().nonnegative().optional(), topLevelExactIdentityCount: z.number().int().nonnegative().optional(),
+})
+export type ManagedHistoryWindowFacts = z.infer<typeof HistoryWindowFactsSchema>
+export type ManagedHistoryWindowStage = z.infer<typeof HistoryWindowStageSchema>
+const HistoryDirectoryFactsSchema = z.object({
+  event: z.literal('managed_history_directory'), mode: HistoryModeSchema, requestSeq: z.number().int().positive(),
+  order: z.number().int().positive(), stage: z.enum(['request', 'response', 'failed', 'body']),
+  method: z.enum(['GET', 'POST', 'other']).optional(), route: z.literal('session-directory').optional(),
+  query: z.object({ queryEmpty: z.boolean(), tier: z.enum(['title', 'other']), limit: z.number().int().positive().max(10000).optional(),
+    includeSubagents: z.boolean(), includeNonInteractive: z.boolean(), includeEmpty: z.boolean(),
+    includeKeysCount: z.number().int().nonnegative().max(10000) }).optional(),
+  status: z.number().int().min(100).max(599).optional(),
+  category: z.enum(['http-error', 'aborted', 'transport-failed', 'body-unavailable', 'unknown', 'body-limit']).optional(),
+  parseSuccess: z.boolean().optional(), issues: z.array(z.object({ code: HistoryIssueCodeSchema,
+    path: z.array(z.enum(['root', 'items', 'contextUsageExtras', 'integrityError', 'index', 'field'])).max(6) })).max(8).optional(),
+  itemCount: z.number().int().nonnegative().optional(), exactIdentityCount: z.number().int().nonnegative().optional(),
+  nextCursorPresent: z.boolean().optional(), partial: z.boolean().optional(), integrity: HistoryIntegritySchema.optional(),
+  snapshotSeq: z.number().int().positive().optional(), ownedContext: z.array(z.object({ projectMatches: z.boolean(),
+    cwdMatches: z.boolean().optional(), checkoutMatches: z.boolean().optional() })).max(8).optional(),
+})
 const HistoryDiagnosticSchema = z.discriminatedUnion('event', [
   z.object({ event: z.literal('managed_history_phase'), phase: HistoryPhaseSchema, mode: HistoryModeSchema,
     state: z.enum(['begin', 'end', 'failed']), callsite: HistoryCallsiteSchema.optional(),
@@ -2009,8 +2043,22 @@ const HistoryDiagnosticSchema = z.discriminatedUnion('event', [
   z.object({ event: z.literal('managed_history_failure'), phase: HistoryPhaseSchema.optional(), mode: HistoryModeSchema.optional(),
     callsite: HistoryCallsiteSchema.optional(), status: z.enum(['failed', 'timedOut', 'interrupted']),
     errorCategory: HistoryErrorCategorySchema, diagnosticLimitReached: z.boolean() }),
+  HistoryDirectoryFactsSchema,
+  z.object({ event: z.literal('managed_history_window'), mode: HistoryModeSchema, stage: HistoryWindowStageSchema,
+    facts: HistoryWindowFactsSchema }),
 ])
 type HistoryDiagnostic = z.infer<typeof HistoryDiagnosticSchema>
+
+function historyDirectoryIssues(issues: readonly z.ZodIssue[]): NonNullable<z.infer<typeof HistoryDirectoryFactsSchema>['issues']> {
+  return issues.slice(0, 8).map(issue => {
+    const code = HistoryIssueCodeSchema.safeParse(issue.code)
+    return { code: code.success ? code.data : 'other', path: issue.path.length ? issue.path.slice(0, 6).map((part, index) => {
+      if (typeof part === 'number') return 'index'
+      if (index === 0 && (part === 'items' || part === 'contextUsageExtras' || part === 'integrityError')) return part
+      return 'field'
+    }) : ['root'] }
+  })
+}
 
 function historyCallsite(location?: { file: string; line: number; column: number }): z.infer<typeof HistoryCallsiteSchema> | undefined {
   if (!location) return undefined
@@ -2030,7 +2078,8 @@ export class ManagedHistoryAwaitedPhases {
   constructor(private readonly emit: (line: string) => void = line => { process.stdout.write(line) }) {}
   private record(event: HistoryDiagnostic): void {
     if (this.emitted++ >= 256) return
-    this.emit(`${HISTORY_DIAGNOSTIC_PREFIX}${JSON.stringify(event)}\n`)
+    const parsed = HistoryDiagnosticSchema.safeParse(event)
+    if (parsed.success) this.emit(`${HISTORY_DIAGNOSTIC_PREFIX}${JSON.stringify(parsed.data)}\n`)
   }
   async run<T>(phase: z.infer<typeof HistoryPhaseSchema>, mode: z.infer<typeof HistoryModeSchema>, operation: () => T | Promise<T>): Promise<T> {
     const location = new Error().stack?.split('\n').filter(line => !/\bat phase\b/.test(line))
@@ -2048,6 +2097,131 @@ export class ManagedHistoryAwaitedPhases {
   }
   navigation(facts: Omit<Extract<HistoryDiagnostic, { event: 'managed_history_navigation' }>, 'event'>): void {
     this.record({ event: 'managed_history_navigation', ...facts })
+  }
+  directory(facts: Omit<z.infer<typeof HistoryDirectoryFactsSchema>, 'event'>): void {
+    this.record({ event: 'managed_history_directory', ...facts })
+  }
+  window(mode: z.infer<typeof HistoryModeSchema>, stage: ManagedHistoryWindowStage, facts: ManagedHistoryWindowFacts): void {
+    this.record({ event: 'managed_history_window', mode, stage, facts })
+  }
+}
+
+/** Passive, locally correlated reads of the requests already made by History. */
+export class ManagedHistoryDirectoryResponses {
+  private readonly requests = new Map<Request, number>()
+  private readonly pending = new Set<Promise<void>>()
+  private sequence = 0
+  private order = 0
+  private closed = false
+  private timer?: ReturnType<typeof setTimeout>
+  private release!: () => void
+  private readonly closing = new Promise<undefined>(resolve => { this.release = () => resolve(undefined) })
+  constructor(private readonly page: Page, private readonly observation: ManagedHistoryAwaitedPhases,
+    private readonly mode: z.infer<typeof HistoryModeSchema>,
+    private readonly identity: { provider: string; nativeSessionId: string; repoRoot: string }) {
+    try { page.on('request', this.request) } catch { /* unavailable page */ }
+    try { page.on('response', this.response) } catch { /* unavailable page */ }
+    try { page.on('requestfailed', this.failed) } catch { /* unavailable page */ }
+  }
+  begin(deadline: number): void {
+    clearTimeout(this.timer)
+    this.timer = setTimeout(() => { void this.close().catch(() => {}) }, Math.max(0, deadline - Date.now()))
+  }
+  private record(facts: Omit<z.infer<typeof HistoryDirectoryFactsSchema>, 'event' | 'mode' | 'order'>): void {
+    try { this.observation.directory({ ...facts, mode: this.mode, order: ++this.order }) } catch { /* diagnostics cannot affect the case */ }
+  }
+  private readonly request = (request: Request): void => {
+    if (this.closed || this.sequence >= 8) return
+    try {
+      const url = new URL(request.url())
+      if (url.pathname !== '/api/session-directory') return
+      const query = url.searchParams, limit = Number(query.get('limit'))
+      const requestSeq = ++this.sequence
+      this.requests.set(request, requestSeq)
+      this.record({ requestSeq, stage: 'request', route: 'session-directory',
+        method: request.method() === 'GET' ? 'GET' : request.method() === 'POST' ? 'POST' : 'other',
+        query: { queryEmpty: !(query.get('query') ?? '').trim(), tier: !query.has('tier') || query.get('tier') === 'title' ? 'title' : 'other',
+          limit: Number.isSafeInteger(limit) && limit > 0 && limit <= 10000 ? limit : undefined,
+          includeSubagents: ['1', 'true'].includes(query.get('includeSubagents') ?? ''),
+          includeNonInteractive: ['1', 'true'].includes(query.get('includeNonInteractive') ?? ''),
+          includeEmpty: ['1', 'true'].includes(query.get('includeEmpty') ?? ''),
+          includeKeysCount: Math.min(10000, query.get('includeKeys')?.split(',').filter(Boolean).length ?? 0) } })
+    } catch { /* unavailable request facts remain unknown */ }
+  }
+  private readonly failed = (request: Request): void => {
+    const requestSeq = this.requests.get(request)
+    if (this.closed || !requestSeq) return
+    this.requests.delete(request)
+    let aborted = false
+    try { aborted = /abort/i.test(request.failure()?.errorText ?? '') } catch { /* no raw failure retention */ }
+    this.record({ requestSeq, stage: 'failed', category: aborted ? 'aborted' : 'transport-failed' })
+  }
+  private readonly response = (response: BrowserResponse): void => {
+    if (this.closed) return
+    try {
+      const request = response.request(), requestSeq = this.requests.get(request)
+      if (!requestSeq) return
+      const status = response.status()
+      this.requests.delete(request)
+      this.record({ requestSeq, stage: 'response', status, category: status < 200 || status >= 300 ? 'http-error' : undefined })
+      if (status < 200 || status >= 300) return
+      this.track(async () => {
+        let facts: Omit<z.infer<typeof HistoryDirectoryFactsSchema>, 'event' | 'mode' | 'order'> = { requestSeq, stage: 'body', status, category: 'unknown' }
+        try {
+          // The race joins our observation at the original action deadline or
+          // cleanup. A still-running browser transport has no asserted result.
+          const body = await Promise.race([response.body(), this.closing])
+          if (body !== undefined) {
+            if (body.length > 131072) facts.category = 'body-limit'
+            else {
+              let input: unknown
+              try { input = JSON.parse(body.toString('utf8')) } catch { /* validate non-JSON as an invalid page */ }
+              const parsed = SessionDirectoryPageSchema.safeParse(input)
+              if (!parsed.success) facts = { requestSeq, stage: 'body', status, parseSuccess: false,
+                issues: historyDirectoryIssues(parsed.error.issues) }
+              else {
+                const data = parsed.data, exact = data.items.filter(item => item.provider === this.identity.provider && item.sessionId === this.identity.nativeSessionId)
+                facts = { requestSeq, stage: 'body', status, parseSuccess: true, itemCount: data.items.length, exactIdentityCount: exact.length,
+                  nextCursorPresent: data.nextCursor !== null, partial: data.partial, integrity: data.integrityError?.kind ?? 'none', snapshotSeq: data.snapshotSeq,
+                  ownedContext: exact.slice(0, 8).map(item => ({ projectMatches: item.projectPath === this.identity.repoRoot,
+                    cwdMatches: item.cwd === undefined ? undefined : item.cwd === this.identity.repoRoot,
+                    checkoutMatches: item.checkoutPath === undefined ? undefined : item.checkoutPath === this.identity.repoRoot })) }
+              }
+            }
+          }
+        } catch { facts.category = 'body-unavailable' }
+        this.record(facts)
+      })
+    } catch { /* unavailable response metadata cannot affect the request */ }
+  }
+  private track(operation: () => Promise<void>): void {
+    const work = operation().catch(() => {}).finally(() => { this.pending.delete(work) })
+    this.pending.add(work)
+  }
+  window(stage: ManagedHistoryWindowStage, facts: ManagedHistoryWindowFacts): void {
+    try { this.observation.window(this.mode, stage, facts) } catch { /* preserve original result */ }
+  }
+  captureWindow(stage: ManagedHistoryWindowStage, read: () => Promise<ManagedHistoryWindowFacts>): void {
+    if (this.closed || this.pending.size >= 13) { this.window(stage, { available: false }); return }
+    this.track(async () => {
+      let facts: ManagedHistoryWindowFacts = { available: false }
+      try { facts = await Promise.race([read(), this.closing]) ?? facts } catch { /* report unknown without the error */ }
+      this.window(stage, facts)
+    })
+  }
+  async settle(): Promise<void> { await Promise.all([...this.pending]) }
+  async close(): Promise<void> {
+    if (!this.closed) {
+      this.closed = true
+      clearTimeout(this.timer)
+      try { this.page.off('request', this.request) } catch { /* unavailable page */ }
+      try { this.page.off('response', this.response) } catch { /* unavailable page */ }
+      try { this.page.off('requestfailed', this.failed) } catch { /* unavailable page */ }
+      for (const requestSeq of this.requests.values()) this.record({ requestSeq, stage: 'failed', category: 'unknown' })
+      this.requests.clear()
+      this.release()
+    }
+    await this.settle()
   }
 }
 
