@@ -88,11 +88,12 @@ async function readJson(selected: string): Promise<any | undefined> {
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error }
 }
 
-async function processIdentity(child: { pid?: number }) {
+export async function processIdentity(child: { pid?: number }) {
   assert(child.pid)
   const raw = await fs.readFile(`/proc/${child.pid}/stat`, 'utf8')
   const fields = raw.slice(raw.lastIndexOf(')') + 2).trim().split(/\s+/)
-  return { pid: child.pid, parentPid: Number(fields[1]), birthTicks: fields[19], cwd: await fs.readlink(`/proc/${child.pid}/cwd`) }
+  return { pid: child.pid, parentPid: Number(fields[1]), processGroupId: Number(fields[2]), sessionId: Number(fields[3]),
+    birthTicks: fields[19], cwd: await fs.readlink(`/proc/${child.pid}/cwd`) }
 }
 
 type NativeExit = { code: number | null; signal: NodeJS.Signals | null }
@@ -120,24 +121,46 @@ async function bounded<T>(completion: Promise<T>, milliseconds: number, descript
   } finally { clearTimeout(timer) }
 }
 
-async function stopExact(child: ChildProcess | undefined, identity: Awaited<ReturnType<typeof processIdentity>> | undefined,
-  completion: Promise<NativeExit> | undefined) {
+export async function stopExact(child: ChildProcess | undefined, identity: Awaited<ReturnType<typeof processIdentity>> | undefined,
+  completion: Promise<NativeExit> | undefined, ownedProcessGroup = false) {
   if (!child || !completion) return
   if (child.exitCode === null && child.signalCode === null) {
-    try {
-      assert(identity, 'Live owned child has no captured identity; retain its fixture')
-      const current = await processIdentity(child)
-      assert.deepEqual(current, identity, 'Owned child identity changed; retain it')
-      child.kill('SIGTERM')
-    } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
-    try { return await bounded(completion, 15_000, 'owned child graceful join') }
-    catch (error) {
+    assert(identity, 'Live owned child has no captured identity; retain its fixture')
+    let current: Awaited<ReturnType<typeof processIdentity>> | undefined
+    try { current = await processIdentity(child) }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+    if (current) assert.deepEqual(current, identity, 'Owned child identity changed; retain it')
+    if (ownedProcessGroup) signalOwnedProcessGroup(identity, 'SIGTERM')
+    else if (current) child.kill('SIGTERM')
+  }
+  try { return await bounded(completion, 15_000, 'owned child graceful join') }
+  catch (error) {
+    if (ownedProcessGroup) {
+      assert(identity, 'Detached owned child group has no captured identity; retain its fixture')
+      if (identity.processGroupId !== identity.pid || identity.sessionId !== identity.pid) {
+        throw new Error('Detached child no longer identifies its unique owned process group; retain its fixture', { cause: error })
+      }
+      if (child.exitCode === null && child.signalCode === null) {
+        assert.deepEqual(await processIdentity(child), identity, 'Owned child identity changed before group escalation; retain it')
+      }
+      signalOwnedProcessGroup(identity, 'SIGKILL')
+    } else {
       if (child.exitCode !== null || child.signalCode !== null) throw error
       assert.deepEqual(await processIdentity(child), identity, 'Owned child identity changed before escalation; retain it')
       child.kill('SIGKILL')
     }
   }
   return bounded(completion, 15_000, 'owned child final join')
+}
+
+function signalOwnedProcessGroup(identity: Awaited<ReturnType<typeof processIdentity>>, signal: NodeJS.Signals): boolean {
+  assert.equal(identity.processGroupId, identity.pid, 'Owned detached process group must match its captured leader')
+  assert.equal(identity.sessionId, identity.pid, 'Owned detached session must match its captured leader')
+  try { process.kill(-identity.processGroupId, signal); return true }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false
+    throw error
+  }
 }
 
 async function terminalDirectory(rig: ManagedRuntimeBrowserRig): Promise<any[]> {
@@ -404,6 +427,20 @@ function dockerMaybe(args: string[], timeout = 10_000): string | undefined {
   return result.stdout.trim()
 }
 
+function cancelOwnedCloudExecution(executionName: string, candidateSha: string): Record<string, unknown> {
+  assert.match(executionName, new RegExp(`^freshell-e2e-${candidateSha.slice(0, 12)}-[a-z0-9-]+$`),
+    'Refusing to cancel a Cloud execution not created for this checkpoint candidate')
+  const account = process.env.FRESHELL_GCP_ACCOUNT ?? process.env.GCLOUD_IDENT
+  const args = ['run', 'jobs', 'executions', 'cancel', executionName, '--quiet',
+    `--project=${process.env.FRESHELL_GCP_PROJECT ?? 'misc-puttering-project'}`,
+    `--region=${process.env.FRESHELL_GCP_REGION ?? 'us-west1'}`]
+  if (account) args.push(`--account=${account}`)
+  const result = spawnSync('gcloud', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 })
+  if (result.error) throw result.error
+  if (result.status !== 0) throw new Error(`Owned Cloud checkpoint execution cancellation failed: ${(result.stderr ?? '').trim().slice(-1500)}`)
+  return { executionName, cancelled: true }
+}
+
 function assertDirectEgressBlocked(containerId: string, subject: string): Record<string, unknown> {
   const probe = String.raw`
 const net = require('node:net')
@@ -512,6 +549,52 @@ async function externalTargetRead(baseUrl: string, token: string, selected: stri
   return JSON.parse(body.content)
 }
 
+async function externalTargetWrite(baseUrl: string, token: string, selected: string, content: string): Promise<void> {
+  const response = await fetch(`${baseUrl}/api/files/write`, {
+    method: 'POST',
+    headers: { 'x-auth-token': token, 'content-type': 'application/json' },
+    body: JSON.stringify({ path: selected, content }),
+    signal: AbortSignal.timeout(15_000),
+  })
+  assert(response.ok, `Owned checkpoint target control write failed with HTTP ${response.status}`)
+}
+
+function runCheckpointControl(containerId: string, identity: { uid: number; gid: number }, action: 'eligible' | 'ignored', requestId: string): void {
+  try {
+    execFileSync('docker', ['exec', '--user', `${identity.uid}:${identity.gid}`, containerId,
+      '/usr/bin/node', '/checkpoint-target/control.mjs', action, requestId, String(identity.uid)],
+    { stdio: ['ignore', 'ignore', 'pipe'], timeout: 15_000 })
+  } catch (error) {
+    const commandError = error as NodeJS.ErrnoException & { status?: number | null; signal?: NodeJS.Signals | null; stderr?: Buffer | string }
+    const stderr = Buffer.isBuffer(commandError.stderr) ? commandError.stderr.toString('utf8') : commandError.stderr
+    const details = [
+      commandError.status === null || commandError.status === undefined ? undefined : `exit=${commandError.status}`,
+      commandError.signal ? `signal=${commandError.signal}` : undefined,
+      stderr?.trim() ? `stderr=${stderr.trim().slice(-2048)}` : undefined,
+    ].filter(Boolean).join('; ')
+    throw new Error(`Restricted checkpoint control ${requestId} (${action}) failed${details ? `: ${details}` : ''}`, { cause: error })
+  }
+}
+
+async function verifyCheckpointControl(
+  baseUrl: string,
+  token: string,
+  containerId: string,
+  identity: { uid: number; gid: number },
+  fixture: { expectedNonce: string },
+  action: 'eligible' | 'ignored',
+): Promise<Record<string, unknown>> {
+  const requestId = randomUUID()
+  await externalTargetWrite(baseUrl, token, checkpointControlRequest, JSON.stringify({ action, expectedNonce: fixture.expectedNonce, requestId }))
+  runCheckpointControl(containerId, identity, action, requestId)
+  const ack = await poll(`restricted fixture control acknowledgement ${requestId}`, async () =>
+    externalTargetRead(baseUrl, token, checkpointControlAck(requestId)), 15_000)
+  assert.deepEqual(ack, { requestId, action, restrictedUid: identity.uid, privateFileUid: 0,
+    privateFileMode: '0600', privateFileDenied: true, effectiveCapabilities: '0000000000000000' })
+  return { requestId, action, restrictedUid: identity.uid, privateFileDenied: true,
+    effectiveCapabilities: ack.effectiveCapabilities }
+}
+
 async function serveCheckpointControls(
   baseUrl: string,
   token: string,
@@ -530,9 +613,7 @@ async function serveCheckpointControls(
       assert(['eligible', 'ignored'].includes(request.action), 'Fixture requested an unsupported private-path state')
       assert.match(request.requestId, /^[a-zA-Z0-9-]{1,96}$/)
       processed.add(request.requestId)
-      execFileSync('docker', ['exec', '--user', `${identity.uid}:${identity.gid}`, containerId,
-        '/usr/bin/node', '/checkpoint-target/control.mjs', request.action, request.requestId, String(identity.uid)],
-      { stdio: ['ignore', 'ignore', 'pipe'], timeout: 15_000 })
+      runCheckpointControl(containerId, identity, request.action, request.requestId)
       const ack = await poll(`restricted fixture control acknowledgement ${request.requestId}`, async () => {
         return externalTargetRead(baseUrl, token, checkpointControlAck(request.requestId))
       }, 15_000)
@@ -734,6 +815,10 @@ export async function runCodeCheckpointTarget() {
     proof.target = { containerId, containerName, networkId, networkName, networkInternal: true, restrictedIdentity: identity,
       targetAddress, targetEgress, forwarderContainerId, forwarderContainerName, forwarderNetworkId, forwarderNetworkName,
       forwarderNetworkMasquerade: false, forwarderEgress, hostLoopbackPort: mapping, serverInfo, initialization }
+    proof.localControlPreflight = []
+    for (const action of ['ignored', 'eligible', 'ignored'] as const) {
+      (proof.localControlPreflight as unknown[]).push(await verifyCheckpointControl(baseUrl, token, containerId, identity, fixture, action))
+    }
 
     const toolHome = path.join(root, 'cloudflared-home')
     await fs.mkdir(toolHome, { mode: 0o700 })
@@ -779,7 +864,7 @@ export async function runCodeCheckpointTarget() {
     const browserSpec = 'test/e2e-browser/specs/code-checkpoint-workspace-external.spec.ts'
     cloudEnvironment.FRESHELL_E2E_CLOUD_DISPATCH_RECEIPT = cloudDispatchReceiptPath
     browser = spawn('pnpm', ['run', 'test:e2e', '--shards=1', '--project=chromium-external-target', browserSpec], {
-      cwd: repoRoot, env: cloudEnvironment, stdio: ['ignore', 'pipe', 'pipe'],
+      cwd: repoRoot, env: cloudEnvironment, stdio: ['ignore', 'pipe', 'pipe'], detached: true,
     })
     browser.stdout!.on('data', chunk => browserSummaryCapture.write(chunk))
     browser.stdout!.pipe(process.stdout); browser.stderr!.pipe(process.stderr)
@@ -813,7 +898,12 @@ export async function runCodeCheckpointTarget() {
       try { cleanup[operation] = await action() }
       catch (error) { errors.push(new Error(`Owned checkpoint target cleanup failed: ${operation}`, { cause: error })); cleanup[operation] = 'FAILED; retain owned fixture' }
     }
-    await attempt('browserJoin', () => stopExact(browser, browserIdentity, browserJoin))
+    const cloudExecution = proof.cloudExecution as { executionName?: unknown } | undefined
+    if (primaryFailure !== undefined && browser?.exitCode === null && browser.signalCode === null
+        && typeof cloudExecution?.executionName === 'string') {
+      await attempt('cloudExecution', () => cancelOwnedCloudExecution(cloudExecution.executionName as string, candidateSha))
+    }
+    await attempt('browserJoin', () => stopExact(browser, browserIdentity, browserJoin, true))
     await attempt('tunnelJoin', () => stopExact(tunnel, tunnelIdentity, tunnelJoin))
     if (forwarderContainerId) await attempt('forwarderContainer', async () => {
       const matching = docker(['ps', '-aq', '--no-trunc', '--filter', `id=${forwarderContainerId}`]).split('\n').filter(Boolean)

@@ -1,10 +1,13 @@
 import { spawn } from 'node:child_process'
+import fs from 'node:fs/promises'
 import { createConnection, createServer, type AddressInfo } from 'node:net'
 import { describe, expect, it } from 'vitest'
 import {
   checkpointTcpForwarderSource,
+  processIdentity,
   resolveManagedProviderEnvironmentTargetMode,
   runManagedProviderEnvironmentTarget,
+  stopExact,
 } from '../../../../scripts/testing/managed-provider-environment-target.js'
 
 async function listenOnLoopback(server: ReturnType<typeof createServer>): Promise<number> {
@@ -93,6 +96,48 @@ describe('managed provider environment target mode', () => {
       }
       await new Promise<void>(resolve => upstream.close(() => resolve()))
     }
+  })
+
+  it('settles the exact detached child process group when a wrapper exits before its child', async () => {
+    const parentSource = `const {spawn}=require('node:child_process');const grandchild=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'inherit'});process.stdout.write(JSON.stringify({pid:grandchild.pid})+'\\n');setInterval(()=>{},1000)`
+    const wrapper = spawn(process.execPath, ['-e', parentSource], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true,
+    })
+    let stdout = ''
+    let stderr = ''
+    wrapper.stdout.on('data', chunk => { stdout += chunk.toString() })
+    wrapper.stderr.on('data', chunk => { stderr += chunk.toString() })
+    const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+      wrapper.once('error', reject)
+      wrapper.once('close', (code, signal) => resolve({ code, signal }))
+    })
+    const childPid = await new Promise<number>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`wrapper did not publish its child PID: ${stdout} ${stderr}`)), 5_000)
+      wrapper.stdout.on('data', () => {
+        const match = stdout.match(/\{"pid":(\d+)\}/)
+        if (!match) return
+        clearTimeout(timer)
+        resolve(Number(match[1]))
+      })
+      wrapper.once('error', error => {
+        clearTimeout(timer)
+        reject(error)
+      })
+      wrapper.once('exit', (code, signal) => {
+        clearTimeout(timer)
+        reject(new Error(`wrapper exited before publishing its child PID (${code ?? signal}): ${stdout} ${stderr}`))
+      })
+    })
+    const identity = await processIdentity(wrapper)
+    expect(identity.processGroupId).toBe(wrapper.pid)
+    expect(identity.sessionId).toBe(wrapper.pid)
+    await stopExact(wrapper, identity, closed, true)
+    expect(wrapper.signalCode).toBe('SIGTERM')
+    const childState = await fs.readFile(`/proc/${childPid}/stat`, 'utf8').then(raw =>
+      raw.slice(raw.lastIndexOf(')') + 2).trim().split(/\s+/)[0],
+    ).catch(() => undefined)
+    expect(childState === undefined || childState === 'Z').toBe(true)
   })
 
   it.each([['--managed'], ['--checkpoint', '--checkpoint'], ['--checkpoint', 'other'], ['--unknown']])(
