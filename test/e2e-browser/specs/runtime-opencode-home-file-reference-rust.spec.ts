@@ -115,6 +115,19 @@ test.describe.serial('freshopencode operator-home {file:} references', () => {
       }
       await fsp.chmod(path.join(home, '.freshell', 'config.json'), 0o640)
 
+      // The production layout nests the workspace INSIDE the operator home
+      // (/home/dan/code/...): the soul mounts the home read-only at its
+      // canonical path PLUS the deeper read-write workspace bind, which must
+      // shadow the RO parent over its subtree. Launch into a nested workspace
+      // so the regression exercises that shape, not an out-of-home cwd. The
+      // workspace is group-writable (0770) — under the rootless mapping the
+      // child's gid 0 is the operator's group, the same group-write posture
+      // production repos rely on.
+      const workspace = path.join(home, 'code', 'workspace')
+      await fsp.mkdir(workspace, { recursive: true })
+      await fsp.chmod(path.join(home, 'code'), 0o750)
+      await fsp.chmod(workspace, 0o770)
+
       process.env.FRESHELL_URL = info.baseUrl
       process.env.FRESHELL_TOKEN = info.token
       await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
@@ -122,7 +135,7 @@ test.describe.serial('freshopencode operator-home {file:} references', () => {
 
       const created = dataOf(await executeAction('new-tab', {
         agent: 'opencode',
-        cwd: rig.repoRoot,
+        cwd: workspace,
         model: 'openai/gpt-5.6-luna',
       }))
       if (!created?.paneId || !created?.sessionId) throw new Error('MCP new-tab did not create a fresh-agent pane')
