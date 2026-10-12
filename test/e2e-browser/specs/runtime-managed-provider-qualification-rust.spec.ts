@@ -181,12 +181,14 @@ async function executeAndAwaitNonceOutput(
   priorStreamId?: string,
   nativeSessionId?: string,
   timeoutMs = 240_000,
+  requireSettledOutput = true,
 ): Promise<string> {
   const response = providerStageResponse(nonce, stage, randomBytes(8).toString('hex'), stage === 'initial')
   const terminal = page.locator(`[data-pane-id="${paneId}"] .xterm:visible`).last()
   let diagnostics: unknown = null
   return sequenceProviderResponse({
     paneId, terminalId, response, priorStreamId, nativeSessionId, timeoutMs,
+    requireSettledOutput,
     waitFor: waitForValue,
     read: async () => {
       const sampled = await page.evaluate(({ id, nonce, expected }) => {
@@ -233,6 +235,18 @@ async function executeAndAwaitNonceOutput(
         event: 'provider_browser.response_sequence', stage, phase, paneId, terminalId, surface, diagnostics }))
     },
   })
+}
+
+async function executeAndAwaitOrdinaryNonceOutput(
+  page: Page,
+  paneId: string,
+  terminalId: string,
+  nonce: string,
+): Promise<string> {
+  // Full-screen provider TUIs can keep advancing terminal output sequences
+  // while already accepting input. Ordinary use needs a current ready stream,
+  // not the quiet-output fence used by continuity qualification.
+  return executeAndAwaitNonceOutput(page, paneId, terminalId, nonce, 'initial', undefined, undefined, 240_000, false)
 }
 
 async function paneNativeId(
@@ -533,12 +547,11 @@ test.describe.serial('ordinary managed-provider use', () => {
       for (const definition of definitions) {
         try {
           const created = await createProviderPane(page, harness, rig, tabId, definition)
-          await executeAndAwaitNonceOutput(
+          await executeAndAwaitOrdinaryNonceOutput(
             page,
             created.paneId,
             created.terminalId,
             `freshell-${randomBytes(12).toString('hex')}`,
-            'initial',
           )
           console.info(JSON.stringify({ severity: 'info', event: 'durable_souls.ordinary_turn_completed',
             lane: 'terminal', provider: definition.provider }))

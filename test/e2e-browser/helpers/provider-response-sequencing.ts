@@ -25,6 +25,7 @@ export async function sequenceProviderResponse(options: {
   waitFor: WaitFor
   report: (phase: 'pre_send' | 'timeout', snapshot: ProviderResponseSnapshot | null) => void
   timeoutMs: number
+  requireSettledOutput?: boolean
 }): Promise<string> {
   const ready = (snapshot: ProviderResponseSnapshot | null): snapshot is ProviderResponseSnapshot => !!snapshot
     && snapshot.terminalId === options.terminalId && snapshot.paneId === options.paneId
@@ -32,7 +33,7 @@ export async function sequenceProviderResponse(options: {
     && !!snapshot.attachRequestId && snapshot.streamId !== options.priorStreamId
     && (!options.nativeSessionId || snapshot.nativeSessionId === options.nativeSessionId)
     && !snapshot.replayPending && !snapshot.writesPending
-    && snapshot.completedSeq >= snapshot.highestObservedSeq
+    && (options.requireSettledOutput === false || snapshot.completedSeq >= snapshot.highestObservedSeq)
   let latest: ProviderResponseSnapshot | null = null
   const read = async () => { latest = await options.read(); return latest }
   const awaitReady = () => options.waitFor('current browser terminal readiness', async () => {
