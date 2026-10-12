@@ -2431,15 +2431,25 @@ describe('interrupted ordinary Stop owner transport', () => {
     vi.spyOn(TestHarness.prototype, 'waitForHarness').mockResolvedValue(undefined)
     vi.spyOn(TestHarness.prototype, 'waitForConnection').mockResolvedValue(undefined)
     vi.spyOn(TestHarness.prototype, 'getState').mockResolvedValue({ tabs: { activeTabId: 'stop-tab' },
-      panes: { layouts: { 'stop-tab': { type: 'leaf', id: 'stop-pane', content: { kind: 'fresh-agent', sessionId: 'stop-session' } } } } } as any)
+      panes: { layouts: { 'stop-tab': { type: 'leaf', id: 'stop-pane', content: {
+        kind: 'fresh-agent', sessionId: 'stop-session', createRequestId: 'stop-create-request',
+      } } } } } as any)
     let fail!: (error: Error) => void
     const pending = new Promise<void>((_resolve, reject) => { fail = reject })
     const prepare = vi.spyOn(f.owned, 'prepareInterruptedOrdinaryStopHistory').mockReturnValue(pending)
     const cleanup = vi.spyOn(f.owned, 'stop').mockResolvedValue({ ok: true, errors: [] })
     const fetcher = vi.fn(async (_url: string, _init?: RequestInit) => new Response('{}', { status: 200 }))
     vi.stubGlobal('fetch', fetcher)
-    const page = { on: () => undefined, goto: async () => undefined,
-      getByRole: () => ({ click: async () => undefined }) }
+    let webSocketListener: ((socket: { on(event: string, callback: (frame: { payload: string }) => void): void }) => void) | undefined
+    let receiveFrame: ((frame: { payload: string }) => void) | undefined
+    const page = {
+      on: (event: string, callback: (socket: any) => void) => { if (event === 'websocket') webSocketListener = callback },
+      goto: async () => { webSocketListener?.({ on: (event, callback) => { if (event === 'framereceived') receiveFrame = callback } }) },
+      getByRole: (role: string) => ({ click: async () => {
+        if (role === 'option') receiveFrame?.({ payload: JSON.stringify({ type: 'freshAgent.created',
+          requestId: 'stop-create-request', sessionId: 'stop-session' }) })
+      } }),
+    }
     const completion = expect(Reflect.apply(callback, undefined, [{ page }])).rejects.toThrow(/refused: 409/)
     try {
       await vi.waitFor(() => expect(prepare).toHaveBeenCalledOnce())
