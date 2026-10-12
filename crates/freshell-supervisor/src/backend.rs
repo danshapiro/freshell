@@ -634,7 +634,7 @@ impl RuntimeBackend for DockerEngineBackend {
                 "provider volume name is not installation-scoped".into(),
             ));
         }
-        let terminal_mounts = match (&spec.terminal, &spec.fresh_agent) {
+        let mut terminal_mounts = match (&spec.terminal, &spec.fresh_agent) {
             (Some(terminal), None) => Some(docker::terminal_mounts(terminal)),
             (None, Some(agent)) => Some(docker::fresh_agent_mounts(agent)),
             (None, None) => None,
@@ -646,6 +646,9 @@ impl RuntimeBackend for DockerEngineBackend {
         }
         .transpose()
         .map_err(BackendError::InvalidConfig)?;
+        let operator_home_record = terminal_mounts
+            .as_mut()
+            .and_then(persisted_operator_home_record);
         let operator_home = terminal_mounts
             .as_ref()
             .and_then(|mounts| mounts.operator_home.as_ref());
@@ -685,10 +688,6 @@ impl RuntimeBackend for DockerEngineBackend {
         for (destination, options) in operator_home_tmpfs {
             runtime_tmpfs_config.insert(destination, options);
         }
-        let operator_home_record = operator_home
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| BackendError::Malformed(e.to_string()))?;
         let extra_hosts = if let Some(reference) =
             workload_mcp_capability(spec.terminal.as_ref(), spec.fresh_agent.as_ref())
         {
@@ -1090,6 +1089,26 @@ fn verify_runtime_environment(inspect: &Value, expected: &[String]) -> Result<()
         }
     }
     Ok(())
+}
+
+/// The persisted creation-time operator-home mount record, write-side
+/// counterpart of [`inspected_operator_home`]. The record is what makes the
+/// mount verifiable, so a home the record cannot represent (non-UTF8 path
+/// bytes) drops the mount from `mounts` instead of failing the create: the
+/// launch proceeds with the exact pre-feature shape — no home bind, no
+/// marker env, no label — and the loss is logged. A launch is never refused
+/// over the home mount.
+fn persisted_operator_home_record(mounts: &mut docker::TerminalMounts) -> Option<String> {
+    let record = mounts.operator_home.as_ref().map(serde_json::to_string);
+    match record {
+        Some(Ok(record)) => Some(record),
+        Some(Err(error)) => {
+            tracing::warn!(error = %error, "supervisor.operator_home_mount_dropped");
+            mounts.operator_home = None;
+            None
+        }
+        None => None,
+    }
 }
 
 /// The container's persisted creation-time operator-home mount record, gated
@@ -2071,6 +2090,44 @@ mod tests {
         assert!(!unmounted
             .iter()
             .any(|e| e.starts_with("FRESHELL_OPERATOR_HOME")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn persisted_operator_home_record_drops_an_unserializable_mount() {
+        // A home path with non-UTF8 bytes cannot produce a persisted record;
+        // the launch must not be refused over the home mount — the mount is
+        // dropped whole so the create keeps the exact pre-feature shape (no
+        // home bind, no marker env, no label).
+        use std::os::unix::ffi::OsStringExt;
+        let mut mounts = TerminalMounts {
+            workspace: PathBuf::from("/workspace"),
+            git_common_dir: None,
+            provider_bootstrap_files: Vec::new(),
+            provider_secret_files: Vec::new(),
+            provider_user_root: None,
+            mcp_capability_file: None,
+            operator_home: Some(OperatorHomeMount {
+                home: PathBuf::from(std::ffi::OsString::from_vec(b"/ho\x80me".to_vec())),
+                mask_rel_paths: vec![".freshell".to_string()],
+            }),
+        };
+        assert!(persisted_operator_home_record(&mut mounts).is_none());
+        assert!(mounts.operator_home.is_none());
+        mounts.operator_home = Some(OperatorHomeMount {
+            home: PathBuf::from("/home/op"),
+            mask_rel_paths: vec![".freshell".to_string()],
+        });
+        let record = persisted_operator_home_record(&mut mounts).unwrap();
+        assert_eq!(
+            record,
+            serde_json::to_string(&OperatorHomeMount {
+                home: PathBuf::from("/home/op"),
+                mask_rel_paths: vec![".freshell".to_string()],
+            })
+            .unwrap()
+        );
+        assert!(mounts.operator_home.is_some());
     }
 
     fn terminal_runtime_fixture(

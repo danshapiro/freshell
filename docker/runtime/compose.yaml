@@ -6,12 +6,22 @@ services:
   supervisor:
     image: ${FRESHELL_SUPERVISOR_IMAGE:?set a pinned supervisor image}
     restart: unless-stopped
-    # The supervisor image's default command is /bin/bash; this block mirrors
-    # the documented launch (installers/systemd/freshell-supervisor.service)
-    # with compose topology paths: registry on the named volume, control
-    # socket/secret inside the control-dir bind (the web service expects those
-    # exact paths), the daemon-host docker socket, the shared runtime root at
-    # itself, and the pinned workload image from managed-runtime.env.
+    # FRESHELL_SUPERVISOR_IMAGE is a deployment-provided pin — this repo
+    # builds only the workload image (docker/runtime/Dockerfile), so the
+    # supervisor image is a contract, not a build product. Required contract:
+    # no supervisor ENTRYPOINT (or one that execs its args verbatim) and the
+    # freshell-supervisor binary on the image PATH. The args below carry the
+    # documented launch's flag set
+    # (installers/systemd/freshell-supervisor.service) over compose topology
+    # paths: registry on the named volume, control socket/secret inside the
+    # control-dir bind (the web service expects those exact paths), the
+    # daemon-host docker socket, the shared runtime root at itself, and the
+    # pinned workload image from managed-runtime.env. A contract violation
+    # is a restart loop whose tell is in `docker compose logs supervisor`:
+    # a binary missing from PATH reports "executable file not found"; an
+    # ENTRYPOINT of the supervisor itself consumes command[0] as a stray
+    # argument and the CLI exits with its usage line (a supervisor.fatal
+    # event) instead of serving.
     command:
       - freshell-supervisor
       - serve
