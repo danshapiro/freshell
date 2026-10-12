@@ -64,7 +64,7 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import
     if (!/^[a-f0-9]{40}$/.test(manifest.candidateSha) || !/^[a-f0-9-]{36}$/.test(manifest.runId)
       || manifest.repoRoot !== fs.realpathSync(process.cwd())) throw new Error('exact task worktree/run identity required')
     const harness = new RuntimeHarness(manifest.repoRoot, manifest.runId, 3)
-    await harness.prepareTask2FixtureArtifacts(manifest)
+    await harness.prepareTask2FixtureArtifactsForCurrentCandidate(manifest)
     await runTask2Fixtures(harness)
   })().catch(() => {
     process.stderr.write(JSON.stringify({ severity: 'error', event: 'task2.synthetic_fixture.refused', reasonCode: 'fixture_matrix_failed' })+'\n')

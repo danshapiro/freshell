@@ -1392,6 +1392,47 @@ describe('owner HTTP failure observability', () => {
       await fixtures.cancel()
     } finally { vi.restoreAllMocks() }
   })
+  it('uses a run-owned current-candidate image when preparing standalone retained fixtures', async () => {
+    const h = new RuntimeHarness(fixtureRepoRoot, '550e8400-e29b-41d4-a716-446655440001', 3)
+    const currentImage = `sha256:${'d'.repeat(64)}`
+    const ensureImage = vi.spyOn(h as any, 'ensureRuntimeImage').mockImplementation(() => { h.imageRef = currentImage })
+    const prepare = vi.spyOn(h, 'prepareTask2FixtureArtifacts').mockResolvedValue(undefined)
+    const artifact = { path: path.join(fixtureRepoRoot, 'fixture-artifact'), sha256: 'c'.repeat(64) }
+    try {
+      await h.prepareTask2FixtureArtifactsForCurrentCandidate({
+        candidateSha: h.candidateSha,
+        currentSupervisor: artifact, currentHost: artifact, currentServer: artifact,
+        legacySupervisor: artifact, legacyHost: artifact,
+        legacyCreatorCommit: '7dbc7ef6b0b87e47ec8386e19115f5e440399898',
+      })
+      expect(ensureImage).toHaveBeenCalledOnce()
+      expect(prepare).toHaveBeenCalledWith(expect.objectContaining({ imageDigest: currentImage }))
+    } finally { vi.restoreAllMocks() }
+  })
+  it('accepts and discards the sealer image digest because the owner supplies the active image', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-retained-manifest-'))
+    const manifestPath = path.join(directory, 'manifest.json')
+    const candidateSha = 'a'.repeat(40)
+    const artifact = { path: path.join(fixtureRepoRoot, 'fixture-artifact'), sha256: 'b'.repeat(64) }
+    const manifest = {
+      repoRoot: fixtureRepoRoot,
+      runId: '550e8400-e29b-41d4-a716-446655440000',
+      candidateSha,
+      imageDigest: `sha256:${'c'.repeat(64)}`,
+      currentSupervisor: artifact, currentHost: artifact, currentServer: artifact,
+      legacySupervisor: artifact, legacyHost: artifact,
+      legacyCreatorCommit: '7dbc7ef6b0b87e47ec8386e19115f5e440399898',
+    }
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest), { mode: 0o600 })
+    fs.chmodSync(manifestPath, 0o600)
+    try {
+      const parsed = runner.readRetainedArtifacts(manifestPath, fixtureRepoRoot, candidateSha)
+      expect(parsed).not.toHaveProperty('imageDigest')
+      expect(parsed).toEqual(expect.objectContaining({ candidateSha, currentSupervisor: artifact }))
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('diagnostic sink failure isolation', () => {

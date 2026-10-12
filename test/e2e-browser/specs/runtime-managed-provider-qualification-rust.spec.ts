@@ -324,7 +324,7 @@ async function qualifyProvider(
 
   const startup = await rig.managedTerminalStartupFacts(rig.runtimeEnclosureHandle(created.view))
   expect(startup.provider).toBe(definition.processBinary)
-  expect(startup.version).toMatch(definition.versionPattern)
+  expect(definition.versionPattern.test(startup.version)).toBe(true)
   expect(startup.providerProcessPresent).toBe(true)
   for (const identity of definition.processIdentityNeedles) {
     expect(startup.processIdentities).toContain(identity)
@@ -604,9 +604,9 @@ async function task2FixtureHarness(): Promise<RuntimeHarness> {
     throw new Error('exact Task2 candidate/run/worktree identity required')
   }
   // Each browser case owns a new run. Admission still hashes the same five
-  // immutable binaries and checks the exact current/legacy image provenance.
+  // immutable binaries and uses a run-owned image built from the current candidate.
   const h = new RuntimeHarness(manifest.repoRoot, randomUUID(), 3)
-  await h.prepareTask2FixtureArtifacts(manifest)
+  await h.prepareTask2FixtureArtifactsForCurrentCandidate(manifest)
   return h
 }
 

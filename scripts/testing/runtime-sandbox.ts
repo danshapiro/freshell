@@ -3159,6 +3159,14 @@ export class RuntimeHarness {
     return { sourceRoot, files, ...(serverPath ? { serverPath } : {}) }
   }
 
+  async prepareTask2FixtureArtifactsForCurrentCandidate(
+    input: Omit<Task2FixtureArtifacts, 'imageDigest'>,
+  ): Promise<void> {
+    if (!this.imageRef) this.ensureRuntimeImage()
+    if (!this.imageRef) throw new Error('current-candidate fixture image was not prepared')
+    await this.prepareTask2FixtureArtifacts({ ...input, imageDigest: this.imageRef })
+  }
+
   async prepareTask2FixtureArtifacts(input: Task2FixtureArtifacts): Promise<void> {
     if (input.candidateSha !== this.candidateSha || !/^sha256:[a-f0-9]{64}$/.test(input.imageDigest)
       || input.legacyCreatorCommit !== '7dbc7ef6b0b87e47ec8386e19115f5e440399898'

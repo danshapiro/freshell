@@ -874,13 +874,7 @@ impl FreshAgentTransport for HostedTransport {
             cwd: Some(profile.cwd.clone()),
             images: None,
             request_id: Some(request_id.as_str().to_string()),
-            settings: Some(FreshAgentSendSettings {
-                cwd: Some(profile.cwd),
-                effort: profile.effort,
-                model: profile.model,
-                permission_mode: profile.permission_mode,
-                sandbox: profile.sandbox.as_deref().and_then(parse_sandbox),
-            }),
+            settings: Some(send_settings_for_profile(&profile)),
         };
         match &self.state {
             ProviderState::Claude(state) => state.handle_send(send).await,
@@ -1502,6 +1496,26 @@ impl FreshAgentTransport for HostedTransport {
     }
 }
 
+fn effective_permission_mode(profile: &FreshAgentProfile) -> Option<String> {
+    if profile.provider == FreshProvider::Codex
+        && profile.permission_mode.as_deref() == Some("default")
+    {
+        None
+    } else {
+        profile.permission_mode.clone()
+    }
+}
+
+fn send_settings_for_profile(profile: &FreshAgentProfile) -> FreshAgentSendSettings {
+    FreshAgentSendSettings {
+        cwd: Some(profile.cwd.clone()),
+        effort: profile.effort.clone(),
+        model: profile.model.clone(),
+        permission_mode: effective_permission_mode(profile),
+        sandbox: profile.sandbox.as_deref().and_then(parse_sandbox),
+    }
+}
+
 fn create_request_for_profile(profile: &FreshAgentProfile) -> FreshAgentCreate {
     let (provider, session_type, provider_name) = match profile.provider {
         FreshProvider::Claude => (AgentProvider::Claude, SessionType::Freshclaude, "claude"),
@@ -1532,7 +1546,7 @@ fn create_request_for_profile(profile: &FreshAgentProfile) -> FreshAgentCreate {
                     model_id: selection.model_id.clone(),
                 })
         }),
-        permission_mode: profile.permission_mode.clone(),
+        permission_mode: effective_permission_mode(profile),
         plugins: profile.plugins.clone(),
         provider: Some(provider),
         resume_session_id: None,
@@ -5138,7 +5152,12 @@ export function query({ prompt, options }) {
                 "kind": selection.kind,
                 "modelId": selection.model_id,
             }))),
-            "permissionMode": profile.permission_mode,
+            "permissionMode": if profile.provider == FreshProvider::Codex
+                && profile.permission_mode.as_deref() == Some("default") {
+                    None
+                } else {
+                    profile.permission_mode.clone()
+                },
             "plugins": profile.plugins,
             "provider": provider,
             "sandbox": profile.sandbox.as_deref().and_then(parse_sandbox),
@@ -5376,6 +5395,8 @@ export function query({ prompt, options }) {
                 .as_mut()
                 .unwrap()
                 .mcp_capability = None;
+            hosted_provider_profile.permission_mode =
+                effective_permission_mode(&hosted_provider_profile);
             assert_eq!(
                 direct_profile, hosted_provider_profile,
                 "provider-visible profile differs for {provider:?}"
@@ -5399,7 +5420,7 @@ export function query({ prompt, options }) {
             run_hosted_actor_matrix(
                 hosted_transport,
                 &hosted_fixture,
-                hosted_profile.clone(),
+                hosted_provider_profile.clone(),
                 dir.path(),
             )
             .await;
@@ -5784,7 +5805,7 @@ export function query({ prompt, options }) {
                     FreshProvider::Opencode => "freshopencode", FreshProvider::Kilroy => unreachable!(),
                 },
                 "cwd":"/workspace", "model":"model-a", "effort":"high",
-                "permissionMode":"default", "sandbox":"workspace-write",
+                "permissionMode":effective_permission_mode(&profile), "sandbox":"workspace-write",
                 "plugins":["plugin-a"], "modelSelection":{"kind":"model","modelId":"model-a"},
                 "sessionRef":{"provider":provider.as_str(),"sessionId":"exact-native"},
                 "namingHandle":"display-only", "tabId":"display-tab",
@@ -5841,6 +5862,46 @@ export function query({ prompt, options }) {
             Some(freshell_protocol::Sandbox::DangerFullAccess)
         );
         assert_eq!(parse_sandbox("unknown"), None);
+    }
+
+    #[test]
+    fn hosted_codex_create_uses_provider_default_for_default_permission_mode() {
+        let profile = parity_profile(FreshProvider::Codex);
+
+        assert_eq!(
+            create_request_for_profile(&profile).permission_mode,
+            None,
+            "the UI's default sentinel is not a Codex approval policy"
+        );
+        assert_eq!(
+            send_settings_for_profile(&profile).permission_mode,
+            None,
+            "Codex send settings must keep using its provider default"
+        );
+
+        let mut explicit = profile;
+        explicit.permission_mode = Some("on-request".into());
+        assert_eq!(
+            create_request_for_profile(&explicit)
+                .permission_mode
+                .as_deref(),
+            Some("on-request")
+        );
+        assert_eq!(
+            send_settings_for_profile(&explicit)
+                .permission_mode
+                .as_deref(),
+            Some("on-request")
+        );
+
+        let claude = parity_profile(FreshProvider::Claude);
+        assert_eq!(
+            create_request_for_profile(&claude)
+                .permission_mode
+                .as_deref(),
+            Some("default"),
+            "Claude's existing default mode remains unchanged"
+        );
     }
 
     #[tokio::test]

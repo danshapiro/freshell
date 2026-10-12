@@ -353,6 +353,46 @@ test.describe.serial('ordinary fresh-agent use', () => {
       }])),
     })
     const wire = observeBrowserWire(page)
+    const expectedMarkers = new Set<string>()
+    const snapshotResponses: Array<{
+      status: number
+      turnCount: number | null
+      userTurnCount: number | null
+      assistantTurnCount: number | null
+      assistantErrorCount: number | null
+      markerPresent: boolean | null
+    }> = []
+    const snapshotResponseTasks: Promise<void>[] = []
+    page.on('response', response => {
+      let pathname: string
+      try { pathname = new URL(response.url()).pathname } catch { return }
+      if (!pathname.startsWith('/api/fresh-agent/threads/freshopencode/opencode/')) return
+      snapshotResponseTasks.push((async () => {
+        const status = response.status()
+        try {
+          const body = await response.json() as { turns?: unknown }
+          const turns = Array.isArray(body.turns) ? body.turns.filter((turn): turn is Record<string, unknown> => (
+            Boolean(turn) && typeof turn === 'object' && !Array.isArray(turn)
+          )) : null
+          const assistantTurns = turns?.filter(turn => turn.role === 'assistant') ?? []
+          const markerPresent = [...expectedMarkers].some(marker => assistantTurns.some(turn => (
+            (typeof turn.summary === 'string' && turn.summary.includes(marker))
+            || (Array.isArray(turn.items) && turn.items.some(item => (
+              Boolean(item) && typeof item === 'object' && item.kind === 'text'
+              && typeof item.text === 'string' && item.text.includes(marker)
+            )))
+          )))
+          snapshotResponses.push({ status, turnCount: turns?.length ?? null,
+            userTurnCount: turns?.filter(turn => turn.role === 'user').length ?? null,
+            assistantTurnCount: assistantTurns.length,
+            assistantErrorCount: assistantTurns.filter(turn => Boolean(turn.error)).length,
+            markerPresent })
+        } catch {
+          snapshotResponses.push({ status, turnCount: null, userTurnCount: null,
+            assistantTurnCount: null, assistantErrorCount: null, markerPresent: null })
+        }
+      })())
+    })
     try {
       const info = await rig.start()
       process.env.FRESHELL_URL = info.baseUrl
@@ -376,6 +416,7 @@ test.describe.serial('ordinary fresh-agent use', () => {
           paneId = created.paneId
           progress.createCompleted = true
           const marker = `FRESHELL-${randomBytes(12).toString('hex')}`
+          expectedMarkers.add(marker)
           const allocationSessionIds = new Set([
             created.reply.sessionId,
             created.sessionId,
@@ -411,6 +452,7 @@ test.describe.serial('ordinary fresh-agent use', () => {
             lane: 'fresh-agent', mode: definition.mode }))
         } catch (error) {
           failedModes.push(definition.mode)
+          await Promise.allSettled(snapshotResponseTasks)
           let assistantDom = { available: false, rows: 0, textCharacters: 0 }
           if (paneId) {
             try {
@@ -423,6 +465,7 @@ test.describe.serial('ordinary fresh-agent use', () => {
             lane: 'fresh-agent', mode: definition.mode,
             errorName: error instanceof Error ? error.name : 'UnknownError',
             providerEvents: ordinaryFreshAgentEventFacts(wire.received.slice(receivedCursor)), assistantDom,
+            opencodeSnapshotResponses: { count: snapshotResponses.length, tail: snapshotResponses.slice(-8) },
             ...progress }))
         }
       }

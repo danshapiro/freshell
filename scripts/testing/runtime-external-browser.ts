@@ -1382,11 +1382,16 @@ const RetainedArtifactsSchema: z.ZodType<RetainedArtifacts> = z.object({
   legacyCreatorCommit: z.literal('7dbc7ef6b0b87e47ec8386e19115f5e440399898'),
 }).strict()
 
-function readRetainedArtifacts(file: string | undefined, repoRoot: string, candidateSha: string): RetainedArtifacts {
+export function readRetainedArtifacts(file: string | undefined, repoRoot: string, candidateSha: string): RetainedArtifacts {
   if (!file || !path.isAbsolute(file) || fs.realpathSync(file) !== file) throw new Error('exact owner Task2 artifact manifest required')
   const stat = fs.lstatSync(file)
   if (!stat.isFile() || (stat.mode & 0o077) !== 0 || stat.uid !== process.getuid?.()) throw new Error('Task2 artifact manifest must be private and owned')
-  const { repoRoot: manifestRoot, runId, ...artifacts } = JSON.parse(fs.readFileSync(file, 'utf8'))
+  const { repoRoot: manifestRoot, runId, ...manifestArtifacts } = JSON.parse(fs.readFileSync(file, 'utf8'))
+  // The sealer records the image used to prepare its immutable files, but a
+  // retained fixture must run inside the active owner's image and Docker
+  // daemon. Validate the legacy metadata shape, then deliberately discard it.
+  const { imageDigest: sourceImageDigest, ...artifacts } = manifestArtifacts
+  z.string().regex(/^sha256:[a-f0-9]{64}$/).optional().parse(sourceImageDigest)
   const parsed = RetainedArtifactsSchema.parse(artifacts)
   if (manifestRoot !== repoRoot || !z.string().uuid().safeParse(runId).success || parsed.candidateSha !== candidateSha) {
     throw new Error('Task2 artifacts differ from the current exact candidate and worktree')
