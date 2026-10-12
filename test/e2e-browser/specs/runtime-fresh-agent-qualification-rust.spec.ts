@@ -105,6 +105,7 @@ function ordinaryFreshAgentEventFacts(frames: readonly any[]) {
     snapshot: 0, changed: 0, turnComplete: 0, result: 0 }
   const turnOutcomes: Record<string, number> = {}
   const createFailureCodes = new Set<string>()
+  const createFailureDiagnostics = new Set<string>()
   let errorCodePresent = false
   let errorMessagePresent = false
   let assistantTextCharacters = 0
@@ -114,6 +115,10 @@ function ordinaryFreshAgentEventFacts(frames: readonly any[]) {
     if (frame?.type === 'freshAgent.create.failed') {
       counts.createFailed++
       if (typeof frame.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(frame.code)) createFailureCodes.add(frame.code)
+      if (typeof frame.message === 'string') {
+        const match = frame.message.match(/startup diagnostic: (authentication|arguments|listener|configuration|network|unclassified|no-diagnostic)/)
+        if (match) createFailureDiagnostics.add(match[1])
+      }
     }
     if (frame?.type !== 'freshAgent.event' || !frame.event || typeof frame.event !== 'object') continue
     const event = frame.event as Record<string, any>
@@ -149,7 +154,8 @@ function ordinaryFreshAgentEventFacts(frames: readonly any[]) {
       case 'freshAgent.result': counts.result++; break
     }
   }
-  return { counts, createFailureCodes: [...createFailureCodes].sort(), errorCodePresent, errorMessagePresent,
+  return { counts, createFailureCodes: [...createFailureCodes].sort(),
+    createFailureDiagnostics: [...createFailureDiagnostics].sort(), errorCodePresent, errorMessagePresent,
     assistantTextCharacters, streamedTextCharacters, turnOutcomes }
 }
 
@@ -355,22 +361,41 @@ test.describe.serial('ordinary fresh-agent use', () => {
     const wire = observeBrowserWire(page)
     const expectedMarkers = new Set<string>()
     const snapshotResponses: Array<{
+      mode: string | null
+      phase: string
       status: number
       turnCount: number | null
       userTurnCount: number | null
       assistantTurnCount: number | null
       assistantErrorCount: number | null
       markerPresent: boolean | null
+      threadMatchesRequest: boolean | null
+      threadMatchesNative: boolean | null
+      sessionIdMatchesNative: boolean | null
+      ownerKind: string | null
+      statusFromLiveState: boolean | null
     }> = []
     const snapshotResponseTasks: Promise<void>[] = []
+    let activeMode: string | null = null
+    let activeSnapshotPhase = 'setup'
+    let expectedNativeSessionId: string | null = null
     page.on('response', response => {
       let pathname: string
       try { pathname = new URL(response.url()).pathname } catch { return }
       if (!pathname.startsWith('/api/fresh-agent/threads/freshopencode/opencode/')) return
+      const mode = activeMode
+      const phase = activeSnapshotPhase
+      const nativeSessionId = expectedNativeSessionId
+      const requestedThreadId = pathname.split('/').at(-1) ?? ''
       snapshotResponseTasks.push((async () => {
         const status = response.status()
         try {
-          const body = await response.json() as { turns?: unknown }
+          const body = await response.json() as {
+            turns?: unknown
+            threadId?: unknown
+            sessionId?: unknown
+            extensions?: Record<string, Record<string, unknown>>
+          }
           const turns = Array.isArray(body.turns) ? body.turns.filter((turn): turn is Record<string, unknown> => (
             Boolean(turn) && typeof turn === 'object' && !Array.isArray(turn)
           )) : null
@@ -382,14 +407,25 @@ test.describe.serial('ordinary fresh-agent use', () => {
               && typeof item.text === 'string' && item.text.includes(marker)
             )))
           )))
-          snapshotResponses.push({ status, turnCount: turns?.length ?? null,
+          const opencodeExtension = body.extensions?.opencode
+          snapshotResponses.push({ mode, phase, status, turnCount: turns?.length ?? null,
             userTurnCount: turns?.filter(turn => turn.role === 'user').length ?? null,
             assistantTurnCount: assistantTurns.length,
             assistantErrorCount: assistantTurns.filter(turn => Boolean(turn.error)).length,
-            markerPresent })
+            markerPresent,
+            threadMatchesRequest: typeof body.threadId === 'string' ? body.threadId === decodeURIComponent(requestedThreadId) : null,
+            threadMatchesNative: typeof body.threadId === 'string' && nativeSessionId
+              ? body.threadId === nativeSessionId : null,
+            sessionIdMatchesNative: typeof body.sessionId === 'string' && nativeSessionId
+              ? body.sessionId === nativeSessionId : null,
+            ownerKind: typeof opencodeExtension?.ownerKind === 'string' ? opencodeExtension.ownerKind : null,
+            statusFromLiveState: typeof opencodeExtension?.statusFromLiveState === 'boolean'
+              ? opencodeExtension.statusFromLiveState : null })
         } catch {
-          snapshotResponses.push({ status, turnCount: null, userTurnCount: null,
-            assistantTurnCount: null, assistantErrorCount: null, markerPresent: null })
+          snapshotResponses.push({ mode, phase, status, turnCount: null, userTurnCount: null,
+            assistantTurnCount: null, assistantErrorCount: null, markerPresent: null,
+            threadMatchesRequest: null, threadMatchesNative: null, sessionIdMatchesNative: null,
+            ownerKind: null, statusFromLiveState: null })
         }
       })())
     })
@@ -402,6 +438,9 @@ test.describe.serial('ordinary fresh-agent use', () => {
 
       const failedModes: string[] = []
       for (const definition of definitions) {
+        activeMode = definition.mode
+        activeSnapshotPhase = 'create'
+        expectedNativeSessionId = null
         const receivedCursor = wire.received.length
         let paneId: string | undefined
         const progress = {
@@ -414,6 +453,8 @@ test.describe.serial('ordinary fresh-agent use', () => {
         try {
           const created = await actualCreate(page, rig, definition, wire)
           paneId = created.paneId
+          expectedNativeSessionId = created.view.nativeSessionId ?? null
+          activeSnapshotPhase = 'before-send'
           progress.createCompleted = true
           const marker = `FRESHELL-${randomBytes(12).toString('hex')}`
           expectedMarkers.add(marker)
@@ -433,6 +474,7 @@ test.describe.serial('ordinary fresh-agent use', () => {
             .slice(sendCursor)
             .find((frame) => frame.type === 'freshAgent.send' && allocationSessionIds.has(frame.sessionId)) ?? null)
           progress.sendObserved = true
+          activeSnapshotPhase = 'send-observed'
           if (!allocationSessionIds.has(sent.sessionId)) {
             throw new Error('fresh-agent send was not associated with the selected allocation')
           }
@@ -442,7 +484,10 @@ test.describe.serial('ordinary fresh-agent use', () => {
               && allocationSessionIds.has(frame.sessionId)
               && frame.event?.type === 'freshAgent.turn.complete'
             ))
-            if (completed) progress.turnCompleteObserved = true
+            if (completed) {
+              progress.turnCompleteObserved = true
+              activeSnapshotPhase = 'turn-complete-observed'
+            }
             const visibleAnswer = await page.locator(`[data-pane-id="${created.paneId}"] [data-turn-role="assistant"]`)
               .evaluateAll((turns, expectedMarker) => turns.some((turn) => turn.textContent?.includes(expectedMarker)), marker)
             if (visibleAnswer) progress.markerVisible = true
@@ -451,6 +496,7 @@ test.describe.serial('ordinary fresh-agent use', () => {
           console.info(JSON.stringify({ severity: 'info', event: 'durable_souls.ordinary_turn_completed',
             lane: 'fresh-agent', mode: definition.mode }))
         } catch (error) {
+          activeSnapshotPhase = 'failure'
           failedModes.push(definition.mode)
           await Promise.allSettled(snapshotResponseTasks)
           let assistantDom = { available: false, rows: 0, textCharacters: 0 }
