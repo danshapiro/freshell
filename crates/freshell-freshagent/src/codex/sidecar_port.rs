@@ -30,6 +30,7 @@ use freshell_codex::launch_plan::{
     CODEX_INITIAL_LAUNCH_RETRY_DELAY_MS,
 };
 use freshell_codex::transport::reap_owned_codex_sidecars;
+use freshell_containment::FORCE_GRACE;
 
 use super::PROVIDER;
 
@@ -74,26 +75,29 @@ pub(super) fn loopback_port_taken(port: u16) -> bool {
 
 /// Whether the listener on `port` belongs to the attempt's own app-server:
 /// the spawned process `pid` or a process it started (the native behind the
-/// Node launcher). One read of the socket tables and the tree's descriptors,
-/// on a blocking thread.
-pub(super) async fn listener_is_the_attempts(port: u16, pid: Option<u32>) -> bool {
-    let Some(pid) = pid else {
-        return false;
-    };
-    tokio::task::spawn_blocking(move || {
-        freshell_containment::listening_socket_owner(port, &[pid]).is_some()
-    })
-    .await
-    .unwrap_or(false)
+/// Node launcher). One read of the socket tables and of the descriptors of
+/// that small process tree, done in place like the lane's other one-shot
+/// `/proc` reads (a hop to a blocking thread would only reorder the
+/// runtime's tasks).
+pub(super) fn listener_is_the_attempts(port: u16, pid: Option<u32>) -> bool {
+    pid.is_some_and(|pid| freshell_containment::listening_socket_owner(port, &[pid]).is_some())
 }
 
 /// The failure of an attempt that lost its port, once the attempt is stopped
-/// so nothing of it is left and nothing of it can confuse the retry. As the
-/// planner's unit-less start does: every process carrying the attempt's
-/// ownership tag gets SIGTERM (while the spawned launcher still holds its
-/// tree together), the exact spawned child is killed and its exit awaited,
-/// bounded by [`GONE_WAIT_BOUND`], and the attempt's tracking record is
-/// removed.
+/// so nothing of it is left and nothing of it can confuse the retry. The
+/// shape of a Force stop, on the planner's unit-less attempt's means (the
+/// ownership tag and the exact child):
+///
+/// 1. Every process carrying the attempt's ownership tag gets SIGTERM
+///    (Linux; elsewhere the tag cannot be read), the native behind the Node
+///    launcher included, while the launcher still holds the tree together.
+/// 2. The exact spawned child's exit is awaited for up to [`FORCE_GRACE`]:
+///    the launcher exits once its native has, so this exit also says the
+///    native is gone.
+/// 3. A child still running is killed, and its exit awaited, bounded by
+///    [`GONE_WAIT_BOUND`].
+///
+/// Then the attempt's tracking record is removed.
 pub(super) async fn stop_lost_attempt(
     child: &mut tokio::process::Child,
     pid: Option<u32>,
@@ -101,11 +105,19 @@ pub(super) async fn stop_lost_attempt(
     reason: String,
 ) -> AttemptFailure {
     reap_owned_codex_sidecars(ownership_id);
-    let _ = child.start_kill();
-    let exited = matches!(
-        tokio::time::timeout(GONE_WAIT_BOUND, child.wait()).await,
-        Ok(Ok(_))
-    );
+    let grace = if cfg!(target_os = "linux") {
+        FORCE_GRACE
+    } else {
+        Duration::ZERO
+    };
+    let mut exited = matches!(tokio::time::timeout(grace, child.wait()).await, Ok(Ok(_)));
+    if !exited {
+        let _ = child.start_kill();
+        exited = matches!(
+            tokio::time::timeout(GONE_WAIT_BOUND, child.wait()).await,
+            Ok(Ok(_))
+        );
+    }
     crate::codex_sidecar_tracking::scrub_sidecar_record(ownership_id);
     AttemptFailure {
         message: reason,
@@ -326,6 +338,38 @@ mod tests {
         proc_starttime(pid as i32) != Some(start)
     }
 
+    /// The processes whose environment carries the sidecar ownership tag
+    /// `ownership_id` (read-only `/proc` scan).
+    fn processes_carrying(ownership_id: &str) -> Vec<u32> {
+        let needle = freshell_codex::durability::ownership_needle(ownership_id);
+        std::fs::read_dir("/proc")
+            .expect("/proc")
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|pid| {
+                std::fs::read(format!("/proc/{pid}/environ")).is_ok_and(|environ| {
+                    environ
+                        .split(|byte| *byte == 0)
+                        .any(|var| var == needle.as_bytes())
+                })
+            })
+            .filter(|pid| proc_starttime(*pid as i32).is_some())
+            .collect()
+    }
+
+    /// Test helper: whether every process carrying `ownership_id` is gone
+    /// within a bound (a SIGTERM the product sends is not awaited for
+    /// processes other than the one it spawned).
+    async fn nothing_carries(ownership_id: &str) -> bool {
+        for _ in 0..250 {
+            if processes_carrying(ownership_id).is_empty() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
     /// A loopback port held by a socket bound to it (without `SO_REUSEADDR`)
     /// that never listens: an app-server told to listen there fails its bind,
     /// and nothing answers a probe.
@@ -446,7 +490,10 @@ mod tests {
     #[tokio::test]
     async fn a_pane_whose_first_port_another_socket_holds_starts_on_a_new_port() {
         let _env = ENV_LOCK.lock().await;
-        configure_fake_codex_cmd("{}");
+        // Each attempt's app-server first starts a helper process (carrying
+        // the attempt's ownership tag), which outlives an app-server that
+        // exits.
+        configure_fake_codex_cmd(r#"{"spawnNativeChild": true}"#);
         let store = TrackingStore::install();
         let records = ListenRecords::new();
         let state = records.state();
@@ -528,19 +575,29 @@ mod tests {
             proc_starttime(lost_pid).is_none(),
             "the lost attempt's app-server is gone"
         );
+        let lost_tag = &retry.fields["ownership_id"];
+        assert!(
+            nothing_carries(lost_tag).await,
+            "nothing the lost attempt started is left: {:?}",
+            processes_carrying(lost_tag)
+        );
         let tracked = store.ownership_ids();
         assert!(
-            !tracked.contains(&retry.fields["ownership_id"]),
+            !tracked.contains(lost_tag),
             "the lost attempt's record is removed: {tracked:?}"
         );
-        assert!(
-            tracked
-                .iter()
-                .any(|id| store.ws_url_of(id).map(|url| port_of(&url)) == Some(served_port)),
-            "the retry is tracked: {tracked:?}"
-        );
+        let retry_tag = tracked
+            .iter()
+            .find(|id| store.ws_url_of(id).map(|url| port_of(&url)) == Some(served_port))
+            .unwrap_or_else(|| panic!("the retry is tracked: {tracked:?}"))
+            .clone();
 
         state.shutdown().await;
+        assert!(
+            nothing_carries(&retry_tag).await,
+            "the shutdown leaves nothing of the retry: {:?}",
+            processes_carrying(&retry_tag)
+        );
         drop(holder);
     }
 

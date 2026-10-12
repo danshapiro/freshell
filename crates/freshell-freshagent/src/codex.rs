@@ -7763,7 +7763,7 @@ impl FreshCodexState {
         // The listener that answered must be this attempt's own app-server
         // (Stage 2: LB-30): one another process put on the port is never
         // taken for it.
-        if !sidecar_port::listener_is_the_attempts(port, spawned_pid).await {
+        if !sidecar_port::listener_is_the_attempts(port, spawned_pid) {
             drop(transport);
             return Err(sidecar_port::stop_lost_attempt(
                 &mut child,
