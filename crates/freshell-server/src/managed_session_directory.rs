@@ -29,7 +29,8 @@ struct CachedRead {
 
 impl CachedRead {
     fn refresh_due(&self) -> bool {
-        self.attempted_at.elapsed() >= PRESENTATION_TTL
+        // Until history has a saved row, its first turn may arrive at any time.
+        self.item.is_none() || self.attempted_at.elapsed() >= PRESENTATION_TTL
     }
 }
 
@@ -313,6 +314,7 @@ mod tests {
         history_home: Option<PathBuf>,
         mismatch: bool,
         reads: Arc<std::sync::atomic::AtomicUsize>,
+        turn_counts: Arc<std::sync::Mutex<Vec<usize>>>,
         slow_souls: HashSet<SoulId>,
     }
 
@@ -336,6 +338,10 @@ mod tests {
                 native_id,
             )
             .map_err(BackendError::Unavailable)?;
+            self.turn_counts
+                .lock()
+                .unwrap()
+                .push(snapshot["turns"].as_array().unwrap().len());
             if self.mismatch {
                 snapshot["threadId"] = json!("wrong-owned-root");
             }
@@ -584,10 +590,7 @@ mod tests {
             } else {
                 (
                     home.join(".claude/projects/fixture"),
-                    vec![
-                        json!({"type":"user","uuid":"user187","sessionId":native_id,"cwd":"/workspace","timestamp":"2026-10-11T10:00:00Z","message":{"role":"user","content":"Saved managed request"}}),
-                        json!({"type":"assistant","uuid":"answer187","parentUuid":"user187","sessionId":native_id,"timestamp":"2026-10-11T10:00:01Z","message":{"id":"msg187","role":"assistant","content":[{"type":"text","text":"Saved managed answer"}],"stop_reason":"end_turn"}}),
-                    ],
+                    claude_fixture_records(native_id).to_vec(),
                 )
             };
             std::fs::create_dir_all(&folder).unwrap();
@@ -606,6 +609,13 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    fn claude_fixture_records(native_id: &str) -> [Value; 2] {
+        [
+            json!({"type":"user","uuid":"user187","sessionId":native_id,"cwd":"/workspace","timestamp":"2026-10-11T10:00:00Z","message":{"role":"user","content":"Saved managed request"}}),
+            json!({"type":"assistant","uuid":"answer187","parentUuid":"user187","sessionId":native_id,"timestamp":"2026-10-11T10:00:01Z","message":{"id":"msg187","role":"assistant","content":[{"type":"text","text":"Saved managed answer"}],"stop_reason":"end_turn"}}),
+        ]
     }
 
     fn directory_state(home: &Path) -> SessionDirectoryState {
@@ -650,6 +660,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_directory_discovers_first_saved_turn_before_negative_cache_expires() {
+        use std::io::Write;
+
+        let root = tempfile::tempdir().unwrap();
+        let web = tempfile::tempdir().unwrap();
+        let provider_home = root.path().join("provider");
+        let native_id = "63333000-0000-4333-8333-000000000275";
+        let folder = provider_home.join(".claude/projects/fixture");
+        std::fs::create_dir_all(&folder).unwrap();
+        let transcript = folder.join(format!("{native_id}.jsonl"));
+        let metadata = json!({"type":"system","subtype":"init","sessionId":native_id,"cwd":"/workspace","timestamp":"2026-10-11T10:00:00Z"});
+        std::fs::write(&transcript, format!("{metadata}\n")).unwrap();
+        let cwd = root.path().to_str().unwrap();
+        let (registry, view) = register(root.path(), "claude", "freshclaude", native_id, cwd).await;
+        let inventory_before = serde_json::to_value(registry.inventory().await.unwrap()).unwrap();
+        let launch_before = serde_json::to_value(
+            registry
+                .recovery_context(view.soul_id.clone())
+                .await
+                .unwrap()
+                .prior_handle
+                .fresh_agent(),
+        )
+        .unwrap();
+        let backend = Arc::new(NativeBackend {
+            history_home: Some(provider_home),
+            ..Default::default()
+        });
+        let (socket, control) = start_control(root.path(), registry.clone(), backend.clone()).await;
+        let cache = Cache::default();
+        // Use the production HTTP handler with an owned cache so the unexpired
+        // decision window is observable without an extra request or a sleep.
+        let app = Router::new()
+            .route(
+                "/api/session-directory",
+                axum::routing::get(session_directory),
+            )
+            .with_state(directory_state(web.path()))
+            .layer(axum::Extension(cache.clone()))
+            .layer(axum::Extension(RuntimeClient::new(
+                socket,
+                "test-control-secret",
+            )));
+        let initial = directory_page(app.clone()).await;
+        let initial_reads = backend.reads.load(std::sync::atomic::Ordering::SeqCst);
+        let initial_negative = {
+            let cached = cache.0.lock().await;
+            let entry = cached.entries.values().next().unwrap();
+            cached.entries.len() == 1 && entry.item.is_none() && !entry.refresh_succeeded
+        };
+        let mut saved = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        for record in claude_fixture_records(native_id) {
+            writeln!(saved, "{record}").unwrap();
+        }
+        drop(saved);
+        let negative_attempt = {
+            let mut cached = cache.0.lock().await;
+            let entry = cached.entries.values_mut().next().unwrap();
+            // Keep setup delays out of the causal assertion. An overrun during
+            // the actual request still fails the unexpired-window precondition.
+            entry.attempted_at = Instant::now();
+            entry.attempted_at
+        };
+        let refreshed = directory_page(app).await;
+        let request_age = negative_attempt.elapsed();
+        let final_reads = backend.reads.load(std::sync::atomic::Ordering::SeqCst);
+        let turn_counts = backend.turn_counts.lock().unwrap().clone();
+        let inventory_after = serde_json::to_value(registry.inventory().await.unwrap()).unwrap();
+        let launch_after = serde_json::to_value(
+            registry
+                .recovery_context(view.soul_id)
+                .await
+                .unwrap()
+                .prior_handle
+                .fresh_agent(),
+        )
+        .unwrap();
+        control.abort();
+        let _ = control.await;
+
+        assert!(initial["items"].as_array().unwrap().is_empty());
+        assert_eq!(initial["partial"], true);
+        assert_eq!(initial_reads, 1);
+        assert_eq!(
+            turn_counts.first(),
+            Some(&0),
+            "initial native store is valid and zero-turn"
+        );
+        assert!(initial_negative, "initial read must cache no presentation");
+        assert!(
+            request_age < PRESENTATION_TTL,
+            "setup failed: request exceeded negative TTL"
+        );
+        assert_eq!(
+            inventory_after, inventory_before,
+            "ownership must remain unchanged"
+        );
+        assert_eq!(
+            launch_after, launch_before,
+            "same owned store, profile and UID"
+        );
+        assert_eq!(
+            final_reads, 2,
+            "next original request must reread the owned store"
+        );
+        assert_eq!(
+            turn_counts,
+            [0, 2],
+            "real native reader sees the first completed turn"
+        );
+        let rows = refreshed["items"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{refreshed}");
+        assert_eq!(rows[0]["provider"], "claude");
+        assert_eq!(rows[0]["sessionId"], native_id);
+        assert_eq!(rows[0]["sessionType"], "freshclaude");
+        assert_eq!(rows[0]["cwd"], cwd);
+        assert_eq!(rows[0]["projectPath"], cwd);
+        assert_eq!(rows[0]["isRunning"], true);
+        assert_eq!(rows[0]["title"], "Saved managed request");
+        assert!(refreshed.get("partial").is_none());
+        assert!(refreshed.get("integrityError").is_none());
+    }
+
+    #[tokio::test]
     async fn managed_directory_timeout_advances_past_dispatched_souls() {
         let root = tempfile::tempdir().unwrap();
         let web = tempfile::tempdir().unwrap();
@@ -686,6 +823,7 @@ mod tests {
                     .take(4)
                     .map(|view| view.soul_id.clone())
                     .collect(),
+                ..Default::default()
             }),
         )
         .await;
