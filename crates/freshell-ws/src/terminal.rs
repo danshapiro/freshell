@@ -13008,6 +13008,128 @@ mod pane_reconcile_gate_tests {
         }
     }
 
+    struct GatedCheckpointSend {
+        seen_send: tokio::sync::Mutex<Option<freshell_protocol::FreshAgentSend>>,
+        entered: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    impl crate::checkpoint_barrier::FreshAgentCheckpointBarrier for GatedCheckpointSend {
+        fn barrier_and_forward(
+            self: Arc<Self>,
+            send: freshell_protocol::FreshAgentSend,
+            forward: futures::future::BoxFuture<'static, ()>,
+        ) -> futures::future::BoxFuture<'static, ()> {
+            Box::pin(async move {
+                *self.seen_send.lock().await = Some(send);
+                if let Some(entered) = self.entered.lock().await.take() {
+                    let _ = entered.send(());
+                }
+                if let Some(release) = self.release.lock().await.take() {
+                    let _ = release.await;
+                }
+                forward.await;
+            })
+        }
+
+        fn replay_for_session(
+            self: Arc<Self>,
+            _provider: freshell_protocol::AgentProvider,
+            _session_id: String,
+            _session_type: freshell_protocol::SessionType,
+        ) -> futures::future::BoxFuture<'static, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_intent_send_is_gated_by_server_barrier_before_opencode_dispatch() {
+        let (mut ws_tx, _client) = loopback_sink_and_client().await;
+        let mut state = state();
+        let mut provider_events = state.broadcast_tx.subscribe();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let barrier = Arc::new(GatedCheckpointSend {
+            seen_send: tokio::sync::Mutex::new(None),
+            entered: tokio::sync::Mutex::new(Some(entered_tx)),
+            release: tokio::sync::Mutex::new(Some(release_rx)),
+        });
+        state.checkpoint_send.service = Some(barrier.clone());
+        let conn_sink: FrameSink = std::sync::Arc::new(|_| {});
+        let (interactive_create_tx, _interactive_create_rx) =
+            mpsc::channel::<interactive_creates::Job>(1);
+        let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
+        let mut host_stats_last_refresh_at = None;
+        let mut conn_identity = ConnectionIdentity::default();
+
+        let keep_open = handle_client_text(
+            r#"{"type":"freshAgent.send","provider":"opencode","sessionId":"missing-opencode-session","sessionType":"freshopencode","text":"checkpoint barrier probe","requestId":"checkpoint-barrier-request","checkpointIntent":{"logicalAttemptId":"checkpoint-barrier-attempt","workspace":{"path":"/tmp/checkpoint-barrier-probe","provenance":"directory-picker"}}}"#,
+            &mut ws_tx,
+            &state,
+            1,
+            &conn_sink,
+            false,
+            false,
+            false,
+            false,
+            &interactive_create_tx,
+            &create_cancel_rx,
+            &mut host_stats_last_refresh_at,
+            &mut conn_identity,
+            &mut Default::default(),
+            &None,
+        )
+        .await;
+        assert!(
+            keep_open,
+            "a checkpointed send must keep the websocket open"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+            .await
+            .expect("checkpoint barrier was invoked")
+            .expect("barrier entry signal");
+
+        let captured = barrier
+            .seen_send
+            .lock()
+            .await
+            .clone()
+            .expect("barrier receives the original send");
+        assert_eq!(
+            captured.request_id.as_deref(),
+            Some("checkpoint-barrier-request")
+        );
+        assert_eq!(
+            captured.checkpoint_intent,
+            Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: "checkpoint-barrier-attempt".to_string(),
+                workspace: Some(freshell_protocol::FreshAgentCheckpointWorkspace {
+                    path: "/tmp/checkpoint-barrier-probe".to_string(),
+                    provenance: freshell_protocol::CheckpointWorkspaceProvenance::DirectoryPicker,
+                }),
+            })
+        );
+        assert!(
+            matches!(
+                provider_events.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "provider dispatch must remain blocked until the barrier settles"
+        );
+
+        release_tx.send(()).expect("release provider dispatch");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), provider_events.recv())
+            .await
+            .expect("provider dispatch produces an event after release")
+            .expect("provider event channel remains open");
+        let event: serde_json::Value = serde_json::from_str(&event).expect("provider event JSON");
+        assert_eq!(event["type"], "error");
+        assert_eq!(event["requestId"], "checkpoint-barrier-request");
+        assert!(event["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("SESSION_NOT_FOUND:")));
+    }
+
     #[tokio::test]
     async fn rejected_unknown_tabs_push_does_not_replace_connection_identity() {
         let (mut ws_tx, mut client) = loopback_sink_and_client().await;

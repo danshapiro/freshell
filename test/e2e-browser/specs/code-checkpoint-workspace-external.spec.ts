@@ -259,6 +259,7 @@ test('Git workspace sends retain per-turn success and failure, then restore the 
   expect(first.outcome.checkpointId).toMatch(/^[a-f0-9]{40}$/)
   await expect(first.row.getByRole('status', { name: 'Code rewind available for this message' }))
     .toContainText('Code rewind is available for this message.')
+  await first.row.hover()
   await expect(first.row.getByRole('button', { name: 'Rewind code to here' })).toBeEnabled()
   await assertNativeUserIdentity(page, first.outcome, first.accepted.submittedTurnId, samePrompt)
 
@@ -345,6 +346,7 @@ test('picker-confirmed non-Git workspace captures and restores all selected file
   } })
   expect(turn.outcome.checkpointId).toMatch(/^[a-f0-9]{40}$/)
   await expect(turn.row.getByRole('status', { name: 'Code rewind available for this message' })).toBeVisible()
+  await turn.row.hover()
   await expect(turn.row.getByRole('button', { name: 'Rewind code to here' })).toBeEnabled()
   await assertNativeUserIdentity(page, turn.outcome, turn.accepted.submittedTurnId, marker)
 

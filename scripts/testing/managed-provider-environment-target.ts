@@ -324,6 +324,10 @@ const uid = Number(process.env.FRESHELL_CHECKPOINT_FIXTURE_UID)
 assert.equal(process.env.FRESHELL_CHECKPOINT_FIXTURE_ROOT, root)
 assert(Number.isSafeInteger(uid) && uid > 0)
 assert.equal(process.getuid(), uid, 'fixture setup must run as restricted UID B')
+// The sandbox entrypoint's gosu handoff resets HOME to /home/sandbox. Restore
+// the explicitly staged synthetic account home so validate-dir exercises the
+// same account-home exclusion that this fixture advertises to the browser.
+process.env.HOME = path.join(root, 'home')
 const status = fs.readFileSync('/proc/self/status', 'utf8')
 const capabilities = status.match(/^CapEff:\s+([0-9a-f]+)$/m)?.[1]
 assert.equal(capabilities, '0000000000000000', 'fixture UID B must have no effective capabilities')
