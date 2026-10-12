@@ -418,14 +418,24 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'],
       providerSettings: { freshcodex: {} },
     })
-    const historyResponses: Array<{ route: 'managed' | 'native'; status: number }> = []
+    const historyResponses: Array<{
+      route: 'managed' | 'native'; status: number; threadId?: string; turnCount?: number; canSend?: boolean
+    }> = []
+    const historyResponseReads: Promise<void>[] = []
     page.on('response', (response) => {
       if (response.request().method() !== 'GET') return
       const pathname = new URL(response.url()).pathname
       const route = pathname.startsWith('/api/runtime/souls/') && pathname.endsWith('/history')
         ? 'managed'
         : pathname.startsWith('/api/fresh-agent/threads/') ? 'native' : undefined
-      if (route) historyResponses.push({ route, status: response.status() })
+      if (!route) return
+      const fact: (typeof historyResponses)[number] = { route, status: response.status() }
+      historyResponses.push(fact)
+      historyResponseReads.push(response.json().then((body: any) => {
+        if (typeof body.threadId === 'string') fact.threadId = body.threadId
+        if (Array.isArray(body.turns)) fact.turnCount = body.turns.length
+        if (typeof body.capabilities?.send === 'boolean') fact.canSend = body.capabilities.send
+      }).catch(() => undefined))
     })
     const sent: any[] = []
     const received: any[] = []
@@ -568,13 +578,16 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       const contentAfterRestart = (await harness.getPaneLayout(created.tabId)).content
       expect(contentAfterRestart).toMatchObject(canonical)
       const postStopHistoryResponses = historyResponses.slice(postStopRestartResponseStart)
+      await Promise.all(historyResponseReads.slice(postStopRestartResponseStart))
       const snapshotRequests = (await harness.getPerfAuditSnapshot())?.perfEvents
         .filter((event) => event.event === 'fresh_agent.snapshot_request')
         .slice(-12)
         .map(({ stage, reason, requestReadOnly, hasSoul, createChanged, soulChanged, revisionChanged, bootChanged,
-          ownerChanged, providerChanged, typeChanged, threadChanged, paneSessionChanged, recoveryChanged }) => ({
+          ownerChanged, providerChanged, typeChanged, threadChanged, paneSessionChanged, recoveryChanged,
+          historyOnly, live, vacant, rows, previousRows, accepted }) => ({
           stage, reason, requestReadOnly, hasSoul, createChanged, soulChanged, revisionChanged, bootChanged,
           ownerChanged, providerChanged, typeChanged, threadChanged, paneSessionChanged, recoveryChanged,
+          historyOnly, live, vacant, rows, previousRows, accepted,
         })) ?? []
       const contentFacts = {
         status: contentAfterRestart.status,
@@ -588,13 +601,17 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       }
       expect(postStopHistoryResponses, `the reloaded stopped pane must request saved history; pane=${JSON.stringify(contentFacts)}; snapshotRequests=${JSON.stringify(snapshotRequests)}`)
         .not.toHaveLength(0)
-      expect(postStopHistoryResponses.some((response) => response.status === 200),
-        `stopped history requests failed: ${JSON.stringify(postStopHistoryResponses)}`).toBe(true)
+      expect(postStopHistoryResponses.some((response) => response.status === 200
+        && response.threadId === nativeId && response.turnCount === retained.turns.length && response.canSend === false),
+      `stopped history response did not contain the retained read-only transcript: ${JSON.stringify(postStopHistoryResponses)}`)
+        .toBe(true)
       const afterHistory = await history()
       expect(afterHistory.threadId).toBe(nativeId)
       expect(afterHistory.turns).toEqual(retained.turns)
       expect(afterHistory.capabilities.send).toBe(false)
-      await expect(pane.getByText('Synthetic saved answer 2', { exact: true })).toBeVisible({ timeout: 60_000 })
+      await expect(pane.getByText('Synthetic saved answer 2', { exact: true }),
+        `history responses=${JSON.stringify(postStopHistoryResponses)}; snapshotRequests=${JSON.stringify(snapshotRequests)}`)
+        .toBeVisible({ timeout: 60_000 })
       await expect(pane.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
       const afterFacts = await rig.interruptedOrdinaryStopFacts(handle)
       const after = afterFacts.durable
