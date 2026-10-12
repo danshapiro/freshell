@@ -541,3 +541,176 @@ async fn a_kill_that_joins_an_internal_stop_is_remembered() {
     );
     assert_eq!(record.create_request_id.as_deref(), Some("crq-join"));
 }
+
+/// Waits (bounded) until `f` holds.
+async fn eventually(what: &str, f: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + LIMIT;
+    while !f() {
+        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Releases the pane ledger's test-only close hold however the test ends
+/// (a held close otherwise blocks a runtime thread past the test).
+struct ReleaseCloseHold(std::sync::Arc<freshell_ws::pane_ledger::ClosePauseGate>);
+
+impl ReleaseCloseHold {
+    fn release(&self) {
+        let mut paused = self.0.paused.lock().expect("close hold lock");
+        *paused = false;
+        self.0.release.notify_all();
+    }
+}
+
+impl Drop for ReleaseCloseHold {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// A kill naming only a createRequestId whose pane is nowhere (never
+/// started here, or long gone) is remembered durably by that
+/// createRequestId, so after a restart a create still carrying it is told
+/// "stopped" too, not only until this server stops (review M1b).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kill_of_a_create_request_id_that_finds_nothing_is_remembered_durably() {
+    let h = UnitHarness::start(with_ledger(HarnessOpts::default())).await;
+    let mut ws = h.connect().await;
+    h.send(
+        &mut ws,
+        json!({"type": "terminal.kill", "requestId": "rk-none", "createRequestId": "crq-none"}),
+    )
+    .await;
+    h.next_matching(&mut ws, LIMIT, |f| {
+        f["type"] == "terminal.killed" && f["requestId"] == "rk-none"
+    })
+    .await
+    .expect("the kill is answered");
+    let record = h
+        .state
+        .pane_ledger
+        .stopped_pane_for_create_request("crq-none")
+        .expect("the killed createRequestId is remembered durably");
+    assert_eq!(record.terminal_id, None, "{record:?}");
+    assert_eq!(record.kind, STOPPED_KIND_TERMINAL);
+}
+
+/// A person's kill that reaches a stopping pane but joins the stop only
+/// after that stop's Gone was published (here the kill's durable pane close
+/// is held until an app-server crash has ended the pane) is still
+/// remembered, by the kill's own terminal id and createRequestId, before it
+/// is answered (review M1c).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kill_joining_a_stop_after_its_gone_is_still_remembered() {
+    let mut h = UnitHarness::start(with_ledger(HarnessOpts {
+        auto_resume: AutoResumeMode::Capture,
+        ..Default::default()
+    }))
+    .await;
+    let mut ws = h.connect().await;
+    let tid = h.create_codex(&mut ws, "crq-late", Some("t-late")).await;
+    tokio::time::timeout(LIMIT, h.state.units.start_settled(h.unit_for(&tid).id()))
+        .await
+        .expect("the start settled");
+    let unit = h.unit_for(&tid);
+    let _gone = unit_harness::GoneDelay::set(3000);
+    let hold = ReleaseCloseHold(h.state.pane_ledger.arm_close_pause_for_tests());
+
+    h.kill_native(&tid);
+    eventually("the crash stop runs", || unit.stop_in_flight().is_some()).await;
+    // The kill finds the stopping pane, and its durable close is held.
+    h.send(
+        &mut ws,
+        json!({"type": "terminal.kill", "terminalId": tid, "requestId": "rk-late", "createRequestId": "crq-late"}),
+    )
+    .await;
+    // The crash's stop ends the pane without the kill: its Gone was
+    // published, and its crash event sent, before the kill joined.
+    tokio::time::timeout(LIMIT, h.crash_rx.as_mut().unwrap().recv())
+        .await
+        .expect("the crash's Gone is published")
+        .expect("a crash event");
+    assert!(
+        h.state
+            .pane_ledger
+            .stopped_pane_for_terminal(&tid)
+            .is_none(),
+        "the crash's Gone remembered nothing"
+    );
+    hold.release();
+
+    let killed = h
+        .next_matching(&mut ws, LIMIT, |f| {
+            f["type"] == "terminal.killed" && f["requestId"] == "rk-late"
+        })
+        .await
+        .expect("the late kill is answered");
+    assert_eq!(killed["success"], true, "{killed}");
+    let record = h
+        .state
+        .pane_ledger
+        .stopped_pane_for_terminal(&tid)
+        .expect("the person's kill is remembered");
+    assert_eq!(record.create_request_id.as_deref(), Some("crq-late"));
+    assert_eq!(record.reason, "shift-x");
+    assert!(h
+        .state
+        .pane_ledger
+        .stopped_pane_for_create_request("crq-late")
+        .is_some());
+}
+
+/// A person's kill that joins the stop of a pane whose unit the server
+/// knows by no createRequestId (a unit registered without one) is
+/// remembered by the kill's own createRequestId as well as by its
+/// terminal, so a create still carrying that createRequestId is told
+/// "stopped" (review M1d).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kill_joining_the_stop_of_a_unit_with_no_create_request_id_remembers_its_own() {
+    let h = UnitHarness::start(with_ledger(HarnessOpts::default())).await;
+    let mut ws = h.connect().await;
+    let tid = h.create_codex(&mut ws, "crq-own", Some("t-own")).await;
+    tokio::time::timeout(LIMIT, h.state.units.start_settled(h.unit_for(&tid).id()))
+        .await
+        .expect("the start settled");
+    let entry = h.state.units.by_terminal(&tid).expect("the pane's unit");
+    h.state.units.register(freshell_containment::UnitEntry {
+        create_request_id: None,
+        ..entry
+    });
+    let _gone = unit_harness::GoneDelay::set(1500);
+    assert!(
+        h.state.registry.kill(&tid),
+        "an internal teardown stops the unit"
+    );
+    assert!(
+        h.unit_for(&tid).stop_in_flight().is_some(),
+        "the internal stop runs"
+    );
+    h.send(
+        &mut ws,
+        json!({"type": "terminal.kill", "terminalId": tid, "requestId": "rk-own", "createRequestId": "crq-own"}),
+    )
+    .await;
+    let killed = h
+        .next_matching(&mut ws, LIMIT, |f| {
+            f["type"] == "terminal.killed" && f["requestId"] == "rk-own"
+        })
+        .await
+        .expect("the joining kill is answered at Gone");
+    assert_eq!(killed["success"], true, "{killed}");
+    assert!(
+        h.state
+            .pane_ledger
+            .stopped_pane_for_terminal(&tid)
+            .is_some(),
+        "the pane is remembered by its terminal"
+    );
+    let record = h
+        .state
+        .pane_ledger
+        .stopped_pane_for_create_request("crq-own")
+        .expect("the kill's own createRequestId is remembered");
+    assert_eq!(record.kind, STOPPED_KIND_TERMINAL);
+}

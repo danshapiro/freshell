@@ -323,10 +323,17 @@ async fn a_stuck_restart_racing_a_crash_cancels_its_auto_resume() {
 
 /// A kill naming a create parked until a Gone withdraws it: the kill is
 /// answered at once (nothing was started for that pane), and the create
-/// never runs, not even after the Gone.
+/// never runs, not even after the Gone. The withdrawn pane is remembered
+/// durably by its createRequestId before the answer, so a copy of the
+/// create that arrives after a restart is told "stopped" too (Task 18
+/// review M1a).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kill_withdraws_a_parked_reopen() {
-    let h = UnitHarness::start(HarnessOpts::default()).await;
+    let h = UnitHarness::start(HarnessOpts {
+        pane_ledger: true,
+        ..Default::default()
+    })
+    .await;
     let _gone = GoneDelay::set(GONE_DELAY_MS);
     let mut ws = h.connect().await;
     let (_a, _c, native, native_start) = pane_a_killed_and_shell_c(&h, &mut ws).await;
@@ -355,6 +362,12 @@ async fn a_kill_withdraws_a_parked_reopen() {
         sent.elapsed()
     );
     assert!(!h.state.gone_waits.is_parked("crq-b"));
+    let record = h
+        .state
+        .pane_ledger
+        .stopped_pane_for_create_request("crq-b")
+        .expect("the withdrawn pane is remembered durably");
+    assert_eq!(record.terminal_id, None, "{record:?}");
     eventually("A's native exited (Gone)", Duration::from_secs(15), || {
         fake_codex::proc_starttime(native) != Some(native_start)
     })

@@ -11487,11 +11487,12 @@ async fn handle_kill(
     }
     // A kill that names nothing running but a create of the pane parked
     // until a conversation's Gone withdraws that create (it will never
-    // run): nothing was ever started for the pane, so the kill is done (and
-    // remembered, so a late copy of the create is answered as stopped). A
-    // kill that names a running pane leaves the park alone: the kill goes
-    // on below (it may be refused), and at Gone the parked create is handed
-    // back and answered as stopped if the kill was honoured.
+    // run): nothing was ever started for the pane, so the kill is done, and
+    // remembered (durably, before the answer), so a late copy of the create
+    // is answered as stopped, after a restart too. A kill that names a
+    // running pane leaves the park alone: the kill goes on below (it may be
+    // refused), and at Gone the parked create is handed back and answered
+    // as stopped if the kill was honoured.
     if let Some(crq) = kill.create_request_id.as_deref() {
         let names_a_running_pane = resolve_kill_unit(state, &kill).is_some()
             || kill
@@ -11503,9 +11504,6 @@ async fn handle_kill(
             .then(|| state.gone_waits.withdraw(crq))
             .flatten()
         {
-            if kill.reason.as_deref() != Some("stuck-recovery") {
-                state.units.remember_killed_start(crq);
-            }
             tracing::info!(target: "freshell_unit",
                 event = "terminal.kill.parked_create_withdrawn",
                 unit_id = %keys.unit_id,
@@ -11515,7 +11513,24 @@ async fn handle_kill(
                 operation_id = %keys.operation_id.as_deref().unwrap_or(""),
                 create_request_id = %crq,
                 "a kill withdrew a create parked until a Gone; nothing was started for the pane");
-            return reply.send(KillAnswer::done());
+            if kill.reason.as_deref() == Some("stuck-recovery") {
+                return reply.send(KillAnswer::done());
+            }
+            state.units.remember_killed_start(crq);
+            let record = crate::pane_ledger::StoppedPaneRecord::terminal(
+                None,
+                Some(crq.to_string()),
+                Some(keys.provider.clone()).filter(|provider| !provider.is_empty()),
+                keys.session_id.clone(),
+                crate::pane_ledger::STOPPED_REASON_KILL,
+                now_ms(),
+            );
+            let state = state.clone();
+            reply.spawn_answering(async move {
+                crate::unit_lifecycle::write_stopped_record(&state, record, &keys).await;
+                KillAnswer::done()
+            });
+            return true;
         }
     }
     if let Some(entry) = resolve_kill_unit(state, &kill) {
@@ -11957,6 +11972,25 @@ async fn kill_not_found(
         }
     }
     let Some(tid) = terminal_id else {
+        // A kill naming only a createRequestId found nothing: that pane is
+        // remembered durably by it (Task 18), so a create still carrying it
+        // is answered as stopped after a restart too.
+        if let Some(crq) = kill
+            .create_request_id
+            .clone()
+            .filter(|crq| !stuck_recovery && !crq.is_empty())
+        {
+            let record = crate::pane_ledger::StoppedPaneRecord::terminal(
+                None,
+                Some(crq),
+                None,
+                None,
+                crate::pane_ledger::STOPPED_REASON_KILL,
+                now_ms(),
+            );
+            let keys = crate::unit_lifecycle::stopped_record_keys(&record, None);
+            crate::unit_lifecycle::write_stopped_record(&state, record, &keys).await;
+        }
         reply.send(KillAnswer::unknown(false));
         return;
     };

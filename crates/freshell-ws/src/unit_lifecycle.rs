@@ -1886,10 +1886,14 @@ async fn end_row_of_gone_unit(state: &WsState, unit: &AgentUnit, terminal_id: &s
 ///    start and remembers the pane's create-request id as killed. Its
 ///    bounded read before the first signal runs on a blocking thread
 ///    ([`start_unit_stop_off_loop`]).
-/// 4. With a `requestId`, `terminal.killed{success}` is sent only at Gone,
-///    after the keys the kill moved are released and the start settled
-///    (a cancelled start settles once its create released its claims), by
-///    a task dropped when the connection closes; the stop runs on.
+/// 4. Once the unit is Gone and the keys the kill moved are released, the
+///    kill is remembered (unless it is a stuck restart) by its own terminal
+///    id and createRequestId where the stop's Gone did not remember them
+///    ([`remember_killed_pane`]), in a task of its own that the connection's
+///    close never cancels. With a `requestId`, `terminal.killed{success}` is
+///    sent only after that and once the start settled (a cancelled start
+///    settles once its create released its claims), by a task dropped when
+///    the connection closes; the stop runs on.
 pub(crate) async fn kill_unit(
     kill: freshell_protocol::TerminalKill,
     entry: UnitEntry,
@@ -1975,6 +1979,17 @@ pub(crate) async fn kill_unit(
     } else {
         (StopReason::ShiftX, initiator.to_string())
     };
+    let killed = (!stuck_recovery).then(|| KilledPane {
+        terminal_id: kill
+            .terminal_id
+            .clone()
+            .or_else(|| entry.terminal_id.clone()),
+        create_request_id: kill
+            .create_request_id
+            .clone()
+            .or_else(|| entry.create_request_id.clone()),
+        reason: reason.as_str(),
+    });
     let stop = start_unit_stop_off_loop(
         state,
         &entry,
@@ -1989,9 +2004,18 @@ pub(crate) async fn kill_unit(
     .await;
 
     // 4.
+    let gone = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            stop.released().await;
+            if let Some(killed) = killed {
+                remember_killed_pane(&state, &entry, killed).await;
+            }
+        })
+    };
     if reply.has_request_id() {
         reply.answer_when(async move {
-            stop.released().await;
+            let _ = gone.await;
             settled.await;
             crate::terminal::KillAnswer::done_after_close(persisted_despite_error)
         });
@@ -1999,6 +2023,58 @@ pub(crate) async fn kill_unit(
         reply.send(crate::terminal::KillAnswer::done_after_close(true));
     }
     true
+}
+
+/// The pane a person's kill named (step 4 of [`kill_unit`]): its terminal
+/// id and createRequestId (the kill's own, else the unit's), and the reason
+/// the kill stopped it with.
+struct KilledPane {
+    terminal_id: Option<String>,
+    create_request_id: Option<String>,
+    reason: &'static str,
+}
+
+/// Step 4 of [`kill_unit`], once the unit is Gone: makes sure the pane a
+/// person killed is remembered (Task 18). The stop's Gone remembers it when
+/// the stop's final intent asks for it, but a kill that joined the stop after
+/// its Gone decided (a crash's stop, say), or a unit the directory knows by
+/// no createRequestId, would otherwise go unremembered. A terminal no record
+/// names yet is written with the kill's createRequestId; a createRequestId
+/// no record names is written alone (a record the Gone wrote for the
+/// terminal is never replaced). Nothing is written when both are remembered.
+async fn remember_killed_pane(state: &WsState, entry: &UnitEntry, killed: KilledPane) {
+    let ledger = &state.pane_ledger;
+    if !ledger.is_enabled() {
+        return;
+    }
+    let terminal_remembered = killed
+        .terminal_id
+        .as_deref()
+        .is_none_or(|terminal_id| ledger.stopped_pane_for_terminal(terminal_id).is_some());
+    let create_request_remembered =
+        killed
+            .create_request_id
+            .as_deref()
+            .is_none_or(|create_request_id| {
+                ledger
+                    .stopped_pane_for_create_request(create_request_id)
+                    .is_some()
+            });
+    let terminal_id = match (terminal_remembered, create_request_remembered) {
+        (true, true) => return,
+        (false, _) => killed.terminal_id,
+        (true, false) => None,
+    };
+    let record = crate::pane_ledger::StoppedPaneRecord::terminal(
+        terminal_id,
+        killed.create_request_id,
+        Some(entry.provider.clone()),
+        entry.unit.label().session_id,
+        killed.reason,
+        now_ms() as i64,
+    );
+    let operation = entry.unit.stop_operation();
+    write_stopped_record(state, record, &unit_keys(&entry.unit, operation.as_deref())).await;
 }
 
 /// Step 1 of [`kill_unit`]: `Some(refusal)` when the kill's observed fence
