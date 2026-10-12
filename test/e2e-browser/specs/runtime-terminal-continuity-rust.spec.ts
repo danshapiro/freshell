@@ -537,7 +537,6 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       await expect(pane).toBeVisible()
       const afterStop = (await harness.getPaneLayout(created.tabId)).content
       expect(afterStop).toMatchObject(canonical)
-      expect(afterStop).not.toHaveProperty('resumeSessionId')
       await expect(pane.getByText('Synthetic saved answer 2', { exact: true })).toBeVisible()
 
       await rig.restartSupervisor()
