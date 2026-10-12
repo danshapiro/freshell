@@ -7344,13 +7344,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
 
   const retryLaunch = () => {
     if (managedRecoveryDecision) return
-    // The Relaunch discipline: a reconcile-driven respawn create re-fires
-    // the lifecycle effect (the reconcileEpoch bump is its ONLY re-fire
-    // signal — createRequestId is preserved, never re-minted).
+    // Preparation can fail before a session exists. Its explicit Retry
+    // starts that same create request without a resume identity; other
+    // launch failures retain the existing respawn behavior.
     dispatch(resetPaneForReconcileCreate({
       tabId,
       paneId,
-      intent: 'respawn',
+      intent: retainedManagedPreparationFailure(terminalContent) ? 'fresh' : 'respawn',
       sessionRef: terminalContent.sessionRef,
     }))
   }
