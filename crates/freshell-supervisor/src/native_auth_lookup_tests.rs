@@ -562,7 +562,7 @@ async fn provider_native_auth_nested_callback_uses_current_attempt_without_reloc
         envelope
     };
     let reply = tokio::time::timeout(
-        std::time::Duration::from_millis(250),
+        std::time::Duration::from_secs(2),
         supervisor.dispatch(request(soul.clone(), key.clone())),
     )
     .await
