@@ -545,8 +545,9 @@ test.describe.serial('ordinary managed-provider use', () => {
 
       const failedProviders: string[] = []
       for (const definition of definitions) {
+        let created: Awaited<ReturnType<typeof createProviderPane>> | undefined
         try {
-          const created = await createProviderPane(page, harness, rig, tabId, definition)
+          created = await createProviderPane(page, harness, rig, tabId, definition)
           await executeAndAwaitOrdinaryNonceOutput(
             page,
             created.paneId,
@@ -557,9 +558,19 @@ test.describe.serial('ordinary managed-provider use', () => {
             lane: 'terminal', provider: definition.provider }))
         } catch (error) {
           failedProviders.push(definition.provider)
+          let terminalFacts: { available: false } | {
+            available: true; provider: string; providerProcessPresent: boolean; nativeSessionIdPresent: boolean
+          } = { available: false }
+          if (created?.view.containerId) {
+            try {
+              const startup = await rig.managedTerminalStartupFacts(rig.runtimeEnclosureHandle(created.view))
+              terminalFacts = { available: true, provider: startup.provider,
+                providerProcessPresent: startup.providerProcessPresent, nativeSessionIdPresent: !!created.view.nativeSessionId }
+            } catch { /* preserve the ordinary-turn failure */ }
+          }
           console.error(JSON.stringify({ severity: 'error', event: 'durable_souls.ordinary_turn_failed',
             lane: 'terminal', provider: definition.provider,
-            errorName: error instanceof Error ? error.name : 'UnknownError' }))
+            errorName: error instanceof Error ? error.name : 'UnknownError', terminalFacts }))
         }
       }
       expect(failedProviders, `ordinary terminal turn failed for: ${failedProviders.join(', ')}`).toEqual([])

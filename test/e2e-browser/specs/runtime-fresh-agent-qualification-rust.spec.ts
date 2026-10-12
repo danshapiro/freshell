@@ -99,6 +99,52 @@ function observeBrowserWire(page: Page): WireObservations {
   return observed
 }
 
+function ordinaryFreshAgentEventFacts(frames: readonly any[]) {
+  const counts = { created: 0, createFailed: 0, assistant: 0, stream: 0, error: 0,
+    snapshot: 0, changed: 0, turnComplete: 0, result: 0 }
+  const createFailureCodes = new Set<string>()
+  let errorCodePresent = false
+  let errorMessagePresent = false
+  let assistantTextCharacters = 0
+  let streamedTextCharacters = 0
+  for (const frame of frames) {
+    if (frame?.type === 'freshAgent.created') counts.created++
+    if (frame?.type === 'freshAgent.create.failed') {
+      counts.createFailed++
+      if (typeof frame.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(frame.code)) createFailureCodes.add(frame.code)
+    }
+    if (frame?.type !== 'freshAgent.event' || !frame.event || typeof frame.event !== 'object') continue
+    const event = frame.event as Record<string, any>
+    switch (event.type) {
+      case 'freshAgent.assistant':
+        counts.assistant++
+        if (Array.isArray(event.content)) {
+          assistantTextCharacters += event.content.reduce((total: number, item: any) =>
+            total + (item?.type === 'text' && typeof item.text === 'string' ? item.text.length : 0), 0)
+        }
+        break
+      case 'freshAgent.stream': {
+        counts.stream++
+        const stream = event.event
+        const delta = stream?.type === 'content_block_delta' ? stream.delta : undefined
+        if (delta?.type === 'text_delta' && typeof delta.text === 'string') streamedTextCharacters += delta.text.length
+        break
+      }
+      case 'freshAgent.error':
+        counts.error++
+        errorCodePresent ||= typeof event.code === 'string'
+        errorMessagePresent ||= typeof event.message === 'string'
+        break
+      case 'freshAgent.session.snapshot': counts.snapshot++; break
+      case 'freshAgent.session.changed': counts.changed++; break
+      case 'freshAgent.turn.complete': counts.turnComplete++; break
+      case 'freshAgent.result': counts.result++; break
+    }
+  }
+  return { counts, createFailureCodes: [...createFailureCodes].sort(), errorCodePresent, errorMessagePresent,
+    assistantTextCharacters, streamedTextCharacters }
+}
+
 async function paneFor(page: Page, observation: Parameters<typeof observeOwnedFreshBrowserPane>[0]) {
   return waitFor('actual fresh pane', () => page.evaluate(observeOwnedFreshBrowserPane, observation))
 }
@@ -304,6 +350,8 @@ test.describe.serial('ordinary fresh-agent use', () => {
 
       const failedModes: string[] = []
       for (const definition of definitions) {
+        const receivedCursor = wire.received.length
+        let paneId: string | undefined
         const progress = {
           createCompleted: false,
           composerSubmitted: false,
@@ -313,6 +361,7 @@ test.describe.serial('ordinary fresh-agent use', () => {
         }
         try {
           const created = await actualCreate(page, rig, definition, wire)
+          paneId = created.paneId
           progress.createCompleted = true
           const marker = `FRESHELL-${randomBytes(12).toString('hex')}`
           const allocationSessionIds = new Set([
@@ -321,7 +370,6 @@ test.describe.serial('ordinary fresh-agent use', () => {
             created.view.nativeSessionId,
           ])
           const sendCursor = wire.sent.length
-          const receivedCursor = wire.received.length
           await sendBrowserNoToolTurn(
             page,
             created.paneId,
@@ -351,9 +399,18 @@ test.describe.serial('ordinary fresh-agent use', () => {
             lane: 'fresh-agent', mode: definition.mode }))
         } catch (error) {
           failedModes.push(definition.mode)
+          let assistantDom = { available: false, rows: 0, textCharacters: 0 }
+          if (paneId) {
+            try {
+              assistantDom = await page.locator(`[data-pane-id="${paneId}"] [data-turn-role="assistant"]`)
+                .evaluateAll((turns) => ({ available: true, rows: turns.length,
+                  textCharacters: turns.reduce((total, turn) => total + (turn.textContent?.length ?? 0), 0) }))
+            } catch { /* preserve the ordinary-turn failure */ }
+          }
           console.error(JSON.stringify({ severity: 'error', event: 'durable_souls.ordinary_turn_failed',
             lane: 'fresh-agent', mode: definition.mode,
             errorName: error instanceof Error ? error.name : 'UnknownError',
+            providerEvents: ordinaryFreshAgentEventFacts(wire.received.slice(receivedCursor)), assistantDom,
             ...progress }))
         }
       }
