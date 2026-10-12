@@ -12,8 +12,6 @@ const productionRuntimeRoots = ['src', 'shared'] as const
 const retiredNodeBackendPaths = [
   'server',
   'test/server',
-  'test/unit/server',
-  'test/integration/server',
   'test/integration/session-repair.test.ts',
   'tsconfig.server.json',
   'dist/server',
