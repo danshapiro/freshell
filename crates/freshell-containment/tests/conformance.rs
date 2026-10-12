@@ -676,6 +676,70 @@ async fn a_daemon_family_member_whose_main_thread_exited_is_never_signalled() {
     }
 }
 
+/// The Gone lock check sees a lock held by a process whose main thread has
+/// exited, whose descriptors the kernel then shows only through a running
+/// thread. On the tag backend the check covers the live members of the
+/// pre-signal snapshot: here the main, which at the stop's SIGTERM execs
+/// into a Codex daemon-family process that takes the unit's lock file and
+/// ends its main thread (a snapshot member that became one of the daemon
+/// family after the snapshot). The kill spares it, and the check neither
+/// signals it nor waits for it, so Gone reports the lock as still held.
+/// (The systemd backend takes no snapshot, and a spared process is no
+/// member there.)
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_gone_lock_check_sees_a_lock_whose_holders_main_thread_exited() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = dir.path().join("thread.lock");
+    let unit = tag_only().create_unit(UnitId::mint(), label()).unwrap();
+    unit.set_lock_paths(vec![lock.clone()]);
+    let script = r#"trap 'exec "$0" leader-exits --lock "$1" app-server --managed-daemon' TERM; echo "agent $$"; read -r _"#;
+    let args = [
+        "-c".to_string(),
+        script.to_string(),
+        HELPER.to_string(),
+        lock.display().to_string(),
+    ];
+    let cmd = unit
+        .tokio_command("bash", &args, MemberRole::Agent)
+        .unwrap();
+    let mut started = StartedCommand::spawn(cmd);
+    let line = started.line("the agent's pid").await;
+    let pid: u32 = line
+        .strip_prefix("agent ")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or_else(|| panic!("unexpected agent line {line:?}"));
+    let agent = started.verify(pid);
+    unit.set_main(agent);
+    // The soft signal (SIGTERM) now, the kill only once the test ends the
+    // grace.
+    let stop = unit.stop(StopRequest::new(
+        StopMode::Graceful {
+            grace: Duration::from_secs(120),
+        },
+        StopReason::Cleanup,
+        "test",
+    ));
+    let line = started.line("the daemon-family holder's report").await;
+    let holder = LeaderExited::reported(started, &line);
+    assert_eq!(holder.pid(), pid, "the agent became the holder");
+    unit.stop(StopRequest::new(
+        StopMode::Force,
+        StopReason::ShiftX,
+        "test",
+    ));
+    let report = stop.wait_for(Duration::from_secs(30)).await.expect("Gone");
+    assert!(
+        !report.lock_released,
+        "the Gone lock check missed the lock held by the process whose main thread exited"
+    );
+    assert!(
+        holder.runs() && process::start_time(pid).ok() == Some(holder.start_time()),
+        "the daemon-family holder was signalled"
+    );
+    stop.wait_swept().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_user_kill_joining_a_weaker_stop_wins_its_reason() {
     for (name, c) in backends() {

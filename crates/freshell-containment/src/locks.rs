@@ -3,7 +3,9 @@
 //! Linux attributes holders by file descriptor. A process holds a lock file
 //! when one of its descriptors refers to that file (same device and inode
 //! as `stat` of the path) and the kernel lists a lock on that descriptor (a
-//! `lock:` line in `/proc/<pid>/fdinfo/<fd>`).
+//! `lock:` line in `/proc/<pid>/fdinfo/<fd>`). Once a process's main thread
+//! has exited while others run on, its descriptor table is read through one
+//! of those threads (`/proc/<pid>/task/<tid>/`).
 //! The lock table's pid column (`/proc/locks`) is never used: it names the
 //! process that TOOK the lock, which may have exited while a child or an
 //! inheriting process keeps the descriptor (a `flock(1)` helper), it reads 0
@@ -246,15 +248,12 @@ pub fn lock_holders_among(paths: &[PathBuf], pids: &[u32]) -> Vec<LockHolder> {
         if !seen.insert(pid) {
             continue;
         }
-        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        let Some((dir, fds)) = descriptors(pid) else {
             continue; // gone, or another uid's descriptor table
         };
         let mut held: Vec<FileId> = Vec::new();
-        for entry in fds.flatten() {
-            let Some(fd) = entry.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            if let Some(id) = fd_holds_lock(pid, &fd, &ids) {
+        for fd in &fds {
+            if let Some(id) = fd_holds_lock(&dir, fd, &ids) {
                 if !held.contains(&id) {
                     held.push(id);
                 }
@@ -281,6 +280,29 @@ pub fn lock_holders_among(paths: &[PathBuf], pids: &[u32]) -> Vec<LockHolder> {
 /// A file's (device, inode), as `stat` reports them.
 #[cfg(target_os = "linux")]
 type FileId = (u64, u64);
+
+/// `pid`'s descriptor table as `/proc` shows it: the directory whose `fd/`
+/// and `fdinfo/` list it, and the descriptor numbers listed there. Once the
+/// main thread has exited, the leader's own `fd/` is root-only and its
+/// `fdinfo/` empty, although the process keeps every descriptor (and every
+/// lock on them); the table is then read through a running thread, which
+/// shares it (`process::through_a_running_thread`). `None` when it cannot be
+/// read (gone, or another uid's).
+#[cfg(target_os = "linux")]
+fn descriptors(pid: u32) -> Option<(PathBuf, Vec<String>)> {
+    crate::process::through_a_running_thread(
+        pid,
+        |dir| {
+            let fds = std::fs::read_dir(dir.join("fd"))?
+                .flatten()
+                .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+                .collect();
+            Ok((dir.to_path_buf(), fds))
+        },
+        |(_, fds): &(PathBuf, Vec<String>)| fds.is_empty(),
+    )
+    .ok()
+}
 
 /// The (device, inode) of the file `path` names (following symlinks, so a
 /// `/proc/<pid>/fd/<n>` link gives its open file), read with
@@ -333,8 +355,9 @@ fn file_id(path: &Path) -> Option<FileId> {
     ))
 }
 
-/// The wanted file that descriptor `fd` of `pid` refers to, when the kernel
-/// lists a lock on that descriptor. The checks run cheapest first: the link
+/// The wanted file that descriptor `fd` of the table `dir` shows
+/// ([`descriptors`]) refers to, when the kernel lists a lock on that
+/// descriptor. The checks run cheapest first: the link
 /// target (sockets, pipes and anonymous inodes are never lock files), then
 /// the fdinfo `lock:` line (both are kernel bookkeeping and never reach the
 /// file's filesystem), and only then the identity of the open file, read
@@ -342,16 +365,16 @@ fn file_id(path: &Path) -> Option<FileId> {
 /// passes thousands of other processes' open files, so it reads the identity
 /// of locked ones only.
 #[cfg(target_os = "linux")]
-fn fd_holds_lock(pid: u32, fd: &str, wanted: &[FileId]) -> Option<FileId> {
-    let link = format!("/proc/{pid}/fd/{fd}");
+fn fd_holds_lock(dir: &Path, fd: &str, wanted: &[FileId]) -> Option<FileId> {
+    let link = dir.join("fd").join(fd);
     if !std::fs::read_link(&link).ok()?.is_absolute() {
         return None;
     }
-    let fdinfo = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).ok()?;
+    let fdinfo = std::fs::read_to_string(dir.join("fdinfo").join(fd)).ok()?;
     if !fdinfo_has_lock(&fdinfo) {
         return None;
     }
-    let id = file_id(Path::new(&link))?; // follows to the open file
+    let id = file_id(&link)?; // follows to the open file
     wanted.contains(&id).then_some(id)
 }
 

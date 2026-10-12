@@ -339,36 +339,50 @@ fn thread_count(pid: u32) -> Option<u32> {
 }
 
 /// Linux: one of the `/proc/<pid>/` files read from the process's memory
-/// (`cmdline`, `environ`). The kernel answers them for the thread-group
-/// leader's own task, which has no memory once the main thread has exited
-/// (`cmdline` reads empty, `environ` is owned by root) although the process
-/// runs on in its other threads. Then they are read through one of those
-/// (`/proc/<pid>/task/<tid>/`), which shows the process's own: the first
-/// non-empty read, else an empty one, else the leader's answer.
+/// (`cmdline`, `environ`), through a running thread once the main thread
+/// has exited (see [`through_a_running_thread`]): the leader's own
+/// `cmdline` then reads empty and its `environ` is owned by root.
 #[cfg(target_os = "linux")]
 fn read_memory_file(pid: u32, file: &str) -> io::Result<Vec<u8>> {
-    let leader = std::fs::read(format!("/proc/{pid}/{file}"));
-    if matches!(&leader, Ok(raw) if !raw.is_empty()) || !main_thread_exited(pid) {
+    through_a_running_thread(pid, |dir| std::fs::read(dir.join(file)), Vec::is_empty)
+}
+
+/// Linux: `read` of `pid`'s own `/proc/<pid>` directory, which the kernel
+/// answers for the thread-group leader's own task. Once the main thread has
+/// exited, that task has no memory and no descriptor table, so what it
+/// shows of them reads empty or is refused, although the process runs on
+/// in its other threads. Then `read` is made of those threads' directories
+/// (`/proc/<pid>/task/<tid>`), which show the process's own: the first
+/// answer that is not `empty`, else an empty one, else the leader's.
+#[cfg(target_os = "linux")]
+pub(crate) fn through_a_running_thread<T>(
+    pid: u32,
+    read: impl Fn(&std::path::Path) -> io::Result<T>,
+    empty: impl Fn(&T) -> bool,
+) -> io::Result<T> {
+    let own = std::path::PathBuf::from(format!("/proc/{pid}"));
+    let leader = read(&own);
+    if matches!(&leader, Ok(found) if !empty(found)) || !main_thread_exited(pid) {
         return leader;
     }
-    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+    let Ok(tasks) = std::fs::read_dir(own.join("task")) else {
         return leader;
     };
     let leader_tid = pid.to_string();
-    let mut empty = None;
+    let mut empty_read = None;
     for task in tasks.flatten() {
         if task.file_name().to_str() == Some(leader_tid.as_str()) {
             continue;
         }
-        match std::fs::read(task.path().join(file)) {
-            Ok(raw) if !raw.is_empty() => return Ok(raw),
-            Ok(raw) => {
-                empty.get_or_insert(raw);
+        match read(&task.path()) {
+            Ok(found) if !empty(&found) => return Ok(found),
+            Ok(found) => {
+                empty_read.get_or_insert(found);
             }
             Err(_) => {}
         }
     }
-    empty.map_or(leader, Ok)
+    empty_read.map_or(leader, Ok)
 }
 
 #[cfg(target_os = "linux")]

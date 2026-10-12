@@ -3,6 +3,8 @@
 //! (fdinfo `lock:` lines), never the lock table's pid column and never the
 //! lock file's existence; the app-server main process is whoever owns the
 //! listening socket. Every process here is spawned and killed by the test.
+mod support;
+
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -220,6 +222,45 @@ async fn lock_holders_attributes_a_lock_to_the_process_holding_its_descriptor() 
         lock_holders(std::slice::from_ref(&lock)).is_empty()
     })
     .await;
+}
+
+/// A process whose main thread has exited while another thread runs on
+/// still holds its lock: the descriptor table belongs to the process, not
+/// to its main thread. The kernel then shows that table only through a
+/// running thread (the leader's own `/proc/<pid>/fd` is root-only and its
+/// `fdinfo` empty). It is reported as the holder, by the lookup over every
+/// process and by the one over a unit's members (the Gone lock check's),
+/// until it is gone.
+#[tokio::test]
+async fn a_lock_held_by_a_process_whose_main_thread_exited_is_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = dir.path().join("t.lock");
+    let mut cmd = tokio::process::Command::new(support::HELPER);
+    cmd.arg("leader-exits").arg("--lock").arg(&lock);
+    let helper = support::LeaderExited::start(cmd).await;
+    let pid = helper.pid();
+    assert!(
+        std::fs::read_dir(format!("/proc/{pid}/fdinfo")).map_or(true, |d| d.count() == 0),
+        "the exited main thread's own descriptor view is empty"
+    );
+
+    let held =
+        |holders: Vec<LockHolder>| holders.into_iter().any(|h| h.pid == pid && h.path == lock);
+    assert!(
+        held(lock_holders_among(std::slice::from_ref(&lock), &[pid])),
+        "the lookup among the members missed the holder whose main thread exited"
+    );
+    assert!(
+        held(lock_holders(std::slice::from_ref(&lock))),
+        "the lookup over every process missed the holder whose main thread exited"
+    );
+
+    helper.pin.signal(Sig::Kill).unwrap();
+    assert!(helper.exited_within(Duration::from_secs(10)).await);
+    assert!(
+        lock_holders(std::slice::from_ref(&lock)).is_empty(),
+        "the lock is released with its holder"
+    );
 }
 
 #[tokio::test]

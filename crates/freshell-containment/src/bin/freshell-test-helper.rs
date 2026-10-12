@@ -15,9 +15,14 @@
 //!   Codex daemon-family process (`is_codex_daemon_family` judges argv).
 //! - `until-eof`: prints `until-eof <pid>` and exits normally when its stdin
 //!   reaches end of file.
-//! - `leader-exits` (Linux only): a running process whose main thread has
-//!   exited, as one whose main thread calls `pthread_exit` while another
-//!   thread works on. It ignores SIGINT, SIGTERM, SIGHUP and SIGQUIT (only a
+//! - `leader-exits [--lock <path>] [args...]` (Linux only): a running
+//!   process whose main thread has exited, as one whose main thread calls
+//!   `pthread_exit` while another thread works on. With `--lock <path>` it
+//!   first takes the lock on `<path>` exactly as `hold-lock` does (exits 3
+//!   when it is held elsewhere) and keeps it: the descriptor table belongs
+//!   to the process, not to its main thread. It ignores its other arguments
+//!   (so `leader-exits app-server --managed-daemon` is shaped like a Codex
+//!   daemon-family process) and SIGINT, SIGTERM, SIGHUP and SIGQUIT (only a
 //!   kill ends it), starts a second thread and ends its main thread alone
 //!   (the `exit` system call, not `exit_group`). The second thread waits
 //!   (bounded) until the kernel shows the main thread exited (its
@@ -64,13 +69,13 @@ fn main() {
         Some("hold-lock") => hold_lock(&args[1..]),
         Some("idle") => idle(),
         Some("until-eof") => until_eof(),
-        Some("leader-exits") => leader_exits(),
+        Some("leader-exits") => leader_exits(&args[1..]),
         Some("job-child") => job_child(),
         Some("breakaway-daemon") => breakaway_daemon(),
         Some("disclaim-exec") => disclaim_exec(&args[1..]),
         _ => {
             eprintln!(
-                "usage: freshell-test-helper hold-lock <path> [--threads N] [--child] | idle [args...] | until-eof | leader-exits | job-child | breakaway-daemon | disclaim-exec -- <command> [args...]"
+                "usage: freshell-test-helper hold-lock <path> [--threads N] [--child] | idle [args...] | until-eof | leader-exits [--lock <path>] [args...] | job-child | breakaway-daemon | disclaim-exec -- <command> [args...]"
             );
             USAGE_EXIT
         }
@@ -102,29 +107,10 @@ fn hold_lock(args: &[String]) -> i32 {
             }
         }
     }
-    // Exactly Codex's open: read + write + create, std's default sharing and
-    // a non-inheritable handle.
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-    {
+    let file = match take_lock("hold-lock", path) {
         Ok(file) => file,
-        Err(err) => {
-            eprintln!("freshell-test-helper hold-lock: cannot open {path}: {err}");
-            return 1;
-        }
+        Err(code) => return code,
     };
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => return WOULD_BLOCK_EXIT,
-        Err(std::fs::TryLockError::Error(err)) => {
-            eprintln!("freshell-test-helper hold-lock: cannot lock {path}: {err}");
-            return 1;
-        }
-    }
     for _ in 0..threads {
         std::thread::spawn(|| loop {
             std::thread::park();
@@ -152,6 +138,32 @@ fn hold_lock(args: &[String]) -> i32 {
     0
 }
 
+/// Opens `path` exactly as Codex opens its thread-writer lock file (read +
+/// write + create, std's default sharing and a non-inheritable handle) and
+/// takes `File::try_lock()` on it. `Err` is the exit code: `WOULD_BLOCK_EXIT`
+/// when the lock is held elsewhere, 1 on any other failure (reported on
+/// stderr under `mode`).
+fn take_lock(mode: &str, path: &str) -> Result<std::fs::File, i32> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|err| {
+            eprintln!("freshell-test-helper {mode}: cannot open {path}: {err}");
+            1
+        })?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(WOULD_BLOCK_EXIT),
+        Err(std::fs::TryLockError::Error(err)) => {
+            eprintln!("freshell-test-helper {mode}: cannot lock {path}: {err}");
+            Err(1)
+        }
+    }
+}
+
 fn idle() -> i32 {
     println!("idle {}", std::process::id());
     let _ = std::io::stdout().flush();
@@ -166,7 +178,18 @@ fn until_eof() -> i32 {
 }
 
 #[cfg(target_os = "linux")]
-fn leader_exits() -> i32 {
+fn leader_exits(args: &[String]) -> i32 {
+    let lock = match args {
+        [flag, path, ..] if flag == "--lock" => match take_lock("leader-exits", path) {
+            Ok(file) => Some(file),
+            Err(code) => return code,
+        },
+        [flag] if flag == "--lock" => {
+            eprintln!("freshell-test-helper leader-exits: --lock needs a path");
+            return USAGE_EXIT;
+        }
+        _ => None,
+    };
     // Only a kill ends it: a soft stop's signal (forwarded by the reaper
     // shim) is ignored, as a stubborn agent ignores it.
     for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
@@ -177,6 +200,9 @@ fn leader_exits() -> i32 {
     let worker = std::thread::Builder::new()
         .name("leader-exits".into())
         .spawn(move || {
+            // Kept by the thread that runs on (the lock lives as long as
+            // the open file, whichever thread exits).
+            let _lock = lock;
             // The kernel shows the thread-group leader's own state in
             // `/proc/<pid>/stat`: Z once the main thread has exited. A
             // bounded wait (a test helper), then the report.
@@ -198,7 +224,7 @@ fn leader_exits() -> i32 {
     }
     // Ends the main thread only (the `exit` system call; `exit_group` would
     // end the process), as `pthread_exit` does after its cleanup. Nothing is
-    // held here: no lock, no stdout buffer.
+    // held here: the worker owns the lock, and no stdout buffer is left.
     // SAFETY: the calling thread exits without unwinding; no Rust frame
     // above it runs again, and the worker owns everything it uses.
     unsafe { libc::syscall(libc::SYS_exit, 0) };
@@ -217,7 +243,7 @@ fn leader_is_zombie(pid: u32) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn leader_exits() -> i32 {
+fn leader_exits(_args: &[String]) -> i32 {
     eprintln!("freshell-test-helper leader-exits: Linux only");
     USAGE_EXIT
 }
