@@ -97,6 +97,18 @@ async fn launcher_exit_listening_on(
     home: &Path,
     codex_home: Option<&str>,
 ) -> LauncherRun {
+    launcher_exit_with_env(listen, behavior, home, codex_home, &[]).await
+}
+
+/// [`launcher_exit_listening_on`] with `extra_env` in the launcher's
+/// environment (and so in its native's).
+async fn launcher_exit_with_env(
+    listen: &str,
+    behavior: Value,
+    home: &Path,
+    codex_home: Option<&str>,
+    extra_env: &[(&str, &str)],
+) -> LauncherRun {
     use tokio::io::AsyncReadExt;
     let manifest_dir = home.join("manifests");
     let mut cmd = tokio::process::Command::new("node");
@@ -113,6 +125,9 @@ async fn launcher_exit_listening_on(
         .kill_on_drop(true);
     if let Some(codex_home) = codex_home {
         cmd.env("CODEX_HOME", codex_home);
+    }
+    for (key, value) in extra_env {
+        cmd.env(key, value);
     }
     let mut child = cmd.spawn().expect("spawn fake launcher");
     let launcher = child.id().expect("launcher pid");
@@ -312,7 +327,9 @@ async fn every_fake_records_whether_it_listened_or_lost_its_port() {
         json!({"pid": lost_pid, "port": taken, "listenError": "EADDRINUSE"})
     );
 
-    // The single-process fake that listens.
+    // The single-process fake that listens. It writes its record before its
+    // port file, and the native before its manifest's mark (see the next
+    // test), so neither read below waits.
     let (_listening, port) = lost_port::spawn_on_its_own_port(single()).await;
     let pid = listen_records(records.path())
         .into_iter()
@@ -343,6 +360,78 @@ async fn every_fake_records_whether_it_listened_or_lost_its_port() {
         json!({"pid": listening_native, "port": native.port, "listening": true})
     );
     drop(holder);
+}
+
+/// A fake that listens writes its listen record first, then its port file
+/// (port-file mode), then its manifest's `listening` mark (the native), all
+/// before it answers anyone. So whoever sees the port file or the mark finds
+/// the record, and whoever sees the mark finds the port file
+/// ([`FakeAppServer::listened`], [`lost_port::spawn_on_its_own_port`] and the
+/// test above read them in that order). Each write is made to fail in turn:
+/// the fake dies at that write, and none of the later ones exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_listening_fake_writes_its_record_then_its_port_file_then_its_mark() {
+    // The record cannot be written: its directory would be under a file.
+    let home = tempfile::tempdir().unwrap();
+    let not_a_directory = home.path().join("not-a-directory");
+    std::fs::write(&not_a_directory, "").unwrap();
+    let record_dir = not_a_directory.join("records");
+    let port_file = home.path().join("port");
+    let run = launcher_exit_with_env(
+        "ws://127.0.0.1:0",
+        json!({}),
+        home.path(),
+        Some(home.path().to_str().unwrap()),
+        &[
+            (
+                lost_port::LISTEN_RECORD_DIR_ENV,
+                record_dir.to_str().unwrap(),
+            ),
+            (lost_port::PORT_FILE_ENV, port_file.to_str().unwrap()),
+        ],
+    )
+    .await;
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
+    assert!(
+        run.stderr.contains("ENOTDIR") && run.stderr.contains(record_dir.to_str().unwrap()),
+        "it dies writing its record: {}",
+        run.stderr
+    );
+    assert!(!port_file.exists(), "no port file before the record");
+    assert!(
+        !run.native.expect("the native's manifest").listening,
+        "no listening mark before the record"
+    );
+
+    // The record is written; the port file cannot be: its directory is missing.
+    let home = tempfile::tempdir().unwrap();
+    let records = tempfile::tempdir().unwrap();
+    let port_file = home.path().join("missing").join("port");
+    let run = launcher_exit_with_env(
+        "ws://127.0.0.1:0",
+        json!({}),
+        home.path(),
+        Some(home.path().to_str().unwrap()),
+        &[
+            (
+                lost_port::LISTEN_RECORD_DIR_ENV,
+                records.path().to_str().unwrap(),
+            ),
+            (lost_port::PORT_FILE_ENV, port_file.to_str().unwrap()),
+        ],
+    )
+    .await;
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
+    assert!(
+        run.stderr.contains("ENOENT") && run.stderr.contains(port_file.to_str().unwrap()),
+        "it dies writing its port file: {}",
+        run.stderr
+    );
+    let native = run.native.expect("the native's manifest");
+    let record = &listen_records(records.path())[&u64::from(native.pid)];
+    assert_eq!(record["listening"], true, "the record before the port file");
+    assert_ne!(record["port"], 0, "the port the kernel gave it: {record}");
+    assert!(!native.listening, "no listening mark before the port file");
 }
 
 #[tokio::test(flavor = "multi_thread")]

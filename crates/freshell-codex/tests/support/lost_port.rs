@@ -108,7 +108,8 @@ where
 /// The directory where the fakes one runtime starts record whether they
 /// listened (`listen-<pid>.json`: `listening`, or `listenError` for a port
 /// another socket took). A fake writes it before it answers anyone, or before
-/// it exits on a taken port. Removed when dropped.
+/// it exits on a taken port; one that listens writes it before its port file
+/// and its manifest's `listening` mark. Removed when dropped.
 pub struct ListenRecords(tempfile::TempDir);
 
 impl Default for ListenRecords {

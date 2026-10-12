@@ -739,16 +739,8 @@ let servedListenUrl = listenUrl
 // and any behavior.listenDelayMs has passed).
 let wss = null
 function listen() {
-  wss = portFile
-    ? new WebSocketServer({ host, port: 0 }, () => {
-        const address = wss.address()
-        if (!address || typeof address === 'string') {
-          throw new Error('fake app-server did not receive a loopback port')
-        }
-        servedListenUrl = `ws://${host}:${address.port}`
-        fs.writeFileSync(portFile, `${address.port}\n`, 'utf8')
-      })
-    : new WebSocketServer({ host, port })
+  // Port-file mode listens on port 0 (checked at startup): the kernel's choice.
+  wss = new WebSocketServer({ host, port })
   wss.on('error', (error) => {
     // Any other listen error stays an uncaught error (exit 1), as before.
     if (error?.code !== 'EADDRINUSE') throw error
@@ -760,9 +752,24 @@ function listen() {
     recordListen({ port, listenError: error.code })
     process.exit(LOST_PORT_EXIT_CODE)
   })
+  // Says that it listens, before it answers anyone (Node runs this before any
+  // connection), in a fixed order: the listen record, then the port file
+  // (port-file mode), then the native manifest's `listening` mark. Whoever
+  // sees the port file or the mark therefore finds the record, and whoever
+  // sees the mark finds the port file. (A lost port, above, marks the
+  // manifest first: a test that counts lost ports by manifest finds every
+  // native whose record says so.)
   wss.on('listening', () => {
+    const address = wss.address()
+    if (!address || typeof address === 'string') {
+      throw new Error('fake app-server did not receive a loopback port')
+    }
+    recordListen({ port: address.port, listening: true })
+    if (portFile) {
+      servedListenUrl = `ws://${host}:${address.port}`
+      fs.writeFileSync(portFile, `${address.port}\n`, 'utf8')
+    }
     nativeRole?.noteListening()
-    recordListen({ port: wss.address().port, listening: true })
   })
   wss.on('connection', handleConnection)
 }
