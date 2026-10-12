@@ -593,25 +593,121 @@ pub fn stat_state(pid: u32) -> Option<String> {
     Some(raw.get(close + 2..)?.split_whitespace().next()?.to_string())
 }
 
+/// Linux: a command this test started, its stdout read line by line and its
+/// stdin held open until it is dropped, and the processes of it the test has
+/// verified as its own. Only verified processes are ever signalled, each
+/// through a pin (pid and start time): the test's own child (unreaped, so its
+/// pid names it), and processes checked after their pin to be that child or
+/// the child's child ([`StartedCommand::verify`]). Dropped, also when a start
+/// fails part way, it kills the verified processes, then each of the child's
+/// own children (pinned, then re-checked as the child's), then the child, and
+/// nothing else.
+#[cfg(target_os = "linux")]
+pub struct StartedCommand {
+    /// The test's own child (a placement wrapper, or the command itself),
+    /// pinned while unreaped.
+    child_pin: ProcWatch,
+    verified: Vec<ProcWatch>,
+    lines: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    _stdin: tokio::process::ChildStdin,
+    /// Never awaited, so the child stays unreaped while this lives.
+    _child: tokio::process::Child,
+}
+
+#[cfg(target_os = "linux")]
+impl StartedCommand {
+    /// Starts `cmd` (directly or through a placement wrapper) with its stdin
+    /// and stdout piped.
+    pub fn spawn(mut cmd: tokio::process::Command) -> Self {
+        use tokio::io::AsyncBufReadExt;
+        cmd.kill_on_drop(false)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        // The test's own unreaped child: its pid names it.
+        let child_pin = match child.id().map(ProcWatch::open) {
+            Some(Ok(pin)) => pin,
+            other => {
+                // Unpinned, it is still the test's own unreaped child.
+                let _ = child.start_kill();
+                panic!("cannot pin the test's own child: {other:?}");
+            }
+        };
+        let lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        Self {
+            child_pin,
+            verified: Vec::new(),
+            lines,
+            _stdin: child.stdin.take().unwrap(),
+            _child: child,
+        }
+    }
+
+    /// The next line the command prints (without its newline), waited for
+    /// (bounded) as `what`.
+    pub async fn line(&mut self, what: &str) -> String {
+        match tokio::time::timeout(Duration::from_secs(15), self.lines.next_line()).await {
+            Ok(Ok(Some(line))) => line,
+            other => panic!("{what}: no line came: {other:?}"),
+        }
+    }
+
+    /// Pins `pid` and checks that it is the test's own: the child itself or
+    /// the child's child (under a placement wrapper such as the reaper
+    /// shim). The check runs after the pin, and the pin has not exited after
+    /// it, so it refers to the pinned incarnation. Panics, signalling
+    /// nothing, when `pid` cannot be pinned or is not the test's; a verified
+    /// process is killed when this is dropped.
+    pub fn verify(&mut self, pid: u32) -> ProcWatch {
+        let pin =
+            ProcWatch::open(pid).unwrap_or_else(|e| panic!("process {pid} cannot be pinned: {e}"));
+        let child = self.child_pin.pid();
+        let ours = pid == child || process::parent(pid) == Some(child);
+        assert!(
+            ours && !pin.has_exited(),
+            "process {pid} is not a running process this test started"
+        );
+        self.verified.push(pin.clone());
+        pin
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for StartedCommand {
+    fn drop(&mut self) {
+        for pin in &self.verified {
+            let _ = pin.signal(Sig::Kill);
+        }
+        // The child is unreaped, so its pid is its own, and once it has
+        // exited no process has it as parent any more.
+        let child = self.child_pin.pid();
+        for pid in process::children(child) {
+            if let Ok(pin) = ProcWatch::open(pid) {
+                if process::parent(pid) == Some(child) && !pin.has_exited() {
+                    let _ = pin.signal(Sig::Kill);
+                }
+            }
+        }
+        let _ = self.child_pin.signal(Sig::Kill);
+    }
+}
+
 /// Linux: a running process whose main thread has exited while its other
 /// thread runs on (`freshell-test-helper leader-exits`, which ignores the
-/// soft signals): `/proc/<pid>/stat` shows it Z. It is the test's own child
-/// or that child's child (under the tag backend's reaper shim), pinned while
-/// it is certainly that process; on drop it is killed through its pin, the
-/// test's child through its own, and then the systemd unit slice holding it
-/// (if any) is stopped.
+/// soft signals): `/proc/<pid>/stat` shows it Z. It is verified as the
+/// test's own (its child, or that child's child under the tag backend's
+/// reaper shim) before anything can signal it. On drop it is killed through
+/// its pin with the rest of what the test started ([`StartedCommand`]), and
+/// then the systemd unit slice holding it (if any) is stopped.
 #[cfg(target_os = "linux")]
 pub struct LeaderExited {
     /// The process whose main thread exited.
     pub pin: ProcWatch,
-    /// The test's own child (the helper itself, or the shim above it),
-    /// pinned while unreaped.
-    child_pin: ProcWatch,
-    _child: tokio::process::Child,
-    _stdout: tokio::io::BufReader<tokio::process::ChildStdout>,
-    /// Dropped after the kills above (`Drop::drop` runs before the fields
-    /// drop): systemd stops a slice by SIGTERM first, which the helper
-    /// ignores.
+    /// Kills the helper and the rest of what the test started when dropped.
+    started: StartedCommand,
+    /// The unit slice holding the verified helper. Fields drop in order, so
+    /// it is stopped after the kills above: systemd stops a slice by SIGTERM
+    /// first, which the helper ignores.
     _slice: StopSliceOnDrop,
 }
 
@@ -620,45 +716,33 @@ impl LeaderExited {
     /// Starts `cmd` (a command running `freshell-test-helper leader-exits
     /// [args...]`, directly or through a placement wrapper) and returns once
     /// the helper reports that its main thread has exited.
-    pub async fn start(mut cmd: tokio::process::Command) -> Self {
-        use tokio::io::AsyncBufReadExt;
-        cmd.kill_on_drop(false)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped());
-        let mut child = cmd.spawn().unwrap();
-        // The test's own unreaped child: its pid names it.
-        let child_pin = ProcWatch::open(child.id().unwrap()).unwrap();
-        let mut stdout = tokio::io::BufReader::new(child.stdout.take().unwrap());
-        let mut line = String::new();
-        let read = tokio::time::timeout(Duration::from_secs(15), stdout.read_line(&mut line)).await;
-        if !matches!(read, Ok(Ok(n)) if n > 0) {
-            let _ = child_pin.signal(Sig::Kill);
-            panic!("the helper never reported that its main thread exited: {read:?} {line:?}");
-        }
+    pub async fn start(cmd: tokio::process::Command) -> Self {
+        let mut started = StartedCommand::spawn(cmd);
+        let line = started
+            .line("the helper's report that its main thread exited")
+            .await;
+        Self::reported(started, &line)
+    }
+
+    /// The helper that reported in `line` (`leader-exits <pid>`), printed by
+    /// `started`, once verified as the test's own and running with its main
+    /// thread exited.
+    pub fn reported(mut started: StartedCommand, line: &str) -> Self {
         let pid: u32 = line
-            .trim()
             .strip_prefix("leader-exits ")
-            .and_then(|p| p.parse().ok())
+            .and_then(|p| p.trim().parse().ok())
             .unwrap_or_else(|| panic!("unexpected helper line {line:?}"));
-        let pin = ProcWatch::open(pid)
-            .unwrap_or_else(|e| panic!("the helper {pid} cannot be pinned: {e}"));
-        // The pinned process is the helper only while it is the child itself
-        // or the child's child; checked after the pin, which has not exited
-        // since, so the check refers to the pinned incarnation.
-        let ours = pid == child_pin.pid() || process::parent(pid) == Some(child_pin.pid());
+        let pin = started.verify(pid);
         let leader_exited = stat_state(pid).as_deref() == Some("Z");
-        let this = Self {
+        assert!(
+            leader_exited && !pin.has_exited(),
+            "the helper {pid} does not run with its main thread exited"
+        );
+        Self {
             _slice: StopSliceOnDrop::holding(pid),
             pin,
-            child_pin,
-            _child: child,
-            _stdout: stdout,
-        };
-        assert!(
-            ours && !this.pin.has_exited() && leader_exited,
-            "process {pid} is not the running helper this test started with its main thread exited"
-        );
-        this
+            started,
+        }
     }
 
     pub fn pid(&self) -> u32 {
@@ -682,13 +766,5 @@ impl LeaderExited {
             tokio::time::timeout(limit, self.pin.exited()).await,
             Ok(Ok(()))
         )
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for LeaderExited {
-    fn drop(&mut self) {
-        let _ = self.pin.signal(Sig::Kill);
-        let _ = self.child_pin.signal(Sig::Kill);
     }
 }
