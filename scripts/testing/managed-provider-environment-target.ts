@@ -121,6 +121,11 @@ async function bounded<T>(completion: Promise<T>, milliseconds: number, descript
   } finally { clearTimeout(timer) }
 }
 
+function processIsGone(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code
+  return code === 'ENOENT' || code === 'ESRCH'
+}
+
 export async function stopExact(child: ChildProcess | undefined, identity: Awaited<ReturnType<typeof processIdentity>> | undefined,
   completion: Promise<NativeExit> | undefined, ownedProcessGroup = false) {
   if (!child || !completion) return
@@ -128,7 +133,7 @@ export async function stopExact(child: ChildProcess | undefined, identity: Await
     assert(identity, 'Live owned child has no captured identity; retain its fixture')
     let current: Awaited<ReturnType<typeof processIdentity>> | undefined
     try { current = await processIdentity(child) }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+    catch (error) { if (!processIsGone(error)) throw error }
     if (current) assert.deepEqual(current, identity, 'Owned child identity changed; retain it')
     if (ownedProcessGroup) signalOwnedProcessGroup(identity, 'SIGTERM')
     else if (current) child.kill('SIGTERM')
@@ -141,13 +146,21 @@ export async function stopExact(child: ChildProcess | undefined, identity: Await
         throw new Error('Detached child no longer identifies its unique owned process group; retain its fixture', { cause: error })
       }
       if (child.exitCode === null && child.signalCode === null) {
-        assert.deepEqual(await processIdentity(child), identity, 'Owned child identity changed before group escalation; retain it')
+        let current: Awaited<ReturnType<typeof processIdentity>> | undefined
+        try { current = await processIdentity(child) }
+        catch (identityError) { if (!processIsGone(identityError)) throw identityError }
+        if (current) assert.deepEqual(current, identity, 'Owned child identity changed before group escalation; retain it')
       }
       signalOwnedProcessGroup(identity, 'SIGKILL')
     } else {
       if (child.exitCode !== null || child.signalCode !== null) throw error
-      assert.deepEqual(await processIdentity(child), identity, 'Owned child identity changed before escalation; retain it')
-      child.kill('SIGKILL')
+      let current: Awaited<ReturnType<typeof processIdentity>> | undefined
+      try { current = await processIdentity(child) }
+      catch (identityError) { if (!processIsGone(identityError)) throw identityError }
+      if (current) {
+        assert.deepEqual(current, identity, 'Owned child identity changed before escalation; retain it')
+        child.kill('SIGKILL')
+      }
     }
   }
   return bounded(completion, 15_000, 'owned child final join')
