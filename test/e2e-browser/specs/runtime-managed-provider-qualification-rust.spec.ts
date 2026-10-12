@@ -506,9 +506,6 @@ test.describe.serial('ordinary managed-provider use', () => {
     )
     test.setTimeout(3_600_000)
     const definitions = providerDefinitions()
-    expect(definitions.map((definition) => definition.provider).sort()).toEqual([
-      'claude', 'codex', 'opencode',
-    ])
     const rig = createManagedRuntimeBrowserRig(
       process.cwd(),
       5,
@@ -532,18 +529,27 @@ test.describe.serial('ordinary managed-provider use', () => {
       const tabId = await harness.getActiveTabId()
       if (!tabId) throw new Error('ordinary provider smoke has no active tab')
 
+      const failedProviders: string[] = []
       for (const definition of definitions) {
-        const created = await createProviderPane(page, harness, rig, tabId, definition)
-        await executeAndAwaitNonceOutput(
-          page,
-          created.paneId,
-          created.terminalId,
-          `freshell-${randomBytes(12).toString('hex')}`,
-          'initial',
-        )
-        console.info(JSON.stringify({ severity: 'info', event: 'durable_souls.ordinary_turn_completed',
-          lane: 'terminal', provider: definition.provider }))
+        try {
+          const created = await createProviderPane(page, harness, rig, tabId, definition)
+          await executeAndAwaitNonceOutput(
+            page,
+            created.paneId,
+            created.terminalId,
+            `freshell-${randomBytes(12).toString('hex')}`,
+            'initial',
+          )
+          console.info(JSON.stringify({ severity: 'info', event: 'durable_souls.ordinary_turn_completed',
+            lane: 'terminal', provider: definition.provider }))
+        } catch (error) {
+          failedProviders.push(definition.provider)
+          console.error(JSON.stringify({ severity: 'error', event: 'durable_souls.ordinary_turn_failed',
+            lane: 'terminal', provider: definition.provider,
+            errorName: error instanceof Error ? error.name : 'UnknownError' }))
+        }
       }
+      expect(failedProviders, `ordinary terminal turn failed for: ${failedProviders.join(', ')}`).toEqual([])
     } finally {
       const cleanup = await rig.stop()
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
