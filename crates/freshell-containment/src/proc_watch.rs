@@ -1146,13 +1146,31 @@ mod linux_tests {
     /// finds no such process answers "process gone".
     #[test]
     fn a_reaped_processs_failed_identity_read_is_process_gone() {
+        use std::process::Stdio;
+        // No inherited output: a child left running would hold the test
+        // binary's stdout, and with it the test run, open.
         let mut child = std::process::Command::new("sleep")
             .arg("600")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        // The test's own unreaped child: its pid names it.
-        let watch = ProcWatch::open(child.id()).unwrap();
-        watch.signal(Sig::Kill).unwrap();
+        // The test's own unreaped child: its pid names it. When it cannot be
+        // pinned or killed through its pin, it is killed by that pid and
+        // reaped before the test fails.
+        let killed = ProcWatch::open(child.id()).and_then(|watch| {
+            watch.signal(Sig::Kill)?;
+            Ok(watch)
+        });
+        let watch = match killed {
+            Ok(watch) => watch,
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the test's own child could not be pinned and killed: {err}");
+            }
+        };
         child.wait().unwrap();
         let err = identity_unread(io::Error::from_raw_os_error(libc::ENOENT), || {
             pidfd_readable(&watch.inner.fd)
