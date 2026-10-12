@@ -1365,6 +1365,33 @@ describe('owner HTTP failure observability', () => {
       expect(JSON.stringify(log.mock.calls)).not.toContain('private-')
     } finally { driver.mockRestore(); vi.restoreAllMocks() }
   })
+  it('uses the exact image admitted by the owning runtime for retained fixtures', async () => {
+    const owner = new ManagedRuntimeOwner(() => { throw new Error('unused owner web') }, fixtureRepoRoot)
+    const ownerImage = `sha256:${'a'.repeat(64)}`
+    Object.assign(owner.runtime, { imageRef: ownerImage })
+    vi.spyOn(owner, 'info', 'get').mockReturnValue({ baseUrl: 'http://127.0.0.1:1', wsUrl: 'ws://127.0.0.1:1/ws', token: 'private-token',
+      port: 1, pid: 42, homeDir: fixtureRepoRoot, configDir: fixtureRepoRoot, logsDir: fixtureRepoRoot,
+      debugLogPath: path.join(fixtureRepoRoot, 'unused-web.jsonl'), runtimeRoot: fixtureRepoRoot })
+    const selectedImages: string[] = []
+    vi.spyOn(RuntimeHarness.prototype, 'prepareTask2FixtureArtifacts').mockImplementation(async input => {
+      selectedImages.push(input.imageDigest)
+      throw new Error('stop after image selection')
+    })
+    vi.spyOn(RuntimeHarness.prototype, 'cleanup').mockResolvedValue({ ok: true, errors: [] })
+    vi.spyOn(RuntimeHarness.prototype, 'verifyTransferCleanup').mockImplementation(() => undefined)
+    const artifact = { path: path.join(fixtureRepoRoot, 'fixture-artifact'), sha256: 'c'.repeat(64) }
+    const artifacts = { candidateSha: owner.runtime.candidateSha,
+      currentSupervisor: artifact, currentHost: artifact, currentServer: artifact,
+      legacySupervisor: artifact, legacyHost: artifact,
+      legacyCreatorCommit: '7dbc7ef6b0b87e47ec8386e19115f5e440399898' as const }
+    const fixtures = new runner.OwnedRetainedBrowserFixtures(owner, artifacts, ['config'])
+    try {
+      fixtures.start('config')
+      await vi.waitFor(() => expect(fixtures.status().kind).toBe('failed'))
+      expect(selectedImages).toEqual([ownerImage])
+      await fixtures.cancel()
+    } finally { vi.restoreAllMocks() }
+  })
 })
 
 describe('diagnostic sink failure isolation', () => {
@@ -1822,7 +1849,7 @@ describe('owned web process lifetime (Node process fixture only)', () => {
     let stopWeb: (() => Promise<void>) | undefined
     let webPid: number | undefined
     const artifact = { path: entry, sha256: 'b'.repeat(64) }
-    const artifacts = { candidateSha: owned.runtime.candidateSha, imageDigest: `sha256:${'c'.repeat(64)}`,
+    const artifacts = { candidateSha: owned.runtime.candidateSha,
       currentSupervisor: artifact, currentHost: artifact, currentServer: artifact, legacySupervisor: artifact, legacyHost: artifact,
       legacyCreatorCommit: '7dbc7ef6b0b87e47ec8386e19115f5e440399898' as const }
     const fixtureOwner = new runner.OwnedRetainedBrowserFixtures(owned, artifacts, ['config'], options => {

@@ -1371,10 +1371,12 @@ export interface ExternalRetainedFixtureControl {
   cancel(): Promise<void>
 }
 
-type RetainedArtifacts = Parameters<RuntimeHarness['prepareTask2FixtureArtifacts']>[0]
+// Runtime images are owned per run; the nested fixture must use its active
+// outer owner's image rather than a digest from an earlier run.
+type RetainedArtifacts = Omit<Parameters<RuntimeHarness['prepareTask2FixtureArtifacts']>[0], 'imageDigest'>
 const RetainedArtifactSchema = z.object({ path: z.string().min(1), sha256: z.string().regex(/^[a-f0-9]{64}$/) }).strict()
 const RetainedArtifactsSchema: z.ZodType<RetainedArtifacts> = z.object({
-  candidateSha: z.string().regex(/^[a-f0-9]{40}$/), imageDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+  candidateSha: z.string().regex(/^[a-f0-9]{40}$/),
   currentSupervisor: RetainedArtifactSchema, currentHost: RetainedArtifactSchema, currentServer: RetainedArtifactSchema,
   legacySupervisor: RetainedArtifactSchema, legacyHost: RetainedArtifactSchema,
   legacyCreatorCommit: z.literal('7dbc7ef6b0b87e47ec8386e19115f5e440399898'),
@@ -1444,7 +1446,7 @@ export class OwnedRetainedBrowserFixtures implements ExternalRetainedFixtureCont
         return pending
       }
       try {
-        await h.prepareTask2FixtureArtifacts(this.artifacts)
+        await h.prepareTask2FixtureArtifacts({ ...this.artifacts, imageDigest: this.owner.runtime.imageRef })
         h.recordLifecycle('external.retained_fixture_registered', { severity: 'info',
           parentRunId: this.owner.runtime.runId, candidateSha: h.candidateSha, fixtureId })
         await runTask2RetainedFixture(h, fixtureId === 'legacy', factory, { observe, retry })
