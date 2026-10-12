@@ -117,6 +117,7 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
     })
     const sent: any[] = []
     const createdReplies: any[] = []
+    const completedTurnSessionIds = new Set<string>()
     const allocations: OwnedHistoryAllocation[] = []
     const observation = new ManagedHistoryAwaitedPhases()
     let historyDiagnostics: ManagedHistoryDirectoryResponses | undefined
@@ -140,6 +141,8 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
         try {
           const message = JSON.parse(String(frame.payload))
           if (message.type === 'freshAgent.created') createdReplies.push(message)
+          if (message.type === 'freshAgent.event' && message.event?.type === 'freshAgent.turn.complete'
+            && typeof message.sessionId === 'string') completedTurnSessionIds.add(message.sessionId)
         } catch { /* non-JSON frame */ }
       })
     })
@@ -204,7 +207,11 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
         await phase('send', () => pane.getByRole('button', { name: 'Send', exact: true }).click())
         await phase('completion', () => waitFor('actual fixture completion', async () => {
           const state = await fixtureState(rig, view)
-          return state.dispatchCount === 1 && state.completionCount === 1 ? state : null
+          // The fixture counter advances before its provider-history write.
+          // The completion event follows that write, so wait for both before
+          // asking History to index the native session.
+          return state.dispatchCount === 1 && state.completionCount === 1
+            && completedTurnSessionIds.has(createdSessionId) ? state : null
         }))
         expect(view.nativeSessionId).toBeTruthy()
         const paneObservation = { ...created, sessionType: definition.mode, provider: wireProvider,
