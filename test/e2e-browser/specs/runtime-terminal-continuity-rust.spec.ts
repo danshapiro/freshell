@@ -586,12 +586,16 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       const snapshotRequests = (await harness.getPerfAuditSnapshot())?.perfEvents
         .filter((event) => event.event === 'fresh_agent.snapshot_request')
         .slice(-12)
-        .map(({ stage, reason, requestReadOnly, hasSoul, createChanged, soulChanged, revisionChanged, bootChanged,
+        .map(({ view, stage, reason, requestSerial, readGeneration, check, stale, fence, outcome, ran,
+          providerMatches, typeMatches, threadMatches, historyOnly, requestReadOnly, hasSoul,
+          createChanged, soulChanged, revisionChanged, bootChanged,
           ownerChanged, providerChanged, typeChanged, threadChanged, paneSessionChanged, recoveryChanged,
-          historyOnly, live, vacant, rows, previousRows, accepted }) => ({
-          stage, reason, requestReadOnly, hasSoul, createChanged, soulChanged, revisionChanged, bootChanged,
+          live, vacant, rows, previousRows, accepted }) => ({
+          view, stage, reason, requestSerial, readGeneration, check, stale, fence, outcome, ran,
+          providerMatches, typeMatches, threadMatches, historyOnly, requestReadOnly, hasSoul,
+          createChanged, soulChanged, revisionChanged, bootChanged,
           ownerChanged, providerChanged, typeChanged, threadChanged, paneSessionChanged, recoveryChanged,
-          historyOnly, live, vacant, rows, previousRows, accepted,
+          live, vacant, rows, previousRows, accepted,
         })) ?? []
       const contentFacts = {
         status: contentAfterRestart.status,
