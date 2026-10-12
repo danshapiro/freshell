@@ -3643,6 +3643,194 @@ describe('FreshAgentView', () => {
     })
   })
 
+  it('accepts a replayed checkpoint outcome after reload when it carries an exact provider row identity', async () => {
+    const checkpointId = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+    const workspace = { path: '/repo/selected', provenance: 'directory-picker' as const }
+    const displayTurnId = 'codex-replayed-turn:row-0'
+    const nativeTurnId = 'codex-replayed-turn'
+    const row = {
+      id: displayTurnId,
+      turnId: displayTurnId,
+      nativeTurnId,
+      role: 'user' as const,
+      summary: 'A transcript row already stored by the provider',
+      items: [{ id: 'replayed-user-text', kind: 'text' as const, text: 'A transcript row already stored by the provider' }],
+    }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'reloaded conversation',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [row, {
+        id: 'codex-replayed-turn:row-1',
+        turnId: 'codex-replayed-turn:row-1',
+        nativeTurnId,
+        role: 'user',
+        summary: 'A second projection row sharing the provider turn',
+        items: [{ id: 'replayed-decoy-text', kind: 'text', text: 'A second projection row sharing the provider turn' }],
+      }],
+    })
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-replayed-conversation',
+        sessionId: 'thread-replayed-conversation',
+        sessionRef: { provider: 'codex', sessionId: 'thread-replayed-conversation' },
+        status: 'idle',
+        checkpointWorkspace: workspace,
+      },
+    }))
+
+    const view = render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    expect(await screen.findByText('A transcript row already stored by the provider')).toBeInTheDocument()
+    expect(onMessage).toBeTypeOf('function')
+
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.checkpoint.outcome',
+        requestId: 'request-replayed-turn',
+        logicalAttemptId: 'attempt-replayed-turn',
+        sessionId: 'thread-replayed-conversation',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        status: 'available',
+        checkpointId,
+        workspace,
+      })
+    })
+    expect(getFreshAgentPaneContent(store).checkpointOutcomes ?? []).toHaveLength(0)
+    expect(screen.queryByRole('status', { name: 'Code rewind available for this message' })).not.toBeInTheDocument()
+
+    // The first broadcast was missed while this pane was detached. The server
+    // replay has no in-memory pending send metadata to rely on after remount.
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.checkpoint.outcome',
+        requestId: 'request-replayed-turn',
+        logicalAttemptId: 'attempt-replayed-turn',
+        sessionId: 'thread-replayed-conversation',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        status: 'available',
+        checkpointId,
+        workspace,
+        nativeTurnId,
+        displayTurnId,
+      })
+    })
+
+    const exactReplayUserRows = screen.getAllByRole('article', { name: 'You transcript turn' })
+    expect(exactReplayUserRows).toHaveLength(2)
+    expect(await within(exactReplayUserRows[0]!).findByRole('status', { name: 'Code rewind available for this message' }))
+      .toHaveTextContent('Code rewind is available for this message.')
+    expect(within(exactReplayUserRows[1]!).queryByRole('status', { name: 'Code rewind available for this message' }))
+      .not.toBeInTheDocument()
+    expect(getFreshAgentPaneContent(store).checkpointOutcomes).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        requestId: 'request-replayed-turn',
+        conversationRequestId: 'req-replayed-conversation',
+        nativeTurnId,
+        displayTurnId,
+        checkpointId,
+        status: 'available',
+      }),
+    ]))
+
+    view.unmount()
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    expect(await screen.findByRole('status', { name: 'Code rewind available for this message' }))
+      .toHaveTextContent('Code rewind is available for this message.')
+  })
+
+  it('uses the selected checkpoint workspace to rewind when a resumed pane has no launch cwd', async () => {
+    const checkpointId = 'cccccccccccccccccccccccccccccccc'
+    const workspace = { path: '/repo/selected-without-launch-cwd', provenance: 'directory-picker' as const }
+    const displayTurnId = 'resume-row-1'
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'resumed conversation',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [{
+        id: displayTurnId,
+        turnId: displayTurnId,
+        nativeTurnId: 'native-resume-row-1',
+        role: 'user',
+        summary: 'Restore the selected workspace',
+        items: [{ id: 'resume-user-text', kind: 'text', text: 'Restore the selected workspace' }],
+      }],
+    })
+    apiMock.get.mockResolvedValue({ checkpoints: [{
+      id: checkpointId,
+      ts: 1,
+      label: 'Restore the selected workspace',
+      workspace,
+    }] })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-resumed-without-cwd',
+        sessionId: 'thread-resumed-without-cwd',
+        sessionRef: { provider: 'codex', sessionId: 'thread-resumed-without-cwd' },
+        status: 'idle',
+        checkpointWorkspace: workspace,
+        checkpointOutcomes: [{
+          version: 1,
+          conversationRequestId: 'req-resumed-without-cwd',
+          requestId: 'request-resume-row-1',
+          displayTurnId,
+          nativeTurnId: 'native-resume-row-1',
+          status: 'available',
+          checkpointId,
+          workspace,
+        }],
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const turn = await screen.findByText('Restore the selected workspace')
+    const article = turn.closest('[data-turn-role="user"]')
+    expect(article).not.toBeNull()
+    fireEvent.click(within(article as HTMLElement).getByRole('button', { name: 'Rewind code to here' }))
+
+    await waitFor(() => {
+      expect(apiMock.get).toHaveBeenCalledWith(
+        '/api/fresh-agent/checkpoints?cwd=%2Frepo%2Fselected-without-launch-cwd&workspacePath=%2Frepo%2Fselected-without-launch-cwd&workspaceProvenance=directory-picker',
+      )
+      expect(apiMock.post).toHaveBeenCalledWith('/api/fresh-agent/checkpoints/restore', {
+        cwd: '/repo/selected-without-launch-cwd',
+        workspace,
+        id: checkpointId,
+      })
+    })
+  })
+
   it('rewinds to the persisted checkpoint ID after reload when duplicate prompts have no metadata links', async () => {
     const checkpointWorkspace = { path: '/repo/selected', provenance: 'directory-picker' as const }
     const firstCheckpointId = '11111111111111111111111111111111'
@@ -3923,6 +4111,9 @@ describe('FreshAgentView', () => {
         reason: workspaceReason,
       })
     })
+    expect(getFreshAgentPaneContent(store).checkpointOutcomes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ requestId, status: 'unavailable', reason: workspaceReason }),
+    ]))
     expect(await screen.findByRole('note', { name: 'Code rewind unavailable for this message' }))
       .toHaveTextContent(`Code rewind unavailable for this message: ${workspaceReason}`)
     expect(screen.getByRole('button', { name: 'Rewind unavailable for this message' })).toBeDisabled()

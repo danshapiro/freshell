@@ -8,9 +8,9 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 use crate::common::{
-    AgentProvider, CodexDurability, FreshAgentCheckpointIntent, PermissionMode, Sandbox,
-    SessionLocator, SessionType, Shell, StringOrNumber, TerminalAttachIntent,
-    TerminalAttachPriority, double_option,
+    double_option, AgentProvider, CodexDurability, FreshAgentCheckpointIntent, PermissionMode,
+    Sandbox, SessionLocator, SessionType, Shell, StringOrNumber, TerminalAttachIntent,
+    TerminalAttachPriority,
 };
 
 /// A message sent from a client to the server.

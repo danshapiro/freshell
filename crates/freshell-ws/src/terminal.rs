@@ -1980,7 +1980,7 @@ async fn handle_client_text(
                             }
                             fresh_codex.handle_attach(attach).await
                         }
-                            .instrument(tracing::Span::current()),
+                        .instrument(tracing::Span::current()),
                     );
                 }
                 freshell_protocol::AgentProvider::Claude => {
@@ -1999,7 +1999,7 @@ async fn handle_client_text(
                             }
                             fresh_claude.handle_attach(attach).await
                         }
-                            .instrument(tracing::Span::current()),
+                        .instrument(tracing::Span::current()),
                     );
                 }
                 freshell_protocol::AgentProvider::Opencode => {
@@ -2018,7 +2018,7 @@ async fn handle_client_text(
                             }
                             fresh_opencode.handle_attach(attach).await
                         }
-                            .instrument(tracing::Span::current()),
+                        .instrument(tracing::Span::current()),
                     );
                 }
                 _ => {}
@@ -11705,7 +11705,7 @@ mod terminals_changed_tests {
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             subagent_interest: Default::default(),
             host_stats: Default::default(),
-        checkpoint_send: Default::default(),
+            checkpoint_send: Default::default(),
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),
@@ -11905,7 +11905,7 @@ mod terminal_kill_stop_wedge_tests {
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             subagent_interest: Default::default(),
             host_stats: Default::default(),
-        checkpoint_send: Default::default(),
+            checkpoint_send: Default::default(),
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),
@@ -12339,7 +12339,7 @@ mod terminal_meta_created_tests {
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             subagent_interest: Default::default(),
             host_stats: Default::default(),
-        checkpoint_send: Default::default(),
+            checkpoint_send: Default::default(),
             terminals_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: std::sync::Arc::new(Vec::new()),
@@ -12984,7 +12984,7 @@ mod pane_reconcile_gate_tests {
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             subagent_interest: Default::default(),
             host_stats: Default::default(),
-        checkpoint_send: Default::default(),
+            checkpoint_send: Default::default(),
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),

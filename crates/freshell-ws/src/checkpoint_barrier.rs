@@ -7,8 +7,8 @@
 
 use std::sync::Arc;
 
-use futures::future::BoxFuture;
 use freshell_protocol::{AgentProvider, FreshAgentSend, SessionType};
+use futures::future::BoxFuture;
 
 pub trait FreshAgentCheckpointBarrier: Send + Sync {
     fn barrier_and_forward(

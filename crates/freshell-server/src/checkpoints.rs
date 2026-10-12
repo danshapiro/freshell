@@ -31,18 +31,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::routing::get as get_method;
 use axum::{
-    Json, Router,
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
+    Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use sha1::{Digest, Sha1};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, OwnedMutexGuard, watch};
+use tokio::sync::{watch, Mutex, OwnedMutexGuard};
 
 use freshell_protocol::{
     AgentProvider, CheckpointWorkspaceProvenance, FreshAgentCheckpointOutcome,
@@ -541,9 +541,8 @@ unsafe impl Sync for WindowsJob {}
 impl WindowsJob {
     fn new() -> std::io::Result<Self> {
         use windows_sys::Win32::System::JobObjects::{
-            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-            SetInformationJobObject,
+            CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         };
 
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
@@ -607,8 +606,8 @@ impl WindowsJob {
 
     fn active_processes(&self) -> std::io::Result<u32> {
         use windows_sys::Win32::System::JobObjects::{
-            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
-            QueryInformationJobObject,
+            JobObjectBasicAccountingInformation, QueryInformationJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
         };
 
         let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
@@ -692,7 +691,7 @@ impl Drop for WindowsJob {
 fn find_process_thread(process_id: u32) -> std::io::Result<u32> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
     };
 
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
@@ -1359,7 +1358,22 @@ impl CheckpointService {
             .as_ref()
             .and_then(|settings| settings.cwd.as_deref())
             .or(send.cwd.as_deref());
-        let Some(launch_cwd) = launch_cwd else {
+        let intent = send
+            .checkpoint_intent
+            .as_ref()
+            .and_then(|intent| serde_json::to_value(intent.workspace.as_ref()).ok())
+            .and_then(|value| if value.is_null() { None } else { Some(value) });
+        // An explicitly selected checkpoint workspace is independent from the
+        // provider's launch cwd. Use it only as the resolver anchor when a
+        // resumed pane no longer has its original cwd; never write it back to
+        // `send` or change the provider's working directory.
+        let workspace_anchor = launch_cwd.or_else(|| {
+            send.checkpoint_intent
+                .as_ref()
+                .and_then(|intent| intent.workspace.as_ref())
+                .map(|workspace| workspace.path.as_str())
+        });
+        let Some(workspace_anchor) = workspace_anchor else {
             return self.new_record(
                 send,
                 logical_attempt_id,
@@ -1371,19 +1385,15 @@ impl CheckpointService {
                 )),
             );
         };
-        let intent = send
-            .checkpoint_intent
-            .as_ref()
-            .and_then(|intent| serde_json::to_value(intent.workspace.as_ref()).ok())
-            .and_then(|value| if value.is_null() { None } else { Some(value) });
         let resolve_control = Arc::new(CheckpointCaptureControl::default());
         let resolve_control_for_task = Arc::clone(&resolve_control);
         let home = Arc::clone(&self.home);
-        let launch_cwd = launch_cwd.to_string();
+        let workspace_anchor = workspace_anchor.to_string();
         let mut resolve_task = tokio::spawn(CHECKPOINT_CAPTURE_CONTEXT.scope(
             resolve_control_for_task,
             async move {
-                resolve_checkpoint_workspace(&home, Path::new(&launch_cwd), intent.as_ref()).await
+                resolve_checkpoint_workspace(&home, Path::new(&workspace_anchor), intent.as_ref())
+                    .await
             },
         ));
         let remaining = CHECKPOINT_AUTO_BUDGET.saturating_sub(started_at.elapsed());
@@ -4904,6 +4914,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_checkpoint_workspace_can_be_captured_without_a_launch_cwd() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let fixture = workspace_dir.path().join("selected-project.txt");
+        tokio::fs::write(&fixture, "workspace selected independently of launch cwd\n")
+            .await
+            .unwrap();
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(8);
+        let service = CheckpointService::new(
+            Arc::new(home_dir.path().to_path_buf()),
+            Arc::new(broadcast_tx),
+        );
+        let send = FreshAgentSend {
+            provider: AgentProvider::Codex,
+            session_id: "thread-no-launch-cwd".to_string(),
+            session_type: SessionType::Freshcodex,
+            text: "continue from the selected project".to_string(),
+            cwd: None,
+            images: None,
+            request_id: Some("request-no-launch-cwd".to_string()),
+            settings: None,
+            observed_epoch: None,
+            observed_generation: None,
+            checkpoint_intent: Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: "attempt-no-launch-cwd".to_string(),
+                workspace: Some(FreshAgentCheckpointWorkspace {
+                    path: workspace_dir.path().to_string_lossy().into_owned(),
+                    provenance: CheckpointWorkspaceProvenance::DirectoryPicker,
+                }),
+            }),
+        };
+
+        let outcome = service
+            .capture_automatic(&send, "request-no-launch-cwd", "attempt-no-launch-cwd")
+            .await;
+
+        assert_eq!(
+            send.cwd, None,
+            "capture must not synthesize provider launch cwd"
+        );
+        assert_eq!(
+            outcome.outcome.status,
+            FreshAgentCheckpointStatus::Available,
+            "an explicit selected workspace is sufficient for checkpoint capture"
+        );
+        assert!(outcome.outcome.checkpoint_id.is_some());
+        assert_eq!(
+            outcome.outcome.workspace,
+            Some(FreshAgentCheckpointWorkspace {
+                path: workspace_dir.path().to_string_lossy().into_owned(),
+                provenance: CheckpointWorkspaceProvenance::DirectoryPicker,
+            }),
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(fixture).await.unwrap(),
+            "workspace selected independently of launch cwd\n"
+        );
+    }
+
+    #[tokio::test]
     async fn picker_home_is_launch_only() {
         let home_dir = tempfile::tempdir().unwrap();
         tokio::fs::write(home_dir.path().join("private.txt"), "private")
@@ -5548,11 +5618,9 @@ mod tests {
             "a descendant cannot continue writing after the route has settled cancellation"
         );
         let entries = list_checkpoints(home_dir.path(), &workspace).await.unwrap();
-        assert!(
-            !entries
-                .iter()
-                .any(|entry| { entry["requestId"].as_str() == Some("dropped-http-capture") })
-        );
+        assert!(!entries
+            .iter()
+            .any(|entry| { entry["requestId"].as_str() == Some("dropped-http-capture") }));
     }
 
     // ── is_valid_checkpoint_id ──────────────────────────────────────────
@@ -5637,12 +5705,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            list_checkpoints(home_dir.path(), cwd_dir.path())
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(list_checkpoints(home_dir.path(), cwd_dir.path())
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -5656,11 +5722,9 @@ mod tests {
 
         let result = list_checkpoints(home_dir.path(), cwd_dir.path()).await;
 
-        assert!(
-            result
-                .unwrap_err()
-                .contains("checkpoint repository exists but its HEAD is missing")
-        );
+        assert!(result
+            .unwrap_err()
+            .contains("checkpoint repository exists but its HEAD is missing"));
     }
 
     #[tokio::test]
@@ -5766,12 +5830,10 @@ mod tests {
         assert_eq!(first["id"].as_str().unwrap().len(), 40);
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = body_json(response).await;
-        assert!(
-            body["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("Git operation log failed")
-        );
+        assert!(body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Git operation log failed"));
     }
 
     #[tokio::test]
@@ -5860,12 +5922,10 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let value = body_json(resp).await;
-        assert!(
-            value["error"]
-                .as_str()
-                .unwrap()
-                .starts_with("cwd does not exist:")
-        );
+        assert!(value["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("cwd does not exist:"));
     }
 
     #[tokio::test]

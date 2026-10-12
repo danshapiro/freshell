@@ -54,7 +54,8 @@ pub(crate) struct HostedFreshAgentProxy {
     pollers: Mutex<HashSet<SoulId>>,
     fixture_modes: HashSet<String>,
     naming: OnceLock<Arc<dyn SessionNaming>>,
-    checkpoint_barrier: OnceLock<Arc<dyn freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier>>,
+    checkpoint_barrier:
+        OnceLock<Arc<dyn freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier>>,
     ownership: OnceLock<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
 }
 
@@ -125,7 +126,10 @@ impl HostedFreshAgentProxy {
         }
         match current.state {
             freshell_ownership::OwnershipState::Live { owner, .. }
-                if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent => Ok(()),
+                if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent =>
+            {
+                Ok(())
+            }
             _ => Err("fresh-agent session is no longer available for this send"),
         }
     }

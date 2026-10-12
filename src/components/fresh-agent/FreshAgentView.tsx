@@ -360,6 +360,27 @@ function checkpointAvailabilityMap(content: FreshAgentPaneContent): Map<string, 
   return availability
 }
 
+function checkpointAvailabilityMatchesTurn(
+  provider: FreshAgentPaneContent['provider'],
+  availability: CheckpointTurnAvailability,
+  turn: FreshAgentTurn,
+): boolean {
+  if (turn.role !== 'user') return false
+  const displayTurnId = getFreshAgentDisplayTurnKey(turn)
+  if (availability.displayTurnId && availability.displayTurnId !== displayTurnId) return false
+  if (availability.nativeTurnId) {
+    if (turn.nativeTurnId) {
+      if (availability.nativeTurnId !== turn.nativeTurnId) return false
+    } else if (
+      checkpointTurnIdentity(provider, availability.nativeTurnId)
+      !== checkpointTurnIdentity(provider, displayTurnId)
+    ) {
+      return false
+    }
+  }
+  return Boolean(availability.displayTurnId || availability.nativeTurnId)
+}
+
 function localEchoLanded(
   turns: readonly FreshAgentTurn[],
   echo: LocalEcho,
@@ -1113,10 +1134,21 @@ export function FreshAgentView({
   const getCheckpointAvailability = useCallback((turn: FreshAgentTurn): CheckpointTurnAvailability | undefined => {
     if (turn.role !== 'user') return undefined
     const scope = checkpointAvailabilityScope(paneContent)
+    const displayTurnId = getFreshAgentDisplayTurnKey(turn)
     const turnAvailability = checkpointAvailabilityByTurn.get(
-      checkpointTurnAvailabilityKey(paneContent, scope, getFreshAgentDisplayTurnKey(turn)),
+      checkpointTurnAvailabilityKey(paneContent, scope, displayTurnId),
     )
-    if (turnAvailability) return turnAvailability
+    if (turnAvailability && checkpointAvailabilityMatchesTurn(paneContent.provider, turnAvailability, turn)) {
+      return turnAvailability
+    }
+    if (turn.nativeTurnId) {
+      const nativeAvailability = checkpointAvailabilityByTurn.get(
+        checkpointTurnAvailabilityKey(paneContent, scope, turn.nativeTurnId),
+      )
+      if (nativeAvailability && checkpointAvailabilityMatchesTurn(paneContent.provider, nativeAvailability, turn)) {
+        return nativeAvailability
+      }
+    }
     const requestId = (turn as FreshAgentTurn & { requestId?: unknown }).requestId
     if (typeof requestId !== 'string' || requestId.length === 0) return undefined
     return checkpointAvailabilityByTurn.get(checkpointAvailabilityKey(scope, 'request', requestId))
@@ -2733,19 +2765,6 @@ export function FreshAgentView({
         const requestId = message.requestId
         const pending = pendingSendMetadataRef.current.get(requestId)
         const current = paneContentRef.current
-        if (
-          !pending
-          || message.logicalAttemptId !== pending.logicalAttemptId
-          || !locatorMatchesPane(
-            message,
-            current,
-            freshOpenCodeRouteCwdRef.current,
-            runtimeOwnersForLocator(),
-          )
-        ) return
-
-        const workspace = normalizeFreshAgentCheckpointWorkspace(message.workspace)
-          ?? pending.checkpointWorkspace
         const checkpointTurnId = (value: unknown): string | undefined => (
           typeof value === 'string'
           && value.length > 0
@@ -2756,6 +2775,21 @@ export function FreshAgentView({
         )
         const nativeTurnId = checkpointTurnId(message.nativeTurnId)
         const displayTurnId = checkpointTurnId(message.displayTurnId)
+        const hasProviderTurnIdentity = Boolean(nativeTurnId || displayTurnId)
+        if (
+          (pending && message.logicalAttemptId !== pending.logicalAttemptId)
+          || (!pending && !hasProviderTurnIdentity)
+          || !locatorMatchesPane(
+            message,
+            current,
+            freshOpenCodeRouteCwdRef.current,
+            runtimeOwnersForLocator(),
+          )
+        ) return
+
+        const workspace = normalizeFreshAgentCheckpointWorkspace(message.workspace)
+          ?? pending?.checkpointWorkspace
+          ?? current.checkpointWorkspace
         let checkpointOutcome: CheckpointTurnAvailability
         if (
           message.status === 'available'
@@ -2797,7 +2831,20 @@ export function FreshAgentView({
             ...(displayTurnId ? { displayTurnId } : {}),
           }
         }
-        recordPendingSendMetadata(requestId, { checkpointOutcome })
+        if (pending) {
+          recordPendingSendMetadata(requestId, { checkpointOutcome })
+        } else {
+          // Replayed outcomes arrive after remount, when the transient send
+          // map is empty. The provider IDs are stamped only after observing
+          // the exact persisted user row, so they safely bind the durable
+          // result to its transcript row without prompt or ordinal matching.
+          publishCheckpointAvailability(
+            checkpointAvailabilityScope(current),
+            requestId,
+            undefined,
+            checkpointOutcome,
+          )
+        }
         return
       }
       if (
@@ -3983,7 +4030,7 @@ export function FreshAgentView({
       return
     }
     const workspace = availability?.workspace ?? current.checkpointWorkspace
-    const cwd = agentSessionCwdRef.current ?? current.initialCwd
+    const cwd = agentSessionCwdRef.current ?? current.initialCwd ?? workspace?.path
     if (!cwd) {
       const reason = 'No project working directory is available for this message.'
       const requestId = (turn as FreshAgentTurn & { requestId?: unknown }).requestId

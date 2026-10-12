@@ -47,26 +47,26 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
-    Json, Router,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::patch,
+    Json, Router,
 };
-use serde_json::{Map, Value, json};
-use tokio::sync::{Mutex as TokioMutex, oneshot};
+use serde_json::{json, Map, Value};
+use tokio::sync::{oneshot, Mutex as TokioMutex};
 
 use freshell_codex::launch_lifecycle::{
-    SIDECAR_START_BUDGET, allocate_loopback_port, drain_child_io,
+    allocate_loopback_port, drain_child_io, SIDECAR_START_BUDGET,
 };
-use freshell_codex::launch_plan::{CodexSidecarLaunchContext, codex_sidecar_spawn_spec};
-use freshell_codex::transport::{TungsteniteTransport, reap_owned_codex_sidecars};
+use freshell_codex::launch_plan::{codex_sidecar_spawn_spec, CodexSidecarLaunchContext};
+use freshell_codex::transport::{reap_owned_codex_sidecars, TungsteniteTransport};
 use freshell_codex::{
-    CODEX_SIDECAR_OWNERSHIP_ENV, CodexAdapterEvent, CodexAppServerClient, CodexAppServerError,
+    mint_ownership_id, next_monotonic_turn_complete_at, normalize_codex_thread_status,
+    normalize_freshcodex_effort, normalize_freshcodex_model, read_rollout_history_mode,
+    to_codex_reasoning_effort, CodexAdapterEvent, CodexAppServerClient, CodexAppServerError,
     CodexNotification, CodexStatus, CodexSubscription, HistoryMode, StartThreadParams,
-    StartTurnParams, ThreadForkParams, mint_ownership_id, next_monotonic_turn_complete_at,
-    normalize_codex_thread_status, normalize_freshcodex_effort, normalize_freshcodex_model,
-    read_rollout_history_mode, to_codex_reasoning_effort,
+    StartTurnParams, ThreadForkParams, CODEX_SIDECAR_OWNERSHIP_ENV,
 };
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCompact, FreshAgentConfigure,
@@ -78,7 +78,7 @@ use freshell_protocol::{
 use freshell_terminal::FrameSink;
 
 use crate::summary::{
-    SUMMARY_KIND_AUTHORED, SUMMARY_KIND_ECHO, TOOL_ERROR_LABEL, TOOL_RESULT_LABEL, truncate_summary,
+    truncate_summary, SUMMARY_KIND_AUTHORED, SUMMARY_KIND_ECHO, TOOL_ERROR_LABEL, TOOL_RESULT_LABEL,
 };
 use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
 
@@ -2408,13 +2408,13 @@ impl FreshCodexState {
         naming_handle: Option<String>,
     ) {
         let _ = &mut own_ticket; // moved to finish_create below on the success path
-        // b8ke focused episode-2 round-2 F4: the claim exists — register the
-        // watchdog machinery NOW, before the spawn + thread/resume awaits (up
-        // to 45s): the cancellation slot + the settle guard (held to THIS
-        // handler's unwind) + the partial runtime (pid None until the spawn
-        // hook arms the real identity). A slow startup swept at 30s is then
-        // cancellable-and-confirmable, never a registration-ignored
-        // StaleStart fence.
+                                 // b8ke focused episode-2 round-2 F4: the claim exists — register the
+                                 // watchdog machinery NOW, before the spawn + thread/resume awaits (up
+                                 // to 45s): the cancellation slot + the settle guard (held to THIS
+                                 // handler's unwind) + the partial runtime (pid None until the spawn
+                                 // hook arms the real identity). A slow startup swept at 30s is then
+                                 // cancellable-and-confirmable, never a registration-ignored
+                                 // StaleStart fence.
         let resume_start_pid_slot = crate::ownership_lane::sidecar_pid_cancel_slot();
         let _resume_start_cancellation =
             crate::ownership_lane::register_start_cancellation_for_ticket(
@@ -2689,10 +2689,10 @@ impl FreshCodexState {
         naming_handle: Option<String>,
     ) {
         let _ = &mut own_ticket; // consumed at the commit below on the success path
-        // D8 (focused-ep1-r5 Finding 2): a HOLLOW `Some` (a partially
-        // initialized client's hello — all fields absent) behaves like `None`
-        // on every decision below: the park, the eviction-guard adopt, and
-        // the binding write's stamps.
+                                 // D8 (focused-ep1-r5 Finding 2): a HOLLOW `Some` (a partially
+                                 // initialized client's hello — all fields absent) behaves like `None`
+                                 // on every decision below: the park, the eviction-guard adopt, and
+                                 // the binding write's stamps.
         let provenance = provenance.filter(|p| p.is_meaningful());
         // kata b8ke Task 3: the sidecar pid for the commit's owner identity
         // (captured before `child` moves into the exit watcher).
@@ -11359,8 +11359,8 @@ pub(crate) mod tests {
         use std::sync::{Arc, Mutex, OnceLock};
         use tracing::field::{Field, Visit};
         use tracing::{Event, Subscriber};
-        use tracing_subscriber::Layer;
         use tracing_subscriber::layer::{Context, SubscriberExt};
+        use tracing_subscriber::Layer;
 
         #[derive(Debug, Clone, Default)]
         pub struct CapturedEvent {
@@ -13200,10 +13200,9 @@ pub(crate) mod tests {
                 _ => panic!("the seed claim must grant"),
             };
         let generation = seed_ticket.as_ref().expect("the seed ticket").generation();
-        assert!(
-            st.commit_lane_claim_at(&mut seed_ticket, "thread-r29-f3", "thread-r29-f3", None,)
-                .is_ok()
-        );
+        assert!(st
+            .commit_lane_claim_at(&mut seed_ticket, "thread-r29-f3", "thread-r29-f3", None,)
+            .is_ok());
 
         insert_fake_session_with_real_consumer(
             &st,
@@ -13278,10 +13277,9 @@ pub(crate) mod tests {
                 _ => panic!("the seed claim must grant"),
             };
         let generation = seed_ticket.as_ref().expect("the seed ticket").generation();
-        assert!(
-            st.commit_lane_claim_at(&mut seed_ticket, "thread-ep5-r2", "thread-ep5-r2", None)
-                .is_ok()
-        );
+        assert!(st
+            .commit_lane_claim_at(&mut seed_ticket, "thread-ep5-r2", "thread-ep5-r2", None)
+            .is_ok());
 
         insert_fake_session_with_real_consumer(
             &st,
@@ -13729,12 +13727,10 @@ pub(crate) mod tests {
             leases.claim(PROVIDER, session_id, "replacement", 1),
             crate::session_lease::FreshSessionClaim::Acquired
         ));
-        assert!(
-            !condemned_priors
-                .lock()
-                .expect("condemned priors lock")
-                .contains_key(session_id)
-        );
+        assert!(!condemned_priors
+            .lock()
+            .expect("condemned priors lock")
+            .contains_key(session_id));
     }
 
     /// b8ke focused review FR9: the half-fenced kill refusal carries the
@@ -14156,8 +14152,8 @@ pub(crate) mod tests {
     /// cleaned) while the answer still reports `success:false`: the kill
     /// visibly fails, never masquerading as clean success nor clean failure.
     #[tokio::test]
-    async fn a_kill_whose_close_persists_despite_the_reported_error_ends_the_session_and_fails_visibly()
-     {
+    async fn a_kill_whose_close_persists_despite_the_reported_error_ends_the_session_and_fails_visibly(
+    ) {
         let (transport, _peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
@@ -14224,8 +14220,8 @@ pub(crate) mod tests {
     /// row revived — then the lane parks pre-registration while the kill
     /// lands.)
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_kill_landing_between_the_commit_and_the_registration_still_closes_the_attached_thread()
-     {
+    async fn a_kill_landing_between_the_commit_and_the_registration_still_closes_the_attached_thread(
+    ) {
         let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd("{}");
         let (st, mut rx, fake) = state_with_sink();
@@ -14333,8 +14329,8 @@ pub(crate) mod tests {
     /// re-check tears the registered session down and the create answers
     /// failed.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_kill_landing_between_the_commit_and_the_registration_still_closes_the_resumed_create()
-     {
+    async fn a_kill_landing_between_the_commit_and_the_registration_still_closes_the_resumed_create(
+    ) {
         let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd("{}");
         let (st, mut rx, fake) = state_with_sink();
@@ -14944,8 +14940,8 @@ pub(crate) mod tests {
     /// folded. Repeat the exact no-slack delivery window enough times to exercise the
     /// independent RPC waiter and notification-consumer tasks on the multi-thread runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn handle_send_always_broadcasts_accepted_before_an_immediate_completion_snapshot_and_chime()
-     {
+    async fn handle_send_always_broadcasts_accepted_before_an_immediate_completion_snapshot_and_chime(
+    ) {
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
@@ -15225,8 +15221,8 @@ pub(crate) mod tests {
     /// between the stale and the matching completion stays BUSY_TURN; the gate
     /// releases EXACTLY at the id-matched completion.
     #[tokio::test]
-    async fn a_stale_prior_completion_never_clears_the_compact_window_and_only_the_matching_completion_does()
-     {
+    async fn a_stale_prior_completion_never_clears_the_compact_window_and_only_the_matching_completion_does(
+    ) {
         let (st, _rx_boot) = state_with_bus();
         let (peer, mut wire) = insert_idle_compact_session(&st, "thread-cstale").await;
 
@@ -15527,8 +15523,8 @@ pub(crate) mod tests {
     /// compact window so the newer turn's own matching completion can reopen the
     /// rollback gate.
     #[tokio::test]
-    async fn an_idless_compact_completion_inside_a_newer_turns_window_stays_busy_and_retires_the_compact()
-     {
+    async fn an_idless_compact_completion_inside_a_newer_turns_window_stays_busy_and_retires_the_compact(
+    ) {
         let (st, _rx_boot) = state_with_bus();
         let (peer, mut wire) = insert_idle_compact_session(&st, "thread-cnewer-idless").await;
 
@@ -17191,8 +17187,8 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn handle_fork_threads_fork_archive_then_child_unarchive_resume_across_two_sidecars_and_replies_forked()
-     {
+    async fn handle_fork_threads_fork_archive_then_child_unarchive_resume_across_two_sidecars_and_replies_forked(
+    ) {
         let _guard = ENV_LOCK.lock().await;
         let log_path = std::env::temp_dir().join(format!(
             "freshell-fork-oplog-{}-{}.jsonl",
@@ -17755,8 +17751,8 @@ pub(crate) mod tests {
     /// guard) but finds a LIVE incumbent at registration time adopts that
     /// incumbent — this arm must restamp exactly like the fast path.
     #[tokio::test]
-    async fn adopt_live_create_through_the_finish_create_eviction_guard_restamps_the_current_connection()
-     {
+    async fn adopt_live_create_through_the_finish_create_eviction_guard_restamps_the_current_connection(
+    ) {
         let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd(
             &json!({
@@ -17882,8 +17878,8 @@ pub(crate) mod tests {
     /// incumbent's already-parked Some to None, and writes nothing (the
     /// ledger's keep-when-None merge preserves the row's stamps).
     #[tokio::test]
-    async fn adopt_live_create_with_no_connection_provenance_keeps_the_parked_stamps_and_writes_nothing()
-     {
+    async fn adopt_live_create_with_no_connection_provenance_keeps_the_parked_stamps_and_writes_nothing(
+    ) {
         let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd("{}");
         let (st, mut rx) = state_with_bus();
@@ -18033,8 +18029,8 @@ pub(crate) mod tests {
     /// with a parent that parks nothing the child stamps fall back to the
     /// parent's DURABLE ROW (the last source that knows the attribution).
     #[tokio::test]
-    async fn fork_falls_back_to_the_durable_row_when_the_fork_connection_is_hollow_and_the_park_is_empty()
-     {
+    async fn fork_falls_back_to_the_durable_row_when_the_fork_connection_is_hollow_and_the_park_is_empty(
+    ) {
         let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd(
             &json!({
@@ -19241,8 +19237,8 @@ pub(crate) mod tests {
     /// latch while a NEWER turn is live (that latch belongs to the newer
     /// turn now) — the seed window deterministically constructed below.
     #[tokio::test]
-    async fn a_superseded_slot_completion_during_the_snapshot_seed_window_keeps_the_newer_turns_latch()
-     {
+    async fn a_superseded_slot_completion_during_the_snapshot_seed_window_keeps_the_newer_turns_latch(
+    ) {
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
@@ -19642,8 +19638,8 @@ pub(crate) mod tests {
     /// publishes its snapshot without a second edge, and a subsequent
     /// crash rings nothing extra.
     #[tokio::test]
-    async fn system_error_status_with_a_turn_in_flight_rings_once_and_gates_the_matching_completion()
-     {
+    async fn system_error_status_with_a_turn_in_flight_rings_once_and_gates_the_matching_completion(
+    ) {
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
@@ -21345,8 +21341,8 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn handle_rollback_double_undo_within_one_epoch_keeps_the_marker_bucket_in_conversation_order()
-     {
+    async fn handle_rollback_double_undo_within_one_epoch_keeps_the_marker_bucket_in_conversation_order(
+    ) {
         // Whole-branch review Minor-3: the codex marker bucket is CONVERSATION
         // order (the plan :165 union rule wins over the codex bullet at :166).
         // Two sequential undos inside ONE epoch (no submission between) remove
@@ -21530,8 +21526,8 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn handle_rollback_undo_send_undo_undo_freezes_epoch_zero_and_orders_the_new_epoch_ascending()
-     {
+    async fn handle_rollback_undo_send_undo_undo_freezes_epoch_zero_and_orders_the_new_epoch_ascending(
+    ) {
         // Delta-r1 F8's codified multi-epoch case: undo → send (decision 5
         // destroy) → undo → undo ⇒ the marker bucket is the FIRST epoch's
         // frozen prefix, then the NEW epoch's entries in conversation order
@@ -24298,8 +24294,8 @@ pub(crate) mod tests {
     // _post_recovery_snapshot` (the other test mutating the process-global
     // `CODEX_CMD`/`FAKE_CODEX_APP_SERVER_BEHAVIOR` env vars) for the test's ENTIRE
     // duration, not just around individual calls.
-    async fn send_after_unrequested_crash_resumes_the_same_thread_id_and_completes_with_no_error_frame()
-     {
+    async fn send_after_unrequested_crash_resumes_the_same_thread_id_and_completes_with_no_error_frame(
+    ) {
         let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
 
@@ -24547,8 +24543,8 @@ pub(crate) mod tests {
     /// session mapped under its OLD id, still marked exited, for a future retry (mirroring
     /// the pre-existing `RespawnFailed` contract for a `thread/start` failure).
     #[tokio::test(flavor = "multi_thread")]
-    async fn send_after_crash_with_transient_resume_failure_reports_respawn_failed_and_stays_exited()
-     {
+    async fn send_after_crash_with_transient_resume_failure_reports_respawn_failed_and_stays_exited(
+    ) {
         let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
 
@@ -24968,8 +24964,8 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread")]
     // Intentional: `_guard` must span every `.await` in this test to serialize it against
     // every other env-var-mutating test in this module for its ENTIRE duration.
-    async fn attach_after_unrequested_crash_respawns_the_sidecar_and_emits_a_post_recovery_snapshot()
-     {
+    async fn attach_after_unrequested_crash_respawns_the_sidecar_and_emits_a_post_recovery_snapshot(
+    ) {
         let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
         let capture = tracing_capture::capture_by_session("attach-recovery-marker-unused");
@@ -26791,12 +26787,10 @@ pub(crate) mod tests {
         assert_eq!(user_rows[0]["id"], "turn-native-1:row-0");
         assert_eq!(user_rows[0]["turnId"], "turn-native-1:row-0");
         assert_eq!(user_rows[0]["nativeTurnId"], "turn-native-1");
-        assert!(
-            turns
-                .iter()
-                .filter(|turn| turn["role"] != "user")
-                .all(|turn| turn.get("nativeTurnId").is_none())
-        );
+        assert!(turns
+            .iter()
+            .filter(|turn| turn["role"] != "user")
+            .all(|turn| turn.get("nativeTurnId").is_none()));
         let raw_thread = json!({"thread":{"turns":[raw_turn.clone()]}});
         assert_eq!(
             checkpoint_codex_turn_identity(&raw_thread, "turn-native-1"),

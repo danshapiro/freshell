@@ -147,13 +147,13 @@ async function sendThroughComposer(
     // The send barrier's first outcome is deliberately pre-forward and may
     // not yet know Codex's persisted user row. Require the later updated
     // native-linked projection before treating the per-turn result as ready.
-    return typeof outcome?.nativeTurnId === 'string'
-      && outcome.displayTurnId === accepted.submittedTurnId
+    return outcome?.nativeTurnId === accepted.submittedTurnId
+      && outcome.displayTurnId === `${accepted.submittedTurnId}:row-0`
   }, { timeout: 120_000 }).toBe(true)
   expect(outcome!.requestId).toBe(sent.requestId)
   expect(outcome!.conversationRequestId).toBe((await currentFreshAgent(page)).content.createRequestId)
-  expect(outcome!.displayTurnId).toBe(accepted.submittedTurnId)
-  expect(outcome!.nativeTurnId).toEqual(expect.any(String))
+  expect(outcome!.displayTurnId).toBe(`${accepted.submittedTurnId}:row-0`)
+  expect(outcome!.nativeTurnId).toBe(accepted.submittedTurnId)
   expect(JSON.stringify((await currentFreshAgent(page)).content.checkpointOutcomes)).not.toContain(text)
 
   const row = paneRoot.locator('article[data-turn-role="user"]', { hasText: text })
@@ -180,9 +180,11 @@ async function assertNativeUserIdentity(
   const user = turn.items.find(item => item.type === 'userMessage'
     && item.content?.some(part => part.text === text))
   expect(user?.id).toBe(`${acceptedTurnId}:user`)
-  // The persisted checkpoint outcome must point at the actual native Codex
-  // user-message identity. The display turn ID is a separate, stable UI join.
-  expect(outcome.nativeTurnId).toBe(user!.id)
+  // The persisted checkpoint outcome must point at the provider turn identity
+  // and the projected user-row identity. The raw user-message item has its own
+  // item id, which is not either checkpoint join key.
+  expect(outcome.nativeTurnId).toBe(acceptedTurnId)
+  expect(outcome.displayTurnId).toBe(`${acceptedTurnId}:row-0`)
   return turn
 }
 

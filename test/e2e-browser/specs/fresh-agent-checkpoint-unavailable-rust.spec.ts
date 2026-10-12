@@ -42,6 +42,130 @@ function findFreshAgentLeaf(node: any): any {
 }
 
 test.describe('fresh-agent checkpoint availability', () => {
+  test('a selected non-Git workspace keeps its successful checkpoint through reload and restores it', async ({ browser }) => {
+    test.setTimeout(180_000)
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-checkpoint-restore-'))
+    const projectDir = path.join(sharedRoot, 'selected-workspace')
+    const sourceFile = path.join(projectDir, 'state.txt')
+    const codexHome = path.join(sharedRoot, 'codex-home')
+    let server: RustServer | undefined
+    let context: Awaited<ReturnType<typeof createFreshE2ePage>>['context'] | undefined
+
+    try {
+      await fs.mkdir(projectDir, { recursive: true })
+      await fs.writeFile(sourceFile, 'before checkpoint\n', 'utf8')
+      const fakeCodexPath = await installFakeCodexAppServer(path.join(sharedRoot, 'bin'))
+      server = new RustServer({
+        env: {
+          CODEX_CMD: fakeCodexPath,
+          CODEX_HOME: codexHome,
+          FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({ recordTurns: true }),
+          FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES: '1',
+        },
+        setupHome: async (homeDir) => {
+          const freshellDir = path.join(homeDir, '.freshell')
+          await fs.mkdir(freshellDir, { recursive: true })
+          await fs.writeFile(path.join(freshellDir, 'config.json'), JSON.stringify({
+            version: 1,
+            settings: {
+              freshAgent: { enabled: true },
+              codingCli: {
+                enabledProviders: ['codex'],
+                providers: { codex: { model: 'gpt-5-codex', sandbox: 'workspace-write' } },
+              },
+            },
+          }, null, 2))
+        },
+      })
+      const info = await server.start()
+      const ownedPage = await createFreshE2ePage(browser, info)
+      context = ownedPage.context
+      const { page } = ownedPage
+      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+      const harness = new TestHarness(page)
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+      await page.evaluate(() => {
+        window.__FRESHELL_TEST_HARNESS__?.dispatch({
+          type: 'connection/setAvailableClis',
+          payload: { claude: false, codex: true },
+        })
+      })
+
+      const picker = await openPanePicker(page)
+      await picker.getByRole('button', { name: /^Freshcodex$/i }).click({ force: true })
+      const directoryInput = page.getByRole('combobox', { name: 'Starting directory for Freshcodex' })
+      await expect(directoryInput).toBeVisible({ timeout: 10_000 })
+      await directoryInput.fill(projectDir)
+      await directoryInput.press('Enter')
+
+      const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+      await expect(paneRoot).toBeVisible({ timeout: 15_000 })
+      const tabId = await harness.getActiveTabId()
+      expect(tabId).toBeTruthy()
+      await expect.poll(async () => {
+        const layout = await harness.getPaneLayout(tabId!)
+        return findFreshAgentLeaf(layout)?.content?.initialCwd
+      }, { timeout: 10_000 }).toBe(projectDir)
+      await expect.poll(async () => {
+        const layout = await harness.getPaneLayout(tabId!)
+        return findFreshAgentLeaf(layout)?.content?.status
+      }, { timeout: 30_000 }).toBe('idle')
+
+      const marker = `checkpoint-restore-${Math.random().toString(36).slice(2, 10)}`
+      const composer = paneRoot.getByRole('textbox', { name: 'Chat message input' })
+      await composer.fill(marker)
+      await paneRoot.getByRole('button', { name: 'Send' }).click()
+
+      const userTurn = paneRoot.locator('[data-turn-role="user"]', { hasText: marker })
+      await expect(userTurn).toBeVisible({ timeout: 20_000 })
+      await expect(userTurn.getByRole('status', { name: 'Code rewind available for this message' }))
+        .toContainText('Code rewind is available for this message.')
+      await expect(paneRoot.getByText('Fixture turn')).toBeVisible({ timeout: 30_000 })
+
+      let content: any
+      await expect.poll(async () => {
+        const layout = await harness.getPaneLayout(tabId!)
+        content = findFreshAgentLeaf(layout)?.content
+        return content?.status
+      }, { timeout: 20_000 }).toBe('idle')
+      const outcome = content.checkpointOutcomes?.find((entry: any) => entry.status === 'available')
+      expect(outcome?.checkpointId).toMatch(/^[a-f0-9]{40}$/)
+      expect(outcome?.workspace).toEqual({ path: projectDir, provenance: 'directory-picker' })
+      expect(JSON.stringify(content.checkpointOutcomes)).not.toContain(marker)
+
+      await fs.writeFile(sourceFile, 'after checkpoint\n', 'utf8')
+      await page.evaluate(() => {
+        window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
+      })
+      await page.reload()
+      const reloadedHarness = new TestHarness(page)
+      await reloadedHarness.waitForHarness()
+      await reloadedHarness.waitForConnection()
+      const reloadedPane = page.locator('[data-context="fresh-agent"]').last()
+      await expect(reloadedPane).toBeVisible({ timeout: 20_000 })
+      const reloadedTurn = reloadedPane.locator('[data-turn-role="user"]', { hasText: marker })
+      await expect(reloadedTurn).toBeVisible({ timeout: 30_000 })
+      await expect(reloadedTurn.getByRole('status', { name: 'Code rewind available for this message' }))
+        .toContainText('Code rewind is available for this message.')
+      await reloadedTurn.hover()
+      const rewind = reloadedTurn.getByRole('button', { name: 'Rewind code to here' })
+      await expect(rewind).toBeEnabled()
+      const dialogAccepted = page.waitForEvent('dialog').then((dialog) => dialog.accept())
+      await rewind.click()
+      await dialogAccepted
+
+      await expect.poll(() => fs.readFile(sourceFile, 'utf8'), { timeout: 20_000 })
+        .toBe('before checkpoint\n')
+      await expect(reloadedPane.getByText(`Code rewound to before: "${marker}"`))
+        .toBeVisible({ timeout: 10_000 })
+    } finally {
+      await context?.close().catch(() => {})
+      await server?.stop().catch(() => {})
+      await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
   test('an unreadable selected project file marks rewind unavailable and still completes the provider turn', async ({ browser }) => {
     test.setTimeout(180_000)
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-checkpoint-unavailable-'))

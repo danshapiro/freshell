@@ -14,7 +14,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use reqwest::{Client, StatusCode};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -217,16 +217,12 @@ async fn restricted_checkpoint_routes_preserve_complete_targets_and_log_correlat
     let private_dir_ignored = project.join("private-dir.ignored");
     let private_dir = project.join("private-dir");
     let ignore_text = fs::read_to_string(project.join(".gitignore")).unwrap();
-    assert!(
-        ignore_text
-            .lines()
-            .any(|line| line == "private-file.ignored")
-    );
-    assert!(
-        ignore_text
-            .lines()
-            .any(|line| line == "private-dir.ignored/")
-    );
+    assert!(ignore_text
+        .lines()
+        .any(|line| line == "private-file.ignored"));
+    assert!(ignore_text
+        .lines()
+        .any(|line| line == "private-dir.ignored/"));
 
     denied_file_read(&private_file_ignored);
     assert_eq!(
@@ -476,11 +472,9 @@ async fn restricted_checkpoint_routes_preserve_complete_targets_and_log_correlat
     assert_eq!(repaired_status, StatusCode::OK, "{repaired_entry}");
     let repaired_list = list_workspace(&client, &base, &home, &project).await;
     assert_eq!(repaired_list.len(), 2);
-    assert!(
-        repaired_list
-            .iter()
-            .any(|entry| entry["id"] == repaired_entry["id"])
-    );
+    assert!(repaired_list
+        .iter()
+        .any(|entry| entry["id"] == repaired_entry["id"]));
     fs::write(project.join("main.rs"), "changed after repaired capture\n").unwrap();
     let (repaired_restore_status, repaired_restore_body) = post_json(
         &client,
@@ -578,12 +572,10 @@ async fn restricted_checkpoint_routes_preserve_complete_targets_and_log_correlat
             .unwrap();
         assert_eq!(event["stage"], "readability");
         assert_eq!(event["filesystem_kind"], "PermissionDenied");
-        assert!(
-            event["cause"]
-                .as_str()
-                .unwrap()
-                .contains("Permission denied")
-        );
+        assert!(event["cause"]
+            .as_str()
+            .unwrap()
+            .contains("Permission denied"));
         let path = event["path"].as_str().unwrap();
         assert!(!path.is_empty());
         let expected_path = if send_request_id == "send-private-file" {
