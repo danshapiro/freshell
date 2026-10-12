@@ -495,6 +495,7 @@ impl FreshAgentTransport for HostedTransport {
                 permission_mode: profile.permission_mode,
                 sandbox: profile.sandbox.as_deref().and_then(parse_sandbox),
             }),
+            checkpoint_intent: None,
         };
         match &self.state {
             ProviderState::Claude(state) => state.handle_send(send).await,
