@@ -160,7 +160,7 @@ type StartupFault = 'ack-request' | 'ack-mode' | 'ack-provider' | 'ack-runtime-p
   | 'current-profile' | 'current-type' | 'current-presentation' | 'current-host' | 'current-container' | 'current-intent'
 
 type ContinuityScenario = { advance?: boolean; split?: boolean; verified?: boolean;
-  mutate?: (state: any, item: any) => void }
+  mutate?: (state: any, item: any) => void; mutateSnapshot?: (state: any, item: any) => void }
 
 /** Execute the registered browser case, including its actual global collector and finally. */
 async function historyCallback(fault?: HistoryFault, startup: 'presentation' | 'native' = 'presentation', startupFault?: StartupFault,
@@ -293,7 +293,9 @@ async function historyCallback(fault?: HistoryFault, startup: 'presentation' | '
   original.waitForConnection.mockResolvedValue(undefined)
   original.state.mockClear().mockImplementation(async () => {
     if (current()?.tabId && allocated.length > sendCount) observedStartupIds.push(state.panes.layouts[current().tabId].content.sessionId)
-    return structuredClone(state)
+    const snapshot = structuredClone(state)
+    if (observedNativePane) continuity?.mutateSnapshot?.(snapshot, current())
+    return snapshot
   })
   original.tabCount.mockImplementation(async () => state.tabs.tabs.length)
   original.layout.mockClear().mockImplementation(async (tabId: string) => structuredClone(state.panes.layouts[tabId]))
@@ -517,6 +519,36 @@ describe('managed History checked continuity', () => {
   }
   const soul = (state: any, item: any) => state.managedRuntime.souls.find((row: any) => row.soulId === item.view.soulId)
   const view = (state: any, item: any) => state.managedRuntime.viewIntents.find((row: any) => row.soulId === item.view.soulId)
+  it('rejects the same wrong projected view ID in both original History snapshots', async () => {
+    const events: any[] = [], snapshots: any[] = []
+    vi.spyOn(process.stdout, 'write').mockImplementation((chunk: any) => {
+      events.push(...external.parseManagedHistoryDiagnosticText(String(chunk))); return true
+    })
+    const wrongViewId = 'nonexistent-projected-view'
+    const { run, allocated, sends } = await historyCallback(undefined, 'native', undefined, undefined, {
+      advance: true, mutateSnapshot: (state, item) => {
+        content(state, item).viewIntentId = wrongViewId
+        snapshots.push(state)
+      },
+    })
+    try { await expect(run).rejects.toThrow(/viewId/) } finally {
+      expect(original.stop).toHaveBeenCalledOnce()
+      const [before, after] = snapshots
+      const expectedView = expect.objectContaining({ viewId: 'view-pane-0', soulId: allocated[0].view.soulId,
+        preferredTabId: 'tab-0', preferredPaneId: 'pane-0' })
+      for (const state of [before, after]) {
+        expect(content(state, allocated[0]).viewIntentId).toBe(wrongViewId)
+        expect(state.managedRuntime.viewIntents).toEqual([expectedView])
+      }
+      expect(after.managedRuntime.viewIntents).toStrictEqual(before.managedRuntime.viewIntents)
+      expectOnlyDurabilityAdvance(before, after)
+    }
+    expect(events.filter(event => event.state === 'failed').map(event => event.phase)).toEqual(['history-layout'])
+    expect(snapshots).toHaveLength(2)
+    expect(allocated).toHaveLength(1)
+    expect(sends()).toBe(1)
+  })
+
   const mutations: [string, (state: any, item: any) => void][] = [
     ...['createRequestId', 'provider', 'sessionType', 'sessionId', 'resumeSessionId', 'soulId', 'incarnationId', 'viewIntentId', 'model'].map(key =>
       [key, (state: any, item: any) => { content(state, item)[key] = 'changed-' + key }] as [string, (state: any, item: any) => void]),

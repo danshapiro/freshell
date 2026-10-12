@@ -69,7 +69,8 @@ export function assertManagedHistoryContinuity(before: HistoryState, after: Hist
         || view.preferredTabId === allocation.tabId && view.preferredPaneId === allocation.paneId)
       expect(views, 'unique authoritative History view').toHaveLength(1)
       const view = views[0]
-      expect(view).toMatchObject({ soulId: allocation.soulId, preferredTabId: allocation.tabId, preferredPaneId: allocation.paneId })
+      expect(view).toMatchObject({ viewId: content.viewIntentId, soulId: allocation.soulId,
+        preferredTabId: allocation.tabId, preferredPaneId: allocation.paneId })
       expect(Number.isSafeInteger(view.revision)).toBe(true)
       expect(view.revision).toBeGreaterThanOrEqual(0)
       expect(view.soulIntentRevision).toBe(soul.intentRevision)
