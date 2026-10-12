@@ -107,13 +107,24 @@ describe('browser selection non-vacuity', () => {
     FRESHELL_RUNTIME_EXTERNAL_SPEC: fixtureSpec,
   }
 
-  it('positively lists the requested owned external managed case on the Cloud project', () => {
-    const listed = listedProjects(cleanEnvironment({ ...external, FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST: '1' }), cloudConfig, [
-      '--project=chromium-external-target', fixtureSpec,
-    ])
+  function expectExternalFixtureCase(title: string) {
+    const grep = `${title}$`
+    const listed = listedProjects(cleanEnvironment({ ...external,
+      FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST: '1', FRESHELL_RUNTIME_EXTERNAL_GREP: grep,
+    }), cloudConfig, ['--project=chromium-external-target', fixtureSpec, '--grep', grep])
+    expect(listed.labels).toEqual(['chromium-external-target'])
     expect(listed.tests).toBe(1)
     expect(listed.files).toBe(1)
-    expect(listed.output).toContain('all modes share activation and exact-native recovery without provider access')
+    expect(listedSpecFiles(listed.output)).toEqual(new Set([path.basename(fixtureSpec)]))
+    expect(listed.output).toContain(title)
+  }
+
+  it('positively lists the requested owned external managed case on the Cloud project', () => {
+    expectExternalFixtureCase('all modes share activation and exact-native recovery without provider access')
+  })
+
+  it('positively lists the owned external managed History case independently', () => {
+    expectExternalFixtureCase('completed owned native fixture history opens its existing browser pane')
   })
 
   it('fails before selection when an external managed descriptor lacks the exact fixture opt-in', () => {
