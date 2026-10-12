@@ -5,13 +5,19 @@
 //! same watch confirms the exit.
 //!
 //! This is its own test binary because it lowers this process's soft
-//! `RLIMIT_NOFILE`, which every thread of the process shares. Every process
-//! signalled here was spawned here, and only through its own pidfd.
+//! `RLIMIT_NOFILE`, which every thread of the process shares; its tests
+//! take [`LIMIT`] in turn. Every process signalled here was spawned here,
+//! and only through its own pidfd.
 #![cfg(target_os = "linux")]
 
 use std::time::Duration;
 
-use freshell_containment::{ProcWatch, Sig};
+use freshell_containment::{is_process_gone, ProcWatch, Sig};
+
+/// Held by each test while it lowers the limit, so no other test's thread
+/// opens a descriptor meanwhile (a tokio lock: one test holds it across
+/// awaits).
+static LIMIT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn own_limits() -> libc::rlimit {
     let mut lim = libc::rlimit {
@@ -64,6 +70,7 @@ impl Drop for KillOnDrop {
 // lowered.
 #[tokio::test(flavor = "current_thread")]
 async fn exited_returns_an_error_instead_of_panicking_when_no_fd_is_left() {
+    let _limit = LIMIT.lock().await;
     let pid = spawn_grandchild_sleep();
     let guard = KillOnDrop(ProcWatch::open(pid).expect("open the watch"));
     let watch = guard.0.clone();
@@ -93,4 +100,35 @@ async fn exited_returns_an_error_instead_of_panicking_when_no_fd_is_left() {
         .expect("the exit is confirmed in time")
         .expect("the watch registers once descriptors are available");
     assert!(watch.has_exited());
+}
+
+/// Once the pidfd pins the process, a failed read of its start time means
+/// "process gone" only when the process is gone. A live process whose
+/// `/proc/<pid>/stat` cannot be opened for want of a descriptor passes the
+/// error through: a caller that skips a gone member (the stop's member
+/// pinning, the kill passes) must never skip this live one.
+#[test]
+fn a_live_process_whose_start_time_cannot_be_read_is_not_process_gone() {
+    let _limit = LIMIT.blocking_lock();
+    let pid = spawn_grandchild_sleep();
+    let guard = KillOnDrop(ProcWatch::open(pid).expect("open the watch"));
+
+    // One descriptor left: the pidfd takes it, so the read of the start
+    // time that follows finds none.
+    let original = own_limits();
+    let one_left = libc::rlimit {
+        rlim_cur: lowest_free_fd() as libc::rlim_t + 1,
+        rlim_max: original.rlim_max,
+    };
+    set_own_limits(&one_left);
+    let opened = ProcWatch::open(pid);
+    set_own_limits(&original);
+
+    let err = opened.expect_err("the start time cannot be read without a descriptor");
+    assert!(
+        !is_process_gone(&err),
+        "a live process was reported gone: {err}"
+    );
+    assert_eq!(err.raw_os_error(), Some(libc::EMFILE), "{err}");
+    assert!(!guard.0.has_exited(), "the process still runs");
 }

@@ -47,11 +47,16 @@ pub enum Sig {
     Kill,
 }
 
-/// The error a watch's open answers when no process has the pid any more:
-/// it exited and was reaped. Its kind is `NotFound` and its text "process
-/// gone"; [`is_process_gone`] tells it from every other open failure (a
-/// different incarnation under the pid, which is also `NotFound`, or an
-/// error of the OS call).
+/// The error a watch's open answers when the process has exited and cannot
+/// be watched: no process has the pid any more (it was reaped), or, on
+/// macOS, the watch's own `NOTE_EXIT` already reported its exit before it
+/// became a zombie (the kernel posts it once the process has closed every
+/// descriptor, so it holds no lock and never runs again). Only a proven
+/// exit is "gone": a read that fails for another reason (no descriptor
+/// left, no memory) is passed through as that error. Its kind is
+/// `NotFound` and its text "process gone"; [`is_process_gone`] tells it
+/// from every other open failure (a different incarnation under the pid,
+/// which is also `NotFound`, or an error of the OS call or of a read).
 #[derive(Debug)]
 struct ProcessGone;
 
@@ -68,9 +73,10 @@ pub(crate) fn process_gone() -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, ProcessGone)
 }
 
-/// Whether `error` is a watch's open finding no process with its pid any
-/// more (the process exited and was reaped), as opposed to a different
-/// incarnation under the pid or a failed OS call.
+/// Whether `error` is a watch's open finding that the process has exited
+/// (it was reaped, or on macOS the watch's own `NOTE_EXIT` already reported
+/// its exit), as opposed to a different incarnation under the pid or a
+/// failed OS call or read.
 pub fn is_process_gone(error: &io::Error) -> bool {
     error
         .get_ref()
@@ -168,7 +174,8 @@ impl ProcWatch {
         let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) };
         // Identity is read AFTER the pidfd pins the incarnation: a pid recycled
         // before pidfd_open shows a different start time and is refused.
-        let identity = crate::process::identity(pid).map_err(|_| process_gone())?;
+        let identity = crate::process::identity(pid)
+            .map_err(|err| identity_unread(err, || pidfd_readable(&fd)))?;
         if expect_start.is_some_and(|s| s != identity.start) {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -297,6 +304,26 @@ impl ProcWatch {
     }
 }
 
+/// What a failed read of a pinned process's identity means: "process gone"
+/// only when it is, that is when the read found no such process (ENOENT,
+/// ESRCH: it was reaped) or `exited` (its pinning handle) says it exited;
+/// any other failure (EMFILE, ENFILE, ENOMEM, a malformed read, ...) is
+/// passed through, so no caller that skips a gone process can skip a live
+/// one.
+#[cfg(any(target_os = "linux", windows))]
+fn identity_unread(err: io::Error, exited: impl FnOnce() -> bool) -> io::Error {
+    #[cfg(target_os = "linux")]
+    let reaped = matches!(err.raw_os_error(), Some(libc::ENOENT | libc::ESRCH));
+    // Windows reads through the handle, which keeps the process object.
+    #[cfg(windows)]
+    let reaped = false;
+    if reaped || exited() {
+        process_gone()
+    } else {
+        err
+    }
+}
+
 /// One zero-timeout `poll` of the pidfd: readable exactly once the process
 /// has exited.
 #[cfg(target_os = "linux")]
@@ -332,8 +359,8 @@ impl ProcWatch {
             }
         })?;
         // Read from the handle itself, which pins the incarnation.
-        let start =
-            crate::process::start_time_of(handle.as_raw_handle()).map_err(|_| process_gone())?;
+        let start = crate::process::start_time_of(handle.as_raw_handle())
+            .map_err(|err| identity_unread(err, || handle_signalled(&handle)))?;
         if expect_start.is_some_and(|s| s != start) {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -358,15 +385,10 @@ impl ProcWatch {
 
     /// Non-blocking: has the process exited?
     pub fn has_exited(&self) -> bool {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
-        use windows_sys::Win32::System::Threading::WaitForSingleObject;
         if self.inner.exited.load(Ordering::SeqCst) {
             return true;
         }
-        // SAFETY: a live handle with SYNCHRONIZE; zero timeout.
-        let signalled =
-            unsafe { WaitForSingleObject(self.inner.handle.as_raw_handle(), 0) } == WAIT_OBJECT_0;
+        let signalled = handle_signalled(&self.inner.handle);
         if signalled {
             self.inner.exited.store(true, Ordering::SeqCst);
         }
@@ -452,6 +474,17 @@ impl ProcWatch {
     }
 }
 
+/// One zero-timeout wait on a process handle (with SYNCHRONIZE): signalled
+/// exactly once the process has exited.
+#[cfg(windows)]
+fn handle_signalled(handle: &std::os::windows::io::OwnedHandle) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    // SAFETY: a live handle with SYNCHRONIZE; zero timeout.
+    unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) == WAIT_OBJECT_0 }
+}
+
 /// One registered thread-pool wait; unregistering waits for a callback
 /// that is already running.
 #[cfg(windows)]
@@ -511,11 +544,29 @@ impl ProcWatch {
         );
         let (info, opened) = match registered {
             Ok(()) => {
-                // Read after the registration pinned an incarnation. An exit
-                // event already pending means the registered process has
-                // exited: `info` names it only if this pid now shows that
-                // incarnation as a zombie, or no process at all.
-                let info = darwin::bsdinfo(pid).map_err(|_| gone())?;
+                // Read after the registration pinned an incarnation. A failed
+                // read is "gone" only when it found no process (the
+                // zombie-aware lookup answers NotFound once it was reaped) or
+                // the registration's exit event is pending; any other
+                // failure is passed through.
+                let exited = || {
+                    kq.wait(Some(std::time::Duration::ZERO))
+                        .is_ok_and(|events| mac::exit_event(&events))
+                };
+                let info = darwin::bsdinfo(pid).map_err(|err| {
+                    if err.kind() == io::ErrorKind::NotFound || exited() {
+                        gone()
+                    } else {
+                        err
+                    }
+                })?;
+                // An exit event already pending means the registered process
+                // has exited (the kernel posts it once the process has closed
+                // every descriptor, before it becomes a zombie): `info`
+                // names it only if this pid now shows that incarnation as a
+                // zombie, or no process at all. Any other answer, a failed
+                // lookup included, is "gone": its death was observed, and
+                // `info` may name a later process under the pid.
                 if mac::exit_event(&kq.wait(Some(std::time::Duration::ZERO))?) {
                     match darwin::bsdinfo(pid) {
                         Ok(now)
@@ -531,8 +582,15 @@ impl ProcWatch {
             }
             // A zombie, or a process that has begun exiting (its descriptors
             // may still be open): refused registration alone proves nothing.
+            // A failed read is "gone" only when it found no process.
             Err(err) if err.raw_os_error() == Some(libc::ESRCH) => {
-                let info = darwin::bsdinfo(pid).map_err(|_| gone())?;
+                let info = darwin::bsdinfo(pid).map_err(|err| {
+                    if err.kind() == io::ErrorKind::NotFound {
+                        gone()
+                    } else {
+                        err
+                    }
+                })?;
                 let opened = if darwin::is_zombie(&info) {
                     mac::Opened::Exited
                 } else {
@@ -932,6 +990,33 @@ mod mac {
                 Some(Err("exit not proven".into()))
             );
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+
+    /// A failed read of a pinned process's identity is "process gone" only
+    /// when the read found no such process (ENOENT, ESRCH) or the pidfd
+    /// says it exited; every other failure passes through unchanged.
+    #[test]
+    fn a_failed_identity_read_is_process_gone_only_when_the_process_is() {
+        let os = io::Error::from_raw_os_error;
+        for errno in [libc::ENOENT, libc::ESRCH] {
+            let err = identity_unread(os(errno), || false);
+            assert!(is_process_gone(&err), "errno {errno}: {err}");
+        }
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOMEM, libc::EACCES] {
+            let err = identity_unread(os(errno), || false);
+            assert!(!is_process_gone(&err), "errno {errno}: {err}");
+            assert_eq!(err.raw_os_error(), Some(errno));
+            let err = identity_unread(os(errno), || true);
+            assert!(is_process_gone(&err), "errno {errno} after the exit: {err}");
+        }
+        let err = identity_unread(io::Error::other("no starttime"), || false);
+        assert!(!is_process_gone(&err), "{err}");
+        assert_eq!(err.to_string(), "no starttime");
     }
 }
 
