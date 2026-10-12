@@ -864,6 +864,32 @@ describe('provider qualification receipt v2', () => {
     }])).toThrow(/provenance|process-args/i)
   })
 
+  it.each(['gpt-5.6-sol', 'unknown', ''])('rejects a wrong or missing Codex native model (%j)', resolvedModel => {
+    const row = providerRow('codex')
+    const proof = { ...row.nativeTurnProofs[0]!, resolvedModel }
+    expect(providerNativeProfileMatches(row, proof)).toBe(false)
+    expect(() => evidenceFixture([{ ...row, nativeTurnProofs: [proof, ...row.nativeTurnProofs.slice(1)] }]))
+      .toThrow(/native|model|profile/i)
+  })
+
+  it('matches a different requested Codex model only to that native model', () => {
+    const row = { ...providerRow('codex'), model: 'gpt-5.2-codex' }
+    const proof = { ...row.nativeTurnProofs[0]!, resolvedModel: row.model }
+    expect(providerNativeProfileMatches(row, row.nativeTurnProofs[0]!)).toBe(false)
+    expect(providerNativeProfileMatches(row, proof)).toBe(true)
+    expect(providerNativeProfileMatches(row, { ...proof, modelProvenance: 'process-args' })).toBe(false)
+  })
+
+  it('keeps unsupported Codex native effort unknown without inventing the requested effort', () => {
+    const row = providerRow('codex')
+    const proof = { ...row.nativeTurnProofs[0]!, resolvedReasoningEffort: 'unknown',
+      reasoningEffortProvenance: 'unsupported-native-telemetry' }
+    expect(providerNativeProfileMatches(row, proof)).toBe(true)
+    expect(proof.resolvedReasoningEffort).toBe('unknown')
+    expect(providerNativeProfileMatches(row, { ...proof, reasoningEffortProvenance: 'codex-native.effort' })).toBe(false)
+    expect(providerNativeProfileMatches(row, { ...proof, resolvedReasoningEffort: row.reasoningEffort })).toBe(false)
+  })
+
   it('rejects raw prompts, raw responses, nonce values, and synthetic secrets before writing evidence', () => {
     const row = providerRow()
     expect(() => evidenceFixture([{ ...row, responseText: 'harmless raw response' }])).toThrow(/redact|responseText/i)

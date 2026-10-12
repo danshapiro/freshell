@@ -3560,6 +3560,187 @@ mod managed_runtime_id_tests {
         descriptor: ManagedTerminalDescriptor,
     }
 
+    struct CaptureLaunchController(std::sync::Mutex<Option<ManagedTerminalLaunch>>);
+
+    impl ManagedTerminalController for CaptureLaunchController {
+        fn lookup_terminal<'a>(
+            &'a self,
+            _: &'a str,
+            _: Option<String>,
+        ) -> ManagedTerminalFuture<'a, Result<Option<ManagedTerminalDescriptor>, String>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn launch<'a>(
+            &'a self,
+            request: ManagedTerminalLaunch,
+        ) -> ManagedTerminalFuture<'a, Result<ManagedTerminalDescriptor, String>> {
+            Box::pin(async move {
+                *self.0.lock().unwrap() = Some(request);
+                Err("captured managed launch without spawning".into())
+            })
+        }
+
+        fn input<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+            _: String,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { panic!("capture must not receive terminal input") })
+        }
+
+        fn resize<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+            _: u16,
+            _: u16,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { panic!("capture must not resize a terminal") })
+        }
+
+        fn stop<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { panic!("capture must not stop a terminal") })
+        }
+
+        fn read_output<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+            _: i64,
+            _: u64,
+        ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
+            Box::pin(async { panic!("capture must not read terminal output") })
+        }
+    }
+
+    struct PresentCodexSession;
+
+    impl crate::existence::SessionExistenceProbe for PresentCodexSession {
+        fn exists(&self, provider: &str, session_id: &str) -> crate::existence::SessionExistence {
+            assert_eq!(provider, "codex");
+            assert_eq!(session_id, "owned-native-root");
+            crate::existence::SessionExistence::Present
+        }
+
+        fn ever_observed(&self, _: &str, _: &str) -> bool {
+            true
+        }
+    }
+
+    async fn assert_managed_codex_model(model: Option<&str>, resume: bool) {
+        let mut state = super::pane_reconcile_gate_tests::state();
+        let mut settings = crate::test_settings();
+        settings.coding_cli.providers.insert(
+            "codex".into(),
+            serde_json::from_value(serde_json::json!({ "model": model, "effort": "low" })).unwrap(),
+        );
+        state.settings = Arc::new(settings);
+        state.cli_commands = Arc::new(vec![freshell_platform::CliCommandSpec {
+            name: "codex".into(),
+            label: "Codex CLI".into(),
+            default_cmd: "codex".into(),
+            model_args: Some(vec!["--model".into(), "{{model}}".into()]),
+            effort_args: Some(vec![
+                "-c".into(),
+                "model_reasoning_effort=\"{{effort}}\"".into(),
+            ]),
+            resume_args: Some(vec!["resume".into(), "{{sessionId}}".into()]),
+            ..Default::default()
+        }]);
+        let controller = Arc::new(CaptureLaunchController(std::sync::Mutex::new(None)));
+        state
+            .registry
+            .set_managed_controller(Some(controller.clone()));
+        state.registry.set_managed_runtime_connection(17, true);
+        state.session_existence = Arc::new(PresentCodexSession);
+        let sink: freshell_terminal::FrameSink = Arc::new(|_| {});
+        let mut output = crate::create_gate::CreateOutput::Channel(&sink);
+        let mut body = serde_json::json!({
+            "requestId": "managed-codex-model", "mode": "codex", "shell": "system",
+            "cwd": std::env::temp_dir(),
+        });
+        if resume {
+            body["sessionRef"] = serde_json::json!({
+                "provider": "codex", "sessionId": "owned-native-root"
+            });
+        }
+        let create = serde_json::from_value(body).unwrap();
+        let mut limiter = crate::create_limit::CreateRateLimiter::new(100, 1000);
+        assert!(
+            super::handle_create(
+                create,
+                None,
+                &mut output,
+                &state,
+                17,
+                true,
+                &mut limiter,
+                &super::ConnectionIdentity::default(),
+                super::now_ms(),
+            )
+            .await
+        );
+        let request = controller
+            .0
+            .lock()
+            .unwrap()
+            .take()
+            .expect("actual managed launch request");
+        assert_eq!(request.provider_model.as_deref(), model);
+        assert_eq!(request.provider_reasoning_effort.as_deref(), Some("low"));
+        let args = &request.spec.args;
+        let models: Vec<_> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--model")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(
+            models,
+            model.into_iter().collect::<Vec<_>>(),
+            "the native TUI must receive the configured model through the shipped template"
+        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-c", "model_reasoning_effort=\"low\""]));
+        assert_eq!(
+            request.resume_session_id.as_deref(),
+            resume.then_some("owned-native-root")
+        );
+        assert_eq!(args.iter().any(|arg| arg == "resume"), resume);
+        if resume {
+            assert!(args
+                .windows(2)
+                .any(|pair| pair == ["resume", "owned-native-root"]));
+        }
+        assert!(
+            state.registry.directory().is_empty(),
+            "capture spawns no provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_codex_model_reaches_native_launch() {
+        assert_managed_codex_model(Some("gpt-5.6-luna"), false).await;
+    }
+
+    #[tokio::test]
+    async fn managed_codex_model_honors_a_different_user_selection() {
+        assert_managed_codex_model(Some("gpt-5.2-codex"), false).await;
+    }
+
+    #[tokio::test]
+    async fn managed_codex_model_missing_does_not_fabricate_a_default() {
+        assert_managed_codex_model(None, false).await;
+    }
+
+    #[tokio::test]
+    async fn managed_codex_model_exact_resume_keeps_model_effort_and_native_root() {
+        assert_managed_codex_model(Some("gpt-5.6-luna"), true).await;
+        assert_managed_codex_model(Some("gpt-5.2-codex"), true).await;
+    }
+
     impl ManagedTerminalController for LookupOnlyController {
         fn lookup_terminal<'a>(
             &'a self,
@@ -6097,11 +6278,17 @@ pub(crate) async fn handle_create(
     } else {
         cli_provider_settings(state, &mode)
     };
-    // Codex model, sandbox, and approval belong to the app-server plan on
-    // both routes. The managed launch still carries them separately to the
-    // soul's sidecar; the TUI gets the ordinary CLI settings tuple.
+    // Preserve the legacy Codex CLI policy. A managed terminal's host adds
+    // --remote to this TUI; the configured model must also reach that TUI
+    // through the manifest, just as on the ordinary REST spawn path. The
+    // sidecar's typed launch plan alone does not apply a native model setting.
     let (cli_permission_mode, cli_model, cli_effort, cli_sandbox) =
         cli_provider_settings(state, &mode);
+    let cli_model = if use_managed_runtime && mode == "codex" {
+        model.as_deref()
+    } else {
+        cli_model.as_deref()
+    };
 
     // opencode: allocate the loopback control endpoint BEFORE building the launch
     // (`ws:2471-2473`; `local-port.ts:13-41`), via the freshell-opencode
@@ -6263,7 +6450,7 @@ pub(crate) async fn handle_create(
         resume_session_id: resume_session_id.as_deref(),
         launch_intent,
         permission_mode: cli_permission_mode.as_deref(),
-        model: cli_model.as_deref(),
+        model: cli_model,
         effort: cli_effort.as_deref(),
         sandbox: cli_sandbox.as_deref(),
         codex_remote_ws_url: codex_remote_ws_url.as_deref(),
