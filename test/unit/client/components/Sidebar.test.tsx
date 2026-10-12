@@ -4,6 +4,7 @@ import { render, screen, fireEvent, cleanup, act, waitFor, within } from '@testi
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import Sidebar from '@/components/Sidebar'
+import { collectPaneContents } from '@/lib/pane-utils'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import tabsReducer, { closeTab } from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
@@ -4205,6 +4206,46 @@ describe('Sidebar Component - Session-Centric Display', () => {
   })
 
   describe('sidebar click opens pane', () => {
+    it.each(['tab', 'split'] as const)('preserves the checkpoint workspace when opening a fresh-agent session in %s mode', async (sessionOpenMode) => {
+      const targetSessionId = sessionId(`fresh-workspace-${sessionOpenMode}`)
+      const checkpointWorkspace = { path: '/selected/fresh-project', provenance: 'directory-picker' as const }
+      const projects: ProjectGroup[] = [{
+        projectPath: '/selected/fresh-project',
+        sessions: [{
+          sessionId: targetSessionId,
+          provider: 'claude',
+          sessionType: 'freshclaude',
+          projectPath: '/selected/fresh-project',
+          lastActivityAt: Date.now(),
+          title: 'Fresh checkpoint workspace',
+          cwd: '/selected/fresh-project',
+          checkpointWorkspace,
+        }],
+      }]
+      const tabs = [{ id: 'tab-1', mode: 'shell' as const }]
+      const panes = {
+        layouts: {
+          'tab-1': {
+            type: 'leaf' as const,
+            id: 'pane-1',
+            content: { kind: 'terminal' as const, mode: 'shell' as const, createRequestId: 'req-1', status: 'running' as const },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+      }
+      const store = createTestStore({ projects, tabs, panes, activeTabId: 'tab-1', sessionOpenMode })
+      renderSidebar(store, [])
+
+      await act(async () => { vi.advanceTimersByTime(100) })
+      fireEvent.click(screen.getByText('Fresh checkpoint workspace').closest('button')!)
+
+      const pane = Object.values(store.getState().panes.layouts)
+        .flatMap((layout) => collectPaneContents(layout))
+        .find((content) => content.kind === 'fresh-agent' && content.sessionRef?.sessionId === targetSessionId)
+      expect(pane).toMatchObject({ kind: 'fresh-agent', checkpointWorkspace })
+    })
+
     it('splits a new pane in the current tab when clicking a session', async () => {
       const projects: ProjectGroup[] = [
         {

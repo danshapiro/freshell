@@ -6,8 +6,7 @@ import { removeSessionFromProjects, toggleProjectExpanded } from '@/store/sessio
 import { api } from '@/lib/api'
 import { activateSessionSurface, fetchSessionWindow, type FetchSessionWindowResult } from '@/store/sessionsThunks'
 import { openSessionTab } from '@/store/tabsSlice'
-import { findPaneContent } from '@/lib/pane-utils'
-import { findPaneForSession } from '@/lib/session-utils'
+import { findCheckpointWorkspaceForSession } from '@/lib/resume-session'
 import { applySessionRenameCascade } from '@/store/titleSync'
 import { receiveSessionNameProjections, receiveSessionNames } from '@/store/sessionNamesSlice'
 import { renameSessionName } from '@/lib/session-names'
@@ -233,14 +232,8 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
     const mode = (session.provider || 'claude') as CodingCliProviderName
     const displayName = sessionDisplayName(session, sessionNames)
     const state = store.getState()
-    const existing = findPaneForSession(
-      state,
-      { provider: mode, sessionId: session.sessionId },
-      state.connection?.serverInstanceId,
-    )
-    const layout = existing?.paneId ? state.panes.layouts[existing.tabId] : undefined
-    const content = layout && existing?.paneId ? findPaneContent(layout, existing.paneId) : null
-    const checkpointWorkspace = content?.kind === 'fresh-agent' ? content.checkpointWorkspace : undefined
+    const checkpointWorkspace = session.checkpointWorkspace
+      ?? findCheckpointWorkspaceForSession(state, { provider: mode, sessionId: session.sessionId })
     dispatch(openSessionTab({
       sessionId: session.sessionId,
       title: displayName || label,

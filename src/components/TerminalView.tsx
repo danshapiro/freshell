@@ -73,6 +73,7 @@ import { TerminalStuckCard } from '@/components/TerminalStuckCard'
 import { TerminalLaunchFailureCard } from '@/components/TerminalLaunchFailureCard'
 import { FencedOwnerRecoveryActions, SessionHandoffErrorBanner } from '@/components/SessionHandoffErrorBanner'
 import { buildResumeContent, freshSessionTypeForPaneFlavor } from '@/lib/session-type-utils'
+import { findCheckpointWorkspaceForSession } from '@/lib/resume-session'
 import type { LaunchFailure } from '@/store/paneTypes'
 import { buildManagedPreparationFailure, retainedManagedPreparationFailure } from '@/store/paneTypes'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
@@ -7324,6 +7325,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     const state = appStore.getState()
     const canonical = resolveCanonicalPaneSession(state, terminalContent)
     const sessionId = canonical?.sessionId ?? sessionRef.sessionId
+    const tabCheckpointWorkspace = state.tabs.tabs.find((candidate) => candidate.id === tabId)
+    const carriesThisSession = tabCheckpointWorkspace?.sessionRef?.provider === sessionRef.provider
+      && tabCheckpointWorkspace.sessionRef.sessionId === sessionRef.sessionId
+    const checkpointWorkspace = findCheckpointWorkspaceForSession(state, {
+      provider: sessionRef.provider,
+      sessionId: sessionRef.sessionId,
+    }) ?? (carriesThisSession ? tabCheckpointWorkspace?.checkpointWorkspace : undefined)
     dispatch(updatePaneContent({
       tabId,
       paneId,
@@ -7331,6 +7339,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         sessionType,
         sessionId,
         cwd: terminalContent.initialCwd,
+        ...(checkpointWorkspace ? { checkpointWorkspace } : {}),
         ...(providerSettings ? { freshAgentProviderSettings: providerSettings } : {}),
       }),
     }))

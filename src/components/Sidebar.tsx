@@ -9,6 +9,7 @@ import { shallowEqual } from 'react-redux'
 import { openSessionTab, setActiveTab, updateTab } from '@/store/tabsSlice'
 import { addPane, setActivePane, updatePaneTitle } from '@/store/panesSlice'
 import { findPaneForSession } from '@/lib/session-utils'
+import { findCheckpointWorkspaceForSession } from '@/lib/resume-session'
 import { resolveSessionTypeConfig, buildResumeContent } from '@/lib/session-type-utils'
 import { getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
@@ -477,6 +478,8 @@ export default function Sidebar({
   const handleItemClick = useCallback((item: SessionItem) => {
     const provider = item.provider as CodingCliProviderName
     const state = store.getState()
+    const checkpointWorkspace = item.checkpointWorkspace
+      ?? findCheckpointWorkspaceForSession(state, { provider, sessionId: item.sessionId })
     const currentActiveTabId = state.tabs.activeTabId
     const runningTerminalId = item.isRunning || item.soulId ? item.runningTerminalId : undefined
     const localServerInstanceId = state.connection.serverInstanceId
@@ -524,6 +527,7 @@ export default function Sidebar({
         sessionId: item.sessionId,
         title: item.title,
         cwd: item.cwd,
+        ...(checkpointWorkspace ? { checkpointWorkspace } : {}),
         provider,
         sessionType,
         terminalId: runningTerminalId,
@@ -545,6 +549,7 @@ export default function Sidebar({
         sessionId: item.sessionId,
         title: item.title,
         cwd: item.cwd,
+        ...(checkpointWorkspace ? { checkpointWorkspace } : {}),
         provider,
         sessionType,
         terminalId: runningTerminalId,
@@ -565,6 +570,7 @@ export default function Sidebar({
         sessionType,
         sessionId: item.sessionId,
         cwd: item.cwd,
+        ...(checkpointWorkspace ? { checkpointWorkspace } : {}),
         freshAgentProviderSettings,
         liveTerminal: runningTerminalId && localServerInstanceId
           ? { terminalId: runningTerminalId, serverInstanceId: localServerInstanceId, ...managedTerminalProjection(item) }

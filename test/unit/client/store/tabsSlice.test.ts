@@ -1114,6 +1114,7 @@ describe('tabsSlice', () => {
 
     it('opens a Claude history row as a fresh-agent pane with resumeSessionId', async () => {
       const store = createOpenSessionStore()
+      const checkpointWorkspace = { path: '/selected/repo', provenance: 'directory-picker' as const }
 
       await store.dispatch(openSessionTab({
         sessionId: VALID_CLAUDE_SESSION_ID,
@@ -1121,12 +1122,14 @@ describe('tabsSlice', () => {
         cwd: '/repo',
         provider: 'claude',
         sessionType: 'freshclaude',
+        checkpointWorkspace,
       }))
 
       const state = store.getState()
       const tab = state.tabs.tabs.find((candidate) => candidate.title === 'Existing Freshclaude session')
       expect(tab).toBeTruthy()
       expect(tab?.sessionRef).toEqual({ provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID })
+      expect(tab?.checkpointWorkspace).toEqual(checkpointWorkspace)
 
       const layout = state.panes.layouts[tab!.id]
       expect(layout.type).toBe('leaf')
@@ -1136,6 +1139,7 @@ describe('tabsSlice', () => {
         provider: 'claude',
         resumeSessionId: VALID_CLAUDE_SESSION_ID,
         sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+        checkpointWorkspace,
       })
     })
 

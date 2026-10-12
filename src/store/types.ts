@@ -45,6 +45,11 @@ export type TabMode = 'shell' | CodingCliProviderName
  */
 export type ShellType = 'system' | 'cmd' | 'powershell' | 'wsl'
 
+export type FreshAgentCheckpointWorkspace = {
+  path: string
+  provenance: 'directory-picker' | 'resolved-project' | 'legacy-checkpoint'
+}
+
 export interface SessionListMetadata {
   sessionType?: string
   firstUserMessage?: string
@@ -62,6 +67,8 @@ export interface Tab extends ManagedRuntimeProjectionFields {
   mode: TabMode
   shell?: ShellType
   initialCwd?: string
+  /** Immutable code-checkpoint workspace used when a fresh-agent pane is reconstructed. */
+  checkpointWorkspace?: FreshAgentCheckpointWorkspace
   sessionRef?: SessionLocator
   codexDurability?: CodexDurabilityRef
   serverInstanceId?: string
@@ -118,6 +125,8 @@ export interface CodingCliSession {
   summary?: string
   firstUserMessage?: string
   cwd?: string
+  /** Optional client/server locator for restoring the session's rewind scope. */
+  checkpointWorkspace?: FreshAgentCheckpointWorkspace
   archived?: boolean
   sourceFile?: string
   isSubagent?: boolean

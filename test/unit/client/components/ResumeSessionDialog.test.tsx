@@ -9,8 +9,10 @@ vi.mock('@/lib/api', () => ({
 }))
 
 const resumeSessionInTab = vi.fn(() => ({ deduped: false }))
+const findCheckpointWorkspaceForSession = vi.fn(() => undefined as unknown)
 vi.mock('@/lib/resume-session', () => ({
   resumeSessionInTab: (...args: unknown[]) => resumeSessionInTab(...args),
+  findCheckpointWorkspaceForSession: (...args: unknown[]) => findCheckpointWorkspaceForSession(...args),
 }))
 
 import { ResumeSessionDialog } from '@/components/ResumeSessionDialog'
@@ -274,6 +276,26 @@ describe('ResumeSessionDialog', () => {
     expect(anyway).toBeDisabled()
     fireEvent.click(anyway)
     expect(resumeSessionInTab).not.toHaveBeenCalled()
+  })
+
+  it('passes the local checkpoint workspace through the resume-anyway fallback', async () => {
+    const checkpointWorkspace = { path: '/selected/project', provenance: 'directory-picker' as const }
+    findCheckpointWorkspaceForSession.mockReturnValue(checkpointWorkspace)
+    apiPost.mockReturnValue(ok([]))
+    renderDialog()
+    typeAndResolve(V7)
+    const anyway = await screen.findByTestId('resume-anyway-button')
+    fireEvent.click(anyway)
+
+    expect(findCheckpointWorkspaceForSession).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      provider: 'codex',
+      sessionId: V7,
+    }))
+    expect(resumeSessionInTab.mock.calls[0]?.[2]).toMatchObject({
+      provider: 'codex',
+      sessionId: V7,
+      checkpointWorkspace,
+    })
   })
 
   it('a NON-ready response never auto-resumes, even with a single cwd match (degraded seam)', async () => {

@@ -10,6 +10,7 @@ import type {
   PaneContent,
   PaneNode,
 } from './paneTypes'
+import { normalizeFreshAgentCheckpointWorkspace } from './paneTypes'
 import { findTabIdForSession, collectSessionRefsFromTabs, liveTerminalRowIdentity } from '@/lib/session-utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
 import { basenameSegment } from '@shared/path-basename'
@@ -312,6 +313,7 @@ type AddTabPayload = {
   mode?: TabMode
   shell?: ShellType
   initialCwd?: string
+  checkpointWorkspace?: FreshAgentCheckpointWorkspace
   sessionRef?: Tab['sessionRef']
   serverInstanceId?: string
   resumeSessionId?: string
@@ -360,6 +362,7 @@ export const tabsSlice = createSlice({
         mode: payload.mode || 'shell',
         shell: payload.shell || 'system',
         initialCwd: payload.initialCwd,
+        checkpointWorkspace: normalizeFreshAgentCheckpointWorkspace(payload.checkpointWorkspace),
         sessionRef,
         serverInstanceId: payload.serverInstanceId,
         resumeSessionId: undefined,
@@ -1908,6 +1911,7 @@ export const openSessionTab = createAsyncThunk(
         mode: resolvedProvider,
         codingCliProvider: resolvedProvider,
         initialCwd: cwd,
+        checkpointWorkspace: desiredResumeContent.checkpointWorkspace,
         sessionRef: desiredResumeContent.sessionRef,
         sessionMetadataByKey: buildSessionMetadataByKey(),
       }))

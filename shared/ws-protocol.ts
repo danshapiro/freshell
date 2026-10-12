@@ -899,6 +899,16 @@ export const FreshAgentSendSchema = z.object({
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
+  /** kata bdpt Task 7: one server-owned pre-turn checkpoint barrier is
+   *  correlated with this provider attempt and dispatched as part of this
+   *  same send. Explicit workspace scope is persisted pane intent only. */
+  checkpointIntent: z.object({
+    logicalAttemptId: z.string().min(1).max(128),
+    workspace: z.object({
+      path: z.string().min(1).max(4096),
+      provenance: z.enum(['directory-picker', 'resolved-project', 'legacy-checkpoint']),
+    }).optional(),
+  }).optional(),
   /** b8ke ext r8 F5: the send's delayed-request fence (crashed-session
    *  recovery re-claims carry it, so a stale queued send is typed-refused,
    *  never an unfenced recreation). */
@@ -1858,6 +1868,7 @@ export type FreshAgentServerMessage =
       ownerKind?: 'terminal' | 'fresh-agent'
       ownerGeneration?: number
       ownerEpoch?: number }
+  | { type: 'freshAgent.checkpoint.outcome'; logicalAttemptId: string; requestId: string; provider: 'claude' | 'codex' | 'opencode'; sessionId: string; sessionType: 'freshclaude' | 'freshcodex' | 'kilroy' | 'freshopencode'; status: 'available' | 'unavailable'; checkpointId?: string; workspace?: { path: string; provenance: 'directory-picker' | 'resolved-project' | 'legacy-checkpoint' }; code?: string; reason?: string }
   | { type: 'freshAgent.send.accepted'; requestId: string; sessionId: string; sessionType: string; provider: string; submittedTurnId?: string; cwd?: string }
   | { type: 'freshAgent.event'; sessionId: string; sessionType: string; provider: string; event: unknown }
   | { type: 'freshAgent.session.materialized'; previousSessionId: string; sessionId: string; sessionType: string; provider: string; sessionRef?: { provider: string; sessionId: string }; sessionName?: SessionNameRecord; nameRef?: SessionNameRef }

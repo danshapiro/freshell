@@ -21,6 +21,7 @@ import {
   stripSessionOwnedTabFreezeFlags,
 } from '@/lib/session-name-migration'
 import {
+  normalizeFreshAgentCheckpointWorkspace,
   normalizeFreshAgentCheckpointOutcomes,
   normalizeFreshAgentPaneModelSelection,
 } from './paneTypes'
@@ -54,6 +55,13 @@ const zSanitizedOptionalString = z.preprocess(
 
 const zTabMode = zSanitizedOptionalString
 const zCodingCliProvider = zSanitizedOptionalString
+const zCheckpointWorkspace = z.preprocess(
+  (value) => normalizeFreshAgentCheckpointWorkspace(value),
+  z.object({
+    path: z.string().min(1),
+    provenance: z.enum(['directory-picker', 'resolved-project', 'legacy-checkpoint']),
+  }).optional(),
+)
 
 const zTab = z.object({
   id: z.string().min(1),
@@ -64,6 +72,7 @@ const zTab = z.object({
   mode: zTabMode,
   codingCliProvider: zCodingCliProvider,
   resumeSessionId: z.string().optional(),
+  checkpointWorkspace: zCheckpointWorkspace,
 }).passthrough()
 
 // The tabs array is validated per-element (see `salvageTabs`) rather than atomically via

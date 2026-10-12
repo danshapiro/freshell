@@ -27,8 +27,9 @@ import { buildShareUrl } from '@/lib/utils'
 import { copyText } from '@/lib/clipboard'
 import { openExternalUrl } from '@/lib/open-url'
 import { triggerHapticFeedback } from '@/lib/mobile-haptics'
-import { collectPaneEntries, collectTerminalIds, findPaneContent } from '@/lib/pane-utils'
+import { collectPaneEntries, collectTerminalIds } from '@/lib/pane-utils'
 import { collectSessionRefsFromNode, findPaneForSession } from '@/lib/session-utils'
+import { findCheckpointWorkspaceForSession } from '@/lib/resume-session'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import { getBrowserActions, getEditorActions, getTerminalActions } from '@/lib/pane-action-registry'
 import { buildResumeCommand, type ResumeCommandProvider } from '@/lib/coding-cli-utils'
@@ -417,17 +418,7 @@ export function ContextMenuProvider({
   }, [getProjectCollections])
 
   const getExistingCheckpointWorkspace = useCallback((provider: CodingCliProviderName, sessionId: string) => {
-    const state = appStore.getState()
-    const existing = findPaneForSession(
-      state,
-      { provider, sessionId },
-      state.connection?.serverInstanceId,
-    )
-    if (!existing?.paneId) return undefined
-    const layout = state.panes.layouts[existing.tabId]
-    if (!layout) return undefined
-    const content = findPaneContent(layout, existing.paneId)
-    return content?.kind === 'fresh-agent' ? content.checkpointWorkspace : undefined
+    return findCheckpointWorkspaceForSession(appStore.getState(), { provider, sessionId })
   }, [appStore])
 
   const getProjectInfo = useCallback((projectPath: string, target?: ContextTarget | null) => {
@@ -468,7 +459,8 @@ export function ContextMenuProvider({
     const mode = (provider || session.provider || 'claude') as CodingCliProviderName
     const sessionType = (target?.kind === 'sidebar-session' ? target.sessionType : undefined)
       || session.sessionType || mode
-    const checkpointWorkspace = getExistingCheckpointWorkspace(mode, session.sessionId)
+    const checkpointWorkspace = session.checkpointWorkspace
+      ?? getExistingCheckpointWorkspace(mode, session.sessionId)
     const runningTerminalId =
       target?.kind === 'sidebar-session' && target.sessionId === sessionId
         ? target.runningTerminalId
@@ -502,7 +494,8 @@ export function ContextMenuProvider({
     const mode = (provider || session.provider || 'claude') as CodingCliProviderName
     const sessionType = (target?.kind === 'sidebar-session' ? target.sessionType : undefined)
       || session.sessionType || mode
-    const checkpointWorkspace = getExistingCheckpointWorkspace(mode, session.sessionId)
+    const checkpointWorkspace = session.checkpointWorkspace
+      ?? getExistingCheckpointWorkspace(mode, session.sessionId)
     const freshAgentType = resolveFreshAgentType(sessionType)
     const freshAgentProviderConfig = getFreshAgentProviderConfig(sessionType)
     const freshAgentProviderSettings = freshAgentType || freshAgentProviderConfig
@@ -815,7 +808,8 @@ export function ContextMenuProvider({
         if (project) {
           for (const session of project.sessions) {
             const provider = (session.provider || 'claude') as CodingCliProviderName
-            const checkpointWorkspace = getExistingCheckpointWorkspace(provider, session.sessionId)
+            const checkpointWorkspace = session.checkpointWorkspace
+              ?? getExistingCheckpointWorkspace(provider, session.sessionId)
             dispatch(openSessionTab({
               sessionId: session.sessionId,
               title: session.title || session.sessionId.slice(0, 8),

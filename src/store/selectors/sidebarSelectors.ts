@@ -2,7 +2,14 @@ import { createSelector } from '@reduxjs/toolkit'
 import type { ManagedRuntimeProjectionFields } from '../../../shared/managed-runtime.js'
 import { isRetainedManagedTerminal, managedTerminalProjection } from '@/lib/managed-terminal'
 import type { RootState } from '../store'
-import type { BackgroundTerminal, CodingCliProviderName, WorktreeGrouping, ProjectGroup } from '../types'
+import type {
+  BackgroundTerminal,
+  CodingCliProviderName,
+  FreshAgentCheckpointWorkspace,
+  WorktreeGrouping,
+  ProjectGroup,
+} from '../types'
+import { normalizeFreshAgentCheckpointWorkspace } from '../paneTypes'
 import { collectSessionRefsFromTabs } from '@/lib/session-utils'
 import { getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
@@ -42,6 +49,7 @@ export interface SidebarSessionItem extends ManagedRuntimeProjectionFields {
   archived?: boolean
   timestamp: number
   cwd?: string
+  checkpointWorkspace?: FreshAgentCheckpointWorkspace
   hasTab: boolean
   ratchetedActivity?: number
   isRunning: boolean
@@ -327,6 +335,7 @@ export function buildSessionItems(
         archived: session.archived,
         timestamp: session.lastActivityAt,
         cwd: session.cwd,
+        checkpointWorkspace: normalizeFreshAgentCheckpointWorkspace(session.checkpointWorkspace),
         hasTab: tabInfo?.hasTab ?? false,
         ratchetedActivity,
         isRunning: runningTerminal ? runningTerminal.isRunning : !!runningTerminalId,

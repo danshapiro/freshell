@@ -1,4 +1,5 @@
-import type { TerminalStatus, TabMode, ShellType } from './types'
+import type { TerminalStatus, TabMode, ShellType, FreshAgentCheckpointWorkspace } from './types'
+export type { FreshAgentCheckpointWorkspace } from './types'
 import {
   FreshAgentModelSelectionSchema,
   type FreshAgentModelSelection,
@@ -68,6 +69,7 @@ export function normalizeFreshAgentEffortOverride(value: unknown): string | unde
 }
 
 export type FreshAgentCheckpointOutcome = {
+  version: 1
   /** Conversation generation; changes only when the pane is deliberately replaced. */
   conversationRequestId?: string
   requestId: string
@@ -99,7 +101,7 @@ function checkpointOutcomeReason(value: unknown): string | undefined {
   return normalized || undefined
 }
 
-function checkpointOutcomeWorkspace(value: unknown): FreshAgentCheckpointWorkspace | undefined {
+export function normalizeFreshAgentCheckpointWorkspace(value: unknown): FreshAgentCheckpointWorkspace | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
   const candidate = value as Record<string, unknown>
   const path = checkpointOutcomeString(candidate.path, 4096)
@@ -125,6 +127,7 @@ export function normalizeFreshAgentCheckpointOutcomes(
     const record = candidate as Record<string, unknown>
     const requestId = checkpointOutcomeString(record.requestId, 128)
     if (!requestId || !/^[A-Za-z0-9_.:-]+$/.test(requestId)) continue
+    if (record.version !== undefined && record.version !== 1) continue
     const recordConversationRequestId = record.conversationRequestId === undefined
       ? undefined
       : checkpointOutcomeString(record.conversationRequestId, 128)
@@ -137,7 +140,7 @@ export function normalizeFreshAgentCheckpointOutcomes(
     const displayTurnId = checkpointOutcomeString(record.displayTurnId, 256)
     const nativeTurnId = checkpointOutcomeString(record.nativeTurnId, 256)
     const checkpointId = checkpointOutcomeString(record.checkpointId, 256)
-    const workspace = checkpointOutcomeWorkspace(record.workspace)
+    const workspace = normalizeFreshAgentCheckpointWorkspace(record.workspace)
     const code = typeof record.code === 'string'
       && record.code.length <= 96
       && /^[a-z0-9_.:-]+$/.test(record.code)
@@ -150,6 +153,7 @@ export function normalizeFreshAgentCheckpointOutcomes(
 
     byRequest.delete(requestId)
     byRequest.set(requestId, {
+      version: 1,
       requestId,
       ...(recordConversationRequestId ? { conversationRequestId: recordConversationRequestId } : {}),
       ...(displayTurnId ? { displayTurnId } : {}),
@@ -515,11 +519,6 @@ export type ExtensionPaneContent = {
   kind: 'extension'
   extensionName: string
   props: Record<string, unknown>
-}
-
-export type FreshAgentCheckpointWorkspace = {
-  path: string
-  provenance: 'directory-picker' | 'resolved-project' | 'legacy-checkpoint'
 }
 
 /**

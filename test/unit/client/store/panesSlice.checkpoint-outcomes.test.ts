@@ -44,6 +44,12 @@ describe('FreshAgent checkpoint outcomes', () => {
             reason: 'invalid identity',
           },
           {
+            version: 2,
+            requestId: 'unsupported-version',
+            status: 'unavailable',
+            reason: 'must not be interpreted as version 1',
+          },
+          {
             requestId: 'stale-conversation-outcome',
             conversationRequestId: 'create-replaced',
             status: 'unavailable',
@@ -59,6 +65,7 @@ describe('FreshAgent checkpoint outcomes', () => {
       kind: 'fresh-agent',
       checkpointOutcomes: [
         {
+          version: 1,
           requestId: 'send-available',
           conversationRequestId: 'create-1',
           displayTurnId: 'turn-4:row-0',
@@ -68,6 +75,7 @@ describe('FreshAgent checkpoint outcomes', () => {
           workspace: { path: '/work/project', provenance: 'directory-picker' },
         },
         {
+          version: 1,
           requestId: 'send-unavailable',
           conversationRequestId: 'create-1',
           displayTurnId: 'turn-5:row-0',

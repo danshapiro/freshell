@@ -307,7 +307,7 @@ function createStoreWithSession() {
   })
 }
 
-function createStoreWithSidebarWindowAgentSession() {
+function createStoreWithSidebarWindowAgentSession(checkpointWorkspace?: { path: string; provenance: 'directory-picker' | 'resolved-project' | 'legacy-checkpoint' }) {
   return configureStore({
     reducer: {
       tabs: tabsReducer,
@@ -408,6 +408,7 @@ function createStoreWithSidebarWindowAgentSession() {
                     updatedAt: 2000,
                     nameRef: { kind: 'session', provider: 'claude', sessionId: VALID_SESSION_ID },
                     sessionName: 'Sidebar Agent Session',
+                    ...(checkpointWorkspace ? { checkpointWorkspace } : {}),
                   },
                 ],
               },
@@ -2457,8 +2458,9 @@ describe('ContextMenuProvider', () => {
     expect(store.getState().panes.layouts[openedTab!.id]).toMatchObject({
       type: 'leaf',
       content: {
-        kind: 'terminal',
-        mode: 'claude',
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
         initialCwd: '/shared/project/history',
         sessionRef: {
           provider: 'claude',
@@ -2512,6 +2514,41 @@ describe('ContextMenuProvider', () => {
 
     const openedTab = store.getState().tabs.tabs.find((tab) => tab.id !== 'tab-1')
     expect(openedTab).toBeTruthy()
+    expect(store.getState().panes.layouts[openedTab!.id]).toMatchObject({
+      type: 'leaf',
+      content: { kind: 'fresh-agent', checkpointWorkspace },
+    })
+  })
+
+  it('preserves a session-provided checkpoint workspace when opening it in a new tab', async () => {
+    const user = userEvent.setup()
+    const checkpointWorkspace = { path: '/selected/project', provenance: 'directory-picker' as const }
+    const store = createStoreWithSidebarWindowAgentSession(checkpointWorkspace)
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.SidebarSession}
+            data-session-id={VALID_SESSION_ID}
+            data-provider="claude"
+            data-session-type="freshclaude"
+          >
+            Sidebar Agent Session
+          </div>
+        </ContextMenuProvider>
+      </Provider>,
+    )
+
+    await user.pointer({ target: screen.getByText('Sidebar Agent Session'), keys: '[MouseRight]' })
+    await user.click(screen.getByText('Open in new tab'))
+
+    const openedTab = store.getState().tabs.tabs.find((tab) => tab.id !== 'tab-1')
+    expect(openedTab?.checkpointWorkspace).toEqual(checkpointWorkspace)
     expect(store.getState().panes.layouts[openedTab!.id]).toMatchObject({
       type: 'leaf',
       content: { kind: 'fresh-agent', checkpointWorkspace },

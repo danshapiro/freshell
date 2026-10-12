@@ -3495,6 +3495,7 @@ describe('TerminalView lifecycle updates', () => {
     function setupTypedPane(options: {
       content?: Partial<TerminalPaneContent>
       tabMetadata?: Record<string, { sessionType?: string }>
+      tabCheckpointWorkspace?: { path: string; provenance: 'directory-picker' | 'resolved-project' | 'legacy-checkpoint' }
       seed?: (store: ReturnType<typeof configureStore>) => void
     } = {}) {
       const tabId = 'tab-b8ke'
@@ -3533,6 +3534,10 @@ describe('TerminalView lifecycle updates', () => {
               title: 'Codex',
               titleSetByUser: false,
               createRequestId: 'req-b8ke',
+              ...(options.tabCheckpointWorkspace ? { checkpointWorkspace: options.tabCheckpointWorkspace } : {}),
+              ...(options.tabCheckpointWorkspace
+                ? { sessionRef: { provider: 'codex' as const, sessionId: TYPED_SESSION_ID } }
+                : {}),
               ...(options.tabMetadata ? { sessionMetadataByKey: options.tabMetadata } : {}),
             }],
             activeTabId: tabId,
@@ -4195,7 +4200,8 @@ describe('TerminalView lifecycle updates', () => {
 
     it('b8ke ext r16 F5: the open-as-fresh-agent action resolves the retired pre-rekey key to the canonical key', async () => {
       const CANONICAL_ID = '77777777-8888-4999-aaaa-bbbbbbbbbbbb'
-      const { store } = setupTypedPane()
+      const checkpointWorkspace = { path: '/selected/project', provenance: 'directory-picker' as const }
+      const { store } = setupTypedPane({ tabCheckpointWorkspace: checkpointWorkspace })
       // The pane holds the RETIRED pre-rekey reference; the runtime-owners
       // map carries the alias mirror (the server's rekey mirror frame —
       // the same chain the owner selection resolves through).
@@ -4247,6 +4253,7 @@ describe('TerminalView lifecycle updates', () => {
         // The converted pane's sessionRef carries the CANONICAL key (the
         // retired pre-rekey key must never reach the lifecycle start).
         expect(leaf.content.sessionRef?.sessionId).toBe(CANONICAL_ID)
+        expect(leaf.content.checkpointWorkspace).toEqual(checkpointWorkspace)
       } else {
         throw new Error('the pane did not convert')
       }

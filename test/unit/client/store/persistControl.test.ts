@@ -104,6 +104,7 @@ describe('persistControl', () => {
     const parsed = parsePersistedLayoutRaw(raw!)!
     const savedContent = (parsed.panes.layouts['tab-1'] as any).content
     expect(savedContent.checkpointOutcomes).toEqual([{
+      version: 1,
       conversationRequestId: 'create-1',
       requestId: 'send-1',
       displayTurnId: 'turn-4:row-0',
