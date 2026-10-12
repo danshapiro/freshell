@@ -53,11 +53,13 @@ pub enum Sig {
 /// became a zombie (the kernel posts it once the process has closed every
 /// descriptor, so it holds no lock and never runs again). Only a proven
 /// exit is "gone": a read that fails for another reason (no descriptor
-/// left, no memory) is passed through as that error, and the id of a live
-/// thread is refused as no process ([`ProcWatch::open`]). Its kind is
-/// `NotFound` and its text "process gone"; [`is_process_gone`] tells it
-/// from every other open failure (a different incarnation under the pid,
-/// which is also `NotFound`, or an error of the OS call or of a read).
+/// left, no memory, or on Linux and Windows a "no such entry" the pinning
+/// handle does not confirm) is passed through as "could not check", never
+/// with the kind `NotFound`, and the id of a live thread is refused as no
+/// process ([`ProcWatch::open`]). Its kind is `NotFound` and its text
+/// "process gone"; [`is_process_gone`] tells it from every other open
+/// failure (a different incarnation under the pid, which is also
+/// `NotFound`, or an error of the OS call or of a read).
 #[derive(Debug)]
 struct ProcessGone;
 
@@ -134,7 +136,8 @@ impl ProcWatch {
     }
 
     /// Watch `pid` only if it is still the incarnation that started at
-    /// `start`; `ErrorKind::NotFound` when it differs or is gone.
+    /// `start`; `ErrorKind::NotFound` when it differs or is gone, never when
+    /// it could not be checked.
     pub fn open_expecting(pid: u32, start: u64) -> io::Result<Self> {
         Self::open_inner(pid, Some(start))
     }
@@ -348,16 +351,47 @@ fn not_a_process(id: u32, process: u32) -> io::Error {
 /// What a failed read of a pinned process's identity means: "process gone"
 /// only when `exited` (its pinning handle) proves the exit: a Linux pidfd
 /// is readable once the process has exited, reaped or not; a Windows
-/// handle is signalled. Any other failure is passed through, also one that
-/// names no such process (Linux ENOENT, ESRCH, which a `/proc` hiding a
-/// live process answers too), so no caller that skips a gone process can
-/// skip a live one.
+/// handle is signalled. Any other failure is "could not check" and is
+/// passed through, but never with the kind `NotFound`: the stop's member
+/// pinning and the kill passes skip a `NotFound` open as a process that
+/// exited since it was listed, and a read that names no such process
+/// (Linux ENOENT, which a `/proc` hiding a live process answers too) proves
+/// nothing. Such an error is wrapped ([`IdentityUnread`], kind `Other`,
+/// the read's error as its source); every other one keeps its own kind and
+/// errno. So no caller that skips a gone process can skip a live one.
 #[cfg(any(target_os = "linux", windows))]
 fn identity_unread(err: io::Error, exited: impl FnOnce() -> bool) -> io::Error {
     if exited() {
         process_gone()
+    } else if err.kind() == io::ErrorKind::NotFound {
+        io::Error::other(IdentityUnread(err))
     } else {
         err
+    }
+}
+
+/// A pinned process's identity read that failed with a "no such entry"
+/// error while nothing proves the process exited: "could not check". Its
+/// source is the read's own error.
+#[cfg(any(target_os = "linux", windows))]
+#[derive(Debug)]
+struct IdentityUnread(io::Error);
+
+#[cfg(any(target_os = "linux", windows))]
+impl std::fmt::Display for IdentityUnread {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the identity of the pinned process could not be read and its exit is not proven (could not check): {}",
+            self.0
+        )
+    }
+}
+
+#[cfg(any(target_os = "linux", windows))]
+impl std::error::Error for IdentityUnread {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
     }
 }
 
@@ -1066,11 +1100,23 @@ mod mac {
 mod linux_tests {
     use super::*;
 
+    /// The errno a read failed with, also when the answer wraps that read's
+    /// error (as its source).
+    fn errno_of(err: &io::Error) -> Option<i32> {
+        err.raw_os_error().or_else(|| {
+            std::error::Error::source(err.get_ref()?)?
+                .downcast_ref::<io::Error>()?
+                .raw_os_error()
+        })
+    }
+
     /// A failed read of a pinned process's identity is "process gone" only
-    /// when the pidfd says the process exited. Every failure passes through
-    /// unchanged while it does not: ENOENT and ESRCH too, which a `/proc`
-    /// mounted `hidepid=invisible`, or of another pid namespace, answers for
-    /// a live process.
+    /// when the pidfd says the process exited. While it does not, the
+    /// failure is "could not check", with the read's errno: ENOENT and
+    /// ESRCH too, which a `/proc` mounted `hidepid=invisible`, or of another
+    /// pid namespace, answers for a live process. Its kind is never
+    /// `NotFound`, which the stop's member pinning and the kill passes skip
+    /// as "exited since the read".
     #[test]
     fn a_failed_identity_read_is_process_gone_only_with_the_pidfds_proof() {
         let os = io::Error::from_raw_os_error;
@@ -1084,12 +1130,14 @@ mod linux_tests {
         ] {
             let err = identity_unread(os(errno), || false);
             assert!(!is_process_gone(&err), "errno {errno}: {err}");
-            assert_eq!(err.raw_os_error(), Some(errno));
+            assert_ne!(err.kind(), io::ErrorKind::NotFound, "errno {errno}: {err}");
+            assert_eq!(errno_of(&err), Some(errno), "{err}");
             let err = identity_unread(os(errno), || true);
             assert!(is_process_gone(&err), "errno {errno} after the exit: {err}");
         }
         let err = identity_unread(io::Error::other("no starttime"), || false);
         assert!(!is_process_gone(&err), "{err}");
+        assert_ne!(err.kind(), io::ErrorKind::NotFound, "{err}");
         assert_eq!(err.to_string(), "no starttime");
     }
 

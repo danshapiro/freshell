@@ -2914,6 +2914,33 @@ sleep 600;"#;
         drop(empty);
     }
 
+    /// A member whose identity cannot be read once it is pinned, while its
+    /// pidfd does not prove its exit (a `/proc` mounted `hidepid=invisible`
+    /// answers ENOENT for a live process), is "could not check": pinning
+    /// the members one read lists fails, and never leaves that member out
+    /// as one that exited since the read.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_member_whose_identity_cannot_be_read_is_never_left_out_as_gone() {
+        let member = Spawned::perl_sleep(&[]);
+        let unit = unit_on(Arc::new(Exiting {
+            listed: vec![member.watch.clone()],
+            spared: Vec::new(),
+            empty: None,
+        }));
+        let hidden = process::test_reads::fail(member.watch.pid(), "stat", libc::ENOENT);
+        let pinned = unit.pinned_members(&unit.log_keys(None)).await;
+        drop(hidden);
+        match pinned {
+            Err(err) => assert_ne!(err.kind(), io::ErrorKind::NotFound, "{err}"),
+            Ok(pinned) => panic!(
+                "a running member was left out as gone ({} pinned)",
+                pinned.len()
+            ),
+        }
+        assert!(member.untouched());
+    }
+
     /// macOS: the Gone lock check, on a backend whose members are exactly
     /// the listed processes (while each still runs as listed), so a member
     /// can lack any exit watch of the unit's.

@@ -930,6 +930,28 @@ sleep 600;"#,
         }
     }
 
+    /// A candidate whose identity cannot be read once it is pinned, while
+    /// its pidfd does not prove its exit (a `/proc` mounted
+    /// `hidepid=invisible` answers ENOENT for a live process), is "could not
+    /// check": the sweep answers that it could not stop it, and never passes
+    /// it over as one that exited.
+    #[test]
+    fn a_candidate_whose_identity_cannot_be_read_is_never_passed_over_as_gone() {
+        let sleep = Sleep::start();
+        let pid = sleep.watch.pid();
+        let hidden = process::test_reads::fail(pid, "stat", libc::ENOENT);
+        let swept = stop_the_world(|| (BTreeSet::from([pid]), BTreeSet::new()), |_, _| true);
+        drop(hidden);
+        match swept {
+            Err(err) => assert_ne!(err.kind(), io::ErrorKind::NotFound, "{err}"),
+            Ok(summary) => panic!("a running candidate was passed over as gone: {summary:?}"),
+        }
+        assert!(
+            !sleep.watch.has_exited(),
+            "it could not be pinned, so it was not signalled"
+        );
+    }
+
     fn fresh_unit() -> TagUnit {
         let id = UnitId::mint();
         TagUnit::new(UNIT_ENV, id.as_str(), &id, None).unwrap()

@@ -981,6 +981,31 @@ mod tests {
         );
     }
 
+    /// A slice process whose identity cannot be read once it is pinned,
+    /// while its pidfd does not prove its exit (a `/proc` mounted
+    /// `hidepid=invisible` answers ENOENT for a live process), is "could
+    /// not check": the one-by-one kill answers that it could not kill it,
+    /// and never passes it over as one that exited.
+    #[test]
+    fn a_process_whose_identity_cannot_be_read_is_never_passed_over_as_gone() {
+        let slice = FakeSlice::new();
+        let member = Own::sleep();
+        let hidden = process::test_reads::fail(member.pid(), "stat", libc::ENOENT);
+        let killed =
+            slice
+                .unit
+                .kill_all_but(&BTreeSet::from([member.pid()]), &BTreeSet::new(), false);
+        drop(hidden);
+        match killed {
+            Err(err) => assert_ne!(err.kind(), io::ErrorKind::NotFound, "{err}"),
+            Ok(killed) => panic!("a running process was passed over as gone ({killed} killed)"),
+        }
+        assert!(
+            !member.watch.has_exited(),
+            "it could not be pinned, so it was not killed"
+        );
+    }
+
     /// A cgroup wait resolves on the flag (already shown, or shown later:
     /// the change wakes it) or on a removed cgroup, and is an error whenever
     /// it cannot watch or read the file: never the flag.

@@ -278,6 +278,8 @@ pub(crate) fn in_codex_daemon_family_unless(pid: u32, cleared: impl Fn(u32, u64)
 /// name holding spaces or parentheses cannot shift them.
 #[cfg(target_os = "linux")]
 pub(crate) fn stat_fields(pid: u32) -> io::Result<Vec<String>> {
+    #[cfg(test)]
+    test_reads::check(pid, "stat")?;
     let raw = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let close = raw
         .rfind(')')
@@ -440,6 +442,8 @@ fn thread_count(pid: u32) -> io::Result<u32> {
 /// `cmdline` then reads empty and its `environ` is owned by root.
 #[cfg(target_os = "linux")]
 fn read_memory_file(pid: u32, file: &str) -> io::Result<Vec<u8>> {
+    #[cfg(test)]
+    test_reads::check(pid, file)?;
     through_a_running_thread(pid, |dir| std::fs::read(dir.join(file)), Vec::is_empty)
 }
 
@@ -1082,6 +1086,54 @@ pub(crate) fn child_listing(pid: u32) -> Listing {
     Listing {
         found: children(pid),
         unread: None,
+    }
+}
+
+/// Test support (Linux): makes this process's reads of one `/proc/<pid>/`
+/// file of a chosen process fail with a chosen errno, as a `/proc` mounted
+/// `hidepid=invisible` (ENOENT), descriptor exhaustion (EMFILE) or a
+/// non-dumpable process (EACCES) answers them, so a unit test can give a
+/// reader that answer about a live process of its own. Files: `stat`,
+/// `cmdline`, `environ`, and `fd` (the descriptor table the lock lookup
+/// reads).
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod test_reads {
+    use std::sync::{Mutex, PoisonError};
+
+    static FAILING: Mutex<Vec<(u32, &'static str, i32)>> = Mutex::new(Vec::new());
+
+    /// Reads of `/proc/<pid>/<file>` fail with `errno` until the returned
+    /// guard is dropped.
+    #[must_use]
+    pub(crate) fn fail(pid: u32, file: &'static str, errno: i32) -> Failing {
+        FAILING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((pid, file, errno));
+        Failing { pid, file }
+    }
+
+    pub(crate) struct Failing {
+        pid: u32,
+        file: &'static str,
+    }
+
+    impl Drop for Failing {
+        fn drop(&mut self) {
+            FAILING
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|(pid, file, _)| (*pid, *file) != (self.pid, self.file));
+        }
+    }
+
+    /// The failure a test gave reads of `/proc/<pid>/<file>`, if any.
+    pub(crate) fn check(pid: u32, file: &str) -> std::io::Result<()> {
+        let failing = FAILING.lock().unwrap_or_else(PoisonError::into_inner);
+        match failing.iter().find(|(p, f, _)| *p == pid && *f == file) {
+            Some((_, _, errno)) => Err(std::io::Error::from_raw_os_error(*errno)),
+            None => Ok(()),
+        }
     }
 }
 
