@@ -235,12 +235,29 @@ impl DeterministicFreshAgentTransport {
 #[async_trait]
 impl FreshAgentTransport for DeterministicFreshAgentTransport {
     async fn start(&self, profile: &FreshAgentProfile) -> Result<TransportStart, String> {
-        self.spawn_provider_process().await?;
         {
             let mut state = self.state.lock().await;
+            let metadata = json!({"provider":self.provider.as_str(),
+                "nativeId":state.native_session_id, "cwd":profile.cwd,
+                "at":unix_millis(),
+                "allowCreate":state.dispatch_count == 0 && state.completion_count == 0
+                    && state.pending_decision_id.is_none()});
+            #[cfg(test)]
+            write_native_history(&self.state_dir, &metadata, false)?;
+            #[cfg(not(test))]
+            provider_state_worker(
+                &self.state_dir,
+                self.run_as_uid,
+                self.run_as_gid,
+                "initialize",
+                Some(&serde_json::to_vec(&metadata).map_err(|error| error.to_string())?),
+            )
+            .await?;
             state.create_profile = Some(profile.clone());
             write_provider_state(&self.state_dir, &state, self.run_as_uid, self.run_as_gid).await?;
         }
+        // Failed metadata reads/writes never leave a newly spawned worker.
+        self.spawn_provider_process().await?;
         Ok(TransportStart {
             native_session_id: Some(self.state.lock().await.native_session_id.clone()),
         })
@@ -497,17 +514,124 @@ fn read_state(state_dir: &Path) -> Result<Option<FixtureState>, String> {
 /// Save the turn emitted by this deterministic transport in its own native
 /// store. Production calls run inside the existing provider-UID state worker.
 fn write_native_completion(state_dir: &Path, completion: &Value) -> Result<(), String> {
+    write_native_history(state_dir, completion, true)
+}
+
+/// Initialize only fixture metadata before the first Send, or append the
+/// fixture's completed turn. Both operations use the provider-UID worker.
+fn write_native_history(state_dir: &Path, input: &Value, completed: bool) -> Result<(), String> {
     use std::io::Write;
     let home = state_dir
         .parent()
         .ok_or("fixture provider home unavailable")?;
-    let provider = completion["provider"]
+    let provider = input["provider"]
         .as_str()
         .ok_or("fixture provider missing")?;
-    let id = completion["nativeId"]
+    let id = input["nativeId"]
         .as_str()
         .filter(|id| !id.is_empty() && !id.contains(['/', '\\']))
         .ok_or("fixture native identity invalid")?;
+    let path = match provider {
+        "claude" | "kilroy" => home
+            .join(".claude/projects/managed-fixture")
+            .join(format!("{id}.jsonl")),
+        "codex" => home
+            .join(".codex/sessions")
+            .join(format!("rollout-fixture-{id}.jsonl")),
+        "opencode" => home.join(".local/share/opencode/opencode.db"),
+        _ => return Err("unsupported fixture native provider".into()),
+    };
+    if !completed {
+        if path.try_exists().map_err(|error| error.to_string())? {
+            // Never repair an unreadable or mismatched existing store by
+            // replacing it with an empty positive snapshot.
+            if provider != "opencode" {
+                use std::io::BufRead;
+                let mut first = String::new();
+                std::io::BufReader::new(fs::File::open(&path).map_err(|error| error.to_string())?)
+                    .read_line(&mut first)
+                    .map_err(|error| error.to_string())?;
+                let metadata: Value =
+                    serde_json::from_str(&first).map_err(|error| error.to_string())?;
+                let owner = if provider == "codex" {
+                    metadata["payload"]["id"].as_str()
+                } else {
+                    metadata["sessionId"].as_str()
+                };
+                if owner != Some(id) {
+                    return Err("fixture native history identity mismatch".into());
+                }
+            }
+            freshell_freshagent::native_history::read(provider, home, id)?;
+            return Ok(());
+        }
+        if input["allowCreate"] != true {
+            return Err("existing fixture native history is absent".into());
+        }
+    }
+    fs::create_dir_all(path.parent().ok_or("fixture native parent unavailable")?)
+        .map_err(|error| error.to_string())?;
+    if provider == "opencode" {
+        // The runtime image already includes Python for its owned SQLite
+        // fixtures. Use the same provider UID, no migration or host-home IO.
+        let script = r#"import sqlite3,json,sys
+c=json.load(sys.stdin); db=sqlite3.connect(sys.argv[1]); native=c['nativeId']; at=c['at']
+db.executescript('CREATE TABLE IF NOT EXISTS session(id TEXT PRIMARY KEY,title TEXT,time_updated INTEGER); CREATE TABLE IF NOT EXISTS message(id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE IF NOT EXISTS part(id TEXT PRIMARY KEY,session_id TEXT,message_id TEXT,time_created INTEGER,data TEXT);')
+db.execute('INSERT INTO session VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET time_updated=excluded.time_updated',(native,'Deterministic fixture history',at))
+if c['completed']:
+ for role,key,text in [('user','user-'+c['requestId'],'deterministic fixture request'),('assistant',c['messageId'],'deterministic fixture completion')]:
+  data={'id':key,'sessionID':native,'role':role,'time':{'created':at,'completed':at}}
+  db.execute('INSERT OR IGNORE INTO message VALUES(?,?,?,?)',(key,native,at,json.dumps(data)))
+  part={'id':'part-'+key,'sessionID':native,'messageID':key,'type':'text','text':text}
+  db.execute('INSERT OR IGNORE INTO part VALUES(?,?,?,?,?)',('part-'+key,native,key,at,json.dumps(part)))
+db.commit(); db.close()
+"#;
+        let mut child = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(script)
+            .arg(&path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        let mut input = input.clone();
+        input["completed"] = json!(completed);
+        let write_result = child
+            .stdin
+            .take()
+            .ok_or_else(|| "fixture native writer stdin unavailable".to_string())
+            .and_then(|mut stdin| {
+                stdin
+                    .write_all(&serde_json::to_vec(&input).map_err(|error| error.to_string())?)
+                    .map_err(|error| error.to_string())
+            });
+        let status = child.wait().map_err(|error| error.to_string())?;
+        write_result?;
+        return if status.success() {
+            Ok(())
+        } else {
+            Err("fixture native SQLite writer failed".into())
+        };
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| error.to_string())?;
+    if file.metadata().map_err(|error| error.to_string())?.len() == 0 {
+        let cwd = input["cwd"].as_str().unwrap_or("/workspace");
+        let metadata = if provider == "codex" {
+            json!({"type":"session_meta","payload":{"id":id,"cwd":cwd}})
+        } else {
+            json!({"type":"system","subtype":"init","sessionId":id,"cwd":cwd})
+        };
+        writeln!(file, "{metadata}").map_err(|error| error.to_string())?;
+    }
+    if !completed {
+        return file.sync_all().map_err(|error| error.to_string());
+    }
+    let completion = input;
     let user_id = format!(
         "user-{}",
         short_hash(
@@ -520,79 +644,19 @@ fn write_native_completion(state_dir: &Path, completion: &Value) -> Result<(), S
         .as_str()
         .ok_or("fixture message missing")?;
     let text = "deterministic fixture completion";
-    if provider == "opencode" {
-        // The runtime image already includes Python for its owned SQLite
-        // fixtures. Use the same provider UID, no migration or host-home IO.
-        let directory = home.join(".local/share/opencode");
-        fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-        let script = r#"import sqlite3,json,sys
-c=json.load(sys.stdin); db=sqlite3.connect(sys.argv[1]); native=c['nativeId']; at=c['at']
-db.executescript('CREATE TABLE IF NOT EXISTS session(id TEXT PRIMARY KEY,title TEXT,time_updated INTEGER); CREATE TABLE IF NOT EXISTS message(id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE IF NOT EXISTS part(id TEXT PRIMARY KEY,session_id TEXT,message_id TEXT,time_created INTEGER,data TEXT);')
-db.execute('INSERT INTO session VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET time_updated=excluded.time_updated',(native,'Deterministic fixture history',at))
-for role,key,text in [('user','user-'+c['requestId'],'deterministic fixture request'),('assistant',c['messageId'],'deterministic fixture completion')]:
- data={'id':key,'sessionID':native,'role':role,'time':{'created':at,'completed':at}}
- db.execute('INSERT OR IGNORE INTO message VALUES(?,?,?,?)',(key,native,at,json.dumps(data)))
- part={'id':'part-'+key,'sessionID':native,'messageID':key,'type':'text','text':text}
- db.execute('INSERT OR IGNORE INTO part VALUES(?,?,?,?,?)',('part-'+key,native,key,at,json.dumps(part)))
-db.commit(); db.close()
-"#;
-        let mut child = std::process::Command::new("python3")
-            .arg("-c")
-            .arg(script)
-            .arg(directory.join("opencode.db"))
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|error| error.to_string())?;
-        child
-            .stdin
-            .take()
-            .ok_or("fixture native writer stdin unavailable")?
-            .write_all(&serde_json::to_vec(completion).map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string())?;
-        return if child.wait().map_err(|error| error.to_string())?.success() {
-            Ok(())
-        } else {
-            Err("fixture native SQLite writer failed".into())
-        };
-    }
-    let (path, records) = match provider {
-        "claude" | "kilroy" => (
-            home.join(".claude/projects/managed-fixture")
-                .join(format!("{id}.jsonl")),
-            vec![
-                json!({"type":"user","uuid":user_id,"sessionId":id,"cwd":"/workspace","message":{"role":"user","content":"deterministic fixture request"}}),
-                json!({"type":"assistant","uuid":message_id,"parentUuid":user_id,"sessionId":id,"message":{"id":message_id,"role":"assistant","content":[{"type":"text","text":text}],"stop_reason":"end_turn"}}),
-            ],
-        ),
-        "codex" => (
-            home.join(".codex/sessions")
-                .join(format!("rollout-fixture-{id}.jsonl")),
-            vec![
-                json!({"type":"turn_context","payload":{"turn_id":completion["turnId"]}}),
-                json!({"type":"response_item","payload":{"type":"message","id":user_id,"role":"user","content":[{"type":"input_text","text":"deterministic fixture request"}]}}),
-                json!({"type":"response_item","payload":{"type":"message","id":message_id,"role":"assistant","content":[{"type":"output_text","text":text}]}}),
-                json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":completion["turnId"]}}),
-            ],
-        ),
+    let records = match provider {
+        "claude" | "kilroy" => vec![
+            json!({"type":"user","uuid":user_id,"sessionId":id,"cwd":"/workspace","message":{"role":"user","content":"deterministic fixture request"}}),
+            json!({"type":"assistant","uuid":message_id,"parentUuid":user_id,"sessionId":id,"message":{"id":message_id,"role":"assistant","content":[{"type":"text","text":text}],"stop_reason":"end_turn"}}),
+        ],
+        "codex" => vec![
+            json!({"type":"turn_context","payload":{"turn_id":completion["turnId"]}}),
+            json!({"type":"response_item","payload":{"type":"message","id":user_id,"role":"user","content":[{"type":"input_text","text":"deterministic fixture request"}]}}),
+            json!({"type":"response_item","payload":{"type":"message","id":message_id,"role":"assistant","content":[{"type":"output_text","text":text}]}}),
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":completion["turnId"]}}),
+        ],
         _ => return Err("unsupported fixture native provider".into()),
     };
-    fs::create_dir_all(path.parent().ok_or("fixture native parent unavailable")?)
-        .map_err(|error| error.to_string())?;
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|error| error.to_string())?;
-    if provider == "codex" && file.metadata().map_err(|error| error.to_string())?.len() == 0 {
-        writeln!(
-            file,
-            "{}",
-            json!({"type":"session_meta","payload":{"id":id,"cwd":"/workspace"}})
-        )
-        .map_err(|error| error.to_string())?;
-    }
     for record in records {
         writeln!(file, "{record}").map_err(|error| error.to_string())?;
     }
@@ -708,24 +772,28 @@ async fn provider_state_worker(
         .arg(operation)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     let mut child = command
         .spawn()
         .map_err(|error| format!("spawn provider-state worker: {error}"))?;
-    if let Some(input) = input {
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| "provider-state worker has no stdin".to_string())?
-            .write_all(input)
-            .await
-            .map_err(|error| format!("write provider-state worker: {error}"))?;
-    }
+    let write_result = if let Some(input) = input {
+        match child.stdin.take() {
+            Some(mut stdin) => stdin
+                .write_all(input)
+                .await
+                .map_err(|error| format!("write provider-state worker: {error}")),
+            None => Err("provider-state worker has no stdin".to_string()),
+        }
+    } else {
+        Ok(())
+    };
     drop(child.stdin.take());
     let output = child
         .wait_with_output()
         .await
         .map_err(|error| format!("wait for provider-state worker: {error}"))?;
+    write_result?;
     if !output.status.success() {
         return Err(format!(
             "provider-state worker exited {:?}: {}",
@@ -753,6 +821,11 @@ pub(crate) fn run_state_worker(args: &[String]) -> Result<(), String> {
                 serde_json::from_reader(std::io::stdin()).map_err(|error| error.to_string())?;
             write_native_completion(state_dir, &completion)
         }
+        [operation] if operation == "initialize" => {
+            let metadata: Value =
+                serde_json::from_reader(std::io::stdin()).map_err(|error| error.to_string())?;
+            write_native_history(state_dir, &metadata, false)
+        }
         [operation] if operation == "snapshot" => {
             let input: Value =
                 serde_json::from_reader(std::io::stdin()).map_err(|error| error.to_string())?;
@@ -769,7 +842,9 @@ pub(crate) fn run_state_worker(args: &[String]) -> Result<(), String> {
             )?;
             serde_json::to_writer(std::io::stdout(), &snapshot).map_err(|error| error.to_string())
         }
-        _ => Err("fixture state worker requires read, write, completion or snapshot".into()),
+        _ => Err(
+            "fixture state worker requires read, write, initialize, completion or snapshot".into(),
+        ),
     }
 }
 
@@ -791,6 +866,293 @@ fn unix_millis() -> u64 {
 mod tests {
     use super::*;
     use freshell_runtime_protocol::FreshAgentTurnSettings;
+
+    fn initial_profile(provider: FreshProvider) -> FreshAgentProfile {
+        FreshAgentProfile {
+            runtime_variant: match provider {
+                FreshProvider::Claude | FreshProvider::Kilroy => "claude-sdk",
+                FreshProvider::Codex => "codex-app-server",
+                FreshProvider::Opencode => "opencode-per-soul-http",
+            }
+            .into(),
+            provider,
+            cwd: "/workspace/fixture".into(),
+            model: None,
+            effort: None,
+            permission_mode: None,
+            sandbox: Some("workspace-write".into()),
+            provider_store_id: "initial-owned-fixture".into(),
+            native_session_id: None,
+            plugins: None,
+            model_selection: None,
+            session_ref: None,
+            provider_launch_context: None,
+            provider_secret_references: Vec::new(),
+        }
+    }
+
+    async fn assert_initial_actor_snapshot(provider: FreshProvider) {
+        let home = tempfile::tempdir().unwrap();
+        let profile = initial_profile(provider.clone());
+        let transport = DeterministicFreshAgentTransport::open(
+            home.path().join("fixture"),
+            &profile,
+            unsafe { libc::getuid() },
+            unsafe { libc::getgid() },
+        )
+        .await
+        .unwrap();
+        let root = transport.state.lock().await.native_session_id.clone();
+        let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+            home.path().join("actor"),
+            profile.clone(),
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        let worker = transport.child.lock().await.as_ref().unwrap().id();
+        let snapshot = actor.snapshot().await;
+        let history =
+            freshell_freshagent::native_history::read(provider.as_str(), home.path(), &root);
+        let persisted = read_state(&home.path().join("fixture")).unwrap().unwrap();
+        let current_profile = actor.profile().await;
+        let events = actor.read_events(0, 20).await;
+        assert!(transport.is_live().await);
+        assert_eq!(transport.child.lock().await.as_ref().unwrap().id(), worker);
+        transport.clone().stop().await.unwrap();
+        assert!(!transport.is_live().await);
+
+        // Assert only after synchronously joining this test's sole worker,
+        // including on the expected pre-repair missing-history failure.
+        let snapshot = snapshot
+            .expect("initial actor snapshot before any Send must read zero-turn native metadata");
+        let history = history.unwrap();
+        let (wire_provider, session_type) = match provider {
+            FreshProvider::Claude => ("claude", "freshclaude"),
+            FreshProvider::Kilroy => ("claude", "kilroy"),
+            FreshProvider::Codex => ("codex", "freshcodex"),
+            FreshProvider::Opencode => ("opencode", "freshopencode"),
+        };
+        assert_eq!(snapshot["threadId"], root);
+        assert_eq!(snapshot["provider"], wire_provider);
+        assert_eq!(snapshot["sessionType"], session_type);
+        assert_eq!(snapshot["turns"], json!([]));
+        assert_eq!(snapshot["status"], "idle");
+        assert_eq!(snapshot["capabilities"]["send"], true);
+        assert_eq!(snapshot["capabilities"]["interrupt"], false);
+        assert_eq!(snapshot["pendingApprovals"], json!([]));
+        assert_eq!(snapshot["pendingQuestions"], json!([]));
+        assert_eq!(
+            snapshot["extensions"][wire_provider]["ownerKind"],
+            "fresh-agent"
+        );
+        assert_eq!(
+            snapshot["extensions"][wire_provider]["statusFromLiveState"],
+            true
+        );
+        assert!(snapshot["extensions"][wire_provider]
+            .get("nativeHistoryAvailable")
+            .is_none());
+        assert_eq!(history["capabilities"]["send"], false);
+        assert_eq!(history["extensions"][wire_provider]["ownerKind"], "vacant");
+        assert_eq!(history["turns"], json!([]));
+        assert_eq!(persisted.native_session_id, root);
+        assert_eq!(persisted.dispatch_count, 0);
+        assert_eq!(persisted.completion_count, 0);
+        assert!(persisted.pending_decision_id.is_none());
+        assert_eq!(persisted.create_profile, Some(profile.clone()));
+        let mut expected_profile = profile;
+        expected_profile.native_session_id = Some(root);
+        assert_eq!(current_profile, expected_profile);
+        assert!(!events.events.iter().any(|entry| matches!(
+            entry.event,
+            AgentEvent::Provider { .. } | AgentEvent::PermissionRequested { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn initial_actor_snapshot_before_send_claude() {
+        assert_initial_actor_snapshot(FreshProvider::Claude).await;
+    }
+
+    #[tokio::test]
+    async fn initial_actor_snapshot_before_send_kilroy() {
+        assert_initial_actor_snapshot(FreshProvider::Kilroy).await;
+    }
+
+    #[tokio::test]
+    async fn initial_actor_snapshot_before_send_codex() {
+        assert_initial_actor_snapshot(FreshProvider::Codex).await;
+    }
+
+    #[tokio::test]
+    async fn initial_actor_snapshot_before_send_opencode() {
+        assert_initial_actor_snapshot(FreshProvider::Opencode).await;
+    }
+
+    fn native_path(home: &Path, provider: &FreshProvider, id: &str) -> PathBuf {
+        match provider {
+            FreshProvider::Claude | FreshProvider::Kilroy => home
+                .join(".claude/projects/managed-fixture")
+                .join(format!("{id}.jsonl")),
+            FreshProvider::Codex => home
+                .join(".codex/sessions")
+                .join(format!("rollout-fixture-{id}.jsonl")),
+            FreshProvider::Opencode => home.join(".local/share/opencode/opencode.db"),
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_start_preserves_completed_store_on_actor_reopen() {
+        for provider in [
+            FreshProvider::Claude,
+            FreshProvider::Kilroy,
+            FreshProvider::Codex,
+            FreshProvider::Opencode,
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let profile = initial_profile(provider.clone());
+            let transport = DeterministicFreshAgentTransport::open(
+                home.path().join("fixture"),
+                &profile,
+                unsafe { libc::getuid() },
+                unsafe { libc::getgid() },
+            )
+            .await
+            .unwrap();
+            let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+                home.path().join("actor"),
+                profile,
+                transport.clone(),
+            )
+            .await
+            .unwrap();
+            actor
+                .dispatch(
+                    RequestId::parse("completed-before-reopen").unwrap(),
+                    "one owned turn".into(),
+                    None::<FreshAgentTurnSettings>,
+                )
+                .await
+                .unwrap();
+            let saved_profile = actor.profile().await;
+            let native_id = saved_profile.native_session_id.as_deref().unwrap();
+            let before = actor.snapshot().await.unwrap();
+            let path = native_path(home.path(), &provider, native_id);
+            let bytes = fs::read(&path).unwrap();
+            actor.stop().await.unwrap();
+            assert!(!transport.is_live().await);
+            drop(transport);
+
+            let reopened = DeterministicFreshAgentTransport::open(
+                home.path().join("fixture"),
+                &saved_profile,
+                unsafe { libc::getuid() },
+                unsafe { libc::getgid() },
+            )
+            .await
+            .unwrap();
+            let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+                home.path().join("actor"),
+                saved_profile.clone(),
+                reopened.clone(),
+            )
+            .await
+            .unwrap();
+            let after = actor.snapshot().await;
+            let state = reopened.state.lock().await.clone();
+            let current_profile = actor.profile().await;
+            actor.stop().await.unwrap();
+            assert!(!reopened.is_live().await);
+            let after = after.unwrap();
+            assert_eq!(before, after);
+            assert!(!after["turns"].as_array().unwrap().is_empty());
+            assert_eq!(
+                fs::read(path).unwrap(),
+                bytes,
+                "startup must not rewrite existing history"
+            );
+            assert_eq!(state.native_session_id, native_id);
+            assert_eq!(state.dispatch_count, 1);
+            assert_eq!(state.completion_count, 1);
+            assert!(state.pending_decision_id.is_none());
+            assert_eq!(state.create_profile, Some(saved_profile.clone()));
+            assert_eq!(current_profile, saved_profile);
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_start_refuses_existing_wrong_root_or_unreadable_store() {
+        for provider in [
+            FreshProvider::Claude,
+            FreshProvider::Kilroy,
+            FreshProvider::Codex,
+            FreshProvider::Opencode,
+        ] {
+            for unreadable in [false, true] {
+                let home = tempfile::tempdir().unwrap();
+                let profile = initial_profile(provider.clone());
+                let transport = DeterministicFreshAgentTransport::open(
+                    home.path().join("fixture"),
+                    &profile,
+                    unsafe { libc::getuid() },
+                    unsafe { libc::getgid() },
+                )
+                .await
+                .unwrap();
+                let id = transport.state.lock().await.native_session_id.clone();
+                let path = native_path(home.path(), &provider, &id);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let before = if unreadable {
+                    // A directory cannot be read as a JSONL/SQLite file,
+                    // regardless of the test runner's privilege level.
+                    fs::create_dir(&path).unwrap();
+                    None
+                } else if provider == FreshProvider::Opencode {
+                    let connection = rusqlite::Connection::open(&path).unwrap();
+                    connection.execute_batch("CREATE TABLE session(id TEXT PRIMARY KEY,title TEXT,time_updated INTEGER); INSERT INTO session VALUES('wrong-root','other history',1);").unwrap();
+                    drop(connection);
+                    Some(fs::read(&path).unwrap())
+                } else {
+                    let row = if provider == FreshProvider::Codex {
+                        json!({"type":"session_meta","payload":{"id":"wrong-root","cwd":profile.cwd}})
+                    } else {
+                        json!({"type":"system","sessionId":"wrong-root","cwd":profile.cwd})
+                    };
+                    fs::write(&path, format!("{row}\n")).unwrap();
+                    Some(fs::read(&path).unwrap())
+                };
+                let started = transport.start(&profile).await;
+                let snapshot = transport.snapshot().await;
+                assert!(
+                    transport.child.lock().await.is_none(),
+                    "failed initialization must not spawn a worker"
+                );
+                assert!(!transport.is_live().await);
+                assert!(
+                    started.is_err(),
+                    "wrong/unreadable existing history must refuse startup"
+                );
+                // Claude's existing history reader trusts its selected filename;
+                // startup adds the metadata-root check instead of hiding that
+                // mismatch behind a fabricated empty positive.
+                if unreadable || !matches!(provider, FreshProvider::Claude | FreshProvider::Kilroy)
+                {
+                    assert!(snapshot.is_err());
+                }
+                if let Some(before) = before {
+                    assert_eq!(fs::read(&path).unwrap(), before);
+                } else {
+                    assert!(path.is_dir());
+                }
+                let state = transport.state.lock().await;
+                assert_eq!(state.native_session_id, id);
+                assert_eq!((state.dispatch_count, state.completion_count), (0, 0));
+                assert!(state.create_profile.is_none());
+                assert!(state.pending_decision_id.is_none());
+            }
+        }
+    }
 
     #[tokio::test]
     async fn fixture_native_identity_is_store_and_provider_specific() {
@@ -821,6 +1183,7 @@ mod tests {
             FreshProvider::Opencode,
         ] {
             let root = tempfile::tempdir().unwrap();
+            let state_dir = root.path().join("provider");
             let mut saved_profile = profile.clone();
             saved_profile.provider = provider;
             let old_id = format!(
@@ -835,14 +1198,14 @@ mod tests {
                 pending_decision_id: Some("pending-preserved".into()),
                 create_profile: Some(saved_profile.clone()),
             };
-            write_provider_state(root.path(), &old, unsafe { libc::getuid() }, unsafe {
+            write_provider_state(&state_dir, &old, unsafe { libc::getuid() }, unsafe {
                 libc::getgid()
             })
             .await
             .unwrap();
             saved_profile.native_session_id = Some(old_id.clone());
             let reopened = DeterministicFreshAgentTransport::open(
-                root.path(),
+                &state_dir,
                 &saved_profile,
                 unsafe { libc::getuid() },
                 unsafe { libc::getgid() },
@@ -855,6 +1218,20 @@ mod tests {
             assert_eq!(preserved.completion_count, 6);
             assert_eq!(preserved.pending_decision_id, old.pending_decision_id);
             assert_eq!(preserved.create_profile, old.create_profile);
+            drop(preserved);
+            // An existing dispatched fixture cannot replace missing saved
+            // history with new zero-turn metadata during startup.
+            let started = reopened.start(&saved_profile).await;
+            let spawned = reopened.is_live().await;
+            reopened.clone().stop().await.unwrap();
+            assert!(started.is_err());
+            assert!(!spawned);
+            assert!(freshell_freshagent::native_history::read(
+                saved_profile.provider.as_str(),
+                root.path(),
+                &old_id,
+            )
+            .is_err());
         }
     }
 
