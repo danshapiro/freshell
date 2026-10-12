@@ -71,18 +71,35 @@ describe('explicit real-root rehearsal admission', () => {
   it('allows an owned delayed HTTP preflight within its budget and refuses after the budget without assuming server settlement', async () => {
     const input = manifest()
     let completed = 0
-    const server = createServer((_request, response) => {
-      setTimeout(() => { completed++; response.end('{}') }, 120)
+    let observeRequest!: () => void
+    const requestObserved = new Promise<void>(resolve => { observeRequest = resolve })
+    let releaseResponse!: () => void
+    const responseGate = new Promise<void>(resolve => { releaseResponse = resolve })
+    let observeSettlement!: () => void
+    const serverSettled = new Promise<void>(resolve => { observeSettlement = resolve })
+    const server = createServer(async (_request, response) => {
+      observeRequest()
+      await responseGate
+      completed++
+      response.end('{}')
+      observeSettlement()
     })
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
     const address = server.address(); if (!address || typeof address === 'string') throw new Error('owned HTTP fixture missing')
     input.preflightUrl = `http://127.0.0.1:${address.port}/api/runtime/soul-loss-repairs/preflight`
+    const preflight = readRehearsalPreflight(input, 'fixture', { timeoutMs: 30 })
     try {
-      await expect(readRehearsalPreflight(input, 'fixture', { timeoutMs: 30 })).rejects.toThrow()
+      await requestObserved
+      await expect(preflight).rejects.toMatchObject({ name: 'TimeoutError' })
       expect(completed).toBe(0)
-      await new Promise(resolve => setTimeout(resolve, 160))
+      releaseResponse()
+      await serverSettled
       expect(completed).toBe(1)
-    } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())) }
+    } finally {
+      releaseResponse()
+      server.closeAllConnections()
+      await new Promise<void>(resolve => server.close(() => resolve()))
+    }
   })
   it('uses actual HTTP source/epoch/auth shape and refuses substituted destination ownership', async () => {
     const input=manifest()
