@@ -372,6 +372,16 @@ function dockerMaybe(args: string[], timeout = 10_000): string | undefined {
   return result.stdout.trim()
 }
 
+async function makeStageTreeReadable(directory: string): Promise<void> {
+  await fs.chmod(directory, 0o755)
+  for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+    const selected = path.join(directory, entry.name)
+    if (entry.isDirectory()) await makeStageTreeReadable(selected)
+    else if (entry.isFile()) await fs.chmod(selected, 0o444)
+    else throw new Error(`Unexpected non-file in staged checkpoint input: ${selected}`)
+  }
+}
+
 async function stageCheckpointTarget(stage: string, repoRoot: string): Promise<void> {
   await fs.mkdir(stage, { recursive: true, mode: 0o700 })
   const binary = path.join(repoRoot, 'target/debug/freshell-server')
@@ -381,18 +391,32 @@ async function stageCheckpointTarget(stage: string, repoRoot: string): Promise<v
   await fs.copyFile(binary, path.join(stage, 'freshell-server'))
   await fs.chmod(path.join(stage, 'freshell-server'), 0o555)
   await fs.cp(client, path.join(stage, 'client'), { recursive: true, dereference: true, preserveTimestamps: false })
+  await makeStageTreeReadable(path.join(stage, 'client'))
   await fs.copyFile(path.resolve(repoRoot, 'docker/sandbox/entrypoint.sh'), path.join(stage, 'sandbox-entrypoint.sh'))
   await fs.chmod(path.join(stage, 'sandbox-entrypoint.sh'), 0o555)
-  await fs.writeFile(path.join(stage, 'launch.mjs'), checkpointTargetLauncher, { mode: 0o444 })
-  await fs.writeFile(path.join(stage, 'control.mjs'), checkpointTargetControl, { mode: 0o444 })
+  const launcher = path.join(stage, 'launch.mjs')
+  await fs.writeFile(launcher, checkpointTargetLauncher, { mode: 0o444 })
+  await fs.chmod(launcher, 0o444)
+  const control = path.join(stage, 'control.mjs')
+  await fs.writeFile(control, checkpointTargetControl, { mode: 0o444 })
+  await fs.chmod(control, 0o444)
   const fake = path.resolve(repoRoot, 'test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs')
   await fs.copyFile(fake, path.join(stage, 'fake-app-server.mjs'))
   await fs.chmod(path.join(stage, 'fake-app-server.mjs'), 0o444)
   const require = createRequire(import.meta.url)
   const wsRoot = path.dirname(require.resolve('ws'))
-  await fs.mkdir(path.join(stage, 'node_modules'), { mode: 0o700 })
-  await fs.cp(wsRoot, path.join(stage, 'node_modules/ws'), { recursive: true, dereference: true, preserveTimestamps: false })
-  await fs.chmod(path.join(stage, 'node_modules'), 0o555)
+  const nodeModules = path.join(stage, 'node_modules')
+  await fs.mkdir(nodeModules, { mode: 0o700 })
+  const stagedWebSocket = path.join(nodeModules, 'ws')
+  await fs.cp(wsRoot, stagedWebSocket, { recursive: true, dereference: true, preserveTimestamps: false })
+  await makeStageTreeReadable(stagedWebSocket)
+  // Rootless Docker maps container UIDs into a private host range, so the
+  // numerically matching sandbox UID still cannot traverse a host-owned 0700
+  // bind-mount root. The mount itself is read-only; grant traversal at the
+  // root and keep copied package contents readable so the restricted process
+  // can load its entrypoint and dependencies.
+  await fs.chmod(nodeModules, 0o755)
+  await fs.chmod(stage, 0o711)
 }
 
 function restrictedIdentity(): { uid: number; gid: number } {
