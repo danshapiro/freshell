@@ -7846,7 +7846,8 @@
                   "fresh",
                   "dead_session",
                   "invalid",
-                  "error"
+                  "error",
+                  "stopped"
                 ],
                 "type": "string"
               }
@@ -7916,7 +7917,8 @@
             "fresh",
             "dead_session",
             "invalid",
-            "error"
+            "error",
+            "stopped"
           ],
           "type": "string"
         }

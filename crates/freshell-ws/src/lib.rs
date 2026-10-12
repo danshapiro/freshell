@@ -1096,6 +1096,7 @@ async fn send_error(
         live_terminal_id: None,
         holder_pid: None,
         holder_command: None,
+        terminal_stopped: None,
     });
     match serde_json::to_string(&msg) {
         Ok(json) => socket.send(Message::Text(json.into())).await,

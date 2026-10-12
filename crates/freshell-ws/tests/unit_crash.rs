@@ -332,6 +332,7 @@ async fn a_screen_only_crash_restarts_the_screen_against_the_running_app_server_
 async fn quitting_codex_ends_the_unit_without_auto_resume() {
     let mut h = UnitHarness::start(HarnessOpts {
         auto_resume: AutoResumeMode::Capture,
+        pane_ledger: true,
         ..Default::default()
     })
     .await;
@@ -366,6 +367,13 @@ async fn quitting_codex_ends_the_unit_without_auto_resume() {
         h.state.units.killed_start("crq-q"),
         "a clean quit is remembered as a stopped pane"
     );
+    let record = h
+        .state
+        .pane_ledger
+        .stopped_pane_for_terminal(&tid)
+        .expect("a clean quit is remembered durably too (Task 18)");
+    assert_eq!(record.create_request_id.as_deref(), Some("crq-q"));
+    assert_eq!(record.reason, "agent-exited");
 }
 
 /// Codex's "quit, run in background" (exit 0 with a turn running): the work
@@ -699,6 +707,7 @@ async fn screens_that_quit_as_they_start_end_the_unit_at_the_cap(
     let mut h = UnitHarness::start(HarnessOpts {
         behavior: json!({"turnCompleteDelayMs": 60000}),
         auto_resume: AutoResumeMode::Capture,
+        pane_ledger: true,
         ..Default::default()
     })
     .await;
@@ -747,6 +756,14 @@ async fn screens_that_quit_as_they_start_end_the_unit_at_the_cap(
         crash.exit_code, 0,
         "auto-resume's decide() settles a clean exit"
     );
+    // A pane whose screens keep quitting as they start ends as a clean
+    // quit: remembered as stopped (Task 17's flag, Task 18's record).
+    let record = h
+        .state
+        .pane_ledger
+        .stopped_pane_for_create_request(&request_id)
+        .expect("the pane is remembered as stopped");
+    assert_eq!(record.terminal_id.as_deref(), Some(tid.as_str()));
 
     // What ended the unit: the restart past the cap, refused by the registry
     // (any other failed restart, or an end at a quit, logs no such refusal).

@@ -866,6 +866,12 @@ pub struct ErrorMsg {
     /// everywhere else.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub holder_command: Option<String>,
+    /// Task 18 (`INVALID_TERMINAL_ID` only): `true` when the terminal or the
+    /// create names a pane the server remembers as stopped (a kill, a
+    /// cleanup stop, a clean quit), so the client shows the pane as stopped
+    /// instead of re-creating it. Additive and omitted everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_stopped: Option<bool>,
 }
 
 // --- extension.* ------------------------------------------------------------
@@ -1102,6 +1108,10 @@ pub enum ReconcileVerdict {
     /// Terminal per-pane error state (replaces the deleted `retry`):
     /// reason is one of "index_warming" | "provider_unavailable".
     Error,
+    /// Task 18: the pane was stopped (a kill, a cleanup stop, a clean
+    /// quit) and is remembered as such; the client shows it stopped and
+    /// never re-creates it.
+    Stopped,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2243,6 +2253,7 @@ mod tests {
             owner_epoch: Some(41),
             holder_pid: None,
             holder_command: None,
+            terminal_stopped: None,
         });
         let json = serde_json::to_string(&msg).expect("serialize");
         assert!(json.contains(r#""ownerKind":"fresh-agent""#), "{json}");
@@ -2268,6 +2279,7 @@ mod tests {
             owner_epoch: None,
             holder_pid: None,
             holder_command: None,
+            terminal_stopped: None,
         });
         let legacy_json = serde_json::to_string(&legacy).expect("serialize");
         assert!(
@@ -2300,6 +2312,7 @@ mod tests {
             owner_epoch: None,
             holder_pid: Some(4242),
             holder_command: Some("perl".into()),
+            terminal_stopped: None,
         });
         let json: serde_json::Value = serde_json::to_value(&msg).expect("serialize");
         assert_eq!(json["code"], "CONVERSATION_HELD_ELSEWHERE", "{json}");

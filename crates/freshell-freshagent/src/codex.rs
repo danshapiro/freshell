@@ -4013,6 +4013,7 @@ impl FreshCodexState {
             live_terminal_id: None,
             holder_pid: None,
             holder_command: None,
+            terminal_stopped: None,
         }));
     }
 
@@ -5431,8 +5432,12 @@ impl FreshCodexState {
     /// `freshAgent.killed`. Idempotent for an unknown session id (mirrors `adapter.kill`'s
     /// unconditional `return true`, adapter.ts:1211-1215) — `ws-handler.ts:3607-3626` always
     /// sends `success:true`. Never touches a process this session did not itself spawn.
-    pub async fn handle_kill(&self, msg: FreshAgentKill) {
-        self.handle_stop(msg, CodexStopMode::Close).await;
+    ///
+    /// Returns whether the session's stop was confirmed and its close
+    /// recorded (the WebSocket dispatch then remembers the pane as stopped,
+    /// Task 18); `false` for every refused or failed kill.
+    pub async fn handle_kill(&self, msg: FreshAgentKill) -> bool {
+        self.handle_stop(msg, CodexStopMode::Close).await
     }
 
     /// Stop only the owned writer so the persisted Codex thread can be resumed.
@@ -5501,7 +5506,7 @@ impl FreshCodexState {
         }
     }
 
-    async fn handle_stop(&self, msg: FreshAgentKill, mode: CodexStopMode) {
+    async fn handle_stop(&self, msg: FreshAgentKill, mode: CodexStopMode) -> bool {
         let session_id = msg.session_id.clone();
 
         // b8ke delta review F7: a half-sent observed pair (exactly one of
@@ -5526,7 +5531,7 @@ impl FreshCodexState {
                             message: Some(err.message().to_string()),
                         }),
                     );
-                    return;
+                    return false;
                 }
             };
 
@@ -5655,7 +5660,7 @@ impl FreshCodexState {
                             message: Some(refusal_message),
                         }),
                     );
-                    return;
+                    return false;
                 }
             } else {
                 // b8ke delta round-3 F1: NO retained stamp — the kill STILL
@@ -5695,7 +5700,7 @@ impl FreshCodexState {
                                     ),
                                 }),
                             );
-                            return;
+                            return false;
                         }
                         let claim = freshell_ownership::StopClaim {
                             expected_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
@@ -5805,7 +5810,7 @@ impl FreshCodexState {
                                         message: Some(refusal_message),
                                     }),
                                 );
-                                return;
+                                return false;
                             }
                         }
                     }
@@ -5830,7 +5835,7 @@ impl FreshCodexState {
                                     .to_string(),
                             ),
                         }));
-                        return;
+                        return false;
                     }
                     freshell_ownership::OwnershipState::Starting { .. }
                     | freshell_ownership::OwnershipState::Stopping { .. } => {
@@ -5853,7 +5858,7 @@ impl FreshCodexState {
                                 ),
                             }),
                         );
-                        return;
+                        return false;
                     }
                     freshell_ownership::OwnershipState::Fenced { .. } => {
                         tracing::warn!(target: "freshell_freshagent::codex",
@@ -5876,7 +5881,7 @@ impl FreshCodexState {
                                 ),
                             }),
                         );
-                        return;
+                        return false;
                     }
                     _ => {
                         // Genuinely Vacant (or residue): lane-local cleanup
@@ -5977,7 +5982,7 @@ impl FreshCodexState {
                     ),
                 }),
             );
-            return;
+            return false;
         }
         let close_reported_failure = close_answer == crate::identity_sink::CloseAnswer::Persisted;
 
@@ -6149,6 +6154,7 @@ impl FreshCodexState {
             .clear_for_session(|record| record.session_id == session_id)
             .await;
 
+        let stop_confirmed = kill_failure.is_none();
         self.broadcast_stop_result(
             &mode,
             &ServerMessage::FreshAgentKilled(FreshAgentKilled {
@@ -6163,6 +6169,9 @@ impl FreshCodexState {
                 message: kill_failure.map(|(_, message)| message),
             }),
         );
+        // The close is recorded (a clean or a persisted-despite-error close)
+        // and the session's runtime was confirmed stopped.
+        stop_confirmed
     }
 
     /// The kill-side lane of `retire_closed` (delta-review round 5):
@@ -13991,15 +14000,17 @@ pub(crate) mod tests {
         )
         .await;
 
-        st.handle_kill(FreshAgentKill {
-            observed_epoch: None,
-            observed_generation: None,
-            provider: freshell_protocol::AgentProvider::Codex,
-            session_id: "thread-1".to_string(),
-            session_type: freshell_protocol::SessionType::Freshcodex,
-            cwd: None,
-        })
-        .await;
+        let closed = st
+            .handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
+                provider: freshell_protocol::AgentProvider::Codex,
+                session_id: "thread-1".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                cwd: None,
+            })
+            .await;
+        assert!(closed, "the session was stopped and closed");
 
         // The owned child was actually reaped (handle_kill awaits the watcher).
         assert!(
@@ -14150,15 +14161,17 @@ pub(crate) mod tests {
     async fn half_fenced_kill_refusal_carries_the_typed_invalid_fence_code() {
         for (epoch, generation) in [(Some(3u64), None), (None, Some(7u64))] {
             let (st, mut rx) = state_with_bus();
-            st.handle_kill(FreshAgentKill {
-                observed_epoch: epoch,
-                observed_generation: generation,
-                provider: freshell_protocol::AgentProvider::Codex,
-                session_id: "half-fenced-kill".to_string(),
-                session_type: freshell_protocol::SessionType::Freshcodex,
-                cwd: None,
-            })
-            .await;
+            let closed = st
+                .handle_kill(FreshAgentKill {
+                    observed_epoch: epoch,
+                    observed_generation: generation,
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: "half-fenced-kill".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    cwd: None,
+                })
+                .await;
+            assert!(!closed, "a refused kill closed nothing");
 
             let raw = rx.try_recv().expect("the refusal frame");
             let frame: Value = serde_json::from_str(&raw).unwrap();
@@ -14178,15 +14191,20 @@ pub(crate) mod tests {
         // session that doesn't exist still yields `success:true`.
         let (st, mut rx) = state_with_bus();
 
-        st.handle_kill(FreshAgentKill {
-            observed_epoch: None,
-            observed_generation: None,
-            provider: freshell_protocol::AgentProvider::Codex,
-            session_id: "does-not-exist".to_string(),
-            session_type: freshell_protocol::SessionType::Freshcodex,
-            cwd: None,
-        })
-        .await;
+        let closed = st
+            .handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
+                provider: freshell_protocol::AgentProvider::Codex,
+                session_id: "does-not-exist".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                cwd: None,
+            })
+            .await;
+        assert!(
+            closed,
+            "an idempotent kill of an unknown session closed it (Task 18 remembers it)"
+        );
 
         let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(frame["type"], "freshAgent.killed");
@@ -14520,15 +14538,17 @@ pub(crate) mod tests {
         // The ledger fails every write (disk-full/permission shape).
         fake.set_fail_writes(true);
 
-        st.handle_kill(FreshAgentKill {
-            observed_epoch: None,
-            observed_generation: None,
-            provider: freshell_protocol::AgentProvider::Codex,
-            session_id: "thread-kill-fail".to_string(),
-            session_type: freshell_protocol::SessionType::Freshcodex,
-            cwd: None,
-        })
-        .await;
+        let closed = st
+            .handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
+                provider: freshell_protocol::AgentProvider::Codex,
+                session_id: "thread-kill-fail".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                cwd: None,
+            })
+            .await;
+        assert!(!closed, "a kill whose close failed closed nothing");
 
         assert!(
             st.sessions.lock().await.contains_key("thread-kill-fail"),

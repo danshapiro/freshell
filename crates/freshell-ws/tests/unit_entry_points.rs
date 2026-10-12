@@ -187,6 +187,7 @@ async fn the_stuck_restart_waits_for_gone() {
 async fn an_attach_by_session_ref_during_stopping_waits_instead_of_refusing() {
     let h = UnitHarness::start(HarnessOpts {
         behavior: json!({"turnCompleteDelayMs": 60000}),
+        pane_ledger: true,
         ..Default::default()
     })
     .await;
@@ -248,6 +249,10 @@ async fn an_attach_by_session_ref_during_stopping_waits_instead_of_refusing() {
     assert_eq!(
         answer["code"], "INVALID_TERMINAL_ID",
         "answered after Gone, when the terminal is gone: {answer}"
+    );
+    assert_eq!(
+        answer["terminalStopped"], true,
+        "the pane was killed, so the device is told it was stopped (Task 18): {answer}"
     );
     assert!(
         h.state.units.by_terminal(&tid).is_none(),

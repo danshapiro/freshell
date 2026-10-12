@@ -1140,7 +1140,9 @@ export type PaneReconcileRequest = z.infer<typeof PaneReconcileRequestSchema>
 export const PaneVerdictSchema = z.object({
   /** Echoed verbatim, 1:1 with request order. */
   paneKey: z.string().min(1),
-  verdict: z.enum(['attach', 'respawn', 'fresh', 'dead_session', 'invalid', 'error']),
+  /** stopped: the server remembers the pane as stopped (a kill, a cleanup
+   *  stop, a clean quit); it is never re-created. */
+  verdict: z.enum(['attach', 'respawn', 'fresh', 'dead_session', 'invalid', 'error', 'stopped']),
   /** attach only: the live terminal to attach to. */
   terminalId: z.string().min(1).optional(),
   /**
@@ -1355,6 +1357,11 @@ export type ErrorMessage = {
    *  line). Additive; omitted everywhere else. */
   holderPid?: number
   holderCommand?: string
+  /** INVALID_TERMINAL_ID only: the terminal (attach) or the
+   *  createRequestId (create) names a pane the server remembers as stopped
+   *  (a kill, a cleanup stop, a clean quit), so the pane shows as stopped
+   *  instead of being re-created. Additive; omitted everywhere else. */
+  terminalStopped?: true
   timestamp: string
 }
 

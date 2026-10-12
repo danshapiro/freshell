@@ -184,13 +184,18 @@ struct Server {
 /// so tests can seed and assert deterministically (the §9.1 headless
 /// convention).
 async fn spawn_server_with_probe(probe: Arc<StubProbe>) -> Server {
+    spawn_server_on_ledger(probe, tempfile::tempdir().expect("ledger temp root")).await
+}
+
+/// [`spawn_server_with_probe`] over a ledger root that may already hold
+/// rows (the server loads them at start, as after a restart).
+async fn spawn_server_on_ledger(probe: Arc<StubProbe>, ledger_root: tempfile::TempDir) -> Server {
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings =
         Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
     let registry = freshell_terminal::TerminalRegistry::new();
     let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
-    let ledger_root = tempfile::tempdir().expect("ledger temp root");
     let pane_ledger = Arc::new(PaneLedger::new_locked(Some(
         ledger_root.path().to_path_buf(),
     )));
@@ -943,4 +948,225 @@ async fn dead_session_verdict_is_warn_logged_with_claimed_identity() {
             .is_some_and(|v| v.contains("session_not_on_disk")),
         "reason recorded: {fields:?}"
     );
+}
+
+// ── Task 18: stopped fresh-agent panes ─────────────────────────────────────────
+
+use freshell_ws::pane_ledger::StoppedPaneRecord;
+
+/// A fresh-agent pane whose createRequestId names a remembered stop answers
+/// `stopped` whatever its session's presence; a pane of the same
+/// conversation reopened under a new createRequestId is never matched, so
+/// it attaches to the live session (Stage 2: LB-42). (The live conversation
+/// is a fake Claude sidecar's; the rule is provider-blind.)
+#[tokio::test]
+async fn a_killed_fresh_agent_session_reconciles_stopped_and_a_reopened_one_attaches() {
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeClaudeEnv::install();
+    let server = spawn_server().await;
+    let (mut ws, _ready) = connect(&server.url, true, true).await;
+    let live = create_live_claude_session(&mut ws, "crq-g").await;
+    server
+        .pane_ledger
+        .record_stopped_pane(&StoppedPaneRecord::fresh_agent(
+            "claude",
+            &live,
+            Some("crq-f".into()),
+            "shift-x",
+            1_000,
+        ))
+        .expect("the earlier stop's record");
+
+    let verdicts = reconcile_request(
+        &mut ws,
+        serde_json::json!([
+            { "paneKey": "stopped", "kind": "fresh-agent", "createRequestId": "crq-f",
+              "sessionRef": {"provider": "claude", "sessionId": live} },
+            { "paneKey": "reopened", "kind": "fresh-agent", "createRequestId": "crq-g",
+              "sessionRef": {"provider": "claude", "sessionId": live} }
+        ]),
+    )
+    .await;
+    assert_eq!(verdicts[0]["verdict"], "stopped", "{verdicts}");
+    assert_eq!(verdicts[1]["verdict"], "attach", "{verdicts}");
+    assert_eq!(verdicts[1]["sessionRef"]["sessionId"], live.as_str());
+}
+
+/// Every stop of one conversation keeps its own record across a restart:
+/// panes of both earlier stops (before and after a reopen) answer `stopped`,
+/// and a later pane of the conversation that was never stopped answers
+/// `respawn` (plan review R2-F3).
+#[tokio::test]
+async fn a_conversation_stopped_again_after_a_reopen_stays_stopped_for_every_earlier_create_request_id(
+) {
+    let root = tempfile::tempdir().expect("ledger temp root");
+    {
+        let before_restart = PaneLedger::new(Some(root.path().to_path_buf()));
+        for (crq, at) in [("crq-a", 1_000), ("crq-b", 2_000)] {
+            before_restart
+                .record_stopped_pane(&StoppedPaneRecord::fresh_agent(
+                    "codex",
+                    "fs2",
+                    Some(crq.into()),
+                    "shift-x",
+                    at,
+                ))
+                .expect("a stop's record");
+        }
+    }
+    let probe = Arc::new(StubProbe::default());
+    probe
+        .answers
+        .lock()
+        .unwrap()
+        .insert(("codex".into(), "fs2".into()), SessionExistence::Present);
+    let server = spawn_server_on_ledger(probe, root).await;
+    let (mut ws, _ready) = connect(&server.url, true, true).await;
+    let verdicts = reconcile_request(
+        &mut ws,
+        serde_json::json!([
+            { "paneKey": "a", "kind": "fresh-agent", "createRequestId": "crq-a",
+              "sessionRef": {"provider": "codex", "sessionId": "fs2"} },
+            { "paneKey": "b", "kind": "fresh-agent", "createRequestId": "crq-b",
+              "sessionRef": {"provider": "codex", "sessionId": "fs2"} },
+            { "paneKey": "c", "kind": "fresh-agent", "createRequestId": "crq-c",
+              "sessionRef": {"provider": "codex", "sessionId": "fs2"} }
+        ]),
+    )
+    .await;
+    assert_eq!(verdicts[0]["verdict"], "stopped", "{verdicts}");
+    assert_eq!(verdicts[1]["verdict"], "stopped", "{verdicts}");
+    assert_eq!(verdicts[2]["verdict"], "respawn", "{verdicts}");
+    assert_eq!(
+        server
+            .respawn_counts
+            .lock()
+            .unwrap()
+            .get(&("codex".to_string(), "fs2".to_string())),
+        Some(&1),
+        "only the respawn answer burns the respawn counter"
+    );
+}
+
+/// A stop that knew no createRequestId names its conversation: a pane of
+/// that conversation answers `stopped` while the session is not live, and
+/// attaches once it is live again (Stage 2: LB-42).
+#[tokio::test]
+async fn a_stop_with_no_create_request_id_stops_its_conversation_while_it_is_not_live() {
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeClaudeEnv::install();
+    let probe = Arc::new(StubProbe::default());
+    probe.answers.lock().unwrap().insert(
+        ("claude".into(), "s-gone".into()),
+        SessionExistence::Present,
+    );
+    let server = spawn_server_with_probe(probe).await;
+    for session in ["s-gone", FAKE_DURABLE_ID] {
+        server
+            .pane_ledger
+            .record_stopped_pane(&StoppedPaneRecord::fresh_agent(
+                "claude", session, None, "shift-x", 1_000,
+            ))
+            .expect("a session-only stop");
+    }
+    let (mut ws, _ready) = connect(&server.url, true, true).await;
+    let live = create_live_claude_session(&mut ws, "crq-live").await;
+    assert_eq!(live, FAKE_DURABLE_ID);
+    let verdicts = reconcile_request(
+        &mut ws,
+        serde_json::json!([
+            { "paneKey": "gone", "kind": "fresh-agent", "createRequestId": "crq-x",
+              "sessionRef": {"provider": "claude", "sessionId": "s-gone"} },
+            { "paneKey": "live", "kind": "fresh-agent", "createRequestId": "crq-y",
+              "sessionRef": {"provider": "claude", "sessionId": live} }
+        ]),
+    )
+    .await;
+    assert_eq!(verdicts[0]["verdict"], "stopped", "{verdicts}");
+    assert_eq!(verdicts[1]["verdict"], "attach", "{verdicts}");
+}
+
+/// `freshAgent.kill` remembers the conversation it closed, under the
+/// createRequestId the pane-ledger binding carries, before a late device
+/// reconciles: that device's pane answers `stopped`, and a pane of the same
+/// conversation under another createRequestId does not.
+#[tokio::test]
+async fn a_fresh_agent_kill_is_remembered_by_its_bound_create_request_id() {
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeClaudeEnv::install();
+    let probe = Arc::new(StubProbe::default());
+    probe.answers.lock().unwrap().insert(
+        ("claude".into(), FAKE_DURABLE_ID.into()),
+        SessionExistence::Present,
+    );
+    let server = spawn_server_with_probe(probe).await;
+    let (mut ws, _ready) = connect(&server.url, true, true).await;
+    let live = create_live_claude_session(&mut ws, "crq-kill").await;
+    // The identity sink's binding (main.rs wires it; this harness has none).
+    server
+        .pane_ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            provider: "claude",
+            session_id: &live,
+            mode: "freshclaude",
+            cwd: Some("/w"),
+            create_request_id: Some("crq-kill"),
+            model: None,
+            sandbox: None,
+            permission_mode: None,
+            effort: None,
+            supersedes: None,
+            provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+            authoritative: false,
+            now_ms: 1_000,
+        })
+        .expect("the binding");
+
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "freshAgent.kill",
+            "provider": "claude",
+            "sessionId": live,
+            "sessionType": "freshclaude",
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send freshAgent.kill");
+    let killed = await_frame(&mut ws, Duration::from_secs(15), |v| {
+        v["type"] == "freshAgent.killed" && v["sessionId"] == live.as_str()
+    })
+    .await;
+    assert_eq!(killed["success"], true, "{killed}");
+    let remembered = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(record) = server
+                .pane_ledger
+                .stopped_pane_for_create_request("crq-kill")
+            {
+                return record;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the kill is remembered");
+    assert_eq!(remembered.provider.as_deref(), Some("claude"));
+    assert_eq!(remembered.session_id.as_deref(), Some(live.as_str()));
+
+    let (mut late, _ready) = connect(&server.url, true, true).await;
+    let verdicts = reconcile_request(
+        &mut late,
+        serde_json::json!([
+            { "paneKey": "killed", "kind": "fresh-agent", "createRequestId": "crq-kill",
+              "sessionRef": {"provider": "claude", "sessionId": live} },
+            { "paneKey": "other", "kind": "fresh-agent", "createRequestId": "crq-other",
+              "sessionRef": {"provider": "claude", "sessionId": live} }
+        ]),
+    )
+    .await;
+    assert_eq!(verdicts[0]["verdict"], "stopped", "{verdicts}");
+    assert_eq!(verdicts[1]["verdict"], "respawn", "{verdicts}");
 }

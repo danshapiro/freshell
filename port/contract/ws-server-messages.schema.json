@@ -634,6 +634,9 @@
         "terminalId": {
           "type": "string"
         },
+        "terminalStopped": {
+          "type": "boolean"
+        },
         "timestamp": {
           "type": "string"
         },
@@ -2838,7 +2841,8 @@
                   "respawn",
                   "fresh",
                   "dead_session",
-                  "invalid"
+                  "invalid",
+                  "stopped"
                 ],
                 "type": "string"
               }

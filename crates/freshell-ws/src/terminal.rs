@@ -1005,6 +1005,7 @@ async fn handle_client_text(
                     live_terminal_id: None,
                     holder_pid: None,
                     holder_command: None,
+                    terminal_stopped: None,
                 });
                 return send(ws_tx, &reply).await;
             }
@@ -1184,6 +1185,7 @@ async fn dispatch_client_message(
                         live_terminal_id: None,
                         holder_pid: None,
                         holder_command: None,
+                        terminal_stopped: None,
                     }),
                 )
                 .await
@@ -1397,6 +1399,7 @@ async fn dispatch_client_message(
                                     live_terminal_id: None,
                                     holder_pid: None,
                                     holder_command: None,
+                                    terminal_stopped: None,
                                 }),
                             )
                             .await;
@@ -1464,6 +1467,7 @@ async fn dispatch_client_message(
                                     live_terminal_id: None,
                                     holder_pid: None,
                                     holder_command: None,
+                                    terminal_stopped: None,
                                 }),
                             )
                             .await;
@@ -1549,6 +1553,7 @@ async fn dispatch_client_message(
                                         live_terminal_id,
                                         holder_pid: None,
                                         holder_command: None,
+                                        terminal_stopped: None,
                                     }),
                                 )
                                 .await;
@@ -1592,6 +1597,7 @@ async fn dispatch_client_message(
                                         live_terminal_id: None,
                                         holder_pid: None,
                                         holder_command: None,
+                                        terminal_stopped: None,
                                     }),
                                 )
                                 .await;
@@ -1705,6 +1711,7 @@ async fn dispatch_client_message(
                                     live_terminal_id: None,
                                     holder_pid: None,
                                     holder_command: None,
+                                    terminal_stopped: None,
                                 }),
                             )
                             .await;
@@ -1756,6 +1763,7 @@ async fn dispatch_client_message(
                                     live_terminal_id: None,
                                     holder_pid: None,
                                     holder_command: None,
+                                    terminal_stopped: None,
                                 }),
                             )
                             .await;
@@ -2218,26 +2226,36 @@ async fn dispatch_client_message(
             }
             true
         }
+        // A kill whose stop the provider confirmed and closed is remembered
+        // (Task 18), so a late or offline device shows the pane stopped
+        // instead of re-creating its conversation. `amplifier` has no
+        // fresh-agent runtime: dropped.
         ClientMessage::FreshAgentKill(kill) => {
-            if is_codex_provider(kill.provider) {
-                let fresh_codex = state.fresh_codex.clone();
-                tokio::spawn(
-                    async move { fresh_codex.handle_kill(kill).await }
-                        .instrument(tracing::Span::current()),
-                );
-            } else if kill.provider == freshell_protocol::AgentProvider::Claude {
-                let fresh_claude = state.fresh_claude.clone();
-                tokio::spawn(
-                    async move { fresh_claude.handle_kill(kill).await }
-                        .instrument(tracing::Span::current()),
-                );
-            } else if kill.provider == freshell_protocol::AgentProvider::Opencode {
-                let fresh_opencode = state.fresh_opencode.clone();
-                tokio::spawn(
-                    async move { fresh_opencode.handle_kill(kill).await }
-                        .instrument(tracing::Span::current()),
-                );
-            }
+            let provider = match kill.provider {
+                freshell_protocol::AgentProvider::Codex => "codex",
+                freshell_protocol::AgentProvider::Claude => "claude",
+                freshell_protocol::AgentProvider::Opencode => "opencode",
+                freshell_protocol::AgentProvider::Amplifier => return true,
+            };
+            let state = state.clone();
+            tokio::spawn(
+                async move {
+                    let session_id = kill.session_id.clone();
+                    let closed = match kill.provider {
+                        freshell_protocol::AgentProvider::Codex => {
+                            state.fresh_codex.handle_kill(kill).await
+                        }
+                        freshell_protocol::AgentProvider::Claude => {
+                            state.fresh_claude.handle_kill(kill).await
+                        }
+                        _ => state.fresh_opencode.handle_kill(kill).await,
+                    };
+                    if closed {
+                        remember_fresh_agent_stop(&state, provider, &session_id).await;
+                    }
+                }
+                .instrument(tracing::Span::current()),
+            );
             true
         }
         ClientMessage::FreshAgentRecoveryStop(stop) => {
@@ -2671,6 +2689,7 @@ async fn dispatch_client_message(
                     live_terminal_id: None,
                     holder_pid: None,
                     holder_command: None,
+                    terminal_stopped: None,
                 }),
             )
             .await;
@@ -3700,6 +3719,7 @@ async fn send_session_reserved(
         live_terminal_id: None,
         holder_pid: None,
         holder_command: None,
+        terminal_stopped: None,
     });
     out.send(&msg).await
 }
@@ -9353,6 +9373,21 @@ async fn handle_pane_reconcile(
             if state.registry.exists(terminal_id) {
                 continue;
             }
+            // Task 18 (Stage 2: LB-13): a pane remembered as stopped is left
+            // to the `stopped` verdict, never adopted back.
+            if state
+                .pane_ledger
+                .stopped_pane_for_terminal(terminal_id)
+                .is_some()
+                || pane.create_request_id.as_deref().is_some_and(|crq| {
+                    state
+                        .pane_ledger
+                        .stopped_pane_for_create_request(crq)
+                        .is_some()
+                })
+            {
+                continue;
+            }
             match state
                 .registry
                 .adopt_managed_for_reconcile(terminal_id, pane.create_request_id.clone())
@@ -9605,6 +9640,7 @@ pub(crate) async fn send_create_error_holder(
         owner_epoch: None,
         holder_pid: Some(pid),
         holder_command: Some(name.to_string()),
+        terminal_stopped: None,
     });
     out.send(&msg).await
 }
@@ -9626,29 +9662,47 @@ fn is_pane_stopped_error(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::Interrupted && err.to_string() == PANE_STOPPED_MESSAGE
 }
 
-/// `Some(answer)` when `request_id` names a pane a kill stopped: the create
-/// is refused with the correlated `INVALID_TERMINAL_ID` and spawns nothing.
+/// `Some(answer)` when `request_id` names a pane a kill stopped (this
+/// server's killed-start memory, or the durable stopped-pane record a stop
+/// wrote, which survives a restart; Task 18): the create is refused with the
+/// correlated `INVALID_TERMINAL_ID`, `terminalStopped: true`, and spawns
+/// nothing. The record is never cleared by such a create.
 pub(crate) async fn refuse_killed_create(
     state: &WsState,
     out: &mut crate::create_gate::CreateOutput<'_>,
     request_id: &str,
 ) -> Option<bool> {
-    if !state.units.killed_start(request_id) {
+    let remembered = state.units.killed_start(request_id)
+        || state
+            .pane_ledger
+            .stopped_pane_for_create_request(request_id)
+            .is_some();
+    if !remembered {
         return None;
     }
     tracing::info!(target: "freshell_ws::terminal",
         create_request_id = %request_id,
         event = "terminal.create.refused_stopped",
         "a create for a pane a kill stopped is refused; nothing spawns");
-    Some(
-        send_create_error(
-            out,
-            ErrorCode::InvalidTerminalId,
-            PANE_STOPPED_MESSAGE.to_string(),
-            request_id,
-        )
-        .await,
-    )
+    let msg = ServerMessage::Error(ErrorMsg {
+        code: ErrorCode::InvalidTerminalId,
+        message: PANE_STOPPED_MESSAGE.to_string(),
+        timestamp: crate::now_iso(),
+        actual_session_ref: None,
+        expected_session_ref: None,
+        request_id: Some(request_id.to_string()),
+        retry_after_ms: None,
+        terminal_exit_code: None,
+        terminal_id: None,
+        live_terminal_id: None,
+        owner_kind: None,
+        owner_generation: None,
+        owner_epoch: None,
+        holder_pid: None,
+        holder_command: None,
+        terminal_stopped: Some(true),
+    });
+    Some(out.send(&msg).await)
 }
 
 /// `send_create_error` + the D7 live-owner hint (`live_terminal_id`): the
@@ -9696,6 +9750,7 @@ pub(crate) async fn send_create_error_with_owner(
         live_terminal_id,
         holder_pid: None,
         holder_command: None,
+        terminal_stopped: None,
     });
     out.send(&msg).await
 }
@@ -9732,6 +9787,7 @@ pub(crate) async fn send_create_error_with_stale_pair(
         live_terminal_id: None,
         holder_pid: None,
         holder_command: None,
+        terminal_stopped: None,
     });
     out.send(&msg).await
 }
@@ -10127,6 +10183,13 @@ async fn handle_attach(
     // gate accepts it (attachRequestIds live in the `pane:N:nanoid` namespace,
     // never colliding with createRequestIds — see ws-client's
     // clearTrackedCreate-on-error behavior).
+    // Task 18: a terminal whose pane was stopped (a kill, a cleanup stop, a
+    // clean quit) is answered as stopped, so a late or offline device shows
+    // the pane stopped instead of re-creating it.
+    let terminal_stopped = state
+        .pane_ledger
+        .stopped_pane_for_terminal(&attach.terminal_id)
+        .map(|_| true);
     AttachReply::Error(Box::new(ServerMessage::Error(ErrorMsg {
         owner_kind: None,
         owner_generation: None,
@@ -10143,6 +10206,7 @@ async fn handle_attach(
         live_terminal_id: None,
         holder_pid: None,
         holder_command: None,
+        terminal_stopped,
     })))
 }
 
@@ -10313,6 +10377,7 @@ fn input_session_identity_mismatch_error(
         live_terminal_id: None,
         holder_pid: None,
         holder_command: None,
+        terminal_stopped: None,
     })
 }
 
@@ -10355,6 +10420,7 @@ fn invalid_dims_error(cols: i64, rows: i64) -> ServerMessage {
         live_terminal_id: None,
         holder_pid: None,
         holder_command: None,
+        terminal_stopped: None,
     })
 }
 
@@ -10414,6 +10480,7 @@ fn managed_runtime_error(terminal_id: &str, detail: &str) -> ServerMessage {
         live_terminal_id: None,
         holder_pid: None,
         holder_command: None,
+        terminal_stopped: None,
     })
 }
 
@@ -11259,6 +11326,7 @@ impl KillReply {
                     live_terminal_id: None,
                     holder_pid: None,
                     holder_command: None,
+                    terminal_stopped: None,
                 })
             }
         };
@@ -11670,6 +11738,9 @@ async fn kill_row(
             .registry
             .mark_ending(&terminal_id, freshell_terminal::UnitEnding::Requested);
         let state = state.clone();
+        let remember = (!stuck_recovery).then(|| RememberStopped {
+            create_request_id: kill.create_request_id.clone(),
+        });
         reply.spawn_answering(async move {
             let _stop_settlement = stop_settlement;
             stop_managed_row(
@@ -11677,6 +11748,7 @@ async fn kill_row(
                 &terminal_id,
                 &mut stop_commit,
                 persisted_despite_error,
+                remember,
             )
             .await
         });
@@ -11723,19 +11795,51 @@ fn spawn_kill_not_found(
     );
 }
 
+/// A managed pane's kill that remembers the pane as stopped once its stop
+/// is verified (Task 18; Stage 2: LB-13). A stuck restart's kill remembers
+/// nothing (its respawn reuses the pane).
+struct RememberStopped {
+    /// The kill's createRequestId, if it named one (else the facade's).
+    create_request_id: Option<String>,
+}
+
 /// A managed facade's stop through its supervisor (its kill already marked
-/// the row stopping): on the verified stop the facade is removed, the
-/// granted fenced stop committed, and the kill answered done; a failed stop
-/// leaves the facade registered and running (no longer reported stopping)
-/// and answers the failure.
+/// the row stopping): on the verified stop the pane is remembered as stopped
+/// (`remember`), then the facade is removed, the granted fenced stop
+/// committed, and the kill answered done; a failed stop leaves the facade
+/// registered and running (no longer reported stopping) and answers the
+/// failure.
 async fn stop_managed_row(
     state: &WsState,
     terminal_id: &str,
     stop_commit: &mut Option<(String, String, String, u64)>,
     persisted_despite_error: bool,
+    remember: Option<RememberStopped>,
 ) -> KillAnswer {
     match state.registry.managed_stop(terminal_id).await {
         Ok(()) => {
+            if let Some(remember) = remember {
+                let descriptor = state.registry.managed_descriptor(terminal_id);
+                let record = crate::pane_ledger::StoppedPaneRecord::terminal(
+                    Some(terminal_id.to_string()),
+                    remember.create_request_id.or_else(|| {
+                        descriptor
+                            .as_ref()
+                            .and_then(|d| d.create_request_id.clone())
+                    }),
+                    descriptor.as_ref().map(|d| d.mode.clone()),
+                    descriptor.and_then(|d| d.resume_session_id),
+                    freshell_containment::StopReason::ShiftX.as_str(),
+                    now_ms(),
+                );
+                let keys = crate::unit_lifecycle::stopped_record_keys(
+                    &record,
+                    stop_commit
+                        .as_ref()
+                        .map(|(_, _, operation_id, _)| operation_id.as_str()),
+                );
+                crate::unit_lifecycle::write_stopped_record(state, record, &keys).await;
+            }
             let existed = remove_managed_after_stop_and_broadcast(state, terminal_id);
             commit_terminal_stop(state, stop_commit);
             if existed || persisted_despite_error {
@@ -11786,9 +11890,41 @@ async fn kill_not_found(
     if let Some(crq) = kill.create_request_id.clone().filter(|_| !stuck_recovery) {
         state.units.remember_killed_start(&crq);
         if let Some(launch) = state.units.managed_starts().settled(&crq) {
-            let Some(outcome) = reply.until_closed(launch).await else {
+            // A start the kill cancelled whose soul is verified stopped is
+            // remembered by its createRequestId alone (Task 18, Stage 2:
+            // LB-13), whether or not this connection is still open for the
+            // answer, and before the answer.
+            let remembering = tokio::spawn({
+                let (state, crq) = (state.clone(), crq.clone());
+                async move {
+                    let outcome = launch.await;
+                    if matches!(
+                        outcome,
+                        freshell_containment::ManagedStartOutcome::StoppedVerified
+                    ) {
+                        let record = crate::pane_ledger::StoppedPaneRecord::terminal(
+                            None,
+                            Some(crq),
+                            None,
+                            None,
+                            freshell_containment::StopReason::ShiftX.as_str(),
+                            now_ms(),
+                        );
+                        let keys = crate::unit_lifecycle::stopped_record_keys(&record, None);
+                        crate::unit_lifecycle::write_stopped_record(&state, record, &keys).await;
+                    }
+                    outcome
+                }
+                .instrument(tracing::Span::current())
+            });
+            let Some(remembered) = reply.until_closed(remembering).await else {
                 return;
             };
+            let outcome = remembered.unwrap_or_else(|join_error| {
+                freshell_containment::ManagedStartOutcome::StopFailed(format!(
+                    "the managed start's outcome was lost: {join_error}"
+                ))
+            });
             match outcome {
                 freshell_containment::ManagedStartOutcome::StoppedVerified => {
                     reply.send(KillAnswer::done());
@@ -11844,7 +11980,10 @@ async fn kill_not_found(
                 state
                     .registry
                     .mark_ending(&tid, freshell_terminal::UnitEnding::Requested);
-                let answer = stop_managed_row(&state, &tid, &mut None, false).await;
+                let remember = (!stuck_recovery).then(|| RememberStopped {
+                    create_request_id: kill.create_request_id.clone(),
+                });
+                let answer = stop_managed_row(&state, &tid, &mut None, false, remember).await;
                 reply.send(answer);
                 return;
             }
@@ -12026,6 +12165,27 @@ fn fresh_agent_create_key(
 /// Whether a `freshAgent.interrupt`/`freshAgent.kill` frame should route to the codex
 /// handler. PR-1 scope: only `codex` is wired to `FreshCodexState`; other providers keep
 /// the prior swallow behavior until a later PR adds their handlers.
+/// Remembers a fresh-agent session a `freshAgent.kill` stopped (Task 18;
+/// Stage 2: LB-42): one record per stop, keyed by the createRequestId the
+/// conversation's pane-ledger binding carries at this stop (so stopping a
+/// reopened conversation again never replaces the record of an earlier
+/// stop), or by the conversation alone when the binding carries none.
+async fn remember_fresh_agent_stop(state: &WsState, provider: &str, session_id: &str) {
+    let create_request_id = state
+        .pane_ledger
+        .load_binding(provider, session_id)
+        .and_then(|row| row.create_request_id);
+    let record = crate::pane_ledger::StoppedPaneRecord::fresh_agent(
+        provider,
+        session_id,
+        create_request_id,
+        freshell_containment::StopReason::ShiftX.as_str(),
+        now_ms(),
+    );
+    let keys = crate::unit_lifecycle::stopped_record_keys(&record, None);
+    crate::unit_lifecycle::write_stopped_record(state, record, &keys).await;
+}
+
 fn is_codex_provider(provider: freshell_protocol::AgentProvider) -> bool {
     matches!(provider, freshell_protocol::AgentProvider::Codex)
 }
@@ -14218,7 +14378,7 @@ mod pane_reconcile_gate_tests {
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >;
 
-    async fn loopback_sink_and_client() -> (WsSink, TestClient) {
+    pub(super) async fn loopback_sink_and_client() -> (WsSink, TestClient) {
         let (sink_tx, sink_rx) = tokio::sync::oneshot::channel::<WsSink>();
         let sink_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(sink_tx)));
         let router = axum::Router::new().route(
@@ -14264,7 +14424,7 @@ mod pane_reconcile_gate_tests {
         (sink, client)
     }
 
-    async fn next_text_frame(client: &mut TestClient) -> serde_json::Value {
+    pub(super) async fn next_text_frame(client: &mut TestClient) -> serde_json::Value {
         let msg = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
             .await
             .expect("frame within timeout")

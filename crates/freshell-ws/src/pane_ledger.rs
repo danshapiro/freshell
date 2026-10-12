@@ -138,6 +138,9 @@ use serde::{Deserialize, Serialize};
 #[path = "pane_ledger_scan.rs"]
 mod pane_ledger_scan;
 pub use pane_ledger_scan::{BootScanReport, QuarantinedRow, PENDING_MARKER_ORPHAN_TTL_MS};
+#[path = "pane_ledger_stopped.rs"]
+mod pane_ledger_stopped;
+pub use pane_ledger_stopped::{StoppedPaneRecord, STOPPED_KIND_FRESH_AGENT, STOPPED_KIND_TERMINAL};
 
 /// Gates schema migration (spec §4.2): rows with a different version are
 /// quarantined loudly at boot, never silently reinterpreted.
@@ -1391,6 +1394,9 @@ struct LedgerIndex {
     /// swept by the close-record retention rule. Never a liveness answer: a
     /// standing record says THIS PANE / these identities were closed.
     close_envelopes: std::collections::HashMap<String, CloseEnvelopeRecord>,
+    /// Task 18: the write-through image of the `stopped-panes/` subtree
+    /// (see [`StoppedPaneRecord`]). Never swept.
+    stopped_panes: pane_ledger_stopped::StoppedPanes,
 }
 
 /// The ledger store. `root: None` ⇒ feature disabled (no resolvable home) —
@@ -1556,6 +1562,27 @@ impl PaneLedger {
                 format!("read {}: {err}", dir.display()),
             )),
         }
+    }
+
+    /// The `*.json` row files of a flat store region (`<root>/<region>/*.json`),
+    /// under [`Self::load_index`]'s fault policy: an absent region has none; a
+    /// region that exists but cannot be listed (or an entry that errors
+    /// mid-listing) is a store fault. Temp and quarantine residue is skipped.
+    fn flat_row_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+        let Some(entries) = Self::read_dir_existing(dir)? else {
+            return Ok(Vec::new());
+        };
+        let mut rows = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|err| {
+                std::io::Error::new(err.kind(), format!("list {}: {err}", dir.display()))
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                rows.push(path); // *.tmp-* / *.quarantined-* residue is skipped
+            }
+        }
+        Ok(rows)
     }
 
     /// Lock-free construction — tests and the integration harness use this
@@ -1906,22 +1933,15 @@ impl PaneLedger {
                 }
             }
         }
-        if let Some(files) = Self::read_dir_existing(&Self::pending_dir(root))? {
-            for file in files {
-                let file = file.map_err(|err| entry_err(err, &Self::pending_dir(root)))?;
-                let path = file.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue;
-                }
-                match load_row::<PendingMarker>(&path) {
-                    Ok(marker) => {
-                        if marker.ledger_version == LEDGER_VERSION {
-                            index.pending.insert(marker.terminal_id.clone(), marker);
-                        }
+        for path in Self::flat_row_files(&Self::pending_dir(root))? {
+            match load_row::<PendingMarker>(&path) {
+                Ok(marker) => {
+                    if marker.ledger_version == LEDGER_VERSION {
+                        index.pending.insert(marker.terminal_id.clone(), marker);
                     }
-                    Err(RowLoadError::Io(err)) => unreadable_row(&path, &RowLoadError::Io(err)),
-                    Err(RowLoadError::Missing) | Err(RowLoadError::Parse(_)) => {}
                 }
+                Err(RowLoadError::Io(err)) => unreadable_row(&path, &RowLoadError::Io(err)),
+                Err(RowLoadError::Missing) | Err(RowLoadError::Parse(_)) => {}
             }
         }
         // Rollback subtree (kata 1wxv): the payload is OPAQUE (`Value`), so the
@@ -2046,56 +2066,44 @@ impl PaneLedger {
         // their `pane:<terminalId>` key, their `kills` feeding the fence
         // index exactly like a journal record's. Retention is the sweep's
         // call, never the loader's.
-        if let Some(files) = Self::read_dir_existing(&Self::pane_close_dir(root))? {
-            for file in files {
-                let file = file.map_err(|err| entry_err(err, &Self::pane_close_dir(root)))?;
-                let path = file.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue; // *.tmp-* / *.quarantined-* residue
-                }
-                if let Ok(record) = load_row::<PaneCloseRecord>(&path) {
-                    if record.ledger_version == LEDGER_VERSION {
-                        let envelope = CloseEnvelopeRecord {
-                            ledger_version: record.ledger_version,
-                            terminal_id: Some(record.terminal_id.clone()),
-                            create_request_id: record.create_request_id.clone(),
-                            closed_at: record.closed_at,
-                            kills: record.kills.clone(),
-                            panes: Vec::new(),
-                        };
-                        feed_close_envelope(
-                            &mut index,
-                            Self::pane_envelope_key(&record.terminal_id),
-                            envelope,
-                        );
-                    }
+        for path in Self::flat_row_files(&Self::pane_close_dir(root))? {
+            if let Ok(record) = load_row::<PaneCloseRecord>(&path) {
+                if record.ledger_version == LEDGER_VERSION {
+                    let envelope = CloseEnvelopeRecord {
+                        ledger_version: record.ledger_version,
+                        terminal_id: Some(record.terminal_id.clone()),
+                        create_request_id: record.create_request_id.clone(),
+                        closed_at: record.closed_at,
+                        kills: record.kills.clone(),
+                        panes: Vec::new(),
+                    };
+                    feed_close_envelope(
+                        &mut index,
+                        Self::pane_envelope_key(&record.terminal_id),
+                        envelope,
+                    );
                 }
             }
         }
         // The close-envelope journal subtree (delta-r6-r4): every clean
         // current-version record loads; the map key comes from the FILENAME
         // (encoded `pane:<terminalId>` / `<provider>:<addressedSessionId>`).
-        if let Some(files) = Self::read_dir_existing(&Self::close_envelope_dir(root))? {
-            for file in files {
-                let file = file.map_err(|err| entry_err(err, &Self::close_envelope_dir(root)))?;
-                let path = file.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue; // *.tmp-* / *.quarantined-* residue
-                }
-                let Some(key) = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .and_then(decode_segment)
-                else {
-                    continue;
-                };
-                if let Ok(record) = load_row::<CloseEnvelopeRecord>(&path) {
-                    if record.ledger_version == LEDGER_VERSION {
-                        feed_close_envelope(&mut index, key, record);
-                    }
+        for path in Self::flat_row_files(&Self::close_envelope_dir(root))? {
+            let Some(key) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(decode_segment)
+            else {
+                continue;
+            };
+            if let Ok(record) = load_row::<CloseEnvelopeRecord>(&path) {
+                if record.ledger_version == LEDGER_VERSION {
+                    feed_close_envelope(&mut index, key, record);
                 }
             }
         }
+        // Task 18: the stopped-pane memory (never swept).
+        Self::load_stopped_panes(root, &mut index, &unreadable_row)?;
         Ok(index)
     }
 

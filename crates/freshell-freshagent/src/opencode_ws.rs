@@ -1276,6 +1276,7 @@ impl FreshOpencodeState {
             live_terminal_id: None,
             holder_pid: None,
             holder_command: None,
+            terminal_stopped: None,
         }));
     }
 
@@ -3442,7 +3443,11 @@ impl FreshOpencodeState {
     /// `freshAgent.killed`. NEVER touches the shared `opencode serve` sidecar — that
     /// child is reused by every session and torn down only by
     /// [`crate::FreshAgentState::shutdown`] at server shutdown.
-    pub async fn handle_kill(&self, msg: FreshAgentKill) {
+    ///
+    /// Returns whether the session was closed (its close recorded and its
+    /// bookkeeping removed; the WebSocket dispatch then remembers the pane
+    /// as stopped, Task 18); `false` for every refused or failed kill.
+    pub async fn handle_kill(&self, msg: FreshAgentKill) -> bool {
         // b8ke delta review F7: a half-sent observed pair (exactly one of
         // epoch/generation) is the typed invalid-fence refusal — BEFORE the
         // durable close envelope, the enumeration gate, or any live-state
@@ -3463,7 +3468,7 @@ impl FreshOpencodeState {
                         code: Some(err.code().to_string()),
                         message: Some(err.message().to_string()),
                     }));
-                    return;
+                    return false;
                 }
             };
         // Retire-on-kill close-durability rule (delta-r6): the durable close
@@ -3711,7 +3716,7 @@ impl FreshOpencodeState {
                         code: Some(refusal_code.to_string()),
                         message: Some(refusal_message),
                     }));
-                    return;
+                    return false;
                 }
             } else {
                 // b8ke delta round-3 F1: NO retained stamp — the kill STILL
@@ -3773,7 +3778,7 @@ impl FreshOpencodeState {
                                         .to_string(),
                                 ),
                             }));
-                            return;
+                            return false;
                         }
                         let claim = freshell_ownership::StopClaim {
                             expected_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
@@ -3912,7 +3917,7 @@ impl FreshOpencodeState {
                                         message: Some(refusal_message),
                                     },
                                 ));
-                                return;
+                                return false;
                             }
                         }
                     }
@@ -3952,7 +3957,7 @@ impl FreshOpencodeState {
                                     .to_string(),
                             ),
                         }));
-                        return;
+                        return false;
                     }
                     freshell_ownership::OwnershipState::Starting { .. }
                     | freshell_ownership::OwnershipState::Stopping { .. } => {
@@ -3988,7 +3993,7 @@ impl FreshOpencodeState {
                                     .to_string(),
                             ),
                         }));
-                        return;
+                        return false;
                     }
                     freshell_ownership::OwnershipState::Fenced { .. } => {
                         tracing::warn!(target: "freshell_freshagent::opencode",
@@ -4024,7 +4029,7 @@ impl FreshOpencodeState {
                                     .to_string(),
                             ),
                         }));
-                        return;
+                        return false;
                     }
                     _ => {
                         // Genuinely Vacant (or residue): lane-local cleanup
@@ -4189,7 +4194,7 @@ impl FreshOpencodeState {
                                     .to_string(),
                             ),
                         }));
-                        return;
+                        return false;
                     }
                 }
             }
@@ -4416,6 +4421,10 @@ impl FreshOpencodeState {
             code: None,
             message: None,
         }));
+        // The close is recorded (a clean or a persisted-despite-error close)
+        // and the session's bookkeeping removed (its runtime is the shared
+        // daemon, which a kill never stops).
+        true
     }
 
     // ── freshAgent.interrupt (WS) ────────────────────────────────────────
@@ -9949,15 +9958,17 @@ mod tests {
             let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
             let st = FreshOpencodeState::new(fresh_agent);
 
-            st.handle_kill(FreshAgentKill {
-                observed_epoch: epoch,
-                observed_generation: generation,
-                provider: AgentProvider::Opencode,
-                session_id: "half-fenced-kill".to_string(),
-                session_type: SessionType::Freshopencode,
-                cwd: None,
-            })
-            .await;
+            let closed = st
+                .handle_kill(FreshAgentKill {
+                    observed_epoch: epoch,
+                    observed_generation: generation,
+                    provider: AgentProvider::Opencode,
+                    session_id: "half-fenced-kill".to_string(),
+                    session_type: SessionType::Freshopencode,
+                    cwd: None,
+                })
+                .await;
+            assert!(!closed, "a refused kill closed nothing");
 
             let raw = rx.try_recv().expect("the refusal frame");
             let frame: Value = serde_json::from_str(&raw).unwrap();
@@ -11178,15 +11189,17 @@ mod tests {
 
         // The ledger fails every write (disk-full/permission shape).
         fake.set_fail_writes(true);
-        st.handle_kill(FreshAgentKill {
-            observed_epoch: None,
-            observed_generation: None,
-            provider: freshell_protocol::AgentProvider::Opencode,
-            session_id: placeholder.to_string(),
-            session_type: SessionType::Freshopencode,
-            cwd: None,
-        })
-        .await;
+        let closed = st
+            .handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
+                provider: freshell_protocol::AgentProvider::Opencode,
+                session_id: placeholder.to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        assert!(!closed, "a kill whose close failed closed nothing");
 
         // NO live state was mutated: both map keys stand, the killed flag was
         // never set, the surviving pending marker was never deleted (the
@@ -12990,15 +13003,20 @@ mod tests {
         let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
         let st = FreshOpencodeState::new(fresh_agent);
 
-        st.handle_kill(FreshAgentKill {
-            observed_epoch: None,
-            observed_generation: None,
-            provider: AgentProvider::Opencode,
-            session_id: "does-not-exist".to_string(),
-            session_type: SessionType::Freshopencode,
-            cwd: None,
-        })
-        .await;
+        let closed = st
+            .handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
+                provider: AgentProvider::Opencode,
+                session_id: "does-not-exist".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        assert!(
+            closed,
+            "an idempotent kill of an unknown session closed it (Task 18 remembers it)"
+        );
 
         let frame: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(frame["type"], "freshAgent.killed");

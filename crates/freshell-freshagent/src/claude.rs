@@ -2773,7 +2773,11 @@ impl FreshClaudeState {
     /// `clearFreshAgentCreateCachesForSession`, `ws-handler.ts:1044-1050`, called from
     /// `ws-handler.ts:3673`), then broadcast `freshAgent.killed`. Idempotent for an
     /// unknown session id, matching the codex/opencode `success:true` pattern.
-    pub async fn handle_kill(&self, msg: FreshAgentKill) {
+    ///
+    /// Returns whether the session's stop was confirmed and its close
+    /// recorded (the WebSocket dispatch then remembers the pane as stopped,
+    /// Task 18); `false` for every refused or failed kill.
+    pub async fn handle_kill(&self, msg: FreshAgentKill) -> bool {
         let session_id = msg.session_id.clone();
         let session_type = session_type_str(msg.session_type);
 
@@ -2796,7 +2800,7 @@ impl FreshClaudeState {
                         code: Some(err.code().to_string()),
                         message: Some(err.message().to_string()),
                     }));
-                    return;
+                    return false;
                 }
             };
 
@@ -3069,7 +3073,7 @@ impl FreshClaudeState {
                         code: Some(refusal_code.to_string()),
                         message: Some(refusal_message),
                     }));
-                    return;
+                    return false;
                 }
             } else {
                 // b8ke delta round-3 F1: NO retained stamp — the kill STILL
@@ -3138,7 +3142,7 @@ impl FreshClaudeState {
                                         .to_string(),
                                 ),
                             }));
-                            return;
+                            return false;
                         }
                         // e3r1 F1: honor the REQUEST'S fence — a delayed
                         // kill carrying a stale observed pair is refused by
@@ -3281,7 +3285,7 @@ impl FreshClaudeState {
                                         message: Some(refusal_message),
                                     },
                                 ));
-                                return;
+                                return false;
                             }
                         }
                     }
@@ -3322,7 +3326,7 @@ impl FreshClaudeState {
                                     .to_string(),
                             ),
                         }));
-                        return;
+                        return false;
                     }
                     freshell_ownership::OwnershipState::Starting { .. }
                     | freshell_ownership::OwnershipState::Stopping { .. } => {
@@ -3353,7 +3357,7 @@ impl FreshClaudeState {
                                     .to_string(),
                             ),
                         }));
-                        return;
+                        return false;
                     }
                     freshell_ownership::OwnershipState::Fenced { .. } => {
                         tracing::warn!(target: "freshell_freshagent::claude",
@@ -3384,7 +3388,7 @@ impl FreshClaudeState {
                                     .to_string(),
                             ),
                         }));
-                        return;
+                        return false;
                     }
                     _ => {
                         // Genuinely Vacant (or this-lane rekey residue):
@@ -3503,7 +3507,7 @@ impl FreshClaudeState {
                     "the pane-ledger close failed; nothing was killed — retry".to_string(),
                 ),
             }));
-            return;
+            return false;
         }
         let main_close_reported_failure =
             close_answer == crate::identity_sink::CloseAnswer::Persisted;
@@ -3720,6 +3724,9 @@ impl FreshClaudeState {
             code: kill_failure.as_ref().map(|(code, _)| code.to_string()),
             message: kill_failure.as_ref().map(|(_, message)| message.clone()),
         }));
+        // The close is recorded (a clean or a persisted-despite-error close)
+        // and the session's runtime tree was confirmed stopped.
+        kill_failure.is_none()
     }
 
     /// Round 5 (focused-ep5-r4 Finding 1): for every id this kill retired
@@ -7375,6 +7382,7 @@ impl FreshClaudeState {
             live_terminal_id: None,
             holder_pid: None,
             holder_command: None,
+            terminal_stopped: None,
         }));
     }
 
@@ -13644,15 +13652,20 @@ rl.on('line', (line) => {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let st = FreshClaudeState::new(Arc::new(tx));
 
-        st.handle_kill(FreshAgentKill {
-            observed_epoch: None,
-            observed_generation: None,
-            provider: freshell_protocol::AgentProvider::Claude,
-            session_id: "unknown-session".to_string(),
-            session_type: SessionType::Freshclaude,
-            cwd: None,
-        })
-        .await;
+        let closed = st
+            .handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
+                provider: freshell_protocol::AgentProvider::Claude,
+                session_id: "unknown-session".to_string(),
+                session_type: SessionType::Freshclaude,
+                cwd: None,
+            })
+            .await;
+        assert!(
+            closed,
+            "an idempotent kill of an unknown session closed it (Task 18 remembers it)"
+        );
 
         let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(frame["type"], "freshAgent.killed");
@@ -13859,15 +13872,17 @@ rl.on('line', (line) => {
         // The ledger fails every write (disk-full/permission shape).
         fake.set_fail_writes(true);
 
-        st.handle_kill(FreshAgentKill {
-            observed_epoch: None,
-            observed_generation: None,
-            provider: freshell_protocol::AgentProvider::Claude,
-            session_id: "sess-kill-fail".to_string(),
-            session_type: SessionType::Freshclaude,
-            cwd: None,
-        })
-        .await;
+        let closed = st
+            .handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
+                provider: freshell_protocol::AgentProvider::Claude,
+                session_id: "sess-kill-fail".to_string(),
+                session_type: SessionType::Freshclaude,
+                cwd: None,
+            })
+            .await;
+        assert!(!closed, "a kill whose close failed closed nothing");
 
         assert!(
             st.sessions.lock().await.contains_key("sess-kill-fail"),
@@ -16698,7 +16713,8 @@ rl.on('line', (line) => {
             msg.observed_epoch = epoch;
             msg.observed_generation = generation;
 
-            st.handle_kill(msg).await;
+            let closed = st.handle_kill(msg).await;
+            assert!(!closed, "a refused kill closed nothing");
 
             let raw = rx.try_recv().expect("the refusal frame");
             let frame: Value = serde_json::from_str(&raw).unwrap();

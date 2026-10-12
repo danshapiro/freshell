@@ -40,6 +40,8 @@ struct Supervisor {
     gated: std::sync::atomic::AtomicBool,
     running: Mutex<Option<ManagedTerminalDescriptor>>,
     stopped: Mutex<Vec<ManagedTerminalDescriptor>>,
+    /// Every inventory lookup asked of it (adoption asks one too).
+    lookups: std::sync::atomic::AtomicUsize,
 }
 
 impl ManagedTerminalController for Supervisor {
@@ -48,6 +50,8 @@ impl ManagedTerminalController for Supervisor {
         terminal_id: &'a str,
         _create_request_id: Option<String>,
     ) -> ManagedTerminalFuture<'a, Result<Option<ManagedTerminalDescriptor>, String>> {
+        self.lookups
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let found = self
             .running
             .lock()
@@ -789,4 +793,168 @@ async fn a_late_claim_of_a_unit_row_is_stamped_with_its_unit() {
         freshell_ownership::OwnershipState::Vacant,
         "the unit's Gone released the late claim's key"
     );
+}
+
+/// A pane-ledger root for one test (removed by the caller).
+fn ledger_root(label: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "terminal-kill-ledger-{label}-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&root).expect("ledger root");
+    root
+}
+
+/// A managed (supervisor-owned) pane's kill is remembered like a unit's
+/// (Task 18; Stage 2: LB-13): the kill arm writes the stopped-pane record
+/// before it removes the facade, a later reconcile of the pane answers
+/// `stopped`, and the managed reconcile pre-pass leaves the remembered pane
+/// alone (no inventory lookup, no adoption).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_killed_managed_pane_is_remembered_and_reconciles_stopped() {
+    let root = ledger_root("managed");
+    let mut state = super::pane_reconcile_gate_tests::state();
+    state.pane_ledger = Arc::new(crate::pane_ledger::PaneLedger::new(Some(root.clone())));
+    let supervisor = Arc::new(Supervisor::default());
+    state
+        .registry
+        .set_managed_controller(Some(supervisor.clone()));
+    let soul = ManagedTerminalDescriptor {
+        mode: "opencode".into(),
+        resume_session_id: Some("ses_mo".into()),
+        ..descriptor("T-mo", "crq-mo")
+    };
+    state.registry.register_managed(soul.clone());
+
+    let (sink, frames) = connection();
+    let (_open, closed) = tokio::sync::watch::channel(false);
+    handle_kill(
+        kill_of(Some("T-mo"), Some("crq-mo"), Some("rk-mo")),
+        &sink,
+        &closed,
+        &state,
+        "test-kill",
+    )
+    .await;
+    eventually("the kill is answered", || {
+        kill_answer(&frames, "rk-mo").is_some()
+    })
+    .await;
+    assert_eq!(kill_answer(&frames, "rk-mo").map(|(_, ok)| ok), Some(true));
+    assert_eq!(*supervisor.stopped.lock().unwrap(), vec![soul]);
+    let record = state
+        .pane_ledger
+        .stopped_pane_for_terminal("T-mo")
+        .expect("the killed managed pane is remembered");
+    assert_eq!(record.create_request_id.as_deref(), Some("crq-mo"));
+    assert_eq!(record.provider.as_deref(), Some("opencode"));
+    assert_eq!(record.session_id.as_deref(), Some("ses_mo"));
+    assert_eq!(
+        state.pane_ledger.stopped_pane_for_create_request("crq-mo"),
+        Some(record)
+    );
+
+    let lookups_before = supervisor.lookups.load(std::sync::atomic::Ordering::SeqCst);
+    let (mut ws_tx, mut client) =
+        super::pane_reconcile_gate_tests::loopback_sink_and_client().await;
+    let request: freshell_protocol::PaneReconcileRequest =
+        serde_json::from_value(serde_json::json!({
+            "reconcileId": "rr-mo",
+            "panes": [{
+                "paneKey": "tab-1:pane-mo", "kind": "terminal", "mode": "opencode",
+                "terminalId": "T-mo", "createRequestId": "crq-mo",
+                "sessionRef": {"provider": "opencode", "sessionId": "ses_mo"}
+            }]
+        }))
+        .expect("reconcile request");
+    assert!(handle_pane_reconcile(request, &mut ws_tx, &state, false, true).await);
+    let result = super::pane_reconcile_gate_tests::next_text_frame(&mut client).await;
+    assert_eq!(result["type"], "pane.reconcile.result", "{result}");
+    assert_eq!(result["verdicts"][0]["verdict"], "stopped", "{result}");
+    assert_eq!(
+        supervisor.lookups.load(std::sync::atomic::Ordering::SeqCst),
+        lookups_before,
+        "the managed pre-pass neither looked the remembered pane up nor adopted it"
+    );
+    assert!(
+        !state.registry.is_managed("T-mo"),
+        "no facade was re-adopted"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A managed pane killed while it launched (its start cancelled by its
+/// createRequestId) is remembered by that createRequestId alone, once its
+/// soul is verified stopped (Task 18; Stage 2: LB-13).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_killed_managed_start_is_remembered_by_create_request_id() {
+    let root = ledger_root("managed-start");
+    let mut state = super::pane_reconcile_gate_tests::state();
+    state.pane_ledger = Arc::new(crate::pane_ledger::PaneLedger::new(Some(root.clone())));
+    let supervisor = Arc::new(Supervisor::default());
+    supervisor
+        .gated
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    state
+        .registry
+        .set_managed_controller(Some(supervisor.clone()));
+    let conn_id = 42;
+    state.registry.set_managed_runtime_connection(conn_id, true);
+    let (sink, frames) = connection();
+    let create: TerminalCreate = serde_json::from_value(serde_json::json!({
+        "requestId": "crq-ms",
+        "mode": "shell",
+        "shell": "system",
+    }))
+    .expect("terminal create");
+    let creating = tokio::spawn({
+        let state = state.clone();
+        let sink = sink.clone();
+        async move {
+            let mut out = crate::create_gate::CreateOutput::Channel(&sink);
+            let mut limiter = crate::create_limit::CreateRateLimiter::new(100, 1000);
+            handle_create(
+                create,
+                None,
+                &mut out,
+                &state,
+                conn_id,
+                false,
+                &mut limiter,
+                &ConnectionIdentity::default(),
+                now_ms(),
+            )
+            .await
+        }
+    });
+    eventually("the managed launch is in flight", || {
+        state.units.managed_starts().settled("crq-ms").is_some()
+    })
+    .await;
+    let (_open, closed) = tokio::sync::watch::channel(false);
+    handle_kill(
+        kill_of(None, Some("crq-ms"), Some("rk-ms")),
+        &sink,
+        &closed,
+        &state,
+        "test-kill",
+    )
+    .await;
+    supervisor.gate.notify_one();
+    tokio::time::timeout(LIMIT, creating)
+        .await
+        .expect("the create finishes")
+        .unwrap();
+    eventually("the kill is answered", || {
+        kill_answer(&frames, "rk-ms").is_some()
+    })
+    .await;
+    assert_eq!(kill_answer(&frames, "rk-ms").map(|(_, ok)| ok), Some(true));
+    let record = state
+        .pane_ledger
+        .stopped_pane_for_create_request("crq-ms")
+        .expect("the killed start is remembered");
+    assert_eq!(record.terminal_id, None, "{record:?}");
+    std::fs::remove_dir_all(&root).ok();
 }

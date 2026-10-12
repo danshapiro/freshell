@@ -9101,3 +9101,282 @@ fn boot_scan_records_scan_faults_and_still_quarantines_each_bad_row() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+// --- Task 18: the stopped-pane memory ---------------------------------------
+
+fn stopped(
+    terminal_id: Option<&str>,
+    create_request_id: Option<&str>,
+    conversation: Option<(&str, &str)>,
+    kind: &str,
+    stopped_at_ms: i64,
+) -> StoppedPaneRecord {
+    StoppedPaneRecord {
+        ledger_version: LEDGER_VERSION,
+        terminal_id: terminal_id.map(str::to_string),
+        create_request_id: create_request_id.map(str::to_string),
+        provider: conversation.map(|(provider, _)| provider.to_string()),
+        session_id: conversation.map(|(_, session_id)| session_id.to_string()),
+        kind: kind.to_string(),
+        reason: "shift-x".to_string(),
+        stopped_at_ms,
+    }
+}
+
+/// Every lookup the four records below answer, against one ledger.
+fn assert_stopped_lookups(
+    ledger: &PaneLedger,
+    terminal: &StoppedPaneRecord,
+    session_only: &StoppedPaneRecord,
+    first_stop: &StoppedPaneRecord,
+    second_stop: &StoppedPaneRecord,
+    when: &str,
+) {
+    assert_eq!(
+        ledger.stopped_pane_for_terminal("T1").as_ref(),
+        Some(terminal),
+        "{when}: by terminal id"
+    );
+    assert_eq!(
+        ledger.stopped_pane_for_create_request("C1").as_ref(),
+        Some(terminal),
+        "{when}: the terminal record by its createRequestId"
+    );
+    assert_eq!(
+        ledger.stopped_pane_for_create_request("F1").as_ref(),
+        Some(first_stop),
+        "{when}: the first stop of the conversation keeps its own record"
+    );
+    assert_eq!(
+        ledger.stopped_pane_for_create_request("F2").as_ref(),
+        Some(second_stop),
+        "{when}: the stop after the reopen has its own record"
+    );
+    assert_eq!(
+        ledger.stopped_fresh_session("codex", "fs"),
+        vec![first_stop.clone(), second_stop.clone()],
+        "{when}: every stop of the conversation, oldest first"
+    );
+    assert_eq!(
+        ledger.stopped_fresh_session("codex", "fs0"),
+        vec![session_only.clone()],
+        "{when}: the stop with no createRequestId, by its conversation"
+    );
+    assert_eq!(ledger.stopped_pane_for_terminal("T2"), None, "{when}");
+    assert_eq!(ledger.stopped_pane_for_create_request("F3"), None, "{when}");
+}
+
+/// Stopped panes are remembered across a restart and never expire: neither
+/// the periodic GC nor the boot scan removes a record, however old (plan
+/// review R1-F5). A second stop of one conversation after a reopen writes a
+/// second record and never replaces the first (plan review R2-F3).
+#[test]
+fn stopped_panes_persist_across_reload_and_never_expire() {
+    let root = temp_root("stopped-panes");
+    let terminal = stopped(Some("T1"), Some("C1"), None, STOPPED_KIND_TERMINAL, 1_000);
+    let session_only = stopped(
+        None,
+        None,
+        Some(("codex", "fs0")),
+        STOPPED_KIND_FRESH_AGENT,
+        1_000,
+    );
+    let first_stop = stopped(
+        None,
+        Some("F1"),
+        Some(("codex", "fs")),
+        STOPPED_KIND_FRESH_AGENT,
+        1_000,
+    );
+    let second_stop = stopped(
+        None,
+        Some("F2"),
+        Some(("codex", "fs")),
+        STOPPED_KIND_FRESH_AGENT,
+        2_000,
+    );
+    {
+        let ledger = PaneLedger::new(Some(root.clone()));
+        for record in [&terminal, &session_only, &first_stop, &second_stop] {
+            ledger
+                .record_stopped_pane(record)
+                .expect("the stop is recorded");
+        }
+        assert_stopped_lookups(
+            &ledger,
+            &terminal,
+            &session_only,
+            &first_stop,
+            &second_stop,
+            "as written",
+        );
+    }
+
+    let reloaded = PaneLedger::new(Some(root.clone()));
+    assert_stopped_lookups(
+        &reloaded,
+        &terminal,
+        &session_only,
+        &first_stop,
+        &second_stop,
+        "after a reload",
+    );
+    let files = std::fs::read_dir(root.join("stopped-panes"))
+        .expect("the stopped-panes directory")
+        .flatten()
+        .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("json"))
+        .count();
+    assert_eq!(files, 4, "one file per stop");
+
+    let ten_years_later = 1_000 + 10 * 365 * 24 * 60 * 60 * 1000;
+    reloaded.gc(
+        ten_years_later,
+        &never_absent,
+        Some(&HashSet::new()),
+        Some(&no_snapshot_refs()),
+    );
+    let report = reloaded.boot_scan(ten_years_later, &never_absent, Some(&no_snapshot_refs()));
+    assert!(
+        report.quarantined.is_empty(),
+        "healthy records are not quarantined"
+    );
+    drop(reloaded);
+    let after_gc = PaneLedger::new(Some(root.clone()));
+    assert_stopped_lookups(
+        &after_gc,
+        &terminal,
+        &session_only,
+        &first_stop,
+        &second_stop,
+        "after the GC",
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A record that names no pane is refused; a disabled ledger remembers
+/// nothing and answers nothing.
+#[test]
+fn a_stopped_record_must_name_a_pane_and_a_disabled_ledger_keeps_none() {
+    let root = temp_root("stopped-panes-keys");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    let nameless = stopped(None, None, None, STOPPED_KIND_TERMINAL, 1_000);
+    assert_eq!(
+        ledger.record_stopped_pane(&nameless).map_err(|e| e.kind()),
+        Err(std::io::ErrorKind::InvalidInput)
+    );
+    let terminal_conversation = stopped(
+        None,
+        None,
+        Some(("codex", "t")),
+        STOPPED_KIND_TERMINAL,
+        1_000,
+    );
+    assert_eq!(
+        ledger
+            .record_stopped_pane(&terminal_conversation)
+            .map_err(|e| e.kind()),
+        Err(std::io::ErrorKind::InvalidInput),
+        "a terminal stop is found by its terminal or createRequestId, never by conversation"
+    );
+
+    let disabled = PaneLedger::disabled();
+    disabled
+        .record_stopped_pane(&stopped(
+            Some("T1"),
+            None,
+            None,
+            STOPPED_KIND_TERMINAL,
+            1_000,
+        ))
+        .expect("a disabled ledger stores nothing");
+    assert_eq!(disabled.stopped_pane_for_terminal("T1"), None);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A stopped-pane file that does not parse is quarantined by the boot scan
+/// (fail loud per row) and never hides the healthy records beside it.
+#[test]
+fn a_corrupt_stopped_record_is_quarantined_and_the_others_still_answer() {
+    let root = temp_root("stopped-panes-corrupt");
+    let healthy = stopped(Some("T1"), Some("C1"), None, STOPPED_KIND_TERMINAL, 1_000);
+    PaneLedger::new(Some(root.clone()))
+        .record_stopped_pane(&healthy)
+        .expect("the stop is recorded");
+    let corrupt = root.join("stopped-panes").join("T-bad.json");
+    std::fs::write(&corrupt, b"not json").unwrap();
+
+    let ledger = PaneLedger::new(Some(root.clone()));
+    assert!(ledger.is_enabled());
+    let report = ledger.boot_scan(2_000, &never_absent, Some(&no_snapshot_refs()));
+    assert_eq!(
+        report
+            .quarantined
+            .iter()
+            .map(|row| row.original_path.clone())
+            .collect::<Vec<_>>(),
+        vec![corrupt.clone()],
+        "the corrupt stopped record is renamed aside"
+    );
+    assert!(!corrupt.exists());
+    assert_eq!(ledger.stopped_pane_for_terminal("T1"), Some(healthy));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A stopped-pane record that cannot be written is never ignored: the
+/// ledger answers `Err`, and the helper every stop uses
+/// (`unit_lifecycle::write_stopped_record`) logs ERROR
+/// `unit.stopped_record.write_failed` with the stop's keys and returns, so
+/// the stop's publication goes on.
+#[tokio::test]
+async fn a_failed_stopped_record_write_is_an_error_log() {
+    let root = temp_root("stopped-panes-unwritable");
+    let ledger = std::sync::Arc::new(PaneLedger::new(Some(root.clone())));
+    assert!(ledger.is_enabled());
+    std::fs::write(root.join("stopped-panes"), b"not a directory").unwrap();
+    let record = stopped(
+        Some("T-unwritable"),
+        Some("C-unwritable"),
+        Some(("codex", "t-unwritable")),
+        STOPPED_KIND_TERMINAL,
+        1_000,
+    );
+    assert!(
+        ledger.record_stopped_pane(&record).is_err(),
+        "the write fails"
+    );
+
+    let events = crate::invariants::capture::capture();
+    let mut state = crate::test_ws_state();
+    state.pane_ledger = ledger;
+    crate::unit_lifecycle::write_stopped_record(
+        &state,
+        record.clone(),
+        &crate::unit_lifecycle::stopped_record_keys(&record, Some("op-unwritable")),
+    )
+    .await;
+    let logged: Vec<_> = events
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|e| {
+            e.target == "freshell_unit"
+                && e.fields.get("terminal_id").map(String::as_str) == Some("T-unwritable")
+        })
+        .cloned()
+        .collect();
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    let failure = &logged[0];
+    assert_eq!(failure.level, "ERROR", "{failure:?}");
+    let field = |name: &str| failure.fields.get(name).map(String::as_str);
+    assert_eq!(field("event"), Some("unit.stopped_record.write_failed"));
+    assert_eq!(field("create_request_id"), Some("C-unwritable"));
+    assert_eq!(field("operation_id"), Some("op-unwritable"));
+    assert_eq!(field("session_id"), Some("t-unwritable"));
+    assert_eq!(field("provider"), Some("codex"));
+    assert!(field("error").is_some_and(|e| !e.is_empty()), "{failure:?}");
+    assert_eq!(
+        state.pane_ledger.stopped_pane_for_terminal("T-unwritable"),
+        None
+    );
+    std::fs::remove_dir_all(&root).ok();
+}

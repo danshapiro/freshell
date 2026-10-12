@@ -318,11 +318,12 @@ impl HostedTransport {
                 .as_ref()
                 .map(|profile| profile.cwd.clone()),
         };
-        match &self.state {
+        // The kill's outcome is read from its `freshAgent.killed` answer below.
+        let _closed = match &self.state {
             ProviderState::Claude(state) => state.handle_kill(message).await,
             ProviderState::Codex(state) => state.handle_kill(message).await,
             ProviderState::Opencode { runtime, .. } => runtime.handle_kill(message).await,
-        }
+        };
         let observed = tokio::time::timeout(RETIRE_TIMEOUT, async {
             loop {
                 match outcomes.recv().await {

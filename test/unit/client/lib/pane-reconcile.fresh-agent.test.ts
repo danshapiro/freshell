@@ -29,6 +29,7 @@ import type {
 } from '@/store/paneTypes'
 import type { AppDispatch, RootState } from '@/store/store'
 import type { PaneVerdict, PaneReconcileRequest, PaneReconcileResultMessage } from '@shared/ws-protocol'
+import { PaneReconcileResultSchema } from '@shared/ws-protocol'
 import {
   buildReconcileRequest,
   buildReconcileRequestForPanes,
@@ -375,6 +376,19 @@ describe('foldVerdicts fresh-agent routing', () => {
     expect(onVerdictFolded.mock.calls.map((c) => c[0]).sort()).toEqual(
       req.panes.map((p) => p.createRequestId).sort(),
     )
+  })
+
+  it('a stopped verdict never re-creates the fresh-agent pane: its held create is withdrawn and nothing is reset', () => {
+    // Task 18: a fresh-agent session a kill stopped is remembered.
+    const { req, dispatch, dispatched } = freshAgentFoldHarness([['stopped', {}]])
+    const parsed = PaneReconcileResultSchema.safeParse(resultFor(req, dispatched.verdicts))
+    expect(parsed.success).toBe(true)
+    if (!parsed.success) return
+    const onVerdictFolded = vi.fn()
+    foldVerdicts(dispatch, req, parsed.data, { onVerdictFolded })
+    expect(onVerdictFolded.mock.calls.map((c) => c[0])).toEqual([req.panes[0].createRequestId])
+    expect(dispatched.types).not.toContain(resetFreshAgentPaneForReconcileCreate.type)
+    expect(dispatched.types).not.toContain(setPaneRestoreError.type)
   })
 
   it('cardinality violation still folds nothing', () => {

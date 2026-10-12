@@ -60,6 +60,10 @@ pub struct HarnessOpts {
     /// sweep (100 ms), as `main.rs` does: the disk fork lane rebinds a
     /// pane whose TUI forked.
     pub codex_locator: bool,
+    /// Give the server an enabled pane ledger under
+    /// `<home>/.freshell/pane-ledger`, as `main.rs` does (default: a
+    /// disabled ledger, which stores nothing).
+    pub pane_ledger: bool,
 }
 
 impl Default for HarnessOpts {
@@ -74,6 +78,7 @@ impl Default for HarnessOpts {
             rest_identity_binder: None,
             activity_hub: false,
             codex_locator: false,
+            pane_ledger: false,
         }
     }
 }
@@ -229,8 +234,13 @@ impl UnitHarness {
         );
         fresh_codex.set_ownership(Arc::clone(&ownership));
 
+        let pane_ledger = if opts.pane_ledger {
+            freshell_ws::pane_ledger::PaneLedger::new_locked(Some(freshell_dir.join("pane-ledger")))
+        } else {
+            freshell_ws::pane_ledger::PaneLedger::disabled()
+        };
         let state = freshell_ws::WsState {
-            pane_ledger: Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
+            pane_ledger: Arc::new(pane_ledger),
             layout: Default::default(),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             terminal_meta: Default::default(),

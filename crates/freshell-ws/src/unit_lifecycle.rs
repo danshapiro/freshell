@@ -518,11 +518,98 @@ fn release_unit_keys(
     released
 }
 
+/// Whether a unit's Gone remembers its pane as stopped (Task 18; Stage 2:
+/// LB-36): the stop's final intent asks for it. That is the first
+/// request's own flag (Shift-X, a kill command, a clean quit), a Shift-X or
+/// a cleanup stop that took the stop over (the report's strongest-intent
+/// reason), or a person's kill that joined it and remembered the pane's
+/// createRequestId as killed (every kill that asks for the memory remembers
+/// it when it starts or joins). A `kill-command` reason alone does not: the
+/// registry's kill hook and the pane-unit stopper also stop units for
+/// internal teardowns under that reason. Crashes, start cancellations,
+/// respawns, stuck restarts, handoffs, boot finishes and shutdown stops
+/// write nothing.
+fn remembers_stopped_pane(
+    state: &WsState,
+    cmd: &UnitStopCommand,
+    report: &StopReport,
+    create_request_id: Option<&str>,
+) -> bool {
+    cmd.record_stopped_pane
+        || report.reason == StopReason::ShiftX.as_str()
+        || report.reason == StopReason::Cleanup.as_str()
+        || create_request_id.is_some_and(|crq| state.units.killed_start(crq))
+}
+
+/// The stop's log keys for a stopped-pane record of a pane outside any unit
+/// (a managed pane, a fresh-agent session).
+pub(crate) fn stopped_record_keys(
+    record: &crate::pane_ledger::StoppedPaneRecord,
+    operation_id: Option<&str>,
+) -> UnitLogKeys {
+    UnitLogKeys {
+        unit_id: String::new(),
+        provider: record.provider.clone().unwrap_or_default(),
+        session_id: record.session_id.clone(),
+        terminal_id: record.terminal_id.clone(),
+        operation_id: operation_id.map(str::to_string),
+    }
+}
+
+/// Durably remembers one stop of a pane (Task 18): the pane ledger's write
+/// runs on a blocking thread and is awaited, so the record exists before the
+/// caller publishes the stop. A failed write (or a panicked write thread) is
+/// an ERROR `unit.stopped_record.write_failed` and the caller goes on: the
+/// stop itself already happened. A disabled ledger remembers nothing.
+pub(crate) async fn write_stopped_record(
+    state: &WsState,
+    record: crate::pane_ledger::StoppedPaneRecord,
+    keys: &UnitLogKeys,
+) {
+    if !state.pane_ledger.is_enabled() {
+        return;
+    }
+    let ledger = Arc::clone(&state.pane_ledger);
+    let written = record.clone();
+    let result = tokio::task::spawn_blocking(move || ledger.record_stopped_pane(&written))
+        .await
+        .unwrap_or_else(|join_error| Err(std::io::Error::other(join_error)));
+    match result {
+        Ok(()) => tracing::info!(target: "freshell_unit",
+            event = "unit.stopped_record.written",
+            unit_id = %keys.unit_id,
+            provider = %keys.provider,
+            session_id = %keys.session_id.as_deref().unwrap_or(""),
+            terminal_id = %keys.terminal_id.as_deref().unwrap_or(""),
+            operation_id = %keys.operation_id.as_deref().unwrap_or(""),
+            create_request_id = %record.create_request_id.as_deref().unwrap_or(""),
+            kind = %record.kind,
+            reason = %record.reason,
+            "the stopped pane is remembered, so late and offline devices are told it was stopped"),
+        Err(error) => tracing::error!(target: "freshell_unit",
+            event = "unit.stopped_record.write_failed",
+            unit_id = %keys.unit_id,
+            provider = %keys.provider,
+            session_id = %keys.session_id.as_deref().unwrap_or(""),
+            terminal_id = %keys.terminal_id.as_deref().unwrap_or(""),
+            operation_id = %keys.operation_id.as_deref().unwrap_or(""),
+            create_request_id = %record.create_request_id.as_deref().unwrap_or(""),
+            kind = %record.kind,
+            reason = %record.reason,
+            error = %error,
+            "the stopped pane could not be remembered durably; a late or offline device may re-create it"),
+    }
+}
+
 /// Publishes a unit's Gone (its `on_gone`), in this order:
 ///
 /// a. the entry is re-read (a terminal noted after the stop began is used),
 ///    and the crash event and the row's main conversation are read before
 ///    the row changes;
+/// a2. a stop whose final intent asks for it ([`remembers_stopped_pane`])
+///    is remembered durably first (its terminal id and createRequestId; a
+///    start that never bound a terminal by its createRequestId alone), so
+///    every device that sees the exit can already be told "stopped";
 /// b. the row ends (`terminal.exit` to its subscribers, then its Gone hook);
 /// c. a removed row is retired and `terminals.changed` broadcast;
 /// d. the Codex launch is finished (proxy closed, sidecar record removed);
@@ -543,11 +630,14 @@ pub(crate) async fn publish_gone(
 ) {
     let unit_id = entry.unit.id().clone();
     // a.
-    let terminal_id = state
-        .units
-        .get(&unit_id)
-        .and_then(|e| e.terminal_id)
+    let current = state.units.get(&unit_id);
+    let terminal_id = current
+        .as_ref()
+        .and_then(|e| e.terminal_id.clone())
         .or_else(|| entry.terminal_id.clone());
+    let create_request_id = current
+        .and_then(|e| e.create_request_id)
+        .or_else(|| entry.create_request_id.clone());
     let ending = match terminal_id
         .as_deref()
         .and_then(|tid| state.registry.ending(tid))
@@ -576,6 +666,25 @@ pub(crate) async fn publish_gone(
         }
         None => (None, None),
     };
+
+    // a2.
+    if remembers_stopped_pane(&state, &cmd, &report, create_request_id.as_deref()) {
+        let record = crate::pane_ledger::StoppedPaneRecord::terminal(
+            terminal_id.clone(),
+            create_request_id.clone(),
+            Some(entry.provider.clone()),
+            main_key
+                .as_ref()
+                .map(|key| key.session_id.clone())
+                .or_else(|| entry.unit.label().session_id),
+            &report.reason,
+            now_ms() as i64,
+        );
+        if record.key().is_some() {
+            write_stopped_record(&state, record, &unit_keys(&entry.unit, Some(&operation_id)))
+                .await;
+        }
+    }
 
     // b.
     if let Some(tid) = terminal_id.clone() {

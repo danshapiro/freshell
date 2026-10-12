@@ -1072,11 +1072,20 @@ impl PaneLedger {
             report,
             &mut candidates,
         );
+        // Task 18: the stopped-pane memory participates the same way (typed
+        // rows, version-gated). It is never swept.
+        collect_from(
+            &Self::stopped_pane_dir(root),
+            false,
+            report,
+            &mut candidates,
+        );
         let rollback_root = Self::rollback_dir(root);
         let kill_tombstone_root = Self::kill_tombstone_dir(root);
         let alias_tombstone_root = Self::alias_tombstone_dir(root);
         let pane_close_root = Self::pane_close_dir(root);
         let close_envelope_root = Self::close_envelope_dir(root);
+        let stopped_pane_root = Self::stopped_pane_dir(root);
         for path in candidates {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name.contains(".tmp-") {
@@ -1113,6 +1122,7 @@ impl PaneLedger {
                         let is_alias_tombstone = path.starts_with(&alias_tombstone_root);
                         let is_pane_close = path.starts_with(&pane_close_root);
                         let is_close_envelope = path.starts_with(&close_envelope_root);
+                        let is_stopped_pane = path.starts_with(&stopped_pane_root);
                         let typed_ok = if is_pending {
                             serde_json::from_value::<PendingMarker>(value).is_ok()
                         } else if is_kill_tombstone {
@@ -1123,6 +1133,8 @@ impl PaneLedger {
                             serde_json::from_value::<PaneCloseRecord>(value).is_ok()
                         } else if is_close_envelope {
                             serde_json::from_value::<CloseEnvelopeRecord>(value).is_ok()
+                        } else if is_stopped_pane {
+                            serde_json::from_value::<StoppedPaneRecord>(value).is_ok()
                         } else {
                             serde_json::from_value::<BindingRow>(value).is_ok()
                         };

@@ -397,6 +397,12 @@ function foldFreshAgentVerdict(
       outcome.invalid++
       return true
     }
+    case 'stopped': {
+      // The server remembers this session as stopped by a kill (Task 18):
+      // never re-created. Folded (the pane's held create is withdrawn by the
+      // caller) and the pane is left as it is.
+      return true
+    }
     case 'error': {
       // Fresh-agent verdicts never emit 'error' today, but the fold must
       // not crash if one arrives — identical handling to the terminal arm.
@@ -572,6 +578,12 @@ export function foldVerdicts(
           }))
         }
         outcome.invalid++
+        break
+      }
+      case 'stopped': {
+        // The server remembers this pane as stopped by a kill (Task 18):
+        // never re-created. Folded (the pane's held create is withdrawn by
+        // the caller) and the pane is left as it is.
         break
       }
       case 'error': {

@@ -24,7 +24,7 @@ import type { PanesState } from '@/store/panesSlice'
 import type { TerminalPaneContent, PaneNode } from '@/store/paneTypes'
 import type { AppDispatch, RootState } from '@/store/store'
 import type { PaneVerdict, PaneReconcileRequest, PaneReconcileResultMessage } from '@shared/ws-protocol'
-import { ReconcilePaneSchema, ReadyCapabilitiesSchema } from '@shared/ws-protocol'
+import { PaneReconcileResultSchema, ReconcilePaneSchema, ReadyCapabilitiesSchema } from '@shared/ws-protocol'
 import {
   buildReconcileRequest,
   buildReconcileRequestForPanes,
@@ -366,6 +366,29 @@ describe('foldVerdicts', () => {
     // folded via the existing restoreError rendering path
     expect(dispatched.countOf(setReconcileWarming.type)).toBe(0)
     expect(dispatched.countOf(setPaneRestoreError.type)).toBe(1)
+  })
+
+  it('a stopped verdict never re-creates the pane: its held create is withdrawn and nothing is reset', () => {
+    // Task 18: the server remembers a pane a kill stopped. The result frame
+    // carrying the verdict is accepted (a rejected frame falls back to the
+    // legacy census, which re-creates panes), and the fold withdraws the
+    // pane's held create without resetting it for a new create.
+    const { req, dispatch, dispatched } = foldHarness([
+      ['stopped', {}],
+      ['respawn', { sessionRef: { provider: 'claude', sessionId: 's' } }],
+    ])
+    const parsed = PaneReconcileResultSchema.safeParse(resultFor(req, dispatched.verdicts))
+    expect(parsed.success).toBe(true)
+    if (!parsed.success) return
+    const onVerdictFolded = vi.fn()
+    foldVerdicts(dispatch, req, parsed.data, { onVerdictFolded })
+    expect(onVerdictFolded.mock.calls.map((c) => c[0])).toEqual([
+      req.panes[0].createRequestId,
+      req.panes[1].createRequestId,
+    ])
+    expect(dispatched.countOf(resetPaneForReconcileCreate.type)).toBe(1)
+    expect(dispatched.lastPayloadOf(resetPaneForReconcileCreate.type)).toMatchObject({ paneId: 'p2' })
+    expect(dispatched.types).not.toContain(setPaneRestoreError.type)
   })
 
   it('invalid becomes a per-pane restoreError and counts as invalid', () => {

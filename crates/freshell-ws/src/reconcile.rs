@@ -283,6 +283,24 @@ fn verdict_for_pane(deps: &ReconcileDeps<'_>, pane: &ReconcilePane) -> PaneVerdi
         return invalid(pane, "missing_create_request_id");
     };
 
+    // Task 18 (Stage 2: LB-36, LB-13): a pane the server remembers as
+    // stopped (by its terminal id, else its createRequestId) whose terminal
+    // is not a running row is `stopped` — before every attach, respawn and
+    // managed rule — so a late or offline device never re-creates it. A
+    // reopen mints a new createRequestId and is never matched.
+    let remembered = pane
+        .terminal_id
+        .as_deref()
+        .and_then(|tid| deps.pane_ledger.stopped_pane_for_terminal(tid))
+        .or_else(|| deps.pane_ledger.stopped_pane_for_create_request(&key));
+    let running = pane
+        .terminal_id
+        .as_deref()
+        .is_some_and(|tid| deps.registry.is_live(tid));
+    if remembered.is_some() && !running {
+        return base(pane, ReconcileVerdict::Stopped);
+    }
+
     // Council rule 6 (sessionRef-level single-flight, reconcile side): a
     // live terminal ALREADY carrying the claimed sessionRef wins over
     // createRequestId keying — every other client's claim for the same ref
@@ -685,6 +703,41 @@ mod tests {
     }
 
     // --- decision table §5.3 --------------------------------------------
+
+    /// Task 18: a pane the server remembers as stopped answers `stopped`,
+    /// by its terminal id or by its createRequestId alone; while its
+    /// terminal is still a running row (the record is written just before
+    /// the row ends) it attaches as before.
+    #[test]
+    fn a_remembered_stopped_pane_answers_stopped_unless_its_terminal_still_runs() {
+        let f = Fixture::new();
+        f.ledger
+            .record_stopped_pane(&crate::pane_ledger::StoppedPaneRecord::terminal(
+                Some("T-stopped".into()),
+                Some("cr-stopped".into()),
+                Some("claude".into()),
+                Some("s-stopped".into()),
+                "shift-x",
+                1,
+            ))
+            .expect("the stop's record");
+        let mut by_terminal = pane("cr-other");
+        by_terminal.terminal_id = Some("T-stopped".to_string());
+        by_terminal.session_ref = Some(sref("claude", "s-stopped"));
+        assert_eq!(f.one(by_terminal).verdict, ReconcileVerdict::Stopped);
+        assert_eq!(f.one(pane("cr-stopped")).verdict, ReconcileVerdict::Stopped);
+        assert_ne!(
+            f.one(pane("cr-never-stopped")).verdict,
+            ReconcileVerdict::Stopped
+        );
+
+        f.headless("T-stopped", Some("cr-stopped"), "claude", 1_000);
+        let mut still_running = pane("cr-stopped");
+        still_running.terminal_id = Some("T-stopped".to_string());
+        let v = f.one(still_running);
+        assert_eq!(v.verdict, ReconcileVerdict::Attach);
+        assert_eq!(v.terminal_id.as_deref(), Some("T-stopped"));
+    }
 
     /// Row 1: a live terminal under this createRequestId wins over anything
     /// the client claims (closes the interrupted-respawn orphan).
