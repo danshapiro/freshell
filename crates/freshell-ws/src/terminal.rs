@@ -4408,28 +4408,29 @@ mod managed_resume_gate_tests {
         state.registry.set_managed_runtime_connection(conn_id, true);
         let (mut ws_tx, mut client) =
             super::pane_reconcile_gate_tests::loopback_sink_and_client().await;
-        let mut output = crate::create_gate::CreateOutput::Socket(&mut ws_tx);
-        let create: TerminalCreate = serde_json::from_value(serde_json::json!({
+        {
+            let mut output = crate::create_gate::CreateOutput::Socket(&mut ws_tx);
+            let create: TerminalCreate = serde_json::from_value(serde_json::json!({
             "requestId": "managed-reference-failed-request", "mode": "opencode", "shell": "system",
             "cwd": root.path(),
         }))
         .unwrap();
-        let mut limiter = crate::create_limit::CreateRateLimiter::new(100, 1000);
-        assert!(
-            handle_create(
-                create,
-                None,
-                &mut output,
-                &state,
-                conn_id,
-                false,
-                &mut limiter,
-                &ConnectionIdentity::default(),
-                now_ms()
-            )
-            .await
-        );
-        drop(output);
+            let mut limiter = crate::create_limit::CreateRateLimiter::new(100, 1000);
+            assert!(
+                handle_create(
+                    create,
+                    None,
+                    &mut output,
+                    &state,
+                    conn_id,
+                    false,
+                    &mut limiter,
+                    &ConnectionIdentity::default(),
+                    now_ms()
+                )
+                .await
+            );
+        }
         let wire = super::pane_reconcile_gate_tests::next_text_frame(&mut client).await;
         let frame: ServerMessage = serde_json::from_value(wire)
             .expect("actual WS frame uses the additive serialized contract");
@@ -6792,6 +6793,7 @@ pub(crate) async fn handle_create(
     // every non-negotiating connection retain the legacy local spawn path.
     // PIN2_PTY_SPAWN_ANCHOR: either the local PTY spawn OR the supervisor's
     // host-owned PTY makes the preallocated identity observable.
+    let mut provider_preparation_failure = None;
     let create_result: std::io::Result<()> = if use_managed_runtime {
         let managed = ManagedTerminalLaunch {
             spec: spec.clone(),
@@ -6818,9 +6820,11 @@ pub(crate) async fn handle_create(
                 );
                 Ok(())
             }
-            Err(error) => Err(std::io::Error::other(format!(
-                "managed runtime launch failed: {error}"
-            ))),
+            Err(error) => {
+                let message = format!("managed runtime launch failed: {error}");
+                provider_preparation_failure = error.provider_preparation_failure;
+                Err(std::io::Error::other(message))
+            }
         }
     } else {
         // The legacy PTY spawn is synchronous; run it on the blocking pool so
@@ -6932,8 +6936,16 @@ pub(crate) async fn handle_create(
             env_var.as_deref(),
             resume_session_id.is_some(),
         );
-        return send_create_error(out, ErrorCode::PtySpawnFailed, message, &create.request_id)
-            .await;
+        return send_create_error_details(
+            out,
+            ErrorCode::PtySpawnFailed,
+            message,
+            &create.request_id,
+            None,
+            None,
+            provider_preparation_failure,
+        )
+        .await;
     }
 
     // D8: arm the lease's TTL kill path — record the just-spawned child's pid
@@ -8598,8 +8610,29 @@ pub(crate) async fn send_create_error_with_owner(
     live_terminal_id: Option<String>,
     owner: Option<&freshell_freshagent::ownership_lane::TerminalOwnerFields>,
 ) -> bool {
+    send_create_error_details(
+        out,
+        code,
+        message,
+        request_id,
+        live_terminal_id,
+        owner,
+        None,
+    )
+    .await
+}
+
+async fn send_create_error_details(
+    out: &mut crate::create_gate::CreateOutput<'_>,
+    code: ErrorCode,
+    message: String,
+    request_id: &str,
+    live_terminal_id: Option<String>,
+    owner: Option<&freshell_freshagent::ownership_lane::TerminalOwnerFields>,
+    provider_preparation_failure: Option<freshell_protocol::ProviderPreparationFailure>,
+) -> bool {
     let msg = ServerMessage::Error(ErrorMsg {
-        provider_preparation_failure: None,
+        provider_preparation_failure,
         owner_kind: owner.map(|o| o.owner_kind.to_string()),
         owner_generation: owner.map(|o| o.owner_generation),
         owner_epoch: owner.map(|o| o.owner_epoch),

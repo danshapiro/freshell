@@ -367,6 +367,7 @@ pub fn read_opencode_sources(
     let mut retained = 0usize;
     for (ordinal, source) in sources.into_iter().enumerate() {
         let fail = |cause| super::ReferenceError {
+            preparation_failure: None,
             operation: "read",
             field: "OpenCode source",
             source_ordinal: ordinal,
@@ -421,6 +422,7 @@ pub fn source_environment_names(
     let mut events = 0usize;
     for (ordinal, source) in sources.iter().enumerate() {
         let fail = |cause| super::ReferenceError {
+            preparation_failure: None,
             operation: "select",
             field: "OpenCode source",
             source_ordinal: ordinal,
@@ -515,6 +517,7 @@ pub fn plan_loaded_opencode_sources_relocated(
         view_budget
             .charge(&loaded.view)
             .map_err(|cause| super::ReferenceError {
+                preparation_failure: None,
                 operation: "read",
                 field: "OpenCode source",
                 source_ordinal: 0,
@@ -528,6 +531,7 @@ pub fn plan_loaded_opencode_sources_relocated(
         let original_form = source.lane != SourceLane::Inline
             && canonical_occurrences[&source.canonical_source] > 1;
         let fail = |cause| super::ReferenceError {
+            preparation_failure: None,
             operation: "read",
             field: "OpenCode source",
             source_ordinal: ordinal,
@@ -658,6 +662,7 @@ pub fn plan_loaded_opencode_sources_relocated(
                 lookup(planned.source.lane, &planned.source.logical_path, name)
             })
             .map_err(|error| super::ReferenceError {
+                preparation_failure: None,
                 operation: "select",
                 field: error.field,
                 source_ordinal: ordinal,

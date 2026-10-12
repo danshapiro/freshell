@@ -74,6 +74,7 @@ import { TerminalLaunchFailureCard } from '@/components/TerminalLaunchFailureCar
 import { FencedOwnerRecoveryActions, SessionHandoffErrorBanner } from '@/components/SessionHandoffErrorBanner'
 import { buildResumeContent, freshSessionTypeForPaneFlavor } from '@/lib/session-type-utils'
 import type { LaunchFailure } from '@/store/paneTypes'
+import { buildManagedPreparationFailure, retainedManagedPreparationFailure } from '@/store/paneTypes'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { focusNextTerminalSearchMatch, focusPreviousTerminalSearchMatch, loadTerminalSearch } from '@/store/terminalDirectoryThunks'
 import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
@@ -6471,7 +6472,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           // the card carries the attach/retry/open-as-fresh-agent actions.
           // Rides the same updateContent (the ref-based merge would
           // otherwise clobber it).
-          const typedLaunchFailure: LaunchFailure | undefined = msg.ownerKind !== undefined || typeof msg.ownerGeneration === 'number'
+          const preparationFailure = launchAttempt && msg.code === 'PTY_SPAWN_FAILED'
+            && mode === 'opencode' && !tid && !contentRef.current?.soulId
+            && !contentRef.current?.sessionRef && !contentRef.current?.resumeSessionId
+            && contentRef.current?.createRequestId === reqId
+            && ws.getServerCapabilities?.()?.managedRuntimeV1 === true
+            && msg.ownerKind === undefined && msg.ownerGeneration === undefined
+            ? buildManagedPreparationFailure(msg.providerPreparationFailure)
+            : undefined
+          const typedLaunchFailure: LaunchFailure | undefined = preparationFailure ?? (msg.ownerKind !== undefined || typeof msg.ownerGeneration === 'number'
             ? {
               code: msg.code === 'RESTORE_UNAVAILABLE' ? 'RESTORE_UNAVAILABLE' : 'LAUNCH_FAILED',
               message: msg.message || msg.code || 'The launch was refused.',
@@ -6480,7 +6489,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               ...(typeof msg.ownerGeneration === 'number' ? { ownerGeneration: msg.ownerGeneration } : {}),
               ...(typeof msg.liveTerminalId === 'string' ? { terminalId: msg.liveTerminalId } : {}),
             }
-            : undefined
+            : undefined)
           updateContent({
             status: 'error',
             streamId: undefined,
@@ -6496,7 +6505,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           const prefix = launchAttempt
             ? (launchAttempt.restore ? '[Restore failed]' : '[Launch failed]')
             : '[Error]'
-          writeLocalXtermNotice(term, `\r\n${prefix} ${msg.message || msg.code || 'Unknown error'}\r\n`)
+          writeLocalXtermNotice(term, `\r\n${prefix} ${preparationFailure?.message || msg.message || msg.code || 'Unknown error'}\r\n`)
         }
 
         const activeAttachForInvalidTerminalError = currentAttachRef.current
@@ -6979,6 +6988,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           pendingSinceSeq: 0,
           pendingReason: 'initial_hydrate',
         }
+        if (contentRef.current && retainedManagedPreparationFailure(contentRef.current)) return
         sendCreate(createRequestId)
       }
     }

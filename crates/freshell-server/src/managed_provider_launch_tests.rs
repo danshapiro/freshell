@@ -2406,7 +2406,8 @@ let raw='';process.stdin.on('data',b=>raw+=b);process.stdin.on('end',()=>{
     if changed_git {
         let error = terminal
             .unwrap()
-            .expect_err("actual final source mismatch must block terminal startup");
+            .expect_err("actual final source mismatch must block terminal startup")
+            .message;
         println!(
             "provider_source_guard_diagnostic {}",
             json!({"selectionChanged":error.contains("Claude native source selection changed"),"commonDir":error.contains("git common dir"),"hostUnreachable":error.contains("host") })
@@ -4076,8 +4077,9 @@ export default {{id:'closed-directory-discovery',async server(){{
             } else {
                 std::fs::rename(&hidden, &selected).unwrap();
             }
-            let error =
-                failed.expect_err("selected unavailable resource must block the actual launch");
+            let error = failed
+                .expect_err("selected unavailable resource must block the actual launch")
+                .message;
             assert!(
                 error.contains(field)
                     && error.contains(if unreadable { "unreadable" } else { "missing" })

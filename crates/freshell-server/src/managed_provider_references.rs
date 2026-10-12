@@ -16,6 +16,7 @@ pub struct FileSourceOrigin<'a> {
 }
 
 pub struct ReferenceError {
+    pub preparation_failure: Option<Box<freshell_protocol::ProviderPreparationFailure>>,
     pub operation: &'static str,
     pub field: &'static str,
     pub source_ordinal: usize,
@@ -32,6 +33,7 @@ impl std::fmt::Debug for ReferenceError {
             .field("declaring_source", &self.declaring_source)
             .field("variables", &self.variables)
             .field("cause", &self.cause)
+            .field("preparation_failure", &self.preparation_failure)
             .finish()
     }
 }
@@ -45,15 +47,25 @@ impl std::fmt::Display for ReferenceError {
             self.source_ordinal,
             self.declaring_source.display(),
             self.cause
-        )
+        )?;
+        if let Some(path) = self
+            .preparation_failure
+            .as_ref()
+            .and_then(|error| error.selected_path.as_ref())
+        {
+            write!(f, " ({path})")?;
+        }
+        Ok(())
     }
 }
 impl std::error::Error for ReferenceError {}
 
-// Preserve the existing generic error until the typed producer behavior is implemented.
 impl From<ReferenceError> for freshell_terminal::registry::ManagedTerminalLaunchError {
     fn from(error: ReferenceError) -> Self {
-        error.to_string().into()
+        Self {
+            message: error.to_string(),
+            provider_preparation_failure: error.preparation_failure.map(|failure| *failure),
+        }
     }
 }
 
@@ -173,12 +185,42 @@ pub(super) fn resolve_file_references_from_view_relocated(
     let substitution_events = std::cell::Cell::new(0usize);
     let input_error = std::cell::Cell::new(None);
     let fail = |ordinal, variables: Vec<String>, cause| ReferenceError {
+        preparation_failure: None,
         operation: "resolve",
         field: "OpenCode file",
         source_ordinal: ordinal,
         declaring_source: origin.declaring_config.into(),
         variables,
         cause,
+    };
+    let fail_io = |ordinal, names: Vec<String>, path: &Path, error: std::io::Error, reason| {
+        use freshell_protocol::{
+            ProviderPreparationFailure, ProviderPreparationFailureCause,
+            ProviderPreparationFailureCode, ProviderPreparationFailureOperation,
+            ProviderPreparationFailureStage,
+        };
+        let cause = match error.kind() {
+            std::io::ErrorKind::NotFound => ProviderPreparationFailureCause::NotFound,
+            std::io::ErrorKind::PermissionDenied => {
+                ProviderPreparationFailureCause::PermissionDenied
+            }
+            _ if error.raw_os_error() == Some(40) => ProviderPreparationFailureCause::Cyclic,
+            _ => ProviderPreparationFailureCause::Unknown,
+        };
+        let selected_path = names
+            .is_empty()
+            .then(|| path.to_string_lossy().into_owned());
+        let mut failure = fail(ordinal, names, reason);
+        failure.preparation_failure = Some(Box::new(ProviderPreparationFailure {
+            code: ProviderPreparationFailureCode::SelectedReferenceUnavailable,
+            stage: ProviderPreparationFailureStage::Configuration,
+            operation: ProviderPreparationFailureOperation::Resolve,
+            cause,
+            workspace: origin.cwd.to_string_lossy().into_owned(),
+            declaring_config: origin.declaring_config.to_string_lossy().into_owned(),
+            selected_path,
+        }));
+        failure
     };
     let lookup = |name: &str| {
         let mut variables = variables.borrow_mut();
@@ -214,17 +256,21 @@ pub(super) fn resolve_file_references_from_view_relocated(
                 origin.original_home,
             );
             let physical_source = projection.relocated_files.get(&path).unwrap_or(&path);
-            let canonical = std::fs::canonicalize(physical_source).map_err(|_| {
-                fail(
+            let canonical = std::fs::canonicalize(physical_source).map_err(|error| {
+                fail_io(
                     token.ordinal,
                     names.clone(),
+                    &path,
+                    error,
                     "referenced file is missing, inaccessible or cyclic",
                 )
             })?;
-            let metadata = std::fs::metadata(&canonical).map_err(|_| {
-                fail(
+            let metadata = std::fs::metadata(&canonical).map_err(|error| {
+                fail_io(
                     token.ordinal,
                     names.clone(),
+                    &path,
+                    error,
                     "referenced file metadata unavailable",
                 )
             })?;
@@ -235,10 +281,12 @@ pub(super) fn resolve_file_references_from_view_relocated(
                     "referenced target must be a regular file at most 16 MiB",
                 ));
             }
-            std::fs::File::open(&canonical).map_err(|_| {
-                fail(
+            std::fs::File::open(&canonical).map_err(|error| {
+                fail_io(
                     token.ordinal,
                     names.clone(),
+                    &path,
+                    error,
                     "referenced file is unreadable",
                 )
             })?;
@@ -431,6 +479,7 @@ pub fn evaluate_generated_recipe(
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<String, ReferenceError> {
     freshell_platform::opencode_recipe::evaluate(recipe, env).map_err(|cause| ReferenceError {
+        preparation_failure: None,
         operation: "prepare",
         field: "OpenCode generated configuration",
         source_ordinal: 0,
@@ -468,8 +517,8 @@ pub(crate) struct OpencodePreparation<'a> {
 
 pub(crate) async fn prepare_managed_opencode(
     request: OpencodePreparation<'_>,
-) -> Result<PreparedManagedOpencode, String> {
-    prepare_managed_opencode_with_publisher(
+) -> Result<PreparedManagedOpencode, freshell_terminal::registry::ManagedTerminalLaunchError> {
+    prepare_managed_opencode_with_typed_publisher(
         request,
         crate::managed_mcp_capability::issue_prepared_opencode_context,
     )
@@ -485,6 +534,20 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
         crate::managed_mcp_capability::OpencodeEphemeralInput<'_>,
     ) -> Result<freshell_runtime_protocol::ProviderLaunchContext, String>,
 ) -> Result<PreparedManagedOpencode, String> {
+    prepare_managed_opencode_with_typed_publisher(request, publish)
+        .await
+        .map_err(|error| error.message)
+}
+
+async fn prepare_managed_opencode_with_typed_publisher(
+    request: OpencodePreparation<'_>,
+    publish: impl FnOnce(
+        &freshell_runtime_protocol::SoulId,
+        &Path,
+        &freshell_runtime_protocol::ProviderLaunchContext,
+        crate::managed_mcp_capability::OpencodeEphemeralInput<'_>,
+    ) -> Result<freshell_runtime_protocol::ProviderLaunchContext, String>,
+) -> Result<PreparedManagedOpencode, freshell_terminal::registry::ManagedTerminalLaunchError> {
     let OpencodePreparation {
         client,
         soul,
@@ -796,7 +859,12 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
     }
     let plan = environment
         .plan_sources(loaded, cwd, home)
-        .map_err(|error| error.to_string())?;
+        .map_err(|mut error| {
+            if let Some(failure) = error.preparation_failure.as_mut() {
+                failure.workspace = workspace.to_string_lossy().into_owned();
+            }
+            freshell_terminal::registry::ManagedTerminalLaunchError::from(error)
+        })?;
     let frozen = environment.frozen_inputs(&plan)?;
     let frozen_names = frozen
         .iter()
@@ -859,7 +927,7 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
             .await
         {
             let _ = crate::managed_mcp_capability::revoke_mcp_capability(&capability.grant_id);
-            return Err(error.to_string());
+            return Err(error.to_string().into());
         }
     }
     context
@@ -931,7 +999,8 @@ pub(crate) async fn launch_initial_opencode(
                     inherited_inline: None,
                     inline_edits: preparation.inline_edits.clone(),
                 })
-                .await?;
+                .await
+                .map_err(|error| error.message)?;
                 if let Some(terminal) = launch.terminal.as_mut() {
                     terminal.provider_secret_references = prepared.references;
                     terminal.provider_launch_context = Some(prepared.context);

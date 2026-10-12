@@ -30,7 +30,7 @@ import { getSelectedMachineId } from '@/lib/machine-identity'
 import { consumeArmedPreMigrationEvidenceClear } from '@/lib/recovery/layout-health'
 import { flushPersistedLayoutNow } from './persistControl'
 import { sanitizeSessionRef } from '@shared/session-contract'
-import { normalizeFreshAgentEffortOverride, normalizeFreshAgentPaneModelSelection } from './paneTypes'
+import { normalizeFreshAgentEffortOverride, normalizeFreshAgentPaneModelSelection, retainedManagedPreparationFailure } from './paneTypes'
 import {
   loadPersistedTabRecency,
   mergeTabRecencyStatesByMax,
@@ -304,16 +304,19 @@ function stripTransientSessionFields(content: any): any {
     // scrubbed from persisted layouts on the next wholesale flush.
     showThinking: _legacyShowThinking,
     showTools: _legacyShowTools,
-    // kata b8ke: the typed failure surfaces are volatile — the launch
-    // failure card and the handoff-error banner re-derive from the live
-    // server state after a reload, never from a persisted snapshot.
+    // Owner refusals and handoff failures re-derive from live state. Only
+    // a typed pre-registration managed preparation failure survives below.
     launchFailure: _launchFailure,
     handoffError: _handoffError,
     ...rest
   } = content
+  const preparationFailure = content.kind === 'terminal'
+    ? retainedManagedPreparationFailure(content)
+    : undefined
 
   return {
     ...rest,
+    ...(preparationFailure ? { launchFailure: preparationFailure } : {}),
     ...(content.kind === 'fresh-agent' && !sessionRef && typeof content.serverInstanceId === 'string' && typeof content.sessionId === 'string'
       ? { sessionId: content.sessionId }
       : {}),

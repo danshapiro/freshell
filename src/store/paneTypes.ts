@@ -10,6 +10,7 @@ import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/f
 import type { FreshAgentStyle } from '@shared/settings'
 import type { SessionNameRef } from '@shared/session-names'
 import type { ManagedRuntimeProjectionFields } from '@shared/managed-runtime'
+import type { ProviderPreparationFailure } from '@shared/ws-protocol'
 
 export type SessionLocator = SharedSessionLocator
 
@@ -89,11 +90,12 @@ export type { CrashTrace }
  * TerminalView's create-error fold for refusal frames carrying the typed
  * owner fields (the additive `ownerKind`/`ownerGeneration` on
  * SESSION_RESERVED / RESTORE_UNAVAILABLE); rendered by the typed failure
- * card with attach/retry/open-as-fresh-agent actions. VOLATILE — stripped
- * by persistMiddleware, never persisted.
+ * card with attach/retry/open-as-fresh-agent actions. Owner refusals are
+ * volatile. A typed managed preparation failure can survive reload before
+ * a backend terminal exists, so reload does not repeat the failed request.
  */
 export type LaunchFailure = {
-  providerPreparationFailure?: import('@shared/ws-protocol').ProviderPreparationFailure
+  providerPreparationFailure?: ProviderPreparationFailure
   code: 'SESSION_RESERVED' | 'RESTORE_UNAVAILABLE' | 'HANDOFF_IN_PROGRESS' | 'REAP_TIMEOUT'
     | 'TARGET_SPAWN_FAILED' | 'STALE_GENERATION' | 'LAUNCH_FAILED' | 'SESSION_MISSING'
   message: string
@@ -117,11 +119,64 @@ export type HandoffError = {
   generation: number
 }
 
+function normalizeProviderPreparationFailure(value: unknown): ProviderPreparationFailure | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const record = value as Record<string, unknown>
+  const isPath = (path: unknown): path is string => typeof path === 'string'
+    && path.length > 0 && !/[\u0000-\u001f]/.test(path)
+  if (record.code !== 'SELECTED_REFERENCE_UNAVAILABLE' || record.stage !== 'configuration'
+    || record.operation !== 'resolve' || !isPath(record.workspace) || !isPath(record.declaringConfig)
+    || !['not_found', 'permission_denied', 'cyclic', 'unknown'].includes(String(record.cause))
+    || (record.selectedPath !== undefined && !isPath(record.selectedPath))) return undefined
+  return {
+    code: record.code,
+    stage: record.stage,
+    operation: record.operation,
+    cause: record.cause as ProviderPreparationFailure['cause'],
+    workspace: record.workspace,
+    declaringConfig: record.declaringConfig,
+    ...(record.selectedPath !== undefined ? { selectedPath: record.selectedPath as string } : {}),
+  }
+}
+
+/** Only typed selection metadata enters the retained card; raw error text stays volatile. */
+export function buildManagedPreparationFailure(value: unknown): LaunchFailure | undefined {
+  const failure = normalizeProviderPreparationFailure(value)
+  if (!failure) return undefined
+  const reasons: Record<ProviderPreparationFailure['cause'], string> = {
+    not_found: 'referenced file was not found',
+    permission_denied: 'referenced file is inaccessible',
+    cyclic: 'referenced file is cyclic',
+    unknown: 'referenced file is unavailable',
+  }
+  return {
+    code: 'LAUNCH_FAILED',
+    message: `Configuration blocked: ${failure.selectedPath ?? failure.declaringConfig}: ${reasons[failure.cause]}`,
+    retryable: true,
+    providerPreparationFailure: failure,
+  }
+}
+
+/** A failure before registration blocks automatic creation, without granting runtime authority. */
+export function retainedManagedPreparationFailure(content: TerminalPaneContent): LaunchFailure | undefined {
+  const failure = content.launchFailure
+  if (content.mode !== 'opencode' || content.status !== 'error' || !content.createRequestId
+    || content.terminalId || content.soulId || content.sessionRef || content.resumeSessionId
+    || failure?.code !== 'LAUNCH_FAILED' || failure.ownerKind !== undefined
+    || failure.ownerGeneration !== undefined || failure.terminalId !== undefined) return undefined
+  return buildManagedPreparationFailure(failure.providerPreparationFailure)
+}
+
 /** Sanitize an unknown value into a LaunchFailure (normalizePaneContent's whitelist gate). */
 export function normalizeLaunchFailure(value: unknown): LaunchFailure | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
   const record = value as Record<string, unknown>
   if (typeof record.code !== 'string' || typeof record.message !== 'string') return undefined
+  if (record.code === 'LAUNCH_FAILED' && record.ownerKind === undefined
+    && record.ownerGeneration === undefined && record.terminalId === undefined) {
+    const failure = buildManagedPreparationFailure(record.providerPreparationFailure)
+    if (failure) return failure
+  }
   return {
     code: record.code as LaunchFailure['code'],
     message: record.message,

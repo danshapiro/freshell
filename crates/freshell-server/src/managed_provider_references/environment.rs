@@ -126,6 +126,7 @@ impl SourceEnvironment {
                 .any(|source| source.source.lane == SourceLane::Main)
         {
             return Err(super::ReferenceError {
+                preparation_failure: None,
                 operation: "prepare",
                 field: "OpenCode native auth source",
                 source_ordinal: 0,
