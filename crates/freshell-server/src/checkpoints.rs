@@ -7011,7 +7011,17 @@ mod tests {
         let cwd_dir = tempfile::tempdir().unwrap();
         let started = home_dir.path().join("filter-descendant-started");
         let late_write = home_dir.path().join("filter-descendant-late-write");
-        let filter = home_dir.path().join("blocking-clean-filter.sh");
+        // Runtime-suite sandboxes mount `/tmp` without executable permission.
+        // Keep this deliberately executable Git filter in the sandbox-owned
+        // executable temp volume when one is configured.
+        let executable_tmp = std::env::var_os("FRESHELL_TEST_EXECUTABLE_TMP_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir.path().to_path_buf());
+        let filter_dir = tempfile::Builder::new()
+            .prefix("freshell-checkpoint-filter-")
+            .tempdir_in(executable_tmp)
+            .unwrap();
+        let filter = filter_dir.path().join("blocking-clean-filter.sh");
         let filter_contents = format!(
             "#!/bin/sh\n( trap '' TERM; printf started > '{}'; sleep 1; printf late > '{}' ) &\nwait\ncat\n",
             started.display(),
