@@ -4477,6 +4477,51 @@ impl TerminalRegistry {
         exit_code.wait(limit)
     }
 
+    /// Takes the exit of the unit row's current screen `pid` for a caller
+    /// that found that process gone (it exited and its PTY's waiter reaped
+    /// it) before the screen's own exit hook took it: a job the screen left
+    /// can hold its terminal open, so its stream, and with it that hook, may
+    /// not end for a long time. The exit is taken as that hook takes it (the
+    /// pid is never signalled again; the [`UnitScreenExit`] carries the code
+    /// the waiter recorded and the screen's run up to now) and only once:
+    /// whichever of this call and the screen's own exit hook comes first
+    /// takes it, and the other hands nothing on. Waits up to `limit` for the
+    /// waiter's code with no lock held (blocks the calling thread).
+    ///
+    /// `Ok(None)`: nothing to take (an unknown or plain row, `pid` is not the
+    /// row's current screen, its exit was already taken, or the row's
+    /// marked ending decides). `TimedOut` when no code was recorded within
+    /// `limit` (the screen still runs, or its reap is late): nothing taken.
+    pub fn take_gone_screen_exit(
+        &self,
+        terminal_id: &str,
+        pid: u32,
+        limit: std::time::Duration,
+    ) -> io::Result<Option<UnitScreenExit>> {
+        let current = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner.terminals.get(terminal_id).and_then(|handle| {
+                let pty = handle.pty.as_ref().filter(|pty| pty.pid() == Some(pid))?;
+                let s = handle.shared.lock().expect("terminal lock");
+                let unit = s.unit.as_ref().filter(|unit| !unit.screen_exit_seen)?;
+                Some((unit.screen_generation, pty.exit_code()))
+            })
+        };
+        let Some((generation, code)) = current else {
+            return Ok(None);
+        };
+        let exit_code = code.wait(limit).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("screen {pid} of terminal {terminal_id} recorded no exit code"),
+            )
+        })?;
+        match screen_exited(&self.inner, terminal_id, Some(generation), exit_code) {
+            ScreenExit::Unit(exit) => Ok(exit),
+            ScreenExit::Ignored | ScreenExit::Plain(_) => Ok(None),
+        }
+    }
+
     /// The unit a row's screen belongs to; `None` for a plain or unknown row.
     pub fn unit_id_for(&self, terminal_id: &str) -> Option<String> {
         let shared = self.shared_for(terminal_id)?;
@@ -7156,6 +7201,9 @@ fn screen_exited(
         let keys = s.unit.is_some().then(|| UnitLogKeys::of(&s));
         let unit = s.unit.as_mut().zip(keys).map(|(unit, keys)| {
             let current = unit.screen_generation;
+            // The screen's own exit hook, delivering an exit its taker
+            // already took (`take_gone_screen_exit`).
+            let taken = generation == Some(current) && unit.screen_exit_seen;
             if generation.is_none_or(|exiting| exiting == current) {
                 unit.screen_exit_seen = true;
             }
@@ -7169,11 +7217,11 @@ fn screen_exited(
                     u64::try_from(now_ms().saturating_sub(unit.screen_started_at)).unwrap_or(0),
                 )
             };
-            (keys, current, lived)
+            (keys, current, lived, taken)
         });
         (unit, ending)
     };
-    if let (Some((keys, current, _)), Some(exiting)) = (&unit, generation) {
+    if let (Some((keys, current, _, taken)), Some(exiting)) = (&unit, generation) {
         if exiting != *current {
             drop(inner);
             unit_log!(
@@ -7185,6 +7233,19 @@ fn screen_exited(
                 current_generation = *current,
                 exit_code,
                 "a replaced screen exited; the row's current screen is unaffected"
+            );
+            return ScreenExit::Ignored;
+        }
+        if *taken {
+            drop(inner);
+            unit_log!(
+                debug,
+                keys,
+                terminal_id,
+                "terminal.screen_exit_already_taken",
+                screen_generation = exiting,
+                exit_code,
+                "a screen's exit reached its hook after it was taken; it is decided once"
             );
             return ScreenExit::Ignored;
         }
@@ -7201,7 +7262,7 @@ fn screen_exited(
     }
     match unit {
         None => ScreenExit::Plain(Arc::clone(&handle.shared)),
-        Some((keys, screen_generation, lived)) => {
+        Some((keys, screen_generation, lived, _)) => {
             ScreenExit::Unit(ending.is_none().then(|| UnitScreenExit {
                 terminal_id: terminal_id.to_string(),
                 unit_id: keys.unit_id,

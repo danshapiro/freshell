@@ -759,6 +759,187 @@ fn a_screens_exit_code_is_known_while_a_job_holds_its_terminal_open() {
     holder.kill();
 }
 
+/// The pid a screen started as `...; sleep 30 & echo HOLDER=$!; ...`
+/// printed for its job, once the line is complete.
+fn holder_pid(seen: &Arc<Mutex<Vec<ServerMessage>>>) -> u32 {
+    wait("holder pid printed", || {
+        output_text(seen).contains("HOLDER=") && output_text(seen).ends_with('\n')
+    });
+    output_text(seen)
+        .split("HOLDER=")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse()
+                .ok()
+        })
+        .expect("the holder pid")
+}
+
+/// A unit row's screen that exited and was reaped while a job it left
+/// holds its terminal open (so its stream, and its own exit hook, have not
+/// ended) has its exit taken by the caller that found it gone (the unit
+/// lifecycle pinning a restarted screen): with the code its waiter recorded
+/// and the run up to now, its pid never signalled again, and only once. The
+/// screen's own exit hook delivering later hands nothing on; nor is an exit
+/// that hook already took taken again (Task 17 concern (a)).
+#[test]
+fn a_gone_screens_exit_is_taken_once() {
+    let reg = TerminalRegistry::new();
+    let got = record_screen_exits(&reg);
+    let pid = reg
+        .create_in_unit(
+            &bash("trap '' HUP; sleep 30 & echo HOLDER=$!; exit 5"),
+            &env(),
+            "T-gone".into(),
+            "S-gone".into(),
+            "codex",
+            Some("ses-gone"),
+            None,
+            None,
+            None,
+            placement(None),
+        )
+        .unwrap();
+    let seen = attach_collector(&reg, "T-gone");
+    let holder = Own::pin(holder_pid(&seen));
+    assert_eq!(
+        reg.wait_screen_exit_code("T-gone", Duration::from_secs(5)),
+        Some(5),
+        "the screen was reaped"
+    );
+    assert_eq!(
+        reg.pid_of("T-gone"),
+        Some(pid),
+        "its exit is not taken yet: the job holds its terminal open"
+    );
+
+    let exit = reg
+        .take_gone_screen_exit("T-gone", pid, Duration::from_secs(5))
+        .expect("its code is recorded")
+        .expect("its exit is taken");
+    assert_eq!(
+        (
+            exit.terminal_id.as_str(),
+            exit.unit_id.as_str(),
+            exit.exit_code,
+            exit.screen_generation
+        ),
+        ("T-gone", "u1", 5, 0)
+    );
+    assert!(exit.lived < Duration::from_secs(10), "{:?}", exit.lived);
+    assert_eq!(
+        reg.pid_of("T-gone"),
+        None,
+        "the gone screen's pid is never signalled again"
+    );
+    assert!(
+        got.lock().unwrap().is_empty(),
+        "the exit goes to its taker, not to the hook"
+    );
+    assert_eq!(
+        reg.take_gone_screen_exit("T-gone", pid, Duration::from_secs(5))
+            .unwrap(),
+        None,
+        "an exit is taken once"
+    );
+
+    // The screen's own exit hook, delivering once the job lets its stream
+    // end, hands nothing on.
+    let (logs, guard) = tracing_capture::capture();
+    (reg.unit_row_exit_hook("T-gone", 0))(5);
+    drop(guard);
+    assert!(got.lock().unwrap().is_empty(), "the exit is decided once");
+    let taken = unit_event(&logs, "terminal.screen_exit_already_taken");
+    assert_unit_keys(&taken, "T-gone", "ses-gone");
+    assert_eq!(taken.fields["screen_generation"], "0");
+    holder.kill();
+
+    // The other way round: an exit the screen's hook took is not taken again.
+    let pid = reg
+        .create_in_unit(
+            &bash("exit 6"),
+            &env(),
+            "T-hooked".into(),
+            "S-hooked".into(),
+            "codex",
+            None,
+            None,
+            None,
+            None,
+            placement(None),
+        )
+        .unwrap();
+    wait("the hook takes the exit", || {
+        got.lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.terminal_id == "T-hooked")
+    });
+    assert_eq!(
+        reg.take_gone_screen_exit("T-hooked", pid, Duration::from_secs(5))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        got.lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.terminal_id == "T-hooked")
+            .count(),
+        1
+    );
+}
+
+/// Nothing is taken for a screen that still runs (its waiter records no
+/// code within the limit: an error), for a pid that is not the row's
+/// current screen, or for an unknown row; the running screen's own exit
+/// later reaches the hook as usual.
+#[test]
+fn a_running_screens_exit_is_never_taken() {
+    let reg = TerminalRegistry::new();
+    let got = record_screen_exits(&reg);
+    let pid = reg
+        .create_in_unit(
+            &bash("read -r _; exit 3"),
+            &env(),
+            "T-live".into(),
+            "S-live".into(),
+            "codex",
+            None,
+            None,
+            None,
+            None,
+            placement(None),
+        )
+        .unwrap();
+    let running = Own::pin(pid);
+    let err = reg
+        .take_gone_screen_exit("T-live", pid, Duration::from_millis(100))
+        .expect_err("a running screen has no exit code");
+    assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(
+        reg.take_gone_screen_exit("T-live", pid + 1, Duration::from_secs(5))
+            .unwrap(),
+        None,
+        "not the row's screen"
+    );
+    assert_eq!(
+        reg.take_gone_screen_exit("T-none", pid, Duration::from_secs(5))
+            .unwrap(),
+        None,
+        "no such row"
+    );
+    assert!(running.alive());
+    assert_eq!(reg.pid_of("T-live"), Some(pid), "nothing was taken");
+    assert!(reg.input("T-live", b"go\n").found);
+    wait("the screen's exit reaches the hook", || {
+        got.lock().unwrap().len() == 1
+    });
+    assert_eq!(got.lock().unwrap()[0].exit_code, 3);
+}
+
 #[test]
 fn complete_unit_end_never_waits_for_a_pty_slave_holder() {
     let reg = TerminalRegistry::new();
