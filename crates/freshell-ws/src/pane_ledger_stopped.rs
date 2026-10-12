@@ -8,8 +8,9 @@
 //! its createRequestId (a fresh-agent pane, which has no terminal, by the
 //! createRequestId of the pane a person closed; never by its conversation).
 //! A reopen mints a new createRequestId, so a reopened pane never matches;
-//! nothing a create or a claim does clears a record. Records are kept with no expiry (the GC never touches them): a
-//! device that returns after any length of time is still answered "stopped".
+//! nothing a create or a claim does clears a record. Records are kept with
+//! no expiry (the GC never touches them): a device that returns after any
+//! length of time is still answered "stopped".
 //!
 //! Layout: `stopped-panes/<enc(key)>.json`, one file per record, named by
 //! [`StoppedPaneRecord::key`]. Distinct stops have distinct keys (every spawn
