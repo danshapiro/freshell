@@ -3729,29 +3729,39 @@ mod unit_sidecar {
         assert!(native.signals.is_empty(), "the holder was never signalled");
     }
 
-    /// Whoever took the port may answer the readiness probe: here another
-    /// app-server holds it, so the seeded start fails as "not a member of
-    /// this unit" while its own native has yet to try the port. The native's
-    /// own record (it lost the port) decides: the attempt's unit is stopped
-    /// and Gone, and a new runtime starts in a new unit on a new port.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_start_whose_port_an_answering_app_server_took_is_retried_in_a_new_unit() {
+    /// A seeded start whose port an answering app-server holds, its first
+    /// attempt run with `first_command` and `first_behavior`: the native's
+    /// own record (it lost the port) decides, so the attempt's unit is
+    /// stopped and Gone with nothing of it left, and a new runtime (the
+    /// realistic launcher) starts in a new unit on a new port, served by its
+    /// own native.
+    async fn an_answered_start_is_retried_in_a_new_unit(
+        session: &str,
+        first_command: String,
+        first_behavior: serde_json::Value,
+    ) {
         let (_holder_home, holder) = an_answering_app_server().await;
         let taken = holder.port;
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(CodexSidecarStore::new(home.path().join("records")));
         let lifecycle = Arc::new(RecordingLifecycle::default());
-        let seed = recording_seed("t-answered", lifecycle.clone());
+        let seed = recording_seed(session, lifecycle.clone());
         let mut builds = 0;
         let (runtime, ready) = ready_retrying_a_lost_port("ready", |records| {
             builds += 1;
+            let first = builds == 1;
+            let (command, behavior) = if first {
+                (first_command.clone(), first_behavior.clone())
+            } else {
+                (fake_codex::launcher_command(), json!({}))
+            };
             let runtime = SpawnedCodexAppServerRuntime::with_command_store_context_and_seed(
-                fake_codex::launcher_command(),
+                command,
                 store.clone(),
-                records.context(fake_context(json!({}), home.path())),
+                records.context(fake_context(behavior, home.path())),
                 seed.clone(),
             );
-            if builds == 1 {
+            if first {
                 runtime.with_forced_listen_port(taken)
             } else {
                 runtime
@@ -3790,6 +3800,45 @@ mod unit_sidecar {
             "test",
         ))
         .wait_swept()
+        .await;
+    }
+
+    /// Whoever took the port may answer the readiness probe: here another
+    /// app-server holds it, so the seeded start fails as "not a member of
+    /// this unit" (or, on systemd, "placement not confirmed": `systemd-run`
+    /// has yet to place itself) while its own native has yet to try the
+    /// port. The native's own record (it lost the port) decides.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_start_whose_port_an_answering_app_server_took_is_retried_in_a_new_unit() {
+        an_answered_start_is_retried_in_a_new_unit(
+            "t-answered",
+            fake_codex::launcher_command(),
+            json!({}),
+        )
+        .await;
+    }
+
+    /// The same start, judged by its native's record although no process of
+    /// the attempt can be read as carrying the unit tag. A process's
+    /// environment reads empty while it execs, and on systemd the attempt's
+    /// `systemd-run` execs the launcher while it is the attempt's only
+    /// process, so a wait that looked for the tag alone could see nothing of
+    /// the attempt and let the start's own failure stand (gate 16). Here the
+    /// launcher runs without the tag (`env -u`) for the whole start, and its
+    /// native tries the port only after a second, so the start's outcome
+    /// always comes before the native's record: the wait must find the
+    /// attempt through its unit's members.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answered_start_is_judged_by_its_record_when_no_process_shows_the_unit_tag() {
+        an_answered_start_is_retried_in_a_new_unit(
+            "t-untagged",
+            format!(
+                "env -u {} {}",
+                freshell_containment::UNIT_ENV,
+                fake_codex::launcher_command()
+            ),
+            json!({"listenDelayMs": 1000}),
+        )
         .await;
     }
 

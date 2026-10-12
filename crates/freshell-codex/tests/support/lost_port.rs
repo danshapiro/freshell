@@ -192,9 +192,9 @@ enum Fate {
 
 /// The processes of one attempt that may still write its record.
 enum Writers {
-    /// Every running process carrying the attempt's unit tag (placed or not
-    /// yet placed in the unit: the tag is in its environment from its spawn).
-    Unit(String),
+    /// The attempt's unit: its members and every running process carrying
+    /// its tag ([`unit_may_write`]).
+    Unit(AgentUnit),
     /// The runtime's own child, by pid and start time.
     Child(u32, u64),
     /// Not known: only the bound ends the wait.
@@ -207,7 +207,7 @@ enum Writers {
 impl Writers {
     async fn of(attempt: &(impl AttemptRuntime + ?Sized), started: bool) -> Self {
         if let Some(unit) = attempt.runtime().unit() {
-            return Self::Unit(unit.id().as_str().to_string());
+            return Self::Unit(unit);
         }
         if !started {
             return Self::Gone;
@@ -220,11 +220,9 @@ impl Writers {
     }
 
     fn may_write(&self) -> bool {
-        use freshell_containment::process::{all_pids, environ_value, is_running, start_time};
+        use freshell_containment::process::{is_running, start_time};
         match self {
-            Self::Unit(id) => all_pids().into_iter().any(|pid| {
-                environ_value(pid, UNIT_ENV).as_deref() == Some(id.as_str()) && is_running(pid)
-            }),
+            Self::Unit(unit) => unit_may_write(unit),
             Self::Child(pid, start) => {
                 is_running(*pid) && start_time(*pid).is_ok_and(|now| now == *start)
             }
@@ -232,6 +230,39 @@ impl Writers {
             Self::Gone => false,
         }
     }
+}
+
+/// Whether a process of `unit`'s attempt still runs: a process carrying the
+/// unit's tag, or a member of the unit. Neither alone sees every moment of a
+/// start:
+///
+/// - The tag is read from `/proc/<pid>/environ`, which reads empty while the
+///   process execs (from when its old image is gone until the new one has its
+///   environment: a fraction of a millisecond). On systemd the attempt's
+///   spawned process, `systemd-run`, execs the launcher once it is placed,
+///   and at that moment it is the attempt's only process: a look for the tag
+///   alone can then find nothing of the attempt while its fake has yet to
+///   start (gate 16).
+/// - Membership does not read the environment: on systemd it is the unit
+///   slice's cgroup, which a process keeps through an exec; on the tag backend
+///   it includes the unit's spawned roots, pinned by pid and start time (which
+///   an exec keeps), and their descendants. But on systemd the spawned process
+///   joins the slice only when `systemd-run` has placed it.
+///
+/// So the tag is looked for first, then the members are read. The spawned
+/// process only moves forward: tagged and not yet placed, then placed, then
+/// (on systemd) its exec. A process the tag look missed was already placed,
+/// and is still a member when the members are read after it. The other way
+/// round, a look at the members before the placement and a look for the tag
+/// after the exec (a scan of every process takes milliseconds) could both
+/// miss it. A membership read that fails cannot rule a writer out.
+fn unit_may_write(unit: &AgentUnit) -> bool {
+    use freshell_containment::process::{all_pids, environ_value, is_running};
+    let id = unit.id().as_str();
+    let tagged = all_pids()
+        .into_iter()
+        .any(|pid| environ_value(pid, UNIT_ENV).as_deref() == Some(id) && is_running(pid));
+    tagged || unit.members().map_or(true, |members| !members.is_empty())
 }
 
 /// Waits (bounded) for what the attempt's fake records since `before`, while
