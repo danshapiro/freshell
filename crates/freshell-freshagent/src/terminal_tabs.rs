@@ -4035,6 +4035,10 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use axum::Router;
+    use freshell_terminal::registry::{
+        ManagedOutputRead, ManagedTerminalController, ManagedTerminalDescriptor,
+        ManagedTerminalFuture,
+    };
     use std::sync::Arc;
     use tower::util::ServiceExt;
 
@@ -7094,6 +7098,132 @@ if (args.includes('app-server')) {{
     }
 
     struct UnusedManagedController;
+
+    struct CapturingManagedController(std::sync::Mutex<Option<ManagedTerminalLaunch>>);
+
+    impl ManagedTerminalController for CapturingManagedController {
+        fn lookup_terminal<'a>(
+            &'a self,
+            _: &'a str,
+            _: Option<String>,
+        ) -> ManagedTerminalFuture<'a, Result<Option<ManagedTerminalDescriptor>, String>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn launch<'a>(
+            &'a self,
+            request: ManagedTerminalLaunch,
+        ) -> ManagedTerminalFuture<'a, Result<ManagedTerminalDescriptor, String>> {
+            Box::pin(async move {
+                *self.0.lock().unwrap() = Some(request);
+                Err("captured managed launch without spawning".into())
+            })
+        }
+
+        fn input<'a>(
+            &'a self,
+            terminal: ManagedTerminalDescriptor,
+            data: String,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            UnusedManagedController.input(terminal, data)
+        }
+
+        fn resize<'a>(
+            &'a self,
+            terminal: ManagedTerminalDescriptor,
+            cols: u16,
+            rows: u16,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            UnusedManagedController.resize(terminal, cols, rows)
+        }
+
+        fn stop<'a>(
+            &'a self,
+            terminal: ManagedTerminalDescriptor,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            UnusedManagedController.stop(terminal)
+        }
+
+        fn read_output<'a>(
+            &'a self,
+            terminal: ManagedTerminalDescriptor,
+            after_seq: i64,
+            max_bytes: u64,
+        ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
+            UnusedManagedController.read_output(terminal, after_seq, max_bytes)
+        }
+    }
+
+    #[tokio::test]
+    async fn rest_managed_codex_model_preserves_explicit_selection_and_exact_resume() {
+        for (model, resume) in [
+            (Some("gpt-5.6-luna"), false),
+            (Some("gpt-5.2-codex"), false),
+            (None, false),
+            (Some("gpt-5.6-luna"), true),
+            (Some("gpt-5.2-codex"), true),
+        ] {
+            let mut spec = managed_codex_cli_spec();
+            spec.effort_args = Some(vec![
+                "-c".into(),
+                "model_reasoning_effort=\"{{effort}}\"".into(),
+            ]);
+            let state = state_with_registry()
+                .with_cli_commands(Arc::new(vec![spec]))
+                .with_resume_probe(probe_answering(
+                    freshell_platform::resume_gate::ResumeExistence::Present,
+                    true,
+                ));
+            let registry = state.terminal_registry.clone().unwrap();
+            let controller = Arc::new(CapturingManagedController(std::sync::Mutex::new(None)));
+            registry.set_managed_controller(Some(controller.clone()));
+            let mut body = json!({"mode":"codex", "cwd":std::env::temp_dir(), "effort":"low"});
+            if let Some(model) = model {
+                body["model"] = json!(model);
+            }
+            if resume {
+                body["sessionRef"] = json!({"provider":"codex", "sessionId":"owned-native-root"});
+            }
+            let (status, response) = post(app(state), "/api/tabs", body, true).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{}", response["message"]);
+            assert!(response["message"]
+                .as_str()
+                .unwrap()
+                .contains("captured managed launch"));
+            let request = controller
+                .0
+                .lock()
+                .unwrap()
+                .take()
+                .expect("actual REST managed launch request");
+            assert_eq!(request.provider_model.as_deref(), model);
+            assert_eq!(request.provider_reasoning_effort.as_deref(), Some("low"));
+            let args = &request.spec.args;
+            let models: Vec<_> = args
+                .windows(2)
+                .filter(|pair| pair[0] == "--model")
+                .map(|pair| pair[1].as_str())
+                .collect();
+            assert_eq!(models, model.into_iter().collect::<Vec<_>>());
+            assert!(args
+                .windows(2)
+                .any(|pair| pair == ["-c", "model_reasoning_effort=\"low\""]));
+            assert_eq!(
+                request.resume_session_id.as_deref(),
+                resume.then_some("owned-native-root")
+            );
+            assert_eq!(args.iter().any(|arg| arg == "resume"), resume);
+            if resume {
+                assert!(args
+                    .windows(2)
+                    .any(|pair| pair == ["resume", "owned-native-root"]));
+            }
+            assert!(
+                registry.directory().is_empty(),
+                "capture spawns no provider"
+            );
+        }
+    }
 
     impl freshell_terminal::registry::ManagedTerminalController for UnusedManagedController {
         fn lookup_terminal<'a>(
