@@ -803,5 +803,20 @@ async fn an_app_server_exit_after_shutdown_started_is_left_to_the_shutdown() {
         .is_err(),
         "no crash event while the server stops"
     );
-    assert!(h.unit_for(&tid).stop_in_flight().is_none(), "no stop began");
+    let unit = h.unit_for(&tid);
+    assert!(unit.stop_in_flight().is_none(), "no stop began");
+    let record = h
+        .state
+        .units
+        .containment
+        .recorded_units()
+        .expect("the unit records")
+        .into_iter()
+        .find(|record| &record.unit_id == unit.id())
+        .expect("the unit's record stays for the next boot");
+    assert_eq!(
+        record.state,
+        freshell_containment::UnitRecordState::Running,
+        "the record is left as it was, for the next boot to decide"
+    );
 }
