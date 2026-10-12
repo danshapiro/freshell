@@ -6,6 +6,7 @@
 //! code_checkpoint_permissions"`; the trusted entrypoint creates the root-owned
 //! unreadable sentinels and this test observes them only as the sandbox user.
 
+use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -15,6 +16,8 @@ use std::time::{Duration, Instant};
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 
 const AUTH_TOKEN: &str = "checkpoint-fixture-auth-marker-do-not-log";
 const OUTGOING_MARKER: &str = "checkpoint-fixture-outgoing-text-do-not-log";
@@ -22,8 +25,9 @@ const OUTGOING_MARKER: &str = "checkpoint-fixture-outgoing-text-do-not-log";
 struct OwnedServer(Option<Child>);
 
 impl OwnedServer {
-    fn start(port: u16, home: &Path, log_dir: &Path) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_freshell-server"))
+    fn start(port: u16, home: &Path, log_dir: &Path, path: Option<OsString>) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_freshell-server"));
+        command
             .env("PORT", port.to_string())
             .env("AUTH_TOKEN", AUTH_TOKEN)
             .env("FRESHELL_HOME", home)
@@ -31,7 +35,11 @@ impl OwnedServer {
             .env("FRESHELL_LOG_DIR", log_dir)
             .env("FRESHELL_BIND_HOST", "127.0.0.1")
             .env("FRESHELL_DISABLE_WSL_PORT_FORWARD", "1")
-            .env_remove("FRESHELL_MANAGED_RUNTIME_V1")
+            .env_remove("FRESHELL_MANAGED_RUNTIME_V1");
+        if let Some(path) = path {
+            command.env("PATH", path);
+        }
+        let child = command
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -48,6 +56,33 @@ impl OwnedServer {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+struct GitBarrierCleanup {
+    pid_path: PathBuf,
+    release_path: PathBuf,
+    wrapper_path: PathBuf,
+    wrapper_dir: PathBuf,
+}
+
+impl Drop for GitBarrierCleanup {
+    fn drop(&mut self) {
+        if let (Ok(raw_pid), Ok(wrapper)) = (
+            fs::read_to_string(&self.pid_path),
+            self.wrapper_path.to_str().ok_or(()),
+        ) {
+            if let Ok(pid) = raw_pid.trim().parse::<i32>() {
+                let command_line = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+                if String::from_utf8_lossy(&command_line).contains(wrapper) {
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+        let _ = fs::write(&self.release_path, "release\n");
+        let _ = fs::remove_dir_all(&self.wrapper_dir);
     }
 }
 
@@ -240,7 +275,7 @@ async fn restricted_checkpoint_routes_preserve_complete_targets_and_log_correlat
 
     fs::create_dir_all(storage.join("logs")).unwrap();
     let port = allocate_port();
-    let mut server = OwnedServer::start(port, &home, &storage.join("logs"));
+    let mut server = OwnedServer::start(port, &home, &storage.join("logs"), None);
     wait_for_health(port, server.child_mut()).await;
 
     let client = Client::new();
@@ -578,4 +613,176 @@ async fn restricted_checkpoint_routes_preserve_complete_targets_and_log_correlat
     );
 
     server.stop();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn dropped_checkpoint_http_request_kills_git_before_publication() {
+    let root = fixture_root();
+    assert_ne!(unsafe { libc::geteuid() }, 0, "fixture must run as UID B");
+    assert_eq!(effective_capabilities(), 0);
+
+    let home = root.join("cancel-home");
+    let storage = root.join("cancel-storage");
+    let project = root.join("cancel-project");
+    let executable_tmp = std::env::var_os("FRESHELL_TEST_EXECUTABLE_TMP_DIR")
+        .map(PathBuf::from)
+        .expect("runtime sandbox provides an executable fixture directory");
+    let wrapper_dir = executable_tmp.join(format!("checkpoint-git-wrapper-{}", std::process::id()));
+    let barrier_dir = root.join("cancel-git-barrier");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(storage.join("logs")).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&wrapper_dir).unwrap();
+    fs::create_dir_all(&barrier_dir).unwrap();
+    fs::write(
+        project.join("source.txt"),
+        "must never publish after abort\n",
+    )
+    .unwrap();
+    run_git(&["init", "-q"], &project);
+
+    let pid_path = barrier_dir.join("git-add.pid");
+    let started_path = barrier_dir.join("git-add.started");
+    let release_path = barrier_dir.join("git-add.release");
+    let calls_path = barrier_dir.join("git.calls");
+    let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|directory| directory.join("git"))
+        .find(|candidate| candidate.is_file())
+        .expect("sandbox PATH contains real Git");
+    let wrapper = format!(
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"--version\" ]; then echo WRAPPED; exit 0; fi\n\
+         target=0\n\
+         add=0\n\
+         printf '%s\\n' \"$*\" >> {}\n\
+         for arg do\n\
+           case \"$arg\" in\n\
+             --work-tree=*) case \"$arg\" in *cancel-project) target=1 ;; esac ;;\n\
+             add) add=1 ;;\n\
+           esac\n\
+         done\n\
+         if [ \"$target\" -eq 1 ] && [ \"$add\" -eq 1 ]; then\n\
+           printf '%s\\n' \"$$\" > {}\n\
+           printf '%s\\n' started > {}\n\
+           while [ ! -e {} ]; do :; done\n\
+         fi\n\
+         exec {} \"$@\"\n",
+        calls_path.display(),
+        pid_path.display(),
+        started_path.display(),
+        release_path.display(),
+        real_git.display(),
+    );
+    let wrapper_path = wrapper_dir.join("git");
+    let _barrier_cleanup = GitBarrierCleanup {
+        pid_path: pid_path.clone(),
+        release_path: release_path.clone(),
+        wrapper_path: wrapper_path.clone(),
+        wrapper_dir: wrapper_dir.clone(),
+    };
+    fs::write(&wrapper_path, wrapper).unwrap();
+    fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let original_path = std::env::var_os("PATH").unwrap_or_default();
+    let server_path = std::env::join_paths(
+        std::iter::once(wrapper_dir.clone()).chain(std::env::split_paths(&original_path)),
+    )
+    .unwrap();
+    let wrapper_probe = Command::new("git")
+        .arg("--version")
+        .env("PATH", &server_path)
+        .output()
+        .expect("resolve the test Git wrapper from the server PATH");
+    assert_eq!(
+        String::from_utf8_lossy(&wrapper_probe.stdout).trim(),
+        "WRAPPED",
+        "server PATH resolves git to the barrier wrapper"
+    );
+    let port = allocate_port();
+    let mut server = OwnedServer::start(port, &home, &storage.join("logs"), Some(server_path));
+    wait_for_health(port, server.child_mut()).await;
+    let server_pid = server.child_mut().id();
+    let server_environment = fs::read(format!("/proc/{server_pid}/environ")).unwrap();
+    let path_entry = server_environment
+        .split(|byte| *byte == 0)
+        .find(|entry| entry.starts_with(b"PATH="))
+        .expect("server process has PATH");
+    assert!(
+        String::from_utf8_lossy(path_entry).contains(&wrapper_dir.display().to_string()),
+        "server PATH includes test barrier directory: {}",
+        String::from_utf8_lossy(path_entry)
+    );
+
+    let body = json!({
+        "cwd": home,
+        "workspace": workspace_intent(&project),
+        "label": "aborted capture",
+        "requestId": "send-aborted-capture",
+    })
+    .to_string();
+    let request = format!(
+        "POST /api/fresh-agent/checkpoints HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nX-Auth-Token: {AUTH_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect to checkpoint route");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("send complete checkpoint request");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !started_path.exists() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        started_path.exists(),
+        "Git add reached the controlled barrier; Git calls were {}; server logs were {}",
+        fs::read_to_string(&calls_path).unwrap_or_default(),
+        fs::read_to_string(storage.join("logs/rust-server.jsonl")).unwrap_or_default()
+    );
+    let git_pid = fs::read_to_string(&pid_path)
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+
+    // Closing the actual HTTP connection drops the Axum handler future while
+    // Git is still blocked before it can write this request's private index.
+    drop(stream);
+    let stopped_deadline = Instant::now() + Duration::from_secs(5);
+    while linux_process_state(git_pid).is_some_and(|state| state != 'Z')
+        && Instant::now() < stopped_deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        linux_process_state(git_pid).is_none_or(|state| state == 'Z'),
+        "Git child {git_pid} must stop executing after the HTTP request is dropped"
+    );
+
+    let client = Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    let checkpoints = list_workspace(&client, &base, &home, &project).await;
+    assert!(checkpoints.is_empty(), "aborted capture is not published");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let later_checkpoints = list_workspace(&client, &base, &home, &project).await;
+    assert!(
+        later_checkpoints.is_empty(),
+        "aborted capture does not publish after the cancellation settles"
+    );
+
+    // Release only after the no-publication assertion so a failed test cannot
+    // leave the controlled child spinning in the disposable container.
+    fs::write(&release_path, "release\n").unwrap();
+    server.stop();
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_state(pid: i32) -> Option<char> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, fields) = stat.rsplit_once(") ")?;
+    fields.chars().next()
 }

@@ -828,6 +828,10 @@ async fn run_git_with_index_input(
     input: &[u8],
 ) -> Result<(), String> {
     let mut cmd = Command::new("git");
+    // Request cancellation drops this future. Tokio leaves child processes
+    // running by default, so every checkpoint-owned Git process must be
+    // configured to stop with its request instead of outliving it.
+    cmd.kill_on_drop(true);
     cmd.args(args).stdin(Stdio::piped());
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
@@ -862,14 +866,17 @@ async fn ignored_git_directories(
 
     let git_dir_arg = format!("--git-dir={}", git_dir.display());
     let work_tree_arg = format!("--work-tree={}", work_tree.display());
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
+        .kill_on_drop(true)
         .arg(git_dir_arg)
         .arg(work_tree_arg)
         .args(["check-ignore", "--no-index", "--stdin", "-z"])
         .current_dir(work_tree)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
         .spawn()
         .map_err(|error| format!("git check-ignore failed to start: {error}"))?;
     let mut input = Vec::new();
@@ -980,6 +987,10 @@ async fn invoke_git(
     index: Option<&Path>,
 ) -> Result<std::process::Output, String> {
     let mut cmd = Command::new("git");
+    // Unlike JavaScript child_process, Tokio's default is to leave a child
+    // alive when its owner future is dropped. HTTP cancellation must not
+    // detach an in-flight snapshot command.
+    cmd.kill_on_drop(true);
     cmd.args(args);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
