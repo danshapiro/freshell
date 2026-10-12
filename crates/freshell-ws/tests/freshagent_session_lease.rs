@@ -692,6 +692,10 @@ async fn expired_lease_kill_sweeps_the_sidecar_tree_before_release() {
         std::path::Path::new(&format!("/proc/{gpid}")).exists(),
         "decoy grandchild must be alive before expiry"
     );
+    // Only A's sidecar spawns a decoy. B's sidecar must not: nothing kills B's tree (its
+    // create succeeds and the test ends), so its detached `sleep 300` would outlive the
+    // run, reparented to pid 1.
+    std::env::remove_var("FAKE_SIDECAR_SPAWN_GRANDCHILD");
     // Let the TTL expire, then client B contends -> ExpiredNeedsKill -> tree kill.
     tokio::time::sleep(Duration::from_millis(300)).await;
     send_json(&mut ws_b, &claude_create_resume("req-ttl-b", durable)).await;
@@ -724,11 +728,22 @@ async fn expired_lease_kill_sweeps_the_sidecar_tree_before_release() {
     }
 
     // ...and only then does B's own resume converge (force-release + re-claim ONCE).
-    let created = await_frame(&mut ws_b, Duration::from_secs(20), |v| {
-        v["type"] == "freshAgent.created" && v["requestId"] == "req-ttl-b"
+    // Wait for B's final answer, whichever it is, so a refusal fails here at once with
+    // its code and message instead of as a budget timeout. The budget only guards a
+    // hang: the product's own create bound (`SIDECAR_CREATE_BUDGET`, 45 s, in
+    // freshell-freshagent's claude.rs) plus ~2 s for the kill-and-confirm path.
+    let hang_guard = Duration::from_secs(45) + Duration::from_secs(2);
+    let answer = await_frame(&mut ws_b, hang_guard, |v| {
+        (v["type"] == "freshAgent.created" || v["type"] == "freshAgent.create.failed")
+            && v["requestId"] == "req-ttl-b"
     })
     .await;
-    assert!(created["sessionId"].is_string());
+    assert_eq!(
+        answer["type"], "freshAgent.created",
+        "B's create was refused: code={} message={} (frame: {answer})",
+        answer["code"], answer["message"]
+    );
+    assert!(answer["sessionId"].is_string());
 }
 
 // ── Task 13: lease at the attach-resume seams ────────────────────────────────────────
