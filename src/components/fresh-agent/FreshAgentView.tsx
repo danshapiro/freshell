@@ -365,7 +365,9 @@ function mergeSnapshotForDisplay(
 // probed-model effort survives everywhere.
 
 function getEffectiveFreshAgentPermissionMode(content: FreshAgentPaneContent): string | undefined {
-  return content.provider === 'opencode' ? undefined : content.permissionMode
+  if (content.provider === 'opencode') return undefined
+  if (content.provider === 'codex' && content.permissionMode === 'default') return undefined
+  return content.permissionMode
 }
 
 function isStatusRegression(current: string, next: string): boolean {

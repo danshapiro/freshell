@@ -880,7 +880,8 @@ describe('picker profile staging', () => {
       expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
       expect(sentFreshAgentMessages('freshAgent.create')[0]).toMatchObject({ requestId: content.createRequestId,
         sessionType: mode, provider, cwd: content.initialCwd, model, modelSelection: { kind: 'exact', modelId: model },
-        ...(provider === 'opencode' ? {} : { permissionMode: 'default' }) })
+        ...(provider === 'claude' ? { permissionMode: 'default' } : {}) })
+      if (provider !== 'claude') expect(sentFreshAgentMessages('freshAgent.create')[0].permissionMode).toBeUndefined()
       expect(sentFreshAgentMessages('freshAgent.create')[0].effort).toBe(effort === 'provider-default' ? undefined : effort)
       expect(getFreshAgentPaneContent(store)).toMatchObject({ createRequestId: content.createRequestId,
         model, permissionMode: 'default' })
