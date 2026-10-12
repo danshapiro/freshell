@@ -357,11 +357,11 @@ impl SystemdUnit {
         let killed = self.kill_all_but(&pids, &spared, frozen);
         // Thawed whatever the kill did, so spared processes resume in place.
         let thawed = thaw.map_or(Ok(()), Thaw::now);
-        let killed = killed?;
+        let (killed, mut incomplete) = killed?;
         if let Err(err) = thawed {
             // A slice systemd removed meanwhile has nothing left to thaw.
             if self.dir.is_dir() {
-                return Err(io::Error::other(format!("cgroup.freeze (thaw): {err}")));
+                incomplete.get_or_insert(io::Error::other(format!("cgroup.freeze (thaw): {err}")));
             }
         }
         Ok(KillSummary {
@@ -372,6 +372,7 @@ impl SystemdUnit {
                 .collect(),
             withheld: 0,
             not_frozen: None,
+            incomplete,
         })
     }
 
@@ -392,13 +393,15 @@ impl SystemdUnit {
     /// fork, exit or exec, and a fatal signal still kills them; what an
     /// unfrozen slice forks after the snapshot is left to the post-Gone
     /// sweep. A pid that cannot be pinned for another reason than being gone
-    /// (for example, no descriptor left) fails the kill after the others.
+    /// (for example, no descriptor left) is not signalled; the first such
+    /// failure is answered with the count (it may have missed a member).
+    /// `Err` only when the whole-slice kill failed.
     fn kill_all_but(
         &self,
         pids: &BTreeSet<u32>,
         spared: &BTreeSet<u32>,
         frozen: bool,
-    ) -> io::Result<usize> {
+    ) -> io::Result<(usize, Option<io::Error>)> {
         let whole = frozen
             && spared.is_empty()
             && !pids.iter().any(|pid| process::main_thread_exited(*pid));
@@ -420,7 +423,7 @@ impl SystemdUnit {
                     killed += 1;
                 }
             }
-            return pin_error.map_or(Ok(killed), Err);
+            return Ok((killed, pin_error));
         }
         if let Err(err) = std::fs::write(self.dir.join("cgroup.kill"), "1") {
             // A slice systemd removed meanwhile has nothing left to kill.
@@ -432,7 +435,7 @@ impl SystemdUnit {
                     })?;
             }
         }
-        Ok(pids.len())
+        Ok((pids.len(), None))
     }
 }
 
@@ -957,11 +960,12 @@ mod tests {
         let doomed = Own::sleep();
         let pids = BTreeSet::from([daemon.pid(), doomed.pid()]);
         // The snapshot judged neither of the daemon family (as before an exec).
-        let killed = slice
+        let (killed, incomplete) = slice
             .unit
             .kill_all_but(&pids, &BTreeSet::new(), false)
             .unwrap();
         assert_eq!(killed, 1);
+        assert!(incomplete.is_none(), "{incomplete:?}");
         assert!(doomed.dies(), "the other process survived");
         assert!(
             !daemon.watch.has_exited(),
@@ -969,11 +973,12 @@ mod tests {
         );
         assert!(!slice.dir().join("cgroup.kill").exists());
 
-        let killed = slice
+        let (killed, incomplete) = slice
             .unit
             .kill_all_but(&BTreeSet::from([daemon.pid()]), &BTreeSet::new(), true)
             .unwrap();
         assert_eq!(killed, 1);
+        assert!(incomplete.is_none(), "{incomplete:?}");
         assert_eq!(
             slice.read("cgroup.kill"),
             "1",
@@ -997,8 +1002,8 @@ mod tests {
                 .kill_all_but(&BTreeSet::from([member.pid()]), &BTreeSet::new(), false);
         drop(hidden);
         match killed {
-            Err(err) => assert_ne!(err.kind(), io::ErrorKind::NotFound, "{err}"),
-            Ok(killed) => panic!("a running process was passed over as gone ({killed} killed)"),
+            Ok((_, Some(err))) => assert_ne!(err.kind(), io::ErrorKind::NotFound, "{err}"),
+            other => panic!("a running process was passed over as gone: {other:?}"),
         }
         assert!(
             !member.watch.has_exited(),

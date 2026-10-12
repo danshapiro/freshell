@@ -1009,8 +1009,10 @@ impl AgentUnit {
     /// `extra`), then SIGKILL through each non-spared pinned watch. Returns
     /// the spared processes (the backend's, plus any pinned process whose
     /// own argv is Codex's daemon family, never signalled even when the
-    /// whole-unit kill failed) and whether the whole-unit kill ran (a
-    /// failure is logged; the pinned processes are still killed).
+    /// whole-unit kill failed) and whether the whole-unit kill ran in full
+    /// (a failure is logged; the pinned processes are still killed). A kill
+    /// that ran but could not read everything (it may have missed a member)
+    /// is logged as failed, and what it spared stays spared.
     async fn kill_whole_unit(
         &self,
         keys: &UnitLogKeys,
@@ -1026,7 +1028,15 @@ impl AgentUnit {
                 if let Some(detail) = &summary.not_frozen {
                     events::freeze_timeout(keys, detail);
                 }
-                (summary.spared, true)
+                match &summary.incomplete {
+                    // The kill may have missed a member: a failed kill, but
+                    // what it spared stays spared.
+                    Some(err) => {
+                        events::kill_all_failed(keys, &err.to_string());
+                        (summary.spared, false)
+                    }
+                    None => (summary.spared, true),
+                }
             }
             Err(err) => {
                 events::kill_all_failed(keys, &err.to_string());
@@ -2342,6 +2352,98 @@ sleep 600;"#;
         assert!(
             daemon.untouched(),
             "the daemon-family process was signalled"
+        );
+    }
+
+    /// A Codex daemon-family stand-in (perl with `app-server
+    /// --managed-daemon` arguments) and a plain child it started, both
+    /// carrying `env`. The child is of the family only as its descendant.
+    /// The child is pinned while its parent, which never reaps it, sleeps;
+    /// on drop it is killed through that pin, then the stand-in.
+    #[cfg(target_os = "linux")]
+    struct DaemonWithChild {
+        child: ProcWatch,
+        daemon: Spawned,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl DaemonWithChild {
+        fn start(env: &[(&str, &str)]) -> Self {
+            use std::io::{BufRead, BufReader};
+            const DAEMON: &str = r#"$| = 1;
+my $c = fork();
+if ($c == 0) { exec "perl", "-e", '$| = 1; print "child $$\n"; sleep 600'; }
+sleep 600;"#;
+            let mut child = std::process::Command::new("perl")
+                .args(["-e", DAEMON, "app-server", "--managed-daemon"])
+                .envs(env.iter().copied())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            // Our own unreaped child: its pid names it.
+            let watch = ProcWatch::open(child.id()).unwrap();
+            let out = child.stdout.take().unwrap();
+            let daemon = Spawned { child, watch };
+            let mut line = String::new();
+            BufReader::new(out).read_line(&mut line).unwrap();
+            let pid: u32 = line
+                .trim()
+                .strip_prefix("child ")
+                .and_then(|pid| pid.parse().ok())
+                .unwrap_or_else(|| panic!("unexpected line {line:?}"));
+            let child = ProcWatch::open(pid).unwrap();
+            assert!(
+                process::parent(pid) == Some(daemon.watch.pid()) && !child.has_exited(),
+                "{pid} is not the stand-in's running child"
+            );
+            Self { child, daemon }
+        }
+
+        fn child_untouched(&self) -> bool {
+            !self.child.has_exited()
+                && process::start_time(self.child.pid()).ok() == Some(self.child.identity().start)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for DaemonWithChild {
+        fn drop(&mut self) {
+            let _ = self.child.signal(Sig::Kill);
+        }
+    }
+
+    /// The tag scan found the daemon family (a stand-in carrying the unit's
+    /// tag, and the plain child it started) but could not read every
+    /// process (here another process's environment): the kill answers that
+    /// it may have missed a member, and still spares the family it found.
+    /// So a pinned descendant of the stand-in, which its own argv would not
+    /// spare, is never signalled, and Gone does not wait for it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pinned_descendant_of_the_daemon_family_is_never_signalled_after_an_incomplete_scan()
+    {
+        let tag = UnitId::mint();
+        let backend =
+            crate::backend::tag::TagUnit::new(crate::UNIT_ENV, tag.as_str(), &tag, None).unwrap();
+        let family = DaemonWithChild::start(&[(crate::UNIT_ENV, tag.as_str())]);
+        let unreadable = Spawned::perl_sleep(&[]);
+        let unit = unit_on(Arc::new(backend));
+        unit.add_root(family.child.clone());
+        let _unread = process::test_reads::fail(unreadable.watch.pid(), "environ", libc::EMFILE);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            unit.stop(StopRequest::new(StopMode::Force, StopReason::ShiftX, "ws"))
+                .wait_swept(),
+        )
+        .await
+        .expect("Gone and swept, without waiting for the spared descendant");
+        assert!(
+            family.child_untouched(),
+            "the daemon-family stand-in's child was signalled"
+        );
+        assert!(
+            family.daemon.untouched(),
+            "the daemon-family stand-in was signalled"
         );
     }
 

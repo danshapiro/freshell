@@ -103,6 +103,13 @@ pub(crate) struct KillSummary {
     /// one snapshot process at a time; the unit logs it with its keys
     /// (`unit.stop.freeze_timeout`).
     pub not_frozen: Option<String>,
+    /// The first read or pin the kill could not make for a reason other
+    /// than a process being gone ("could not check": it may have missed a
+    /// member), or a thaw that failed after it. The kill still killed every
+    /// process it found and spared what it judged spared, so `spared` stays
+    /// valid; the unit logs this as a failed kill
+    /// (`unit.stop.kill_all_failed`) and keeps sparing them.
+    pub incomplete: Option<io::Error>,
 }
 
 /// One one-shot reading of a unit's live, non-spared members.

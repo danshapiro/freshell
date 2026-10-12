@@ -9,7 +9,8 @@
 //! the scan counts it. A read that fails for any reason but the process
 //! being gone is "could not check": the member list is then an error, never
 //! a list without the members it could not read, and the kill still kills
-//! every candidate found but then answers that error.
+//! every candidate found and spares what it judged spared, but names that
+//! read in its summary (it may have missed a member).
 //!
 //! On Linux every member the unit spawns starts under the `__unit-exec
 //! --reaper` shim (`crate::reaper`), a child subreaper: the kernel reparents
@@ -335,7 +336,7 @@ impl TagUnit {
     /// through its roots, which this process pinned, and their descendants
     /// only. It follows no forks (on macOS every process the unit's fork
     /// tracker followed is recorded as a root).
-    pub(crate) fn kill_recorded_now(record: &UnitRecord) -> io::Result<KillSummary> {
+    pub(crate) fn kill_recorded_now(record: &UnitRecord) -> KillSummary {
         let unit = match &record.legacy_tag {
             Some(_) => Self::untagged(&record.unit_id),
             None => Self::legacy(UNIT_ENV, record.unit_id.as_str(), &record.unit_id),
@@ -343,10 +344,10 @@ impl TagUnit {
         unit.kill_all_now(&record.roots)
     }
 
-    /// Every candidate the sweep finds is killed; when a reading could not
-    /// be made in full, the kill then answers that error (it may have
-    /// missed a member).
-    fn kill_all_now(&self, roots: &[(u32, u64)]) -> io::Result<KillSummary> {
+    /// Every candidate the sweep finds is killed and what it judged spared
+    /// is spared; when a reading could not be made in full, the summary
+    /// also names that read (`incomplete`: it may have missed a member).
+    fn kill_all_now(&self, roots: &[(u32, u64)]) -> KillSummary {
         let mut withheld = None;
         let mut unread = None;
         let summary = stop_the_world(
@@ -366,14 +367,12 @@ impl TagUnit {
                     || self.kernel_tracked(pid, start)
                     || process::parent(pid).is_some_and(|pp| candidates.contains(&pp))
             },
-        )?;
-        if let Some(err) = unread {
-            return Err(self.unread(err));
-        }
-        Ok(KillSummary {
+        );
+        KillSummary {
             withheld: withheld.unwrap_or(0),
+            incomplete: unread.map(|err| self.unread(err)).or(summary.incomplete),
             ..summary
-        })
+        }
     }
 }
 
@@ -392,7 +391,7 @@ impl UnitBackend for TagUnit {
         Box::pin(async move {
             tokio::task::spawn_blocking(move || self.kill_all_now(&roots))
                 .await
-                .map_err(io::Error::other)?
+                .map_err(io::Error::other)
         })
     }
 
@@ -594,11 +593,13 @@ pub(crate) fn daemon_family_within(set: &BTreeSet<u32>) -> BTreeSet<u32> {
 /// through its watch, descendants before ancestors ([`kill_order`]), so no
 /// exit orphans a process group that still has a stopped member (the kernel
 /// would SIGHUP that whole group, spared members included). Nothing waits
-/// for the killed processes to exit.
+/// for the killed processes to exit. A candidate that cannot be pinned for
+/// a reason other than being gone is not signalled, and the summary names
+/// that failure (`incomplete`) next to what it spared.
 pub(crate) fn stop_the_world(
     mut find: impl FnMut() -> (BTreeSet<u32>, BTreeSet<u32>),
     belongs: impl Fn(&ProcWatch, &BTreeSet<u32>) -> bool,
-) -> io::Result<KillSummary> {
+) -> KillSummary {
     let mut stopped: BTreeMap<u32, ProcWatch> = BTreeMap::new();
     // Every pid already handled: stopped, gone, or refused as not a member.
     let mut handled: BTreeSet<u32> = BTreeSet::new();
@@ -653,10 +654,7 @@ pub(crate) fn stop_the_world(
         }
     }
     spared.extend(&resumed);
-    if let Some(err) = pin_error {
-        return Err(err);
-    }
-    Ok(KillSummary {
+    KillSummary {
         killed,
         spared: spared
             .iter()
@@ -664,7 +662,8 @@ pub(crate) fn stop_the_world(
             .collect(),
         withheld: 0,
         not_frozen: None,
-    })
+        incomplete: pin_error,
+    }
 }
 
 /// The order in which the sweep SIGKILLs its stopped processes: deepest in
@@ -862,8 +861,7 @@ sleep 600;"#,
                 }
                 member
             },
-        )
-        .unwrap();
+        );
         let doomed = doomed.into_inner();
         assert!(
             doomed.iter().any(|w| w.pid() == l),
@@ -952,9 +950,9 @@ sleep 600;"#,
         let hidden = process::test_reads::fail(pid, "stat", libc::ENOENT);
         let swept = stop_the_world(|| (BTreeSet::from([pid]), BTreeSet::new()), |_, _| true);
         drop(hidden);
-        match swept {
-            Err(err) => assert_ne!(err.kind(), io::ErrorKind::NotFound, "{err}"),
-            Ok(summary) => panic!("a running candidate was passed over as gone: {summary:?}"),
+        match swept.incomplete {
+            Some(err) => assert_ne!(err.kind(), io::ErrorKind::NotFound, "{err}"),
+            None => panic!("a running candidate was passed over as gone: {swept:?}"),
         }
         assert!(
             !sleep.watch.has_exited(),
@@ -986,7 +984,7 @@ sleep 600;"#,
         );
         let refused = unit.confirm_placement(pid, &stale).unwrap_err();
         assert_ne!(refused.kind(), io::ErrorKind::NotFound, "{refused}");
-        unit.kill_all_now(&stale).unwrap();
+        unit.kill_all_now(&stale);
         std::thread::sleep(Duration::from_millis(200));
         assert!(
             !sleep.watch.has_exited(),
@@ -1002,7 +1000,7 @@ sleep 600;"#,
             .iter()
             .any(|m| m.pid == pid));
         unit.confirm_placement(pid, &current).unwrap();
-        unit.kill_all_now(&current).unwrap();
+        unit.kill_all_now(&current);
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(sleep.child.wait().unwrap().signal(), Some(libc::SIGKILL));
     }
@@ -1077,7 +1075,7 @@ mod macos_tests {
             !listed.contains(&pid) && !listed.contains(&child),
             "a stale tracked pid made a stranger a member: {listed:?}"
         );
-        unit.kill_all_now(&[]).unwrap();
+        unit.kill_all_now(&[]);
         std::thread::sleep(Duration::from_millis(300));
         assert!(
             tree.pins.iter().all(|pin| !pin.has_exited()),
