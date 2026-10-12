@@ -417,13 +417,11 @@
         "shell",
         "opencode",
         "claude",
-        "codex",
-        "amplifier"
+        "codex"
       ],
       "blockingProviders": [
         "claude",
-        "codex",
-        "amplifier"
+        "codex"
       ]
     }
   }

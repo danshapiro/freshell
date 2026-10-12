@@ -119,8 +119,33 @@ describe('checked-in provider certification manifest', () => {
 })
 
 describe('production certification status', () => {
+  it('allows an advertised retained scope while Amplifier remains pending and disabled', () => {
+    const manifest = manifestFixture([
+      { provider: 'claude', certificationState: 'certified', managedEnabled: true, durableRecoveryEnabled: true, blockedReason: null },
+      { provider: 'codex', certificationState: 'certified', managedEnabled: true, durableRecoveryEnabled: true, blockedReason: null },
+    ])
+    manifest.certification.productionGate.requiredCertifiedProviders = ['shell', 'claude', 'codex', 'opencode']
+    manifest.releaseScope.managedTerminalProviders = ['claude', 'codex', 'opencode']
+    manifest.certification.deferredProviders = ['amplifier']
+    manifest.certification.landingGate.deferrableProviders = ['amplifier']
+    manifest.certification.certifiedDurableProviders = certifiedDurableProviders(manifest)
+    for (const row of manifest.freshAgentModes) if (row.mode !== 'kilroy') {
+      Object.assign(row, { enabledInReleaseScope: true, certified: true, liveQualificationStatus: 'certified' })
+      Object.assign(manifest.doorways.find((doorway: any) => doorway.id === `rest-${row.mode}-create`),
+        { policy: 'managed', enabledInReleaseScope: true })
+    }
+    manifest.releaseScope.freshAgentEnabled = true
+    manifest.releaseScope.disabledFreshAgentModes = ['kilroy']
+    expect(capabilityClaimViolations(manifest)).toEqual([])
+    expect(productionCertificationStatus(manifest).status).toBe('ELIGIBLE')
+    manifest.certification.productionGate.requiredCertifiedProviders = ['shell', 'claude', 'codex']
+    expect(capabilityClaimViolations(manifest).join(' ')).toContain('opencode')
+  })
+
   it('is blocked, never pass, while any provider awaits live certification', () => {
-    const status = productionCertificationStatus(loadCapabilityManifest(repoRoot))
+    const manifest = loadCapabilityManifest(repoRoot)
+    manifest.certification.productionGate.requiredCertifiedProviders = ['shell', 'opencode', 'claude', 'codex', 'amplifier']
+    const status = productionCertificationStatus(manifest)
     expect(status.status).toBe('BLOCKED_PENDING_LIVE_PROVIDER_CERTIFICATION')
     expect(status.reason).toBe(PENDING_LIVE_PROVIDER_CERTIFICATION)
     expect(status.blockingProviders).toEqual(['claude', 'codex', 'amplifier'])

@@ -896,7 +896,7 @@ impl Supervisor {
             &request.provider,
             request.fixture.is_some(),
             request.terminal.is_some(),
-            request.fresh_agent.is_some(),
+            request.fresh_agent.as_ref(),
         ) {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::UnsupportedWorkload,
@@ -3807,10 +3807,17 @@ fn release_qualified_workload(
     provider: &str,
     is_fixture: bool,
     has_terminal: bool,
-    has_fresh_agent: bool,
+    fresh_agent: Option<&FreshAgentLaunchSpec>,
 ) -> bool {
     is_fixture
-        || has_fresh_agent
+        || fresh_agent.is_some_and(|agent| {
+            agent.provider.as_str() == provider
+                && (crate::registry::deterministic_fresh_agent_fixture(provider, agent)
+                    || freshell_agent_runtime::managed_native_fresh_agent_enabled(
+                        &agent.provider,
+                        &agent.session_type,
+                    ))
+        })
         || (has_terminal && freshell_agent_runtime::managed_provider_enabled(provider))
 }
 
@@ -4489,11 +4496,11 @@ mod release_scope_tests {
 
     #[test]
     fn direct_terminal_launch_cannot_bypass_live_qualification_scope() {
-        assert!(release_qualified_workload("shell", false, true, false));
-        assert!(release_qualified_workload("opencode", false, true, false));
+        assert!(release_qualified_workload("shell", false, true, None));
+        assert!(release_qualified_workload("opencode", false, true, None));
         for provider in ["claude", "codex", "amplifier", "gemini", "kimi"] {
             assert!(
-                !release_qualified_workload(provider, false, true, false),
+                !release_qualified_workload(provider, false, true, None),
                 "{provider}"
             );
         }
@@ -4501,9 +4508,74 @@ mod release_scope_tests {
             "native-session-fixture",
             true,
             false,
-            false
+            None
         ));
-        assert!(release_qualified_workload("claude", false, false, true));
+        for (provider, mode) in [
+            ("claude", "freshclaude"),
+            ("codex", "freshcodex"),
+            ("opencode", "freshopencode"),
+            ("kilroy", "kilroy"),
+        ] {
+            let mut agent: freshell_runtime_protocol::FreshAgentLaunchSpec =
+                serde_json::from_value(serde_json::json!({
+                    "sessionId":"public-test", "provider":provider, "sessionType":mode,
+                    "runtimeVariant":"owned-test-variant", "providerStoreId":"soul-test",
+                    "cwd":"/workspace", "workspacePath":"/workspace", "runAsUid":65534,"runAsGid":0
+                }))
+                .unwrap();
+            assert_eq!(
+                release_qualified_workload(provider, false, false, Some(&agent)),
+                provider != "kilroy"
+            );
+            assert!(!release_qualified_workload(
+                "other",
+                false,
+                false,
+                Some(&agent)
+            ));
+            agent.fixture_transport =
+                Some(freshell_runtime_protocol::FreshAgentFixtureTransport::Deterministic);
+            assert!(release_qualified_workload(
+                provider,
+                false,
+                false,
+                Some(&agent)
+            ));
+            agent.session_type = "mismatched-mode".into();
+            assert!(!release_qualified_workload(
+                provider,
+                false,
+                false,
+                Some(&agent)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn release_qualified_workload_rejects_native_kilroy_before_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::registry::Registry::open(dir.path().join("registry"), None).unwrap();
+        let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+        let request: freshell_runtime_protocol::LaunchRequest = serde_json::from_value(serde_json::json!({
+            "soulId":"soul-excluded-kilroy", "provider":"kilroy", "providerStoreId":"soul-excluded-kilroy",
+            "creationSeedRef":"excluded-kilroy", "limits":{"cpuMilli":2000,"memoryBytes":1073741824,"swapBytes":0,"pidsMax":512},
+            "freshAgent":{"sessionId":"public-kilroy", "provider":"kilroy", "sessionType":"kilroy",
+                "runtimeVariant":"kilroy-claude-agent-sdk", "providerStoreId":"soul-excluded-kilroy",
+                "cwd":"/workspace", "workspacePath":"/workspace", "runAsUid":65534,"runAsGid":0}
+        })).unwrap();
+        let mut mismatched = request.clone();
+        mismatched.fresh_agent.as_mut().unwrap().session_type = "freshclaude".into();
+        let error = supervisor
+            .launch(freshell_runtime_protocol::RequestId::new(), mismatched)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, RuntimeErrorCode::InvalidRequest);
+        let error = supervisor
+            .launch(freshell_runtime_protocol::RequestId::new(), request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, RuntimeErrorCode::UnsupportedWorkload);
+        assert!(registry.inventory().await.unwrap().is_empty());
     }
 
     #[test]

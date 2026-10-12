@@ -558,6 +558,21 @@ pub fn managed_provider_enabled(provider: &str) -> bool {
         || qualification_managed_provider_enabled(provider)
 }
 
+/// Native fresh transports retained by the repair. This admission boundary
+/// does not certify their recovery or enable a release promise.
+pub fn managed_native_fresh_agent_enabled(
+    provider: &freshell_runtime_protocol::FreshProvider,
+    session_type: &str,
+) -> bool {
+    use freshell_runtime_protocol::FreshProvider;
+    matches!(
+        (provider, session_type),
+        (FreshProvider::Claude, "freshclaude")
+            | (FreshProvider::Codex, "freshcodex")
+            | (FreshProvider::Opencode, "freshopencode")
+    )
+}
+
 /// True only when the provider may make a production durable-soul promise:
 /// live-certified, managed-enabled, and durable-recovery-enabled together.
 ///

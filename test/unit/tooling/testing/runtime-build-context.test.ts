@@ -44,6 +44,9 @@ describe('managed builders copy the actual Cargo target artifacts', () => {
     directory = fs.mkdtempSync(path.join(os.tmpdir(), 'runtime-build-target-'))
     const repo = path.join(directory, 'repo')
     fs.mkdirSync(repo)
+    fs.mkdirSync(path.join(repo, 'docs/development'), { recursive: true })
+    fs.copyFileSync(path.join(root, 'docs/development/runtime-provider-capabilities.json'),
+      path.join(repo, 'docs/development/runtime-provider-capabilities.json'))
     execFileSync('git', ['init', '--quiet'], { cwd: repo })
     execFileSync('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
       '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '--quiet', '-m', 'fixture'], { cwd: repo })
@@ -106,5 +109,52 @@ describe('managed builders copy the actual Cargo target artifacts', () => {
       expect(fs.readFileSync(path.join(repo, 'target', profile, 'freshell-supervisor'), 'utf8'))
         .toBe(`stale:${profile}:freshell-supervisor`)
     }
+  })
+
+  it.each(['pending', 'promoted', 'not-ready', 'fixture'] as const)('dispatches %s builds from current requested capabilities', kind => {
+    directory = fs.mkdtempSync(path.join(os.tmpdir(), 'runtime-build-policy-'))
+    const repo = path.join(directory, 'repo')
+    fs.mkdirSync(path.join(repo, 'docs/development'), { recursive: true })
+    const manifest = JSON.parse(fs.readFileSync(path.join(root, 'docs/development/runtime-provider-capabilities.json'), 'utf8'))
+    for (const row of manifest.providers) if (['claude', 'codex'].includes(row.provider)) {
+      if (kind === 'promoted') Object.assign(row, { certificationState: 'certified', managedEnabled: true })
+      if (kind === 'not-ready') row.qualificationReady = false
+    }
+    fs.writeFileSync(path.join(repo, 'docs/development/runtime-provider-capabilities.json'), JSON.stringify(manifest))
+    execFileSync('git', ['init', '--quiet'], { cwd: repo })
+    execFileSync('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
+      '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '--quiet', '-m', 'fixture'], { cwd: repo })
+    const home = path.join(directory, 'builder-home')
+    const mise = path.join(home, '.local/bin/mise')
+    fs.mkdirSync(path.dirname(mise), { recursive: true })
+    fs.writeFileSync(mise, `#!${process.execPath}\n
+      const fs = require('node:fs'); const path = require('node:path');
+      const args = process.argv.slice(2);
+      fs.appendFileSync('dispatch.jsonl', JSON.stringify(args) + '\\n');
+      const bin = args[args.indexOf('-p') + 1];
+      fs.mkdirSync('target/release', { recursive: true });
+      fs.writeFileSync(path.join('target/release', bin), 'controlled-current-artifact');
+    `, { mode: 0o755 })
+    const env = { ...process.env, HOME: home }
+    delete env.CARGO_TARGET_DIR
+    const outcome = JSON.parse(execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', `
+      const { ManagedRuntimeOwner } = await import(${JSON.stringify(pathToFileURL(path.join(root, 'scripts/testing/runtime-sandbox.ts')).href)});
+      const rig = new ManagedRuntimeOwner(() => { throw new Error('web unused'); },
+        ${JSON.stringify(repo)}, 2, {}, {}, ${JSON.stringify(kind === 'fixture' ? 'test' : 'release')},
+        ${JSON.stringify(kind === 'fixture'
+          ? { enabledProviders: [], freshAgentModes: ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'], fixtureFreshAgentModes: ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'] }
+          : { enabledProviders: ['claude', 'codex', 'opencode'] })});
+      const fs = await import('node:fs'); fs.mkdirSync(rig.runtime.buildDir, { recursive: true });
+      const supervisor = rig.buildQualificationSupervisor(); const server = rig.buildManagedServer();
+      process.stdout.write(JSON.stringify({ supervisor: supervisor ?? null, server, environment: rig.qualificationEnvironment() }));
+    `], { cwd: root, env, encoding: 'utf8', timeout: 15_000 }))
+    const calls = fs.readFileSync(path.join(repo, 'dispatch.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line) as string[])
+    const server = calls.find(args => args.includes('freshell-server'))!
+    expect(server[server.indexOf('--features') + 1]).toBe(kind === 'fixture' ? 'managed-fresh-agent-fixtures'
+      : kind === 'pending' ? 'managed-provider-qualification' : 'managed-runtime-v1')
+    expect(calls.some(args => args.includes('freshell-supervisor'))).toBe(kind === 'pending')
+    expect(outcome.supervisor !== null).toBe(kind === 'pending')
+    expect(outcome.environment).toEqual(kind === 'pending' ? { FRESHELL_MANAGED_PROVIDER_QUALIFICATION: 'claude,codex' } : {})
+    expect(fs.readFileSync(outcome.server, 'utf8')).toBe('controlled-current-artifact')
   })
 })

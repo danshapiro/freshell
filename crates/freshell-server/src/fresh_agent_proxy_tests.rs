@@ -456,33 +456,92 @@ async fn create_failure_trace_missing_cwd() {
     let events = crate::test_trace_capture::captured_trace_events();
     let root = tempfile::tempdir().unwrap();
     let proxy = snapshot_outage_proxy(&root.path().join("never-contacted.sock"));
-    let message = serde_json::from_value(serde_json::json!({"requestId":"trace-cwd-owned", "provider":"claude", "sessionType":"freshclaude",
-        "cwd":root.path().join("missing-private-workspace")})).unwrap();
+    for (provider, mode) in [
+        ("claude", "freshclaude"),
+        ("codex", "freshcodex"),
+        ("opencode", "freshopencode"),
+    ] {
+        let request_id = format!("trace-cwd-owned-{provider}");
+        let message = serde_json::from_value(
+            serde_json::json!({"requestId":request_id, "provider":provider, "sessionType":mode,
+        "cwd":root.path().join("missing-private-workspace")}),
+        )
+        .unwrap();
+        assert!(proxy.create(message).await.is_err());
+        let captured = events.snapshot();
+        let event = captured
+            .iter()
+            .find(|event| {
+                event.fields.get("request_id").map(String::as_str) == Some(request_id.as_str())
+            })
+            .expect("executed cwd refusal must emit its finite create observation");
+        assert_eq!(event.level, tracing::Level::WARN);
+        assert_eq!(
+            event.fields.get("event").map(String::as_str),
+            Some("fresh_agent.create.preparation_failed")
+        );
+        assert_eq!(
+            event.fields.get("reason").map(String::as_str),
+            Some("cwd_unavailable")
+        );
+        assert_eq!(
+            event.fields.get("provider").map(String::as_str),
+            Some(provider)
+        );
+        assert_eq!(
+            event.fields.get("session_type").map(String::as_str),
+            Some(mode)
+        );
+        assert!(!format!("{event:?}").contains("missing-private-workspace"));
+        assert!(!event.fields.contains_key("error"));
+    }
+}
+
+#[tokio::test]
+async fn create_failure_trace_excluded_native_mode_before_bootstrap() {
+    if create_failure_trace_child(
+        "excluded-native",
+        "fresh_agent_proxy::tests::create_failure_trace_excluded_native_mode_before_bootstrap",
+    ) {
+        return;
+    }
+    let events = crate::test_trace_capture::captured_trace_events();
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("never-contacted.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let proxy = snapshot_outage_proxy(&socket);
+    let message = serde_json::from_value(serde_json::json!({"requestId":"excluded-native-kilroy", "provider":"claude", "sessionType":"kilroy", "cwd":root.path().join("missing-workspace")})).unwrap();
     assert!(proxy.create(message).await.is_err());
-    let captured = events.snapshot();
-    let event = captured
-        .iter()
-        .find(|event| event.fields.get("request_id").map(String::as_str) == Some("trace-cwd-owned"))
-        .expect("executed cwd refusal must emit its finite create observation");
-    assert_eq!(event.level, tracing::Level::WARN);
-    assert_eq!(
-        event.fields.get("event").map(String::as_str),
-        Some("fresh_agent.create.preparation_failed")
+    let message = serde_json::from_value(serde_json::json!({"requestId":"excluded-native-kilroy-resume", "provider":"claude", "sessionType":"kilroy",
+        "sessionRef":{"provider":"claude", "sessionId":"owned-never-resumed"}, "cwd":root.path()})).unwrap();
+    assert!(proxy.create(message).await.is_err());
+    for (provider, mode) in [
+        ("codex", "freshclaude"),
+        ("opencode", "freshcodex"),
+        ("claude", "freshopencode"),
+    ] {
+        let message = serde_json::from_value(
+            serde_json::json!({"requestId":format!("invalid-pair-{provider}"),
+            "provider":provider, "sessionType":mode, "cwd":root.path()}),
+        )
+        .unwrap();
+        assert!(proxy.create(message).await.is_err());
+    }
+    let observed = events.snapshot();
+    assert!(
+        observed
+            .iter()
+            .any(|event| event.fields.get("reason").map(String::as_str)
+                == Some("mode_not_release_qualified")),
+        "{observed:?}"
     );
-    assert_eq!(
-        event.fields.get("reason").map(String::as_str),
-        Some("cwd_unavailable")
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), listener.accept())
+            .await
+            .is_err()
     );
-    assert_eq!(
-        event.fields.get("provider").map(String::as_str),
-        Some("claude")
-    );
-    assert_eq!(
-        event.fields.get("session_type").map(String::as_str),
-        Some("freshclaude")
-    );
-    assert!(!format!("{event:?}").contains("missing-private-workspace"));
-    assert!(!event.fields.contains_key("error"));
+    assert!(proxy.aliases.lock().await.is_empty());
+    assert!(proxy.pollers.lock().await.is_empty());
 }
 
 #[tokio::test]
@@ -585,6 +644,7 @@ async fn create_failure_trace_launch_rejection() {
     assert!(!event.fields.contains_key("error"));
 }
 
+#[cfg(feature = "managed-fresh-agent-fixtures")]
 #[tokio::test]
 async fn kilroy_create_uses_claude_native_dependencies_without_changing_runtime_identity() {
     if create_failure_trace_child("kilroy-family", "fresh_agent_proxy::tests::kilroy_create_uses_claude_native_dependencies_without_changing_runtime_identity") { return; }
@@ -636,6 +696,10 @@ async fn kilroy_create_uses_claude_native_dependencies_without_changing_runtime_
                     assert_eq!(fresh.provider, FreshProvider::Kilroy);
                     assert_eq!(fresh.session_type, "kilroy");
                     assert_eq!(fresh.runtime_variant, "kilroy-claude-agent-sdk");
+                    assert_eq!(
+                        fresh.fixture_transport,
+                        Some(FreshAgentFixtureTransport::Deterministic)
+                    );
                     assert_eq!(fresh.provider_secret_references.len(), 1);
                     assert_eq!(
                         fresh.provider_secret_references[0].source_path,
@@ -702,7 +766,11 @@ async fn kilroy_create_uses_claude_native_dependencies_without_changing_runtime_
             .unwrap();
         }
     });
-    let proxy = snapshot_outage_proxy(&socket);
+    let mut proxy = snapshot_outage_proxy(&socket);
+    Arc::get_mut(&mut proxy)
+        .unwrap()
+        .fixture_modes
+        .insert("kilroy".into());
     let message = serde_json::from_value(serde_json::json!({"requestId":"owned-kilroy-create", "provider":"claude", "sessionType":"kilroy", "cwd":root.path()})).unwrap();
     assert!(
         tokio::time::timeout(Duration::from_secs(5), proxy.create(message))

@@ -20,6 +20,7 @@ import { buildProviderQualificationReceipt, type ProviderQualificationReceiptV2,
 import { buildFreshAgentQualificationReceipt, deriveFreshBrowserExecution, matchesFreshBrowserFrame, sameFreshBrowserActivation, validateFreshBrowserAlias, validateFreshApprovalCheckpoint, validateFreshApprovalDispatch, validateFreshApprovalRecovery, nativeCompletedTurnProofs, type FreshBrowserIngressObservation, type FreshAgentQualificationReceiptV1, type FreshAgentQualificationRow } from './fresh-agent-qualification-receipt.js'
 import { claudeNativeInspection, nativeCheckpointTranscriptRetained, observeNativeSoloBashOutcome, openCodeFreeAccessScript } from './runtime-native-feasibility.js'
 import type { QualifiableTerminalProvider } from './provider-qualification-selection.js'
+import { deferredProviders, loadCapabilityManifest } from './provider-certification.js'
 import { deriveNativeRecoveryOriginals, NATIVE_RECOVERY_ORIGINALS_FILE, type NativeOriginalReference, type NativeRecoveryStage } from './qualification-observations.js'
 import type { NativeHistory } from './provider-native-history.js'
 
@@ -8037,9 +8038,13 @@ export class ManagedRuntimeOwner {
   }
 
   private pendingQualificationProviders(): QualifiableTerminalProvider[] {
+    if (this.enabledProviders.length === 0) return []
+    const manifest = loadCapabilityManifest(this.repoRoot)
+    const pending = new Set(deferredProviders(manifest).filter(provider =>
+      manifest.providers.find(row => row.provider === provider)?.qualificationReady === true))
     return this.enabledProviders.filter(
       (provider): provider is QualifiableTerminalProvider => (
-        provider === 'claude' || provider === 'codex' || provider === 'amplifier'
+        pending.has(provider)
       ),
     )
   }

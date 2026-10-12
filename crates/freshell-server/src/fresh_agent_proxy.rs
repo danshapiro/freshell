@@ -375,6 +375,21 @@ impl HostedFreshAgentProxy {
                 );
             })?;
         let public_provider = fresh_provider_wire(&provider);
+        let session_type = session_type_wire(message.session_type);
+        let fixture_selected = cfg!(feature = "managed-fresh-agent-fixtures")
+            && self.fixture_modes.contains(&session_type);
+        if !fixture_selected
+            && !freshell_agent_runtime::managed_native_fresh_agent_enabled(&provider, &session_type)
+        {
+            tracing::warn!(
+                event = "fresh_agent.create.preparation_failed",
+                reason = "mode_not_release_qualified",
+                request_id = message.request_id.as_str(),
+                provider = provider.as_str(),
+                session_type = session_type.as_str()
+            );
+            return Err(());
+        }
         if let Some(session_ref) = message.session_ref.as_ref() {
             if session_ref.provider != public_provider {
                 tracing::warn!(
@@ -489,7 +504,6 @@ impl HostedFreshAgentProxy {
             .session_ref
             .as_ref()
             .map(|value| value.session_id.clone());
-        let session_type = session_type_wire(message.session_type);
         let request_id = stable_request_id(&message.request_id).map_err(|_| {
             tracing::warn!(event="fresh_agent.create.preparation_failed", reason="invalid_request_id",
                 request_id=message.request_id.as_str(), provider=provider.as_str(), session_type=session_type.as_str(), soul_id=%soul);
@@ -582,9 +596,7 @@ impl HostedFreshAgentProxy {
                     session_id: reference.session_id.clone(),
                 }
             }),
-            fixture_transport: self
-                .fixture_modes
-                .contains(&session_type)
+            fixture_transport: fixture_selected
                 .then_some(FreshAgentFixtureTransport::Deterministic),
             provider_bootstrap_files,
             provider_secret_references,
