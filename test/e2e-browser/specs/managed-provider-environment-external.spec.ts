@@ -33,7 +33,7 @@ async function activePane(page: Page) {
 }
 
 async function launch(page: Page, scenario: string) {
-  await page.goto(`${paired!.targetUrl}/?token=${encodeURIComponent(paired!.targetToken)}`)
+  await page.goto(`${paired!.targetUrl}/?token=${encodeURIComponent(paired!.targetToken)}&e2e=1`)
   await page.waitForFunction(() => Boolean(window.__FRESHELL_TEST_HARNESS__), undefined, { timeout: 60_000 })
   await new TestHarness(page).waitForConnection(120_000)
   const info = await json(page, '/api/server-info')
