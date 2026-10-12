@@ -19,7 +19,6 @@ use freshell_runtime_protocol::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-#[cfg(not(test))]
 use std::process::Stdio;
 use std::{
     fs,
@@ -27,7 +26,6 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-#[cfg(not(test))]
 use tokio::io::AsyncWriteExt;
 use tokio::{
     process::{Child, Command},
@@ -60,6 +58,7 @@ pub(crate) struct DeterministicFreshAgentTransport {
     event_rx: std::sync::Mutex<Option<mpsc::Receiver<AgentEvent>>>,
     run_as_uid: u32,
     run_as_gid: u32,
+    helpers: ProviderStateHelpers,
 }
 
 impl DeterministicFreshAgentTransport {
@@ -70,19 +69,21 @@ impl DeterministicFreshAgentTransport {
         run_as_gid: u32,
     ) -> Result<Arc<Self>, String> {
         let state_dir = state_dir.into();
-        let state =
-            if let Some(state) = read_provider_state(&state_dir, run_as_uid, run_as_gid).await? {
-                state
-            } else {
-                FixtureState {
-                    schema_version: 1,
-                    native_session_id: fixture_native_id(profile),
-                    dispatch_count: 0,
-                    completion_count: 0,
-                    pending_decision_id: None,
-                    create_profile: None,
-                }
-            };
+        let helpers = ProviderStateHelpers::default();
+        let state = if let Some(state) =
+            read_provider_state(&state_dir, run_as_uid, run_as_gid, &helpers).await?
+        {
+            state
+        } else {
+            FixtureState {
+                schema_version: 1,
+                native_session_id: fixture_native_id(profile),
+                dispatch_count: 0,
+                completion_count: 0,
+                pending_decision_id: None,
+                create_profile: None,
+            }
+        };
         if profile
             .native_session_id
             .as_deref()
@@ -90,7 +91,7 @@ impl DeterministicFreshAgentTransport {
         {
             return Err("deterministic provider native identity mismatch".into());
         }
-        write_provider_state(&state_dir, &state, run_as_uid, run_as_gid).await?;
+        write_provider_state(&state_dir, &state, run_as_uid, run_as_gid, &helpers).await?;
         let (event_tx, event_rx) = mpsc::channel(EVENT_CAPACITY);
         Ok(Arc::new(Self {
             state_dir,
@@ -101,6 +102,7 @@ impl DeterministicFreshAgentTransport {
             event_rx: std::sync::Mutex::new(Some(event_rx)),
             run_as_uid,
             run_as_gid,
+            helpers,
         }))
     }
 
@@ -156,9 +158,15 @@ impl DeterministicFreshAgentTransport {
             let turn_id = format!("turn-{}-{ordinal}", short_hash(request_id.as_str()));
             let message_id = format!("assistant-{}-{ordinal}", short_hash(&turn_id));
             let native = state.native_session_id.clone();
-            write_provider_state(&self.state_dir, &state, self.run_as_uid, self.run_as_gid)
-                .await
-                .map_err(non_ambiguous)?;
+            write_provider_state(
+                &self.state_dir,
+                &state,
+                self.run_as_uid,
+                self.run_as_gid,
+                &self.helpers,
+            )
+            .await
+            .map_err(non_ambiguous)?;
             (native, turn_id, message_id)
         };
         let completion = json!({"provider":self.provider.as_str(), "nativeId":native_session_id,
@@ -170,6 +178,7 @@ impl DeterministicFreshAgentTransport {
             &self.state_dir,
             self.run_as_uid,
             self.run_as_gid,
+            &self.helpers,
             "completion",
             Some(
                 &serde_json::to_vec(&completion)
@@ -249,12 +258,20 @@ impl FreshAgentTransport for DeterministicFreshAgentTransport {
                 &self.state_dir,
                 self.run_as_uid,
                 self.run_as_gid,
+                &self.helpers,
                 "initialize",
                 Some(&serde_json::to_vec(&metadata).map_err(|error| error.to_string())?),
             )
             .await?;
             state.create_profile = Some(profile.clone());
-            write_provider_state(&self.state_dir, &state, self.run_as_uid, self.run_as_gid).await?;
+            write_provider_state(
+                &self.state_dir,
+                &state,
+                self.run_as_uid,
+                self.run_as_gid,
+                &self.helpers,
+            )
+            .await?;
         }
         // Failed metadata reads/writes never leave a newly spawned worker.
         self.spawn_provider_process().await?;
@@ -281,9 +298,15 @@ impl FreshAgentTransport for DeterministicFreshAgentTransport {
                 }
                 let decision_id = format!("decision-{}", short_hash(request_id.as_str()));
                 state.pending_decision_id = Some(decision_id.clone());
-                write_provider_state(&self.state_dir, &state, self.run_as_uid, self.run_as_gid)
-                    .await
-                    .map_err(non_ambiguous)?;
+                write_provider_state(
+                    &self.state_dir,
+                    &state,
+                    self.run_as_uid,
+                    self.run_as_gid,
+                    &self.helpers,
+                )
+                .await
+                .map_err(non_ambiguous)?;
                 drop(state);
                 self.event_tx
                     .send(AgentEvent::PermissionRequested {
@@ -301,9 +324,15 @@ impl FreshAgentTransport for DeterministicFreshAgentTransport {
                     provider_ack_id: Some(request_id.as_str().into()),
                 });
             }
-            write_provider_state(&self.state_dir, &state, self.run_as_uid, self.run_as_gid)
-                .await
-                .map_err(non_ambiguous)?;
+            write_provider_state(
+                &self.state_dir,
+                &state,
+                self.run_as_uid,
+                self.run_as_gid,
+                &self.helpers,
+            )
+            .await
+            .map_err(non_ambiguous)?;
         }
         if text != HANG_AFTER_ACCEPT_CONTROL {
             self.emit_completion(request_id).await?;
@@ -324,9 +353,15 @@ impl FreshAgentTransport for DeterministicFreshAgentTransport {
                 return Err(non_ambiguous("deterministic decision identity mismatch"));
             }
             state.pending_decision_id = None;
-            write_provider_state(&self.state_dir, &state, self.run_as_uid, self.run_as_gid)
-                .await
-                .map_err(non_ambiguous)?;
+            write_provider_state(
+                &self.state_dir,
+                &state,
+                self.run_as_uid,
+                self.run_as_gid,
+                &self.helpers,
+            )
+            .await
+            .map_err(non_ambiguous)?;
             RequestId::parse(format!("resolved-{decision_id}"))
                 .map_err(|error| non_ambiguous(error.to_string()))?
         };
@@ -347,6 +382,7 @@ impl FreshAgentTransport for DeterministicFreshAgentTransport {
             &state.native_session_id,
             self.run_as_uid,
             self.run_as_gid,
+            &self.helpers,
         )
         .await?;
         let provider = if self.provider == FreshProvider::Kilroy {
@@ -382,11 +418,12 @@ impl FreshAgentTransport for DeterministicFreshAgentTransport {
     }
 
     async fn stop(self: Arc<Self>) -> Result<(), String> {
+        let helper_result = self.helpers.settle().await;
         if let Some(mut child) = self.child.lock().await.take() {
             child.kill().await.map_err(|error| error.to_string())?;
             let _ = child.wait().await;
         }
-        Ok(())
+        helper_result
     }
 
     fn take_event_stream(&self) -> Option<mpsc::Receiver<AgentEvent>> {
@@ -435,7 +472,14 @@ pub(crate) async fn probe_resume(
     run_as_uid: u32,
     run_as_gid: u32,
 ) -> Result<ProviderStoreProbe, String> {
-    let Some(state) = read_provider_state(state_dir, run_as_uid, run_as_gid).await? else {
+    let Some(state) = read_provider_state(
+        state_dir,
+        run_as_uid,
+        run_as_gid,
+        &ProviderStateHelpers::default(),
+    )
+    .await?
+    else {
         return Ok(ProviderStoreProbe::DefinitivelyUnavailable {
             reason: "deterministic provider state is absent".into(),
             evidence: vec!["fixtureState=missing".into()],
@@ -586,6 +630,8 @@ if c['completed']:
   db.execute('INSERT OR IGNORE INTO part VALUES(?,?,?,?,?)',('part-'+key,native,key,at,json.dumps(part)))
 db.commit(); db.close()
 "#;
+        #[cfg(test)]
+        let script = script.replace("db.executescript(", "if c.get('writerGate'):\n import socket\n gate=socket.socket(socket.AF_UNIX); gate.settimeout(10); gate.connect(c['writerGate']); gate.sendall(b'R'); gate.recv(1); gate.close()\ndb.executescript(");
         let mut child = std::process::Command::new("python3")
             .arg("-c")
             .arg(script)
@@ -668,6 +714,7 @@ async fn read_provider_state(
     state_dir: &Path,
     _run_as_uid: u32,
     _run_as_gid: u32,
+    _helpers: &ProviderStateHelpers,
 ) -> Result<Option<FixtureState>, String> {
     read_state(state_dir)
 }
@@ -678,6 +725,7 @@ async fn write_provider_state(
     state: &FixtureState,
     _run_as_uid: u32,
     _run_as_gid: u32,
+    _helpers: &ProviderStateHelpers,
 ) -> Result<(), String> {
     write_state(state_dir, state)
 }
@@ -687,8 +735,10 @@ async fn read_provider_state(
     state_dir: &Path,
     run_as_uid: u32,
     run_as_gid: u32,
+    helpers: &ProviderStateHelpers,
 ) -> Result<Option<FixtureState>, String> {
-    let output = provider_state_worker(state_dir, run_as_uid, run_as_gid, "read", None).await?;
+    let output =
+        provider_state_worker(state_dir, run_as_uid, run_as_gid, helpers, "read", None).await?;
     serde_json::from_slice(&output)
         .map_err(|error| format!("decode provider-state worker reply: {error}"))
 }
@@ -700,6 +750,7 @@ async fn read_provider_snapshot(
     native_id: &str,
     _: u32,
     _: u32,
+    _helpers: &ProviderStateHelpers,
 ) -> Result<Value, String> {
     freshell_freshagent::native_history::read(
         provider,
@@ -717,11 +768,19 @@ async fn read_provider_snapshot(
     native_id: &str,
     run_as_uid: u32,
     run_as_gid: u32,
+    helpers: &ProviderStateHelpers,
 ) -> Result<Value, String> {
     let input = serde_json::to_vec(&json!({"provider":provider,"nativeId":native_id}))
         .map_err(|error| error.to_string())?;
-    let output =
-        provider_state_worker(state_dir, run_as_uid, run_as_gid, "snapshot", Some(&input)).await?;
+    let output = provider_state_worker(
+        state_dir,
+        run_as_uid,
+        run_as_gid,
+        helpers,
+        "snapshot",
+        Some(&input),
+    )
+    .await?;
     serde_json::from_slice(&output).map_err(|error| format!("decode provider snapshot: {error}"))
 }
 
@@ -731,11 +790,19 @@ async fn write_provider_state(
     state: &FixtureState,
     run_as_uid: u32,
     run_as_gid: u32,
+    helpers: &ProviderStateHelpers,
 ) -> Result<(), String> {
     let input = serde_json::to_vec(state).map_err(|error| error.to_string())?;
-    provider_state_worker(state_dir, run_as_uid, run_as_gid, "write", Some(&input))
-        .await
-        .map(|_| ())
+    provider_state_worker(
+        state_dir,
+        run_as_uid,
+        run_as_gid,
+        helpers,
+        "write",
+        Some(&input),
+    )
+    .await
+    .map(|_| ())
 }
 
 #[cfg(not(test))]
@@ -743,6 +810,7 @@ async fn provider_state_worker(
     state_dir: &Path,
     run_as_uid: u32,
     run_as_gid: u32,
+    helpers: &ProviderStateHelpers,
     operation: &str,
     input: Option<&[u8]>,
 ) -> Result<Vec<u8>, String> {
@@ -774,13 +842,54 @@ async fn provider_state_worker(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    helpers.run(command, input.map(<[u8]>::to_vec)).await
+}
+
+type HelperTask = tokio::task::JoinHandle<Result<Vec<u8>, String>>;
+
+/// A cancelled request leaves its helper join handle with the transport.
+/// The worker itself waits for its SQLite child before this task can finish.
+#[derive(Default)]
+struct ProviderStateHelpers {
+    task: Mutex<Option<HelperTask>>,
+}
+
+impl ProviderStateHelpers {
+    async fn settle(&self) -> Result<(), String> {
+        Self::join(&mut *self.task.lock().await).await.map(|_| ())
+    }
+
+    async fn join(slot: &mut Option<HelperTask>) -> Result<Vec<u8>, String> {
+        let Some(task) = slot.as_mut() else {
+            return Ok(Vec::new());
+        };
+        // Await by reference: cancellation must not take or drop the handle.
+        let result = task
+            .await
+            .map_err(|error| format!("join provider-state worker: {error}"));
+        *slot = None;
+        result?
+    }
+
+    async fn run(&self, command: Command, input: Option<Vec<u8>>) -> Result<Vec<u8>, String> {
+        let mut slot = self.task.lock().await;
+        Self::join(&mut slot).await?;
+        *slot = Some(tokio::spawn(wait_for_state_worker(command, input)));
+        Self::join(&mut slot).await
+    }
+}
+
+async fn wait_for_state_worker(
+    mut command: Command,
+    input: Option<Vec<u8>>,
+) -> Result<Vec<u8>, String> {
     let mut child = command
         .spawn()
         .map_err(|error| format!("spawn provider-state worker: {error}"))?;
     let write_result = if let Some(input) = input {
         match child.stdin.take() {
             Some(mut stdin) => stdin
-                .write_all(input)
+                .write_all(&input)
                 .await
                 .map_err(|error| format!("write provider-state worker: {error}")),
             None => Err("provider-state worker has no stdin".to_string()),
@@ -866,6 +975,128 @@ fn unix_millis() -> u64 {
 mod tests {
     use super::*;
     use freshell_runtime_protocol::FreshAgentTurnSettings;
+
+    #[test]
+    fn controlled_sqlite_helper_child() {
+        let Some(home) = std::env::var_os("FRESHELL_CONTROLLED_HELPER_HOME") else {
+            return;
+        };
+        let home = PathBuf::from(home);
+        let input: Value =
+            serde_json::from_slice(&fs::read(home.join("input.json")).unwrap()).unwrap();
+        write_native_history(&home.join("fixture"), &input, false).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_native_helper_is_joined_before_stop() {
+        assert_cancelled_native_helper(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_native_helper_is_joined_before_reuse() {
+        assert_cancelled_native_helper(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_native_helper_input_error_is_joined_before_stop() {
+        assert_cancelled_native_helper(false, true).await;
+    }
+
+    fn controlled_writer_command(home: &Path) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("providers::deterministic_fresh_agent::tests::controlled_sqlite_helper_child")
+            .arg("--nocapture")
+            .env_clear()
+            .env("FRESHELL_CONTROLLED_HELPER_HOME", home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    async fn assert_cancelled_native_helper(reuse: bool, input_error: bool) {
+        use std::{
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+        use tokio::io::AsyncReadExt;
+        let home = tempfile::tempdir().unwrap();
+        let profile = initial_profile(FreshProvider::Opencode);
+        let transport = DeterministicFreshAgentTransport::open(
+            home.path().join("fixture"),
+            &profile,
+            unsafe { libc::getuid() },
+            unsafe { libc::getgid() },
+        )
+        .await
+        .unwrap();
+        let root = transport.state.lock().await.native_session_id.clone();
+        let socket = home.path().join("writer.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        fs::write(
+            home.path().join("input.json"),
+            serde_json::to_vec(&json!({
+                "provider":"opencode", "nativeId":root, "cwd":profile.cwd,
+                "at":1, "allowCreate":true, "writerGate":socket,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // The exact Rust test child never reads stdin: a large write must fail
+        // with BrokenPipe after that child has joined its SQLite writer.
+        let input = input_error.then(|| vec![b'x'; 1024 * 1024]);
+        let outcome: Result<_, String> = async {
+            let mut operation = Box::pin(transport.helpers.run(controlled_writer_command(home.path()), input));
+            let (mut writer, _) = tokio::select! {
+                result = &mut operation => return Err(format!("helper exited before controlled SQLite IO: {result:?}")),
+                result = tokio::time::timeout(Duration::from_secs(10), listener.accept()) => result.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?,
+            };
+            let mut ready = [0];
+            writer.read_exact(&mut ready).await.map_err(|e| e.to_string())?;
+            // Python has opened this exact SQLite file and is blocked on our socket.
+            // Drop the owning request, then poll its next owner at this boundary.
+            drop(operation);
+            let mut next: std::pin::Pin<Box<dyn Future<Output = Result<(), String>>>> = if reuse {
+                Box::pin(async { transport.helpers.run(controlled_writer_command(home.path()), None).await.map(|_| ()) })
+            } else {
+                Box::pin(transport.clone().stop())
+            };
+            let next_poll = next.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+            let owner_waited = matches!(next_poll, Poll::Pending);
+            writer.write_all(b"C").await.map_err(|e| e.to_string())?;
+            drop(writer);
+            let result = match next_poll {
+                Poll::Pending => next.await,
+                Poll::Ready(result) => result,
+            };
+            Ok((ready, owner_waited, result))
+        }.await;
+        // Finally join every owned helper even after a handoff/IO error or RED.
+        let settlement = transport.helpers.settle().await;
+        let stop = transport.clone().stop().await;
+        let (ready, owner_waited, result) = outcome.unwrap();
+        settlement.unwrap();
+        stop.unwrap();
+        assert_eq!(ready, [b'R']);
+        if input_error {
+            assert!(result
+                .unwrap_err()
+                .starts_with("write provider-state worker:"));
+        } else {
+            result.unwrap();
+        }
+        assert!(transport.helpers.task.lock().await.is_none());
+        let saved =
+            freshell_freshagent::native_history::read("opencode", home.path(), &root).unwrap();
+        assert_eq!(saved["turns"], json!([]));
+        assert_eq!(saved["threadId"], root);
+        assert!(
+            owner_waited,
+            "owner completed while its cancelled operation's SQLite writer was still blocked"
+        );
+    }
 
     fn initial_profile(provider: FreshProvider) -> FreshAgentProfile {
         FreshAgentProfile {
@@ -1198,9 +1429,13 @@ mod tests {
                 pending_decision_id: Some("pending-preserved".into()),
                 create_profile: Some(saved_profile.clone()),
             };
-            write_provider_state(&state_dir, &old, unsafe { libc::getuid() }, unsafe {
-                libc::getgid()
-            })
+            write_provider_state(
+                &state_dir,
+                &old,
+                unsafe { libc::getuid() },
+                unsafe { libc::getgid() },
+                &ProviderStateHelpers::default(),
+            )
             .await
             .unwrap();
             saved_profile.native_session_id = Some(old_id.clone());
