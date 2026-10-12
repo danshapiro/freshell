@@ -7,7 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 import { ManagedRuntimeBrowserRig } from '../../e2e-browser/helpers/managed-runtime.js'
-import { exposeGrantsToHarness, fakeOnecliGrants, withMissingGrant } from './provider-parity-onecli.js'
+import { exposeGrantsToHarness, fakeOnecliGrants, withMissingGrant } from '../../helpers/provider-parity-onecli.js'
 
 const root = path.resolve(import.meta.dirname, '../../..')
 const providers = [

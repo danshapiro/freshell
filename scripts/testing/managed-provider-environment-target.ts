@@ -11,7 +11,7 @@ import { WS_PROTOCOL_VERSION, type ClientMessage } from '../../shared/ws-protoco
 import { ManagedRuntimeBrowserRig, type ManagedRuntimeView } from '../../test/e2e-browser/helpers/managed-runtime.js'
 import { authorizeProviderParityRequest, captureProviderParityVolumes, cleanupProviderParityVolumes } from '../../test/helpers/provider-parity-broker.js'
 import { managedEnvironmentOpencodeSelection } from '../../test/helpers/provider-parity-environment.js'
-import { fakeOnecliGrants } from '../../test/integration/server/provider-parity-onecli.js'
+import { fakeOnecliGrants } from '../../test/helpers/provider-parity-onecli.js'
 import type { InitialProviderVolumeAuthorization } from './runtime-test-broker.js'
 import { resolvePairedExternalFixture } from './e2e-external-target.js'
 import { assertManagedTerminalCreated, observeManagedEnvironmentNativeIdentity, readManagedEnvironmentDaemonId, serviceManagedEnvironmentCases } from './managed-environment-create.js'
