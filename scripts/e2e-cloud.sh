@@ -864,10 +864,13 @@ cmd_run() {
   # Extract and display a per-shard summary from the Playwright output.
   # Each shard's entrypoint prints "Shard X/Y assignment" and Playwright's
   # line reporter prints a final "  N passed (duration)" or
-  # "  N failed, M passed (duration)" summary line.
+  # "  N failed, M passed (duration)" summary line. Cloud Logging prefixes
+  # each returned line with its timestamp and can preserve terminal cursor
+  # controls from Playwright, so normalize those before the target validates
+  # the footer's pass/fail/skip counts.
   echo ""
   echo "[e2e-cloud] Per-shard summary:"
-  echo "$log_output" | grep -E '(\[e2e-entrypoint\] Shard [0-9]+/[0-9]+ assignment|^\s+[0-9]+ (passed|failed))' || true
+  printf '%s\n' "$log_output" | node "$ROOT/scripts/testing/e2e-cloud-log-summary.mjs"
 
   # Check execution status — transient describe errors right after
   # `execute --wait` are a real flake class, so retry briefly; a PERMANENT
