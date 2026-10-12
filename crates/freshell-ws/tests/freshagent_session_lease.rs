@@ -744,6 +744,23 @@ async fn expired_lease_kill_sweeps_the_sidecar_tree_before_release() {
         answer["code"], answer["message"]
     );
     assert!(answer["sessionId"].is_string());
+
+    // A's own create failed because B's kill closed its sidecar under it. A release
+    // without that kill would instead let A's sidecar answer at 5 s, and A would be
+    // refused for losing its lease (`FRESH_AGENT_CREATE_FAILED`).
+    let a_answer = await_frame(&mut ws_a, hang_guard, |v| {
+        (v["type"] == "freshAgent.created" || v["type"] == "freshAgent.create.failed")
+            && v["requestId"] == "req-ttl-a"
+    })
+    .await;
+    assert_eq!(
+        (a_answer["type"].as_str(), a_answer["code"].as_str()),
+        (
+            Some("freshAgent.create.failed"),
+            Some("CLAUDE_CREATE_FAILED")
+        ),
+        "A's create must fail because its sidecar was killed (frame: {a_answer})"
+    );
 }
 
 // ── Task 13: lease at the attach-resume seams ────────────────────────────────────────

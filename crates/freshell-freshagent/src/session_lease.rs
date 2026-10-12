@@ -1501,6 +1501,123 @@ mod tests {
         );
     }
 
+    /// Test cleanup for a test-spawned process the test does not parent:
+    /// SIGKILL it through its pinned incarnation (pid + start time) if it is
+    /// still alive when the test ends, so a failed assertion leaks nothing.
+    #[cfg(target_os = "linux")]
+    struct KillIncarnationOnDrop {
+        pid: u32,
+        start_time: u64,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for KillIncarnationOnDrop {
+        fn drop(&mut self) {
+            let _ = signal_recorded_incarnation(self.pid, Some(self.start_time), libc::SIGKILL);
+        }
+    }
+
+    /// The expired-lease kill (`ExpiredNeedsKill`, then
+    /// [`kill_and_confirm_tree_dead`], then
+    /// `force_release_after_confirmed_kill`) kills the holder's WHOLE tagged
+    /// tree. The holder's tagged grandchild outlives a kill of the holder
+    /// alone, so it must be found by its tag, killed and confirmed dead
+    /// before the lease is released.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_expired_lease_kill_confirms_the_tagged_grandchild_dead_before_release() {
+        use tokio::io::AsyncBufReadExt;
+
+        const OWNERSHIP_ENV: &str = "FRESHELL_LEASE_TREE_KILL_TEST_ID";
+        let ownership_id = format!("lease-tree-kill-{}-{}", std::process::id(), now_epoch_ms());
+        // The holder: a tagged shell that starts a tagged grandchild in the
+        // background, reports its pid, then becomes a long sleep. Killing the
+        // holder does not kill the grandchild.
+        let mut holder = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 300 </dev/null >/dev/null 2>&1 & echo $!; exec sleep 300")
+            .env(OWNERSHIP_ENV, &ownership_id)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the tagged holder");
+        let holder_pid = holder.id().expect("holder pid");
+        let mut report = String::new();
+        tokio::io::BufReader::new(holder.stdout.take().expect("holder stdout"))
+            .read_line(&mut report)
+            .await
+            .expect("read the grandchild's pid");
+        let grandchild_pid: u32 = report
+            .trim()
+            .parse()
+            .expect("the holder reports its grandchild's pid");
+        let holder_start = proc_starttime(holder_pid as i32).expect("the holder's start time");
+        let grandchild_start =
+            proc_starttime(grandchild_pid as i32).expect("the grandchild's start time");
+        let _grandchild_cleanup = KillIncarnationOnDrop {
+            pid: grandchild_pid,
+            start_time: grandchild_start,
+        };
+        let scan = scan_tagged_pids(OWNERSHIP_ENV, &ownership_id, Some(holder_pid as i32));
+        let mut tagged = scan.pids;
+        tagged.sort_unstable();
+        let mut expected = vec![holder_pid as i32, grandchild_pid as i32];
+        expected.sort_unstable();
+        assert!(
+            scan.complete && tagged == expected,
+            "precondition: the holder and its grandchild both carry the tag (found {tagged:?})"
+        );
+
+        let leases = FreshAgentSessionLeases::new();
+        assert_eq!(
+            leases.claim("claude", "sid-tree", "req-holder", 0),
+            FreshSessionClaim::Acquired
+        );
+        leases.set_kill_handle(
+            "claude",
+            "sid-tree",
+            "req-holder",
+            holder_pid,
+            &ownership_id,
+        );
+        let FreshSessionClaim::ExpiredNeedsKill {
+            pid,
+            ownership_id: kill_tag,
+        } = leases.claim("claude", "sid-tree", "req-contender", TTL + 1)
+        else {
+            panic!("an expired holder with a kill handle must demand the tree kill");
+        };
+        assert_eq!(
+            (pid, kill_tag.as_str()),
+            (holder_pid, ownership_id.as_str())
+        );
+
+        let confirmed = kill_and_confirm_tree_dead(pid, OWNERSHIP_ENV, &kill_tag).await;
+
+        // Before the release: the whole tree is confirmed dead.
+        assert!(
+            confirmed,
+            "the kill must confirm the holder's whole tagged tree dead"
+        );
+        assert_ne!(
+            proc_starttime(holder_pid as i32),
+            Some(holder_start),
+            "the holder must be dead"
+        );
+        assert_ne!(
+            proc_starttime(grandchild_pid as i32),
+            Some(grandchild_start),
+            "the tagged grandchild must be dead: a kill of the holder alone leaves it running"
+        );
+        leases.force_release_after_confirmed_kill("claude", "sid-tree");
+        assert_eq!(
+            leases.claim("claude", "sid-tree", "req-contender", TTL + 2),
+            FreshSessionClaim::Acquired
+        );
+        let _ = holder.wait().await;
+    }
+
     /// An owned candidate whose process observation was incomplete is not a
     /// confirmed reap. The direct pid may already be gone, but the missing
     /// candidate evidence could still represent a surviving writer.
