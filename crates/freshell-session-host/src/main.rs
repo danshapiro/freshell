@@ -2560,7 +2560,15 @@ fn child_can_traverse(
 }
 
 fn provider_run_as_identity() -> (u32, u32) {
-    let parse = |key: &str| std::env::var(key).ok().and_then(|value| value.parse().ok());
+    provider_run_as_identity_from(|key| std::env::var(key).ok())
+}
+
+/// The provider child identity from `FRESHELL_PROVIDER_RUN_AS_UID`/`_GID`,
+/// defaulting per field to the managed-runtime child (65534:0). The lookup is
+/// injected so tests cover the set-and-parseable path without a
+/// process-wide env race.
+fn provider_run_as_identity_from(lookup: impl Fn(&str) -> Option<String>) -> (u32, u32) {
+    let parse = |key: &str| lookup(key).and_then(|value| value.parse().ok());
     (
         parse("FRESHELL_PROVIDER_RUN_AS_UID").unwrap_or(65_534),
         parse("FRESHELL_PROVIDER_RUN_AS_GID").unwrap_or(0),
@@ -3882,5 +3890,23 @@ mod tests {
         std::env::remove_var("FRESHELL_PROVIDER_RUN_AS_UID");
         std::env::remove_var("FRESHELL_PROVIDER_RUN_AS_GID");
         assert_eq!(provider_run_as_identity(), (65_534, 0));
+    }
+
+    #[test]
+    fn provider_run_as_identity_parses_set_env_values() {
+        // Set-and-parseable vars produce the parsed child identity (the
+        // identity startup feeds the operator_home_readiness event); a value
+        // that does not parse keeps the per-field default.
+        let identity = provider_run_as_identity_from(|key| match key {
+            "FRESHELL_PROVIDER_RUN_AS_UID" => Some("1500".to_string()),
+            "FRESHELL_PROVIDER_RUN_AS_GID" => Some("2500".to_string()),
+            _ => None,
+        });
+        assert_eq!(identity, (1500, 2500));
+        let partial = provider_run_as_identity_from(|key| match key {
+            "FRESHELL_PROVIDER_RUN_AS_UID" => Some("not-a-uid".to_string()),
+            _ => None,
+        });
+        assert_eq!(partial, (65_534, 0));
     }
 }

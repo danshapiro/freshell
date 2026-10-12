@@ -2190,4 +2190,78 @@ mod tests {
             Err(BackendError::OwnershipMismatch(_))
         ));
     }
+
+    fn operator_home_fixture(root: &Path) -> docker::OperatorHomeMount {
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        docker::OperatorHomeMount {
+            home: home.canonicalize().unwrap(),
+            mask_rel_paths: vec![".freshell".to_string()],
+        }
+    }
+
+    #[test]
+    fn verify_inspect_config_fails_closed_when_the_marker_env_lacks_its_persisted_record() {
+        // The marker env is the creator's assertion that a persisted record
+        // exists; a container presenting the marker without the label must
+        // fail verification rather than pass with no home assertions.
+        let root = tempfile::tempdir().unwrap();
+        let mount = operator_home_fixture(root.path());
+        let (handle, mut inspected) = terminal_runtime_fixture(root.path(), Some(mount));
+        assert!(verify_inspect_config(&handle, &inspected).is_ok());
+        inspected["Config"]["Labels"]
+            .as_object_mut()
+            .unwrap()
+            .remove(OPERATOR_HOME_MOUNT_LABEL);
+        match verify_inspect_config(&handle, &inspected) {
+            Err(BackendError::OwnershipMismatch(message)) => assert!(
+                message.contains("lacks its persisted mount record"),
+                "{message}"
+            ),
+            other => panic!("expected OwnershipMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_inspect_config_fails_closed_on_a_malformed_persisted_mount_record() {
+        let root = tempfile::tempdir().unwrap();
+        let mount = operator_home_fixture(root.path());
+        let (handle, mut inspected) = terminal_runtime_fixture(root.path(), Some(mount));
+        assert!(verify_inspect_config(&handle, &inspected).is_ok());
+        inspected["Config"]["Labels"]
+            .as_object_mut()
+            .unwrap()
+            .insert(OPERATOR_HOME_MOUNT_LABEL.into(), json!("not-a-record"));
+        match verify_inspect_config(&handle, &inspected) {
+            Err(BackendError::OwnershipMismatch(message)) => {
+                assert!(message.contains("malformed"), "{message}")
+            }
+            other => panic!("expected OwnershipMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_inspect_config_fails_closed_when_the_env_home_diverges_from_the_record() {
+        let root = tempfile::tempdir().unwrap();
+        let mount = operator_home_fixture(root.path());
+        let (handle, mut inspected) = terminal_runtime_fixture(root.path(), Some(mount));
+        assert!(verify_inspect_config(&handle, &inspected).is_ok());
+        let env = inspected["Config"]["Env"].as_array_mut().unwrap();
+        let entry = env
+            .iter_mut()
+            .find(|entry| {
+                entry
+                    .as_str()
+                    .is_some_and(|entry| entry.starts_with("FRESHELL_OPERATOR_HOME="))
+            })
+            .expect("fixture stamps the operator-home env");
+        *entry = json!("FRESHELL_OPERATOR_HOME=/a/different/home");
+        match verify_inspect_config(&handle, &inspected) {
+            Err(BackendError::OwnershipMismatch(message)) => assert!(
+                message.contains("diverged from its persisted mount record"),
+                "{message}"
+            ),
+            other => panic!("expected OwnershipMismatch, got {other:?}"),
+        }
+    }
 }
