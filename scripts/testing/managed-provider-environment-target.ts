@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { spawn, type ChildProcess } from 'node:child_process'
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import fs from 'node:fs/promises'
 import os from 'node:os'
@@ -221,11 +221,27 @@ async function stageProof(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeVie
 
 const requireMode = (metadata: { mode: number }) => (metadata.mode & 0o777).toString(8).padStart(4, '0')
 
+export function buildManagedEnvironmentClient(repoRoot: string, candidateSha: string): void {
+  assert.match(candidateSha, /^[a-f0-9]{40}$/, 'Managed acceptance requires a known worktree commit')
+  execFileSync('pnpm', ['run', 'build:client'], {
+    cwd: repoRoot,
+    env: { ...process.env, FRESHELL_BUILD_COMMIT: candidateSha },
+    stdio: 'inherit',
+  })
+}
+
 export async function runManagedEnvironmentTarget() {
   assert.equal(process.env.FRESHELL_E2E_BACKEND, 'cloud', 'Managed acceptance requires configured Cloud')
   assert.equal(process.env.GCLOUD_ROBOT_REQUIRE, '1', 'Managed acceptance requires the robot identity')
   assert.equal(process.env.GCLOUD_ROBOT_ACCOUNT, 'gcloud-robot@misc-puttering-project.iam.gserviceaccount.com')
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
+  const candidateSha = execFileSync('git', ['rev-parse', 'HEAD'], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'inherit'],
+    timeout: 5_000,
+  }).trim()
+  buildManagedEnvironmentClient(repoRoot, candidateSha)
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'frs-managed-environment-'))
   const grants = fakeOnecliGrants(['opencode'])
   const nonce = randomUUID()
