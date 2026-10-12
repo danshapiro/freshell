@@ -14,6 +14,7 @@ import { fakeOnecliGrants } from '../../test/integration/server/provider-parity-
 import type { InitialProviderVolumeAuthorization } from './runtime-test-broker.js'
 import { resolvePairedExternalFixture } from './e2e-external-target.js'
 import { assertManagedTerminalCreated, observeManagedEnvironmentNativeIdentity, readManagedEnvironmentDaemonId, serviceManagedEnvironmentCases } from './managed-environment-create.js'
+import { waitForCloudExecutionDispatch } from './cloud-execution-dispatch.js'
 
 const cloudflaredVersion = '2026.10.0'
 const cloudflaredSha = 'd33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db'
@@ -352,10 +353,16 @@ export async function runManagedEnvironmentTarget() {
     delete cloudEnvironment.FRESHELL_E2E_TARGET_HOME
     resolvePairedExternalFixture(cloudEnvironment, true)
     await writeJson(path.join(root, 'handoff.json'), { fixture, origin, token: rig.info.token, tunnelIdentity })
+    const cloudDispatchReceiptPath = path.join(root, 'cloud-execution-dispatch.json')
+    cloudEnvironment.FRESHELL_E2E_CLOUD_DISPATCH_RECEIPT = cloudDispatchReceiptPath
     browser = spawn('pnpm', ['run', 'test:e2e', '--shards=1', '--project=chromium-external-target',
       'test/e2e-browser/specs/managed-provider-environment-external.spec.ts'], { cwd: repoRoot, env: cloudEnvironment, stdio: ['ignore', 'inherit', 'inherit'] })
     browserJoin = joined(browser); browserJoin.catch(() => {})
     browserIdentity = await processIdentity(browser)
+    const cloudDispatch = await waitForCloudExecutionDispatch(cloudDispatchReceiptPath,
+      () => browser?.exitCode === null && browser.signalCode === null)
+    proof.cloudExecution = cloudDispatch
+    console.log(JSON.stringify({ severity: 'info', event: 'managed_environment.cloud_execution_dispatched', ...cloudDispatch }))
     await serviceManagedEnvironmentCases(fixture, scenario => {
       const cwd = path.join(selected.workspace, scenario)
       return {

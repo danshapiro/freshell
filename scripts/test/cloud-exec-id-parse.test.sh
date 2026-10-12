@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Test: cloud-exec-id-parse — regression for execution-ID capture from
-# `gcloud run jobs execute --wait` output.
+# Test: cloud-exec-id-parse — regression for execution-ID capture from both
+# `gcloud run jobs execute --wait` and `--async` output.
 #
 # gcloud prints "Execution [NAME] has successfully completed." (brackets are
 # literal around the name, ANSI SGR codes around it on color-capable output).
@@ -46,13 +46,24 @@ touch "$FAKE_LOG"
 cat > "$FAKE_DIR/gcloud" << 'FAKE'
 #!/usr/bin/env bash
 echo "FAKE_GCLOUD: $@" >> "$FAKE_LOG"
-# Mimic current gcloud: "Execution [NAME] ..." with literal brackets and ANSI
-# SGR codes around the name (observed ngcloud output 2026-08-18).
+# Mimic gcloud's accepted execution output with literal brackets and ANSI
+# SGR codes around the name (observed gcloud output 2026-08-18).
 if [[ "$*" == *"run jobs execute"* ]]; then
-  printf 'Creating execution...\nExecution [\033[1mtest-exec-123\033[m] has successfully completed.\n'
+  if [[ "$*" == *" --async"* ]]; then
+    printf 'Creating execution...\nExecution [\033[1mtest-exec-123\033[m] has successfully started running.\n'
+  else
+    printf 'Creating execution...\nExecution [\033[1mtest-exec-123\033[m] has successfully completed.\n'
+  fi
   exit 0
 fi
 if [[ "$*" == *"executions describe"* ]]; then
+  if [[ "$*" == *"completionTime"* ]]; then
+    if [[ -s "${FRESHELL_E2E_CLOUD_DISPATCH_RECEIPT:-/nonexistent}" ]]; then
+      echo "dispatch receipt available before completion wait" >> "$FAKE_LOG"
+    fi
+    echo "2026-10-12T00:00:00Z"
+    exit 0
+  fi
   if [[ "$*" == *"succeededCount"* ]]; then
     # Report every requested shard as succeeded (vitest passes per-execution
     # --tasks=N; e2e creates the job with --tasks=N). The wrappers require
@@ -92,13 +103,23 @@ check "vitest wrapper prints success footer" grep -q "All tasks completed succes
 check "vitest describe targets clean execution id" \
   bash -c "grep -q 'executions describe .* test-exec-123 ' '$FAKE_LOG' && ! grep -q 'executions describe .*\[' '$FAKE_LOG'"
 
+# Confirm the Vitest wrapper still waits in its existing execution path.
+check "vitest wrapper retains wait-for-completion execution mode" \
+  grep -q 'run jobs execute .* --wait' "$FAKE_LOG"
+
 # --- e2e wrapper ---
 rm -f "$FAKE_LOG"; touch "$FAKE_LOG"
+export FRESHELL_E2E_CLOUD_DISPATCH_RECEIPT="$FAKE_DIR/e2e-dispatch.json"
+rm -f "$FRESHELL_E2E_CLOUD_DISPATCH_RECEIPT"
 E2E_OUT=$(bash "$ROOT/scripts/e2e-cloud.sh" run --cloud --shards=1 2>&1) && E2E_RC=0 || E2E_RC=$?
 check "e2e wrapper exits 0 on green run" bash -c "[ $E2E_RC -eq 0 ]"
 check "e2e wrapper reports truthfully (succeeded=1)" grep -q "Succeeded tasks: 1" <<< "$E2E_OUT"
 check "e2e describe targets clean execution id" \
   bash -c "grep -q 'executions describe .* test-exec-123 ' '$FAKE_LOG' && ! grep -q 'executions describe .*\[' '$FAKE_LOG'"
+check "e2e execution uses asynchronous acceptance before its bounded completion wait" \
+  bash -c "grep -q 'run jobs execute .* --async' '$FAKE_LOG' && grep -q 'dispatch receipt available before completion wait' '$FAKE_LOG'"
+check "e2e wrapper records the exact accepted Cloud Run execution" \
+  bash -c "jq -e '.jobName and .executionName == \"test-exec-123\" and (.acceptedAt | test(\"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$\"))' '$FRESHELL_E2E_CLOUD_DISPATCH_RECEIPT' >/dev/null"
 
 echo ""
 if [ "$FAILURES" -eq 0 ]; then

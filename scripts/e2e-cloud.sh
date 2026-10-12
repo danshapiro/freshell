@@ -155,6 +155,79 @@ account_flag() {
   fi
 }
 
+cloud_duration_seconds() {
+  local remaining="$1" total=0 amount unit numeric_amount
+  if [[ "$remaining" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$remaining"
+    return 0
+  fi
+  while [[ -n "$remaining" ]]; do
+    if [[ "$remaining" =~ ^([0-9]+)(s|m|h|d)(.*)$ ]]; then
+      amount="${BASH_REMATCH[1]}"
+      unit="${BASH_REMATCH[2]}"
+      remaining="${BASH_REMATCH[3]}"
+      numeric_amount=$((10#$amount))
+      case "$unit" in
+        s) total=$((total + numeric_amount)) ;;
+        m) total=$((total + numeric_amount * 60)) ;;
+        h) total=$((total + numeric_amount * 3600)) ;;
+        d) total=$((total + numeric_amount * 86400)) ;;
+      esac
+    else
+      return 1
+    fi
+  done
+  printf '%s' "$total"
+}
+
+write_cloud_dispatch_receipt() {
+  local receipt_path="${FRESHELL_E2E_CLOUD_DISPATCH_RECEIPT:-}"
+  [ -n "$receipt_path" ] || return 0
+  if ! [[ "$RUN_JOB_NAME" =~ ^[a-z][a-z0-9-]{0,48}$ && "$execution_id" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]]; then
+    echo "[e2e-cloud] ERROR: cannot write a dispatch receipt for an invalid job or execution name." >&2
+    return 1
+  fi
+  local temporary="${receipt_path}.tmp.$$"
+  local accepted_at
+  accepted_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if ! (umask 077; printf '{"jobName":"%s","executionName":"%s","acceptedAt":"%s"}\n' \
+    "$RUN_JOB_NAME" "$execution_id" "$accepted_at" > "$temporary") \
+    || ! mv -f "$temporary" "$receipt_path"; then
+    rm -f "$temporary"
+    echo "[e2e-cloud] ERROR: could not publish the accepted Cloud Run execution receipt." >&2
+    return 1
+  fi
+  return 0
+}
+
+wait_for_cloud_execution_completion() {
+  local task_timeout="$1" timeout_seconds completion_time deadline describe_failures=0
+  if ! timeout_seconds=$(cloud_duration_seconds "$task_timeout") || [ "$timeout_seconds" -le 0 ]; then
+    echo "[e2e-cloud] ERROR: unsupported Cloud Run task timeout duration '$task_timeout'." >&2
+    return 1
+  fi
+  # Allow five minutes for Cloud Run's terminal status to settle after the
+  # configured per-task deadline.
+  deadline=$((SECONDS + timeout_seconds + 300))
+  echo "[e2e-cloud] Waiting for execution $execution_id to complete (task deadline: $task_timeout)."
+  while (( SECONDS <= deadline )); do
+    if completion_time=$(gcloud run jobs executions describe $(gcloud_flags) "$execution_id" \
+      --format="value(status.completionTime)" 2>/dev/null); then
+      describe_failures=0
+      if [ -n "$completion_time" ] && [ "$completion_time" != "(unset)" ]; then return 0; fi
+    else
+      describe_failures=$((describe_failures + 1))
+      if [ "$describe_failures" -ge 5 ]; then
+        echo "[e2e-cloud] ERROR: failed to query execution $execution_id status five consecutive times." >&2
+        return 1
+      fi
+    fi
+    sleep 3
+  done
+  echo "[e2e-cloud] ERROR: execution $execution_id did not reach a terminal state within its task timeout and status-settlement margin." >&2
+  return 1
+}
+
 # kata e83z: cheap live-credential check at lane start — fails in seconds,
 # before any build/submit work, when the resolved identity cannot mint a token.
 # The error names the resolved identity and its source so the failure path is
@@ -682,22 +755,22 @@ cmd_run() {
     --memory=4Gi \
     --cpu=4
 
-  # Execute this run's job and wait for completion, capturing the exit
-  # status: an execute failure (quota, permissions, template error) MAY NOT
-  # masquerade as a test outcome.
+  # Start this run's job and capture the accepted execution ID immediately.
+  # The external managed-environment target uses the dispatch receipt below
+  # to start its browser acceptance window after cold image build and job
+  # setup, while this wrapper still waits for the exact execution to finish.
   echo "[e2e-cloud] Executing Cloud Run Job..."
   local execute_output
   local execute_exit=0
   local execution_id=""
-  execute_output=$(gcloud run jobs execute $(gcloud_flags) "$RUN_JOB_NAME" --wait 2>&1) || execute_exit=$?
+  execute_output=$(gcloud run jobs execute $(gcloud_flags) "$RUN_JOB_NAME" --async 2>&1) || execute_exit=$?
   echo "$execute_output"
 
   # Extract the execution ID from the execute output. gcloud prints
-  # `Execution [NAME] has successfully completed.` — brackets are literal and,
-  # on color-capable captures, the name is wrapped in ANSI SGR codes — so strip
-  # escapes and allow the bracket form. (A bare `Execution \K[^ ]+` captured
-  # the bracket+escapes; downstream describe/logs then addressed a nonexistent
-  # execution and the `|| echo 0` masking below reported succeeded=0 forever.)
+  # `Execution [NAME] has successfully started running.` — brackets are
+  # literal and may contain ANSI SGR codes — so strip escapes and allow the
+  # bracket form. A bare `Execution \K[^ ]+` captured the bracket+escapes,
+  # making downstream describe/logs address a nonexistent execution.
   execution_id=$(echo "$execute_output" \
     | sed -E 's/\x1b\[[0-9;]*m//g' \
     | grep -oP 'Execution \[?\K[A-Za-z0-9][A-Za-z0-9-]*' \
@@ -719,6 +792,18 @@ cmd_run() {
       echo "[e2e-cloud] Fetching logs..."
       gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" 2>/dev/null || true
     fi
+    exit 1
+  fi
+
+  if [ -z "$execution_id" ]; then
+    echo "[e2e-cloud] ERROR: Cloud Run accepted the execute request but returned no execution ID." >&2
+    exit 1
+  fi
+  if ! write_cloud_dispatch_receipt; then
+    exit 1
+  fi
+  echo "[e2e-cloud] Cloud Run execution accepted: $execution_id"
+  if ! wait_for_cloud_execution_completion "$timeout"; then
     exit 1
   fi
 
