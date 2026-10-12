@@ -1323,6 +1323,37 @@ async fn signals_carry_the_unit_record_state_and_wedge_knobs_hold() {
     assert_eq!(entry.record_state, None);
 }
 
+/// A reserved port ([`lost_port::ReservedPort`]) is one the kernel never
+/// chooses by itself, no other reservation can share it, and the fake binds
+/// and listens on it while the reservation holds it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_fake_listens_on_a_reserved_port_that_nothing_else_is_given() {
+    let reserved = lost_port::ReservedPort::new();
+    let port = reserved.port();
+    assert!(
+        !lost_port::ephemeral_port_range().contains(&port),
+        "{port} is outside the kernel's ephemeral range {:?}",
+        lost_port::ephemeral_port_range()
+    );
+    let other = tokio::net::TcpSocket::new_v4().unwrap();
+    assert!(
+        other
+            .bind(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+            .is_err(),
+        "no other reservation can share it"
+    );
+    drop(other);
+
+    let home = tempfile::tempdir().unwrap();
+    let mut fake = FakeAppServer::spawn_on_port(port, json!({}), home.path(), &[]).await;
+    fake.listened()
+        .await
+        .expect("the fake listens on the reserved port");
+    assert_eq!(listening_sockets_of(fake.native().await.pid), [port]);
+    let _rpc = connected(port).await;
+    drop(reserved);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn listen_delay_holds_off_the_listener() {
     let home = tempfile::tempdir().unwrap();

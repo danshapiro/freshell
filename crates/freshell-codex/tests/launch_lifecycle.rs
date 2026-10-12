@@ -2509,6 +2509,39 @@ mod unit_sidecar {
         .await
     }
 
+    /// [`ready_realistic`] on `port`, a port no other socket can take: for a
+    /// start that could not be retried after a lost port (a disabled store
+    /// kills a failed attempt's launcher before its fake can say so). The
+    /// start is still judged by its fake's own record.
+    async fn ready_realistic_on(
+        port: &lost_port::ReservedPort,
+        behavior: serde_json::Value,
+        home: &Path,
+        store: Arc<CodexSidecarStore>,
+        seed: UnitSeed,
+    ) -> (SpawnedCodexAppServerRuntime, CodexRuntimeReady) {
+        let records = ListenRecords::new();
+        let runtime = SpawnedCodexAppServerRuntime::with_command_store_context_and_seed(
+            fake_codex::launcher_command(),
+            store,
+            records.context(fake_context(behavior, home)),
+            seed,
+        )
+        .with_forced_listen_port(port.port());
+        let (runtime, ready) = ready_attempt(runtime, &records).await.expect("ready");
+        assert_eq!(port_of(&ready.ws_url), port.port(), "on the reserved port");
+        (runtime, ready)
+    }
+
+    /// Whether `terminal_id`'s app-server listens on a reserved port: one
+    /// outside the kernel's ephemeral range, which only a reservation names.
+    fn on_a_reserved_port(manager: &CodexTerminalLaunchManager, terminal_id: &str) -> bool {
+        let url = manager
+            .sidecar_ws_url(terminal_id)
+            .expect("the terminal's app-server");
+        !lost_port::ephemeral_port_range().contains(&port_of(&url))
+    }
+
     /// Every native manifest (`native-<pid>.json`) in `dir`.
     fn native_manifests_in(dir: &Path) -> Vec<fake_codex::NativeManifest> {
         std::fs::read_dir(dir)
@@ -2594,15 +2627,48 @@ mod unit_sidecar {
         home: &Path,
         behavior: serde_json::Value,
     ) -> CodexTerminalLaunchManager {
+        realistic_manager(store, home, behavior, false)
+    }
+
+    /// [`manager_with_realistic_runtime`] whose every start listens on a
+    /// port of its own reservation ([`lost_port::ReservedPort`], held while
+    /// the manager lives): for starts that could not be retried after a lost
+    /// port (a disabled store kills a failed attempt's launcher before its
+    /// fake can say so).
+    fn manager_with_realistic_runtime_on_reserved_ports(
+        store: Arc<CodexSidecarStore>,
+        home: &Path,
+        behavior: serde_json::Value,
+    ) -> CodexTerminalLaunchManager {
+        realistic_manager(store, home, behavior, true)
+    }
+
+    fn realistic_manager(
+        store: Arc<CodexSidecarStore>,
+        home: &Path,
+        behavior: serde_json::Value,
+        reserve_ports: bool,
+    ) -> CodexTerminalLaunchManager {
         let home = home.to_path_buf();
+        let reserved = Mutex::new(Vec::new());
         CodexTerminalLaunchManager::new(Box::new(move |plan| {
+            let forced_port = reserve_ports.then(|| {
+                let port = lost_port::ReservedPort::new();
+                let number = port.port();
+                reserved.lock().unwrap().push(port);
+                number
+            });
             let runtime = ListenChecked::build(fake_context(behavior.clone(), &home), |context| {
-                SpawnedCodexAppServerRuntime::with_command_store_context_and_seed(
+                let runtime = SpawnedCodexAppServerRuntime::with_command_store_context_and_seed(
                     fake_codex::launcher_command(),
                     store.clone(),
                     context,
                     plan.unit_seed.clone().expect("a seeded plan"),
-                )
+                );
+                match forced_port {
+                    Some(port) => runtime.with_forced_listen_port(port),
+                    None => runtime,
+                }
             }) as Arc<dyn CodexLaunchRuntime>;
             Box::pin(async move { runtime })
         }))
@@ -3242,7 +3308,9 @@ mod unit_sidecar {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(CodexSidecarStore::disabled());
         let lifecycle = Arc::new(RecordingLifecycle::default());
-        let (runtime, _ready) = ready_realistic(
+        let port = lost_port::ReservedPort::new();
+        let (runtime, _ready) = ready_realistic_on(
+            &port,
             json!({}),
             home.path(),
             store.clone(),
@@ -4396,9 +4464,15 @@ mod unit_sidecar {
     async fn shutdown_starts_every_stop_at_once_under_one_deadline() {
         let home = tempfile::tempdir().unwrap();
         // A disabled store: nothing is retainable (the macOS/Windows shape).
+        // Its failed starts could not say they lost a port, so every start
+        // runs on a reserved one.
         let store = Arc::new(CodexSidecarStore::disabled());
         let wedged = json!({"ignoreSigint": true});
-        let manager = manager_with_realistic_runtime(store.clone(), home.path(), wedged.clone());
+        let manager = manager_with_realistic_runtime_on_reserved_ports(
+            store.clone(),
+            home.path(),
+            wedged.clone(),
+        );
         let mut natives = Vec::new();
         for (session, terminal) in [("t-sd-1", "T-sd-1"), ("t-sd-2", "T-sd-2")] {
             seed_rollout(home.path(), session);
@@ -4410,6 +4484,7 @@ mod unit_sidecar {
             .await;
             natives.push(launch.unit.clone().unwrap());
             manager.adopt(terminal, launch, 1).await.expect("adopt");
+            assert!(on_a_reserved_port(&manager, terminal));
         }
         manager.begin_shutdown_retention();
         let t0 = std::time::Instant::now();
@@ -4429,7 +4504,8 @@ mod unit_sidecar {
         // A deadline shorter than a stop: shutdown returns at the deadline
         // and the stops go on.
         let home2 = tempfile::tempdir().unwrap();
-        let manager2 = manager_with_realistic_runtime(store, home2.path(), wedged);
+        let manager2 =
+            manager_with_realistic_runtime_on_reserved_ports(store, home2.path(), wedged);
         seed_rollout(home2.path(), "t-sd-3");
         let launch = plan_retrying_a_lost_port(
             "plan 3",
@@ -4439,6 +4515,7 @@ mod unit_sidecar {
         .await;
         let unit = launch.unit.clone().unwrap();
         manager2.adopt("T-sd-3", launch, 1).await.expect("adopt 3");
+        assert!(on_a_reserved_port(&manager2, "T-sd-3"));
         let t0 = std::time::Instant::now();
         manager2
             .shutdown(tokio::time::Instant::now() + Duration::from_millis(300))
