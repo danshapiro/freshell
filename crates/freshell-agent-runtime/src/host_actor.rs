@@ -307,6 +307,8 @@ pub enum ActorError {
     AmbiguousDispatch,
     #[error("provider does not support this operation")]
     UnsupportedOperation,
+    #[error("fresh-agent provider start failed (startup diagnostic: {diagnostic})")]
+    ProviderStartFailed { diagnostic: ProviderStartDiagnostic },
     #[error("permission request is unknown")]
     UnknownDecision,
     #[error("permission request is already resolved")]
@@ -315,6 +317,53 @@ pub enum ActorError {
     Transport(String),
     #[error("durable fresh-agent state failed: {0}")]
     Persistence(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderStartDiagnostic {
+    Authentication,
+    Arguments,
+    Listener,
+    Configuration,
+    Network,
+    Unclassified,
+    NoDiagnostic,
+}
+
+impl ProviderStartDiagnostic {
+    fn from_provider_error(error: &str) -> Self {
+        let Some((_, suffix)) = error.rsplit_once("startup diagnostic:") else {
+            return Self::NoDiagnostic;
+        };
+        let category = suffix
+            .trim_start()
+            .split(|character: char| !character.is_ascii_lowercase() && character != '-')
+            .next()
+            .unwrap_or_default();
+        match category {
+            "authentication" => Self::Authentication,
+            "arguments" => Self::Arguments,
+            "listener" => Self::Listener,
+            "configuration" => Self::Configuration,
+            "network" => Self::Network,
+            "no-diagnostic" => Self::NoDiagnostic,
+            _ => Self::Unclassified,
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderStartDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Authentication => "authentication",
+            Self::Arguments => "arguments",
+            Self::Listener => "listener",
+            Self::Configuration => "configuration",
+            Self::Network => "network",
+            Self::Unclassified => "unclassified",
+            Self::NoDiagnostic => "no-diagnostic",
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -651,10 +700,11 @@ impl FreshAgentHostActor {
                 .await
                 .map_err(ActorError::Transport)?;
         }
-        let started = transport
-            .start(&state.profile)
-            .await
-            .map_err(ActorError::Transport)?;
+        let started = transport.start(&state.profile).await.map_err(|error| {
+            ActorError::ProviderStartFailed {
+                diagnostic: ProviderStartDiagnostic::from_provider_error(&error),
+            }
+        })?;
         let observed_native_session_id = started.native_session_id.clone();
         if let Some(expected) = state.profile.native_session_id.as_deref() {
             if started.native_session_id.as_deref() != Some(expected) {

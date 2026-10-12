@@ -1183,6 +1183,7 @@ pub enum RuntimeDiagnosticCode {
     ProviderChildEnvironmentInstallFailed,
     ProviderProcessSpawnFailed,
     FreshAgentOpenFailed,
+    FreshAgentProviderStartFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -4475,6 +4476,16 @@ mod tests {
         .with_diagnostic_code(RuntimeDiagnosticCode::ProviderStatePrepareFailed);
         let encoded = serde_json::to_value(&error).unwrap();
         assert_eq!(encoded["diagnosticCode"], "PROVIDER_STATE_PREPARE_FAILED");
+
+        let provider_start = RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            "hosted fresh-agent provider failed to start (startup diagnostic: authentication)",
+        )
+        .with_diagnostic_code(RuntimeDiagnosticCode::FreshAgentProviderStartFailed);
+        assert_eq!(
+            serde_json::to_value(provider_start).unwrap()["diagnosticCode"],
+            "FRESH_AGENT_PROVIDER_START_FAILED"
+        );
 
         let old_payload = serde_json::json!({
             "code": "HOST_UNREACHABLE",

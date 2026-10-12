@@ -14,9 +14,9 @@ use freshell_runtime_protocol::{
     GrantId, HostBootId, HostCommand, HostReply, HostResult, IncarnationId,
     OpenCodeAdoptionBaseline, OpenCodeAdoptionExpectation, OpenCodeAdoptionStatus,
     OpenCodeTransferDescriptor, OpenCodeTransferReadinessReceipt, OpenCodeVerifiedRootTail,
-    ProviderBootstrapFile, RecoveryProbe, ResumeSpec, RuntimeError, RuntimeErrorCode,
-    RuntimeLimits, RuntimeMetrics, SoulId, TerminalLaunchSpec, CONTROL_PROTOCOL_VERSION,
-    MAX_OPENCODE_TRANSFER_MANIFEST_BYTES,
+    ProviderBootstrapFile, RecoveryProbe, ResumeSpec, RuntimeDiagnosticCode, RuntimeError,
+    RuntimeErrorCode, RuntimeLimits, RuntimeMetrics, SoulId, TerminalLaunchSpec,
+    CONTROL_PROTOCOL_VERSION, MAX_OPENCODE_TRANSFER_MANIFEST_BYTES,
 };
 use pty::HostedPty;
 use serde::{Deserialize, Serialize};
@@ -88,7 +88,10 @@ trait GrantExecutionEffects: Sync {
         &self,
         state_dir: &Path,
         launch: FreshAgentLaunchSpec,
-    ) -> Result<Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>, String> {
+    ) -> Result<
+        Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>,
+        freshell_agent_runtime::host_actor::ActorError,
+    > {
         providers::open_hosted_fresh_agent(state_dir, launch).await
     }
 
@@ -1104,11 +1107,33 @@ fn map_actor_error(error: freshell_agent_runtime::host_actor::ActorError) -> Run
         ActorError::WriterBusy => RuntimeErrorCode::OwnershipMismatch,
         ActorError::UnsupportedOperation => RuntimeErrorCode::UnsupportedOperation,
         ActorError::InvalidProfile => RuntimeErrorCode::InvalidRequest,
-        ActorError::Transport(_) | ActorError::Persistence(_) => RuntimeErrorCode::HostUnreachable,
+        ActorError::ProviderStartFailed { .. }
+        | ActorError::Transport(_)
+        | ActorError::Persistence(_) => RuntimeErrorCode::HostUnreachable,
     };
     // Provider error strings may contain request bodies, environment values,
     // or credentials. Keep the control payload typed and deliberately opaque.
     RuntimeError::new(code, "hosted fresh-agent command failed")
+}
+
+fn map_fresh_agent_open_error(
+    error: freshell_agent_runtime::host_actor::ActorError,
+) -> RuntimeError {
+    use freshell_agent_runtime::host_actor::ActorError;
+    match error {
+        ActorError::ProviderStartFailed { diagnostic } => RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            format!(
+                "hosted fresh-agent provider failed to start (startup diagnostic: {diagnostic})"
+            ),
+        )
+        .with_diagnostic_code(RuntimeDiagnosticCode::FreshAgentProviderStartFailed),
+        _ => RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            "hosted fresh-agent provider failed to start",
+        )
+        .with_diagnostic_code(RuntimeDiagnosticCode::FreshAgentOpenFailed),
+    }
 }
 
 fn ensure_incarnation(
@@ -1627,15 +1652,7 @@ async fn grant_execution(
             let actor = effects
                 .open_fresh_agent(&state.state_dir, launch.clone())
                 .await
-                .map_err(|error| {
-                    RuntimeError::new(
-                        RuntimeErrorCode::HostUnreachable,
-                        format!("hosted fresh-agent provider failed to start: {error}"),
-                    )
-                    .with_diagnostic_code(
-                        freshell_runtime_protocol::RuntimeDiagnosticCode::FreshAgentOpenFailed,
-                    )
-                })?;
+                .map_err(map_fresh_agent_open_error)?;
             let profile = actor.profile().await;
             let native_session_id = actor.observed_native_session_id().await;
             let evidence = serde_json::json!({
@@ -5185,6 +5202,35 @@ fn now_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fresh_agent_open_errors_expose_only_a_closed_failure_category() {
+        use freshell_agent_runtime::host_actor::{ActorError, ProviderStartDiagnostic};
+        use freshell_runtime_protocol::{RuntimeDiagnosticCode, RuntimeErrorCode};
+
+        let provider_start = super::map_fresh_agent_open_error(ActorError::ProviderStartFailed {
+            diagnostic: ProviderStartDiagnostic::Authentication,
+        });
+        assert_eq!(provider_start.code, RuntimeErrorCode::HostUnreachable);
+        assert_eq!(
+            provider_start.diagnostic_code,
+            Some(RuntimeDiagnosticCode::FreshAgentProviderStartFailed)
+        );
+        assert_eq!(
+            provider_start.message,
+            "hosted fresh-agent provider failed to start (startup diagnostic: authentication)"
+        );
+
+        let secret_detail = "private-provider-output-should-not-cross-the-host-boundary";
+        let other = super::map_fresh_agent_open_error(ActorError::Transport(secret_detail.into()));
+        assert_eq!(other.code, RuntimeErrorCode::HostUnreachable);
+        assert_eq!(
+            other.diagnostic_code,
+            Some(RuntimeDiagnosticCode::FreshAgentOpenFailed)
+        );
+        assert_eq!(other.message, "hosted fresh-agent provider failed to start");
+        assert!(!other.message.contains(secret_detail));
+    }
+
     #[cfg(unix)]
     #[test]
     fn stopped_repair_descriptor_io_keeps_system_category() {
@@ -6806,7 +6852,10 @@ mod tests {
             &self,
             state_dir: &Path,
             launch: FreshAgentLaunchSpec,
-        ) -> Result<Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>, String> {
+        ) -> Result<
+            Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>,
+            freshell_agent_runtime::host_actor::ActorError,
+        > {
             self.opens.fetch_add(1, Ordering::SeqCst);
             let profile = FreshAgentProfile {
                 provider: launch.provider,
@@ -6831,14 +6880,14 @@ mod tests {
                     launch.run_as_uid,
                     launch.run_as_gid,
                 )
-                .await?;
+                .await
+                .map_err(freshell_agent_runtime::host_actor::ActorError::Transport)?;
             freshell_agent_runtime::host_actor::FreshAgentHostActor::open_deterministic_fixture(
                 state_dir.join("fixture-actor"),
                 profile,
                 transport,
             )
             .await
-            .map_err(|error| error.to_string())
         }
     }
 
@@ -7251,7 +7300,10 @@ mod tests {
             &self,
             state_dir: &Path,
             launch: FreshAgentLaunchSpec,
-        ) -> Result<Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>, String> {
+        ) -> Result<
+            Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>,
+            freshell_agent_runtime::host_actor::ActorError,
+        > {
             self.opens.fetch_add(1, Ordering::SeqCst);
             let transport = Arc::new(RpcFixtureTransport {
                 native_evidence: std::sync::Mutex::new(self.native_evidence.clone()),
@@ -7282,7 +7334,6 @@ mod tests {
                 transport,
             )
             .await
-            .map_err(|error| error.to_string())
         }
     }
 

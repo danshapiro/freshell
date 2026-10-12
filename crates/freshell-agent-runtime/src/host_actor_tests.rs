@@ -474,6 +474,7 @@ struct FakeTransport {
     recovery_started: tokio::sync::Notify,
     native: String,
     starts: AtomicUsize,
+    start_error: Option<String>,
     dispatches: AtomicUsize,
     decisions: AtomicUsize,
     stops: AtomicUsize,
@@ -574,6 +575,7 @@ impl FakeTransport {
         Arc::new(Self {
             native: native.into(),
             starts: AtomicUsize::new(0),
+            start_error: None,
             dispatches: AtomicUsize::new(0),
             decisions: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
@@ -592,6 +594,7 @@ impl FakeTransport {
             ..Self {
                 native: native.into(),
                 starts: AtomicUsize::new(0),
+                start_error: None,
                 dispatches: AtomicUsize::new(0),
                 decisions: AtomicUsize::new(0),
                 stops: AtomicUsize::new(0),
@@ -630,6 +633,9 @@ impl FreshAgentTransport for FakeTransport {
     }
     async fn start(&self, _profile: &FreshAgentProfile) -> Result<TransportStart, String> {
         self.starts.fetch_add(1, Ordering::SeqCst);
+        if let Some(error) = &self.start_error {
+            return Err(error.clone());
+        }
         Ok(TransportStart {
             native_session_id: Some(self.native.clone()),
         })
@@ -692,6 +698,70 @@ fn profile(provider: FreshProvider, store: &str, native: Option<&str>) -> FreshA
         provider_launch_context: None,
         provider_secret_references: Vec::new(),
     }
+}
+
+#[test]
+fn provider_start_diagnostic_accepts_only_known_categories() {
+    for (error, expected) in [
+        (
+            "private detail (startup diagnostic: authentication)",
+            ProviderStartDiagnostic::Authentication,
+        ),
+        (
+            "private detail (startup diagnostic: arguments)",
+            ProviderStartDiagnostic::Arguments,
+        ),
+        (
+            "private detail (startup diagnostic: listener)",
+            ProviderStartDiagnostic::Listener,
+        ),
+        (
+            "private detail (startup diagnostic: configuration)",
+            ProviderStartDiagnostic::Configuration,
+        ),
+        (
+            "private detail (startup diagnostic: network)",
+            ProviderStartDiagnostic::Network,
+        ),
+        (
+            "private detail (startup diagnostic: unexpected)",
+            ProviderStartDiagnostic::Unclassified,
+        ),
+        (
+            "private detail with no category",
+            ProviderStartDiagnostic::NoDiagnostic,
+        ),
+    ] {
+        assert_eq!(
+            ProviderStartDiagnostic::from_provider_error(error),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn provider_start_failure_keeps_only_the_fixed_diagnostic_category() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret_detail = "private-provider-output-should-not-cross-the-actor-boundary";
+    let mut transport = FakeTransport::new("native-codex");
+    Arc::get_mut(&mut transport).unwrap().start_error = Some(format!(
+        "provider start rejected; private detail {secret_detail}; startup diagnostic: authentication"
+    ));
+
+    let error = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Codex, "codex-start-failure", None),
+        transport,
+    )
+    .await
+    .err()
+    .expect("provider start should fail");
+
+    assert_eq!(
+        error.to_string(),
+        "fresh-agent provider start failed (startup diagnostic: authentication)"
+    );
+    assert!(!format!("{error:?}").contains(secret_detail));
 }
 
 #[tokio::test]

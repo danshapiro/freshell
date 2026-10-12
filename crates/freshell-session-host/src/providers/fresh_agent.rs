@@ -286,7 +286,7 @@ struct HostedTransport {
 pub(crate) async fn open_hosted_fresh_agent(
     _incarnation_state_dir: &std::path::Path,
     launch: FreshAgentLaunchSpec,
-) -> Result<Arc<FreshAgentHostActor>, String> {
+) -> Result<Arc<FreshAgentHostActor>, freshell_agent_runtime::host_actor::ActorError> {
     let profile = profile_from_launch(&launch);
     let transport: Arc<dyn FreshAgentTransport> = match launch.fixture_transport {
         None => {
@@ -297,7 +297,9 @@ pub(crate) async fn open_hosted_fresh_agent(
             .await
         }
         Some(FreshAgentFixtureTransport::Deterministic) => {
-            deterministic_transport(&profile, launch.run_as_uid, launch.run_as_gid).await?
+            deterministic_transport(&profile, launch.run_as_uid, launch.run_as_gid)
+                .await
+                .map_err(freshell_agent_runtime::host_actor::ActorError::Transport)?
         }
     };
     // The supervisor mounts one protected, per-soul directory here across
@@ -310,7 +312,6 @@ pub(crate) async fn open_hosted_fresh_agent(
         launch.fixture_transport,
     )
     .await
-    .map_err(|error| error.to_string())
 }
 
 async fn open_actor_for_transport(
