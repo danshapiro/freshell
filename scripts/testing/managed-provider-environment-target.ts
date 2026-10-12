@@ -15,6 +15,7 @@ import type { InitialProviderVolumeAuthorization } from './runtime-test-broker.j
 import { resolvePairedExternalFixture } from './e2e-external-target.js'
 import { assertManagedTerminalCreated, observeManagedEnvironmentNativeIdentity, readManagedEnvironmentDaemonId, serviceManagedEnvironmentCases } from './managed-environment-create.js'
 import { waitForCloudExecutionDispatch } from './cloud-execution-dispatch.js'
+import { ManagedEnvironmentBrowserSummaryCapture, type ManagedEnvironmentBrowserSummary } from './managed-environment-browser-summary.js'
 
 const cloudflaredVersion = '2026.10.0'
 const cloudflaredSha = 'd33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db'
@@ -55,6 +56,13 @@ function joined(child: ChildProcess): Promise<NativeExit> {
   return new Promise((resolve, reject) => {
     child.once('error', reject)
     child.once('exit', (code, signal) => resolve({ code, signal }))
+  })
+}
+
+function joinedAfterOutput(child: ChildProcess): Promise<NativeExit> {
+  return new Promise((resolve, reject) => {
+    child.once('error', reject)
+    child.once('close', (code, signal) => resolve({ code, signal }))
   })
 }
 
@@ -252,6 +260,7 @@ export async function runManagedEnvironmentTarget() {
     versionJoin: Promise<NativeExit> | undefined
   let tunnel: ChildProcess | undefined, tunnelIdentity: Awaited<ReturnType<typeof processIdentity>> | undefined, tunnelJoin: Promise<NativeExit> | undefined
   let browser: ChildProcess | undefined, browserIdentity: Awaited<ReturnType<typeof processIdentity>> | undefined, browserJoin: Promise<NativeExit> | undefined
+  const browserSummaryCapture = new ManagedEnvironmentBrowserSummaryCapture()
   const owners: InitialProviderVolumeAuthorization[] = []
   let capturedVolumes: ReturnType<typeof captureProviderParityVolumes> = []
   const proof: Record<string, unknown> = { expectedNonce: nonce }
@@ -356,8 +365,11 @@ export async function runManagedEnvironmentTarget() {
     const cloudDispatchReceiptPath = path.join(root, 'cloud-execution-dispatch.json')
     cloudEnvironment.FRESHELL_E2E_CLOUD_DISPATCH_RECEIPT = cloudDispatchReceiptPath
     browser = spawn('pnpm', ['run', 'test:e2e', '--shards=1', '--project=chromium-external-target',
-      'test/e2e-browser/specs/managed-provider-environment-external.spec.ts'], { cwd: repoRoot, env: cloudEnvironment, stdio: ['ignore', 'inherit', 'inherit'] })
-    browserJoin = joined(browser); browserJoin.catch(() => {})
+      'test/e2e-browser/specs/managed-provider-environment-external.spec.ts'], { cwd: repoRoot, env: cloudEnvironment, stdio: ['ignore', 'pipe', 'pipe'] })
+    browser.stdout!.on('data', chunk => browserSummaryCapture.write(chunk))
+    browser.stdout!.pipe(process.stdout)
+    browser.stderr!.pipe(process.stderr)
+    browserJoin = joinedAfterOutput(browser); browserJoin.catch(() => {})
     browserIdentity = await processIdentity(browser)
     const cloudDispatch = await waitForCloudExecutionDispatch(cloudDispatchReceiptPath,
       () => browser?.exitCode === null && browser.signalCode === null)
@@ -404,7 +416,13 @@ export async function runManagedEnvironmentTarget() {
     }, async () => {
       const browserExit = await bounded(browserJoin!, 120_000, 'configured Cloud browser final join')
       assert.equal(browserExit.code, 0, 'Configured Cloud browser acceptance failed')
-      proof.cloudBrowser = { actualNativeExit: browserExit, identity: browserIdentity, expectedCases: 3, printedFooter: 'UNKNOWN' }
+      const browserSummary: ManagedEnvironmentBrowserSummary = browserSummaryCapture.finish()
+      assert.equal(browserSummary.executedCases, scenarios.length, 'Configured Cloud ran an unexpected number of browser cases')
+      assert.equal(browserSummary.passedCases, scenarios.length, 'Every configured managed-environment browser case must pass')
+      assert.equal(browserSummary.failedCases, 0, 'Configured managed-environment browser cases failed')
+      assert.equal(browserSummary.skippedCases, 0, 'Configured managed-environment browser cases were skipped')
+      assert.equal(browserSummary.interruptedCases, 0, 'Configured managed-environment browser cases were interrupted')
+      proof.cloudBrowser = { actualNativeExit: browserExit, identity: browserIdentity, selectedScenarios: [...scenarios], ...browserSummary }
     })
     const healthy = proof.healthy as any
     const original = (await rig.inventory()).find(row => row.soulId === healthy.soulId)
@@ -426,8 +444,10 @@ export async function runManagedEnvironmentTarget() {
     proof.nativeReplacement = { priorIncarnationId: original.incarnationId, incarnationId: replacement.incarnationId,
       soulId: replacement.soulId, nativeSessionId: replacement.nativeSessionId, stage: replacementStage, child: replacementChild }
     await writeJson(path.join(rig.runtime.evidenceDir, 'managed-environment-acceptance.json'), proof)
+    const browserSummary = proof.cloudBrowser as ManagedEnvironmentBrowserSummary
     console.log(JSON.stringify({ severity: 'info', event: 'managed_environment.acceptance_passed', candidateSha: fixture.candidateSha,
-      runId: fixture.runId, expectedBrowserCases: 3, receipt: path.join(rig.runtime.evidenceDir, 'managed-environment-acceptance.json') }))
+      runId: fixture.runId, executedBrowserCases: browserSummary.executedCases, passedBrowserCases: browserSummary.passedCases,
+      receipt: path.join(rig.runtime.evidenceDir, 'managed-environment-acceptance.json') }))
   } finally {
     const errors: Error[] = []
     const cleanup: Record<string, unknown> = {}
