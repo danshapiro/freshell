@@ -500,7 +500,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       expect(original.soulId).toBe(view.soulId)
       expect(original.sessionRef.sessionId).toBe(nativeId)
       const canonical = { soulId: original.soulId, sessionRef: original.sessionRef,
-        resumeSessionId: original.resumeSessionId, createRequestId: original.createRequestId }
+        createRequestId: original.createRequestId }
       const beforeFacts = await rig.installInterruptedOrdinaryStopCounters(handle)
       const before = beforeFacts.durable
       expect(before.incarnations).toHaveLength(1)
@@ -535,7 +535,9 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       }
       expect(sent.slice(sentAtStop).filter((frame) => frame.type === 'freshAgent.kill')).toHaveLength(1)
       await expect(pane).toBeVisible()
-      expect((await harness.getPaneLayout(created.tabId)).content).toMatchObject(canonical)
+      const afterStop = (await harness.getPaneLayout(created.tabId)).content
+      expect(afterStop).toMatchObject(canonical)
+      expect(afterStop).not.toHaveProperty('resumeSessionId')
       await expect(pane.getByText('Synthetic saved answer 2', { exact: true })).toBeVisible()
 
       await rig.restartSupervisor()
