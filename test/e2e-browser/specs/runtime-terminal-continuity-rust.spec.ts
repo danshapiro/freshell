@@ -481,11 +481,15 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         const state = await harness.getState()
         const tabId = state.tabs.activeTabId!
         const leaf = state.panes.layouts[tabId]
-        return leaf?.type === 'leaf' && leaf.content.kind === 'fresh-agent' && leaf.content.sessionId
-          ? { tabId, paneId: leaf.id, sessionId: leaf.content.sessionId } : null
+        return leaf?.type === 'leaf' && leaf.content.kind === 'fresh-agent'
+          ? { tabId, paneId: leaf.id, createRequestId: leaf.content.createRequestId } : null
+      }, 60_000)
+      const createdReply = await waitForValue('synthetic fresh-agent create acknowledgement', async () => {
+        const reply = received.find((frame) => frame.type === 'freshAgent.created' && frame.requestId === created.createRequestId)
+        return typeof reply?.sessionId === 'string' && reply.sessionId.length > 0 ? reply : null
       }, 60_000)
       const view = await waitForValue('synthetic managed native root', async () => {
-        const current = await rig.runningViewForFreshSession(created.sessionId)
+        const current = await rig.runningViewForFreshSession(createdReply.sessionId)
         return current?.containerId && current.nativeSessionId ? current : null
       }, 90_000)
       const nativeId = view.nativeSessionId!
