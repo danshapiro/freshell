@@ -602,9 +602,35 @@ pub(crate) fn proc_starttime(pid: i32) -> Option<u64> {
 /// distinct result from a process that is gone.
 #[cfg(target_os = "linux")]
 fn proc_starttime_observation(pid: i32) -> Result<Option<u64>, ()> {
-    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+    starttime_observation_of_opened_stat(pid, std::fs::File::open(format!("/proc/{pid}/stat")))
+}
+
+/// The read half of [`proc_starttime_observation`]: read and parse a
+/// `/proc/<pid>/stat` handle the caller opened (or the open's error).
+#[cfg(target_os = "linux")]
+fn starttime_observation_of_opened_stat(
+    pid: i32,
+    opened: std::io::Result<std::fs::File>,
+) -> Result<Option<u64>, ()> {
+    let read = opened.and_then(|mut file| {
+        let mut stat = String::new();
+        std::io::Read::read_to_string(&mut file, &mut stat).map(|_| stat)
+    });
+    let stat = match read {
         Ok(stat) => stat,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // ESRCH on the read of an opened handle: the incarnation the handle
+        // refers to was reaped after the open. That is proof of death, never
+        // a recycled pid (the handle cannot reach a later process).
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+            tracing::debug!(target: "freshell_freshagent::session_lease",
+                event = "session_lease.stat_read_raced_reap",
+                pid,
+                "the process was reaped between the open and the read of its /proc stat; \
+                 it counts as gone"
+            );
+            return Ok(None);
+        }
         Err(_) => return Err(()),
     };
     // comm (field 2) may contain spaces/parens: split at the LAST ')' — the remainder
@@ -1433,6 +1459,46 @@ mod tests {
             "the recorded child itself was signaled (through the pidfd) and is dead"
         );
         let _ = child.kill().await;
+    }
+
+    /// A process reaped between the open of its `/proc/<pid>/stat` and the
+    /// read is GONE. The open handle refers to that one incarnation, so the
+    /// kernel answers the read with ESRCH once it is reaped — proof of death,
+    /// never a recycled pid. Reading it as "cannot observe" made a
+    /// kill-and-confirm report a dead tree unconfirmed (the false
+    /// `SESSION_RESERVED` "Another resume for this session is in flight").
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stat_read_that_races_the_reap_reads_as_gone() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn the observed child");
+        let pid = child.id() as i32;
+        let live_start = proc_starttime(pid);
+        // Open while the child is alive: the handles pin this incarnation.
+        let probe = std::fs::File::open(format!("/proc/{pid}/stat"));
+        let opened = std::fs::File::open(format!("/proc/{pid}/stat"));
+        // Our own unreaped child: its pid cannot be recycled before the wait.
+        child.kill().expect("kill the observed child");
+        child.wait().expect("reap the observed child");
+
+        assert!(live_start.is_some(), "the live child has a start time");
+        let probe_error = std::io::Read::read_to_string(
+            &mut probe.expect("open the live child's stat"),
+            &mut String::new(),
+        )
+        .expect_err("a reaped incarnation's open stat handle cannot be read");
+        assert_eq!(
+            probe_error.raw_os_error(),
+            Some(libc::ESRCH),
+            "precondition: the kernel answers the reaped incarnation's read with ESRCH"
+        );
+        assert_eq!(
+            starttime_observation_of_opened_stat(pid, opened),
+            Ok(None),
+            "a stat read that races the reap is proof the process is gone"
+        );
     }
 
     /// An owned candidate whose process observation was incomplete is not a
