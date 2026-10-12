@@ -734,21 +734,25 @@ pub fn screen_exit_hook(
     state: WsState,
     rt: tokio::runtime::Handle,
 ) -> Arc<dyn Fn(UnitScreenExit) + Send + Sync> {
-    Arc::new(move |exit: UnitScreenExit| {
-        let state = state.clone();
-        rt.spawn(async move {
-            on_member_exit(
-                &state,
-                &exit.unit_id,
-                &exit.terminal_id,
-                MemberExit::Screen {
-                    exit_code: exit.exit_code,
-                    lived: exit.lived,
-                },
-            )
-            .await
-        });
-    })
+    Arc::new(move |exit: UnitScreenExit| decide_screen_exit(&rt, state.clone(), exit))
+}
+
+/// Hands a screen's exit to the decision table ([`on_member_exit`]) in a
+/// task of its own on `rt`: the screen-exit hook's exits, and the exit a
+/// restart takes for a new screen it found gone ([`screen_gone_at_pin`]).
+fn decide_screen_exit(rt: &tokio::runtime::Handle, state: WsState, exit: UnitScreenExit) {
+    rt.spawn(async move {
+        on_member_exit(
+            &state,
+            &exit.unit_id,
+            &exit.terminal_id,
+            MemberExit::Screen {
+                exit_code: exit.exit_code,
+                lived: exit.lived,
+            },
+        )
+        .await
+    });
 }
 
 /// The directory's bind hook: every unit bound to its terminal, by any
@@ -1077,11 +1081,13 @@ async fn on_member_exit(state: &WsState, unit_id: &str, terminal_id: &str, exit:
 ///
 /// `counts_toward_cap` false (the user quit with a turn running) skips the
 /// respawn liveness accounting. `prior_lived` is how long the exited screen
-/// ran (logged). Any failure (no stored spawn inputs, a
-/// placement error, the `respawn cap`, a new screen that cannot be pinned)
-/// ends the whole unit as an agent exit with `exit_code` and ERROR
-/// `unit.screen.respawn_failed`, unless the unit's stop already began (that
-/// stop ends it).
+/// ran (logged). A new screen that already exited when it is pinned has
+/// simply exited: its exit goes to the decision table like any other
+/// ([`screen_gone_at_pin`]). Any failure (no stored spawn inputs, a
+/// placement error, the `respawn cap`, a new screen that cannot be pinned
+/// for another reason) ends the whole unit as an agent exit with
+/// `exit_code` and ERROR `unit.screen.respawn_failed`, unless the unit's
+/// stop already began (that stop ends it).
 pub async fn respawn_screen(
     state: &WsState,
     entry: &UnitEntry,
@@ -1093,8 +1099,8 @@ pub async fn respawn_screen(
     let replaced = replace_and_pin_screen(state, entry, &terminal_id, counts_toward_cap).await;
     let screen = match replaced {
         Ok(Some(screen)) => screen,
-        // The new screen already exited and its exit reached the hook,
-        // which decides again.
+        // The new screen already exited: the decision table decides its
+        // exit.
         Ok(None) => return,
         Err(cause) => {
             respawn_failed(
@@ -1125,8 +1131,9 @@ pub async fn respawn_screen(
 }
 
 /// The new screen of [`respawn_screen`], spawned and pinned: `Ok(None)`
-/// when it already exited (its exit was taken by the screen-exit hook
-/// before it could be pinned), `Err` with the cause of a failure.
+/// when it already exited before it could be pinned (its exit taken by the
+/// screen-exit hook, or by [`screen_gone_at_pin`]; either hands it to the
+/// decision table), `Err` with the cause of a failure.
 async fn replace_and_pin_screen(
     state: &WsState,
     entry: &UnitEntry,
@@ -1163,11 +1170,99 @@ async fn replace_and_pin_screen(
     .await
     .map_err(|error| format!("the replacement did not finish: {error}"))?
     .map_err(|error| error.to_string())?;
+    #[cfg(test)]
+    pin_after_reap::hold(state, terminal_id).await;
     match pin_screen(state, terminal_id, pid) {
         Ok(screen) => Ok(Some(screen)),
         // Not the row's running screen any more: its exit was taken.
         Err(_) if state.registry.pid_of(terminal_id) != Some(pid) => Ok(None),
-        Err(reason) => Err(format!("the new screen {pid} cannot be pinned: {reason}")),
+        Err(failure) if failure.process_gone() => {
+            screen_gone_at_pin(state, entry, terminal_id, pid).await
+        }
+        Err(failure) => Err(format!("the new screen {pid} cannot be pinned: {failure}")),
+    }
+}
+
+/// A new screen found gone at its pin (Task 17 concern (a)): it exited and
+/// was reaped before its own exit hook took its exit, which may not happen
+/// for a long time (a job the screen left can hold its terminal open). It
+/// has simply exited: its exit is taken now, with the code its waiter
+/// recorded and its run up to now, and handed to the decision table like
+/// any other screen exit, so a screen that quits as it starts counts toward
+/// the respawn cap like any other quick quit. The registry takes an exit
+/// once, so the screen's own hook, should it still deliver, decides
+/// nothing. `Ok(None)` once the exit is decided elsewhere (here, by the
+/// hook, or by the row's marked ending); `Err` when the waiter recorded no
+/// exit code within [`SCREEN_EXIT_CODE_WAIT`] (the restart then fails).
+async fn screen_gone_at_pin(
+    state: &WsState,
+    entry: &UnitEntry,
+    terminal_id: &str,
+    pid: u32,
+) -> Result<Option<ProcWatch>, String> {
+    let registry = state.registry.clone();
+    let tid = terminal_id.to_string();
+    let taken = tokio::task::spawn_blocking(move || {
+        registry.take_gone_screen_exit(&tid, pid, SCREEN_EXIT_CODE_WAIT)
+    })
+    .await
+    .map_err(|error| format!("the new screen {pid} exited before it was pinned: {error}"))?
+    .map_err(|error| format!("the new screen {pid} exited before it was pinned: {error}"))?;
+    if let Some(exit) = taken {
+        member_event!(
+            info,
+            entry,
+            terminal_id,
+            "unit.screen.exited_before_pin",
+            pid = pid,
+            exit_code = exit.exit_code,
+            lived_ms = millis(exit.lived),
+            "the new screen exited before it could be pinned; its exit is decided like any other"
+        );
+        decide_screen_exit(&tokio::runtime::Handle::current(), state.clone(), exit);
+    }
+    Ok(None)
+}
+
+/// Test-only: holds the pin of a targeted terminal's restarted screens until
+/// the new screen's PTY waiter reaped it (bounded), so a test can make a new
+/// screen exit, and be reaped, before the restart pins it (Task 17 concern
+/// (a)). Targeted by terminal id, so concurrent tests pass through.
+#[cfg(test)]
+pub(crate) mod pin_after_reap {
+    use std::sync::{Mutex, PoisonError};
+    use std::time::Duration;
+
+    static TARGETS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// The longest the pin is held for a screen that does not exit.
+    const LIMIT: Duration = Duration::from_secs(15);
+
+    /// Holds the restarted screens of `terminal_id` from now on.
+    pub(crate) fn arm(terminal_id: &str) {
+        let mut targets = TARGETS.lock().unwrap_or_else(PoisonError::into_inner);
+        targets.push(terminal_id.to_string());
+    }
+
+    /// Stops holding the restarted screens of `terminal_id`.
+    pub(crate) fn disarm(terminal_id: &str) {
+        let mut targets = TARGETS.lock().unwrap_or_else(PoisonError::into_inner);
+        targets.retain(|target| target != terminal_id);
+    }
+
+    pub(super) async fn hold(state: &crate::WsState, terminal_id: &str) {
+        let targeted = TARGETS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|target| target == terminal_id);
+        if !targeted {
+            return;
+        }
+        let registry = state.registry.clone();
+        let tid = terminal_id.to_string();
+        let _ =
+            tokio::task::spawn_blocking(move || registry.wait_screen_exit_code(&tid, LIMIT)).await;
     }
 }
 
@@ -1489,18 +1584,44 @@ pub enum Spawned {
 /// not waited for.
 pub type ClaimRelay = tokio::sync::oneshot::Receiver<Box<dyn std::any::Any + Send>>;
 
+/// Why a screen could not be pinned (its text is the logged reason).
+#[derive(Debug)]
+enum PinFailure {
+    /// The row records no start time for its screen (its exit was taken).
+    NoStartTime,
+    /// The watch could not be opened: the process is gone, its pid names a
+    /// different incarnation, or the OS call failed.
+    Open(std::io::Error),
+}
+
+impl PinFailure {
+    /// No process has the screen's pid any more: it exited and was reaped.
+    fn process_gone(&self) -> bool {
+        matches!(self, PinFailure::Open(error) if freshell_containment::is_process_gone(error))
+    }
+}
+
+impl std::fmt::Display for PinFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PinFailure::NoStartTime => {
+                f.write_str("no start time is recorded for the screen (it already exited)")
+            }
+            PinFailure::Open(error) => write!(f, "{error}"),
+        }
+    }
+}
+
 /// The screen `pid` the registry spawned for `terminal_id`, pinned by pid
 /// AND the start time its row recorded at the spawn, before anything could
 /// reap it (a pid alone could name a later process once the screen was
 /// reaped). `Err` says why it could not be pinned.
-fn pin_screen(state: &WsState, terminal_id: &str, pid: u32) -> Result<ProcWatch, String> {
+fn pin_screen(state: &WsState, terminal_id: &str, pid: u32) -> Result<ProcWatch, PinFailure> {
     let start = state
         .registry
         .screen_start_time(terminal_id)
-        .ok_or_else(|| {
-            "no start time is recorded for the screen (it already exited)".to_string()
-        })?;
-    ProcWatch::open_expecting(pid, start).map_err(|error| error.to_string())
+        .ok_or(PinFailure::NoStartTime)?;
+    ProcWatch::open_expecting(pid, start).map_err(PinFailure::Open)
 }
 
 /// One start of a coding-agent terminal pane inside its unit (see the module
@@ -1661,7 +1782,9 @@ impl StartScope {
             Ok(watch) => unit.set_screen(watch),
             // An exit the screen already took reaches the screen-exit hook
             // as a start failure.
-            Err(reason) => events::screen_unpinned(&unit_keys(&unit, None), screen_pid, &reason),
+            Err(reason) => {
+                events::screen_unpinned(&unit_keys(&unit, None), screen_pid, &reason.to_string())
+            }
         }
         self.state.units.note_terminal(unit.id(), terminal_id);
         self.spawned_terminal = Some(terminal_id.to_string());

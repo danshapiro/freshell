@@ -1515,6 +1515,92 @@ async fn a_quit_right_after_a_turn_ended_waits_for_the_table_to_take_that_end() 
     );
 }
 
+/// The `event` lines of the row `terminal_id`, in order.
+fn row_lines(
+    logs: &Arc<Mutex<Vec<crate::invariants::capture::CapturedEvent>>>,
+    terminal_id: &str,
+    event: &str,
+) -> Vec<crate::invariants::capture::CapturedEvent> {
+    let logs = logs.lock().unwrap_or_else(|p| p.into_inner());
+    logs.iter()
+        .filter(|e| {
+            e.fields.get("event").map(String::as_str) == Some(event)
+                && e.fields.get("terminal_id").map(String::as_str) == Some(terminal_id)
+        })
+        .cloned()
+        .collect()
+}
+
+/// A restarted screen that exits before the restart pins it has simply
+/// exited (Task 17 concern (a)): its exit is decided by the decision table
+/// like any other, so screens that quit as they start (exit 0 while a turn
+/// runs, faster than any person) count toward the respawn cap and end the
+/// unit there, never through a failed pin. Each new screen here quits at
+/// once and leaves a job holding its terminal, so its own exit never reaches
+/// the screen-exit hook while its restart runs, and every restart's pin is
+/// held until the new screen was reaped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_screen_that_exits_before_it_is_pinned_counts_toward_the_respawn_cap() {
+    let logs = crate::invariants::capture::capture();
+    let root = tempfile::tempdir().unwrap();
+    let (state, mut crashes) = unit_state(root.path());
+    let cap = 3;
+    state.registry.set_respawn_generation_cap(cap);
+    let tid = "T-gone-at-pin";
+    let quit_at_start = root.path().join("quit-at-start");
+    // The first screen quits when told; every later one quits as it starts,
+    // leaving a job (which ignores the hangup) holding its terminal open.
+    let script = format!(
+        "if [ -e '{}' ]; then trap '' HUP; sleep 30 & exit 0; fi; read -r _; exit 0",
+        quit_at_start.display()
+    );
+    let main = OwnChild::sleeping();
+    let entry = running_pane_with_main(&state, tid, "crq-gone-at-pin", &script, main.pin()).await;
+    // A turn runs, so a screen that quits is restarted against the agent.
+    crate::unit_threads::observe_status(&state, tid, "t-gone-at-pin", "active");
+    pin_after_reap::arm(tid);
+    std::fs::write(&quit_at_start, "").expect("the marker");
+    assert!(state.registry.input(tid, b"quit\n").found);
+
+    let watched = entry.unit.clone();
+    eventually("the unit ends", move || watched.stop_in_flight().is_some()).await;
+    pin_after_reap::disarm(tid);
+    let report = entry
+        .unit
+        .stop_in_flight()
+        .expect("the unit's stop")
+        .wait_for(LIMIT)
+        .await
+        .expect("Gone");
+    assert_eq!(report.reason, "agent-exited");
+
+    // What ended the unit: the restart past the cap, never a failed pin.
+    let failed = unit_line(&logs, &entry.unit, "unit.screen.respawn_failed");
+    assert_eq!(
+        failed.fields.get("cause").map(String::as_str),
+        Some("respawn cap"),
+        "the unit ended at the respawn cap: {failed:?}"
+    );
+    // Every new screen exited before its restart pinned it, and each of
+    // those exits was decided as a quick quit: the row's quick-restart count
+    // at each screen it installed rose to the cap.
+    let counts: Vec<u32> = row_lines(&logs, tid, "terminal.screen_replaced")
+        .iter()
+        .map(|e| e.fields["quick_screen_restarts"].parse().expect("a count"))
+        .collect();
+    assert_eq!(counts.last().copied(), Some(cap as u32), "{counts:?}");
+    assert_eq!(
+        row_lines(&logs, tid, "unit.screen.exited_before_pin").len(),
+        counts.len(),
+        "every restarted screen exited before it was pinned (installed: {counts:?})"
+    );
+    let crash = tokio::time::timeout(LIMIT, crashes.recv())
+        .await
+        .expect("the end reaches auto-resume")
+        .expect("a crash event");
+    assert_eq!(crash.exit_code, 0, "the screens' own clean code");
+}
+
 /// A restarted Codex TUI resumes the conversation its terminal is bound to
 /// now: the `resume` argument is rewritten, or appended to a spawn that had
 /// none (a fresh pane); a Windows shell's single command string is kept.
