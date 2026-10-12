@@ -4,6 +4,8 @@ import type { TestCase, TestResult } from '@playwright/test/reporter'
 import * as external from '../../../../scripts/testing/runtime-external-browser.js'
 import { buildManagedRuntimeMergePlan } from '../../../../src/lib/recovery/managed-runtime-recovery.js'
 import { EventEmitter } from 'node:events'
+import panesReducer, { updatePaneContent } from '../../../../src/store/panesSlice.js'
+import managedRuntimeReducer, { managedRuntimeSnapshotReceived } from '../../../../src/store/managedRuntimeSlice.js'
 
 const original = vi.hoisted(() => ({
   cases: new Map<string, (context: any) => Promise<void>>(),
@@ -155,16 +157,22 @@ type StartupFault = 'ack-request' | 'ack-mode' | 'ack-provider' | 'ack-runtime-p
   | 'create-tab' | 'pane-request' | 'pane-mode' | 'pane-provider' | 'pane-root' | 'pane-soul' | 'pane-incarnation'
   | 'inventory-missing' | 'inventory-stale' | 'inventory-ambiguous' | 'inventory-other-alias' | 'inventory-profile'
   | 'reply-run' | 'current-soul' | 'current-incarnation' | 'current-root' | 'current-ambiguous'
+  | 'current-profile' | 'current-type' | 'current-presentation' | 'current-host' | 'current-container' | 'current-intent'
+
+type ContinuityScenario = { advance?: boolean; split?: boolean; verified?: boolean;
+  mutate?: (state: any, item: any) => void; mutateSnapshot?: (state: any, item: any) => void }
 
 /** Execute the registered browser case, including its actual global collector and finally. */
 async function historyCallback(fault?: HistoryFault, startup: 'presentation' | 'native' = 'presentation', startupFault?: StartupFault,
-  actualHistoryHelper?: (...args: any[]) => Promise<void>) {
+  actualHistoryHelper?: (...args: any[]) => Promise<void>, continuity?: ContinuityScenario) {
   await import('../../../e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.js')
   vi.stubEnv('FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST', '1')
   const definitions = [
     ['freshclaude', 'claude'], ['kilroy', 'claude'], ['freshcodex', 'codex'], ['freshopencode', 'opencode'],
   ]
-  const state: any = { tabs: { activeTabId: '', tabs: [] }, panes: { layouts: {} } }
+  const state: any = { tabs: { activeTabId: '', tabs: [] },
+    panes: structuredClone(panesReducer(undefined, { type: 'controlled/init' })),
+    managedRuntime: structuredClone(managedRuntimeReducer(undefined, { type: 'controlled/init' })) }
   const allocated: any[] = []
   let observedNativePane = false
   let framesent!: (frame: { payload: string }) => void
@@ -172,6 +180,7 @@ async function historyCallback(fault?: HistoryFault, startup: 'presentation' | '
   let sendCount = 0
   let inventoryAfterHistory = 0
   const promotions: number[] = []
+  const historySnapshots: any[] = []
   const observedStartupIds: string[] = []
   const frame = (value: any) => framesent({ payload: JSON.stringify(value) })
   const current = () => allocated.at(-1)!
@@ -220,10 +229,14 @@ async function historyCallback(fault?: HistoryFault, startup: 'presentation' | '
       observedNativePane = false
       const index = allocated.length, [sessionType, provider] = definitions[index]
       const tabId = `tab-${index}`, paneId = `pane-${index}`, sessionId = `created-${index}`
-      const view = { soulId: `soul-${index}`, incarnationId: `incarnation-${index}`, nativeSessionId: `native-${index}`,
+      const view = { soulId: `soul-${index}`, incarnationId: `incarnation-${index}`, nativeSessionId: `11111111-1111-4111-8111-${String(index).padStart(12, '0')}`,
         freshAgentSessionId: sessionId, freshAgentSessionType: sessionType,
         provider: sessionType === 'kilroy' ? 'kilroy' : provider, profile: 'default_agent',
-        launchState: 'running', intentRevision: 1, containerId: String(index + 1).repeat(64), hostBootId: `boot-${index}` }
+        launchState: 'running', cleanupState: 'none', executionGeneration: 1, intentRevision: 1,
+        desiredState: 'running', recoveryState: 'live',
+        allocationState: continuity?.verified ? 'verified_durable' : 'materializing',
+        durabilityState: continuity?.verified ? 'resume_captured' : 'unknown',
+        evidenceRevision: 0, successfulRecoveriesInWindow: 0, containerId: String(index + 1).repeat(64), hostBootId: `boot-${index}` }
       const content = { kind: 'fresh-agent', sessionType, provider, sessionId, createRequestId: `request-${index}` }
       state.tabs.activeTabId = tabId
       state.tabs.tabs.push({ id: tabId })
@@ -243,30 +256,49 @@ async function historyCallback(fault?: HistoryFault, startup: 'presentation' | '
     } : locator }),
     evaluate: async (operation: any, argument: any) => {
       vi.stubGlobal('window', { __FRESHELL_TEST_HARNESS__: { getState: () => state } })
-      try { const result = operation(argument); observedNativePane = true; return result } finally { vi.unstubAllGlobals() }
+      try {
+        const result = operation(argument); observedNativePane = true
+        if (continuity?.split) {
+          const item = current(), leaf = state.panes.layouts[item.tabId]
+          if (leaf.type === 'leaf') state.panes.layouts[item.tabId] = { type: 'split', id: `split-${item.paneId}`,
+            direction: 'horizontal', sizes: [35, 65], children: [leaf,
+              { type: 'leaf', id: `browser-${item.paneId}`, content: { kind: 'browser', url: 'https://controlled.invalid' } }] }
+        }
+        return result
+      } finally { vi.unstubAllGlobals() }
     },
   }
-  const promote = (item: any) => {
-    const soul = { ...item.view, freshAgentCreateRequestId: `request-${allocated.indexOf(item)}`,
-      desiredState: 'running', recoveryState: 'live' }
-    const view = { viewId: `view-${item.paneId}`, soulId: item.view.soulId, revision: 1,
-      kind: 'automatic_primary', visibility: 'visible', preferredTabId: item.tabId, preferredPaneId: item.paneId }
-    const plan = buildManagedRuntimeMergePlan({ revision: 1, souls: [soul], viewIntents: [view] } as any, state)
+  const fold = (snapshot: any) => {
+    const plan = buildManagedRuntimeMergePlan(snapshot, state)
     expect(plan.creates).toHaveLength(0)
-    expect(plan.updates).toHaveLength(1)
-    state.panes.layouts[item.tabId].content = plan.updates[0].content
+    for (const update of plan.updates) state.panes = structuredClone(panesReducer(state.panes, updatePaneContent(update)))
+    state.managedRuntime = structuredClone(managedRuntimeReducer(state.managedRuntime,
+      managedRuntimeSnapshotReceived({ snapshot, reconstructedViewCount: 0 })))
+    return plan
+  }
+  const promote = (item: any) => {
+    const soul = { ...item.view, freshAgentCreateRequestId: `request-${allocated.indexOf(item)}` }
+    const view = { viewId: `view-${item.paneId}`, soulId: item.view.soulId, revision: 1,
+      kind: 'automatic_primary', visibility: 'visible', preferredTabId: item.tabId, preferredPaneId: item.paneId,
+      ownerId: 'controlled-owner', workspaceId: 'controlled-workspace', title: 'controlled title',
+      placementGroup: 'controlled-group', soulIntentRevision: 1, createdAt: 1, updatedAt: 1 }
+    const plan = fold({ revision: state.managedRuntime.revision + 1, pendingProjectionCount: 0,
+      souls: [...state.managedRuntime.souls, soul], viewIntents: [...state.managedRuntime.viewIntents, view] })
+    expect(plan.updates).toHaveLength(allocated.length)
     promotions.push(allocated.indexOf(item))
   }
   original.start.mockResolvedValue({ baseUrl: 'https://fixture.invalid', token: 'private-token' })
   original.stop.mockClear().mockResolvedValue({ ok: true, errors: [] })
   original.waitForHarness.mockResolvedValue(undefined)
   original.waitForConnection.mockResolvedValue(undefined)
-  original.state.mockImplementation(async () => {
-    if (allocated.length > sendCount) observedStartupIds.push(state.panes.layouts[current().tabId].content.sessionId)
-    return structuredClone(state)
+  original.state.mockClear().mockImplementation(async () => {
+    if (current()?.tabId && allocated.length > sendCount) observedStartupIds.push(state.panes.layouts[current().tabId].content.sessionId)
+    const snapshot = structuredClone(state)
+    if (observedNativePane) continuity?.mutateSnapshot?.(snapshot, current())
+    return snapshot
   })
   original.tabCount.mockImplementation(async () => state.tabs.tabs.length)
-  original.layout.mockImplementation(async (tabId: string) => structuredClone(state.panes.layouts[tabId]))
+  original.layout.mockClear().mockImplementation(async (tabId: string) => structuredClone(state.panes.layouts[tabId]))
   original.activeTab.mockImplementation(async () => state.tabs.activeTabId)
   const inventory = () => {
     const rows = allocated.map(item => ({ ...item.view }))
@@ -280,6 +312,12 @@ async function historyCallback(fault?: HistoryFault, startup: 'presentation' | '
       if (startupFault === 'current-soul') rows[0].soulId = 'changed-current-soul'
       if (startupFault === 'current-incarnation') rows[0].incarnationId = 'changed-current-incarnation'
       if (startupFault === 'current-root') rows[0].nativeSessionId = 'changed-current-root'
+      if (startupFault === 'current-profile') rows[0].profile = 'test_fixture'
+      if (startupFault === 'current-type') rows[0].freshAgentSessionType = 'freshcodex'
+      if (startupFault === 'current-presentation') rows[0].freshAgentSessionId = 'changed-presentation'
+      if (startupFault === 'current-host') rows[0].hostBootId = 'changed-boot'
+      if (startupFault === 'current-container') rows[0].containerId = 'f'.repeat(64)
+      if (startupFault === 'current-intent') rows[0].intentRevision = 2
       if (startupFault === 'current-ambiguous') rows.push({ ...rows[0], incarnationId: 'ambiguous-current-incarnation' })
     }
     return rows
@@ -302,13 +340,24 @@ async function historyCallback(fault?: HistoryFault, startup: 'presentation' | '
     repoRoot: '/controlled/checkout',
     runningViewForFreshSession: externalRig.runningViewForFreshSession.bind(externalRig),
     exactRuntimeHandle: externalRig.exactRuntimeHandle.bind(externalRig),
-    fixtureNativeState: async () => ({ dispatchCount: 1, completionCount: 1 }),
+    fixtureNativeState: async () => ({ dispatchCount: current().dispatchCount ?? 1, completionCount: 1 }),
     inventory: externalRig.inventory.bind(externalRig),
   }
   original.history.mockClear().mockImplementation(async (...args: any[]) => {
     if (actualHistoryHelper) return actualHistoryHelper(...args)
     const index = allocated.length - 1
-    const attach = (item: any) => ({ type: 'freshAgent.attach', ...state.panes.layouts[item.tabId].content })
+    if (continuity?.advance) {
+      const before = structuredClone(state)
+      const snapshot = { ...structuredClone(state.managedRuntime), revision: state.managedRuntime.revision + 1 }
+      const soul = snapshot.souls.find((row: any) => row.soulId === current().view.soulId)
+      soul.allocationState = 'verified_durable'; soul.durabilityState = 'resume_captured'
+      fold(snapshot)
+      historySnapshots.push({ before, after: structuredClone(state) })
+    }
+    const attach = (item: any) => {
+      const root = state.panes.layouts[item.tabId]
+      return { type: 'freshAgent.attach', ...(root.type === 'split' ? root.children[0].content : root.content) }
+    }
     const messages = allocated.map(attach)
     if (index === 1 && fault) {
       const target = messages.at(-1)!
@@ -326,6 +375,7 @@ async function historyCallback(fault?: HistoryFault, startup: 'presentation' | '
         requestId: fault === 'create-owner' ? 'unowned-request' : target.createRequestId,
       }
     }
+    continuity?.mutate?.(state, current())
     for (const message of messages) frame(message)
     // Cancel only the controlled probe's original 90s boundary; no host timer wedge.
     if (index === 1 && fault === 'missing-target') {
@@ -335,12 +385,12 @@ async function historyCallback(fault?: HistoryFault, startup: 'presentation' | '
   })
   if (fault === 'misbound-pane') original.state.mockImplementation(async () => {
     const snapshot = structuredClone(state)
-    if (allocated.length === 2 && observedNativePane) snapshot.panes.layouts['tab-1'].content.sessionId = 'native-0'
+    if (allocated.length === 2 && observedNativePane) snapshot.panes.layouts['tab-1'].content.sessionId = allocated[0].view.nativeSessionId
     return snapshot
   })
   const run = original.cases.get('completed owned native fixture history opens its existing browser pane')!({ page })
   void run.catch(() => {}) // Controlled clocks may settle refusal before the caller awaits it.
-  return { run, allocated, lookups, transport, promotions, observedStartupIds, page, sends: () => sendCount }
+  return { run, allocated, lookups, transport, promotions, observedStartupIds, page, state, historySnapshots, sends: () => sendCount }
 }
 
 describe('managed History startup inventory binding', () => {
@@ -363,7 +413,8 @@ describe('managed History startup inventory binding', () => {
   it.each<StartupFault>(['ack-request', 'ack-mode', 'ack-provider', 'ack-runtime-provider', 'ack-root', 'ack-missing-root', 'ack-duplicate',
     'create-tab', 'pane-request', 'pane-mode', 'pane-provider', 'pane-root', 'pane-soul', 'pane-incarnation',
     'inventory-missing', 'inventory-stale', 'inventory-ambiguous', 'inventory-other-alias', 'inventory-profile', 'reply-run',
-    'current-soul', 'current-incarnation', 'current-root', 'current-ambiguous'])(
+    'current-soul', 'current-incarnation', 'current-root', 'current-ambiguous',
+    'current-profile', 'current-type', 'current-presentation', 'current-host', 'current-container', 'current-intent'])(
     'refuses %s through the actual callback and closes exactly once', async startupFault => {
       const phases: string[] = []
       vi.spyOn(process.stdout, 'write').mockImplementation((chunk: any) => {
@@ -389,6 +440,9 @@ describe('managed History startup inventory binding', () => {
         'current-soul': /changed-current-soul/, 'current-incarnation': /changed-current-incarnation/,
         'current-root': /changed-current-root/,
         'current-ambiguous': /Received length: 2/,
+        'current-profile': /test_fixture/, 'current-type': /freshcodex/,
+        'current-presentation': /Received: undefined/, 'current-host': /changed-boot/,
+        'current-container': /ffffffff/, 'current-intent': /intentRevision/,
       }
       await expect(run).rejects.toThrow(cause[startupFault])
       const afterHistory = startupFault.startsWith('current-')
@@ -400,6 +454,206 @@ describe('managed History startup inventory binding', () => {
       expect(original.stop).toHaveBeenCalledOnce()
     },
   )
+})
+
+function expectOnlyDurabilityAdvance(before: any, after: any) {
+  const expected = structuredClone(before.panes.layouts)
+  const summary = expected[before.tabs.activeTabId].content.recoverySummary
+  summary.allocationState = 'verified_durable'
+  summary.durabilityState = 'resume_captured'
+  expect(after.panes.layouts).toStrictEqual(expected)
+  expect(after.managedRuntime.revision).toBeGreaterThan(before.managedRuntime.revision)
+}
+
+describe('managed History checked continuity', () => {
+  it('accepts corroborated atomic durability advancement through all four original modes', async () => {
+    const events: any[] = []
+    vi.spyOn(process.stdout, 'write').mockImplementation((chunk: any) => {
+      events.push(...external.parseManagedHistoryDiagnosticText(String(chunk))); return true
+    })
+    const { run, allocated, historySnapshots, sends, transport } = await historyCallback(undefined, 'native', undefined, undefined, { advance: true })
+    try { await run } catch (error) {
+      expect(events.filter(event => event.state === 'failed').map(event => event.phase)).toEqual(['history-layout'])
+      expect(sends()).toBe(1)
+      expect(allocated).toHaveLength(1)
+      expect(original.stop).toHaveBeenCalledOnce()
+      const { before, after } = historySnapshots[0]
+      expectOnlyDurabilityAdvance(before, after)
+      throw error
+    }
+    expect(allocated).toHaveLength(4)
+    expect(historySnapshots).toHaveLength(4)
+    for (const { before, after } of historySnapshots) {
+      expectOnlyDurabilityAdvance(before, after)
+    }
+    for (const mode of ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode']) {
+      const phases = events.filter(event => event.event === 'managed_history_phase' && event.mode === mode)
+      expect(phases.filter(event => event.state === 'end')).toHaveLength(24)
+      expect(phases.filter(event => event.state === 'failed')).toEqual([])
+      const ordered = ['new-tab', 'picker-visible', 'picker-click', 'directory-fill', 'directory-enter', 'pane-observation',
+        'first-inventory', 'composer-enabled', 'composer-fill', 'send', 'completion', 'native-pane', 'tab-count', 'layout',
+        'inventory-before', 'history-open', 'history-pane-visible', 'history-active-tab', 'history-tab-count', 'history-layout',
+        'history-inventory', 'history-wire', 'history-current', 'history-dispatch']
+      expect(phases.map(event => [event.phase, event.state])).toEqual(ordered.flatMap(phase => [[phase, 'begin'], [phase, 'end']]))
+    }
+    expect(sends()).toBe(4)
+    expect(original.state).toHaveBeenCalledTimes(12)
+    expect(original.layout).not.toHaveBeenCalled()
+    expect(transport).toHaveBeenCalledTimes(24)
+    expect(original.history).toHaveBeenCalledTimes(4)
+    expect(original.stop).toHaveBeenCalledOnce()
+  })
+
+  it.each([false, true])('keeps unchanged observations and split geometry (durable=%s)', async verified => {
+    vi.spyOn(process.stdout, 'write').mockReturnValue(true)
+    const { run, allocated, sends } = await historyCallback(undefined, 'native', undefined, undefined, { split: true, verified })
+    await expect(run).resolves.toBeUndefined()
+    expect(allocated).toHaveLength(4)
+    expect(sends()).toBe(4)
+    expect(original.stop).toHaveBeenCalledOnce()
+  })
+
+  const content = (state: any, item: any) => {
+    const root = state.panes.layouts[item.tabId]
+    return root.type === 'split' ? root.children[0].content : root.content
+  }
+  const soul = (state: any, item: any) => state.managedRuntime.souls.find((row: any) => row.soulId === item.view.soulId)
+  const view = (state: any, item: any) => state.managedRuntime.viewIntents.find((row: any) => row.soulId === item.view.soulId)
+  it('rejects the same wrong projected view ID in both original History snapshots', async () => {
+    const events: any[] = [], snapshots: any[] = []
+    vi.spyOn(process.stdout, 'write').mockImplementation((chunk: any) => {
+      events.push(...external.parseManagedHistoryDiagnosticText(String(chunk))); return true
+    })
+    const wrongViewId = 'nonexistent-projected-view'
+    const { run, allocated, sends } = await historyCallback(undefined, 'native', undefined, undefined, {
+      advance: true, mutateSnapshot: (state, item) => {
+        content(state, item).viewIntentId = wrongViewId
+        snapshots.push(state)
+      },
+    })
+    try { await expect(run).rejects.toThrow(/viewId/) } finally {
+      expect(original.stop).toHaveBeenCalledOnce()
+      const [before, after] = snapshots
+      const expectedView = expect.objectContaining({ viewId: 'view-pane-0', soulId: allocated[0].view.soulId,
+        preferredTabId: 'tab-0', preferredPaneId: 'pane-0' })
+      for (const state of [before, after]) {
+        expect(content(state, allocated[0]).viewIntentId).toBe(wrongViewId)
+        expect(state.managedRuntime.viewIntents).toEqual([expectedView])
+      }
+      expect(after.managedRuntime.viewIntents).toStrictEqual(before.managedRuntime.viewIntents)
+      expectOnlyDurabilityAdvance(before, after)
+    }
+    expect(events.filter(event => event.state === 'failed').map(event => event.phase)).toEqual(['history-layout'])
+    expect(snapshots).toHaveLength(2)
+    expect(allocated).toHaveLength(1)
+    expect(sends()).toBe(1)
+  })
+
+  const mutations: [string, (state: any, item: any) => void][] = [
+    ...['createRequestId', 'provider', 'sessionType', 'sessionId', 'resumeSessionId', 'soulId', 'incarnationId', 'viewIntentId', 'model'].map(key =>
+      [key, (state: any, item: any) => { content(state, item)[key] = 'changed-' + key }] as [string, (state: any, item: any) => void]),
+    ['sessionRef', (state, item) => { content(state, item).sessionRef.sessionId = 'wrong-native-root' }],
+    ['view-revision', (state, item) => { content(state, item).viewIntentRevision++ }],
+    ['soul-intent', (state, item) => { content(state, item).soulIntentRevision++ }],
+    ...['reason', 'recoveryState', 'desiredState', 'attemptId', 'incidentId'].map(key =>
+      ['summary-' + key, (state: any, item: any) => { content(state, item).recoverySummary[key] = 'changed-' + key }] as [string, (state: any, item: any) => void]),
+    ['missing-pair', (state, item) => { delete content(state, item).recoverySummary.allocationState }],
+    ['partial-pair', (state, item) => {
+      for (const row of [content(state, item).recoverySummary, soul(state, item)]) row.durabilityState = 'unknown'
+    }],
+    ['partial-allocation', (state, item) => {
+      for (const row of [content(state, item).recoverySummary, soul(state, item)]) row.allocationState = 'materializing'
+    }],
+    ['unknown-pair', (state, item) => {
+      for (const row of [content(state, item).recoverySummary, soul(state, item)]) row.allocationState = 'unknown'
+    }],
+    ['checkpoint', (state, item) => {
+      for (const row of [content(state, item).recoverySummary, soul(state, item)]) row.durabilityState = 'checkpoint_captured'
+    }],
+    ['uncorroborated-pair', (state, item) => { soul(state, item).allocationState = 'materializing'; soul(state, item).durabilityState = 'unknown' }],
+    ['missing-soul', (state) => { state.managedRuntime.souls = [] }],
+    ['duplicate-soul', (state, item) => { state.managedRuntime.souls.push({ ...soul(state, item), nativeSessionId: 'wrong-duplicate-root' }) }],
+    ['duplicate-native-owner', (state, item) => { state.managedRuntime.souls.push({ ...soul(state, item), soulId: 'other-soul-owner' }) }],
+    ['missing-view', (state) => { state.managedRuntime.viewIntents = [] }],
+    ['duplicate-view', (state, item) => { state.managedRuntime.viewIntents.push({ ...view(state, item), preferredPaneId: 'wrong-duplicate-pane' }) }],
+    ['duplicate-pane-owner', (state, item) => { state.managedRuntime.viewIntents.push({ ...view(state, item), viewId: 'other-view-owner' }) }],
+    ['stale-snapshot', (state) => { state.managedRuntime.revision = 0 }],
+    ...['nativeSessionId', 'profile', 'provider', 'freshAgentSessionId', 'freshAgentSessionType', 'freshAgentCreateRequestId',
+      'soulId', 'incarnationId', 'containerId', 'hostBootId', 'freshAgentRuntimeVariant'].map(key =>
+      ['soul-' + key, (state: any, item: any) => { soul(state, item)[key] = 'changed-' + key }] as [string, (state: any, item: any) => void]),
+    ['soul-intent-revision', (state, item) => { soul(state, item).intentRevision++ }],
+    ['execution-generation', (state, item) => { soul(state, item).executionGeneration++ }],
+    ['missing-intent', (state, item) => { delete soul(state, item).intentRevision }],
+    ['missing-native-reference', (state, item) => { delete content(state, item).sessionRef }],
+    ['missing-durability', (state, item) => { delete content(state, item).recoverySummary.durabilityState }],
+    ['authoritative-launch-state', (state, item) => { soul(state, item).launchState = 'stopped' }],
+    ['view-soul', (state, item) => { view(state, item).soulId = 'wrong-view-soul' }],
+    ['view-pane', (state, item) => { view(state, item).preferredPaneId = 'wrong-view-pane' }],
+    ['view-tab', (state, item) => { view(state, item).preferredTabId = 'wrong-view-tab' }],
+    ['view-kind', (state, item) => { view(state, item).kind = 'explicit' }],
+    ['missing-view-revision', (state, item) => { delete view(state, item).revision }],
+    ['view-placement', (state, item) => { view(state, item).placementGroup = 'changed-group' }],
+    ['leaf-id', (state, item) => { state.panes.layouts[item.tabId].children[0].id = 'changed-leaf' }],
+    ['leaf-type', (state, item) => { state.panes.layouts[item.tabId].children[0].type = 'split'; state.panes.layouts[item.tabId].children[0].children = [] }],
+    ['content-kind', (state, item) => { content(state, item).kind = 'terminal' }],
+    ['root-id', (state, item) => { state.panes.layouts[item.tabId].id = 'changed-root' }],
+    ['split-direction', (state, item) => { state.panes.layouts[item.tabId].direction = 'vertical' }],
+    ['split-sizes', (state, item) => { state.panes.layouts[item.tabId].sizes = [50, 50] }],
+    ['split-order', (state, item) => { state.panes.layouts[item.tabId].children.reverse() }],
+    ['added-leaf', (state, item) => { state.panes.layouts[item.tabId].children.push({ type: 'leaf', id: 'extra', content: { kind: 'browser', url: 'https://extra.invalid' } }) }],
+    ['removed-leaf', (state, item) => { state.panes.layouts[item.tabId].children.pop() }],
+    ['other-leaf-content', (state, item) => { state.panes.layouts[item.tabId].children[1].content.url = 'https://changed.invalid' }],
+    ['background-owner', (state) => { state.panes.layouts['tab-0'].children[0].content.sessionId = 'wrong-background-native' }],
+  ]
+  it.each(mutations)('rejects %s through the original History continuity guard', async (name, mutate) => {
+    const failures: string[] = []
+    vi.spyOn(process.stdout, 'write').mockImplementation((chunk: any) => {
+      failures.push(...external.parseManagedHistoryDiagnosticText(String(chunk)).filter(event => event.state === 'failed').map(event => event.phase!))
+      return true
+    })
+    const background = name === 'background-owner'
+    const { run, allocated, sends } = await historyCallback(undefined, 'native', undefined, undefined, {
+      advance: true, split: true, mutate: (state, item) => { if (!background || item.tabId === 'tab-1') mutate(state, item) },
+    })
+    await expect(run).rejects.toThrow()
+    expect(failures).toEqual(['history-layout'])
+    expect(allocated).toHaveLength(background ? 2 : 1)
+    expect(sends()).toBe(background ? 2 : 1)
+    expect(original.stop).toHaveBeenCalledOnce()
+  })
+
+  it('rejects a fully corroborated backwards durability pair', async () => {
+    const failures: string[] = []
+    vi.spyOn(process.stdout, 'write').mockImplementation((chunk: any) => {
+      failures.push(...external.parseManagedHistoryDiagnosticText(String(chunk)).filter(event => event.state === 'failed').map(event => event.phase!)); return true
+    })
+    const { run } = await historyCallback(undefined, 'native', undefined, undefined, { verified: true,
+      mutate: (state, item) => {
+        for (const row of [content(state, item).recoverySummary, soul(state, item)]) {
+          row.allocationState = 'materializing'; row.durabilityState = 'unknown'
+        }
+      } })
+    await expect(run).rejects.toThrow(/materializing/)
+    expect(failures).toEqual(['history-layout'])
+    expect(original.stop).toHaveBeenCalledOnce()
+  })
+
+  it.each(['new-tab', 'dispatch-two'] as const)('retains the later %s guard with valid continuity', async fault => {
+    const failures: string[] = []
+    vi.spyOn(process.stdout, 'write').mockImplementation((chunk: any) => {
+      failures.push(...external.parseManagedHistoryDiagnosticText(String(chunk)).filter(event => event.state === 'failed').map(event => event.phase!)); return true
+    })
+    const { run, sends, allocated } = await historyCallback(undefined, 'native', undefined, undefined, { advance: true,
+      mutate: (state, item) => {
+        if (fault === 'new-tab') state.tabs.tabs.push({ id: 'unexpected-tab' })
+        else item.dispatchCount = 2
+      } })
+    await expect(run).rejects.toThrow()
+    expect(failures).toEqual([fault === 'new-tab' ? 'history-tab-count' : 'history-dispatch'])
+    expect(sends()).toBe(1)
+    expect(allocated).toHaveLength(1)
+    expect(original.stop).toHaveBeenCalledOnce()
+  })
 })
 
 describe('managed History original wire ownership', () => {
@@ -426,7 +680,7 @@ describe('managed History original wire ownership', () => {
       const { run, allocated } = await historyCallback(fault)
       const cause: Partial<Record<HistoryFault, RegExp>> = {
         unknown: /Received length: 0/,
-        provider: /opencode/, mode: /kilroy/, root: /wrong-root/, 'misbound-pane': /native-0/,
+        provider: /opencode/, mode: /kilroy/, root: /wrong-root/, 'misbound-pane': /11111111-1111-4111-8111-000000000000/,
         create: /freshclaude/, 'create-owner': /unowned-request/, send: /freshAgent.send/,
         'missing-target': /timed out waiting for actual owned History wire ingress/,
         'new-allocation': /new-soul/,

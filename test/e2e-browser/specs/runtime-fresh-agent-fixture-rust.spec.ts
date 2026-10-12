@@ -11,6 +11,7 @@ import { ManagedHistoryAwaitedPhases, ManagedHistoryDirectoryResponses, observeO
 import { test } from '../helpers/fixtures.js'
 import { createManagedRuntimeBrowserRig, openFreshHistorySession, type ManagedFixtureRig, type ManagedRuntimeView, type FixtureNativeState } from '../helpers/managed-runtime.js'
 import { TestHarness } from '../helpers/test-harness.js'
+import { assertManagedHistoryContinuity, type OwnedHistoryAllocation } from '../helpers/managed-history-continuity.js'
 
 const FIXTURE_ENV = 'FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST'
 const PENDING_CONTROL = '[freshell-fixture:pending-approval]'
@@ -24,10 +25,6 @@ const MODES = [
 
 type Created = { paneId: string; sessionId: string; view: ManagedRuntimeView }
 type ObservedResourceType = Parameters<ManagedHistoryAwaitedPhases['navigation']>[0]['resourceType']
-type OwnedHistoryAllocation = {
-  tabId: string; paneId: string; createRequestId: string; createdSessionId: string
-  sessionType: string; provider: string; nativeSessionId: string
-}
 
 /** Snapshot every existing pane before Projects unmounts and remounts the workspace. */
 function historyPaneOwners(state: any, allocations: OwnedHistoryAllocation[]) {
@@ -213,12 +210,13 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
           createdSessionId, nativeSessionId: view.nativeSessionId! }
         const nativePane = await phase('native-pane', () => waitFor('browser pane bound to the actual owned allocation',
           () => page.evaluate(observeOwnedFreshBrowserPane, paneObservation)))
-        allocations.push(paneObservation)
+        allocations.push({ ...paneObservation, soulId: view.soulId, incarnationId: view.incarnationId,
+          containerId: view.containerId!, hostBootId: view.hostBootId!, intentRevision: view.intentRevision })
         const tabCount = await phase('tab-count', () => harness.getTabCount())
-        const { layout, owners } = await phase('layout', async () => ({
-          layout: await harness.getPaneLayout(created.tabId),
-          owners: historyPaneOwners(await harness.getState(), allocations),
-        }))
+        const { baseline, owners } = await phase('layout', async () => {
+          const baseline = await harness.getState()
+          return { baseline, owners: historyPaneOwners(baseline, allocations) }
+        })
         expect(owners.find(owner => owner.paneId === created.paneId)?.sessionId).toBe(nativePane.sessionId)
         const soulIds = (await phase('inventory-before', () => rig.inventory())).map(row => row.soulId).sort()
         const cursor = sent.length
@@ -228,7 +226,11 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
         await phase('history-pane-visible', () => expect(pane).toBeVisible())
         await phase('history-active-tab', async () => expect(await harness.getActiveTabId()).toBe(created.tabId))
         await phase('history-tab-count', async () => expect(await harness.getTabCount()).toBe(tabCount))
-        await phase('history-layout', async () => expect(await harness.getPaneLayout(created.tabId)).toEqual(layout))
+        await phase('history-layout', async () => {
+          const currentState = await harness.getState()
+          assertManagedHistoryContinuity(baseline, currentState, allocations)
+          expect(historyPaneOwners(currentState, allocations)).toEqual(owners)
+        })
         await phase('history-inventory', async () => expect((await rig.inventory()).map(row => row.soulId).sort()).toEqual(soulIds))
         await phase('history-wire', () => waitFor('actual owned History wire ingress', () => sent.slice(cursor).find(frame =>
           frame.type === 'freshAgent.attach' && frame.sessionId === nativePane.sessionId
@@ -259,6 +261,7 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
           expect(current?.incarnationId).toBe(view.incarnationId)
           expect(current?.nativeSessionId).toBe(view.nativeSessionId)
           expect(current).toMatchObject({ provider: view.provider, profile: view.profile,
+            intentRevision: view.intentRevision,
             freshAgentSessionType: definition.mode, freshAgentSessionId: createdSessionId })
           expect(rig.exactRuntimeHandle(current!)).toEqual(rig.exactRuntimeHandle(view))
         })
