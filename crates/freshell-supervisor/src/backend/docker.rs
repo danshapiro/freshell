@@ -2,6 +2,7 @@ use freshell_runtime_protocol::{
     FreshAgentLaunchSpec, ProviderBootstrapFile, ProviderConfigRoot, ProviderLaunchContext,
     ProviderSecretReference, TerminalLaunchSpec,
 };
+use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     sync::OnceLock,
@@ -28,7 +29,7 @@ pub fn configure_capability_dir(control_socket: &Path) -> Result<(), String> {
         .map_err(|_| "managed MCP capability directory already configured".into())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperatorHomeMount {
     pub home: PathBuf,
     pub mask_rel_paths: Vec<String>,
@@ -197,6 +198,15 @@ fn workload_mounts(
             Ok(canonical)
         })
         .transpose()?;
+    let euid = unsafe { libc::geteuid() };
+    let operator_home = effective_operator_mount(
+        explicit_operator_home(
+            std::env::var_os("FRESHELL_SUPERVISOR_OPERATOR_HOME").as_deref(),
+            euid,
+        )
+        .or_else(|| operator_home_mount(std::env::var_os("HOME").as_deref(), euid)),
+        &workspace,
+    );
     Ok(TerminalMounts {
         workspace,
         git_common_dir,
@@ -204,7 +214,7 @@ fn workload_mounts(
         provider_secret_files,
         provider_user_root,
         mcp_capability_file,
-        operator_home: None,
+        operator_home,
     })
 }
 
@@ -225,7 +235,6 @@ pub fn operator_home_mount(
     derive_operator_mount(home_env, supervisor_euid)
 }
 
-#[allow(dead_code)]
 fn effective_operator_mount(
     mount: Option<OperatorHomeMount>,
     workspace: &Path,

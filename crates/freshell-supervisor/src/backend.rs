@@ -21,6 +21,8 @@ use tokio::{
 
 const DOCKER_API: &str = "/v1.47";
 
+const OPERATOR_HOME_MOUNT_LABEL: &str = "com.freshell.operator-home-mount";
+
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
     #[error("docker backend unavailable: {0}")]
@@ -312,12 +314,14 @@ impl DockerEngineBackend {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn docker_create_body(
     spec: &CreateRuntimeSpec,
     binds: Vec<String>,
     host_env: Vec<String>,
     extra_hosts: Vec<String>,
     runtime_tmpfs_config: BTreeMap<String, String>,
+    operator_home_record: Option<String>,
     requested_limits: String,
     memory_swap: u64,
 ) -> Value {
@@ -326,6 +330,17 @@ fn docker_create_body(
     } else {
         Vec::new()
     };
+    let mut labels = json!({
+        "project": "freshell",
+        "com.freshell.managed": "true",
+        "com.freshell.installation-id": spec.installation_id.as_str(),
+        "com.freshell.soul-id": spec.soul_id.as_str(),
+        "com.freshell.incarnation-id": spec.incarnation_id.as_str(),
+        "com.freshell.runtime-test-run-id": spec.test_run_id,
+    });
+    if let Some(record) = operator_home_record {
+        labels[OPERATOR_HOME_MOUNT_LABEL] = json!(record);
+    }
     json!({
         "Image": spec.image_ref,
         "Env": host_env,
@@ -337,14 +352,7 @@ fn docker_create_body(
             "--incarnation-id", spec.incarnation_id.as_str(),
             "--requested-limits", requested_limits
         ],
-        "Labels": {
-            "project": "freshell",
-            "com.freshell.managed": "true",
-            "com.freshell.installation-id": spec.installation_id.as_str(),
-            "com.freshell.soul-id": spec.soul_id.as_str(),
-            "com.freshell.incarnation-id": spec.incarnation_id.as_str(),
-            "com.freshell.runtime-test-run-id": spec.test_run_id,
-        },
+        "Labels": labels,
         "HostConfig": {
             "AutoRemove": false,
             "NetworkMode": if spec.terminal.is_some() || spec.fresh_agent.is_some() { "bridge" } else { "none" },
@@ -402,6 +410,7 @@ fn host_gateway_alias(rootless: bool, host_address: Option<&str>) -> Result<Stri
 fn runtime_host_environment(
     terminal: Option<&TerminalLaunchSpec>,
     fresh_agent: Option<&FreshAgentLaunchSpec>,
+    mounted_home: Option<&Path>,
 ) -> Result<Vec<String>, BackendError> {
     let mut values = BTreeMap::new();
     for key in [
@@ -490,10 +499,88 @@ fn runtime_host_environment(
             ),
         );
     }
+    if let Some(home) = mounted_home {
+        values.insert("FRESHELL_OPERATOR_HOME_MOUNT".into(), "1".into());
+        values.insert(
+            "FRESHELL_OPERATOR_HOME".into(),
+            home.to_string_lossy().into_owned(),
+        );
+    }
     Ok(values
         .into_iter()
         .map(|(key, value)| format!("{key}={value}"))
         .collect())
+}
+
+fn assemble_workload_binds(
+    binary: &Path,
+    runtime_dir: &Path,
+    provider_volume_name: &str,
+    actor_state_dir: Option<&Path>,
+    mounts: Option<&docker::TerminalMounts>,
+) -> anyhow::Result<(Vec<String>, std::collections::BTreeMap<String, String>)> {
+    let mut binds = vec![
+        format!("{}:/runtime/freshell-session-host:ro", binary.display()),
+        format!("{}:/run/freshell:rw", runtime_dir.display()),
+        format!("{}:/home/freshell/provider:rw", provider_volume_name),
+    ];
+    if let Some(actor_state_dir) = actor_state_dir {
+        binds.push(format!(
+            "{}:{HOST_ACTOR_STATE_MOUNT}:rw",
+            actor_state_dir.display()
+        ));
+    }
+    let mut tmpfs = BTreeMap::new();
+    if let Some(mounts) = mounts {
+        binds.push(format!(
+            "{}:{}:rw",
+            mounts.workspace.display(),
+            mounts.workspace.display()
+        ));
+        if let Some(git) = &mounts.git_common_dir {
+            if !git.starts_with(&mounts.workspace) {
+                binds.push(format!("{}:{}:rw", git.display(), git.display()));
+            }
+        }
+        for (index, source) in mounts.provider_bootstrap_files.iter().enumerate() {
+            binds.push(format!(
+                "{}:/run/freshell-bootstrap/provider-{index}:ro",
+                source.display()
+            ));
+        }
+        for (index, source) in mounts.provider_secret_files.iter().enumerate() {
+            binds.push(format!(
+                "{}:/run/freshell-secrets/provider-{index}:ro",
+                source.display()
+            ));
+        }
+        if let Some(source) = &mounts.provider_user_root {
+            binds.push(format!(
+                "{}:/run/freshell-private/user-provider:ro",
+                source.display()
+            ));
+        }
+        if let Some(source) = &mounts.mcp_capability_file {
+            binds.push(format!(
+                "{}:/run/freshell/mcp-capability.json:ro",
+                source.display()
+            ));
+        }
+        if let Some(operator_home) = &mounts.operator_home {
+            binds.push(format!(
+                "{}:{}:ro",
+                operator_home.home.display(),
+                operator_home.home.display()
+            ));
+            for rel in &operator_home.mask_rel_paths {
+                tmpfs.insert(
+                    format!("{}/{}", operator_home.home.display(), rel),
+                    String::new(),
+                );
+            }
+        }
+    }
+    Ok((binds, tmpfs))
 }
 
 #[async_trait]
@@ -559,6 +646,9 @@ impl RuntimeBackend for DockerEngineBackend {
         }
         .transpose()
         .map_err(BackendError::InvalidConfig)?;
+        let operator_home = terminal_mounts
+            .as_ref()
+            .and_then(|mounts| mounts.operator_home.as_ref());
         let expected = ExpectedConfig::new(spec, &binary, &runtime_dir);
         let immutable_config_digest = digest_expected(&expected)?;
         let (daemon_id, rootless) = self.daemon_info().await?;
@@ -569,54 +659,19 @@ impl RuntimeBackend for DockerEngineBackend {
             .ok_or_else(|| BackendError::InvalidConfig("memory+swap overflow".into()))?;
         let requested_limits = serde_json::to_string(&spec.limits)
             .map_err(|e| BackendError::Malformed(e.to_string()))?;
-        let mut binds = vec![
-            format!("{}:/runtime/freshell-session-host:ro", binary.display()),
-            format!("{}:/run/freshell:rw", runtime_dir.display()),
-            format!("{}:/home/freshell/provider:rw", spec.provider_volume_name),
-        ];
-        if let Some(actor_state_dir) = &actor_state_dir {
-            binds.push(format!(
-                "{}:{HOST_ACTOR_STATE_MOUNT}:rw",
-                actor_state_dir.display()
-            ));
-        }
-        if let Some(mounts) = &terminal_mounts {
-            binds.push(format!(
-                "{}:{}:rw",
-                mounts.workspace.display(),
-                mounts.workspace.display()
-            ));
-            if let Some(git) = &mounts.git_common_dir {
-                if !git.starts_with(&mounts.workspace) {
-                    binds.push(format!("{}:{}:rw", git.display(), git.display()));
-                }
-            }
-            for (index, source) in mounts.provider_bootstrap_files.iter().enumerate() {
-                binds.push(format!(
-                    "{}:/run/freshell-bootstrap/provider-{index}:ro",
-                    source.display()
-                ));
-            }
-            for (index, source) in mounts.provider_secret_files.iter().enumerate() {
-                binds.push(format!(
-                    "{}:/run/freshell-secrets/provider-{index}:ro",
-                    source.display()
-                ));
-            }
-            if let Some(source) = &mounts.provider_user_root {
-                binds.push(format!(
-                    "{}:/run/freshell-private/user-provider:ro",
-                    source.display()
-                ));
-            }
-            if let Some(source) = &mounts.mcp_capability_file {
-                binds.push(format!(
-                    "{}:/run/freshell/mcp-capability.json:ro",
-                    source.display()
-                ));
-            }
-        }
-        let host_env = runtime_host_environment(spec.terminal.as_ref(), spec.fresh_agent.as_ref())?;
+        let (binds, operator_home_tmpfs) = assemble_workload_binds(
+            &binary,
+            &runtime_dir,
+            &spec.provider_volume_name,
+            actor_state_dir.as_deref(),
+            terminal_mounts.as_ref(),
+        )
+        .map_err(|e| BackendError::Malformed(e.to_string()))?;
+        let host_env = runtime_host_environment(
+            spec.terminal.as_ref(),
+            spec.fresh_agent.as_ref(),
+            operator_home.map(|mount| mount.home.as_path()),
+        )?;
         let runtime_mode = spec
             .terminal
             .as_ref()
@@ -626,7 +681,14 @@ impl RuntimeBackend for DockerEngineBackend {
                     .as_ref()
                     .map(|agent| agent.provider.as_str())
             });
-        let runtime_tmpfs_config = runtime_tmpfs(runtime_mode);
+        let mut runtime_tmpfs_config = runtime_tmpfs(runtime_mode);
+        for (destination, options) in operator_home_tmpfs {
+            runtime_tmpfs_config.insert(destination, options);
+        }
+        let operator_home_record = operator_home
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| BackendError::Malformed(e.to_string()))?;
         let extra_hosts = if let Some(reference) =
             workload_mcp_capability(spec.terminal.as_ref(), spec.fresh_agent.as_ref())
         {
@@ -643,6 +705,7 @@ impl RuntimeBackend for DockerEngineBackend {
             host_env,
             extra_hosts,
             runtime_tmpfs_config,
+            operator_home_record,
             requested_limits,
             memory_swap,
         );
@@ -1029,6 +1092,50 @@ fn verify_runtime_environment(inspect: &Value, expected: &[String]) -> Result<()
     Ok(())
 }
 
+/// The container's persisted creation-time operator-home mount record, gated
+/// on the inspected marker env: pre-upgrade containers (which lack the
+/// marker) keep passing with no home assertions at all. The mask set is
+/// creation-time state, so it is read from the record Docker persists with
+/// the container, never recomputed from the current host.
+fn inspected_operator_home(
+    value: &Value,
+    labels: &serde_json::Map<String, Value>,
+) -> Result<Option<docker::OperatorHomeMount>, BackendError> {
+    let env = value
+        .pointer("/Config/Env")
+        .and_then(Value::as_array)
+        .ok_or_else(|| BackendError::OwnershipMismatch("missing runtime environment".into()))?;
+    let mut entries: std::collections::BTreeMap<&str, &str> = Default::default();
+    for entry in env.iter().filter_map(Value::as_str) {
+        if let Some((key, entry_value)) = entry.split_once('=') {
+            entries.insert(key, entry_value);
+        }
+    }
+    if entries.get("FRESHELL_OPERATOR_HOME_MOUNT").copied() != Some("1") {
+        return Ok(None);
+    }
+    let record = labels
+        .get(OPERATOR_HOME_MOUNT_LABEL)
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            BackendError::OwnershipMismatch(
+                "operator-home marker env lacks its persisted mount record".into(),
+            )
+        })?;
+    let mount: docker::OperatorHomeMount = serde_json::from_str(record).map_err(|error| {
+        BackendError::OwnershipMismatch(format!(
+            "persisted operator-home mount record is malformed: {error}"
+        ))
+    })?;
+    let home = mount.home.to_string_lossy().into_owned();
+    if entries.get("FRESHELL_OPERATOR_HOME").copied() != Some(home.as_str()) {
+        return Err(BackendError::OwnershipMismatch(
+            "operator-home env diverged from its persisted mount record".into(),
+        ));
+    }
+    Ok(Some(mount))
+}
+
 fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(), BackendError> {
     let actual_image = value
         .get("Image")
@@ -1062,7 +1169,8 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
             )));
         }
     }
-    let expected_env = runtime_host_environment(handle.terminal(), handle.fresh_agent())?;
+    let operator_home = inspected_operator_home(value, labels)?;
+    let expected_env = runtime_host_environment(handle.terminal(), handle.fresh_agent(), None)?;
     verify_runtime_environment(value, &expected_env)?;
 
     let host_config = value
@@ -1125,7 +1233,12 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
         .terminal()
         .map(|terminal| terminal.mode.as_str())
         .or_else(|| handle.fresh_agent().map(|agent| agent.provider.as_str()));
-    let expected_tmpfs = runtime_tmpfs(expected_mode);
+    let mut expected_tmpfs = runtime_tmpfs(expected_mode);
+    if let Some(mount) = &operator_home {
+        for rel in &mount.mask_rel_paths {
+            expected_tmpfs.insert(format!("{}/{}", mount.home.display(), rel), String::new());
+        }
+    }
     let actual_tmpfs = host_config
         .get("Tmpfs")
         .and_then(Value::as_object)
@@ -1203,6 +1316,19 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
         return Err(BackendError::OwnershipMismatch(
             "non-agent runtime gained an actor state mount".into(),
         ));
+    }
+    if let Some(mount) = &operator_home {
+        let home = mount.home.to_string_lossy();
+        let has_home = mounts.iter().any(|entry| {
+            entry.get("Source").and_then(Value::as_str) == Some(home.as_ref())
+                && entry.get("Destination").and_then(Value::as_str) == Some(home.as_ref())
+                && entry.get("RW").and_then(Value::as_bool) == Some(false)
+        });
+        if !has_home {
+            return Err(BackendError::OwnershipMismatch(
+                "operator home mount changed".into(),
+            ));
+        }
     }
     if let Some(terminal) = handle.terminal() {
         let expected =
@@ -1423,6 +1549,7 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    use super::docker::{OperatorHomeMount, TerminalMounts};
     use super::*;
     use freshell_runtime_protocol::{FreshProvider, LaunchNonce};
     use std::os::unix::fs::PermissionsExt;
@@ -1470,7 +1597,7 @@ mod tests {
         let installation_id = InstallationId::parse("installation-one").unwrap();
         let soul_id = SoulId::parse("soul-one").unwrap();
         let incarnation_id = IncarnationId::parse("incarnation-one").unwrap();
-        let env = runtime_host_environment(None, Some(&agent)).unwrap();
+        let env = runtime_host_environment(None, Some(&agent), None).unwrap();
         let handle = OwnedRuntimeHandle::from_registry(
             installation_id.clone(),
             soul_id.clone(),
@@ -1627,7 +1754,7 @@ mod tests {
             provider_secret_references: Vec::new(),
             provider_launch_context: None,
         };
-        let env = runtime_host_environment(Some(&terminal), None).unwrap();
+        let env = runtime_host_environment(Some(&terminal), None, None).unwrap();
         assert!(env
             .iter()
             .any(|value| value == "HOME=/home/freshell/provider"));
@@ -1718,6 +1845,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             BTreeMap::new(),
+            None,
             serde_json::to_string(&spec.limits).unwrap(),
             spec.limits.memory_bytes,
         );
@@ -1829,5 +1957,237 @@ mod tests {
 
         running.provider_store_id = "store-two".into();
         assert_ne!(digest(running), original);
+    }
+
+    fn fresh_agent_spec_fixture() -> FreshAgentLaunchSpec {
+        FreshAgentLaunchSpec {
+            session_id: "session-fixture".into(),
+            provider: FreshProvider::Codex,
+            session_type: "freshcodex".into(),
+            runtime_variant: "test".into(),
+            provider_store_id: "store-fixture".into(),
+            cwd: "/workspace".into(),
+            workspace_path: "/workspace".into(),
+            git_common_dir: None,
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            model: None,
+            effort: None,
+            permission_mode: None,
+            sandbox: None,
+            native_session_id: None,
+            plugins: None,
+            model_selection: None,
+            session_ref: None,
+            fixture_transport: None,
+            provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: None,
+        }
+    }
+
+    fn terminal_spec_fixture(workspace: &Path) -> TerminalLaunchSpec {
+        TerminalLaunchSpec {
+            terminal_id: "terminal-fixture".into(),
+            stream_id: "stream-fixture".into(),
+            mode: "shell".into(),
+            program: "bash".into(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: workspace.to_string_lossy().into_owned(),
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            cols: 80,
+            rows: 24,
+            project_key: "project-fixture".into(),
+            workspace_path: workspace.to_string_lossy().into_owned(),
+            git_common_dir: None,
+            create_request_id: None,
+            resume_session_id: None,
+            provider_model: None,
+            provider_reasoning_effort: None,
+            provider_sandbox: None,
+            provider_permission_mode: None,
+            provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: None,
+        }
+    }
+
+    #[test]
+    fn workload_binds_include_read_only_home_and_mask_tmpfs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let workspace = home.join("code").join("repo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let home = home.canonicalize().unwrap();
+        let mounts = TerminalMounts {
+            workspace: workspace.clone(),
+            git_common_dir: None,
+            provider_bootstrap_files: vec![],
+            provider_secret_files: vec![],
+            provider_user_root: None,
+            mcp_capability_file: None,
+            operator_home: Some(OperatorHomeMount {
+                home: home.clone(),
+                mask_rel_paths: vec![".freshell".to_string()],
+            }),
+        };
+        let (binds, tmpfs) = assemble_workload_binds(
+            &tmp.path().join("binary"),
+            &tmp.path().join("runtime"),
+            "provider-vol",
+            None,
+            Some(&mounts),
+        )
+        .unwrap();
+        assert!(binds.contains(&format!("{}:{}:ro", home.display(), home.display())));
+        assert!(binds.contains(&format!(
+            "{}:{}:rw",
+            workspace.display(),
+            workspace.display()
+        )));
+        assert_eq!(
+            tmpfs
+                .get(&format!("{}/.freshell", home.display()))
+                .map(String::as_str),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn home_mount_env_marker_is_set_only_when_mounted() {
+        let spec = fresh_agent_spec_fixture();
+        let mounted =
+            runtime_host_environment(None, Some(&spec), Some(std::path::Path::new("/home/op")))
+                .unwrap();
+        assert!(mounted
+            .iter()
+            .any(|e| e == "FRESHELL_OPERATOR_HOME_MOUNT=1"));
+        assert!(mounted
+            .iter()
+            .any(|e| e == "FRESHELL_OPERATOR_HOME=/home/op"));
+        let unmounted = runtime_host_environment(None, Some(&spec), None).unwrap();
+        assert!(!unmounted
+            .iter()
+            .any(|e| e.starts_with("FRESHELL_OPERATOR_HOME")));
+    }
+
+    fn terminal_runtime_fixture(
+        root: &Path,
+        operator_home: Option<docker::OperatorHomeMount>,
+    ) -> (OwnedRuntimeHandle, serde_json::Value) {
+        let runtime_dir = root.join("incarnation-one");
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&runtime_dir).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let workspace = std::fs::canonicalize(&workspace).unwrap();
+        let binary = root.join("freshell-session-host");
+        std::fs::write(&binary, b"host").unwrap();
+        let terminal = terminal_spec_fixture(&workspace);
+        let installation_id = InstallationId::parse("installation-one").unwrap();
+        let soul_id = SoulId::parse("soul-one").unwrap();
+        let incarnation_id = IncarnationId::parse("incarnation-one").unwrap();
+        let handle = OwnedRuntimeHandle::from_registry(
+            installation_id.clone(),
+            soul_id.clone(),
+            incarnation_id.clone(),
+            LaunchNonce::new(),
+            DockerDaemonId::new(),
+            "container-one".into(),
+            "sha256:image".into(),
+            runtime_dir.clone(),
+            binary.clone(),
+            "sha256:config".into(),
+            RuntimeLimits {
+                cpu_milli: 500,
+                memory_bytes: 128 * 1024 * 1024,
+                swap_bytes: 0,
+                pids_max: 64,
+            },
+            None,
+            Some(terminal.clone()),
+            None,
+            "freshell-provider-aaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        );
+        let mut env = runtime_host_environment(Some(&terminal), None, None).unwrap();
+        let mut tmpfs = runtime_tmpfs(Some("shell"));
+        let mut labels = serde_json::json!({
+            "com.freshell.managed":"true",
+            "com.freshell.installation-id":installation_id.as_str(),
+            "com.freshell.soul-id":soul_id.as_str(),
+            "com.freshell.incarnation-id":incarnation_id.as_str(),
+        });
+        let mut mounts = vec![
+            serde_json::json!({"Source":binary,"Destination":"/runtime/freshell-session-host","RW":false}),
+            serde_json::json!({"Source":runtime_dir,"Destination":"/run/freshell","RW":true}),
+            serde_json::json!({"Name":handle.provider_volume_name(),"Destination":"/home/freshell/provider","RW":true}),
+            serde_json::json!({"Source":workspace,"Destination":workspace,"RW":true}),
+        ];
+        if let Some(mount) = &operator_home {
+            env.push("FRESHELL_OPERATOR_HOME_MOUNT=1".into());
+            env.push(format!("FRESHELL_OPERATOR_HOME={}", mount.home.display()));
+            for rel in &mount.mask_rel_paths {
+                tmpfs.insert(format!("{}/{}", mount.home.display(), rel), String::new());
+            }
+            labels[OPERATOR_HOME_MOUNT_LABEL] =
+                serde_json::json!(serde_json::to_string(mount).unwrap());
+            mounts
+                .push(serde_json::json!({"Source":mount.home,"Destination":mount.home,"RW":false}));
+        }
+        let inspected = serde_json::json!({
+            "Image":"sha256:image",
+            "Config": {
+                "Labels": labels,
+                "Env": env,
+            },
+            "HostConfig": {
+                "NetworkMode":"bridge",
+                "PidMode":"",
+                "Privileged":false,
+                "CapAdd":["CHOWN","SETGID","SETUID"],
+                "Tmpfs": tmpfs,
+            },
+            "Mounts": mounts,
+        });
+        (handle, inspected)
+    }
+
+    #[test]
+    fn verify_inspect_config_ignores_home_mounts_without_the_marker_env() {
+        // Pre-upgrade running souls lack FRESHELL_OPERATOR_HOME_MOUNT entirely;
+        // inspection must keep passing for them.
+        let root = tempfile::tempdir().unwrap();
+        let (handle, inspected) = terminal_runtime_fixture(root.path(), None);
+        assert!(verify_inspect_config(&handle, &inspected).is_ok());
+    }
+
+    #[test]
+    fn verify_inspect_config_uses_the_persisted_creation_time_mask_list() {
+        // Late-directory case: a soul created with masks [".freshell"] because
+        // .config/gcloud was absent, verified AFTER the directory appears on the
+        // host, must still PASS against the persisted creation-time list.
+        // And a container whose live tmpfs topology no longer matches its own
+        // persisted list must FAIL.
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(home.join(".freshell")).unwrap();
+        let home = std::fs::canonicalize(&home).unwrap();
+        let mount = docker::OperatorHomeMount {
+            home: home.clone(),
+            mask_rel_paths: vec![".freshell".to_string()],
+        };
+        let (handle, mut inspected) = terminal_runtime_fixture(root.path(), Some(mount));
+        std::fs::create_dir_all(home.join(".config").join("gcloud")).unwrap();
+        assert!(verify_inspect_config(&handle, &inspected).is_ok());
+
+        inspected["HostConfig"]["Tmpfs"]
+            .as_object_mut()
+            .unwrap()
+            .remove(&format!("{}/.freshell", home.display()));
+        assert!(matches!(
+            verify_inspect_config(&handle, &inspected),
+            Err(BackendError::OwnershipMismatch(_))
+        ));
     }
 }

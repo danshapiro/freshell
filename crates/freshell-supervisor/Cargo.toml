@@ -14,6 +14,7 @@ provider-qualification = ["freshell-agent-runtime/provider-qualification"]
 freshell-agent-runtime = { path = "../freshell-agent-runtime" }
 freshell-runtime-protocol = { path = "../freshell-runtime-protocol" }
 freshell-runtime-observability = { path = "../freshell-runtime-observability" }
+anyhow = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 rusqlite = { package = "rusqlite", version = "0.31", features = ["bundled"] }
