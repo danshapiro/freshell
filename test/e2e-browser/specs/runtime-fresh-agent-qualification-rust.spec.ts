@@ -14,6 +14,7 @@ import {
   type QualifiableFreshAgentMode,
 } from '../../../scripts/testing/fresh-agent-qualification-selection.js'
 import { FRESH_AGENT_QUALIFICATION_LIVE_ENV } from '../../../scripts/testing/runtime-fresh-agent-qualification.js'
+import { findFreshAgentCreateOutcome } from '../../../scripts/testing/fresh-agent-create-result.js'
 import { test } from '../helpers/fixtures.js'
 import { createManagedRuntimeBrowserRig, openFreshHistorySession, splitFreshBrowserPane, observeFreshMcpIngress, type ManagedRuntimeView, type ManagedFixtureRig } from '../helpers/managed-runtime.js'
 import { observeOwnedFreshBrowserPane, stageOwnedFreshBrowserProfile } from '../../../scripts/testing/runtime-external-browser.js'
@@ -180,7 +181,11 @@ async function actualCreate(page: Page, rig: ManagedFixtureRig, definition: Defi
       { mode: definition.mode, model: definition.model, effort: definition.effort }))
     const request = await waitFor('actual UI fresh create request', () => wire.sent.slice(cursor).find(frame => frame.type === 'freshAgent.create' && frame.sessionType === definition.mode) ?? null)
     expect(request.requestId).toBe(staged.createRequestId)
-    const reply = await waitFor('actual UI fresh create reply', () => wire.received.find(frame => frame.type === 'freshAgent.created' && frame.requestId === request.requestId) ?? null)
+    const reply = await waitFor('actual UI fresh create result', () => {
+      const outcome = findFreshAgentCreateOutcome(wire.received, request.requestId)
+      if (outcome?.kind === 'failed') throw new Error(`fresh-agent create failed (${outcome.code})`)
+      return outcome?.kind === 'created' ? outcome.reply : null
+    })
     const view = await waitFor('actual supervised UI native allocation', async () => {
       const value = await rig.runningViewForFreshSession(reply.sessionId)
       return value?.nativeSessionId && value.containerId ? value : null
