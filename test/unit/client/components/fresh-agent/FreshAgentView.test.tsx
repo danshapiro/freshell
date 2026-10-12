@@ -3438,8 +3438,9 @@ describe('FreshAgentView', () => {
         capabilities: { send: true, interrupt: true, fork: true },
         turns: [
           {
-            id: 'native-user-turn:row-0',
-            turnId: 'display-user-1:row-0',
+            id: 'codex-turn-17:row-0',
+            turnId: 'codex-turn-17:row-0',
+            nativeTurnId: 'codex-turn-17',
             role: 'user',
             summary: 'Ship it',
             items: [{ id: 'user-text-1', kind: 'text', text: 'Ship it' }],
@@ -3459,8 +3460,9 @@ describe('FreshAgentView', () => {
         capabilities: { send: true, interrupt: true, fork: true },
         turns: [
           {
-            id: 'native-user-turn:row-0',
-            turnId: 'display-user-1:row-0',
+            id: 'codex-turn-17:row-0',
+            turnId: 'codex-turn-17:row-0',
+            nativeTurnId: 'codex-turn-17',
             role: 'user',
             summary: 'Ship it',
             items: [{ id: 'user-text-1', kind: 'text', text: 'Ship it' }],
@@ -3558,7 +3560,27 @@ describe('FreshAgentView', () => {
       onMessage?.({
         type: 'freshAgent.send.accepted',
         requestId,
-        submittedTurnId: 'display-user-1',
+        submittedTurnId: 'codex-turn-17',
+      })
+    })
+    const acceptedOutcome = getFreshAgentPaneContent(store).checkpointOutcomes?.find(
+      (outcome) => outcome.requestId === requestId,
+    )
+    expect(acceptedOutcome).not.toHaveProperty('nativeTurnId')
+    expect(acceptedOutcome).not.toHaveProperty('displayTurnId')
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.checkpoint.outcome',
+        requestId,
+        logicalAttemptId,
+        sessionId: 'thread-normalized-send',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        status: 'available',
+        checkpointId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        workspace: resolvedCheckpointWorkspace,
+        nativeTurnId: 'codex-turn-17',
+        displayTurnId: 'codex-turn-17:row-0',
       })
     })
 
@@ -3589,7 +3611,8 @@ describe('FreshAgentView', () => {
     expect(persistedOutcomes).toEqual(expect.arrayContaining([expect.objectContaining({
       requestId,
       conversationRequestId: 'req-normalized-send',
-      displayTurnId: 'display-user-1',
+      displayTurnId: 'codex-turn-17:row-0',
+      nativeTurnId: 'codex-turn-17',
       status: 'available',
       checkpointId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
       workspace: resolvedCheckpointWorkspace,
@@ -3911,7 +3934,22 @@ describe('FreshAgentView', () => {
         sessionId: 'thread-checkpoint-failure',
         sessionType: 'freshcodex',
         provider: 'codex',
-        submittedTurnId: 'display-failed-turn',
+        submittedTurnId: 'native-failed-turn',
+      })
+    })
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.checkpoint.outcome',
+        requestId,
+        logicalAttemptId,
+        sessionId: 'thread-checkpoint-failure',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        status: 'unavailable',
+        code: 'workspace_unavailable',
+        reason: workspaceReason,
+        nativeTurnId: 'native-failed-turn',
+        displayTurnId: 'native-failed-turn:row-0',
       })
     })
 
@@ -3920,7 +3958,8 @@ describe('FreshAgentView', () => {
       version: 1,
       requestId,
       conversationRequestId: 'req-checkpoint-failure',
-      displayTurnId: 'display-failed-turn',
+      displayTurnId: 'native-failed-turn:row-0',
+      nativeTurnId: 'native-failed-turn',
       status: 'unavailable',
       code: 'workspace_unavailable',
       reason: workspaceReason,

@@ -254,6 +254,9 @@ type CheckpointTurnAvailability = FreshAgentTurnRewindAvailability & {
   workspace?: NonNullable<FreshAgentPaneContent['checkpointWorkspace']>
   checkpointId?: string
   code?: string
+  /** Exact provider identity, present only after observing the real user row. */
+  nativeTurnId?: string
+  displayTurnId?: string
 }
 
 const CHECKPOINT_FAILURE_FALLBACK = 'The project workspace could not be saved before this message was sent.'
@@ -327,12 +330,16 @@ function checkpointOutcomeAvailability(outcome: FreshAgentCheckpointOutcome): Ch
         status: 'available',
         checkpointId: outcome.checkpointId,
         ...(outcome.workspace ? { workspace: outcome.workspace } : {}),
+        ...(outcome.nativeTurnId ? { nativeTurnId: outcome.nativeTurnId } : {}),
+        ...(outcome.displayTurnId ? { displayTurnId: outcome.displayTurnId } : {}),
       }
     : {
         status: 'unavailable',
         reason: outcome.reason ?? CHECKPOINT_FAILURE_FALLBACK,
         ...(outcome.code ? { code: outcome.code } : {}),
         ...(outcome.workspace ? { workspace: outcome.workspace } : {}),
+        ...(outcome.nativeTurnId ? { nativeTurnId: outcome.nativeTurnId } : {}),
+        ...(outcome.displayTurnId ? { displayTurnId: outcome.displayTurnId } : {}),
       }
 }
 
@@ -1064,21 +1071,22 @@ export function FreshAgentView({
       if (submittedTurnId) {
         next.set(checkpointTurnAvailabilityKey(paneContentRef.current, scope, submittedTurnId), availability)
       }
+      if (availability.displayTurnId) {
+        next.set(checkpointTurnAvailabilityKey(paneContentRef.current, scope, availability.displayTurnId), availability)
+      }
+      if (availability.nativeTurnId) {
+        next.set(checkpointTurnAvailabilityKey(paneContentRef.current, scope, availability.nativeTurnId), availability)
+      }
       return next
     })
     if (!requestId || availability.status === 'pending') return
 
-    const matchingTurn = submittedTurnId
-      ? snapshotRef.current?.turns.find((turn) => turn.role === 'user'
-          && checkpointTurnIdentity(paneContentRef.current.provider, getFreshAgentDisplayTurnKey(turn))
-            === checkpointTurnIdentity(paneContentRef.current.provider, submittedTurnId))
-      : undefined
     const outcome: FreshAgentCheckpointOutcome = {
       version: 1,
       requestId,
       conversationRequestId: scope,
-      ...(submittedTurnId ? { displayTurnId: submittedTurnId } : {}),
-      ...(matchingTurn?.id ? { nativeTurnId: matchingTurn.id } : {}),
+      ...(availability.displayTurnId ? { displayTurnId: availability.displayTurnId } : {}),
+      ...(availability.nativeTurnId ? { nativeTurnId: availability.nativeTurnId } : {}),
       status: availability.status,
       ...(availability.status === 'available' && availability.checkpointId
         ? { checkpointId: availability.checkpointId }
@@ -2738,6 +2746,16 @@ export function FreshAgentView({
 
         const workspace = normalizeFreshAgentCheckpointWorkspace(message.workspace)
           ?? pending.checkpointWorkspace
+        const checkpointTurnId = (value: unknown): string | undefined => (
+          typeof value === 'string'
+          && value.length > 0
+          && value.length <= 256
+          && !/[\u0000-\u001f\u007f-\u009f]/.test(value)
+            ? value
+            : undefined
+        )
+        const nativeTurnId = checkpointTurnId(message.nativeTurnId)
+        const displayTurnId = checkpointTurnId(message.displayTurnId)
         let checkpointOutcome: CheckpointTurnAvailability
         if (
           message.status === 'available'
@@ -2750,6 +2768,8 @@ export function FreshAgentView({
             status: 'available',
             checkpointId: message.checkpointId,
             ...(workspace ? { workspace } : {}),
+            ...(nativeTurnId ? { nativeTurnId } : {}),
+            ...(displayTurnId ? { displayTurnId } : {}),
           }
         } else if (message.status === 'unavailable') {
           const suppliedReason = typeof message.reason === 'string'
@@ -2764,6 +2784,8 @@ export function FreshAgentView({
             reason: suppliedReason || CHECKPOINT_FAILURE_FALLBACK,
             ...(suppliedCode ? { code: suppliedCode } : {}),
             ...(workspace ? { workspace } : {}),
+            ...(nativeTurnId ? { nativeTurnId } : {}),
+            ...(displayTurnId ? { displayTurnId } : {}),
           }
         } else {
           checkpointOutcome = {
@@ -2771,6 +2793,8 @@ export function FreshAgentView({
             reason: 'The server did not return a saved code checkpoint.',
             code: 'checkpoint_capture_failed',
             ...(workspace ? { workspace } : {}),
+            ...(nativeTurnId ? { nativeTurnId } : {}),
+            ...(displayTurnId ? { displayTurnId } : {}),
           }
         }
         recordPendingSendMetadata(requestId, { checkpointOutcome })
