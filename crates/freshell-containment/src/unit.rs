@@ -2134,10 +2134,16 @@ mod tests {
         /// child's exec has finished, and until then its
         /// `/proc/<pid>/cmdline` reads this test's own argv, then nothing.
         fn perl_sleep(extra: &[&str]) -> Self {
+            Self::perl_sleep_with(extra, &[])
+        }
+
+        /// [`Spawned::perl_sleep`] with `env` added to its environment.
+        fn perl_sleep_with(extra: &[&str], env: &[(&str, &str)]) -> Self {
             use std::io::{BufRead, BufReader};
             let mut child = std::process::Command::new("perl")
                 .args(["-e", r#"$| = 1; print "running\n"; sleep 600"#])
                 .args(extra)
+                .envs(env.iter().copied())
                 .stdout(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
@@ -2414,10 +2420,11 @@ sleep 600;"#;
 
     /// The tag scan found the daemon family (a stand-in carrying the unit's
     /// tag, and the plain child it started) but could not read every
-    /// process (here another process's environment): the kill answers that
-    /// it may have missed a member, and still spares the family it found.
-    /// So a pinned descendant of the stand-in, which its own argv would not
-    /// spare, is never signalled, and Gone does not wait for it.
+    /// process (here the state of another member carrying the tag, which
+    /// only this unit's own scans read): the kill answers that it may have
+    /// missed a member, and still spares the family it found. So a pinned
+    /// descendant of the stand-in, which its own argv would not spare, is
+    /// never signalled, and Gone does not wait for it.
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_pinned_descendant_of_the_daemon_family_is_never_signalled_after_an_incomplete_scan()
@@ -2425,11 +2432,12 @@ sleep 600;"#;
         let tag = UnitId::mint();
         let backend =
             crate::backend::tag::TagUnit::new(crate::UNIT_ENV, tag.as_str(), &tag, None).unwrap();
-        let family = DaemonWithChild::start(&[(crate::UNIT_ENV, tag.as_str())]);
-        let unreadable = Spawned::perl_sleep(&[]);
+        let tagged = [(crate::UNIT_ENV, tag.as_str())];
+        let family = DaemonWithChild::start(&tagged);
+        let unreadable = Spawned::perl_sleep_with(&[], &tagged);
         let unit = unit_on(Arc::new(backend));
         unit.add_root(family.child.clone());
-        let _unread = process::test_reads::fail(unreadable.watch.pid(), "environ", libc::EMFILE);
+        let _unread = process::test_reads::fail(unreadable.watch.pid(), "stat", libc::EMFILE);
         tokio::time::timeout(
             Duration::from_secs(10),
             unit.stop(StopRequest::new(StopMode::Force, StopReason::ShiftX, "ws"))
