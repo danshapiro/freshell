@@ -7528,6 +7528,7 @@ async fn opencode_handoff_stop_aborts_the_active_turn_through_the_manager_before
             settings: None,
             observed_epoch: None,
             observed_generation: None,
+            checkpoint_intent: None,
         })
         .await;
     env.await_audit_row(Duration::from_secs(20), |r| {
@@ -7669,6 +7670,7 @@ async fn opencode_handoff_stop_aborts_a_daemon_turn_left_running_by_a_finished_l
             settings: None,
             observed_epoch: None,
             observed_generation: None,
+            checkpoint_intent: None,
         })
         .await;
     env.await_audit_row(Duration::from_secs(20), |r| {

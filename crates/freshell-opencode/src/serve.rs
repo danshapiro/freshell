@@ -2003,8 +2003,38 @@ impl OpencodeServeManager {
         accepted_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
         dispatched_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<(), ServeError> {
+        self.run_turn_with_message_id(
+            session_id,
+            text,
+            model,
+            effort,
+            None,
+            timeout,
+            route,
+            accepted_witness,
+            dispatched_witness,
+        )
+        .await
+    }
+
+    /// The native-identity variant of [`Self::run_turn`]. `message_id` is threaded
+    /// through the same production prompt and idle-settlement path; persistence remains
+    /// an observation made by the caller through [`Self::list_messages`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_turn_with_message_id(
+        &self,
+        session_id: &str,
+        text: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+        message_id: Option<&str>,
+        timeout: Duration,
+        route: Route,
+        accepted_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        dispatched_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<(), ServeError> {
         let rx = self.subscribe(session_id);
-        let body = build_prompt_body(text, model, effort);
+        let body = build_prompt_body_with_message_id(text, model, effort, message_id);
         self.prompt_async(
             session_id,
             body,
@@ -2101,6 +2131,39 @@ fn dispatch_event_on_era(inner: &Arc<Inner>, event: ParsedServeEvent, era: Optio
 /// round-4 R4-2: it composes subscribe + prompt_async + await_idle itself
 /// so the prompt POST issues INSIDE its dispatch/condemn critical section).
 pub fn build_prompt_body(text: &str, model: Option<&str>, effort: Option<&str>) -> Value {
+    build_prompt_body_with_message_id(text, model, effort, None)
+}
+
+/// Build the production prompt body with an optional native message ID. OpenCode's
+/// `PromptInput.messageID` is the identity of the persisted user message; callers must
+/// only claim it after observing the matching user row in session history.
+pub fn build_prompt_body_with_message_id(
+    text: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+    message_id: Option<&str>,
+) -> Value {
+    let mut body = match build_prompt_body_without_native_id(text, model, effort) {
+        Value::Object(body) => body,
+        _ => unreachable!("prompt body builder returns an object"),
+    };
+    if let Some(message_id) = message_id.filter(|id| is_valid_opencode_message_id(id)) {
+        body.insert("messageID".into(), Value::String(message_id.to_string()));
+    }
+    Value::Object(body)
+}
+
+fn is_valid_opencode_message_id(message_id: &str) -> bool {
+    message_id
+        .strip_prefix("msg_")
+        .is_some_and(|suffix| suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+fn build_prompt_body_without_native_id(
+    text: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Value {
     let mut body = Map::new();
     body.insert(
         "parts".into(),
@@ -2116,6 +2179,22 @@ pub fn build_prompt_body(text: &str, model: Option<&str>, effort: Option<&str>) 
         body.insert("variant".into(), Value::String(e.to_string()));
     }
     Value::Object(body)
+}
+
+/// Return the actual persisted user-message id only when exactly one row matches the
+/// requested native ID and is role-qualified as a user row.
+pub fn observed_user_message_id(messages: &Value, expected_message_id: &str) -> Option<String> {
+    if !is_valid_opencode_message_id(expected_message_id) {
+        return None;
+    }
+    let matches = messages.as_array()?.iter().filter_map(|message| {
+        let info = message.get("info")?;
+        (info.get("id")?.as_str()? == expected_message_id && info.get("role")?.as_str()? == "user")
+            .then(|| expected_message_id.to_string())
+    });
+    let mut matches = matches;
+    let found = matches.next()?;
+    matches.next().is_none().then_some(found)
 }
 
 /// `isHealthyResponse(body)` (`serve-manager.ts:57-59`) over the raw probe body: a JSON

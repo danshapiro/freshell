@@ -78,6 +78,19 @@ use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySi
 /// The runtime provider (`AGENT_SESSION_TYPES.claude.provider`).
 const PROVIDER: &str = "claude";
 
+/// Build the sidecar-only correlation record for one checkpointed Claude
+/// send. The UUID is supplied on SDKUserMessage and later accepted only when
+/// the SDK replays the persisted user row carrying that same UUID.
+fn checkpoint_attempt_for_send(msg: &FreshAgentSend) -> Option<Value> {
+    let intent = msg.checkpoint_intent.as_ref()?;
+    let request_id = msg.request_id.as_deref().filter(|id| !id.is_empty())?;
+    Some(json!({
+        "uuid": uuid::Uuid::new_v4().to_string(),
+        "logicalAttemptId": intent.logical_attempt_id,
+        "requestId": request_id,
+    }))
+}
+
 /// b8ke ext r22 F1: the pane-scoped PROVISIONAL identity for a fresh
 /// create's pre-spawn claim — the createRequestId the caller already
 /// carries, namespaced so it can never collide with a provider-minted
@@ -4448,8 +4461,12 @@ impl FreshClaudeState {
         };
         // Address the sidecar by ITS id for this session (== the map key for created
         // sessions; differs for resumed-on-attach sessions, Task 6).
+        let checkpoint_attempt = checkpoint_attempt_for_send(&msg);
         let mut send_req =
             json!({ "type": "send", "sessionId": session.sidecar_session_id, "text": msg.text });
+        if let Some(attempt) = checkpoint_attempt {
+            send_req["checkpointAttempt"] = attempt;
+        }
         if let Some(images) = msg.images {
             send_req["images"] = json!(images);
         }
@@ -9237,6 +9254,7 @@ fn normalize_sdk_type(sdk_type: &str) -> Option<&'static str> {
         "sdk.session.snapshot" => "freshAgent.session.snapshot",
         "sdk.session.changed" => "freshAgent.session.changed",
         "sdk.session.init" => "freshAgent.session.init",
+        "sdk.checkpointTurnIdentity" => "checkpointTurnIdentity",
         "sdk.session.metadata" => "freshAgent.session.metadata",
         "sdk.assistant" => "freshAgent.assistant",
         "sdk.stream" => "freshAgent.stream",
@@ -11509,7 +11527,30 @@ rl.on('line', (line) => {
             settings: None,
             observed_epoch: None,
             observed_generation: None,
+            checkpoint_intent: None,
         }
+    }
+
+    #[test]
+    fn checkpoint_turn_identity_claude_send_carries_valid_uuid_and_attempt_correlation() {
+        let mut msg = send_msg("claude-placeholder", "same prompt");
+        msg.request_id = Some("request-7".to_string());
+        msg.checkpoint_intent = Some(freshell_protocol::FreshAgentCheckpointIntent {
+            logical_attempt_id: "attempt-7".to_string(),
+            workspace: None,
+        });
+
+        let attempt = checkpoint_attempt_for_send(&msg).expect("checkpoint attempt");
+        let uuid = uuid::Uuid::parse_str(attempt["uuid"].as_str().expect("UUID string"))
+            .expect("valid UUID");
+        assert_eq!(
+            uuid.get_version_num(),
+            4,
+            "the SDK input uses a fresh v4 UUID"
+        );
+        assert_eq!(attempt["requestId"], "request-7");
+        assert_eq!(attempt["logicalAttemptId"], "attempt-7");
+        assert!(checkpoint_attempt_for_send(&send_msg("legacy", "prompt")).is_none());
     }
 
     /// kata z7j7 (claude scope honesty): a settings-bearing send whose payload

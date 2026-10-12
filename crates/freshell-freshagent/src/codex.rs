@@ -9555,6 +9555,9 @@ fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Result<Vec<Value>,
     }
 
     let row_count = rows.len();
+    let unique_user_row = (rows.iter().filter(|row| row.role == "user").count() == 1)
+        .then(|| rows.iter().position(|row| row.role == "user"))
+        .flatten();
     let turns = rows
         .into_iter()
         .enumerate()
@@ -9567,7 +9570,7 @@ fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Result<Vec<Value>,
                 format!("{turn_id}:row-{row_index}")
             };
             let (summary, summary_kind) = summarize_codex_items(&row.items);
-            json!({
+            let mut turn = json!({
                 "id": row_turn_id,
                 "turnId": row_turn_id,
                 "ordinal": ordinal,
@@ -9576,7 +9579,11 @@ fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Result<Vec<Value>,
                 "summary": summary,
                 "summaryKind": summary_kind,
                 "items": row.items,
-            })
+            });
+            if unique_user_row == Some(row_index) && !turn_id.is_empty() {
+                turn["nativeTurnId"] = json!(turn_id);
+            }
+            turn
         })
         .collect();
 
@@ -12322,6 +12329,7 @@ pub(crate) mod tests {
             settings: None,
             observed_epoch: None,
             observed_generation: None,
+            checkpoint_intent: None,
         }
     }
 
@@ -15287,6 +15295,7 @@ pub(crate) mod tests {
                     settings: None,
                     observed_epoch: None,
                     observed_generation: None,
+                    checkpoint_intent: None,
                 })
                 .await;
             })
@@ -15432,6 +15441,7 @@ pub(crate) mod tests {
                     settings: None,
                     observed_epoch: None,
                     observed_generation: None,
+                    checkpoint_intent: None,
                 })
                 .await;
             })
@@ -15551,6 +15561,7 @@ pub(crate) mod tests {
                     settings: None,
                     observed_epoch: None,
                     observed_generation: None,
+                    checkpoint_intent: None,
                 })
                 .await;
             })
@@ -21090,6 +21101,7 @@ pub(crate) mod tests {
                     settings: None,
                     observed_epoch: None,
                     observed_generation: None,
+                    checkpoint_intent: None,
                 })
                 .await;
             })
@@ -21442,6 +21454,7 @@ pub(crate) mod tests {
                     settings: None,
                     observed_epoch: None,
                     observed_generation: None,
+                    checkpoint_intent: None,
                 })
                 .await;
             })
@@ -21570,6 +21583,7 @@ pub(crate) mod tests {
                     settings: None,
                     observed_epoch: None,
                     observed_generation: None,
+                    checkpoint_intent: None,
                 })
                 .await;
             })
@@ -24185,6 +24199,7 @@ pub(crate) mod tests {
             settings: None,
             observed_epoch: None,
             observed_generation: None,
+            checkpoint_intent: None,
         })
         .await;
 
@@ -24268,6 +24283,7 @@ pub(crate) mod tests {
             settings: None,
             observed_epoch: None,
             observed_generation: None,
+            checkpoint_intent: None,
         })
         .await;
 
@@ -24363,6 +24379,7 @@ pub(crate) mod tests {
             settings: None,
             observed_epoch: None,
             observed_generation: None,
+            checkpoint_intent: None,
         })
         .await;
 
@@ -24439,6 +24456,7 @@ pub(crate) mod tests {
             settings: None,
             observed_epoch: None,
             observed_generation: None,
+            checkpoint_intent: None,
         })
         .await;
 
@@ -24737,6 +24755,7 @@ pub(crate) mod tests {
                     settings: None,
                     observed_epoch: None,
                     observed_generation: None,
+                    checkpoint_intent: None,
                 })
                 .await;
         });
@@ -26627,6 +26646,45 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn checkpoint_turn_identity_codex_binds_native_id_only_to_one_actual_user_row() {
+        let raw_turn = json!({
+            "id": "turn-native-1",
+            "status": "completed",
+            "items": [
+                { "id": "user-item-1", "type": "userMessage", "content": [{ "type": "text", "text": "same prompt" }] },
+                { "id": "assistant-item-1", "type": "agentMessage", "text": "answer" }
+            ]
+        });
+
+        let turns = build_codex_turn_json(&raw_turn, 0).expect("turn builds");
+        let user_rows: Vec<_> = turns.iter().filter(|turn| turn["role"] == "user").collect();
+        assert_eq!(user_rows.len(), 1);
+        assert_eq!(user_rows[0]["id"], "turn-native-1:row-0");
+        assert_eq!(user_rows[0]["turnId"], "turn-native-1:row-0");
+        assert_eq!(user_rows[0]["nativeTurnId"], "turn-native-1");
+        assert!(turns
+            .iter()
+            .filter(|turn| turn["role"] != "user")
+            .all(|turn| turn.get("nativeTurnId").is_none()));
+
+        let ambiguous = json!({
+            "id": "turn-native-ambiguous",
+            "status": "completed",
+            "items": [
+                { "id": "u1", "type": "userMessage", "content": [{ "type": "text", "text": "same prompt" }] },
+                { "id": "a1", "type": "agentMessage", "text": "answer" },
+                { "id": "u2", "type": "userMessage", "content": [{ "type": "text", "text": "same prompt" }] }
+            ]
+        });
+        let turns = build_codex_turn_json(&ambiguous, 0).expect("ambiguous turn still builds");
+        assert_eq!(
+            turns.iter().filter(|turn| turn["role"] == "user").count(),
+            2
+        );
+        assert!(turns.iter().all(|turn| turn.get("nativeTurnId").is_none()));
+    }
+
+    #[test]
     fn build_codex_turn_json_empty_response_synthetic_row_also_carries_assistant_role() {
         // A completed turn with ONLY user-role items and no assistant output gets a synthetic
         // "empty-response" row appended (`normalize.ts:642-652`) -- also role `assistant`,
@@ -27073,6 +27131,7 @@ pub(crate) mod tests {
             }),
             observed_epoch: None,
             observed_generation: None,
+            checkpoint_intent: None,
         };
 
         // First send carries the initial pair.
@@ -27314,6 +27373,7 @@ pub(crate) mod tests {
             settings: None,
             observed_epoch: Some(before.epoch),
             observed_generation: Some(before.generation),
+            checkpoint_intent: None,
         })
         .await;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -28300,6 +28360,7 @@ pub(crate) mod tests {
             settings: None,
             observed_epoch: Some(7),
             observed_generation: None,
+            checkpoint_intent: None,
         })
         .await;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);

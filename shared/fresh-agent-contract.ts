@@ -220,6 +220,9 @@ export const FreshAgentTranscriptItemSchema = z.discriminatedUnion('kind', [
 export const FreshAgentTurnSchema = z.object({
   id: z.string().min(1),
   turnId: z.string().min(1),
+  /** Provider-native identity for an observed user row when it differs from
+   *  the display key or must be matched to a server-accepted submission. */
+  nativeTurnId: z.string().min(1).optional(),
   messageId: z.string().min(1).optional(),
   ordinal: z.number().int().nonnegative().optional(),
   source: z.enum(['durable', 'live', 'server']).optional(),

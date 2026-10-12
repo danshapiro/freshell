@@ -88,6 +88,39 @@ const PROVIDER: &str = "opencode";
 /// `DEFAULT_TURN_TIMEOUT_MS` (`adapter.ts:35`).
 const DEFAULT_TURN_TIMEOUT: Duration = Duration::from_millis(600_000);
 
+#[derive(Clone, Debug)]
+struct CheckpointTurnIdentity {
+    logical_attempt_id: String,
+    request_id: String,
+    native_message_id: String,
+}
+
+/// Derive a stable OpenCode-native message ID only for a modern attempt with a
+/// valid v4 logical identity and request correlation. The same ID is regenerated
+/// when a send waits behind compact, so queue/drain preserves the exact identity.
+fn checkpoint_turn_identity(send: &FreshAgentSend) -> Option<CheckpointTurnIdentity> {
+    let intent = send.checkpoint_intent.as_ref()?;
+    let logical_attempt_id = intent.logical_attempt_id.trim();
+    if logical_attempt_id.is_empty() {
+        return None;
+    }
+    let request_id = send
+        .request_id
+        .as_deref()
+        .filter(|request_id| !request_id.trim().is_empty())?;
+    Some(CheckpointTurnIdentity {
+        logical_attempt_id: logical_attempt_id.to_string(),
+        request_id: request_id.to_string(),
+        // The client currently uses a 21-character URL-safe nanoid for logical
+        // attempts. Hash that stable value into OpenCode's native message-ID shape;
+        // do not constrain the protocol correlation to UUID syntax.
+        native_message_id: format!(
+            "msg_{}",
+            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, logical_attempt_id.as_bytes()).simple()
+        ),
+    })
+}
+
 /// Shared, cheaply-cloneable freshopencode WS state (mergeable into `WsState`).
 #[derive(Clone)]
 pub struct FreshOpencodeState {
@@ -2092,6 +2125,7 @@ impl FreshOpencodeState {
         already_accepted: bool,
     ) {
         let request_id = msg.request_id.clone();
+        let checkpoint_identity = checkpoint_turn_identity(&msg);
         // materializeOrSend:334-335 -- a fresh turn starts un-aborted and un-errored;
         // `handle_interrupt` flips `turn_aborted` while we are parked on idle, and
         // the serve-stream bridge flips `turn_errored` if the turn reports an error.
@@ -2635,16 +2669,36 @@ impl FreshOpencodeState {
             // settled outcome below (or a confirmed abort) may disarm it.
             let mut op_guard = op_guard; // Option<AttachGuard>, owned here
             let dispatch_witness = prompt_dispatched.clone();
-            let mut turn_fut = Box::pin(manager.run_turn(
-                &real_id,
-                &text,
-                model.as_deref(),
-                effort.as_deref(),
-                DEFAULT_TURN_TIMEOUT,
-                route.clone(),
-                Some(daemon_turn_accepted.clone()),
-                Some(dispatch_witness),
-            ));
+            let mut turn_fut = Box::pin(async {
+                if let Some(identity) = checkpoint_identity.as_ref() {
+                    manager
+                        .run_turn_with_message_id(
+                            &real_id,
+                            &text,
+                            model.as_deref(),
+                            effort.as_deref(),
+                            Some(&identity.native_message_id),
+                            DEFAULT_TURN_TIMEOUT,
+                            route.clone(),
+                            Some(daemon_turn_accepted.clone()),
+                            Some(dispatch_witness),
+                        )
+                        .await
+                } else {
+                    manager
+                        .run_turn(
+                            &real_id,
+                            &text,
+                            model.as_deref(),
+                            effort.as_deref(),
+                            DEFAULT_TURN_TIMEOUT,
+                            route.clone(),
+                            Some(daemon_turn_accepted.clone()),
+                            Some(dispatch_witness),
+                        )
+                        .await
+                }
+            });
             // The compact drive's own guard-release discipline: race the
             // fresh dispatch witness against the drive. The guard releases
             // at the DISPATCH boundary — the prompt POST's request leg —
@@ -2684,6 +2738,45 @@ impl FreshOpencodeState {
                 // (fail closed: the stop path would rather issue one redundant
                 // abort than miss a live daemon-side writer).
                 Err(_) => {}
+            }
+
+            // A prompt ID is only a candidate until provider history shows that exact
+            // ID on a role=user row. Observe after dispatch; never join by text/order.
+            if prompt_dispatched.load(Ordering::SeqCst) {
+                if let Some(identity) = checkpoint_identity.as_ref() {
+                    match manager.list_messages(&real_id, &route).await {
+                        Ok(messages) => {
+                            if let Some(native_id) = freshell_opencode::observed_user_message_id(
+                                &messages,
+                                &identity.native_message_id,
+                            ) {
+                                this.broadcast(&event_frame(
+                                    &real_id,
+                                    json!({
+                                        "type": "checkpointTurnIdentity",
+                                        "logicalAttemptId": identity.logical_attempt_id,
+                                        "requestId": identity.request_id,
+                                        "sessionId": real_id,
+                                        "nativeTurnId": native_id,
+                                        "displayTurnId": identity.native_message_id,
+                                    }),
+                                ));
+                            } else {
+                                tracing::warn!(target: "freshell_freshagent::opencode",
+                                    session_id = %real_id,
+                                    request_id = %identity.request_id,
+                                    logical_attempt_id = %identity.logical_attempt_id,
+                                    "checkpoint_turn_identity_unobserved");
+                            }
+                        }
+                        Err(error) => tracing::warn!(target: "freshell_freshagent::opencode",
+                            session_id = %real_id,
+                            request_id = %identity.request_id,
+                            logical_attempt_id = %identity.logical_attempt_id,
+                            error = %error,
+                            "checkpoint_turn_identity_history_read_failed"),
+                    }
+                }
             }
 
             settle_turn_outcome(
@@ -9663,7 +9756,31 @@ mod tests {
             settings: None,
             observed_epoch,
             observed_generation,
+            checkpoint_intent: None,
         }
+    }
+
+    #[test]
+    fn checkpoint_turn_identity_opencode_message_id_is_stable_for_nanoid_attempt() {
+        let logical_attempt_id = "V1StGXR8_Z5jdHi6B-myT";
+        let mut send = send_msg("ses_identity", "first request");
+        send.request_id = Some("request-first".into());
+        send.checkpoint_intent = Some(freshell_protocol::FreshAgentCheckpointIntent {
+            logical_attempt_id: logical_attempt_id.into(),
+            workspace: None,
+        });
+        let first = checkpoint_turn_identity(&send).expect("modern send has identity");
+        send.request_id = Some("request-retry".into());
+        let retry = checkpoint_turn_identity(&send).expect("retry preserves logical identity");
+
+        assert_eq!(first.logical_attempt_id, logical_attempt_id);
+        assert_eq!(first.request_id, "request-first");
+        assert_eq!(retry.request_id, "request-retry");
+        assert_eq!(first.native_message_id, retry.native_message_id);
+        assert_eq!(
+            first.native_message_id,
+            "msg_55c25d96e4445f67b35ea116686e169c"
+        );
     }
 
     // ── tests ────────────────────────────────────────────────────────────
@@ -16696,6 +16813,7 @@ mod tests {
         next_session: AtomicUsize,
         requests: StdMutex<Vec<RecordedRequest>>,
         busy_budget: StdMutex<std::collections::HashMap<String, usize>>,
+        persisted_message_history: StdMutex<std::collections::HashMap<String, Vec<Value>>>,
         summarize_outcome: SummarizeOutcome,
         config_body: Vec<u8>,
         bus_probe: StdMutex<tokio::sync::broadcast::Receiver<String>>,
@@ -16774,6 +16892,7 @@ mod tests {
                 next_session: AtomicUsize::new(0),
                 requests: StdMutex::new(Vec::new()),
                 busy_budget: StdMutex::new(std::collections::HashMap::new()),
+                persisted_message_history: StdMutex::new(std::collections::HashMap::new()),
                 summarize_outcome,
                 config_body,
                 bus_probe: StdMutex::new(bus_probe),
@@ -16948,7 +17067,7 @@ mod tests {
                 .push(RecordedRequest {
                     method: method.clone(),
                     url: req.url.clone(),
-                    body: body_value,
+                    body: body_value.clone(),
                 });
 
             if req.url.contains("/global/health") {
@@ -17110,6 +17229,19 @@ mod tests {
                     .and_then(|rest| rest.split(['/', '?']).next())
                     .unwrap_or("")
                     .to_string();
+                if let Some(message_id) = body_value
+                    .as_ref()
+                    .and_then(|body| body.get("messageID"))
+                    .and_then(Value::as_str)
+                {
+                    self.persisted_message_history
+                        .lock()
+                        .expect("persisted message history mutex")
+                        .insert(
+                            id.clone(),
+                            vec![json!({"info": {"id": message_id, "role": "user"}})],
+                        );
+                }
                 self.busy_budget
                     .lock()
                     .expect("busy budget mutex")
@@ -17120,6 +17252,28 @@ mod tests {
                         gate.notified().await;
                     }
                     Ok(ServeHttpResponse::new(200, b"{}".to_vec()))
+                });
+            }
+            if method == "GET" && req.url.contains("/message") {
+                let id = req
+                    .url
+                    .split("/session/")
+                    .nth(1)
+                    .and_then(|rest| rest.split(['/', '?']).next())
+                    .unwrap_or("")
+                    .to_string();
+                let messages = self
+                    .persisted_message_history
+                    .lock()
+                    .expect("persisted message history mutex")
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_default();
+                return Box::pin(async move {
+                    Ok(ServeHttpResponse::new(
+                        200,
+                        serde_json::to_vec(&messages).expect("history encodes as JSON"),
+                    ))
                 });
             }
             if method == "GET" && req.url.contains("/session/status") {
@@ -21934,6 +22088,7 @@ mod tests {
             }),
             observed_epoch: None,
             observed_generation: None,
+            checkpoint_intent: None,
         }
     }
 
@@ -24894,6 +25049,85 @@ mod tests {
             idle_ix[1] < running_ix[2],
             "the first send's trailing idle precedes the second queued send's running"
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_turn_identity_opencode_checkpoint_message_id_survives_compact_queue() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, mut rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_checkpoint_queue", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_checkpoint_queue")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+
+        let logical_attempt_id = "V1StGXR8_Z5jdHi6B-myT";
+        let expected_message_id = "msg_55c25d96e4445f67b35ea116686e169c";
+        let mut send = send_msg("ses_checkpoint_queue", "queued checkpoint send");
+        send.checkpoint_intent = Some(freshell_protocol::FreshAgentCheckpointIntent {
+            logical_attempt_id: logical_attempt_id.into(),
+            workspace: None,
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), st.handle_send(send))
+            .await
+            .expect("checkpoint send queues behind compact");
+        let accepted_frames = frames_until(&mut rx, |frame| {
+            frame["type"] == "freshAgent.send.accepted"
+                && frame["requestId"] == "req-queued checkpoint send"
+        })
+        .await;
+        let accepted = accepted_frames
+            .iter()
+            .find(|frame| frame["type"] == "freshAgent.send.accepted")
+            .expect("send acceptance is present");
+        assert!(accepted["submittedTurnId"].is_null());
+        assert!(
+            drain_frames(&mut rx)
+                .iter()
+                .all(|frame| { frame["event"]["type"] != "checkpointTurnIdentity" }),
+            "queue acknowledgement remains pending until the provider persists the user row"
+        );
+
+        summarize_gate.notify_waiters();
+        await_prompt_posted(&http, "queued checkpoint send").await;
+        let prompt = http
+            .recorded()
+            .into_iter()
+            .find(|request| {
+                request.url.contains("prompt_async")
+                    && r_body_contains(request, "queued checkpoint send")
+            })
+            .expect("queued prompt drains through the provider transport");
+        assert_eq!(prompt.body.unwrap()["messageID"], expected_message_id);
+
+        let receipt_frames = frames_until(&mut rx, |frame| {
+            frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "checkpointTurnIdentity"
+        })
+        .await;
+        let receipt = receipt_frames
+            .iter()
+            .find(|frame| {
+                frame["type"] == "freshAgent.event"
+                    && frame["event"]["type"] == "checkpointTurnIdentity"
+            })
+            .expect("checkpoint identity receipt is present");
+        assert_eq!(receipt["sessionId"], "ses_checkpoint_queue");
+        assert_eq!(receipt["event"]["logicalAttemptId"], logical_attempt_id);
+        assert_eq!(receipt["event"]["requestId"], "req-queued checkpoint send");
+        assert_eq!(receipt["event"]["nativeTurnId"], expected_message_id);
+        assert_eq!(receipt["event"]["displayTurnId"], expected_message_id);
+        assert!(receipt["event"].get("text").is_none());
+        st.fresh_agent.ensure_manager().await.shutdown().await;
     }
 
     // ── merged from the send-during-compact-queue branch ──

@@ -88,7 +88,7 @@ futures-util = "0.3"
 # app-server sidecar spawn (`process`), and its stdio drain (`io-util`).
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "process", "io-util"] }
 # paneId / tabId / placeholder-suffix / submittedTurnId + claude-sidecar ownership-id minting.
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 # DIAG-01 lifecycle events (session created/send accepted/turn complete/crash
 # detected/crash recovery/sidecar spawn+reap): flows to the global `tracing`
 # subscriber `freshell-server` installs (`crates/freshell-server/src/logging.rs`)

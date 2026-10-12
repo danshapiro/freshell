@@ -89,6 +89,27 @@ describe('fresh-agent display turn helpers', () => {
     expect(() => FreshAgentTurnSchema.parse({ ...base, summaryKind: 'bogus' })).toThrow()
   })
 
+  it('accepts the optional native turn identity without changing display turn ids', () => {
+    const turn = FreshAgentTurnSchema.parse({
+      id: 'turn-native:row-0',
+      turnId: 'turn-native:row-0',
+      nativeTurnId: 'turn-native',
+      role: 'user',
+      summary: 'same prompt',
+      items: [],
+    })
+    expect(turn.turnId).toBe('turn-native:row-0')
+    expect(turn.nativeTurnId).toBe('turn-native')
+    expect(() => FreshAgentTurnSchema.parse({
+      id: 'turn-native:row-0',
+      turnId: 'turn-native:row-0',
+      nativeTurnId: '',
+      role: 'user',
+      summary: 'same prompt',
+      items: [],
+    })).toThrow()
+  })
+
   it('treats only an explicit echo tag as non-authored (missing is conservative)', () => {
     expect(turnSummaryIsAuthored({ summaryKind: 'echo' })).toBe(false)
     expect(turnSummaryIsAuthored({ summaryKind: 'authored' })).toBe(true)
