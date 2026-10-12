@@ -495,11 +495,13 @@ async function consumeStream(sessionId, sdkQuery) {
   const st = sessions.get(sessionId)
   const nativeChannel = st?.nativeChannel
   const abort = st?.abort
+  let streamFailed = false
   try {
     for await (const msg of sdkQuery) {
       if (st?.query === sdkQuery && sessions.get(sessionId) === st) await handleSdkMessage(sessionId, msg)
     }
   } catch (err) {
+    streamFailed = true
     if (st?.query === sdkQuery) emit({ type: 'sdk.error', sessionId, message: `SDK error: ${err?.message || 'Unknown error'}` })
   } finally {
     if (st?.query !== sdkQuery) {
@@ -507,6 +509,7 @@ async function consumeStream(sessionId, sdkQuery) {
       await nativeChannel?.cleanup()
       return
     }
+    const closeReason = abort?.signal.aborted ? 'aborted' : streamFailed ? 'stream_error' : 'stream_end'
     // Stream ended (natural end, error, or abort). The transport is closing:
     // clear any parked cards WITHOUT resolving their promises (LB-04: a late
     // resolve lands inside the SDK's floating promise chain → unhandled
@@ -532,6 +535,11 @@ async function consumeStream(sessionId, sdkQuery) {
     if (st?.abort.signal.aborted) emit({ type: 'sdk.exit', sessionId })
     else emit({ type: 'sdk.status', sessionId, status: 'idle' })
     sessions.delete(sessionId)
+    // Idle describes the last turn, not a usable native query. The Node bridge
+    // stays open after native EOF/death; the host needs this separate lifecycle
+    // edge to stop advertising a session that can no longer accept input.
+    emit({ type: 'sdk.session.closed', sessionId, nativeSessionId: st?.cliSessionId, queryGeneration: st?.queryGeneration,
+      reason: closeReason })
     st?.abort.abort()
     await st?.nativeChannel?.cleanup()
   }
