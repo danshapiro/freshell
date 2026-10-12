@@ -19,6 +19,17 @@ export type ManagedEnvironmentCompletion = ManagedEnvironmentAttempt & {
   willRetry: boolean
 }
 
+export async function serviceManagedEnvironmentCases(
+  fixture: ManagedEnvironmentFixture,
+  operations: (scenario: 'healthy' | 'missing-reference' | 'startup-before-identity') => Parameters<typeof serviceManagedEnvironmentScenario>[2],
+  joinBrowser: () => Promise<void>,
+) {
+  for (const scenario of ['healthy', 'missing-reference', 'startup-before-identity'] as const) {
+    await serviceManagedEnvironmentScenario(fixture, scenario, operations(scenario))
+  }
+  await joinBrowser()
+}
+
 export async function serviceManagedEnvironmentScenario(
   fixture: ManagedEnvironmentFixture, scenario: string,
   operations: {

@@ -35,7 +35,7 @@ import { RuntimeHarness, dockerSocketPath } from '../../../../scripts/testing/ru
 import { RestrictedDockerBroker, type PreparedInputAuthorization } from '../../../../scripts/testing/runtime-test-broker.js'
 import { ManagedRuntimeBrowserRig } from '../../../e2e-browser/helpers/managed-runtime.js'
 import { prepareProviderParityUserRoots } from '../../../helpers/provider-parity-environment.js'
-import { assertManagedTerminalCreated, observeManagedEnvironmentNativeIdentity, readManagedEnvironmentDaemonId, serviceManagedEnvironmentScenario, type ManagedEnvironmentAttempt, type ManagedEnvironmentCompletion } from '../../../../scripts/testing/managed-environment-create.js'
+import { assertManagedTerminalCreated, observeManagedEnvironmentNativeIdentity, readManagedEnvironmentDaemonId, serviceManagedEnvironmentScenario, serviceManagedEnvironmentCases, type ManagedEnvironmentAttempt, type ManagedEnvironmentCompletion } from '../../../../scripts/testing/managed-environment-create.js'
 import type { ErrorMessage } from '../../../../shared/ws-protocol.js'
 
 describe('managed environment browser attempt lifetime', () => {
@@ -108,6 +108,85 @@ describe('managed environment browser attempt lifetime', () => {
     })).resolves.toBeUndefined()
     expect(authorize).not.toHaveBeenCalled()
     expect(publishAuthorization).not.toHaveBeenCalled()
+  })
+
+  it('authorizes both concurrent negative cases while healthy completion remains pending', async () => {
+    await ownedFixture(async directory => {
+      const cases = ['healthy', 'missing-reference', 'startup-before-identity'] as const
+      for (const selected of cases) {
+        await fs.mkdir(path.join(directory, selected))
+        await fs.writeFile(path.join(directory, selected, 'request.json'), JSON.stringify({
+          ...fixture, scenario: selected, attempt: 0, createRequestId: `actual-${selected}`,
+        }))
+      }
+      let release!: () => void
+      const pending = new Promise<void>(resolve => { release = resolve })
+      const authorized: string[] = []
+      const run = serviceManagedEnvironmentCases(fixture, selected => ({
+        nextAttempt: async () => ({ request: JSON.parse(await fs.readFile(path.join(directory, selected, 'request.json'), 'utf8')) }),
+        authorize: id => { authorized.push(id) },
+        publishAuthorization: async value => { await fs.writeFile(path.join(directory, selected, 'authorized.json'), JSON.stringify(value)) },
+        onAuthorized: async () => {},
+        waitForCompletion: async value => {
+          if (selected === 'healthy') await pending
+          return { ...value, status: 'passed', willRetry: false }
+        },
+      }), async () => {})
+      try {
+        await vi.waitFor(() => expect(authorized).toContain('actual-startup-before-identity'))
+        expect(authorized).toContain('actual-missing-reference')
+        for (const selected of cases) expect(JSON.parse(await fs.readFile(path.join(directory, selected, 'authorized.json'), 'utf8')))
+          .toMatchObject({ scenario: selected, createRequestId: `actual-${selected}`, ...fixture })
+      } finally { release(); await run }
+    })
+  })
+
+  it('settles every selected case after one service fails before the browser join and cleanup', async () => {
+    const selected: string[] = [], settled: string[] = []
+    let release!: () => void
+    const pending = new Promise<void>(resolve => { release = resolve })
+    const failure = new Error('actual owned scenario failure')
+    let returned = false
+    const joinBrowser = vi.fn(async () => { expect(settled).toEqual(['missing-reference', 'startup-before-identity']) })
+    const run = serviceManagedEnvironmentCases(fixture, scenario => ({
+      nextAttempt: async () => {
+        selected.push(scenario)
+        if (scenario === 'healthy') throw failure
+        await pending
+        settled.push(scenario)
+        return { completion: { ...fixture, scenario, attempt: 0, status: 'failed', willRetry: false } }
+      },
+      authorize: vi.fn(), publishAuthorization: vi.fn(), onAuthorized: vi.fn(), waitForCompletion: vi.fn(),
+    }), joinBrowser).then(() => undefined, error => error).finally(() => { returned = true })
+    try {
+      await new Promise<void>(resolve => setImmediate(resolve))
+      expect.soft(selected).toEqual(['healthy', 'missing-reference', 'startup-before-identity'])
+      expect.soft(returned).toBe(false)
+      expect.soft(joinBrowser).not.toHaveBeenCalled()
+    } finally { release() }
+    expect.soft(await run).toBe(failure)
+    expect.soft(settled).toEqual(['missing-reference', 'startup-before-identity'])
+    expect(joinBrowser).toHaveBeenCalledOnce()
+  })
+
+  it('waits for the actual final browser join before propagating a service failure', async () => {
+    let release!: () => void
+    const pending = new Promise<void>(resolve => { release = resolve })
+    let joining = false, returned = false
+    const failure = new Error('owned request mismatch')
+    const run = serviceManagedEnvironmentCases(fixture, scenario => ({
+      nextAttempt: async () => {
+        if (scenario === 'healthy') throw failure
+        return { completion: { ...fixture, scenario, attempt: 0, status: 'failed', willRetry: false } }
+      },
+      authorize: vi.fn(), publishAuthorization: vi.fn(), onAuthorized: vi.fn(), waitForCompletion: vi.fn(),
+    }), async () => { joining = true; await pending }).then(() => undefined, error => error).finally(() => { returned = true })
+    try {
+      await new Promise<void>(resolve => setImmediate(resolve))
+      expect.soft(joining).toBe(true)
+      expect.soft(returned).toBe(false)
+    } finally { release() }
+    expect(await run).toBe(failure)
   })
 })
 

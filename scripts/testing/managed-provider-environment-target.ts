@@ -13,7 +13,7 @@ import { managedEnvironmentOpencodeSelection } from '../../test/helpers/provider
 import { fakeOnecliGrants } from '../../test/integration/server/provider-parity-onecli.js'
 import type { InitialProviderVolumeAuthorization } from './runtime-test-broker.js'
 import { resolvePairedExternalFixture } from './e2e-external-target.js'
-import { assertManagedTerminalCreated, observeManagedEnvironmentNativeIdentity, readManagedEnvironmentDaemonId, serviceManagedEnvironmentScenario } from './managed-environment-create.js'
+import { assertManagedTerminalCreated, observeManagedEnvironmentNativeIdentity, readManagedEnvironmentDaemonId, serviceManagedEnvironmentCases } from './managed-environment-create.js'
 
 const cloudflaredVersion = '2026.10.0'
 const cloudflaredSha = 'd33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db'
@@ -338,9 +338,9 @@ export async function runManagedEnvironmentTarget() {
       'test/e2e-browser/specs/managed-provider-environment-external.spec.ts'], { cwd: repoRoot, env: cloudEnvironment, stdio: ['ignore', 'inherit', 'inherit'] })
     browserJoin = joined(browser); browserJoin.catch(() => {})
     browserIdentity = await processIdentity(browser)
-    for (const scenario of scenarios) {
+    await serviceManagedEnvironmentCases(fixture, scenario => {
       const cwd = path.join(selected.workspace, scenario)
-      await serviceManagedEnvironmentScenario(fixture, scenario, {
+      return {
         nextAttempt: attempt => poll(`Cloud ${scenario} attempt ${attempt} picker or completion`, async () => {
           const request = await readJson(path.join(cwd, '.managed-fixture/request.json'))
           if (request?.attempt === attempt) return { request }
@@ -375,11 +375,12 @@ export async function runManagedEnvironmentTarget() {
         await writeJson(path.join(cwd, '.managed-fixture/target-receipt.json'), receipt)
         proof.healthy = receipt
         } },
-      })
-    }
-    const browserExit = await bounded(browserJoin, 120_000, 'configured Cloud browser final join')
-    assert.equal(browserExit.code, 0, 'Configured Cloud browser acceptance failed')
-    proof.cloudBrowser = { actualNativeExit: browserExit, identity: browserIdentity, expectedCases: 3, printedFooter: 'UNKNOWN' }
+      }
+    }, async () => {
+      const browserExit = await bounded(browserJoin!, 120_000, 'configured Cloud browser final join')
+      assert.equal(browserExit.code, 0, 'Configured Cloud browser acceptance failed')
+      proof.cloudBrowser = { actualNativeExit: browserExit, identity: browserIdentity, expectedCases: 3, printedFooter: 'UNKNOWN' }
+    })
     const healthy = proof.healthy as any
     const original = (await rig.inventory()).find(row => row.soulId === healthy.soulId)
     assert(original?.containerId)
