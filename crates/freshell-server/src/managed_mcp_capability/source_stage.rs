@@ -381,6 +381,7 @@ mod configured_resource_tests {
         }
         let sound = external.join("selected.wav");
         std::fs::write(&sound, b"RIFF-selected-wave-bytes").unwrap();
+        std::fs::set_permissions(&sound, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::fs::write(tool.join("resource"), "mcp-resource").unwrap();
         std::fs::write(
             tool.join("node_modules/dependency/index.js"),
