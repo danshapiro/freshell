@@ -53,7 +53,8 @@ pub enum Sig {
 /// became a zombie (the kernel posts it once the process has closed every
 /// descriptor, so it holds no lock and never runs again). Only a proven
 /// exit is "gone": a read that fails for another reason (no descriptor
-/// left, no memory) is passed through as that error. Its kind is
+/// left, no memory) is passed through as that error, and the id of a live
+/// thread is refused as no process ([`ProcWatch::open`]). Its kind is
 /// `NotFound` and its text "process gone"; [`is_process_gone`] tells it
 /// from every other open failure (a different incarnation under the pid,
 /// which is also `NotFound`, or an error of the OS call or of a read).
@@ -124,7 +125,10 @@ impl std::fmt::Debug for ProcWatch {
 }
 
 impl ProcWatch {
-    /// Watch the process `pid` is now, pinning that incarnation.
+    /// Watch the process `pid` is now, pinning that incarnation. `pid` is a
+    /// process id (a thread-group id); the id of a thread is refused with
+    /// `ErrorKind::InvalidInput`, never "process gone" (macOS numbers no
+    /// thread in the pid space).
     pub fn open(pid: u32) -> io::Result<Self> {
         Self::open_inner(pid, None)
     }
@@ -159,16 +163,15 @@ impl ProcWatch {
         let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
         if raw < 0 {
             let err = io::Error::last_os_error();
-            // No process has the pid: ESRCH when nothing names it any more;
-            // EINVAL (for a positive pid and no flags) when it still names
-            // something other than a process, such as the process group or
-            // session of a reaped leader whose job lives on.
-            let gone = match err.raw_os_error() {
-                Some(libc::ESRCH) => true,
-                Some(libc::EINVAL) => libc::pid_t::try_from(pid).is_ok_and(|pid| pid > 0),
-                _ => false,
-            };
-            return Err(if gone { process_gone() } else { err });
+            let positive = libc::pid_t::try_from(pid).is_ok_and(|pid| pid > 0);
+            return Err(match err.raw_os_error() {
+                // Nothing has the pid any more.
+                Some(libc::ESRCH) => process_gone(),
+                // No thread-group leader has it (for a positive pid and no
+                // flags: EINVAL before Linux 6.15, ENOENT from 6.15).
+                Some(libc::EINVAL | libc::ENOENT) if positive => no_leader_with(pid, err),
+                _ => err,
+            });
         }
         // SAFETY: `raw` is a fresh pidfd this call owns exclusively.
         let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) };
@@ -304,6 +307,44 @@ impl ProcWatch {
     }
 }
 
+/// Linux: `pidfd_open` found no thread-group leader with `pid`. Either no
+/// task has the pid any more (it still names the process group or session
+/// of a reaped leader whose job lives on): the process is gone. Or it names
+/// a live thread of a process (`/proc/<pid>` exists for every task, though
+/// the directory lists only processes): that is no process, and the answer
+/// is a distinct `InvalidInput` error, never "gone", so no caller can skip
+/// a running process by passing one of its thread ids. Anything else (the
+/// task's status unreadable, or a process under the pid by now) passes
+/// through as an error, never "gone".
+#[cfg(target_os = "linux")]
+fn no_leader_with(pid: u32, refused: io::Error) -> io::Error {
+    let status = match std::fs::read_to_string(format!("/proc/{pid}/status")) {
+        Ok(status) => status,
+        Err(err) if matches!(err.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
+            return process_gone();
+        }
+        Err(err) => return err,
+    };
+    let tgid = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Tgid:"))
+        .and_then(|tgid| tgid.trim().parse::<u32>().ok());
+    match tgid {
+        Some(tgid) if tgid != pid => not_a_process(pid, tgid),
+        _ => io::Error::other(format!("pid {pid} cannot be watched: {refused}")),
+    }
+}
+
+/// The error a watch's open answers for the id of a thread of `process`:
+/// the id names no process (kind `InvalidInput`, never "process gone").
+#[cfg(any(target_os = "linux", windows))]
+fn not_a_process(id: u32, process: u32) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{id} is a thread of process {process}, not a process"),
+    )
+}
+
 /// What a failed read of a pinned process's identity means: "process gone"
 /// only when it is, that is when the read found no such process (ENOENT,
 /// ESRCH: it was reaped) or `exited` (its pinning handle) says it exited;
@@ -346,14 +387,15 @@ impl ProcWatch {
         use windows_sys::Win32::System::Threading::{
             PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
         };
-        // `NotFound` from the open: no process has the pid.
+        // `NotFound` from the open: no process has the id (a thread's id
+        // included).
         let handle = crate::process::open_process(
             pid,
             PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
         )
         .map_err(|err| {
             if err.kind() == io::ErrorKind::NotFound {
-                process_gone()
+                no_process_with(pid)
             } else {
                 err
             }
@@ -472,6 +514,37 @@ impl ProcWatch {
             )),
         }
     }
+}
+
+/// Windows: `OpenProcess` found no process with the id `pid`. Thread and
+/// process ids come from one pool, and `OpenProcess` refuses a thread's id
+/// as it refuses an id nothing has, so the id is looked up as a thread: no
+/// thread has it either, and the process is gone; a thread has it, and the
+/// answer is a distinct `InvalidInput` error, never "gone", so no caller
+/// can skip a running process by passing one of its thread ids; the lookup
+/// fails otherwise, and that error is passed through.
+#[cfg(windows)]
+fn no_process_with(pid: u32) -> io::Error {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+    use windows_sys::Win32::System::Threading::{
+        GetProcessIdOfThread, OpenThread, THREAD_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: plain OpenThread; the result is checked before use.
+    let raw = unsafe { OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if raw.is_null() {
+        let err = io::Error::last_os_error();
+        return if err.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+            process_gone()
+        } else {
+            err
+        };
+    }
+    // SAFETY: a fresh handle this call owns exclusively.
+    let thread = unsafe { OwnedHandle::from_raw_handle(raw) };
+    // SAFETY: a live thread handle with THREAD_QUERY_LIMITED_INFORMATION.
+    let process = unsafe { GetProcessIdOfThread(thread.as_raw_handle()) };
+    not_a_process(pid, process)
 }
 
 /// One zero-timeout wait on a process handle (with SYNCHRONIZE): signalled

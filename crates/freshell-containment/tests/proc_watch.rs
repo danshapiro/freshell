@@ -9,7 +9,7 @@ use std::time::Instant;
 
 #[cfg(unix)]
 use freshell_containment::identity;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 use freshell_containment::is_process_gone;
 use freshell_containment::{is_codex_daemon_family, ProcWatch, Sig, UnitId};
 
@@ -220,6 +220,56 @@ fn a_reaped_process_is_gone_even_while_its_group_lives_on() {
         .unwrap()
         .signal(Sig::Kill)
         .unwrap();
+}
+
+/// A thread of this test process that runs until the returned sender is
+/// dropped (the join waits for it), and its id as the OS numbers it.
+#[cfg(any(target_os = "linux", windows))]
+fn live_thread() -> (
+    u32,
+    std::sync::mpsc::Sender<()>,
+    std::thread::JoinHandle<()>,
+) {
+    let (id_tx, id_rx) = std::sync::mpsc::channel();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        #[cfg(target_os = "linux")]
+        // SAFETY: gettid has no preconditions.
+        let id = unsafe { libc::gettid() } as u32;
+        #[cfg(windows)]
+        // SAFETY: GetCurrentThreadId has no preconditions.
+        let id = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+        id_tx.send(id).unwrap();
+        let _ = stop_rx.recv();
+    });
+    (id_rx.recv().unwrap(), stop_tx, thread)
+}
+
+/// A watch is opened on a process (a thread-group id), never on a thread:
+/// the id of a live thread of a running process (this test's own) is
+/// refused with an error that is neither "process gone" nor `NotFound`, so
+/// no caller that skips a gone member can skip a running process by being
+/// handed one of its thread ids. (Linux `pidfd_open` refuses it with EINVAL
+/// before 6.15 and ENOENT from 6.15, both of which can also mean "gone";
+/// Windows `OpenProcess` refuses a thread id as an invalid parameter, as it
+/// does a pid no process has.) Nothing is signalled.
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+fn a_live_threads_id_is_refused_and_never_process_gone() {
+    let (tid, stop, thread) = live_thread();
+    assert_ne!(tid, std::process::id(), "the main thread's id is the pid");
+    for (how, opened) in [
+        ("open", ProcWatch::open(tid)),
+        ("open_expecting", ProcWatch::open_expecting(tid, 0)),
+    ] {
+        let err = opened.expect_err("a thread id names no process");
+        assert!(!is_process_gone(&err), "{how}: {err}");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{how}: {err}");
+        let owner = format!("thread of process {}", std::process::id());
+        assert!(err.to_string().contains(&owner), "{how}: {err}");
+    }
+    drop(stop);
+    thread.join().unwrap();
 }
 
 /// A process whose main thread exited while another thread runs on (a main
