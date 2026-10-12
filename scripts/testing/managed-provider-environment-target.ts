@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
+import { execFileSync, spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
+import { createRequire } from 'node:module'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -21,8 +22,20 @@ const cloudflaredVersion = '2026.10.0'
 const cloudflaredSha = 'd33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db'
 const scenarios = ['healthy', 'missing-reference', 'startup-before-identity'] as const
 const ordinaryFixtureMode = 'managed-fixture-ordinary'
+const checkpointImage = 'freshell-sandbox:latest'
+const checkpointContainerPort = 3477
+const checkpointFixtureRoot = '/tmp/freshell-checkpoint-fixture'
+const checkpointControlRequest = `${checkpointFixtureRoot}/control/request.json`
+const checkpointControlAck = (id: string) => `${checkpointFixtureRoot}/control/ack-${id}.json`
+export type ManagedProviderEnvironmentTargetMode = 'managed-environment' | 'code-checkpoint'
 const delay = (milliseconds: number) => new Promise(resolve => setTimeout(resolve, milliseconds))
 const digest = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex')
+
+export function resolveManagedProviderEnvironmentTargetMode(args: string[]): ManagedProviderEnvironmentTargetMode {
+  if (args.length === 0) return 'managed-environment'
+  if (args.length === 1 && args[0] === '--checkpoint') return 'code-checkpoint'
+  throw new Error('Usage: managed-provider-environment-target.ts [--checkpoint]')
+}
 
 async function poll<T>(description: string, operation: () => Promise<T | undefined>, timeout = 180_000): Promise<T> {
   const end = Date.now() + timeout
@@ -230,6 +243,226 @@ async function stageProof(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeVie
 
 const requireMode = (metadata: { mode: number }) => (metadata.mode & 0o777).toString(8).padStart(4, '0')
 
+const checkpointTargetLauncher = String.raw`import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import fsp from 'node:fs/promises'
+import path from 'node:path'
+import { execFileSync, spawn } from 'node:child_process'
+
+const root = '/tmp/freshell-checkpoint-fixture'
+const uid = Number(process.env.FRESHELL_CHECKPOINT_FIXTURE_UID)
+assert.equal(process.env.FRESHELL_CHECKPOINT_FIXTURE_ROOT, root)
+assert(Number.isSafeInteger(uid) && uid > 0)
+assert.equal(process.getuid(), uid, 'fixture setup must run as restricted UID B')
+const status = fs.readFileSync('/proc/self/status', 'utf8')
+const capabilities = status.match(/^CapEff:\s+([0-9a-f]+)$/m)?.[1]
+assert.equal(capabilities, '0000000000000000', 'fixture UID B must have no effective capabilities')
+
+const project = path.join(root, 'project')
+const home = path.join(root, 'home')
+const storage = path.join(root, 'storage')
+const control = path.join(root, 'control')
+const deniedFile = path.join(project, 'private-file.ignored')
+const deniedDirectory = path.join(project, 'private-dir.ignored')
+const mode = (selected) => fs.lstatSync(selected).mode & 0o777
+function assertDeniedFile(selected) {
+  assert.throws(() => fs.readFileSync(selected), { code: 'EACCES' })
+}
+function assertDeniedDirectory(selected) {
+  assert.throws(() => fs.readdirSync(selected), { code: 'EACCES' })
+}
+const fileStat = fs.lstatSync(deniedFile)
+const directoryStat = fs.lstatSync(deniedDirectory)
+assert.equal(fileStat.uid, 0)
+assert.equal(mode(deniedFile), 0o600)
+assert.equal(directoryStat.uid, 0)
+assert.equal(mode(deniedDirectory), 0o700)
+assertDeniedFile(deniedFile)
+assertDeniedDirectory(deniedDirectory)
+const eligibleFile = path.join(project, 'private-file')
+const eligibleDirectory = path.join(project, 'private-dir')
+fs.renameSync(deniedFile, eligibleFile)
+assertDeniedFile(eligibleFile)
+fs.renameSync(eligibleFile, deniedFile)
+fs.renameSync(deniedDirectory, eligibleDirectory)
+assertDeniedDirectory(eligibleDirectory)
+fs.renameSync(eligibleDirectory, deniedDirectory)
+assert.deepEqual([fs.lstatSync(deniedFile).uid, mode(deniedFile)], [0, 0o600])
+assert.deepEqual([fs.lstatSync(deniedDirectory).uid, mode(deniedDirectory)], [0, 0o700])
+
+fs.mkdirSync(control, { recursive: true, mode: 0o700 })
+fs.mkdirSync(path.join(project, '.freshell-checkpoint-fixture'), { recursive: true, mode: 0o700 })
+fs.writeFileSync(path.join(project, 'main.rs'), 'main before checkpoint\n')
+fs.writeFileSync(path.join(project, 'notes.txt'), 'notes before checkpoint\n')
+fs.writeFileSync(path.join(project, 'run.sh'), '#!/bin/sh\necho before\n', { mode: 0o755 })
+fs.symlinkSync('main.rs', path.join(project, 'main-link'))
+execFileSync('git', ['init', '-q'], { cwd: project, stdio: 'ignore' })
+execFileSync('git', ['config', 'user.name', 'Freshell checkpoint fixture'], { cwd: project, stdio: 'ignore' })
+execFileSync('git', ['config', 'user.email', 'fixture@example.invalid'], { cwd: project, stdio: 'ignore' })
+execFileSync('git', ['add', '--', '.gitignore', 'main.rs', 'notes.txt', 'run.sh', 'main-link'], { cwd: project, stdio: 'ignore' })
+execFileSync('git', ['commit', '-q', '-m', 'synthetic checkpoint fixture'], { cwd: project, stdio: 'ignore' })
+
+const nonGit = path.join(root, 'non-git')
+fs.mkdirSync(nonGit, { mode: 0o755 })
+fs.writeFileSync(path.join(nonGit, 'one.txt'), 'one before checkpoint\n')
+fs.writeFileSync(path.join(nonGit, 'two.txt'), 'two before checkpoint\n')
+fs.mkdirSync(path.join(home, '.freshell'), { recursive: true, mode: 0o700 })
+fs.mkdirSync(path.join(home, '.codex'), { recursive: true, mode: 0o700 })
+fs.mkdirSync(path.join(storage, 'logs'), { recursive: true, mode: 0o700 })
+fs.writeFileSync(path.join(home, '.freshell', 'config.json'), JSON.stringify({ version: 1, settings: {
+  network: { configured: true, host: '127.0.0.1' },
+  freshAgent: { enabled: true, initialSetupDone: true, defaultPlugins: [], providers: {} },
+  codingCli: { enabledProviders: ['codex'], providers: { codex: { model: 'gpt-5-codex', sandbox: 'workspace-write' } } },
+} }))
+fs.writeFileSync(path.join(control, 'initialization.json'), JSON.stringify({ restrictedUid: uid,
+  effectiveCapabilities: capabilities, privateFileDenied: true, privateDirectoryDenied: true,
+  privateFileUid: fileStat.uid, privateFileMode: '0600', privateDirectoryUid: directoryStat.uid,
+  privateDirectoryMode: '0700', sameParentRenameVerified: true, nonGitWorkspace: nonGit }))
+console.log(JSON.stringify({ severity: 'info', event: 'code_checkpoint.target_fixture_initialized',
+  restrictedUid: uid, effectiveCapabilities: capabilities, privateFileDenied: true,
+  privateDirectoryDenied: true, sameParentRenameVerified: true }))
+
+const child = spawn('/checkpoint-target/freshell-server', [], { stdio: 'inherit', env: process.env })
+child.once('error', (error) => { console.error(error.message); process.exitCode = 1 })
+for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => child.kill(signal))
+const exit = await new Promise((resolve, reject) => {
+  child.once('error', reject)
+  child.once('exit', (code, signal) => resolve({ code, signal }))
+})
+if (exit.signal) process.exitCode = 1
+else process.exitCode = exit.code ?? 1
+`
+
+const checkpointTargetControl = String.raw`import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import path from 'node:path'
+
+const [action, requestId, expectedUidText] = process.argv.slice(2)
+const expectedUid = Number(expectedUidText)
+assert(['eligible', 'ignored'].includes(action))
+assert(/^[a-zA-Z0-9-]{1,96}$/.test(requestId ?? ''))
+assert(Number.isSafeInteger(expectedUid) && expectedUid > 0)
+assert.equal(process.getuid(), expectedUid, 'control must run as restricted UID B')
+const capabilities = fs.readFileSync('/proc/self/status', 'utf8').match(/^CapEff:\s+([0-9a-f]+)$/m)?.[1]
+assert.equal(capabilities, '0000000000000000', 'control must not receive capabilities')
+const project = '/tmp/freshell-checkpoint-fixture/project'
+const from = path.join(project, action === 'eligible' ? 'private-file.ignored' : 'private-file')
+const to = path.join(project, action === 'eligible' ? 'private-file' : 'private-file.ignored')
+if (fs.existsSync(from)) fs.renameSync(from, to)
+const privatePath = action === 'eligible' ? to : path.join(project, 'private-file.ignored')
+const privateStat = fs.lstatSync(privatePath)
+assert.equal(privateStat.uid, 0)
+assert.equal(privateStat.mode & 0o777, 0o600)
+assert.throws(() => fs.readFileSync(privatePath), { code: 'EACCES' })
+const root = '/tmp/freshell-checkpoint-fixture/control'
+const ack = path.join(root, 'ack-' + requestId + '.json')
+fs.writeFileSync(ack, JSON.stringify({ requestId, action, restrictedUid: expectedUid,
+  privateFileUid: privateStat.uid, privateFileMode: '0600', privateFileDenied: true,
+  effectiveCapabilities: capabilities }), { flag: 'wx', mode: 0o600 })
+`
+
+function docker(args: string[], timeout = 30_000): string {
+  return execFileSync('docker', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout }).trim()
+}
+
+function dockerMaybe(args: string[], timeout = 10_000): string | undefined {
+  const result = spawnSync('docker', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout })
+  if (result.error) throw result.error
+  if (result.status !== 0) return undefined
+  return result.stdout.trim()
+}
+
+async function stageCheckpointTarget(stage: string, repoRoot: string): Promise<void> {
+  await fs.mkdir(stage, { recursive: true, mode: 0o700 })
+  const binary = path.join(repoRoot, 'target/debug/freshell-server')
+  const client = path.join(repoRoot, 'dist/client')
+  assert((await fs.stat(binary)).isFile(), 'Feature-enabled checkpoint server binary is missing')
+  assert((await fs.stat(client)).isDirectory(), 'Built client assets are missing')
+  await fs.copyFile(binary, path.join(stage, 'freshell-server'))
+  await fs.chmod(path.join(stage, 'freshell-server'), 0o555)
+  await fs.cp(client, path.join(stage, 'client'), { recursive: true, dereference: true, preserveTimestamps: false })
+  await fs.copyFile(path.resolve(repoRoot, 'docker/sandbox/entrypoint.sh'), path.join(stage, 'sandbox-entrypoint.sh'))
+  await fs.chmod(path.join(stage, 'sandbox-entrypoint.sh'), 0o555)
+  await fs.writeFile(path.join(stage, 'launch.mjs'), checkpointTargetLauncher, { mode: 0o444 })
+  await fs.writeFile(path.join(stage, 'control.mjs'), checkpointTargetControl, { mode: 0o444 })
+  const fake = path.resolve(repoRoot, 'test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs')
+  await fs.copyFile(fake, path.join(stage, 'fake-app-server.mjs'))
+  await fs.chmod(path.join(stage, 'fake-app-server.mjs'), 0o444)
+  const require = createRequire(import.meta.url)
+  const wsRoot = path.dirname(require.resolve('ws'))
+  await fs.mkdir(path.join(stage, 'node_modules'), { mode: 0o700 })
+  await fs.cp(wsRoot, path.join(stage, 'node_modules/ws'), { recursive: true, dereference: true, preserveTimestamps: false })
+  await fs.chmod(path.join(stage, 'node_modules'), 0o555)
+}
+
+function restrictedIdentity(): { uid: number; gid: number } {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
+  if (!dockerMaybe(['image', 'inspect', '--format', '{{.Id}}', checkpointImage])) {
+    execFileSync(path.join(repoRoot, 'scripts/sandbox-build.sh'), { cwd: repoRoot, stdio: 'inherit' })
+  }
+  const readIdentity = () => ({
+    uid: Number(docker(['run', '--rm', '--read-only', '--network', 'none', '--entrypoint', '/usr/bin/id',
+      checkpointImage, '-u', 'sandbox'])),
+    gid: Number(docker(['run', '--rm', '--read-only', '--network', 'none', '--entrypoint', '/usr/bin/id',
+      checkpointImage, '-g', 'sandbox'])),
+  })
+  let { uid, gid } = readIdentity()
+  if (uid !== process.getuid() || gid !== process.getgid()) {
+    execFileSync(path.join(repoRoot, 'scripts/sandbox-build.sh'), { cwd: repoRoot, stdio: 'inherit' })
+    const rebuiltIdentity = readIdentity()
+    uid = rebuiltIdentity.uid
+    gid = rebuiltIdentity.gid
+  }
+  assert(Number.isSafeInteger(uid) && uid > 0 && Number.isSafeInteger(gid) && gid > 0,
+    'Sandbox image must provide its fixed non-root restricted identity')
+  return { uid, gid }
+}
+
+async function externalTargetRead(baseUrl: string, token: string, selected: string): Promise<any | undefined> {
+  const response = await fetch(`${baseUrl}/api/files/read?path=${encodeURIComponent(selected)}`, {
+    headers: { 'x-auth-token': token }, signal: AbortSignal.timeout(15_000),
+  })
+  if (response.status === 404) return undefined
+  assert(response.ok, `Owned checkpoint target control read failed with HTTP ${response.status}`)
+  const body = await response.json() as { content?: unknown }
+  assert(typeof body.content === 'string')
+  return JSON.parse(body.content)
+}
+
+async function serveCheckpointControls(
+  baseUrl: string,
+  token: string,
+  containerId: string,
+  identity: { uid: number; gid: number },
+  fixture: { expectedNonce: string },
+  browser: ChildProcess,
+  proof: Record<string, unknown>,
+): Promise<void> {
+  const processed = new Set<string>()
+  while (browser.exitCode === null && browser.signalCode === null) {
+    const request = await externalTargetRead(baseUrl, token, checkpointControlRequest)
+    if (request && typeof request.requestId === 'string' && !processed.has(request.requestId)) {
+      assert.deepEqual(Object.keys(request).sort(), ['action', 'expectedNonce', 'requestId'])
+      assert.equal(request.expectedNonce, fixture.expectedNonce, 'Fixture control nonce did not match this owned run')
+      assert(['eligible', 'ignored'].includes(request.action), 'Fixture requested an unsupported private-path state')
+      assert.match(request.requestId, /^[a-zA-Z0-9-]{1,96}$/)
+      processed.add(request.requestId)
+      execFileSync('docker', ['exec', '--user', `${identity.uid}:${identity.gid}`, containerId,
+        '/usr/bin/node', '/checkpoint-target/control.mjs', request.action, request.requestId, String(identity.uid)],
+      { stdio: ['ignore', 'ignore', 'pipe'], timeout: 15_000 })
+      const ack = await poll(`restricted fixture control acknowledgement ${request.requestId}`, async () => {
+        return externalTargetRead(baseUrl, token, checkpointControlAck(request.requestId))
+      }, 15_000)
+      assert.deepEqual(ack, { requestId: request.requestId, action: request.action, restrictedUid: identity.uid,
+        privateFileUid: 0, privateFileMode: '0600', privateFileDenied: true, effectiveCapabilities: '0000000000000000' })
+      const controls = (proof.controls ??= []) as unknown[]
+      controls.push({ requestId: request.requestId, action: request.action, restrictedUid: identity.uid,
+        privateFileDenied: true, effectiveCapabilities: ack.effectiveCapabilities })
+    }
+    await delay(150)
+  }
+}
+
 export function buildManagedEnvironmentClient(repoRoot: string, candidateSha: string): void {
   assert.match(candidateSha, /^[a-f0-9]{40}$/, 'Managed acceptance requires a known worktree commit')
   execFileSync('pnpm', ['run', 'build:client'], {
@@ -237,6 +470,269 @@ export function buildManagedEnvironmentClient(repoRoot: string, candidateSha: st
     env: { ...process.env, FRESHELL_BUILD_COMMIT: candidateSha },
     stdio: 'inherit',
   })
+}
+
+export async function runCodeCheckpointTarget() {
+  assert.equal(process.env.FRESHELL_E2E_BACKEND, 'cloud', 'Checkpoint acceptance requires configured Cloud')
+  assert.equal(process.env.GCLOUD_ROBOT_REQUIRE, '1', 'Checkpoint acceptance requires the robot identity')
+  assert.equal(process.env.GCLOUD_ROBOT_ACCOUNT, 'gcloud-robot@misc-puttering-project.iam.gserviceaccount.com')
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
+  const candidateSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot, encoding: 'utf8', timeout: 5_000 }).trim()
+  assert.match(candidateSha, /^[a-f0-9]{40}$/)
+  const dirty = execFileSync('git', ['status', '--porcelain'], { cwd: repoRoot, encoding: 'utf8', timeout: 5_000 }).trim()
+  assert.equal(dirty, '', 'Checkpoint Cloud acceptance must build an exact committed candidate')
+  execFileSync('mise', ['exec', 'rust@1.96', '--', 'cargo', 'build', '-p', 'freshell-server',
+    '--features', 'managed-runtime-v1', '--locked'], {
+    cwd: repoRoot, env: { ...process.env, FRESHELL_BUILD_COMMIT: candidateSha }, stdio: 'inherit',
+  })
+  buildManagedEnvironmentClient(repoRoot, candidateSha)
+
+  const runId = randomUUID()
+  const expectedNonce = randomUUID()
+  const identity = restrictedIdentity()
+  assert.equal(identity.uid, process.getuid(), 'Sandbox image UID must match the invoking test owner for read-only fixture mounts')
+  assert.equal(identity.gid, process.getgid(), 'Sandbox image GID must match the invoking test owner for read-only fixture mounts')
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'frs-code-checkpoint-'))
+  const stage = path.join(root, 'artifacts')
+  const token = randomUUID()
+  const fixture = {
+    candidateSha,
+    runId,
+    syntheticWorkspacePath: path.join(checkpointFixtureRoot, 'project'),
+    syntheticHomePath: path.join(checkpointFixtureRoot, 'home'),
+    nonGitWorkspacePath: path.join(checkpointFixtureRoot, 'non-git'),
+    restrictedUid: identity.uid,
+    expectedNonce,
+  }
+  const proof: Record<string, unknown> = { candidateSha, runId, fixture, image: checkpointImage }
+  const networkName = `freshell-checkpoint-${runId.slice(0, 8)}`
+  const containerName = `freshell-checkpoint-${runId.slice(0, 8)}`
+  const containerIdPath = path.join(root, 'container.id')
+  const dockerEnvPath = path.join(root, 'target.env')
+  const cloudDispatchReceiptPath = path.join(root, 'cloud-execution-dispatch.json')
+  const evidenceDir = path.join(repoRoot, '.runtime-evidence', candidateSha, runId)
+  const receiptPath = path.join(evidenceDir, 'code-checkpoint-acceptance.json')
+  let networkId: string | undefined
+  let containerId: string | undefined
+  let dockerRun: ChildProcess | undefined, dockerRunIdentity: Awaited<ReturnType<typeof processIdentity>> | undefined,
+    dockerRunJoin: Promise<NativeExit> | undefined
+  let tunnel: ChildProcess | undefined, tunnelIdentity: Awaited<ReturnType<typeof processIdentity>> | undefined,
+    tunnelJoin: Promise<NativeExit> | undefined
+  let browser: ChildProcess | undefined, browserIdentity: Awaited<ReturnType<typeof processIdentity>> | undefined,
+    browserJoin: Promise<NativeExit> | undefined
+  let dockerStdout = '', dockerStderr = ''
+  const browserSummaryCapture = new ManagedEnvironmentBrowserSummaryCapture()
+  try {
+    await stageCheckpointTarget(stage, repoRoot)
+    await fs.writeFile(dockerEnvPath, [
+      `AUTH_TOKEN=${token}`,
+      `PORT=${checkpointContainerPort}`,
+      'NODE_ENV=production',
+      'FRESHELL_BIND_HOST=0.0.0.0',
+      'FRESHELL_DISABLE_WSL_PORT_FORWARD=1',
+      'HIDE_STARTUP_TOKEN=true',
+      `FRESHELL_HOME=${fixture.syntheticHomePath}`,
+      `HOME=${fixture.syntheticHomePath}`,
+      `CODEX_HOME=${fixture.syntheticHomePath}/.codex`,
+      `FRESHELL_LOG_DIR=${checkpointFixtureRoot}/storage/logs`,
+      'FRESHELL_CLIENT_DIR=/checkpoint-target/client',
+      'CODEX_CMD=node /checkpoint-target/fake-app-server.mjs',
+      'FAKE_CODEX_APP_SERVER_BEHAVIOR={"recordTurns":true,"uniqueThreadIds":true}',
+      'FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES=1',
+      `FRESHELL_CHECKPOINT_FIXTURE_ROOT=${checkpointFixtureRoot}`,
+      `FRESHELL_CHECKPOINT_FIXTURE_UID=${identity.uid}`,
+      'FRESHELL_SANDBOX_MODE=runtime-suite',
+      'FRESHELL_SANDBOX_CHECKPOINT_FIXTURE=1',
+      '',
+    ].join('\n'), { mode: 0o600 })
+
+    networkId = docker(['network', 'create', '--driver', 'bridge', '--internal', '--label', 'freshell.owner=checkpoint-acceptance',
+      '--label', `freshell.run-id=${runId}`, networkName])
+    assert.match(networkId, /^[a-f0-9]{64}$/)
+    const networkDetails = docker(['network', 'inspect', '--format', '{{.Id}} {{index .Labels "freshell.run-id"}} {{.Internal}}', networkId])
+    assert.equal(networkDetails, `${networkId} ${runId} true`, 'Checkpoint network must be internally isolated and owned by this run')
+
+    const dockerArgs = [
+      'run', '--rm', '--init', '--name', containerName, '--cidfile', containerIdPath,
+      '--label', 'freshell.owner=checkpoint-acceptance', '--label', `freshell.run-id=${runId}`,
+      '--network', networkId, '--publish', `127.0.0.1::${checkpointContainerPort}/tcp`,
+      '--pids-limit', '512', '--memory', '4g', '--read-only', '--security-opt', 'no-new-privileges',
+      '--tmpfs', '/tmp:rw,nosuid,nodev,size=512m', '--tmpfs', '/workspace:rw,nosuid,nodev,size=64m',
+      '--tmpfs', '/usr/local/cargo:rw,nosuid,nodev,size=256m',
+      '--tmpfs', '/home/sandbox/.cache:rw,nosuid,nodev,size=256m',
+      '--mount', `type=bind,source=${stage},target=/checkpoint-target,readonly`,
+      '--env-file', dockerEnvPath, '--entrypoint', '/checkpoint-target/sandbox-entrypoint.sh',
+      checkpointImage, '/usr/local/bin/node', '/checkpoint-target/launch.mjs',
+    ]
+    dockerRun = spawn('docker', dockerArgs, { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] })
+    dockerRunJoin = joinedAfterOutput(dockerRun); dockerRunJoin.catch(() => {})
+    dockerRun.stdout!.on('data', (chunk: Buffer) => {
+      dockerStdout = (dockerStdout + chunk.toString()).slice(-262_144)
+    })
+    dockerRun.stderr!.on('data', (chunk: Buffer) => {
+      dockerStderr = (dockerStderr + chunk.toString()).slice(-262_144)
+    })
+    dockerRunIdentity = await processIdentity(dockerRun)
+    containerId = await poll('owned checkpoint container identity', async () => {
+      const contents = await fs.readFile(containerIdPath, 'utf8').catch(error => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+        throw error
+      })
+      if (contents) return contents.trim()
+      assert.equal(dockerRun!.exitCode, null, 'Owned checkpoint container exited before publishing its ID')
+      return undefined
+    }, 60_000)
+    assert.match(containerId, /^[a-f0-9]{64}$/)
+    const containerDetails = docker(['container', 'inspect', '--format', '{{.Id}} {{index .Config.Labels "freshell.run-id"}}', containerId])
+    assert.equal(containerDetails, `${containerId} ${runId}`, 'Checkpoint container ownership labels did not match this run')
+    const mapping = await poll('loopback-only ephemeral checkpoint target port', async () => {
+      const value = dockerMaybe(['port', containerId!, `${checkpointContainerPort}/tcp`])
+      if (!value) return undefined
+      const match = value.match(/^127\.0\.0\.1:(\d+)$/m)
+      if (!match) throw new Error('Checkpoint target port was not published on host loopback only')
+      return Number(match[1])
+    }, 60_000)
+    assert(Number.isSafeInteger(mapping) && mapping > 0 && mapping <= 65535)
+    const baseUrl = `http://127.0.0.1:${mapping}`
+    await poll('restricted checkpoint target health', async () => {
+      const response = await fetch(`${baseUrl}/api/health`, { signal: AbortSignal.timeout(5_000) }).catch(() => undefined)
+      return response?.ok ? true : undefined
+    }, 120_000)
+    const initialization = await poll('fixed restricted-UID initializer proof', () =>
+      externalTargetRead(baseUrl, token, `${checkpointFixtureRoot}/control/initialization.json`), 30_000)
+    assert.deepEqual(initialization, { restrictedUid: identity.uid, effectiveCapabilities: '0000000000000000',
+      privateFileDenied: true, privateDirectoryDenied: true, privateFileUid: 0, privateFileMode: '0600',
+      privateDirectoryUid: 0, privateDirectoryMode: '0700', sameParentRenameVerified: true,
+      nonGitWorkspace: fixture.nonGitWorkspacePath })
+    const serverInfoResponse = await fetch(`${baseUrl}/api/server-info`, { headers: { 'x-auth-token': token }, signal: AbortSignal.timeout(15_000) })
+    assert(serverInfoResponse.ok)
+    const serverInfo = await serverInfoResponse.json() as { commit?: unknown; buildDirty?: unknown; runtime?: unknown }
+    assert.equal(serverInfo.runtime, 'rust')
+    assert.equal(serverInfo.commit, candidateSha)
+    assert.equal(serverInfo.buildDirty, false)
+    proof.target = { containerId, containerName, networkId, networkName, networkInternal: true, restrictedIdentity: identity,
+      hostLoopbackPort: mapping, serverInfo, initialization }
+
+    const toolHome = path.join(root, 'cloudflared-home')
+    await fs.mkdir(toolHome, { mode: 0o700 })
+    const tool = path.join(root, 'cloudflared')
+    const download = await fetch(`https://github.com/cloudflare/cloudflared/releases/download/${cloudflaredVersion}/cloudflared-linux-amd64`,
+      { signal: AbortSignal.timeout(120_000) })
+    assert(download.ok)
+    const bytes = Buffer.from(await download.arrayBuffer())
+    assert.equal(digest(bytes), cloudflaredSha, 'Pinned cloudflared checksum mismatch')
+    await fs.writeFile(tool, bytes, { mode: 0o700 })
+    const versionText = execFileSync(tool, ['--version'], { cwd: root, env: { PATH: process.env.PATH ?? '', HOME: toolHome },
+      encoding: 'utf8', timeout: 30_000 })
+    assert.match(versionText, /^cloudflared version 2026\.10\.0(?:\s|$)/)
+    tunnel = spawn(tool, ['tunnel', '--url', baseUrl], {
+      cwd: root, env: { PATH: process.env.PATH ?? '', HOME: toolHome, XDG_CONFIG_HOME: toolHome },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    tunnelJoin = joined(tunnel); tunnelJoin.catch(() => {})
+    tunnelIdentity = await processIdentity(tunnel)
+    let tunnelLog = ''
+    const tunnelOutput = (chunk: Buffer) => { tunnelLog = (tunnelLog + chunk.toString()).slice(-65_536) }
+    tunnel.stdout!.on('data', tunnelOutput); tunnel.stderr!.on('data', tunnelOutput)
+    const origin = await poll('pinned checkpoint Quick Tunnel hostname', async () => {
+      assert.equal(tunnel!.exitCode, null, 'Owned checkpoint tunnel exited before publication')
+      return tunnelLog.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/)?.[0]
+    }, 120_000)
+    await poll('checkpoint tunnel health', async () => {
+      const response = await fetch(`${origin}/api/health`, { signal: AbortSignal.timeout(15_000) }).catch(() => undefined)
+      return response?.ok ? true : undefined
+    }, 120_000)
+
+    const cloudEnvironment: NodeJS.ProcessEnv = { ...process.env,
+      FRESHELL_E2E_EXTERNAL_FIXTURE_KIND: 'code-checkpoint',
+      FRESHELL_CODE_CHECKPOINT_FIXTURE: JSON.stringify(fixture),
+      FRESHELL_E2E_TARGET_URL: origin,
+      FRESHELL_E2E_TARGET_WS_URL: origin.replace('https:', 'wss:') + '/ws',
+      FRESHELL_E2E_TARGET_TOKEN: token,
+    }
+    delete cloudEnvironment.FRESHELL_MANAGED_ENVIRONMENT_FIXTURE
+    delete cloudEnvironment.FRESHELL_E2E_TARGET_HOME
+    const paired = resolvePairedExternalFixture(cloudEnvironment, true)
+    assert.equal(paired?.kind, 'code-checkpoint')
+    const browserSpec = 'test/e2e-browser/specs/code-checkpoint-workspace-external.spec.ts'
+    cloudEnvironment.FRESHELL_E2E_CLOUD_DISPATCH_RECEIPT = cloudDispatchReceiptPath
+    browser = spawn('pnpm', ['run', 'test:e2e', '--shards=1', '--project=chromium-external-target', browserSpec], {
+      cwd: repoRoot, env: cloudEnvironment, stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    browser.stdout!.on('data', chunk => browserSummaryCapture.write(chunk))
+    browser.stdout!.pipe(process.stdout); browser.stderr!.pipe(process.stderr)
+    browserJoin = joinedAfterOutput(browser); browserJoin.catch(() => {})
+    browserIdentity = await processIdentity(browser)
+    const cloudDispatch = await waitForCloudExecutionDispatch(cloudDispatchReceiptPath,
+      () => browser?.exitCode === null && browser.signalCode === null)
+    proof.cloudExecution = cloudDispatch
+    console.log(JSON.stringify({ severity: 'info', event: 'code_checkpoint.cloud_execution_dispatched', ...cloudDispatch }))
+    await serveCheckpointControls(baseUrl, token, containerId, identity, fixture, browser, proof)
+    const browserExit = await bounded(browserJoin, 120_000, 'configured Cloud checkpoint browser final join')
+    assert.equal(browserExit.code, 0, 'Configured Cloud checkpoint browser acceptance failed')
+    const browserSummary = browserSummaryCapture.finish()
+    assert.equal(browserSummary.executedCases, 3, 'Configured Cloud must execute all three checkpoint browser cases')
+    assert.equal(browserSummary.passedCases, 3, 'Every configured checkpoint browser case must pass')
+    assert.equal(browserSummary.failedCases, 0)
+    assert.equal(browserSummary.skippedCases, 0)
+    assert.equal(browserSummary.interruptedCases, 0)
+    proof.cloudBrowser = { actualNativeExit: browserExit, identity: browserIdentity, ...browserSummary }
+    await fs.mkdir(evidenceDir, { recursive: true, mode: 0o700 })
+    await writeJson(receiptPath, proof)
+    console.log(JSON.stringify({ severity: 'info', event: 'code_checkpoint.acceptance_passed', candidateSha, runId,
+      executedBrowserCases: browserSummary.executedCases, passedBrowserCases: browserSummary.passedCases, receipt: receiptPath }))
+  } finally {
+    const errors: Error[] = []
+    const cleanup: Record<string, unknown> = {}
+    const attempt = async (operation: string, action: () => unknown | Promise<unknown>) => {
+      try { cleanup[operation] = await action() }
+      catch (error) { errors.push(new Error(`Owned checkpoint target cleanup failed: ${operation}`, { cause: error })); cleanup[operation] = 'FAILED; retain owned fixture' }
+    }
+    await attempt('browserJoin', () => stopExact(browser, browserIdentity, browserJoin))
+    await attempt('tunnelJoin', () => stopExact(tunnel, tunnelIdentity, tunnelJoin))
+    if (containerId) await attempt('container', async () => {
+      const matching = docker(['ps', '-aq', '--no-trunc', '--filter', `id=${containerId}`]).split('\n').filter(Boolean)
+      if (matching.length) {
+        assert.deepEqual(matching, [containerId], 'Only the exact owned checkpoint container may be stopped')
+        const details = docker(['container', 'inspect', '--format', '{{.Id}} {{index .Config.Labels "freshell.run-id"}}', containerId])
+        assert.equal(details, `${containerId} ${runId}`, 'Refusing to clean up an unowned checkpoint container')
+        docker(['container', 'stop', '--time', '10', containerId], 20_000)
+      }
+      const remaining = docker(['ps', '-aq', '--no-trunc', '--filter', `id=${containerId}`]).split('\n').filter(Boolean)
+      if (remaining.length) docker(['container', 'rm', '--force', containerId], 20_000)
+      assert.deepEqual(docker(['ps', '-aq', '--no-trunc', '--filter', `id=${containerId}`]).split('\n').filter(Boolean), [])
+      return { containerId, settled: true }
+    })
+    else if (dockerRun && dockerRunIdentity && dockerRunJoin) await attempt('containerIdentity', async () => {
+      const named = docker(['ps', '-aq', '--no-trunc', '--filter', `name=^/${containerName}$`]).split('\n').filter(Boolean)
+      assert.deepEqual(named, [], 'Container without a published owned ID remains unknown; retain its fixture')
+    })
+    await attempt('dockerRunJoin', () => stopExact(dockerRun, dockerRunIdentity, dockerRunJoin))
+    if (networkId) await attempt('network', async () => {
+      const matching = docker(['network', 'ls', '-q', '--no-trunc', '--filter', `id=${networkId}`]).split('\n').filter(Boolean)
+      if (matching.length) {
+        assert.deepEqual(matching, [networkId], 'Only the exact owned checkpoint network may be removed')
+        const details = docker(['network', 'inspect', '--format', '{{.Id}} {{index .Labels "freshell.run-id"}}', networkId])
+        assert.equal(details, `${networkId} ${runId}`, 'Refusing to remove an unowned checkpoint network')
+        docker(['network', 'rm', networkId])
+      }
+      assert.deepEqual(docker(['network', 'ls', '-q', '--no-trunc', '--filter', `id=${networkId}`]).split('\n').filter(Boolean), [])
+      return { networkId, settled: true }
+    })
+    if (errors.length === 0) await attempt('fixtureDirectory', () => fs.rm(root, { recursive: true, force: true }))
+    proof.cleanup = cleanup
+    proof.knownOwnedSettled = errors.length === 0
+    if (errors.length) proof.retainedFixture = root
+    await attempt('cleanupReceipt', async () => {
+      proof.targetOutput = {
+        stdoutTail: dockerStdout.replaceAll(token, '[redacted]').slice(-8192),
+        stderrTail: dockerStderr.replaceAll(token, '[redacted]').slice(-8192),
+      }
+      await fs.mkdir(evidenceDir, { recursive: true, mode: 0o700 })
+      await writeJson(path.join(evidenceDir, 'code-checkpoint-cleanup.json'), proof)
+    })
+    if (errors.length) throw new AggregateError(errors, 'Checkpoint target cleanup remains unsettled')
+  }
 }
 
 export async function runManagedEnvironmentTarget() {
@@ -496,9 +992,16 @@ export async function runManagedEnvironmentTarget() {
   }
 }
 
+export async function runManagedProviderEnvironmentTarget(args = process.argv.slice(2)) {
+  const mode = resolveManagedProviderEnvironmentTargetMode(args)
+  if (mode === 'code-checkpoint') return runCodeCheckpointTarget()
+  return runManagedEnvironmentTarget()
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
-  runManagedEnvironmentTarget().catch(error => {
-    console.error(JSON.stringify({ severity: 'error', event: 'managed_environment.acceptance_failed', error: error instanceof Error ? error.message : 'Unknown fixture failure' }))
+  runManagedProviderEnvironmentTarget().catch(error => {
+    const mode = process.argv.slice(2).includes('--checkpoint') ? 'code_checkpoint' : 'managed_environment'
+    console.error(JSON.stringify({ severity: 'error', event: `${mode}.acceptance_failed`, error: error instanceof Error ? error.message : 'Unknown fixture failure' }))
     process.exitCode = 1
   })
 }

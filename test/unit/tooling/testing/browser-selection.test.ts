@@ -117,6 +117,28 @@ describe('browser selection non-vacuity', () => {
     expect(ordinaryExplicit.status).toBe(1)
   }, 90_000)
 
+  it('discovers checkpoint workspace cases only through their paired dedicated Cloud project', () => {
+    const spec = 'code-checkpoint-workspace-external.spec.ts'
+    const ordinary = listedProjects(cleanEnvironment(), cloudConfig)
+    expect(listedSpecFiles(ordinary.output).has(spec)).toBe(false)
+    const fixture = JSON.stringify({ candidateSha: 'a'.repeat(40), runId: '11111111-1111-4111-8111-111111111111',
+      syntheticWorkspacePath: '/tmp/selected-checkpoint-fixture/project',
+      syntheticHomePath: '/tmp/selected-checkpoint-fixture/home',
+      nonGitWorkspacePath: '/tmp/selected-checkpoint-fixture/non-git', restrictedUid: 65534,
+      expectedNonce: 'selection-checkpoint-nonce' })
+    const paired = cleanEnvironment({ FRESHELL_E2E_EXTERNAL_FIXTURE_KIND: 'code-checkpoint',
+      FRESHELL_CODE_CHECKPOINT_FIXTURE: fixture, FRESHELL_E2E_TARGET_URL: 'https://fixture.invalid',
+      FRESHELL_E2E_TARGET_TOKEN: 'synthetic-selection-token' })
+    const selected = listedProjects(paired, cloudConfig, ['--project=chromium-external-target', spec])
+    expect(selected.labels).toEqual(['chromium-external-target'])
+    expect(selected.tests).toBe(3)
+    expect(selected.files).toBe(1)
+    expect([...listedSpecFiles(selected.output)]).toEqual([spec])
+    const ordinaryExplicit = spawnSync(process.execPath, [playwrightCli, 'test', '--config', cloudConfig,
+      '--list', '--project=chromium', spec], { cwd: projectRoot, env: paired, encoding: 'utf8' })
+    expect(ordinaryExplicit.status).toBe(1)
+  }, 90_000)
+
   it.each(['missing', 'mismatched'] as const)('refuses external discovery with a %s fixture pair', pairing => {
     const env = cleanEnvironment({ FRESHELL_E2E_EXTERNAL_FIXTURE_KIND: 'managed-environment',
       FRESHELL_E2E_TARGET_URL: 'https://fixture.invalid', FRESHELL_E2E_TARGET_TOKEN: 'synthetic-selection-token',

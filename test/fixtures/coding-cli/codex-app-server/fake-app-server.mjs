@@ -304,6 +304,8 @@ function makeThreadTurnsPage(params = {}) {
   }
 }
 
+let uniqueThreadStartCounter = 0
+
 function successResult(method, params) {
   if (method === 'initialize') {
     return {
@@ -314,7 +316,10 @@ function successResult(method, params) {
     }
   }
   if (method === 'thread/start') {
-    const threadId = behavior.threadStartThreadId || 'thread-new-1'
+    const threadId = behavior.threadStartThreadId
+      || (behavior.uniqueThreadIds === true
+        ? `thread-${process.pid}-${++uniqueThreadStartCounter}`
+        : 'thread-new-1')
     const rolloutPath = behavior.threadStartRolloutPath || behavior.rolloutPath
     const thread = makeThread(threadId, params)
     if (rolloutPath) thread.path = rolloutPath
