@@ -537,14 +537,19 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
 
 it('requires signal authority for new provider runtimes and retains exact Stop ownership', async () => {
   await withHttpBroker(async ({ request, forwarded, broker }) => {
-    for (const capabilities of [['CHOWN', 'SETGID', 'SETUID'], ['CHOWN', 'KILL', 'SETGID', 'SETUID', 'SYS_ADMIN']]) {
+    for (const capabilities of [
+      ['CHOWN', 'SETGID', 'SETUID', 'SYS_ADMIN'],
+      ['CHOWN', 'KILL', 'SETGID', 'SETUID', 'SYS_ADMIN'],
+    ]) {
       const body = JSON.parse(createBody([...ordinaryBinds, actorBind]).toString())
       body.HostConfig.CapAdd = capabilities
       expect((await request('POST', '/v1.47/containers/create?name=refused-runtime', body)).status).toBe(403)
     }
     expect(forwarded).toEqual([])
     expect(broker.receipts()).toEqual([])
-    expect((await request('POST', '/v1.47/containers/create?name=owned-runtime', createBody([...ordinaryBinds, actorBind]))).status).toBe(201)
+    const legacyProfile = JSON.parse(createBody([...ordinaryBinds, actorBind]).toString())
+    legacyProfile.HostConfig.CapAdd = ['CHOWN', 'SETGID', 'SETUID']
+    expect((await request('POST', '/v1.47/containers/create?name=owned-runtime', legacyProfile)).status).toBe(201)
     expect(broker.receipts()).toHaveLength(1)
     expect((await request('POST', `/v1.47/containers/${ownedId}/stop?t=2`)).status).toBe(200)
     expect(forwarded.map(row => row.url)).toEqual(['/v1.47/containers/create?name=owned-runtime', `/v1.47/containers/${ownedId}/stop?t=2`])
