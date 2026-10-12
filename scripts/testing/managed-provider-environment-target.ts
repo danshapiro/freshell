@@ -824,6 +824,17 @@ export async function runCodeCheckpointTarget() {
     for (const action of ['ignored', 'eligible', 'ignored'] as const) {
       (proof.localControlPreflight as unknown[]).push(await verifyCheckpointControl(baseUrl, token, containerId, identity, fixture, action))
     }
+    await externalTargetWrite(baseUrl, token, checkpointControlRequest, '{}')
+    proof.localControlPreflightRequestCleared = true
+    if (process.env.FRESHELL_CODE_CHECKPOINT_PREFLIGHT_ONLY === '1') {
+      proof.localPreflightOnly = true
+      await fs.mkdir(evidenceDir, { recursive: true, mode: 0o700 })
+      const preflightReceipt = path.join(evidenceDir, 'code-checkpoint-preflight.json')
+      await writeJson(preflightReceipt, proof)
+      console.log(JSON.stringify({ severity: 'info', event: 'code_checkpoint.local_preflight_passed', candidateSha, runId,
+        controlActions: ['ignored', 'eligible', 'ignored'], receipt: preflightReceipt }))
+      return
+    }
 
     const toolHome = path.join(root, 'cloudflared-home')
     await fs.mkdir(toolHome, { mode: 0o700 })
@@ -901,7 +912,11 @@ export async function runCodeCheckpointTarget() {
     const cleanup: Record<string, unknown> = {}
     const attempt = async (operation: string, action: () => unknown | Promise<unknown>) => {
       try { cleanup[operation] = await action() }
-      catch (error) { errors.push(new Error(`Owned checkpoint target cleanup failed: ${operation}`, { cause: error })); cleanup[operation] = 'FAILED; retain owned fixture' }
+      catch (error) {
+        errors.push(new Error(`Owned checkpoint target cleanup failed: ${operation}`, { cause: error }))
+        const message = error instanceof Error ? error.message : String(error)
+        cleanup[operation] = { settled: false, error: message.replaceAll(token, '[redacted]').slice(-2048) }
+      }
     }
     const cloudExecution = proof.cloudExecution as { executionName?: unknown } | undefined
     if (primaryFailure !== undefined && browser?.exitCode === null && browser.signalCode === null
