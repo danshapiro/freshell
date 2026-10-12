@@ -1,5 +1,10 @@
 # Soul Home Mounts Implementation Plan
 
+> **SUPERSEDED (2026-10-11):** this document is the SPEC and provenance record
+> (ratified User Request, load-bearing evidence, six fresh-eyes review rounds).
+> The executable plan is `docs/plans/2026-10-11-soul-home-mounts.md`. Where the
+> two disagree, the 2026-10-11 plan wins.
+
 > **For agentic workers:** Execute this plan task by task with a fresh
 > implementer and a specification-plus-quality review after every task. Track
 > progress with the checkbox steps below.
