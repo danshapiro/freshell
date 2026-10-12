@@ -205,17 +205,18 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
         await phase('composer-enabled', () => expect(composer).toBeEnabled())
         await phase('composer-fill', () => composer.fill(`deterministic saved fixture turn for ${definition.mode}`))
         await phase('send', () => pane.getByRole('button', { name: 'Send', exact: true }).click())
+        expect(view.nativeSessionId).toBeTruthy()
+        const nativeSessionId = view.nativeSessionId!
         await phase('completion', () => waitFor('actual fixture completion', async () => {
           const state = await fixtureState(rig, view)
           // The fixture counter advances before its provider-history write.
-          // The completion event follows that write, so wait for both before
-          // asking History to index the native session.
+          // The completion event follows that write and is keyed by the native
+          // session ID, while the create reply may still carry the presentation ID.
           return state.dispatchCount === 1 && state.completionCount === 1
-            && completedTurnSessionIds.has(createdSessionId) ? state : null
+            && completedTurnSessionIds.has(nativeSessionId) ? state : null
         }))
-        expect(view.nativeSessionId).toBeTruthy()
         const paneObservation = { ...created, sessionType: definition.mode, provider: wireProvider,
-          createdSessionId, nativeSessionId: view.nativeSessionId! }
+          createdSessionId, nativeSessionId }
         const nativePane = await phase('native-pane', () => waitFor('browser pane bound to the actual owned allocation',
           () => page.evaluate(observeOwnedFreshBrowserPane, paneObservation)))
         allocations.push({ ...paneObservation, soulId: view.soulId, incarnationId: view.incarnationId,
