@@ -141,6 +141,20 @@ check "cloud timeout parser accepts ISO time durations" check_duration "PT1H" "3
 check "cloud timeout parser accepts ISO day and time durations" check_duration "P1DT2H" "93600"
 check "cloud timeout parser matches gcloud fractional-year normalization" \
   check_duration "P0.00016Y" "6308"
+check "cloud timeout parser preserves gcloud's lower-side year half-way rounding" \
+  check_duration "P0.00005Y" "3154"
+check "cloud timeout parser preserves gcloud's lower-adjacent year half-way rounding" \
+  check_duration "P0.00015Y" "3154"
+check "cloud timeout parser preserves gcloud's upper-side year half-way rounding" \
+  check_duration "P0.00025Y" "9470"
+check "cloud timeout parser preserves gcloud's upper-adjacent year half-way rounding" \
+  check_duration "P0.00035Y" "9470"
+check "cloud timeout parser preserves gcloud's lower-side hour half-way rounding" \
+  check_duration "1.00015h" "3601"
+check "cloud timeout parser preserves gcloud's upper-side hour half-way rounding" \
+  check_duration "1.00025h" "3602"
+check "cloud timeout parser preserves gcloud's upper-adjacent hour half-way rounding" \
+  check_duration "1.00035h" "3602"
 check "cloud timeout parser matches gcloud fractional-month normalization" \
   check_duration "P0.1M" "259200"
 check "cloud timeout parser rounds gcloud fractional-day normalization up safely" \

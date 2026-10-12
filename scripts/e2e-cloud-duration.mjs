@@ -3,25 +3,48 @@ const daysPerYear = 365.2422
 const secondsPerYear = daysPerYear * secondsPerDay
 const secondsPerMonth = secondsPerYear / 12
 const maxWaitSeconds = Number.MAX_SAFE_INTEGER - 300
+const binary64Buffer = new ArrayBuffer(8)
+const binary64View = new DataView(binary64Buffer)
 
 function roundHalfEven(value, places = 4) {
-  const scale = 10 ** places
-  const scaled = value * scale
-  if (!Number.isFinite(scaled)) return value
+  if (!Number.isFinite(value) || value === 0) return value
 
-  const sign = Math.sign(scaled)
-  const absolute = Math.abs(scaled)
-  const whole = Math.floor(absolute)
-  const fraction = absolute - whole
-  let rounded
-  if (fraction < 0.5) {
-    rounded = whole
-  } else if (fraction > 0.5 || whole % 2 === 1) {
-    rounded = whole + 1
-  } else {
-    rounded = whole
+  // Match Python round(value, places) from the exact binary64 input. Multiplying
+  // by 10 ** places first can erase whether a decimal half-way value lies just
+  // above or below the tie, which changes gcloud's component normalization.
+  const negative = value < 0
+  binary64View.setFloat64(0, Math.abs(value), false)
+  const bits = binary64View.getBigUint64(0, false)
+  const exponentBits = Number((bits >> 52n) & 0x7ffn)
+  const fractionBits = bits & ((1n << 52n) - 1n)
+  let significand = fractionBits
+  let binaryExponent = -1074
+  if (exponentBits !== 0) {
+    significand |= 1n << 52n
+    binaryExponent = exponentBits - 1023 - 52
   }
-  return sign * rounded / scale
+
+  let numerator = significand * (10n ** BigInt(places))
+  let denominator = 1n
+  if (binaryExponent >= 0) {
+    numerator <<= BigInt(binaryExponent)
+  } else {
+    denominator <<= BigInt(-binaryExponent)
+  }
+
+  let rounded = numerator / denominator
+  const remainder = numerator % denominator
+  const halfComparison = remainder * 2n - denominator
+  if (halfComparison > 0n || (halfComparison === 0n && rounded % 2n === 1n)) {
+    rounded += 1n
+  }
+
+  let decimal = rounded.toString()
+  if (places > 0) {
+    decimal = decimal.padStart(places + 1, '0')
+    decimal = `${decimal.slice(0, -places)}.${decimal.slice(-places)}`
+  }
+  return Number(`${negative ? '-' : ''}${decimal}`)
 }
 
 function percolate(value) {
