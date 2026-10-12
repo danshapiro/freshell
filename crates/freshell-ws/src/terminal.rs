@@ -11889,7 +11889,8 @@ async fn stop_managed_row(
 ///   not re-adopted (a web-server restart) is registered and stopped.
 /// - Otherwise "not found" is success only when the owner registry confirms
 ///   nothing holds a conversation for the terminal
-///   ([`crate::unit_lifecycle::confirm_gone_for_unknown`]).
+///   ([`crate::unit_lifecycle::confirm_gone_for_unknown`]); a kill that also
+///   names a createRequestId is then remembered durably by both.
 async fn kill_not_found(
     state: WsState,
     kill: TerminalKill,
@@ -12031,6 +12032,25 @@ async fn kill_not_found(
     match confirmed {
         None => {}
         Some(Ok(())) => {
+            // The terminal is confirmed gone (it crashed and was not
+            // resumed, or it died with an earlier server): a person's kill
+            // naming the pane's createRequestId too is remembered durably
+            // before the answer (Task 18, re-review 2 R2-m2), so a copy of
+            // that pane is told "stopped" after a restart as well.
+            if let Some(crq) = kill
+                .create_request_id
+                .filter(|crq| !stuck_recovery && !crq.is_empty())
+            {
+                let killed = crate::unit_lifecycle::KilledPane {
+                    terminal_id: Some(tid),
+                    create_request_id: Some(crq),
+                    reason: crate::pane_ledger::STOPPED_REASON_KILL,
+                };
+                if let Some(record) = killed.missing_record(&state.pane_ledger, None, None) {
+                    let keys = crate::unit_lifecycle::stopped_record_keys(&record, None);
+                    crate::unit_lifecycle::write_stopped_record(&state, record, &keys).await;
+                }
+            }
             reply.send(KillAnswer::unknown(true));
         }
         Some(Err(_)) => {

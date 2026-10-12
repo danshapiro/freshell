@@ -13,7 +13,9 @@ mod unit_harness;
 
 use std::time::Duration;
 
-use freshell_ws::pane_ledger::{StoppedPaneRecord, LEDGER_VERSION, STOPPED_KIND_TERMINAL};
+use freshell_ws::pane_ledger::{
+    PaneLedger, StoppedPaneRecord, LEDGER_VERSION, STOPPED_KIND_TERMINAL, STOPPED_REASON_KILL,
+};
 use serde_json::json;
 use unit_harness::{fake_codex, AutoResumeMode, HarnessOpts, TestWs, UnitHarness};
 
@@ -594,6 +596,94 @@ async fn a_kill_of_a_create_request_id_that_finds_nothing_is_remembered_durably(
         .expect("the killed createRequestId is remembered durably");
     assert_eq!(record.terminal_id, None, "{record:?}");
     assert_eq!(record.kind, STOPPED_KIND_TERMINAL);
+}
+
+/// A person's kill naming a terminal this server no longer runs (its pane
+/// crashed and was not resumed, or it died with an earlier server) and the
+/// pane's createRequestId is remembered durably by both, so a copy of that
+/// pane is told "stopped" instead of re-creating its conversation, after a
+/// restart too, not only until this server stops (re-review 2, R2-m2).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kill_of_a_terminal_that_is_gone_is_remembered_durably() {
+    let h = UnitHarness::start(with_ledger(HarnessOpts::default())).await;
+    let mut ws = h.connect().await;
+    let tid = "fedcba9876543210fedcba9876543210";
+    h.send(
+        &mut ws,
+        json!({"type": "terminal.kill", "terminalId": tid, "requestId": "rk-gone", "createRequestId": "crq-gone"}),
+    )
+    .await;
+    let killed = h
+        .next_matching(&mut ws, LIMIT, |f| {
+            f["type"] == "terminal.killed" && f["requestId"] == "rk-gone"
+        })
+        .await
+        .expect("the kill is answered");
+    assert_eq!(killed["success"], true, "{killed}");
+
+    let verdict = reconcile_one(
+        &h,
+        &mut ws,
+        "rr-gone",
+        codex_pane(Some(tid), "crq-gone", "t-gone"),
+    )
+    .await;
+    assert_eq!(
+        verdict["verdict"], "stopped",
+        "a copy of the killed pane: {verdict}"
+    );
+
+    // A restart: the server's next generation loads the same store.
+    let reloaded = PaneLedger::new(Some(h.home.path().join(".freshell").join("pane-ledger")));
+    let record = reloaded
+        .stopped_pane_for_terminal(tid)
+        .expect("the killed terminal is remembered after a restart");
+    assert_eq!(record.create_request_id.as_deref(), Some("crq-gone"));
+    assert_eq!(record.kind, STOPPED_KIND_TERMINAL);
+    assert_eq!(record.reason, STOPPED_REASON_KILL);
+    assert!(
+        reloaded
+            .stopped_pane_for_create_request("crq-gone")
+            .is_some(),
+        "the killed createRequestId is remembered after a restart"
+    );
+}
+
+/// A second kill of a pane whose stop is already remembered (a retried
+/// Shift-X, or another device's) finds its terminal gone and leaves the
+/// record its stop wrote as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeated_kill_of_a_remembered_pane_keeps_its_record() {
+    let h = UnitHarness::start(with_ledger(HarnessOpts::default())).await;
+    let tid = killed_pane(&h).await;
+    let remembered = h
+        .state
+        .pane_ledger
+        .stopped_pane_for_terminal(&tid)
+        .expect("the first kill is remembered");
+    let mut ws = h.connect().await;
+    h.send(
+        &mut ws,
+        json!({"type": "terminal.kill", "terminalId": tid, "requestId": "rk-again", "createRequestId": "crq-m"}),
+    )
+    .await;
+    let killed = h
+        .next_matching(&mut ws, LIMIT, |f| {
+            f["type"] == "terminal.killed" && f["requestId"] == "rk-again"
+        })
+        .await
+        .expect("the repeated kill is answered");
+    assert_eq!(killed["success"], true, "{killed}");
+    assert_eq!(
+        h.state.pane_ledger.stopped_pane_for_terminal(&tid),
+        Some(remembered.clone()),
+        "the stop's record is kept"
+    );
+    assert_eq!(
+        h.state.pane_ledger.stopped_pane_for_create_request("crq-m"),
+        Some(remembered),
+        "no second record names the createRequestId"
+    );
 }
 
 /// A person's kill that reaches a stopping pane but joins the stop only

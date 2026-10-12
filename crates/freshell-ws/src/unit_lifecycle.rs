@@ -2148,54 +2148,73 @@ pub(crate) async fn kill_unit(
     true
 }
 
-/// The pane a person's kill named (step 4 of [`kill_unit`]): its terminal
-/// id and createRequestId (the kill's own, else the unit's), and the reason
-/// the kill stopped it with.
-struct KilledPane {
-    terminal_id: Option<String>,
-    create_request_id: Option<String>,
-    reason: &'static str,
+/// The pane a person's kill named (step 4 of [`kill_unit`], and a kill whose
+/// terminal is already gone): its terminal id and createRequestId (the
+/// kill's own, else the unit's), and the reason the kill stopped it with.
+pub(crate) struct KilledPane {
+    pub(crate) terminal_id: Option<String>,
+    pub(crate) create_request_id: Option<String>,
+    pub(crate) reason: &'static str,
+}
+
+impl KilledPane {
+    /// The record that makes sure this pane is remembered (Task 18), or
+    /// `None` when nothing is missing (or the ledger is disabled). A
+    /// terminal no record names yet is recorded with the kill's
+    /// createRequestId; a createRequestId no record names is recorded alone,
+    /// so a record that already names the terminal (its stop's Gone wrote
+    /// it) is never replaced.
+    pub(crate) fn missing_record(
+        self,
+        ledger: &crate::pane_ledger::PaneLedger,
+        provider: Option<String>,
+        session_id: Option<String>,
+    ) -> Option<crate::pane_ledger::StoppedPaneRecord> {
+        if !ledger.is_enabled() {
+            return None;
+        }
+        let terminal_remembered = self
+            .terminal_id
+            .as_deref()
+            .is_none_or(|terminal_id| ledger.stopped_pane_for_terminal(terminal_id).is_some());
+        let create_request_remembered =
+            self.create_request_id
+                .as_deref()
+                .is_none_or(|create_request_id| {
+                    ledger
+                        .stopped_pane_for_create_request(create_request_id)
+                        .is_some()
+                });
+        let terminal_id = match (terminal_remembered, create_request_remembered) {
+            (true, true) => return None,
+            (false, _) => self.terminal_id,
+            (true, false) => None,
+        };
+        Some(crate::pane_ledger::StoppedPaneRecord::terminal(
+            terminal_id,
+            self.create_request_id,
+            provider,
+            session_id,
+            self.reason,
+            now_ms() as i64,
+        ))
+    }
 }
 
 /// Step 4 of [`kill_unit`], once the unit is Gone: makes sure the pane a
 /// person killed is remembered (Task 18). The stop's Gone remembers it when
 /// the stop's final intent asks for it, but a kill that joined the stop after
 /// its Gone decided (a crash's stop, say), or a unit the directory knows by
-/// no createRequestId, would otherwise go unremembered. A terminal no record
-/// names yet is written with the kill's createRequestId; a createRequestId
-/// no record names is written alone (a record the Gone wrote for the
-/// terminal is never replaced). Nothing is written when both are remembered.
+/// no createRequestId, would otherwise go unremembered. Writes
+/// [`KilledPane::missing_record`]; nothing when both are remembered.
 async fn remember_killed_pane(state: &WsState, entry: &UnitEntry, killed: KilledPane) {
-    let ledger = &state.pane_ledger;
-    if !ledger.is_enabled() {
-        return;
-    }
-    let terminal_remembered = killed
-        .terminal_id
-        .as_deref()
-        .is_none_or(|terminal_id| ledger.stopped_pane_for_terminal(terminal_id).is_some());
-    let create_request_remembered =
-        killed
-            .create_request_id
-            .as_deref()
-            .is_none_or(|create_request_id| {
-                ledger
-                    .stopped_pane_for_create_request(create_request_id)
-                    .is_some()
-            });
-    let terminal_id = match (terminal_remembered, create_request_remembered) {
-        (true, true) => return,
-        (false, _) => killed.terminal_id,
-        (true, false) => None,
-    };
-    let record = crate::pane_ledger::StoppedPaneRecord::terminal(
-        terminal_id,
-        killed.create_request_id,
+    let Some(record) = killed.missing_record(
+        &state.pane_ledger,
         Some(entry.provider.clone()),
         entry.unit.label().session_id,
-        killed.reason,
-        now_ms() as i64,
-    );
+    ) else {
+        return;
+    };
     let operation = entry.unit.stop_operation();
     write_stopped_record(state, record, &unit_keys(&entry.unit, operation.as_deref())).await;
 }
