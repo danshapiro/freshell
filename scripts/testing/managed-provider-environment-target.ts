@@ -341,28 +341,40 @@ export async function runManagedEnvironmentTarget() {
     for (const scenario of scenarios) {
       const cwd = path.join(selected.workspace, scenario)
       await serviceManagedEnvironmentScenario(fixture, scenario, {
-      nextAttempt: async () => ({ request: await poll(`Cloud ${scenario} picker request`, async () => {
-        const request = await readJson(path.join(cwd, '.managed-fixture/request.json'))
-        if (request) return request
-        assert.equal(browser!.exitCode, null, 'Cloud browser exited before completing its three cases')
-        assert.equal(browser!.signalCode, null, 'Cloud browser was signaled before completing its three cases')
-        return undefined
-      }, 600_000) }),
-      authorize,
-      publishAuthorization: request => writeJson(path.join(cwd, '.managed-fixture/authorized.json'), request),
-      waitForCompletion: async () => { throw new Error('Attempt completion is not yet consumed') },
-      onAuthorized: async () => { if (scenario === 'healthy') {
-        const child = await poll('actual selected Bun child', async () => readJson(path.join(cwd, '.managed-fixture/child-receipt.json')))
+        nextAttempt: attempt => poll(`Cloud ${scenario} attempt ${attempt} picker or completion`, async () => {
+          const request = await readJson(path.join(cwd, '.managed-fixture/request.json'))
+          if (request?.attempt === attempt) return { request }
+          const completion = await readJson(path.join(cwd, '.managed-fixture/completion.json'))
+          if (completion?.attempt === attempt) return { completion }
+          assert.equal(browser!.exitCode, null, 'Cloud browser exited before completing its three cases')
+          assert.equal(browser!.signalCode, null, 'Cloud browser was signaled before completing its three cases')
+          return undefined
+        }, attempt === 0 ? 600_000 : scenario === 'healthy' ? 360_000 : 300_000),
+        authorize,
+        publishAuthorization: request => writeJson(path.join(cwd, '.managed-fixture/authorized.json'), request),
+        waitForCompletion: request => poll(`Cloud ${scenario} attempt ${request.attempt} completion`, async () => {
+          const completion = await readJson(path.join(cwd, '.managed-fixture/completion.json'))
+          if (completion?.attempt === request.attempt) return completion
+          assert.equal(browser!.exitCode, null, 'Cloud browser exited without its attempt completion')
+          return undefined
+        }, scenario === 'healthy' ? 360_000 : 300_000),
+        onAuthorized: async request => { if (scenario === 'healthy') {
+        const { child, view } = await poll('actual selected Bun child and current request', async () => {
+          const child = await readJson(path.join(cwd, '.managed-fixture/child-receipt.json'))
+          if (!child) return undefined
+          const view = (await rig!.inventory()).find(row => row.terminalId === child.terminalId
+            && row.terminalCreateRequestId === request.createRequestId && row.nativeSessionId === child.nativeSessionId && row.launchState === 'running')
+          return view ? { child, view } : undefined
+        })
         assert.equal(child.expectedNonce, nonce); assert.equal(child.candidateSha, fixture.candidateSha); assert.equal(child.runId, fixture.runId)
         assert.equal(child.bun, true); assert.equal(child.opencodeVersion, '1.18.21'); assert.match(child.bunExecutable, /opencode/)
         assert.equal(child.executableMode, '0711')
-        const view = await poll('created managed native identity', async () => (await rig!.inventory()).find(row => row.terminalId === child.terminalId && row.nativeSessionId === child.nativeSessionId && row.launchState === 'running'))
         const stage = await stageProof(rig!, view, nonce)
         const receipt = { ...fixture, terminalId: view.terminalId, soulId: view.soulId, incarnationId: view.incarnationId,
           nativeSessionId: view.nativeSessionId, stage, child }
         await writeJson(path.join(cwd, '.managed-fixture/target-receipt.json'), receipt)
         proof.healthy = receipt
-      } },
+        } },
       })
     }
     const browserExit = await bounded(browserJoin, 120_000, 'configured Cloud browser final join')

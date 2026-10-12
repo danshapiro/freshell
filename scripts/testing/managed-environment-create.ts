@@ -29,15 +29,38 @@ export async function serviceManagedEnvironmentScenario(
     waitForCompletion(request: ManagedEnvironmentAttempt): Promise<ManagedEnvironmentCompletion>
   },
 ) {
-  const { request } = await operations.nextAttempt(0)
-  assert(request, 'Cloud picker request is unavailable')
-  for (const key of ['candidateSha', 'runId', 'remoteWorkspacePath', 'expectedNonce'] as const) assert.equal(request[key], fixture[key])
-  assert.equal(request.scenario, scenario)
-  assert.equal(typeof request.createRequestId, 'string')
-  assert(request.createRequestId!.length > 0)
-  operations.authorize(request.createRequestId!)
-  await operations.publishAuthorization(request)
-  await operations.onAuthorized(request)
+  const matchAttempt = (value: ManagedEnvironmentAttempt, attempt: number) => {
+    for (const key of ['candidateSha', 'runId', 'remoteWorkspacePath', 'expectedNonce'] as const) assert.equal(value[key], fixture[key])
+    assert.equal(value.scenario, scenario)
+    assert.equal(value.attempt, attempt)
+  }
+  // The existing Cloud project permits two retries. A completion keeps this
+  // fixture alive; it never supplies provider or terminal authority.
+  for (let attempt = 0; attempt <= 2; attempt++) {
+    const next = await operations.nextAttempt(attempt)
+    let completion = next.completion
+    if (next.request) {
+      const request = next.request
+      matchAttempt(request, attempt)
+      assert.equal(typeof request.createRequestId, 'string')
+      assert(request.createRequestId!.length > 0)
+      operations.authorize(request.createRequestId!)
+      await operations.publishAuthorization(request)
+      await operations.onAuthorized(request)
+      completion = await operations.waitForCompletion(request)
+      assert.equal(completion.createRequestId, request.createRequestId)
+    } else {
+      assert(completion, 'Cloud attempt has neither request nor completion')
+      assert.equal(completion.createRequestId, undefined, 'Pre-picker completion cannot invent a request')
+      assert.notEqual(completion.status, 'passed', 'A successful case must have its real request')
+    }
+    matchAttempt(completion, attempt)
+    assert(['passed', 'failed', 'timedOut', 'skipped', 'interrupted'].includes(completion.status))
+    assert.equal(typeof completion.willRetry, 'boolean')
+    if (!completion.willRetry) return
+    assert.notEqual(completion.status, 'passed')
+    assert(attempt < 2, 'Cloud attempt exceeded the existing retry count')
+  }
 }
 
 export async function observeManagedEnvironmentNativeIdentity(
