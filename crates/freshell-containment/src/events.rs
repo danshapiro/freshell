@@ -158,6 +158,19 @@ pub fn spared(k: &UnitLogKeys, spared: &[ProcIdentity]) {
     }
 }
 
+/// A process the stop left alone because whether it belongs to Codex's own
+/// daemon family could not be read (its argv, or a parent link that may
+/// lead to the family): it may be the daemon, so it is never signalled, but
+/// it is waited for as any member, so the stop stays unconfirmed while it
+/// runs. One WARN per process, by name, pid and start time, never argv.
+pub fn spared_unchecked(k: &UnitLogKeys, unchecked: &[ProcIdentity]) {
+    for process in unchecked {
+        keyed!(warn, k, "unit.stop.spared_unchecked", pid = process.pid, start = process.start,
+            name = %process.name,
+            "unit stop did not signal a process it could not tell from Codex's daemon");
+    }
+}
+
 /// Stopping could not be saved to the unit record (`error`: the OS error
 /// text). Nothing is signalled until it is.
 pub fn persist_failed(k: &UnitLogKeys, error: &str) {

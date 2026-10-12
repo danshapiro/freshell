@@ -262,10 +262,15 @@ impl Shared {
         }
         let same = matches!(darwin::bsdinfo(pid),
             Ok(info) if darwin::start_of(&info) == start && !darwin::is_zombie(&info));
+        // A process whose place in the family cannot be read is not
+        // followed either: it may be the daemon.
         if !same
-            || process::in_codex_daemon_family_unless(pid, |up, start| {
-                tracked.get(&up) == Some(&start)
-            })
+            || !matches!(
+                process::in_codex_daemon_family_unless(pid, |up, start| {
+                    tracked.get(&up) == Some(&start)
+                }),
+                Ok(false)
+            )
         {
             self.unregister(pid);
             return false;
@@ -327,9 +332,11 @@ impl Shared {
             // reaches its argv and refuses the child).
             for event in proc_events() {
                 let pid = event.ident as u32;
+                // Also one whose new argv cannot be read: it may be the
+                // daemon.
                 let joined_daemon = event.fflags & libc::NOTE_EXEC != 0
                     && event.fflags & libc::NOTE_EXIT == 0
-                    && process::argv(pid).is_ok_and(|argv| process::is_codex_daemon_family(&argv));
+                    && !matches!(process::daemon_family_checked(pid), Ok(false));
                 if joined_daemon {
                     self.unregister(pid);
                     if self.untrack(pid) {

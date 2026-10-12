@@ -33,7 +33,7 @@
 //! unfinished) has no job: its members are the record's identity-verified
 //! roots that still run plus their descendants, reached by handle.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -67,8 +67,8 @@ use windows_sys::Win32::System::IO::{
 };
 
 use super::{
-    spared_closure, Backend, BackendKind, Capability, KillSummary, MemberList, UnitBackend,
-    UnitObserver,
+    spared_closure, Backend, BackendKind, Capability, KillSummary, MemberList, Sparing,
+    UnitBackend, UnitObserver,
 };
 use crate::containment::ShimCommand;
 use crate::proc_watch::{ProcWatch, Sig};
@@ -255,8 +255,9 @@ struct UnitShared {
 struct MemberState {
     /// Kill-on-close was cleared: members are recorded and ended one by one.
     per_member: bool,
-    /// Daemon-family members (and their descendants) known to be spared.
-    spared: HashSet<u32>,
+    /// Daemon-family members (and their descendants) known to be spared,
+    /// and members whose place in the family could not be read.
+    spared: Sparing,
     observer: Option<Arc<dyn UnitObserver>>,
 }
 
@@ -300,17 +301,31 @@ impl UnitShared {
 
     /// A process joined the job. Once kill-on-close is cleared, a
     /// daemon-family process (by its own command line) or a child of a
-    /// spared one is spared, and any other is recorded as a root.
+    /// spared one is spared, and any other is recorded as a root. One whose
+    /// command line, or (while anything is spared) whose parent, cannot be
+    /// read is spared too: it may be of the family.
     fn joined(&self, pid: u32) {
         if !lock(&self.state).per_member {
             return;
         }
-        let family = process::argv(pid).is_ok_and(|argv| process::is_codex_daemon_family(&argv));
-        let parent = process::parent(pid);
+        let family = process::daemon_family_checked(pid);
+        let parent = process::parent_checked(pid);
         let observer = {
             let mut state = lock(&self.state);
-            if family || parent.is_some_and(|p| state.spared.contains(&p)) {
-                state.spared.insert(pid);
+            let spared = &mut state.spared;
+            if matches!(family, Ok(true))
+                || matches!(&parent, Ok(Some(p)) if spared.family.contains(p))
+            {
+                spared.family.insert(pid);
+                return;
+            }
+            let unchecked = family.is_err()
+                || match &parent {
+                    Ok(parent) => parent.is_some_and(|p| spared.unchecked.contains(&p)),
+                    Err(_) => !spared.is_empty(),
+                };
+            if unchecked {
+                spared.unchecked.insert(pid);
                 return;
             }
             state.observer.clone()
@@ -327,7 +342,8 @@ impl UnitShared {
             if !state.per_member {
                 return;
             }
-            state.spared.remove(&pid);
+            state.spared.family.remove(&pid);
+            state.spared.unchecked.remove(&pid);
             state.observer.clone()
         };
         if let Some(observer) = observer {
@@ -485,7 +501,7 @@ impl JobUnit {
         let observer = {
             let mut state = lock(&self.shared.state);
             state.per_member = true;
-            state.spared.extend(spared.iter().copied());
+            state.spared.extend(&spared);
             state.observer.clone()
         };
         self.clear_kill_on_close()?;
@@ -493,9 +509,15 @@ impl JobUnit {
         let mut spared = spared_closure(pids.iter().copied());
         {
             let state = lock(&self.shared.state);
-            spared.extend(pids.iter().filter(|p| state.spared.contains(p)));
+            let known = |set: &std::collections::BTreeSet<u32>| {
+                pids.iter().copied().filter(|p| set.contains(p)).collect()
+            };
+            spared.extend(&Sparing {
+                family: known(&state.spared.family),
+                unchecked: known(&state.spared.unchecked),
+            });
         }
-        let doomed: Vec<u32> = pids.into_iter().filter(|p| !spared.contains(p)).collect();
+        let doomed: Vec<u32> = pids.into_iter().filter(|p| !spared.contains(*p)).collect();
         if let Some(observer) = &observer {
             for pid in &doomed {
                 if let Ok(start) = process::start_time(*pid) {
@@ -507,12 +529,15 @@ impl JobUnit {
             .iter()
             .filter(|pid| self.terminate_member(**pid))
             .count();
+        let identities = |pids: &std::collections::BTreeSet<u32>| {
+            pids.iter()
+                .filter_map(|pid| process::identity(*pid).ok())
+                .collect()
+        };
         Ok(KillSummary {
             killed,
-            spared: spared
-                .into_iter()
-                .filter_map(|pid| process::identity(pid).ok())
-                .collect(),
+            spared: identities(&spared.family),
+            unchecked: identities(&spared.unchecked),
             ..KillSummary::default()
         })
     }
@@ -605,10 +630,11 @@ impl UnitBackend for JobUnit {
     fn members(&self, _roots: &[(u32, u64)]) -> io::Result<MemberList> {
         let pids = self.pids()?;
         let spared = spared_closure(pids.iter().copied());
+        // The unchecked stay members: never signalled, but waited for.
         Ok(MemberList {
             members: pids
                 .into_iter()
-                .filter(|pid| !spared.contains(pid))
+                .filter(|pid| !spared.family.contains(pid))
                 .filter_map(|pid| process::identity(pid).ok())
                 .collect(),
             withheld: 0,
@@ -721,7 +747,7 @@ impl UnitBackend for RecordedUnit {
                 let spared = spared_closure(pids.iter().copied());
                 let mut summary = KillSummary::default();
                 for (pid, start) in tree {
-                    if spared.contains(&pid) {
+                    if spared.contains(pid) {
                         continue;
                     }
                     if let Ok(watch) = ProcWatch::open_expecting(pid, start) {
@@ -730,10 +756,13 @@ impl UnitBackend for RecordedUnit {
                         }
                     }
                 }
-                summary.spared = spared
-                    .into_iter()
-                    .filter_map(|pid| process::identity(pid).ok())
-                    .collect();
+                let identities = |pids: &std::collections::BTreeSet<u32>| {
+                    pids.iter()
+                        .filter_map(|pid| process::identity(*pid).ok())
+                        .collect()
+                };
+                summary.spared = identities(&spared.family);
+                summary.unchecked = identities(&spared.unchecked);
                 summary
             })
             .await
@@ -745,10 +774,11 @@ impl UnitBackend for RecordedUnit {
         let tree = RecordedUnit::tree(roots);
         let pids: Vec<u32> = tree.iter().map(|(pid, _)| *pid).collect();
         let spared = spared_closure(pids.iter().copied());
+        // The unchecked stay members: never signalled, but waited for.
         Ok(MemberList {
             members: tree
                 .into_iter()
-                .filter(|(pid, _)| !spared.contains(pid))
+                .filter(|(pid, _)| !spared.family.contains(pid))
                 .filter_map(|(pid, start)| {
                     process::identity(pid).ok().filter(|id| id.start == start)
                 })

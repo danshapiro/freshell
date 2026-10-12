@@ -231,15 +231,62 @@ pub fn is_codex_daemon_family(argv: &[String]) -> bool {
             .any(|w| w[0] == "--listen" && w[1] == "unix://")
 }
 
+/// Whether `pid`'s OWN argv is Codex's daemon family
+/// ([`is_codex_daemon_family`]), as far as it can be read: `Ok(false)` also
+/// when the process is gone (there is nothing to spare); `Err` when its
+/// argv could not be read for another reason ("could not check"). Every
+/// caller spares a process it gets `Err` for, as it spares the family: a
+/// process is never signalled while Freshell cannot tell whether it is
+/// Codex's daemon (Stage 2: LB-06).
+#[cfg(target_os = "linux")]
+pub(crate) fn daemon_family_checked(pid: u32) -> io::Result<bool> {
+    match argv(pid) {
+        Ok(argv) => Ok(is_codex_daemon_family(&argv)),
+        Err(err) if is_gone(&err) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+/// macOS: [`daemon_family_checked`]; the zombie-aware lookup tells a
+/// process that was reaped, or is a zombie (it never runs again), from one
+/// whose arguments could not be read.
+#[cfg(target_os = "macos")]
+pub(crate) fn daemon_family_checked(pid: u32) -> io::Result<bool> {
+    match argv(pid) {
+        Ok(argv) => Ok(is_codex_daemon_family(&argv)),
+        Err(err) => match crate::darwin::bsdinfo(pid) {
+            Err(gone) if gone.kind() == io::ErrorKind::NotFound => Ok(false),
+            Ok(info) if crate::darwin::is_zombie(&info) => Ok(false),
+            _ => Err(err),
+        },
+    }
+}
+
+/// Windows: [`daemon_family_checked`]; a process that has exited (its
+/// command line is no longer readable) is gone.
+#[cfg(windows)]
+pub(crate) fn daemon_family_checked(pid: u32) -> io::Result<bool> {
+    match argv(pid) {
+        Ok(argv) => Ok(is_codex_daemon_family(&argv)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => match has_exited(pid) {
+            Ok(true) => Ok(false),
+            _ => Err(err),
+        },
+    }
+}
+
 /// Whether `pid` is in Codex's daemon family: its own argv is
 /// ([`is_codex_daemon_family`]), or an ancestor's is, since the family
 /// includes every descendant. The parent chain is read up to this server
 /// at most (whatever started the server is never judged), and only through
 /// parents that started no later than their child (on Windows a dead
-/// parent's pid can name a later process). One-shot reads, used only to
-/// spare a process: a unit never records it as a root nor pins it from a
-/// record.
-pub(crate) fn in_codex_daemon_family(pid: u32) -> bool {
+/// parent's pid can name a later process). `Err` when an argv, start time
+/// or parent link on the way could not be read for a reason other than
+/// the process being gone ("could not check"): callers spare it as they
+/// spare the family. One-shot reads, used only to spare a process: a unit
+/// never records it as a root nor pins it from a record.
+pub(crate) fn in_codex_daemon_family(pid: u32) -> io::Result<bool> {
     in_codex_daemon_family_unless(pid, |_, _| false)
 }
 
@@ -248,30 +295,33 @@ pub(crate) fn in_codex_daemon_family(pid: u32) -> bool {
 /// family (the macOS fork tracker's tracked processes, each judged when it
 /// was tracked and dropped if it execs into the family).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) fn in_codex_daemon_family_unless(pid: u32, cleared: impl Fn(u32, u64) -> bool) -> bool {
+pub(crate) fn in_codex_daemon_family_unless(
+    pid: u32,
+    cleared: impl Fn(u32, u64) -> bool,
+) -> io::Result<bool> {
     let me = std::process::id();
     let mut at = pid;
     for _ in 0..4096 {
-        if argv(at).is_ok_and(|argv| is_codex_daemon_family(&argv)) {
-            return true;
+        if daemon_family_checked(at)? {
+            return Ok(true);
         }
-        let (Ok(started), Some(up)) = (start_time(at), parent(at)) else {
-            return false;
+        let (Some(started), Some(up)) = (start_time_checked(at)?, parent_checked(at)?) else {
+            return Ok(false);
         };
         if up <= 1 || up == me || up == at {
-            return false;
+            return Ok(false);
         }
-        match start_time(up) {
-            Ok(parent_started) if parent_started <= started => {
+        match start_time_checked(up)? {
+            Some(parent_started) if parent_started <= started => {
                 if cleared(up, parent_started) {
-                    return false;
+                    return Ok(false);
                 }
                 at = up;
             }
-            _ => return false,
+            _ => return Ok(false),
         }
     }
-    false
+    Ok(false)
 }
 
 /// Linux: the fields of `/proc/<pid>/stat` after `pid (comm) `, so a process
@@ -512,7 +562,22 @@ pub(crate) fn through_a_running_thread<T>(
 
 #[cfg(target_os = "linux")]
 pub fn parent(pid: u32) -> Option<u32> {
-    stat_fields(pid).ok()?.get(1)?.parse().ok()
+    parent_checked(pid).ok().flatten()
+}
+
+/// Linux: [`parent`], `None` when the process is gone; a read that failed
+/// for another reason is `Err` ("could not check").
+#[cfg(target_os = "linux")]
+pub(crate) fn parent_checked(pid: u32) -> io::Result<Option<u32>> {
+    match stat_fields(pid) {
+        Ok(fields) => fields
+            .get(1)
+            .and_then(|parent| parent.parse().ok())
+            .map(Some)
+            .ok_or_else(|| io::Error::other("malformed stat")),
+        Err(err) if is_gone(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 /// Linux: the direct children of every thread of `pid`
@@ -568,6 +633,11 @@ pub(crate) fn pid_listing() -> Listing {
 #[cfg(target_os = "linux")]
 pub(crate) fn child_listing(pid: u32) -> Listing {
     let mut listing = Listing::default();
+    #[cfg(test)]
+    if let Err(err) = test_reads::check(pid, "children") {
+        listing.unread = Some(err);
+        return listing;
+    }
     let tasks = match std::fs::read_dir(format!("/proc/{pid}/task")) {
         Ok(tasks) => tasks,
         Err(err) => {
@@ -861,6 +931,12 @@ pub(crate) fn open_process(
 /// Toolhelp32 snapshot (empty when the snapshot cannot be taken).
 #[cfg(windows)]
 fn snapshot() -> Vec<(u32, u32, String)> {
+    snapshot_checked().unwrap_or_default()
+}
+
+/// Windows: [`snapshot`], `Err` when the snapshot cannot be taken.
+#[cfg(windows)]
+fn snapshot_checked() -> io::Result<Vec<(u32, u32, String)>> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
@@ -870,7 +946,7 @@ fn snapshot() -> Vec<(u32, u32, String)> {
     // SAFETY: a process snapshot; the handle is checked and closed below.
     let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snap == INVALID_HANDLE_VALUE {
-        return out;
+        return Err(io::Error::last_os_error());
     }
     // SAFETY: an all-zero PROCESSENTRY32W is valid; dwSize is set before use.
     let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
@@ -893,7 +969,7 @@ fn snapshot() -> Vec<(u32, u32, String)> {
     }
     // SAFETY: the snapshot handle is ours and closed once.
     unsafe { CloseHandle(snap) };
-    out
+    Ok(out)
 }
 
 /// Windows: `(pid, parent pid)` of every process, from one snapshot.
@@ -1001,10 +1077,46 @@ pub fn is_running(pid: u32) -> bool {
 /// relying on the link.
 #[cfg(windows)]
 pub fn parent(pid: u32) -> Option<u32> {
-    snapshot()
+    parent_checked(pid).ok().flatten()
+}
+
+/// Windows: [`parent`], `None` when the process is gone; `Err` when the
+/// snapshot cannot be taken ("could not check").
+#[cfg(windows)]
+pub(crate) fn parent_checked(pid: u32) -> io::Result<Option<u32>> {
+    Ok(snapshot_checked()?
         .into_iter()
         .find(|(p, _, _)| *p == pid)
-        .map(|(_, parent, _)| parent)
+        .map(|(_, parent, _)| parent))
+}
+
+/// Windows: [`start_time`], `None` when no process has the pid.
+#[cfg(windows)]
+pub(crate) fn start_time_checked(pid: u32) -> io::Result<Option<u64>> {
+    match start_time(pid) {
+        Ok(start) => Ok(Some(start)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Windows: whether `pid` has exited (no process has it, or its handle is
+/// signalled); `Err` when that cannot be read.
+#[cfg(windows)]
+fn has_exited(pid: u32) -> io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::{
+        WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    };
+    match open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE) {
+        // SAFETY: a live handle with SYNCHRONIZE; zero timeout.
+        Ok(handle) => {
+            Ok(unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) } == WAIT_OBJECT_0)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(err) => Err(err),
+    }
 }
 
 /// Windows: the processes whose recorded parent pid is `pid` (see
@@ -1055,6 +1167,17 @@ pub fn parent(pid: u32) -> Option<u32> {
     crate::darwin::bsdinfo(pid).ok().map(|info| info.pbi_ppid)
 }
 
+/// macOS: [`parent`], `None` when the process was reaped; another failed
+/// lookup is `Err` ("could not check").
+#[cfg(target_os = "macos")]
+pub(crate) fn parent_checked(pid: u32) -> io::Result<Option<u32>> {
+    match crate::darwin::bsdinfo(pid) {
+        Ok(info) => Ok(Some(info.pbi_ppid)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 /// macOS: the processes whose parent is `pid` (the kernel's own filter of
 /// its process list, zombies included).
 #[cfg(target_os = "macos")]
@@ -1094,8 +1217,9 @@ pub(crate) fn child_listing(pid: u32) -> Listing {
 /// `hidepid=invisible` (ENOENT), descriptor exhaustion (EMFILE) or a
 /// non-dumpable process (EACCES) answers them, so a unit test can give a
 /// reader that answer about a live process of its own. Files: `stat`,
-/// `cmdline`, `environ`, and `fd` and `fdinfo` (the descriptor table and a
-/// descriptor's lock information the lock lookup reads).
+/// `cmdline`, `environ`, `children` (the listing of its threads' children),
+/// and `fd` and `fdinfo` (the descriptor table and a descriptor's lock
+/// information the lock lookup reads).
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod test_reads {
     use std::sync::{Mutex, PoisonError};

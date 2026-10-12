@@ -3,6 +3,7 @@
 //! drives every stop through these two traits; backends hold no lifecycle
 //! state and never enumerate units beyond a recorded unit id.
 
+use std::collections::BTreeSet;
 use std::io;
 use std::sync::Arc;
 
@@ -49,38 +50,91 @@ pub struct Capability {
     pub reason: Option<String>,
 }
 
+/// Who a kill leaves alone: Codex's daemon family, and the processes whose
+/// place in it could not be read. Both can only spare a process, never
+/// select one for a signal.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Sparing {
+    /// Of Codex's daemon family, by its own argv or as a descendant of such
+    /// a process: never signalled, never a member.
+    pub family: BTreeSet<u32>,
+    /// Not known to be outside it: its own argv, or a parent link that may
+    /// lead to the family, could not be read ("could not check"). Never
+    /// signalled, but still a member: a stop waits for it as for any other.
+    pub unchecked: BTreeSet<u32>,
+}
+
+impl Sparing {
+    /// Whether `pid` is left alone.
+    pub(crate) fn contains(&self, pid: u32) -> bool {
+        self.family.contains(&pid) || self.unchecked.contains(&pid)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.family.is_empty() && self.unchecked.is_empty()
+    }
+
+    /// Adds `other`; a process found of the family is no longer unchecked.
+    pub(crate) fn extend(&mut self, other: &Sparing) {
+        self.family.extend(&other.family);
+        self.unchecked.extend(&other.unchecked);
+        self.unchecked.retain(|pid| !self.family.contains(pid));
+    }
+}
+
 /// The Codex daemon-family processes among `pids`, each judged by its OWN
 /// command line (`is_codex_daemon_family`), plus every process of `pids`
 /// whose parent is spared, to a fixed point over this one snapshot
 /// (siblings are covered because each family member matches on its own
-/// argv). It can only spare a process, never select one for a signal. The
-/// tag backend keeps its own, because it builds membership from the tag.
+/// argv). A process whose argv cannot be read, or whose parent link cannot
+/// be read while anything is spared, is unchecked, and so is a child of an
+/// unchecked one ([`Sparing`]). The tag backend keeps its own, because it
+/// builds membership from the tag.
 #[cfg(any(target_os = "linux", windows))]
-pub(crate) fn spared_closure(
-    pids: impl IntoIterator<Item = u32>,
-) -> std::collections::BTreeSet<u32> {
+pub(crate) fn spared_closure(pids: impl IntoIterator<Item = u32>) -> Sparing {
     use crate::process;
     let pids: Vec<u32> = pids.into_iter().collect();
-    let mut spared: std::collections::BTreeSet<u32> = pids
-        .iter()
-        .copied()
-        .filter(|pid| process::argv(*pid).is_ok_and(|argv| process::is_codex_daemon_family(&argv)))
-        .collect();
+    let mut spared = Sparing::default();
+    for pid in &pids {
+        match process::daemon_family_checked(*pid) {
+            Ok(true) => {
+                spared.family.insert(*pid);
+            }
+            Ok(false) => {}
+            Err(_) => {
+                spared.unchecked.insert(*pid);
+            }
+        }
+    }
     if spared.is_empty() {
         return spared;
     }
-    let parents: Vec<(u32, Option<u32>)> = pids
+    let parents: Vec<(u32, io::Result<Option<u32>>)> = pids
         .iter()
-        .map(|pid| (*pid, process::parent(*pid)))
+        .map(|pid| (*pid, process::parent_checked(*pid)))
         .collect();
     loop {
-        let before = spared.len();
+        let before = spared.clone();
         for (pid, parent) in &parents {
-            if parent.is_some_and(|pp| spared.contains(&pp)) {
-                spared.insert(*pid);
+            if spared.family.contains(pid) {
+                continue;
+            }
+            match parent {
+                Ok(Some(pp)) if spared.family.contains(pp) => {
+                    spared.unchecked.remove(pid);
+                    spared.family.insert(*pid);
+                }
+                Ok(Some(pp)) if spared.unchecked.contains(pp) => {
+                    spared.unchecked.insert(*pid);
+                }
+                Ok(_) => {}
+                // Its parent may be spared.
+                Err(_) => {
+                    spared.unchecked.insert(*pid);
+                }
             }
         }
-        if spared.len() == before {
+        if spared == before {
             return spared;
         }
     }
@@ -95,6 +149,11 @@ pub(crate) struct KillSummary {
     #[allow(dead_code)]
     pub killed: usize,
     pub spared: Vec<ProcIdentity>,
+    /// The processes it left alone because whether they are of Codex's
+    /// daemon family could not be read ([`Sparing::unchecked`]). They are
+    /// still members: the unit logs them (`unit.stop.spared_unchecked`) and
+    /// waits for them as for any member.
+    pub unchecked: Vec<ProcIdentity>,
     /// See [`MemberList::withheld`].
     pub withheld: u64,
     /// Why the kill could not confirm its container frozen first (cgroup

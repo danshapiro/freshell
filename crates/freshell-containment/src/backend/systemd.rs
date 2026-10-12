@@ -38,13 +38,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{
-    inotify, spared_closure, Backend, BackendKind, Capability, KillSummary, MemberList, UnitBackend,
+    inotify, spared_closure, Backend, BackendKind, Capability, KillSummary, MemberList, Sparing,
+    UnitBackend,
 };
 use crate::containment::SelectOptions;
 use crate::proc_watch::{ProcWatch, Sig};
-use crate::process::{
-    self, is_codex_daemon_family, run_capture_with_deadline, CommandOutput, ProcIdentity,
-};
+use crate::process::{self, run_capture_with_deadline, CommandOutput, ProcIdentity};
 use crate::unit::{MemberRole, Placement};
 use crate::{BoxFuture, UnitId, UNIT_ENV};
 
@@ -353,30 +352,41 @@ impl SystemdUnit {
     /// confirmed so: one snapshot, the spared set, the kill, and the thaw.
     fn kill_frozen(&self, thaw: Option<Thaw>, frozen: bool) -> io::Result<KillSummary> {
         let pids = self.pids();
-        let spared = spared_closure(pids.iter().copied());
+        let mut spared = spared_closure(pids.iter().copied());
         let killed = self.kill_all_but(&pids, &spared, frozen);
         // Thawed whatever the kill did, so spared processes resume in place.
         let thawed = thaw.map_or(Ok(()), Thaw::now);
-        let (killed, mut incomplete) = killed?;
+        let OneByOne {
+            killed,
+            unchecked,
+            mut incomplete,
+        } = killed?;
+        spared.extend(&Sparing {
+            family: BTreeSet::new(),
+            unchecked,
+        });
         if let Err(err) = thawed {
             // A slice systemd removed meanwhile has nothing left to thaw.
             if self.dir.is_dir() {
                 incomplete.get_or_insert(io::Error::other(format!("cgroup.freeze (thaw): {err}")));
             }
         }
+        let identities = |pids: &BTreeSet<u32>| {
+            pids.iter()
+                .filter_map(|pid| process::identity(*pid).ok())
+                .collect()
+        };
         Ok(KillSummary {
             killed,
-            spared: spared
-                .iter()
-                .filter_map(|pid| process::identity(*pid).ok())
-                .collect(),
+            spared: identities(&spared.family),
+            unchecked: identities(&spared.unchecked),
             withheld: 0,
             not_frozen: None,
             incomplete,
         })
     }
 
-    /// SIGKILLs every process of `pids` outside `spared`; returns how many.
+    /// SIGKILLs every process of `pids` that `spared` does not leave alone.
     ///
     /// Only a slice confirmed `frozen` with nothing spared is killed whole by
     /// the kernel (`cgroup.kill`, race-free against forks; else `systemctl
@@ -389,7 +399,9 @@ impl SystemdUnit {
     /// would kill too; so then, as when processes are spared or a main
     /// thread has exited, each other pid is pinned and re-checked before its
     /// SIGKILL: still a slice member (no recycled pid is ever signalled) and,
-    /// by its own argv, still not of the daemon family. Frozen tasks cannot
+    /// by its own argv, still not of the daemon family (an argv that can no
+    /// longer be read leaves it alone too, reported `unchecked`). Frozen
+    /// tasks cannot
     /// fork, exit or exec, and a fatal signal still kills them; what an
     /// unfrozen slice forks after the snapshot is left to the post-Gone
     /// sweep. A pid that cannot be pinned for another reason than being gone
@@ -399,31 +411,39 @@ impl SystemdUnit {
     fn kill_all_but(
         &self,
         pids: &BTreeSet<u32>,
-        spared: &BTreeSet<u32>,
+        spared: &Sparing,
         frozen: bool,
-    ) -> io::Result<(usize, Option<io::Error>)> {
+    ) -> io::Result<OneByOne> {
         let whole = frozen
             && spared.is_empty()
             && !pids.iter().any(|pid| process::main_thread_exited(*pid));
         if !whole {
-            let mut killed = 0;
-            let mut pin_error = None;
-            for pid in pids.difference(spared) {
+            let mut done = OneByOne::default();
+            for pid in pids.iter().filter(|pid| !spared.contains(**pid)) {
                 let watch = match ProcWatch::open(*pid) {
                     Ok(watch) => watch,
                     Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
                     Err(err) => {
-                        pin_error.get_or_insert(err);
+                        done.incomplete.get_or_insert(err);
                         continue;
                     }
                 };
-                let member = cgroup_of(watch.pid()).is_some_and(|cg| self.contains(&cg));
-                let daemon = process::argv(watch.pid()).is_ok_and(|a| is_codex_daemon_family(&a));
-                if member && !daemon && !watch.has_exited() && watch.signal(Sig::Kill).is_ok() {
-                    killed += 1;
+                if !cgroup_of(watch.pid()).is_some_and(|cg| self.contains(&cg)) {
+                    continue;
+                }
+                match process::daemon_family_checked(watch.pid()) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        if !watch.has_exited() && watch.signal(Sig::Kill).is_ok() {
+                            done.killed += 1;
+                        }
+                    }
+                    Err(_) => {
+                        done.unchecked.insert(watch.pid());
+                    }
                 }
             }
-            return Ok((killed, pin_error));
+            return Ok(done);
         }
         if let Err(err) = std::fs::write(self.dir.join("cgroup.kill"), "1") {
             // A slice systemd removed meanwhile has nothing left to kill.
@@ -435,8 +455,23 @@ impl SystemdUnit {
                     })?;
             }
         }
-        Ok((pids.len(), None))
+        Ok(OneByOne {
+            killed: pids.len(),
+            ..OneByOne::default()
+        })
     }
+}
+
+/// What [`SystemdUnit::kill_all_but`] did.
+#[derive(Debug, Default)]
+struct OneByOne {
+    /// How many processes it signalled.
+    killed: usize,
+    /// The processes it left alone because their argv could no longer be
+    /// read ([`Sparing::unchecked`]).
+    unchecked: BTreeSet<u32>,
+    /// The first pid it could not pin for a reason other than being gone.
+    incomplete: Option<io::Error>,
 }
 
 /// Thaws a slice it was made for when dropped, unless thawed already: made
@@ -545,9 +580,10 @@ impl UnitBackend for SystemdUnit {
     fn members(&self, _roots: &[(u32, u64)]) -> io::Result<MemberList> {
         let pids = self.pids();
         let spared = spared_closure(pids.iter().copied());
+        // The unchecked stay members: never signalled, but waited for.
         Ok(MemberList {
             members: pids
-                .difference(&spared)
+                .difference(&spared.family)
                 .filter_map(|pid| process::identity(*pid).ok())
                 .collect::<Vec<ProcIdentity>>(),
             withheld: 0,
@@ -960,12 +996,12 @@ mod tests {
         let doomed = Own::sleep();
         let pids = BTreeSet::from([daemon.pid(), doomed.pid()]);
         // The snapshot judged neither of the daemon family (as before an exec).
-        let (killed, incomplete) = slice
+        let done = slice
             .unit
-            .kill_all_but(&pids, &BTreeSet::new(), false)
+            .kill_all_but(&pids, &Sparing::default(), false)
             .unwrap();
-        assert_eq!(killed, 1);
-        assert!(incomplete.is_none(), "{incomplete:?}");
+        assert_eq!(done.killed, 1);
+        assert!(done.incomplete.is_none(), "{done:?}");
         assert!(doomed.dies(), "the other process survived");
         assert!(
             !daemon.watch.has_exited(),
@@ -973,12 +1009,12 @@ mod tests {
         );
         assert!(!slice.dir().join("cgroup.kill").exists());
 
-        let (killed, incomplete) = slice
+        let done = slice
             .unit
-            .kill_all_but(&BTreeSet::from([daemon.pid()]), &BTreeSet::new(), true)
+            .kill_all_but(&BTreeSet::from([daemon.pid()]), &Sparing::default(), true)
             .unwrap();
-        assert_eq!(killed, 1);
-        assert!(incomplete.is_none(), "{incomplete:?}");
+        assert_eq!(done.killed, 1);
+        assert!(done.incomplete.is_none(), "{done:?}");
         assert_eq!(
             slice.read("cgroup.kill"),
             "1",
@@ -999,15 +1035,71 @@ mod tests {
         let killed =
             slice
                 .unit
-                .kill_all_but(&BTreeSet::from([member.pid()]), &BTreeSet::new(), false);
+                .kill_all_but(&BTreeSet::from([member.pid()]), &Sparing::default(), false);
         drop(hidden);
         match killed {
-            Ok((_, Some(err))) => assert_ne!(err.kind(), io::ErrorKind::NotFound, "{err}"),
+            Ok(OneByOne {
+                incomplete: Some(err),
+                ..
+            }) => assert_ne!(err.kind(), io::ErrorKind::NotFound, "{err}"),
             other => panic!("a running process was passed over as gone: {other:?}"),
         }
         assert!(
             !member.watch.has_exited(),
             "it could not be pinned, so it was not killed"
+        );
+    }
+
+    /// A process that may be Codex's daemon is never killed: one whose
+    /// argv cannot be read (here for want of a descriptor) is left alone by
+    /// the slice kill, as the daemon family is.
+    #[test]
+    fn a_process_whose_family_cannot_be_read_is_never_killed() {
+        let slice = FakeSlice::new();
+        let unjudged = Own::sleep();
+        let doomed = Own::sleep();
+        slice.set_procs(&[&unjudged, &doomed]);
+        let unread = process::test_reads::fail(unjudged.pid(), "cmdline", libc::EMFILE);
+        let summary = current_thread().block_on(slice.unit.clone().kill_all(Vec::new()));
+        drop(unread);
+        assert!(doomed.dies(), "the other process survived: {summary:?}");
+        assert!(
+            !unjudged
+                .watch
+                .wait_exited_blocking(Duration::from_millis(500))
+                .unwrap(),
+            "a process whose argv could not be read was killed: {summary:?}"
+        );
+        let summary = summary.unwrap();
+        assert!(
+            summary.unchecked.iter().any(|p| p.pid == unjudged.pid()),
+            "{summary:?}"
+        );
+    }
+
+    /// The one-by-one kill judges each process again by its own argv right
+    /// before its signal: one whose argv can no longer be read is left
+    /// alone and reported, as the daemon family is left alone.
+    #[test]
+    fn the_one_by_one_kill_leaves_a_process_whose_family_cannot_be_read_alone() {
+        let slice = FakeSlice::new();
+        let unjudged = Own::sleep();
+        let unread = process::test_reads::fail(unjudged.pid(), "cmdline", libc::EMFILE);
+        let done = slice.unit.kill_all_but(
+            &BTreeSet::from([unjudged.pid()]),
+            &Sparing::default(),
+            false,
+        );
+        drop(unread);
+        let done = done.unwrap();
+        assert_eq!(done.killed, 0, "{done:?}");
+        assert!(done.unchecked.contains(&unjudged.pid()), "{done:?}");
+        assert!(
+            !unjudged
+                .watch
+                .wait_exited_blocking(Duration::from_millis(500))
+                .unwrap(),
+            "a process whose argv could not be read was killed"
         );
     }
 

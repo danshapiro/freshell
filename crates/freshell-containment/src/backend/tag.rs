@@ -30,15 +30,18 @@
 //! stopped (a stopped process cannot fork, exit or exec, so the set
 //! converges); then every stopped process is killed through its watch. The
 //! Codex daemon family (each process judged by its own argv, plus its
-//! descendants) is spared and reported, never signalled.
+//! descendants) is spared and reported, never signalled, and so is every
+//! process whose place in it could not be read ([`Sparing`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
 
-use super::{Backend, BackendKind, Capability, KillSummary, MemberList, MemberRead, UnitBackend};
+use super::{
+    Backend, BackendKind, Capability, KillSummary, MemberList, MemberRead, Sparing, UnitBackend,
+};
 use crate::proc_watch::ProcWatch;
-use crate::process::{self, is_codex_daemon_family, EnvRead};
+use crate::process::{self, EnvRead};
 use crate::record::UnitRecord;
 use crate::unit::{MemberRole, Placement};
 use crate::{BoxFuture, UnitId, UNIT_ENV};
@@ -146,8 +149,9 @@ struct Scan {
     /// Tag carriers, live roots and every descendant of those (kept also
     /// when their state could not be read).
     candidates: BTreeSet<u32>,
-    /// Daemon-family candidates and every descendant of them.
-    spared: BTreeSet<u32>,
+    /// Daemon-family candidates and every descendant of them, and the
+    /// candidates whose place in the family could not be read.
+    spared: Sparing,
     /// Same-uid processes whose environment the kernel withholds.
     withheld: u64,
     /// The first read that failed for a reason other than the process being
@@ -406,7 +410,8 @@ impl UnitBackend for TagUnit {
         let scan = self.scan(roots, true);
         let mut unread = scan.unread;
         let mut members = Vec::new();
-        for pid in scan.candidates.difference(&scan.spared) {
+        // The unchecked stay members: never signalled, but waited for.
+        for pid in scan.candidates.difference(&scan.spared.family) {
             match process::identity_checked(*pid) {
                 Ok(Some(member)) => members.push(member),
                 Ok(None) => {} // exited since
@@ -539,6 +544,7 @@ fn is_live_root_checked(pid: u32, start: u64) -> io::Result<bool> {
 
 /// `set` plus every descendant of its processes (one-shot child reads),
 /// never including `exclude` (the caller itself).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn with_descendants(set: BTreeSet<u32>, exclude: u32) -> BTreeSet<u32> {
     with_descendants_checked(set, exclude).0
 }
@@ -566,16 +572,77 @@ fn with_descendants_checked(
     (set, unread)
 }
 
-/// The processes in `set` whose OWN argv is Codex's daemon family, plus every
-/// descendant of each (the only argv inspection in the kill path; it can only
-/// spare a process, never select one).
-pub(crate) fn daemon_family_within(set: &BTreeSet<u32>) -> BTreeSet<u32> {
-    let family = set
-        .iter()
-        .copied()
-        .filter(|pid| process::argv(*pid).is_ok_and(|argv| is_codex_daemon_family(&argv)))
-        .collect();
-    with_descendants(family, std::process::id())
+/// The processes in `set` a kill leaves alone ([`Sparing`]; the only argv
+/// inspection in the kill path, so it can only spare a process, never
+/// select one): of the family, each one whose OWN argv is Codex's daemon
+/// family and each one descending from such a process of `set`; unchecked,
+/// each other one whose own argv, or a parent link on its way up, could
+/// not be read for a reason other than being gone, or that descends from
+/// an unchecked process of `set`. Descent is read up each process's own
+/// parent links, through any process, to the top of the tree or to this
+/// process (the server, or the reaper shim).
+pub(crate) fn daemon_family_within(set: &BTreeSet<u32>) -> Sparing {
+    let mut own = Sparing::default();
+    for &pid in set {
+        match process::daemon_family_checked(pid) {
+            Ok(true) => {
+                own.family.insert(pid);
+            }
+            Ok(false) => {}
+            Err(_) => {
+                own.unchecked.insert(pid);
+            }
+        }
+    }
+    if own.is_empty() {
+        return own;
+    }
+    let me = std::process::id();
+    let mut spared = own.clone();
+    for &pid in set.iter().filter(|pid| !own.family.contains(pid)) {
+        match lineage(pid, me, &own) {
+            Some(Lineage::Family) => {
+                spared.unchecked.remove(&pid);
+                spared.family.insert(pid);
+            }
+            Some(Lineage::Unchecked) => {
+                spared.unchecked.insert(pid);
+            }
+            None => {}
+        }
+    }
+    spared
+}
+
+/// Where a process's ancestors put it in [`daemon_family_within`].
+enum Lineage {
+    Family,
+    Unchecked,
+}
+
+/// `pid`'s ancestors (read up its parent links to the top of the tree, to
+/// `stop`, or to a process that is gone) against the judgments `of`:
+/// `Family` below a process of the family, else `Unchecked` below an
+/// unchecked one or when a parent link could not be read, else `None`.
+fn lineage(pid: u32, stop: u32, of: &Sparing) -> Option<Lineage> {
+    let mut below_unchecked = false;
+    let mut at = pid;
+    for _ in 0..MAX_ANCESTRY {
+        let up = match process::parent_checked(at) {
+            Ok(Some(up)) => up,
+            Ok(None) => break,
+            Err(_) => return Some(Lineage::Unchecked),
+        };
+        if up <= 1 || up == stop || up == at {
+            break;
+        }
+        if of.family.contains(&up) {
+            return Some(Lineage::Family);
+        }
+        below_unchecked |= of.unchecked.contains(&up);
+        at = up;
+    }
+    below_unchecked.then_some(Lineage::Unchecked)
 }
 
 /// The stop-the-world sweep shared by the tag backend and the reaper shim.
@@ -588,22 +655,23 @@ pub(crate) fn daemon_family_within(set: &BTreeSet<u32>) -> BTreeSet<u32> {
 /// non-spared candidate is pinned, re-verified, confirmed not yet exited and
 /// stopped with SIGSTOP through its watch. Then each stopped process's argv
 /// is read again: one that exec'd into the daemon family between the check
-/// and the stop (and its stopped descendants) is resumed with SIGCONT and
-/// spared, before anything is killed; every other one then gets SIGKILL
-/// through its watch, descendants before ancestors ([`kill_order`]), so no
-/// exit orphans a process group that still has a stopped member (the kernel
-/// would SIGHUP that whole group, spared members included). Nothing waits
+/// and the stop (and its stopped descendants), or whose argv can no longer
+/// be read, is resumed with SIGCONT and spared, before anything is killed;
+/// every other one then gets SIGKILL through its watch, descendants before
+/// ancestors ([`kill_order`]), so no exit orphans a process group that still
+/// has a stopped member (the kernel would SIGHUP that whole group, spared
+/// members included). Nothing waits
 /// for the killed processes to exit. A candidate that cannot be pinned for
 /// a reason other than being gone is not signalled, and the summary names
 /// that failure (`incomplete`) next to what it spared.
 pub(crate) fn stop_the_world(
-    mut find: impl FnMut() -> (BTreeSet<u32>, BTreeSet<u32>),
+    mut find: impl FnMut() -> (BTreeSet<u32>, Sparing),
     belongs: impl Fn(&ProcWatch, &BTreeSet<u32>) -> bool,
 ) -> KillSummary {
     let mut stopped: BTreeMap<u32, ProcWatch> = BTreeMap::new();
     // Every pid already handled: stopped, gone, or refused as not a member.
     let mut handled: BTreeSet<u32> = BTreeSet::new();
-    let mut spared: BTreeSet<u32> = BTreeSet::new();
+    let mut spared = Sparing::default();
     let mut pin_error: Option<io::Error> = None;
     for _ in 0..MAX_ROUNDS {
         let (candidates, round_spared) = find();
@@ -611,7 +679,7 @@ pub(crate) fn stop_the_world(
         let fresh: Vec<u32> = candidates
             .iter()
             .copied()
-            .filter(|pid| !round_spared.contains(pid) && !handled.contains(pid))
+            .filter(|pid| !round_spared.contains(*pid) && !handled.contains(pid))
             .collect();
         if fresh.is_empty() {
             break;
@@ -637,9 +705,11 @@ pub(crate) fn stop_the_world(
         }
     }
     let stopped_set: BTreeSet<u32> = stopped.keys().copied().collect();
-    let resumed: BTreeSet<u32> = daemon_family_within(&stopped_set)
-        .intersection(&stopped_set)
+    let rejudged = daemon_family_within(&stopped_set);
+    let resumed: BTreeSet<u32> = stopped_set
+        .iter()
         .copied()
+        .filter(|pid| rejudged.contains(*pid))
         .collect();
     // The spared resume first: a process still stopped when its process
     // group is orphaned would bring the kernel's SIGHUP down on the group.
@@ -653,13 +723,16 @@ pub(crate) fn stop_the_world(
             killed += 1;
         }
     }
-    spared.extend(&resumed);
+    spared.extend(&rejudged);
+    let identities = |pids: &BTreeSet<u32>| {
+        pids.iter()
+            .filter_map(|pid| process::identity(*pid).ok())
+            .collect()
+    };
     KillSummary {
         killed,
-        spared: spared
-            .iter()
-            .filter_map(|pid| process::identity(*pid).ok())
-            .collect(),
+        spared: identities(&spared.family),
+        unchecked: identities(&spared.unchecked),
         withheld: 0,
         not_frozen: None,
         incomplete: pin_error,
@@ -837,7 +910,7 @@ sleep 600;"#,
         tree.extra.push(s_watch.clone());
         // S runs its daemon-family argv only once it has exec'd.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !process::argv(s).is_ok_and(|argv| is_codex_daemon_family(&argv)) {
+        while !process::argv(s).is_ok_and(|argv| process::is_codex_daemon_family(&argv)) {
             assert!(std::time::Instant::now() < deadline, "S never exec'd");
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -909,7 +982,7 @@ sleep 600;"#,
                 || {
                     let mut tree = with_descendants(BTreeSet::from([root]), std::process::id());
                     tree.retain(|pid| process::is_running(*pid));
-                    (tree, BTreeSet::new())
+                    (tree, Sparing::default())
                 },
                 |watch, tree| {
                     let pid = watch.pid();
@@ -948,7 +1021,7 @@ sleep 600;"#,
         let sleep = Sleep::start();
         let pid = sleep.watch.pid();
         let hidden = process::test_reads::fail(pid, "stat", libc::ENOENT);
-        let swept = stop_the_world(|| (BTreeSet::from([pid]), BTreeSet::new()), |_, _| true);
+        let swept = stop_the_world(|| (BTreeSet::from([pid]), Sparing::default()), |_, _| true);
         drop(hidden);
         match swept.incomplete {
             Some(err) => assert_ne!(err.kind(), io::ErrorKind::NotFound, "{err}"),
@@ -957,6 +1030,44 @@ sleep 600;"#,
         assert!(
             !sleep.watch.has_exited(),
             "it could not be pinned, so it was not signalled"
+        );
+    }
+
+    /// A candidate whose argv cannot be read (here for want of a
+    /// descriptor) may be Codex's daemon: the sweep never stops or kills
+    /// it.
+    #[test]
+    fn the_sweep_never_stops_a_candidate_whose_family_cannot_be_read() {
+        let sleep = Sleep::start();
+        let pid = sleep.watch.pid();
+        let unread = process::test_reads::fail(pid, "cmdline", libc::EMFILE);
+        let summary = stop_the_world(
+            || {
+                let candidates = BTreeSet::from([pid]);
+                let spared = daemon_family_within(&candidates);
+                (candidates, spared)
+            },
+            |_, _| true,
+        );
+        drop(unread);
+        assert!(
+            !sleep
+                .watch
+                .wait_exited_blocking(Duration::from_millis(500))
+                .unwrap(),
+            "a candidate whose argv could not be read was killed: {summary:?}"
+        );
+        assert!(
+            summary.unchecked.iter().any(|p| p.pid == pid) && summary.spared.is_empty(),
+            "{summary:?}"
+        );
+        assert_ne!(
+            process::stat_fields(pid)
+                .unwrap()
+                .first()
+                .map(String::as_str),
+            Some("T"),
+            "a candidate whose argv could not be read was left stopped"
         );
     }
 

@@ -619,20 +619,29 @@ impl AgentUnit {
     /// root that cannot be pinned is never signalled (Stage 2: LB-02), and
     /// neither is one in Codex's daemon family (a record written before the
     /// family was kept out of the roots can name one): it is logged as
-    /// spared and never pinned.
+    /// spared and never pinned. Nor is one whose place in the family cannot
+    /// be read (`unit.root.not_pinned`): it may be the daemon.
     pub(crate) fn pin_recorded_roots(&self, roots: &[(u32, u64)]) {
         for (pid, start) in roots {
             // Told to the backend even when it has exited (it then ignores
             // it); the macOS fork tracker refuses the daemon family itself.
             self.inner.backend.root_pinned(*pid, *start);
             match ProcWatch::open_expecting(*pid, *start) {
-                Ok(watch) if process::in_codex_daemon_family(*pid) => {
-                    events::spared(&self.log_keys(None), &[watch.identity().clone()]);
-                }
-                Ok(watch) => {
-                    watch.watch_lock_paths(&lock(&self.inner.lock_paths));
-                    lock(&self.inner.members).roots.push(watch);
-                }
+                Ok(watch) => match process::in_codex_daemon_family(*pid) {
+                    Ok(false) => {
+                        watch.watch_lock_paths(&lock(&self.inner.lock_paths));
+                        lock(&self.inner.members).roots.push(watch);
+                    }
+                    Ok(true) => {
+                        events::spared(&self.log_keys(None), &[watch.identity().clone()]);
+                    }
+                    Err(err) => events::root_not_pinned(
+                        &self.log_keys(None),
+                        *pid,
+                        *start,
+                        &family_unchecked(&err),
+                    ),
+                },
                 Err(err) => {
                     events::root_not_pinned(&self.log_keys(None), *pid, *start, &err.to_string())
                 }
@@ -995,14 +1004,18 @@ impl AgentUnit {
 
     /// Step d: kill the whole unit (sparing the daemon family), then every
     /// pinned process directly, so a unit whose container does not exist yet
-    /// is still stopped. The last signal of the sequence. Returns the spared.
+    /// is still stopped. The last signal of the sequence. Returns the spared
+    /// daemon family. The processes left alone because their place in the
+    /// family could not be read are logged (`unit.stop.spared_unchecked`)
+    /// and not returned: they are members Gone still waits for.
     async fn kill_unit(&self, keys: &UnitLogKeys, snapshot: &[ProcWatch]) -> Vec<ProcIdentity> {
-        let (spared, whole_unit_killed) = self.kill_whole_unit(keys, snapshot).await;
-        events::spared(keys, &spared);
-        if whole_unit_killed {
+        let killed = self.kill_whole_unit(keys, snapshot).await;
+        events::spared(keys, &killed.spared);
+        events::spared_unchecked(keys, &killed.unchecked);
+        if killed.whole {
             events::signal_sent(keys, "SIGKILL", "unit", None);
         }
-        spared
+        killed.spared
     }
 
     /// The backend's whole-unit kill over every live pinned process (plus
@@ -1012,51 +1025,51 @@ impl AgentUnit {
     /// whole-unit kill failed) and whether the whole-unit kill ran in full
     /// (a failure is logged; the pinned processes are still killed). A kill
     /// that ran but could not read everything (it may have missed a member)
-    /// is logged as failed, and what it spared stays spared.
-    async fn kill_whole_unit(
-        &self,
-        keys: &UnitLogKeys,
-        extra: &[ProcWatch],
-    ) -> (Vec<ProcIdentity>, bool) {
+    /// is logged as failed, and what it spared stays spared. Neither the
+    /// backend nor the unit signals a process whose place in Codex's daemon
+    /// family could not be read (`unchecked`).
+    async fn kill_whole_unit(&self, keys: &UnitLogKeys, extra: &[ProcWatch]) -> UnitKill {
         let mut pinned = self.pinned_watches();
         pinned.extend(extra.iter().cloned());
         let roots = live_identities(&pinned);
-        let (mut spared, whole_unit_killed) = match self.inner.backend.clone().kill_all(roots).await
-        {
+        let mut killed = match self.inner.backend.clone().kill_all(roots).await {
             Ok(summary) => {
                 self.note_withheld(keys, summary.withheld);
                 if let Some(detail) = &summary.not_frozen {
                     events::freeze_timeout(keys, detail);
                 }
-                match &summary.incomplete {
-                    // The kill may have missed a member: a failed kill, but
-                    // what it spared stays spared.
-                    Some(err) => {
-                        events::kill_all_failed(keys, &err.to_string());
-                        (summary.spared, false)
-                    }
-                    None => (summary.spared, true),
+                // The kill may have missed a member: a failed kill, but what
+                // it spared stays spared.
+                if let Some(err) = &summary.incomplete {
+                    events::kill_all_failed(keys, &err.to_string());
+                }
+                UnitKill {
+                    whole: summary.incomplete.is_none(),
+                    spared: summary.spared,
+                    unchecked: summary.unchecked,
                 }
             }
             Err(err) => {
                 events::kill_all_failed(keys, &err.to_string());
-                (Vec::new(), false)
+                UnitKill::default()
             }
         };
         for watch in &pinned {
-            if is_spared(watch, &spared) {
+            if is_spared(watch, &killed.spared) || is_spared(watch, &killed.unchecked) {
                 continue;
             }
             // Judged by its own argv, as the backends' per-process kills
             // judge each process: a root pinned from a record written
             // before the daemon family was kept out of the roots.
-            if own_argv_is_daemon_family(watch.pid()) {
-                spared.push(watch.identity().clone());
-                continue;
+            match judge(watch) {
+                Judged::Signal => {
+                    let _ = watch.signal(Sig::Kill);
+                }
+                Judged::Family => killed.spared.push(watch.identity().clone()),
+                Judged::Unchecked => killed.unchecked.push(watch.identity().clone()),
             }
-            let _ = watch.signal(Sig::Kill);
         }
-        (spared, whole_unit_killed)
+        killed
     }
 
     /// Step e: wait (event-driven) for the main, the screen and every
@@ -1216,12 +1229,19 @@ impl AgentUnit {
         }
         let first = self.member_lock_holders(&paths, &snapshot.watches).await?;
         if !first.is_empty() {
+            let keys = self.log_keys(self.stop_operation());
             for holder in first {
                 if let Ok(watch) = ProcWatch::open_expecting(holder.pid, holder.start) {
-                    if own_argv_is_daemon_family(watch.pid()) {
-                        continue;
+                    match judge(&watch) {
+                        Judged::Signal => {
+                            let _ = watch.signal(Sig::Kill);
+                        }
+                        Judged::Family => continue,
+                        // It may hold the lock: awaited, not signalled.
+                        Judged::Unchecked => {
+                            events::spared_unchecked(&keys, &[watch.identity().clone()])
+                        }
                     }
-                    let _ = watch.signal(Sig::Kill);
                     watch.exited().await?;
                 }
             }
@@ -1281,6 +1301,7 @@ impl AgentUnit {
         if paths.is_empty() {
             return Ok(true);
         }
+        let keys = self.log_keys(self.stop_operation());
         let unlocks = {
             let paths = paths.clone();
             blocking(move || locks::UnlockEvents::watch(&paths)).await??
@@ -1303,10 +1324,16 @@ impl AgentUnit {
                     // Pinned only to deliver the kill: its exit proves
                     // nothing here, the unlock does.
                     if let Ok(watch) = ProcWatch::open_expecting(who.pid, who.start) {
-                        if own_argv_is_daemon_family(watch.pid()) {
-                            continue;
+                        match judge(&watch) {
+                            Judged::Signal => {
+                                let _ = watch.signal(Sig::Kill);
+                            }
+                            Judged::Family => continue,
+                            // Not signalled; its unlock is awaited.
+                            Judged::Unchecked => {
+                                events::spared_unchecked(&keys, &[watch.identity().clone()])
+                            }
                         }
-                        let _ = watch.signal(Sig::Kill);
                     }
                     // A file created after the watch began has no unlock
                     // event to wait for; the final scan decides for it.
@@ -1338,10 +1365,14 @@ impl AgentUnit {
             .await?;
         }
         for watch in &awaited {
-            if own_argv_is_daemon_family(watch.pid()) {
-                continue;
+            match judge(watch) {
+                Judged::Signal => {
+                    let _ = watch.signal(Sig::Kill);
+                }
+                Judged::Family => continue,
+                // Not signalled; its exit is awaited.
+                Judged::Unchecked => events::spared_unchecked(&keys, &[watch.identity().clone()]),
             }
-            let _ = watch.signal(Sig::Kill);
             watch.exited().await?;
         }
         while !pending.is_empty() {
@@ -1688,12 +1719,40 @@ fn live_identities(watches: &[ProcWatch]) -> Vec<(u32, u64)> {
     roots
 }
 
-/// Whether `pid`'s own argv is Codex's daemon family right now
-/// (`process::is_codex_daemon_family`): the unit's own kills (the pinned
-/// processes after the whole-unit kill, the Gone lock check) never signal
-/// such a process. Checked right before each signal, on a pinned watch.
-fn own_argv_is_daemon_family(pid: u32) -> bool {
-    process::argv(pid).is_ok_and(|argv| process::is_codex_daemon_family(&argv))
+/// What the unit's whole-unit kill did: the processes it spared as Codex's
+/// daemon family, those it left alone because their place in the family
+/// could not be read, and whether the backend's kill ran in full.
+#[derive(Default)]
+struct UnitKill {
+    spared: Vec<ProcIdentity>,
+    unchecked: Vec<ProcIdentity>,
+    whole: bool,
+}
+
+/// How the unit's own kills (the pinned processes after the whole-unit
+/// kill, the Gone lock check) judge a pinned process right before they
+/// would signal it, by its own argv (`process::daemon_family_checked`).
+enum Judged {
+    Signal,
+    /// Of Codex's daemon family: never signalled, never waited for.
+    Family,
+    /// Its argv could not be read: it may be the daemon, so it is never
+    /// signalled, but it is waited for as any member.
+    Unchecked,
+}
+
+fn judge(watch: &ProcWatch) -> Judged {
+    match process::daemon_family_checked(watch.pid()) {
+        Ok(false) => Judged::Signal,
+        Ok(true) => Judged::Family,
+        Err(_) => Judged::Unchecked,
+    }
+}
+
+/// Why a recorded root is not pinned: its place in Codex's daemon family
+/// could not be read (`err`), so it may be the daemon.
+pub(crate) fn family_unchecked(err: &io::Error) -> String {
+    format!("whether it is in Codex's daemon family could not be checked: {err}")
 }
 
 fn is_spared(watch: &ProcWatch, spared: &[ProcIdentity]) -> bool {
@@ -2453,6 +2512,197 @@ sleep 600;"#;
             family.daemon.untouched(),
             "the daemon-family stand-in was signalled"
         );
+    }
+
+    /// A process that may be Codex's daemon is never signalled: when the
+    /// argv of a pinned process cannot be read (here for want of a
+    /// descriptor), the unit's own kill leaves it alone and says so with
+    /// the unit's keys. It is still a member the stop must see gone, so the
+    /// stop then follows the unconfirmed rules: no Gone while it runs (ERROR
+    /// `unit.stop.unconfirmed` at the 5 s mark), and Gone once it exits.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pinned_process_whose_family_cannot_be_read_is_never_signalled() {
+        let unjudged = Spawned::perl_sleep(&[]);
+        let plain = Spawned::perl_sleep(&[]);
+        let unit = unit_on(Arc::new(NoProcesses));
+        unit.add_root(unjudged.watch.clone());
+        unit.add_root(plain.watch.clone());
+        let unread = process::test_reads::fail(unjudged.watch.pid(), "cmdline", libc::EMFILE);
+        let events = capture_on_runtime(async {
+            let handle = unit.stop(
+                StopRequest::new(StopMode::Force, StopReason::ShiftX, "ws").operation("op-1"),
+            );
+            tokio::time::timeout(Duration::from_secs(5), plain.watch.exited())
+                .await
+                .expect("the plain root was killed")
+                .unwrap();
+            assert!(
+                handle
+                    .wait_for(UNCONFIRMED_AFTER + Duration::from_millis(500))
+                    .await
+                    .is_none(),
+                "Gone while a member that was not signalled still ran"
+            );
+            assert!(
+                unjudged.untouched(),
+                "a process whose argv could not be read was signalled"
+            );
+            drop(unread);
+            // The test ends it: only then is the unit gone.
+            unjudged.watch.signal(Sig::Kill).unwrap();
+            assert!(
+                handle.wait_for(Duration::from_secs(5)).await.is_some(),
+                "Gone once the process exited"
+            );
+        });
+        let unchecked = named(&events, "unit.stop.spared_unchecked");
+        assert_eq!(unchecked.len(), 1, "{events:?}");
+        assert_eq!(unchecked[0].level, tracing::Level::WARN);
+        assert_eq!(unchecked[0].u64("pid"), u64::from(unjudged.watch.pid()));
+        assert_unit_keys(unchecked[0], &unit, "op-1");
+        let unconfirmed = named(&events, "unit.stop.unconfirmed");
+        assert_eq!(unconfirmed.len(), 1, "{events:?}");
+        assert_eq!(unconfirmed[0].level, tracing::Level::ERROR);
+    }
+
+    /// A recorded root whose place in Codex's daemon family cannot be read
+    /// is never pinned (so never signalled): the boot pin says so with the
+    /// unit's keys (`unit.root.not_pinned`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_recorded_root_whose_family_cannot_be_read_is_never_pinned() {
+        let unjudged = Spawned::perl_sleep(&[]);
+        let (unit, _store) = unit_with_record(Arc::new(NoProcesses));
+        let unread = process::test_reads::fail(unjudged.watch.pid(), "cmdline", libc::EMFILE);
+        let events = capture(|| unit.pin_recorded_roots(&[unjudged.identity()]));
+        drop(unread);
+        assert!(
+            unit.pinned_watches().is_empty(),
+            "a root whose argv could not be read was pinned"
+        );
+        let not_pinned = named(&events, "unit.root.not_pinned");
+        assert_eq!(not_pinned.len(), 1, "{events:?}");
+        assert_eq!(not_pinned[0].u64("pid"), u64::from(unjudged.watch.pid()));
+        assert!(unjudged.untouched());
+    }
+
+    /// The tag sweep judges each candidate by its own argv and its parent
+    /// links: a child of a daemon-family process is spared even when that
+    /// process's children cannot be listed, so it is never stopped.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_sweep_spares_a_daemon_familys_child_whose_parent_cannot_list_it() {
+        use crate::backend::tag::{daemon_family_within, stop_the_world};
+        use std::collections::BTreeSet;
+        let family = DaemonWithChild::start(&[]);
+        let (daemon, child) = (family.daemon.watch.pid(), family.child.pid());
+        let unlisted = process::test_reads::fail(daemon, "children", libc::EMFILE);
+        let _ = stop_the_world(
+            || {
+                let set = BTreeSet::from([daemon, child]);
+                let spared = daemon_family_within(&set);
+                (set, spared)
+            },
+            |_, _| true,
+        );
+        drop(unlisted);
+        assert!(
+            !family
+                .child
+                .wait_exited_blocking(Duration::from_millis(500))
+                .unwrap(),
+            "the daemon-family stand-in's child was killed"
+        );
+        assert!(family.child_untouched() && family.daemon.untouched());
+    }
+
+    /// The judgment every kill shares: of the family by its own argv, or
+    /// below a family process of the set; unchecked when its own argv, or
+    /// its parent link, cannot be read. Both the tag backend's judgment
+    /// (parent links up the tree) and the cgroup and job backends' (parent
+    /// links within the set) answer the same.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_is_unchecked_when_its_argv_or_its_parent_link_cannot_be_read() {
+        use crate::backend::{spared_closure, tag::daemon_family_within, Sparing};
+        use std::collections::BTreeSet;
+        let family = DaemonWithChild::start(&[]);
+        let plain = Spawned::perl_sleep(&[]);
+        let (daemon, child, other) = (
+            family.daemon.watch.pid(),
+            family.child.pid(),
+            plain.watch.pid(),
+        );
+        let set = BTreeSet::from([daemon, child, other]);
+        let judged = || {
+            [
+                ("tag", daemon_family_within(&set)),
+                ("closure", spared_closure(set.iter().copied())),
+            ]
+        };
+        for (how, sparing) in judged() {
+            assert_eq!(
+                sparing,
+                Sparing {
+                    family: BTreeSet::from([daemon, child]),
+                    unchecked: BTreeSet::new(),
+                },
+                "{how}: everything readable"
+            );
+        }
+        let unread_argv = process::test_reads::fail(other, "cmdline", libc::EMFILE);
+        let unread_parent = process::test_reads::fail(child, "stat", libc::EMFILE);
+        let unreadable = judged();
+        drop((unread_argv, unread_parent));
+        for (how, sparing) in unreadable {
+            assert_eq!(
+                sparing,
+                Sparing {
+                    family: BTreeSet::from([daemon]),
+                    unchecked: BTreeSet::from([child, other]),
+                },
+                "{how}: an argv and a parent link unreadable"
+            );
+        }
+    }
+
+    /// The Gone lock check never signals a holder whose place in Codex's
+    /// daemon family cannot be read; it may hold the lock, so the check
+    /// waits for its exit (if that never comes, Gone stays unconfirmed).
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_lock_check_never_signals_a_holder_whose_family_cannot_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("thread.lock");
+        let holder = Spawned::perl_lock(&lock_path, &[]);
+        let unit = unit_on(Arc::new(NoProcesses));
+        unit.set_lock_paths(vec![lock_path]);
+        let snapshot = Snapshot::whole(vec![holder.watch.clone()]);
+        let unread = process::test_reads::fail(holder.watch.pid(), "cmdline", libc::EMFILE);
+        let check = tokio::spawn({
+            let unit = unit.clone();
+            async move { unit.check_locks(&snapshot).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), holder.watch.exited())
+                .await
+                .is_err(),
+            "the lock check signalled a holder whose argv could not be read"
+        );
+        assert!(
+            !check.is_finished(),
+            "the check did not wait for the holder"
+        );
+        drop(unread);
+        // The test ends it: only then is the lock released.
+        holder.watch.signal(Sig::Kill).unwrap();
+        let released = tokio::time::timeout(Duration::from_secs(5), check)
+            .await
+            .expect("the check ended once the holder exited")
+            .unwrap()
+            .unwrap();
+        assert!(released, "the holder's exit released the lock");
     }
 
     /// The same rule in the Gone lock check, whose holders include the
