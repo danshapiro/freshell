@@ -19,7 +19,8 @@
 //! POSITIVE arm is pinned here by
 //! `duplicate_claim_prefers_the_live_writer_over_newer_updated_at` (an
 //! initialize-gated fixture — the real-codex shape). Tests bind loopback
-//! ephemeral ports only; never port 3001.
+//! ports only (ephemeral ones, and the reserved port of
+//! `unused_loopback_ws_url`); never port 3001.
 //!
 //! /proc semantics are Linux-only, so these tests are
 //! `#[cfg(target_os = "linux")]` (the sidecar_store_tests precedent).
@@ -34,8 +35,9 @@ use super::*;
 use crate::durability::mint_ownership_id;
 use crate::sidecar_store::{proc_cmdline, proc_starttime, CodexSidecarRecord};
 use crate::sidecar_test_support::{
-    record_for_child, spawn_own_fake_app_server, spawn_own_fake_app_server_with_behavior,
-    spawn_own_sleep_child, store_in, NEVER_SIGNALLED_GRACE, SESSION,
+    ephemeral_port_range, record_for_child, spawn_own_fake_app_server,
+    spawn_own_fake_app_server_with_behavior, spawn_own_sleep_child, store_in,
+    NEVER_SIGNALLED_GRACE, SESSION,
 };
 
 #[test]
@@ -543,12 +545,32 @@ async fn reattach_reaps_verified_but_unusable_survivor() {
     let ownership_id = "codex-sidecar-a6000003-cccc-4ccc-8ccc-cccccccccccc";
     // Fixture listens on port A; the record's ws_url points at port B where
     // NOTHING listens (record_for_child's default) — pid evidence stays
-    // valid, so identity is Verified but the probe fails fast.
+    // valid, so identity is Verified but the probe fails fast. Port B is
+    // reserved for this test process, so no other test's server can answer
+    // the probe (a handshake is all it asks).
     let (mut child, _fixture_ws_url) = spawn_own_fake_app_server(ownership_id).await;
     let record = record_for_child(
         ownership_id,
         child.id().expect("live fixture pid"),
         Some(SESSION),
+    );
+    let dialled = record
+        .ws_url
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .expect("the record's port");
+    assert!(
+        !ephemeral_port_range().contains(&dialled),
+        "the probe dials a reserved port, outside the kernel's ephemeral \
+         range {:?}: {dialled}",
+        ephemeral_port_range()
+    );
+    assert!(
+        tokio::net::TcpSocket::new_v4()
+            .expect("a socket")
+            .bind(std::net::SocketAddr::from(([127, 0, 0, 1], dialled)))
+            .is_err(),
+        "the reservation still holds {dialled}: no other socket can bind it"
     );
     store.write(&record).expect("write record");
 

@@ -5,8 +5,9 @@
 //! `cfg(test)` on Linux (the `/proc` evidence helpers), never shipped.
 //!
 //! PROCESS SAFETY: every helper spawns and signals ONLY the calling test's
-//! own children; temp stores only; loopback ephemeral ports only, never
-//! 3001/3002.
+//! own children; temp stores only; loopback ports only (ephemeral ones, and
+//! one reserved port above the ephemeral range where nothing listens),
+//! never 3001/3002.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +16,12 @@ use crate::sidecar_store::{
     proc_cmdline, proc_starttime, CodexSidecarRecord, CodexSidecarStore, SidecarRecordState,
     SIDECAR_RECORD_VERSION,
 };
+
+// The integration tests' reservation, shared: one copy of the code.
+#[path = "../tests/support/reserved_port.rs"]
+mod reserved_port;
+pub(crate) use reserved_port::ephemeral_port_range;
+use reserved_port::ReservedPort;
 
 /// The codex session (thread) id the suites share.
 pub(crate) const SESSION: &str = "019810de-1e5f-7db3-9c47-1c2a3b4c5d6e";
@@ -70,18 +77,23 @@ pub(crate) fn spawn_own_shell_child(
     guard
 }
 
-/// A loopback `ws://` URL on an ephemeral port NOTHING listens on (bound,
-/// read, dropped) — probe dials fail fast with connection-refused. Never
-/// port 3001. For dial-fail records ONLY: the freed port can in principle
-/// be re-issued by the kernel to a concurrent listener within the test's
-/// window (never observed). Fixture spawns must NOT use this — they use
-/// the fixture's port-file protocol ([`FIXTURE_PORT_FILE_ENV`]) instead,
-/// which has no free-port window at all.
+/// A loopback `ws://` URL on a port NOTHING listens on — probe dials fail
+/// fast with connection-refused. Never port 3001. The port is reserved for
+/// this whole test process ([`ReservedPort`], held in a static, so it
+/// outlives every record that names it): it lies outside the
+/// kernel's ephemeral range, so no socket that binds port 0 or connects is
+/// given it, and the reserving socket never listens. A port bound and
+/// released could instead be given to another test's app-server or proxy,
+/// which would answer a probe that must fail. For dial-fail records ONLY.
+/// Fixture spawns must NOT use this — they use the fixture's port-file
+/// protocol ([`FIXTURE_PORT_FILE_ENV`]) instead, which has no free-port
+/// window at all.
 pub(crate) fn unused_loopback_ws_url() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
-    format!("ws://127.0.0.1:{port}")
+    static DEAD: std::sync::OnceLock<ReservedPort> = std::sync::OnceLock::new();
+    format!(
+        "ws://127.0.0.1:{}",
+        DEAD.get_or_init(ReservedPort::new).port()
+    )
 }
 
 /// Opt-in port-report mode of the fake app-server fixture: when set, the
