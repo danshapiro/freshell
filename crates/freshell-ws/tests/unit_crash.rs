@@ -647,6 +647,33 @@ async fn a_quit_during_a_backgrounded_restart_does_not_count_toward_the_cap() {
 /// ends (Task 17 review M1).
 #[tokio::test(flavor = "multi_thread")]
 async fn screens_that_quit_as_they_start_while_a_turn_runs_end_the_unit_at_the_respawn_cap() {
+    screens_that_quit_as_they_start_end_the_unit_at_the_cap("qs", None, LIMIT).await;
+}
+
+/// The floor's clock starts once a screen was spawned: a screen whose
+/// spawn takes longer than the floor (a loaded host) and that then quits at
+/// once is as fast as any other screen that quits as it starts, so its
+/// restarts count toward the cap too (Task 17 re-review R2-m2).
+#[tokio::test(flavor = "multi_thread")]
+async fn screens_slow_to_spawn_that_quit_at_once_end_the_unit_at_the_respawn_cap() {
+    let spawn_takes =
+        freshell_ws::unit_lifecycle::BACKGROUND_QUIT_FLOOR + Duration::from_millis(200);
+    // Each restart takes longer; the turn still runs for 60 s.
+    screens_that_quit_as_they_start_end_the_unit_at_the_cap("qss", Some(spawn_takes), LIMIT * 2)
+        .await;
+}
+
+/// A pane with a turn running whose screens, from its first quit on, quit
+/// (exit 0) as they start: the unit ends at the respawn cap with the
+/// screens' code, its app-server included, and auto-resume hears a clean
+/// exit, within `limit` of the first quit. With `spawn_takes`, every screen
+/// spawn after the first takes that long before it returns (its process
+/// already exists).
+async fn screens_that_quit_as_they_start_end_the_unit_at_the_cap(
+    name: &str,
+    spawn_takes: Option<Duration>,
+    limit: Duration,
+) {
     let mut h = UnitHarness::start(HarnessOpts {
         behavior: json!({"turnCompleteDelayMs": 60000}),
         auto_resume: AutoResumeMode::Capture,
@@ -654,12 +681,23 @@ async fn screens_that_quit_as_they_start_while_a_turn_runs_end_the_unit_at_the_r
     })
     .await;
     let mut ws = h.connect().await;
-    let tid = h.create_codex(&mut ws, "crq-qs", Some("t-qs")).await;
+    let (request_id, thread_id) = (format!("crq-{name}"), format!("t-{name}"));
+    let tid = h
+        .create_codex(&mut ws, &request_id, Some(thread_id.as_str()))
+        .await;
     ready(&h, &mut ws, &tid).await;
     start_settled(&h, &tid).await;
     let native = h.native_pid(&tid);
     turn_running(&h, &mut ws, &tid).await;
 
+    if let Some(spawn_takes) = spawn_takes {
+        h.state
+            .registry
+            .set_process_start_reader(std::sync::Arc::new(move |pid| {
+                std::thread::sleep(spawn_takes);
+                freshell_containment::process::start_time(pid).ok()
+            }));
+    }
     // Every screen started from now on quits as it starts (exit 0).
     std::fs::write(h.home.path().join(".fake-tui-quit-at-start"), "").expect("the marker");
     h.send(
@@ -668,7 +706,7 @@ async fn screens_that_quit_as_they_start_while_a_turn_runs_end_the_unit_at_the_r
     )
     .await;
 
-    let exit = exit_within(&h, &mut ws, &tid, LIMIT)
+    let exit = exit_within(&h, &mut ws, &tid, limit)
         .await
         .expect("screens that quit as they start end the unit at the respawn cap");
     assert_eq!(exit["exitCode"], 0, "the screens' own code: {exit}");

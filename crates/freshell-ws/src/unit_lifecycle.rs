@@ -664,7 +664,9 @@ const SCREEN_EXIT_CODE_WAIT: Duration = Duration::from_secs(1);
 /// not count toward the respawn cap). No one reads Codex's quit prompt and
 /// chooses faster; a screen that quits sooner (a TUI that exits 0 as it
 /// starts, or a turn status no event clears) restarts counted, so the cap
-/// bounds it like a crash (Task 17 review M1).
+/// bounds it like a crash (Task 17 review M1). The run is timed from the
+/// moment the screen's spawn returned (the registry's `UnitScreenExit::lived`),
+/// so a slow spawn never lifts a quick quit over the floor (re-review R2-m2).
 pub const BACKGROUND_QUIT_FLOOR: Duration = Duration::from_secs(1);
 
 /// How long a screen's clean exit with a turn running waits for the pane's
@@ -765,7 +767,7 @@ enum MemberExit {
 ///    - code 0 with a turn running (Codex's "quit, run in background"): a
 ///      new screen against the running agent, not counted toward the cap
 ///      unless the screen quit within [`BACKGROUND_QUIT_FLOOR`] of its
-///      start (faster than any person chooses);
+///      spawn returning (faster than any person chooses);
 ///    - otherwise (a screen crash, the agent alive): a new screen, counted
 ///      toward the respawn cap.
 ///

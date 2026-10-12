@@ -116,9 +116,10 @@ pub struct UnitScreenExit {
     pub exit_code: i64,
     /// 0 for the row's first screen, +1 for each replacement.
     pub screen_generation: u32,
-    /// How long the exiting screen ran: from its own start (the row's
-    /// spawn, or the reservation of its replacement) to the moment its exit
-    /// was taken.
+    /// How long the exiting screen ran: from the moment its spawn returned
+    /// (a replacement's, as the replacement installed it) to the moment its
+    /// exit was taken; zero when its exit was taken before its replacement
+    /// installed it. The time a spawn takes is never counted.
     pub lived: std::time::Duration,
 }
 
@@ -790,7 +791,11 @@ struct UnitRow {
     unit_id: String,
     /// 0 for the first screen, +1 for each [`TerminalRegistry::replace_screen`].
     screen_generation: u32,
-    /// When the current screen started (epoch ms).
+    /// When the current screen's clock started (epoch ms): the moment its
+    /// spawn returned (a replacement's, as it was installed), so the time a
+    /// slow spawn takes is not time the screen ran. A replacement in
+    /// progress holds its reservation's time until it installs its screen
+    /// (a failed spawn keeps it).
     screen_started_at: i64,
     /// Consecutive replacements of screens that died within the respawn
     /// liveness window: the per-row screen-restart cap.
@@ -2699,6 +2704,13 @@ impl TerminalRegistry {
                 return Err(err);
             }
         };
+        // A unit row's screen is timed from now, its spawn returned, never
+        // from before the spawn: its exit is taken only once the row is in
+        // the registry (below), so no exit reads the time the row was built
+        // with.
+        if let Some(unit) = shared.lock().expect("terminal lock").unit.as_mut() {
+            unit.screen_started_at = now_ms();
+        }
 
         // DIAG-01: terminal lifecycle event -- captured BEFORE `pty` is moved
         // into the registry, from the just-spawned PTY (so `pid` reflects
@@ -4651,8 +4663,10 @@ impl TerminalRegistry {
     /// `respawn cap` without spawning. A restart that does not count (the
     /// agent goes on working after its screen quit, Stage 2: LB-40) leaves
     /// the count as it is and is never refused by the cap; either way the
-    /// new screen's lifetime is measured from its own start. Auto-resume's
-    /// create-request budget ([`Self::respawn_exhausted`]) is never touched.
+    /// new screen is timed from the moment it is installed, right after its
+    /// spawn returned (the time the spawn takes is not counted, and an exit
+    /// taken before the install ran no time). Auto-resume's create-request
+    /// budget ([`Self::respawn_exhausted`]) is never touched.
     /// A replacement whose spawn fails still counts, and leaves the row
     /// ready for another replacement. If the row ends or an ending is marked
     /// while the new screen starts, the new screen is not put into the row:
@@ -4719,6 +4733,9 @@ impl TerminalRegistry {
                     // No screen of the reserved generation runs, so the row
                     // is ready for the next replacement.
                     unit.screen_exit_seen = true;
+                } else {
+                    // The new screen's clock starts as it is installed.
+                    unit.screen_started_at = now_ms();
                 }
                 Some((open, unit.screen_exit_seen))
             });
@@ -4847,6 +4864,7 @@ impl TerminalRegistry {
             unit.quick_screen_restarts
         };
         unit.screen_generation += 1;
+        // Until the new screen is installed (a failed spawn keeps it).
         unit.screen_started_at = now;
         unit.quick_screen_restarts = restarts;
         unit.screen_exit_seen = false;
@@ -7139,9 +7157,16 @@ fn screen_exited(
             if generation.is_none_or(|exiting| exiting == current) {
                 unit.screen_exit_seen = true;
             }
-            let lived = std::time::Duration::from_millis(
-                u64::try_from(now_ms().saturating_sub(unit.screen_started_at)).unwrap_or(0),
-            );
+            // A screen's clock starts once its spawn returned (a
+            // replacement's, as it is installed): a new screen whose exit is
+            // taken before its replacement installed it ran no time.
+            let lived = if unit.replacing {
+                std::time::Duration::ZERO
+            } else {
+                std::time::Duration::from_millis(
+                    u64::try_from(now_ms().saturating_sub(unit.screen_started_at)).unwrap_or(0),
+                )
+            };
             (keys, current, lived)
         });
         (unit, ending)

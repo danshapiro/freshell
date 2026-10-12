@@ -588,6 +588,92 @@ fn a_screen_exit_says_how_long_that_screen_ran() {
     );
 }
 
+/// A screen's run is timed from the moment its spawn returned, never from
+/// before it: the time a slow spawn takes (a loaded host) is not counted, so
+/// a screen that quits as it starts is never taken for one a person quit,
+/// and a screen whose exit was taken before its replacement installed it
+/// ran no time at all (Task 17 re-review R2-m2).
+#[test]
+fn a_screens_run_is_timed_from_its_spawn() {
+    let _serial = interlock_serial();
+    const SPAWN_TAKES: Duration = Duration::from_millis(600);
+    let reg = TerminalRegistry::new();
+    let got = record_screen_exits(&reg);
+    let seen_exits = |n: usize| {
+        let got = got.clone();
+        move || got.lock().unwrap().len() >= n
+    };
+    // Every spawn from now on takes `SPAWN_TAKES` before it returns (its
+    // process already exists).
+    reg.set_process_start_reader(Arc::new(|pid| {
+        std::thread::sleep(SPAWN_TAKES);
+        stat(pid).map(|(_, start)| start)
+    }));
+    // The longest a screen spawned after `asked` can have run by now: its
+    // spawn took `SPAWN_TAKES` of that time (plus the clock's ms rounding).
+    let ran_at_most =
+        |asked: Instant| asked.elapsed().saturating_sub(SPAWN_TAKES) + Duration::from_millis(2);
+
+    let asked = Instant::now();
+    reg.create_in_unit(
+        &bash("sleep 1; exit 0"),
+        &env(),
+        "T-spawn".into(),
+        "S-spawn".into(),
+        "codex",
+        None,
+        None,
+        None,
+        None,
+        placement(None),
+    )
+    .unwrap();
+    wait("screen 0 exits", seen_exits(1));
+    let bound = ran_at_most(asked);
+    let first = got.lock().unwrap()[0].lived;
+    assert!(
+        first <= bound,
+        "the row's first screen is timed from its spawn: ran {first:?}, at most {bound:?}"
+    );
+
+    // The new screen quits at once; its exit is taken while the replacement
+    // is parked before installing it.
+    REPLACE_SCREEN_INTERLOCK.arm("T-spawn");
+    let replacing = reg.clone();
+    let replace = std::thread::spawn(move || {
+        replacing.replace_screen("T-spawn", &bash("exit 0"), &env(), placement(None), false)
+    });
+    wait(
+        "the replacement parked before installing its screen",
+        || REPLACE_SCREEN_INTERLOCK.reached(),
+    );
+    wait("the new screen's exit reaches the hook", seen_exits(2));
+    REPLACE_SCREEN_INTERLOCK.release();
+    replace.join().unwrap().expect("the replacement completes");
+    assert_eq!(
+        got.lock().unwrap()[1].lived,
+        Duration::ZERO,
+        "a screen whose exit was taken before its replacement installed it ran no time"
+    );
+
+    let asked = Instant::now();
+    reg.replace_screen(
+        "T-spawn",
+        &bash("sleep 1; exit 0"),
+        &env(),
+        placement(None),
+        false,
+    )
+    .expect("a new screen");
+    wait("screen 2 exits", seen_exits(3));
+    let bound = ran_at_most(asked);
+    let third = got.lock().unwrap()[2].lived;
+    assert!(
+        third <= bound,
+        "an installed replacement is timed from its spawn: ran {third:?}, at most {bound:?}"
+    );
+}
+
 /// The exit code of a row's screen is known as soon as its process is
 /// reaped, even while a background job it left holds the terminal open, so
 /// the stream (and the screen-exit hook) never ends (Task 11 review M4: an
