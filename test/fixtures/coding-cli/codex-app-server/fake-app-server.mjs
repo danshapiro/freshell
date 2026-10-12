@@ -718,6 +718,10 @@ if (behavior.spawnDurableWriter) {
 // does.
 const LOST_PORT_EXIT_CODE = 98
 
+// The URL this fake serves on, as the thread operation log names it: the
+// --listen URL, or in port-file mode the one with the port the kernel gave it.
+let servedListenUrl = listenUrl
+
 // Created by listen() at the end of the module (after the native role is ready
 // and any behavior.listenDelayMs has passed).
 let wss = null
@@ -728,6 +732,7 @@ function listen() {
         if (!address || typeof address === 'string') {
           throw new Error('fake app-server did not receive a loopback port')
         }
+        servedListenUrl = `ws://${host}:${address.port}`
         fs.writeFileSync(portFile, `${address.port}\n`, 'utf8')
       })
     : new WebSocketServer({ host, port })
@@ -803,7 +808,7 @@ function appendThreadOperation(method, params, result) {
     method,
     threadId,
     params,
-    listenUrl,
+    listenUrl: servedListenUrl,
     at: new Date().toISOString(),
   }) + '\n', 'utf8')
 }

@@ -714,67 +714,31 @@ fn assert_prepared_pair_uses_one_reserved_context(
 
 // ─── the survivor: this test's OWN fake app-server child ─────────────────────
 
-/// Allocate a loopback ephemeral ws URL (bind 127.0.0.1:0, read, release).
-fn bind_loopback_ws_url() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
-    format!("ws://127.0.0.1:{port}")
-}
-
-/// Spawn the SURVIVOR fixture on an ephemeral loopback port with a
-/// per-instance behavior JSON (Command env overrides the inherited process
-/// env, so the survivor's knobs never touch the dispatcher-spawned sidecars').
-/// `kill_on_drop(true)` is the leak backstop — an assertion failure anywhere
-/// still reaps this test's own child. The port is chosen and released here,
-/// so another socket can take it first: the fixture then exits 98 and a new
-/// one starts on a new port. Returns (child, pid, listen ws url).
+/// Spawn the SURVIVOR fixture on a loopback port the kernel gives it as it
+/// binds (no other socket can take it first), with a per-instance behavior
+/// JSON (Command env overrides the inherited process env, so the survivor's
+/// knobs never touch the dispatcher-spawned sidecars'). It reports the port
+/// once it listens: by then exec has long completed, so the /proc evidence
+/// captured afterwards is really the fixture's (the Task 7
+/// no-post-fork-flake convention). `kill_on_drop(true)` is the leak
+/// backstop — an assertion failure anywhere still reaps this test's own
+/// child. Returns (child, pid, listen ws url).
 async fn spawn_survivor(
     ownership_id: &str,
     behavior: &serde_json::Value,
 ) -> (tokio::process::Child, u32, String) {
-    lost_port::retrying_a_lost_port("the survivor fixture listens", move || async move {
-        let listen_ws_url = bind_loopback_ws_url();
-        let mut child = tokio::process::Command::new("node")
-            .arg(fixture_path())
-            .arg("--listen")
-            .arg(&listen_ws_url)
-            .env(CODEX_SIDECAR_OWNERSHIP_ENV, ownership_id)
-            .env("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior.to_string())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn this test's own survivor fixture");
-        let pid = child.id().expect("live survivor pid");
-        // Wait for the WS listener: by then exec has long completed, so the
-        // /proc evidence captured afterwards is really the fixture's (the Task 7
-        // no-post-fork-flake convention).
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            if let Ok(Ok((probe, _response))) = tokio::time::timeout(
-                Duration::from_secs(1),
-                tokio_tungstenite::connect_async(&listen_ws_url),
-            )
-            .await
-            {
-                drop(probe);
-                return Ok((child, pid, listen_ws_url));
-            }
-            if let Ok(Some(status)) = child.try_wait() {
-                return Err(format!(
-                    "survivor fixture exited before listening: {status}"
-                ));
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "survivor fixture WS never came up"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
+    let mut fixture = tokio::process::Command::new("node");
+    fixture
+        .arg(fixture_path())
+        .env(CODEX_SIDECAR_OWNERSHIP_ENV, ownership_id)
+        .env("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let (child, port) = lost_port::spawn_on_its_own_port(fixture).await;
+    let pid = child.id().expect("live survivor pid");
+    (child, pid, format!("ws://127.0.0.1:{port}"))
 }
 
 // ─── the TUI: dial the proxy, initialize, thread/resume ──────────────────────

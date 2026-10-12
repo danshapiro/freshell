@@ -141,6 +141,9 @@ struct LauncherManifest {
 
 pub struct FakeAppServer {
     pub child: tokio::process::Child,
+    /// The port the native listens on. A fake started on a port of its own
+    /// ([`Self::spawn_on_its_own_port`]) learns it when it listens; until
+    /// then it is 0.
     pub port: u16,
     pub codex_home: PathBuf,
     pub manifest_dir: PathBuf,
@@ -148,21 +151,37 @@ pub struct FakeAppServer {
     launcher: (u32, u64),
     /// The native's (pid, start time), as the native pinned itself in its manifest.
     native: (u32, u64),
+    /// Where the native reports the port the kernel gave it (a fake on a
+    /// port of its own).
+    port_file: Option<tempfile::NamedTempFile>,
 }
 
 impl FakeAppServer {
-    /// A fake listening on a port of its own. The port is chosen and released
-    /// before the native binds it, so another socket can take it first; that
-    /// native exits 98 and a new fake starts on a new port.
+    /// A fake listening on a port of its own, returned once it listens.
     pub async fn spawn(behavior: Value, codex_home: &Path, extra_env: &[(&str, &str)]) -> Self {
-        let behavior = &behavior;
-        lost_port::retrying_a_lost_port("the fake app-server listens", move || async move {
-            let mut fake =
-                Self::spawn_on_port(unique_free_port(), behavior.clone(), codex_home, extra_env)
-                    .await;
-            fake.listened().await.map(|()| fake)
-        })
-        .await
+        let mut fake = Self::spawn_on_its_own_port(behavior, codex_home, extra_env).await;
+        if let Err(error) = fake.listened().await {
+            panic!("the fake app-server listens: {error}");
+        }
+        fake
+    }
+
+    /// A fake that binds a port the kernel chooses when it binds, so no other
+    /// socket can take it first, returned once its native runs (before it
+    /// listens; [`Self::listened`] then sets [`Self::port`]).
+    pub async fn spawn_on_its_own_port(
+        behavior: Value,
+        codex_home: &Path,
+        extra_env: &[(&str, &str)],
+    ) -> Self {
+        let port_file =
+            tempfile::NamedTempFile::new().expect("a port file for the fake app-server");
+        let reported = port_file.path().display().to_string();
+        let mut env = extra_env.to_vec();
+        env.push((lost_port::PORT_FILE_ENV, &reported));
+        let mut fake = Self::spawn_on_port(0, behavior, codex_home, &env).await;
+        fake.port_file = Some(port_file);
+        fake
     }
 
     /// A fake on `port`, returned once its native runs (before it listens).
@@ -202,23 +221,31 @@ impl FakeAppServer {
             manifest_dir,
             launcher: (launcher_pid, launcher_start),
             native: (manifest.pid, manifest.start_time(manifest.pid)),
+            port_file: None,
         }
     }
 
-    /// Waits until the native listens. When the launcher exits first, its
-    /// status says why (98: the native lost its port).
+    /// Waits until the native listens; a fake on a port of its own then
+    /// knows its port. When the launcher exits first, its status says why
+    /// (98: the native lost its port).
     pub async fn listened(&mut self) -> Result<(), String> {
         let manifest_dir = self.manifest_dir.clone();
         let launcher = self.launcher.0;
         tokio::select! {
-            status = self.child.wait() => Err(format!(
+            status = self.child.wait() => return Err(format!(
                 "fake app-server exited before listening: {}",
                 status.map_or_else(|error| error.to_string(), |status| status.to_string())
             )),
             () = wait_until("the native to listen", Duration::from_secs(10), move || {
                 read_native_manifest(&manifest_dir, launcher).is_some_and(|native| native.listening)
-            }) => Ok(()),
+            }) => {}
         }
+        // The native writes the port file before it marks itself listening.
+        if let Some(port_file) = self.port_file.take() {
+            self.port = lost_port::reported_port(port_file.path())
+                .expect("a listening native has reported its port");
+        }
+        Ok(())
     }
 
     /// The launcher's pid (recorded at spawn, so still known after it is reaped).

@@ -44,7 +44,7 @@ use freshell_containment::{StopHandle, StopMode, StopReason};
 mod lost_port;
 use lost_port::{
     plan_retrying_a_lost_port, ready_attempt, ready_retrying_a_lost_port, retrying_a_lost_port,
-    LOST_PORT, LOST_PORT_ATTEMPTS,
+    spawn_on_its_own_port, LOST_PORT, LOST_PORT_ATTEMPTS,
 };
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1560,7 +1560,7 @@ async fn plan_retry_spawns_fresh_after_claimed_reattach_ensure_ready_fails() {
     // the sweep's empty check) covers the whole host. A fixed id would be
     // shared with the survivor of a concurrent run of this test.
     let survivor_ownership = &mint_ownership_id();
-    let fixture = &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs");
     let bind_unused_ws_url = || {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -1568,47 +1568,19 @@ async fn plan_retry_spawns_fresh_after_claimed_reattach_ensure_ready_fails() {
         drop(listener);
         format!("ws://127.0.0.1:{port}")
     };
-    // Its port is chosen and released here, so a lost port (the fixture has
-    // already exited 98) is retried on a new one.
-    let mut survivor = retrying_a_lost_port(
-        "spawn this test's own fake app-server",
-        move || async move {
-            let listen_ws_url = bind_unused_ws_url();
-            let mut survivor = tokio::process::Command::new("node")
-                .arg(fixture)
-                .arg("--listen")
-                .arg(&listen_ws_url)
-                .env(CODEX_SIDECAR_OWNERSHIP_ENV, survivor_ownership)
-                .env("CODEX_HOME", isolated_codex_home())
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .kill_on_drop(true)
-                .spawn()
-                .expect("spawn this test's own fake app-server");
-            // Wait for the WS listener: by then exec has long completed, so the
-            // /proc evidence captured below is really the fixture's (no
-            // post-fork/pre-exec cmdline flake).
-            let listen_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-            loop {
-                if let Ok(Ok((probe, _response))) =
-                    timeout(Duration::from_secs(1), connect_async(&listen_ws_url)).await
-                {
-                    drop(probe);
-                    return Ok(survivor);
-                }
-                if let Ok(Some(status)) = survivor.try_wait() {
-                    return Err(format!("fake app-server exited before listening: {status}"));
-                }
-                assert!(
-                    tokio::time::Instant::now() < listen_deadline,
-                    "fake app-server WS never came up"
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        },
-    )
-    .await;
+    // On a port the kernel gives it as it binds (no other socket can take it
+    // first). It reports the port once it listens: by then exec has long
+    // completed, so the /proc evidence captured below is really the
+    // fixture's (no post-fork/pre-exec cmdline flake).
+    let mut fake = tokio::process::Command::new("node");
+    fake.arg(&fixture)
+        .env(CODEX_SIDECAR_OWNERSHIP_ENV, survivor_ownership)
+        .env("CODEX_HOME", isolated_codex_home())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let (mut survivor, _port) = spawn_on_its_own_port(fake).await;
     let survivor_pid = survivor.id().expect("live fixture pid");
 
     // The record: the fixture's REAL /proc evidence (claim-time

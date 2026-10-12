@@ -1139,28 +1139,58 @@ async fn signals_carry_the_unit_record_state_and_wedge_knobs_hold() {
 #[tokio::test(flavor = "multi_thread")]
 async fn listen_delay_holds_off_the_listener() {
     let home = tempfile::tempdir().unwrap();
-    // Started on a port it may lose when the delay ends (a new fake then
-    // starts on a new port), so the check runs per start.
-    let home = home.path();
-    let (fake, t0) =
-        lost_port::retrying_a_lost_port("the delayed fake listens", move || async move {
-            let t0 = Instant::now();
-            let mut fake = FakeAppServer::spawn_on_port(
-                unique_free_port(),
-                json!({"listenDelayMs": 1500}),
-                home,
-                &[],
-            )
+    let t0 = Instant::now();
+    // On a port of its own: it binds no port at all until it listens.
+    let mut fake =
+        FakeAppServer::spawn_on_its_own_port(json!({"listenDelayMs": 1500}), home.path(), &[])
             .await;
-            assert!(
-                std::net::TcpStream::connect(("127.0.0.1", fake.port)).is_err(),
-                "nothing listens while listenDelayMs runs"
-            );
-            fake.listened().await.map(|()| (fake, t0))
-        })
-        .await;
-    let _rpc = connected(fake.port).await;
+    let native = fake.native().await;
+    assert!(
+        listening_sockets_of(native.pid).is_empty(),
+        "nothing listens while listenDelayMs runs"
+    );
+    assert!(!native.listening, "nor does the native say it listens");
+    fake.listened().await.expect("the native listens");
     assert!(t0.elapsed() >= Duration::from_millis(1500));
+    assert_eq!(
+        listening_sockets_of(native.pid),
+        [fake.port],
+        "then it listens on the port it reported"
+    );
+    let _rpc = connected(fake.port).await;
+}
+
+/// The local ports of the TCP sockets `pid` holds that are listening (Linux:
+/// its socket descriptors matched against `/proc/net/tcp{,6}`).
+fn listening_sockets_of(pid: u32) -> Vec<u16> {
+    let inodes: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|fd| std::fs::read_link(fd.path()).ok())
+        .filter_map(|target| {
+            let target = target.to_string_lossy();
+            Some(
+                target
+                    .strip_prefix("socket:[")?
+                    .strip_suffix(']')?
+                    .to_string(),
+            )
+        })
+        .collect();
+    let mut ports = Vec::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let raw = std::fs::read_to_string(table).unwrap_or_default();
+        for line in raw.lines().skip(1) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            // Field 3 is the state (0A: LISTEN), field 9 the socket's inode.
+            if f.len() > 9 && f[3] == "0A" && inodes.iter().any(|inode| inode == f[9]) {
+                let port = f[1].rsplit(':').next().unwrap_or_default();
+                ports.extend(u16::from_str_radix(port, 16).ok());
+            }
+        }
+    }
+    ports
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1408,10 +1438,9 @@ async fn the_native_refuses_to_run_without_an_explicit_codex_home() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_single_process_fake_refuses_the_real_users_codex_home() {
     use tokio::io::AsyncReadExt;
-    let spawn = |home: Option<&Path>, port: u16| {
+    let command = |home: Option<&Path>| {
         let mut cmd = tokio::process::Command::new("node");
         cmd.arg(fixture_path("fake-app-server.mjs"))
-            .args(["--listen", &format!("ws://127.0.0.1:{port}")])
             .env_remove("CODEX_HOME")
             .env_remove("HOME")
             .stdin(std::process::Stdio::null())
@@ -1421,10 +1450,16 @@ async fn the_single_process_fake_refuses_the_real_users_codex_home() {
         if let Some(home) = home {
             cmd.env("HOME", home);
         }
-        cmd.spawn().expect("spawn the single-process fake")
+        cmd
     };
 
-    let mut refused = spawn(None, unique_free_port());
+    let mut refused = command(None)
+        .args([
+            "--listen",
+            &format!("ws://127.0.0.1:{}", unique_free_port()),
+        ])
+        .spawn()
+        .expect("spawn the single-process fake");
     let mut stderr = refused.stderr.take().expect("the fake's stderr");
     let status = tokio::time::timeout(Duration::from_secs(5), refused.wait())
         .await
@@ -1438,9 +1473,10 @@ async fn the_single_process_fake_refuses_the_real_users_codex_home() {
         "{text}"
     );
 
+    // This one listens: on a port the kernel gives it as it binds, which no
+    // other socket can take first.
     let home = tempfile::tempdir().unwrap();
-    let port = unique_free_port();
-    let mut isolated = spawn(Some(home.path()), port);
+    let (mut isolated, port) = lost_port::spawn_on_its_own_port(command(Some(home.path()))).await;
     let mut rpc = Rpc::connect(port).await;
     let ready = rpc
         .call(

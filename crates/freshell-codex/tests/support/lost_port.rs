@@ -6,10 +6,12 @@
 //! (`fake-app-server.mjs` `listen()`). The product's planner retries such a
 //! start (`plan_create_with_retry`); a test that starts the app-server with a
 //! single attempt retries it through these helpers. Every other start failure
-//! fails the test at once. (A test that spawns the fake itself lets the fake
-//! choose its port instead: `FAKE_CODEX_APP_SERVER_PORT_FILE`.)
+//! fails the test at once. A test that starts the fake itself avoids the race
+//! altogether: the fake binds a port the kernel chooses and reports it
+//! ([`spawn_on_its_own_port`], `FAKE_CODEX_APP_SERVER_PORT_FILE`).
 #![allow(dead_code)]
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,6 +21,9 @@ use freshell_codex::launch_lifecycle::{
 };
 use freshell_codex::launch_plan::CodexLaunchPlanInput;
 use freshell_containment::{StopMode, StopReason, StopRequest};
+
+/// Where a fake told to listen on port 0 reports the port it was given.
+pub const PORT_FILE_ENV: &str = "FAKE_CODEX_APP_SERVER_PORT_FILE";
 
 /// What a start of the fake app-server returns when the fake lost its port.
 pub const LOST_PORT: &str = "exited before listening: exit status: 98";
@@ -129,4 +134,43 @@ pub async fn plan_retrying_a_lost_port(
         manager.plan_create_with_retry_uncancellable(input, 1, LaunchClass::Interactive)
     })
     .await
+}
+
+/// Starts the single-process fake app-server `fake` (`node
+/// fake-app-server.mjs` with its other arguments) on a port the kernel
+/// chooses as the fake binds it (`--listen ws://127.0.0.1:0` and a port
+/// file), and returns it with that port once it listens. No other socket can
+/// take the port first. Panics when the fake exits first or reports nothing
+/// within 30 s.
+pub async fn spawn_on_its_own_port(
+    mut fake: tokio::process::Command,
+) -> (tokio::process::Child, u16) {
+    let port_file = tempfile::NamedTempFile::new().expect("a port file for the fake app-server");
+    fake.args(["--listen", "ws://127.0.0.1:0"])
+        .env(PORT_FILE_ENV, port_file.path());
+    let mut child = fake.spawn().expect("spawn the fake app-server");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(port) = reported_port(port_file.path()) {
+            return (child, port);
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("the fake app-server exited before it listened: {status}");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the fake app-server never reported the port it listens on"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The port a fake wrote to `port_file` once it listened (`<port>\n`;
+/// nothing before).
+pub fn reported_port(port_file: &Path) -> Option<u16> {
+    let raw = std::fs::read_to_string(port_file).ok()?;
+    raw.strip_suffix('\n')?
+        .parse()
+        .ok()
+        .filter(|port| *port != 0)
 }
