@@ -1,16 +1,118 @@
-const secondsPerYear = 365.2422 * 24 * 60 * 60
+const secondsPerDay = 24 * 60 * 60
+const daysPerYear = 365.2422
+const secondsPerYear = daysPerYear * secondsPerDay
+const secondsPerMonth = secondsPerYear / 12
 const maxWaitSeconds = Number.MAX_SAFE_INTEGER - 300
+
+function roundHalfEven(value, places = 4) {
+  const scale = 10 ** places
+  const scaled = value * scale
+  if (!Number.isFinite(scaled)) return value
+
+  const sign = Math.sign(scaled)
+  const absolute = Math.abs(scaled)
+  const whole = Math.floor(absolute)
+  const fraction = absolute - whole
+  let rounded
+  if (fraction < 0.5) {
+    rounded = whole
+  } else if (fraction > 0.5 || whole % 2 === 1) {
+    rounded = whole + 1
+  } else {
+    rounded = whole
+  }
+  return sign * rounded / scale
+}
+
+function percolate(value) {
+  const whole = Math.trunc(value)
+  const fraction = roundHalfEven(roundHalfEven(value) - whole)
+  return [whole, fraction]
+}
+
+function normalizeGcloudDuration(parts) {
+  let [years, yearsFraction] = percolate(parts.years)
+  let days = parts.days + daysPerYear * yearsFraction
+
+  let [months, monthsFraction] = percolate(parts.months)
+  days += Math.trunc(daysPerYear * monthsFraction / 12)
+
+  let [wholeDays, daysFraction] = percolate(days)
+  let hours = parts.hours + 24 * daysFraction
+  let [wholeHours, hoursFraction] = percolate(hours)
+  let minutes = parts.minutes + 60 * hoursFraction
+  let [wholeMinutes, minutesFraction] = percolate(minutes)
+  let seconds = parts.seconds + 60 * minutesFraction
+  let [wholeSeconds, secondsFraction] = percolate(seconds)
+  let microseconds = Math.trunc(1_000_000 * secondsFraction)
+
+  let totalSeconds = 0
+  let carry = Math.trunc(microseconds / 1_000_000)
+  microseconds -= carry * 1_000_000
+  totalSeconds += microseconds / 1_000_000
+  wholeSeconds += carry
+
+  carry = Math.trunc(wholeSeconds / 60)
+  wholeSeconds -= carry * 60
+  totalSeconds += wholeSeconds
+  wholeMinutes += carry
+
+  carry = Math.trunc(wholeMinutes / 60)
+  wholeMinutes -= carry * 60
+  totalSeconds += wholeMinutes * 60
+  wholeHours += carry
+
+  if (wholeDays || months || years) {
+    carry = Math.trunc(wholeHours / 24)
+    wholeHours -= carry * 24
+    totalSeconds += wholeHours * 60 * 60
+    wholeDays += carry
+
+    if (wholeDays >= 366) {
+      wholeDays -= 366
+      years += 1
+    } else if (wholeDays <= -366) {
+      wholeDays += 366
+      years -= 1
+    }
+    carry = Math.trunc(wholeDays / daysPerYear)
+    wholeDays -= Math.trunc(carry * daysPerYear)
+    totalSeconds += wholeDays * secondsPerDay
+    years += carry
+
+    carry = Math.trunc(months / 12)
+    months -= carry * 12
+    totalSeconds += months * secondsPerMonth
+    years += carry
+    totalSeconds += years * secondsPerYear
+    totalSeconds = roundHalfEven(totalSeconds, 0) + microseconds / 1_000_000
+  } else {
+    totalSeconds += wholeHours * 60 * 60
+  }
+
+  return totalSeconds
+}
+
+function validatedSeconds(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 1 || seconds > maxWaitSeconds) {
+    throw new Error('duration is outside the supported wait range')
+  }
+  return Math.ceil(seconds)
+}
 
 function parseCloudDurationSeconds(value) {
   if (typeof value !== 'string' || value.length === 0) {
     throw new Error('duration is required')
   }
 
-  const original = value.toUpperCase()
-  if (/^[+-]?\d+$/.test(original)) {
-    return validatedSeconds(Number(original))
+  // gcloud's Duration parser first tries Python int(), which accepts surrounding
+  // whitespace and underscores, and treats that value as seconds.
+  const bareInteger = value.trim()
+  if (/^[+-]?[0-9]+(?:_[0-9]+)*$/.test(bareInteger)) {
+    return validatedSeconds(Number(bareInteger.replaceAll('_', '')))
   }
 
+  const original = value.toUpperCase()
   let duration = original
   let sign = 1
   if (duration.startsWith('-')) {
@@ -19,6 +121,7 @@ function parseCloudDurationSeconds(value) {
   } else if (duration.startsWith('+')) {
     duration = duration.slice(1)
   }
+  if (sign < 0) throw new Error('negative durations are below Cloud Run\'s minimum')
 
   let timeSeparatorSeen = false
   let timePartImplied = false
@@ -28,8 +131,8 @@ function parseCloudDurationSeconds(value) {
     timePartImplied = true
   }
 
+  const parts = { years: 0, months: 0, days: 0, hours: 0, minutes: 0, seconds: 0 }
   let amount = ''
-  let seconds = 0
   for (let index = 0; index < duration.length; index += 1) {
     const character = duration[index]
     if (/[0-9]/.test(character)) {
@@ -48,7 +151,7 @@ function parseCloudDurationSeconds(value) {
     }
     if (amount.length === 0) throw new Error('duration unit has no preceding number')
 
-    const component = Number(amount) * sign
+    const component = Number(amount)
     if (!Number.isFinite(component)) throw new Error('duration component is out of range')
     amount = ''
 
@@ -56,35 +159,35 @@ function parseCloudDurationSeconds(value) {
       && index + 2 === duration.length
       && duration[index + 1] === 'S') {
       const divisor = character === 'M' ? 1_000 : character === 'U' ? 1_000_000 : 1_000_000_000
-      seconds += component / divisor
+      parts.seconds += component / divisor
       index += 1
       continue
     }
 
     switch (character) {
       case 'Y':
-        seconds += component * secondsPerYear
+        parts.years += component
         break
       case 'W':
-        seconds += component * 7 * 24 * 60 * 60
+        parts.days += component * 7
         break
       case 'D':
-        seconds += component * 24 * 60 * 60
+        parts.days += component
         break
       case 'H':
-        seconds += component * 60 * 60
+        parts.hours += component
         timePartImplied = true
         break
       case 'M':
         if (timePartImplied) {
-          seconds += component * 60
+          parts.minutes += component
         } else {
-          seconds += component * (secondsPerYear / 12)
+          parts.months += component
           timePartImplied = true
         }
         break
       case 'S':
-        seconds += component
+        parts.seconds += component
         timePartImplied = true
         break
       default:
@@ -97,14 +200,7 @@ function parseCloudDurationSeconds(value) {
     throw new Error('duration must end with a unit')
   }
 
-  return validatedSeconds(Math.round(seconds * 10_000) / 10_000)
-}
-
-function validatedSeconds(seconds) {
-  if (!Number.isFinite(seconds) || seconds < 1 || seconds > maxWaitSeconds) {
-    throw new Error('duration is outside the supported wait range')
-  }
-  return Math.ceil(seconds)
+  return validatedSeconds(normalizeGcloudDuration(parts))
 }
 
 try {

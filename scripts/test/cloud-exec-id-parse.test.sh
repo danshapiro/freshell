@@ -127,12 +127,31 @@ check_duration() {
   [[ "$actual" == "$expected" ]]
 }
 
+check_duration_rejected() {
+  local input="$1"
+  ! node "$ROOT/scripts/e2e-cloud-duration.mjs" "$input" >/dev/null 2>&1
+}
+
 check "cloud timeout parser accepts decimal hours" check_duration "1.5h" "5400"
 check "cloud timeout parser rounds a fractional mixed duration up to whole seconds" \
   check_duration "1m30.5s" "91"
+check "cloud timeout parser preserves gcloud's rounded one-second minimum" \
+  check_duration "PT0.99995S" "1"
 check "cloud timeout parser accepts ISO time durations" check_duration "PT1H" "3600"
 check "cloud timeout parser accepts ISO day and time durations" check_duration "P1DT2H" "93600"
+check "cloud timeout parser matches gcloud fractional-year normalization" \
+  check_duration "P0.00016Y" "6308"
+check "cloud timeout parser matches gcloud fractional-month normalization" \
+  check_duration "P0.1M" "259200"
+check "cloud timeout parser rounds gcloud fractional-day normalization up safely" \
+  check_duration "P0.00016D" "18"
+check "cloud timeout parser rounds gcloud fractional-week normalization up safely" \
+  check_duration "P0.00016W" "96"
 check "cloud timeout parser treats a bare integer as seconds" check_duration "60" "60"
+check "cloud timeout parser accepts whitespace around a bare integer" \
+  check_duration " 60 " "60"
+check "cloud timeout parser rejects calendar fractions that normalize below gcloud's minimum" \
+  check_duration_rejected "P0.001M"
 
 check_rejected_timeout_before_job() {
   local duration="$1" output
@@ -155,6 +174,8 @@ check "cloud timeout parser rejects values below gcloud's one-second minimum bef
   check_rejected_timeout_before_job "0.5s"
 check "cloud timeout parser rejects durations beyond the safe wait bound before creating a job" \
   check_rejected_timeout_before_job "999999999999999999999999999999999999999s"
+check "cloud timeout parser rejects calendar fractions below gcloud's minimum before creating a job" \
+  check_rejected_timeout_before_job "P0.001M"
 
 : > "$FAKE_LOG"
 VALID_DECIMAL_OUT=$(bash "$ROOT/scripts/e2e-cloud.sh" run --cloud --shards=1 --timeout=1.5h 2>&1) && VALID_DECIMAL_RC=0 || VALID_DECIMAL_RC=$?
