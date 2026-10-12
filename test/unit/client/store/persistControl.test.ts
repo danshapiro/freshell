@@ -15,6 +15,7 @@ import {
   getCanonicalDurableSessionId,
   getPreferredResumeSessionId,
 } from '@/store/persistControl'
+import { parsePersistedLayoutRaw } from '@/store/persistedState'
 import tabsReducer, { addTab, updateTab } from '@/store/tabsSlice'
 
 const WINDOW_ID = 'client-persist-control-tests'
@@ -62,6 +63,56 @@ describe('persistControl', () => {
     const raw = localStorage.getItem(OWN_LAYOUT_KEY)
     expect(raw).not.toBeNull()
     expect(JSON.parse(raw!).tabs.tabs[0].title).toBe('Renamed')
+  })
+
+  it('persists settled checkpoint outcomes and restores their bounded whitelist', () => {
+    const store = configureStore({
+      reducer: {
+        freshAgent: freshAgentReducer,
+        tabs: tabsReducer,
+        panes: panesReducer,
+      },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+    })
+
+    store.dispatch(addTab({ id: 'tab-1', title: 'Checkpoint test', mode: 'freshclaude' }))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'create-1',
+        status: 'running',
+        checkpointOutcomes: [{
+          conversationRequestId: 'create-1',
+          requestId: 'send-1',
+          displayTurnId: 'turn-4:row-0',
+          nativeTurnId: 'native-user-4',
+          status: 'unavailable',
+          code: 'checkpoint_path_unreadable',
+          reason: 'A selected file could not be read.',
+          outgoingText: 'never persist this prompt',
+        }],
+      } as never,
+    }))
+    store.dispatch(flushPersistedLayoutNow())
+
+    const raw = localStorage.getItem(OWN_LAYOUT_KEY)
+    expect(raw).not.toBeNull()
+    const parsed = parsePersistedLayoutRaw(raw!)!
+    const savedContent = (parsed.panes.layouts['tab-1'] as any).content
+    expect(savedContent.checkpointOutcomes).toEqual([{
+      conversationRequestId: 'create-1',
+      requestId: 'send-1',
+      displayTurnId: 'turn-4:row-0',
+      nativeTurnId: 'native-user-4',
+      status: 'unavailable',
+      code: 'checkpoint_path_unreadable',
+      reason: 'A selected file could not be read.',
+    }])
+    expect(raw).not.toContain('never persist this prompt')
   })
 
   it('does not force immediate flush for unrelated session updates', () => {

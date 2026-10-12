@@ -67,6 +67,104 @@ export function normalizeFreshAgentEffortOverride(value: unknown): string | unde
   return trimmed.length > 0 ? trimmed : undefined
 }
 
+export type FreshAgentCheckpointOutcome = {
+  /** Conversation generation; changes only when the pane is deliberately replaced. */
+  conversationRequestId?: string
+  requestId: string
+  displayTurnId?: string
+  nativeTurnId?: string
+  status: 'available' | 'unavailable'
+  checkpointId?: string
+  workspace?: FreshAgentCheckpointWorkspace
+  code?: string
+  reason?: string
+}
+
+const FRESH_AGENT_CHECKPOINT_OUTCOME_LIMIT = 200
+
+function checkpointOutcomeString(value: unknown, maxLength: number): string | undefined {
+  if (typeof value !== 'string' || value.length === 0 || value.length > maxLength) return undefined
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(value)) return undefined
+  return value
+}
+
+function checkpointOutcomeReason(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const normalized = value
+    .replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 240)
+  return normalized || undefined
+}
+
+function checkpointOutcomeWorkspace(value: unknown): FreshAgentCheckpointWorkspace | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const candidate = value as Record<string, unknown>
+  const path = checkpointOutcomeString(candidate.path, 4096)
+  if (!path) return undefined
+  if (candidate.provenance !== 'directory-picker'
+    && candidate.provenance !== 'resolved-project'
+    && candidate.provenance !== 'legacy-checkpoint') return undefined
+  return { path, provenance: candidate.provenance }
+}
+
+/**
+ * Persist only a bounded record of settled checkpoint availability. The
+ * whitelist deliberately excludes the submitted prompt and provider payloads.
+ */
+export function normalizeFreshAgentCheckpointOutcomes(
+  value: unknown,
+  conversationRequestId?: string,
+): FreshAgentCheckpointOutcome[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const byRequest = new Map<string, FreshAgentCheckpointOutcome>()
+  for (const candidate of value) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue
+    const record = candidate as Record<string, unknown>
+    const requestId = checkpointOutcomeString(record.requestId, 128)
+    if (!requestId || !/^[A-Za-z0-9_.:-]+$/.test(requestId)) continue
+    const recordConversationRequestId = record.conversationRequestId === undefined
+      ? undefined
+      : checkpointOutcomeString(record.conversationRequestId, 128)
+    if (record.conversationRequestId !== undefined
+      && (!recordConversationRequestId || !/^[A-Za-z0-9_.:-]+$/.test(recordConversationRequestId))) continue
+    if (conversationRequestId && recordConversationRequestId
+      && recordConversationRequestId !== conversationRequestId) continue
+    if (record.status !== 'available' && record.status !== 'unavailable') continue
+
+    const displayTurnId = checkpointOutcomeString(record.displayTurnId, 256)
+    const nativeTurnId = checkpointOutcomeString(record.nativeTurnId, 256)
+    const checkpointId = checkpointOutcomeString(record.checkpointId, 256)
+    const workspace = checkpointOutcomeWorkspace(record.workspace)
+    const code = typeof record.code === 'string'
+      && record.code.length <= 96
+      && /^[a-z0-9_.:-]+$/.test(record.code)
+      ? record.code
+      : undefined
+    const reason = checkpointOutcomeReason(record.reason)
+
+    if (record.status === 'available' && !checkpointId) continue
+    if (record.status === 'unavailable' && !code && !reason) continue
+
+    byRequest.delete(requestId)
+    byRequest.set(requestId, {
+      requestId,
+      ...(recordConversationRequestId ? { conversationRequestId: recordConversationRequestId } : {}),
+      ...(displayTurnId ? { displayTurnId } : {}),
+      ...(nativeTurnId ? { nativeTurnId } : {}),
+      status: record.status,
+      ...(checkpointId ? { checkpointId } : {}),
+      ...(workspace ? { workspace } : {}),
+      ...(code ? { code } : {}),
+      ...(reason ? { reason } : {}),
+    })
+  }
+  const normalized = [...byRequest.values()].slice(-FRESH_AGENT_CHECKPOINT_OUTCOME_LIMIT)
+  return normalized.length > 0 ? normalized : undefined
+}
+
 export function normalizeFreshAgentModelEffortLevels(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) {
     return undefined
@@ -357,6 +455,10 @@ export type FreshAgentPaneContent = {
   /** Explicit restore failure when no canonical durable target exists. */
   restoreError?: RestoreError
   initialCwd?: string
+  /** Independently selected code scope for per-turn rewind checkpoints. */
+  checkpointWorkspace?: FreshAgentCheckpointWorkspace
+  /** Bounded settled per-turn rewind availability; prompt text is never stored here. */
+  checkpointOutcomes?: FreshAgentCheckpointOutcome[]
   createError?: FreshAgentCreateError
   /** Volatile close failure, shown in the pane's dismissible yellow error banner. */
   closeError?: string
@@ -413,6 +515,11 @@ export type ExtensionPaneContent = {
   kind: 'extension'
   extensionName: string
   props: Record<string, unknown>
+}
+
+export type FreshAgentCheckpointWorkspace = {
+  path: string
+  provenance: 'directory-picker' | 'resolved-project' | 'legacy-checkpoint'
 }
 
 /**

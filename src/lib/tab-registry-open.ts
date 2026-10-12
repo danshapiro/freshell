@@ -23,6 +23,7 @@ import {
 import {
   normalizeFreshAgentEffortOverride,
   normalizeFreshAgentModelSelection,
+  type FreshAgentCheckpointWorkspace,
   type PaneContentInput,
   type SessionLocator,
 } from '@/store/paneTypes'
@@ -161,6 +162,7 @@ export function sanitizePaneSnapshot(
       ...(restoreError && !sessionRef ? { restoreError } : {}),
       serverInstanceId: record.serverInstanceId,
       initialCwd: payload.initialCwd as string | undefined,
+      checkpointWorkspace: payload.checkpointWorkspace as FreshAgentCheckpointWorkspace | undefined,
       model: payload.model as string | undefined,
       modelSelection: normalizeFreshAgentModelSelection(payload.modelSelection, payload.model),
       permissionMode: payload.permissionMode as string | undefined,

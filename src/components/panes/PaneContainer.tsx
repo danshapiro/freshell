@@ -689,7 +689,11 @@ function PickerWrapper({
     return (freshAgentProviderConfig ? freshAgentProviderConfig.codingCliProvider : providerType) as CodingCliProviderName
   }, [])
 
-  const createContentForType = useCallback((type: PanePickerType, cwd?: string): PaneContent => {
+  const createContentForType = useCallback((
+    type: PanePickerType,
+    cwd?: string,
+    checkpointWorkspace?: { path: string; provenance: 'directory-picker' },
+  ): PaneContent => {
     if (typeof type === 'string' && type.startsWith('ext:')) {
       const extensionName = type.slice(4)
       return {
@@ -755,6 +759,7 @@ function PickerWrapper({
         plugins: freshAgentType.runtimeProvider === 'claude' ? freshAgentSettings?.defaultPlugins : undefined,
         style: providerSettings?.style ?? DEFAULT_FRESH_AGENT_STYLE,
         ...(cwd ? { initialCwd: cwd } : {}),
+        ...(checkpointWorkspace ? { checkpointWorkspace } : {}),
       }
     }
 
@@ -841,11 +846,14 @@ function PickerWrapper({
     dispatch(updatePaneContent({ tabId, paneId, content: newContent }))
   }, [createContentForType, dispatch, tabId, paneId, extensionEntries])
 
-  const handleDirectoryConfirm = useCallback((cwd: string) => {
+  const handleDirectoryConfirm = useCallback((
+    cwd: string,
+    checkpointWorkspace?: { path: string; provenance: 'directory-picker' },
+  ) => {
     if (step.step !== 'directory') return
 
     const providerType = step.providerType
-    const newContent = createContentForType(providerType, cwd)
+    const newContent = createContentForType(providerType, cwd, checkpointWorkspace)
     dispatch(updatePaneContent({ tabId, paneId, content: newContent }))
 
     // Save the selected directory for the provider

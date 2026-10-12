@@ -2,6 +2,7 @@ import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import { nanoid } from 'nanoid'
 import {
   normalizeFreshAgentEffortOverride,
+  normalizeFreshAgentCheckpointOutcomes,
   normalizeFreshAgentModelEffortLevels,
   normalizeFreshAgentModelSelection,
   normalizeFreshAgentPendingLocalEcho,
@@ -9,6 +10,8 @@ import {
   normalizeLaunchFailure,
   type DeadSessionEntry,
   type CrashTrace,
+  type FreshAgentCheckpointWorkspace,
+  type FreshAgentCheckpointOutcome,
   type FreshAgentPaneContent,
   type HandoffError,
   type LaunchFailure,
@@ -70,6 +73,23 @@ function normalizeManagedRuntimeProjection(
   return Object.fromEntries(
     Object.entries(parsed.data).filter(([, value]) => value !== undefined),
   ) as ManagedRuntimeProjectionFields
+}
+
+function normalizeCheckpointWorkspace(value: unknown): FreshAgentCheckpointWorkspace | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const candidate = value as Record<string, unknown>
+  if (typeof candidate.path !== 'string' || candidate.path.length === 0) return undefined
+  if (candidate.provenance !== 'directory-picker'
+    && candidate.provenance !== 'resolved-project'
+    && candidate.provenance !== 'legacy-checkpoint') return undefined
+  return { path: candidate.path, provenance: candidate.provenance }
+}
+
+function normalizeCheckpointOutcomes(
+  value: unknown,
+  conversationRequestId?: string,
+): FreshAgentCheckpointOutcome[] | undefined {
+  return normalizeFreshAgentCheckpointOutcomes(value, conversationRequestId)
 }
 
 function buildPreservedSessionRef(
@@ -176,6 +196,15 @@ function normalizePaneContent(
     const pendingLocalEcho = normalizeFreshAgentPendingLocalEcho(rawFreshAgent.pendingLocalEcho)
     const modelEffortLevels = normalizeFreshAgentModelEffortLevels(rawFreshAgent.modelEffortLevels)
     const freshHandoffError = normalizeHandoffError(rawFreshAgent.handoffError)
+    const checkpointWorkspace = normalizeCheckpointWorkspace(rawFreshAgent.checkpointWorkspace)
+    const outcomeConversationRequestId = typeof rawFreshAgent.createRequestId === 'string'
+      && rawFreshAgent.createRequestId
+      ? rawFreshAgent.createRequestId
+      : previousCreateRequestId
+    const checkpointOutcomes = normalizeCheckpointOutcomes(
+      rawFreshAgent.checkpointOutcomes,
+      outcomeConversationRequestId,
+    )
     const closeError = typeof input.closeError === 'string' ? input.closeError : undefined
     const rawModelLabel = rawFreshAgent.modelLabel
     const modelLabel =
@@ -229,6 +258,8 @@ function normalizePaneContent(
           serverInstanceId: typeof input.serverInstanceId === 'string' ? input.serverInstanceId : undefined,
           restoreError: existingRestoreError,
           initialCwd: input.initialCwd,
+          ...(checkpointWorkspace ? { checkpointWorkspace } : {}),
+          ...(checkpointOutcomes ? { checkpointOutcomes } : {}),
           createError: input.createError,
           closeError,
           modelSelection: normalizeFreshAgentModelSelection(
@@ -314,6 +345,8 @@ function normalizePaneContent(
       serverInstanceId: typeof input.serverInstanceId === 'string' ? input.serverInstanceId : undefined,
       ...('restoreError' in durableState && durableState.restoreError ? { restoreError: durableState.restoreError } : {}),
       initialCwd: input.initialCwd,
+      ...(checkpointWorkspace ? { checkpointWorkspace } : {}),
+      ...(checkpointOutcomes ? { checkpointOutcomes } : {}),
       createError: input.createError,
       modelSelection: normalizeFreshAgentModelSelection(
         (input as { modelSelection?: unknown }).modelSelection,

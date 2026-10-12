@@ -7,7 +7,11 @@ import { getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import type { FreshAgentProviderName, FreshAgentProviderSettings } from '@/lib/fresh-agent-provider-types'
 import type { CodingCliProviderName } from '@/store/types'
-import type { FreshAgentPaneInput, TerminalPaneInput } from '@/store/paneTypes'
+import type {
+  FreshAgentCheckpointWorkspace,
+  FreshAgentPaneInput,
+  TerminalPaneInput,
+} from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import {
   getPairedPublicSessionType,
@@ -190,6 +194,7 @@ export function buildResumeContent(opts: {
   sessionType: string
   sessionId: string
   cwd?: string
+  checkpointWorkspace?: FreshAgentCheckpointWorkspace
   freshAgentProviderSettings?: FreshAgentProviderSettings
   liveTerminal?: {
     terminalId: string
@@ -213,6 +218,7 @@ export function buildResumeContent(opts: {
         sessionId: opts.sessionId,
       },
       initialCwd: opts.cwd,
+      ...(opts.checkpointWorkspace ? { checkpointWorkspace: opts.checkpointWorkspace } : {}),
       modelSelection: ps?.modelSelection,
       model: freshAgentType.defaultModel,
       ...(permissionMode ? { permissionMode } : {}),
@@ -233,6 +239,7 @@ export function buildResumeContent(opts: {
         sessionId: opts.sessionId,
       },
       initialCwd: opts.cwd,
+      ...(opts.checkpointWorkspace ? { checkpointWorkspace: opts.checkpointWorkspace } : {}),
       modelSelection: ps?.modelSelection,
       permissionMode: ps?.defaultPermissionMode ?? freshAgentProviderConfig.defaultPermissionMode,
       effort: ps?.effort,

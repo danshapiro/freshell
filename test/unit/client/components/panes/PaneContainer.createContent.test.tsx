@@ -23,8 +23,9 @@ import {
 } from '@shared/settings'
 
 // Hoist mock functions so vi.mock can reference them
-const { mockSend, mockTerminalView, saveServerSettingsPatchSpy } = vi.hoisted(() => ({
+const { mockSend, mockTerminalView, mockApiPost, saveServerSettingsPatchSpy } = vi.hoisted(() => ({
   mockSend: vi.fn(),
+  mockApiPost: vi.fn(),
   mockTerminalView: vi.fn(({ tabId, paneId }: { tabId: string; paneId: string }) => (
     <div data-testid={`terminal-${paneId}`}>Terminal for {tabId}/{paneId}</div>
   )),
@@ -41,7 +42,7 @@ vi.mock('@/lib/ws-client', () => ({
 vi.mock('@/lib/api', () => ({
   api: {
     get: vi.fn().mockResolvedValue({ directories: [] }),
-    post: vi.fn().mockResolvedValue({ valid: true, resolvedPath: '/resolved/path' }),
+    post: (...args: unknown[]) => mockApiPost(...args),
     patch: vi.fn().mockResolvedValue({}),
   },
 }))
@@ -184,6 +185,7 @@ describe('createContentForType with ext: prefix', () => {
   beforeEach(() => {
     mockSend.mockClear()
     mockTerminalView.mockClear()
+    mockApiPost.mockReset().mockResolvedValue({ valid: true, resolvedPath: '/resolved/path' })
     saveServerSettingsPatchSpy.mockClear()
     vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => {
       if (url === '/api/terminals') return { ok: true, text: async () => '[]' }
@@ -276,6 +278,11 @@ describe('createContentForType with ext: prefix', () => {
   })
 
   it('creates fresh-agent content for freshclaude selections', async () => {
+    mockApiPost.mockResolvedValueOnce({
+      valid: true,
+      resolvedPath: '/workspace/project',
+      checkpointWorkspaceEligible: true,
+    })
     const node = createPickerNode('pane-1')
     const store = createStore(
       { layouts: { 'tab-1': node }, activePane: { 'tab-1': 'pane-1' } },
@@ -311,6 +318,11 @@ describe('createContentForType with ext: prefix', () => {
         kind: 'fresh-agent',
         sessionType: 'freshclaude',
         provider: 'claude',
+        initialCwd: '/workspace/project',
+        checkpointWorkspace: {
+          path: '/workspace/project',
+          provenance: 'directory-picker',
+        },
       })
     })
   })

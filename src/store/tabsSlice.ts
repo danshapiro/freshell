@@ -5,7 +5,11 @@ import { nanoid } from 'nanoid'
 import { closePane, initLayout, restoreLayout, removeLayout, replacePane, setPaneCloseError, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle, markTabClosing, clearTabClosing, markPaneClosing, clearPaneClosing, hasAnyClosePending } from './panesSlice'
 import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
 import { updateSessionActivity } from './sessionActivitySlice'
-import type { PaneContent, PaneNode } from './paneTypes'
+import type {
+  FreshAgentCheckpointWorkspace,
+  PaneContent,
+  PaneNode,
+} from './paneTypes'
 import { findTabIdForSession, collectSessionRefsFromTabs, liveTerminalRowIdentity } from '@/lib/session-utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
 import { basenameSegment } from '@shared/path-basename'
@@ -1695,10 +1699,11 @@ export const reopenClosedTab = createAsyncThunk(
 export const openSessionTab = createAsyncThunk(
   'tabs/openSessionTab',
   async (
-    { sessionId, title, cwd, provider, sessionType, terminalId, managedRuntime, forceNew, firstUserMessage, isSubagent, isNonInteractive, hasTitle, liveTerminalOnly }: {
+    { sessionId, title, cwd, checkpointWorkspace, provider, sessionType, terminalId, managedRuntime, forceNew, firstUserMessage, isSubagent, isNonInteractive, hasTitle, liveTerminalOnly }: {
       sessionId: string
       title?: string
       cwd?: string
+      checkpointWorkspace?: FreshAgentCheckpointWorkspace
       provider?: CodingCliProviderName
       sessionType?: string
       terminalId?: string
@@ -1738,6 +1743,7 @@ export const openSessionTab = createAsyncThunk(
       sessionType: resolvedSessionType,
       sessionId,
       cwd,
+      checkpointWorkspace,
       freshAgentProviderSettings,
     })
 
