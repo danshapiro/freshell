@@ -1032,14 +1032,41 @@ mod tests {
         assert!(turn_running(&state, TERMINAL), "a helper runs a turn");
     }
 
+    /// A waker that records being woken, so a test polling a future by hand
+    /// knows the future heard an event.
+    #[derive(Default)]
+    struct WokenFlag(std::sync::atomic::AtomicBool);
+
+    impl WokenFlag {
+        /// Whether the waker was woken since the last call.
+        fn take(&self) -> bool {
+            self.0.swap(false, std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl std::task::Wake for WokenFlag {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     /// A quit decided while the table says a turn runs gives the table a
     /// grace to take the turn's end: a pane with no running turn is answered
-    /// at once; a turn end taken while waiting answers "not running" (a
-    /// change of another thread does not); none answers "still running" at
-    /// the grace (Task 17 review M3).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// at once; none answers "still running" at the grace; a change of
+    /// another thread, of this pane or another, wakes the waiter but does not
+    /// end its wait (the change signal is shared by every pane); the turn's
+    /// own end answers "not running" (Task 17 review M3, re-review R2-m1).
+    #[tokio::test]
     async fn a_running_turn_is_given_a_grace_to_end() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
         let (state, _containment) = state_with_unit();
+        let _other_pane = register_test_unit(&state, "term-other");
         let limit = Duration::from_secs(10);
         let answered = tokio::time::timeout(
             limit,
@@ -1057,21 +1084,40 @@ mod tests {
             "a turn that keeps running is waited for the whole grace"
         );
 
-        let waiting = {
-            let state = state.clone();
-            tokio::spawn(async move {
-                turn_still_running(&state, TERMINAL, Duration::from_secs(600)).await
-            })
-        };
+        // The waiter is polled by hand: its first poll subscribes it to the
+        // change signal and leaves it waiting.
+        let woken = Arc::new(WokenFlag::default());
+        let waker = Waker::from(woken.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut waiting = std::pin::pin!(turn_still_running(
+            &state,
+            TERMINAL,
+            Duration::from_secs(600)
+        ));
+        assert!(
+            waiting.as_mut().poll(&mut cx).is_pending(),
+            "a running turn is waited for"
+        );
+
+        // Other threads change: one of this pane, one of another pane.
         observe_status(&state, TERMINAL, "t-help", "active");
         observe_status(&state, TERMINAL, "t-help", "idle");
-        assert!(turn_running(&state, TERMINAL));
+        observe_status(&state, "term-other", "t-other", "active");
+        assert!(woken.take(), "the waiter hears every change");
+        assert!(
+            waiting.as_mut().poll(&mut cx).is_pending(),
+            "another thread's change does not end the wait"
+        );
+        assert!(!woken.take(), "nothing changed since");
+
+        // The turn's own end.
         observe_status(&state, TERMINAL, "t-main", "idle");
-        let answered = tokio::time::timeout(limit, waiting)
-            .await
-            .expect("the turn's end is taken while waiting")
-            .expect("the waiter");
-        assert!(!answered, "the turn ended within the grace");
+        assert!(woken.take(), "the waiter hears the turn's end");
+        assert_eq!(
+            waiting.as_mut().poll(&mut cx),
+            Poll::Ready(false),
+            "the turn ended within the grace"
+        );
     }
 
     #[tokio::test]
