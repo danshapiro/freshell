@@ -3646,12 +3646,17 @@ describe('FreshAgentView', () => {
   it('accepts a replayed checkpoint outcome after reload when it carries an exact provider row identity', async () => {
     const checkpointId = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
     const workspace = { path: '/repo/selected', provenance: 'directory-picker' as const }
-    const displayTurnId = 'codex-replayed-turn:row-0'
     const nativeTurnId = 'codex-replayed-turn'
+    // A provider may report the accepted identity while its user row is still
+    // projected under the raw turn ID. Once the assistant row arrives, Codex
+    // gives the user row the stable display key `${turnId}:row-0`.
+    const receiptDisplayTurnId = nativeTurnId
+    const renderedUserDisplayTurnId = `${nativeTurnId}:row-0`
     const row = {
-      id: displayTurnId,
-      turnId: displayTurnId,
+      id: renderedUserDisplayTurnId,
+      turnId: renderedUserDisplayTurnId,
       nativeTurnId,
+      source: 'durable' as const,
       role: 'user' as const,
       summary: 'A transcript row already stored by the provider',
       items: [{ id: 'replayed-user-text', kind: 'text' as const, text: 'A transcript row already stored by the provider' }],
@@ -3664,6 +3669,7 @@ describe('FreshAgentView', () => {
         id: 'codex-replayed-turn:row-1',
         turnId: 'codex-replayed-turn:row-1',
         nativeTurnId,
+        source: 'durable',
         role: 'user',
         summary: 'A second projection row sharing the provider turn',
         items: [{ id: 'replayed-decoy-text', kind: 'text', text: 'A second projection row sharing the provider turn' }],
@@ -3728,7 +3734,7 @@ describe('FreshAgentView', () => {
         checkpointId,
         workspace,
         nativeTurnId,
-        displayTurnId,
+        displayTurnId: receiptDisplayTurnId,
       })
     })
 
@@ -3738,12 +3744,16 @@ describe('FreshAgentView', () => {
       .toHaveTextContent('Code rewind is available for this message.')
     expect(within(exactReplayUserRows[1]!).queryByRole('status', { name: 'Code rewind available for this message' }))
       .not.toBeInTheDocument()
+    expect(within(exactReplayUserRows[1]!).getByRole('note', { name: 'Code rewind unavailable for this message' }))
+      .toHaveTextContent('No exact code checkpoint is available for this message.')
+    expect(within(exactReplayUserRows[1]!).getByRole('button', { name: 'Rewind unavailable for this message' }))
+      .toBeDisabled()
     expect(getFreshAgentPaneContent(store).checkpointOutcomes).toEqual(expect.arrayContaining([
       expect.objectContaining({
         requestId: 'request-replayed-turn',
         conversationRequestId: 'req-replayed-conversation',
         nativeTurnId,
-        displayTurnId,
+        displayTurnId: receiptDisplayTurnId,
         checkpointId,
         status: 'available',
       }),
@@ -3755,8 +3765,69 @@ describe('FreshAgentView', () => {
         <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
       </Provider>,
     )
-    expect(await screen.findByRole('status', { name: 'Code rewind available for this message' }))
+    const remountedUserRows = await screen.findAllByRole('article', { name: 'You transcript turn' })
+    expect(remountedUserRows).toHaveLength(2)
+    expect(await within(remountedUserRows[0]!).findByRole('status', { name: 'Code rewind available for this message' }))
       .toHaveTextContent('Code rewind is available for this message.')
+    expect(within(remountedUserRows[0]!).getByRole('button', { name: 'Rewind code to here' })).toBeEnabled()
+    expect(within(remountedUserRows[1]!).queryByRole('status', { name: 'Code rewind available for this message' }))
+      .not.toBeInTheDocument()
+    expect(within(remountedUserRows[1]!).getByRole('note', { name: 'Code rewind unavailable for this message' }))
+      .toHaveTextContent('No exact code checkpoint is available for this message.')
+    expect(within(remountedUserRows[1]!).getByRole('button', { name: 'Rewind unavailable for this message' }))
+      .toBeDisabled()
+  })
+
+  it('keeps an unbound modern turn unavailable instead of matching its prompt to another checkpoint', async () => {
+    const duplicatePrompt = 'Apply this repeated prompt'
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'unbound modern turn',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [{
+        id: 'modern-unbound-turn:row-0',
+        turnId: 'modern-unbound-turn:row-0',
+        nativeTurnId: 'modern-unbound-turn',
+        source: 'durable',
+        role: 'user',
+        summary: duplicatePrompt,
+        items: [{ id: 'modern-unbound-user-text', kind: 'text', text: duplicatePrompt }],
+      }],
+    })
+    apiMock.get.mockResolvedValue({ checkpoints: [{
+      id: 'cccccccccccccccccccccccccccccccc',
+      ts: 1,
+      label: duplicatePrompt,
+    }] })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-unbound-modern-conversation',
+        sessionId: 'thread-unbound-modern',
+        status: 'idle',
+        initialCwd: '/repo',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    const [userRow] = await screen.findAllByRole('article', { name: 'You transcript turn' })
+    expect(within(userRow!).getByRole('note', { name: 'Code rewind unavailable for this message' }))
+      .toHaveTextContent('No exact code checkpoint is available for this message.')
+    const rewindButton = within(userRow!).getByRole('button', { name: 'Rewind unavailable for this message' })
+    expect(rewindButton).toBeDisabled()
+    fireEvent.click(rewindButton)
+    expect(apiMock.get).not.toHaveBeenCalledWith(expect.stringContaining('/api/fresh-agent/checkpoints?'))
+    expect(apiMock.post).not.toHaveBeenCalledWith('/api/fresh-agent/checkpoints/restore', expect.anything())
   })
 
   it('uses the selected checkpoint workspace to rewind when a resumed pane has no launch cwd', async () => {

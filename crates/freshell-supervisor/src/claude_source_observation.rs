@@ -11,12 +11,16 @@ impl Supervisor {
     ) -> Result<freshell_platform::claude_inputs::observation::ObservationReply, RuntimeError> {
         request.validate()?;
         let denied = || {
-            RuntimeError::new(RuntimeErrorCode::InvalidRequest,
-            "Claude source observation requires its current creation or recovery attempt; retain inputs and reprepare")
+            RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "Claude source observation requires its current creation or recovery attempt; retain inputs and reprepare",
+            )
         };
         let unavailable = || {
-            RuntimeError::new(RuntimeErrorCode::HostUnreachable,
-            "Claude native source evidence is unavailable; retain inputs and repair the source before dispatch")
+            RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                "Claude native source evidence is unavailable; retain inputs and repair the source before dispatch",
+            )
         };
         let mut recovery = None;
         let owner = match &request.authority {
@@ -463,10 +467,14 @@ mod tests {
             .await
             .expect("nested Claude source lookup must not reacquire the held soul lifecycle lock")
             .result;
-            assert_eq!(backend.2.load(std::sync::atomic::Ordering::SeqCst),usize::from(mode!="candidate-unrecorded-prior"),"unrecorded prior inputs must block before the backend; valid provenance reaches it once");
+            assert_eq!(
+                backend.2.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(mode != "candidate-unrecorded-prior"),
+                "unrecorded prior inputs must block before the backend; valid provenance reaches it once"
+            );
             assert_eq!(
                 result.is_ok(),
-                matches!(mode,"live"|"candidate"),
+                matches!(mode, "live" | "candidate"),
                 "{mode}: changed scoped authority after IPC cannot qualify source evidence: {result:?}"
             );
             if let Err(error) = result {

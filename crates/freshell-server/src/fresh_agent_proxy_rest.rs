@@ -176,7 +176,7 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
             .map_err(|_| ())?;
         let request_id = RequestId::parse(request.request_id).map_err(|_| ())?;
         self.client
-            .fresh_agent_send(request_id, soul.clone(), request.text, None)
+            .fresh_agent_send(request_id, soul.clone(), request.text, None, None)
             .await
             .map_err(|_| ())?;
         let completed = wait_for_completion(

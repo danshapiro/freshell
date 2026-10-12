@@ -138,6 +138,10 @@ impl HostedFreshAgentProxy {
         let provider = message.provider;
         let session_id = message.session_id.clone();
         let session_type = message.session_type;
+        let checkpoint_logical_attempt_id = message
+            .checkpoint_intent
+            .as_ref()
+            .map(|intent| intent.logical_attempt_id.clone());
         if let Err(reason) = self.post_barrier_admission(&message) {
             self.error_event_code(
                 &provider,
@@ -160,7 +164,13 @@ impl HostedFreshAgentProxy {
             Some(soul) => {
                 let settings = turn_settings(message.settings, message.cwd);
                 self.client
-                    .fresh_agent_send(request_id, soul, message.text, settings)
+                    .fresh_agent_send(
+                        request_id,
+                        soul,
+                        message.text,
+                        settings,
+                        checkpoint_logical_attempt_id,
+                    )
                     .await
                     .map(|_| ())
             }

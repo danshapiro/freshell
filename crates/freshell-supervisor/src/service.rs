@@ -102,6 +102,7 @@ type ProviderPathInputBindings = HashMap<
         Option<Instant>,
     ),
 >;
+pub(crate) type LiveResumeEvidenceKey = (String, String, Option<String>);
 
 #[derive(Clone)]
 pub struct Supervisor {
@@ -112,6 +113,8 @@ pub struct Supervisor {
     /// remain independently recoverable. Stop intentionally does not take this
     /// lock: its durable intent revision must be able to preempt recovery.
     pub(crate) recovery_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// Bounds repeated provider-store probes for an unchanged live identity.
+    pub(crate) live_resume_evidence_attempts: Arc<Mutex<HashMap<LiveResumeEvidenceKey, Instant>>>,
     auth_lookup_authorities: Arc<StdMutex<HashMap<String, AuthLookupAuthority>>>,
     provider_path_inputs: Arc<StdMutex<ProviderPathInputBindings>>,
 }
@@ -160,6 +163,7 @@ impl Supervisor {
             backend,
             config: Arc::new(config),
             recovery_locks: Arc::new(Mutex::new(HashMap::new())),
+            live_resume_evidence_attempts: Arc::new(Mutex::new(HashMap::new())),
             auth_lookup_authorities: Arc::new(StdMutex::new(HashMap::new())),
             provider_path_inputs: Arc::new(StdMutex::new(HashMap::new())),
         })
@@ -505,6 +509,7 @@ impl Supervisor {
                         request.soul_id,
                         request.text,
                         request.settings,
+                        request.checkpoint_logical_attempt_id,
                     )
                     .await?;
                 Ok(AdminResult::FreshAgentCommand { state })
@@ -1451,6 +1456,7 @@ impl Supervisor {
         soul_id: SoulId,
         text: String,
         settings: Option<freshell_runtime_protocol::FreshAgentTurnSettings>,
+        checkpoint_logical_attempt_id: Option<String>,
     ) -> Result<CommandState, RuntimeError> {
         if text.len() > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES / 2 {
             return Err(RuntimeError::new(
@@ -1471,7 +1477,13 @@ impl Supervisor {
                 "soul is not a hosted fresh-agent",
             ));
         }
-        let settings_correlation = serde_json::to_vec(&settings).map_err(|_| {
+        let settings_correlation = match checkpoint_logical_attempt_id.as_deref() {
+            Some(logical_attempt_id) => {
+                serde_json::to_vec(&(settings.as_ref(), logical_attempt_id))
+            }
+            None => serde_json::to_vec(&settings),
+        }
+        .map_err(|_| {
             RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
                 "fresh-agent settings could not be correlated",
@@ -1530,6 +1542,7 @@ impl Supervisor {
                     request_id: request_id.clone(),
                     text,
                     settings,
+                    checkpoint_logical_attempt_id,
                 },
             )
             .await;

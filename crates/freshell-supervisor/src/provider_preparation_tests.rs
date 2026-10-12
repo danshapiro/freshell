@@ -21,6 +21,7 @@ struct Daemon {
     reject_inputs: bool,
     consumed_rejection: bool,
     recovery_probes: Vec<String>,
+    recovery_probe_available: bool,
 }
 struct Backend(Arc<Mutex<Daemon>>, std::path::PathBuf);
 
@@ -213,15 +214,29 @@ impl RuntimeBackend for Backend {
                         resume_spec: Some(spec),
                         ..
                     } => {
+                        let mut state = state.lock().unwrap();
                         state
-                            .lock()
-                            .unwrap()
                             .recovery_probes
                             .push(spec.provider_session.native_session_id.clone());
-                        HostResult::RecoveryProbe(RecoveryProbe::ResumeReady {
-                            evidence_revision: spec.evidence_revision,
-                            resume_spec: spec,
-                        })
+                        if state.recovery_probe_available {
+                            HostResult::RecoveryProbe(RecoveryProbe::ResumeReady {
+                                evidence_revision: spec.evidence_revision,
+                                resume_spec: spec,
+                            })
+                        } else {
+                            HostResult::RecoveryProbe(RecoveryProbe::Blocked {
+                                path: RecoveryPath::NativeResume,
+                                reason: RecoveryBlockReason::StoreUnreadable,
+                                retry_hint: RetryHint {
+                                    automatic_after_ms: None,
+                                    manual_retry: true,
+                                    repair: None,
+                                },
+                                evidence: vec![
+                                    "synthetic provider store is temporarily unavailable".into(),
+                                ],
+                            })
+                        }
                     }
                     command => panic!("unexpected synthetic host command {command:?}"),
                 };
@@ -381,7 +396,7 @@ async fn control_listener(supervisor: &Supervisor) -> tokio::task::JoinHandle<()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn live_opencode_probe_persists_resume_evidence_before_enclosure_exit() {
+async fn live_opencode_probe_coalesces_failed_evidence_reads_then_recovers_before_exit() {
     let temp = tempfile::tempdir().unwrap();
     let registry_root = temp.path().join("registry");
     let registry = Registry::open(&registry_root, None).unwrap();
@@ -402,6 +417,7 @@ async fn live_opencode_probe_persists_resume_evidence_before_enclosure_exit() {
         lifecycle_log: temp.path().join("lifecycle.jsonl"),
         admission: crate::admission::AdmissionPolicy::default(),
     };
+    let lifecycle_log = config.lifecycle_log.clone();
     let backend = Arc::new(Backend(daemon.clone(), registry_root));
     let supervisor = Supervisor::new(registry.clone(), backend.clone(), config).unwrap();
     let terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
@@ -475,6 +491,46 @@ async fn live_opencode_probe_persists_resume_evidence_before_enclosure_exit() {
 
     let live = supervisor.probe_recovery(soul.clone()).await.unwrap();
     assert!(matches!(live, RecoveryProbe::ReattachReady { .. }));
+    let after_first_probe = registry.recovery_context(soul.clone()).await.unwrap();
+    assert_eq!(
+        after_first_probe
+            .resume_spec
+            .as_ref()
+            .map(|spec| spec.provider_session.native_session_id.as_str()),
+        None,
+        "an unverified provider-store read must not become durable resume evidence"
+    );
+    assert_eq!(daemon.lock().unwrap().recovery_probes, ["ses_exact"]);
+    let count_live_resume_events = || {
+        std::fs::read_to_string(&lifecycle_log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event["event"] == "supervisor.recovery.live_resume_evidence")
+            .count()
+    };
+    assert_eq!(count_live_resume_events(), 1);
+
+    let repeated_live = supervisor.probe_recovery(soul.clone()).await.unwrap();
+    assert!(matches!(repeated_live, RecoveryProbe::ReattachReady { .. }));
+    assert_eq!(
+        daemon.lock().unwrap().recovery_probes,
+        ["ses_exact"],
+        "unchanged live identity must not repeat a failing provider-store read on every poll"
+    );
+    assert_eq!(
+        count_live_resume_events(),
+        1,
+        "unchanged failures should not append duplicate lifecycle events"
+    );
+
+    tokio::time::sleep(
+        crate::recovery::LIVE_RESUME_EVIDENCE_RETRY_INTERVAL + Duration::from_millis(25),
+    )
+    .await;
+    daemon.lock().unwrap().recovery_probe_available = true;
+    let retried_live = supervisor.probe_recovery(soul.clone()).await.unwrap();
+    assert!(matches!(retried_live, RecoveryProbe::ReattachReady { .. }));
     let durable = registry.recovery_context(soul.clone()).await.unwrap();
     assert_eq!(
         durable
@@ -482,9 +538,13 @@ async fn live_opencode_probe_persists_resume_evidence_before_enclosure_exit() {
             .as_ref()
             .map(|spec| spec.provider_session.native_session_id.as_str()),
         Some("ses_exact"),
-        "a healthy live probe must capture exact provider-store evidence before the enclosure can disappear"
+        "a later verified exact-session read must become durable resume evidence"
     );
-    assert_eq!(daemon.lock().unwrap().recovery_probes, ["ses_exact"]);
+    assert_eq!(
+        daemon.lock().unwrap().recovery_probes,
+        ["ses_exact", "ses_exact"]
+    );
+    assert_eq!(count_live_resume_events(), 2);
 
     daemon
         .lock()

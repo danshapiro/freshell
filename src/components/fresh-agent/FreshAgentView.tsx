@@ -302,19 +302,11 @@ function checkpointAvailabilityKey(scope: string, kind: 'request' | 'turn', id: 
   return `${scope}:${kind}:${id}`
 }
 
-function checkpointTurnIdentity(provider: FreshAgentPaneContent['provider'], id: string): string {
-  // Codex can split one provider turn into user and assistant display rows.
-  // Its accepted-turn id is the unsuffixed provider id, while each rendered
-  // row carries `:row-N`; match the rewind status to the user row's parent.
-  return provider === 'codex' ? id.replace(/:row-\d+$/, '') : id
-}
-
-function checkpointTurnAvailabilityKey(
-  content: FreshAgentPaneContent,
-  scope: string,
-  id: string,
-): string {
-  return checkpointAvailabilityKey(scope, 'turn', checkpointTurnIdentity(content.provider, id))
+function checkpointTurnAvailabilityKey(scope: string, id: string): string {
+  // Display row IDs and provider-native turn IDs are separate aliases. Keep
+  // display IDs exact here; the Codex row-0 transition is handled explicitly
+  // when matching an outcome to a row, so row-1 cannot inherit row-0 state.
+  return checkpointAvailabilityKey(scope, 'turn', id)
 }
 
 function checkpointAvailabilityScope(content: FreshAgentPaneContent): string {
@@ -351,10 +343,10 @@ function checkpointAvailabilityMap(content: FreshAgentPaneContent): Map<string, 
     const value = checkpointOutcomeAvailability(outcome)
     availability.set(checkpointAvailabilityKey(scope, 'request', outcome.requestId), value)
     if (outcome.displayTurnId) {
-      availability.set(checkpointTurnAvailabilityKey(content, scope, outcome.displayTurnId), value)
+      availability.set(checkpointTurnAvailabilityKey(scope, outcome.displayTurnId), value)
     }
     if (outcome.nativeTurnId) {
-      availability.set(checkpointTurnAvailabilityKey(content, scope, outcome.nativeTurnId), value)
+      availability.set(checkpointTurnAvailabilityKey(scope, outcome.nativeTurnId), value)
     }
   }
   return availability
@@ -367,18 +359,38 @@ function checkpointAvailabilityMatchesTurn(
 ): boolean {
   if (turn.role !== 'user') return false
   const displayTurnId = getFreshAgentDisplayTurnKey(turn)
-  if (availability.displayTurnId && availability.displayTurnId !== displayTurnId) return false
-  if (availability.nativeTurnId) {
-    if (turn.nativeTurnId) {
-      if (availability.nativeTurnId !== turn.nativeTurnId) return false
-    } else if (
-      checkpointTurnIdentity(provider, availability.nativeTurnId)
-      !== checkpointTurnIdentity(provider, displayTurnId)
-    ) {
-      return false
-    }
+  const nativeIdentityMatches = Boolean(
+    availability.nativeTurnId
+    && turn.nativeTurnId
+    && availability.nativeTurnId === turn.nativeTurnId,
+  )
+  if (availability.displayTurnId === displayTurnId) {
+    return !availability.nativeTurnId || !turn.nativeTurnId || nativeIdentityMatches
   }
-  return Boolean(availability.displayTurnId || availability.nativeTurnId)
+
+  if (!availability.nativeTurnId || !nativeIdentityMatches) return false
+  if (provider === 'codex') {
+    // During an in-progress Codex turn the accepted identity can arrive before
+    // transcript projection has split the native turn into row-0 (user) and
+    // row-1 (assistant). Once materialized, only row-0 represents that user
+    // message; a different row sharing the same native ID is not a match.
+    return availability.displayTurnId === availability.nativeTurnId
+      && displayTurnId === `${availability.nativeTurnId}:row-0`
+  }
+  return availability.displayTurnId === undefined
+}
+
+const MODERN_TURN_CHECKPOINT_UNAVAILABLE = 'No exact code checkpoint is available for this message.'
+
+function isModernCheckpointTurn(turn: FreshAgentTurn): boolean {
+  // Current provider snapshots mark materialized/live turns with their source;
+  // providers that expose an exact native identity are modern even when an
+  // older server omitted that source field. Older snapshots with neither keep
+  // the legacy label-based rewind path.
+  return Boolean(turn.nativeTurnId)
+    || turn.source === 'durable'
+    || turn.source === 'live'
+    || turn.source === 'server'
 }
 
 function localEchoLanded(
@@ -1090,13 +1102,13 @@ export function FreshAgentView({
         next.set(checkpointAvailabilityKey(scope, 'request', requestId), availability)
       }
       if (submittedTurnId) {
-        next.set(checkpointTurnAvailabilityKey(paneContentRef.current, scope, submittedTurnId), availability)
+        next.set(checkpointTurnAvailabilityKey(scope, submittedTurnId), availability)
       }
       if (availability.displayTurnId) {
-        next.set(checkpointTurnAvailabilityKey(paneContentRef.current, scope, availability.displayTurnId), availability)
+        next.set(checkpointTurnAvailabilityKey(scope, availability.displayTurnId), availability)
       }
       if (availability.nativeTurnId) {
-        next.set(checkpointTurnAvailabilityKey(paneContentRef.current, scope, availability.nativeTurnId), availability)
+        next.set(checkpointTurnAvailabilityKey(scope, availability.nativeTurnId), availability)
       }
       return next
     })
@@ -1136,14 +1148,14 @@ export function FreshAgentView({
     const scope = checkpointAvailabilityScope(paneContent)
     const displayTurnId = getFreshAgentDisplayTurnKey(turn)
     const turnAvailability = checkpointAvailabilityByTurn.get(
-      checkpointTurnAvailabilityKey(paneContent, scope, displayTurnId),
+      checkpointTurnAvailabilityKey(scope, displayTurnId),
     )
     if (turnAvailability && checkpointAvailabilityMatchesTurn(paneContent.provider, turnAvailability, turn)) {
       return turnAvailability
     }
     if (turn.nativeTurnId) {
       const nativeAvailability = checkpointAvailabilityByTurn.get(
-        checkpointTurnAvailabilityKey(paneContent, scope, turn.nativeTurnId),
+        checkpointTurnAvailabilityKey(scope, turn.nativeTurnId),
       )
       if (nativeAvailability && checkpointAvailabilityMatchesTurn(paneContent.provider, nativeAvailability, turn)) {
         return nativeAvailability
@@ -1155,7 +1167,11 @@ export function FreshAgentView({
   }, [checkpointAvailabilityByTurn, paneContent.createRequestId, paneContent.provider])
   const getRewindAvailability = useCallback((turn: FreshAgentTurn): FreshAgentTurnRewindAvailability | undefined => {
     const availability = getCheckpointAvailability(turn)
-    if (!availability) return undefined
+    if (!availability) {
+      return isModernCheckpointTurn(turn)
+        ? { status: 'unavailable', reason: MODERN_TURN_CHECKPOINT_UNAVAILABLE }
+        : undefined
+    }
     if (availability.status === 'unavailable') return { status: 'unavailable', reason: availability.reason }
     return { status: availability.status }
   }, [getCheckpointAvailability])
@@ -4029,6 +4045,10 @@ export function FreshAgentView({
       setNotice(`Rewind unavailable for this message: ${availability.reason}`)
       return
     }
+    if (!availability && isModernCheckpointTurn(turn)) {
+      setNotice(`Rewind unavailable for this message: ${MODERN_TURN_CHECKPOINT_UNAVAILABLE}`)
+      return
+    }
     const workspace = availability?.workspace ?? current.checkpointWorkspace
     const cwd = agentSessionCwdRef.current ?? current.initialCwd ?? workspace?.path
     if (!cwd) {
@@ -4065,7 +4085,9 @@ export function FreshAgentView({
         // without a persisted checkpoint ID.
         const checkpoint = availability?.checkpointId
           ? checkpoints.find((entry) => entry.id === availability.checkpointId) ?? null
-          : pickCheckpointForTurn(checkpoints, snapshot?.turns ?? [], turn) as CheckpointCreationEntry | null
+          : isModernCheckpointTurn(turn)
+            ? null
+            : pickCheckpointForTurn(checkpoints, snapshot?.turns ?? [], turn) as CheckpointCreationEntry | null
         if (!checkpoint) {
           const reason = availability?.checkpointId
             ? 'The saved code checkpoint for this message is no longer available.'

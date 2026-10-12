@@ -201,6 +201,18 @@ pub trait FreshAgentTransport: Send + Sync {
         text: &str,
         profile: &FreshAgentProfile,
     ) -> Result<DispatchAck, DispatchFailure>;
+    /// Dispatches a send whose checkpoint attempt identity must reach the
+    /// provider-native turn receipt. Legacy transports remain compatible and
+    /// ignore the optional metadata by delegating to `dispatch`.
+    async fn dispatch_with_checkpoint_identity(
+        &self,
+        request_id: &RequestId,
+        text: &str,
+        profile: &FreshAgentProfile,
+        _logical_attempt_id: Option<&str>,
+    ) -> Result<DispatchAck, DispatchFailure> {
+        self.dispatch(request_id, text, profile).await
+    }
     async fn resolve_permission(
         &self,
         decision_id: &str,
@@ -572,11 +584,32 @@ impl FreshAgentHostActor {
         text: String,
         settings: Option<FreshAgentTurnSettings>,
     ) -> Result<CommandState, ActorError> {
+        self.dispatch_with_checkpoint_identity(request_id, text, settings, None)
+            .await
+    }
+
+    pub async fn dispatch_with_checkpoint_identity(
+        &self,
+        request_id: RequestId,
+        text: String,
+        settings: Option<FreshAgentTurnSettings>,
+        logical_attempt_id: Option<String>,
+    ) -> Result<CommandState, ActorError> {
         // One provider conversation has one ordered input lane. Keep the
         // durability transition and provider acceptance boundary within the
         // same fence so concurrent gateways cannot become double writers.
         let _dispatch_guard = self.dispatch_lock.lock().await;
-        let command_material = serde_json::to_vec(&(text.as_str(), &settings)).map_err(persist)?;
+        // Preserve the exact historical digest for legacy sends so a command
+        // journal created before this field existed remains idempotent after
+        // upgrade. A modern checkpointed send additionally fences the logical
+        // attempt identity into durable request-ID conflict detection.
+        let command_material = match logical_attempt_id.as_deref() {
+            Some(logical_attempt_id) => {
+                serde_json::to_vec(&(text.as_str(), &settings, logical_attempt_id))
+            }
+            None => serde_json::to_vec(&(text.as_str(), &settings)),
+        }
+        .map_err(persist)?;
         let digest = digest(&command_material);
         let dispatch_profile;
         {
@@ -618,7 +651,12 @@ impl FreshAgentHostActor {
 
         let result = self
             .transport
-            .dispatch(&request_id, &text, &dispatch_profile)
+            .dispatch_with_checkpoint_identity(
+                &request_id,
+                &text,
+                &dispatch_profile,
+                logical_attempt_id.as_deref(),
+            )
             .await;
         let mut state = self.state.lock().await;
         let command = state

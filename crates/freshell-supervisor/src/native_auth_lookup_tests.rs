@@ -67,8 +67,11 @@ async fn provider_claude_creation_source_operation_requires_reader_evidence_afte
     let mut lookup = Envelope::new(RequestId::new(), ControlRole::Web, command);
     lookup.auth = Some(secret.into());
     let result = supervisor.dispatch(lookup).await.result;
-    assert_eq!(result.unwrap_err().code, RuntimeErrorCode::HostUnreachable,
-        "proved initial volume absence must not substitute for unavailable source-selection evidence");
+    assert_eq!(
+        result.unwrap_err().code,
+        RuntimeErrorCode::HostUnreachable,
+        "proved initial volume absence must not substitute for unavailable source-selection evidence"
+    );
     assert_eq!(
         backend.0.load(Ordering::SeqCst),
         3,

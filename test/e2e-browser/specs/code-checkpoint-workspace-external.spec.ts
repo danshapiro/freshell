@@ -303,8 +303,13 @@ test('Git workspace sends retain per-turn success and failure, then restore the 
   const durable = await targetJson<FixtureTurn[]>(page,
     `${fixture.syntheticHomePath}/.codex/fake-turns/${originalSessionId}.json`)
   expect(durable).toHaveLength(2)
-  expect(durable?.map(turn => turn.items.find(item => item.type === 'userMessage')?.id))
+  // The provider-native turn ID is the durable turn's raw `id`. The nested
+  // userMessage.id is a distinct item ID (`<turnId>:user`) and must never be
+  // used as the checkpoint identity join key.
+  expect(durable?.map(turn => turn.id))
     .toEqual([first.outcome.nativeTurnId, second.outcome.nativeTurnId])
+  expect(durable?.map(turn => turn.items.find(item => item.type === 'userMessage')?.id))
+    .toEqual(durable?.map(turn => `${turn.id}:user`))
 })
 
 test('picker-confirmed non-Git workspace captures and restores all selected files', async ({ page }) => {

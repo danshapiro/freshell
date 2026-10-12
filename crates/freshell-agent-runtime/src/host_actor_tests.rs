@@ -335,6 +335,7 @@ struct FakeTransport {
     starts: AtomicUsize,
     start_profiles: std::sync::Mutex<Vec<FreshAgentProfile>>,
     dispatches: AtomicUsize,
+    checkpoint_attempts: std::sync::Mutex<Vec<Option<String>>>,
     decisions: AtomicUsize,
     stops: AtomicUsize,
     ambiguous_dispatch: bool,
@@ -434,6 +435,7 @@ impl FakeTransport {
             starts: AtomicUsize::new(0),
             start_profiles: std::sync::Mutex::new(Vec::new()),
             dispatches: AtomicUsize::new(0),
+            checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
             decisions: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             ambiguous_dispatch: false,
@@ -448,6 +450,7 @@ impl FakeTransport {
                 starts: AtomicUsize::new(0),
                 start_profiles: std::sync::Mutex::new(Vec::new()),
                 dispatches: AtomicUsize::new(0),
+                checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
                 decisions: AtomicUsize::new(0),
                 stops: AtomicUsize::new(0),
                 ambiguous_dispatch: false,
@@ -483,6 +486,19 @@ impl FreshAgentTransport for FakeTransport {
                 provider_ack_id: Some("ack-1".into()),
             })
         }
+    }
+    async fn dispatch_with_checkpoint_identity(
+        &self,
+        request_id: &RequestId,
+        text: &str,
+        profile: &FreshAgentProfile,
+        logical_attempt_id: Option<&str>,
+    ) -> Result<DispatchAck, DispatchFailure> {
+        self.checkpoint_attempts
+            .lock()
+            .unwrap()
+            .push(logical_attempt_id.map(str::to_owned));
+        self.dispatch(request_id, text, profile).await
     }
     async fn resolve_permission(
         &self,
@@ -880,6 +896,73 @@ async fn ambiguous_accepted_input_is_never_dispatched_twice() {
         Err(ActorError::AmbiguousDispatch)
     );
     assert_eq!(transport.dispatches.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn checkpoint_attempt_identity_survives_recovery_and_fences_request_id_reuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = FakeTransport::new("checkpoint-native");
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Opencode, "checkpoint-store", None),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let request = RequestId::parse("checkpoint-command").unwrap();
+    assert_eq!(
+        actor
+            .dispatch_with_checkpoint_identity(
+                request.clone(),
+                "checkpointed work".into(),
+                None,
+                Some("attempt-one".into()),
+            )
+            .await,
+        Ok(CommandState::ProviderAcked)
+    );
+    drop(actor);
+
+    let recovered = FreshAgentHostActor::open(
+        dir.path(),
+        profile(
+            FreshProvider::Opencode,
+            "checkpoint-store",
+            Some("checkpoint-native"),
+        ),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        recovered
+            .dispatch_with_checkpoint_identity(
+                request.clone(),
+                "checkpointed work".into(),
+                None,
+                Some("attempt-one".into()),
+            )
+            .await,
+        Ok(CommandState::ProviderAcked),
+        "retrying the durable request with the same identity returns its recorded result"
+    );
+    assert_eq!(
+        recovered
+            .dispatch_with_checkpoint_identity(
+                request,
+                "checkpointed work".into(),
+                None,
+                Some("attempt-two".into()),
+            )
+            .await,
+        Err(ActorError::RequestConflict),
+        "one durable request ID cannot be rebound to another logical attempt"
+    );
+    assert_eq!(transport.dispatches.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *transport.checkpoint_attempts.lock().unwrap(),
+        vec![Some("attempt-one".into())]
+    );
 }
 
 #[tokio::test]

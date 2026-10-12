@@ -14,9 +14,10 @@ use freshell_codex::launch_plan::CodexSidecarLaunchContext;
 use freshell_freshagent::rollback_record::{RollbackDirection, RollbackModeReq, RollbackRequest};
 use freshell_freshagent::{FreshAgentState, FreshClaudeState, FreshCodexState, FreshOpencodeState};
 use freshell_protocol::{
-    AgentProvider, FreshAgentApprovalRespond, FreshAgentCompact, FreshAgentCreate, FreshAgentFork,
-    FreshAgentInterrupt, FreshAgentKill, FreshAgentQuestionRespond, FreshAgentSend,
-    FreshAgentSendSettings, ServerMessage, SessionLocator, SessionType, StringOrNumber,
+    AgentProvider, FreshAgentApprovalRespond, FreshAgentCheckpointIntent, FreshAgentCompact,
+    FreshAgentCreate, FreshAgentFork, FreshAgentInterrupt, FreshAgentKill,
+    FreshAgentQuestionRespond, FreshAgentSend, FreshAgentSendSettings, ServerMessage,
+    SessionLocator, SessionType, StringOrNumber,
 };
 use freshell_runtime_protocol::{
     AgentEvent, FreshAgentCapture, FreshAgentFixtureTransport, FreshAgentLaunchSpec,
@@ -462,6 +463,17 @@ impl FreshAgentTransport for HostedTransport {
         text: &str,
         profile: &FreshAgentProfile,
     ) -> Result<DispatchAck, DispatchFailure> {
+        self.dispatch_with_checkpoint_identity(request_id, text, profile, None)
+            .await
+    }
+
+    async fn dispatch_with_checkpoint_identity(
+        &self,
+        request_id: &RequestId,
+        text: &str,
+        profile: &FreshAgentProfile,
+        logical_attempt_id: Option<&str>,
+    ) -> Result<DispatchAck, DispatchFailure> {
         #[cfg(test)]
         if let Some(delegate) = self.test_delegate.as_ref() {
             return delegate.dispatch(request_id, text, profile).await;
@@ -495,7 +507,12 @@ impl FreshAgentTransport for HostedTransport {
                 permission_mode: profile.permission_mode,
                 sandbox: profile.sandbox.as_deref().and_then(parse_sandbox),
             }),
-            checkpoint_intent: None,
+            checkpoint_intent: logical_attempt_id.map(|logical_attempt_id| {
+                FreshAgentCheckpointIntent {
+                    logical_attempt_id: logical_attempt_id.to_string(),
+                    workspace: None,
+                }
+            }),
         };
         match &self.state {
             ProviderState::Claude(state) => state.handle_send(send).await,
@@ -1514,12 +1531,30 @@ lines.on('line', line=>{
         let pre = actor.snapshot().await;
         let spawned_before_send = audit.exists();
         let first = actor
-            .dispatch(
+            .dispatch_with_checkpoint_identity(
                 RequestId::parse("first-owned-send").unwrap(),
                 "First owned prompt".into(),
                 None,
+                Some("managed-opencode-attempt-1".into()),
             )
             .await;
+        let checkpoint_identity = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let events = actor.read_events(0, 256).await.events;
+                if let Some(payload) = events.iter().find_map(|entry| match &entry.event {
+                    AgentEvent::Provider { payload }
+                        if payload["event"]["type"] == "checkpointTurnIdentity" =>
+                    {
+                        Some(payload.clone())
+                    }
+                    _ => None,
+                }) {
+                    break payload;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
         let identity = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if let Some(native) = actor.profile().await.native_session_id {
@@ -1556,6 +1591,14 @@ lines.on('line', line=>{
         .await;
         let final_native = actor.profile().await.native_session_id;
         transport.stop().await.unwrap();
+        let checkpoint_identity = match checkpoint_identity {
+            Ok(payload) => payload,
+            Err(_) => panic!(
+                "hosted OpenCode send must preserve checkpoint identity through the provider; actor events: {:#?}; fixture audit: {}",
+                actor.read_events(0, 256).await,
+                std::fs::read_to_string(&audit).unwrap_or_default()
+            ),
+        };
         let rows: Vec<Value> = std::fs::read_to_string(&audit)
             .unwrap_or_default()
             .lines()
@@ -1568,7 +1611,35 @@ lines.on('line', line=>{
         assert_eq!(pre.unwrap()["threadId"], registered);
         first.unwrap();
         second.unwrap();
+        assert_eq!(
+            checkpoint_identity["event"]["logicalAttemptId"],
+            "managed-opencode-attempt-1"
+        );
+        assert_eq!(
+            checkpoint_identity["event"]["requestId"],
+            "first-owned-send"
+        );
+        assert!(checkpoint_identity["event"]["nativeTurnId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("msg_")));
         observed_prompts.unwrap();
+        let identity_receipt_count = actor
+            .read_events(0, 256)
+            .await
+            .events
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    &entry.event,
+                    AgentEvent::Provider { payload }
+                        if payload["event"]["type"] == "checkpointTurnIdentity"
+                )
+            })
+            .count();
+        assert_eq!(
+            identity_receipt_count, 1,
+            "the second legacy send must not create a checkpoint identity receipt"
+        );
         let native = identity.unwrap();
         assert_eq!(live.unwrap()["threadId"], native);
         assert_eq!(final_native.as_deref(), Some(native.as_str()));

@@ -2478,6 +2478,12 @@ pub struct FreshAgentSendRequest {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<FreshAgentTurnSettings>,
+    /// Opaque checkpoint attempt identity, when this send crossed the modern
+    /// server-owned snapshot barrier. It is passed through the managed host to
+    /// the provider so the native turn receipt can be joined without text or
+    /// ordinal matching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_logical_attempt_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_control_epoch: Option<u64>,
 }
@@ -3425,6 +3431,8 @@ pub enum HostCommand {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         settings: Option<FreshAgentTurnSettings>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkpoint_logical_attempt_id: Option<String>,
     },
     FreshAgentFork {
         incarnation_id: IncarnationId,
@@ -3684,6 +3692,66 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hosted_checkpoint_send_identity_is_optional_and_backward_compatible() {
+        let request: FreshAgentSendRequest = serde_json::from_value(serde_json::json!({
+            "soulId": "soul-hosted",
+            "text": "continue",
+            "checkpointLogicalAttemptId": "attempt-hosted-1"
+        }))
+        .unwrap();
+        assert_eq!(
+            request.checkpoint_logical_attempt_id.as_deref(),
+            Some("attempt-hosted-1")
+        );
+
+        let legacy_request: FreshAgentSendRequest = serde_json::from_value(serde_json::json!({
+            "soulId": "soul-hosted",
+            "text": "legacy continue"
+        }))
+        .unwrap();
+        assert_eq!(legacy_request.checkpoint_logical_attempt_id, None);
+        assert_eq!(
+            serde_json::to_value(&legacy_request).unwrap(),
+            serde_json::json!({ "soulId": "soul-hosted", "text": "legacy continue" })
+        );
+
+        let host_command: HostCommand = serde_json::from_value(serde_json::json!({
+            "method": "fresh_agent_send",
+            "params": {
+                "incarnation_id": "incarnation-hosted",
+                "request_id": "request-hosted",
+                "text": "continue",
+                "checkpoint_logical_attempt_id": "attempt-hosted-1"
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            host_command,
+            HostCommand::FreshAgentSend {
+                checkpoint_logical_attempt_id: Some(ref id),
+                ..
+            } if id == "attempt-hosted-1"
+        ));
+
+        let legacy_host_command: HostCommand = serde_json::from_value(serde_json::json!({
+            "method": "fresh_agent_send",
+            "params": {
+                "incarnation_id": "incarnation-hosted",
+                "request_id": "request-hosted",
+                "text": "legacy continue"
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy_host_command,
+            HostCommand::FreshAgentSend {
+                checkpoint_logical_attempt_id: None,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn provider_preparation_serialization_stops_before_materializing_oversized_metadata() {

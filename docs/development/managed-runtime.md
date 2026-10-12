@@ -345,6 +345,41 @@ durable session-host app-server. The provider still runs in a soul-owned home;
 OpenCode runs one pinned runtime per soul on private loopback, with native
 identity learned inside that runtime. The web controller does not own provider
 processes or reach into private provider state.
+
+Provider resources are copied with the shared bounded copier during both
+controller preparation and session-host staging. Copies retain executable bits
+for scripts and binaries while using private permissions; the source files are
+never chmodded. Configuration file references are resolved against the file
+that declares them, including relative paths and supported environment
+references, then staged under the provider home. A missing, unreadable, cyclic,
+or oversized reference fails preparation with a typed explanation instead of
+being silently removed. Native conversation databases and credential sources
+are excluded from ordinary resource copying and continue to use their dedicated
+store or secret-reference paths.
+
+Modern fresh-agent sends may include a checkpoint attempt ID. The server takes
+and verifies the pre-turn code snapshot for the selected workspace, then
+records an outcome tied to that exact send before forwarding it to the provider.
+A completed snapshot failure leaves rewind unavailable for that message but
+does not discard the message. If snapshot work has not settled, the bounded
+barrier keeps that send queued while the child is quarantined. Once settlement
+is confirmed, the same send is forwarded exactly once with rewind unavailable;
+if settlement cannot be confirmed, the send remains withheld. Durable outcome
+storage read failures preserve the last complete attempt snapshot: known
+dispatched or unsettled sends stay withheld, while a new settled attempt can
+use a bounded process-local duplicate fence. If the store cannot be read before
+any trusted snapshot is available, the send is withheld because prior dispatch
+cannot be ruled out. Once a store has been observed or failed to read, a later
+missing file remains a read failure. A restart during a process-local fallback
+loses that temporary fence, so an unreadable store at startup fails closed.
+The durable presence marker also keeps a removed outcome file from appearing
+to be a first-use store after restart; restore the outcome file to resume sends
+when that marker is present.
+Provider identity is joined from persisted native IDs: Codex
+associates its native turn ID only with the matching user row, Claude uses the
+SDK replay UUID, and OpenCode uses the persisted message ID. Display text and
+row order are not identity keys. A replayed turn without an exact identity
+keeps rewind unavailable, including after the pane is remounted.
 The managed fresh-agent adapter routes create/send, interrupt, permission
 resolutions, compact, rollback, event history, read-only transcript capture, and
 supported provider-native fork operations through the session host. The Rust web

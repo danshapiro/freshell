@@ -563,6 +563,7 @@ async fn dispatch(
                     request_id,
                     text,
                     settings,
+                    checkpoint_logical_attempt_id,
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
                     let actor = state
@@ -572,7 +573,12 @@ async fn dispatch(
                         .clone()
                         .ok_or_else(unsupported_fresh_agent)?;
                     let command_state = actor
-                        .dispatch(request_id, text, settings)
+                        .dispatch_with_checkpoint_identity(
+                            request_id,
+                            text,
+                            settings,
+                            checkpoint_logical_attempt_id,
+                        )
                         .await
                         .map_err(map_actor_error)?;
                     let native_session_id = actor.profile().await.native_session_id;
@@ -5752,6 +5758,7 @@ mod tests {
 
     struct RpcFixtureTransport {
         dispatches: AtomicUsize,
+        checkpoint_attempts: std::sync::Mutex<Vec<Option<String>>>,
         decisions: AtomicUsize,
         operations: AtomicUsize,
         captures: AtomicUsize,
@@ -5773,6 +5780,23 @@ mod tests {
             _profile: &FreshAgentProfile,
         ) -> Result<DispatchAck, DispatchFailure> {
             self.dispatches.fetch_add(1, Ordering::SeqCst);
+            Ok(DispatchAck {
+                provider_ack_id: Some(request_id.to_string()),
+            })
+        }
+
+        async fn dispatch_with_checkpoint_identity(
+            &self,
+            request_id: &RequestId,
+            _text: &str,
+            _profile: &FreshAgentProfile,
+            logical_attempt_id: Option<&str>,
+        ) -> Result<DispatchAck, DispatchFailure> {
+            self.dispatches.fetch_add(1, Ordering::SeqCst);
+            self.checkpoint_attempts
+                .lock()
+                .unwrap()
+                .push(logical_attempt_id.map(str::to_owned));
             Ok(DispatchAck {
                 provider_ack_id: Some(request_id.to_string()),
             })
@@ -5874,6 +5898,7 @@ mod tests {
         let state = test_host_state();
         let transport = Arc::new(RpcFixtureTransport {
             dispatches: AtomicUsize::new(0),
+            checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
             decisions: AtomicUsize::new(0),
             operations: AtomicUsize::new(0),
             captures: AtomicUsize::new(0),
@@ -5916,6 +5941,7 @@ mod tests {
                     request_id: request_id.clone(),
                     text: "perform fixture work".into(),
                     settings: None,
+                    checkpoint_logical_attempt_id: Some("managed-attempt-rpc-1".into()),
                 },
             ),
             &state,
@@ -5930,6 +5956,10 @@ mod tests {
             }
             if native == "fixture-native-thread"
         ));
+        assert_eq!(
+            *transport.checkpoint_attempts.lock().unwrap(),
+            vec![Some("managed-attempt-rpc-1".into())]
+        );
 
         // A gateway reconnect is only a new cursor. The same request and the
         // same decision are idempotent at the host-owned actor.

@@ -28,6 +28,12 @@ use freshell_runtime_protocol::{
 use sha2::{Digest, Sha256};
 use tokio::time::{sleep, Duration, Instant};
 
+#[cfg(test)]
+pub(crate) const LIVE_RESUME_EVIDENCE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+#[cfg(not(test))]
+pub(crate) const LIVE_RESUME_EVIDENCE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+const LIVE_RESUME_EVIDENCE_ATTEMPT_CACHE_MAX_ENTRIES: usize = 1_024;
+
 impl Supervisor {
     pub(crate) async fn probe_recovery(
         &self,
@@ -193,6 +199,10 @@ impl Supervisor {
         host: &crate::service::AuthenticatedHost,
         status: &crate::service::HostStatus,
     ) {
+        if !self.live_resume_evidence_capture_due(context, status).await {
+            return;
+        }
+
         let capture = match resume_catalog::exact_resume_candidate(
             context,
             status.native_session_id.as_deref(),
@@ -242,6 +252,41 @@ impl Supervisor {
                 "capture": capture,
             }),
         );
+    }
+
+    async fn live_resume_evidence_capture_due(
+        &self,
+        context: &RecoveryContext,
+        status: &crate::service::HostStatus,
+    ) -> bool {
+        let key = (
+            context.soul_id.as_str().to_string(),
+            context.prior_handle.incarnation_id().as_str().to_string(),
+            status
+                .native_session_id
+                .clone()
+                .or_else(|| context.native_session_id.clone()),
+        );
+        let now = Instant::now();
+        let mut attempts = self.live_resume_evidence_attempts.lock().await;
+        attempts.retain(|_, attempted_at| {
+            now.duration_since(*attempted_at) < LIVE_RESUME_EVIDENCE_RETRY_INTERVAL
+        });
+        if attempts.contains_key(&key) {
+            return false;
+        }
+
+        if attempts.len() >= LIVE_RESUME_EVIDENCE_ATTEMPT_CACHE_MAX_ENTRIES {
+            if let Some(oldest_key) = attempts
+                .iter()
+                .min_by_key(|(_, attempted_at)| **attempted_at)
+                .map(|(key, _)| key.clone())
+            {
+                attempts.remove(&oldest_key);
+            }
+        }
+        attempts.insert(key, now);
+        true
     }
 
     async fn probe_host_store(
@@ -1724,6 +1769,7 @@ impl Supervisor {
                     request_id: request_id.clone(),
                     text: command.data,
                     settings: Some(fresh_agent_replay_settings(agent)),
+                    checkpoint_logical_attempt_id: None,
                 }
             } else {
                 HostCommand::TerminalInput {

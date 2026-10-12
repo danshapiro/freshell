@@ -95,6 +95,63 @@ const CHECKPOINT_TIMEOUT_COOLDOWN: Duration = Duration::from_secs(60);
 const CHECKPOINT_COOLDOWN_LIMIT: usize = 128;
 const CHECKPOINT_OUTCOME_STORE_VERSION: u8 = 1;
 const CHECKPOINT_OUTCOME_STORE_LIMIT: usize = 8192;
+const CHECKPOINT_DISPATCH_FENCE_LIMIT: usize = CHECKPOINT_OUTCOME_STORE_LIMIT;
+const CHECKPOINT_VOLATILE_FENCE_LIMIT: usize = 1024;
+
+#[derive(Clone, Copy)]
+struct CheckpointAttemptFence {
+    dispatch_started: bool,
+    capture_settled: bool,
+}
+
+#[derive(Default)]
+struct CheckpointOutcomeCache {
+    outcomes: HashMap<String, StoredCheckpointOutcome>,
+    snapshot_loaded: bool,
+    store_file_observed: bool,
+    snapshot_complete: bool,
+}
+
+impl CheckpointOutcomeCache {
+    fn replace_from_store(&mut self, store: &CheckpointOutcomeStore) {
+        self.snapshot_loaded = true;
+        self.store_file_observed = true;
+        self.snapshot_complete = store.outcomes.len() <= CHECKPOINT_DISPATCH_FENCE_LIMIT;
+        self.outcomes = store
+            .outcomes
+            .iter()
+            .take(CHECKPOINT_DISPATCH_FENCE_LIMIT)
+            .map(|(key, record)| (key.clone(), record.clone()))
+            .collect();
+    }
+
+    fn observe_absent_store(&mut self) {
+        self.snapshot_loaded = true;
+        self.snapshot_complete = true;
+    }
+
+    fn known_attempt(&self, key: &str) -> Option<CheckpointAttemptFence> {
+        self.outcomes.get(key).map(|record| CheckpointAttemptFence {
+            dispatch_started: record.dispatch_started,
+            capture_settled: record.capture_settled,
+        })
+    }
+
+    fn cached_outcome(&self, key: &str) -> Option<StoredCheckpointOutcome> {
+        self.outcomes.get(key).cloned()
+    }
+
+    fn cached_outcomes(&self) -> BTreeMap<String, StoredCheckpointOutcome> {
+        self.outcomes
+            .iter()
+            .map(|(key, outcome)| (key.clone(), outcome.clone()))
+            .collect()
+    }
+
+    fn can_rule_out_unknown_attempt(&self) -> bool {
+        self.snapshot_loaded && self.snapshot_complete
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -204,7 +261,10 @@ pub struct CheckpointService {
     outcome_gate: Mutex<()>,
     attempt_jobs: Mutex<HashMap<String, Arc<CheckpointAttemptJob>>>,
     cooldowns: StdMutex<HashMap<PathBuf, CheckpointCooldown>>,
-    in_memory_outcomes: StdMutex<BTreeMap<String, StoredCheckpointOutcome>>,
+    durable_outcome_cache: StdMutex<CheckpointOutcomeCache>,
+    volatile_outcomes: StdMutex<BTreeMap<String, StoredCheckpointOutcome>>,
+    #[cfg(test)]
+    test_capture_attempt_override: StdMutex<Option<CaptureAttempt>>,
 }
 
 tokio::task_local! {
@@ -727,7 +787,10 @@ impl CheckpointService {
             outcome_gate: Mutex::new(()),
             attempt_jobs: Mutex::new(HashMap::new()),
             cooldowns: StdMutex::new(HashMap::new()),
-            in_memory_outcomes: StdMutex::new(BTreeMap::new()),
+            durable_outcome_cache: StdMutex::new(CheckpointOutcomeCache::default()),
+            volatile_outcomes: StdMutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            test_capture_attempt_override: StdMutex::new(None),
         }
     }
 
@@ -761,6 +824,82 @@ impl CheckpointService {
             .join(".freshell")
             .join("checkpoints")
             .join("attempt-outcomes-v1.json")
+    }
+
+    fn outcome_store_presence_marker_path(&self) -> PathBuf {
+        self.home
+            .join(".freshell")
+            .join("checkpoints")
+            .join("attempt-outcomes-v1.initialized")
+    }
+
+    async fn ensure_outcome_store_presence_marker(&self) -> Result<(), String> {
+        let path = self.outcome_store_presence_marker_path();
+        #[cfg(unix)]
+        let open_result = {
+            let mut options = tokio::fs::OpenOptions::new();
+            options.write(true).create_new(true).mode(0o600);
+            options.open(&path).await
+        };
+        #[cfg(not(unix))]
+        let open_result = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await;
+
+        let mut marker = match open_result {
+            Ok(marker) => marker,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(error) => {
+                return Err(format!(
+                    "failed to create checkpoint outcome presence marker: {error}"
+                ));
+            }
+        };
+        marker
+            .write_all(b"freshell checkpoint outcomes initialized v1\n")
+            .await
+            .map_err(|error| {
+                format!("failed to write checkpoint outcome presence marker: {error}")
+            })?;
+        marker.sync_all().await.map_err(|error| {
+            format!("failed to flush checkpoint outcome presence marker: {error}")
+        })?;
+        #[cfg(unix)]
+        {
+            let parent = path.parent().ok_or_else(|| {
+                "checkpoint outcome presence marker has no parent directory".to_owned()
+            })?;
+            tokio::fs::File::open(parent)
+                .await
+                .map_err(|error| {
+                    format!("failed to open checkpoint outcome directory for flush: {error}")
+                })?
+                .sync_all()
+                .await
+                .map_err(|error| {
+                    format!("failed to flush checkpoint outcome directory: {error}")
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn outcome_store_presence_marker_exists(&self) -> Result<bool, String> {
+        match tokio::fs::symlink_metadata(self.outcome_store_presence_marker_path()).await {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(format!(
+                "failed to inspect checkpoint outcome presence marker: {error}"
+            )),
+        }
+    }
+
+    fn mark_outcome_store_observed(&self) {
+        self.durable_outcome_cache
+            .lock()
+            .expect("checkpoint dispatch fences mutex poisoned")
+            .store_file_observed = true;
     }
 
     fn workspace_lock(&self, workspace: &Path) -> Arc<Mutex<()>> {
@@ -858,22 +997,59 @@ impl CheckpointService {
         let raw = match tokio::fs::read(&path).await {
             Ok(raw) => raw,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let marker_exists = match self.outcome_store_presence_marker_exists().await {
+                    Ok(exists) => exists,
+                    Err(marker_error) => {
+                        self.mark_outcome_store_observed();
+                        return Err(marker_error);
+                    }
+                };
+                let mut fences = self
+                    .durable_outcome_cache
+                    .lock()
+                    .expect("checkpoint dispatch fences mutex poisoned");
+                if marker_exists || fences.store_file_observed {
+                    fences.store_file_observed = true;
+                    return Err(
+                        "checkpoint attempt outcome store is missing after its prior presence could not be ruled out".into(),
+                    );
+                }
+                fences.observe_absent_store();
                 return Ok(CheckpointOutcomeStore {
                     version: CHECKPOINT_OUTCOME_STORE_VERSION,
                     outcomes: BTreeMap::new(),
                 });
             }
             Err(error) => {
+                self.mark_outcome_store_observed();
+                let marker_error = self
+                    .ensure_outcome_store_presence_marker()
+                    .await
+                    .err()
+                    .map(|error| format!("; {error}"))
+                    .unwrap_or_default();
                 return Err(format!(
-                    "failed to read checkpoint attempt outcomes: {error}"
+                    "failed to read checkpoint attempt outcomes: {error}{marker_error}"
                 ));
             }
         };
+        self.mark_outcome_store_observed();
+        if let Err(error) = self.ensure_outcome_store_presence_marker().await {
+            tracing::error!(
+                event = "code_checkpoint.outcome_presence_marker_write_failed",
+                cause = %error,
+                "checkpoint outcome store was readable but its durable presence marker could not be written"
+            );
+        }
         let store: CheckpointOutcomeStore = serde_json::from_slice(&raw)
             .map_err(|error| format!("invalid checkpoint attempt outcome store: {error}"))?;
         if store.version != CHECKPOINT_OUTCOME_STORE_VERSION {
             return Err("unsupported checkpoint attempt outcome store version".to_string());
         }
+        self.durable_outcome_cache
+            .lock()
+            .expect("checkpoint dispatch fences mutex poisoned")
+            .replace_from_store(&store);
         Ok(store)
     }
 
@@ -885,6 +1061,7 @@ impl CheckpointService {
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(|error| format!("failed to create checkpoint outcome directory: {error}"))?;
+        self.ensure_outcome_store_presence_marker().await?;
         let temporary = parent.join(format!(
             "attempt-outcomes-v1.json.tmp-{}",
             uuid::Uuid::new_v4()
@@ -918,6 +1095,10 @@ impl CheckpointService {
             let _ = tokio::fs::remove_file(&temporary).await;
             return Err(format!("failed to publish checkpoint outcomes: {error}"));
         }
+        self.durable_outcome_cache
+            .lock()
+            .expect("checkpoint dispatch fences mutex poisoned")
+            .replace_from_store(store);
         Ok(())
     }
 
@@ -939,33 +1120,113 @@ impl CheckpointService {
             store.outcomes.remove(&oldest);
         }
         self.write_outcome_store(&store).await?;
-        self.in_memory_outcomes
+        self.volatile_outcomes
             .lock()
-            .expect("checkpoint outcome memory cache poisoned")
-            .insert(key.to_string(), outcome);
+            .expect("volatile checkpoint outcomes mutex poisoned")
+            .remove(key);
         Ok(())
+    }
+
+    fn attempt_state_for_store_failure(&self, key: &str) -> (Option<CheckpointAttemptFence>, bool) {
+        let fences = self
+            .durable_outcome_cache
+            .lock()
+            .expect("checkpoint dispatch fences mutex poisoned");
+        (
+            fences.known_attempt(key),
+            fences.can_rule_out_unknown_attempt(),
+        )
+    }
+
+    fn remember_volatile_outcome(&self, key: &str, outcome: StoredCheckpointOutcome) -> bool {
+        let mut outcomes = self
+            .volatile_outcomes
+            .lock()
+            .expect("volatile checkpoint outcomes mutex poisoned");
+        if !outcomes.contains_key(key) && outcomes.len() >= CHECKPOINT_VOLATILE_FENCE_LIMIT {
+            return false;
+        }
+        outcomes.insert(key.to_string(), outcome);
+        true
+    }
+
+    fn mark_outcome_store_failure(
+        record: &mut StoredCheckpointOutcome,
+        operation: &'static str,
+    ) -> bool {
+        let allow_forward = record.capture_settled;
+        record.dispatch_started = allow_forward;
+        record.outcome.status = FreshAgentCheckpointStatus::Unavailable;
+        record.outcome.checkpoint_id = None;
+        record.outcome.code = Some("outcome_store_unavailable".into());
+        record.outcome.reason = Some(if allow_forward {
+            format!(
+                "{operation}; rewind for this message is unknown. Your message will still be sent."
+            )
+        } else {
+            format!("{operation}, and the pre-turn snapshot is still settling; your message was withheld.")
+        });
+        allow_forward
+    }
+
+    fn mark_known_attempt_store_failure(
+        record: &mut StoredCheckpointOutcome,
+        state: CheckpointAttemptFence,
+    ) {
+        record.dispatch_started = state.dispatch_started;
+        record.capture_settled = state.capture_settled;
+        record.outcome.status = FreshAgentCheckpointStatus::Unavailable;
+        record.outcome.checkpoint_id = None;
+        record.outcome.code = Some("outcome_store_unavailable".into());
+        record.outcome.reason = Some(if !state.capture_settled {
+            "Rewind status could not be read, and the pre-turn snapshot is still settling; your message was withheld.".into()
+        } else {
+            "Rewind status could not be read; an earlier dispatch may already have started, so this retry was withheld to prevent a duplicate.".into()
+        });
+    }
+
+    fn mark_unverified_attempt_store_failure(record: &mut StoredCheckpointOutcome) {
+        record.dispatch_started = false;
+        record.capture_settled = false;
+        record.outcome.status = FreshAgentCheckpointStatus::Unavailable;
+        record.outcome.checkpoint_id = None;
+        record.outcome.code = Some("outcome_store_unavailable".into());
+        record.outcome.reason = Some(
+            "Rewind status could not be read, and prior send history could not be verified; your message was withheld.".into(),
+        );
+    }
+
+    fn mark_volatile_fence_capacity_failure(record: &mut StoredCheckpointOutcome) {
+        record.dispatch_started = false;
+        record.outcome.status = FreshAgentCheckpointStatus::Unavailable;
+        record.outcome.checkpoint_id = None;
+        record.outcome.code = Some("outcome_store_unavailable".into());
+        record.outcome.reason = Some(
+            "Rewind status could not be saved, and local duplicate protection is full; your message was withheld.".into(),
+        );
     }
 
     async fn find_outcome(&self, key: &str) -> Result<Option<StoredCheckpointOutcome>, String> {
         if let Some(outcome) = self
-            .in_memory_outcomes
+            .volatile_outcomes
             .lock()
-            .expect("checkpoint outcome memory cache poisoned")
+            .expect("volatile checkpoint outcomes mutex poisoned")
             .get(key)
             .cloned()
         {
             return Ok(Some(outcome));
         }
+        if let Some(outcome) = self
+            .durable_outcome_cache
+            .lock()
+            .expect("durable checkpoint outcome cache mutex poisoned")
+            .cached_outcome(key)
+        {
+            return Ok(Some(outcome));
+        }
         let _guard = self.outcome_gate.lock().await;
         let store = self.read_outcome_store().await?;
-        let outcome = store.outcomes.get(key).cloned();
-        if let Some(outcome) = &outcome {
-            self.in_memory_outcomes
-                .lock()
-                .expect("checkpoint outcome memory cache poisoned")
-                .insert(key.to_string(), outcome.clone());
-        }
-        Ok(outcome)
+        Ok(store.outcomes.get(key).cloned())
     }
 
     async fn replay_for_identity(
@@ -974,18 +1235,29 @@ impl CheckpointService {
         session_id: &str,
         session_type: SessionType,
     ) {
-        let records = match self.read_outcome_store().await {
-            Ok(store) => store.outcomes,
-            Err(error) => {
-                tracing::error!(
-                    event = "code_checkpoint.outcome_store_read_failed",
-                    cause = %error,
-                    "durable checkpoint outcomes could not be replayed"
-                );
-                self.in_memory_outcomes
-                    .lock()
-                    .expect("checkpoint outcome memory cache poisoned")
-                    .clone()
+        let records = {
+            let _guard = self.outcome_gate.lock().await;
+            match self.read_outcome_store().await {
+                Ok(store) => store.outcomes,
+                Err(error) => {
+                    tracing::error!(
+                        event = "code_checkpoint.outcome_store_read_failed",
+                        cause = %error,
+                        "durable checkpoint outcomes could not be replayed"
+                    );
+                    let mut cached = self
+                        .durable_outcome_cache
+                        .lock()
+                        .expect("durable checkpoint outcome cache mutex poisoned")
+                        .cached_outcomes();
+                    cached.extend(
+                        self.volatile_outcomes
+                            .lock()
+                            .expect("volatile checkpoint outcomes mutex poisoned")
+                            .clone(),
+                    );
+                    cached
+                }
             }
         };
         for record in records.values().filter(|record| {
@@ -1047,13 +1319,6 @@ impl CheckpointService {
         }
         if !changed.is_empty() {
             self.write_outcome_store(&store).await?;
-            let mut cache = self
-                .in_memory_outcomes
-                .lock()
-                .expect("checkpoint outcome memory cache poisoned");
-            for (key, record) in &store.outcomes {
-                cache.insert(key.clone(), record.clone());
-            }
         }
         Ok(changed)
     }
@@ -1093,8 +1358,19 @@ impl CheckpointService {
                             .session_aliases
                             .iter()
                             .any(|alias| alias == session_id)
+                        && submitted_turn_id.as_deref().is_none_or(|submitted| {
+                            record
+                                .outcome
+                                .native_turn_id
+                                .as_deref()
+                                .is_none_or(|native| native == submitted)
+                        })
                 },
-                |record| record.submitted_turn_id = submitted_turn_id.clone(),
+                |record| {
+                    if submitted_turn_id.is_some() {
+                        record.submitted_turn_id = submitted_turn_id.clone();
+                    }
+                },
             )
             .await;
         if let Err(error) = updated {
@@ -1205,6 +1481,10 @@ impl CheckpointService {
                             .session_aliases
                             .iter()
                             .any(|alias| alias == session_id)
+                        && record
+                            .submitted_turn_id
+                            .as_deref()
+                            .is_none_or(|submitted| submitted == native_turn_id)
                         && record
                             .outcome
                             .native_turn_id
@@ -1381,7 +1661,7 @@ impl CheckpointService {
                 None,
                 Err((
                     "workspace_unavailable",
-                    "No selected code workspace is available for this send.".into(),
+                    "No selected code workspace is available for a snapshot; rewind is unavailable, and your message will still be sent.".into(),
                 )),
             );
         };
@@ -1408,7 +1688,7 @@ impl CheckpointService {
                     None,
                     Err((
                         "workspace_unavailable",
-                        "No eligible code workspace is available for this send.".into(),
+                        "No eligible code workspace is available for a snapshot; rewind is unavailable, and your message will still be sent.".into(),
                     )),
                 );
             }
@@ -1580,7 +1860,7 @@ impl CheckpointService {
                     )),
                 );
                 record.capture_settled = false;
-                let _quarantine = self.quarantine_workspace(
+                let quarantine = self.quarantine_workspace(
                     workspace.path.clone(),
                     lock,
                     control,
@@ -1588,6 +1868,40 @@ impl CheckpointService {
                     "automatic_capture",
                     error,
                 );
+                match quarantine.await {
+                    Ok(()) => {
+                        if let Some(checkpoint_id) = self
+                            .reconcile_published_request(&workspace, request_id)
+                            .await
+                        {
+                            return self.new_record(
+                                send,
+                                logical_attempt_id,
+                                request_id,
+                                Some((&workspace, "")),
+                                Ok(checkpoint_id),
+                            );
+                        }
+                        record.capture_settled = true;
+                        record.outcome.code = Some("capture_failed".into());
+                        record.outcome.reason = Some(
+                            "The code snapshot could not be completed; rewind is unavailable, and your message will still be sent."
+                                .into(),
+                        );
+                    }
+                    Err(settlement_error) => {
+                        tracing::error!(
+                            event = "code_checkpoint.quarantine_task_failed",
+                            workspace = %workspace.path.display(),
+                            request_id,
+                            cause = %settlement_error,
+                            "checkpoint child settlement was not confirmed; the provider send remains withheld"
+                        );
+                        record.outcome.reason = Some(format!(
+                            "The code snapshot could not be confirmed settled; your message was withheld ({settlement_error})."
+                        ));
+                    }
+                }
                 record
             }
             CaptureAttempt::Failed(error) => {
@@ -1809,6 +2123,16 @@ impl CheckpointService {
         budget: Duration,
         mut cancellation: Option<watch::Receiver<bool>>,
     ) -> CaptureAttempt {
+        #[cfg(test)]
+        if let Some(attempt) = self
+            .test_capture_attempt_override
+            .lock()
+            .expect("checkpoint test capture override mutex poisoned")
+            .take()
+        {
+            return attempt;
+        }
+
         // The task is owned by this server service, not by the socket/HTTP
         // request future. On budget expiry the scoped runner is terminated,
         // reaped, and reconciled under the workspace lock before this returns.
@@ -2069,7 +2393,8 @@ impl freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier for Checkpoint
                 return;
             }
 
-            let (record, allow_forward) = match self.find_outcome(&key).await {
+            let mut volatile_fallback = false;
+            let (record, mut allow_forward) = match self.find_outcome(&key).await {
                 Ok(Some(mut record)) => {
                     let added_alias = !record.request_ids.iter().any(|alias| alias == &request_id)
                         && record.request_ids.len() < 16;
@@ -2112,21 +2437,21 @@ impl freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier for Checkpoint
                         match self.persist_outcome(&key, record.clone()).await {
                             Ok(()) => (record, true),
                             Err(error) => {
+                                let allow_forward = Self::mark_outcome_store_failure(
+                                    &mut record,
+                                    "Rewind status could not be saved",
+                                );
+                                volatile_fallback = true;
                                 tracing::error!(
                                     event = "code_checkpoint.outcome_persist_failed",
                                     send_request_id = %request_id,
                                     logical_attempt_id = %logical_attempt_id,
                                     cause = %error,
-                                    "checkpoint outcome and dispatch fence could not be saved; provider send was withheld"
+                                    dispatch_allowed = allow_forward,
+                                    dispatch_fence = if allow_forward { "process_local" } else { "none" },
+                                    "checkpoint outcome and durable dispatch fence could not be saved"
                                 );
-                                record.dispatch_started = false;
-                                record.outcome.status = FreshAgentCheckpointStatus::Unavailable;
-                                record.outcome.checkpoint_id = None;
-                                record.outcome.code = Some("outcome_store_unavailable".into());
-                                record.outcome.reason = Some(
-                                    "The checkpoint result could not be saved; this turn will remain unavailable.".into(),
-                                );
-                                (record, false)
+                                (record, allow_forward)
                             }
                         }
                     }
@@ -2142,49 +2467,87 @@ impl freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier for Checkpoint
                             (record, allow_forward)
                         }
                         Err(error) => {
+                            let allow_forward = Self::mark_outcome_store_failure(
+                                &mut record,
+                                "Rewind status could not be saved",
+                            );
+                            volatile_fallback = true;
                             tracing::error!(
                                 event = "code_checkpoint.outcome_persist_failed",
                                 send_request_id = %request_id,
                                 logical_attempt_id = %logical_attempt_id,
                                 cause = %error,
-                                "checkpoint outcome and dispatch fence could not be saved; provider send was withheld"
+                                dispatch_allowed = allow_forward,
+                                dispatch_fence = if allow_forward { "process_local" } else { "none" },
+                                "checkpoint outcome and durable dispatch fence could not be saved"
                             );
-                            record.dispatch_started = false;
-                            record.outcome.status = FreshAgentCheckpointStatus::Unavailable;
-                            record.outcome.checkpoint_id = None;
-                            record.outcome.code = Some("outcome_store_unavailable".into());
-                            record.outcome.reason = Some(
-                                "The checkpoint result could not be saved; this turn will remain unavailable.".into(),
-                            );
-                            (record, false)
+                            (record, allow_forward)
                         }
                     }
                 }
                 Err(error) => {
+                    let (known_attempt, can_rule_out_prior_attempt) =
+                        self.attempt_state_for_store_failure(&key);
                     tracing::error!(
                         event = "code_checkpoint.outcome_store_read_failed",
                         send_request_id = %request_id,
                         logical_attempt_id = %logical_attempt_id,
                         cause = %error,
-                        "checkpoint attempt could not be safely deduplicated"
+                        known_dispatched_attempt = known_attempt.is_some_and(|state| state.dispatch_started),
+                        known_unsettled_attempt = known_attempt.is_some_and(|state| !state.capture_settled),
+                        can_rule_out_prior_attempt,
+                        "durable checkpoint attempt history is unavailable; dispatch depends on the last trusted snapshot"
                     );
-                    (
-                        self.new_record(
-                            &send,
-                            &logical_attempt_id,
-                            &request_id,
-                            None,
-                            Err((
-                                "outcome_store_unavailable",
-                                "The checkpoint result could not be saved; this turn will remain unavailable.".into(),
-                            )),
-                        ),
-                        false,
-                    )
+                    let mut record = self.new_record(
+                        &send,
+                        &logical_attempt_id,
+                        &request_id,
+                        None,
+                        Err((
+                            "outcome_store_unavailable",
+                            "Rewind status could not be read".into(),
+                        )),
+                    );
+                    let allow_forward = match known_attempt {
+                        Some(state) if !state.capture_settled || state.dispatch_started => {
+                            Self::mark_known_attempt_store_failure(&mut record, state);
+                            false
+                        }
+                        Some(_) => {
+                            volatile_fallback = true;
+                            Self::mark_outcome_store_failure(
+                                &mut record,
+                                "Rewind status could not be read",
+                            )
+                        }
+                        None if can_rule_out_prior_attempt => {
+                            volatile_fallback = true;
+                            Self::mark_outcome_store_failure(
+                                &mut record,
+                                "Rewind status could not be read",
+                            )
+                        }
+                        None => {
+                            Self::mark_unverified_attempt_store_failure(&mut record);
+                            false
+                        }
+                    };
+                    (record, allow_forward)
                 }
             };
             let mut record = record;
             record.outcome.request_id = request_id.clone();
+            if volatile_fallback && !self.remember_volatile_outcome(&key, record.clone()) {
+                Self::mark_volatile_fence_capacity_failure(&mut record);
+                allow_forward = false;
+                tracing::error!(
+                    event = "code_checkpoint.volatile_fence_capacity_exhausted",
+                    send_request_id = %request_id,
+                    logical_attempt_id = %logical_attempt_id,
+                    capacity = CHECKPOINT_VOLATILE_FENCE_LIMIT,
+                    "checkpoint send was withheld because its process-local duplicate fence could not be retained"
+                );
+            }
             self.broadcast_outcome(record.outcome.clone());
             job.outcome.send_replace(Some(record));
             if allow_forward {
@@ -4546,6 +4909,981 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outcome_store_read_failure_without_a_trusted_baseline_withholds_send() {
+        use freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier;
+        use std::sync::atomic::AtomicUsize;
+
+        let home = tempfile::tempdir().unwrap();
+        let store_path = home
+            .path()
+            .join(".freshell/checkpoints/attempt-outcomes-v1.json");
+        tokio::fs::create_dir_all(&store_path).await.unwrap();
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(16);
+        let mut outcome_rx = broadcast_tx.subscribe();
+        let service = Arc::new(CheckpointService::new(
+            Arc::new(home.path().to_path_buf()),
+            Arc::new(broadcast_tx),
+        ));
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let make_send = |request_id: &str| FreshAgentSend {
+            provider: AgentProvider::Opencode,
+            session_id: "session-read-failure".into(),
+            session_type: SessionType::Freshopencode,
+            text: "send despite unavailable rewind status".into(),
+            cwd: None,
+            images: None,
+            request_id: Some(request_id.into()),
+            settings: None,
+            observed_epoch: None,
+            observed_generation: None,
+            checkpoint_intent: Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: "attempt-read-failure".into(),
+                workspace: None,
+            }),
+        };
+        let make_forward = |dispatches: Arc<AtomicUsize>| {
+            Box::pin(async move {
+                dispatches.fetch_add(1, Ordering::SeqCst);
+            }) as futures_util::future::BoxFuture<'static, ()>
+        };
+
+        service
+            .clone()
+            .barrier_and_forward(
+                make_send("request-read-failure-1"),
+                make_forward(Arc::clone(&dispatches)),
+            )
+            .await;
+        service
+            .clone()
+            .barrier_and_forward(
+                make_send("request-read-failure-2"),
+                make_forward(Arc::clone(&dispatches)),
+            )
+            .await;
+
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            0,
+            "an unreadable store at startup cannot prove that this attempt was never dispatched"
+        );
+        let outcome: Value = serde_json::from_str(&outcome_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(outcome["type"], "freshAgent.checkpoint.outcome");
+        assert_eq!(outcome["status"], "unavailable");
+        assert_eq!(outcome["code"], "outcome_store_unavailable");
+        assert!(outcome["reason"]
+            .as_str()
+            .unwrap()
+            .contains("prior send history could not be verified"));
+        assert!(outcome["reason"].as_str().unwrap().contains("withheld"));
+    }
+
+    #[tokio::test]
+    async fn malformed_seen_store_disappearing_does_not_establish_empty_baseline() {
+        use freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier;
+        use std::sync::atomic::AtomicUsize;
+
+        let home = tempfile::tempdir().unwrap();
+        let store_path = home
+            .path()
+            .join(".freshell/checkpoints/attempt-outcomes-v1.json");
+        tokio::fs::create_dir_all(store_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&store_path, b"not a checkpoint outcome store")
+            .await
+            .unwrap();
+
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(16);
+        let mut outcome_rx = broadcast_tx.subscribe();
+        let service = Arc::new(CheckpointService::new(
+            Arc::new(home.path().to_path_buf()),
+            Arc::new(broadcast_tx),
+        ));
+        let key = "\"opencode\":\"freshopencode\":session-malformed-store:attempt-malformed-store";
+        assert!(service.find_outcome(key).await.is_err());
+        tokio::fs::remove_file(&store_path).await.unwrap();
+
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let send = FreshAgentSend {
+            provider: AgentProvider::Opencode,
+            session_id: "session-malformed-store".into(),
+            session_type: SessionType::Freshopencode,
+            text: "do not assume a deleted malformed store was empty".into(),
+            cwd: None,
+            images: None,
+            request_id: Some("request-malformed-store".into()),
+            settings: None,
+            observed_epoch: None,
+            observed_generation: None,
+            checkpoint_intent: Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: "attempt-malformed-store".into(),
+                workspace: None,
+            }),
+        };
+        service
+            .clone()
+            .barrier_and_forward(
+                send,
+                Box::pin({
+                    let dispatches = Arc::clone(&dispatches);
+                    async move {
+                        dispatches.fetch_add(1, Ordering::SeqCst);
+                    }
+                }),
+            )
+            .await;
+
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+        let outcome: Value = serde_json::from_str(&outcome_rx.recv().await.unwrap()).unwrap();
+        assert!(outcome["reason"]
+            .as_str()
+            .unwrap()
+            .contains("prior send history could not be verified"));
+    }
+
+    #[tokio::test]
+    async fn durable_dispatch_fence_blocks_retry_when_outcome_store_becomes_unreadable() {
+        use freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier;
+        use std::sync::atomic::AtomicUsize;
+
+        let home = tempfile::tempdir().unwrap();
+        let store_path = home
+            .path()
+            .join(".freshell/checkpoints/attempt-outcomes-v1.json");
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(16);
+        let service = Arc::new(CheckpointService::new(
+            Arc::new(home.path().to_path_buf()),
+            Arc::new(broadcast_tx),
+        ));
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let make_send = |request_id: &str| FreshAgentSend {
+            provider: AgentProvider::Opencode,
+            session_id: "session-read-after-dispatch".into(),
+            session_type: SessionType::Freshopencode,
+            text: "retry must not duplicate an already dispatched turn".into(),
+            cwd: None,
+            images: None,
+            request_id: Some(request_id.into()),
+            settings: None,
+            observed_epoch: None,
+            observed_generation: None,
+            checkpoint_intent: Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: "attempt-read-after-dispatch".into(),
+                workspace: None,
+            }),
+        };
+        let make_forward = |dispatches: Arc<AtomicUsize>| {
+            Box::pin(async move {
+                dispatches.fetch_add(1, Ordering::SeqCst);
+            }) as futures_util::future::BoxFuture<'static, ()>
+        };
+
+        service
+            .clone()
+            .barrier_and_forward(
+                make_send("request-read-after-dispatch-1"),
+                make_forward(Arc::clone(&dispatches)),
+            )
+            .await;
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+
+        tokio::fs::remove_file(&store_path).await.unwrap();
+        tokio::fs::create_dir(&store_path).await.unwrap();
+        service
+            .clone()
+            .barrier_and_forward(
+                make_send("request-read-after-dispatch-2"),
+                make_forward(Arc::clone(&dispatches)),
+            )
+            .await;
+
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            1,
+            "an unreadable durable history cannot turn a known dispatched attempt into a new send"
+        );
+    }
+
+    #[tokio::test]
+    async fn loaded_durable_dispatch_fence_blocks_retry_after_store_is_removed() {
+        use freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier;
+        use std::sync::atomic::AtomicUsize;
+
+        let home = tempfile::tempdir().unwrap();
+        let store_path = home
+            .path()
+            .join(".freshell/checkpoints/attempt-outcomes-v1.json");
+        let (seed_broadcast_tx, _) = tokio::sync::broadcast::channel(16);
+        let seed_service = Arc::new(CheckpointService::new(
+            Arc::new(home.path().to_path_buf()),
+            Arc::new(seed_broadcast_tx),
+        ));
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let make_send = |request_id: &str| FreshAgentSend {
+            provider: AgentProvider::Opencode,
+            session_id: "session-loaded-dispatch".into(),
+            session_type: SessionType::Freshopencode,
+            text: "retry must not duplicate a durable dispatch from a prior service".into(),
+            cwd: None,
+            images: None,
+            request_id: Some(request_id.into()),
+            settings: None,
+            observed_epoch: None,
+            observed_generation: None,
+            checkpoint_intent: Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: "attempt-loaded-dispatch".into(),
+                workspace: None,
+            }),
+        };
+        let make_forward = |dispatches: Arc<AtomicUsize>| {
+            Box::pin(async move {
+                dispatches.fetch_add(1, Ordering::SeqCst);
+            }) as futures_util::future::BoxFuture<'static, ()>
+        };
+
+        seed_service
+            .clone()
+            .barrier_and_forward(
+                make_send("request-loaded-dispatch-1"),
+                make_forward(Arc::clone(&dispatches)),
+            )
+            .await;
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(16);
+        let mut outcome_rx = broadcast_tx.subscribe();
+        let service = Arc::new(CheckpointService::new(
+            Arc::new(home.path().to_path_buf()),
+            Arc::new(broadcast_tx),
+        ));
+        let key = "\"opencode\":\"freshopencode\":session-loaded-dispatch:attempt-loaded-dispatch";
+        let loaded = service.find_outcome(key).await.unwrap().unwrap();
+        assert!(loaded.dispatch_started);
+        assert!(loaded.capture_settled);
+
+        tokio::fs::remove_file(&store_path).await.unwrap();
+        assert!(service.read_outcome_store().await.is_err());
+        service
+            .clone()
+            .barrier_and_forward(
+                make_send("request-loaded-dispatch-2"),
+                make_forward(Arc::clone(&dispatches)),
+            )
+            .await;
+
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+        let outcome: Value = serde_json::from_str(&outcome_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(outcome["requestId"], "request-loaded-dispatch-2");
+    }
+
+    #[tokio::test]
+    async fn durable_outcome_presence_marker_blocks_retry_after_restart_and_store_deletion() {
+        use freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier;
+        use std::sync::atomic::AtomicUsize;
+
+        let home = tempfile::tempdir().unwrap();
+        let store_path = home
+            .path()
+            .join(".freshell/checkpoints/attempt-outcomes-v1.json");
+        let (seed_broadcast_tx, _) = tokio::sync::broadcast::channel(16);
+        let seed_service = Arc::new(CheckpointService::new(
+            Arc::new(home.path().to_path_buf()),
+            Arc::new(seed_broadcast_tx),
+        ));
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let make_send = |request_id: &str| FreshAgentSend {
+            provider: AgentProvider::Opencode,
+            session_id: "session-restart-store-deletion".into(),
+            session_type: SessionType::Freshopencode,
+            text: "do not duplicate after restart if the durable fence disappears".into(),
+            cwd: None,
+            images: None,
+            request_id: Some(request_id.into()),
+            settings: None,
+            observed_epoch: None,
+            observed_generation: None,
+            checkpoint_intent: Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: "attempt-restart-store-deletion".into(),
+                workspace: None,
+            }),
+        };
+        let make_forward = |dispatches: Arc<AtomicUsize>| {
+            Box::pin(async move {
+                dispatches.fetch_add(1, Ordering::SeqCst);
+            }) as futures_util::future::BoxFuture<'static, ()>
+        };
+
+        seed_service
+            .clone()
+            .barrier_and_forward(
+                make_send("request-restart-store-deletion-1"),
+                make_forward(Arc::clone(&dispatches)),
+            )
+            .await;
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+        tokio::fs::remove_file(&store_path).await.unwrap();
+
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(16);
+        let service = Arc::new(CheckpointService::new(
+            Arc::new(home.path().to_path_buf()),
+            Arc::new(broadcast_tx),
+        ));
+        service
+            .clone()
+            .barrier_and_forward(
+                make_send("request-restart-store-deletion-2"),
+                make_forward(Arc::clone(&dispatches)),
+            )
+            .await;
+
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            1,
+            "a restarted service must not treat a deleted durable history as first use"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_durable_outcome_replays_when_store_becomes_unreadable() {
+        use freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier;
+        use std::sync::atomic::AtomicUsize;
+
+        let home = tempfile::tempdir().unwrap();
+        let store_path = home
+            .path()
+            .join(".freshell/checkpoints/attempt-outcomes-v1.json");
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(16);
+        let mut outcome_rx = broadcast_tx.subscribe();
+        let service = Arc::new(CheckpointService::new(
+            Arc::new(home.path().to_path_buf()),
+            Arc::new(broadcast_tx),
+        ));
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let send = FreshAgentSend {
+            provider: AgentProvider::Opencode,
+            session_id: "session-cache-replay".into(),
+            session_type: SessionType::Freshopencode,
+            text: "replay the saved outcome after a transient store error".into(),
+            cwd: None,
+            images: None,
+            request_id: Some("request-cache-replay".into()),
+            settings: None,
+            observed_epoch: None,
+            observed_generation: None,
+            checkpoint_intent: Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: "attempt-cache-replay".into(),
+                workspace: None,
+            }),
+        };
+        service
+            .clone()
+            .barrier_and_forward(
+                send,
+                Box::pin({
+                    let dispatches = Arc::clone(&dispatches);
+                    async move {
+                        dispatches.fetch_add(1, Ordering::SeqCst);
+                    }
+                }),
+            )
+            .await;
+        tokio::fs::remove_file(&store_path).await.unwrap();
+        tokio::fs::create_dir(&store_path).await.unwrap();
+
+        service
+            .replay_for_identity(
+                AgentProvider::Opencode,
+                "session-cache-replay",
+                SessionType::Freshopencode,
+            )
+            .await;
+
+        let outcome: Value = serde_json::from_str(&outcome_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(outcome["requestId"], "request-cache-replay");
+        assert_eq!(outcome["logicalAttemptId"], "attempt-cache-replay");
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn loaded_unsettled_attempt_stays_withheld_after_store_becomes_unreadable() {
+        use freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier;
+        use std::sync::atomic::AtomicUsize;
+
+        let home = tempfile::tempdir().unwrap();
+        let store_path = home
+            .path()
+            .join(".freshell/checkpoints/attempt-outcomes-v1.json");
+        let (seed_broadcast_tx, _) = tokio::sync::broadcast::channel(16);
+        let seed_service = Arc::new(CheckpointService::new(
+            Arc::new(home.path().to_path_buf()),
+            Arc::new(seed_broadcast_tx),
+        ));
+        let seed_send = FreshAgentSend {
+            provider: AgentProvider::Opencode,
+            session_id: "session-loaded-unsettled".into(),
+            session_type: SessionType::Freshopencode,
+            text: "do not release this send until capture settlement is known".into(),
+            cwd: None,
+            images: None,
+            request_id: Some("request-loaded-unsettled-1".into()),
+            settings: None,
+            observed_epoch: None,
+            observed_generation: None,
+            checkpoint_intent: Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: "attempt-loaded-unsettled".into(),
+                workspace: None,
+            }),
+        };
+        let key =
+            "\"opencode\":\"freshopencode\":session-loaded-unsettled:attempt-loaded-unsettled";
+        let mut unsettled = seed_service.new_record(
+            &seed_send,
+            "attempt-loaded-unsettled",
+            "request-loaded-unsettled-1",
+            None,
+            Err((
+                "checkpoint_settlement_pending",
+                "snapshot still settling".into(),
+            )),
+        );
+        unsettled.capture_settled = false;
+        unsettled.dispatch_started = false;
+        seed_service.persist_outcome(key, unsettled).await.unwrap();
+
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(16);
+        let mut outcome_rx = broadcast_tx.subscribe();
+        let service = Arc::new(CheckpointService::new(
+            Arc::new(home.path().to_path_buf()),
+            Arc::new(broadcast_tx),
+        ));
+        let loaded = service.find_outcome(key).await.unwrap().unwrap();
+        assert!(!loaded.dispatch_started);
+        assert!(!loaded.capture_settled);
+
+        tokio::fs::remove_file(&store_path).await.unwrap();
+        tokio::fs::create_dir(&store_path).await.unwrap();
+        assert!(service.read_outcome_store().await.is_err());
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let retry = FreshAgentSend {
+            request_id: Some("request-loaded-unsettled-2".into()),
+            ..seed_send
+        };
+        service
+            .clone()
+            .barrier_and_forward(
+                retry,
+                Box::pin({
+                    let dispatches = Arc::clone(&dispatches);
+                    async move {
+                        dispatches.fetch_add(1, Ordering::SeqCst);
+                    }
+                }),
+            )
+            .await;
+
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+        let outcome: Value = serde_json::from_str(&outcome_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(outcome["requestId"], "request-loaded-unsettled-2");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn outcome_store_write_failure_forwards_once_and_reports_unknown_rewind() {
+        use freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::AtomicUsize;
+
+        let home = tempfile::tempdir().unwrap();
+        let store_dir = home.path().join(".freshell/checkpoints");
+        tokio::fs::create_dir_all(&store_dir).await.unwrap();
+        let store_path = store_dir.join("attempt-outcomes-v1.json");
+        let empty_store = CheckpointOutcomeStore {
+            version: CHECKPOINT_OUTCOME_STORE_VERSION,
+            outcomes: BTreeMap::new(),
+        };
+        tokio::fs::write(&store_path, serde_json::to_vec(&empty_store).unwrap())
+            .await
+            .unwrap();
+        let mut permissions = tokio::fs::metadata(&store_dir).await.unwrap().permissions();
+        permissions.set_mode(0o555);
+        tokio::fs::set_permissions(&store_dir, permissions)
+            .await
+            .unwrap();
+
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(16);
+        let mut outcome_rx = broadcast_tx.subscribe();
+        let service = Arc::new(CheckpointService::new(
+            Arc::new(home.path().to_path_buf()),
+            Arc::new(broadcast_tx),
+        ));
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let make_send = |request_id: &str| FreshAgentSend {
+            provider: AgentProvider::Opencode,
+            session_id: "session-write-failure".into(),
+            session_type: SessionType::Freshopencode,
+            text: "send despite unavailable rewind status".into(),
+            cwd: None,
+            images: None,
+            request_id: Some(request_id.into()),
+            settings: None,
+            observed_epoch: None,
+            observed_generation: None,
+            checkpoint_intent: Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: "attempt-write-failure".into(),
+                workspace: None,
+            }),
+        };
+        let make_forward = |dispatches: Arc<AtomicUsize>| {
+            Box::pin(async move {
+                dispatches.fetch_add(1, Ordering::SeqCst);
+            }) as futures_util::future::BoxFuture<'static, ()>
+        };
+
+        service
+            .clone()
+            .barrier_and_forward(
+                make_send("request-write-failure-1"),
+                make_forward(Arc::clone(&dispatches)),
+            )
+            .await;
+        service
+            .clone()
+            .barrier_and_forward(
+                make_send("request-write-failure-2"),
+                make_forward(Arc::clone(&dispatches)),
+            )
+            .await;
+        let mut permissions = tokio::fs::metadata(&store_dir).await.unwrap().permissions();
+        permissions.set_mode(0o755);
+        tokio::fs::set_permissions(&store_dir, permissions)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            1,
+            "a store write error must allow one send and fence its duplicate"
+        );
+        let outcome: Value = serde_json::from_str(&outcome_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(outcome["type"], "freshAgent.checkpoint.outcome");
+        assert_eq!(outcome["status"], "unavailable");
+        assert_eq!(outcome["code"], "outcome_store_unavailable");
+        assert!(outcome["reason"].as_str().unwrap().contains("rewind"));
+        assert!(outcome["reason"].as_str().unwrap().contains("sent"));
+    }
+
+    #[tokio::test]
+    async fn volatile_fence_capacity_fails_closed_without_duplicate_dispatch() {
+        use freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier;
+        use std::sync::atomic::AtomicUsize;
+
+        let home = tempfile::tempdir().unwrap();
+        let store_path = home
+            .path()
+            .join(".freshell/checkpoints/attempt-outcomes-v1.json");
+        let store_dir = store_path.parent().unwrap();
+        tokio::fs::create_dir_all(store_dir).await.unwrap();
+        let empty_store = CheckpointOutcomeStore {
+            version: CHECKPOINT_OUTCOME_STORE_VERSION,
+            outcomes: BTreeMap::new(),
+        };
+        tokio::fs::write(&store_path, serde_json::to_vec(&empty_store).unwrap())
+            .await
+            .unwrap();
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(16);
+        let service = Arc::new(CheckpointService::new(
+            Arc::new(home.path().to_path_buf()),
+            Arc::new(broadcast_tx.clone()),
+        ));
+        assert!(service
+            .read_outcome_store()
+            .await
+            .unwrap()
+            .outcomes
+            .is_empty());
+        tokio::fs::remove_file(&store_path).await.unwrap();
+        tokio::fs::create_dir(&store_path).await.unwrap();
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let make_send = |attempt: usize, request_id: String| FreshAgentSend {
+            provider: AgentProvider::Opencode,
+            session_id: "session-fence-capacity".into(),
+            session_type: SessionType::Freshopencode,
+            text: "send only when duplicate protection is retained".into(),
+            cwd: None,
+            images: None,
+            request_id: Some(request_id),
+            settings: None,
+            observed_epoch: None,
+            observed_generation: None,
+            checkpoint_intent: Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: format!("attempt-fence-capacity-{attempt}"),
+                workspace: None,
+            }),
+        };
+        let make_forward = |dispatches: Arc<AtomicUsize>| {
+            Box::pin(async move {
+                dispatches.fetch_add(1, Ordering::SeqCst);
+            }) as futures_util::future::BoxFuture<'static, ()>
+        };
+
+        for attempt in 0..CHECKPOINT_VOLATILE_FENCE_LIMIT {
+            service
+                .clone()
+                .barrier_and_forward(
+                    make_send(attempt, format!("request-fence-capacity-{attempt}")),
+                    make_forward(Arc::clone(&dispatches)),
+                )
+                .await;
+        }
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            CHECKPOINT_VOLATILE_FENCE_LIMIT
+        );
+        let current_len = service
+            .volatile_outcomes
+            .lock()
+            .expect("volatile checkpoint outcomes mutex poisoned")
+            .len();
+        assert_eq!(
+            current_len, CHECKPOINT_VOLATILE_FENCE_LIMIT,
+            "process-local fences must never exceed their configured capacity"
+        );
+
+        let mut outcome_rx = broadcast_tx.subscribe();
+        service
+            .clone()
+            .barrier_and_forward(
+                make_send(
+                    CHECKPOINT_VOLATILE_FENCE_LIMIT,
+                    "request-fence-capacity-overflow".into(),
+                ),
+                make_forward(Arc::clone(&dispatches)),
+            )
+            .await;
+        service
+            .clone()
+            .barrier_and_forward(
+                make_send(
+                    CHECKPOINT_VOLATILE_FENCE_LIMIT,
+                    "request-fence-capacity-overflow-retry".into(),
+                ),
+                make_forward(Arc::clone(&dispatches)),
+            )
+            .await;
+
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            CHECKPOINT_VOLATILE_FENCE_LIMIT,
+            "an attempt without retained local duplicate protection must stay withheld"
+        );
+        for _ in 0..2 {
+            let outcome: Value = serde_json::from_str(&outcome_rx.recv().await.unwrap()).unwrap();
+            assert_eq!(outcome["status"], "unavailable");
+            assert_eq!(outcome["code"], "outcome_store_unavailable");
+            assert!(outcome["reason"].as_str().unwrap().contains("withheld"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_outcomes_do_not_consume_volatile_fence_capacity() {
+        use freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::AtomicUsize;
+
+        let home = tempfile::tempdir().unwrap();
+        let store_dir = home.path().join(".freshell/checkpoints");
+        tokio::fs::create_dir_all(&store_dir).await.unwrap();
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(16);
+        let service = Arc::new(CheckpointService::new(
+            Arc::new(home.path().to_path_buf()),
+            Arc::new(broadcast_tx),
+        ));
+        let mut outcomes = BTreeMap::new();
+        for index in 0..CHECKPOINT_VOLATILE_FENCE_LIMIT {
+            let request_id = format!("durable-request-{index}");
+            let send = FreshAgentSend {
+                provider: AgentProvider::Opencode,
+                session_id: format!("durable-session-{index}"),
+                session_type: SessionType::Freshopencode,
+                text: "not stored".into(),
+                cwd: None,
+                images: None,
+                request_id: Some(request_id.clone()),
+                settings: None,
+                observed_epoch: None,
+                observed_generation: None,
+                checkpoint_intent: None,
+            };
+            let mut record = service.new_record(
+                &send,
+                &format!("durable-attempt-{index}"),
+                &request_id,
+                None,
+                Err(("workspace_unavailable", "No workspace".into())),
+            );
+            record.dispatch_started = true;
+            outcomes.insert(format!("durable-key-{index}"), record);
+        }
+        service
+            .write_outcome_store(&CheckpointOutcomeStore {
+                version: CHECKPOINT_OUTCOME_STORE_VERSION,
+                outcomes,
+            })
+            .await
+            .unwrap();
+        service
+            .observe_accepted(&json!({
+                "requestId": "durable-request-0",
+                "provider": "opencode",
+                "sessionId": "durable-session-0",
+                "sessionType": "freshopencode",
+                "submittedTurnId": "durable-turn-0"
+            }))
+            .await;
+
+        let durable_count = service.read_outcome_store().await.unwrap().outcomes.len();
+        assert_eq!(durable_count, CHECKPOINT_VOLATILE_FENCE_LIMIT);
+        let cached_durable_count = service
+            .volatile_outcomes
+            .lock()
+            .expect("volatile checkpoint outcomes mutex poisoned")
+            .len();
+        assert_eq!(
+            cached_durable_count, 0,
+            "durable outcomes remain on disk and must not consume volatile fence slots"
+        );
+
+        let mut permissions = tokio::fs::metadata(&store_dir).await.unwrap().permissions();
+        permissions.set_mode(0o555);
+        tokio::fs::set_permissions(&store_dir, permissions)
+            .await
+            .unwrap();
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let send = FreshAgentSend {
+            provider: AgentProvider::Opencode,
+            session_id: "session-needs-volatile-fence".into(),
+            session_type: SessionType::Freshopencode,
+            text: "send with a new volatile fence slot".into(),
+            cwd: None,
+            images: None,
+            request_id: Some("request-needs-volatile-fence".into()),
+            settings: None,
+            observed_epoch: None,
+            observed_generation: None,
+            checkpoint_intent: Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: "attempt-needs-volatile-fence".into(),
+                workspace: None,
+            }),
+        };
+        service
+            .clone()
+            .barrier_and_forward(
+                send,
+                Box::pin({
+                    let dispatches = Arc::clone(&dispatches);
+                    async move {
+                        dispatches.fetch_add(1, Ordering::SeqCst);
+                    }
+                }),
+            )
+            .await;
+        let mut permissions = tokio::fs::metadata(&store_dir).await.unwrap().permissions();
+        permissions.set_mode(0o755);
+        tokio::fs::set_permissions(&store_dir, permissions)
+            .await
+            .unwrap();
+
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+        let volatile_count = service
+            .volatile_outcomes
+            .lock()
+            .expect("volatile checkpoint outcomes mutex poisoned")
+            .len();
+        assert_eq!(
+            volatile_count, 1,
+            "only the failed durable write should consume a volatile fence slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn settled_workspace_failure_forwards_once_and_reports_unavailable_rewind() {
+        use freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier;
+        use std::sync::atomic::AtomicUsize;
+
+        let home = tempfile::tempdir().unwrap();
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(16);
+        let mut outcome_rx = broadcast_tx.subscribe();
+        let service = Arc::new(CheckpointService::new(
+            Arc::new(home.path().to_path_buf()),
+            Arc::new(broadcast_tx),
+        ));
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let make_send = |request_id: &str| FreshAgentSend {
+            provider: AgentProvider::Opencode,
+            session_id: "session-workspace-failure".into(),
+            session_type: SessionType::Freshopencode,
+            text: "send despite missing workspace".into(),
+            cwd: None,
+            images: None,
+            request_id: Some(request_id.into()),
+            settings: None,
+            observed_epoch: None,
+            observed_generation: None,
+            checkpoint_intent: Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: "attempt-workspace-failure".into(),
+                workspace: None,
+            }),
+        };
+        let make_forward = |dispatches: Arc<AtomicUsize>| {
+            Box::pin(async move {
+                dispatches.fetch_add(1, Ordering::SeqCst);
+            }) as futures_util::future::BoxFuture<'static, ()>
+        };
+
+        service
+            .clone()
+            .barrier_and_forward(
+                make_send("request-workspace-failure-1"),
+                make_forward(Arc::clone(&dispatches)),
+            )
+            .await;
+        service
+            .clone()
+            .barrier_and_forward(
+                make_send("request-workspace-failure-2"),
+                make_forward(Arc::clone(&dispatches)),
+            )
+            .await;
+
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            1,
+            "a settled workspace failure must not suppress or duplicate the provider send"
+        );
+        let outcome: Value = serde_json::from_str(&outcome_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(outcome["type"], "freshAgent.checkpoint.outcome");
+        assert_eq!(outcome["status"], "unavailable");
+        assert_eq!(outcome["code"], "workspace_unavailable");
+        assert!(outcome["reason"]
+            .as_str()
+            .unwrap()
+            .contains("message will still be sent"));
+    }
+
+    #[tokio::test]
+    async fn pending_send_forwards_once_after_quarantine_confirms_settlement() {
+        use freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier;
+        use std::sync::atomic::AtomicUsize;
+
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        run_git(&["init", "-q"], Some(workspace.path()))
+            .await
+            .unwrap();
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(16);
+        let mut outcome_rx = broadcast_tx.subscribe();
+        let service = Arc::new(CheckpointService::new(
+            Arc::new(home.path().to_path_buf()),
+            Arc::new(broadcast_tx),
+        ));
+        let gate = Arc::new(TestSettlementGate {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let control = Arc::new(CheckpointCaptureControl::default());
+        *control
+            .test_settlement_gate
+            .lock()
+            .expect("checkpoint test settlement gate poisoned") = Some(Arc::clone(&gate));
+        *service
+            .test_capture_attempt_override
+            .lock()
+            .expect("checkpoint test capture override mutex poisoned") =
+            Some(CaptureAttempt::Unsettled {
+                message: "simulated uncertain child settlement".into(),
+                control,
+            });
+
+        let make_send = |request_id: &str| FreshAgentSend {
+            provider: AgentProvider::Opencode,
+            session_id: "session-quarantine-settlement".into(),
+            session_type: SessionType::Freshopencode,
+            text: "continue after snapshot child settles".into(),
+            cwd: Some(workspace.path().to_string_lossy().into_owned()),
+            images: None,
+            request_id: Some(request_id.into()),
+            settings: None,
+            observed_epoch: None,
+            observed_generation: None,
+            checkpoint_intent: Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: "attempt-quarantine-settlement".into(),
+                workspace: None,
+            }),
+        };
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let make_forward = |dispatches: Arc<AtomicUsize>| {
+            Box::pin(async move {
+                dispatches.fetch_add(1, Ordering::SeqCst);
+            }) as futures_util::future::BoxFuture<'static, ()>
+        };
+        let first = tokio::spawn(service.clone().barrier_and_forward(
+            make_send("request-quarantine-settlement-1"),
+            make_forward(Arc::clone(&dispatches)),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), gate.entered.notified())
+            .await
+            .expect("automatic capture entered the existing quarantine settlement gate");
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+        assert!(
+            service
+                .lock_workspace(workspace.path(), Duration::from_millis(30))
+                .await
+                .is_err(),
+            "the provider send must stay behind the quarantined workspace lock"
+        );
+
+        let duplicate = tokio::spawn(service.clone().barrier_and_forward(
+            make_send("request-quarantine-settlement-2"),
+            make_forward(Arc::clone(&dispatches)),
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+        gate.release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .expect("settled pending send completed")
+            .expect("pending send task completed");
+        tokio::time::timeout(Duration::from_secs(2), duplicate)
+            .await
+            .expect("duplicate joined the pending send")
+            .expect("duplicate task completed");
+
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            1,
+            "a settled quarantined attempt forwards once despite a duplicate request"
+        );
+        let outcome: Value = serde_json::from_str(&outcome_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(outcome["type"], "freshAgent.checkpoint.outcome");
+        assert_eq!(outcome["status"], "unavailable");
+        assert_eq!(outcome["code"], "capture_failed");
+        assert!(outcome["reason"]
+            .as_str()
+            .unwrap()
+            .contains("message will still be sent"));
+        let key = format!(
+            "\"opencode\":\"freshopencode\":session-quarantine-settlement:attempt-quarantine-settlement"
+        );
+        let saved = service.find_outcome(&key).await.unwrap().unwrap();
+        assert!(saved.capture_settled);
+        assert!(saved.dispatch_started);
+    }
+
+    #[tokio::test]
     async fn codex_identity_receipt_is_durable_and_replayed_after_service_reload() {
         use freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier;
 
@@ -4637,6 +5975,166 @@ mod tests {
         assert_eq!(replayed["logicalAttemptId"], "codex-logical-attempt-1");
         assert_eq!(replayed["nativeTurnId"], "codex-native-turn-1");
         assert_eq!(replayed["displayTurnId"], "codex-native-turn-1:row-0");
+    }
+
+    #[tokio::test]
+    async fn codex_checkpoint_identity_must_match_accepted_provider_turn_id_in_either_event_order()
+    {
+        let home = tempfile::tempdir().unwrap();
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(16);
+        let service =
+            CheckpointService::new(Arc::new(home.path().to_path_buf()), Arc::new(broadcast_tx));
+        let workspace = ResolvedCheckpointWorkspace {
+            path: PathBuf::from("/work/codex-project"),
+            provenance: "directory-picker".to_string(),
+        };
+        let send = |request_id: &str, attempt_id: &str| FreshAgentSend {
+            provider: AgentProvider::Codex,
+            session_id: "codex-session".to_string(),
+            session_type: SessionType::Freshcodex,
+            text: "identity mismatch must not enable rewind".to_string(),
+            cwd: Some("/work/codex-project".to_string()),
+            images: None,
+            request_id: Some(request_id.to_string()),
+            settings: None,
+            observed_epoch: None,
+            observed_generation: None,
+            checkpoint_intent: Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: attempt_id.to_string(),
+                workspace: None,
+            }),
+        };
+        let identity_event = |request_id: &str, attempt_id: &str, native_turn_id: &str| {
+            json!({
+                "provider": "codex",
+                "sessionId": "codex-session",
+                "sessionType": "freshcodex",
+                "event": {
+                    "type": "checkpointTurnIdentity",
+                    "requestId": request_id,
+                    "logicalAttemptId": attempt_id,
+                    "sessionId": "codex-session",
+                    "nativeTurnId": native_turn_id,
+                    "displayTurnId": format!("{native_turn_id}:row-0")
+                }
+            })
+        };
+
+        let first_send = send("request-identity-first", "attempt-identity-first");
+        let first_key = checkpoint_attempt_key(&first_send, "attempt-identity-first");
+        let mut first = service.new_record(
+            &first_send,
+            "attempt-identity-first",
+            "request-identity-first",
+            Some((&workspace, "")),
+            Ok("checkpoint-first".to_string()),
+        );
+        first.dispatch_started = true;
+        first.submitted_turn_id = Some("accepted-turn-first".to_string());
+        service.persist_outcome(&first_key, first).await.unwrap();
+
+        service
+            .observe_turn_identity(&identity_event(
+                "request-identity-first",
+                "attempt-identity-first",
+                "different-turn-first",
+            ))
+            .await;
+        let persisted = service.read_outcome_store().await.unwrap();
+        let first_saved = persisted.outcomes.get(&first_key).unwrap();
+        assert_eq!(first_saved.outcome.native_turn_id, None);
+        assert_eq!(first_saved.outcome.display_turn_id, None);
+
+        service
+            .observe_turn_identity(&identity_event(
+                "request-identity-first",
+                "attempt-identity-first",
+                "accepted-turn-first",
+            ))
+            .await;
+        let persisted = service.read_outcome_store().await.unwrap();
+        assert_eq!(
+            persisted
+                .outcomes
+                .get(&first_key)
+                .unwrap()
+                .outcome
+                .native_turn_id
+                .as_deref(),
+            Some("accepted-turn-first")
+        );
+
+        let second_send = send("request-identity-second", "attempt-identity-second");
+        let second_key = checkpoint_attempt_key(&second_send, "attempt-identity-second");
+        let mut second = service.new_record(
+            &second_send,
+            "attempt-identity-second",
+            "request-identity-second",
+            Some((&workspace, "")),
+            Ok("checkpoint-second".to_string()),
+        );
+        second.dispatch_started = true;
+        service.persist_outcome(&second_key, second).await.unwrap();
+        service
+            .observe_turn_identity(&identity_event(
+                "request-identity-second",
+                "attempt-identity-second",
+                "identity-before-acceptance",
+            ))
+            .await;
+        service
+            .observe_accepted(&json!({
+                "requestId": "request-identity-second",
+                "provider": "codex",
+                "sessionId": "codex-session",
+                "sessionType": "freshcodex",
+                "submittedTurnId": "different-accepted-turn"
+            }))
+            .await;
+
+        let persisted = service.read_outcome_store().await.unwrap();
+        let second_saved = persisted.outcomes.get(&second_key).unwrap();
+        assert_eq!(
+            second_saved.outcome.native_turn_id.as_deref(),
+            Some("identity-before-acceptance")
+        );
+        assert_eq!(
+            second_saved.submitted_turn_id, None,
+            "a conflicting later acceptance cannot be joined to this checkpoint"
+        );
+
+        let third_send = send("request-identity-third", "attempt-identity-third");
+        let third_key = checkpoint_attempt_key(&third_send, "attempt-identity-third");
+        let mut third = service.new_record(
+            &third_send,
+            "attempt-identity-third",
+            "request-identity-third",
+            Some((&workspace, "")),
+            Ok("checkpoint-third".to_string()),
+        );
+        third.dispatch_started = true;
+        third.submitted_turn_id = Some("accepted-turn-third".to_string());
+        service.persist_outcome(&third_key, third).await.unwrap();
+        service
+            .observe_accepted(&json!({
+                "requestId": "request-identity-third",
+                "provider": "codex",
+                "sessionId": "codex-session",
+                "sessionType": "freshcodex"
+            }))
+            .await;
+
+        let persisted = service.read_outcome_store().await.unwrap();
+        assert_eq!(
+            persisted
+                .outcomes
+                .get(&third_key)
+                .unwrap()
+                .submitted_turn_id
+                .as_deref(),
+            Some("accepted-turn-third"),
+            "an accepted event without an optional native ID must preserve exact identity already recorded"
+        );
     }
 
     async fn body_json(resp: Response) -> Value {

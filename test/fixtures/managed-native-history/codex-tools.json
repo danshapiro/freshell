@@ -43,6 +43,7 @@
       "role": "user",
       "summary": "Saved coding request",
       "summaryKind": "echo",
+      "nativeTurnId": "native-turn",
       "items": [
         {
           "id": "user-native:part:0",

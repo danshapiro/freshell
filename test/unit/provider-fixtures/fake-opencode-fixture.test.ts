@@ -122,4 +122,40 @@ describe('fake-opencode fixture fork sequence parity (ep3-r1 F3)', () => {
       .map((m) => (m.parts ?? []).filter((p) => p.type === 'text').map((p) => p.text).join('\n'))
     expect(userTexts).toEqual(['turn one', 'turn two', 'follow-up'])
   }, 30_000)
+
+  it('persists the native user message ID supplied to prompt_async', async () => {
+    const sessionId = 'ses_checkpoint_identity'
+    const seeded = spawnSync(
+      process.execPath,
+      [FIXTURE, 'run', 'seed prompt', '--session', sessionId],
+      {
+        env: {
+          ...process.env,
+          XDG_DATA_HOME: xdgDataHome,
+          FAKE_OPENCODE_AUDIT_LOG: auditLog,
+        },
+      },
+    )
+    expect(seeded.status).toBe(0)
+
+    const headers = { 'content-type': 'application/json', 'x-opencode-directory': projectRoot }
+    const messageId = 'msg_0123456789abcdef0123456789abcdef'
+    const promptRes = await fetch(`http://127.0.0.1:${port}/session/${sessionId}/prompt_async`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        parts: [{ type: 'text', text: 'checkpointed prompt' }],
+        messageID: messageId,
+      }),
+    })
+    expect(promptRes.status).toBe(200)
+
+    const messagesRes = await fetch(`http://127.0.0.1:${port}/session/${sessionId}/message`, { headers })
+    expect(messagesRes.status).toBe(200)
+    const messages = (await messagesRes.json()) as FakeMessage[]
+    const userMessage = messages.find((message) => message.info.id === messageId)
+
+    expect(userMessage?.info.role).toBe('user')
+    expect(userMessage?.parts?.map((part) => part.text)).toContain('checkpointed prompt')
+  }, 30_000)
 })
