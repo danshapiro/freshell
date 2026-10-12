@@ -200,8 +200,19 @@ async fn validate_dir(
                 .unwrap_or(false)
         })
         .unwrap_or(false);
+    let checkpoint_workspace_eligible = is_dir
+        && resolved
+            .fs_path
+            .as_deref()
+            .and_then(|path| std::fs::canonicalize(path).ok())
+            .is_some_and(|path| !crate::checkpoints::is_os_account_home(&path));
 
-    Json(json!({ "valid": is_dir, "resolvedPath": resolved.display })).into_response()
+    Json(json!({
+        "valid": is_dir,
+        "resolvedPath": resolved.display,
+        "checkpointWorkspaceEligible": checkpoint_workspace_eligible,
+    }))
+    .into_response()
 }
 
 /// `GET /api/files/read?path=<p>` \u2192 `{ content, size, modifiedAt }` (`files-router.ts:85`).
@@ -1394,6 +1405,7 @@ mod tests {
         let v = body_json(resp).await;
         assert_eq!(v["valid"], true);
         assert_eq!(v["resolvedPath"], dir);
+        assert_eq!(v["checkpointWorkspaceEligible"], true);
         let bogus = format!("{}/freshell-nonexistent-xyz", tmp.path().display());
         let resp = validate_dir(
             State(test_state()),
@@ -1404,6 +1416,24 @@ mod tests {
         .into_response();
         let v = body_json(resp).await;
         assert_eq!(v["valid"], false);
+        assert_eq!(v["checkpointWorkspaceEligible"], false);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn validate_dir_marks_account_home_as_launch_only() {
+        let _guard = env_lock();
+        let home = std::env::var("HOME").expect("test environment has HOME");
+        let response = validate_dir(
+            State(test_state()),
+            auth_headers(),
+            Json(json!({ "path": home })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = body_json(response).await;
+        assert_eq!(value["valid"], true);
+        assert_eq!(value["checkpointWorkspaceEligible"], false);
     }
 
     /// Node's `normalizeUserPath` runs `path.posix.resolve` on POSIX inputs

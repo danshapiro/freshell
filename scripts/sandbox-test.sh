@@ -11,6 +11,7 @@
 #   scripts/sandbox-test.sh --corpus "cargo test -p freshell-sessions -- --ignored perf"
 #   scripts/sandbox-test.sh --native-tools <manifest-path> --receipt-dir <absolute-directory>
 #   scripts/sandbox-test.sh --runtime-suite "cargo test -p freshell-codex ..."
+#   scripts/sandbox-test.sh --runtime-suite --checkpoint-fixture "cargo test -p freshell-server --features managed-runtime-v1 --locked --test code_checkpoint_permissions"
 #
 # --runtime-suite is the stricter managed-runtime lifecycle mode: no network,
 # no real provider corpus, no Docker/admin socket, read-only container root.
@@ -91,6 +92,7 @@ if [ "${1:-}" = "--settle-owned" ]; then
 else
   MOUNT_CORPUS=0
   RUNTIME_SUITE=0
+  CHECKPOINT_FIXTURE=0
   while [ "$#" -gt 0 ]; do
     case "${1}" in
       --corpus)
@@ -99,6 +101,10 @@ else
         ;;
       --runtime-suite)
         RUNTIME_SUITE=1
+        shift
+        ;;
+      --checkpoint-fixture)
+        CHECKPOINT_FIXTURE=1
         shift
         ;;
       --)
@@ -113,6 +119,11 @@ else
 
   if [ "${MOUNT_CORPUS}" -eq 1 ] && [ "${RUNTIME_SUITE}" -eq 1 ]; then
     echo "[sandbox] --runtime-suite may not mount the real --corpus provider data" >&2
+    exit 2
+  fi
+
+  if [ "${CHECKPOINT_FIXTURE}" -eq 1 ] && [ "${RUNTIME_SUITE}" -ne 1 ]; then
+    echo "[sandbox] --checkpoint-fixture requires --runtime-suite" >&2
     exit 2
   fi
 
@@ -358,6 +369,9 @@ if [ "${RUNTIME_SUITE}" -eq 1 ]; then
     --security-opt no-new-privileges
     -e FRESHELL_SANDBOX_MODE=runtime-suite
   )
+  if [ "${CHECKPOINT_FIXTURE}" -eq 1 ]; then
+    DOCKER_ARGS+=(-e FRESHELL_SANDBOX_CHECKPOINT_FIXTURE=1)
+  fi
 fi
 
 if [ "${MOUNT_CORPUS}" -eq 1 ]; then
