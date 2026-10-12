@@ -23,10 +23,11 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::routing::get as get_method;
 use axum::{
@@ -36,10 +37,18 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha1::{Digest, Sha1};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
+use tokio::sync::{Mutex, OwnedMutexGuard, watch};
+
+use freshell_protocol::{
+    AgentProvider, CheckpointWorkspaceProvenance, FreshAgentCheckpointOutcome,
+    FreshAgentCheckpointStatus, FreshAgentCheckpointWorkspace, FreshAgentSend, ServerMessage,
+    SessionType,
+};
 
 use crate::boot::{is_authed, unauthorized};
 
@@ -74,6 +83,2125 @@ pub struct CheckpointsApiState {
     /// request, matching this crate's convention for boot-resolved paths (see
     /// `main.rs`'s `session_metadata_dir`).
     pub home: Arc<PathBuf>,
+    /// Same service instance used by the WebSocket local and managed send
+    /// paths, so REST capture, listing and restore share workspace locks and
+    /// durable attempt outcomes.
+    pub service: Arc<CheckpointService>,
+}
+
+const CHECKPOINT_AUTO_BUDGET: Duration = Duration::from_secs(15);
+const CHECKPOINT_EXPLICIT_BUDGET: Duration = Duration::from_secs(120);
+const CHECKPOINT_TIMEOUT_COOLDOWN: Duration = Duration::from_secs(60);
+const CHECKPOINT_COOLDOWN_LIMIT: usize = 128;
+const CHECKPOINT_OUTCOME_STORE_VERSION: u8 = 1;
+const CHECKPOINT_OUTCOME_STORE_LIMIT: usize = 8192;
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredCheckpointOutcome {
+    version: u8,
+    outcome: FreshAgentCheckpointOutcome,
+    request_ids: Vec<String>,
+    session_aliases: Vec<String>,
+    #[serde(default)]
+    dispatch_started: bool,
+    #[serde(default = "capture_settled_by_default")]
+    capture_settled: bool,
+    submitted_turn_id: Option<String>,
+    created_at_ms: u64,
+}
+
+fn capture_settled_by_default() -> bool {
+    true
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckpointOutcomeStore {
+    version: u8,
+    outcomes: BTreeMap<String, StoredCheckpointOutcome>,
+}
+
+struct CheckpointAttemptJob {
+    outcome: watch::Sender<Option<StoredCheckpointOutcome>>,
+    finished: watch::Sender<bool>,
+}
+
+#[derive(Clone)]
+struct CheckpointCooldown {
+    expires_at: Instant,
+}
+
+struct CaptureRequestCancellation {
+    sender: watch::Sender<bool>,
+}
+
+impl Drop for CaptureRequestCancellation {
+    fn drop(&mut self) {
+        self.sender.send_replace(true);
+    }
+}
+
+enum ExplicitCaptureError {
+    WorkspaceUnavailable(CheckpointWorkspaceUnavailable),
+    ResolutionTimeout(String),
+    WorkspaceBusy(ResolvedCheckpointWorkspace),
+    Capture {
+        workspace: ResolvedCheckpointWorkspace,
+        message: String,
+    },
+    Unsettled {
+        candidate: PathBuf,
+        workspace: Option<ResolvedCheckpointWorkspace>,
+        message: String,
+    },
+    Cancelled,
+    ServiceStopped,
+}
+
+async fn wait_for_capture_cancellation(receiver: &mut watch::Receiver<bool>) {
+    if !*receiver.borrow() {
+        let _ = receiver.changed().await;
+    }
+}
+
+async fn cancel_and_settle_capture_task<T>(
+    control: &CheckpointCaptureControl,
+    task: &mut tokio::task::JoinHandle<T>,
+) -> Result<(), String> {
+    if let Err(error) = control.cancel_processes().await {
+        tracing::error!(
+            event = "code_checkpoint.process_termination_failed",
+            cause = %error,
+            "checkpoint child termination was not confirmed"
+        );
+    }
+    // Let the runner reap a killed direct child normally. If it is still in a
+    // filesystem future after its process groups/jobs are gone, abort that
+    // remaining future rather than letting it outlive the attempt deadline.
+    if tokio::time::timeout(Duration::from_secs(1), &mut *task)
+        .await
+        .is_err()
+    {
+        task.abort();
+        let _ = task.await;
+    }
+    control
+        .wait_for_process_groups()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Shared checkpoint route/service state. Automatic WebSocket sends and the
+/// explicit REST capture path use the same workspace serialization and
+/// published shadow repository. Outcomes are persisted separately from the
+/// checkpoint metadata patch, so a lost client connection can recover the
+/// result after reattach.
+pub struct CheckpointService {
+    home: Arc<PathBuf>,
+    broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+    workspace_locks: StdMutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
+    outcome_gate: Mutex<()>,
+    attempt_jobs: Mutex<HashMap<String, Arc<CheckpointAttemptJob>>>,
+    cooldowns: StdMutex<HashMap<PathBuf, CheckpointCooldown>>,
+    in_memory_outcomes: StdMutex<BTreeMap<String, StoredCheckpointOutcome>>,
+}
+
+tokio::task_local! {
+    static CHECKPOINT_CAPTURE_CONTEXT: Arc<CheckpointCaptureControl>;
+}
+
+#[derive(Default)]
+struct CheckpointCaptureControl {
+    cancelled: AtomicBool,
+    #[cfg(unix)]
+    process_groups: StdMutex<HashSet<i32>>,
+    #[cfg(windows)]
+    jobs: StdMutex<Vec<Arc<WindowsJob>>>,
+    #[cfg(test)]
+    test_settlement_gate: StdMutex<Option<Arc<TestSettlementGate>>>,
+}
+
+#[cfg(test)]
+struct TestSettlementGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl CheckpointCaptureControl {
+    fn spawn_child(self: &Arc<Self>, command: &mut Command) -> std::io::Result<CheckpointChild> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let mut groups = self
+                .process_groups
+                .lock()
+                .expect("checkpoint process group set poisoned");
+            if self.cancelled.load(Ordering::SeqCst) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "checkpoint capture was cancelled",
+                ));
+            }
+            command.as_std_mut().process_group(0);
+            command.kill_on_drop(true);
+            let child = command.spawn()?;
+            let group = child
+                .id()
+                .and_then(|pid| i32::try_from(pid).ok())
+                .ok_or_else(|| {
+                    std::io::Error::other("checkpoint child process has no process group id")
+                })?;
+            groups.insert(group);
+            return Ok(CheckpointChild {
+                child: Some(child),
+                control: Some(Arc::clone(self)),
+                process_group: Some(group),
+                #[cfg(windows)]
+                job: None,
+            });
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+
+            let mut jobs = self.jobs.lock().expect("checkpoint job list poisoned");
+            if self.cancelled.load(Ordering::SeqCst) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "checkpoint capture was cancelled",
+                ));
+            }
+            let job = Arc::new(WindowsJob::new()?);
+            command.as_std_mut().creation_flags(CREATE_SUSPENDED);
+            command.kill_on_drop(true);
+            let mut child = command.spawn()?;
+            let process_id = child.id().ok_or_else(|| {
+                std::io::Error::other("checkpoint child process has no process id")
+            })?;
+            if let Err(error) = job.assign_suspended_process(process_id) {
+                job.terminate();
+                let _ = child.start_kill();
+                return Err(error);
+            }
+            jobs.push(Arc::clone(&job));
+            Ok(CheckpointChild {
+                child: Some(child),
+                control: Some(Arc::clone(self)),
+                process_group: None,
+                job: Some(job),
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            if self.cancelled.load(Ordering::SeqCst) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "checkpoint capture was cancelled",
+                ));
+            }
+            command.kill_on_drop(true);
+            let child = command.spawn()?;
+            Ok(CheckpointChild {
+                child: Some(child),
+                control: Some(Arc::clone(self)),
+                process_group: None,
+                #[cfg(windows)]
+                job: None,
+            })
+        }
+    }
+
+    async fn cancel_processes(&self) -> std::io::Result<()> {
+        self.cancelled.store(true, Ordering::SeqCst);
+        #[cfg(unix)]
+        {
+            let groups = self
+                .process_groups
+                .lock()
+                .expect("checkpoint process group set poisoned")
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+            for group in &groups {
+                signal_process_group(*group, libc::SIGTERM);
+            }
+            if !groups.is_empty() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            for group in groups {
+                signal_process_group(group, libc::SIGKILL);
+            }
+        }
+        #[cfg(windows)]
+        {
+            let jobs = self
+                .jobs
+                .lock()
+                .expect("checkpoint job list poisoned")
+                .clone();
+            for job in jobs {
+                job.terminate();
+            }
+        }
+        Ok(())
+    }
+
+    async fn wait_for_process_groups(&self) -> std::io::Result<()> {
+        #[cfg(test)]
+        let test_gate = {
+            self.test_settlement_gate
+                .lock()
+                .expect("checkpoint test settlement gate poisoned")
+                .clone()
+        };
+        #[cfg(test)]
+        if let Some(gate) = test_gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+        #[cfg(unix)]
+        {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let has_groups = {
+                    let mut groups = self
+                        .process_groups
+                        .lock()
+                        .expect("checkpoint process group set poisoned");
+                    groups.retain(|group| process_group_exists(*group));
+                    !groups.is_empty()
+                };
+                if !has_groups {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "checkpoint process group did not settle within five seconds",
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+        #[cfg(windows)]
+        {
+            let jobs = self
+                .jobs
+                .lock()
+                .expect("checkpoint job list poisoned")
+                .clone();
+            for job in jobs {
+                job.settle().await?;
+                self.jobs
+                    .lock()
+                    .expect("checkpoint job list poisoned")
+                    .retain(|candidate| !Arc::ptr_eq(candidate, &job));
+            }
+            Ok(())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    async fn settle_process_group(&self, group: i32) -> std::io::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        if process_group_exists(group) {
+            signal_process_group(group, libc::SIGTERM);
+            for _ in 0..4 {
+                if !process_group_exists(group) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            if process_group_exists(group) {
+                signal_process_group(group, libc::SIGKILL);
+            }
+            while process_group_exists(group) {
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "checkpoint child process group did not settle within five seconds",
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+        self.process_groups
+            .lock()
+            .expect("checkpoint process group set poisoned")
+            .remove(&group);
+        Ok(())
+    }
+}
+
+struct CheckpointChild {
+    child: Option<Child>,
+    control: Option<Arc<CheckpointCaptureControl>>,
+    process_group: Option<i32>,
+    #[cfg(windows)]
+    job: Option<Arc<WindowsJob>>,
+}
+
+impl CheckpointChild {
+    async fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
+        let child = self
+            .child
+            .take()
+            .expect("checkpoint child must be present before wait")
+            .wait_with_output()
+            .await?;
+        self.settle().await?;
+        Ok(child)
+    }
+
+    async fn terminate_and_wait(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+        let _ = self.settle().await;
+    }
+
+    async fn settle(&mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        if let (Some(control), Some(group)) = (&self.control, self.process_group) {
+            control.settle_process_group(group).await?;
+        }
+        #[cfg(windows)]
+        if let (Some(control), Some(job)) = (&self.control, &self.job) {
+            job.settle().await?;
+            control
+                .jobs
+                .lock()
+                .expect("checkpoint job list poisoned")
+                .retain(|candidate| !Arc::ptr_eq(candidate, job));
+        }
+        Ok(())
+    }
+}
+
+fn checkpoint_child(command: &mut Command) -> std::io::Result<CheckpointChild> {
+    CHECKPOINT_CAPTURE_CONTEXT
+        .try_with(|control| control.spawn_child(command))
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::other(
+                "checkpoint Git process requires the server-owned capture runner",
+            ))
+        })
+}
+
+/// Non-capture checkpoint operations (listing, metadata lookup, and restore)
+/// still use the same child wrapper, but do not have a capture supervisor.
+/// Capture code is guarded by `create_checkpoint` and can only use the strict
+/// `checkpoint_child` path above.
+fn checkpoint_read_only_child(command: &mut Command) -> std::io::Result<CheckpointChild> {
+    match CHECKPOINT_CAPTURE_CONTEXT.try_with(|control| control.spawn_child(command)) {
+        Ok(result) => result,
+        Err(_) => {
+            command.kill_on_drop(true);
+            command.spawn().map(|child| CheckpointChild {
+                child: Some(child),
+                control: None,
+                process_group: None,
+                #[cfg(windows)]
+                job: None,
+            })
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_process_group(group: i32, signal: i32) {
+    // Negative PID targets the complete group, including Git filters/hooks.
+    let _ = unsafe { libc::kill(-group, signal) };
+}
+
+#[cfg(unix)]
+fn process_group_exists(group: i32) -> bool {
+    let result = unsafe { libc::kill(-group, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+struct WindowsJob {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+unsafe impl Send for WindowsJob {}
+#[cfg(windows)]
+unsafe impl Sync for WindowsJob {}
+
+#[cfg(windows)]
+impl WindowsJob {
+    fn new() -> std::io::Result<Self> {
+        use windows_sys::Win32::System::JobObjects::{
+            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(limits).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if configured == 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+            return Err(error);
+        }
+        Ok(Self { handle })
+    }
+
+    fn assign_suspended_process(&self, process_id: u32) -> std::io::Result<()> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+        };
+
+        let process = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, process_id) };
+        if process.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let assigned = unsafe { AssignProcessToJobObject(self.handle, process) };
+        let assign_error = (assigned == 0).then(std::io::Error::last_os_error);
+        unsafe { CloseHandle(process) };
+        if let Some(error) = assign_error {
+            return Err(error);
+        }
+
+        let thread_id = find_process_thread(process_id)?;
+        let thread = unsafe {
+            windows_sys::Win32::System::Threading::OpenThread(
+                windows_sys::Win32::System::Threading::THREAD_SUSPEND_RESUME,
+                0,
+                thread_id,
+            )
+        };
+        if thread.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let resumed = unsafe { windows_sys::Win32::System::Threading::ResumeThread(thread) };
+        unsafe { CloseHandle(thread) };
+        if resumed == u32::MAX {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn active_processes(&self) -> std::io::Result<u32> {
+        use windows_sys::Win32::System::JobObjects::{
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
+            QueryInformationJobObject,
+        };
+
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        let queried = unsafe {
+            QueryInformationJobObject(
+                self.handle,
+                JobObjectBasicAccountingInformation,
+                std::ptr::addr_of_mut!(accounting).cast(),
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if queried == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(accounting.ActiveProcesses)
+    }
+
+    fn terminate(&self) {
+        let terminated =
+            unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.handle, 1) };
+        if terminated == 0 {
+            tracing::error!(
+                event = "code_checkpoint.job_termination_failed",
+                cause = %std::io::Error::last_os_error(),
+                "checkpoint child job could not be terminated"
+            );
+        }
+    }
+
+    async fn settle(&self) -> std::io::Result<()> {
+        let active_processes = match self.active_processes() {
+            Ok(active_processes) => active_processes,
+            Err(error) => {
+                tracing::error!(
+                    event = "code_checkpoint.job_process_query_failed",
+                    cause = %error,
+                    "checkpoint child job activity could not be queried; terminating it"
+                );
+                u32::MAX
+            }
+        };
+        if active_processes > 0 {
+            self.terminate();
+        } else {
+            return Ok(());
+        }
+        let handle = self.handle as usize;
+        let wait_result = tokio::task::spawn_blocking(move || unsafe {
+            windows_sys::Win32::System::Threading::WaitForSingleObject(
+                handle as windows_sys::Win32::Foundation::HANDLE,
+                5_000,
+            )
+        })
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!("checkpoint job wait task failed: {error}"))
+        })?;
+        match wait_result {
+            windows_sys::Win32::Foundation::WAIT_OBJECT_0 => Ok(()),
+            windows_sys::Win32::Foundation::WAIT_TIMEOUT => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "checkpoint job did not settle within five seconds",
+            )),
+            windows_sys::Win32::Foundation::WAIT_FAILED => Err(std::io::Error::last_os_error()),
+            status => Err(std::io::Error::other(format!(
+                "checkpoint job wait returned unexpected status {status}"
+            ))),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsJob {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
+    }
+}
+
+#[cfg(windows)]
+fn find_process_thread(process_id: u32) -> std::io::Result<u32> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut entry = THREADENTRY32 {
+        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+        ..Default::default()
+    };
+    let mut found = None;
+    let mut has_entry = unsafe { Thread32First(snapshot, &mut entry) };
+    while has_entry != 0 {
+        if entry.th32OwnerProcessID == process_id {
+            found = Some(entry.th32ThreadID);
+            break;
+        }
+        has_entry = unsafe { Thread32Next(snapshot, &mut entry) };
+    }
+    unsafe { CloseHandle(snapshot) };
+    found.ok_or_else(|| std::io::Error::other("suspended Git process thread was not found"))
+}
+
+impl CheckpointService {
+    pub fn new(
+        home: Arc<PathBuf>,
+        broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+    ) -> Self {
+        Self {
+            home,
+            broadcast_tx,
+            workspace_locks: StdMutex::new(HashMap::new()),
+            outcome_gate: Mutex::new(()),
+            attempt_jobs: Mutex::new(HashMap::new()),
+            cooldowns: StdMutex::new(HashMap::new()),
+            in_memory_outcomes: StdMutex::new(BTreeMap::new()),
+        }
+    }
+
+    pub fn start_observer(self: &Arc<Self>) {
+        let mut receiver = self.broadcast_tx.subscribe();
+        let service = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(frame) => {
+                        let Some(service) = service.upgrade() else {
+                            break;
+                        };
+                        service.observe_broadcast_frame(&frame).await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                        tracing::warn!(
+                            event = "code_checkpoint.outcome_observer_lagged",
+                            skipped_frames = count,
+                            "checkpoint outcome observer skipped broadcast frames"
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
+    fn outcome_store_path(&self) -> PathBuf {
+        self.home
+            .join(".freshell")
+            .join("checkpoints")
+            .join("attempt-outcomes-v1.json")
+    }
+
+    fn workspace_lock(&self, workspace: &Path) -> Arc<Mutex<()>> {
+        let key = resolve_absolute(workspace);
+        let mut locks = self
+            .workspace_locks
+            .lock()
+            .expect("checkpoint workspace lock map poisoned");
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
+    }
+
+    async fn lock_workspace(
+        &self,
+        workspace: &Path,
+        budget: Duration,
+    ) -> Result<OwnedMutexGuard<()>, ()> {
+        tokio::time::timeout(budget, self.workspace_lock(workspace).lock_owned())
+            .await
+            .map_err(|_| ())
+    }
+
+    fn quarantine_workspace(
+        &self,
+        workspace: PathBuf,
+        lock: OwnedMutexGuard<()>,
+        control: Arc<CheckpointCaptureControl>,
+        request_id: Option<String>,
+        stage: &'static str,
+        initial_cause: String,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            // Keep the lock alive for the whole retry loop. A caller must never
+            // release workspace serialization while a child may still mutate
+            // the shadow repository.
+            let _workspace_lock = lock;
+            tracing::error!(
+                event = "code_checkpoint.workspace_quarantined",
+                workspace = %workspace.display(),
+                request_id = request_id.as_deref().unwrap_or(""),
+                stage,
+                cause = %initial_cause,
+                "checkpoint child settlement is uncertain; workspace remains locked"
+            );
+            let mut retry = 0_u64;
+            loop {
+                retry = retry.saturating_add(1);
+                if let Err(error) = control.cancel_processes().await {
+                    tracing::error!(
+                        event = "code_checkpoint.quarantine_termination_failed",
+                        workspace = %workspace.display(),
+                        request_id = request_id.as_deref().unwrap_or(""),
+                        stage,
+                        retry,
+                        cause = %error,
+                        "checkpoint process termination retry failed"
+                    );
+                }
+                match control.wait_for_process_groups().await {
+                    Ok(()) => {
+                        tracing::warn!(
+                            event = "code_checkpoint.workspace_quarantine_released",
+                            workspace = %workspace.display(),
+                            request_id = request_id.as_deref().unwrap_or(""),
+                            stage,
+                            retry,
+                            "checkpoint children settled; workspace lock released"
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            event = "code_checkpoint.quarantine_settlement_pending",
+                            workspace = %workspace.display(),
+                            request_id = request_id.as_deref().unwrap_or(""),
+                            stage,
+                            retry,
+                            cause = %error,
+                            "checkpoint workspace remains locked until child settlement is confirmed"
+                        );
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        })
+    }
+
+    async fn read_outcome_store(&self) -> Result<CheckpointOutcomeStore, String> {
+        let path = self.outcome_store_path();
+        let raw = match tokio::fs::read(&path).await {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(CheckpointOutcomeStore {
+                    version: CHECKPOINT_OUTCOME_STORE_VERSION,
+                    outcomes: BTreeMap::new(),
+                });
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to read checkpoint attempt outcomes: {error}"
+                ));
+            }
+        };
+        let store: CheckpointOutcomeStore = serde_json::from_slice(&raw)
+            .map_err(|error| format!("invalid checkpoint attempt outcome store: {error}"))?;
+        if store.version != CHECKPOINT_OUTCOME_STORE_VERSION {
+            return Err("unsupported checkpoint attempt outcome store version".to_string());
+        }
+        Ok(store)
+    }
+
+    async fn write_outcome_store(&self, store: &CheckpointOutcomeStore) -> Result<(), String> {
+        let path = self.outcome_store_path();
+        let parent = path
+            .parent()
+            .ok_or_else(|| "checkpoint outcome store has no parent directory".to_string())?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| format!("failed to create checkpoint outcome directory: {error}"))?;
+        let temporary = parent.join(format!(
+            "attempt-outcomes-v1.json.tmp-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let serialized = serde_json::to_vec_pretty(store)
+            .map_err(|error| format!("failed to serialize checkpoint outcomes: {error}"))?;
+        #[cfg(unix)]
+        let write_result = {
+            let mut options = tokio::fs::OpenOptions::new();
+            options.write(true).create_new(true).mode(0o600);
+            match options.open(&temporary).await {
+                Ok(mut file) => match file.write_all(&serialized).await {
+                    Ok(()) => file
+                        .sync_all()
+                        .await
+                        .map_err(|error| format!("failed to flush checkpoint outcomes: {error}")),
+                    Err(error) => Err(format!("failed to write checkpoint outcomes: {error}")),
+                },
+                Err(error) => Err(format!("failed to create checkpoint outcome file: {error}")),
+            }
+        };
+        #[cfg(not(unix))]
+        let write_result = tokio::fs::write(&temporary, &serialized)
+            .await
+            .map_err(|error| format!("failed to write checkpoint outcomes: {error}"));
+        if let Err(error) = write_result {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error);
+        }
+        if let Err(error) = tokio::fs::rename(&temporary, &path).await {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(format!("failed to publish checkpoint outcomes: {error}"));
+        }
+        Ok(())
+    }
+
+    async fn persist_outcome(
+        &self,
+        key: &str,
+        outcome: StoredCheckpointOutcome,
+    ) -> Result<(), String> {
+        let _guard = self.outcome_gate.lock().await;
+        let mut store = self.read_outcome_store().await?;
+        store.outcomes.insert(key.to_string(), outcome.clone());
+        while store.outcomes.len() > CHECKPOINT_OUTCOME_STORE_LIMIT {
+            let oldest = store
+                .outcomes
+                .iter()
+                .min_by_key(|(_, item)| item.created_at_ms)
+                .map(|(key, _)| key.clone());
+            let Some(oldest) = oldest else { break };
+            store.outcomes.remove(&oldest);
+        }
+        self.write_outcome_store(&store).await?;
+        self.in_memory_outcomes
+            .lock()
+            .expect("checkpoint outcome memory cache poisoned")
+            .insert(key.to_string(), outcome);
+        Ok(())
+    }
+
+    async fn find_outcome(&self, key: &str) -> Result<Option<StoredCheckpointOutcome>, String> {
+        if let Some(outcome) = self
+            .in_memory_outcomes
+            .lock()
+            .expect("checkpoint outcome memory cache poisoned")
+            .get(key)
+            .cloned()
+        {
+            return Ok(Some(outcome));
+        }
+        let _guard = self.outcome_gate.lock().await;
+        let store = self.read_outcome_store().await?;
+        let outcome = store.outcomes.get(key).cloned();
+        if let Some(outcome) = &outcome {
+            self.in_memory_outcomes
+                .lock()
+                .expect("checkpoint outcome memory cache poisoned")
+                .insert(key.to_string(), outcome.clone());
+        }
+        Ok(outcome)
+    }
+
+    async fn replay_for_identity(
+        &self,
+        provider: AgentProvider,
+        session_id: &str,
+        session_type: SessionType,
+    ) {
+        let records = match self.read_outcome_store().await {
+            Ok(store) => store.outcomes,
+            Err(error) => {
+                tracing::error!(
+                    event = "code_checkpoint.outcome_store_read_failed",
+                    cause = %error,
+                    "durable checkpoint outcomes could not be replayed"
+                );
+                self.in_memory_outcomes
+                    .lock()
+                    .expect("checkpoint outcome memory cache poisoned")
+                    .clone()
+            }
+        };
+        for record in records.values().filter(|record| {
+            record.outcome.provider == provider
+                && record.outcome.session_type == session_type
+                && record
+                    .session_aliases
+                    .iter()
+                    .any(|alias| alias == session_id)
+        }) {
+            if record.request_ids.is_empty() {
+                self.broadcast_outcome(record.outcome.clone());
+            } else {
+                for request_id in &record.request_ids {
+                    let mut outcome = record.outcome.clone();
+                    outcome.request_id = request_id.clone();
+                    self.broadcast_outcome(outcome);
+                }
+            }
+        }
+    }
+
+    fn broadcast_outcome(&self, outcome: FreshAgentCheckpointOutcome) {
+        let message = ServerMessage::FreshAgentCheckpointOutcome(outcome);
+        if let Ok(frame) = serde_json::to_string(&message) {
+            let _ = self.broadcast_tx.send(frame);
+        }
+    }
+
+    async fn observe_broadcast_frame(&self, frame: &str) {
+        let Ok(message) = serde_json::from_str::<Value>(frame) else {
+            return;
+        };
+        match message.get("type").and_then(Value::as_str) {
+            Some("freshAgent.send.accepted") => self.observe_accepted(&message).await,
+            Some("freshAgent.session.materialized") => self.observe_materialized(&message).await,
+            Some("freshAgent.event") => self.observe_turn_identity(&message).await,
+            _ => {}
+        }
+    }
+
+    async fn update_matching_outcomes<Matches, Update>(
+        &self,
+        mut matches: Matches,
+        mut update: Update,
+    ) -> Result<Vec<StoredCheckpointOutcome>, String>
+    where
+        Matches: FnMut(&StoredCheckpointOutcome) -> bool,
+        Update: FnMut(&mut StoredCheckpointOutcome),
+    {
+        let _guard = self.outcome_gate.lock().await;
+        let mut store = self.read_outcome_store().await?;
+        let mut changed = Vec::new();
+        for record in store.outcomes.values_mut() {
+            if matches(record) {
+                update(record);
+                changed.push(record.clone());
+            }
+        }
+        if !changed.is_empty() {
+            self.write_outcome_store(&store).await?;
+            let mut cache = self
+                .in_memory_outcomes
+                .lock()
+                .expect("checkpoint outcome memory cache poisoned");
+            for (key, record) in &store.outcomes {
+                cache.insert(key.clone(), record.clone());
+            }
+        }
+        Ok(changed)
+    }
+
+    async fn observe_accepted(&self, message: &Value) {
+        let Some(request_id) = message.get("requestId").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(provider) = message
+            .get("provider")
+            .and_then(Value::as_str)
+            .and_then(parse_agent_provider)
+        else {
+            return;
+        };
+        let Some(session_type) = message
+            .get("sessionType")
+            .and_then(Value::as_str)
+            .and_then(parse_session_type)
+        else {
+            return;
+        };
+        let Some(session_id) = message.get("sessionId").and_then(Value::as_str) else {
+            return;
+        };
+        let submitted_turn_id = message
+            .get("submittedTurnId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let updated = self
+            .update_matching_outcomes(
+                |record| {
+                    record.outcome.provider == provider
+                        && record.outcome.session_type == session_type
+                        && record.request_ids.iter().any(|alias| alias == request_id)
+                        && record
+                            .session_aliases
+                            .iter()
+                            .any(|alias| alias == session_id)
+                },
+                |record| record.submitted_turn_id = submitted_turn_id.clone(),
+            )
+            .await;
+        if let Err(error) = updated {
+            tracing::error!(
+                event = "code_checkpoint.accepted_identity_persist_failed",
+                request_id,
+                cause = %error,
+                "accepted turn identity could not be persisted"
+            );
+        }
+    }
+
+    async fn observe_materialized(&self, message: &Value) {
+        let Some(previous) = message.get("previousSessionId").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(session_id) = message.get("sessionId").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(provider) = message
+            .get("provider")
+            .and_then(Value::as_str)
+            .and_then(parse_agent_provider)
+        else {
+            return;
+        };
+        let Some(session_type) = message
+            .get("sessionType")
+            .and_then(Value::as_str)
+            .and_then(parse_session_type)
+        else {
+            return;
+        };
+        let updated = self
+            .update_matching_outcomes(
+                |record| {
+                    record.outcome.provider == provider
+                        && record.outcome.session_type == session_type
+                        && record.session_aliases.iter().any(|alias| alias == previous)
+                },
+                |record| {
+                    if !record
+                        .session_aliases
+                        .iter()
+                        .any(|alias| alias == session_id)
+                    {
+                        record.session_aliases.push(session_id.to_string());
+                    }
+                },
+            )
+            .await;
+        if let Err(error) = updated {
+            tracing::error!(
+                event = "code_checkpoint.session_alias_persist_failed",
+                cause = %error,
+                "checkpoint session materialization alias could not be persisted"
+            );
+        }
+    }
+
+    async fn observe_turn_identity(&self, message: &Value) {
+        let Some(event) = message.get("event") else {
+            return;
+        };
+        if event.get("type").and_then(Value::as_str) != Some("checkpointTurnIdentity") {
+            return;
+        }
+        let Some(logical_attempt_id) = event.get("logicalAttemptId").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(request_id) = event.get("requestId").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(native_turn_id) = event.get("nativeTurnId").and_then(Value::as_str) else {
+            return;
+        };
+        let session_id = event
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .or_else(|| message.get("sessionId").and_then(Value::as_str));
+        let Some(session_id) = session_id else { return };
+        let display_turn_id = event
+            .get("displayTurnId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let Some(provider) = message
+            .get("provider")
+            .and_then(Value::as_str)
+            .and_then(parse_agent_provider)
+        else {
+            return;
+        };
+        let Some(session_type) = message
+            .get("sessionType")
+            .and_then(Value::as_str)
+            .and_then(parse_session_type)
+        else {
+            return;
+        };
+        let updated = self
+            .update_matching_outcomes(
+                |record| {
+                    record.outcome.logical_attempt_id == logical_attempt_id
+                        && record.outcome.provider == provider
+                        && record.outcome.session_type == session_type
+                        && record.request_ids.iter().any(|alias| alias == request_id)
+                        && record
+                            .session_aliases
+                            .iter()
+                            .any(|alias| alias == session_id)
+                        && record
+                            .outcome
+                            .native_turn_id
+                            .as_deref()
+                            .is_none_or(|existing| existing == native_turn_id)
+                },
+                |record| {
+                    record.outcome.native_turn_id = Some(native_turn_id.to_string());
+                    if display_turn_id.is_some() {
+                        record.outcome.display_turn_id = display_turn_id.clone();
+                    }
+                },
+            )
+            .await;
+        match updated {
+            Ok(records) => {
+                for record in records {
+                    if record.request_ids.is_empty() {
+                        self.broadcast_outcome(record.outcome.clone());
+                    } else {
+                        for request_id in &record.request_ids {
+                            let mut outcome = record.outcome.clone();
+                            outcome.request_id = request_id.clone();
+                            self.broadcast_outcome(outcome);
+                        }
+                    }
+                }
+            }
+            Err(error) => tracing::error!(
+                event = "code_checkpoint.turn_identity_persist_failed",
+                logical_attempt_id,
+                cause = %error,
+                "provider checkpoint turn identity could not be persisted"
+            ),
+        }
+    }
+
+    fn active_cooldown(&self, workspace: &Path) -> Option<Duration> {
+        let now = Instant::now();
+        let mut cooldowns = self
+            .cooldowns
+            .lock()
+            .expect("checkpoint cooldown map poisoned");
+        cooldowns.retain(|_, cooldown| cooldown.expires_at > now);
+        cooldowns
+            .get(workspace)
+            .map(|cooldown| cooldown.expires_at.saturating_duration_since(now))
+    }
+
+    fn establish_cooldown(&self, workspace: &Path) {
+        let now = Instant::now();
+        let mut cooldowns = self
+            .cooldowns
+            .lock()
+            .expect("checkpoint cooldown map poisoned");
+        cooldowns.retain(|_, cooldown| cooldown.expires_at > now);
+        cooldowns.insert(
+            workspace.to_path_buf(),
+            CheckpointCooldown {
+                expires_at: now + CHECKPOINT_TIMEOUT_COOLDOWN,
+            },
+        );
+        while cooldowns.len() > CHECKPOINT_COOLDOWN_LIMIT {
+            let oldest = cooldowns
+                .iter()
+                .min_by_key(|(_, cooldown)| cooldown.expires_at)
+                .map(|(path, _)| path.clone());
+            let Some(oldest) = oldest else { break };
+            cooldowns.remove(&oldest);
+        }
+    }
+
+    fn clear_cooldown(&self, workspace: &Path) {
+        self.cooldowns
+            .lock()
+            .expect("checkpoint cooldown map poisoned")
+            .remove(workspace);
+    }
+
+    fn new_record(
+        &self,
+        send: &FreshAgentSend,
+        logical_attempt_id: &str,
+        request_id: &str,
+        workspace: Option<(&ResolvedCheckpointWorkspace, &str)>,
+        result: Result<String, (&'static str, String)>,
+    ) -> StoredCheckpointOutcome {
+        let (status, checkpoint_id, code, reason, resolved_workspace) = match result {
+            Ok(checkpoint_id) => (
+                FreshAgentCheckpointStatus::Available,
+                Some(checkpoint_id),
+                None,
+                None,
+                workspace.map(|(workspace, _)| FreshAgentCheckpointWorkspace {
+                    path: workspace.path.to_string_lossy().into_owned(),
+                    provenance: workspace_provenance(&workspace.provenance),
+                }),
+            ),
+            Err((code, reason)) => (
+                FreshAgentCheckpointStatus::Unavailable,
+                None,
+                Some(code.to_string()),
+                Some(reason),
+                workspace.map(|(workspace, _)| FreshAgentCheckpointWorkspace {
+                    path: workspace.path.to_string_lossy().into_owned(),
+                    provenance: workspace_provenance(&workspace.provenance),
+                }),
+            ),
+        };
+        let mut request_ids = vec![request_id.to_string()];
+        request_ids.truncate(16);
+        let mut session_aliases = vec![send.session_id.clone()];
+        session_aliases.truncate(16);
+        StoredCheckpointOutcome {
+            version: CHECKPOINT_OUTCOME_STORE_VERSION,
+            outcome: FreshAgentCheckpointOutcome {
+                logical_attempt_id: logical_attempt_id.to_string(),
+                request_id: request_id.to_string(),
+                provider: send.provider,
+                session_id: send.session_id.clone(),
+                session_type: send.session_type,
+                status,
+                checkpoint_id,
+                workspace: resolved_workspace,
+                code,
+                reason,
+                native_turn_id: None,
+                display_turn_id: None,
+            },
+            request_ids,
+            session_aliases,
+            dispatch_started: false,
+            capture_settled: true,
+            submitted_turn_id: None,
+            created_at_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        }
+    }
+
+    async fn capture_automatic(
+        &self,
+        send: &FreshAgentSend,
+        request_id: &str,
+        logical_attempt_id: &str,
+    ) -> StoredCheckpointOutcome {
+        let started_at = Instant::now();
+        let launch_cwd = send
+            .settings
+            .as_ref()
+            .and_then(|settings| settings.cwd.as_deref())
+            .or(send.cwd.as_deref());
+        let Some(launch_cwd) = launch_cwd else {
+            return self.new_record(
+                send,
+                logical_attempt_id,
+                request_id,
+                None,
+                Err((
+                    "workspace_unavailable",
+                    "No selected code workspace is available for this send.".into(),
+                )),
+            );
+        };
+        let intent = send
+            .checkpoint_intent
+            .as_ref()
+            .and_then(|intent| serde_json::to_value(intent.workspace.as_ref()).ok())
+            .and_then(|value| if value.is_null() { None } else { Some(value) });
+        let resolve_control = Arc::new(CheckpointCaptureControl::default());
+        let resolve_control_for_task = Arc::clone(&resolve_control);
+        let home = Arc::clone(&self.home);
+        let launch_cwd = launch_cwd.to_string();
+        let mut resolve_task = tokio::spawn(CHECKPOINT_CAPTURE_CONTEXT.scope(
+            resolve_control_for_task,
+            async move {
+                resolve_checkpoint_workspace(&home, Path::new(&launch_cwd), intent.as_ref()).await
+            },
+        ));
+        let remaining = CHECKPOINT_AUTO_BUDGET.saturating_sub(started_at.elapsed());
+        let workspace = match tokio::time::timeout(remaining, &mut resolve_task).await {
+            Ok(Ok(Ok(workspace))) => workspace,
+            Ok(Ok(Err(error))) => {
+                log_workspace_unavailable(&error.candidate, &error.reason, Some(request_id));
+                return self.new_record(
+                    send,
+                    logical_attempt_id,
+                    request_id,
+                    None,
+                    Err((
+                        "workspace_unavailable",
+                        "No eligible code workspace is available for this send.".into(),
+                    )),
+                );
+            }
+            Ok(Err(error)) => {
+                return self.new_record(
+                    send,
+                    logical_attempt_id,
+                    request_id,
+                    None,
+                    Err((
+                        "workspace_resolution_failed",
+                        format!("Workspace resolution failed; your message will still be sent ({error})."),
+                    )),
+                );
+            }
+            Err(_) => {
+                let settlement =
+                    cancel_and_settle_capture_task(&resolve_control, &mut resolve_task).await;
+                let mut record = self.new_record(
+                    send,
+                    logical_attempt_id,
+                    request_id,
+                    None,
+                    Err(match &settlement {
+                        Ok(()) => (
+                            "workspace_resolution_timeout",
+                            "Workspace resolution took too long; your message will still be sent.".into(),
+                        ),
+                        Err(cause) => (
+                            "workspace_resolution_unsettled",
+                            format!("Workspace resolution timed out and its child process could not be confirmed settled; the send was withheld ({cause})."),
+                        ),
+                    }),
+                );
+                record.capture_settled = settlement.is_ok();
+                return record;
+            }
+        };
+        if let Some(remaining) = self.active_cooldown(&workspace.path) {
+            return self.new_record(
+                send,
+                logical_attempt_id,
+                request_id,
+                Some((&workspace, "")),
+                Err((
+                    "capture_timeout_cooldown",
+                    format!("Code snapshot capture is paused briefly after a timeout; retry in {} seconds.", remaining.as_secs().saturating_add(1)),
+                )),
+            );
+        }
+
+        let remaining = CHECKPOINT_AUTO_BUDGET.saturating_sub(started_at.elapsed());
+        if remaining.is_zero() {
+            return self.new_record(
+                send,
+                logical_attempt_id,
+                request_id,
+                Some((&workspace, "")),
+                Err(("workspace_resolution_timeout", "Workspace resolution used the available snapshot time; your message will still be sent.".into())),
+            );
+        }
+        let lock = match self.lock_workspace(&workspace.path, remaining).await {
+            Ok(lock) => lock,
+            Err(()) => {
+                return self.new_record(
+                    send,
+                    logical_attempt_id,
+                    request_id,
+                    Some((&workspace, "")),
+                    Err(("workspace_lock_timeout", "This workspace is busy with another snapshot; your message will still be sent.".into())),
+                );
+            }
+        };
+        let remaining = CHECKPOINT_AUTO_BUDGET.saturating_sub(started_at.elapsed());
+        if remaining.is_zero() {
+            drop(lock);
+            return self.new_record(
+                send,
+                logical_attempt_id,
+                request_id,
+                Some((&workspace, "")),
+                Err(("workspace_lock_timeout", "This workspace is busy with another snapshot; your message will still be sent.".into())),
+            );
+        }
+
+        match self
+            .capture_with_budget(
+                &workspace,
+                "Automatic pre-turn snapshot",
+                request_id,
+                remaining,
+                None,
+            )
+            .await
+        {
+            CaptureAttempt::Published(checkpoint_id) => {
+                self.clear_cooldown(&workspace.path);
+                drop(lock);
+                self.new_record(
+                    send,
+                    logical_attempt_id,
+                    request_id,
+                    Some((&workspace, "")),
+                    Ok(checkpoint_id),
+                )
+            }
+            CaptureAttempt::TimedOut(published) => {
+                self.establish_cooldown(&workspace.path);
+                drop(lock);
+                if let Some(checkpoint_id) = published {
+                    self.clear_cooldown(&workspace.path);
+                    self.new_record(
+                        send,
+                        logical_attempt_id,
+                        request_id,
+                        Some((&workspace, "")),
+                        Ok(checkpoint_id),
+                    )
+                } else {
+                    self.new_record(
+                        send,
+                        logical_attempt_id,
+                        request_id,
+                        Some((&workspace, "")),
+                        Err((
+                            "capture_timeout",
+                            "The code snapshot took too long; your message will still be sent."
+                                .into(),
+                        )),
+                    )
+                }
+            }
+            CaptureAttempt::Cancelled(published) => {
+                drop(lock);
+                if let Some(checkpoint_id) = published {
+                    self.new_record(
+                        send,
+                        logical_attempt_id,
+                        request_id,
+                        Some((&workspace, "")),
+                        Ok(checkpoint_id),
+                    )
+                } else {
+                    self.new_record(
+                        send,
+                        logical_attempt_id,
+                        request_id,
+                        Some((&workspace, "")),
+                        Err((
+                            "capture_cancelled",
+                            "The code snapshot was cancelled; your message will still be sent."
+                                .into(),
+                        )),
+                    )
+                }
+            }
+            CaptureAttempt::Unsettled {
+                message: error,
+                control,
+            } => {
+                let mut record = self.new_record(
+                    send,
+                    logical_attempt_id,
+                    request_id,
+                    Some((&workspace, "")),
+                    Err((
+                        "capture_unsettled",
+                        format!("The code snapshot could not be confirmed settled; the send was withheld ({error})."),
+                    )),
+                );
+                record.capture_settled = false;
+                let _quarantine = self.quarantine_workspace(
+                    workspace.path.clone(),
+                    lock,
+                    control,
+                    Some(request_id.to_string()),
+                    "automatic_capture",
+                    error,
+                );
+                record
+            }
+            CaptureAttempt::Failed(error) => {
+                drop(lock);
+                let failure =
+                    CheckpointFailure::from_capture_detail(&self.home, &workspace.path, &error);
+                failure.log(Some(request_id));
+                self.new_record(
+                    send,
+                    logical_attempt_id,
+                    request_id,
+                    Some((&workspace, "")),
+                    Err((failure.code, failure.user_details.to_string())),
+                )
+            }
+        }
+    }
+
+    async fn capture_explicit(
+        self: &Arc<Self>,
+        launch_cwd: PathBuf,
+        workspace_intent: Option<Value>,
+        label: String,
+        request_id: Option<String>,
+    ) -> Result<(Value, ResolvedCheckpointWorkspace), ExplicitCaptureError> {
+        let deadline = Instant::now() + CHECKPOINT_EXPLICIT_BUDGET;
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let cancellation_guard = CaptureRequestCancellation { sender: cancel_tx };
+        let service = Arc::clone(self);
+        let (settled_tx, settled_rx) = tokio::sync::oneshot::channel::<
+            Result<(Value, ResolvedCheckpointWorkspace), ExplicitCaptureError>,
+        >();
+        tokio::spawn(async move {
+            let result = service
+                .capture_explicit_supervisor(
+                    launch_cwd,
+                    workspace_intent,
+                    label,
+                    request_id,
+                    deadline,
+                    cancel_rx,
+                )
+                .await;
+            let _ = settled_tx.send(result);
+        });
+        let result = settled_rx
+            .await
+            .unwrap_or(Err(ExplicitCaptureError::ServiceStopped));
+        drop(cancellation_guard);
+        result
+    }
+
+    async fn capture_explicit_supervisor(
+        &self,
+        launch_cwd: PathBuf,
+        workspace_intent: Option<Value>,
+        label: String,
+        request_id: Option<String>,
+        deadline: Instant,
+        mut cancel_rx: watch::Receiver<bool>,
+    ) -> Result<(Value, ResolvedCheckpointWorkspace), ExplicitCaptureError> {
+        let resolve_control = Arc::new(CheckpointCaptureControl::default());
+        let resolve_control_for_task = Arc::clone(&resolve_control);
+        let launch_cwd_for_task = launch_cwd.clone();
+        let home = Arc::clone(&self.home);
+        let mut resolve_task = tokio::spawn(CHECKPOINT_CAPTURE_CONTEXT.scope(
+            resolve_control_for_task,
+            async move {
+                resolve_checkpoint_workspace(&home, &launch_cwd_for_task, workspace_intent.as_ref())
+                    .await
+            },
+        ));
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let candidate = launch_cwd.clone();
+            return match cancel_and_settle_capture_task(&resolve_control, &mut resolve_task).await {
+                Ok(()) => Err(ExplicitCaptureError::ResolutionTimeout(
+                    candidate.to_string_lossy().into_owned(),
+                )),
+                Err(message) => Err(ExplicitCaptureError::Unsettled {
+                    candidate,
+                    workspace: None,
+                    message,
+                }),
+            };
+        }
+
+        let workspace = tokio::select! {
+            biased;
+            _ = wait_for_capture_cancellation(&mut cancel_rx) => {
+                let candidate = launch_cwd.clone();
+                return match cancel_and_settle_capture_task(&resolve_control, &mut resolve_task).await {
+                    Ok(()) => Err(ExplicitCaptureError::Cancelled),
+                    Err(message) => Err(ExplicitCaptureError::Unsettled {
+                        candidate,
+                        workspace: None,
+                        message,
+                    }),
+                };
+            }
+            result = tokio::time::timeout(remaining, &mut resolve_task) => {
+                match result {
+                    Ok(Ok(Ok(workspace))) => workspace,
+                    Ok(Ok(Err(error))) => return Err(ExplicitCaptureError::WorkspaceUnavailable(error)),
+                    Ok(Err(error)) => return Err(ExplicitCaptureError::Capture {
+                        workspace: ResolvedCheckpointWorkspace {
+                            path: resolve_absolute(&launch_cwd),
+                            provenance: "resolved-project".to_string(),
+                        },
+                        message: format!("workspace resolution task failed: {error}"),
+                    }),
+                    Err(_) => {
+                        let candidate = launch_cwd.clone();
+                        return match cancel_and_settle_capture_task(&resolve_control, &mut resolve_task).await {
+                            Ok(()) => Err(ExplicitCaptureError::ResolutionTimeout(
+                                candidate.to_string_lossy().into_owned(),
+                            )),
+                            Err(message) => Err(ExplicitCaptureError::Unsettled {
+                                candidate,
+                                workspace: None,
+                                message,
+                            }),
+                        };
+                    }
+                }
+            }
+        };
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ExplicitCaptureError::ResolutionTimeout(
+                launch_cwd.to_string_lossy().into_owned(),
+            ));
+        }
+        let lock = tokio::select! {
+            biased;
+            _ = wait_for_capture_cancellation(&mut cancel_rx) => {
+                return Err(ExplicitCaptureError::Cancelled);
+            }
+            lock = self.lock_workspace(&workspace.path, remaining) => match lock {
+                Ok(lock) => lock,
+                Err(()) => return Err(ExplicitCaptureError::WorkspaceBusy(workspace)),
+            }
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            drop(lock);
+            return Err(ExplicitCaptureError::WorkspaceBusy(workspace));
+        }
+        let result = self
+            .capture_with_budget(
+                &workspace,
+                &label,
+                request_id.as_deref().unwrap_or(""),
+                remaining,
+                Some(cancel_rx),
+            )
+            .await;
+        match result {
+            CaptureAttempt::Published(checkpoint_id) => {
+                self.clear_cooldown(&workspace.path);
+                drop(lock);
+                Ok((
+                    explicit_capture_response(checkpoint_id, &label, request_id.as_deref()),
+                    workspace,
+                ))
+            }
+            CaptureAttempt::TimedOut(Some(checkpoint_id)) => {
+                self.clear_cooldown(&workspace.path);
+                drop(lock);
+                Ok((
+                    explicit_capture_response(checkpoint_id, &label, request_id.as_deref()),
+                    workspace,
+                ))
+            }
+            CaptureAttempt::TimedOut(None) => {
+                self.establish_cooldown(&workspace.path);
+                drop(lock);
+                Err(ExplicitCaptureError::Capture {
+                    workspace,
+                    message: "checkpoint capture timed out".to_string(),
+                })
+            }
+            CaptureAttempt::Cancelled(_) => {
+                drop(lock);
+                Err(ExplicitCaptureError::Cancelled)
+            }
+            CaptureAttempt::Unsettled { message, control } => {
+                let candidate = workspace.path.clone();
+                let _quarantine = self.quarantine_workspace(
+                    candidate.clone(),
+                    lock,
+                    control,
+                    request_id.clone(),
+                    "explicit_capture",
+                    message.clone(),
+                );
+                Err(ExplicitCaptureError::Unsettled {
+                    candidate,
+                    workspace: Some(workspace),
+                    message,
+                })
+            }
+            CaptureAttempt::Failed(error) => {
+                drop(lock);
+                Err(ExplicitCaptureError::Capture {
+                    workspace,
+                    message: error,
+                })
+            }
+        }
+    }
+
+    async fn capture_with_budget(
+        &self,
+        workspace: &ResolvedCheckpointWorkspace,
+        label: &str,
+        request_id: &str,
+        budget: Duration,
+        mut cancellation: Option<watch::Receiver<bool>>,
+    ) -> CaptureAttempt {
+        // The task is owned by this server service, not by the socket/HTTP
+        // request future. On budget expiry the scoped runner is terminated,
+        // reaped, and reconciled under the workspace lock before this returns.
+        let control = Arc::new(CheckpointCaptureControl::default());
+        let home = Arc::clone(&self.home);
+        let workspace_path = workspace.path.clone();
+        let label = label.to_string();
+        let request_id_owned = request_id.to_string();
+        let task_control = Arc::clone(&control);
+        let mut task = tokio::spawn(CHECKPOINT_CAPTURE_CONTEXT.scope(task_control, async move {
+            create_checkpoint(
+                &home,
+                &workspace_path,
+                &label,
+                if request_id_owned.is_empty() {
+                    None
+                } else {
+                    Some(request_id_owned.as_str())
+                },
+            )
+            .await
+        }));
+        let result = if let Some(receiver) = cancellation.as_mut() {
+            tokio::select! {
+                biased;
+                _ = wait_for_capture_cancellation(receiver) => {
+                    match cancel_and_settle_capture_task(&control, &mut task).await {
+                        Ok(()) => {
+                            let published = self.reconcile_published_request(workspace, request_id).await;
+                            return CaptureAttempt::Cancelled(published);
+                        }
+                        Err(error) => {
+                            return CaptureAttempt::Unsettled {
+                                message: error,
+                                control: Arc::clone(&control),
+                            };
+                        }
+                    }
+                }
+                result = tokio::time::timeout(budget, &mut task) => result,
+            }
+        } else {
+            tokio::time::timeout(budget, &mut task).await
+        };
+        match result {
+            Ok(Ok(Ok(entry))) => {
+                CaptureAttempt::Published(entry["id"].as_str().unwrap_or_default().to_string())
+            }
+            Ok(Ok(Err(error))) => {
+                if let Err(settlement_error) = control.wait_for_process_groups().await {
+                    return CaptureAttempt::Unsettled {
+                        message: format!(
+                            "Git operation failed ({error}); child settlement failed ({settlement_error})"
+                        ),
+                        control: Arc::clone(&control),
+                    };
+                }
+                if let Some(published) = self
+                    .reconcile_published_request(workspace, request_id)
+                    .await
+                {
+                    CaptureAttempt::Published(published)
+                } else {
+                    CaptureAttempt::Failed(error)
+                }
+            }
+            Ok(Err(error)) => {
+                if let Err(settlement_error) = control.cancel_processes().await {
+                    tracing::error!(
+                        event = "code_checkpoint.process_termination_failed",
+                        cause = %settlement_error,
+                        "checkpoint child termination was not confirmed after a capture task failure"
+                    );
+                }
+                if let Err(settlement_error) = control.wait_for_process_groups().await {
+                    return CaptureAttempt::Unsettled {
+                        message: format!(
+                            "capture task failed ({error}); child settlement failed ({settlement_error})"
+                        ),
+                        control: Arc::clone(&control),
+                    };
+                }
+                if let Some(published) = self
+                    .reconcile_published_request(workspace, request_id)
+                    .await
+                {
+                    CaptureAttempt::Published(published)
+                } else {
+                    CaptureAttempt::Failed(format!("checkpoint capture task failed: {error}"))
+                }
+            }
+            Err(_) => {
+                if let Err(error) = cancel_and_settle_capture_task(&control, &mut task).await {
+                    return CaptureAttempt::Unsettled {
+                        message: error,
+                        control: Arc::clone(&control),
+                    };
+                }
+                let published = self
+                    .reconcile_published_request(workspace, request_id)
+                    .await;
+                CaptureAttempt::TimedOut(published)
+            }
+        }
+    }
+
+    async fn reconcile_published_request(
+        &self,
+        workspace: &ResolvedCheckpointWorkspace,
+        request_id: &str,
+    ) -> Option<String> {
+        if request_id.is_empty() {
+            return None;
+        }
+        list_checkpoints(&self.home, &workspace.path)
+            .await
+            .ok()
+            .and_then(|entries| {
+                entries
+                    .into_iter()
+                    .find(|entry| entry["requestId"].as_str() == Some(request_id))
+                    .and_then(|entry| entry["id"].as_str().map(str::to_string))
+            })
+    }
+}
+
+enum CaptureAttempt {
+    Published(String),
+    Failed(String),
+    TimedOut(Option<String>),
+    Cancelled(Option<String>),
+    Unsettled {
+        message: String,
+        control: Arc<CheckpointCaptureControl>,
+    },
+}
+
+fn explicit_capture_response(
+    checkpoint_id: String,
+    label: &str,
+    request_id: Option<&str>,
+) -> Value {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut response = Map::new();
+    response.insert("id".to_string(), json!(checkpoint_id));
+    response.insert("ts".to_string(), json!(ts));
+    response.insert("label".to_string(), json!(label));
+    if let Some(request_id) = request_id {
+        response.insert("requestId".to_string(), json!(request_id));
+    }
+    Value::Object(response)
+}
+
+fn checkpoint_attempt_key(send: &FreshAgentSend, logical_attempt_id: &str) -> String {
+    let provider = serde_json::to_string(&send.provider).unwrap_or_default();
+    let session_type = serde_json::to_string(&send.session_type).unwrap_or_default();
+    format!(
+        "{provider}:{session_type}:{}:{logical_attempt_id}",
+        send.session_id
+    )
+}
+
+fn parse_agent_provider(value: &str) -> Option<AgentProvider> {
+    match value {
+        "claude" => Some(AgentProvider::Claude),
+        "codex" => Some(AgentProvider::Codex),
+        "opencode" => Some(AgentProvider::Opencode),
+        _ => None,
+    }
+}
+
+fn parse_session_type(value: &str) -> Option<SessionType> {
+    match value {
+        "freshclaude" => Some(SessionType::Freshclaude),
+        "freshcodex" => Some(SessionType::Freshcodex),
+        "kilroy" => Some(SessionType::Kilroy),
+        "freshopencode" => Some(SessionType::Freshopencode),
+        _ => None,
+    }
+}
+
+fn workspace_provenance(value: &str) -> CheckpointWorkspaceProvenance {
+    match value {
+        "directory-picker" => CheckpointWorkspaceProvenance::DirectoryPicker,
+        "legacy-checkpoint" => CheckpointWorkspaceProvenance::LegacyCheckpoint,
+        _ => CheckpointWorkspaceProvenance::ResolvedProject,
+    }
+}
+
+impl freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier for CheckpointService {
+    fn barrier_and_forward(
+        self: Arc<Self>,
+        send: FreshAgentSend,
+        forward: futures_util::future::BoxFuture<'static, ()>,
+    ) -> futures_util::future::BoxFuture<'static, ()> {
+        Box::pin(async move {
+            let Some(intent) = send.checkpoint_intent.clone() else {
+                forward.await;
+                return;
+            };
+            let Some(request_id) = send
+                .request_id
+                .clone()
+                .filter(|request_id| !request_id.trim().is_empty())
+            else {
+                tracing::warn!(
+                    event = "code_checkpoint.send_missing_request_id",
+                    provider = ?send.provider,
+                    session_id = %send.session_id,
+                    logical_attempt_id = %intent.logical_attempt_id,
+                    "checkpoint send was refused because its request identity is missing"
+                );
+                return;
+            };
+            let logical_attempt_id = intent.logical_attempt_id.trim().to_string();
+            let key = checkpoint_attempt_key(&send, &logical_attempt_id);
+
+            let (job, leader) = {
+                let mut jobs = self.attempt_jobs.lock().await;
+                if let Some(job) = jobs.get(&key) {
+                    (Arc::clone(job), false)
+                } else {
+                    let (outcome, _) = watch::channel(None);
+                    let (finished, _) = watch::channel(false);
+                    let job = Arc::new(CheckpointAttemptJob { outcome, finished });
+                    jobs.insert(key.clone(), Arc::clone(&job));
+                    (job, true)
+                }
+            };
+
+            if !leader {
+                let mut outcome_rx = job.outcome.subscribe();
+                while outcome_rx.borrow().is_none() {
+                    if outcome_rx.changed().await.is_err() {
+                        return;
+                    }
+                }
+                let outcome_snapshot = outcome_rx.borrow().clone();
+                if let Some(mut record) = outcome_snapshot {
+                    if !record.request_ids.iter().any(|alias| alias == &request_id)
+                        && record.request_ids.len() < 16
+                    {
+                        record.request_ids.push(request_id.clone());
+                        let _ = self.persist_outcome(&key, record.clone()).await;
+                    }
+                    record.outcome.request_id = request_id.clone();
+                    self.broadcast_outcome(record.outcome);
+                }
+                let mut finished_rx = job.finished.subscribe();
+                while !*finished_rx.borrow() {
+                    if finished_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+                return;
+            }
+
+            let (record, allow_forward) = match self.find_outcome(&key).await {
+                Ok(Some(mut record)) => {
+                    let added_alias = !record.request_ids.iter().any(|alias| alias == &request_id)
+                        && record.request_ids.len() < 16;
+                    if added_alias {
+                        record.request_ids.push(request_id.clone());
+                    }
+                    if !record.capture_settled {
+                        if added_alias {
+                            if let Err(error) = self.persist_outcome(&key, record.clone()).await {
+                                tracing::error!(
+                                    event = "code_checkpoint.outcome_alias_persist_failed",
+                                    send_request_id = %request_id,
+                                    logical_attempt_id = %logical_attempt_id,
+                                    cause = %error,
+                                    "checkpoint request alias could not be persisted"
+                                );
+                            }
+                        }
+                        (record, false)
+                    } else if record.dispatch_started {
+                        if added_alias {
+                            if let Err(error) = self.persist_outcome(&key, record.clone()).await {
+                                tracing::error!(
+                                    event = "code_checkpoint.outcome_alias_persist_failed",
+                                    send_request_id = %request_id,
+                                    logical_attempt_id = %logical_attempt_id,
+                                    cause = %error,
+                                    "checkpoint request alias could not be persisted"
+                                );
+                            }
+                        }
+                        // A durable dispatch fence is terminal for this logical
+                        // attempt. An explicit retry must use a new attempt ID.
+                        (record, false)
+                    } else {
+                        // Persist the admission fence before forwarding. A crash
+                        // after this point can lose a provider send, but cannot
+                        // replay the same logical attempt twice.
+                        record.dispatch_started = true;
+                        match self.persist_outcome(&key, record.clone()).await {
+                            Ok(()) => (record, true),
+                            Err(error) => {
+                                tracing::error!(
+                                    event = "code_checkpoint.outcome_persist_failed",
+                                    send_request_id = %request_id,
+                                    logical_attempt_id = %logical_attempt_id,
+                                    cause = %error,
+                                    "checkpoint outcome and dispatch fence could not be saved; provider send was withheld"
+                                );
+                                record.dispatch_started = false;
+                                record.outcome.status = FreshAgentCheckpointStatus::Unavailable;
+                                record.outcome.checkpoint_id = None;
+                                record.outcome.code = Some("outcome_store_unavailable".into());
+                                record.outcome.reason = Some(
+                                    "The checkpoint result could not be saved; this turn will remain unavailable.".into(),
+                                );
+                                (record, false)
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {
+                    let mut record = self
+                        .capture_automatic(&send, &request_id, &logical_attempt_id)
+                        .await;
+                    record.dispatch_started = record.capture_settled;
+                    match self.persist_outcome(&key, record.clone()).await {
+                        Ok(()) => {
+                            let allow_forward = record.capture_settled;
+                            (record, allow_forward)
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                event = "code_checkpoint.outcome_persist_failed",
+                                send_request_id = %request_id,
+                                logical_attempt_id = %logical_attempt_id,
+                                cause = %error,
+                                "checkpoint outcome and dispatch fence could not be saved; provider send was withheld"
+                            );
+                            record.dispatch_started = false;
+                            record.outcome.status = FreshAgentCheckpointStatus::Unavailable;
+                            record.outcome.checkpoint_id = None;
+                            record.outcome.code = Some("outcome_store_unavailable".into());
+                            record.outcome.reason = Some(
+                                "The checkpoint result could not be saved; this turn will remain unavailable.".into(),
+                            );
+                            (record, false)
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(
+                        event = "code_checkpoint.outcome_store_read_failed",
+                        send_request_id = %request_id,
+                        logical_attempt_id = %logical_attempt_id,
+                        cause = %error,
+                        "checkpoint attempt could not be safely deduplicated"
+                    );
+                    (
+                        self.new_record(
+                            &send,
+                            &logical_attempt_id,
+                            &request_id,
+                            None,
+                            Err((
+                                "outcome_store_unavailable",
+                                "The checkpoint result could not be saved; this turn will remain unavailable.".into(),
+                            )),
+                        ),
+                        false,
+                    )
+                }
+            };
+            let mut record = record;
+            record.outcome.request_id = request_id.clone();
+            self.broadcast_outcome(record.outcome.clone());
+            job.outcome.send_replace(Some(record));
+            if allow_forward {
+                forward.await;
+            }
+            job.finished.send_replace(true);
+            let mut jobs = self.attempt_jobs.lock().await;
+            if jobs
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &job))
+            {
+                jobs.remove(&key);
+            }
+        })
+    }
+
+    fn replay_for_session(
+        self: Arc<Self>,
+        provider: AgentProvider,
+        session_id: String,
+        session_type: SessionType,
+    ) -> futures_util::future::BoxFuture<'static, ()> {
+        Box::pin(async move {
+            self.replay_for_identity(provider, &session_id, session_type)
+                .await;
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -548,19 +2676,18 @@ async fn post_checkpoint(
         .filter(|s| !s.is_empty())
         .map(str::to_string);
 
-    let cwd_path = Path::new(&cwd);
     let send_request_id = safe_send_request_id(request_id.as_deref());
-    let workspace =
-        match resolve_checkpoint_workspace(&state.home, cwd_path, body.get("workspace")).await {
-            Ok(workspace) => workspace,
-            Err(error) => {
-                log_workspace_unavailable(&error.candidate, &error.reason, send_request_id);
-                return error.response();
-            }
-        };
-
-    match create_checkpoint(&state.home, &workspace.path, &label, request_id.as_deref()).await {
-        Ok(mut entry) => {
+    match state
+        .service
+        .capture_explicit(
+            PathBuf::from(&cwd),
+            body.get("workspace").cloned(),
+            label,
+            request_id.clone(),
+        )
+        .await
+    {
+        Ok((mut entry, workspace)) => {
             if let Some(fields) = entry.as_object_mut() {
                 fields.insert(
                     "workspace".to_string(),
@@ -569,12 +2696,78 @@ async fn post_checkpoint(
             }
             Json(entry).into_response()
         }
-        Err(message) => {
+        Err(ExplicitCaptureError::WorkspaceUnavailable(error)) => {
+            log_workspace_unavailable(&error.candidate, &error.reason, send_request_id);
+            error.response()
+        }
+        Err(ExplicitCaptureError::ResolutionTimeout(candidate)) => {
+            tracing::warn!(
+                event = "code_checkpoint.workspace_resolution_timeout",
+                request_id = ?send_request_id,
+                candidate = %candidate,
+                "checkpoint workspace resolution exceeded its budget"
+            );
+            let failure = CheckpointFailure::from_capture_detail(
+                &state.home,
+                Path::new(&candidate),
+                "workspace resolution timed out",
+            );
+            failure.log(send_request_id);
+            failure.response()
+        }
+        Err(ExplicitCaptureError::WorkspaceBusy(workspace)) => {
+            tracing::warn!(
+                event = "code_checkpoint.workspace_lock_timeout",
+                request_id = ?send_request_id,
+                workspace = %workspace.path.display(),
+                "checkpoint workspace stayed busy until the request budget expired"
+            );
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "checkpoint workspace lock wait timed out" })),
+            )
+                .into_response()
+        }
+        Err(ExplicitCaptureError::Capture { workspace, message }) => {
             let failure =
                 CheckpointFailure::from_capture_detail(&state.home, &workspace.path, &message);
             failure.log(send_request_id);
             failure.response()
         }
+        Err(ExplicitCaptureError::Unsettled {
+            candidate,
+            workspace,
+            message,
+        }) => {
+            let path = workspace
+                .as_ref()
+                .map(|workspace| workspace.path.as_path())
+                .unwrap_or(candidate.as_path());
+            tracing::error!(
+                event = "code_checkpoint.capture_settlement_failed",
+                request_id = ?send_request_id,
+                workspace = %path.display(),
+                cause = %message,
+                "checkpoint child settlement could not be confirmed; no provider dispatch is involved"
+            );
+            let failure = CheckpointFailure::from_capture_detail(
+                &state.home,
+                path,
+                "checkpoint child settlement could not be confirmed",
+            );
+            failure.log(send_request_id);
+            failure.response()
+        }
+        Err(ExplicitCaptureError::Cancelled) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "checkpoint capture was cancelled" })),
+        )
+            .into_response(),
+        Err(ExplicitCaptureError::ServiceStopped) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "checkpoint capture service stopped unexpectedly" })),
+        )
+            .into_response(),
     }
 }
 
@@ -594,6 +2787,11 @@ async fn create_checkpoint(
     label: &str,
     request_id: Option<&str>,
 ) -> Result<Value, String> {
+    let capture_started_at = Instant::now();
+    if CHECKPOINT_CAPTURE_CONTEXT.try_with(|_| ()).is_err() {
+        return Err("checkpoint capture requires the server-owned capture runner".to_string());
+    }
+    let repo_prepare_started_at = Instant::now();
     let git_dir = ensure_checkpoint_repo(home, cwd).await?;
     let git_dir_arg = format!("--git-dir={}", git_dir.display());
     let work_tree_arg = format!("--work-tree={}", cwd.display());
@@ -640,18 +2838,38 @@ async fn create_checkpoint(
         )
         .await?;
     }
+    let repo_prepare_ms = repo_prepare_started_at.elapsed().as_millis() as u64;
+    let mut stage_ms = BTreeMap::<&'static str, u64>::new();
 
     let capture = async {
+        let stage_started_at = Instant::now();
         verify_readable_directories(&git_dir, cwd).await?;
+        stage_ms.insert("readability", stage_started_at.elapsed().as_millis() as u64);
+
+        let stage_started_at = Instant::now();
         run_git_with_index(
             &[&git_dir_arg, &work_tree_arg, "add", "-A", "--", "."],
             Some(cwd),
             &request_index,
         )
         .await?;
-        expand_nested_repositories(&git_dir, cwd, &request_index).await?;
-        verify_checkpoint_index(&git_dir, cwd, &request_index).await?;
+        stage_ms.insert("git_add", stage_started_at.elapsed().as_millis() as u64);
 
+        let stage_started_at = Instant::now();
+        expand_nested_repositories(&git_dir, cwd, &request_index).await?;
+        stage_ms.insert(
+            "nested_expansion",
+            stage_started_at.elapsed().as_millis() as u64,
+        );
+
+        let stage_started_at = Instant::now();
+        let eligible_file_count = verify_checkpoint_index(&git_dir, cwd, &request_index).await?;
+        stage_ms.insert(
+            "index_validation",
+            stage_started_at.elapsed().as_millis() as u64,
+        );
+
+        let stage_started_at = Instant::now();
         let tree = run_git_with_index(&[&git_dir_arg, "write-tree"], None, &request_index)
             .await?
             .trim()
@@ -665,10 +2883,35 @@ async fn create_checkpoint(
         commit_args.extend(["-m", label]);
         let sha = run_git(&commit_args, None).await?.trim().to_string();
 
+        let changed_file_count = run_git_bytes(
+            &[
+                &git_dir_arg,
+                "diff-tree",
+                "--root",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                "-z",
+                &sha,
+            ],
+            None,
+        )
+        .await?
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .count();
+        stage_ms.insert(
+            "tree_and_commit",
+            stage_started_at.elapsed().as_millis() as u64,
+        );
+
         if let Some(request_id) = request_id {
+            let stage_started_at = Instant::now();
             update_checkpoint_metadata(&git_dir, &sha, request_id).await?;
+            stage_ms.insert("metadata", stage_started_at.elapsed().as_millis() as u64);
         }
 
+        let stage_started_at = Instant::now();
         let head_ref = run_git(&[&git_dir_arg, "symbolic-ref", "HEAD"], None)
             .await?
             .trim()
@@ -678,13 +2921,17 @@ async fn create_checkpoint(
             update_ref.push(parent);
         }
         run_git(&update_ref, None).await?;
+        stage_ms.insert(
+            "ref_publication",
+            stage_started_at.elapsed().as_millis() as u64,
+        );
 
-        Ok::<String, String>(sha)
+        Ok::<(String, usize, usize), String>((sha, eligible_file_count, changed_file_count))
     }
     .await;
 
-    let sha = match capture {
-        Ok(sha) => sha,
+    let (sha, eligible_file_count, changed_file_count) = match capture {
+        Ok(capture) => capture,
         Err(error) => {
             let _ = tokio::fs::remove_file(&request_index).await;
             return Err(error);
@@ -693,6 +2940,7 @@ async fn create_checkpoint(
 
     // The published tree is already complete. Losing this disposable stat cache
     // can make the next request slower, but cannot hide or invalidate a target.
+    let index_cache_started_at = Instant::now();
     if let Err(error) = install_checkpoint_index(&request_index, &index_path).await {
         tracing::warn!(
             event = "code_checkpoint.index_cache_install_failed",
@@ -702,6 +2950,27 @@ async fn create_checkpoint(
         );
         let _ = tokio::fs::remove_file(&request_index).await;
     }
+    let index_cache_install_ms = index_cache_started_at.elapsed().as_millis() as u64;
+
+    tracing::info!(
+        event = "code_checkpoint.capture_succeeded",
+        workspace = %cwd.display(),
+        request_id = ?safe_send_request_id(request_id),
+        checkpoint_id = %sha,
+        eligible_file_count,
+        changed_file_count,
+        repo_prepare_ms,
+        readability_ms = stage_ms.get("readability").copied().unwrap_or_default(),
+        git_add_ms = stage_ms.get("git_add").copied().unwrap_or_default(),
+        nested_expansion_ms = stage_ms.get("nested_expansion").copied().unwrap_or_default(),
+        index_validation_ms = stage_ms.get("index_validation").copied().unwrap_or_default(),
+        tree_and_commit_ms = stage_ms.get("tree_and_commit").copied().unwrap_or_default(),
+        metadata_ms = stage_ms.get("metadata").copied().unwrap_or_default(),
+        ref_publication_ms = stage_ms.get("ref_publication").copied().unwrap_or_default(),
+        index_cache_install_ms,
+        total_ms = capture_started_at.elapsed().as_millis() as u64,
+        "checkpoint capture published successfully"
+    );
 
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -832,17 +3101,19 @@ async fn run_git_with_index_input(
     // running by default, so every checkpoint-owned Git process must be
     // configured to stop with its request instead of outliving it.
     cmd.kill_on_drop(true);
-    cmd.args(args).stdin(Stdio::piped());
+    cmd.args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
     cmd.env("GIT_INDEX_FILE", index);
-    let mut child = cmd
-        .spawn()
+    let mut child = checkpoint_child(&mut cmd)
         .map_err(|error| format!("git update-index failed to start: {error}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
+    if let Some(mut stdin) = child.child.as_mut().and_then(|child| child.stdin.take()) {
         if let Err(error) = stdin.write_all(input).await {
-            let _ = child.kill().await;
+            child.terminate_and_wait().await;
             return Err(format!(
                 "git update-index failed to write path list: {error}"
             ));
@@ -876,17 +3147,16 @@ async fn ignored_git_directories(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
+    let mut child = checkpoint_child(&mut command)
         .map_err(|error| format!("git check-ignore failed to start: {error}"))?;
     let mut input = Vec::new();
     for path in directory_paths {
         input.extend_from_slice(path);
         input.push(0);
     }
-    if let Some(mut stdin) = child.stdin.take() {
+    if let Some(mut stdin) = child.child.as_mut().and_then(|child| child.stdin.take()) {
         if let Err(error) = stdin.write_all(&input).await {
-            let _ = child.kill().await;
+            child.terminate_and_wait().await;
             return Err(format!("git check-ignore failed to write paths: {error}"));
         }
     }
@@ -992,15 +3262,22 @@ async fn invoke_git(
     // detach an in-flight snapshot command.
     cmd.kill_on_drop(true);
     cmd.args(args);
+    // `wait_with_output` only captures the output streams that were explicitly
+    // piped. Keep Git output available for both normal values (tree/ref ids)
+    // and actionable structured failure causes instead of inheriting/discarding
+    // it in the server process.
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
     if let Some(index) = index {
         cmd.env("GIT_INDEX_FILE", index);
     }
-    cmd.output()
+    checkpoint_read_only_child(&mut cmd)
+        .map_err(|e| format!("Git process failed to start: {e}"))?
+        .wait_with_output()
         .await
-        .map_err(|e| format!("Git process failed to start: {e}"))
+        .map_err(|e| format!("Git process failed to wait: {e}"))
 }
 
 fn check_git_output(args: &[&str], output: std::process::Output) -> Result<String, String> {
@@ -1404,9 +3681,9 @@ async fn verify_checkpoint_index(
     git_dir: &Path,
     work_tree: &Path,
     index: &Path,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let staged = checkpoint_index_entries(git_dir, index).await?;
-    for entry in staged {
+    for entry in &staged {
         let mode = entry.mode.as_slice();
         let path = git_relative_path(&entry.path);
         if path.is_absolute()
@@ -1479,7 +3756,7 @@ async fn verify_checkpoint_index(
             }
         }
     }
-    Ok(())
+    Ok(staged.len())
 }
 
 async fn install_checkpoint_index(
@@ -1598,12 +3875,41 @@ fn is_valid_checkpoint_id(id: &str) -> bool {
 /// error — mirrors the two `try {} catch { return [] }` guards in legacy.
 async fn list_checkpoints(home: &Path, cwd: &Path) -> Result<Vec<Value>, String> {
     let git_dir = checkpoint_git_dir(home, cwd);
-    if tokio::fs::metadata(git_dir.join("HEAD")).await.is_err() {
-        return Ok(Vec::new());
+    match tokio::fs::symlink_metadata(git_dir.join("HEAD")).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match tokio::fs::symlink_metadata(&git_dir).await {
+                Err(directory_error) if directory_error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(Vec::new())
+                }
+                Ok(_) => Err("checkpoint repository exists but its HEAD is missing".to_string()),
+                Err(directory_error) => Err(format!(
+                    "failed to inspect checkpoint repository: {directory_error}"
+                )),
+            };
+        }
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect checkpoint repository HEAD: {error}"
+            ));
+        }
     }
     let git_dir_arg = format!("--git-dir={}", git_dir.display());
+    // A successfully inspected but unborn shadow repository is the one
+    // legitimate `git log` failure that means "no checkpoints yet". Probe
+    // HEAD first and accept only Git's quiet missing-revision status; corrupt
+    // refs, unreadable storage, and all other Git failures must remain errors
+    // so callers cannot erase a previously Available turn as an empty list.
+    let head_args = [&git_dir_arg, "rev-parse", "--verify", "--quiet", "HEAD"];
+    let head = invoke_git(&head_args, None, None).await?;
+    if !head.status.success() {
+        if head.status.code() == Some(1) {
+            return Ok(Vec::new());
+        }
+        check_git_output(&head_args, head)?;
+    }
     let limit = CHECKPOINT_LIST_LIMIT.to_string();
-    let raw = match run_git(
+    let raw = run_git(
         &[
             &git_dir_arg,
             "log",
@@ -1613,12 +3919,7 @@ async fn list_checkpoints(home: &Path, cwd: &Path) -> Result<Vec<Value>, String>
         ],
         None,
     )
-    .await
-    {
-        Ok(raw) => raw,
-        // Empty repo (no commits yet) — `git log` errors on a HEAD-less repo.
-        Err(_) => return Ok(Vec::new()),
-    };
+    .await?;
     let metadata = read_checkpoint_metadata(&git_dir).await?;
     let mut entries = Vec::new();
     for line in raw.split('\n') {
@@ -1811,7 +4112,10 @@ async fn get_checkpoints(
         // root. Old panes can still have an immutable checkpoint store keyed
         // by their exact launch cwd, so include that store only when it already
         // exists. An unselected non-Git directory or HOME therefore lists as
-        // empty and can never become an implicit capture scope.
+        // empty and can never become an implicit capture scope. Include the
+        // exact launch cwd as a candidate even when its store is absent; the
+        // shared workspace lock makes the missing-store check race-free with
+        // the first create.
         let mut workspaces = Vec::new();
         if let Ok(workspace) =
             resolve_checkpoint_workspace(&state.home, Path::new(&cwd), None).await
@@ -1830,11 +4134,7 @@ async fn get_checkpoints(
             let already_present = workspaces
                 .iter()
                 .any(|workspace| workspace.path == legacy_path);
-            if !already_present
-                && tokio::fs::metadata(checkpoint_git_dir(&state.home, &legacy_path).join("HEAD"))
-                    .await
-                    .is_ok()
-            {
+            if !already_present {
                 workspaces.push(ResolvedCheckpointWorkspace {
                     path: legacy_path,
                     provenance: "legacy-checkpoint".to_string(),
@@ -1846,6 +4146,20 @@ async fn get_checkpoints(
 
     let mut entries = Vec::new();
     for workspace in workspaces {
+        let _workspace_lock = match state
+            .service
+            .lock_workspace(&workspace.path, CHECKPOINT_EXPLICIT_BUDGET)
+            .await
+        {
+            Ok(lock) => lock,
+            Err(()) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "checkpoint workspace is busy" })),
+                )
+                    .into_response();
+            }
+        };
         match list_checkpoints(&state.home, &workspace.path).await {
             Ok(mut scoped_entries) => {
                 for entry in &mut scoped_entries {
@@ -1919,6 +4233,20 @@ async fn post_checkpoint_metadata(
         cwd_path.to_path_buf()
     };
 
+    let _workspace_lock = match state
+        .service
+        .lock_workspace(&workspace, CHECKPOINT_EXPLICIT_BUDGET)
+        .await
+    {
+        Ok(lock) => lock,
+        Err(()) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "checkpoint workspace is busy" })),
+            )
+                .into_response();
+        }
+    };
     match apply_checkpoint_metadata_patch(&state.home, &workspace, id, request_id, turn_id).await {
         Ok(entry) => Json(entry).into_response(),
         Err(message) => {
@@ -1960,6 +4288,20 @@ async fn post_checkpoint_restore(
         cwd_path.to_path_buf()
     };
 
+    let _workspace_lock = match state
+        .service
+        .lock_workspace(&workspace, CHECKPOINT_EXPLICIT_BUDGET)
+        .await
+    {
+        Ok(lock) => lock,
+        Err(()) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "checkpoint workspace is busy" })),
+            )
+                .into_response();
+        }
+    };
     match restore_checkpoint(&state.home, &workspace, id).await {
         Ok(()) => Json(json!({ "restored": true })).into_response(),
         Err(message) => {
@@ -1984,10 +4326,307 @@ mod tests {
     }
 
     fn state(home: &Path) -> CheckpointsApiState {
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(8);
+        let home = Arc::new(home.to_path_buf());
         CheckpointsApiState {
             auth_token: Arc::new("tok".to_string()),
-            home: Arc::new(home.to_path_buf()),
+            home: Arc::clone(&home),
+            service: Arc::new(CheckpointService::new(home, Arc::new(broadcast_tx))),
         }
+    }
+
+    #[tokio::test]
+    async fn unsettled_capture_quarantine_holds_workspace_lock_until_settlement() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let state = state(home_dir.path());
+        let service = Arc::clone(&state.service);
+        let workspace = workspace_dir.path().to_path_buf();
+        let lock = service
+            .lock_workspace(&workspace, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let control = Arc::new(CheckpointCaptureControl::default());
+        let gate = Arc::new(TestSettlementGate {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *control
+            .test_settlement_gate
+            .lock()
+            .expect("test settlement gate mutex poisoned") = Some(Arc::clone(&gate));
+
+        let quarantine = service.quarantine_workspace(
+            workspace.clone(),
+            lock,
+            Arc::clone(&control),
+            Some("unsettled-attempt".to_string()),
+            "automatic_capture_test",
+            "simulated uncertain child settlement".to_string(),
+        );
+        tokio::time::timeout(Duration::from_secs(1), gate.entered.notified())
+            .await
+            .expect("quarantine began checking child settlement");
+
+        assert!(
+            service
+                .lock_workspace(&workspace, Duration::from_millis(30))
+                .await
+                .is_err(),
+            "another capture must not enter while child settlement is unconfirmed"
+        );
+
+        gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), quarantine)
+            .await
+            .expect("quarantine released after settlement was confirmed")
+            .expect("quarantine worker completed");
+        let later_lock = service
+            .lock_workspace(&workspace, Duration::from_secs(1))
+            .await
+            .expect("workspace lock becomes available after settlement");
+        drop(later_lock);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checkpoint_timeout_settles_spawned_descendant_before_returning() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = dir.path().join("descendant-started");
+        let marker = dir.path().join("late-publish");
+        let shell_script = format!(
+            "(sleep 0.8; printf late > '{}') & printf started > '{}'; wait",
+            marker.display(),
+            started.display(),
+        );
+        let control = Arc::new(CheckpointCaptureControl::default());
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(shell_script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = control.spawn_child(&mut command).unwrap();
+        let child_task = tokio::spawn(async move { child.wait_with_output().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the child started its delayed descendant");
+
+        control.cancel_processes().await.unwrap();
+        child_task.await.unwrap().unwrap();
+        control.wait_for_process_groups().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(
+            !marker.exists(),
+            "a killed Git descendant must not publish after checkpoint settlement"
+        );
+        assert!(control.process_groups.lock().unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn checkpoint_timeout_settles_windows_job_descendant_before_returning() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = dir.path().join("descendant-started.txt");
+        let marker = dir.path().join("late-publish.txt");
+        let started_path = started.to_string_lossy().replace('\'', "''");
+        let marker_path = marker.to_string_lossy().replace('\'', "''");
+        let script = format!(
+            "start \"\" /B powershell -NoProfile -Command \"Set-Content -NoNewline -Path '{started_path}' -Value started; Start-Sleep -Seconds 1; Set-Content -NoNewline -Path '{marker_path}' -Value late\" & ping -n 60 127.0.0.1 > nul"
+        );
+        let control = Arc::new(CheckpointCaptureControl::default());
+        let mut command = Command::new("cmd.exe");
+        command
+            .args(["/C", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = control.spawn_child(&mut command).unwrap();
+        let child_task = tokio::spawn(async move { child.wait_with_output().await });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the Windows child started its Job-owned descendant");
+
+        control.cancel_processes().await.unwrap();
+        child_task.await.unwrap().unwrap();
+        control.wait_for_process_groups().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(
+            !marker.exists(),
+            "a terminated Job descendant cannot publish after checkpoint settlement"
+        );
+        assert!(control.jobs.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn accepted_logical_attempt_is_never_forwarded_again() {
+        use freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier;
+        use std::sync::atomic::AtomicUsize;
+
+        let home = tempfile::tempdir().unwrap();
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(16);
+        let service = Arc::new(CheckpointService::new(
+            Arc::new(home.path().to_path_buf()),
+            Arc::new(broadcast_tx),
+        ));
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let make_send = |request_id: &str| FreshAgentSend {
+            provider: AgentProvider::Opencode,
+            session_id: "session-1".into(),
+            session_type: SessionType::Freshopencode,
+            text: "the request body is never stored in checkpoint outcomes".into(),
+            cwd: None,
+            images: None,
+            request_id: Some(request_id.into()),
+            settings: None,
+            observed_epoch: None,
+            observed_generation: None,
+            checkpoint_intent: Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: "logical-attempt-1".into(),
+                workspace: None,
+            }),
+        };
+
+        let dispatches_for_first = Arc::clone(&dispatches);
+        service
+            .clone()
+            .barrier_and_forward(
+                make_send("request-1"),
+                Box::pin(async move {
+                    dispatches_for_first.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+            .await;
+        service
+            .observe_accepted(&json!({
+                "requestId": "request-1",
+                "provider": "opencode",
+                "sessionId": "session-1",
+                "sessionType": "freshopencode",
+                "submittedTurnId": "provider-turn-1"
+            }))
+            .await;
+
+        let dispatches_for_second = Arc::clone(&dispatches);
+        service
+            .clone()
+            .barrier_and_forward(
+                make_send("request-2"),
+                Box::pin(async move {
+                    dispatches_for_second.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+            .await;
+
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+        let key = format!("\"opencode\":\"freshopencode\":session-1:logical-attempt-1");
+        let record = service.find_outcome(&key).await.unwrap().unwrap();
+        assert!(record.dispatch_started);
+        assert_eq!(record.submitted_turn_id.as_deref(), Some("provider-turn-1"));
+        assert!(record.request_ids.contains(&"request-2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn codex_identity_receipt_is_durable_and_replayed_after_service_reload() {
+        use freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier;
+
+        let home = tempfile::tempdir().unwrap();
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(16);
+        let service =
+            CheckpointService::new(Arc::new(home.path().to_path_buf()), Arc::new(broadcast_tx));
+        let workspace = ResolvedCheckpointWorkspace {
+            path: PathBuf::from("/work/codex-project"),
+            provenance: "directory-picker".to_string(),
+        };
+        let send = FreshAgentSend {
+            provider: AgentProvider::Codex,
+            session_id: "codex-session".to_string(),
+            session_type: SessionType::Freshcodex,
+            text: "do not persist this prompt".to_string(),
+            cwd: Some("/work/codex-project".to_string()),
+            images: None,
+            request_id: Some("codex-request-1".to_string()),
+            settings: None,
+            observed_epoch: None,
+            observed_generation: None,
+            checkpoint_intent: Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: "codex-logical-attempt-1".to_string(),
+                workspace: None,
+            }),
+        };
+        let key = checkpoint_attempt_key(&send, "codex-logical-attempt-1");
+        let mut record = service.new_record(
+            &send,
+            "codex-logical-attempt-1",
+            "codex-request-1",
+            Some((&workspace, "")),
+            Ok("checkpoint-sha".to_string()),
+        );
+        record.dispatch_started = true;
+        record.submitted_turn_id = Some("codex-native-turn-1".to_string());
+        service.persist_outcome(&key, record).await.unwrap();
+
+        service
+            .observe_turn_identity(&json!({
+                "provider": "codex",
+                "sessionId": "codex-session",
+                "sessionType": "freshcodex",
+                "event": {
+                    "type": "checkpointTurnIdentity",
+                    "requestId": "codex-request-1",
+                    "logicalAttemptId": "codex-logical-attempt-1",
+                    "sessionId": "codex-session",
+                    "nativeTurnId": "codex-native-turn-1",
+                    "displayTurnId": "codex-native-turn-1:row-0"
+                }
+            }))
+            .await;
+
+        let persisted = service.read_outcome_store().await.unwrap();
+        let saved = persisted.outcomes.get(&key).unwrap();
+        assert_eq!(
+            saved.outcome.native_turn_id.as_deref(),
+            Some("codex-native-turn-1")
+        );
+        assert_eq!(
+            saved.outcome.display_turn_id.as_deref(),
+            Some("codex-native-turn-1:row-0")
+        );
+        assert!(
+            !serde_json::to_string(&persisted)
+                .unwrap()
+                .contains("do not persist this prompt"),
+            "durable checkpoint identity state never stores the sent prompt"
+        );
+
+        let (replay_tx, mut replay_rx) = tokio::sync::broadcast::channel(8);
+        let reloaded = Arc::new(CheckpointService::new(
+            Arc::new(home.path().to_path_buf()),
+            Arc::new(replay_tx),
+        ));
+        reloaded
+            .clone()
+            .replay_for_session(
+                AgentProvider::Codex,
+                "codex-session".to_string(),
+                SessionType::Freshcodex,
+            )
+            .await;
+        let frame = replay_rx.recv().await.unwrap();
+        let replayed: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(replayed["type"], "freshAgent.checkpoint.outcome");
+        assert_eq!(replayed["logicalAttemptId"], "codex-logical-attempt-1");
+        assert_eq!(replayed["nativeTurnId"], "codex-native-turn-1");
+        assert_eq!(replayed["displayTurnId"], "codex-native-turn-1:row-0");
     }
 
     async fn body_json(resp: Response) -> Value {
@@ -2081,13 +4720,17 @@ mod tests {
         .await
         .unwrap();
 
-        let ignored = ignored_git_directories(
-            &git_dir,
-            work_tree.path(),
-            &[b"private-dir.ignored/".to_vec()],
-        )
-        .await
-        .unwrap();
+        let ignored = CHECKPOINT_CAPTURE_CONTEXT
+            .scope(
+                Arc::new(CheckpointCaptureControl::default()),
+                ignored_git_directories(
+                    &git_dir,
+                    work_tree.path(),
+                    &[b"private-dir.ignored/".to_vec()],
+                ),
+            )
+            .await
+            .unwrap();
         assert!(ignored.contains(b"private-dir.ignored/".as_slice()));
     }
 
@@ -2793,6 +5436,125 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_http_capture_holds_workspace_until_descendant_is_settled() {
+        use std::os::unix::fs::PermissionsExt;
+        use tower::ServiceExt;
+
+        let home_dir = tempfile::tempdir().unwrap();
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let started = home_dir.path().join("filter-descendant-started");
+        let late_write = home_dir.path().join("filter-descendant-late-write");
+        let filter = home_dir.path().join("blocking-clean-filter.sh");
+        let filter_contents = format!(
+            "#!/bin/sh\n( trap '' TERM; printf started > '{}'; sleep 1; printf late > '{}' ) &\nwait\ncat\n",
+            started.display(),
+            late_write.display(),
+        );
+        tokio::fs::write(&filter, filter_contents).await.unwrap();
+        let mut permissions = tokio::fs::metadata(&filter).await.unwrap().permissions();
+        permissions.set_mode(0o755);
+        tokio::fs::set_permissions(&filter, permissions)
+            .await
+            .unwrap();
+        tokio::fs::write(
+            cwd_dir.path().join(".gitattributes"),
+            "*.slow filter=blocking\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(cwd_dir.path().join("payload.slow"), "checkpoint data\n")
+            .await
+            .unwrap();
+
+        let git_dir = ensure_checkpoint_repo(home_dir.path(), cwd_dir.path())
+            .await
+            .unwrap();
+        let git_dir_arg = format!("--git-dir={}", git_dir.display());
+        let filter_command = filter.to_string_lossy().into_owned();
+        run_git(
+            &[
+                &git_dir_arg,
+                "config",
+                "filter.blocking.clean",
+                &filter_command,
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+        run_git(
+            &[&git_dir_arg, "config", "filter.blocking.required", "true"],
+            None,
+        )
+        .await
+        .unwrap();
+
+        let state = state(home_dir.path());
+        let service = Arc::clone(&state.service);
+        let workspace = cwd_dir.path().to_path_buf();
+        let workspace_text = workspace.to_string_lossy().into_owned();
+        let app = router(state);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/fresh-agent/checkpoints")
+            .header("content-type", "application/json")
+            .header("x-auth-token", "tok")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&json!({
+                    "cwd": workspace_text,
+                    "workspace": {
+                        "path": workspace_text,
+                        "provenance": "directory-picker"
+                    },
+                    "requestId": "dropped-http-capture"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let request_task = tokio::spawn(app.oneshot(request));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the Git clean filter started its descendant");
+
+        request_task.abort();
+        let _ = request_task.await;
+
+        let during_settlement = service
+            .lock_workspace(&workspace, Duration::from_millis(30))
+            .await;
+        assert!(
+            during_settlement.is_err(),
+            "the workspace lock must remain owned while the descendant is being killed and reaped"
+        );
+
+        let settled_lock = tokio::time::timeout(
+            Duration::from_secs(3),
+            service.lock_workspace(&workspace, Duration::from_secs(3)),
+        )
+        .await
+        .expect("the HTTP cancellation supervisor settles")
+        .expect("the workspace is released after settlement");
+        drop(settled_lock);
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(
+            !late_write.exists(),
+            "a descendant cannot continue writing after the route has settled cancellation"
+        );
+        let entries = list_checkpoints(home_dir.path(), &workspace).await.unwrap();
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| { entry["requestId"].as_str() == Some("dropped-http-capture") })
+        );
+    }
+
     // ── is_valid_checkpoint_id ──────────────────────────────────────────
 
     #[test]
@@ -2868,6 +5630,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_returns_empty_for_an_initialized_but_unborn_shadow_repository() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let cwd_dir = tempfile::tempdir().unwrap();
+        ensure_checkpoint_repo(home_dir.path(), cwd_dir.path())
+            .await
+            .unwrap();
+
+        assert!(
+            list_checkpoints(home_dir.path(), cwd_dir.path())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_reports_an_existing_shadow_repository_with_missing_head_as_corrupt() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let git_dir = ensure_checkpoint_repo(home_dir.path(), cwd_dir.path())
+            .await
+            .unwrap();
+        tokio::fs::remove_file(git_dir.join("HEAD")).await.unwrap();
+
+        let result = list_checkpoints(home_dir.path(), cwd_dir.path()).await;
+
+        assert!(
+            result
+                .unwrap_err()
+                .contains("checkpoint repository exists but its HEAD is missing")
+        );
+    }
+
+    #[tokio::test]
     async fn list_does_not_require_cwd_to_exist_on_disk() {
         // Legacy GET /checkpoints has no fsp.access(cwd) guard (unlike POST
         // /checkpoints, /diff, /exec) -- fresh-agent-extras-router.ts:370-380.
@@ -2931,6 +5727,51 @@ mod tests {
         assert_eq!(checkpoints[1]["id"], json!(id1));
         assert_eq!(checkpoints[1]["label"], json!("first"));
         assert!(checkpoints[0]["ts"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn list_storage_error_is_not_reported_as_an_empty_checkpoint_history() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let first = CHECKPOINT_CAPTURE_CONTEXT
+            .scope(
+                Arc::new(CheckpointCaptureControl::default()),
+                create_checkpoint(home_dir.path(), cwd_dir.path(), "first", Some("req-1")),
+            )
+            .await
+            .unwrap();
+        let git_dir = checkpoint_git_dir(home_dir.path(), cwd_dir.path());
+        let head_ref = run_git(
+            &[
+                &format!("--git-dir={}", git_dir.display()),
+                "symbolic-ref",
+                "HEAD",
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+        let ref_path = git_dir.join(head_ref.trim());
+        tokio::fs::write(&ref_path, format!("{}\n", "0".repeat(40)))
+            .await
+            .unwrap();
+
+        let response = get_checkpoints(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            list_query(cwd_dir.path().to_str().unwrap()),
+        )
+        .await;
+
+        assert_eq!(first["id"].as_str().unwrap().len(), 40);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_json(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Git operation log failed")
+        );
     }
 
     #[tokio::test]

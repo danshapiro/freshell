@@ -69,6 +69,8 @@ fn hosted_created_frame_uses_the_public_request_identity() {
         pollers: Mutex::new(HashSet::new()),
         fixture_modes: HashSet::new(),
         naming: OnceLock::new(),
+        checkpoint_barrier: OnceLock::new(),
+        ownership: OnceLock::new(),
     };
     proxy.forward_host_event(
         AgentEvent::Provider {
@@ -101,6 +103,8 @@ async fn managed_recovery_stop_refuses_without_contacting_the_host() {
         pollers: Mutex::new(HashSet::new()),
         fixture_modes: HashSet::new(),
         naming: OnceLock::new(),
+        checkpoint_barrier: OnceLock::new(),
+        ownership: OnceLock::new(),
     });
 
     proxy
@@ -375,6 +379,8 @@ async fn managed_provider_fork_rekeys_the_same_soul_without_launch_or_stop() {
         pollers: Mutex::new(HashSet::new()),
         fixture_modes: HashSet::new(),
         naming: std::sync::OnceLock::new(),
+        checkpoint_barrier: std::sync::OnceLock::new(),
+        ownership: std::sync::OnceLock::new(),
     });
     Arc::clone(&proxy)
         .handle(HostedFreshAgentCommand::Fork(FreshAgentFork {
@@ -698,6 +704,8 @@ async fn rollback_commands_keep_direction_target_and_request_fences() {
             pollers: Mutex::new(HashSet::new()),
             fixture_modes: HashSet::new(),
             naming: OnceLock::new(),
+            checkpoint_barrier: OnceLock::new(),
+            ownership: OnceLock::new(),
         });
         let message = serde_json::json!({"provider":"codex","sessionId":"public-thread","sessionType":"freshcodex",
             "requestId":"rollback-ui-request","mode":"toTurn","turnId":"turn-selected","cwd":"/workspace"});
@@ -763,6 +771,8 @@ fn snapshot_outage_proxy(socket: &Path) -> Arc<HostedFreshAgentProxy> {
         pollers: Mutex::new(HashSet::new()),
         fixture_modes: HashSet::new(),
         naming: OnceLock::new(),
+        checkpoint_barrier: OnceLock::new(),
+        ownership: OnceLock::new(),
     })
 }
 

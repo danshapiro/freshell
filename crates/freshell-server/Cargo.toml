@@ -135,6 +135,7 @@ socket2 = { version = "0.6", features = ["all"] }
 hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "service"] }
 tower = { version = "0.5", features = ["util"] }
+futures-util = "0.3"
 # The from-the-first-byte redaction scrub (DIAG-03): matches `"...token...":"…"`
 # and `"cookie":"…"` JSON fields (and a raw `Cookie:`/`Set-Cookie:` header
 # fragment, belt-and-braces) regardless of which call site produced them.
@@ -152,6 +153,18 @@ unicode-normalization = "=0.1.25"
 # lock's own unix-only implementation.
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+# Checkpoint Git children are started suspended, assigned to a kill-on-close
+# Job Object, and only then resumed. This owns filters/hooks and other child
+# processes through timeout settlement on native Windows.
+windows-sys = { version = "=0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+] }
+
 [target.'cfg(unix)'.dev-dependencies]
 freshell-supervisor = { path = "../freshell-supervisor" }
 
@@ -168,7 +181,6 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # against the compiled binary (same version freshell-ws's own tests already
 # use, `crates/freshell-ws/Cargo.toml`) — no mock, the actual wire protocol.
 tokio-tungstenite = "0.24"
-futures-util = "0.3"
 # NET-09: black-box config-preservation test requires reqwest with json encoding
 # (main [dependencies] reqwest is feature-gated for stream+rustls only).
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }

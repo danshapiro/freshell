@@ -12,8 +12,8 @@ use freshell_freshagent::naming::{admit_pending_projection, session_projection, 
 use freshell_protocol::session_names::NamedProvider;
 use freshell_protocol::{
     AgentProvider, FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent, FreshAgentForked,
-    FreshAgentKilled, FreshAgentRecoveryStopped, ServerMessage, SessionLocator, SessionType,
-    StringOrNumber,
+    FreshAgentKilled, FreshAgentRecoveryStopped, FreshAgentSend, ServerMessage, SessionLocator,
+    SessionType, StringOrNumber,
 };
 use freshell_runtime_client::RuntimeClient;
 use freshell_runtime_protocol::{
@@ -54,6 +54,8 @@ pub(crate) struct HostedFreshAgentProxy {
     pollers: Mutex<HashSet<SoulId>>,
     fixture_modes: HashSet<String>,
     naming: OnceLock<Arc<dyn SessionNaming>>,
+    checkpoint_barrier: OnceLock<Arc<dyn freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier>>,
+    ownership: OnceLock<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
 }
 
 struct RollbackInvocation {
@@ -87,7 +89,87 @@ impl HostedFreshAgentProxy {
             pollers: Mutex::new(HashSet::new()),
             fixture_modes,
             naming: OnceLock::new(),
+            checkpoint_barrier: OnceLock::new(),
+            ownership: OnceLock::new(),
         })))
+    }
+
+    pub(crate) fn set_checkpoint_barrier(
+        &self,
+        barrier: Arc<dyn freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier>,
+    ) {
+        let _ = self.checkpoint_barrier.set(barrier);
+    }
+
+    pub(crate) fn set_ownership(
+        &self,
+        ownership: Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+    ) {
+        let _ = self.ownership.set(ownership);
+    }
+
+    fn post_barrier_admission(&self, message: &FreshAgentSend) -> Result<(), &'static str> {
+        let (epoch, generation) = match (message.observed_epoch, message.observed_generation) {
+            (None, None) => return Ok(()),
+            (Some(epoch), Some(generation)) => (epoch, generation),
+            _ => return Err("fresh-agent ownership fence is incomplete"),
+        };
+        let Some(ownership) = self.ownership.get() else {
+            return Ok(());
+        };
+        let provider = provider_wire(&message.provider);
+        let canonical_id = ownership.resolve_canonical(&provider, &message.session_id);
+        let current = ownership.observe(&provider, &canonical_id);
+        if current.epoch != epoch || current.generation != generation {
+            return Err("fresh-agent session changed while the checkpoint was being captured");
+        }
+        match current.state {
+            freshell_ownership::OwnershipState::Live { owner, .. }
+                if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent => Ok(()),
+            _ => Err("fresh-agent session is no longer available for this send"),
+        }
+    }
+
+    async fn dispatch_send(&self, message: FreshAgentSend) {
+        let provider = message.provider;
+        let session_id = message.session_id.clone();
+        let session_type = message.session_type;
+        if let Err(reason) = self.post_barrier_admission(&message) {
+            self.error_event_code(
+                &provider,
+                &session_id,
+                session_type,
+                "FRESH_AGENT_STALE_SESSION",
+                reason,
+            );
+            return;
+        }
+        let request_id = message
+            .request_id
+            .as_deref()
+            .and_then(|value| RequestId::parse(value.to_string()).ok())
+            .unwrap_or_else(RequestId::new);
+        let result = match self
+            .resolve_soul(&provider, session_type, &session_id)
+            .await
+        {
+            Some(soul) => {
+                let settings = turn_settings(message.settings, message.cwd);
+                self.client
+                    .fresh_agent_send(request_id, soul, message.text, settings)
+                    .await
+                    .map(|_| ())
+            }
+            None => Err(freshell_runtime_client::ClientError::UnexpectedResult),
+        };
+        if result.is_err() {
+            self.error_event(
+                &provider,
+                &session_id,
+                session_type,
+                "managed fresh-agent input was not accepted",
+            );
+        }
     }
 
     pub(crate) fn set_session_naming(&self, naming: Arc<dyn SessionNaming>) {
@@ -114,6 +196,15 @@ impl HostedFreshAgentProxy {
                 }
             }
             HostedFreshAgentCommand::Attach(message) => {
+                if let Some(barrier) = self.checkpoint_barrier.get() {
+                    Arc::clone(barrier)
+                        .replay_for_session(
+                            message.provider,
+                            message.session_id.clone(),
+                            message.session_type,
+                        )
+                        .await;
+                }
                 if let Some(soul) = self
                     .resolve_soul(&message.provider, message.session_type, &message.session_id)
                     .await
@@ -142,34 +233,19 @@ impl HostedFreshAgentProxy {
                 }
             }
             HostedFreshAgentCommand::Send(message) => {
-                let provider = message.provider;
-                let session_id = message.session_id.clone();
-                let session_type = message.session_type;
-                let request_id = message
-                    .request_id
-                    .as_deref()
-                    .and_then(|value| RequestId::parse(value.to_string()).ok())
-                    .unwrap_or_else(RequestId::new);
-                let result = match self
-                    .resolve_soul(&provider, session_type, &session_id)
-                    .await
-                {
-                    Some(soul) => {
-                        let settings = turn_settings(message.settings, message.cwd);
-                        self.client
-                            .fresh_agent_send(request_id, soul, message.text, settings)
-                            .await
-                            .map(|_| ())
+                if message.checkpoint_intent.is_some() {
+                    if let Some(barrier) = self.checkpoint_barrier.get() {
+                        let proxy = Arc::clone(&self);
+                        let capture_send = message.clone();
+                        let forward = Box::pin(async move { proxy.dispatch_send(message).await });
+                        Arc::clone(barrier)
+                            .barrier_and_forward(capture_send, forward)
+                            .await;
+                    } else {
+                        self.dispatch_send(message).await;
                     }
-                    None => Err(freshell_runtime_client::ClientError::UnexpectedResult),
-                };
-                if result.is_err() {
-                    self.error_event(
-                        &provider,
-                        &session_id,
-                        session_type,
-                        "managed fresh-agent input was not accepted",
-                    );
+                } else {
+                    self.dispatch_send(message).await;
                 }
             }
             HostedFreshAgentCommand::Interrupt(message) => {

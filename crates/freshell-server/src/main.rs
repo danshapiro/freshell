@@ -1003,6 +1003,14 @@ async fn main() -> ExitCode {
     // socket — the original `WsHandler.broadcast`. Capacity is generous so a paced
     // fresh-agent turn's handful of broadcasts never laps a briefly-busy consumer.
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(1024).0);
+    let checkpoint_home = Arc::new(home.clone().unwrap_or_else(|| PathBuf::from(".")));
+    let checkpoint_service = Arc::new(checkpoints::CheckpointService::new(
+        Arc::clone(&checkpoint_home),
+        Arc::clone(&broadcast_tx),
+    ));
+    let checkpoint_barrier: Arc<dyn freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier> =
+        checkpoint_service.clone();
+    checkpoint_service.start_observer();
 
     // The shared UI-screenshot broker over that same bus: `POST /api/screenshots`
     // registers a request + broadcasts `screenshot.capture`; the `/ws` loop routes
@@ -1178,6 +1186,8 @@ async fn main() -> ExitCode {
     });
     #[cfg(feature = "managed-runtime-v1")]
     if let Some(gateway) = hosted_fresh_gateway.as_ref() {
+        gateway.set_checkpoint_barrier(Arc::clone(&checkpoint_barrier));
+        gateway.set_ownership(Arc::clone(&ownership));
         fresh_agent_state
             .set_hosted_rest_gateway(gateway.clone())
             .unwrap_or_else(|error| {
@@ -2280,6 +2290,9 @@ async fn main() -> ExitCode {
             interest: host_stats_interest.clone(),
             collector: Some(host_stats_collector.clone()),
         },
+        checkpoint_send: freshell_ws::checkpoint_barrier::WsCheckpointState {
+            service: Some(Arc::clone(&checkpoint_barrier)),
+        },
         terminals_revision: Arc::clone(&terminals_revision),
         sessions_revision: Arc::clone(&sessions_revision),
         cli_commands: Arc::clone(&cli_commands),
@@ -3001,7 +3014,8 @@ async fn main() -> ExitCode {
     // back to the cwd-relative `.` the other home-relative state above uses.
     let checkpoints_state = checkpoints::CheckpointsApiState {
         auth_token: Arc::clone(&auth_token),
-        home: Arc::new(home.clone().unwrap_or_else(|| PathBuf::from("."))),
+        home: Arc::clone(&checkpoint_home),
+        service: Arc::clone(&checkpoint_service),
     };
 
     // `POST /api/fresh-agent/attachments` (`fresh-agent-extras-router.ts:260-287`):
@@ -4667,6 +4681,7 @@ mod sessions_sweep_tests {
             screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
             subagent_interest: Default::default(),
             host_stats: Default::default(),
+        checkpoint_send: Default::default(),
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),

@@ -1053,6 +1053,41 @@ async fn handle_client_text(
     if let Some(reply) = fresh_agent_control_refusal(&message) {
         return send(ws_tx, &reply).await;
     }
+    if let ClientMessage::FreshAgentSend(fresh_send) = &message {
+        if fresh_send.checkpoint_intent.is_some()
+            && fresh_send
+                .request_id
+                .as_deref()
+                .is_none_or(|request_id| request_id.trim().is_empty())
+        {
+            tracing::warn!(
+                event = "code_checkpoint.send_missing_request_id",
+                provider = ?fresh_send.provider,
+                session_id = %fresh_send.session_id,
+                "modern checkpoint send was rejected before capture or provider dispatch"
+            );
+            return send(
+                ws_tx,
+                &ServerMessage::Error(ErrorMsg {
+                    provider_preparation_failure: None,
+                    code: ErrorCode::InvalidMessage,
+                    message: "requestId is required when checkpointIntent is present".into(),
+                    timestamp: crate::now_iso(),
+                    actual_session_ref: None,
+                    expected_session_ref: None,
+                    request_id: None,
+                    retry_after_ms: None,
+                    terminal_exit_code: None,
+                    terminal_id: None,
+                    live_terminal_id: None,
+                    owner_kind: None,
+                    owner_generation: None,
+                    owner_epoch: None,
+                }),
+            )
+            .await;
+        }
+    }
     // Explicit managed fresh-agent rollout: every fresh-agent operation is
     // consumed by the external gateway when installed. It is never allowed
     // to fall through and mint a competing web-owned provider writer.
@@ -1928,25 +1963,61 @@ async fn handle_client_text(
         // same pattern as the other `freshAgent.*` arms. `_` keeps swallowing only
         // `Amplifier` (no fresh-agent runtime, same as the `FreshAgentSend` arm).
         ClientMessage::FreshAgentAttach(attach) => {
+            let checkpoint_replay = state.checkpoint_send.service.clone();
             match attach.provider {
                 freshell_protocol::AgentProvider::Codex => {
                     let fresh_codex = state.fresh_codex.clone();
                     tokio::spawn(
-                        async move { fresh_codex.handle_attach(attach).await }
+                        async move {
+                            if let Some(service) = checkpoint_replay {
+                                Arc::clone(&service)
+                                    .replay_for_session(
+                                        attach.provider,
+                                        attach.session_id.clone(),
+                                        attach.session_type,
+                                    )
+                                    .await;
+                            }
+                            fresh_codex.handle_attach(attach).await
+                        }
                             .instrument(tracing::Span::current()),
                     );
                 }
                 freshell_protocol::AgentProvider::Claude => {
                     let fresh_claude = state.fresh_claude.clone();
+                    let checkpoint_replay = state.checkpoint_send.service.clone();
                     tokio::spawn(
-                        async move { fresh_claude.handle_attach(attach).await }
+                        async move {
+                            if let Some(service) = checkpoint_replay {
+                                Arc::clone(&service)
+                                    .replay_for_session(
+                                        attach.provider,
+                                        attach.session_id.clone(),
+                                        attach.session_type,
+                                    )
+                                    .await;
+                            }
+                            fresh_claude.handle_attach(attach).await
+                        }
                             .instrument(tracing::Span::current()),
                     );
                 }
                 freshell_protocol::AgentProvider::Opencode => {
                     let fresh_opencode = state.fresh_opencode.clone();
+                    let checkpoint_replay = state.checkpoint_send.service.clone();
                     tokio::spawn(
-                        async move { fresh_opencode.handle_attach(attach).await }
+                        async move {
+                            if let Some(service) = checkpoint_replay {
+                                Arc::clone(&service)
+                                    .replay_for_session(
+                                        attach.provider,
+                                        attach.session_id.clone(),
+                                        attach.session_type,
+                                    )
+                                    .await;
+                            }
+                            fresh_opencode.handle_attach(attach).await
+                        }
                             .instrument(tracing::Span::current()),
                     );
                 }
@@ -1955,6 +2026,32 @@ async fn handle_client_text(
             true
         }
         ClientMessage::FreshAgentSend(send) => {
+            if send.checkpoint_intent.is_some() {
+                if let Some(service) = state.checkpoint_send.service.clone() {
+                    let captured_send = send.clone();
+                    let forward: futures::future::BoxFuture<'static, ()> = match send.provider {
+                        freshell_protocol::AgentProvider::Codex => {
+                            let fresh_codex = state.fresh_codex.clone();
+                            Box::pin(async move { fresh_codex.handle_send(send).await })
+                        }
+                        freshell_protocol::AgentProvider::Claude => {
+                            let fresh_claude = state.fresh_claude.clone();
+                            Box::pin(async move { fresh_claude.handle_send(send).await })
+                        }
+                        freshell_protocol::AgentProvider::Opencode => {
+                            let fresh_opencode = state.fresh_opencode.clone();
+                            Box::pin(async move { fresh_opencode.handle_send(send).await })
+                        }
+                        freshell_protocol::AgentProvider::Amplifier => Box::pin(async {}),
+                    };
+                    tokio::spawn(
+                        Arc::clone(&service)
+                            .barrier_and_forward(captured_send, forward)
+                            .instrument(tracing::Span::current()),
+                    );
+                    return true;
+                }
+            }
             match send.provider {
                 freshell_protocol::AgentProvider::Codex => {
                     let fresh_codex = state.fresh_codex.clone();
@@ -11608,6 +11705,7 @@ mod terminals_changed_tests {
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             subagent_interest: Default::default(),
             host_stats: Default::default(),
+        checkpoint_send: Default::default(),
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),
@@ -11807,6 +11905,7 @@ mod terminal_kill_stop_wedge_tests {
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             subagent_interest: Default::default(),
             host_stats: Default::default(),
+        checkpoint_send: Default::default(),
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),
@@ -12240,6 +12339,7 @@ mod terminal_meta_created_tests {
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             subagent_interest: Default::default(),
             host_stats: Default::default(),
+        checkpoint_send: Default::default(),
             terminals_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: std::sync::Arc::new(Vec::new()),
@@ -12884,6 +12984,7 @@ mod pane_reconcile_gate_tests {
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             subagent_interest: Default::default(),
             host_stats: Default::default(),
+        checkpoint_send: Default::default(),
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),
@@ -13721,6 +13822,7 @@ mod host_stats_dispatch_tests {
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             subagent_interest: Default::default(),
             host_stats,
+            checkpoint_send: Default::default(),
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),

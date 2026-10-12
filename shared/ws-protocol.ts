@@ -903,7 +903,7 @@ export const FreshAgentSendSchema = z.object({
    *  correlated with this provider attempt and dispatched as part of this
    *  same send. Explicit workspace scope is persisted pane intent only. */
   checkpointIntent: z.object({
-    logicalAttemptId: z.string().min(1).max(128),
+    logicalAttemptId: z.string().trim().min(1).max(128),
     workspace: z.object({
       path: z.string().min(1).max(4096),
       provenance: z.enum(['directory-picker', 'resolved-project', 'legacy-checkpoint']),
@@ -927,6 +927,14 @@ export const FreshAgentSendSchema = z.object({
     mediaType: z.string(),
     data: z.string(),
   })).optional(),
+}).superRefine((send, context) => {
+  if (send.checkpointIntent && !send.requestId?.trim()) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['requestId'],
+      message: 'requestId is required when checkpointIntent is present',
+    })
+  }
 })
 
 export const FreshAgentInterruptSchema = z.object({
@@ -1858,6 +1866,27 @@ export type SdkRestoreFailureCode =
   | 'RESTORE_DIVERGED'
   | 'RESTORE_STALE_REVISION'
 
+export const FreshAgentCheckpointOutcomeSchema = z.object({
+  type: z.literal('freshAgent.checkpoint.outcome'),
+  logicalAttemptId: z.string().min(1),
+  requestId: z.string().min(1),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  status: z.enum(['available', 'unavailable']),
+  checkpointId: z.string().min(1).optional(),
+  workspace: z.object({
+    path: z.string().min(1),
+    provenance: z.enum(['directory-picker', 'resolved-project', 'legacy-checkpoint']),
+  }).strict().optional(),
+  code: z.string().optional(),
+  reason: z.string().optional(),
+  nativeTurnId: z.string().min(1).optional(),
+  displayTurnId: z.string().min(1).optional(),
+}).strict()
+
+export type FreshAgentCheckpointOutcome = z.infer<typeof FreshAgentCheckpointOutcomeSchema>
+
 export type FreshAgentServerMessage =
   | { type: 'freshAgent.created'; requestId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string }; sessionName?: SessionNameRecord; nameRef?: SessionNameRef }
   | { type: 'freshAgent.create.failed'; requestId: string; code: string; message: string; retryable?: boolean
@@ -1868,7 +1897,7 @@ export type FreshAgentServerMessage =
       ownerKind?: 'terminal' | 'fresh-agent'
       ownerGeneration?: number
       ownerEpoch?: number }
-  | { type: 'freshAgent.checkpoint.outcome'; logicalAttemptId: string; requestId: string; provider: 'claude' | 'codex' | 'opencode'; sessionId: string; sessionType: 'freshclaude' | 'freshcodex' | 'kilroy' | 'freshopencode'; status: 'available' | 'unavailable'; checkpointId?: string; workspace?: { path: string; provenance: 'directory-picker' | 'resolved-project' | 'legacy-checkpoint' }; code?: string; reason?: string }
+  | FreshAgentCheckpointOutcome
   | { type: 'freshAgent.send.accepted'; requestId: string; sessionId: string; sessionType: string; provider: string; submittedTurnId?: string; cwd?: string }
   | { type: 'freshAgent.event'; sessionId: string; sessionType: string; provider: string; event: unknown }
   | { type: 'freshAgent.session.materialized'; previousSessionId: string; sessionId: string; sessionType: string; provider: string; sessionRef?: { provider: string; sessionId: string }; sessionName?: SessionNameRecord; nameRef?: SessionNameRef }

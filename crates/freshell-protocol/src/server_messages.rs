@@ -10,8 +10,8 @@ use std::collections::HashMap;
 
 use crate::common::{
     AgentProvider, AmplifierActivityRecord, ClaudeActivityRecord, CodexActivityRecord,
-    CodexDurability, ErrorCode, OpencodeActivityRecord, SessionLocator, TerminalMetaRecord,
-    TurnCompletionSnapshot,
+    CodexDurability, ErrorCode, FreshAgentCheckpointWorkspace, OpencodeActivityRecord,
+    SessionLocator, SessionType, TerminalMetaRecord, TurnCompletionSnapshot,
 };
 use crate::session_names::{SessionNameRecord, SessionNameRef, SessionNameUpdated};
 use crate::settings::ServerSettings;
@@ -66,6 +66,8 @@ pub enum ServerMessage {
     ExtensionsRegistry(ExtensionsRegistry),
     #[serde(rename = "freshAgent.create.failed")]
     FreshAgentCreateFailed(FreshAgentCreateFailed),
+    #[serde(rename = "freshAgent.checkpoint.outcome")]
+    FreshAgentCheckpointOutcome(FreshAgentCheckpointOutcome),
     #[serde(rename = "freshAgent.created")]
     FreshAgentCreated(FreshAgentCreated),
     #[serde(rename = "freshAgent.event")]
@@ -207,7 +209,7 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 69] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 70] = [
     "amplifier.activity.list.response",
     "amplifier.activity.updated",
     "claude.activity.list.response",
@@ -226,6 +228,7 @@ pub const SERVER_MESSAGE_TYPES: [&str; 69] = [
     "extension.server.starting",
     "extension.server.stopped",
     "extensions.registry",
+    "freshAgent.checkpoint.outcome",
     "freshAgent.create.failed",
     "freshAgent.created",
     "freshAgent.event",
@@ -278,6 +281,40 @@ pub const SERVER_MESSAGE_TYPES: [&str; 69] = [
     "terminals.changed",
     "ui.command",
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshAgentCheckpointStatus {
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentCheckpointOutcome {
+    pub logical_attempt_id: String,
+    pub request_id: String,
+    pub provider: AgentProvider,
+    pub session_id: String,
+    pub session_type: SessionType,
+    pub status: FreshAgentCheckpointStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<FreshAgentCheckpointWorkspace>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Provider-native user row identity, added only after the provider confirms
+    /// the actual persisted/replayed row for this logical attempt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_turn_id: Option<String>,
+    /// Actual display-row key joined to `nativeTurnId`, when the provider
+    /// projection has materialized that row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_turn_id: Option<String>,
+}
 
 /// Supervisor startup-scan readiness carried by
 /// [`ServerMessage::RuntimeInventoryChanged`]. Mirrors
