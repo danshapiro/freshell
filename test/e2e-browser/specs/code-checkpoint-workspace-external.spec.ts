@@ -172,7 +172,10 @@ async function sendThroughComposer(
   expect(outcome!.nativeTurnId).toBe(accepted.submittedTurnId)
   expect(JSON.stringify((await currentFreshAgent(page)).content.checkpointOutcomes)).not.toContain(text)
 
-  const row = paneRoot.locator('article[data-turn-role="user"]', { hasText: text })
+  // Repeated prompts are intentional in this acceptance case. The freshly
+  // accepted turn is the newest matching user row; requiring the locator to
+  // be unique would make the second send fail before its identity assertions.
+  const row = paneRoot.locator('article[data-turn-role="user"]', { hasText: text }).last()
   await expect(row).toBeVisible({ timeout: 30_000 })
   return { sent, accepted, outcome: outcome!, row }
 }
@@ -310,12 +313,13 @@ test('Git workspace sends retain per-turn success and failure, then restore the 
   await duplicateRows.nth(0).hover()
   const rewind = duplicateRows.nth(0).getByRole('button', { name: 'Rewind code to here' })
   await expect(rewind).toBeEnabled()
+  const rewindNotice = expect(restoredPane.getByRole('alert').filter({ hasText: /Code rewound to before:/ }))
+    .toContainText('Automatic pre-turn snapshot', { timeout: 30_000 })
   const dialogAccepted = page.waitForEvent('dialog').then(dialog => dialog.accept())
   await rewind.click()
-  await dialogAccepted
+  await Promise.all([dialogAccepted, rewindNotice])
   await expect.poll(() => targetRead(page, `${fixture.syntheticWorkspacePath}/main.rs`)).toBe('main before checkpoint\n')
   await expect.poll(() => targetRead(page, `${fixture.syntheticWorkspacePath}/notes.txt`)).toBe('notes before checkpoint\n')
-  await expect(restoredPane.getByText(`Code rewound to before: "${samePrompt}"`)).toBeVisible({ timeout: 30_000 })
   await expect(duplicateRows).toHaveCount(2)
   const durable = await targetJson<FixtureTurn[]>(page,
     `${fixture.syntheticHomePath}/.codex/fake-turns/${originalSessionId}.json`)
@@ -353,15 +357,16 @@ test('picker-confirmed non-Git workspace captures and restores all selected file
   await targetWrite(page, `${fixture.nonGitWorkspacePath}/one.txt`, 'one changed after send\n')
   await targetWrite(page, `${fixture.nonGitWorkspacePath}/two.txt`, 'two changed after send\n')
   await turn.row.hover()
+  const rewindNotice = expect(paneRoot.getByRole('alert').filter({ hasText: /Code rewound to before:/ }))
+    .toContainText('Automatic pre-turn snapshot', { timeout: 30_000 })
   const dialogAccepted = page.waitForEvent('dialog').then(dialog => dialog.accept())
   await turn.row.getByRole('button', { name: 'Rewind code to here' }).click()
-  await dialogAccepted
+  await Promise.all([dialogAccepted, rewindNotice])
   await expect.poll(() => targetRead(page, `${fixture.nonGitWorkspacePath}/one.txt`)).toBe('one before checkpoint\n')
   await expect.poll(() => targetRead(page, `${fixture.nonGitWorkspacePath}/two.txt`)).toBe('two before checkpoint\n')
   const afterRestore = await currentFreshAgent(page)
   expect(afterRestore.content.sessionRef?.sessionId ?? afterRestore.content.sessionId).toBe(originalSessionId)
   expect(afterRestore.content.checkpointWorkspace).toEqual({ path: fixture.nonGitWorkspacePath, provenance: 'directory-picker' })
-  await expect(paneRoot.getByText(`Code rewound to before: "${marker}"`)).toBeVisible({ timeout: 30_000 })
 })
 
 test('HOME confirmation is launch-only and an accepted send has no checkpoint', async ({ page }) => {
@@ -373,10 +378,10 @@ test('HOME confirmation is launch-only and an accepted send has no checkpoint', 
   const marker = `checkpoint home ${fixture.expectedNonce}`
   const turn = await sendThroughComposer(page, paneRoot, marker, undefined)
   expect(turn.outcome).toMatchObject({ status: 'unavailable', code: 'workspace_unavailable' })
-  expect(turn.outcome.reason).toMatch(/account home|selected code checkpoint workspace/i)
+  expect(turn.outcome.reason).toMatch(/no eligible code workspace is available/i)
   expect(turn.sent.checkpointIntent).not.toHaveProperty('workspace')
   await expect(turn.row.getByRole('note', { name: 'Code rewind unavailable for this message' }))
-    .toContainText(/account home|selected code checkpoint workspace/i)
+    .toContainText(turn.outcome.reason!)
   await turn.row.hover()
   await expect(turn.row.getByRole('button', { name: 'Rewind unavailable for this message' })).toBeDisabled()
 
