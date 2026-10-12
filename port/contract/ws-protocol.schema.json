@@ -2461,6 +2461,10 @@
         {
           "additionalProperties": false,
           "properties": {
+            "createRequestId": {
+              "minLength": 1,
+              "type": "string"
+            },
             "cwd": {
               "type": "string"
             },
@@ -3912,6 +3916,10 @@
         {
           "additionalProperties": false,
           "properties": {
+            "createRequestId": {
+              "minLength": 1,
+              "type": "string"
+            },
             "cwd": {
               "type": "string"
             },
@@ -4548,6 +4556,10 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
+        "createRequestId": {
+          "minLength": 1,
+          "type": "string"
+        },
         "cwd": {
           "type": "string"
         },

@@ -92,17 +92,16 @@ pub struct FreshAgentPaneFacts {
 pub struct FreshAgentReconcileSnapshot {
     pub facts: std::collections::HashMap<String /* paneKey */, FreshAgentPaneFacts>,
     /// Task 18 (Stage 2: LB-42): the panes the server remembers as stopped
-    /// (by their createRequestId, or, while their conversation is not live,
-    /// by a stop that named only the conversation); they answer `stopped`,
-    /// claim nothing in the in-request dedupe and never burn the respawn
-    /// counter.
+    /// (by their createRequestId); they answer `stopped`, claim nothing in
+    /// the in-request dedupe and never burn the respawn counter.
     pub stopped: std::collections::HashSet<String /* paneKey */>,
 }
 
 /// Task 18 (Stage 2: LB-42): the pane's createRequestId names a remembered
-/// stop. Every stop's record is found by its own createRequestId, whatever
-/// the session's presence now; a reopened pane mints a new createRequestId,
-/// so it never matches.
+/// stop. Every closed pane's record is found by its own createRequestId,
+/// whatever the session's presence now; a reopened pane mints a new
+/// createRequestId, so it never matches. Nothing is remembered by
+/// conversation: a stop never marks a later pane of the conversation.
 fn stopped_by_create_request(
     ledger: &crate::pane_ledger::PaneLedger,
     pane: &ReconcilePane,
@@ -111,22 +110,6 @@ fn stopped_by_create_request(
         .as_deref()
         .filter(|crq| !crq.is_empty())
         .is_some_and(|crq| ledger.stopped_pane_for_create_request(crq).is_some())
-}
-
-/// Task 18 (Stage 2: LB-42): a stop that knew no createRequestId names one
-/// of these ids of the conversation (the claimed one, or the one the claim
-/// was superseded by). Applied only while the conversation is not live.
-fn conversation_stopped(
-    ledger: &crate::pane_ledger::PaneLedger,
-    provider: &str,
-    session_ids: &[&str],
-) -> bool {
-    session_ids.iter().any(|session_id| {
-        ledger
-            .stopped_fresh_session(provider, session_id)
-            .iter()
-            .any(|record| record.create_request_id.is_none())
-    })
 }
 
 /// The ONE async gathering pass per reconcile request (Task 13): session-map
@@ -247,20 +230,6 @@ pub async fn build_snapshot(
                 }
             }
         };
-        // Task 18: a conversation stopped by a stop that knew no
-        // createRequestId, while it is not live: `stopped` (no burn, and
-        // the pane gives its in-request claim back).
-        if presence != FreshAgentPresence::Live
-            && conversation_stopped(
-                &state.pane_ledger,
-                &sref.provider,
-                &[&sref.session_id, &session_id],
-            )
-        {
-            claimed.remove(&key);
-            stopped.insert(pane.pane_key.clone());
-            continue;
-        }
         // Respawn cap (V2/A7 — reworked): count only answers that actually
         // come back `respawn`, and CLEAR the counter when presence resolves
         // Live (a successful respawn is OBSERVED as the session going live).

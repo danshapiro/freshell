@@ -306,6 +306,7 @@ impl HostedTransport {
             .expect("suppressed kill lock")
             .insert(session_id.to_string());
         let message = FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: self.provider_wire(),

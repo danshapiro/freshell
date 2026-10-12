@@ -3445,9 +3445,20 @@ impl FreshOpencodeState {
     /// [`crate::FreshAgentState::shutdown`] at server shutdown.
     ///
     /// Returns whether the session was closed (its close recorded and its
-    /// bookkeeping removed; the WebSocket dispatch then remembers the pane
-    /// as stopped, Task 18); `false` for every refused or failed kill.
+    /// bookkeeping removed); `false` for every refused or failed kill.
     pub async fn handle_kill(&self, msg: FreshAgentKill) -> bool {
+        self.handle_kill_then(msg, None).await
+    }
+
+    /// [`Self::handle_kill`], running `on_confirmed_close` once the session
+    /// is closed, before `freshAgent.killed` is broadcast (Task 18: the
+    /// WebSocket dispatch remembers the closed pane there). A refused or
+    /// failed kill never runs it.
+    pub async fn handle_kill_then(
+        &self,
+        msg: FreshAgentKill,
+        on_confirmed_close: Option<crate::OnConfirmedClose>,
+    ) -> bool {
         // b8ke delta review F7: a half-sent observed pair (exactly one of
         // epoch/generation) is the typed invalid-fence refusal — BEFORE the
         // durable close envelope, the enumeration gate, or any live-state
@@ -4413,6 +4424,9 @@ impl FreshOpencodeState {
         // PERSISTED-despite-error close ends the session (consistent with
         // the durable close) while the kill visibly fails (delta-r6-r4,
         // round 3 Finding 3).
+        if let Some(on_confirmed_close) = on_confirmed_close {
+            on_confirmed_close.await;
+        }
         self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
             provider: PROVIDER.to_string(),
             session_id: msg.session_id,
@@ -9915,6 +9929,7 @@ mod tests {
         );
 
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: AgentProvider::Opencode,
@@ -9960,6 +9975,7 @@ mod tests {
 
             let closed = st
                 .handle_kill(FreshAgentKill {
+                    create_request_id: None,
                     observed_epoch: epoch,
                     observed_generation: generation,
                     provider: AgentProvider::Opencode,
@@ -10035,6 +10051,7 @@ mod tests {
 
         // THE PLACEHOLDER-ADDRESSED KILL.
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: AgentProvider::Opencode,
@@ -10504,6 +10521,7 @@ mod tests {
         };
 
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: AgentProvider::Opencode,
@@ -10552,6 +10570,7 @@ mod tests {
         );
 
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: AgentProvider::Opencode,
@@ -10596,6 +10615,7 @@ mod tests {
         // The evicted-session arm: a durable id no longer in the session map
         // still retires the row it names (idempotent when no row exists).
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: AgentProvider::Opencode,
@@ -10657,6 +10677,7 @@ mod tests {
         let st2 = st.clone();
         let kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                create_request_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 provider: AgentProvider::Opencode,
@@ -11103,6 +11124,7 @@ mod tests {
         let ph = placeholder.to_string();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                create_request_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
@@ -11191,6 +11213,7 @@ mod tests {
         fake.set_fail_writes(true);
         let closed = st
             .handle_kill(FreshAgentKill {
+                create_request_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
@@ -11330,6 +11353,7 @@ mod tests {
         while rx.try_recv().is_ok() {}
 
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: freshell_protocol::AgentProvider::Opencode,
@@ -11439,6 +11463,7 @@ mod tests {
         while rx.try_recv().is_ok() {}
 
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: freshell_protocol::AgentProvider::Opencode,
@@ -11512,6 +11537,7 @@ mod tests {
         fake.fail_retires_as_persisted
             .store(true, std::sync::atomic::Ordering::SeqCst);
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: freshell_protocol::AgentProvider::Opencode,
@@ -11586,6 +11612,7 @@ mod tests {
         );
 
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: freshell_protocol::AgentProvider::Opencode,
@@ -11687,6 +11714,7 @@ mod tests {
         let ph = placeholder.to_string();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                create_request_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
@@ -11767,6 +11795,7 @@ mod tests {
         let ph = placeholder.to_string();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                create_request_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
@@ -11847,6 +11876,7 @@ mod tests {
         let ph = placeholder.to_string();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                create_request_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
@@ -11922,6 +11952,7 @@ mod tests {
         // The close the user MEANT (before this attach): row Closed + fence.
         state
             .handle_kill(FreshAgentKill {
+                create_request_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 provider: AgentProvider::Opencode,
@@ -12063,6 +12094,7 @@ mod tests {
         let st2 = st.clone();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                create_request_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
@@ -12152,6 +12184,7 @@ mod tests {
         let ph = placeholder.to_string();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                create_request_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
@@ -12245,6 +12278,7 @@ mod tests {
         let ph = placeholder.to_string();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                create_request_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
@@ -12979,6 +13013,7 @@ mod tests {
         let real_id = session_arc.lock().await.real_session_id.clone().unwrap();
 
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: AgentProvider::Opencode,
@@ -12997,6 +13032,48 @@ mod tests {
         assert!(!guard.contains_key(&real_id), "durable key removed");
     }
 
+    /// Task 18 (review M2): a confirmed kill runs its close work (the
+    /// WebSocket dispatch remembers the closed pane there) BEFORE
+    /// `freshAgent.killed` is broadcast, so no device sees the kill before
+    /// the pane is remembered; a refused kill never runs it.
+    #[tokio::test]
+    async fn a_confirmed_kill_runs_its_close_work_before_broadcasting_killed() {
+        let kill = |session_id: &str, observed_epoch: Option<u64>| FreshAgentKill {
+            create_request_id: Some("crq-closed".to_string()),
+            observed_epoch,
+            observed_generation: None,
+            provider: AgentProvider::Opencode,
+            session_id: session_id.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        };
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let tx = Arc::new(tx);
+        let st = FreshOpencodeState::new(FreshAgentState::new(
+            Arc::new("tok".to_string()),
+            Arc::clone(&tx),
+        ));
+        let (hook, ran) = crate::close_hook_observing(tx.subscribe());
+        assert!(
+            st.handle_kill_then(kill("ses_closed", None), Some(hook))
+                .await
+        );
+        assert_eq!(
+            *ran.lock().unwrap(),
+            Some(false),
+            "the close work ran, before freshAgent.killed was broadcast"
+        );
+        let frame: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["type"], "freshAgent.killed", "{frame}");
+
+        let (hook, ran) = crate::close_hook_observing(tx.subscribe());
+        assert!(
+            !st.handle_kill_then(kill("ses_refused", Some(3)), Some(hook))
+                .await
+        );
+        assert_eq!(*ran.lock().unwrap(), None, "a refused kill closes nothing");
+    }
+
     #[tokio::test]
     async fn kill_of_unknown_session_still_broadcasts_success() {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
@@ -13005,6 +13082,7 @@ mod tests {
 
         let closed = st
             .handle_kill(FreshAgentKill {
+                create_request_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 provider: AgentProvider::Opencode,
@@ -13013,10 +13091,7 @@ mod tests {
                 cwd: None,
             })
             .await;
-        assert!(
-            closed,
-            "an idempotent kill of an unknown session closed it (Task 18 remembers it)"
-        );
+        assert!(closed, "an idempotent kill of an unknown session closed it");
 
         let frame: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(frame["type"], "freshAgent.killed");
@@ -13642,6 +13717,7 @@ mod tests {
         // the map never held this session; the row is durable).
         state
             .handle_kill(FreshAgentKill {
+                create_request_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
@@ -13799,6 +13875,7 @@ mod tests {
         // durable serve session the local map never tracked — retired by name).
         state
             .handle_kill(FreshAgentKill {
+                create_request_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
@@ -13885,6 +13962,7 @@ mod tests {
         // The close the user will MEAN: row Closed + fence, before the resume.
         state
             .handle_kill(FreshAgentKill {
+                create_request_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
@@ -13921,6 +13999,7 @@ mod tests {
         // the commit decides.
         state
             .handle_kill(FreshAgentKill {
+                create_request_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
@@ -19598,6 +19677,7 @@ mod tests {
         await_summarize_posted(&http).await;
 
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: AgentProvider::Opencode,
@@ -23023,6 +23103,7 @@ mod tests {
         // the killed flag, EVERY map key aliasing the child, the bridge
         // abort, and the coordinator's Stopping→Vacant commit.
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             provider: AgentProvider::Opencode,
             session_id: "ses_child".to_string(),
             session_type: SessionType::Freshopencode,
@@ -23151,6 +23232,7 @@ mod tests {
 
         // The concurrent kill, through the REAL path, to completion.
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             provider: AgentProvider::Opencode,
             session_id: "ses_resume".to_string(),
             session_type: SessionType::Freshopencode,
@@ -23649,6 +23731,7 @@ mod tests {
             // completion — the mover's teardown owns the cleanup.
             mover_state
                 .handle_kill(FreshAgentKill {
+                    create_request_id: None,
                     provider: AgentProvider::Opencode,
                     session_id: durable.to_string(),
                     session_type: SessionType::Freshopencode,
@@ -23824,6 +23907,7 @@ mod tests {
         // through the REAL path to completion (the durable close, every
         // map key, the killed flag, the bridge abort, Stopping→Vacant).
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             provider: AgentProvider::Opencode,
             session_id: durable.to_string(),
             session_type: SessionType::Freshopencode,
@@ -24006,6 +24090,7 @@ mod tests {
             // completion — the mover's teardown owns the cleanup.
             mover_state
                 .handle_kill(FreshAgentKill {
+                    create_request_id: None,
                     provider: AgentProvider::Opencode,
                     session_id: durable.to_string(),
                     session_type: SessionType::Freshopencode,
@@ -24477,6 +24562,7 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
             st.handle_kill(FreshAgentKill {
+                create_request_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 provider: AgentProvider::Opencode,
@@ -24566,6 +24652,7 @@ mod tests {
         let st2 = st.clone();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                create_request_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 provider: AgentProvider::Opencode,
@@ -24779,6 +24866,7 @@ mod tests {
             .cloned()
             .expect("session present before the kill");
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: AgentProvider::Opencode,
@@ -27470,6 +27558,7 @@ mod tests {
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             st.handle_kill(FreshAgentKill {
+                create_request_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 provider: AgentProvider::Opencode,

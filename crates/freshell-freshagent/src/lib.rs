@@ -100,6 +100,39 @@ pub use naming::{
 /// Defaults to "always false" (behavior-preserving for constructors that don't wire it).
 pub type TerminalLivenessProbe = std::sync::Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 
+/// What a `freshAgent.kill` runs once its session's stop is confirmed and its
+/// close recorded, BEFORE `freshAgent.killed` is broadcast (Task 18): the
+/// WebSocket dispatch remembers the pane a person closed as stopped there, so
+/// every device that sees the kill can already be told "stopped" (the
+/// terminal path writes its record before publishing the exit, too). A
+/// refused or failed kill never runs it. This crate cannot reach the pane
+/// ledger, so the caller supplies the work.
+pub type OnConfirmedClose = futures_util::future::BoxFuture<'static, ()>;
+
+/// Test support for [`OnConfirmedClose`] (Task 18 review M2): a close hook
+/// that records, when it runs, whether `bus` had already carried a
+/// `freshAgent.killed` (`Some(true)`: it ran after the broadcast); `None`
+/// until it runs. `bus` must be subscribed before the kill.
+#[cfg(test)]
+pub(crate) fn close_hook_observing(
+    bus: tokio::sync::broadcast::Receiver<String>,
+) -> (OnConfirmedClose, Arc<std::sync::Mutex<Option<bool>>>) {
+    let ran: Arc<std::sync::Mutex<Option<bool>>> = Arc::default();
+    let hook: OnConfirmedClose = Box::pin({
+        let ran = Arc::clone(&ran);
+        let mut bus = bus;
+        async move {
+            let mut killed_already = false;
+            while let Ok(frame) = bus.try_recv() {
+                let frame: serde_json::Value = serde_json::from_str(&frame).unwrap_or_default();
+                killed_already |= frame["type"] == "freshAgent.killed";
+            }
+            *ran.lock().expect("close hook lock") = Some(killed_already);
+        }
+    });
+    (hook, ran)
+}
+
 /// Door 3 (resume-validation): the gate-fired callback shape --
 /// `(provider, stale_session_id)`. In production, `freshell-server`'s main.rs
 /// implements it as pane-ledger `retire_missing` + `tracing::warn!`.

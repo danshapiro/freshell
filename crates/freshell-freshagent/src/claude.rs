@@ -2775,9 +2775,21 @@ impl FreshClaudeState {
     /// unknown session id, matching the codex/opencode `success:true` pattern.
     ///
     /// Returns whether the session's stop was confirmed and its close
-    /// recorded (the WebSocket dispatch then remembers the pane as stopped,
-    /// Task 18); `false` for every refused or failed kill.
+    /// recorded; `false` for every refused or failed kill.
     pub async fn handle_kill(&self, msg: FreshAgentKill) -> bool {
+        self.handle_kill_then(msg, None).await
+    }
+
+    /// [`Self::handle_kill`], running `on_confirmed_close` once the
+    /// session's stop is confirmed and its close recorded, before
+    /// `freshAgent.killed` is broadcast (Task 18: the WebSocket dispatch
+    /// remembers the closed pane there). A refused or failed kill never runs
+    /// it.
+    pub async fn handle_kill_then(
+        &self,
+        msg: FreshAgentKill,
+        on_confirmed_close: Option<crate::OnConfirmedClose>,
+    ) -> bool {
         let session_id = msg.session_id.clone();
         let session_type = session_type_str(msg.session_type);
 
@@ -3716,6 +3728,9 @@ impl FreshClaudeState {
             }
         }
 
+        if let Some(on_confirmed_close) = on_confirmed_close.filter(|_| kill_failure.is_none()) {
+            on_confirmed_close.await;
+        }
         self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
             provider: PROVIDER.to_string(),
             session_id,
@@ -12423,6 +12438,7 @@ rl.on('line', (line) => {
         let killed_session_id = created["sessionId"].as_str().unwrap().to_string();
 
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
@@ -13654,6 +13670,7 @@ rl.on('line', (line) => {
 
         let closed = st
             .handle_kill(FreshAgentKill {
+                create_request_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Claude,
@@ -13711,6 +13728,7 @@ rl.on('line', (line) => {
         // Kill addressed by the DURABLE id must retire the durable-keyed row
         // (resolve_session_key walks cli_index to the live map key).
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
@@ -13742,6 +13760,7 @@ rl.on('line', (line) => {
             .expect("session tracked under the placeholder")
             .cli_session_id = Some(durable.to_string());
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
@@ -13773,6 +13792,7 @@ rl.on('line', (line) => {
         st.set_identity_sink(fake.clone());
 
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
@@ -13823,6 +13843,7 @@ rl.on('line', (line) => {
         let ph = placeholder.clone();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                create_request_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Claude,
@@ -13874,6 +13895,7 @@ rl.on('line', (line) => {
 
         let closed = st
             .handle_kill(FreshAgentKill {
+                create_request_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Claude,
@@ -13928,6 +13950,7 @@ rl.on('line', (line) => {
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
@@ -14007,6 +14030,7 @@ rl.on('line', (line) => {
         let ph = placeholder.clone();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                create_request_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Claude,
@@ -14091,6 +14115,7 @@ rl.on('line', (line) => {
         while rx.try_recv().is_ok() {} // drain pre-kill frames
 
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
@@ -14173,6 +14198,7 @@ rl.on('line', (line) => {
         }
 
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
@@ -14230,6 +14256,7 @@ rl.on('line', (line) => {
         let ph = placeholder.clone();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                create_request_id: None,
                 observed_epoch: None,
                 observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Claude,
@@ -16069,6 +16096,7 @@ rl.on('line', (line) => {
 
         fake.fail_retires_after(0); // every close call fails Clean
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
@@ -16180,6 +16208,7 @@ rl.on('line', (line) => {
         while rx.try_recv().is_ok() {}
 
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
@@ -16322,6 +16351,7 @@ rl.on('line', (line) => {
 
         while rx.try_recv().is_ok() {}
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
@@ -16470,6 +16500,7 @@ rl.on('line', (line) => {
 
         // THE WIRE SHAPE THE CLIENT ACTUALLY SENDS: the bare placeholder.
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
@@ -16534,6 +16565,7 @@ rl.on('line', (line) => {
         // The user closes the pane NOW (the bare placeholder — the real wire
         // shape) while that write is still in flight.
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
@@ -16612,6 +16644,7 @@ rl.on('line', (line) => {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
@@ -16692,6 +16725,7 @@ rl.on('line', (line) => {
 
     fn kill_msg(session_id: &str) -> FreshAgentKill {
         FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
@@ -16699,6 +16733,37 @@ rl.on('line', (line) => {
             session_type: SessionType::Freshclaude,
             cwd: None,
         }
+    }
+
+    /// Task 18 (review M2): a confirmed kill runs its close work (the
+    /// WebSocket dispatch remembers the closed pane there) BEFORE
+    /// `freshAgent.killed` is broadcast, so no device sees the kill before
+    /// the pane is remembered; a refused kill never runs it.
+    #[tokio::test]
+    async fn a_confirmed_kill_runs_its_close_work_before_broadcasting_killed() {
+        let (st, mut rx) = state_with_bus();
+        let (hook, ran) = crate::close_hook_observing(st.broadcast_tx.subscribe());
+        assert!(st.handle_kill_then(kill_msg("closed"), Some(hook)).await);
+        assert_eq!(
+            *ran.lock().unwrap(),
+            Some(false),
+            "the close work ran, before freshAgent.killed was broadcast"
+        );
+        let mut killed = None;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.killed" {
+                killed = Some(frame);
+            }
+        }
+        let killed = killed.expect("freshAgent.killed is broadcast");
+        assert_eq!(killed["success"], true, "{killed}");
+
+        let mut refused = kill_msg("refused");
+        refused.observed_epoch = Some(3);
+        let (hook, ran) = crate::close_hook_observing(st.broadcast_tx.subscribe());
+        assert!(!st.handle_kill_then(refused, Some(hook)).await);
+        assert_eq!(*ran.lock().unwrap(), None, "a refused kill closes nothing");
     }
 
     /// b8ke focused review FR9: the half-fenced kill refusal carries the
@@ -19362,6 +19427,7 @@ rl.on('line', (line) => {
         );
         // Kill evicts the index entry.
         st.handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,

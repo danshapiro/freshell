@@ -385,6 +385,7 @@ async fn handle_kill_leaves_no_record() {
     assert_eq!(guard.records().len(), 1);
 
     st.handle_kill(freshell_protocol::FreshAgentKill {
+        create_request_id: None,
         provider: freshell_protocol::AgentProvider::Codex,
         session_id,
         session_type: freshell_protocol::SessionType::Freshcodex,
@@ -474,6 +475,7 @@ async fn durable_writer_fixture_exposes_live_witness_and_stops_with_the_sidecar(
     );
 
     st.handle_kill(freshell_protocol::FreshAgentKill {
+        create_request_id: None,
         provider: freshell_protocol::AgentProvider::Codex,
         session_id,
         session_type: freshell_protocol::SessionType::Freshcodex,

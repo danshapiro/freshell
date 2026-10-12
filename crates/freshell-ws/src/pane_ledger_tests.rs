@@ -9123,11 +9123,10 @@ fn stopped(
     }
 }
 
-/// Every lookup the four records below answer, against one ledger.
+/// Every lookup the three records below answer, against one ledger.
 fn assert_stopped_lookups(
     ledger: &PaneLedger,
     terminal: &StoppedPaneRecord,
-    session_only: &StoppedPaneRecord,
     first_stop: &StoppedPaneRecord,
     second_stop: &StoppedPaneRecord,
     when: &str,
@@ -9152,16 +9151,6 @@ fn assert_stopped_lookups(
         Some(second_stop),
         "{when}: the stop after the reopen has its own record"
     );
-    assert_eq!(
-        ledger.stopped_fresh_session("codex", "fs"),
-        vec![first_stop.clone(), second_stop.clone()],
-        "{when}: every stop of the conversation, oldest first"
-    );
-    assert_eq!(
-        ledger.stopped_fresh_session("codex", "fs0"),
-        vec![session_only.clone()],
-        "{when}: the stop with no createRequestId, by its conversation"
-    );
     assert_eq!(ledger.stopped_pane_for_terminal("T2"), None, "{when}");
     assert_eq!(ledger.stopped_pane_for_create_request("F3"), None, "{when}");
 }
@@ -9174,13 +9163,6 @@ fn assert_stopped_lookups(
 fn stopped_panes_persist_across_reload_and_never_expire() {
     let root = temp_root("stopped-panes");
     let terminal = stopped(Some("T1"), Some("C1"), None, STOPPED_KIND_TERMINAL, 1_000);
-    let session_only = stopped(
-        None,
-        None,
-        Some(("codex", "fs0")),
-        STOPPED_KIND_FRESH_AGENT,
-        1_000,
-    );
     let first_stop = stopped(
         None,
         Some("F1"),
@@ -9197,26 +9179,18 @@ fn stopped_panes_persist_across_reload_and_never_expire() {
     );
     {
         let ledger = PaneLedger::new(Some(root.clone()));
-        for record in [&terminal, &session_only, &first_stop, &second_stop] {
+        for record in [&terminal, &first_stop, &second_stop] {
             ledger
                 .record_stopped_pane(record)
                 .expect("the stop is recorded");
         }
-        assert_stopped_lookups(
-            &ledger,
-            &terminal,
-            &session_only,
-            &first_stop,
-            &second_stop,
-            "as written",
-        );
+        assert_stopped_lookups(&ledger, &terminal, &first_stop, &second_stop, "as written");
     }
 
     let reloaded = PaneLedger::new(Some(root.clone()));
     assert_stopped_lookups(
         &reloaded,
         &terminal,
-        &session_only,
         &first_stop,
         &second_stop,
         "after a reload",
@@ -9226,7 +9200,7 @@ fn stopped_panes_persist_across_reload_and_never_expire() {
         .flatten()
         .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("json"))
         .count();
-    assert_eq!(files, 4, "one file per stop");
+    assert_eq!(files, 3, "one file per stop");
 
     let ten_years_later = 1_000 + 10 * 365 * 24 * 60 * 60 * 1000;
     reloaded.gc(
@@ -9245,7 +9219,6 @@ fn stopped_panes_persist_across_reload_and_never_expire() {
     assert_stopped_lookups(
         &after_gc,
         &terminal,
-        &session_only,
         &first_stop,
         &second_stop,
         "after the GC",
@@ -9277,6 +9250,21 @@ fn a_stopped_record_must_name_a_pane_and_a_disabled_ledger_keeps_none() {
             .map_err(|e| e.kind()),
         Err(std::io::ErrorKind::InvalidInput),
         "a terminal stop is found by its terminal or createRequestId, never by conversation"
+    );
+    let fresh_agent_conversation = stopped(
+        None,
+        None,
+        Some(("claude", "s")),
+        STOPPED_KIND_FRESH_AGENT,
+        1_000,
+    );
+    assert_eq!(
+        ledger
+            .record_stopped_pane(&fresh_agent_conversation)
+            .map_err(|e| e.kind()),
+        Err(std::io::ErrorKind::InvalidInput),
+        "a fresh-agent stop is found by the closed pane's createRequestId, never by its \
+         conversation (a conversation-wide record would stop every later pane of it)"
     );
 
     let disabled = PaneLedger::disabled();

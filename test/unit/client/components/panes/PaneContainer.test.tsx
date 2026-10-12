@@ -1465,11 +1465,14 @@ describe('PaneContainer', () => {
 
       fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
 
+      // A person's close names the pane, so the server remembers it as
+      // stopped for late and offline devices (Task 18).
       expect(mockSend).toHaveBeenCalledWith({
         type: 'freshAgent.kill',
         sessionId: 'thread-codex-1',
         sessionType: 'freshcodex',
         provider: 'codex',
+        createRequestId: 'req-fresh-close',
       })
     })
 
@@ -1611,6 +1614,7 @@ describe('PaneContainer', () => {
         sessionType: 'freshopencode',
         provider: 'opencode',
         cwd: '/repo/route-aware',
+        createRequestId: 'req-freshopencode-close',
       })
     })
 
@@ -1662,6 +1666,7 @@ describe('PaneContainer', () => {
         sessionType: 'freshopencode',
         provider: 'opencode',
         cwd: '/repo/session-state',
+        createRequestId: 'req-freshopencode-close',
       })
     })
 

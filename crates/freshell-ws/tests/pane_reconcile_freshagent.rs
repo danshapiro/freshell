@@ -26,6 +26,9 @@ use freshell_ws::existence::SessionExistence;
 use freshell_ws::pane_ledger::{FreshAgentBindingWrite, PaneLedger};
 use freshell_ws::WsState;
 
+#[path = "support/ledger_identity_sink.rs"]
+mod ledger_identity_sink;
+
 const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
 
 /// Serializes every test in this file that mutates the process-global
@@ -173,9 +176,14 @@ struct Server {
     pane_ledger: Arc<PaneLedger>,
     /// Clone of `WsState.fresh_agent_respawn_counts` for direct assertions.
     respawn_counts: Arc<Mutex<HashMap<(String, String), u32>>>,
-    /// Keeps the ledger's temp root alive for the server's lifetime.
+    /// Keeps the ledger's temp root alive for the server's lifetime (a
+    /// server generation over a root the test owns keeps none).
     #[allow(dead_code)]
-    ledger_root: tempfile::TempDir,
+    ledger_root: Option<tempfile::TempDir>,
+    /// The server's broadcast bus (every `freshAgent.killed` rides it).
+    broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+    /// The server's freshopencode lane (a test reaps its shared serve).
+    fresh_opencode: freshell_freshagent::FreshOpencodeState,
 }
 
 /// Real axum server on an ephemeral loopback port, with the scripted
@@ -190,15 +198,36 @@ async fn spawn_server_with_probe(probe: Arc<StubProbe>) -> Server {
 /// [`spawn_server_with_probe`] over a ledger root that may already hold
 /// rows (the server loads them at start, as after a restart).
 async fn spawn_server_on_ledger(probe: Arc<StubProbe>, ledger_root: tempfile::TempDir) -> Server {
+    let pane_ledger = Arc::new(PaneLedger::new_locked(Some(
+        ledger_root.path().to_path_buf(),
+    )));
+    spawn_server_over(probe, pane_ledger, Some(ledger_root), false).await
+}
+
+/// One server generation over the ledger at `root`, with the pane-ledger
+/// identity sink a production server wires into every fresh-agent lane
+/// (`main.rs`; mirrored by [`ledger_identity_sink::TestLedgerSink`]), so the
+/// bindings, closes and claims the panes' creates and kills write are the
+/// production ones. A later generation over the same root IS a server
+/// restart (the ledger is opened unlocked, so the earlier generation, still
+/// alive in this process, never disables it).
+async fn spawn_generation(probe: Arc<StubProbe>, root: &std::path::Path) -> Server {
+    let pane_ledger = Arc::new(PaneLedger::new(Some(root.to_path_buf())));
+    spawn_server_over(probe, pane_ledger, None, true).await
+}
+
+async fn spawn_server_over(
+    probe: Arc<StubProbe>,
+    pane_ledger: Arc<PaneLedger>,
+    ledger_root: Option<tempfile::TempDir>,
+    identity_sink: bool,
+) -> Server {
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings =
         Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
     let registry = freshell_terminal::TerminalRegistry::new();
     let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
-    let pane_ledger = Arc::new(PaneLedger::new_locked(Some(
-        ledger_root.path().to_path_buf(),
-    )));
     let respawn_counts: Arc<Mutex<HashMap<(String, String), u32>>> = Arc::default();
 
     let state = WsState {
@@ -258,6 +287,16 @@ async fn spawn_server_on_ledger(probe: Arc<StubProbe>, ledger_root: tempfile::Te
         units: Default::default(),
     };
 
+    if identity_sink {
+        let sink: freshell_freshagent::SharedPaneIdentitySink =
+            Arc::new(ledger_identity_sink::TestLedgerSink {
+                ledger: Arc::clone(&pane_ledger),
+            });
+        state.fresh_codex.set_identity_sink(sink.clone());
+        state.fresh_claude.set_identity_sink(sink.clone());
+        state.fresh_opencode.set_identity_sink(sink);
+    }
+    let fresh_opencode = state.fresh_opencode.clone();
     let router = freshell_ws::router(state);
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -274,6 +313,8 @@ async fn spawn_server_on_ledger(probe: Arc<StubProbe>, ledger_root: tempfile::Te
         pane_ledger,
         respawn_counts,
         ledger_root,
+        broadcast_tx,
+        fresh_opencode,
     }
 }
 
@@ -971,8 +1012,8 @@ async fn a_killed_fresh_agent_session_reconciles_stopped_and_a_reopened_one_atta
         .record_stopped_pane(&StoppedPaneRecord::fresh_agent(
             "claude",
             &live,
-            Some("crq-f".into()),
-            "shift-x",
+            "crq-f".into(),
+            "kill",
             1_000,
         ))
         .expect("the earlier stop's record");
@@ -1007,8 +1048,8 @@ async fn a_conversation_stopped_again_after_a_reopen_stays_stopped_for_every_ear
                 .record_stopped_pane(&StoppedPaneRecord::fresh_agent(
                     "codex",
                     "fs2",
-                    Some(crq.into()),
-                    "shift-x",
+                    crq.into(),
+                    "kill",
                     at,
                 ))
                 .expect("a stop's record");
@@ -1048,125 +1089,395 @@ async fn a_conversation_stopped_again_after_a_reopen_stays_stopped_for_every_ear
     );
 }
 
-/// A stop that knew no createRequestId names its conversation: a pane of
-/// that conversation answers `stopped` while the session is not live, and
-/// attaches once it is live again (Stage 2: LB-42).
-#[tokio::test]
-async fn a_stop_with_no_create_request_id_stops_its_conversation_while_it_is_not_live() {
-    let _guard = CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeClaudeEnv::install();
-    let probe = Arc::new(StubProbe::default());
-    probe.answers.lock().unwrap().insert(
-        ("claude".into(), "s-gone".into()),
-        SessionExistence::Present,
-    );
-    let server = spawn_server_with_probe(probe).await;
-    for session in ["s-gone", FAKE_DURABLE_ID] {
-        server
-            .pane_ledger
-            .record_stopped_pane(&StoppedPaneRecord::fresh_agent(
-                "claude", session, None, "shift-x", 1_000,
-            ))
-            .expect("a session-only stop");
+// ── Task 18 fix (review I1, M2): a fresh-agent pane close is remembered by
+//    the closed pane's own createRequestId, before `freshAgent.killed` ──────
+//
+// These run a server generation with the identity sink a production server
+// wires (`spawn_generation`), so every binding the panes' creates write is
+// the production one; no test writes a binding by hand.
+
+/// A `freshAgent.kill` as a client sends it: a person's close of the pane
+/// names the pane's createRequestId; the other kills (an "Agent appears
+/// stuck" restart, the cleanup after a fork, "Start new conversation")
+/// name none.
+fn fresh_agent_kill(
+    provider: &str,
+    session_type: &str,
+    session_id: &str,
+    create_request_id: Option<&str>,
+) -> Value {
+    let mut kill = serde_json::json!({
+        "type": "freshAgent.kill",
+        "provider": provider,
+        "sessionType": session_type,
+        "sessionId": session_id,
+        "cwd": "/tmp",
+    });
+    if let Some(create_request_id) = create_request_id {
+        kill["createRequestId"] = serde_json::json!(create_request_id);
     }
-    let (mut ws, _ready) = connect(&server.url, true, true).await;
-    let live = create_live_claude_session(&mut ws, "crq-live").await;
-    assert_eq!(live, FAKE_DURABLE_ID);
-    let verdicts = reconcile_request(
-        &mut ws,
-        serde_json::json!([
-            { "paneKey": "gone", "kind": "fresh-agent", "createRequestId": "crq-x",
-              "sessionRef": {"provider": "claude", "sessionId": "s-gone"} },
-            { "paneKey": "live", "kind": "fresh-agent", "createRequestId": "crq-y",
-              "sessionRef": {"provider": "claude", "sessionId": live} }
-        ]),
-    )
-    .await;
-    assert_eq!(verdicts[0]["verdict"], "stopped", "{verdicts}");
-    assert_eq!(verdicts[1]["verdict"], "attach", "{verdicts}");
+    kill
 }
 
-/// `freshAgent.kill` remembers the conversation it closed, under the
-/// createRequestId the pane-ledger binding carries, before a late device
-/// reconciles: that device's pane answers `stopped`, and a pane of the same
-/// conversation under another createRequestId does not.
-#[tokio::test]
-async fn a_fresh_agent_kill_is_remembered_by_its_bound_create_request_id() {
-    let _guard = CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeClaudeEnv::install();
+/// Sends `kill` and returns its `freshAgent.killed` answer.
+async fn kill_session(ws: &mut TestWs, kill: Value) -> Value {
+    let session_id = kill["sessionId"].as_str().expect("sessionId").to_string();
+    ws.send(WsMessage::Text(kill.to_string()))
+        .await
+        .expect("send freshAgent.kill");
+    await_frame(ws, Duration::from_secs(15), |v| {
+        v["type"] == "freshAgent.killed" && v["sessionId"] == session_id.as_str()
+    })
+    .await
+}
+
+/// Reopens the claude conversation `session_id` in a new pane minted under
+/// `create_request_id` (a sidebar reopen: a create resuming it).
+async fn reopen_claude_session(ws: &mut TestWs, create_request_id: &str, session_id: &str) {
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "freshAgent.create",
+            "requestId": create_request_id,
+            "sessionType": "freshclaude",
+            "provider": "claude",
+            "cwd": "/tmp",
+            "sessionRef": {"provider": "claude", "sessionId": session_id},
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send the reopening freshAgent.create");
+    let init = await_frame(ws, Duration::from_secs(15), |v| {
+        v["type"] == "freshAgent.event" && v["event"]["type"] == "freshAgent.session.init"
+    })
+    .await;
+    assert_eq!(
+        init["event"]["cliSessionId"], session_id,
+        "the reopen resumes the conversation: {init}"
+    );
+}
+
+/// The stopped-pane files under the ledger root.
+fn stopped_record_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(root.join("stopped-panes"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("json"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn claude_present_probe() -> Arc<StubProbe> {
     let probe = Arc::new(StubProbe::default());
     probe.answers.lock().unwrap().insert(
         ("claude".into(), FAKE_DURABLE_ID.into()),
         SessionExistence::Present,
     );
-    let server = spawn_server_with_probe(probe).await;
-    let (mut ws, _ready) = connect(&server.url, true, true).await;
-    let live = create_live_claude_session(&mut ws, "crq-kill").await;
-    // The identity sink's binding (main.rs wires it; this harness has none).
-    server
-        .pane_ledger
-        .record_fresh_agent_binding(&FreshAgentBindingWrite {
-            provider: "claude",
-            session_id: &live,
-            mode: "freshclaude",
-            cwd: Some("/w"),
-            create_request_id: Some("crq-kill"),
-            model: None,
-            sandbox: None,
-            permission_mode: None,
-            effort: None,
-            supersedes: None,
-            provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
-            observed_epoch: None,
-            observed_generation: None,
-            authoritative: false,
-            now_ms: 1_000,
-        })
-        .expect("the binding");
+    probe
+}
 
-    ws.send(WsMessage::Text(
-        serde_json::json!({
-            "type": "freshAgent.kill",
-            "provider": "claude",
-            "sessionId": live,
-            "sessionType": "freshclaude",
-        })
-        .to_string(),
-    ))
-    .await
-    .expect("send freshAgent.kill");
-    let killed = await_frame(&mut ws, Duration::from_secs(15), |v| {
-        v["type"] == "freshAgent.killed" && v["sessionId"] == live.as_str()
-    })
+/// A person closes a freshclaude pane, then reopens its conversation (the
+/// reopen mints a new createRequestId), and the server restarts: the
+/// reopened pane is respawned, as it always was, and only the closed pane is
+/// "stopped". A close names its own pane only: the binding a production
+/// server writes for freshclaude carries no createRequestId, so a record
+/// taken from the binding named the whole conversation and stopped every
+/// later pane of it (review I1).
+#[tokio::test]
+async fn a_closed_freshclaude_conversation_reopened_in_a_new_pane_is_not_stopped_after_a_restart() {
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeClaudeEnv::install();
+    let root = tempfile::tempdir().expect("ledger root");
+    let probe = claude_present_probe();
+    {
+        let server = spawn_generation(Arc::clone(&probe), root.path()).await;
+        let (mut ws, _ready) = connect(&server.url, true, true).await;
+        let session = create_live_claude_session(&mut ws, "crq-closed").await;
+        let killed = kill_session(
+            &mut ws,
+            fresh_agent_kill("claude", "freshclaude", &session, Some("crq-closed")),
+        )
+        .await;
+        assert_eq!(killed["success"], true, "{killed}");
+        reopen_claude_session(&mut ws, "crq-reopened", &session).await;
+    }
+
+    let restarted = spawn_generation(probe, root.path()).await;
+    let (mut ws, _ready) = connect(&restarted.url, true, true).await;
+    let verdicts = reconcile_request(
+        &mut ws,
+        serde_json::json!([
+            { "paneKey": "closed", "kind": "fresh-agent", "createRequestId": "crq-closed",
+              "sessionRef": {"provider": "claude", "sessionId": FAKE_DURABLE_ID} },
+            { "paneKey": "reopened", "kind": "fresh-agent", "createRequestId": "crq-reopened",
+              "sessionRef": {"provider": "claude", "sessionId": FAKE_DURABLE_ID} }
+        ]),
+    )
     .await;
-    assert_eq!(killed["success"], true, "{killed}");
-    let remembered = tokio::time::timeout(Duration::from_secs(5), async {
+    assert_eq!(verdicts[0]["verdict"], "stopped", "{verdicts}");
+    assert_eq!(
+        verdicts[1]["verdict"], "respawn",
+        "the reopened pane is not stopped: {verdicts}"
+    );
+}
+
+/// A kill that names no pane keeps or replaces its conversation, so it
+/// remembers nothing. Here the "Agent appears stuck" restart: it kills the
+/// session, then resumes the conversation under a new createRequestId (the
+/// cleanup after a fork, "Start new conversation" and a repeat kill send the
+/// same kill). No record is written, and after a restart the restarted pane
+/// is respawned, never "stopped" (review I1).
+#[tokio::test]
+async fn a_stuck_restart_kill_remembers_nothing() {
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeClaudeEnv::install();
+    let root = tempfile::tempdir().expect("ledger root");
+    let probe = claude_present_probe();
+    {
+        let server = spawn_generation(Arc::clone(&probe), root.path()).await;
+        let (mut ws, _ready) = connect(&server.url, true, true).await;
+        let session = create_live_claude_session(&mut ws, "crq-stuck").await;
+        let killed = kill_session(
+            &mut ws,
+            fresh_agent_kill("claude", "freshclaude", &session, None),
+        )
+        .await;
+        assert_eq!(killed["success"], true, "{killed}");
+        reopen_claude_session(&mut ws, "crq-restarted", &session).await;
+        assert_eq!(
+            stopped_record_files(root.path()),
+            Vec::<std::path::PathBuf>::new(),
+            "a kill naming no pane writes no record"
+        );
+    }
+
+    let restarted = spawn_generation(probe, root.path()).await;
+    let (mut ws, _ready) = connect(&restarted.url, true, true).await;
+    let verdicts = reconcile_request(
+        &mut ws,
+        serde_json::json!([
+            { "paneKey": "restarted", "kind": "fresh-agent", "createRequestId": "crq-restarted",
+              "sessionRef": {"provider": "claude", "sessionId": FAKE_DURABLE_ID} }
+        ]),
+    )
+    .await;
+    assert_eq!(verdicts[0]["verdict"], "respawn", "{verdicts}");
+}
+
+/// The close is remembered before `freshAgent.killed` is published (as a
+/// terminal pane's record is written before its exit is), so a device that
+/// reconciles the moment it sees the kill is told "stopped", never
+/// `respawn` (review M2).
+#[tokio::test]
+async fn a_device_reconciling_as_soon_as_it_sees_fresh_agent_killed_is_told_stopped() {
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeClaudeEnv::install();
+    let root = tempfile::tempdir().expect("ledger root");
+    let server = spawn_generation(claude_present_probe(), root.path()).await;
+    let (mut closing, _ready) = connect(&server.url, true, true).await;
+    let (mut late, _ready) = connect(&server.url, true, true).await;
+    let session = create_live_claude_session(&mut closing, "crq-k").await;
+
+    let mut bus = server.broadcast_tx.subscribe();
+    closing
+        .send(WsMessage::Text(
+            fresh_agent_kill("claude", "freshclaude", &session, Some("crq-k")).to_string(),
+        ))
+        .await
+        .expect("send freshAgent.kill");
+    let killed = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            if let Some(record) = server
-                .pane_ledger
-                .stopped_pane_for_create_request("crq-kill")
-            {
-                return record;
+            let frame = bus.recv().await.expect("the broadcast bus stays open");
+            let frame: Value = serde_json::from_str(&frame).expect("json frame");
+            if frame["type"] == "freshAgent.killed" && frame["sessionId"] == session.as_str() {
+                return frame;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("the kill is remembered");
-    assert_eq!(remembered.provider.as_deref(), Some("claude"));
-    assert_eq!(remembered.session_id.as_deref(), Some(live.as_str()));
+    .expect("the kill is published");
+    let at_publication = server.pane_ledger.stopped_pane_for_create_request("crq-k");
+    assert_eq!(killed["success"], true, "{killed}");
+    let record = at_publication.expect("the close is remembered when it is published");
+    assert_eq!(record.provider.as_deref(), Some("claude"));
+    assert_eq!(record.session_id.as_deref(), Some(session.as_str()));
+    assert_eq!(record.reason, "kill");
 
-    let (mut late, _ready) = connect(&server.url, true, true).await;
+    await_frame(&mut late, Duration::from_secs(15), |v| {
+        v["type"] == "freshAgent.killed" && v["sessionId"] == session.as_str()
+    })
+    .await;
     let verdicts = reconcile_request(
         &mut late,
         serde_json::json!([
-            { "paneKey": "killed", "kind": "fresh-agent", "createRequestId": "crq-kill",
-              "sessionRef": {"provider": "claude", "sessionId": live} },
+            { "paneKey": "closed", "kind": "fresh-agent", "createRequestId": "crq-k",
+              "sessionRef": {"provider": "claude", "sessionId": session} },
             { "paneKey": "other", "kind": "fresh-agent", "createRequestId": "crq-other",
-              "sessionRef": {"provider": "claude", "sessionId": live} }
+              "sessionRef": {"provider": "claude", "sessionId": session} }
         ]),
     )
     .await;
     assert_eq!(verdicts[0]["verdict"], "stopped", "{verdicts}");
     assert_eq!(verdicts[1]["verdict"], "respawn", "{verdicts}");
+}
+
+// ── fake `opencode serve` (the cross_kind_liveness.rs shape) ────────────────
+
+const FAKE_OPENCODE_SERVE_SOURCE: &str = r#"#!/usr/bin/env node
+const http = require('node:http')
+function argValue(name) {
+  const i = process.argv.indexOf(name)
+  return i < 0 ? undefined : process.argv[i + 1]
+}
+const hostname = argValue('--hostname') || '127.0.0.1'
+const port = Number(argValue('--port'))
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url || '/', `http://${hostname}:${port}`)
+  if (url.pathname === '/global/health') {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ status: 'ok' }))
+    return
+  }
+  if (url.pathname === '/event' || url.pathname === '/global/event') {
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' })
+    res.write(':ok\n\n')
+    return // held open
+  }
+  const m = url.pathname.match(/^\/session\/([^/]+)$/)
+  if (m && req.method === 'GET') {
+    const id = decodeURIComponent(m[1])
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ id, directory: '/tmp', title: 'fake opencode session' }))
+    return
+  }
+  res.writeHead(404, { 'content-type': 'application/json' })
+  res.end(JSON.stringify({ error: 'not found' }))
+})
+server.listen(port, hostname)
+"#;
+
+/// The fake serve script, with `OPENCODE_CMD` pointed at it. Caller holds
+/// [`CLAUDE_ENV_LOCK`] (it serializes this file's env mutation).
+struct FakeOpencodeServeEnv {
+    dir: std::path::PathBuf,
+}
+
+impl FakeOpencodeServeEnv {
+    fn install() -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "freshell-reconcile-opencode-serve-{}",
+            uuid_like_suffix()
+        ));
+        std::fs::create_dir_all(&dir).expect("create fake serve temp dir");
+        let script = dir.join("fake-opencode-serve");
+        std::fs::write(&script, FAKE_OPENCODE_SERVE_SOURCE).expect("write fake serve");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("chmod fake serve");
+        }
+        std::env::set_var("OPENCODE_CMD", &script);
+        Self { dir }
+    }
+}
+
+impl Drop for FakeOpencodeServeEnv {
+    fn drop(&mut self) {
+        std::env::remove_var("OPENCODE_CMD");
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Opens the freshopencode conversation `session_id` in a pane minted under
+/// `create_request_id` (a create resuming it).
+async fn open_opencode_session(ws: &mut TestWs, create_request_id: &str, session_id: &str) {
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "freshAgent.create",
+            "requestId": create_request_id,
+            "sessionType": "freshopencode",
+            "provider": "opencode",
+            "cwd": "/tmp",
+            "sessionRef": {"provider": "opencode", "sessionId": session_id},
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send freshAgent.create");
+    let created = await_frame(ws, Duration::from_secs(30), |v| {
+        v["requestId"] == create_request_id
+            && (v["type"] == "freshAgent.created" || v["type"] == "freshAgent.create.failed")
+    })
+    .await;
+    assert_eq!(created["type"], "freshAgent.created", "{created}");
+    assert_eq!(created["sessionId"], session_id, "{created}");
+}
+
+/// freshopencode: a pane is closed, its conversation reopened in a new pane,
+/// and that pane closed too. Each close is remembered by its own pane's
+/// createRequestId and the second never replaces the first (the binding
+/// keeps the first create's createRequestId, or none, across a reopen), so
+/// after a restart both panes are "stopped" and a later pane of the
+/// conversation that was never closed is respawned (review I1; plan review
+/// R2-F3).
+#[tokio::test]
+async fn freshopencode_closes_before_and_after_a_reopen_each_remember_their_own_pane() {
+    const SESSION: &str = "ses_stoppedreopenedaaaaaaaaaaa";
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
+    let _serve = FakeOpencodeServeEnv::install();
+    let root = tempfile::tempdir().expect("ledger root");
+    let probe = Arc::new(StubProbe::default());
+    probe.answers.lock().unwrap().insert(
+        ("opencode".into(), SESSION.into()),
+        SessionExistence::Present,
+    );
+    {
+        let server = spawn_generation(Arc::clone(&probe), root.path()).await;
+        let (mut ws, _ready) = connect(&server.url, true, true).await;
+        for create_request_id in ["crq-oc-first", "crq-oc-reopened"] {
+            open_opencode_session(&mut ws, create_request_id, SESSION).await;
+            let killed = kill_session(
+                &mut ws,
+                fresh_agent_kill(
+                    "opencode",
+                    "freshopencode",
+                    SESSION,
+                    Some(create_request_id),
+                ),
+            )
+            .await;
+            assert_eq!(killed["success"], true, "{killed}");
+        }
+        for create_request_id in ["crq-oc-first", "crq-oc-reopened"] {
+            let record = server
+                .pane_ledger
+                .stopped_pane_for_create_request(create_request_id)
+                .unwrap_or_else(|| panic!("the close of {create_request_id} is remembered"));
+            assert_eq!(record.session_id.as_deref(), Some(SESSION));
+        }
+        server.fresh_opencode.fresh_agent().shutdown().await;
+    }
+
+    let restarted = spawn_generation(probe, root.path()).await;
+    let (mut ws, _ready) = connect(&restarted.url, true, true).await;
+    let verdicts = reconcile_request(
+        &mut ws,
+        serde_json::json!([
+            { "paneKey": "first", "kind": "fresh-agent", "createRequestId": "crq-oc-first",
+              "sessionRef": {"provider": "opencode", "sessionId": SESSION} },
+            { "paneKey": "reopened", "kind": "fresh-agent", "createRequestId": "crq-oc-reopened",
+              "sessionRef": {"provider": "opencode", "sessionId": SESSION} },
+            { "paneKey": "later", "kind": "fresh-agent", "createRequestId": "crq-oc-later",
+              "sessionRef": {"provider": "opencode", "sessionId": SESSION} }
+        ]),
+    )
+    .await;
+    assert_eq!(verdicts[0]["verdict"], "stopped", "{verdicts}");
+    assert_eq!(verdicts[1]["verdict"], "stopped", "{verdicts}");
+    assert_eq!(verdicts[2]["verdict"], "respawn", "{verdicts}");
 }

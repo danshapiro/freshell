@@ -9877,6 +9877,37 @@ describe('freshcodex wedged-sidecar notice', () => {
     expect(screen.getByRole('button', { name: /start new conversation/i })).toBeInTheDocument()
   })
 
+  it('the freshclaude Restart sidecar kill names no pane, so nothing is remembered as stopped (Task 18)', async () => {
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-claude-stuck',
+            sessionId: 'claude-stuck-1',
+            status: 'running',
+          }}
+        />
+      </Provider>,
+    )
+    act(() => {
+      store.dispatch(setSessionStatus({
+        sessionId: 'claude-stuck-1', sessionType: 'freshclaude', provider: 'claude', status: 'stuck',
+      }))
+    })
+    await screen.findByRole('alert')
+    wsMock.send.mockClear()
+    fireEvent.click(screen.getByRole('button', { name: /restart sidecar and resume session/i }))
+    const kill = wsMock.send.mock.calls.find(([message]) => message.type === 'freshAgent.kill')?.[0]
+    expect(kill).toMatchObject({ sessionId: 'claude-stuck-1', sessionType: 'freshclaude', provider: 'claude' })
+    expect(kill).not.toHaveProperty('createRequestId')
+  })
+
   it('Restart sidecar confirms the process stop before resuming the same durable thread', async () => {
     const handlers: Array<(message: Record<string, unknown>) => void> = []
     wsMock.onMessage.mockReset()

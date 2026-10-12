@@ -570,6 +570,11 @@ export interface FreshAgentKillRequest {
    *  neither-sent is legacy-unfenced. */
   observedEpoch?: number
   observedGeneration?: number
+  /** The createRequestId of the pane a person is closing. Only a close of
+   *  the pane names it: the server then remembers that pane as stopped for
+   *  late and offline devices. A kill that keeps or replaces the
+   *  conversation ("Start new conversation") leaves it out. */
+  createRequestId?: string
 }
 
 /**
@@ -594,6 +599,7 @@ export function sendFreshAgentKillAndAwait(
     ...(req.observedEpoch !== undefined && req.observedGeneration !== undefined
       ? { observedEpoch: req.observedEpoch, observedGeneration: req.observedGeneration }
       : {}),
+    ...(req.createRequestId ? { createRequestId: req.createRequestId } : {}),
   })
   return awaitCloseFrame((msg) => {
     const m = msg as Record<string, unknown>

@@ -1088,6 +1088,15 @@ pub struct FreshAgentKill {
     pub observed_epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<u64>,
+    /// The createRequestId of the pane a person closed (Task 18): sent only
+    /// by a close of the pane, and the server then remembers that pane as
+    /// stopped once the kill is confirmed, so a late or offline device holding
+    /// it is told "stopped" instead of re-creating the conversation. A kill
+    /// that keeps or replaces the conversation (the "Agent appears stuck"
+    /// restart, the cleanup after a fork, "Start new conversation") sends
+    /// none and is not remembered. Additive optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_request_id: Option<String>,
 }
 
 /// Request-correlated, process-only Codex recovery. A regular
@@ -1245,6 +1254,20 @@ mod tests {
             ClientMessage::FreshAgentKill(k) => {
                 assert_eq!(k.observed_epoch, Some(9));
                 assert_eq!(k.observed_generation, Some(4));
+                assert_eq!(k.create_request_id, None);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        // Task 18: a person's close of the pane names the pane's
+        // createRequestId (the server remembers that pane as stopped).
+        let close = r#"{"type":"freshAgent.kill","sessionId":"s1","sessionType":"freshclaude","provider":"claude","createRequestId":"crq-closed"}"#;
+        match serde_json::from_str::<ClientMessage>(close).expect("parse close") {
+            ClientMessage::FreshAgentKill(k) => {
+                assert_eq!(k.create_request_id.as_deref(), Some("crq-closed"));
+                assert_eq!(
+                    serde_json::to_value(&k).unwrap()["createRequestId"],
+                    "crq-closed"
+                );
             }
             other => panic!("wrong variant: {other:?}"),
         }

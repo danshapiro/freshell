@@ -140,7 +140,9 @@ mod pane_ledger_scan;
 pub use pane_ledger_scan::{BootScanReport, QuarantinedRow, PENDING_MARKER_ORPHAN_TTL_MS};
 #[path = "pane_ledger_stopped.rs"]
 mod pane_ledger_stopped;
-pub use pane_ledger_stopped::{StoppedPaneRecord, STOPPED_KIND_FRESH_AGENT, STOPPED_KIND_TERMINAL};
+pub use pane_ledger_stopped::{
+    StoppedPaneRecord, STOPPED_KIND_FRESH_AGENT, STOPPED_KIND_TERMINAL, STOPPED_REASON_KILL,
+};
 
 /// Gates schema migration (spec §4.2): rows with a different version are
 /// quarantined loudly at boot, never silently reinterpreted.

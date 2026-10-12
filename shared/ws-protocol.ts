@@ -1008,6 +1008,12 @@ export const FreshAgentKillSchema = z.object({
    *  it carries the observed (epoch, generation) pair. */
   observedEpoch: z.number().int().nonnegative().optional(),
   observedGeneration: z.number().int().nonnegative().optional(),
+  /** The createRequestId of the pane a person closed: only a close of the
+   *  pane sends it, and the server then remembers that pane as stopped, so
+   *  a late or offline device is told "stopped" instead of re-creating the
+   *  conversation. Kills that keep or replace the conversation (the stuck
+   *  restart, the cleanup after a fork, "Start new conversation") send none. */
+  createRequestId: z.string().min(1).optional(),
 })
 
 /** Codex-only process stop used by the stuck card. This extension stays

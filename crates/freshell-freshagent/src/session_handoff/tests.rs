@@ -785,6 +785,7 @@ fn create_msg(sid: &str) -> FreshAgentCreate {
 
 fn kill_msg(sid: &str) -> FreshAgentKill {
     FreshAgentKill {
+        create_request_id: None,
         provider: AgentProvider::Claude,
         session_id: sid.to_string(),
         session_type: SessionType::Freshclaude,
@@ -5095,6 +5096,7 @@ async fn a_wire_fenced_kill_at_the_handoff_generation_converges_after_a_restore(
     // Vacant — not a StaleClaim refusal loop.
     rig.fresh_claude
         .handle_kill(FreshAgentKill {
+            create_request_id: None,
             observed_epoch: Some(epoch),
             observed_generation: Some(generation),
             ..kill_msg(&sid)

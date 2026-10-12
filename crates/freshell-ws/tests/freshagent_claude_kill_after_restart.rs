@@ -465,6 +465,7 @@ fn attach_msg(seat: &str, durable: &str) -> FreshAgentAttach {
 
 fn kill_msg(session_id: &str) -> FreshAgentKill {
     FreshAgentKill {
+        create_request_id: None,
         observed_epoch: None,
         observed_generation: None,
         provider: AgentProvider::Claude,

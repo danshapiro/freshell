@@ -5,10 +5,10 @@
 //! "stopped" instead of re-creating the pane's conversation.
 //!
 //! A record matches only the stopped pane's own copies: its terminal id or
-//! its createRequestId (a fresh-agent stop with no bound createRequestId
-//! names its conversation instead). A reopen mints a new createRequestId, so
-//! a reopened pane never matches; nothing a create or a claim does clears a
-//! record. Records are kept with no expiry (the GC never touches them): a
+//! its createRequestId (a fresh-agent pane, which has no terminal, by the
+//! createRequestId of the pane a person closed; never by its conversation).
+//! A reopen mints a new createRequestId, so a reopened pane never matches;
+//! nothing a create or a claim does clears a record. Records are kept with no expiry (the GC never touches them): a
 //! device that returns after any length of time is still answered "stopped".
 //!
 //! Layout: `stopped-panes/<enc(key)>.json`, one file per record, named by
@@ -19,15 +19,22 @@
 //! ledger's write-through index and row helpers.
 
 use super::*;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 /// [`StoppedPaneRecord::kind`] of a terminal pane's stop.
 pub const STOPPED_KIND_TERMINAL: &str = "terminal";
 /// [`StoppedPaneRecord::kind`] of a fresh-agent pane's stop.
 pub const STOPPED_KIND_FRESH_AGENT: &str = "fresh-agent";
+/// [`StoppedPaneRecord::reason`] of a stop a person's kill asked for that is
+/// remembered outside a unit's stop (a managed pane's stop, a start or a
+/// parked create the kill cancelled, a fresh-agent pane's close): the writer
+/// knows the kill was honoured, not which gesture asked for it. A unit
+/// stop's record carries that stop's own reason.
+pub const STOPPED_REASON_KILL: &str = "kill";
 
-/// One stop of a pane. At least one of `terminal_id`, `create_request_id`,
-/// or (`provider`, `session_id`) for a fresh-agent record is present.
+/// One stop of a pane. At least one of `terminal_id` and
+/// `create_request_id` is present (a fresh-agent record always has its
+/// createRequestId; its conversation is informational).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoppedPaneRecord {
@@ -70,19 +77,19 @@ impl StoppedPaneRecord {
         }
     }
 
-    /// A fresh-agent session's stop: the conversation, and the
-    /// createRequestId bound to it at that stop when one is known.
+    /// The close of a fresh-agent pane: the createRequestId of the pane a
+    /// person closed, and its conversation (informational).
     pub fn fresh_agent(
         provider: &str,
         session_id: &str,
-        create_request_id: Option<String>,
+        create_request_id: String,
         reason: &str,
         stopped_at_ms: i64,
     ) -> Self {
         Self {
             ledger_version: LEDGER_VERSION,
             terminal_id: None,
-            create_request_id,
+            create_request_id: Some(create_request_id),
             provider: Some(provider.to_string()),
             session_id: Some(session_id.to_string()),
             kind: STOPPED_KIND_FRESH_AGENT.to_string(),
@@ -92,47 +99,25 @@ impl StoppedPaneRecord {
     }
 
     /// The record's file key: the terminal id when bound, else
-    /// `crq-<createRequestId>`, else `session-<provider>-<sessionId>` for a
-    /// fresh-agent record. `None` when the record names no pane (a terminal
-    /// stop is found by its terminal or createRequestId only).
+    /// `crq-<createRequestId>`. `None` when the record names no pane (a stop
+    /// is found by its terminal or createRequestId only, never by its
+    /// conversation).
     pub fn key(&self) -> Option<String> {
         let present = |value: &Option<String>| value.clone().filter(|v| !v.is_empty());
         if let Some(terminal_id) = present(&self.terminal_id) {
             return Some(terminal_id);
         }
-        if let Some(create_request_id) = present(&self.create_request_id) {
-            return Some(format!("crq-{create_request_id}"));
-        }
-        match (
-            self.kind.as_str(),
-            present(&self.provider),
-            present(&self.session_id),
-        ) {
-            (STOPPED_KIND_FRESH_AGENT, Some(provider), Some(session_id)) => {
-                Some(format!("session-{provider}-{session_id}"))
-            }
-            _ => None,
-        }
-    }
-
-    /// The fresh-agent conversation this record is indexed under.
-    fn fresh_session(&self) -> Option<(String, String)> {
-        if self.kind != STOPPED_KIND_FRESH_AGENT {
-            return None;
-        }
-        Some((self.provider.clone()?, self.session_id.clone()?))
+        present(&self.create_request_id).map(|create_request_id| format!("crq-{create_request_id}"))
     }
 }
 
 /// The in-memory image of the `stopped-panes/` subtree, indexed by terminal
-/// id, by createRequestId and by fresh-agent conversation (each index names
-/// record keys).
+/// id and by createRequestId (each index names record keys).
 #[derive(Default)]
 pub(super) struct StoppedPanes {
     by_key: HashMap<String, StoppedPaneRecord>,
     by_terminal: HashMap<String, String>,
     by_create_request: HashMap<String, String>,
-    by_fresh_session: HashMap<(String, String), BTreeSet<String>>,
 }
 
 impl StoppedPanes {
@@ -145,12 +130,6 @@ impl StoppedPanes {
         if let Some(create_request_id) = record.create_request_id.clone() {
             self.by_create_request
                 .insert(create_request_id, key.clone());
-        }
-        if let Some(session) = record.fresh_session() {
-            self.by_fresh_session
-                .entry(session)
-                .or_default()
-                .insert(key.clone());
         }
         self.by_key.insert(key, record);
     }
@@ -174,14 +153,6 @@ impl StoppedPanes {
                 self.by_create_request.remove(create_request_id);
             }
         }
-        if let Some(session) = old.fresh_session() {
-            if let Some(keys) = self.by_fresh_session.get_mut(&session) {
-                keys.remove(key);
-                if keys.is_empty() {
-                    self.by_fresh_session.remove(&session);
-                }
-            }
-        }
     }
 
     fn for_terminal(&self, terminal_id: &str) -> Option<&StoppedPaneRecord> {
@@ -191,18 +162,6 @@ impl StoppedPanes {
     fn for_create_request(&self, create_request_id: &str) -> Option<&StoppedPaneRecord> {
         self.by_key
             .get(self.by_create_request.get(create_request_id)?)
-    }
-
-    fn for_fresh_session(&self, provider: &str, session_id: &str) -> Vec<StoppedPaneRecord> {
-        let mut records: Vec<StoppedPaneRecord> = self
-            .by_fresh_session
-            .get(&(provider.to_string(), session_id.to_string()))
-            .into_iter()
-            .flatten()
-            .filter_map(|key| self.by_key.get(key).cloned())
-            .collect();
-        records.sort_by_key(|record| record.stopped_at_ms);
-        records
     }
 }
 
@@ -251,7 +210,7 @@ impl PaneLedger {
         let key = record.key().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "a stopped-pane record must name a terminal, a createRequestId or a fresh-agent conversation",
+                "a stopped-pane record must name a terminal or a createRequestId",
             )
         })?;
         let mut index = self.guard();
@@ -279,20 +238,5 @@ impl PaneLedger {
             .stopped_panes
             .for_create_request(create_request_id)
             .cloned()
-    }
-
-    /// Every fresh-agent stop remembered for this conversation, oldest
-    /// first. Memory-only.
-    pub fn stopped_fresh_session(
-        &self,
-        provider: &str,
-        session_id: &str,
-    ) -> Vec<StoppedPaneRecord> {
-        if self.root.is_none() {
-            return Vec::new();
-        }
-        self.guard()
-            .stopped_panes
-            .for_fresh_session(provider, session_id)
     }
 }

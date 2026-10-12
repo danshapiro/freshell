@@ -101,11 +101,14 @@ describe('fresh-agent-ws', () => {
     }, ws)
 
     expect(handled).toBe(true)
+    // The pane was closed while it started: its kill names it, so the
+    // server remembers it as stopped (Task 18).
     expect(ws.send).toHaveBeenCalledWith({
       type: 'freshAgent.kill',
       sessionId: 'thread-orphan',
       sessionType: 'freshcodex',
       provider: 'codex',
+      createRequestId: 'req-orphan',
     })
     expect(store.getState().freshAgent.sessions['freshcodex:codex:thread-orphan']).toBeUndefined()
   })
@@ -136,6 +139,7 @@ describe('fresh-agent-ws', () => {
       sessionType: 'freshopencode',
       provider: 'opencode',
       cwd: '/repo/route-aware',
+      createRequestId: 'req-opencode-orphan',
     })
     expect(store.getState().freshAgent.sessions['freshopencode:opencode:ses_orphan']).toBeUndefined()
   })
@@ -199,6 +203,7 @@ describe('fresh-agent-ws', () => {
       sessionType: 'freshclaude',
       provider: 'claude',
       cwd: '/repo/reserved-route',
+      createRequestId: 'req-reserved-1',
     })
   })
 

@@ -187,6 +187,9 @@ export function handleFreshAgentMessage(
           // record means legacy-unfenced; the server falls back to its
           // retained stamp).
           const fence = getOwnerFence?.(provider, created.sessionId)
+          // The pane was closed while it started: the kill names it (its
+          // createRequestId is the create's), so the server remembers it
+          // as stopped.
           ws?.send({
             type: 'freshAgent.kill',
             sessionId: created.sessionId,
@@ -194,6 +197,7 @@ export function handleFreshAgentMessage(
             provider,
             ...(route?.cwd ? { cwd: route.cwd } : {}),
             ...(fence ? { observedEpoch: fence.epoch, observedGeneration: fence.generation } : {}),
+            createRequestId: created.requestId,
           })
         }
         return true

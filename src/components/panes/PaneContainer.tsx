@@ -413,12 +413,15 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         // already surfaces through the pane's ordinary session-error banner
         // (the freshAgent.killed fold writes it); an unanswered wait
         // surfaces there too (same banner surface, timeout copy).
+        // The close names the pane, so the server remembers it as stopped
+        // and a late or offline device never re-creates its conversation.
         void sendFreshAgentKillAndAwait({
           sessionId,
           sessionType: content.sessionType,
           provider: content.provider,
           ...(cwd ? { cwd } : {}),
           ...(fence ? { observedEpoch: fence.epoch, observedGeneration: fence.generation } : {}),
+          createRequestId: content.createRequestId,
         }).then((ack) => {
           if (!ack.ok) {
             // The pane's ordinary session-error banner carries the failure

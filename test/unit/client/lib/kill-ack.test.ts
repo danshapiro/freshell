@@ -294,6 +294,24 @@ describe('kill-ack', () => {
       await expect(pending).resolves.toEqual({ ok: false, timedOut: true })
     })
 
+    it("names the closed pane's createRequestId when one is given (a person's close is remembered as stopped)", async () => {
+      const pending = sendFreshAgentKillAndAwait({
+        sessionId: 'ses-close',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'crq-closed-pane',
+      })
+      expect(mockSend).toHaveBeenCalledWith({
+        type: 'freshAgent.kill',
+        sessionId: 'ses-close',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'crq-closed-pane',
+      })
+      emit({ type: 'freshAgent.killed', sessionId: 'ses-close', sessionType: 'freshclaude', provider: 'claude', success: true })
+      await expect(pending).resolves.toEqual({ ok: true })
+    })
+
     it('forwards the observed (epoch, generation) fence on the kill (kata b8ke)', async () => {
       const pending = sendFreshAgentKillAndAwait({
         sessionId: 'ses-fence',

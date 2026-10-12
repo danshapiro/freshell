@@ -2226,33 +2226,29 @@ async fn dispatch_client_message(
             }
             true
         }
-        // A kill whose stop the provider confirmed and closed is remembered
-        // (Task 18), so a late or offline device shows the pane stopped
-        // instead of re-creating its conversation. `amplifier` has no
-        // fresh-agent runtime: dropped.
+        // A person's close of the pane (the kill names the pane's
+        // createRequestId) is remembered once the provider confirmed the
+        // stop and before it broadcasts `freshAgent.killed` (Task 18), so a
+        // late or offline device shows the pane stopped instead of
+        // re-creating its conversation. `amplifier` has no fresh-agent
+        // runtime: dropped.
         ClientMessage::FreshAgentKill(kill) => {
-            let provider = match kill.provider {
-                freshell_protocol::AgentProvider::Codex => "codex",
-                freshell_protocol::AgentProvider::Claude => "claude",
-                freshell_protocol::AgentProvider::Opencode => "opencode",
-                freshell_protocol::AgentProvider::Amplifier => return true,
-            };
+            if kill.provider == freshell_protocol::AgentProvider::Amplifier {
+                return true;
+            }
             let state = state.clone();
             tokio::spawn(
                 async move {
-                    let session_id = kill.session_id.clone();
-                    let closed = match kill.provider {
+                    let remember = remember_fresh_agent_close(&state, &kill);
+                    match kill.provider {
                         freshell_protocol::AgentProvider::Codex => {
-                            state.fresh_codex.handle_kill(kill).await
+                            state.fresh_codex.handle_kill_then(kill, remember).await
                         }
                         freshell_protocol::AgentProvider::Claude => {
-                            state.fresh_claude.handle_kill(kill).await
+                            state.fresh_claude.handle_kill_then(kill, remember).await
                         }
-                        _ => state.fresh_opencode.handle_kill(kill).await,
+                        _ => state.fresh_opencode.handle_kill_then(kill, remember).await,
                     };
-                    if closed {
-                        remember_fresh_agent_stop(&state, provider, &session_id).await;
-                    }
                 }
                 .instrument(tracing::Span::current()),
             );
@@ -12162,30 +12158,45 @@ fn fresh_agent_create_key(
     })
 }
 
-/// Whether a `freshAgent.interrupt`/`freshAgent.kill` frame should route to the codex
-/// handler. PR-1 scope: only `codex` is wired to `FreshCodexState`; other providers keep
-/// the prior swallow behavior until a later PR adds their handlers.
-/// Remembers a fresh-agent session a `freshAgent.kill` stopped (Task 18;
-/// Stage 2: LB-42): one record per stop, keyed by the createRequestId the
-/// conversation's pane-ledger binding carries at this stop (so stopping a
-/// reopened conversation again never replaces the record of an earlier
-/// stop), or by the conversation alone when the binding carries none.
-async fn remember_fresh_agent_stop(state: &WsState, provider: &str, session_id: &str) {
-    let create_request_id = state
-        .pane_ledger
-        .load_binding(provider, session_id)
-        .and_then(|row| row.create_request_id);
-    let record = crate::pane_ledger::StoppedPaneRecord::fresh_agent(
-        provider,
-        session_id,
-        create_request_id,
-        freshell_containment::StopReason::ShiftX.as_str(),
-        now_ms(),
-    );
-    let keys = crate::unit_lifecycle::stopped_record_keys(&record, None);
-    crate::unit_lifecycle::write_stopped_record(state, record, &keys).await;
+/// What a `freshAgent.kill` runs once the provider confirmed its stop, before
+/// `freshAgent.killed` is broadcast (Task 18; Stage 2: LB-42): a person's
+/// close of the pane names the pane's createRequestId, and that pane is
+/// remembered as stopped by it. Every close writes its own record, so
+/// closing a reopened conversation's pane never replaces the record of an
+/// earlier close, and a reopen (which mints a new createRequestId) is never
+/// matched. A kill that names no pane (the "Agent appears stuck" restart, the
+/// cleanup after a fork, "Start new conversation") remembers nothing.
+fn remember_fresh_agent_close(
+    state: &WsState,
+    kill: &freshell_protocol::FreshAgentKill,
+) -> Option<freshell_freshagent::OnConfirmedClose> {
+    let create_request_id = kill
+        .create_request_id
+        .clone()
+        .filter(|create_request_id| !create_request_id.is_empty())?;
+    let provider = match kill.provider {
+        freshell_protocol::AgentProvider::Codex => "codex",
+        freshell_protocol::AgentProvider::Claude => "claude",
+        freshell_protocol::AgentProvider::Opencode => "opencode",
+        freshell_protocol::AgentProvider::Amplifier => return None,
+    };
+    let (state, session_id) = (state.clone(), kill.session_id.clone());
+    Some(Box::pin(async move {
+        let record = crate::pane_ledger::StoppedPaneRecord::fresh_agent(
+            provider,
+            &session_id,
+            create_request_id,
+            crate::pane_ledger::STOPPED_REASON_KILL,
+            now_ms(),
+        );
+        let keys = crate::unit_lifecycle::stopped_record_keys(&record, None);
+        crate::unit_lifecycle::write_stopped_record(&state, record, &keys).await;
+    }))
 }
 
+/// Whether a `freshAgent.interrupt` frame should route to the codex
+/// handler. PR-1 scope: only `codex` is wired to `FreshCodexState`; other providers keep
+/// the prior swallow behavior until a later PR adds their handlers.
 fn is_codex_provider(provider: freshell_protocol::AgentProvider) -> bool {
     matches!(provider, freshell_protocol::AgentProvider::Codex)
 }
