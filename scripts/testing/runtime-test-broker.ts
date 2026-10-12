@@ -45,6 +45,7 @@ export type RestrictedDockerBrokerPolicy = {
   allowedWorkspaceRoots?: Set<string>
   allowedProviderUserRoots?: Set<string>
   allowedBootstrapFiles?: Set<string>
+  allowedOperatorHomeRoots?: Set<string>
   testRunId: string
   logPath: string
 }
@@ -321,6 +322,11 @@ export class RestrictedDockerBroker {
     const allowedTmpfsKeys = ['/tmp']
     if (tmpfsKeys.includes('/run/freshell-private')) allowedTmpfsKeys.push('/run/freshell-private')
     if (tmpfsKeys.includes('/run/opencode-tmp')) allowedTmpfsKeys.push('/run/opencode-tmp')
+    for (const destination of tmpfsKeys) {
+      if (isOperatorHomeMaskDestination(destination, this.policy.allowedOperatorHomeRoots) && tmpfs[destination] === '') {
+        allowedTmpfsKeys.push(destination)
+      }
+    }
     allowedTmpfsKeys.sort()
     if (JSON.stringify(tmpfsKeys) !== JSON.stringify(allowedTmpfsKeys)) return { ok: false, reason: `unexpected runtime tmpfs topology: ${tmpfsKeys.join(',')}` }
     if (tmpfs['/run/opencode-tmp'] !== undefined && tmpfs['/run/opencode-tmp'] !== 'rw,exec,nosuid,nodev,size=64m,mode=1777') {
@@ -358,6 +364,9 @@ export class RestrictedDockerBroker {
       }
       if (terminalWorkload && destination === source && mode === 'rw' && this.isAllowedWorkspacePath(source)) {
         if (!workspacePath) workspacePath = source
+        continue
+      }
+      if (terminalWorkload && destination === source && mode === 'ro' && this.policy.allowedOperatorHomeRoots?.has(source)) {
         continue
       }
       if (terminalWorkload && /^\/run\/freshell-bootstrap\/provider-\d+$/.test(destination) && mode === 'ro' && this.policy.allowedBootstrapFiles?.has(source)) {
@@ -513,6 +522,25 @@ async function readBoundedBody(request: IncomingMessage): Promise<Buffer> {
 function stringField(object: Record<string, unknown>, key: string): string {
   const value = object[key]
   return typeof value === 'string' ? value : ''
+}
+
+/**
+ * Secret-mask destinations the supervisor mounts over the read-only operator
+ * home. Mirrors OPERATOR_HOME_MASK_REL_PATHS in
+ * crates/freshell-supervisor/src/backend/docker.rs; the supervisor filters
+ * these to destinations that exist, and always mounts them with empty
+ * (default) tmpfs options.
+ */
+const OPERATOR_HOME_MASK_REL_PATHS = ['.freshell', '.amplifier/onecli', '.config/gcloud']
+
+function isOperatorHomeMaskDestination(destination: string, roots?: Set<string>): boolean {
+  if (!roots) return false
+  for (const root of roots) {
+    for (const relative of OPERATOR_HOME_MASK_REL_PATHS) {
+      if (destination === `${root}/${relative}`) return true
+    }
+  }
+  return false
 }
 
 function isStrictDescendant(candidate: string, root: string): boolean {
