@@ -418,6 +418,15 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'],
       providerSettings: { freshcodex: {} },
     })
+    const historyResponses: Array<{ route: 'managed' | 'native'; status: number }> = []
+    page.on('response', (response) => {
+      if (response.request().method() !== 'GET') return
+      const pathname = new URL(response.url()).pathname
+      const route = pathname.startsWith('/api/runtime/souls/') && pathname.endsWith('/history')
+        ? 'managed'
+        : pathname.startsWith('/api/fresh-agent/threads/') ? 'native' : undefined
+      if (route) historyResponses.push({ route, status: response.status() })
+    })
     const sent: any[] = []
     const received: any[] = []
     const socketStartedAt = Date.now()
@@ -549,6 +558,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         intentRevision: before.soul.intent_revision + 1 })
       expect((await rig.ownedContainerState(rig.runtimeEnclosureHandle(view))).running).toBe(false)
       ready = await harness.getLastReadyAt()
+      const postStopRestartResponseStart = historyResponses.length
       await rig.restartWebGracefully()
       await harness.waitForConnectionAfter(ready, 90_000)
       await page.reload()
@@ -556,12 +566,17 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       await harness.waitForConnection()
       await expect(pane).toBeVisible()
       expect((await harness.getPaneLayout(created.tabId)).content).toMatchObject(canonical)
-      await expect(pane.getByText('Synthetic saved answer 2', { exact: true })).toBeVisible({ timeout: 60_000 })
-      await expect(pane.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
+      const postStopHistoryResponses = historyResponses.slice(postStopRestartResponseStart)
+      expect(postStopHistoryResponses, 'the reloaded stopped pane must request saved history')
+        .not.toHaveLength(0)
+      expect(postStopHistoryResponses.some((response) => response.status === 200),
+        `stopped history requests failed: ${JSON.stringify(postStopHistoryResponses)}`).toBe(true)
       const afterHistory = await history()
       expect(afterHistory.threadId).toBe(nativeId)
       expect(afterHistory.turns).toEqual(retained.turns)
       expect(afterHistory.capabilities.send).toBe(false)
+      await expect(pane.getByText('Synthetic saved answer 2', { exact: true })).toBeVisible({ timeout: 60_000 })
+      await expect(pane.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
       const afterFacts = await rig.interruptedOrdinaryStopFacts(handle)
       const after = afterFacts.durable
       expect(after.soul).toEqual({ ...before.soul, desired_state: 'stopped', intent_revision: stopped.intentRevision })
