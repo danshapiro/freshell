@@ -791,7 +791,7 @@ fn hosted_created_frame_uses_the_public_request_identity() {
         client: RuntimeClient::new("/tmp/unopened-fresh-agent-proxy.sock", "fixture"),
         broadcast: Arc::new(broadcast),
         aliases: Mutex::new(HashMap::new()),
-        presentation_ids: Mutex::new(HashMap::new()),
+        presentation_routes: Mutex::new(HashMap::new()),
         pollers: Mutex::new(HashSet::new()),
         fixture_modes: HashSet::new(),
         naming: OnceLock::new(),
@@ -869,7 +869,10 @@ async fn managed_ordinary_stop_eof_broadcasts_one_failed_ack_to_both_receivers()
                 soul.clone(),
             ),
         ])),
-        presentation_ids: Mutex::new(HashMap::from([(soul, "presentation-stop-session".into())])),
+        presentation_routes: Mutex::new(HashMap::from([(
+            soul,
+            PresentationRoute::initial("presentation-stop-session"),
+        )])),
         pollers: Mutex::new(HashSet::new()),
         fixture_modes: HashSet::new(),
         naming: OnceLock::new(),
@@ -924,7 +927,7 @@ async fn managed_recovery_stop_refuses_without_contacting_the_host() {
         client: RuntimeClient::new(&socket, "0123456789abcdef"),
         broadcast: Arc::new(broadcast),
         aliases: Mutex::new(HashMap::from([(("codex".into(), "thread-1".into()), soul)])),
-        presentation_ids: Mutex::new(HashMap::new()),
+        presentation_routes: Mutex::new(HashMap::new()),
         pollers: Mutex::new(HashSet::new()),
         fixture_modes: HashSet::new(),
         naming: OnceLock::new(),
@@ -978,6 +981,170 @@ fn presentation_rewrite_keeps_materialized_native_identity() {
     rewrite_presentation_id(&mut materialized, "public");
     assert_eq!(materialized["previousSessionId"], "public");
     assert_eq!(materialized["sessionId"], "native");
+}
+
+#[tokio::test]
+async fn materialization_keeps_following_transcript_invalidations_on_the_native_route() {
+    let (broadcast, mut receiver) = broadcast::channel(8);
+    let soul = SoulId::parse("soul-materialization-route").unwrap();
+    let proxy = HostedFreshAgentProxy {
+        client: RuntimeClient::new("/unused/supervisor.sock", "0123456789abcdef"),
+        broadcast: Arc::new(broadcast),
+        aliases: Mutex::new(HashMap::new()),
+        presentation_routes: Mutex::new(HashMap::from([(
+            soul.clone(),
+            PresentationRoute::initial("managed-public"),
+        )])),
+        pollers: Mutex::new(HashSet::new()),
+        fixture_modes: HashSet::new(),
+        naming: OnceLock::new(),
+    };
+    let events = [
+        serde_json::json!({
+            "type":"freshAgent.session.materialized",
+            "provider":"opencode",
+            "sessionType":"freshopencode",
+            "previousSessionId":"managed-public",
+            "sessionId":"ses_native"
+        }),
+        serde_json::json!({
+            "type":"freshAgent.event",
+            "provider":"opencode",
+            "sessionType":"freshopencode",
+            "sessionId":"ses_native",
+            "event":{"type":"freshAgent.session.changed","sessionId":"ses_native"}
+        }),
+        serde_json::json!({
+            "type":"freshAgent.event",
+            "provider":"opencode",
+            "sessionType":"freshopencode",
+            "sessionId":"ses_native",
+            "event":{"type":"freshAgent.turn.complete","sessionId":"ses_native","at":42}
+        }),
+    ];
+
+    for event in events {
+        proxy
+            .forward_polled_event(
+                &soul,
+                AgentEvent::Provider { payload: event },
+                "opencode",
+                "managed-public",
+                "freshopencode",
+            )
+            .await;
+    }
+
+    let frames: Vec<serde_json::Value> = (0..3)
+        .map(|_| serde_json::from_str(&receiver.try_recv().unwrap()).unwrap())
+        .collect();
+    assert_eq!(frames[0]["previousSessionId"], "managed-public");
+    assert_eq!(frames[0]["sessionId"], "ses_native");
+    for (frame, event_type) in frames[1..]
+        .iter()
+        .zip(["freshAgent.session.changed", "freshAgent.turn.complete"])
+    {
+        assert_eq!(frame["event"]["type"], event_type);
+        assert_eq!(
+            frame["sessionId"], "ses_native",
+            "{event_type} must follow the pane's materialized native session key"
+        );
+    }
+    assert_eq!(
+        proxy
+            .presentation_routes
+            .lock()
+            .await
+            .get(&soul)
+            .map(|route| route.session_id.as_str()),
+        Some("ses_native"),
+    );
+}
+
+#[tokio::test]
+async fn replayed_materialization_does_not_rekey_a_forked_pane_to_its_retired_parent() {
+    let (broadcast, mut receiver) = broadcast::channel(8);
+    let soul = SoulId::parse("soul-materialization-fork-route").unwrap();
+    // Model the fork route retained after a poller exits; its next poller
+    // starts at cursor zero and sees the parent's old materialization again.
+    let proxy = HostedFreshAgentProxy {
+        client: RuntimeClient::new("/unused/supervisor.sock", "0123456789abcdef"),
+        broadcast: Arc::new(broadcast),
+        aliases: Mutex::new(HashMap::new()),
+        presentation_routes: Mutex::new(HashMap::from([(
+            soul.clone(),
+            PresentationRoute::materialized("ses_child"),
+        )])),
+        pollers: Mutex::new(HashSet::new()),
+        fixture_modes: HashSet::new(),
+        naming: OnceLock::new(),
+    };
+    let events = [
+        serde_json::json!({
+            "type":"freshAgent.session.materialized",
+            "provider":"opencode",
+            "sessionType":"freshopencode",
+            "previousSessionId":"managed-public",
+            "sessionId":"ses_parent"
+        }),
+        serde_json::json!({
+            "type":"freshAgent.event",
+            "provider":"opencode",
+            "sessionType":"freshopencode",
+            "sessionId":"ses_parent",
+            "event":{"type":"freshAgent.session.changed","sessionId":"ses_parent"}
+        }),
+        serde_json::json!({
+            "type":"freshAgent.event",
+            "provider":"opencode",
+            "sessionType":"freshopencode",
+            "sessionId":"ses_parent",
+            "event":{"type":"freshAgent.turn.complete","sessionId":"ses_parent","at":42}
+        }),
+    ];
+
+    for event in events {
+        proxy
+            .forward_polled_event(
+                &soul,
+                AgentEvent::Provider { payload: event },
+                "opencode",
+                "managed-public",
+                "freshopencode",
+            )
+            .await;
+    }
+
+    let frames: Vec<serde_json::Value> = std::iter::from_fn(|| {
+        receiver
+            .try_recv()
+            .ok()
+            .map(|frame| serde_json::from_str(&frame).unwrap())
+    })
+    .collect();
+    assert_eq!(frames.len(), 2, "the stale materialization must be dropped");
+    for (frame, event_type) in frames
+        .iter()
+        .zip(["freshAgent.session.changed", "freshAgent.turn.complete"])
+    {
+        assert_eq!(frame["event"]["type"], event_type);
+        assert_eq!(frame["sessionId"], "ses_child");
+    }
+    assert_eq!(
+        proxy
+            .presentation_routes
+            .lock()
+            .await
+            .get(&soul)
+            .map(|route| route.session_id.as_str()),
+        Some("ses_child"),
+    );
+    assert!(proxy
+        .presentation_routes
+        .lock()
+        .await
+        .get(&soul)
+        .is_some_and(|route| route.materialized));
 }
 
 #[test]
@@ -1198,7 +1365,10 @@ async fn managed_provider_fork_rekeys_the_same_soul_without_launch_or_stop() {
             ("codex".into(), "public-parent".into()),
             soul.clone(),
         )])),
-        presentation_ids: Mutex::new(HashMap::from([(soul.clone(), "public-parent".into())])),
+        presentation_routes: Mutex::new(HashMap::from([(
+            soul.clone(),
+            PresentationRoute::initial("public-parent"),
+        )])),
         pollers: Mutex::new(HashSet::new()),
         fixture_modes: HashSet::new(),
         naming: std::sync::OnceLock::new(),
@@ -1240,13 +1410,19 @@ async fn managed_provider_fork_rekeys_the_same_soul_without_launch_or_stop() {
     );
     assert_eq!(
         proxy
-            .presentation_ids
+            .presentation_routes
             .lock()
             .await
             .get(&soul)
-            .map(String::as_str),
+            .map(|route| route.session_id.as_str()),
         Some("native-child")
     );
+    assert!(proxy
+        .presentation_routes
+        .lock()
+        .await
+        .get(&soul)
+        .is_some_and(|route| route.materialized));
     let aliases = proxy.aliases.lock().await;
     assert_eq!(
         aliases.get(&("codex".into(), "native-child".into())),
@@ -1521,7 +1697,7 @@ async fn rollback_commands_keep_direction_target_and_request_fences() {
                 ("codex".into(), "public-thread".into()),
                 soul,
             )])),
-            presentation_ids: Mutex::new(HashMap::new()),
+            presentation_routes: Mutex::new(HashMap::new()),
             pollers: Mutex::new(HashSet::new()),
             fixture_modes: HashSet::new(),
             naming: OnceLock::new(),
@@ -1586,7 +1762,7 @@ fn snapshot_outage_proxy(socket: &Path) -> Arc<HostedFreshAgentProxy> {
         client: RuntimeClient::new(socket, "0123456789abcdef"),
         broadcast: Arc::new(broadcast::channel(16).0),
         aliases: Mutex::new(HashMap::new()),
-        presentation_ids: Mutex::new(HashMap::new()),
+        presentation_routes: Mutex::new(HashMap::new()),
         pollers: Mutex::new(HashSet::new()),
         fixture_modes: HashSet::new(),
         naming: OnceLock::new(),

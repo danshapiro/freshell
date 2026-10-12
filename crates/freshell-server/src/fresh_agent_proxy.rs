@@ -44,7 +44,7 @@ pub(crate) struct HostedFreshAgentProxy {
     client: RuntimeClient,
     broadcast: Arc<broadcast::Sender<String>>,
     aliases: Mutex<HashMap<(String, String), SoulId>>,
-    presentation_ids: Mutex<HashMap<SoulId, String>>,
+    presentation_routes: Mutex<HashMap<SoulId, PresentationRoute>>,
     pollers: Mutex<HashSet<SoulId>>,
     fixture_modes: HashSet<String>,
     naming: OnceLock<Arc<dyn SessionNaming>>,
@@ -59,6 +59,28 @@ struct RollbackInvocation {
     mode: Option<freshell_protocol::RollbackMode>,
     turn_id: Option<String>,
     cwd: Option<String>,
+}
+
+#[derive(Clone)]
+struct PresentationRoute {
+    session_id: String,
+    materialized: bool,
+}
+
+impl PresentationRoute {
+    fn initial(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            materialized: false,
+        }
+    }
+
+    fn materialized(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            materialized: true,
+        }
+    }
 }
 
 impl HostedFreshAgentProxy {
@@ -77,7 +99,7 @@ impl HostedFreshAgentProxy {
             client,
             broadcast,
             aliases: Mutex::new(HashMap::new()),
-            presentation_ids: Mutex::new(HashMap::new()),
+            presentation_routes: Mutex::new(HashMap::new()),
             pollers: Mutex::new(HashSet::new()),
             fixture_modes,
             naming: OnceLock::new(),
@@ -306,10 +328,10 @@ impl HostedFreshAgentProxy {
                                 soul.clone(),
                             );
                         }
-                        self.presentation_ids
-                            .lock()
-                            .await
-                            .insert(soul, transition.child_session_id.clone());
+                        self.presentation_routes.lock().await.insert(
+                            soul,
+                            PresentationRoute::materialized(transition.child_session_id.clone()),
+                        );
                         self.send(ServerMessage::FreshAgentForked(FreshAgentForked {
                             request_id: message.request_id,
                             parent_session_id: transition.parent_session_id,
@@ -421,6 +443,10 @@ impl HostedFreshAgentProxy {
                 .find(|view| resume_view_matches(view, provider.as_str(), &session_ref.session_id));
             if let Some(view) = view {
                 let public_session_id = session_ref.session_id.clone();
+                if view.native_session_id.as_deref() == Some(public_session_id.as_str()) {
+                    self.observe_native_session(&view.soul_id, &public_session_id)
+                        .await;
+                }
                 let projection = session_projection(
                     &self.naming.get().cloned(),
                     named_provider(&provider),
@@ -791,6 +817,9 @@ impl HostedFreshAgentProxy {
                 && (view.fresh_agent_session_id.as_deref() == Some(session_id)
                     || view.native_session_id.as_deref() == Some(session_id))
         })?;
+        if view.native_session_id.as_deref() == Some(session_id) {
+            self.observe_native_session(&view.soul_id, session_id).await;
+        }
         self.aliases.lock().await.insert(
             (public_provider, session_id.to_string()),
             view.soul_id.clone(),
@@ -805,11 +834,11 @@ impl HostedFreshAgentProxy {
         presentation_session_id: String,
         session_type: String,
     ) -> bool {
-        self.presentation_ids
+        self.presentation_routes
             .lock()
             .await
             .entry(soul.clone())
-            .or_insert_with(|| presentation_session_id.clone());
+            .or_insert_with(|| PresentationRoute::initial(presentation_session_id.clone()));
         if !self.pollers.lock().await.insert(soul.clone()) {
             return false;
         }
@@ -824,35 +853,37 @@ impl HostedFreshAgentProxy {
                 {
                     Ok(batch) => {
                         if batch.reset_required {
+                            let current_presentation = proxy
+                                .presentation_routes
+                                .lock()
+                                .await
+                                .get(&soul)
+                                .map(|route| route.session_id.clone())
+                                .unwrap_or_else(|| presentation_session_id.clone());
                             proxy.send(ServerMessage::FreshAgentEvent(FreshAgentEvent {
                                 event: serde_json::json!({
                                     "type":"freshAgent.host.journal.reset",
                                     "retainedFrom":batch.retained_from,
                                 }),
                                 provider: provider.clone(),
-                                session_id: presentation_session_id.clone(),
+                                session_id: current_presentation,
                                 session_type: session_type.clone(),
                             }));
                         }
                         for event in batch.events {
                             cursor = cursor.max(event.sequence);
-                            // Provider-native identity is nested provider state. The public
-                            // routing alias changes only through an explicit same-soul fork
-                            // transition or durable inventory reconciliation, never merely
-                            // because initial startup observed a native ID.
-                            let current_presentation = proxy
-                                .presentation_ids
-                                .lock()
-                                .await
-                                .get(&soul)
-                                .cloned()
-                                .unwrap_or_else(|| presentation_session_id.clone());
-                            proxy.forward_host_event(
-                                event.event,
-                                &provider,
-                                &current_presentation,
-                                &session_type,
-                            );
+                            // Materialization is the explicit event transition at which the
+                            // client rekeys its pane to the provider-native session id. Keep
+                            // subsequent invalidators on that same route.
+                            proxy
+                                .forward_polled_event(
+                                    &soul,
+                                    event.event,
+                                    &provider,
+                                    &presentation_session_id,
+                                    &session_type,
+                                )
+                                .await;
                         }
                     }
                     Err(_) => {
@@ -872,7 +903,8 @@ impl HostedFreshAgentProxy {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             proxy.pollers.lock().await.remove(&soul);
-            proxy.presentation_ids.lock().await.remove(&soul);
+            // A replacement poller replays from cursor zero; keep the current
+            // route so historical materialization cannot revive a retired ID.
         });
         true
     }
@@ -884,11 +916,61 @@ impl HostedFreshAgentProxy {
         presentation_session_id: &str,
         session_type: &str,
     ) {
-        let Ok(batch) = self.client.fresh_agent_events(soul, 0, 4096).await else {
+        let Ok(batch) = self.client.fresh_agent_events(soul.clone(), 0, 4096).await else {
             return;
         };
         for event in batch.events {
-            self.forward_host_event(event.event, provider, presentation_session_id, session_type);
+            self.forward_polled_event(
+                &soul,
+                event.event,
+                provider,
+                presentation_session_id,
+                session_type,
+            )
+            .await;
+        }
+    }
+
+    async fn forward_polled_event(
+        &self,
+        soul: &SoulId,
+        event: AgentEvent,
+        provider: &str,
+        fallback_presentation_id: &str,
+        session_type: &str,
+    ) {
+        let materialized_session_id = materialized_session_id(&event);
+        let mut presentation_routes = self.presentation_routes.lock().await;
+        let route = presentation_routes
+            .entry(soul.clone())
+            .or_insert_with(|| PresentationRoute::initial(fallback_presentation_id));
+        if materialized_session_id
+            .as_ref()
+            .is_some_and(|session_id| route.materialized && session_id != &route.session_id)
+        {
+            // The journal replays from cursor zero. After a fork, an older
+            // parent materialization must not move this soul back off its
+            // current native session.
+            return;
+        }
+
+        self.forward_host_event(event, provider, &route.session_id, session_type);
+        if let Some(session_id) = materialized_session_id {
+            route.session_id = session_id;
+            route.materialized = true;
+        }
+    }
+
+    async fn observe_native_session(&self, soul: &SoulId, session_id: &str) {
+        let mut presentation_routes = self.presentation_routes.lock().await;
+        match presentation_routes.entry(soul.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(PresentationRoute::materialized(session_id));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) if !entry.get().materialized => {
+                entry.insert(PresentationRoute::materialized(session_id));
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {}
         }
     }
 
@@ -1231,6 +1313,27 @@ fn rewrite_presentation_id(payload: &mut serde_json::Value, presentation_id: &st
     for child in object.values_mut() {
         rewrite_presentation_id(child, presentation_id);
     }
+}
+
+fn materialized_session_id(event: &AgentEvent) -> Option<String> {
+    let AgentEvent::Provider { payload } = event else {
+        return None;
+    };
+    find_materialized_session_id(payload)
+}
+
+fn find_materialized_session_id(payload: &serde_json::Value) -> Option<String> {
+    let object = payload.as_object()?;
+    if object.get("type").and_then(serde_json::Value::as_str)
+        == Some("freshAgent.session.materialized")
+    {
+        return object
+            .get("sessionId")
+            .and_then(serde_json::Value::as_str)
+            .filter(|session_id| !session_id.is_empty())
+            .map(str::to_owned);
+    }
+    object.values().find_map(find_materialized_session_id)
 }
 
 fn stable_hex(value: &str) -> String {
