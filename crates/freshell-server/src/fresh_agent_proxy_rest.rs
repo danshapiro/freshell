@@ -148,6 +148,7 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
                 session_id,
             }),
             tab_id: None,
+            pane_id: None,
             naming_handle: None,
         };
         let session_id = presentation_id_for_create(

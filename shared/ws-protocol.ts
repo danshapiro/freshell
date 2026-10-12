@@ -867,6 +867,8 @@ export const FreshAgentCreateSchema = z.object({
   /** D8: the creating tab's client-side id; the server composes the ledger row's
    * `tabKey` as `deviceId:tabId`. Non-strict schema — tolerated by older servers. */
   tabId: z.string().min(1).optional(),
+  /** The creating pane's client-side id; carried into managed view intent. */
+  paneId: z.string().min(1).optional(),
   /** Unified agent names (Task 1): the pane's pre-durable naming handle — see
    * `terminal.create.namingHandle`. Additive optional. */
   namingHandle: z.string().min(1).optional(),

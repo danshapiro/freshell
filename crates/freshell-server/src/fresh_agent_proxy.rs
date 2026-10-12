@@ -625,7 +625,7 @@ impl HostedFreshAgentProxy {
                 workspace_id: project_key,
                 kind: ViewIntentKind::AutomaticPrimary,
                 preferred_tab_id: message.tab_id.clone(),
-                preferred_pane_id: None,
+                preferred_pane_id: message.pane_id.clone(),
                 title: Some(format!("{} agent", provider.as_str())),
                 placement_group: None,
                 visibility: ViewVisibilityIntent::Visible,

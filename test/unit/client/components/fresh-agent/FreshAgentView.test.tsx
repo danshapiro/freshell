@@ -839,7 +839,7 @@ describe('picker profile staging', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(100) })
     expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
     expect(sentFreshAgentMessages('freshAgent.create')[0]).toMatchObject({ requestId: staged.createRequestId,
-      model: 'haiku', effort: 'low', permissionMode: 'default' })
+      paneId: 'pane-1', model: 'haiku', effort: 'low', permissionMode: 'default' })
     const sent = getFreshAgentPaneContent(store)
     expect(sent.namingHandle).toBeTruthy()
     act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: { ...sent } })))

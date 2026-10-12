@@ -174,7 +174,8 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
           expect(created).toMatchObject({ sessionType: definition.mode, provider: wireProvider })
           const requests = sent.filter(frame => frame.type === 'freshAgent.create' && frame.requestId === created.createRequestId)
           expect(requests, 'one original pane creation request').toHaveLength(1)
-          expect(requests[0]).toMatchObject({ tabId: created.tabId, sessionType: definition.mode, provider: wireProvider })
+          expect(requests[0]).toMatchObject({ tabId: created.tabId, paneId: created.paneId,
+            sessionType: definition.mode, provider: wireProvider })
           const replies = createdReplies.filter(reply => reply.requestId === created.createRequestId)
           if (!replies.length) return null
           expect(replies, 'one original creation acknowledgement').toHaveLength(1)
