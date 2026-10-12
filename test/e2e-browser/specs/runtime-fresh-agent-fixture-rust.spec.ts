@@ -141,8 +141,10 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
         try {
           const message = JSON.parse(String(frame.payload))
           if (message.type === 'freshAgent.created') createdReplies.push(message)
-          if (message.type === 'freshAgent.event' && message.event?.type === 'freshAgent.turn.complete'
-            && typeof message.sessionId === 'string') completedTurnSessionIds.add(message.sessionId)
+          const event = message.type === 'freshAgent.event' ? message.event : message
+          if (event?.type === 'freshAgent.turn.complete' && typeof message.sessionId === 'string') {
+            completedTurnSessionIds.add(message.sessionId)
+          }
         } catch { /* non-JSON frame */ }
       })
     })
@@ -210,10 +212,10 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
         await phase('completion', () => waitFor('actual fixture completion', async () => {
           const state = await fixtureState(rig, view)
           // The fixture counter advances before its provider-history write.
-          // The completion event follows that write and is keyed by the native
-          // session ID, while the create reply may still carry the presentation ID.
+          // The event follows that write, then the proxy sends its raw frame
+          // with the pane's presentation ID. Match that wire ID before History.
           return state.dispatchCount === 1 && state.completionCount === 1
-            && completedTurnSessionIds.has(nativeSessionId) ? state : null
+            && completedTurnSessionIds.has(createdSessionId) ? state : null
         }))
         const paneObservation = { ...created, sessionType: definition.mode, provider: wireProvider,
           createdSessionId, nativeSessionId }
