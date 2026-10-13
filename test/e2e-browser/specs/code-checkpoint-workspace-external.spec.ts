@@ -239,6 +239,15 @@ async function flushLayoutAndReload(page: import('@playwright/test').Page): Prom
   await expect(page.locator('[data-context="fresh-agent"]')).toBeVisible({ timeout: 30_000 })
 }
 
+async function closePaneForContent(paneRoot: import('@playwright/test').Locator): Promise<void> {
+  // PaneHeader is a sibling of the provider content, so its close button is
+  // owned by the nearest pane shell rather than nested inside `paneRoot`.
+  await paneRoot
+    .locator('xpath=ancestor::*[@data-pane-shell="true"][1]')
+    .getByRole('button', { name: 'Close pane' })
+    .click()
+}
+
 async function openSessionFromHistory(
   page: import('@playwright/test').Page,
   paneRoot: import('@playwright/test').Locator,
@@ -265,7 +274,7 @@ async function openSessionFromHistory(
 
   // Closing the seed pane makes History restore from its directory projection,
   // which proves the explicit workspace provenance survived session metadata.
-  await paneRoot.getByRole('button', { name: 'Close pane' }).click()
+  await closePaneForContent(paneRoot)
   await expect(page.locator('[data-context="fresh-agent"]')).toHaveCount(0, { timeout: 30_000 })
   await page.locator('button[title="Projects (Ctrl+B P)"]').click()
   const projectHeader = page.locator(`[data-project-path="${projectPath}"]`)
@@ -459,7 +468,7 @@ test('opening a linked-worktree session from History rewinds its resolved checko
   // History must open from its directory projection; keeping the seed pane
   // open would exercise the already-open-pane path and preserve its explicit
   // picker scope instead of testing ordinary session restoration.
-  await paneRoot.getByRole('button', { name: 'Close pane' }).click()
+  await closePaneForContent(paneRoot)
   await expect(page.locator('[data-context="fresh-agent"]')).toHaveCount(0, { timeout: 30_000 })
   await page.locator('button[title="Projects (Ctrl+B P)"]').click()
   const projectHeader = page.locator(`[data-project-path="${fixture.syntheticWorkspacePath}"]`)
