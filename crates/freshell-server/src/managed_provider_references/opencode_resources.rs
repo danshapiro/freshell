@@ -243,6 +243,13 @@ fn nested_fields(raw: &str, tui: bool) -> Result<Vec<(&'static str, String)>, &'
                     let script_index = script_operand_index(&command);
                     let script_runtime =
                         command_uses_script_runtime(command.first().map(String::as_str));
+                    let node_script_field =
+                        if command_uses_node_module_resolution(command.first().map(String::as_str))
+                        {
+                            "OpenCode mcp.node-script"
+                        } else {
+                            "OpenCode mcp.script"
+                        };
                     for (index, argument) in command.iter().enumerate() {
                         let script_file = if script_runtime {
                             script_index.is_some_and(|script| {
@@ -257,10 +264,10 @@ fn nested_fields(raw: &str, tui: bool) -> Result<Vec<(&'static str, String)>, &'
                         let script_operand = script_runtime
                             && script_index == Some(index)
                             && !is_bun_run_bare_operand(&command, index);
-                        if script_file || script_operand {
-                            result.push(("OpenCode mcp.script", argument.clone()));
-                        } else if index == 0 && is_explicit_command_path(argument) {
+                        if index == 0 && is_explicit_command_path(argument) {
                             result.push(("OpenCode mcp.command", argument.clone()));
+                        } else if script_file || script_operand {
+                            result.push((node_script_field, argument.clone()));
                         }
                     }
                     if let Some(script_index) = script_index {
@@ -414,6 +421,30 @@ fn command_uses_script_runtime(executable: Option<&str>) -> bool {
             | "pwsh"
             | "powershell"
     )
+}
+
+fn command_uses_node_module_resolution(executable: Option<&str>) -> bool {
+    let Some(executable) = executable.and_then(|executable| Path::new(executable).file_name())
+    else {
+        return false;
+    };
+    let executable = executable.to_string_lossy().to_ascii_lowercase();
+    let executable = executable.strip_suffix(".exe").unwrap_or(&executable);
+    matches!(
+        executable,
+        "node" | "nodejs" | "bun" | "deno" | "tsx" | "ts-node"
+    )
+}
+
+fn is_mcp_command_path_field(field: &str) -> bool {
+    matches!(
+        field,
+        "OpenCode mcp.command" | "OpenCode mcp.script" | "OpenCode mcp.node-script"
+    )
+}
+
+fn is_mcp_script_field(field: &str) -> bool {
+    matches!(field, "OpenCode mcp.script" | "OpenCode mcp.node-script")
 }
 
 fn script_operand_index(command: &[String]) -> Option<usize> {
@@ -773,7 +804,7 @@ pub fn select(
                 }
             }
             field = if is_script_path(&spelling) {
-                "OpenCode mcp.script"
+                "OpenCode mcp.node-script"
             } else {
                 "OpenCode mcp.command"
             };
@@ -802,10 +833,7 @@ pub fn select(
             } else {
                 continue;
             } // Native package identity remains native.
-        } else if field == "OpenCode mcp.cwd"
-            || field == "OpenCode mcp.command"
-            || field == "OpenCode mcp.script"
-        {
+        } else if field == "OpenCode mcp.cwd" || is_mcp_command_path_field(field) {
             // Native path.resolve(instance cwd, raw): no HOME or URL expansion.
             PathBuf::from(&spelling)
         } else {
@@ -876,7 +904,7 @@ pub fn select(
                     .join(path);
             } else if field == "OpenCode skills.paths" || field == "OpenCode mcp.cwd" {
                 path = source.instance_cwd.join(path);
-            } else if field == "OpenCode mcp.command" || field == "OpenCode mcp.script" {
+            } else if is_mcp_command_path_field(field) {
                 path = if let Some(working_dir) = &current_mcp_working_dir {
                     working_dir.join(path)
                 } else {
@@ -898,12 +926,9 @@ pub fn select(
         }
         if matches!(
             field,
-            "OpenCode skills.paths"
-                | "OpenCode mcp.cwd"
-                | "OpenCode mcp.command"
-                | "OpenCode mcp.script"
-                | "OpenCode attention.sounds"
-        ) {
+            "OpenCode skills.paths" | "OpenCode mcp.cwd" | "OpenCode attention.sounds"
+        ) || is_mcp_command_path_field(field)
+        {
             // Native resolution resolution normalizes .. before deciding
             // whether the selected resource is supplied by the workspace.
             path = freshell_platform::opencode_config::lexical_path(&path);
@@ -917,7 +942,7 @@ pub fn select(
             insert_resource(&mut result, &mut resource_path_bytes, path, field)?;
             continue;
         }
-        if field == "OpenCode mcp.command" || field == "OpenCode mcp.script" {
+        if is_mcp_command_path_field(field) {
             if !canonical.is_file() {
                 return Err(fail(
                     field,
@@ -960,7 +985,7 @@ pub fn select(
                 )?;
                 continue;
             }
-            if field == "OpenCode mcp.script" {
+            if is_mcp_script_field(field) {
                 let canonical_home = std::fs::canonicalize(home).ok();
                 if command_parent == Path::new("/")
                     || canonical_home.as_deref() == Some(command_parent)
@@ -969,6 +994,16 @@ pub fn select(
                         field,
                         "standalone MCP script requires copying an unbounded account or system directory",
                     ));
+                }
+                if field == "OpenCode mcp.node-script" {
+                    insert_installed_package_ancestor_resources(
+                        command_parent,
+                        home,
+                        declaring,
+                        &mut result,
+                        &mut resource_path_bytes,
+                        field,
+                    )?;
                 }
                 // A standalone script may import sibling files without a
                 // package manifest. Copy its containing directory as the

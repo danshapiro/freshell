@@ -68,8 +68,13 @@ mod configured_resource_tests {
                 source: host.join(&mount.provider_relative_path),
                 destination_relative: Path::new(&mount.effective_destination)
                     .strip_prefix(owned_root)
-                    .unwrap()
-                    .to_path_buf(),
+                    .map(Path::to_path_buf)
+                    .or_else(|_| {
+                        Path::new(&mount.effective_destination)
+                            .strip_prefix("/home/freshell/provider")
+                            .map(|relative| Path::new(".provider-home").join(relative))
+                    })
+                    .expect("test provider destinations must map into the temporary root"),
             })
             .collect::<Vec<_>>();
         copy_environment(&provider_selections, &provider, &[], Default::default()).unwrap();
@@ -705,6 +710,74 @@ mod configured_resource_tests {
     }
 
     #[test]
+    fn direct_executable_script_in_home_runs_after_all_resource_copies() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let command = home.join("mcp.sh");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "#!/bin/sh\nprintf 'home MCP executable started\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = workspace.join("opencode.json");
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "mcp": { "direct": { "type": "local", "command": [command] } },
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config,
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Workspace,
+            }],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .unwrap();
+        assert!(plan[0]
+            .configured_resources
+            .contains(&command.canonicalize().unwrap()));
+        assert!(!plan[0]
+            .configured_resources
+            .contains(&home.canonicalize().unwrap()));
+
+        let units = resource_units(
+            &home,
+            &home.join(".config/opencode"),
+            &workspace,
+            &plan,
+            None,
+        )
+        .unwrap();
+        let provider = copy_selected_units_through_provider(owned.path(), &units);
+        let provider_command = provider.join(".provider-home/mcp.sh");
+        let hidden_home = owned.path().join("home-hidden");
+        std::fs::rename(&home, &hidden_home).unwrap();
+        let output = execute_selected_resource(&provider_command);
+        std::fs::rename(&hidden_home, &home).unwrap();
+        let output = output.unwrap();
+        assert!(
+            output.status.success(),
+            "the direct executable selected under HOME must still start: {:?}",
+            output.stderr
+        );
+        assert_eq!(output.stdout, b"home MCP executable started\n");
+    }
+
+    #[test]
     fn standalone_mcp_script_imports_sibling_after_all_resource_copies() {
         let owned = tempfile::tempdir().unwrap();
         let home = owned.path().join("home");
@@ -780,6 +853,86 @@ mod configured_resource_tests {
             output.stderr
         );
         assert_eq!(output.stdout, b"sibling MCP helper loaded");
+    }
+
+    #[test]
+    fn standalone_node_mcp_script_loads_dependency_from_home_node_modules() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let script_dir = home.join("scripts");
+        let node_modules = home.join("node_modules");
+        let dependency = node_modules.join("parent-dependency");
+        let command = script_dir.join("server.js");
+        for path in [&script_dir, &dependency, &workspace] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(
+            &command,
+            "process.stdout.write(require('parent-dependency'))\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dependency.join("index.js"),
+            "module.exports = 'ancestor MCP dependency loaded'\n",
+        )
+        .unwrap();
+        let config = workspace.join("opencode.json");
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "mcp": {
+                    "standalone": { "type": "local", "command": ["node", command] },
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config,
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Workspace,
+            }],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .unwrap();
+        assert!(
+            plan[0]
+                .configured_resources
+                .contains(&node_modules.canonicalize().unwrap()),
+            "the standalone Node script must select ancestor node_modules"
+        );
+        let units = resource_units(
+            &home,
+            &home.join(".config/opencode"),
+            &workspace,
+            &plan,
+            None,
+        )
+        .unwrap();
+        let provider = copy_selected_units_through_provider(owned.path(), &units);
+        let provider_command = provider.join(".provider-home/scripts/server.js");
+
+        let hidden_home = owned.path().join("home-hidden");
+        std::fs::rename(&home, &hidden_home).unwrap();
+        let output = std::process::Command::new("node")
+            .arg(&provider_command)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .output();
+        std::fs::rename(&hidden_home, &home).unwrap();
+        let output = output.unwrap();
+        assert!(
+            output.status.success(),
+            "the managed Node script must resolve its copied ancestor dependency: {:?}",
+            output.stderr
+        );
+        assert_eq!(output.stdout, b"ancestor MCP dependency loaded");
     }
 
     #[test]
