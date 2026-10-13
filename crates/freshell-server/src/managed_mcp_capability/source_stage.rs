@@ -778,6 +778,77 @@ mod configured_resource_tests {
     }
 
     #[test]
+    fn direct_mcp_shell_script_loads_sibling_after_home_copy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let tools = home.join("tools");
+        let command = tools.join("start.sh");
+        let helper = tools.join("helper.sh");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "#!/bin/sh\nSCRIPT_DIR=$(dirname \"$0\")\n. \"$SCRIPT_DIR/helper.sh\"\nprintf '%s\\n' \"$MCP_HELPER_RESULT\"\n",
+        )
+        .unwrap();
+        std::fs::write(&helper, "MCP_HELPER_RESULT='sibling shell helper loaded'\n").unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = workspace.join("opencode.json");
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "mcp": { "direct": { "type": "local", "command": [command] } },
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config,
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Workspace,
+            }],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .unwrap();
+        assert!(
+            plan[0]
+                .configured_resources
+                .contains(&tools.canonicalize().unwrap()),
+            "a direct MCP script must retain its bounded sibling-resource directory"
+        );
+
+        let units = resource_units(
+            &home,
+            &home.join(".config/opencode"),
+            &workspace,
+            &plan,
+            None,
+        )
+        .unwrap();
+        let provider = copy_selected_units_through_provider(owned.path(), &units);
+        let provider_command = provider.join(".provider-home/tools/start.sh");
+        let hidden_home = owned.path().join("home-hidden");
+        std::fs::rename(&home, &hidden_home).unwrap();
+        let output = execute_selected_resource(&provider_command);
+        std::fs::rename(&hidden_home, &home).unwrap();
+        let output = output.unwrap();
+        assert!(
+            output.status.success(),
+            "the directly launched managed script must load its sibling helper: {:?}",
+            output.stderr
+        );
+        assert_eq!(output.stdout, b"sibling shell helper loaded\n");
+    }
+
+    #[test]
     fn standalone_mcp_script_imports_sibling_after_all_resource_copies() {
         let owned = tempfile::tempdir().unwrap();
         let home = owned.path().join("home");

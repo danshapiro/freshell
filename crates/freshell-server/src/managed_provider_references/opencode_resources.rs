@@ -265,7 +265,16 @@ fn nested_fields(raw: &str, tui: bool) -> Result<Vec<(&'static str, String)>, &'
                             && script_index == Some(index)
                             && !is_bun_run_bare_operand(&command, index);
                         if index == 0 && is_explicit_command_path(argument) {
-                            result.push(("OpenCode mcp.command", argument.clone()));
+                            if is_script_path(argument) {
+                                let field = if is_node_script_path(argument) {
+                                    "OpenCode mcp.node-direct-script"
+                                } else {
+                                    "OpenCode mcp.direct-script"
+                                };
+                                result.push((field, argument.clone()));
+                            } else {
+                                result.push(("OpenCode mcp.command", argument.clone()));
+                            }
                         } else if script_file || script_operand {
                             result.push((node_script_field, argument.clone()));
                         }
@@ -436,15 +445,48 @@ fn command_uses_node_module_resolution(executable: Option<&str>) -> bool {
     )
 }
 
+fn is_node_script_path(path: &str) -> bool {
+    Path::new(path).extension().is_some_and(|extension| {
+        matches!(
+            extension.to_string_lossy().to_ascii_lowercase().as_str(),
+            "js" | "mjs" | "cjs" | "ts" | "mts" | "cts"
+        )
+    })
+}
+
 fn is_mcp_command_path_field(field: &str) -> bool {
     matches!(
         field,
-        "OpenCode mcp.command" | "OpenCode mcp.script" | "OpenCode mcp.node-script"
+        "OpenCode mcp.command"
+            | "OpenCode mcp.script"
+            | "OpenCode mcp.node-script"
+            | "OpenCode mcp.direct-script"
+            | "OpenCode mcp.node-direct-script"
     )
 }
 
 fn is_mcp_script_field(field: &str) -> bool {
-    matches!(field, "OpenCode mcp.script" | "OpenCode mcp.node-script")
+    matches!(
+        field,
+        "OpenCode mcp.script"
+            | "OpenCode mcp.node-script"
+            | "OpenCode mcp.direct-script"
+            | "OpenCode mcp.node-direct-script"
+    )
+}
+
+fn is_mcp_direct_script_field(field: &str) -> bool {
+    matches!(
+        field,
+        "OpenCode mcp.direct-script" | "OpenCode mcp.node-direct-script"
+    )
+}
+
+fn is_mcp_node_script_field(field: &str) -> bool {
+    matches!(
+        field,
+        "OpenCode mcp.node-script" | "OpenCode mcp.node-direct-script"
+    )
 }
 
 fn script_operand_index(command: &[String]) -> Option<usize> {
@@ -990,12 +1032,16 @@ pub fn select(
                 if command_parent == Path::new("/")
                     || canonical_home.as_deref() == Some(command_parent)
                 {
+                    if is_mcp_direct_script_field(field) {
+                        insert_resource(&mut result, &mut resource_path_bytes, canonical, field)?;
+                        continue;
+                    }
                     return Err(fail(
                         field,
                         "standalone MCP script requires copying an unbounded account or system directory",
                     ));
                 }
-                if field == "OpenCode mcp.node-script" {
+                if is_mcp_node_script_field(field) {
                     insert_installed_package_ancestor_resources(
                         command_parent,
                         home,
