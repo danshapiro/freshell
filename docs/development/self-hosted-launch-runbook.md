@@ -32,7 +32,7 @@ Run this on the machine that owns the server:
 
 ```bash
 cd /home/dan/code/freshell
-curl -fsS http://127.0.0.1:3001/api/health
+curl -fsS --connect-timeout 5 --max-time 10 http://127.0.0.1:3001/api/health
 ```
 
 If the health check fails, start the server with the canonical launcher:
@@ -201,9 +201,12 @@ the procedure mid-way and leave the service down. Two sequences:
 
 - Quick (compatible changes): build, then restart immediately, accepting
   the short skew window.
-- Strict (changes that must never skew): `systemctl --user stop
-  freshell-supervisor.service` (the server stops with it via the `Requires=`
-  coupling), build, then start in socket order: start BOTH units —
+- Strict (changes that must never skew): FIRST `systemctl --user stop
+  freshell-supervisor.service` (the server stops with it via the
+  `Requires=` coupling), THEN run the build command from the Build
+  surface above — never before the stop, or the running supervisor
+  picks up the new session host mid-flight (the exact skew this
+  sequence exists to prevent) — then start in socket order: start BOTH units —
   `Requires=` pulls the supervisor in when the server starts, but starting
   the supervisor alone does not start its dependent server, so starting
   only the supervisor would leave the web server down. The supervisor
@@ -380,7 +383,7 @@ drop-in, plus `freshell-supervisor.service`):
 
 **Post-deploy verification checklist:**
 
-1. Health: `curl -fsS http://127.0.0.1:3001/api/health` → `"ready": true`.
+1. Health: `curl -fsS --connect-timeout 5 --max-time 10 http://127.0.0.1:3001/api/health` → `"ready": true`.
 2. Feature present AND scan completed: with the auth token,
    `GET /api/runtime/readiness` answers `200` — a `404` means the running
    binary was built WITHOUT the feature; rebuild with the command above
@@ -694,6 +697,9 @@ print((d.get("codingCli") or {}).get("providers",{}).get("opencode",{}).get("cwd
     # the confirmation dispatches a UI update, terminal.create goes out
     # from a React effect, and the managed launch is asynchronous — so
     # the soul may not exist the instant you confirm. Poll up to ~120s:
+    # The manual UI step must finish BEFORE the clock starts — create
+    # the pane, then press ENTER to start the bounded poll:
+    read -r -p "Create the OpenCode pane at $BWS in the hard-refreshed client, then press ENTER to poll: " _
     POLL_DEADLINE=$((SECONDS + 120))
     while [ "$SECONDS" -lt "$POLL_DEADLINE" ]; do
       if curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
@@ -1034,7 +1040,26 @@ print("" if cur is None else cur)')
     rm -f "${RUN:-/nonexistent}/hdr" "$D/hdr"   # scrub NOW; the trap only
     # fires at shell EXIT, which is too late for $RUN/hdr in a still-
     # living interactive shell
-    rm -rf "$D" "${PROBE_ROOT:-}" "$WS" "${BWS:-}"   # success only
+    # Delete the probe workspaces, and the ROOT only when it holds
+    # nothing besides this run's known workspaces — a root with other
+    # entries (another workspace, hidden data) is NOT ours to delete:
+    rm -rf "$D" "$WS" "${BWS:-}"
+    if [ -n "${PROBE_ROOT:-}" ]; then
+      UNEXPECTED=""
+      shopt -s nullglob
+      for ENTRY in "$PROBE_ROOT"/* "$PROBE_ROOT"/.[!.]*; do
+        case "$ENTRY" in
+          "$WS"|"$BWS") ;;
+          *) UNEXPECTED="$UNEXPECTED $ENTRY" ;;
+        esac
+      done
+      shopt -u nullglob
+      if [ -z "$UNEXPECTED" ]; then
+        rm -rf "$PROBE_ROOT"
+      else
+        echo "probe root kept — it contains unexpected entries:$UNEXPECTED"
+      fi
+    fi
     ```
 
     If the block aborts before `verified_empty`, the token header is
