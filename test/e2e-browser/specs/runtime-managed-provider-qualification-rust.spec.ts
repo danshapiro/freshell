@@ -45,6 +45,7 @@ import { providerStageResponse, sequenceProviderResponse } from '../helpers/prov
 import {
   buildTerminalOrdinaryTurnBrowserScript,
   TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL,
+  waitForTerminalOrdinaryTurnBaseline,
   type TerminalOrdinaryTurnBaseline,
   type TerminalOrdinaryTurnBrowserObservation,
   type TerminalOrdinaryTurnProvider,
@@ -245,7 +246,7 @@ async function executeAndAwaitNonceOutput(
 }
 
 class OrdinaryTerminalTurnError extends Error {
-  constructor(readonly facts: TerminalOrdinaryTurnBrowserObservation | null) {
+  constructor(readonly stage: 'attach_ready' | 'turn_completion', readonly facts: TerminalOrdinaryTurnBrowserObservation | null) {
     super('ordinary terminal turn did not show provider activity, fresh output, and completion')
     this.name = 'OrdinaryTerminalTurnError'
   }
@@ -262,11 +263,11 @@ async function executeAndAwaitOrdinaryTurn(
   await terminal.click()
   await page.keyboard.insertText('Reply in one short sentence. Do not use tools.')
 
-  const baseline = await page.evaluate(({ globalName, providerName, id }) => {
+  const baseline = await waitForTerminalOrdinaryTurnBaseline(() => page.evaluate(({ globalName, providerName, id }) => {
     const observer = (window as any)[globalName]
     return observer?.prepareBeforeSend(providerName, id) ?? null
-  }, { globalName: TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL, providerName: provider, id: terminalId }) as TerminalOrdinaryTurnBaseline | null
-  if (!baseline) throw new OrdinaryTerminalTurnError(null)
+  }, { globalName: TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL, providerName: provider, id: terminalId }) as Promise<TerminalOrdinaryTurnBaseline | null>)
+  if (!baseline) throw new OrdinaryTerminalTurnError('attach_ready', null)
 
   await page.keyboard.press('Enter')
   let latestFacts: TerminalOrdinaryTurnBrowserObservation | null = null
@@ -285,7 +286,7 @@ async function executeAndAwaitOrdinaryTurn(
         : null
     }, 240_000)
   } catch {
-    throw new OrdinaryTerminalTurnError(latestFacts)
+    throw new OrdinaryTerminalTurnError('turn_completion', latestFacts)
   }
 }
 
@@ -610,6 +611,7 @@ test.describe.serial('ordinary managed-provider use', () => {
           console.error(JSON.stringify({ severity: 'error', event: 'durable_souls.ordinary_turn_failed',
             lane: 'terminal', provider: definition.provider,
             errorName: error instanceof Error ? error.name : 'UnknownError', terminalFacts,
+            ordinaryTurnFailureStage: error instanceof OrdinaryTerminalTurnError ? error.stage : null,
             ordinaryTurnFacts: error instanceof OrdinaryTerminalTurnError ? error.facts : null }))
         }
       }

@@ -34,6 +34,20 @@ export type TerminalOrdinaryTurnBrowserObserver = {
   observeAfterSend(baseline: TerminalOrdinaryTurnBaseline): TerminalOrdinaryTurnBrowserObservation | null
 }
 
+export async function waitForTerminalOrdinaryTurnBaseline(
+  read: () => Promise<TerminalOrdinaryTurnBaseline | null>,
+  timeoutMs = 30_000,
+  intervalMs = 200,
+): Promise<TerminalOrdinaryTurnBaseline | null> {
+  const deadline = Date.now() + timeoutMs
+  let baseline = await read()
+  while (baseline === null && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, Math.min(intervalMs, deadline - Date.now())))
+    baseline = await read()
+  }
+  return baseline
+}
+
 export const TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL = '__FRESHELL_TERMINAL_ORDINARY_TURN__'
 
 /**

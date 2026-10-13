@@ -6,6 +6,7 @@ import {
   buildTerminalOrdinaryTurnBrowserScript,
   captureTerminalOrdinaryTurnBaseline,
   reduceTerminalOrdinaryTurnFrames,
+  waitForTerminalOrdinaryTurnBaseline,
 } from '../../../../scripts/testing/terminal-ordinary-turn.js'
 
 const target = { provider: 'claude', terminalId: 'terminal-1', streamId: 'stream-1' } as const
@@ -31,6 +32,33 @@ function complete(provider: string = target.provider, terminalId: string = targe
 }
 
 describe('body-free terminal ordinary-turn reduction', () => {
+  it('waits for the attach-ready baseline before a live turn can be submitted', async () => {
+    const ready = baseline([
+      { type: 'terminal.attach.ready', terminalId: target.terminalId, streamId: target.streamId, headSeq: 6 },
+    ])
+    let attempts = 0
+
+    const captured = await waitForTerminalOrdinaryTurnBaseline(async () => {
+      attempts += 1
+      return attempts < 3 ? null : ready
+    }, 1_000, 0)
+
+    expect(attempts).toBe(3)
+    expect(captured).toEqual(ready)
+  })
+
+  it('stops checking when no attach-ready baseline arrives by the deadline', async () => {
+    let attempts = 0
+
+    const captured = await waitForTerminalOrdinaryTurnBaseline(async () => {
+      attempts += 1
+      return null
+    }, 0, 0)
+
+    expect(captured).toBeNull()
+    expect(attempts).toBe(1)
+  })
+
   it('captures only same-terminal, same-stream output and matching completion baselines', () => {
     const captured = captureTerminalOrdinaryTurnBaseline([
       { type: 'terminal.attach.ready', terminalId: target.terminalId, streamId: target.streamId, headSeq: 10 },
