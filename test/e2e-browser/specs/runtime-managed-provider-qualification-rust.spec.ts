@@ -42,6 +42,13 @@ import {
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { providerStageResponse, sequenceProviderResponse } from '../helpers/provider-response-sequencing.js'
+import {
+  buildTerminalOrdinaryTurnBrowserScript,
+  TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL,
+  type TerminalOrdinaryTurnBaseline,
+  type TerminalOrdinaryTurnBrowserObservation,
+  type TerminalOrdinaryTurnProvider,
+} from '../../../scripts/testing/terminal-ordinary-turn.js'
 
 const LIVE_ENV = 'FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE'
 const AMPLIFIER_MODEL = 'glm-5.3'
@@ -237,16 +244,49 @@ async function executeAndAwaitNonceOutput(
   })
 }
 
-async function executeAndAwaitOrdinaryNonceOutput(
+class OrdinaryTerminalTurnError extends Error {
+  constructor(readonly facts: TerminalOrdinaryTurnBrowserObservation | null) {
+    super('ordinary terminal turn did not show provider activity, fresh output, and completion')
+    this.name = 'OrdinaryTerminalTurnError'
+  }
+}
+
+async function executeAndAwaitOrdinaryTurn(
   page: Page,
   paneId: string,
   terminalId: string,
-  nonce: string,
-): Promise<string> {
-  // Full-screen provider TUIs can keep advancing terminal output sequences
-  // while already accepting input. Ordinary use needs a current ready stream,
-  // not the quiet-output fence used by continuity qualification.
-  return executeAndAwaitNonceOutput(page, paneId, terminalId, nonce, 'initial', undefined, undefined, 240_000, false)
+  provider: TerminalOrdinaryTurnProvider,
+): Promise<TerminalOrdinaryTurnBrowserObservation> {
+  const terminal = page.locator(`[data-pane-id="${paneId}"] .xterm:visible`).last()
+  await terminal.waitFor({ state: 'visible', timeout: 90_000 })
+  await terminal.click()
+  await page.keyboard.insertText('Reply in one short sentence. Do not use tools.')
+
+  const baseline = await page.evaluate(({ globalName, providerName, id }) => {
+    const observer = (window as any)[globalName]
+    return observer?.prepareBeforeSend(providerName, id) ?? null
+  }, { globalName: TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL, providerName: provider, id: terminalId }) as TerminalOrdinaryTurnBaseline | null
+  if (!baseline) throw new OrdinaryTerminalTurnError(null)
+
+  await page.keyboard.press('Enter')
+  let latestFacts: TerminalOrdinaryTurnBrowserObservation | null = null
+  try {
+    return await waitForValue('ordinary terminal provider turn completion', async () => {
+      latestFacts = await page.evaluate(({ globalName, currentBaseline }) => {
+        const observer = (window as any)[globalName]
+        return observer?.observeAfterSend(currentBaseline) ?? null
+      }, { globalName: TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL, currentBaseline: baseline }) as TerminalOrdinaryTurnBrowserObservation | null
+      return latestFacts
+        && latestFacts.inputSeen
+        && latestFacts.activitySeen
+        && latestFacts.outputSeen
+        && latestFacts.completionSeen
+        ? latestFacts
+        : null
+    }, 240_000)
+  } catch {
+    throw new OrdinaryTerminalTurnError(latestFacts)
+  }
 }
 
 async function paneNativeId(
@@ -536,6 +576,7 @@ test.describe.serial('ordinary managed-provider use', () => {
     )
     try {
       const info = await rig.start()
+      await page.addInitScript(buildTerminalOrdinaryTurnBrowserScript())
       await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
       const harness = new TestHarness(page)
       await harness.waitForHarness()
@@ -548,12 +589,10 @@ test.describe.serial('ordinary managed-provider use', () => {
         let created: Awaited<ReturnType<typeof createProviderPane>> | undefined
         try {
           created = await createProviderPane(page, harness, rig, tabId, definition)
-          await executeAndAwaitOrdinaryNonceOutput(
-            page,
-            created.paneId,
-            created.terminalId,
-            `freshell-${randomBytes(12).toString('hex')}`,
-          )
+          if (definition.provider === 'amplifier') {
+            throw new Error('Amplifier is excluded from the ordinary terminal smoke')
+          }
+          await executeAndAwaitOrdinaryTurn(page, created.paneId, created.terminalId, definition.provider)
           console.info(JSON.stringify({ severity: 'info', event: 'durable_souls.ordinary_turn_completed',
             lane: 'terminal', provider: definition.provider }))
         } catch (error) {
@@ -570,7 +609,8 @@ test.describe.serial('ordinary managed-provider use', () => {
           }
           console.error(JSON.stringify({ severity: 'error', event: 'durable_souls.ordinary_turn_failed',
             lane: 'terminal', provider: definition.provider,
-            errorName: error instanceof Error ? error.name : 'UnknownError', terminalFacts }))
+            errorName: error instanceof Error ? error.name : 'UnknownError', terminalFacts,
+            ordinaryTurnFacts: error instanceof OrdinaryTerminalTurnError ? error.facts : null }))
         }
       }
       expect(failedProviders, `ordinary terminal turn failed for: ${failedProviders.join(', ')}`).toEqual([])

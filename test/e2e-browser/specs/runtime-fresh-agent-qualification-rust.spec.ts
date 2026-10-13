@@ -14,7 +14,11 @@ import {
   type QualifiableFreshAgentMode,
 } from '../../../scripts/testing/fresh-agent-qualification-selection.js'
 import { FRESH_AGENT_QUALIFICATION_LIVE_ENV } from '../../../scripts/testing/runtime-fresh-agent-qualification.js'
-import { findFreshAgentCreateOutcome } from '../../../scripts/testing/fresh-agent-create-result.js'
+import {
+  observeFreshAgentBrowserWire,
+  type FreshAgentWireFrame,
+  type FreshAgentWireObservations,
+} from '../helpers/fresh-agent-browser-wire-observer.js'
 import {
   freshAgentAssistantResponseFacts,
   freshAgentTurnCompletionStatus,
@@ -23,6 +27,15 @@ import { test } from '../helpers/fixtures.js'
 import { createManagedRuntimeBrowserRig, openFreshHistorySession, splitFreshBrowserPane, observeFreshMcpIngress, type ManagedRuntimeView, type ManagedFixtureRig } from '../helpers/managed-runtime.js'
 import { observeOwnedFreshBrowserPane, stageOwnedFreshBrowserProfile } from '../../../scripts/testing/runtime-external-browser.js'
 import { TestHarness } from '../helpers/test-harness.js'
+
+type FreshAgentWireType = FreshAgentWireFrame['type']
+
+function isWireFrameOfType<T extends FreshAgentWireType>(
+  frame: FreshAgentWireFrame,
+  type: T,
+): frame is Extract<FreshAgentWireFrame, { type: T }> {
+  return frame.type === type
+}
 
 type Definition = {
   mode: QualifiableFreshAgentMode
@@ -67,7 +80,8 @@ function dataOf(result: any): any {
   return result?.data?.data ?? result?.data ?? result
 }
 
-async function sendBrowserNoToolTurn(page: Page, paneId: string, instruction: string): Promise<void> {
+async function sendBrowserNoToolTurn(page: Page, paneId: string, instruction: string, wire: FreshAgentWireObservations): Promise<void> {
+  await wire.allowSendPrompt(instruction)
   const composer = page.locator('[data-pane-id="' + paneId + '"]').getByRole('textbox', { name: 'Chat message input' })
   await expect(composer).toBeEnabled({ timeout: 60_000 })
   await composer.fill(instruction)
@@ -94,17 +108,7 @@ export async function aliasActivation(rig: ManagedFixtureRig, created: { reply: 
   })
 }
 
-type WireObservations = { sent: any[]; received: any[] }
-function observeBrowserWire(page: Page): WireObservations {
-  const observed: WireObservations = { sent: [], received: [] }
-  page.on('websocket', socket => {
-    socket.on('framesent', frame => { try { observed.sent.push(JSON.parse(String(frame.payload))) } catch { /* non-JSON frame */ } })
-    socket.on('framereceived', frame => { try { observed.received.push(JSON.parse(String(frame.payload))) } catch { /* non-JSON frame */ } })
-  })
-  return observed
-}
-
-function ordinaryFreshAgentEventFacts(frames: readonly any[]) {
+function ordinaryFreshAgentEventFacts(frames: readonly FreshAgentWireFrame[]) {
   const counts = { created: 0, createFailed: 0, assistant: 0, stream: 0, error: 0,
     snapshot: 0, changed: 0, turnComplete: 0, result: 0 }
   const turnOutcomes: Record<string, number> = {}
@@ -117,10 +121,7 @@ function ordinaryFreshAgentEventFacts(frames: readonly any[]) {
     if (frame?.type === 'freshAgent.create.failed') {
       counts.createFailed++
       if (typeof frame.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(frame.code)) createFailureCodes.add(frame.code)
-      if (typeof frame.message === 'string') {
-        const match = frame.message.match(/startup diagnostic: (authentication|arguments|listener|configuration|network|unclassified|no-diagnostic)/)
-        if (match) createFailureDiagnostics.add(match[1])
-      }
+      if (typeof frame.startupDiagnostic === 'string') createFailureDiagnostics.add(frame.startupDiagnostic)
     }
     if (frame?.type !== 'freshAgent.event' || !frame.event || typeof frame.event !== 'object') continue
     const event = frame.event as Record<string, any>
@@ -131,8 +132,8 @@ function ordinaryFreshAgentEventFacts(frames: readonly any[]) {
       case 'freshAgent.stream': counts.stream++; break
       case 'freshAgent.error':
         counts.error++
-        errorCodePresent ||= typeof event.code === 'string'
-        errorMessagePresent ||= typeof event.message === 'string'
+        errorCodePresent ||= event.codePresent === true
+        errorMessagePresent ||= event.messagePresent === true
         break
       case 'freshAgent.session.snapshot': counts.snapshot++; break
       case 'freshAgent.session.changed': counts.changed++; break
@@ -216,7 +217,7 @@ async function paneFor(page: Page, observation: Parameters<typeof observeOwnedFr
   return waitFor('actual fresh pane', () => page.evaluate(observeOwnedFreshBrowserPane, observation))
 }
 
-async function actualCreate(page: Page, rig: ManagedFixtureRig, definition: Definition, wire: WireObservations, splitPaneId?: string) {
+async function actualCreate(page: Page, rig: ManagedFixtureRig, definition: Definition, wire: FreshAgentWireObservations, splitPaneId?: string) {
   const cursor = wire.sent.length
   const beforeSouls = (await rig.inventory()).map(view => view.soulId).sort()
   // The existing harness holds network effects only while the real picker
@@ -238,13 +239,22 @@ async function actualCreate(page: Page, rig: ManagedFixtureRig, definition: Defi
     expect((await rig.inventory()).map(view => view.soulId).sort()).toEqual(beforeSouls)
     const staged = await waitFor('picker-staged fresh pane', () => page.evaluate(stageOwnedFreshBrowserProfile,
       { mode: definition.mode, model: definition.model, effort: definition.effort }))
-    const request = await waitFor('actual UI fresh create request', () => wire.sent.slice(cursor).find(frame => frame.type === 'freshAgent.create' && frame.sessionType === definition.mode) ?? null)
+    const requestCandidate = await waitFor('actual UI fresh create request', () => wire.sent.slice(cursor).find((frame): frame is Extract<FreshAgentWireFrame, { type: 'freshAgent.create' }> => (
+      isWireFrameOfType(frame, 'freshAgent.create') && frame.sessionType === definition.mode
+    )) ?? null)
+    if (typeof requestCandidate.requestId !== 'string') throw new Error('fresh-agent create request has no string request ID')
+    const request = { ...requestCandidate, requestId: requestCandidate.requestId }
     expect(request.requestId).toBe(staged.createRequestId)
     const reply = await waitFor('actual UI fresh create result', () => {
-      const outcome = findFreshAgentCreateOutcome(wire.received, request.requestId)
-      if (outcome?.kind === 'failed') throw new Error(`fresh-agent create failed (${outcome.code})`)
-      return outcome?.kind === 'created' ? outcome.reply : null
+      const failed = wire.received.find((frame): frame is Extract<FreshAgentWireFrame, { type: 'freshAgent.create.failed' }> => (
+        isWireFrameOfType(frame, 'freshAgent.create.failed') && frame.requestId === request.requestId
+      ))
+      if (failed) throw new Error(`fresh-agent create failed (${failed.code ?? 'UNKNOWN'})`)
+      return wire.received.find((frame): frame is Extract<FreshAgentWireFrame, { type: 'freshAgent.created' }> => (
+        isWireFrameOfType(frame, 'freshAgent.created') && frame.requestId === request.requestId
+      )) ?? null
     })
+    if (reply.requestId !== request.requestId) throw new Error('fresh-agent create reply request ID differs')
     const view = await waitFor('actual supervised UI native allocation', async () => {
       const value = await rig.runningViewForFreshSession(reply.sessionId)
       return value?.nativeSessionId && value.containerId ? value : null
@@ -263,7 +273,7 @@ async function reloadOwnedBrowser(page: Page, rig: ManagedFixtureRig) {
   await new TestHarness(page).waitForConnection()
 }
 
-async function qualify(page: Page, rig: ManagedFixtureRig, definition: Definition, wire: WireObservations): Promise<FreshAgentQualificationRow> {
+async function qualify(page: Page, rig: ManagedFixtureRig, definition: Definition, wire: FreshAgentWireObservations): Promise<FreshAgentQualificationRow> {
   const initial = await actualCreate(page, rig, definition, wire)
   let main = initial.view
   const collection = await rig.registerFreshNativeCollection(rig.exactRuntimeHandle(main), 'codename-' + randomBytes(16).toString('hex'))
@@ -277,10 +287,14 @@ async function qualify(page: Page, rig: ManagedFixtureRig, definition: Definitio
   await rig.observeFreshBrowserIngress(rig.exactRuntimeHandle(other), id, { ingress: 'browser-split', request: auxiliary.request, reply: auxiliary.reply })
   const ui = await rig.registerFreshBrowserTurn(rig.exactRuntimeHandle(other), id)
   const sendCursor = wire.sent.length
-  await sendBrowserNoToolTurn(page, auxiliary.paneId, ui.prompt!)
+  await sendBrowserNoToolTurn(page, auxiliary.paneId, ui.prompt!, wire)
   const sentPane = await paneFor(page, auxiliary.paneObservation)
-  const send = await waitFor('browser composer send', () => wire.sent.slice(sendCursor).find(frame => frame.type === 'freshAgent.send' && frame.sessionId === sentPane.sessionId) ?? null)
-  const accepted = await waitFor('browser composer accepted', () => wire.received.find(frame => frame.type === 'freshAgent.send.accepted' && frame.requestId === send.requestId) ?? null)
+  const send = await waitFor('browser composer send', () => wire.sent.slice(sendCursor).find((frame): frame is Extract<FreshAgentWireFrame, { type: 'freshAgent.send' }> => (
+    isWireFrameOfType(frame, 'freshAgent.send') && frame.sessionId === sentPane.sessionId
+  )) ?? null)
+  const accepted = await waitFor('browser composer accepted', () => wire.received.find((frame): frame is Extract<FreshAgentWireFrame, { type: 'freshAgent.send.accepted' }> => (
+    isWireFrameOfType(frame, 'freshAgent.send.accepted') && frame.requestId === send.requestId
+  )) ?? null)
   await rig.finishFreshBrowserTurn(rig.exactRuntimeHandle(other), ui.challengeId, send, accepted)
 
   // Each alias doorway is invoked separately against the existing root. It needs no additional model call.
@@ -304,18 +318,26 @@ async function qualify(page: Page, rig: ManagedFixtureRig, definition: Definitio
   const historyCursor = wire.sent.length
   await openFreshHistorySession(page, { repoRoot: rig.repoRoot, provider: definition.provider, nativeSessionId: main.nativeSessionId! })
   const historyPane = await paneFor(page, initial.paneObservation)
-  const historyRequest = await waitFor('actual history resume route', () => wire.sent.slice(historyCursor).find(frame =>
-    frame.type === 'freshAgent.create' && frame.sessionRef?.sessionId === main.nativeSessionId
-    || frame.type === 'freshAgent.attach' && frame.sessionId === historyPane.sessionId) ?? null)
+  const historyRequest = await waitFor('actual history resume route', () => wire.sent.slice(historyCursor).find((frame): frame is (
+    Extract<FreshAgentWireFrame, { type: 'freshAgent.create' }> | Extract<FreshAgentWireFrame, { type: 'freshAgent.attach' }>
+  ) => (
+    isWireFrameOfType(frame, 'freshAgent.create') && frame.sessionRef?.sessionId === main.nativeSessionId
+  ) || (
+    isWireFrameOfType(frame, 'freshAgent.attach') && frame.sessionId === historyPane.sessionId
+  )) ?? null)
   const historyReply = historyRequest.type === 'freshAgent.create' ? await waitFor('actual history create reply',
-    () => wire.received.find(frame => frame.type === 'freshAgent.created' && frame.requestId === historyRequest.requestId) ?? null) : undefined
+    () => wire.received.find((frame): frame is Extract<FreshAgentWireFrame, { type: 'freshAgent.created' }> => (
+      isWireFrameOfType(frame, 'freshAgent.created') && frame.requestId === historyRequest.requestId
+    )) ?? null) : undefined
   await rig.observeFreshBrowserIngress(rig.exactRuntimeHandle(main), id, { ingress: 'history-resume', request: historyRequest, ...(historyReply ? { reply: historyReply } : {}) })
 
   const attachCursor = wire.sent.length
   await rig.crashAndRestartWeb()
   await reloadOwnedBrowser(page, rig)
   const reconnectedPane = await paneFor(page, initial.paneObservation)
-  const attach = await waitFor('actual reconnect attach', () => wire.sent.slice(attachCursor).find(frame => frame.type === 'freshAgent.attach' && frame.sessionId === reconnectedPane.sessionId) ?? null)
+  const attach = await waitFor('actual reconnect attach', () => wire.sent.slice(attachCursor).find(frame => (
+    isWireFrameOfType(frame, 'freshAgent.attach') && frame.sessionId === reconnectedPane.sessionId
+  )) ?? null)
   await rig.observeFreshBrowserIngress(rig.exactRuntimeHandle(main), id, { ingress: 'ws-attach', request: attach })
   await rig.restartSupervisor()
   await rig.crashRuntimeHost(rig.exactRuntimeHandle(main))
@@ -331,6 +353,8 @@ async function qualify(page: Page, rig: ManagedFixtureRig, definition: Definitio
       const { paneId } = await paneFor(page, auxiliary.paneObservation)
       const composer = page.locator('[data-pane-id="' + paneId + '"]').getByRole('textbox', { name: 'Chat message input' })
       await expect(composer).toBeEnabled()
+      if (!challenge.prompt) throw new Error('approval challenge has no controlled prompt')
+      await wire.allowSendPrompt(challenge.prompt)
       await composer.fill(challenge.prompt!)
       await composer.press('Enter')
       await rig.captureFreshApprovalCheckpoint(rig.exactRuntimeHandle(other), challenge.challengeId)
@@ -345,8 +369,9 @@ async function qualify(page: Page, rig: ManagedFixtureRig, definition: Definitio
       const decisionCursor = wire.sent.length
       const decisionPane = page.locator('[data-pane-id="' + (await paneFor(page, auxiliary.paneObservation)).paneId + '"]')
       await decisionPane.getByRole('button', { name: allowed ? 'Allow tool use' : 'Deny tool use', exact: true }).click()
-      const decision = await waitFor('actual current browser approval response', () => wire.sent.slice(decisionCursor).find(frame =>
-        frame.type === 'freshAgent.approval.respond' && String(frame.requestId) === current.decisionId) ?? null)
+      const decision = await waitFor('actual current browser approval response', () => wire.sent.slice(decisionCursor).find(frame => (
+        isWireFrameOfType(frame, 'freshAgent.approval.respond') && String(frame.requestId) === current.decisionId
+      )) ?? null)
       await rig.finishFreshApproval(rig.exactRuntimeHandle(other), challenge.challengeId, decision)
     }
   }
@@ -373,7 +398,7 @@ test.describe.serial('authentic fresh-agent qualification', () => {
     })
     await rig.validateFreshAgentIngressInventory()
     const rows: FreshAgentQualificationRow[] = []
-    const wire = observeBrowserWire(page)
+    const wire = await observeFreshAgentBrowserWire(page)
     try {
       const info = await rig.start()
       process.env.FRESHELL_URL = info.baseUrl
@@ -411,7 +436,7 @@ test.describe.serial('ordinary fresh-agent use', () => {
         effort: row.effort === 'provider-default' ? undefined : row.effort,
       }])),
     })
-    const wire = observeBrowserWire(page)
+    const wire = await observeFreshAgentBrowserWire(page)
     try {
       const info = await rig.start()
       process.env.FRESHELL_URL = info.baseUrl
@@ -464,14 +489,16 @@ test.describe.serial('ordinary fresh-agent use', () => {
           progress.stage = 'waiting_for_send_frame'
           const sent = await waitFor('actual fresh-agent composer send', () => wire.sent
             .slice(sendCursor)
-            .find((frame) => frame.type === 'freshAgent.send') ?? null)
+            .find((frame): frame is Extract<FreshAgentWireFrame, { type: 'freshAgent.send' }> => (
+              isWireFrameOfType(frame, 'freshAgent.send')
+            )) ?? null)
           progress.sendObserved = true
           if (!allocationSessionIds.has(sent.sessionId)) {
             throw new Error('fresh-agent send was not associated with the selected allocation')
           }
           await waitFor(`${definition.mode} completed answer`, async () => {
-            const turnFrames = wire.received.slice(turnReceivedCursor).filter((frame) => (
-              frame.type === 'freshAgent.event' && frame.sessionId === sent.sessionId
+            const turnFrames = wire.received.slice(turnReceivedCursor).filter((frame): frame is Extract<FreshAgentWireFrame, { type: 'freshAgent.event' }> => (
+              isWireFrameOfType(frame, 'freshAgent.event') && frame.sessionId === sent.sessionId
             ))
             if (turnFrames.some((frame) => frame.event?.type === 'freshAgent.error')) {
               throw new Error('fresh-agent turn emitted a correlated provider error')
@@ -503,7 +530,9 @@ test.describe.serial('ordinary fresh-agent use', () => {
           let readiness = null
           if (paneId) {
             const attachSessions = wire.sent.slice(createSentCursor)
-              .filter((frame) => frame?.type === 'freshAgent.attach' && typeof frame.sessionId === 'string')
+              .filter((frame): frame is Extract<FreshAgentWireFrame, { type: 'freshAgent.attach' }> => (
+                isWireFrameOfType(frame, 'freshAgent.attach')
+              ))
               .map((frame) => ({ sessionId: frame.sessionId as string, sessionType: frame.sessionType, provider: frame.provider }))
             try { readiness = await page.evaluate(ordinaryFreshAgentReadinessFacts, { paneId, attachSessions }) } catch { /* preserve the ordinary-turn failure */ }
           }
