@@ -345,6 +345,7 @@ mod tests {
     /// disk must NOT be recorded as complete -- Node aborts before
     /// markMigrationDone and retries next boot. Self-skips when the process
     /// can write through a read-only dir (e.g. root/CAP_DAC_OVERRIDE).
+    #[cfg(unix)]
     #[tokio::test]
     async fn cleanup_skips_marker_when_clears_cannot_persist() {
         use std::os::unix::fs::PermissionsExt;

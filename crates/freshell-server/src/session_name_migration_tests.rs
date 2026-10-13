@@ -1086,6 +1086,7 @@ async fn cleanup_removes_only_title_fields_and_preserves_row_data() {
 /// Fault after the canonical commit before cleanup: the receipt stands, a
 /// later boot finishes the cleanup idempotently, and no duplicate
 /// consolidation runs.
+#[cfg(unix)]
 #[tokio::test]
 async fn fault_after_commit_before_cleanup_finishes_idempotently() {
     let (tmp, home) = fresh_home();

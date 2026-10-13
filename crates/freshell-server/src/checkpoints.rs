@@ -26,7 +26,9 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(unix)]
+use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::routing::get as get_method;
@@ -7228,6 +7230,43 @@ mod tests {
     #[test]
     fn windows_user_without_a_profile_fails_closed() {
         assert!(windows_account_home_for_owner_kind(WindowsAccountOwnerKind::User, None).is_err());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_system_profile_is_rejected_as_checkpoint_scope() {
+        let system_root = std::env::var_os("SystemRoot").expect("Windows sets SystemRoot");
+        let system_profile = PathBuf::from(system_root)
+            .join("System32")
+            .join("config")
+            .join("systemprofile");
+        let canonical_profile = std::fs::canonicalize(&system_profile)
+            .expect("the Windows SYSTEM profile directory exists");
+        let server_home = tempfile::tempdir().unwrap();
+        let lookup = |path: &Path| account_home_for_directory(path);
+
+        let owner_home = account_home_for_directory(&system_profile)
+            .expect("native owner SID and ProfileList lookups succeed")
+            .expect("the well-known SYSTEM SID has a registered profile");
+        assert_eq!(owner_home, canonical_profile);
+        assert!(account_home_checkpoint_path_with_lookup(&system_profile, &lookup).unwrap());
+
+        let intent = json!({
+            "path": system_profile,
+            "provenance": "directory-picker",
+        });
+        let launch_cwd = Path::new(intent["path"].as_str().unwrap());
+        assert!(
+            resolve_checkpoint_workspace_with_account_home(
+                server_home.path(),
+                launch_cwd,
+                Some(&intent),
+                &lookup,
+            )
+            .await
+            .is_err(),
+            "a selected SYSTEM profile must never become a checkpoint workspace"
+        );
     }
 
     #[tokio::test]
