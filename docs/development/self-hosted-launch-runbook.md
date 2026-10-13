@@ -76,12 +76,12 @@ confirms the home root's group traversal afterward.
 
 ## Redeploy managed runtime (build, units, restart effects)
 
-The managed runtime spans THREE binaries, one opt-in feature flag, and two
-systemd user units. A server-only rebuild or restart is NOT enough to change
-soul behavior — and a plain rebuild silently loses it.
+The managed runtime spans three binaries, a pinned workload image, one opt-in
+feature flag, and two systemd user units. A server-only rebuild or restart is
+NOT enough to change soul behavior — and a plain rebuild silently loses it.
 
-**Build surface.** Build all three from the repo root when any of them
-changes:
+**Build surface.** Build all three binaries from the repo root when any of
+them changes:
 
 ```bash
 cargo build --release -p freshell-server -p freshell-supervisor \
@@ -101,6 +101,16 @@ cargo build --release -p freshell-server -p freshell-supervisor \
   creation (the supervisor's `--host-binary` argument). New souls pick the
   new binary automatically; running souls keep the one they were created
   with until their next incarnation.
+- The WORKLOAD IMAGE is a fourth deploy surface: every soul runs the image
+  recorded in `~/.config/freshell/managed-runtime.env` as
+  `FRESHELL_RUNTIME_IMAGE` (an immutable `sha256:` ID — build it from
+  `docker/runtime/Dockerfile` per
+  [managed-runtime-rollout.md](managed-runtime-rollout.md)). Rebuilding the
+  Rust binaries never updates it. To deploy image changes: build the new
+  image, record its `sha256:` ID in that file, and restart
+  `freshell-supervisor.service` (the unit reads the file at start). New
+  souls use the new image; running souls keep theirs until their next
+  incarnation.
 
 **Units and restart coupling.** With the systemd topology
 (`installers/systemd/freshell-rust.service` + its `managed-runtime.conf`
@@ -115,6 +125,10 @@ drop-in, plus `freshell-supervisor.service`):
   server-only changes.
 - Restarting the production server always requires the user's explicit
   approval (`APPROVED`), including the coupled bounce above.
+- The deployed unit's port wins: the checked-in installer unit defaults to
+  `PORT=3002`, while this host's installed unit serves `PORT=3001`. The
+  commands below use 3001 — substitute the port the deployed unit actually
+  sets.
 
 **What a restart does:**
 
@@ -124,12 +138,17 @@ drop-in, plus `freshell-supervisor.service`):
   connect; the supervisor re-verifies each running container against its
   persisted creation-time state, so pre-restart souls pass with no
   migration. Souls keep the mounts they were created with (running souls
-  gain the operator-home mount only at their next incarnation).
-- **Non-soul terminals end.** Host terminals (shell panes and host-run CLI
-  panes) are child processes of the server, so a restart terminates them.
-  Their panes rehydrate as exited terminals; resume those conversations
-  through the CLI's own durable storage (`claude --resume`,
-  `codex resume`, opencode's session picker), not through Freshell.
+  gain the operator-home mount only at their next incarnation). With the
+  managed runtime live this includes SHELL panes — `shell` mode routes
+  through souls, so shells survive the restart and reattach like any other
+  soul-backed pane.
+- **Host-side terminals end.** Only terminals the server hosts as its own
+  child processes die with it: panes created while the feature was missing
+  (they silently spawned host-side), panes from clients that did not
+  negotiate `managedRuntimeV1`, and host-run CLI panes. Their panes
+  rehydrate as exited terminals; resume those conversations through the
+  CLI's own durable storage (`claude --resume`, `codex resume`, opencode's
+  session picker), not through Freshell.
 
 **Post-deploy verification checklist:**
 
@@ -151,8 +170,13 @@ drop-in, plus `freshell-supervisor.service`):
    `FRESHELL_OPERATOR_HOME_MOUNT=1` marker env (`docker inspect`), and that
    its session host emitted one `operator_home_readiness` event
    (`docker exec <container> cat /run/freshell/host-lifecycle.jsonl`). Close
-   the probe pane afterward; its container is collected by the idle
-   reaper after the idle timeout, not immediately on close.
+   the probe pane afterward. The probe soul is NOT auto-collected: the
+   server's idle reaper explicitly skips managed terminals (their lifetime
+   is supervisor-owned) and the supervisor has no idle reaper, so the
+   container persists as a durable background session — the same lifecycle
+   as any closed pane's soul. To remove it immediately, `docker stop` the
+   container; a later reattach mints a new incarnation rather than resuming
+   it.
 
 ## Launch the native Windows client
 
