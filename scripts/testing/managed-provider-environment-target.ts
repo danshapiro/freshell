@@ -250,12 +250,19 @@ async function webChildren(rig: ManagedRuntimeBrowserRig): Promise<number[]> {
   return [...children].sort((left, right) => left - right)
 }
 
-async function configure(root: string, nonce: string, candidateSha: string, runId: string) {
-  const home = path.join(root, 'home'), xdg = path.join(home, 'fixture-xdg'), workspace = path.join(root, 'workspace')
-  const resources = path.join(workspace, 'selected-resources'), plugin = path.join(resources, 'fixture-plugin')
+export function managedEnvironmentFixtureLayout(root: string) {
+  const workspace = path.join(root, 'workspace')
+  const resources = path.join(root, 'selected-resources')
+  const plugin = path.join(resources, 'fixture-plugin')
   const mcpPackage = path.join(resources, 'fixture-mcp')
   const mcpNested = path.join(mcpPackage, 'nested')
   const mcpParentDependency = path.join(resources, 'node_modules/managed-fixture-mcp-dependency')
+  return { workspace, resources, plugin, mcpPackage, mcpNested, mcpParentDependency }
+}
+
+async function configure(root: string, nonce: string, candidateSha: string, runId: string) {
+  const home = path.join(root, 'home'), xdg = path.join(home, 'fixture-xdg')
+  const { workspace, resources, plugin, mcpPackage, mcpNested, mcpParentDependency } = managedEnvironmentFixtureLayout(root)
   await fs.mkdir(path.join(plugin, 'node_modules/managed-fixture-dependency'), { recursive: true, mode: 0o755 })
   await fs.mkdir(mcpNested, { recursive: true, mode: 0o755 })
   await fs.mkdir(mcpParentDependency, { recursive: true, mode: 0o755 })
@@ -848,7 +855,7 @@ export async function runCodeCheckpointTarget() {
       `FRESHELL_LOG_DIR=${checkpointFixtureRoot}/storage/logs`,
       'FRESHELL_CLIENT_DIR=/checkpoint-target/client',
       'CODEX_CMD=/checkpoint-target/fake-codex',
-      'FAKE_CODEX_APP_SERVER_BEHAVIOR={"recordTurns":true,"uniqueThreadIds":true}',
+      'FAKE_CODEX_APP_SERVER_BEHAVIOR={"recordTurns":true,"uniqueThreadIds":true,"persistRolloutUserMessages":true}',
       'FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES=1',
       `FRESHELL_CHECKPOINT_FIXTURE_ROOT=${checkpointFixtureRoot}`,
       `FRESHELL_CHECKPOINT_FIXTURE_UID=${identity.uid}`,

@@ -1,10 +1,12 @@
 import { spawn } from 'node:child_process'
 import fs from 'node:fs/promises'
 import { createConnection, createServer, type AddressInfo } from 'node:net'
+import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
   checkpointTcpForwarderSource,
   externalTargetRead,
+  managedEnvironmentFixtureLayout,
   processIdentity,
   resolveManagedProviderEnvironmentTargetMode,
   runManagedProviderEnvironmentTarget,
@@ -45,6 +47,13 @@ describe('managed provider environment target mode', () => {
   it('keeps the existing managed target as the default and selects checkpoint only explicitly', () => {
     expect(resolveManagedProviderEnvironmentTargetMode([])).toBe('managed-environment')
     expect(resolveManagedProviderEnvironmentTargetMode(['--checkpoint'])).toBe('code-checkpoint')
+  })
+
+  it('keeps the OpenCode MCP package and parent dependency outside the mounted workspace', () => {
+    const fixture = managedEnvironmentFixtureLayout('/tmp/managed-environment-fixture')
+    const packageRelativeToWorkspace = path.relative(fixture.workspace, fixture.mcpPackage)
+    expect(packageRelativeToWorkspace.startsWith(`..${path.sep}`) || path.isAbsolute(packageRelativeToWorkspace)).toBe(true)
+    expect(fixture.mcpParentDependency).toBe(path.join(fixture.resources, 'node_modules/managed-fixture-mcp-dependency'))
   })
 
   it('forwards one fixed TCP target while preserving streamed client data', async () => {

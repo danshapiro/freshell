@@ -570,6 +570,18 @@ test('picker-confirmed HOME captures and restores a harmless home file', async (
     .toBeVisible()
   await assertNativeUserIdentity(page, turn.outcome, turn.accepted.submittedTurnId, marker)
 
+  const query = new URLSearchParams({
+    cwd: fixture.syntheticHomePath,
+    workspacePath: fixture.syntheticHomePath,
+    workspaceProvenance: 'directory-picker',
+  })
+  const listUrl = `${paired!.targetUrl}/api/fresh-agent/checkpoints?${query}`
+  const capturedList = await page.request.get(listUrl, { headers, timeout: 30_000 })
+  expect(capturedList.ok()).toBe(true)
+  expect(await capturedList.json()).toMatchObject({
+    checkpoints: [expect.objectContaining({ id: turn.outcome.checkpointId })],
+  })
+
   await targetWrite(page, homeFile, 'home file changed after send\n')
   await turn.row.hover()
   const rewindNotice = expect(paneRoot.getByRole('alert').filter({ hasText: /Code rewound to before:/ }))
@@ -579,13 +591,7 @@ test('picker-confirmed HOME captures and restores a harmless home file', async (
   await Promise.all([dialogAccepted, rewindNotice])
   await expect.poll(() => targetRead(page, homeFile)).toBe('home file before checkpoint\n')
 
-  const query = new URLSearchParams({
-    cwd: fixture.syntheticHomePath,
-    workspacePath: fixture.syntheticHomePath,
-    workspaceProvenance: 'directory-picker',
-  })
-  const list = await page.request.get(`${paired!.targetUrl}/api/fresh-agent/checkpoints?${query}`,
-    { headers, timeout: 30_000 })
+  const list = await page.request.get(listUrl, { headers, timeout: 30_000 })
   expect(list.ok()).toBe(true)
   expect(await list.json()).toMatchObject({ checkpoints: [expect.objectContaining({ id: turn.outcome.checkpointId })] })
   const workspaceKey = createHash('sha1').update(resolve(fixture.syntheticHomePath)).digest('hex').slice(0, 16)

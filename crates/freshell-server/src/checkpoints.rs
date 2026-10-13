@@ -7311,6 +7311,48 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{entry}");
         assert_eq!(entry["workspace"]["path"], json!(home_dir.path()));
         assert_eq!(entry["workspace"]["provenance"], json!("directory-picker"));
+        let checkpoint_id = entry["id"].as_str().unwrap().to_string();
+
+        tokio::fs::write(home_dir.path().join("private.txt"), "changed after capture")
+            .await
+            .unwrap();
+        restore_checkpoint(home_dir.path(), home_dir.path(), &checkpoint_id)
+            .await
+            .expect("the selected HOME checkpoint restores");
+        assert_eq!(
+            tokio::fs::read_to_string(home_dir.path().join("private.txt"))
+                .await
+                .unwrap(),
+            "private"
+        );
+
+        let list_params = HashMap::from([
+            (
+                "cwd".to_string(),
+                home_dir.path().to_string_lossy().into_owned(),
+            ),
+            (
+                "workspacePath".to_string(),
+                home_dir.path().to_string_lossy().into_owned(),
+            ),
+            (
+                "workspaceProvenance".to_string(),
+                "directory-picker".to_string(),
+            ),
+        ]);
+        let listed = get_checkpoints(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Query(list_params),
+        )
+        .await;
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed = body_json(listed).await;
+        assert!(listed["checkpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|checkpoint| { checkpoint["id"].as_str() == Some(checkpoint_id.as_str()) }));
 
         let git_dir = checkpoint_git_dir(home_dir.path(), home_dir.path());
         let index = checkpoint_index_entries(&git_dir, &git_dir.join("index"))
