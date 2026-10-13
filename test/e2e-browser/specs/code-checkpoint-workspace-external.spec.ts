@@ -1,4 +1,5 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
+import { resolve } from 'node:path'
 import { resolvePairedExternalFixture } from '../../../scripts/testing/e2e-external-target.js'
 import { test, expect } from '../helpers/fixtures.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
@@ -369,25 +370,47 @@ test('picker-confirmed non-Git workspace captures and restores all selected file
   expect(afterRestore.content.checkpointWorkspace).toEqual({ path: fixture.nonGitWorkspacePath, provenance: 'directory-picker' })
 })
 
-test('HOME confirmation is launch-only and an accepted send has no checkpoint', async ({ page }) => {
+test('picker-confirmed HOME captures and restores a harmless home file', async ({ page }) => {
   test.setTimeout(240_000)
   await verifyTarget(page)
+  const homeFile = `${fixture.syntheticHomePath}/checkpoint-home-file.txt`
+  await targetWrite(page, homeFile, 'home file before checkpoint\n')
   const { paneRoot, content } = await launchCodex(page, fixture.syntheticHomePath)
   expect(content.initialCwd).toBe(fixture.syntheticHomePath)
-  expect(content.checkpointWorkspace).toBeUndefined()
+  expect(content.checkpointWorkspace).toEqual({
+    path: fixture.syntheticHomePath,
+    provenance: 'directory-picker',
+  })
   const marker = `checkpoint home ${fixture.expectedNonce}`
-  const turn = await sendThroughComposer(page, paneRoot, marker, undefined)
-  expect(turn.outcome).toMatchObject({ status: 'unavailable', code: 'workspace_unavailable' })
-  expect(turn.outcome.reason).toMatch(/no eligible code workspace is available/i)
-  expect(turn.sent.checkpointIntent).not.toHaveProperty('workspace')
-  await expect(turn.row.getByRole('note', { name: 'Code rewind unavailable for this message' }))
-    .toContainText(turn.outcome.reason!)
-  await turn.row.hover()
-  await expect(turn.row.getByRole('button', { name: 'Rewind unavailable for this message' })).toBeDisabled()
+  const turn = await sendThroughComposer(page, paneRoot, marker,
+    { path: fixture.syntheticHomePath, provenance: 'directory-picker' })
+  expect(turn.outcome).toMatchObject({ status: 'available', workspace: {
+    path: fixture.syntheticHomePath, provenance: 'directory-picker',
+  } })
+  expect(turn.outcome.checkpointId).toMatch(/^[a-f0-9]{40}$/)
+  await expect(turn.row.getByRole('status', { name: 'Code rewind available for this message' }))
+    .toBeVisible()
+  await assertNativeUserIdentity(page, turn.outcome, turn.accepted.submittedTurnId, marker)
 
-  const list = await page.request.get(`${paired!.targetUrl}/api/fresh-agent/checkpoints?cwd=${encodeURIComponent(fixture.syntheticHomePath)}`,
+  await targetWrite(page, homeFile, 'home file changed after send\n')
+  await turn.row.hover()
+  const rewindNotice = expect(paneRoot.getByRole('alert').filter({ hasText: /Code rewound to before:/ }))
+    .toContainText('Automatic pre-turn snapshot', { timeout: 30_000 })
+  const dialogAccepted = page.waitForEvent('dialog').then(dialog => dialog.accept())
+  await turn.row.getByRole('button', { name: 'Rewind code to here' }).click()
+  await Promise.all([dialogAccepted, rewindNotice])
+  await expect.poll(() => targetRead(page, homeFile)).toBe('home file before checkpoint\n')
+
+  const query = new URLSearchParams({
+    cwd: fixture.syntheticHomePath,
+    workspacePath: fixture.syntheticHomePath,
+    workspaceProvenance: 'directory-picker',
+  })
+  const list = await page.request.get(`${paired!.targetUrl}/api/fresh-agent/checkpoints?${query}`,
     { headers, timeout: 30_000 })
   expect(list.ok()).toBe(true)
-  expect(await list.json()).toEqual({ checkpoints: [] })
-  expect(await targetRead(page, `${fixture.syntheticHomePath}/.freshell/checkpoints/HEAD`)).toBeUndefined()
+  expect(await list.json()).toMatchObject({ checkpoints: [expect.objectContaining({ id: turn.outcome.checkpointId })] })
+  const workspaceKey = createHash('sha1').update(resolve(fixture.syntheticHomePath)).digest('hex').slice(0, 16)
+  expect(await targetRead(page,
+    `${fixture.syntheticHomePath}/.freshell/checkpoints/${workspaceKey}.git/HEAD`)).toBeTruthy()
 })
