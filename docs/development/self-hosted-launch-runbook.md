@@ -1012,11 +1012,18 @@ print("stopped browser soul:", o["outcome"])'
     # about-to-be-deleted workspace:
     if [ -n "${BWS:-}" ]; then
       for i in $(seq 1 15); do
-        CUR=$(curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" http://127.0.0.1:3001/api/settings \
-          | python3 -c 'import json,sys
-d=json.load(sys.stdin); d=d.get("data",d)
-cur=(d.get("codingCli") or {}).get("providers",{}).get("opencode",{}).get("cwd")
-print("" if cur is None else cur)')
+        SETTINGS_CODE=$(curl -s --connect-timeout 5 --max-time 10 \
+          -o "$D/settings.json" -w '%{http_code}' -H @"$D/hdr" \
+          http://127.0.0.1:3001/api/settings)
+        if ! grep -q '^2' <<<"$SETTINGS_CODE"; then sleep 2; continue; fi
+        CUR=$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+assert isinstance(d, dict), "malformed settings response"
+d=d.get("data",d)
+cc=d.get("codingCli")
+assert isinstance(cc, dict), "malformed settings response: no codingCli"
+cur=(cc.get("providers") or {}).get("opencode",{}).get("cwd")
+print("" if cur is None else cur)' "$D/settings.json" 2>/dev/null) || { sleep 2; continue; }
         if [ "$CUR" = "$BWS" ]; then break; fi
         sleep 2
       done
@@ -1037,11 +1044,18 @@ print("" if cur is None else cur)')
       OLD=$(cat "$D/old-opencode-cwd.txt")
       # Restore ONLY if the setting still points at THIS probe's path —
       # a newer user choice made after our read must not be overwritten:
-      CURNOW=$(curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" http://127.0.0.1:3001/api/settings \
-        | python3 -c 'import json,sys
-d=json.load(sys.stdin); d=d.get("data",d)
-cur=(d.get("codingCli") or {}).get("providers",{}).get("opencode",{}).get("cwd")
-print("" if cur is None else cur)')
+      SETTINGS_CODE=$(curl -s --connect-timeout 5 --max-time 10 \
+        -o "$D/settings.json" -w '%{http_code}' -H @"$D/hdr" \
+        http://127.0.0.1:3001/api/settings)
+      grep -q '^2' <<<"$SETTINGS_CODE" || { echo "settings read failed (HTTP $SETTINGS_CODE)"; exit 1; }
+      CURNOW=$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+assert isinstance(d, dict), "malformed settings response"
+d=d.get("data",d)
+cc=d.get("codingCli")
+assert isinstance(cc, dict), "malformed settings response: no codingCli"
+cur=(cc.get("providers") or {}).get("opencode",{}).get("cwd")
+print("" if cur is None else cur)' "$D/settings.json")
       if [ "$CURNOW" != "$BWS" ]; then
         echo "OpenCode default no longer points at the probe path (now '$CURNOW') — leaving the newer value alone"
       else
@@ -1081,13 +1095,37 @@ print("" if cur is None else cur)')
         echo "NOTE: the pre-check OpenCode default was lost with the lost shell — set your preferred default in Settings → Coding CLI → OpenCode"
       fi
     fi
-    rm -f "${RUN:-/nonexistent}/hdr" "$D/hdr"   # scrub NOW; the trap only
-    # fires at shell EXIT, which is too late for $RUN/hdr in a still-
-    # living interactive shell
     # Delete the probe workspaces, and the ROOT only when it holds
     # nothing besides this run's known workspaces — a root with other
     # entries (another workspace, hidden data) is NOT ours to delete:
     rm -rf "$D" "$WS" "${BWS:-}"
+    # POST-DELETION SWEEP: the client's settings save is unawaited, so a
+    # late landing can set the default to the now-DELETED $BWS after all
+    # the pre-restore checks passed. Give it a moment, re-read (verified),
+    # and clear the default if it landed on the probe path:
+    if [ -n "${BWS:-}" ]; then
+      sleep 3
+      SETTINGS_CODE=$(curl -s --connect-timeout 5 --max-time 10 \
+        -o "/tmp/freshell-settings-sweep.json" -w '%{http_code}' -H @"$RUN/hdr" \
+        http://127.0.0.1:3001/api/settings 2>/dev/null) || SETTINGS_CODE=000
+      if grep -q '^2' <<<"$SETTINGS_CODE" 2>/dev/null; then
+        SWEEP_CWD=$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1])); d=d.get("data",d)
+cur=((d.get("codingCli") or {}).get("providers",{}).get("opencode",{}) or {}).get("cwd")
+print("" if cur is None else cur)' /tmp/freshell-settings-sweep.json 2>/dev/null) || SWEEP_CWD=""
+        if [ "$SWEEP_CWD" = "$BWS" ]; then
+          BODY=$(python3 -c 'import json;print(json.dumps({"codingCli":{"providers":{"opencode":{"cwd":None}}}}))')
+          curl -s --connect-timeout 5 --max-time 30 -X PATCH -H @"$RUN/hdr" \
+            -H "Content-Type: application/json" -d "$BODY" \
+            http://127.0.0.1:3001/api/settings > /dev/null
+          echo "NOTE: a late picker save re-pointed OpenCode at the deleted probe dir — cleared; set your default in Settings"
+        fi
+        rm -f /tmp/freshell-settings-sweep.json
+      fi
+    fi
+    rm -f "${RUN:-/nonexistent}/hdr" "$D/hdr" 2>/dev/null   # scrub last —
+    # the sweep above needed $RUN/hdr; the trap alone only fires at shell
+    # EXIT, which is too late in a still-living interactive shell
     if [ -n "${PROBE_ROOT:-}" ]; then
       UNEXPECTED=""
       shopt -s nullglob
@@ -1111,6 +1149,14 @@ print("" if cur is None else cur)')
     records — the soul ID and the tab response — remain in `$D` for the
     documented recheck-and-retry; delete `$D`, `$WS`, and `$BWS`
     manually once BOTH probe souls are resolved.
+
+   HONEST LIMIT on the settings restore: the settings API has no
+   compare-and-swap, so a concurrent writer can still race the
+   read-then-PATCH sequence; the procedure narrows the window (re-read
+   immediately before patching, verified reads, and the post-deletion
+   sweep above) but cannot eliminate a truly concurrent write. The sweep
+   catches saves that land during cleanup; a save landing after the
+   sweep's read is out of the runbook's hands — Settings shows it.
 
    Do NOT `docker stop` a probe container directly — the supervisor
    treats an externally stopped container as an unexpected exit and runs
