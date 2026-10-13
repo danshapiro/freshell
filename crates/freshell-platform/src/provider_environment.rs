@@ -552,8 +552,8 @@ impl Drop for TemporaryProjection {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
-/// Removal authority covers only inodes created by this attempt. Replaced
-/// provider inodes remain on the same filesystem until publication commits.
+/// Removal authority covers only inodes created by this attempt. A hard link
+/// keeps each replaced provider inode available for rollback until commit.
 struct Publication {
     backup: TemporaryProjection,
     created: Vec<PathBuf>,
@@ -1069,7 +1069,10 @@ fn stage_environment_with_publisher(
                         .backup
                         .0
                         .join(publication.replaced.len().to_string());
-                    fs::rename(&destination, &backup)
+                    // Keep the provider-visible leaf in place until rename
+                    // atomically publishes the staged replacement. The hard
+                    // link retains the prior inode for ordinary-error rollback.
+                    fs::hard_link(&destination, &backup)
                         .map_err(|cause| io_error(relative, "retain_replacement", cause))?;
                     publication.replaced.push((destination.clone(), backup));
                 }
@@ -1237,6 +1240,66 @@ mod tests {
         assert_eq!(fs::read(home.join("a-first")).unwrap(), b"new-a-first");
         assert_eq!(fs::read(home.join("z-last")).unwrap(), b"new-z-last");
         assert_eq!(fs::read(home.join("sibling")).unwrap(), b"sibling-nonce");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn abrupt_termination_during_replacement_keeps_existing_leaf() {
+        const CHILD_ROOT: &str = "FRESHELL_PROVIDER_PUBLICATION_CHILD_ROOT";
+        const PUBLISH_REACHED: &str = "publisher-reached";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let source = root.join("source/config.json");
+            let home = root.join("home");
+            let reached = root.join(PUBLISH_REACHED);
+            let _ = copy_environment_with_publisher(
+                &[selection(&source, "config.json")],
+                &home,
+                &[],
+                Default::default(),
+                None,
+                |_, _| {
+                    fs::write(&reached, b"reached").unwrap();
+                    loop {
+                        std::thread::park_timeout(std::time::Duration::from_secs(10));
+                    }
+                },
+            );
+            panic!("child should be killed at the publication boundary");
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let home = root.path().join("home");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&home).unwrap();
+        fs::write(source.join("config.json"), b"replacement").unwrap();
+        fs::write(home.join("config.json"), b"original").unwrap();
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "provider_environment::tests::abrupt_termination_during_replacement_keeps_existing_leaf",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, root.path())
+            .spawn()
+            .unwrap();
+        let reached = root.path().join(PUBLISH_REACHED);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !reached.exists() {
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("child exited before the publication boundary: {status}");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child did not reach the publication boundary"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+        assert_eq!(fs::read(home.join("config.json")).unwrap(), b"original");
     }
 
     fn selection(source: &Path, destination: &str) -> CopySelection {
