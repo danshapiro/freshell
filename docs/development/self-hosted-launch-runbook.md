@@ -278,6 +278,7 @@ drop-in, plus `freshell-supervisor.service`):
    ```bash
    set -euo pipefail   # a failed step must halt, not continue half-named
    D=$(mktemp -d)   # private per-run directory
+   echo "$D" > "$HOME/.freshell/managed-runtime-probe-dir"   # recovery pointer
    CHECKOUT=$(systemctl --user show freshell-rust.service -p WorkingDirectory --value)
    TOK=$(grep -E '^AUTH_TOKEN=' "$CHECKOUT/.env" | cut -d= -f2-)
    umask 077
@@ -305,6 +306,10 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
    whereas every routine or agent-driven runtime API call must use the
    scope-limited OneCLI grant instead (see
    [managed-runtime-rollout.md](managed-runtime-rollout.md)).
+
+   Run steps 5-7 in ONE shell session: the private directory `$D` and its
+   records persist between them. If the shell is lost, the pointer file
+   `~/.freshell/managed-runtime-probe-dir` names the directory.
 
     Then confirm the probe container carries the operator-home bind and the
     `FRESHELL_OPERATOR_HOME_MOUNT=1` marker env (`docker inspect`), and that
@@ -360,7 +365,14 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
 
     ```bash
     set -euo pipefail   # a failed check must halt BEFORE the stop request
-    D=<the step-5 private directory>
+    D=${D:-$(cat "$HOME/.freshell/managed-runtime-probe-dir")}
+    CHECKOUT=$(systemctl --user show freshell-rust.service -p WorkingDirectory --value)
+    # Self-healing retry: the trap removed the header on the previous exit;
+    # recreate it (0600) only when missing:
+    if [ ! -f "$D/hdr" ]; then
+      TOK=$(grep -E '^AUTH_TOKEN=' "$CHECKOUT/.env" | cut -d= -f2-)
+      umask 077; printf 'x-auth-token: %s\n' "$TOK" > "$D/hdr"
+    fi
     trap 'rm -f "$D/hdr"' EXIT   # scrub the token file on every exit path
     SOUL_ID=$(cat "$D/probe-soul-id.txt")
     TID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["data"]["terminalId"])' "$D/probe-tab.json")
@@ -394,17 +406,29 @@ print("stopped:", o["outcome"])'
    automatic recovery path, which may recreate the soul or mark a session
    without a durable resume path as lost. Leaving the probe soul running
    is also fine; it is inert.
- 8. Browser-path check (required when the web client was redeployed): the
+ 8. Browser-path check (required on EVERY managed-runtime redeploy — not
+   only after a client redeploy: any reconnected client can be stale): the
    REST probe in step 5 deliberately bypasses WebSocket capability
    negotiation, so it can pass while a stale browser client still creates
-   host-side panes. Hard-refresh the web client, create a terminal pane
-   FROM THE UI, and confirm that pane also gets a soul: snapshot
-   `GET /api/runtime/souls` before and after, and a newly appeared soul
-   matching the moment of pane creation is the pass; no new soul (and no
-   host-side process instead) means the client is stale or not
-   negotiating `managedRuntimeV1` — rebuild/redeploy the client and
-   hard-refresh again. Close the test pane (and stop its soul per step 7
-   if desired).
+   host-side panes. Hard-refresh the web client, then create a terminal
+   pane FROM THE UI in a distinctive throwaway workspace used only by
+   this check (for example `mkdir -p ~/scratch/browser-path-check` and
+   point the pane at it). Prove that exact pane is managed by matching
+   its workspace, not its timing — a soul appearing "around the same
+   moment" proves nothing under concurrency:
+
+   ```bash
+   curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
+     | python3 -c 'import json,sys
+souls=json.load(sys.stdin)["souls"]
+hits=[s for s in souls if s.get("terminalCwd")==sys.argv[1] and s.get("launchState")=="running"]
+assert hits, "no managed soul for the UI pane — client is stale or not negotiating"
+print("UI pane is managed:", hits[0]["soulId"])' ~/scratch/browser-path-check
+   ```
+
+   If the assertion fails, the client is stale or not negotiating
+   `managedRuntimeV1` — rebuild/redeploy the client and hard-refresh
+   again. Close the test pane (and stop its soul per step 7 if desired).
 
 ## Launch the native Windows client
 
