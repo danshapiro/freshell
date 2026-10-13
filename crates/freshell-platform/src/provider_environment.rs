@@ -1699,7 +1699,6 @@ impl EnvironmentPublication {
             relative: PathBuf,
             path: PathBuf,
             backup_id: usize,
-            next_backup_id: usize,
         }
 
         let mut unique = BTreeSet::new();
@@ -1724,7 +1723,7 @@ impl EnvironmentPublication {
 
         let mut candidates = Vec::new();
         let mut scheduled = BTreeSet::new();
-        let first_backup_id = self
+        let mut next_backup_id = self
             .rollback
             .as_ref()
             .map(|publication| publication.next_backup_id)
@@ -1778,17 +1777,14 @@ impl EnvironmentPublication {
                     continue;
                 }
             }
-            let backup_id = first_backup_id
-                .checked_add(candidates.len())
-                .ok_or_else(|| error(&relative, "remove_obsolete", "backup id overflow"))?;
-            let next_backup_id = backup_id
+            let backup_id = next_backup_id;
+            next_backup_id = backup_id
                 .checked_add(1)
                 .ok_or_else(|| error(&relative, "remove_obsolete", "backup id overflow"))?;
             candidates.push(Candidate {
                 relative: relative.clone(),
                 path,
                 backup_id,
-                next_backup_id,
             });
             scheduled.insert(relative);
         }
@@ -1803,6 +1799,10 @@ impl EnvironmentPublication {
                 "new root has no previous projection",
             )
         })?;
+        // Reserve the complete range before journaling it. A partial move can
+        // fail after any candidate, and a later removal must not reuse an ID
+        // already assigned to a still-pending journal entry.
+        publication.next_backup_id = next_backup_id;
         let journal_entries = candidates
             .iter()
             .rev()
@@ -1827,9 +1827,6 @@ impl EnvironmentPublication {
             })?;
             fs::rename(&candidate.path, &backup)
                 .map_err(|cause| io_error(&candidate.relative, "retain_obsolete", cause))?;
-            // A successful move consumes this ID even if a later path fails.
-            // Advance before the next fallible operation so retries cannot reuse it.
-            publication.next_backup_id = candidate.next_backup_id;
             publication
                 .replaced
                 .push((candidate.path.clone(), backup.clone()));
@@ -3060,7 +3057,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn retrying_partial_obsolete_batch_preserves_prior_backup_ids() {
+    fn recovery_reserves_backup_ids_across_partial_obsolete_batch_retry() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
         let source = root.path().join("source");
@@ -3068,6 +3065,7 @@ mod tests {
         fs::create_dir(&source).unwrap();
         fs::write(home.join("old-a"), b"A").unwrap();
         fs::write(home.join("old-b"), b"B").unwrap();
+        fs::write(home.join("old-c"), b"C").unwrap();
         fs::write(source.join("new"), b"new").unwrap();
 
         let mut publication = stage_environment(
@@ -3089,14 +3087,22 @@ mod tests {
         assert_eq!(fs::read(home.join("old-b")).unwrap(), b"B");
 
         fs::remove_dir(&obstructed_backup).unwrap();
-        publication.remove_obsolete_batch(&obsolete).unwrap();
+        publication.remove_obsolete(Path::new("old-c")).unwrap();
+        assert!(!home.join("old-c").exists());
+        publication.remove_obsolete(Path::new("old-b")).unwrap();
+        assert!(!home.join("old-b").exists());
         assert_eq!(fs::read(&first_backup).unwrap(), b"A");
-        assert_eq!(fs::read(backup_path(&backup_root, 2)).unwrap(), b"B");
 
-        drop(publication);
+        // Model process interruption: recovery sees only the durable journal
+        // and backup files, with no in-memory rollback running first.
+        std::mem::forget(publication);
+        recover_environment(&home).unwrap();
+
         assert_eq!(fs::read(home.join("old-a")).unwrap(), b"A");
         assert_eq!(fs::read(home.join("old-b")).unwrap(), b"B");
+        assert_eq!(fs::read(home.join("old-c")).unwrap(), b"C");
         assert!(!home.join("new").exists());
+        assert!(!backup_root.exists());
     }
 
     #[test]
