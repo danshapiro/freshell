@@ -162,10 +162,15 @@ drop-in, plus `freshell-supervisor.service`):
 - Restarting the production server always requires the user's explicit
   approval (`APPROVED`), including the coupled bounce above.
 - When the checked-in unit files or drop-ins under `installers/systemd/`
-  changed, DEPLOY THEM TOO: copy them into `~/.config/systemd/user/`
-  (preserving the `.service.d/` drop-in layout) and run
-  `systemctl --user daemon-reload` before restarting — a restart alone
-  runs the previously installed configuration.
+  changed, DEPLOY THEM TOO — but never blind-copy over the installed
+  units: they can carry site-specific settings (this host's installed
+  unit sets `PORT=3001` where the checked-in unit says `3002`, plus its
+  own `EnvironmentFile` lines). Diff the checked-in file against the
+  installed one, port over only the intended changes, verify the effective
+  unit (`systemctl --user cat freshell-rust.service
+  freshell-supervisor.service`), and run `systemctl --user daemon-reload`
+  before restarting — a restart alone runs the previously installed
+  configuration.
 - The deployed unit's port wins: the checked-in installer unit defaults to
   `PORT=3002`, while this host's installed unit serves `PORT=3001`. The
   commands below use 3001 — substitute the port the deployed unit actually
@@ -177,9 +182,15 @@ drop-in, plus `freshell-supervisor.service`):
   container):
 
   ```bash
-  docker ps -q --filter name=incarnation | xargs docker inspect \
+  set -o pipefail
+  docker ps -q --filter name=incarnation | xargs -r docker inspect \
     --format '{{.Id}} {{.Name}} {{.State.StartedAt}}' | tee /tmp/souls-before.txt
+  test -s /tmp/souls-before.txt || echo "CAPTURE FAILED — do not proceed"
   ```
+
+  `pipefail` plus the non-empty check matter: without them a Docker
+  failure could leave an empty baseline that the later comparison
+  "passes" while proving nothing.
 
 **What a restart does:**
 
@@ -241,6 +252,7 @@ drop-in, plus `freshell-supervisor.service`):
    can stop the other run's soul:
 
    ```bash
+   set -euo pipefail   # a failed step must halt, not continue half-named
    D=$(mktemp -d)   # private per-run directory
    CHECKOUT=$(systemctl --user show freshell-rust.service -p WorkingDirectory --value)
    TOK=$(grep -E '^AUTH_TOKEN=' "$CHECKOUT/.env" | cut -d= -f2-)
@@ -318,24 +330,31 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
     retry with the new revision if needed):
 
     ```bash
+    set -euo pipefail   # a failed check must halt BEFORE the stop request
     SOUL_ID=$(cat "$D/probe-soul-id.txt")
     TID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["data"]["terminalId"])' "$D/probe-tab.json")
+    # Identity re-check FIRST; with set -e its failure aborts the block
+    # before the revision fetch and the stop request are ever reached:
     curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls/$SOUL_ID \
       | python3 -c 'import json,sys
 s=json.load(sys.stdin)["soul"]
 assert s.get("terminalId")==sys.argv[1], ("SOUL/PROBE MISMATCH", s)
-print("revision:", s["intentRevision"])' "$TID"
+print("identity ok:", s.get("terminalId"))' "$TID"
     REV=$(curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls/$SOUL_ID \
       | python3 -c 'import json,sys;print(json.load(sys.stdin)["soul"]["intentRevision"])')
     curl -s -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
       -d "{\"requestId\":\"probe-cleanup\",\"expectedIntentRevision\":$REV}" \
       http://127.0.0.1:3001/api/runtime/souls/$SOUL_ID/stop \
-      | python3 -c 'import json,sys;
+      | python3 -c 'import json,sys
 o=json.load(sys.stdin)
 assert o.get("outcome")=="verified_empty", o
 print("stopped:", o["outcome"])'
-    rm -rf "$D"   # contains the token header file
+    rm -rf "$D"   # contains the token header file; runs only on success
     ```
+
+    If the block aborts before `verified_empty`, `$D` is deliberately
+    left in place — the saved soul ID and header are what the recheck-and-
+    retry needs; delete `$D` manually once the probe soul is resolved.
 
    Do NOT `docker stop` the container directly — the supervisor treats an
    externally stopped container as an unexpected exit and runs its
