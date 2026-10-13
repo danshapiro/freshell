@@ -1300,8 +1300,11 @@ fn insert_direct_script_dependencies(
             .ok_or_else(|| fail("direct MCP script has no containing directory"))?;
         for candidate in direct_script_dependency_paths(parent, &source, runtime).map_err(fail)? {
             let dependency = checked(&candidate, field, declaring)?;
-            if !dependency.is_file() {
-                return Err(fail("direct MCP dependency is not a regular file"));
+            let dependency_is_file = dependency.is_file();
+            if !dependency_is_file && !dependency.is_dir() {
+                return Err(fail(
+                    "direct MCP dependency is neither a regular file nor directory",
+                ));
             }
             if !dependency.starts_with(scope) {
                 return Err(fail(
@@ -1315,7 +1318,9 @@ fn insert_direct_script_dependencies(
                 field,
                 declaring,
             )?;
-            pending.push(dependency);
+            if dependency_is_file {
+                pending.push(dependency);
+            }
         }
     }
     Ok(())

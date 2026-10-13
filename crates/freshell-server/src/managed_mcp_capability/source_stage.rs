@@ -28,13 +28,24 @@ mod configured_resource_tests {
         };
         let mut command = std::process::Command::new(path);
         command.env_clear().env("PATH", search_path);
-        // Match the existing copied-script helper's finite spawn retry, while
-        // retaining this consumer's isolated environment. ETXTBSY has no child.
+        // Retain this consumer's isolated environment while retrying a brief
+        // executable-copy race. A shebang's `/usr/bin/env` can report ETXTBSY
+        // in stderr after the script process itself has already started.
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
         loop {
             match command.output() {
                 Err(error)
                     if error.raw_os_error() == Some(libc::ETXTBSY)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Ok(output)
+                    if !output.status.success()
+                        && output
+                            .stderr
+                            .windows(b"Text file busy".len())
+                            .any(|window| window == b"Text file busy")
                         && std::time::Instant::now() < deadline =>
                 {
                     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1115,6 +1126,44 @@ mod configured_resource_tests {
         let output = output.unwrap();
         assert!(output.status.success(), "{:?}", output.stderr);
         assert_eq!(output.stdout, b"static schema loaded\n");
+    }
+
+    #[test]
+    fn direct_node_script_in_home_keeps_static_import_meta_url_directory_after_all_copies() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let command = home.join("mcp.mjs");
+        let templates = home.join("templates");
+        std::fs::create_dir_all(&templates).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "import { readdirSync } from 'node:fs';\nprocess.stdout.write(readdirSync(new URL('./templates/', import.meta.url)).join(','));\n",
+        )
+        .unwrap();
+        std::fs::write(templates.join("welcome.md"), "welcome").unwrap();
+
+        let (plan, provider_script) =
+            plan_and_stage_direct_mcp_command(owned.path(), &home, &workspace, &command);
+        assert!(plan[0]
+            .configured_resources
+            .contains(&templates.canonicalize().unwrap()));
+        assert!(!plan[0]
+            .configured_resources
+            .contains(&home.canonicalize().unwrap()));
+
+        let hidden_home = owned.path().join("home-hidden");
+        std::fs::rename(&home, &hidden_home).unwrap();
+        let output = std::process::Command::new("node")
+            .arg(&provider_script)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .output();
+        std::fs::rename(&hidden_home, &home).unwrap();
+        let output = output.unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"welcome.md");
     }
 
     #[test]
