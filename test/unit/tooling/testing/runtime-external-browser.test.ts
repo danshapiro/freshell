@@ -998,6 +998,90 @@ describe('candidate-bound Cloud execution events', () => {
   })
 })
 
+describe('body-free ordinary-turn Cloud diagnostics', () => {
+  it('forwards only the fixed setup stage and safe facts from the selected terminal smoke', () => {
+    for (const [key, value] of Object.entries(descriptor)) vi.stubEnv(key, value)
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+    try {
+      const reporter = new runner.default()
+      const testCase = { id: 'ordinary-turn-codex', location: {
+        file: 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts',
+      } } as any
+      reporter.onStdOut(`${JSON.stringify({
+        severity: 'error', event: 'durable_souls.ordinary_turn_failed', lane: 'terminal', provider: 'codex',
+        paneSetupFailureStage: 'managed_runtime_view', ordinaryTurnFailureStage: null,
+        terminalFacts: { available: false }, ordinaryTurnFacts: null,
+        prompt: 'private-prompt-sentinel', providerOutput: 'private-provider-output-sentinel',
+      })}\n`, testCase)
+
+      expect(write).toHaveBeenCalledOnce()
+      const forwarded = JSON.parse(String(write.mock.calls[0][0]))
+      expect(forwarded).toEqual({
+        severity: 'info', runId: descriptor.FRESHELL_RUNTIME_EXTERNAL_RUN_ID,
+        candidateSha: descriptor.FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA,
+        event: 'managed_external_ordinary_turn', id: 'ordinary-turn-codex',
+        file: 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts',
+        sourceEvent: 'durable_souls.ordinary_turn_failed', outcome: 'failed', lane: 'terminal', provider: 'codex',
+        paneSetupFailureStage: 'managed_runtime_view', ordinaryTurnFailureStage: null,
+        terminalFacts: { available: false }, ordinaryTurnFacts: null,
+      })
+      expect(JSON.stringify(forwarded)).not.toContain('private-prompt-sentinel')
+      expect(JSON.stringify(forwarded)).not.toContain('private-provider-output-sentinel')
+    } finally {
+      write.mockRestore()
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it('forwards fixed FreshAgent progress facts without readiness errors or assistant text', () => {
+    for (const [key, value] of Object.entries(descriptor)) vi.stubEnv(key, value)
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+    try {
+      const reporter = new runner.default()
+      const testCase = { id: 'ordinary-turn-freshcodex', location: {
+        file: 'test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts',
+      } } as any
+      const event = JSON.stringify({
+        severity: 'error', event: 'durable_souls.ordinary_turn_failed', lane: 'fresh-agent', mode: 'freshcodex',
+        stage: 'waiting_for_composer', createCompleted: true, composerFilled: false,
+        assistantBaselineKnownEmpty: false, composerSubmitted: false, sendObserved: false,
+        turnCompleteObserved: false, assistantTextDisplayed: false,
+        assistantDom: { available: true, rows: 0, textCharacters: 0, assistantText: 'private-assistant-sentinel' },
+        providerEvents: { counts: { created: 1, createFailed: 0, assistant: 0, stream: 0, error: 0,
+          snapshot: 0, changed: 0, turnComplete: 0, result: 0 }, createFailureCodes: [],
+          createFailureDiagnostics: [], errorCodePresent: false, errorMessagePresent: false,
+          unapproved: 'private-provider-output-sentinel' },
+        readiness: { sessionError: 'private-readiness-sentinel' },
+      })
+      reporter.onStdOut(event.slice(0, 80), testCase)
+      reporter.onStdOut(`${event.slice(80)}\n`, testCase)
+
+      expect(write).toHaveBeenCalledOnce()
+      const forwarded = JSON.parse(String(write.mock.calls[0][0]))
+      expect(forwarded).toEqual({
+        severity: 'info', runId: descriptor.FRESHELL_RUNTIME_EXTERNAL_RUN_ID,
+        candidateSha: descriptor.FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA,
+        event: 'managed_external_ordinary_turn', id: 'ordinary-turn-freshcodex',
+        file: 'test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts',
+        sourceEvent: 'durable_souls.ordinary_turn_failed', outcome: 'failed', lane: 'fresh-agent',
+        mode: 'freshcodex', stage: 'waiting_for_composer', createCompleted: true, composerFilled: false,
+        assistantBaselineKnownEmpty: false, composerSubmitted: false, sendObserved: false,
+        turnCompleteObserved: false, assistantTextDisplayed: false,
+        assistantDom: { available: true, rows: 0, textCharacters: 0 },
+        providerEvents: { counts: { created: 1, createFailed: 0, assistant: 0, stream: 0, error: 0,
+          snapshot: 0, changed: 0, turnComplete: 0, result: 0 }, createFailureCodes: [],
+          createFailureDiagnostics: [], errorCodePresent: false, errorMessagePresent: false },
+      })
+      for (const sentinel of ['private-assistant-sentinel', 'private-provider-output-sentinel', 'private-readiness-sentinel']) {
+        expect(JSON.stringify(forwarded)).not.toContain(sentinel)
+      }
+    } finally {
+      write.mockRestore()
+      vi.unstubAllEnvs()
+    }
+  })
+})
+
 describe('owned stable relay admission and lifetime (transport unit coverage only)', () => {
   it('admits the existing bounded CPU diagnostic and then finishes the owner over actual HTTP', async () => {
     const owned = new ManagedRuntimeOwner(() => { throw new Error('unused relay diagnostic web') }, fixtureRepoRoot)

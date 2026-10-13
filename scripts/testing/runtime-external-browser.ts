@@ -2056,6 +2056,72 @@ const HistoryDiagnosticSchema = z.discriminatedUnion('event', [
 ])
 type HistoryDiagnostic = z.infer<typeof HistoryDiagnosticSchema>
 
+const OrdinaryTerminalProviderSchema = z.enum(['claude', 'codex', 'opencode'])
+const OrdinaryTerminalSetupStageSchema = z.enum(['existing_panes', 'picker_open', 'provider_selection',
+  'directory_dialog', 'pane_creation', 'terminal_visible', 'managed_runtime_view', 'ready'])
+const OrdinaryTerminalTurnStageSchema = z.enum(['attach_ready', 'turn_completion'])
+const OrdinaryTerminalFactsSchema = z.object({
+  available: z.boolean(), provider: OrdinaryTerminalProviderSchema.optional(),
+  providerProcessPresent: z.boolean().optional(), nativeSessionIdPresent: z.boolean().optional(),
+})
+const OrdinaryTerminalTurnFactsSchema = z.object({
+  inputSeen: z.boolean(), activitySeen: z.boolean(), outputSeen: z.boolean(),
+  outputFrameCount: z.number().int().nonnegative().max(10000), completionSeen: z.boolean(),
+})
+const OrdinaryTerminalDiagnosticSchema = z.discriminatedUnion('event', [
+  z.object({ event: z.literal('durable_souls.ordinary_turn_completed'), lane: z.literal('terminal'),
+    provider: OrdinaryTerminalProviderSchema }),
+  z.object({ event: z.literal('durable_souls.ordinary_turn_failed'), lane: z.literal('terminal'),
+    provider: OrdinaryTerminalProviderSchema, paneSetupFailureStage: OrdinaryTerminalSetupStageSchema.nullable().optional(),
+    ordinaryTurnFailureStage: OrdinaryTerminalTurnStageSchema.nullable().optional(),
+    terminalFacts: OrdinaryTerminalFactsSchema.optional(), ordinaryTurnFacts: OrdinaryTerminalTurnFactsSchema.nullable().optional() }),
+])
+const OrdinaryFreshModeSchema = z.enum(['freshclaude', 'freshcodex', 'freshopencode'])
+const OrdinaryFreshStageSchema = z.enum(['creating', 'pane_created', 'waiting_for_composer', 'filling_composer',
+  'pressing_enter', 'waiting_for_send_frame', 'completed'])
+const OrdinaryFreshProviderFailureCodeSchema = z.enum(['FRESH_AGENT_CREATE_FAILED', 'FRESH_AGENT_PROVIDER_START_FAILED'])
+const OrdinaryFreshProviderStartupDiagnosticSchema = z.enum(['authentication', 'arguments', 'listener',
+  'configuration', 'network', 'unclassified', 'no-diagnostic'])
+const OrdinaryFreshCountSchema = z.number().int().nonnegative().max(10000)
+const OrdinaryFreshProviderEventsSchema = z.object({
+  counts: z.object({ created: OrdinaryFreshCountSchema, createFailed: OrdinaryFreshCountSchema,
+    assistant: OrdinaryFreshCountSchema, stream: OrdinaryFreshCountSchema, error: OrdinaryFreshCountSchema,
+    snapshot: OrdinaryFreshCountSchema, changed: OrdinaryFreshCountSchema, turnComplete: OrdinaryFreshCountSchema,
+    result: OrdinaryFreshCountSchema }),
+  createFailureCodes: z.array(OrdinaryFreshProviderFailureCodeSchema).max(8),
+  createFailureDiagnostics: z.array(OrdinaryFreshProviderStartupDiagnosticSchema).max(8),
+  errorCodePresent: z.boolean(), errorMessagePresent: z.boolean(),
+})
+const OrdinaryFreshDiagnosticSchema = z.union([
+  z.object({ event: z.literal('durable_souls.ordinary_turn_completed'), lane: z.literal('fresh-agent'),
+    mode: OrdinaryFreshModeSchema }),
+  z.object({ event: z.literal('durable_souls.ordinary_turn_failed'), lane: z.literal('fresh-agent'),
+    mode: OrdinaryFreshModeSchema, stage: OrdinaryFreshStageSchema,
+    createCompleted: z.boolean(), composerFilled: z.boolean(), assistantBaselineKnownEmpty: z.boolean(),
+    composerSubmitted: z.boolean(), sendObserved: z.boolean(), turnCompleteObserved: z.boolean(), assistantTextDisplayed: z.boolean(),
+    assistantDom: z.object({ available: z.boolean(), rows: OrdinaryFreshCountSchema, textCharacters: OrdinaryFreshCountSchema }),
+    providerEvents: OrdinaryFreshProviderEventsSchema }),
+])
+type ManagedOrdinaryDiagnostic = z.infer<typeof OrdinaryTerminalDiagnosticSchema> | z.infer<typeof OrdinaryFreshDiagnosticSchema>
+
+/** Parse only bounded, body-free observations from the two ordinary-turn smoke specs. */
+export function parseManagedOrdinaryTurnDiagnosticText(text: string): ManagedOrdinaryDiagnostic[] {
+  const events: ManagedOrdinaryDiagnostic[] = []
+  for (const line of text.split('\n')) {
+    if (line.length > 8192) continue
+    const offset = line.indexOf('{')
+    if (offset < 0) continue
+    try {
+      const raw: unknown = JSON.parse(line.slice(offset))
+      const terminal = OrdinaryTerminalDiagnosticSchema.safeParse(raw)
+      if (terminal.success) { events.push(terminal.data); continue }
+      const fresh = OrdinaryFreshDiagnosticSchema.safeParse(raw)
+      if (fresh.success) events.push(fresh.data)
+    } catch { /* unrelated or truncated display line */ }
+  }
+  return events
+}
+
 function historyDirectoryIssues(issues: readonly z.ZodIssue[]): NonNullable<z.infer<typeof HistoryDirectoryFactsSchema>['issues']> {
   return issues.slice(0, 8).map(issue => {
     const code = HistoryIssueCodeSchema.safeParse(issue.code)
@@ -2252,6 +2318,7 @@ export default class ManagedExternalExecutionReporter implements Reporter {
   private cases = 0
   private readonly descriptor = resolveManagedExternalDescriptor(process.env)
   private readonly history = new Map<string, { buffer: string; count: number; active?: Extract<HistoryDiagnostic, { event: 'managed_history_phase' }>; callsite?: z.infer<typeof HistoryCallsiteSchema> }>()
+  private readonly ordinaryTurns = new Map<string, { buffer: string; count: number }>()
 
   printsToStdio(): boolean { return true }
   private emit(event: Record<string, unknown>): void {
@@ -2265,20 +2332,56 @@ export default class ManagedExternalExecutionReporter implements Reporter {
       runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha, id: test.id, ...event })}\n`)
   }
   onStdOut(chunk: string | Buffer, test?: TestCase, _result?: TestResult): void {
-    if (!test || path.basename(test.location.file) !== 'runtime-fresh-agent-fixture-rust.spec.ts') return
-    const state = this.history.get(test.id) ?? { buffer: '', count: 0 }
-    this.history.set(test.id, state)
-    state.buffer = (state.buffer + String(chunk)).slice(-8192)
+    if (!test) return
+    const fileName = path.basename(test.location.file)
+    if (fileName === 'runtime-fresh-agent-fixture-rust.spec.ts') {
+      const state = this.history.get(test.id) ?? { buffer: '', count: 0 }
+      this.history.set(test.id, state)
+      state.buffer = (state.buffer + String(chunk)).slice(-8192)
+      const lines = state.buffer.split('\n')
+      state.buffer = lines.pop()!
+      for (const event of parseManagedHistoryDiagnosticText(lines.join('\n'))) {
+        if (state.count++ >= 256) continue
+        if (event.event === 'managed_history_phase') {
+          if (event.state === 'begin') { state.active = event; state.callsite = event.callsite }
+          else if (event.state === 'end' && state.active?.phase === event.phase && state.active.mode === event.mode) state.active = undefined
+          else if (event.state === 'failed' && state.active?.phase === event.phase && state.active.mode === event.mode) state.active = event
+        }
+        this.emitHistory(test, event)
+      }
+      return
+    }
+    if (fileName !== 'runtime-managed-provider-qualification-rust.spec.ts'
+      && fileName !== 'runtime-fresh-agent-qualification-rust.spec.ts') return
+
+    const state = this.ordinaryTurns.get(test.id) ?? { buffer: '', count: 0 }
+    this.ordinaryTurns.set(test.id, state)
+    state.buffer = (state.buffer + String(chunk)).slice(-16_384)
     const lines = state.buffer.split('\n')
     state.buffer = lines.pop()!
-    for (const event of parseManagedHistoryDiagnosticText(lines.join('\n'))) {
-      if (state.count++ >= 256) continue
-      if (event.event === 'managed_history_phase') {
-        if (event.state === 'begin') { state.active = event; state.callsite = event.callsite }
-        else if (event.state === 'end' && state.active?.phase === event.phase && state.active.mode === event.mode) state.active = undefined
-        else if (event.state === 'failed' && state.active?.phase === event.phase && state.active.mode === event.mode) state.active = event
+    const file = `test/e2e-browser/specs/${fileName}`
+    for (const source of parseManagedOrdinaryTurnDiagnosticText(lines.join('\n'))) {
+      if (state.count++ >= 16) continue
+      const common = { event: 'managed_external_ordinary_turn', id: test.id, file,
+        sourceEvent: source.event, outcome: source.event.endsWith('_failed') ? 'failed' : 'completed', lane: source.lane }
+      if (source.lane === 'terminal' && source.event === 'durable_souls.ordinary_turn_failed') {
+        this.emit({ ...common, provider: source.provider,
+          paneSetupFailureStage: source.paneSetupFailureStage ?? null,
+          ordinaryTurnFailureStage: source.ordinaryTurnFailureStage ?? null,
+          terminalFacts: source.terminalFacts ?? { available: false },
+          ordinaryTurnFacts: source.ordinaryTurnFacts ?? null })
+      } else if (source.lane === 'terminal') {
+        this.emit({ ...common, provider: source.provider })
+      } else if (source.event === 'durable_souls.ordinary_turn_failed') {
+        this.emit({ ...common, mode: source.mode, stage: source.stage,
+          createCompleted: source.createCompleted, composerFilled: source.composerFilled,
+          assistantBaselineKnownEmpty: source.assistantBaselineKnownEmpty, composerSubmitted: source.composerSubmitted,
+          sendObserved: source.sendObserved, turnCompleteObserved: source.turnCompleteObserved,
+          assistantTextDisplayed: source.assistantTextDisplayed, assistantDom: source.assistantDom,
+          providerEvents: source.providerEvents })
+      } else {
+        this.emit({ ...common, mode: source.mode })
       }
-      this.emitHistory(test, event)
     }
   }
   onStepBegin(test: TestCase, _result: TestResult, step: TestStep): void {
@@ -2294,6 +2397,7 @@ export default class ManagedExternalExecutionReporter implements Reporter {
           : history.active?.errorCategory ?? 'operation-error', diagnosticLimitReached: history.count >= 256 })
     }
     this.history.delete(test.id)
+    this.ordinaryTurns.delete(test.id)
     const file = path.basename(test.location.file)
     const titles = test.titlePath()
     const fileIndex = titles.findIndex(title => path.basename(title) === file)
