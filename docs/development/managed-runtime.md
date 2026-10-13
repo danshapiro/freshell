@@ -8,6 +8,13 @@ server built with `managed-runtime-v1`, booted with the runtime controller, and
 a client that negotiated `managedRuntimeV1` can use it. Other routes remain
 legacy.
 
+Deploying or restarting the managed runtime is an operator procedure with its
+own build surface, unit coupling, and restart effects — see "Redeploy managed
+runtime" in the
+[self-hosted launch runbook](self-hosted-launch-runbook.md). The build must
+compile the feature in (`--features freshell-server/managed-runtime-v1`); the
+runtime env var alone arms nothing.
+
 ## Current release qualification
 
 OpenCode 1.18.21 (`openai/gpt-5.6-luna`, using the configured OpenAI OAuth

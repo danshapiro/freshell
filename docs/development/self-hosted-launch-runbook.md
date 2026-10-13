@@ -74,6 +74,82 @@ re-run is the ratified tradeoff, not a gap — the failing provider's error
 names the exact path. The session host's `operator_home_readiness` event
 confirms the home root's group traversal afterward.
 
+## Redeploy managed runtime (build, units, restart effects)
+
+The managed runtime spans THREE binaries, one opt-in feature flag, and two
+systemd user units. A server-only rebuild or restart is NOT enough to change
+soul behavior — and a plain rebuild silently loses it.
+
+**Build surface.** Build all three from the repo root when any of them
+changes:
+
+```bash
+cargo build --release -p freshell-server -p freshell-supervisor \
+  -p freshell-session-host --features freshell-server/managed-runtime-v1
+```
+
+- The server's soul controller is strictly opt-in (`default = []` in
+  `crates/freshell-server/Cargo.toml`). Setting `FRESHELL_MANAGED_RUNTIME_V1=1`
+  in the unit enables nothing by itself — the env var only arms a binary that
+  was compiled with the feature. A server built without it serves fresh panes
+  on the HOST (no soul isolation) and answers `404` on `/api/runtime/*`.
+- The SUPERVISOR creates and owns soul containers (`freshell-supervisor
+  serve ...`); the home mount, masks, and the `--operator-home` flag live
+  there. It must match the server's expectations, so redeploy it together
+  with the server.
+- The SESSION HOST binary is injected into every NEW soul at container
+  creation (the supervisor's `--host-binary` argument). New souls pick the
+  new binary automatically; running souls keep the one they were created
+  with until their next incarnation.
+
+**Units and restart coupling.** With the systemd topology
+(`installers/systemd/freshell-rust.service` + its `managed-runtime.conf`
+drop-in, plus `freshell-supervisor.service`):
+
+- `freshell-rust.service` has `Requires=` + `After=` on
+  `freshell-supervisor.service`. Restarting the SUPERVISOR therefore also
+  restarts the server in the same transaction — one
+  `systemctl --user restart freshell-supervisor.service` redeploys both.
+- Restarting the server alone (`systemctl --user restart
+  freshell-rust.service`) leaves the supervisor running. Use this for
+  server-only changes.
+- Restarting the production server always requires the user's explicit
+  approval (`APPROVED`), including the coupled bounce above.
+
+**What a restart does:**
+
+- **Existing souls keep running.** Soul containers are owned by the Docker
+  daemon and tracked by the supervisor's durable registry, not by the server
+  process. After the restart, soul-backed panes reattach on the next client
+  connect; the supervisor re-verifies each running container against its
+  persisted creation-time state, so pre-restart souls pass with no
+  migration. Souls keep the mounts they were created with (running souls
+  gain the operator-home mount only at their next incarnation).
+- **Non-soul terminals end.** Host terminals (shell panes and host-run CLI
+  panes) are child processes of the server, so a restart terminates them.
+  Their panes rehydrate as exited terminals; resume those conversations
+  through the CLI's own durable storage (`claude --resume`,
+  `codex resume`, opencode's session picker), not through Freshell.
+
+**Post-deploy verification checklist:**
+
+1. Health: `curl -fsS http://127.0.0.1:3001/api/health` → `"ready": true`.
+2. Feature present: with the auth token,
+   `GET /api/runtime/readiness` answers `200`. A `404` means the running
+   binary was built WITHOUT the feature — rebuild with the command above
+   and restart again.
+3. Units: `systemctl --user is-active freshell-rust.service
+   freshell-supervisor.service` → both `active`.
+4. Existing souls: `docker ps --filter name=incarnation` shows the same
+   containers with unchanged uptimes.
+5. New-soul probe: create a terminal pane in a real workspace and confirm a
+   NEW `freshell-incarnation-*` container appears (`docker ps`), that it
+   carries the operator-home bind and the
+   `FRESHELL_OPERATOR_HOME_MOUNT=1` marker env (`docker inspect`), and that
+   its session host emitted one `operator_home_readiness` event
+   (`docker exec <container> cat /run/freshell/host-lifecycle.jsonl`). Close
+   the probe pane afterward.
+
 ## Launch the native Windows client
 
 Run this in a native Windows PowerShell terminal:
