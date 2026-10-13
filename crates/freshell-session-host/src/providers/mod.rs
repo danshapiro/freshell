@@ -24,12 +24,63 @@ pub(crate) use codex::PreparedCodexLaunch;
 use freshell_agent_runtime::ProviderStoreProbe;
 use freshell_runtime_protocol::{
     CheckpointReference, RecoveryBlockReason, RecoveryPath, RecoveryProbe, ResumeSpec, RetryHint,
+    RuntimeDiagnosticCode,
 };
+use std::fmt;
 
 pub struct PreparedTerminal {
     pub terminal: freshell_runtime_protocol::TerminalLaunchSpec,
     pub codex: Option<codex::PreparedCodexLaunch>,
     pub child_env: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug)]
+pub struct ProviderLaunchPreparationError {
+    message: String,
+    diagnostic_code: Option<RuntimeDiagnosticCode>,
+}
+
+impl ProviderLaunchPreparationError {
+    fn generic(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            diagnostic_code: None,
+        }
+    }
+
+    fn with_diagnostic_code(
+        message: impl Into<String>,
+        diagnostic_code: RuntimeDiagnosticCode,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            diagnostic_code: Some(diagnostic_code),
+        }
+    }
+
+    pub fn diagnostic_code_or(&self, fallback: RuntimeDiagnosticCode) -> RuntimeDiagnosticCode {
+        self.diagnostic_code.unwrap_or(fallback)
+    }
+}
+
+impl fmt::Display for ProviderLaunchPreparationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ProviderLaunchPreparationError {}
+
+impl From<String> for ProviderLaunchPreparationError {
+    fn from(message: String) -> Self {
+        Self::generic(message)
+    }
+}
+
+impl From<&str> for ProviderLaunchPreparationError {
+    fn from(message: &str) -> Self {
+        Self::generic(message)
+    }
 }
 
 pub fn prepare_provider_state_before_bootstrap_at(
@@ -79,7 +130,7 @@ pub fn prepare_provider_state_before_bootstrap_at(
 pub async fn prepare_terminal(
     terminal: freshell_runtime_protocol::TerminalLaunchSpec,
     child_secret_env: &std::collections::BTreeMap<String, String>,
-) -> Result<PreparedTerminal, String> {
+) -> Result<PreparedTerminal, ProviderLaunchPreparationError> {
     prepare_terminal_with_provider_feature_runner(
         terminal,
         child_secret_env,
@@ -92,7 +143,7 @@ async fn prepare_terminal_with_provider_feature_runner<F>(
     mut terminal: freshell_runtime_protocol::TerminalLaunchSpec,
     child_secret_env: &std::collections::BTreeMap<String, String>,
     prepare_features: F,
-) -> Result<PreparedTerminal, String>
+) -> Result<PreparedTerminal, ProviderLaunchPreparationError>
 where
     F: Fn(u32, u32, &[&str]) -> Result<Option<String>, String>,
 {
@@ -798,6 +849,16 @@ mod provider_secret_context_tests {
     };
 
     #[test]
+    fn generic_provider_prepare_errors_keep_the_existing_diagnostic_fallback() {
+        let error = ProviderLaunchPreparationError::from("generic local preparation detail");
+        assert_eq!(
+            error.diagnostic_code_or(RuntimeDiagnosticCode::ProviderLaunchPrepareFailed),
+            RuntimeDiagnosticCode::ProviderLaunchPrepareFailed
+        );
+        assert_eq!(error.to_string(), "generic local preparation detail");
+    }
+
+    #[test]
     fn scoped_mcp_grant_becomes_provider_process_environment() {
         let grant = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
@@ -1049,7 +1110,7 @@ mod provider_secret_context_tests {
         )
         .await;
         assert_eq!(
-            result.err().unwrap(),
+            result.err().unwrap().to_string(),
             refusal,
             "preparation refusal must reach the existing launch caller"
         );

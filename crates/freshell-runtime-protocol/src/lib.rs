@@ -1179,6 +1179,9 @@ pub enum RuntimeDiagnosticCode {
     ProviderSecretResolutionFailed,
     ProviderFilesPrepareFailed,
     ProviderLaunchPrepareFailed,
+    CodexConfigPlanningFailed,
+    CodexAppServerStartFailed,
+    CodexProxyStartFailed,
     ProviderChildEnvironmentPrepareFailed,
     ProviderChildEnvironmentInstallFailed,
     ProviderProcessSpawnFailed,
@@ -4552,6 +4555,33 @@ mod tests {
         assert!(undecorated
             .get("freshAgentProviderStartDiagnostic")
             .is_none());
+    }
+
+    #[test]
+    fn codex_prepare_diagnostics_have_stable_body_free_wire_codes() {
+        let cases = [
+            (
+                RuntimeDiagnosticCode::CodexConfigPlanningFailed,
+                "CODEX_CONFIG_PLANNING_FAILED",
+            ),
+            (
+                RuntimeDiagnosticCode::CodexAppServerStartFailed,
+                "CODEX_APP_SERVER_START_FAILED",
+            ),
+            (
+                RuntimeDiagnosticCode::CodexProxyStartFailed,
+                "CODEX_PROXY_START_FAILED",
+            ),
+        ];
+
+        for (diagnostic_code, wire_code) in cases {
+            let encoded = serde_json::to_value(diagnostic_code).unwrap();
+            assert_eq!(encoded, wire_code);
+            assert_eq!(
+                serde_json::from_value::<RuntimeDiagnosticCode>(encoded).unwrap(),
+                diagnostic_code
+            );
+        }
     }
 
     #[test]

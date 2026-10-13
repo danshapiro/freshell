@@ -823,7 +823,9 @@ fn codex_launch_error_response(
     use freshell_codex::launch_lifecycle::CodexLaunchError;
     let status = match &error {
         CodexLaunchError::Config(_) => StatusCode::BAD_REQUEST,
-        CodexLaunchError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        CodexLaunchError::AppServerStart(_)
+        | CodexLaunchError::ProxyStart(_)
+        | CodexLaunchError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
         // Restore-class-only variants. The REST door is Interactive by
         // construction, so these are defensively mapped, mirroring
         // spawn_gate_error_response's QueueFull -> 429.
@@ -4167,7 +4169,7 @@ mod tests {
     /// sandbox etc.) is an INPUT error → 400; any other launch failure (runtime/proxy
     /// IO, planner shutdown) → 500.
     #[test]
-    fn rest_codex_launch_error_maps_config_to_400_and_failed_to_500() {
+    fn rest_codex_launch_error_keeps_config_and_runtime_failures_on_their_existing_statuses() {
         use freshell_codex::launch_lifecycle::CodexLaunchError;
         use freshell_codex::launch_plan::CodexLaunchConfigError;
         let config =
@@ -4175,10 +4177,14 @@ mod tests {
                 message: "Invalid Codex sandbox setting \"x\".".to_string(),
             }));
         assert_eq!(config.status(), StatusCode::BAD_REQUEST);
-        let failed = codex_launch_error_response(CodexLaunchError::Failed(
-            "codex app-server WS never came up".to_string(),
-        ));
-        assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        for failure in [
+            CodexLaunchError::AppServerStart("local readiness failure".into()),
+            CodexLaunchError::ProxyStart("local proxy failure".into()),
+            CodexLaunchError::Failed("unclassified local failure".into()),
+        ] {
+            let response = codex_launch_error_response(failure);
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        }
     }
 
     /// `router.ts:177`: `resumeSessionId: opts.resumeSessionId ? (plan.sessionId ??

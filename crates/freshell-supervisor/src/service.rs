@@ -4732,6 +4732,52 @@ mod release_scope_tests {
         assert!(event["data"].get("errorMessage").is_none());
         assert!(!contents.contains("prepare provider bootstrap failed"));
     }
+
+    #[test]
+    fn codex_prepare_stage_diagnostics_reach_the_body_free_failure_reason() {
+        let prepared = PreparedLaunch {
+            soul_id: SoulId::new(),
+            incarnation_id: IncarnationId::new(),
+            launch_nonce: LaunchNonce::new(),
+            state: LaunchState::Created,
+            intent_revision: 7,
+            existing_request: false,
+        };
+        let cases = [
+            (
+                freshell_runtime_protocol::RuntimeDiagnosticCode::CodexConfigPlanningFailed,
+                "CODEX_CONFIG_PLANNING_FAILED",
+            ),
+            (
+                freshell_runtime_protocol::RuntimeDiagnosticCode::CodexAppServerStartFailed,
+                "CODEX_APP_SERVER_START_FAILED",
+            ),
+            (
+                freshell_runtime_protocol::RuntimeDiagnosticCode::CodexProxyStartFailed,
+                "CODEX_PROXY_START_FAILED",
+            ),
+        ];
+
+        for (diagnostic_code, expected_reason) in cases {
+            let error = RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                "private local preparation detail",
+            )
+            .with_diagnostic_code(diagnostic_code);
+            let data = activation_failure_data(
+                &prepared,
+                LaunchState::Starting,
+                "deliver_execution_grant",
+                &error,
+            );
+
+            assert_eq!(data["failureReason"], expected_reason);
+            assert!(data.get("errorMessage").is_none());
+            assert!(!data
+                .to_string()
+                .contains("private local preparation detail"));
+        }
+    }
 }
 
 #[cfg(test)]

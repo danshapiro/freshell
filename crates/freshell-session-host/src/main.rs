@@ -1486,13 +1486,14 @@ async fn grant_execution(
             let mut prepared = providers::prepare_terminal(terminal, &resolved_secrets.environment)
                 .await
                 .map_err(|error| {
+                    let diagnostic_code = error.diagnostic_code_or(
+                        freshell_runtime_protocol::RuntimeDiagnosticCode::ProviderLaunchPrepareFailed,
+                    );
                     RuntimeError::new(
                         RuntimeErrorCode::HostUnreachable,
                         format!("prepare managed provider: {error}"),
                     )
-                    .with_diagnostic_code(
-                        freshell_runtime_protocol::RuntimeDiagnosticCode::ProviderLaunchPrepareFailed,
-                    )
+                    .with_diagnostic_code(diagnostic_code)
                 })?;
             if let Some(binding) = persisted.native_identity_launch.as_ref() {
                 prepared.child_env.insert(
