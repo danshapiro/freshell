@@ -108,7 +108,16 @@ post-deploy soul sweep:
 ```bash
 set -euo pipefail
 RUN=$(mktemp -d)   # private per-run dir for the survival snapshots
-docker ps -q --filter name=incarnation | xargs -r docker inspect \
+# Scope the capture to THIS installation: the daemon may host containers
+# from other Freshell installations with the same name shape, and the
+# installation label is the only discriminator:
+INSTALL_ID=$(sqlite3 "$HOME/.freshell/managed-runtime/registry/runtime.sqlite3" \
+  "select installation_id from installation")
+test -n "$INSTALL_ID" || { echo "cannot read installation id from the registry"; exit 1; }
+echo "$INSTALL_ID" > "$RUN/installation-id"
+docker ps -q --filter name=incarnation \
+  --filter label=com.freshell.installation-id="$INSTALL_ID" \
+  | xargs -r docker inspect \
   --format '{{.Id}} {{.Name}} {{.State.StartedAt}}' | sort | tee "$RUN/souls-before.txt"
 CHECKOUT=$(systemctl --user show freshell-rust.service -p WorkingDirectory --value)
 # The server may be DEAD at this point (this procedure is also the
@@ -196,18 +205,29 @@ the procedure mid-way and leave the service down. Two sequences:
   # Two failure detectors: supervisor-unit LIVENESS (fast — a dead unit
   # ends the wait immediately) and an inventory-sized absolute CAP
   # (stall — a live-but-wedged process must not hang the redeploy
-  # forever). Size from the ACTUAL effective concurrency: read
-  # FRESHELL_RUNTIME_STARTUP_CONCURRENCY from the supervisor unit's
-  # environment files (default 4), and use the documented 900s per-soul
-  # reconciliation ceiling: worst-case N*900/C seconds, doubled for
-  # margin, floored at an hour. Extreme configs can override the env var:
-  C=4
-  for EF in $(systemctl --user show freshell-supervisor.service \
-                -p EnvironmentFiles --value | tr ' ' '\n' \
-                | sed 's/(.*//' | grep -v '^$'); do
-    V=$(sed -n 's/^FRESHELL_RUNTIME_STARTUP_CONCURRENCY=//p' "$EF" 2>/dev/null | tail -1)
-    [ -n "$V" ] && C="$V"
-  done
+  # forever). Read the EFFECTIVE concurrency the way the supervisor
+  # does: unit Environment= lines and its EnvironmentFiles, then the
+  # supervisor's own 1..16 clamp (0 or garbage become 1/defaults, never
+  # a division by zero). Worst case is N * 900s / C, doubled for
+  # margin, floored at an hour; extreme configs can override the env
+  # var. The if-forms below are load-bearing under set -e: an
+  # `&&`-short-circuit as the loop's last command would make the LOOP
+  # return 1 and abort the whole sequence:
+  C=""
+  V=$(systemctl --user show freshell-supervisor.service -p Environment --value 2>/dev/null \
+        | tr ' ' '\n' | sed -n 's/^FRESHELL_RUNTIME_STARTUP_CONCURRENCY=//p' | tail -1)
+  if [ -n "$V" ]; then C="$V"; fi
+  if [ -z "$C" ]; then
+    for EF in $(systemctl --user show freshell-supervisor.service \
+                  -p EnvironmentFiles --value | tr ' ' '\n' \
+                  | sed 's/(.*//' | grep -v '^$'); do
+      V=$(sed -n 's/^FRESHELL_RUNTIME_STARTUP_CONCURRENCY=//p' "$EF" 2>/dev/null | tail -1)
+      if [ -n "$V" ]; then C="$V"; fi
+    done
+  fi
+  case "$C" in ''|*[!0-9]*) C=4;; esac   # absent/garbage -> supervisor default
+  [ "$C" -ge 1 ] 2>/dev/null || C=1      # supervisor clamps to 1..16 — mirror it
+  [ "$C" -le 16 ] 2>/dev/null || C=16
   N=$(wc -l < "$RUN/desired-running.txt" 2>/dev/null || echo 0)
   [ "$N" -gt 0 ] || N=$(wc -l < "$RUN/souls-before.txt" 2>/dev/null || echo 0)
   WC=$(( N * 900 / C * 2 ))
@@ -402,7 +422,7 @@ drop-in, plus `freshell-supervisor.service`):
         | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
 for s in souls:
-    print(s["soulId"])' > "$RUN/souls-all.txt"
+    print(s["soulId"], s.get("containerId") or "")' > "$RUN/souls-all.txt"
       curl -s -H @"$RUN/hdr" http://127.0.0.1:3001/api/runtime/souls \
         | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
@@ -416,10 +436,12 @@ for s in souls:
         CID=${CIDLINE%% *}
         [ -n "$CID" ] || continue
         SID=$(docker inspect "$CID" \
-          --format '{{index .Config.Labels "com.freshell.soul-id"}}' 2>/dev/null || true)
-        [ -n "$SID" ] || continue
-        grep -qx "$SID" "$RUN/souls-all.txt" \
-          || { echo "ORPHANED container — soul $SID not in the deployed registry: $CID"; exit 1; }
+          --format '{{index .Config.Labels "com.freshell.soul-id"}}') \
+          || { echo "docker inspect failed for baseline container $CID"; exit 1; }
+        # Ownership is per (soul, incarnation, container): match the
+        # PAIR against the deployed registry, not the soul id alone:
+        grep -q "^$SID $CID$" "$RUN/souls-all.txt" \
+          || { echo "ORPHANED container — ($SID, $CID) not owned by the deployed registry"; exit 1; }
       done < "$RUN/souls-before.txt"
     fi
     echo "sweeping $(wc -l < "$RUN/desired-running.txt") desired-running soul(s)"
@@ -603,10 +625,10 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
       | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
 rows=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
-# The inventory returns ONE ROW PER INCARNATION (recovered souls keep
-# their old rows); the invariant is exactly one SOUL per probe
-# workspace. Group by soulId, refuse on ambiguity, and inspect the
-# NEWEST incarnation row (the list is creation-ordered):
+# The registry stores one row per incarnation, but the API collapses to
+# the LATEST row per soul — so normally one row per soul. The grouping
+# below stays robust either way: exactly one SOUL must match the probe
+# workspace; refuse on ambiguity and act on the last matching row:
 sids={r["soulId"] for r in rows}
 assert len(sids)==1, ("workspace ambiguous (mint a fresh BWS and retry)", rows)
 cur=rows[-1]
@@ -705,9 +727,9 @@ PY
         | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
 rows=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
-# One row per INCARNATION; the invariant is exactly one SOUL per probe
-# workspace — group by soulId, refuse on ambiguity, act on the NEWEST
-# incarnation row (creation-ordered list):
+# The API collapses per-incarnation rows to the latest per soul; the
+# grouping stays robust either way — exactly one SOUL per probe
+# workspace, refuse on ambiguity, act on the last matching row:
 sids={r["soulId"] for r in rows}
 assert len(sids)==1, ("workspace ambiguous — do not stop anything; resolve manually", rows)
 s=rows[-1]
@@ -744,8 +766,9 @@ print("stopped:", o["outcome"])'
         | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
 rows=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
-# One row per INCARNATION; exactly one SOUL per probe workspace; act on
-# the NEWEST incarnation row (creation-ordered list):
+# The API collapses per-incarnation rows to the latest per soul; the
+# grouping stays robust either way — exactly one SOUL per probe
+# workspace, act on the last matching row:
 sids={r["soulId"] for r in rows}
 assert len(sids)<=1, ("workspace ambiguous — do not stop anything; resolve manually", rows)
 if rows:
