@@ -17,7 +17,10 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     process::Command,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 use tokio::sync::Mutex;
 
@@ -45,6 +48,8 @@ impl RecoveryPublication {
 }
 #[derive(Debug, Clone)]
 struct SoulRecoverySlot {
+    // While recovering, this is the task token. Otherwise it is the last
+    // local publication or inventory-read token accepted for this soul.
     sequence: u64,
     task_in_flight: bool,
     // Durable supervisor generation, independent of the local task sequence.
@@ -76,6 +81,26 @@ impl SoulRecoverySlot {
 #[derive(Default)]
 struct ManagedRecoveryState {
     slots: Mutex<HashMap<String, SoulRecoverySlot>>,
+    generation_clock: AtomicU64,
+}
+impl ManagedRecoveryState {
+    fn next_generation(&self) -> u64 {
+        self.next_generation_after(0)
+    }
+
+    fn next_generation_after(&self, minimum: u64) -> u64 {
+        loop {
+            let current = self.generation_clock.load(Ordering::Relaxed);
+            let next = current.max(minimum).saturating_add(1);
+            if self
+                .generation_clock
+                .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return next;
+            }
+        }
+    }
 }
 
 fn wire_label(value: &impl serde::Serialize) -> String {
@@ -230,10 +255,17 @@ impl ServerManagedRuntimeController {
             .is_some_and(|slot| slot.task_in_flight)
     }
 
+    #[cfg(test)]
     async fn hydrate(&self, view: RuntimeView) {
+        let generation = self.recovery.next_generation();
+        self.hydrate_at_generation(view, generation).await;
+    }
+
+    async fn hydrate_at_generation(&self, view: RuntimeView, generation: u64) {
         let mut slots = self.recovery.slots.lock().await;
         if slots.get(view.soul_id.as_str()).is_some_and(|slot| {
             slot.task_in_flight
+                || slot.sequence > generation
                 || slot
                     .intent_revision
                     .is_some_and(|revision| revision > view.intent_revision)
@@ -276,6 +308,7 @@ impl ServerManagedRuntimeController {
             );
             slot.incarnation_id = Some(view.incarnation_id.to_string());
             slot.terminal_id = view.terminal_id.clone();
+            slot.sequence = generation;
             slot.intent_revision = Some(view.intent_revision);
             slot.evidence_revision = Some(view.evidence_revision);
             slot.publication = publication;
@@ -290,7 +323,7 @@ impl ServerManagedRuntimeController {
             slots.insert(
                 view.soul_id.to_string(),
                 SoulRecoverySlot {
-                    sequence: 0,
+                    sequence: generation,
                     task_in_flight: false,
                     incarnation_id: Some(view.incarnation_id.to_string()),
                     terminal_id: view.terminal_id.clone(),
@@ -326,7 +359,7 @@ impl ServerManagedRuntimeController {
             if !manual && lifecycle(&slot.publication).state != ManagedLifecycleState::Running {
                 return None;
             }
-            let sequence = slot.sequence.checked_add(1)?;
+            let sequence = self.recovery.next_generation_after(slot.sequence);
             let publication = RecoveryPublication::Recovering {
                 previous: slot.publication.result().cloned().map(Box::new),
             };
@@ -343,8 +376,9 @@ impl ServerManagedRuntimeController {
             Some(sequence)
         } else {
             let publication = RecoveryPublication::Recovering { previous: None };
+            let sequence = self.recovery.next_generation();
             let mut slot = SoulRecoverySlot {
-                sequence: 1,
+                sequence,
                 task_in_flight: true,
                 incarnation_id: None,
                 terminal_id: None,
@@ -366,7 +400,7 @@ impl ServerManagedRuntimeController {
                 slot.incarnation_id.as_deref(),
             );
             slots.insert(soul.to_string(), slot);
-            Some(1)
+            Some(sequence)
         }
     }
 
@@ -386,6 +420,7 @@ impl ServerManagedRuntimeController {
         {
             return;
         }
+        let published_generation = self.recovery.next_generation_after(sequence);
         let publication = match result {
             Ok(result) => RecoveryPublication::Finished(Box::new(result.clone())),
             Err(error) => RecoveryPublication::Failed {
@@ -408,6 +443,7 @@ impl ServerManagedRuntimeController {
             slot.terminal_id.as_deref(),
             slot.incarnation_id.as_deref(),
         );
+        slot.sequence = published_generation;
         slot.publication = publication;
         slot.task_in_flight = false;
     }
@@ -481,6 +517,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
         create_request_id: Option<String>,
     ) -> ManagedTerminalFuture<'a, Result<Option<ManagedTerminalDescriptor>, String>> {
         Box::pin(async move {
+            let inventory_generation = self.recovery.next_generation();
             let views = self
                 .client
                 .inventory()
@@ -493,7 +530,8 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             else {
                 return Ok(None);
             };
-            self.hydrate(view.clone()).await;
+            self.hydrate_at_generation(view.clone(), inventory_generation)
+                .await;
             managed_descriptor_from_view(view, create_request_id).map(Some)
         })
     }
@@ -741,6 +779,10 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                 }),
                 expected_control_epoch: None,
             };
+            // A view returned by this launch may arrive after a concurrent
+            // recovery publication. Reserve its ordering before dispatch so
+            // that a later local publication remains authoritative.
+            let launch_generation = self.recovery.next_generation();
             let result = if request.mode == "opencode" {
                 let home = original_provider_home(&request.env)?;
                 let original = |name: &str| {
@@ -798,7 +840,8 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     }
                 }
             };
-            self.hydrate(result.view.clone()).await;
+            self.hydrate_at_generation(result.view.clone(), launch_generation)
+                .await;
             Ok(ManagedTerminalDescriptor {
                 soul_id: result.view.soul_id.to_string(),
                 incarnation_id: result.view.incarnation_id.to_string(),
@@ -873,6 +916,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             {
                 StopOutcome::VerifiedEmpty => {
                     crate::managed_mcp_capability::revoke_soul_capabilities(&soul)?;
+                    let inventory_generation = self.recovery.next_generation();
                     let views = self
                         .client
                         .inventory()
@@ -883,7 +927,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                         .rev()
                         .find(|view| view.soul_id.as_str() == soul_key)
                     {
-                        self.hydrate(view).await;
+                        self.hydrate_at_generation(view, inventory_generation).await;
                     }
                     Ok(())
                 }

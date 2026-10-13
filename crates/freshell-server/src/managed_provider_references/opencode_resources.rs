@@ -683,7 +683,12 @@ fn shell_executable_name(token: &str) -> String {
     name.strip_suffix(".exe").unwrap_or(&name).to_owned()
 }
 
-fn shell_node_script_operand(line: &str) -> Option<String> {
+struct ShellNodeInvocation {
+    script_operand: Option<String>,
+    file_operands: Vec<(String, bool)>,
+}
+
+fn shell_node_invocation(line: &str) -> Option<ShellNodeInvocation> {
     let words = line
         .split_ascii_whitespace()
         .map(|word| word.trim_matches(['"', '\'']))
@@ -702,13 +707,37 @@ fn shell_node_script_operand(line: &str) -> Option<String> {
         "--env-file",
         "--inspect-port",
     ];
+    const NODE_SCRIPT_FILE_OPTIONS: [&str; 5] = [
+        "-r",
+        "--require",
+        "--import",
+        "--loader",
+        "--experimental-loader",
+    ];
+    let mut file_operands = Vec::new();
     while let Some(argument) = words.get(index) {
         if *argument == "--" {
             index += 1;
             break;
         }
-        if NODE_OPTIONS_WITH_VALUE.contains(argument) {
-            index += 2;
+        let (option, inline_value) = argument
+            .split_once('=')
+            .map_or((*argument, None), |(option, value)| (option, Some(value)));
+        if NODE_OPTIONS_WITH_VALUE.contains(&option) {
+            let value = inline_value.or_else(|| words.get(index + 1).copied());
+            if let Some(value) = value {
+                let value = value.trim_end_matches([';', '&']);
+                let is_script = NODE_SCRIPT_FILE_OPTIONS.contains(&option);
+                let is_path = (option == "--env-file" && !value.starts_with('-'))
+                    || Path::new(value).is_absolute()
+                    || value.starts_with("./")
+                    || value.starts_with("../")
+                    || value.contains(['$', '*', '?']);
+                if is_path && (is_script || option == "--env-file") {
+                    file_operands.push((value.to_owned(), is_script));
+                }
+            }
+            index += if inline_value.is_some() { 1 } else { 2 };
             continue;
         }
         if argument.starts_with('-') {
@@ -717,13 +746,20 @@ fn shell_node_script_operand(line: &str) -> Option<String> {
         }
         break;
     }
-    let argument = words.get(index)?.trim_end_matches([';', '&']);
-    let path = Path::new(argument);
-    (!path.is_absolute()
-        && !argument.is_empty()
-        && !argument.contains(['$', '*', '?'])
-        && is_node_script_path(argument))
-    .then(|| argument.to_owned())
+    let script_operand = words
+        .get(index)
+        .map(|argument| argument.trim_end_matches([';', '&']))
+        .filter(|argument| {
+            !Path::new(argument).is_absolute()
+                && !argument.is_empty()
+                && !argument.contains(['$', '*', '?'])
+                && is_node_script_path(argument)
+        })
+        .map(str::to_owned);
+    Some(ShellNodeInvocation {
+        script_operand,
+        file_operands,
+    })
 }
 
 fn shell_source_operand(line: &str) -> Option<String> {
@@ -875,7 +911,129 @@ fn shell_line_invokes_node(line: &str) -> bool {
 enum JavaScriptToken {
     Identifier(String),
     String(Option<String>),
+    Regex,
     Punctuation(u8),
+}
+
+fn javascript_control_header_closes(tokens: &[JavaScriptToken]) -> bool {
+    if !matches!(tokens.last(), Some(JavaScriptToken::Punctuation(b')'))) {
+        return false;
+    }
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().rev() {
+        match token {
+            JavaScriptToken::Punctuation(b')') => depth += 1,
+            JavaScriptToken::Punctuation(b'(') => {
+                depth -= 1;
+                if depth == 0 {
+                    return index > 0
+                        && matches!(
+                            tokens.get(index - 1),
+                            Some(JavaScriptToken::Identifier(keyword))
+                                if matches!(keyword.as_str(), "for" | "if" | "while" | "with")
+                        );
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn javascript_regex_can_start_after(tokens: &[JavaScriptToken]) -> bool {
+    match tokens.last() {
+        None => true,
+        Some(JavaScriptToken::Punctuation(byte)) => {
+            matches!(
+                byte,
+                b'(' | b'['
+                    | b'{'
+                    | b','
+                    | b';'
+                    | b':'
+                    | b'='
+                    | b'!'
+                    | b'?'
+                    | b'&'
+                    | b'|'
+                    | b'+'
+                    | b'-'
+                    | b'*'
+                    | b'%'
+                    | b'^'
+                    | b'~'
+                    | b'<'
+                    | b'>'
+                    | b'/'
+            ) || matches!(byte, b')') && javascript_control_header_closes(tokens)
+                || matches!(byte, b'+' | b'-')
+                    && tokens.len() >= 3
+                    && matches!(
+                        (tokens.get(tokens.len() - 2), tokens.get(tokens.len() - 3)),
+                        (
+                            Some(JavaScriptToken::Punctuation(previous)),
+                            Some(JavaScriptToken::Identifier(_)
+                                | JavaScriptToken::String(_)
+                                | JavaScriptToken::Regex)
+                        ) if previous == byte
+                    )
+        }
+        Some(JavaScriptToken::Identifier(keyword)) => {
+            !matches!(
+                tokens.get(tokens.len().saturating_sub(2)),
+                Some(JavaScriptToken::Punctuation(b'.'))
+            ) && matches!(
+                keyword.as_str(),
+                "await"
+                    | "case"
+                    | "delete"
+                    | "do"
+                    | "else"
+                    | "in"
+                    | "instanceof"
+                    | "new"
+                    | "of"
+                    | "return"
+                    | "throw"
+                    | "typeof"
+                    | "void"
+                    | "yield"
+            )
+        }
+        Some(JavaScriptToken::String(_) | JavaScriptToken::Regex) => false,
+    }
+}
+
+fn javascript_regex_end(bytes: &[u8], start: usize) -> Result<Option<usize>, &'static str> {
+    let mut at = start + 1;
+    let mut escaped = false;
+    let mut in_character_class = false;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        if byte == b'\n' || byte == b'\r' {
+            return Err("direct MCP Node script has an unterminated regular expression");
+        }
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == b'[' {
+            in_character_class = true;
+        } else if byte == b']' {
+            in_character_class = false;
+        } else if byte == b'/' && !in_character_class {
+            at += 1;
+            while bytes
+                .get(at)
+                .is_some_and(|flag| *flag == b'_' || *flag == b'$' || flag.is_ascii_alphanumeric())
+            {
+                at += 1;
+            }
+            return Ok(Some(at));
+        }
+        at += 1;
+    }
+    Ok(None)
 }
 
 fn javascript_tokens(source: &str) -> Result<Vec<JavaScriptToken>, &'static str> {
@@ -940,6 +1098,14 @@ fn javascript_tokens(source: &str) -> Result<Vec<JavaScriptToken>, &'static str>
             }
             at += 1;
             result.push(JavaScriptToken::String(None));
+        } else if byte == b'/' && javascript_regex_can_start_after(&result) {
+            if let Some(end) = javascript_regex_end(bytes, at)? {
+                at = end;
+                result.push(JavaScriptToken::Regex);
+            } else {
+                at += 1;
+                result.push(JavaScriptToken::Punctuation(byte));
+            }
         } else if byte == b'_' || byte == b'$' || byte.is_ascii_alphabetic() {
             at += 1;
             while bytes
@@ -1647,6 +1813,9 @@ fn insert_shell_script_dependencies(
                 }
             }
             let invokes_node = shell_line_invokes_node(node_line);
+            let node_invocation = invokes_node
+                .then(|| shell_node_invocation(node_line))
+                .flatten();
             for relative in shell_directory_relative_paths(line, &directory_variables) {
                 let parse_as_node_script = invokes_node && is_node_script_path(&relative);
                 candidates
@@ -1655,11 +1824,30 @@ fn insert_shell_script_dependencies(
                     .or_insert((false, parse_as_node_script));
             }
             if working_directory_is_script_parent && invokes_node {
-                if let Some(relative) = shell_node_script_operand(node_line) {
-                    candidates
-                        .entry(script_parent.join(relative))
-                        .and_modify(|kind: &mut (bool, bool)| kind.1 = true)
-                        .or_insert((false, true));
+                if let Some(invocation) = node_invocation {
+                    if let Some(relative) = invocation.script_operand {
+                        candidates
+                            .entry(script_parent.join(relative))
+                            .and_modify(|kind: &mut (bool, bool)| kind.1 = true)
+                            .or_insert((false, true));
+                    }
+                    for (operand, parse_as_node_script) in invocation.file_operands {
+                        if operand.contains(['$', '*', '?']) {
+                            return Err(fail(
+                                "direct MCP Node option has an unresolved dynamic file path",
+                            ));
+                        }
+                        let path = Path::new(&operand);
+                        let candidate = if path.is_absolute() {
+                            path.to_owned()
+                        } else {
+                            script_parent.join(path)
+                        };
+                        candidates
+                            .entry(candidate)
+                            .and_modify(|kind: &mut (bool, bool)| kind.1 |= parse_as_node_script)
+                            .or_insert((false, parse_as_node_script));
+                    }
                 }
             }
             for (candidate, (parse_as_script, parse_as_node_script)) in candidates {

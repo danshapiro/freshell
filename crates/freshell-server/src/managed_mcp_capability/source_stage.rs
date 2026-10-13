@@ -1190,6 +1190,36 @@ mod configured_resource_tests {
     }
 
     #[test]
+    fn direct_node_script_scanner_ignores_quotes_inside_regex_literals() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let command = home.join("mcp.js");
+        let helper = home.join("helper.js");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            r#"const quote = /require\(['"]\.\/missing/;
+if (false) /'/;
+process.stdout.write(require('./helper.js'))
+"#,
+        )
+        .unwrap();
+        std::fs::write(&helper, "module.exports = 'regex scanner loaded\\n'\n").unwrap();
+
+        let (plan, provider_script) =
+            plan_and_stage_direct_mcp_command(owned.path(), &home, &workspace, &command);
+        assert!(plan[0]
+            .configured_resources
+            .contains(&helper.canonicalize().unwrap()));
+
+        let output = execute_node_with_home_hidden(owned.path(), &home, &provider_script);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"regex scanner loaded\n");
+    }
+
+    #[test]
     fn direct_node_script_in_home_keeps_path_join_data_after_all_resource_copies() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1613,6 +1643,88 @@ mod configured_resource_tests {
         let output = execute_with_home_hidden(owned.path(), &home, &provider_command);
         assert!(output.status.success(), "{:?}", output.stderr);
         assert_eq!(output.stdout, b"sibling-loaded:package-loaded\n");
+    }
+
+    #[test]
+    fn shell_mcp_wrapper_stages_node_preload_before_server_script() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let command = home.join("start");
+        let preload = home.join("preload.js");
+        let preload_helper = home.join("preload-helper.js");
+        let second_preload = home.join("second-preload.js");
+        let imported_preload = home.join("preload.mjs");
+        let loader = home.join("loader.mjs");
+        let env_file = home.join(".env");
+        let server = home.join("server.js");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "#!/bin/sh\ncd \"$(dirname \"$0\")\" && exec node -r ./preload.js --require=./second-preload.js --import ./preload.mjs --loader=./loader.mjs --env-file=.env server.js\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &preload,
+            "require('./preload-helper.js');\nglobalThis.managedPreload = 'loaded';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &preload_helper,
+            "globalThis.managedPreloadHelper = 'loaded';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &second_preload,
+            "globalThis.managedSecondPreload = 'loaded';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &imported_preload,
+            "globalThis.managedImportedPreload = 'loaded';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &loader,
+            "export async function resolve(specifier, context, nextResolve) { return nextResolve(specifier, context); }\n",
+        )
+        .unwrap();
+        std::fs::write(&env_file, "MANAGED_ENV_FILE=loaded\n").unwrap();
+        std::fs::write(
+            &server,
+            "if (globalThis.managedPreload !== 'loaded' || globalThis.managedPreloadHelper !== 'loaded' || globalThis.managedSecondPreload !== 'loaded' || globalThis.managedImportedPreload !== 'loaded' || process.env.MANAGED_ENV_FILE !== 'loaded') process.exit(1);\nprocess.stdout.write('preload staged\\n');\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (plan, provider_command) =
+            plan_and_stage_direct_mcp_command(owned.path(), &home, &workspace, &command);
+        for required in [
+            &preload,
+            &preload_helper,
+            &second_preload,
+            &imported_preload,
+            &loader,
+            &env_file,
+        ] {
+            assert!(
+                plan[0]
+                    .configured_resources
+                    .contains(&required.canonicalize().unwrap()),
+                "Node option dependency omitted {}",
+                required.display()
+            );
+        }
+        assert!(plan[0]
+            .configured_resources
+            .contains(&server.canonicalize().unwrap()));
+
+        let output = execute_with_home_hidden(owned.path(), &home, &provider_command);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"preload staged\n");
     }
 
     #[test]
