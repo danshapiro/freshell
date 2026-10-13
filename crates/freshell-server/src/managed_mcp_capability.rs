@@ -4097,7 +4097,7 @@ except Exception as error:
             ".codex/skills/freshell-discovered-agents/fixture/scripts/run",
         ];
         for relative in resources {
-            let output = Command::new(projection.join(relative)).output().unwrap();
+            let output = execute_copied_script(&projection.join(relative)).unwrap();
             assert!(output.status.success(), "{output:?}");
             assert_eq!(output.stdout, b"resource-nonce\n");
         }
