@@ -100,7 +100,10 @@ Sequence the build and restart deliberately: the build rewrites
 `target/release/freshell-session-host` in place, and the running supervisor
 bind-mounts that path into every NEW soul — so a soul created between the
 build and the restart runs the new session host against the old supervisor
-and server. Two sequences:
+and server. Run the whole procedure from a shell OUTSIDE the server's
+process tree (for example an SSH session to the host) — a host-side
+Freshell terminal pane is itself killed by the restart, which would abort
+the procedure mid-way and leave the service down. Two sequences:
 
 - Quick (compatible changes): build, then restart immediately, accepting
   the short skew window.
@@ -158,6 +161,11 @@ drop-in, plus `freshell-supervisor.service`):
   server-only changes.
 - Restarting the production server always requires the user's explicit
   approval (`APPROVED`), including the coupled bounce above.
+- When the checked-in unit files or drop-ins under `installers/systemd/`
+  changed, DEPLOY THEM TOO: copy them into `~/.config/systemd/user/`
+  (preserving the `.service.d/` drop-in layout) and run
+  `systemctl --user daemon-reload` before restarting — a restart alone
+  runs the previously installed configuration.
 - The deployed unit's port wins: the checked-in installer unit defaults to
   `PORT=3002`, while this host's installed unit serves `PORT=3001`. The
   commands below use 3001 — substitute the port the deployed unit actually
@@ -201,10 +209,13 @@ drop-in, plus `freshell-supervisor.service`):
 **Post-deploy verification checklist:**
 
 1. Health: `curl -fsS http://127.0.0.1:3001/api/health` → `"ready": true`.
-2. Feature present: with the auth token,
-   `GET /api/runtime/readiness` answers `200`. A `404` means the running
-   binary was built WITHOUT the feature — rebuild with the command above
-   and restart again.
+2. Feature present AND unblocked: with the auth token,
+   `GET /api/runtime/readiness` answers `200` — a `404` means the running
+   binary was built WITHOUT the feature; rebuild with the command above
+   and restart again — AND the response's `initialScanState` is
+   `"complete"` with an empty `blockedSubsystems` list: the handler
+   answers `200` even when startup recovery of existing souls is blocked,
+   so the status code alone is not readiness.
 3. Units: `systemctl --user is-active freshell-rust.service
    freshell-supervisor.service` → both `active`.
 4. Existing souls: re-run the pre-restart capture command and compare with
@@ -214,36 +225,46 @@ drop-in, plus `freshell-supervisor.service`):
    container absent from the capture may appear within seconds of the
    restart: that is a client reconnecting and a durable terminal pane
    reattaching, not an old soul being replaced.
- 5. New-soul probe: create a terminal pane in a real workspace that is NOT
-    the operator home itself (a subdirectory of it is fine) — when the
-    workspace equals the operator home, the supervisor deliberately omits
-    the separate home bind (the workspace bind already provides it), so the
-    checks below do not apply to that launch. TIE THE PROBE TO ITS OWN
-    IDENTITY: create the pane through the REST tab API and keep the
-    response's `terminalId` — every soul record carries its `terminalId`,
-    so the probe's soul is selected by an exact match, immune to
-    concurrent soul creation in the same workspace ("the newest container"
-    is never a safe selector, and the stop request's revision guard
-    protects against staleness, not against stopping the wrong soul):
+5. New-soul probe: create a terminal pane in a real workspace that is NOT
+   the operator home itself (a subdirectory of it is fine) — when the
+   workspace equals the operator home, the supervisor deliberately omits
+   the separate home bind (the workspace bind already provides it), so the
+   checks below do not apply to that launch. TIE THE PROBE TO ITS OWN
+   IDENTITY: create the pane through the REST tab API and keep the
+   response's `terminalId` — every soul record carries its `terminalId`,
+   so the probe's soul is selected by an exact match, immune to
+   concurrent soul creation in the same workspace ("the newest container"
+   is never a safe selector, and the stop request's revision guard
+   protects against staleness, not against stopping the wrong soul). Use a
+   private per-run directory — two operators (or two windows) running the
+   probe concurrently must never share probe files, or one run's cleanup
+   can stop the other run's soul:
 
-    ```bash
-    CHECKOUT=$(systemctl --user show freshell-rust.service -p WorkingDirectory --value)
-    TOK=$(grep -E '^AUTH_TOKEN=' "$CHECKOUT/.env" | cut -d= -f2-)
-    # create the probe pane (example); record terminalId from the response:
-    curl -s -X POST -H "x-auth-token: $TOK" -H "Content-Type: application/json" \
-      -d '{"mode":"shell","cwd":"<a real workspace outside the operator home>","name":"home-mount probe"}' \
-      http://127.0.0.1:3001/api/tabs | tee /tmp/probe-tab.json
-    TID=$(python3 -c 'import json;print(json.load(open("/tmp/probe-tab.json"))["data"]["terminalId"])')
-    SOUL_ID=$(curl -s -H "x-auth-token: $TOK" http://127.0.0.1:3001/api/runtime/souls \
-      | python3 -c 'import json,sys
+   ```bash
+   D=$(mktemp -d)   # private per-run directory
+   CHECKOUT=$(systemctl --user show freshell-rust.service -p WorkingDirectory --value)
+   TOK=$(grep -E '^AUTH_TOKEN=' "$CHECKOUT/.env" | cut -d= -f2-)
+   umask 077
+   printf 'x-auth-token: %s\n' "$TOK" > "$D/hdr"   # header file, not argv
+   # create the probe pane (example); record terminalId from the response:
+   curl -s -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
+     -d '{"mode":"shell","cwd":"<a real workspace outside the operator home>","name":"home-mount probe"}' \
+     http://127.0.0.1:3001/api/tabs | tee "$D/probe-tab.json"
+   TID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["data"]["terminalId"])' "$D/probe-tab.json")
+   SOUL_ID=$(curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
+     | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
-print(next(s["soulId"] for s in souls if s.get("terminalId")=="'$TID'"))' \
-      | tee /tmp/probe-soul-id.txt)
-    CID=$(docker ps -q --filter label=com.freshell.soul-id=$SOUL_ID)
-    ```
+print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$TID" \
+     | tee "$D/probe-soul-id.txt")
+   CID=$(docker ps -q --filter label=com.freshell.soul-id=$SOUL_ID)
+   ```
 
-    If the unit's environment (not the checkout's `.env`) is what supplies
-    the token on your installation, read `TOK` from there instead.
+   If the unit's environment (not the checkout's `.env`) is what supplies
+   the token on your installation, read `TOK` from there instead. The
+   header-file form keeps the token out of process argument lists
+   (visible via `/proc/*/cmdline`); it is still the full-scope token — the
+   OneCLI route below is the preferred, scope-limited form for anything
+   but a one-off operator probe.
 
     Then confirm the probe container carries the operator-home bind and the
     `FRESHELL_OPERATOR_HOME_MOUNT=1` marker env (`docker inspect`), and that
@@ -280,33 +301,40 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")=="'$TID'"))' \
     supervisor-owned) and the supervisor has no idle reaper, so the
     container persists as a durable background session. To remove it
     immediately, stop the soul recorded in step 5 — never a soul picked
-    fresh from `docker ps` at cleanup time — through the fenced runtime
-    API. Protected runtime API calls go through OneCLI per the rollout
+    fresh from `docker ps` at cleanup time — and RE-VERIFY the identity
+    immediately before stopping: `GET /api/runtime/souls/$SOUL_ID` must
+    still report the probe's `terminalId` (the one saved in `$D`); if it
+    does not match, stop — you are about to stop someone else's session.
+    Protected runtime API calls go through OneCLI per the rollout
     procedure (its grant is scoped to the server host and `/api/runtime/*`
     and injects `x-auth-token` — see
-    [managed-runtime-rollout.md](managed-runtime-rollout.md)); the direct
-    form below is the equivalent for an operator holding the checkout's
-    token. The stop is intent-revision-guarded, and HTTP 200 alone proves
-    nothing — the response's `outcome` must be `verified_empty` (other
-    outcomes such as `termination_unconfirmed` or `blocked_ownership` mean
-    the soul is NOT confirmed stopped; re-check
-    `GET /api/runtime/souls/$SOUL_ID` and retry with the new revision if
-    needed):
+    [managed-runtime-rollout.md](managed-runtime-rollout.md)); that is the
+    preferred path for anything but a one-off operator probe, because the
+    raw checkout token authorizes the broader API. The stop is
+    intent-revision-guarded, and HTTP 200 alone proves nothing — the
+    response's `outcome` must be `verified_empty` (other outcomes such as
+    `termination_unconfirmed` or `blocked_ownership` mean the soul is NOT
+    confirmed stopped; re-check `GET /api/runtime/souls/$SOUL_ID` and
+    retry with the new revision if needed):
 
     ```bash
-    TOK=$(grep -E '^AUTH_TOKEN=' "$CHECKOUT/.env" | cut -d= -f2-)
-    SOUL_ID=$(cat /tmp/probe-soul-id.txt)
-    REV=$(curl -s -H "x-auth-token: $TOK" \
-      http://127.0.0.1:3001/api/runtime/souls/$SOUL_ID \
+    SOUL_ID=$(cat "$D/probe-soul-id.txt")
+    TID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["data"]["terminalId"])' "$D/probe-tab.json")
+    curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls/$SOUL_ID \
+      | python3 -c 'import json,sys
+s=json.load(sys.stdin)["soul"]
+assert s.get("terminalId")==sys.argv[1], ("SOUL/PROBE MISMATCH", s)
+print("revision:", s["intentRevision"])' "$TID"
+    REV=$(curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls/$SOUL_ID \
       | python3 -c 'import json,sys;print(json.load(sys.stdin)["soul"]["intentRevision"])')
-    curl -s -X POST -H "x-auth-token: $TOK" \
-      -H "Content-Type: application/json" \
+    curl -s -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
       -d "{\"requestId\":\"probe-cleanup\",\"expectedIntentRevision\":$REV}" \
       http://127.0.0.1:3001/api/runtime/souls/$SOUL_ID/stop \
       | python3 -c 'import json,sys;
 o=json.load(sys.stdin)
 assert o.get("outcome")=="verified_empty", o
 print("stopped:", o["outcome"])'
+    rm -rf "$D"   # contains the token header file
     ```
 
    Do NOT `docker stop` the container directly — the supervisor treats an
