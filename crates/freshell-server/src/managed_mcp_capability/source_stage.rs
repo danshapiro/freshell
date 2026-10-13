@@ -128,13 +128,35 @@ mod configured_resource_tests {
         command: &[String],
         selected_resource: &Path,
     ) -> (Vec<PlannedSourceOccurrence>, std::path::PathBuf) {
+        plan_and_stage_mcp_command_for_resource_with_cwd(
+            owned_root,
+            home,
+            workspace,
+            command,
+            selected_resource,
+            None,
+        )
+    }
+
+    fn plan_and_stage_mcp_command_for_resource_with_cwd(
+        owned_root: &Path,
+        home: &Path,
+        workspace: &Path,
+        command: &[String],
+        selected_resource: &Path,
+        mcp_cwd: Option<&Path>,
+    ) -> (Vec<PlannedSourceOccurrence>, std::path::PathBuf) {
         let config = workspace.join("opencode.json");
+        let mut mcp_entry = serde_json::json!({
+            "type": "local",
+            "command": command,
+        });
+        if let Some(mcp_cwd) = mcp_cwd {
+            mcp_entry["cwd"] = serde_json::json!(mcp_cwd.to_string_lossy());
+        }
         std::fs::write(
             &config,
-            serde_json::json!({
-                "mcp": { "direct": { "type": "local", "command": command } },
-            })
-            .to_string(),
+            serde_json::json!({ "mcp": { "direct": mcp_entry } }).to_string(),
         )
         .unwrap();
         let plan = plan_opencode_sources(
@@ -207,6 +229,22 @@ mod configured_resource_tests {
         std::fs::rename(home, &hidden_home).unwrap();
         let output = std::process::Command::new("node")
             .arg(provider_script)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .output();
+        std::fs::rename(&hidden_home, home).unwrap();
+        output.unwrap()
+    }
+
+    fn execute_node_command_with_home_hidden(
+        owned_root: &Path,
+        home: &Path,
+        arguments: &[String],
+    ) -> std::process::Output {
+        let hidden_home = owned_root.join("home-hidden");
+        std::fs::rename(home, &hidden_home).unwrap();
+        let output = std::process::Command::new("node")
+            .args(arguments)
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .output();
@@ -1287,6 +1325,298 @@ process.stdout.write(require('./helper.js'))
     }
 
     #[test]
+    fn direct_node_command_stages_inline_and_separated_file_options() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let command = home.join("server.mjs");
+        let preload = home.join("preload.cjs");
+        let preload_helper = home.join("preload-helper.cjs");
+        let imported = home.join("imported.mjs");
+        let loader = home.join("loader.mjs");
+        let experimental_loader = home.join("experimental-loader.mjs");
+        let env_file = home.join(".env");
+        let second_env_file = home.join(".env.local");
+        let optional_env_file = home.join(".env.optional");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(&command, "if (globalThis.managedPreload !== 'loaded' || globalThis.managedPreloadHelper !== 'loaded' || globalThis.managedImport !== 'loaded' || process.env.MANAGED_ENV_FILE !== 'loaded' || process.env.MANAGED_ENV_FILE_LOCAL !== 'loaded') process.exit(1);\nprocess.stdout.write('command options staged\\n');\n").unwrap();
+        std::fs::write(
+            &preload,
+            "require('./preload-helper.cjs');\nglobalThis.managedPreload = 'loaded';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &preload_helper,
+            "globalThis.managedPreloadHelper = 'loaded';\n",
+        )
+        .unwrap();
+        std::fs::write(&imported, "globalThis.managedImport = 'loaded';\n").unwrap();
+        std::fs::write(&loader, "export async function resolve(specifier, context, nextResolve) { return nextResolve(specifier, context); }\n").unwrap();
+        std::fs::write(&experimental_loader, "export async function resolve(specifier, context, nextResolve) { return nextResolve(specifier, context); }\n").unwrap();
+        std::fs::write(&env_file, "MANAGED_ENV_FILE=loaded\n").unwrap();
+        std::fs::write(&second_env_file, "MANAGED_ENV_FILE_LOCAL=loaded\n").unwrap();
+
+        let option_arguments = vec![
+            "node".to_owned(),
+            format!("--require={}", preload.display()),
+            "--import".to_owned(),
+            imported.to_string_lossy().into_owned(),
+            format!("--loader={}", loader.display()),
+            "--experimental-loader".to_owned(),
+            experimental_loader.to_string_lossy().into_owned(),
+            format!("--env-file={}", env_file.display()),
+            "--env-file".to_owned(),
+            second_env_file.to_string_lossy().into_owned(),
+            format!("--env-file-if-exists={}", optional_env_file.display()),
+            command.to_string_lossy().into_owned(),
+        ];
+        let (plan, _) = plan_and_stage_mcp_command_for_resource(
+            owned.path(),
+            &home,
+            &workspace,
+            &option_arguments,
+            &command,
+        );
+        for required in [
+            &preload,
+            &preload_helper,
+            &imported,
+            &loader,
+            &experimental_loader,
+            &env_file,
+            &second_env_file,
+        ] {
+            assert!(
+                plan[0]
+                    .configured_resources
+                    .contains(&required.canonicalize().unwrap()),
+                "direct Node command option resource omitted {}",
+                required.display()
+            );
+        }
+        assert!(!plan[0]
+            .configured_resources
+            .contains(&home.canonicalize().unwrap()));
+        assert!(!plan[0].configured_resources.contains(
+            &optional_env_file
+                .canonicalize()
+                .unwrap_or(optional_env_file.clone())
+        ));
+
+        let provider = copy_selected_units_through_provider(
+            owned.path(),
+            &resource_units(
+                &home,
+                &home.join(".config/opencode"),
+                &workspace,
+                &plan,
+                None,
+            )
+            .unwrap(),
+        );
+        let staged = |path: &Path| {
+            provider
+                .join(".provider-home")
+                .join(path.strip_prefix(&home).unwrap())
+        };
+        let arguments = vec![
+            format!("--require={}", staged(&preload).display()),
+            "--import".to_owned(),
+            staged(&imported).to_string_lossy().into_owned(),
+            format!("--loader={}", staged(&loader).display()),
+            "--experimental-loader".to_owned(),
+            staged(&experimental_loader).to_string_lossy().into_owned(),
+            format!("--env-file={}", staged(&env_file).display()),
+            "--env-file".to_owned(),
+            staged(&second_env_file).to_string_lossy().into_owned(),
+            format!(
+                "--env-file-if-exists={}",
+                staged(&optional_env_file).display()
+            ),
+            staged(&command).to_string_lossy().into_owned(),
+        ];
+        let output = execute_node_command_with_home_hidden(owned.path(), &home, &arguments);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"command options staged\n");
+    }
+
+    #[test]
+    fn direct_node_command_options_inside_mcp_cwd_use_the_directory_copy() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let mcp_cwd = home.join("tools");
+        let command = mcp_cwd.join("server.js");
+        let preload = mcp_cwd.join("preload.cjs");
+        let env_file = mcp_cwd.join(".env");
+        std::fs::create_dir_all(&mcp_cwd).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "if (globalThis.cwdPreload !== 'loaded' || process.env.MANAGED_CWD_ENV !== 'loaded') process.exit(1);\nprocess.stdout.write('cwd options loaded\\n');\n",
+        )
+        .unwrap();
+        std::fs::write(&preload, "globalThis.cwdPreload = 'loaded';\n").unwrap();
+        std::fs::write(&env_file, "MANAGED_CWD_ENV=loaded\n").unwrap();
+        let command_arguments = vec![
+            "node".to_owned(),
+            "--require=./preload.cjs".to_owned(),
+            "--env-file=.env".to_owned(),
+            "server.js".to_owned(),
+        ];
+
+        let (plan, _) = plan_and_stage_mcp_command_for_resource_with_cwd(
+            owned.path(),
+            &home,
+            &workspace,
+            &command_arguments,
+            &command,
+            Some(&mcp_cwd),
+        );
+        let canonical_cwd = mcp_cwd.canonicalize().unwrap();
+        assert!(plan[0].configured_resources.contains(&canonical_cwd));
+        for covered in [&command, &preload, &env_file] {
+            assert!(
+                !plan[0]
+                    .configured_resources
+                    .contains(&covered.canonicalize().unwrap()),
+                "MCP cwd should supply {} without an overlapping exact-file mount",
+                covered.display()
+            );
+        }
+
+        let units = resource_units(
+            &home,
+            &home.join(".config/opencode"),
+            &workspace,
+            &plan,
+            None,
+        )
+        .unwrap();
+        let cwd_mount = units
+            .iter()
+            .find(|(source, _)| source == &canonical_cwd)
+            .map(|(_, mount)| mount)
+            .expect("selected MCP cwd must have a provider resource mount");
+        let provider_relative = Path::new(&cwd_mount.effective_destination)
+            .strip_prefix(owned.path())
+            .map(Path::to_path_buf)
+            .or_else(|_| {
+                Path::new(&cwd_mount.effective_destination)
+                    .strip_prefix("/home/freshell/provider")
+                    .map(|relative| Path::new(".provider-home").join(relative))
+            })
+            .expect("test MCP cwd destination must map into the provider root");
+        let provider = copy_selected_units_through_provider(owned.path(), &units);
+        let provider_cwd = provider.join(provider_relative);
+        assert!(provider_cwd.is_dir(), "{}", provider_cwd.display());
+
+        let hidden_home = owned.path().join("home-hidden");
+        std::fs::rename(&home, &hidden_home).unwrap();
+        let output = std::process::Command::new("node")
+            .args(["--require=./preload.cjs", "--env-file=.env", "server.js"])
+            .current_dir(&provider_cwd)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .output();
+        std::fs::rename(&hidden_home, &home).unwrap();
+        let output = output.unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"cwd options loaded\n");
+    }
+
+    #[test]
+    fn direct_node_script_does_not_stage_absent_sibling_write_targets() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let command = home.join("writer.mjs");
+        let path_output = home.join("generated-path.json");
+        let url_output = home.join("generated-url.json");
+        let append_output = home.join("existing-output.txt");
+        let append_url_output = home.join("existing-url-output.txt");
+        let copy_source = home.join("copy-source.txt");
+        let copy_output = home.join("copy-output.txt");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "import fs from 'node:fs';\nimport path from 'node:path';\nimport { fileURLToPath } from 'node:url';\nconst __dirname = path.dirname(fileURLToPath(import.meta.url));\nfs.writeFileSync(path.join(__dirname, 'generated-path.json'), 'path output');\nfs.writeFileSync(new URL('./generated-url.json', import.meta.url), 'url output');\nfs.appendFileSync(path.join(__dirname, 'existing-output.txt'), ' appended');\nfs.appendFileSync(new URL('./existing-url-output.txt', import.meta.url), ' appended');\nfs.copyFileSync(path.join(__dirname, 'copy-source.txt'), path.join(__dirname, 'copy-output.txt'));\nprocess.stdout.write(__dirname + '\\n');\n",
+        )
+        .unwrap();
+        std::fs::write(&append_output, "existing").unwrap();
+        std::fs::write(&append_url_output, "url existing").unwrap();
+        std::fs::write(&copy_source, "copy input").unwrap();
+
+        let (plan, provider_script) =
+            plan_and_stage_direct_mcp_command(owned.path(), &home, &workspace, &command);
+        for output in [&path_output, &url_output] {
+            assert!(
+                !plan[0]
+                    .configured_resources
+                    .contains(&output.canonicalize().unwrap_or_else(|_| output.clone())),
+                "a prospective write destination must not be a required staged input"
+            );
+        }
+        assert!(plan[0]
+            .configured_resources
+            .contains(&append_output.canonicalize().unwrap()));
+        assert!(plan[0]
+            .configured_resources
+            .contains(&append_url_output.canonicalize().unwrap()));
+        assert!(plan[0]
+            .configured_resources
+            .contains(&copy_source.canonicalize().unwrap()));
+        assert!(!plan[0].configured_resources.contains(
+            &copy_output
+                .canonicalize()
+                .unwrap_or_else(|_| copy_output.clone())
+        ));
+
+        let output = execute_node_with_home_hidden(owned.path(), &home, &provider_script);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        let provider_script_directory = std::fs::canonicalize(&provider_script)
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            output.stdout,
+            format!("{}\n", provider_script_directory.display()).as_bytes()
+        );
+        let staged_path_output = provider_script_directory.join("generated-path.json");
+        let staged_url_output = provider_script_directory.join("generated-url.json");
+        let staged_append_output = provider_script_directory.join("existing-output.txt");
+        let staged_append_url_output = provider_script_directory.join("existing-url-output.txt");
+        let staged_copy_output = provider_script_directory.join("copy-output.txt");
+        assert_eq!(
+            std::fs::read(&staged_path_output).unwrap_or_else(|error| panic!(
+                "failed to read {} beside {}: {error}; entries: {:?}; staged script: {:?}; stdout: {:?}",
+                staged_path_output.display(),
+                provider_script.display(),
+                std::fs::read_dir(&provider_script_directory)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect::<Vec<_>>(),
+                std::fs::read_to_string(&provider_script),
+                output.stdout
+            )),
+            b"path output"
+        );
+        assert_eq!(std::fs::read(&staged_url_output).unwrap(), b"url output");
+        assert_eq!(
+            std::fs::read(&staged_append_output).unwrap(),
+            b"existing appended"
+        );
+        assert_eq!(
+            std::fs::read(&staged_append_url_output).unwrap(),
+            b"url existing appended"
+        );
+        assert_eq!(std::fs::read(&staged_copy_output).unwrap(), b"copy input");
+    }
+
+    #[test]
     fn direct_node_script_in_nested_home_directory_keeps_relative_module_closure() {
         let owned = tempfile::tempdir().unwrap();
         let home = owned.path().join("home");
@@ -2273,6 +2603,52 @@ process.stdout.write(require('./helper.js'))
         let output = execute_with_home_hidden(owned.path(), &home, &provider_command);
         assert!(output.status.success(), "{:?}", output.stderr);
         assert_eq!(output.stdout, expected);
+    }
+
+    #[test]
+    fn direct_shell_script_does_not_stage_absent_sibling_redirection_targets() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let command = home.join("writer");
+        let generated = home.join("generated.txt");
+        let existing_output = home.join("existing.txt");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "#!/bin/sh\nSCRIPT_DIR=$(dirname \"$0\")\nprintf 'created by shell\\n' > \"$SCRIPT_DIR/generated.txt\"\nprintf 'appended by shell\\n' >> \"$SCRIPT_DIR/generated.txt\"\nprintf ' appended' >> \"$SCRIPT_DIR/existing.txt\"\n",
+        )
+        .unwrap();
+        std::fs::write(&existing_output, "existing").unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (plan, provider_command) =
+            plan_and_stage_direct_mcp_command(owned.path(), &home, &workspace, &command);
+        assert!(
+            !plan[0].configured_resources.contains(
+                &generated
+                    .canonicalize()
+                    .unwrap_or_else(|_| generated.clone())
+            ),
+            "a shell redirection destination must not be a required staged input"
+        );
+        assert!(plan[0]
+            .configured_resources
+            .contains(&existing_output.canonicalize().unwrap()));
+
+        let output = execute_with_home_hidden(owned.path(), &home, &provider_command);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(
+            std::fs::read(provider_command.with_file_name("generated.txt")).unwrap(),
+            b"created by shell\nappended by shell\n"
+        );
+        assert_eq!(
+            std::fs::read(provider_command.with_file_name("existing.txt")).unwrap(),
+            b"existing appended"
+        );
     }
 
     #[test]
