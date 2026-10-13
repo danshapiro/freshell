@@ -328,7 +328,11 @@ impl Plan {
             }
         }
         if resource == Path::new("/") || self.account_home.as_deref() == Some(resource.as_path()) {
-            return Err(error(path,"select_resource_scope","an external resource cannot infer the entire account home or filesystem root; select a complete resource/package directory with its own scope"));
+            return Err(error(
+                path,
+                "select_resource_scope",
+                "an external resource cannot infer the entire account home or filesystem root; select a complete resource/package directory with its own scope",
+            ));
         }
         let destination = Path::new(".freshell/resources/tree")
             .join(resource.strip_prefix(Path::new("/")).unwrap_or(&resource));
@@ -506,7 +510,11 @@ impl Plan {
             let mode = 0;
             self.claim(path, Node::File(canonical, mode, metadata.len()))?;
         } else {
-            return Err(error(&path,"inspect","selected resource must be a regular file, directory or resolvable symbolic link; replace the unsupported node"));
+            return Err(error(
+                &path,
+                "inspect",
+                "selected resource must be a regular file, directory or resolvable symbolic link; replace the unsupported node",
+            ));
         }
         Ok(())
     }
@@ -552,12 +560,653 @@ impl Drop for TemporaryProjection {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
+
+const STAGE_PREFIX: &str = ".freshell-copy-v1-";
+const BACKUP_PREFIX: &str = ".freshell-copy-backups-v1-";
+const JOURNAL_FILE: &str = ".manifest.json";
+const JOURNAL_TEMP_FILE: &str = ".manifest.tmp";
+const COMMITTED_FILE: &str = ".committed";
+const OLD_FILES_DIR: &str = ".old";
+const MAX_JOURNAL_BYTES: u64 = 160 * 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PublicationJournalEntry {
+    Leaf {
+        relative: PathBuf,
+        backup_id: usize,
+        had_original: bool,
+    },
+    CreatedDirectory(PathBuf),
+    Obsolete {
+        relative: PathBuf,
+        backup_id: usize,
+    },
+}
+
+fn publication_paths(
+    parent: &Path,
+    destination_root: &Path,
+    existing_root: bool,
+) -> Result<(TemporaryProjection, Option<TemporaryProjection>), CopyError> {
+    loop {
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            NEXT_PROJECTION.fetch_add(1, Ordering::Relaxed)
+        );
+        let stage_path = parent.join(format!("{STAGE_PREFIX}{suffix}"));
+        let backup_path = destination_root.join(format!("{BACKUP_PREFIX}{suffix}"));
+        if path_exists(&stage_path)? || (existing_root && path_exists(&backup_path)?) {
+            continue;
+        }
+
+        let stage = TemporaryProjection::create(stage_path)?;
+        let backup = if existing_root {
+            Some(TemporaryProjection::create(backup_path)?)
+        } else {
+            None
+        };
+        return Ok((stage, backup));
+    }
+}
+
+fn path_exists(path: &Path) -> Result<bool, CopyError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(cause) => Err(io_error(Path::new(""), "inspect_publication_path", cause)),
+    }
+}
+
+fn encode_relative_path(path: &Path) -> Result<String, CopyError> {
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes()
+    };
+    #[cfg(not(unix))]
+    let bytes = path
+        .to_str()
+        .ok_or_else(|| {
+            error(
+                path,
+                "write_journal",
+                "path is not representable in the journal",
+            )
+        })?
+        .as_bytes();
+
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}")
+            .map_err(|_| error(path, "write_journal", "could not encode journal path"))?;
+    }
+    Ok(encoded)
+}
+
+fn decode_relative_path(encoded: &str) -> Option<PathBuf> {
+    if encoded.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.as_bytes().chunks_exact(2) {
+        let high = (pair[0] as char).to_digit(16)? as u8;
+        let low = (pair[1] as char).to_digit(16)? as u8;
+        bytes.push((high << 4) | low);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(bytes).ok().map(PathBuf::from)
+    }
+}
+
+fn journal_entry_value(entry: &PublicationJournalEntry) -> Result<serde_json::Value, CopyError> {
+    match entry {
+        PublicationJournalEntry::Leaf {
+            relative,
+            backup_id,
+            had_original,
+        } => Ok(serde_json::json!({
+            "kind": "leaf",
+            "pathHex": encode_relative_path(relative)?,
+            "backupId": backup_id,
+            "hadOriginal": had_original,
+        })),
+        PublicationJournalEntry::CreatedDirectory(path) => Ok(serde_json::json!({
+            "kind": "created_directory",
+            "pathHex": encode_relative_path(path)?,
+        })),
+        PublicationJournalEntry::Obsolete {
+            relative,
+            backup_id,
+        } => Ok(serde_json::json!({
+            "kind": "obsolete",
+            "pathHex": encode_relative_path(relative)?,
+            "backupId": backup_id,
+        })),
+    }
+}
+
+fn write_publication_journal(
+    destination_root: &Path,
+    backup_root: &Path,
+    entries: &[PublicationJournalEntry],
+) -> Result<(), CopyError> {
+    let entries = entries
+        .iter()
+        .map(journal_entry_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    let bytes = serde_json::to_vec(&serde_json::json!({ "version": 1, "entries": entries }))
+        .map_err(|_| {
+            error(
+                Path::new(""),
+                "write_journal",
+                "could not encode publication journal",
+            )
+        })?;
+    if bytes.len() as u64 > MAX_JOURNAL_BYTES {
+        return Err(error(
+            Path::new(""),
+            "write_journal",
+            "publication journal exceeds its size limit",
+        ));
+    }
+    let temporary = backup_root.join(JOURNAL_TEMP_FILE);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|cause| io_error(Path::new(""), "create_journal", cause))?;
+    file.write_all(&bytes)
+        .map_err(|cause| io_error(Path::new(""), "write_journal", cause))?;
+    file.sync_all()
+        .map_err(|cause| io_error(Path::new(""), "sync_journal", cause))?;
+    drop(file);
+    fs::rename(&temporary, backup_root.join(JOURNAL_FILE))
+        .map_err(|cause| io_error(Path::new(""), "publish_journal", cause))?;
+    sync_directory_chain(destination_root, backup_root)
+}
+
+fn sync_directory_chain(root: &Path, directory: &Path) -> Result<(), CopyError> {
+    let mut current = directory;
+    loop {
+        File::open(current)
+            .and_then(|handle| handle.sync_all())
+            .map_err(|cause| io_error(Path::new(""), "sync_publication", cause))?;
+        if current == root {
+            return Ok(());
+        }
+        current = current.parent().ok_or_else(|| {
+            error(
+                Path::new(""),
+                "sync_publication",
+                "publication directory escaped its root",
+            )
+        })?;
+        if !current.starts_with(root) {
+            return Err(error(
+                Path::new(""),
+                "sync_publication",
+                "publication directory escaped its root",
+            ));
+        }
+    }
+}
+
+fn read_publication_journal(path: &Path) -> Result<Vec<PublicationJournalEntry>, CopyError> {
+    let metadata =
+        fs::metadata(path).map_err(|cause| io_error(Path::new(""), "read_journal", cause))?;
+    if metadata.len() > MAX_JOURNAL_BYTES {
+        return Err(error(
+            Path::new(""),
+            "read_journal",
+            "publication journal exceeds its size limit",
+        ));
+    }
+    let bytes = fs::read(path).map_err(|cause| io_error(Path::new(""), "read_journal", cause))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+        error(
+            Path::new(""),
+            "read_journal",
+            "publication journal is invalid",
+        )
+    })?;
+    if value.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+        return Err(error(
+            Path::new(""),
+            "read_journal",
+            "publication journal version is unsupported",
+        ));
+    }
+    let entries = value
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            error(
+                Path::new(""),
+                "read_journal",
+                "publication journal has no entries",
+            )
+        })?;
+    let mut result = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let kind = entry
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                error(
+                    Path::new(""),
+                    "read_journal",
+                    "publication journal entry is invalid",
+                )
+            })?;
+        let encoded_path = entry
+            .get("pathHex")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                error(
+                    Path::new(""),
+                    "read_journal",
+                    "publication journal path is invalid",
+                )
+            })?;
+        let path = decode_relative_path(encoded_path)
+            .filter(|path| valid_relative(path))
+            .ok_or_else(|| {
+                error(
+                    Path::new(""),
+                    "read_journal",
+                    "publication journal path is unsafe",
+                )
+            })?;
+        result.push(match kind {
+            "leaf" => PublicationJournalEntry::Leaf {
+                relative: path,
+                backup_id: entry
+                    .get("backupId")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| {
+                        error(
+                            Path::new(""),
+                            "read_journal",
+                            "publication backup reference is invalid",
+                        )
+                    })?,
+                had_original: entry
+                    .get("hadOriginal")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or_else(|| {
+                        error(
+                            Path::new(""),
+                            "read_journal",
+                            "publication prior-state flag is invalid",
+                        )
+                    })?,
+            },
+            "created_directory" => PublicationJournalEntry::CreatedDirectory(path),
+            "obsolete" => PublicationJournalEntry::Obsolete {
+                relative: path,
+                backup_id: entry
+                    .get("backupId")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| {
+                        error(
+                            Path::new(""),
+                            "read_journal",
+                            "publication backup reference is invalid",
+                        )
+                    })?,
+            },
+            _ => {
+                return Err(error(
+                    Path::new(""),
+                    "read_journal",
+                    "publication journal entry kind is unknown",
+                ));
+            }
+        });
+    }
+    Ok(result)
+}
+
+fn backup_path(backup_root: &Path, backup_id: usize) -> PathBuf {
+    backup_root.join(OLD_FILES_DIR).join(backup_id.to_string())
+}
+
+fn remove_if_present(path: &Path) -> Result<(), CopyError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            fs::remove_dir_all(path)
+                .map_err(|cause| io_error(Path::new(""), "remove_recovery_artifact", cause))
+        }
+        Ok(_) => fs::remove_file(path)
+            .map_err(|cause| io_error(Path::new(""), "remove_recovery_artifact", cause)),
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(cause) => Err(io_error(Path::new(""), "inspect_recovery_artifact", cause)),
+    }
+}
+
+fn remove_recovered_leaf(path: &Path) -> Result<(), CopyError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Err(error(
+            path,
+            "recover_publication",
+            "journal leaf unexpectedly resolves to a directory",
+        )),
+        Ok(_) => {
+            fs::remove_file(path).map_err(|cause| io_error(path, "remove_recovered_leaf", cause))
+        }
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(cause) => Err(io_error(path, "inspect_recovered_leaf", cause)),
+    }
+}
+
+fn recover_interrupted_publications(destination_root: &Path) -> Result<(), CopyError> {
+    let mut transactions = Vec::new();
+    for entry in fs::read_dir(destination_root)
+        .map_err(|cause| io_error(Path::new(""), "list_publication_transactions", cause))?
+    {
+        let entry = entry
+            .map_err(|cause| io_error(Path::new(""), "list_publication_transactions", cause))?;
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.starts_with(BACKUP_PREFIX))
+        {
+            transactions.push(path);
+        }
+    }
+    transactions.sort();
+    for backup_root in transactions {
+        let metadata = fs::symlink_metadata(&backup_root)
+            .map_err(|cause| io_error(Path::new(""), "inspect_publication_transaction", cause))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(error(
+                Path::new(""),
+                "recover_publication",
+                "publication transaction must be a physical directory",
+            ));
+        }
+        let name = backup_root
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or_else(|| {
+                error(
+                    Path::new(""),
+                    "recover_publication",
+                    "publication transaction name is invalid",
+                )
+            })?;
+        let suffix = name.strip_prefix(BACKUP_PREFIX).ok_or_else(|| {
+            error(
+                Path::new(""),
+                "recover_publication",
+                "publication transaction name is invalid",
+            )
+        })?;
+        let stage_root = destination_root.join(format!("{STAGE_PREFIX}{suffix}"));
+        let committed = match fs::symlink_metadata(backup_root.join(COMMITTED_FILE)) {
+            Ok(_) => true,
+            Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => false,
+            Err(cause) => return Err(io_error(Path::new(""), "inspect_publication_commit", cause)),
+        };
+        if committed {
+            remove_if_present(&stage_root)?;
+            remove_if_present(&backup_root)?;
+            sync_directory_chain(destination_root, destination_root)?;
+            continue;
+        }
+
+        let journal_path = backup_root.join(JOURNAL_FILE);
+        let entries = match fs::symlink_metadata(&journal_path) {
+            Ok(_) => read_publication_journal(&journal_path)?,
+            // The journal is atomically installed before any destination path
+            // changes, so a transaction without it has nothing to roll back.
+            Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(cause) => {
+                return Err(io_error(
+                    Path::new(""),
+                    "inspect_publication_journal",
+                    cause,
+                ));
+            }
+        };
+
+        let mut created_directories = Vec::new();
+        for entry in &entries {
+            match entry {
+                PublicationJournalEntry::CreatedDirectory(relative) => {
+                    created_directories.push(relative.clone());
+                }
+                PublicationJournalEntry::Leaf {
+                    relative,
+                    backup_id,
+                    ..
+                }
+                | PublicationJournalEntry::Obsolete {
+                    relative,
+                    backup_id,
+                } => {
+                    let had_original = match entry {
+                        PublicationJournalEntry::Leaf { had_original, .. } => *had_original,
+                        PublicationJournalEntry::Obsolete { .. } => true,
+                        PublicationJournalEntry::CreatedDirectory(_) => unreachable!(),
+                    };
+                    let destination = destination_root.join(relative);
+                    let backup = backup_path(&backup_root, *backup_id);
+                    match fs::symlink_metadata(&backup) {
+                        Ok(backup_metadata) => {
+                            let parent = destination.parent().ok_or_else(|| {
+                                error(
+                                    relative,
+                                    "recover_publication",
+                                    "journal destination has no parent",
+                                )
+                            })?;
+                            for component in relative
+                                .parent()
+                                .into_iter()
+                                .flat_map(Path::ancestors)
+                                .filter(|path| !path.as_os_str().is_empty())
+                            {
+                                match fs::symlink_metadata(destination_root.join(component)) {
+                                    Ok(parent_metadata)
+                                        if parent_metadata.is_dir()
+                                            && !parent_metadata.file_type().is_symlink() => {}
+                                    Ok(_) => {
+                                        return Err(error(
+                                            relative,
+                                            "recover_publication",
+                                            "journal parent is not a physical directory",
+                                        ));
+                                    }
+                                    Err(cause) => {
+                                        return Err(io_error(
+                                            relative,
+                                            "inspect_recovery_parent",
+                                            cause,
+                                        ));
+                                    }
+                                }
+                            }
+                            match fs::symlink_metadata(&destination) {
+                                Ok(destination_metadata)
+                                    if matches!(
+                                        entry,
+                                        PublicationJournalEntry::Obsolete { .. }
+                                    ) || (destination_metadata.is_dir()
+                                        && !destination_metadata.file_type().is_symlink())
+                                        || (backup_metadata.is_dir()
+                                            && !backup_metadata.file_type().is_symlink()) =>
+                                {
+                                    return Err(error(
+                                        relative,
+                                        "recover_publication",
+                                        "recovery destination conflicts with retained data",
+                                    ));
+                                }
+                                Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(cause) => {
+                                    return Err(io_error(
+                                        relative,
+                                        "inspect_recovery_destination",
+                                        cause,
+                                    ));
+                                }
+                                _ => {}
+                            }
+                            fs::rename(&backup, &destination).map_err(|cause| {
+                                io_error(relative, "restore_recovery_backup", cause)
+                            })?;
+                            sync_directory_chain(destination_root, parent)?;
+                        }
+                        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {
+                            if matches!(entry, PublicationJournalEntry::Leaf { .. })
+                                && !had_original
+                            {
+                                match fs::symlink_metadata(stage_root.join(relative)) {
+                                    Ok(_) => {}
+                                    Err(stage_error)
+                                        if stage_error.kind() == std::io::ErrorKind::NotFound =>
+                                    {
+                                        remove_recovered_leaf(&destination)?;
+                                    }
+                                    Err(stage_error) => {
+                                        return Err(io_error(
+                                            relative,
+                                            "inspect_recovery_stage",
+                                            stage_error,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        Err(cause) => {
+                            return Err(io_error(relative, "inspect_recovery_backup", cause));
+                        }
+                    }
+                }
+            }
+        }
+        created_directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+        for relative in created_directories {
+            let path = destination_root.join(relative);
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                    match fs::remove_dir(&path) {
+                        Ok(()) => {}
+                        Err(cause) if cause.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+                        Err(cause) => {
+                            return Err(io_error(
+                                Path::new(""),
+                                "remove_recovered_directory",
+                                cause,
+                            ));
+                        }
+                    }
+                }
+                Ok(_) => {
+                    return Err(error(
+                        Path::new(""),
+                        "recover_publication",
+                        "journal directory conflicts with a non-directory",
+                    ));
+                }
+                Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {}
+                Err(cause) => {
+                    return Err(io_error(
+                        Path::new(""),
+                        "inspect_recovered_directory",
+                        cause,
+                    ));
+                }
+            }
+        }
+        sync_directory_chain(destination_root, destination_root)?;
+        remove_if_present(&stage_root)?;
+        remove_if_present(&backup_root)?;
+        sync_directory_chain(destination_root, destination_root)?;
+    }
+    Ok(())
+}
+
+impl Publication {
+    fn record_journal_entry(
+        &mut self,
+        destination_root: &Path,
+        entry: PublicationJournalEntry,
+    ) -> Result<(), CopyError> {
+        if self.journal_entries.contains(&entry) {
+            return Ok(());
+        }
+        self.journal_entries.push(entry);
+        write_publication_journal(destination_root, &self.backup.0, &self.journal_entries)
+    }
+
+    fn set_leaf_had_original(
+        &mut self,
+        destination_root: &Path,
+        relative: &Path,
+        had_original: bool,
+    ) -> Result<(), CopyError> {
+        let entry = self
+            .journal_entries
+            .iter_mut()
+            .find(|entry| {
+                matches!(entry, PublicationJournalEntry::Leaf { relative: path, .. } if path == relative)
+            })
+            .ok_or_else(|| error(relative, "write_journal", "published leaf is absent from the journal"))?;
+        if let PublicationJournalEntry::Leaf {
+            had_original: previous,
+            ..
+        } = entry
+        {
+            if *previous == had_original {
+                return Ok(());
+            }
+            *previous = had_original;
+        }
+        write_publication_journal(destination_root, &self.backup.0, &self.journal_entries)
+    }
+
+    fn write_committed_marker(&self, destination_root: &Path) -> Result<(), CopyError> {
+        let temporary = self.backup.0.join(format!("{COMMITTED_FILE}.tmp"));
+        let path = self.backup.0.join(COMMITTED_FILE);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|cause| io_error(Path::new(""), "create_publication_commit", cause))?;
+        file.write_all(b"committed\n")
+            .map_err(|cause| io_error(Path::new(""), "write_publication_commit", cause))?;
+        file.sync_all()
+            .map_err(|cause| io_error(Path::new(""), "sync_publication_commit", cause))?;
+        drop(file);
+        fs::rename(&temporary, &path)
+            .map_err(|cause| io_error(Path::new(""), "publish_publication_commit", cause))?;
+        sync_directory_chain(destination_root, &self.backup.0)
+    }
+}
+
 /// Removal authority covers only inodes created by this attempt. A hard link
 /// keeps each replaced provider inode available for rollback until commit.
 struct Publication {
     backup: TemporaryProjection,
     created: Vec<PathBuf>,
     replaced: Vec<(PathBuf, PathBuf)>,
+    journal_entries: Vec<PublicationJournalEntry>,
+    next_backup_id: usize,
     committed: bool,
 }
 impl Drop for Publication {
@@ -673,12 +1322,27 @@ impl EnvironmentPublication {
                 "new root has no previous projection",
             )
         })?;
-        let backup = publication
-            .backup
-            .0
-            .join(publication.replaced.len().to_string());
+        let backup_id = publication.next_backup_id;
+        publication.record_journal_entry(
+            &self.root,
+            PublicationJournalEntry::Obsolete {
+                relative: relative.to_owned(),
+                backup_id,
+            },
+        )?;
+        publication.next_backup_id += 1;
+        let backup = backup_path(&publication.backup.0, backup_id);
+        let backup_parent = backup
+            .parent()
+            .ok_or_else(|| error(relative, "retain_obsolete", "backup path has no parent"))?;
+        fs::create_dir_all(backup_parent)
+            .map_err(|cause| io_error(relative, "create_obsolete_backup_parent", cause))?;
         fs::rename(&path, &backup).map_err(|cause| io_error(relative, "retain_obsolete", cause))?;
-        publication.replaced.push((path, backup));
+        publication.replaced.push((path.clone(), backup.clone()));
+        if let Some(parent) = path.parent() {
+            sync_directory_chain(&self.root, parent)?;
+        }
+        sync_directory_chain(&self.root, backup_parent)?;
         Ok(())
     }
     pub fn created_paths(&self) -> &[PathBuf] {
@@ -689,6 +1353,7 @@ impl EnvironmentPublication {
             .and_then(|directory| directory.sync_all())
             .map_err(|cause| io_error(Path::new(""), "sync_publication", cause))?;
         if let Some(publication) = self.rollback.as_mut() {
+            publication.write_committed_marker(&self.root)?;
             publication.committed = true;
         }
         self.unfinished_new_root = false;
@@ -844,7 +1509,11 @@ fn stage_environment_with_publisher(
         let canonical = fs::canonicalize(&selection.source)
             .map_err(|cause| io_error(path, "resolve_selection", cause))?;
         if plan.excluded(&canonical) {
-            return Err(error(path,"select","selected resource is excluded native state or a credential source; keep native state in its store and use managed references for credentials"));
+            return Err(error(
+                path,
+                "select",
+                "selected resource is excluded native state or a credential source; keep native state in its store and use managed references for credentials",
+            ));
         }
         plan.select_linked_ancestors(selection, &selections, &canonical)?;
         if metadata.file_type().is_symlink() {
@@ -883,11 +1552,14 @@ fn stage_environment_with_publisher(
                 Path::new(""),
                 "publish",
                 "destination root must be a physical directory",
-            ))
+            ));
         }
         Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => false,
         Err(cause) => return Err(io_error(Path::new(""), "inspect_destination", cause)),
     };
+    if existing_root {
+        recover_interrupted_publications(destination_root)?;
+    }
     let parent = if existing_root {
         destination_root
     } else {
@@ -898,11 +1570,7 @@ fn stage_environment_with_publisher(
             .map_err(|cause| io_error(Path::new(""), "create_stage_parent", cause))?;
         parent
     };
-    let temporary = TemporaryProjection::create(parent.join(format!(
-        ".freshell-copy-{}-{}",
-        std::process::id(),
-        NEXT_PROJECTION.fetch_add(1, Ordering::Relaxed)
-    )))?;
+    let (temporary, backup_root) = publication_paths(parent, destination_root, existing_root)?;
     let mut actual_bytes = 0u64;
     for (relative, node) in &plan.nodes {
         let destination = temporary.0.join(relative);
@@ -993,6 +1661,8 @@ fn stage_environment_with_publisher(
                 "destination root must be a physical directory",
             ));
         }
+        let mut journal_entries = Vec::new();
+        let mut next_backup_id = 0;
         for (relative, node) in &plan.nodes {
             for parent in relative
                 .parent()
@@ -1006,16 +1676,21 @@ fn stage_environment_with_publisher(
                             relative,
                             "inspect_destination",
                             "selected destination parent must be a physical directory",
-                        ))
+                        ));
                     }
                     Err(cause) if cause.kind() != std::io::ErrorKind::NotFound => {
-                        return Err(io_error(relative, "inspect_destination", cause))
+                        return Err(io_error(relative, "inspect_destination", cause));
                     }
                     _ => {}
                 }
             }
-            match fs::symlink_metadata(destination_root.join(relative)) {
-                Ok(metadata)
+            let existing = match fs::symlink_metadata(destination_root.join(relative)) {
+                Ok(metadata) => Some(metadata),
+                Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => None,
+                Err(cause) => return Err(io_error(relative, "inspect_destination", cause)),
+            };
+            match existing.as_ref() {
+                Some(metadata)
                     if matches!(node, Node::Directory(_))
                         && (!metadata.is_dir() || metadata.file_type().is_symlink()) =>
                 {
@@ -1023,31 +1698,55 @@ fn stage_environment_with_publisher(
                         relative,
                         "inspect_destination",
                         "existing destination type conflicts with selected resource",
-                    ))
+                    ));
                 }
-                Ok(metadata) if !matches!(node, Node::Directory(_)) && metadata.is_dir() => {
+                Some(metadata) if !matches!(node, Node::Directory(_)) && metadata.is_dir() => {
                     return Err(error(
                         relative,
                         "inspect_destination",
                         "existing directory conflicts with selected resource leaf",
-                    ))
-                }
-                Err(cause) if cause.kind() != std::io::ErrorKind::NotFound => {
-                    return Err(io_error(relative, "inspect_destination", cause))
+                    ));
                 }
                 _ => {}
             }
+            if matches!(node, Node::Directory(_)) {
+                if existing.is_none() {
+                    journal_entries
+                        .push(PublicationJournalEntry::CreatedDirectory(relative.clone()));
+                }
+            } else {
+                journal_entries.push(PublicationJournalEntry::Leaf {
+                    relative: relative.clone(),
+                    backup_id: next_backup_id,
+                    had_original: existing.is_some(),
+                });
+                next_backup_id += 1;
+            }
         }
         let mut publication = Publication {
-            backup: TemporaryProjection::create(destination_root.join(format!(
-                ".freshell-copy-backups-{}-{}",
-                std::process::id(),
-                NEXT_PROJECTION.fetch_add(1, Ordering::Relaxed)
-            )))?,
+            backup: backup_root.ok_or_else(|| {
+                error(
+                    Path::new(""),
+                    "publish",
+                    "existing HOME has no publication journal",
+                )
+            })?,
             created: Vec::new(),
             replaced: Vec::new(),
+            journal_entries,
+            next_backup_id,
             committed: false,
         };
+        write_publication_journal(
+            destination_root,
+            &publication.backup.0,
+            &publication.journal_entries,
+        )?;
+        let old_files = publication.backup.0.join(OLD_FILES_DIR);
+        fs::create_dir(&old_files)
+            .map_err(|cause| io_error(Path::new(""), "create_publication_backups", cause))?;
+        sync_directory_chain(destination_root, &old_files)?;
+        let mut backup_id = 0;
         for (relative, node) in &plan.nodes {
             let destination = destination_root.join(relative);
             let existing = match fs::symlink_metadata(&destination) {
@@ -1061,31 +1760,42 @@ fn stage_environment_with_publisher(
                         .map_err(|cause| io_error(relative, "publish_directory", cause))?;
                     publication.created.push(destination.clone());
                     mode(&destination, 0o700, relative)?;
+                    if let Some(parent) = destination.parent() {
+                        sync_directory_chain(destination_root, parent)?;
+                    }
                 }
                 // An existing parent grants no chmod/chown/removal authority.
             } else {
+                publication.set_leaf_had_original(
+                    destination_root,
+                    relative,
+                    existing.is_some(),
+                )?;
                 if existing.is_some() {
-                    let backup = publication
-                        .backup
-                        .0
-                        .join(publication.replaced.len().to_string());
+                    let backup = backup_path(&publication.backup.0, backup_id);
                     // Keep the provider-visible leaf in place until rename
                     // atomically publishes the staged replacement. The hard
                     // link retains the prior inode for ordinary-error rollback.
                     fs::hard_link(&destination, &backup)
                         .map_err(|cause| io_error(relative, "retain_replacement", cause))?;
                     publication.replaced.push((destination.clone(), backup));
+                    sync_directory_chain(
+                        destination_root,
+                        publication.backup.0.join(OLD_FILES_DIR).as_path(),
+                    )?;
+                }
+                if existing.is_none() {
+                    publication.created.push(destination.clone());
                 }
                 publish(&temporary.0.join(relative), &destination)
                     .map_err(|cause| io_error(relative, "publish_leaf", cause))?;
-                if existing.is_none() {
-                    publication.created.push(destination);
+                if let Some(parent) = destination.parent() {
+                    sync_directory_chain(destination_root, parent)?;
                 }
+                backup_id += 1;
             }
         }
-        File::open(destination_root)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|cause| io_error(Path::new(""), "sync_publication", cause))?;
+        sync_directory_chain(destination_root, destination_root)?;
         rollback = Some(publication);
     }
     let entries = plan.nodes.len();
@@ -1313,6 +2023,113 @@ mod tests {
         child.0.kill().unwrap();
         assert!(!child.0.wait().unwrap().success());
         assert_eq!(fs::read(home.join("config.json")).unwrap(), b"original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn abrupt_termination_after_partial_publish_recovers_prior_home_before_retry() {
+        const CHILD_ROOT: &str = "FRESHELL_PROVIDER_MULTI_PUBLICATION_CHILD_ROOT";
+        const PARTIAL_PUBLISH_REACHED: &str = "partial-publish-reached";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let source = root.join("source");
+            let home = root.join("home");
+            let reached = root.join(PARTIAL_PUBLISH_REACHED);
+            let mut published = 0;
+            let _ = copy_environment_with_publisher(
+                &[
+                    selection(&source.join("a-first"), "a-first"),
+                    selection(&source.join("m-new"), "m-new"),
+                    selection(&source.join("z-last"), "z-last"),
+                ],
+                &home,
+                &[],
+                Default::default(),
+                None,
+                |from, to| {
+                    fs::rename(from, to)?;
+                    published += 1;
+                    if published == 2 {
+                        fs::write(&reached, b"published").unwrap();
+                        loop {
+                            std::thread::park_timeout(std::time::Duration::from_secs(10));
+                        }
+                    }
+                    Ok(())
+                },
+            );
+            panic!("child should be killed after publishing part of the projection");
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let home = root.path().join("home");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&home).unwrap();
+        for name in ["a-first", "z-last"] {
+            fs::write(source.join(name), format!("new-{name}")).unwrap();
+            fs::write(home.join(name), format!("prior-{name}")).unwrap();
+        }
+        fs::write(source.join("m-new"), b"new-m-new").unwrap();
+
+        let mut child = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "provider_environment::tests::abrupt_termination_after_partial_publish_recovers_prior_home_before_retry",
+                    "--nocapture",
+                ])
+                .env(CHILD_ROOT, root.path())
+                .spawn()
+                .unwrap(),
+        );
+        let reached = root.path().join(PARTIAL_PUBLISH_REACHED);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !reached.exists() {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                panic!("child exited before the partial publication: {status}");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child did not publish a partial projection"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        child.0.kill().unwrap();
+        assert!(!child.0.wait().unwrap().success());
+
+        let unrelated = source.join("unrelated");
+        fs::write(&unrelated, b"unrelated").unwrap();
+        stage_environment(
+            &[selection(&unrelated, "unrelated")],
+            &home,
+            &[],
+            Default::default(),
+        )
+        .unwrap()
+        .commit()
+        .unwrap();
+        assert_eq!(fs::read(home.join("a-first")).unwrap(), b"prior-a-first");
+        assert_eq!(fs::read(home.join("z-last")).unwrap(), b"prior-z-last");
+        assert!(!home.join("m-new").exists());
+        assert_eq!(fs::read(home.join("unrelated")).unwrap(), b"unrelated");
+
+        stage_environment(
+            &[
+                selection(&source.join("a-first"), "a-first"),
+                selection(&source.join("m-new"), "m-new"),
+                selection(&source.join("z-last"), "z-last"),
+            ],
+            &home,
+            &[],
+            Default::default(),
+        )
+        .unwrap()
+        .commit()
+        .unwrap();
+        assert_eq!(fs::read(home.join("a-first")).unwrap(), b"new-a-first");
+        assert_eq!(fs::read(home.join("m-new")).unwrap(), b"new-m-new");
+        assert_eq!(fs::read(home.join("z-last")).unwrap(), b"new-z-last");
     }
 
     #[cfg(target_os = "linux")]
