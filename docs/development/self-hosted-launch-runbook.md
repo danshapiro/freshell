@@ -244,7 +244,10 @@ the procedure mid-way and leave the service down. Two sequences:
   case "$C" in ''|*[!0-9]*) C=4;; esac   # absent/garbage -> supervisor default
   [ "$C" -ge 1 ] 2>/dev/null || C=1      # supervisor clamps to 1..16 — mirror it
   [ "$C" -le 16 ] 2>/dev/null || C=16
-  N=$(wc -l < "$RUN/desired-running.txt" 2>/dev/null || echo 0)
+  # Count UNIQUE soul IDs: the inventory stores per-incarnation rows, so
+  # a raw line count can multiply one soul by its history and inflate the
+  # cap uselessly:
+  N=$(sort -u "$RUN/desired-running.txt" 2>/dev/null | wc -l || echo 0)
   [ "$N" -gt 0 ] || N=$(wc -l < "$RUN/souls-before.txt" 2>/dev/null || echo 0)
   WC=$(( N * 900 / C * 2 ))
   [ "$WC" -ge 3600 ] || WC=3600
@@ -467,7 +470,7 @@ for s in souls:
 souls=json.load(sys.stdin)["souls"]
 for s in souls:
     if s.get("desiredState")=="running":
-        print(s["soulId"])' > "$RUN/desired-running-after.txt"
+        print(s["soulId"])' | sort -u > "$RUN/desired-running-after.txt"
     # POSITIVE ownership check for EVERY baseline container: its
     # (soul, container) pair must appear in the deployed registry with a
     # RUNNING incarnation — a registry swap or restore leaves containers
@@ -658,6 +661,15 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
     BWS=$(mktemp -d "$PROBE_ROOT/bws.XXXXXX")   # unique per run
     chmod 0770 "$BWS"   # same in-soul-shell access requirement as $WS
     echo "BWS=$BWS" >> "$D/run.env"
+    # The directory picker PERSISTS the chosen path as OpenCode's default
+    # cwd (the confirm handler patches settings) — record the current
+    # default so step 8 can restore it:
+    curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/settings \
+      | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+d=d.get("data",d)
+print((d.get("codingCli") or {}).get("providers",{}).get("opencode",{}).get("cwd") or "")' \
+      > "$D/old-opencode-cwd.txt"
     # Hard-refresh the web client, then in the UI: open the pane picker
     # and choose OPENCODE specifically — the only managed-enabled
     # coding-CLI provider in the current release (Claude, Codex, and
@@ -840,6 +852,18 @@ o=json.load(sys.stdin)
 assert o.get("outcome")=="verified_empty", o
 print("stopped browser soul:", o["outcome"])'
         fi
+      fi
+    fi
+    # Restore OpenCode's default cwd that the directory step overwrote
+    # (only when the browser check ran — $BWS set):
+    if [ -n "${BWS:-}" ] && [ -f "$D/old-opencode-cwd.txt" ]; then
+      OLD=$(cat "$D/old-opencode-cwd.txt")
+      if [ -n "$OLD" ]; then
+        curl -s -X PATCH -H @"$D/hdr" -H "Content-Type: application/json" \
+          -d '{"codingCli":{"providers":{"opencode":{"cwd":"'"$OLD"'"}}}}' \
+          http://127.0.0.1:3001/api/settings > /dev/null
+      else
+        echo "OpenCode had no default cwd — clear the probe path in Settings → Coding CLI → OpenCode"
       fi
     fi
     rm -rf "$D" "${PROBE_ROOT:-}" "$WS" "${BWS:-}"   # success only; both
