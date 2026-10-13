@@ -3064,14 +3064,15 @@ async fn resolve_checkpoint_workspace(
                 candidate: candidate.clone(),
                 reason,
             })?;
-        let explicitly_selected_home = provenance == "directory-picker";
+        let explicitly_selected_home =
+            provenance == "directory-picker" && is_recognized_account_home(&selected, &homes);
         if is_recognized_account_home(&selected, &homes) && !explicitly_selected_home {
             return Err(CheckpointWorkspaceUnavailable {
                 candidate,
                 reason: "account home cannot be used as a code checkpoint workspace".to_string(),
             });
         }
-        let path = if provenance == "legacy-checkpoint" {
+        let path = if provenance == "legacy-checkpoint" || explicitly_selected_home {
             selected
         } else {
             git_checkout_root(&selected).await.unwrap_or(selected)
@@ -3560,17 +3561,22 @@ fn checkpoint_storage_exclusion(
     let storage = git_dir.parent().ok_or_else(|| {
         "checkpoint operation resolve-storage failed: storage path has no parent".to_string()
     })?;
-    if work_tree.starts_with(storage) {
+    let home = storage.parent().and_then(Path::parent).ok_or_else(|| {
+        "checkpoint operation resolve-storage failed: storage path has no home anchor".to_string()
+    })?;
+    let canonical_home = std::fs::canonicalize(home).map_err(|_| {
+        "checkpoint operation resolve-storage failed: home anchor cannot be resolved".to_string()
+    })?;
+    // Canonicalize the home anchor so aliases compare against the canonical
+    // workspace, then retain the logical suffix for Git's pathspec.
+    let storage = canonical_home.join(".freshell").join("checkpoints");
+    if work_tree.starts_with(&storage) {
         return Err(
             "checkpoint operation resolve-storage failed: workspace overlaps Freshell checkpoint storage"
                 .to_string(),
         );
     }
     match storage.strip_prefix(work_tree) {
-        Ok(relative) if relative.as_os_str().is_empty() => Err(
-            "checkpoint operation resolve-storage failed: workspace is Freshell checkpoint storage"
-                .to_string(),
-        ),
         Ok(relative) => Ok(Some(relative.to_owned())),
         Err(_) => Ok(None),
     }
@@ -6662,6 +6668,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_picker_home_keeps_exact_scope_when_git_root_is_its_parent() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        tokio::fs::create_dir(&home).await.unwrap();
+        run_git(&["init", "-q"], Some(owned.path())).await.unwrap();
+        let intent = json!({
+            "path": home,
+            "provenance": "directory-picker",
+        });
+
+        let resolved = resolve_checkpoint_workspace(&home, &home, Some(&intent))
+            .await
+            .expect("explicit account-home selection is an eligible scope");
+
+        assert_eq!(resolved.path, home.canonicalize().unwrap());
+    }
+
+    #[tokio::test]
+    async fn picker_subdirectory_of_account_home_git_repo_is_rejected() {
+        let home = tempfile::tempdir().unwrap();
+        let selected = home.path().join("project");
+        tokio::fs::create_dir(&selected).await.unwrap();
+        run_git(&["init", "-q"], Some(home.path())).await.unwrap();
+        let intent = json!({
+            "path": selected,
+            "provenance": "directory-picker",
+        });
+
+        let error = resolve_checkpoint_workspace(home.path(), &selected, Some(&intent))
+            .await
+            .expect_err("selecting a child must not authorize its account-home Git root");
+
+        assert!(error.reason.contains("account home"), "{}", error.reason);
+    }
+
+    #[tokio::test]
     async fn review_r6_automatic_checkpoint_missing_workspace_is_logged() {
         use tracing::instrument::WithSubscriber;
         use tracing_subscriber::prelude::*;
@@ -6867,6 +6909,52 @@ mod tests {
             entry.path.starts_with(b".freshell/checkpoints/")
                 || entry.path == b".freshell/checkpoints"
         }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_picker_home_symlink_excludes_internal_store_and_rejects_store_scope() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("actual-home");
+        let alias = owned.path().join("home-alias");
+        tokio::fs::create_dir(&home).await.unwrap();
+        std::os::unix::fs::symlink(&home, &alias).unwrap();
+        tokio::fs::write(home.join("private.txt"), "private")
+            .await
+            .unwrap();
+
+        let response = post_checkpoint(
+            State(state(&alias)),
+            headers_with_token("tok"),
+            Json(json!({
+                "cwd": alias,
+                "workspace": {
+                    "path": alias,
+                    "provenance": "directory-picker",
+                },
+            })),
+        )
+        .await;
+
+        let status = response.status();
+        let entry = body_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{entry}");
+        let git_dir = checkpoint_git_dir(&alias, &home);
+        let index = checkpoint_index_entries(&git_dir, &git_dir.join("index"))
+            .await
+            .expect("published aliased-home checkpoint index is readable");
+        assert!(index.iter().any(|entry| entry.path == b"private.txt"));
+        assert!(!index.iter().any(|entry| {
+            entry.path.starts_with(b".freshell/checkpoints/")
+                || entry.path == b".freshell/checkpoints"
+        }));
+
+        let nested_workspace = home.join(".freshell/checkpoints/nested-workspace");
+        tokio::fs::create_dir_all(&nested_workspace).await.unwrap();
+        let canonical_nested = tokio::fs::canonicalize(&nested_workspace).await.unwrap();
+        let error = checkpoint_storage_exclusion(&git_dir, &canonical_nested)
+            .expect_err("the aliased checkpoint store cannot become a workspace");
+        assert!(error.contains("overlaps Freshell checkpoint storage"));
     }
 
     #[tokio::test]
