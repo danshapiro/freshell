@@ -241,6 +241,7 @@ impl AmplifierActivityTracker {
                     at,
                     completion_seq: seq,
                     outcome: None,
+                    outcome_update: false,
                 });
                 effects
             }

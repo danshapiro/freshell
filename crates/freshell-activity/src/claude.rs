@@ -258,6 +258,7 @@ impl ClaudeActivityTracker {
                 at,
                 completion_seq: seq,
                 outcome: None,
+                outcome_update: false,
             });
         }
         state.last_observed_at = at;
@@ -382,6 +383,7 @@ impl ClaudeActivityTracker {
             at,
             completion_seq: seq,
             outcome: None,
+            outcome_update: false,
         });
         effects
     }

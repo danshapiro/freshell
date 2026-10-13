@@ -2052,6 +2052,7 @@ fn claude_frames(
                 at,
                 completion_seq,
                 outcome,
+                outcome_update: _,
             } => {
                 idle.note_turn_boundary(&terminal_id, at);
                 frames.push(turn_complete_frame(
@@ -2113,8 +2114,11 @@ fn codex_frames(
                 at,
                 completion_seq,
                 outcome,
+                outcome_update,
             } => {
-                idle.note_turn_boundary(&terminal_id, at);
+                if !outcome_update {
+                    idle.note_turn_boundary(&terminal_id, at);
+                }
                 frames.push(turn_complete_frame(
                     AgentProvider::Codex,
                     terminal_id,
@@ -2171,6 +2175,7 @@ fn opencode_frames(
                 at,
                 completion_seq,
                 outcome,
+                outcome_update: _,
             } => {
                 idle.note_turn_boundary(&terminal_id, at);
                 frames.push(turn_complete_frame(
@@ -2231,6 +2236,7 @@ fn amplifier_frames(
                 at,
                 completion_seq,
                 outcome,
+                outcome_update: _,
             } => {
                 idle.note_turn_boundary(&terminal_id, at);
                 frames.push(turn_complete_frame(
@@ -4601,6 +4607,33 @@ mod tests {
         .expect("failed turn completion");
         assert_eq!(complete["provider"], "codex");
         assert_eq!(complete["outcome"], "failed");
+    }
+
+    #[test]
+    fn codex_outcome_update_preserves_the_existing_idle_deadline() {
+        let mut idle = IdleGate::with_grace_ms(10);
+        idle.note_turn_boundary("terminal-1", 100);
+
+        let (frames, force_reads) = codex_frames(
+            &mut idle,
+            vec![TrackerEffect::TurnComplete {
+                terminal_id: "terminal-1".to_string(),
+                session_id: Some("session-1".to_string()),
+                at: 200,
+                completion_seq: 1,
+                outcome: Some(TerminalTurnOutcome::Completed),
+                outcome_update: true,
+            }],
+        );
+
+        assert!(force_reads.is_empty());
+        assert!(matches!(
+            frames.as_slice(),
+            [ServerMessage::TerminalTurnComplete(frame)]
+                if frame.completion_seq == 1
+                    && frame.outcome == Some(TerminalTurnOutcome::Completed)
+        ));
+        assert_eq!(idle.expire(110).len(), 1);
     }
 
     fn codex_rollout_fixture(lines: &[String]) -> (tempfile::TempDir, std::path::PathBuf) {

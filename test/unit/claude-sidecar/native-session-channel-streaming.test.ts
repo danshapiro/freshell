@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, open, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -21,5 +21,22 @@ describe('streaming native transcript safety scan', () => {
     await writeFile(path, row.repeat(count))
 
     await expect(nativeTranscriptHasDeferredOperation({ path })).resolves.toBe(false)
+  })
+
+  it('rejects an individual row beyond the previously supported transcript size', async () => {
+    directory = await mkdtemp(join(tmpdir(), 'native-transcript-large-row-'))
+    const path = join(directory, 'session.jsonl')
+    const file = await open(path, 'w')
+    try {
+      await file.write('{"type":"user","message":{"content":"')
+      const chunk = 'x'.repeat(1024 * 1024)
+      for (let index = 0; index < 33; index += 1) await file.write(chunk)
+      await file.write('"}}\n')
+    } finally {
+      await file.close()
+    }
+
+    await expect(nativeTranscriptHasDeferredOperation({ path }))
+      .rejects.toMatchObject({ code: 'NATIVE_TRANSCRIPT_INVALID' })
   })
 })

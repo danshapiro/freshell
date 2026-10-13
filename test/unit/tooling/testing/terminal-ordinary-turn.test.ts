@@ -132,10 +132,16 @@ describe('body-free terminal ordinary-turn reduction', () => {
       ...frames,
       { ...complete('codex', codexTarget.terminalId, 1), outcome: 'completed' },
     ], codexBaseline)
+    const completedAfterProvisional = reduceTerminalOrdinaryTurnFrames([
+      ...frames,
+      complete('codex', codexTarget.terminalId, 1),
+      { ...complete('codex', codexTarget.terminalId, 1), outcome: 'completed' },
+    ], codexBaseline)
 
     expect(failed).toMatchObject({ outputSeen: true, completionSeen: false, completionSeq: null })
     expect(unavailable).toMatchObject({ outputSeen: true, completionSeen: false, completionSeq: null })
     expect(completed).toMatchObject({ outputSeen: true, completionSeen: true, completionSeq: 1 })
+    expect(completedAfterProvisional).toMatchObject({ outputSeen: true, completionSeen: true, completionSeq: 1 })
   })
 
   it('counts a nonempty output batch without retaining its body or segment data', () => {

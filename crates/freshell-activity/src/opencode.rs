@@ -275,6 +275,7 @@ impl OpencodeActivityTracker {
                     at: completed_at,
                     completion_seq: seq,
                     outcome: None,
+                    outcome_update: false,
                 }]
             }
             Ownership::AwaitingAssociation { previous_known, .. } => {
@@ -777,6 +778,7 @@ fn reduce_idle_edge(
                     at,
                     completion_seq: seq,
                     outcome: None,
+                    outcome_update: false,
                 });
             }
             effects
@@ -1035,6 +1037,7 @@ fn reduce_snapshot(
                         at,
                         completion_seq: seq,
                         outcome: None,
+                        outcome_update: false,
                     });
                 }
                 effects
@@ -1205,6 +1208,7 @@ mod tests {
             at,
             completion_seq: seq,
             outcome: None,
+            outcome_update: false,
         }
     }
 

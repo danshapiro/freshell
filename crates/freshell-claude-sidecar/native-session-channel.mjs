@@ -2,7 +2,6 @@ import { randomUUID, createHash } from 'node:crypto'
 import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
-import { StringDecoder } from 'node:string_decoder'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
 
@@ -12,6 +11,10 @@ const ownPath = fileURLToPath(import.meta.url)
 const quote = (value) => `'${value.replaceAll("'", "'\\''")}'`
 const validRoot = (root) => typeof root === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(root)
 const sessionStartSources = new Set(['startup', 'resume', 'clear', 'compact', 'fork'])
+// The previous whole-file reader rejected transcripts above this size, so a
+// single row could never have been larger. Keep that compatibility bound per
+// row while allowing an unlimited number of ordinary-sized rows.
+const maxNativeTranscriptRowBytes = 32 * 1024 * 1024
 
 function canonicalJson(value) {
   if (Array.isArray(value)) return '[' + value.map(canonicalJson).join(',') + ']'
@@ -48,24 +51,75 @@ async function readNativeTranscript(path, allowMissing = false) {
   } finally { await file?.close() }
 }
 
-async function scanNativeTranscript(path, { allowMissing = false, expectedSessionId } = {}) {
+async function forEachNativeTranscriptRow(path, { allowMissing = false } = {}, consume) {
   const invalid = (reason) => Object.assign(new Error(reason), { code: 'NATIVE_TRANSCRIPT_INVALID' })
   let file
   try {
     file = await open(path, 'r')
   } catch (error) {
     if (error?.code === 'ENOENT' && allowMissing) {
-      return { hasDeferredOperation: false, messageCount: 0, sessionIdentityMatches: true }
+      return { byteLength: 0n, identity: null, rowCount: 0 }
     }
     throw error
   }
 
-  const pending = new Set()
   const identity = (metadata) => [metadata.dev, metadata.ino, metadata.size, metadata.mtimeNs, metadata.ctimeNs].join(':')
-  const decoder = new StringDecoder('utf8')
-  let buffer = ''
+  let lineParts = []
+  let lineBytes = 0
+  let lineOffset = 0n
   let bytesRead = 0n
   let lastByte = null
+  let rowCount = 0
+
+  try {
+    const before = await file.stat({ bigint: true })
+    if (!before.isFile()) throw invalid('invalid native transcript file')
+    const stream = file.createReadStream({ start: 0, autoClose: false })
+    const processLine = () => {
+      const lineBuffer = Buffer.concat(lineParts, lineBytes)
+      const line = lineBuffer.toString('utf8')
+      if (line.trim()) {
+        consume(JSON.parse(line), line, lineOffset)
+        rowCount += 1
+      }
+      lineOffset += BigInt(lineBytes + 1)
+      lineParts = []
+      lineBytes = 0
+    }
+    const appendPart = (part) => {
+      if (!part.length) return
+      lineBytes += part.length
+      if (lineBytes > maxNativeTranscriptRowBytes) throw invalid('native transcript row exceeds the supported size')
+      lineParts.push(part)
+    }
+
+    for await (const chunk of stream) {
+      bytesRead += BigInt(chunk.length)
+      if (chunk.length) lastByte = chunk.at(-1)
+      let start = 0
+      let boundary
+      while ((boundary = chunk.indexOf(10, start)) >= 0) {
+        appendPart(chunk.subarray(start, boundary))
+        processLine()
+        start = boundary + 1
+      }
+      appendPart(chunk.subarray(start))
+    }
+    if (lineBytes > 0) throw invalid('native transcript changed or has incomplete EOF')
+
+    const after = await file.stat({ bigint: true })
+    const current = await stat(path, { bigint: true })
+    if (identity(before) !== identity(after) || identity(after) !== identity(current)
+      || bytesRead !== after.size || (bytesRead ? lastByte !== 10 : !allowMissing)) {
+      throw invalid('native transcript changed or has incomplete EOF')
+    }
+
+    return { byteLength: bytesRead, identity: identity(after), rowCount }
+  } finally { await file.close() }
+}
+
+async function scanNativeTranscript(path, { allowMissing = false, expectedSessionId } = {}) {
+  const pending = new Set()
   let malformedToolUse = false
   let latestDeferredMarkerSeen = false
   let latestDeferredToolUseID = null
@@ -74,10 +128,7 @@ async function scanNativeTranscript(path, { allowMissing = false, expectedSessio
   let messageCount = 0
   let sessionIdentityMatches = true
 
-  const consumeLine = (line) => {
-    if (!line.trim()) return
-    const row = JSON.parse(line)
-
+  await forEachNativeTranscriptRow(path, { allowMissing }, (row, line) => {
     if (latestDeferredToolUseID !== null
       && line.includes('"tool_use_id":"' + latestDeferredToolUseID + '"')) {
       latestDeferredToolUseMatched = true
@@ -103,38 +154,12 @@ async function scanNativeTranscript(path, { allowMissing = false, expectedSessio
       latestDeferredToolUseValid = typeof latestDeferredToolUseID === 'string' && latestDeferredToolUseID.length > 0
       latestDeferredToolUseMatched = false
     }
-  }
+  })
 
-  try {
-    const before = await file.stat({ bigint: true })
-    if (!before.isFile()) throw invalid('invalid native transcript file')
-    const stream = file.createReadStream({ start: 0, autoClose: false })
-    for await (const chunk of stream) {
-      bytesRead += BigInt(chunk.length)
-      if (chunk.length) lastByte = chunk.at(-1)
-      buffer += decoder.write(chunk)
-      let boundary
-      while ((boundary = buffer.indexOf('\n')) >= 0) {
-        const line = buffer.slice(0, boundary)
-        buffer = buffer.slice(boundary + 1)
-        consumeLine(line)
-      }
-    }
-    buffer += decoder.end()
-    if (buffer.length > 0) throw invalid('native transcript changed or has incomplete EOF')
-
-    const after = await file.stat({ bigint: true })
-    const current = await stat(path, { bigint: true })
-    if (identity(before) !== identity(after) || identity(after) !== identity(current)
-      || bytesRead !== after.size || (bytesRead ? lastByte !== 10 : !allowMissing)) {
-      throw invalid('native transcript changed or has incomplete EOF')
-    }
-
-    const hasDeferredOperation = malformedToolUse || pending.size > 0
-      || (latestDeferredMarkerSeen
-        && (!latestDeferredToolUseValid || !latestDeferredToolUseMatched))
-    return { hasDeferredOperation, messageCount, sessionIdentityMatches }
-  } finally { await file.close() }
+  const hasDeferredOperation = malformedToolUse || pending.size > 0
+    || (latestDeferredMarkerSeen
+      && (!latestDeferredToolUseValid || !latestDeferredToolUseMatched))
+  return { hasDeferredOperation, messageCount, sessionIdentityMatches }
 }
 
 /** Whether the pinned native loader has an unfinished operation on first
@@ -214,39 +239,75 @@ export async function inspectNativeDeferredCheckpoint({ path, nativeSessionId, t
   if (!validRoot(nativeSessionId) || typeof toolUseID !== 'string' || !/^toolu_[A-Za-z0-9]+$/.test(toolUseID)
     || typeof inputDigest !== 'string' || !/^[a-f0-9]{64}$/.test(inputDigest)) return null
   try {
-    const { bytes, lines, rows } = await readNativeTranscript(path)
-    const checkpointIndex = rows.findLastIndex((row) => row.type === 'attachment' && row.attachment?.type === 'hook_deferred_tool'
-      && (!checkpointUuid || row.uuid === checkpointUuid))
-    if (checkpointIndex < 0) return null
-    const checkpoint = rows[checkpointIndex]
-    const attachment = checkpoint.attachment
-    if (checkpoint.sessionId !== nativeSessionId || checkpoint.version !== '2.1.237'
-      || typeof checkpoint.uuid !== 'string' || !checkpoint.uuid || attachment.toolUseID !== toolUseID
-      || attachment.toolName !== 'Bash' || attachment.hookEvent !== 'PreToolUse'
-      || nativeInputDigest(attachment.toolInput) !== inputDigest) return null
-    // The pinned native loader scans only the final MiB and invalidates the
-    // marker on any later raw correlated tool_use_id, including denials.
-    const checkpointOffset = Buffer.byteLength(lines.slice(0, checkpointIndex).join('\n')) + (checkpointIndex ? 1 : 0)
-    const consumed = lines.slice(checkpointIndex + 1).some((line) => line.includes('"tool_use_id":"' + toolUseID + '"'))
-    if ((bytes.length - checkpointOffset > 1024 * 1024 && !(includeConsumed && consumed))
-      || (consumed && !includeConsumed)) return null
-    const assistant = rows.slice(0, checkpointIndex).findLast((row) => row.type === 'assistant'
-      && Array.isArray(row.message?.content) && row.message.content.some((block) => block.type === 'tool_use' && block.id === toolUseID))
-    const messageId = assistant?.message.id
-    if (typeof messageId !== 'string' || !messageId) return null
-    // Native streaming serializes one model response into multiple assistant
-    // rows. Count the entire response, including rows after the attachment.
-    const batchRows = rows.filter((row) => row.type === 'assistant' && row.message?.id === messageId)
-    if (batchRows.some((row) => row.sessionId !== nativeSessionId || row.version !== '2.1.237'
-      || !Array.isArray(row.message.content))) return null
-    const tools = batchRows.flatMap((row) => row.message.content.filter((block) => block.type === 'tool_use'))
-    if (assistant?.sessionId !== nativeSessionId || assistant.version !== '2.1.237'
-      || typeof assistant.uuid !== 'string' || !assistant.uuid || tools?.length !== 1
-      || tools[0].name !== attachment.toolName || nativeInputDigest(tools[0].input) !== inputDigest) return null
-    return { nativeSessionId, toolUseID, inputDigest, toolName: attachment.toolName,
-      checkpointUuid: checkpoint.uuid, assistantUuid: assistant.uuid, nativeVersion: checkpoint.version,
-      checkpointDigest: createHash('sha256').update(lines[checkpointIndex]).digest('hex'),
-      ...(includeConsumed ? { consumed } : {}) }
+    let previousAssistant = null
+    let candidate = null
+    const firstPass = await forEachNativeTranscriptRow(path, {}, (row, line, offset) => {
+      if (row.type === 'assistant' && Array.isArray(row.message?.content)
+        && row.message.content.some((block) => block.type === 'tool_use' && block.id === toolUseID)) {
+        previousAssistant = {
+          messageId: row.message.id,
+          sessionId: row.sessionId,
+          version: row.version,
+          uuid: row.uuid,
+        }
+      }
+
+      if (row.type === 'attachment' && row.attachment?.type === 'hook_deferred_tool'
+        && (!checkpointUuid || row.uuid === checkpointUuid)) {
+        const attachment = row.attachment
+        candidate = {
+          valid: row.sessionId === nativeSessionId && row.version === '2.1.237'
+            && typeof row.uuid === 'string' && row.uuid.length > 0
+            && attachment.toolUseID === toolUseID && attachment.toolName === 'Bash'
+            && attachment.hookEvent === 'PreToolUse'
+            && nativeInputDigest(attachment.toolInput) === inputDigest,
+          checkpointUuid: row.uuid,
+          checkpointDigest: createHash('sha256').update(line).digest('hex'),
+          checkpointOffset: offset,
+          checkpointVersion: row.version,
+          assistant: previousAssistant,
+          consumed: false,
+        }
+      } else if (candidate && line.includes('"tool_use_id":"' + toolUseID + '"')) {
+        candidate.consumed = true
+      }
+    })
+
+    if (!candidate?.valid || candidate.consumed && !includeConsumed) return null
+    if (firstPass.byteLength - candidate.checkpointOffset > 1024n * 1024n
+      && !(includeConsumed && candidate.consumed)) return null
+
+    const assistant = candidate.assistant
+    if (!assistant || typeof assistant.messageId !== 'string' || !assistant.messageId
+      || assistant.sessionId !== nativeSessionId || assistant.version !== '2.1.237'
+      || typeof assistant.uuid !== 'string' || !assistant.uuid) return null
+
+    let batchRowsValid = true
+    let toolCount = 0
+    let tool
+    const secondPass = await forEachNativeTranscriptRow(path, {}, (row) => {
+      if (row.type !== 'assistant' || row.message?.id !== assistant.messageId) return
+      if (row.sessionId !== nativeSessionId || row.version !== '2.1.237'
+        || !Array.isArray(row.message.content)) {
+        batchRowsValid = false
+        return
+      }
+      for (const block of row.message.content) {
+        if (block.type !== 'tool_use') continue
+        toolCount += 1
+        if (toolCount === 1) tool = block
+      }
+    })
+    if (firstPass.identity !== secondPass.identity || firstPass.byteLength !== secondPass.byteLength) {
+      throw Object.assign(new Error('native transcript changed between checkpoint scans'), { code: 'NATIVE_TRANSCRIPT_INVALID' })
+    }
+    if (!batchRowsValid || toolCount !== 1 || tool?.name !== 'Bash'
+      || nativeInputDigest(tool.input) !== inputDigest) return null
+
+    return { nativeSessionId, toolUseID, inputDigest, toolName: 'Bash',
+      checkpointUuid: candidate.checkpointUuid, assistantUuid: assistant.uuid,
+      nativeVersion: candidate.checkpointVersion, checkpointDigest: candidate.checkpointDigest,
+      ...(includeConsumed ? { consumed: candidate.consumed } : {}) }
   } catch (error) {
     if (error?.code === 'ENOENT' || error?.code === 'NATIVE_TRANSCRIPT_INVALID' || error instanceof SyntaxError) return null
     throw new Error('native deferred checkpoint is unreadable')
