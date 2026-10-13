@@ -1,5 +1,5 @@
 import type { ManagedRuntimeProjectionFields } from '../../shared/managed-runtime.js'
-import { managedTerminalProjection } from './managed-terminal.js'
+import { managedTerminalProjection, managedTerminalResumePaneStatus } from './managed-terminal.js'
 import type { ComponentType } from 'react'
 import { PROVIDER_ICONS, DefaultProviderIcon } from '@/components/icons/provider-icons'
 import { isNonShellMode, getProviderLabel } from '@/lib/coding-cli-utils'
@@ -256,7 +256,7 @@ export function buildResumeContent(opts: {
       ? {
           terminalId: opts.liveTerminal.terminalId,
           serverInstanceId: opts.liveTerminal.serverInstanceId,
-          status: opts.liveTerminal.runtimeStatus === 'exited' ? 'exited' as const : 'running' as const,
+          status: managedTerminalResumePaneStatus(opts.liveTerminal),
           ...managedTerminalProjection(opts.liveTerminal),
         }
       : {}),

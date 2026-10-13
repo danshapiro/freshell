@@ -5970,12 +5970,23 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               }, msg.status === 'running' || msg.status === 'recovering' ? msg.status : 'exited')
               updateContent({ status, runtimeStatus: msg.status, recoverySummary: msg.recoverySummary })
               const statusTab = tabRef.current
-              if (statusTab) dispatch(updateTab({ id: statusTab.id, updates: { status } }))
+              if (statusTab) dispatch(updateTab({ id: statusTab.id, updates: {
+                status,
+                runtimeStatus: msg.status,
+                recoverySummary: msg.recoverySummary,
+              } }))
             } else if (msg.status === 'running' || msg.status === 'recovering') {
-              const status = managedTerminalPaneStatus(contentRef.current ?? {}, msg.status)
+              const terminal = contentRef.current
+              const status = managedTerminalPaneStatus(terminal ?? {}, msg.status)
               updateContent({ status })
               const statusTab = tabRef.current
-              if (statusTab) dispatch(updateTab({ id: statusTab.id, updates: { status } }))
+              if (statusTab) dispatch(updateTab({ id: statusTab.id, updates: {
+                status,
+                ...(terminal?.soulId ? {
+                  runtimeStatus: status === msg.status ? msg.status : terminal.runtimeStatus,
+                  recoverySummary: terminal.recoverySummary,
+                } : {}),
+              } }))
             }
           }
           return
@@ -6042,10 +6053,19 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             clearQuarantineRepair()
             dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
             discardPendingInput('terminal_gone')
-            const status = managedTerminalPaneStatus(contentRef.current ?? {}, 'exited')
-            updateContent({ status, runtimeStatus: 'exited' })
+            const terminal = contentRef.current
+            const status = managedTerminalPaneStatus(terminal ?? {}, 'exited')
+            const runtimeStatus = terminal?.runtimeStatus === 'blocked'
+              || terminal?.recoverySummary?.recoveryState === 'blocked'
+              ? 'blocked'
+              : 'exited'
+            updateContent({ status, runtimeStatus })
             const exitTab = tabRef.current
-            if (exitTab) dispatch(updateTab({ id: exitTab.id, updates: { status } }))
+            if (exitTab) dispatch(updateTab({ id: exitTab.id, updates: {
+              status,
+              runtimeStatus,
+              recoverySummary: terminal?.recoverySummary,
+            } }))
             return
           }
 

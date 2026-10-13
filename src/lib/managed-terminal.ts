@@ -3,11 +3,22 @@ import type { TerminalStatus } from '../store/types.js'
 
 /** A retained process ending does not erase the supervisor's final verdict. */
 export function managedTerminalPaneStatus(terminal: ManagedRuntimeProjectionFields, fallback: TerminalStatus): TerminalStatus {
+  if (terminal.runtimeStatus === 'blocked') return 'error'
   if (!terminal.soulId || !terminal.recoverySummary) return fallback
   const { recoveryState, desiredState } = terminal.recoverySummary
   if (recoveryState === 'blocked' || recoveryState === 'lost') return 'error'
   if (recoveryState === 'stopped' || desiredState === 'stopped') return 'exited'
   return fallback
+}
+
+/** Status for a pane reconstructed from a retained managed terminal projection. */
+export function managedTerminalResumePaneStatus(terminal: ManagedRuntimeProjectionFields): TerminalStatus {
+  const fallback = terminal.runtimeStatus === 'exited'
+    ? 'exited'
+    : terminal.runtimeStatus === 'recovering'
+      ? 'recovering'
+      : 'running'
+  return managedTerminalPaneStatus(terminal, fallback)
 }
 
 export function managedTerminalRecoveryLabel(terminal: ManagedRuntimeProjectionFields): string | undefined {

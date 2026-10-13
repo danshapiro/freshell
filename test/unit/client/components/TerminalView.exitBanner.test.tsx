@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act, render, screen, fireEvent, cleanup } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider, useSelector } from 'react-redux'
-import tabsReducer from '@/store/tabsSlice'
+import tabsReducer, { updateTab } from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
@@ -383,13 +383,18 @@ describe('TerminalView exited-pane error banner', () => {
     expect(paneState(store)).toMatchObject({ status, runtimeStatus, recoverySummary: summary,
       terminalId: 'retained-managed', streamId: 'retained-epoch', createRequestId: REQ,
       sessionRef: { provider: 'codex', sessionId: SESSION_ID } })
-    expect(store.getState().tabs.tabs[0].status).toBe(status)
+    expect(store.getState().tabs.tabs[0]).toMatchObject({ status, runtimeStatus, recoverySummary: summary })
   })
 
   it.each([
     ['blocked', 'error'], ['lost', 'error'], ['stopped', 'exited'],
   ] as const)('keeps an authoritative %s final status when an unqualified running frame arrives later', async (recoveryState, status) => {
     const { store, paneContent } = makeStore({ mode: 'codex', status, recoveryState })
+    act(() => store.dispatch(updateTab({ id: TAB, updates: {
+      soulId: 'managed-soul',
+      runtimeStatus: recoveryState === 'blocked' ? 'blocked' : 'exited',
+      recoverySummary: paneContent.recoverySummary,
+    } })))
     act(() => store.dispatch(updatePaneContent({ tabId: TAB, paneId: PANE, content: {
       ...paneContent, terminalId: 'retained-managed', streamId: 'retained-epoch',
       runtimeStatus: recoveryState === 'blocked' ? 'blocked' : 'exited',
@@ -397,8 +402,12 @@ describe('TerminalView exited-pane error banner', () => {
     await renderPane(store, paneState(store))
     act(() => messageHandler!({ type: 'terminal.status', terminalId: 'retained-managed', status: 'running' }))
     expect(paneState(store)).toMatchObject({ status, recoverySummary: { recoveryState },
+      runtimeStatus: recoveryState === 'blocked' ? 'blocked' : 'exited',
       terminalId: 'retained-managed', streamId: 'retained-epoch', createRequestId: REQ })
-    expect(store.getState().tabs.tabs[0].status).toBe(status)
+    expect(store.getState().tabs.tabs[0]).toMatchObject({
+      status,
+      runtimeStatus: recoveryState === 'blocked' ? 'blocked' : 'exited',
+    })
   })
 
   it.each([
@@ -406,6 +415,11 @@ describe('TerminalView exited-pane error banner', () => {
   ] as const)('retains the %s final status when replay completes with unavailable exit evidence', async (recoveryState, status) => {
     const { store, paneContent } = makeStore({ mode: 'codex', status, recoveryState,
       lifecycle: { lastTerminalId: 'retained-managed', exit: { exitCode: 9, at: Date.now() } } })
+    act(() => store.dispatch(updateTab({ id: TAB, updates: {
+      soulId: 'managed-soul',
+      runtimeStatus: recoveryState === 'blocked' ? 'blocked' : 'exited',
+      recoverySummary: paneContent.recoverySummary,
+    } })))
     act(() => store.dispatch(updatePaneContent({ tabId: TAB, paneId: PANE, content: {
       ...paneContent, terminalId: 'retained-managed', streamId: 'retained-epoch',
       runtimeStatus: recoveryState === 'blocked' ? 'blocked' : 'exited',
@@ -414,8 +428,12 @@ describe('TerminalView exited-pane error banner', () => {
     act(() => messageHandler!({ type: 'terminal.exit', terminalId: 'retained-managed',
       exitCode: -1, managedRetained: true, exitCodeAvailable: false }))
     expect(paneState(store)).toMatchObject({ status, recoverySummary: { recoveryState },
+      runtimeStatus: recoveryState === 'blocked' ? 'blocked' : 'exited',
       terminalId: 'retained-managed', streamId: 'retained-epoch', createRequestId: REQ })
-    expect(store.getState().tabs.tabs[0].status).toBe(status)
+    expect(store.getState().tabs.tabs[0]).toMatchObject({
+      status,
+      runtimeStatus: recoveryState === 'blocked' ? 'blocked' : 'exited',
+    })
     expect(selectExitRecordFrom(store.getState().terminalLifecycle, PANE)).toBeUndefined()
     expect(screen.queryByText(/code -1/)).toBeNull()
   })

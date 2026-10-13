@@ -15,7 +15,7 @@ import { findTabIdForSession, collectSessionRefsFromTabs, liveTerminalRowIdentit
 import { getProviderLabel } from '@/lib/coding-cli-utils'
 import { basenameSegment } from '@shared/path-basename'
 import { buildResumeContent } from '@/lib/session-type-utils'
-import { managedTerminalProjection } from '@/lib/managed-terminal'
+import { managedTerminalProjection, managedTerminalResumePaneStatus } from '@/lib/managed-terminal'
 import { getFreshAgentProviderConfig, getFreshAgentProviderLabel } from '@/lib/fresh-agent-provider-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { recordClosedTabSnapshot, pushReopenEntry, popReopenEntry } from './tabRegistrySlice'
@@ -359,6 +359,7 @@ export const tabsSlice = createSlice({
         description: payload.description,
         codingCliProvider,
         status: payload.status || 'creating',
+        runtimeStatus: payload.runtimeStatus,
         mode: payload.mode || 'shell',
         shell: payload.shell || 'system',
         initialCwd: payload.initialCwd,
@@ -1826,13 +1827,14 @@ export const openSessionTab = createAsyncThunk(
           return
         }
       }
-      // Running terminals are always terminal panes (fresh-agent uses SDK, not PTY)
+      // Retained terminals are always terminal panes (fresh-agent uses SDK, not PTY).
       const tabId = nanoid()
+      const status = managedTerminalResumePaneStatus(managedRuntime ?? {})
       dispatch(addTab({
         id: tabId,
         // Coding agents name by working directory; provider label is the fallback.
         title: title || (cwd ? basenameSegment(cwd) : null) || getProviderLabel(resolvedProvider, extensions),
-        status: managedRuntime?.runtimeStatus === 'exited' ? 'exited' : 'running',
+        status,
         ...managedTerminalProjection(managedRuntime),
         mode: resolvedProvider,
         codingCliProvider: resolvedProvider,
@@ -1849,7 +1851,7 @@ export const openSessionTab = createAsyncThunk(
           serverInstanceId: localServerInstanceId,
           sessionRef: liveTerminalOnly ? undefined : desiredResumeContent.sessionRef,
           initialCwd: cwd,
-          status: managedRuntime?.runtimeStatus === 'exited' ? 'exited' : 'running',
+          status,
         ...managedTerminalProjection(managedRuntime),
         },
       }))
