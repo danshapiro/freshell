@@ -14,7 +14,7 @@ class PreparedInputTargetError extends Error {
   }
 }
 
-function diagnosticPath(value: string): string | undefined {
+export function diagnosticPath(value: string): string | undefined {
   return value.length <= 4096 && path.isAbsolute(value) && path.normalize(value) === value
     && !/[\x00-\x1f\x7f]/.test(value) ? value : undefined
 }

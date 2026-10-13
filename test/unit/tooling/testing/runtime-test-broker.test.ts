@@ -1,5 +1,5 @@
-import { createHash } from 'node:crypto'
-import { spawnSync } from 'node:child_process'
+import { createHash, randomBytes } from 'node:crypto'
+import { spawn, spawnSync } from 'node:child_process'
 import os from 'node:os'
 import fs from 'node:fs/promises'
 import http from 'node:http'
@@ -76,6 +76,71 @@ it('classifies owned provider publication failures without retaining error bodie
     { event: 'provider.projection.transaction.failed', stage: 'publish' },
   ])
   expect(JSON.stringify(diagnostic)).not.toContain(secret)
+})
+
+it('serializes rejected target paths in managed provider launch broker failures', async () => {
+  const root = path.join('/tmp', `fln-${randomBytes(8).toString('hex')}`)
+  const imageRef = 'sha256:967627e41734aa903e824e4be22849c7f22ce0e69487ce61bb72004c4817f89c'
+  const hostBinaryPath = path.join(root, 'freshell-session-host')
+  const authorization = (installationId: string, soulId: string) => ({
+    installationId,
+    soulId,
+    providerVolumeName: `freshell-provider-${createHash('sha256').update(`${installationId}\0${soulId}`).digest('hex').slice(0, 24)}`,
+    imageRef,
+    hostBinaryPath,
+    binarySha256: 'a'.repeat(64),
+    daemonId: 'fixture-daemon',
+  })
+  let child: ReturnType<typeof spawn> | undefined
+  try {
+    await fs.mkdir(path.join(root, 'handoff'), { recursive: true, mode: 0o700 })
+    await fs.mkdir(path.join(root, 'candidate-handoff'), { mode: 0o700 })
+    const owner = authorization('install-one', 'soul-one')
+    await fs.writeFile(path.join(root, 'broker-configuration.json'), JSON.stringify({
+      provider: 'opencode', claudeFlavor: 'freshclaude', imageRef, hostBinaryPath,
+      initialVolumes: [owner, authorization('install-two', 'soul-two')], runId: 'launch-diagnostic-test',
+    }))
+    await fs.writeFile(path.join(root, 'handoff', 'attempt-one.json'), JSON.stringify({
+      ...owner, incarnationId: 'incarnation-one', generationId: 'grant-one',
+      stageRoot: path.join(root, 'scenarios/scenario/control/provider-roots/grant-one'),
+      configurationBinds: [{ sourceRelativePath: '.freshell/templates/source-0', effectiveDestination: '/outside/rejected-target' }],
+      resourceMounts: [], indexedSecretSources: [],
+    }))
+
+    child = spawn(process.execPath, [
+      path.resolve('node_modules/tsx/dist/cli.mjs'), path.resolve('scripts/testing/managed-provider-launch-broker.ts'),
+    ], { env: { ...process.env, FRESHELL_PROVIDER_LAUNCH_FIXTURE: root }, stdio: ['ignore', 'ignore', 'pipe'] })
+    let stderr = ''
+    child.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk })
+    const closed = new Promise<number | null>((resolve, reject) => {
+      child!.once('error', reject)
+      child!.once('close', (code) => resolve(code))
+    })
+    const failurePath = path.join(root, 'broker-failure')
+    const deadline = Date.now() + 10_000
+    let failureExists = false
+    while (Date.now() < deadline) {
+      try { await fs.access(failurePath); failureExists = true; break } catch {}
+      if (child.exitCode !== null) break
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    if (!failureExists && child.exitCode === null) {
+      child.kill('SIGKILL')
+      await closed
+      throw new Error(`managed provider launch broker did not write a failure receipt: ${stderr}`)
+    }
+    const exitCode = await closed
+    expect(exitCode, stderr).toBe(1)
+    const failure = JSON.parse(await fs.readFile(failurePath, 'utf8'))
+    expect(failure).toEqual({
+      cause: 'prepared input target is outside selected fixture roots',
+      targetPath: '/outside/rejected-target',
+      preparationStageRoot: path.join(root, 'scenarios/scenario/control/provider-roots/grant-one'),
+    })
+  } finally {
+    if (child && child.exitCode === null) child.kill('SIGKILL')
+    await fs.rm(root, { recursive: true, force: true })
+  }
 })
 
 it('executes selected OpenCode resources after fixture readability preparation', async () => {

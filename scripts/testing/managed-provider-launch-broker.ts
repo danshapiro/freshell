@@ -2,7 +2,7 @@
 //! the native startup fixture receives this broker's restricted proxy socket.
 import fs from 'node:fs'
 import path from 'node:path'
-import { RestrictedDockerBroker, type ClaudeCandidateAuthorization, type PreparedInputAuthorization } from './runtime-test-broker.js'
+import { diagnosticPath, RestrictedDockerBroker, type ClaudeCandidateAuthorization, type PreparedInputAuthorization } from './runtime-test-broker.js'
 
 const root=process.env.FRESHELL_PROVIDER_LAUNCH_FIXTURE ?? ''
 if (path.dirname(root)!=='/tmp' || !/^fln-[a-f0-9]{16}$/.test(path.basename(root))) {
