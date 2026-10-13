@@ -649,6 +649,94 @@ async fn turn_started_and_completed_notifications_carry_full_params_for_small_fr
 }
 
 #[tokio::test]
+async fn small_turn_notifications_extract_inline_turn_ids() {
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
+    let _tui = connect_tui(proxy.ws_url()).await;
+    let conn = upstream.accept().await;
+
+    conn.send_text(
+        json!({"method": "turn/started", "params": {"threadId": "t1", "turn": {"id": "inline-start"}}})
+            .to_string(),
+    );
+    let received_events = recv_events(&mut events, 1).await;
+    match &received_events[0] {
+        RemoteProxyEvent::TurnStarted(event) => {
+            assert_eq!(event.turn_id.as_deref(), Some("inline-start"));
+            assert_eq!(event.params["turn"]["id"], json!("inline-start"));
+        }
+        other => panic!("expected TurnStarted, got {other:?}"),
+    }
+
+    conn.send_text(
+        json!({"method": "turn/completed", "params": {"threadId": "t1", "turn": {"id": "inline-complete", "status": "completed"}}})
+            .to_string(),
+    );
+    let received_events = recv_events(&mut events, 1).await;
+    match &received_events[0] {
+        RemoteProxyEvent::TurnCompleted(event) => {
+            assert_eq!(event.turn_id.as_deref(), Some("inline-complete"));
+            assert_eq!(event.params["turn"]["status"], json!("completed"));
+        }
+        other => panic!("expected TurnCompleted, got {other:?}"),
+    }
+
+    proxy.close().await;
+}
+
+#[tokio::test]
+async fn oversized_turn_notifications_extract_inline_turn_ids() {
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
+    let _tui = connect_tui(proxy.ws_url()).await;
+    let conn = upstream.accept().await;
+    let padding = huge_string(2 * 1024 * 1024);
+
+    let started = json!({
+        "method": "turn/started",
+        "params": {"threadId": "t1", "turn": {"id": "inline-large-start"}, "padding": padding},
+    })
+    .to_string();
+    assert!(started.len() > 1024 * 1024);
+    conn.send_text(started);
+    let received_events = recv_events(&mut events, 1).await;
+    match &received_events[0] {
+        RemoteProxyEvent::TurnStarted(event) => {
+            assert_eq!(event.turn_id.as_deref(), Some("inline-large-start"));
+        }
+        other => panic!("expected TurnStarted, got {other:?}"),
+    }
+
+    let completed = json!({
+        "method": "turn/completed",
+        "params": {
+            "threadId": "t1",
+            "turn": {"id": "inline-large-complete", "status": "completed"},
+            "padding": padding,
+        },
+    })
+    .to_string();
+    assert!(completed.len() > 1024 * 1024);
+    conn.send_text(completed);
+    let received_events = recv_events(&mut events, 1).await;
+    match &received_events[0] {
+        RemoteProxyEvent::TurnCompleted(event) => {
+            assert_eq!(event.turn_id.as_deref(), Some("inline-large-complete"));
+            assert_eq!(event.params.get("status"), Some(&json!("completed")));
+        }
+        other => panic!("expected TurnCompleted, got {other:?}"),
+    }
+
+    proxy.close().await;
+}
+
+#[tokio::test]
 async fn fs_changed_notification_emits_a_repair_trigger() {
     let mut upstream = start_fake_upstream().await;
     let (proxy, mut events) =

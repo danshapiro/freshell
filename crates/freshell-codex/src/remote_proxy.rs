@@ -1600,8 +1600,10 @@ impl Hub {
                 return None;
             }
             let turn_id = params
-                .get("turnId")
-                .and_then(|v| v.as_str())
+                .get("turn")
+                .and_then(|turn| turn.get("id"))
+                .and_then(Value::as_str)
+                .or_else(|| params.get("turnId").and_then(Value::as_str))
                 .map(str::to_string);
             let event = TurnEventParams {
                 thread_id,

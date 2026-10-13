@@ -543,7 +543,7 @@ pub fn extract_turn_notification_event(raw: &[u8]) -> SideEffectResult<TurnEvent
     }
 
     let thread_id = extract_required_string(raw, &params_object.entries, "threadId")?;
-    let turn_id = extract_optional_string(raw, &params_object.entries, "turnId")?;
+    let turn_id = extract_turn_id(raw, &params_object.entries)?;
 
     if method == "turn/started" {
         return Ok(TurnEvent::Started { thread_id, turn_id });
@@ -555,6 +555,27 @@ pub fn extract_turn_notification_event(raw: &[u8]) -> SideEffectResult<TurnEvent
         turn_id,
         status,
     })
+}
+
+fn extract_turn_id(raw: &[u8], params_entries: &[ObjectEntry]) -> SideEffectResult<Option<String>> {
+    if let Some(turn) = find_entry(params_entries, "turn") {
+        if turn.value_kind == ValueKind::Object {
+            let turn_object = scan_object(raw, turn.value_start, MAX_SCANNED_TOKEN_BYTES)?;
+            if has_any_duplicate_key(&turn_object.entries, &["id"]) {
+                return Err(SideEffectError::UnsafeDuplicateKey);
+            }
+            if let Some(id) = find_entry(&turn_object.entries, "id") {
+                if id.value_kind == ValueKind::String {
+                    return Ok(Some(
+                        decode_string_entry(raw, id)
+                            .map_err(|_| SideEffectError::UnsupportedShape)?,
+                    ));
+                }
+            }
+        }
+    }
+
+    extract_optional_string(raw, params_entries, "turnId")
 }
 
 fn extract_turn_completed_status(
@@ -1254,7 +1275,7 @@ mod tests {
             extract_turn_notification_event(completed_raw.as_bytes()).unwrap(),
             TurnEvent::Completed {
                 thread_id: "thread-1".into(),
-                turn_id: Some("turn-1".into()),
+                turn_id: Some("turn-huge".into()),
                 status: Some("completed".into()),
             }
         );
