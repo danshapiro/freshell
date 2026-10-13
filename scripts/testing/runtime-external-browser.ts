@@ -2343,7 +2343,7 @@ export default class ManagedExternalExecutionReporter implements Reporter {
   private cases = 0
   private readonly descriptor = resolveManagedExternalDescriptor(process.env)
   private readonly history = new Map<string, { buffer: string; count: number; active?: Extract<HistoryDiagnostic, { event: 'managed_history_phase' }>; callsite?: z.infer<typeof HistoryCallsiteSchema> }>()
-  private readonly ordinaryTurns = new Map<string, { buffer: string; count: number }>()
+  private readonly ordinaryTurns = new Map<string, { buffer: string; stderrBuffer: string; count: number }>()
 
   printsToStdio(): boolean { return true }
   private emit(event: Record<string, unknown>): void {
@@ -2385,6 +2385,18 @@ export default class ManagedExternalExecutionReporter implements Reporter {
       }
     }
   }
+  private captureOrdinaryTurnText(test: TestCase, chunk: string | Buffer, stream: 'stdout' | 'stderr'): void {
+    const target = ordinaryTurnTarget(test)
+    if (!target) return
+
+    const state = this.ordinaryTurns.get(test.id) ?? { buffer: '', stderrBuffer: '', count: 0 }
+    this.ordinaryTurns.set(test.id, state)
+    const key = stream === 'stdout' ? 'buffer' : 'stderrBuffer'
+    state[key] = (state[key] + String(chunk)).slice(-16_384)
+    const lines = state[key].split('\n')
+    state[key] = lines.pop()!
+    this.forwardOrdinaryTurnText(test, state, lines.join('\n'), target)
+  }
   onStdOut(chunk: string | Buffer, test?: TestCase, _result?: TestResult): void {
     if (!test) return
     const fileName = path.basename(test.location.file)
@@ -2405,15 +2417,11 @@ export default class ManagedExternalExecutionReporter implements Reporter {
       }
       return
     }
-    const target = ordinaryTurnTarget(test)
-    if (!target) return
-
-    const state = this.ordinaryTurns.get(test.id) ?? { buffer: '', count: 0 }
-    this.ordinaryTurns.set(test.id, state)
-    state.buffer = (state.buffer + String(chunk)).slice(-16_384)
-    const lines = state.buffer.split('\n')
-    state.buffer = lines.pop()!
-    this.forwardOrdinaryTurnText(test, state, lines.join('\n'), target)
+    this.captureOrdinaryTurnText(test, chunk, 'stdout')
+  }
+  onStdErr(chunk: string | Buffer, test?: TestCase, _result?: TestResult): void {
+    if (!test) return
+    this.captureOrdinaryTurnText(test, chunk, 'stderr')
   }
   onStepBegin(test: TestCase, _result: TestResult, step: TestStep): void {
     const state = this.history.get(test.id)
@@ -2428,9 +2436,11 @@ export default class ManagedExternalExecutionReporter implements Reporter {
           : history.active?.errorCategory ?? 'operation-error', diagnosticLimitReached: history.count >= 256 })
     }
     const target = ordinaryTurnTarget(test), ordinary = this.ordinaryTurns.get(test.id)
-    if (target && ordinary?.buffer) {
-      this.forwardOrdinaryTurnText(test, ordinary, ordinary.buffer, target)
+    if (target && ordinary) {
+      if (ordinary.buffer) this.forwardOrdinaryTurnText(test, ordinary, ordinary.buffer, target)
+      if (ordinary.stderrBuffer) this.forwardOrdinaryTurnText(test, ordinary, ordinary.stderrBuffer, target)
       ordinary.buffer = ''
+      ordinary.stderrBuffer = ''
     }
     this.history.delete(test.id)
     this.ordinaryTurns.delete(test.id)

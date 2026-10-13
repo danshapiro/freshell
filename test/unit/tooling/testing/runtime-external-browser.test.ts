@@ -1116,6 +1116,71 @@ describe('body-free ordinary-turn Cloud diagnostics', () => {
     }
   })
 
+  it('forwards safe stderr diagnostics only for exact ordinary-turn targets and flushes a final partial FreshAgent line', () => {
+    for (const [key, value] of Object.entries(descriptor)) vi.stubEnv(key, value)
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+    try {
+      const reporter = new runner.default()
+      const terminalTest = { id: 'stderr-terminal', location: {
+        file: 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts',
+      }, title: 'each selected terminal provider completes one ordinary turn' } as any
+      const terminalDiagnostic = JSON.stringify({
+        event: 'durable_souls.ordinary_turn_failed', lane: 'terminal', provider: 'codex',
+        paneSetupFailureStage: 'managed_runtime_view', ordinaryTurnFailureStage: null,
+        terminalFacts: { available: false }, ordinaryTurnFacts: null,
+        prompt: 'private-stderr-prompt-sentinel', providerOutput: 'private-stderr-output-sentinel',
+      })
+      const line = `${JSON.stringify({ event: 'durable_souls.ordinary_turn_completed', lane: 'terminal', provider: 'codex' })}\n`
+      reporter.onStdErr(`${terminalDiagnostic}\n`, terminalTest)
+      reporter.onStdErr(line, { id: 'stderr-wrong-title', location: terminalTest.location,
+        title: 'a different test title' } as any)
+      reporter.onStdErr(line, { id: 'stderr-wrong-spec', location: {
+        file: 'test/e2e-browser/specs/other.spec.ts',
+      }, title: terminalTest.title } as any)
+
+      const freshAgentTest = { id: 'stderr-fresh-agent', location: {
+        file: 'test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts',
+      }, title: 'each selected fresh-agent mode completes one ordinary turn', titlePath: () => [
+        'runtime-fresh-agent-qualification-rust.spec.ts', 'ordinary turns',
+        'each selected fresh-agent mode completes one ordinary turn',
+      ] } as any
+      reporter.onStdErr(`${JSON.stringify({
+        event: 'durable_souls.ordinary_turn_completed', lane: 'fresh-agent', mode: 'freshopencode',
+        assistantText: 'private-stderr-assistant-sentinel',
+      })}`, freshAgentTest)
+      expect(write).toHaveBeenCalledOnce()
+
+      reporter.onTestEnd(freshAgentTest, { status: 'passed' } as any)
+
+      const forwarded = write.mock.calls.map(([output]) => JSON.parse(String(output)))
+      expect(forwarded.map(event => event.event)).toEqual([
+        'managed_external_ordinary_turn', 'managed_external_ordinary_turn', 'managed_external_case',
+      ])
+      expect(forwarded[0]).toEqual({
+        severity: 'info', runId: descriptor.FRESHELL_RUNTIME_EXTERNAL_RUN_ID,
+        candidateSha: descriptor.FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA,
+        event: 'managed_external_ordinary_turn', id: 'stderr-terminal',
+        file: 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts',
+        sourceEvent: 'durable_souls.ordinary_turn_failed', outcome: 'failed', lane: 'terminal', provider: 'codex',
+        paneSetupFailureStage: 'managed_runtime_view', ordinaryTurnFailureStage: null,
+        terminalFacts: { available: false }, ordinaryTurnFacts: null,
+      })
+      expect(forwarded[1]).toMatchObject({
+        severity: 'info', event: 'managed_external_ordinary_turn', id: 'stderr-fresh-agent',
+        file: 'test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts',
+        sourceEvent: 'durable_souls.ordinary_turn_completed', outcome: 'completed', lane: 'fresh-agent',
+        mode: 'freshopencode',
+      })
+      const serialized = JSON.stringify(forwarded)
+      for (const sentinel of [
+        'private-stderr-prompt-sentinel', 'private-stderr-output-sentinel', 'private-stderr-assistant-sentinel',
+      ]) expect(serialized).not.toContain(sentinel)
+    } finally {
+      write.mockRestore()
+      vi.unstubAllEnvs()
+    }
+  })
+
   it('flushes one valid buffered final diagnostic line when the selected test ends', () => {
     for (const [key, value] of Object.entries(descriptor)) vi.stubEnv(key, value)
     const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
