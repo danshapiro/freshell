@@ -744,6 +744,7 @@ async fn session_directory(
         apply_naming_projection(items, state.identity.naming().as_ref()).await;
     match apply_query(items, &query, &identities) {
         Ok(mut page) => {
+            apply_checkpoint_workspace_projection(&mut page, &metadata_entries);
             page["revision"] = json!(revision);
             page["snapshotSeq"] = json!(snapshot_seq);
             page["serverInstance"] = json!(state.server_instance.as_str());
@@ -1574,6 +1575,44 @@ fn apply_session_metadata(
             item
         })
         .collect()
+}
+
+/// Add the explicitly selected checkpoint scope to the same directory rows
+/// used by History and search. Only the validated picker provenance is
+/// projected; inferred project paths continue to be resolved by the client.
+fn apply_checkpoint_workspace_projection(
+    page: &mut Value,
+    metadata: &std::collections::HashMap<String, Value>,
+) {
+    let Some(items) = page.get_mut("items").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in items {
+        let (Some(provider), Some(session_id)) = (
+            item.get("provider").and_then(Value::as_str),
+            item.get("sessionId").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let Some(workspace) = metadata
+            .get(&format!("{provider}:{session_id}"))
+            .and_then(|entry| entry.get("checkpointWorkspace"))
+        else {
+            continue;
+        };
+        let (Some(path), Some("directory-picker")) = (
+            workspace.get("path").and_then(Value::as_str),
+            workspace.get("provenance").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        if !path.is_empty() && path.encode_utf16().count() <= 4096 && !path.contains('\0') {
+            item["checkpointWorkspace"] = json!({
+                "path": path,
+                "provenance": "directory-picker",
+            });
+        }
+    }
 }
 
 // ── Sidebar join (Fix Spec: Session Naming Cluster, SYMPTOM 1) ─────────────
@@ -3362,6 +3401,37 @@ mod tests {
             apply_session_overrides(items, &overrides, false, &std::collections::HashSet::new());
         assert_eq!(out[0].title.as_deref(), Some("Resurrected Alias"));
         assert!(out[0].title_overridden);
+    }
+
+    #[test]
+    fn explicit_checkpoint_workspace_projects_to_history_and_search_items() {
+        let workspace = json!({
+            "path": "/tmp/non-git-workspace",
+            "provenance": "directory-picker",
+        });
+        let mut page = json!({
+            "items": [
+                { "provider": "codex", "sessionId": "session-1" },
+                { "provider": "codex", "sessionId": "session-2" },
+            ],
+        });
+        let metadata = std::collections::HashMap::from([
+            (
+                "codex:session-1".to_string(),
+                json!({ "checkpointWorkspace": workspace.clone() }),
+            ),
+            (
+                "codex:session-2".to_string(),
+                json!({
+                    "checkpointWorkspace": { "path": "/tmp/project", "provenance": "resolved-project" }
+                }),
+            ),
+        ]);
+
+        apply_checkpoint_workspace_projection(&mut page, &metadata);
+
+        assert_eq!(page["items"][0]["checkpointWorkspace"], workspace);
+        assert!(page["items"][1].get("checkpointWorkspace").is_none());
     }
 
     #[test]

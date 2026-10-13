@@ -239,6 +239,85 @@ async function flushLayoutAndReload(page: import('@playwright/test').Page): Prom
   await expect(page.locator('[data-context="fresh-agent"]')).toBeVisible({ timeout: 30_000 })
 }
 
+async function openSessionFromHistory(
+  page: import('@playwright/test').Page,
+  paneRoot: import('@playwright/test').Locator,
+  projectPath: string,
+  sessionId: string,
+  checkpointWorkspace: { path: string; provenance: 'directory-picker' },
+) {
+  await expect.poll(async () => {
+    const response = await page.request.get(
+      `${paired!.targetUrl}/api/session-directory?priority=visible&limit=50`,
+      { headers },
+    )
+    expect(response.ok()).toBe(true)
+    const payload = await response.json() as { items: Array<{
+      sessionId: string
+      projectPath: string
+      checkpointWorkspace?: { path: string; provenance: string }
+    }> }
+    return payload.items.find((item) => item.sessionId === sessionId)
+  }, { timeout: 60_000, intervals: [500, 1000, 2000] }).toMatchObject({
+    projectPath,
+    checkpointWorkspace,
+  })
+
+  // Closing the seed pane makes History restore from its directory projection,
+  // which proves the explicit workspace provenance survived session metadata.
+  await paneRoot.getByRole('button', { name: 'Close pane' }).click()
+  await expect(page.locator('[data-context="fresh-agent"]')).toHaveCount(0, { timeout: 30_000 })
+  await page.locator('button[title="Projects (Ctrl+B P)"]').click()
+  const projectHeader = page.locator(`[data-project-path="${projectPath}"]`)
+  await expect(projectHeader).toBeVisible({ timeout: 30_000 })
+  await projectHeader.click()
+  const historyRow = page.locator(`[data-context="history-session"][data-session-id="${sessionId}"]`)
+  await expect(historyRow).toBeVisible({ timeout: 30_000 })
+  await historyRow.getByRole('button', { name: 'Open session' }).click()
+
+  const reopenedPane = page.locator('[data-context="fresh-agent"]').last()
+  await expect.poll(async () => (await currentFreshAgent(page)).content.checkpointWorkspace)
+    .toEqual(checkpointWorkspace)
+  return reopenedPane
+}
+
+async function verifyPickerWorkspaceReopensForRewind(
+  page: import('@playwright/test').Page,
+  workspacePath: string,
+  fileName: string,
+  label: string,
+): Promise<void> {
+  await verifyTarget(page)
+  const selectedWorkspace = { path: workspacePath, provenance: 'directory-picker' as const }
+  const file = `${workspacePath}/${fileName}`
+  await targetWrite(page, file, `${label} before first turn\n`)
+  const { paneRoot } = await launchCodex(page, workspacePath)
+  const initial = await currentFreshAgent(page)
+  const sessionId = initial.content.sessionRef?.sessionId ?? initial.content.sessionId
+  expect(sessionId).toEqual(expect.any(String))
+  const initialTurn = await sendThroughComposer(page, paneRoot, `${label} seed ${fixture.expectedNonce}`, selectedWorkspace)
+  expect(initialTurn.outcome.status).toBe('available')
+
+  const reopenedPane = await openSessionFromHistory(
+    page, paneRoot, workspacePath, sessionId, selectedWorkspace,
+  )
+  const beforeTurn = `${label} before reopened turn\n`
+  await targetWrite(page, file, beforeTurn)
+  const turn = await sendThroughComposer(page, reopenedPane, `${label} reopened ${fixture.expectedNonce}`, selectedWorkspace)
+  expect(turn.outcome).toMatchObject({ status: 'available', workspace: selectedWorkspace })
+
+  await targetWrite(page, file, `${label} changed after reopened turn\n`)
+  await turn.row.hover()
+  const rewind = turn.row.getByRole('button', { name: 'Rewind code to here' })
+  await expect(rewind).toBeEnabled()
+  const rewindNotice = expect(reopenedPane.getByRole('alert').filter({ hasText: /Code rewound to before:/ }))
+    .toContainText('Automatic pre-turn snapshot', { timeout: 30_000 })
+  const dialogAccepted = page.waitForEvent('dialog').then((dialog) => dialog.accept())
+  await rewind.click()
+  await Promise.all([dialogAccepted, rewindNotice])
+  await expect.poll(() => targetRead(page, file)).toBe(beforeTurn)
+}
+
 test('Git workspace sends retain per-turn success and failure, then restore the exact successful row', async ({ page }) => {
   test.setTimeout(360_000)
   await verifyTarget(page)
@@ -457,6 +536,16 @@ test('picker-confirmed non-Git workspace captures and restores all selected file
   const afterRestore = await currentFreshAgent(page)
   expect(afterRestore.content.sessionRef?.sessionId ?? afterRestore.content.sessionId).toBe(originalSessionId)
   expect(afterRestore.content.checkpointWorkspace).toEqual({ path: fixture.nonGitWorkspacePath, provenance: 'directory-picker' })
+})
+
+test('History reopening preserves a non-Git picker workspace for later rewind', async ({ page }) => {
+  test.setTimeout(360_000)
+  await verifyPickerWorkspaceReopensForRewind(page, fixture.nonGitWorkspacePath, 'one.txt', 'non-Git')
+})
+
+test('History reopening preserves an explicitly selected HOME workspace for later rewind', async ({ page }) => {
+  test.setTimeout(360_000)
+  await verifyPickerWorkspaceReopensForRewind(page, fixture.syntheticHomePath, 'checkpoint-home-file.txt', 'HOME')
 })
 
 test('picker-confirmed HOME captures and restores a harmless home file', async ({ page }) => {

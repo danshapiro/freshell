@@ -536,17 +536,21 @@ function getCreatedResumeSessionId(
   return message.sessionId
 }
 
-function persistDurableFreshAgentFlavor(message: {
-  provider: string
-  sessionId?: string
-  sessionType: string
-  sessionRef?: { provider: string; sessionId: string }
-}) {
+function persistDurableFreshAgentFlavor(
+  message: {
+    provider: string
+    sessionId?: string
+    sessionType: string
+    sessionRef?: { provider: string; sessionId: string }
+  },
+  checkpointWorkspace?: FreshAgentPaneContent['checkpointWorkspace'],
+) {
   const provider = message.sessionRef?.provider ?? message.provider
   const sessionId = message.sessionRef?.sessionId ?? message.sessionId
   if (!provider || !sessionId || !isDurableProviderSessionId(provider, sessionId)) return
   setSessionMetadata(provider, sessionId, message.sessionType, {
     sessionTypeSource: 'materialized',
+    ...(checkpointWorkspace?.provenance === 'directory-picker' ? { checkpointWorkspace } : {}),
   }).catch((err) => {
     log.warn({
       event: 'fresh_agent_session_metadata_tag_failed',
@@ -2693,7 +2697,7 @@ export function FreshAgentView({
         releasePendingRebind()
         clearReserveRedrive() // Task 14: a completed create ends the reservation window
         const current = paneContentRef.current
-        persistDurableFreshAgentFlavor(message)
+        persistDurableFreshAgentFlavor(message, current.checkpointWorkspace)
         dispatch(updatePaneContent({
           tabId,
           paneId,
@@ -2750,7 +2754,7 @@ export function FreshAgentView({
           sessionId: message.sessionId,
           sessionType: message.sessionType,
           sessionRef,
-        })
+        }, current.checkpointWorkspace)
         migratePendingAutoTitle(current.sessionId, message.sessionId, message.provider, message.sessionType)
         requestSnapshotRefresh('materialized')
         dispatch(updatePaneContent({

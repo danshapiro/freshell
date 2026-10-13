@@ -1072,6 +1072,28 @@ describe('searchSessions cursor pagination', () => {
     expect(terminalSearch?.checkpointWorkspace).toBeUndefined()
   })
 
+  it('restores an explicitly selected non-Git workspace from snapshots and search', async () => {
+    const workspace = { path: '/tmp/non-git-workspace', provenance: 'directory-picker' as const }
+    const item = {
+      sessionId: 'session-non-git',
+      provider: 'codex',
+      projectPath: '/tmp/non-git-workspace',
+      checkpointWorkspace: workspace,
+      cwd: '/tmp/non-git-workspace',
+      isRunning: false,
+      lastActivityAt: 1_000,
+    }
+    mockFetch
+      .mockResolvedValueOnce(mockJson({ items: [item], nextCursor: null, revision: 1 }))
+      .mockResolvedValueOnce(mockJson({ items: [item], nextCursor: null, revision: 2 }))
+
+    const snapshot = await fetchSidebarSessionsSnapshot()
+    const search = await searchSessions({ query: 'non-git' })
+
+    expect(snapshot.projects[0]?.sessions[0]?.checkpointWorkspace).toEqual(workspace)
+    expect(search.results[0]?.checkpointWorkspace).toEqual(workspace)
+  })
+
   it('forwards the cursor to the session-directory request when paginating a search', async () => {
     mockFetch.mockResolvedValueOnce(mockJson({
       items: [],
@@ -1136,6 +1158,28 @@ describe('setSessionMetadata()', () => {
           sessionId: 'ses_real_1',
           sessionType: 'freshopencode',
           sessionTypeSource: 'materialized',
+        }),
+      }),
+    )
+  })
+
+  it('persists an explicitly selected checkpoint workspace with materialized session metadata', async () => {
+    mockFetch.mockResolvedValueOnce({ ok: true, text: () => Promise.resolve('') })
+
+    await setSessionMetadata('codex', 'session-non-git', 'freshcodex', {
+      sessionTypeSource: 'materialized',
+      checkpointWorkspace: { path: '/tmp/non-git-workspace', provenance: 'directory-picker' },
+    })
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/api/session-metadata',
+      expect.objectContaining({
+        body: JSON.stringify({
+          provider: 'codex',
+          sessionId: 'session-non-git',
+          sessionType: 'freshcodex',
+          sessionTypeSource: 'materialized',
+          checkpointWorkspace: { path: '/tmp/non-git-workspace', provenance: 'directory-picker' },
         }),
       }),
     )

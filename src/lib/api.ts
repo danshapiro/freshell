@@ -873,9 +873,14 @@ function groupDirectoryItemsAsProjects(
 }
 
 function checkpointWorkspaceForDirectoryItem(
-  item: Pick<ReadModelSessionDirectoryItem, 'checkoutPath' | 'projectPath'>,
+  item: Pick<ReadModelSessionDirectoryItem, 'checkoutPath' | 'projectPath' | 'checkpointWorkspace'>,
 ): FreshAgentCheckpointWorkspace | undefined {
-  const path = item.checkoutPath || item.projectPath
+  if (item.checkoutPath) {
+    return normalizeFreshAgentCheckpointWorkspace({ path: item.checkoutPath, provenance: 'resolved-project' })
+  }
+  const explicitWorkspace = normalizeFreshAgentCheckpointWorkspace(item.checkpointWorkspace)
+  if (explicitWorkspace?.provenance === 'directory-picker') return explicitWorkspace
+  const path = item.projectPath
   if (!path || path === 'unknown' || path.startsWith('terminal:')) return undefined
   return normalizeFreshAgentCheckpointWorkspace({ path, provenance: 'resolved-project' })
 }
@@ -884,13 +889,19 @@ export async function setSessionMetadata(
   provider: string,
   sessionId: string,
   sessionType: string,
-  options: { sessionTypeSource?: 'explicit' | 'materialized' } = {},
+  options: {
+    sessionTypeSource?: 'explicit' | 'materialized'
+    checkpointWorkspace?: FreshAgentCheckpointWorkspace
+  } = {},
 ): Promise<void> {
   await api.post('/api/session-metadata', {
     provider,
     sessionId,
     sessionType,
     sessionTypeSource: options.sessionTypeSource ?? 'explicit',
+    ...(options.checkpointWorkspace?.provenance === 'directory-picker'
+      ? { checkpointWorkspace: options.checkpointWorkspace }
+      : {}),
   })
 }
 
