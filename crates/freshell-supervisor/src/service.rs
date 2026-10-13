@@ -7729,6 +7729,184 @@ mod interrupted_transaction_tests {
     }
 
     #[tokio::test]
+    async fn exited_unless_stopped_container_is_suppressed_before_settlement() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut supervisor = open(dir.path());
+        let id = seed(&supervisor, dir.path(), false).await;
+        let fixture = docker_fixture(&mut supervisor, dir.path(), false).await;
+        let view = supervisor.registry.inventory().await.unwrap().remove(0);
+        let handle = supervisor
+            .registry
+            .owned_handle(view.incarnation_id.clone())
+            .await
+            .unwrap();
+        {
+            let mut state = fixture.state.lock().unwrap();
+            state.inspection["State"] = serde_json::json!({
+                "Status":"exited","Running":false,"Paused":false,"Restarting":false
+            });
+            state.inspection["HostConfig"]["RestartPolicy"] = serde_json::json!({
+                "Name":"unless-stopped","MaximumRetryCount":0
+            });
+        }
+        assert!(
+            !fixture.backend.verify_empty(&handle).await.unwrap(),
+            "an exited container with restart enabled is not yet safe to settle"
+        );
+
+        let (outcome, _) = supervisor.stop(id, Some(1)).await.unwrap();
+
+        assert_eq!(outcome, StopOutcome::VerifiedEmpty);
+        let (update_request, update_body) = fixture
+            .state
+            .lock()
+            .unwrap()
+            .restart_updates
+            .first()
+            .cloned()
+            .expect("cleanup must disable the container's restart policy");
+        assert_eq!(
+            update_request,
+            format!(
+                "POST /v1.47/containers/{}/update HTTP/1.1",
+                handle.container_id()
+            )
+        );
+        assert_eq!(
+            update_body,
+            serde_json::json!({
+                "RestartPolicy":{"Name":"no","MaximumRetryCount":0}
+            })
+        );
+        let state = fixture.state.lock().unwrap();
+        assert_eq!(
+            state.inspection["HostConfig"]["RestartPolicy"]["Name"],
+            "no"
+        );
+        let final_inspection = format!(
+            "GET /v1.47/containers/{}/json HTTP/1.1",
+            handle.container_id()
+        );
+        assert_eq!(
+            state.requests.last().map(String::as_str),
+            Some(final_inspection.as_str()),
+            "the exact owned container must be inspected after restart suppression"
+        );
+        drop(state);
+
+        assert!(supervisor
+            .registry
+            .pending_stop_handles()
+            .await
+            .unwrap()
+            .is_empty());
+        let conn = Connection::open(supervisor.registry.database_path()).unwrap();
+        let claims: (u64, u64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM writer_claims WHERE incarnation_id=?1), \
+                        (SELECT COUNT(*) FROM admission_reservations WHERE incarnation_id=?1)",
+                [handle.incarnation_id().as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(claims, (0, 0));
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn exited_unless_stopped_container_stays_pending_without_policy_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut supervisor = open(dir.path());
+        let id = seed(&supervisor, dir.path(), false).await;
+        let fixture = docker_fixture(&mut supervisor, dir.path(), false).await;
+        {
+            let mut state = fixture.state.lock().unwrap();
+            state.inspection["State"] = serde_json::json!({
+                "Status":"exited","Running":false,"Paused":false,"Restarting":false
+            });
+            state.inspection["HostConfig"]["RestartPolicy"] = serde_json::json!({
+                "Name":"unless-stopped","MaximumRetryCount":0
+            });
+            state.apply_restart_update = false;
+        }
+
+        let (outcome, _) = supervisor.stop(id, Some(1)).await.unwrap();
+
+        assert_ne!(outcome, StopOutcome::VerifiedEmpty);
+        assert_eq!(
+            fixture.state.lock().unwrap().inspection["HostConfig"]["RestartPolicy"]["Name"],
+            "unless-stopped"
+        );
+        assert_eq!(
+            fixture.state.lock().unwrap().restart_updates.len(),
+            1,
+            "a successful update response without a verified policy change must fail closed"
+        );
+        assert_eq!(
+            supervisor
+                .registry
+                .pending_stop_handles()
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the Stop intent must remain pending while restart remains enabled"
+        );
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn stop_stays_pending_when_exact_container_remains_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut supervisor = open(dir.path());
+        let id = seed(&supervisor, dir.path(), false).await;
+        let fixture = docker_fixture(&mut supervisor, dir.path(), false).await;
+        let view = supervisor.registry.inventory().await.unwrap().remove(0);
+        let handle = supervisor
+            .registry
+            .owned_handle(view.incarnation_id)
+            .await
+            .unwrap();
+        fixture.state.lock().unwrap().inspection["HostConfig"]["RestartPolicy"] =
+            serde_json::json!({"Name":"unless-stopped","MaximumRetryCount":0});
+
+        let (outcome, _) = supervisor.stop(id, Some(1)).await.unwrap();
+
+        assert_eq!(outcome, StopOutcome::TerminationUnconfirmed);
+        let state = fixture.state.lock().unwrap();
+        assert_eq!(
+            state.inspection["HostConfig"]["RestartPolicy"]["Name"],
+            "no"
+        );
+        assert_eq!(
+            state
+                .restart_updates
+                .first()
+                .map(|(request, _)| request.as_str()),
+            Some(
+                format!(
+                    "POST /v1.47/containers/{}/update HTTP/1.1",
+                    handle.container_id()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(state.inspection["State"]["Running"], true);
+        drop(state);
+        assert_eq!(
+            supervisor
+                .registry
+                .pending_stop_handles()
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "an active exact container must keep the Stop pending"
+        );
+        fixture.close().await;
+    }
+
+    #[tokio::test]
     async fn ordinary_stop_docker_created_reopen_preserves_history_and_settles_exact_revoke() {
         // Capability configuration is process-wide. Keep this production
         // ownership test independent of other tests' configured directories.

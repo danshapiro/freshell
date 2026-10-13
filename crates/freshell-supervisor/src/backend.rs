@@ -395,6 +395,50 @@ impl DockerEngineBackend {
         Ok(Some(value))
     }
 
+    /// Disable restart on the exact owned container before Stop can settle an
+    /// empty observation. Return the post-update inspection so callers act on
+    /// its current state, including a restart that raced the update.
+    async fn suppress_restart_policy(
+        &self,
+        handle: &OwnedRuntimeHandle,
+    ) -> Result<Option<Value>, BackendError> {
+        let Some(value) = self.verify_handle_value(handle).await? else {
+            return Ok(None);
+        };
+        if restart_policy_is_disabled(&value)? {
+            return Ok(Some(value));
+        }
+
+        let body = json!({"RestartPolicy":{"Name":"no","MaximumRetryCount":0}});
+        let response = self
+            .request(
+                "POST",
+                &format!("{DOCKER_API}/containers/{}/update", handle.container_id()),
+                Some(&body),
+            )
+            .await?;
+        if response.status != 200 {
+            return Err(response.as_error());
+        }
+
+        let Some(updated) = self.verify_handle_value(handle).await? else {
+            return Err(BackendError::OwnershipMismatch(
+                "owned container disappeared while disabling restart".into(),
+            ));
+        };
+        if !matches!(
+            updated
+                .pointer("/HostConfig/RestartPolicy/Name")
+                .and_then(Value::as_str),
+            Some("no")
+        ) {
+            return Err(BackendError::PolicyMismatch(
+                "Docker did not confirm the disabled restart policy".into(),
+            ));
+        }
+        Ok(Some(updated))
+    }
+
     async fn request(
         &self,
         method: &str,
@@ -902,38 +946,8 @@ impl RuntimeBackend for DockerEngineBackend {
                 configured_limits: handle.requested_limits(),
             });
         };
-        let state_value = value.get("State").cloned().unwrap_or(Value::Null);
-        let running = state_value
-            .get("Running")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let paused = state_value
-            .get("Paused")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let restarting = state_value
-            .get("Restarting")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let status = state_value
-            .get("Status")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let state = if paused {
-            BackendRuntimeState::Paused
-        } else if restarting {
-            BackendRuntimeState::Restarting
-        } else if running {
-            BackendRuntimeState::Running
-        } else {
-            match status {
-                "created" => BackendRuntimeState::Created,
-                "dead" => BackendRuntimeState::Dead,
-                _ => BackendRuntimeState::Exited,
-            }
-        };
         Ok(BackendInspection {
-            state,
+            state: runtime_state_from_inspect(&value),
             configured_limits: configured_limits_from_inspect(&value, handle.requested_limits()),
         })
     }
@@ -943,8 +957,10 @@ impl RuntimeBackend for DockerEngineBackend {
         handle: &OwnedRuntimeHandle,
         grace_seconds: u64,
     ) -> Result<(), BackendError> {
-        let inspected = self.inspect(handle).await?;
-        match inspected.state {
+        let Some(value) = self.suppress_restart_policy(handle).await? else {
+            return Ok(());
+        };
+        match runtime_state_from_inspect(&value) {
             BackendRuntimeState::Missing
             | BackendRuntimeState::Exited
             | BackendRuntimeState::Dead => return Ok(()),
@@ -981,14 +997,17 @@ impl RuntimeBackend for DockerEngineBackend {
     }
 
     async fn force_stop(&self, handle: &OwnedRuntimeHandle) -> Result<(), BackendError> {
-        let inspected = self.inspect(handle).await?;
+        let Some(value) = self.suppress_restart_policy(handle).await? else {
+            return Ok(());
+        };
+        let state = runtime_state_from_inspect(&value);
         if matches!(
-            inspected.state,
+            state,
             BackendRuntimeState::Missing | BackendRuntimeState::Exited | BackendRuntimeState::Dead
         ) {
             return Ok(());
         }
-        if inspected.state == BackendRuntimeState::Paused {
+        if state == BackendRuntimeState::Paused {
             let response = self
                 .request(
                     "POST",
@@ -1021,13 +1040,14 @@ impl RuntimeBackend for DockerEngineBackend {
         // inspect first proves the daemon, full id and immutable ownership.
         // A positively inspected Created enclosure has never run a workload;
         // Docker stop/kill are no-ops and need not turn it into Exited.
-        Ok(matches!(
-            self.inspect(handle).await?.state,
-            BackendRuntimeState::Missing
-                | BackendRuntimeState::Created
-                | BackendRuntimeState::Exited
-                | BackendRuntimeState::Dead
-        ))
+        let Some(value) = self.verify_handle_value(handle).await? else {
+            return Ok(true);
+        };
+        let empty = matches!(
+            runtime_state_from_inspect(&value),
+            BackendRuntimeState::Created | BackendRuntimeState::Exited | BackendRuntimeState::Dead
+        );
+        Ok(empty && restart_policy_is_disabled(&value)?)
     }
 
     async fn list_known(
@@ -1653,6 +1673,49 @@ fn verify_workload_mounts(
     Ok(())
 }
 
+fn runtime_state_from_inspect(value: &Value) -> BackendRuntimeState {
+    let state = value.get("State").cloned().unwrap_or(Value::Null);
+    let running = state
+        .get("Running")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let paused = state
+        .get("Paused")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let restarting = state
+        .get("Restarting")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let status = state
+        .get("Status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if paused {
+        BackendRuntimeState::Paused
+    } else if restarting {
+        BackendRuntimeState::Restarting
+    } else if running {
+        BackendRuntimeState::Running
+    } else {
+        match status {
+            "created" => BackendRuntimeState::Created,
+            "dead" => BackendRuntimeState::Dead,
+            _ => BackendRuntimeState::Exited,
+        }
+    }
+}
+
+fn restart_policy_is_disabled(value: &Value) -> Result<bool, BackendError> {
+    let name = value
+        .pointer("/HostConfig/RestartPolicy/Name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            BackendError::PolicyMismatch("container restart policy is missing or malformed".into())
+        })?;
+    Ok(name.is_empty() || name == "no")
+}
+
 fn configured_limits_from_inspect(value: &Value, fallback: RuntimeLimits) -> RuntimeLimits {
     let host = value.get("HostConfig").unwrap_or(&Value::Null);
     let memory = host
@@ -1791,6 +1854,8 @@ pub(crate) mod tests {
         pub(crate) inspection: Value,
         pub(crate) daemon_id: String,
         pub(crate) requests: Vec<String>,
+        pub(crate) restart_updates: Vec<(String, Value)>,
+        pub(crate) apply_restart_update: bool,
         pub(crate) silence: Option<&'static str>,
         pub(crate) stop_response_overhead: Option<Duration>,
         pub(crate) completed_stops: usize,
@@ -1820,6 +1885,7 @@ pub(crate) mod tests {
                     "com.freshell.incarnation-id":handle.incarnation_id()
                 },"Env":runtime_host_environment(None,Some(agent)).unwrap()},
                 "HostConfig":{"NetworkMode":"bridge","PidMode":"","Privileged":false,
+                    "RestartPolicy":{"Name":"no","MaximumRetryCount":0},
                     "CapAdd":["CHOWN","SETUID","SETGID"],"Tmpfs":runtime_tmpfs(Some(agent.provider.as_str()))},
                 "Mounts":[
                     {"Source":handle.host_binary_path(),"Destination":"/runtime/freshell-session-host","RW":false},
@@ -1850,6 +1916,8 @@ pub(crate) mod tests {
                 inspection,
                 daemon_id: handle.daemon_id().to_string(),
                 requests: vec![],
+                restart_updates: vec![],
+                apply_restart_update: true,
                 silence: None,
                 stop_response_overhead: None,
                 completed_stops: 0,
@@ -1881,6 +1949,24 @@ pub(crate) mod tests {
                                 }
                                 let header = String::from_utf8(header).unwrap();
                                 let request = header.lines().next().unwrap().to_owned();
+                                let content_length = header
+                                    .lines()
+                                    .find_map(|line| {
+                                        line.split_once(':').and_then(|(name, value)| {
+                                            name.eq_ignore_ascii_case("content-length")
+                                                .then_some(value.trim())
+                                        })
+                                    })
+                                    .unwrap_or("0")
+                                    .parse::<usize>()
+                                    .unwrap();
+                                let mut body_bytes = vec![0; content_length];
+                                stream.read_exact(&mut body_bytes).await.unwrap();
+                                let body = if body_bytes.is_empty() {
+                                    None
+                                } else {
+                                    Some(serde_json::from_slice::<Value>(&body_bytes).unwrap())
+                                };
                                 let (silent, status, response, stop_delay) = {
                                     let mut state = state.lock().unwrap();
                                     let inspect = request == format!("GET {DOCKER_API}/containers/{container}/json HTTP/1.1");
@@ -1889,6 +1975,7 @@ pub(crate) mod tests {
                                     }
                                     let stop = request == format!("POST {DOCKER_API}/containers/{container}/stop?t=2 HTTP/1.1");
                                     let force = request == format!("POST {DOCKER_API}/containers/{container}/kill?signal=KILL HTTP/1.1");
+                                    let update = request == format!("POST {DOCKER_API}/containers/{container}/update HTTP/1.1");
                                     let after_stop = state.requests.iter().any(|r| r.contains("/stop?"));
                                     let after_force = state.requests.iter().any(|r| r.contains("/kill?"));
                                     let observations = state.requests.iter().filter(|r| r.contains("/json ")).count();
@@ -1907,6 +1994,14 @@ pub(crate) mod tests {
                                         (200, json!({"ID":state.daemon_id,"SecurityOptions":["name=rootless"]}))
                                     } else if inspect {
                                         (200, state.inspection.clone())
+                                    } else if update {
+                                        let body = body.clone().expect("Docker update requires a JSON body");
+                                        state.restart_updates.push((request.clone(), body.clone()));
+                                        if state.apply_restart_update {
+                                            state.inspection["HostConfig"]["RestartPolicy"] =
+                                                body["RestartPolicy"].clone();
+                                        }
+                                        (200, json!({}))
                                     } else if stop || force {
                                         // Docker never starts or changes a Created container for
                                         // these no-op requests. Running fixtures survive signals.
