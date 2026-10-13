@@ -15,6 +15,8 @@ Fix the durable-souls problems identified in the diagnosis and make ordinary use
 - Keep verification proportional to the stated threat model: behavior tests and diagnosable logs are enough; do not build a formal certification or audit campaign.
 - Avoid strict provider-session continuity or automatic migration across a transition. If existing sessions need moving, manual porting later is acceptable.
 - Use the easiest existing authorized Codex account path and confirm the existing Claude login works.
+- Do not inspect provider-result files, Cloud launcher output, provider output, terminal snapshots, prompts, or response bodies.
+- For Stage 5 Fresh Eyes, use the runner's `--gpt` option because other models are unavailable; this is the user's explicit exception to the different-model-family preference.
 
 ### Accepted tradeoffs and residuals
 - Existing provider sessions may not survive a runtime transition; manual porting may be needed later.
