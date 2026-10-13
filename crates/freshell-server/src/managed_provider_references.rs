@@ -641,6 +641,7 @@ async fn prepare_managed_opencode_with_typed_publisher(
         .map_err(str::to_string)?
     };
     let mut loaded = read_opencode_sources(selected).map_err(|error| error.to_string())?;
+    sources::snapshot_freshell_mcp_ownership(&mut loaded).map_err(|error| error.to_string())?;
     if let Some(raw) = inherited_inline {
         if raw.len() > 16 * 1024 * 1024 {
             return Err("OpenCode inherited inline source exceeds 16 MiB".into());
@@ -655,14 +656,7 @@ async fn prepare_managed_opencode_with_typed_publisher(
         let user_owns_freshell_mcp = loaded
             .iter()
             .filter(|source| source.source.lane == SourceLane::Main)
-            .try_fold(false, |owned, source| {
-                freshell_platform::opencode_config::source_owns_freshell_mcp(
-                    &source.view,
-                    &source.source.logical_path,
-                )
-                .map(|user_owns| owned || user_owns)
-            })
-            .map_err(|error| error.to_string())?;
+            .any(|source| source.mcp_ownership_snapshot == Some(true));
         let view = freshell_platform::opencode_config::merge_owned_entries_bounded(
             Some(&raw),
             &freshell_platform::opencode_config::OpencodeConfigPlan {
@@ -676,6 +670,7 @@ async fn prepare_managed_opencode_with_typed_publisher(
         .map_err(|error| error.to_string())?;
         let inline = LoadedSourceOccurrence {
             requires_config_bind: true,
+            mcp_ownership_snapshot: Some(false),
             source: SourceOccurrence {
                 logical_path: "OPENCODE_CONFIG_CONTENT".into(),
                 canonical_source: "OPENCODE_CONFIG_CONTENT".into(),

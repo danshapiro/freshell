@@ -311,6 +311,9 @@ pub struct PlannedSourceOccurrence {
     pub requires_config_bind: bool,
     pub instance_cwd: PathBuf,
     pub configured_resources: Vec<PathBuf>,
+    /// Captured with the retained source view so later staging does not
+    /// reinterpret a generated entry after ordinary-terminal cleanup.
+    pub user_owns_freshell_mcp: bool,
 }
 
 #[derive(Default)]
@@ -350,10 +353,63 @@ pub fn retained_source_view_bytes(
     Ok(budget.bytes)
 }
 
+/// Capture generated-versus-user MCP ownership only after all retained source
+/// views pass the shared byte bound. The snapshot then travels with the views
+/// through resource selection and staging.
+pub fn snapshot_freshell_mcp_ownership(
+    sources: &mut [LoadedSourceOccurrence],
+) -> Result<(), super::ReferenceError> {
+    let mut budget = SourceViewBudget::default();
+    for source in sources.iter() {
+        budget
+            .charge(&source.view)
+            .map_err(|cause| super::ReferenceError {
+                preparation_failure: None,
+                operation: "read",
+                field: "OpenCode source",
+                source_ordinal: 0,
+                declaring_source: source.source.logical_path.clone(),
+                variables: vec![],
+                cause,
+            })?;
+    }
+    snapshot_freshell_mcp_ownership_after_budget(sources)?;
+    Ok(())
+}
+
+fn snapshot_freshell_mcp_ownership_after_budget(
+    sources: &mut [LoadedSourceOccurrence],
+) -> Result<(), super::ReferenceError> {
+    for (ordinal, source) in sources.iter_mut().enumerate() {
+        if source.mcp_ownership_snapshot.is_some() {
+            continue;
+        }
+        source.mcp_ownership_snapshot = Some(if source.source.lane == SourceLane::Main {
+            freshell_platform::opencode_config::source_owns_freshell_mcp(
+                &source.view,
+                &source.source.logical_path,
+            )
+            .map_err(|_| super::ReferenceError {
+                preparation_failure: None,
+                operation: "select",
+                field: "OpenCode MCP ownership",
+                source_ordinal: ordinal,
+                declaring_source: source.source.logical_path.clone(),
+                variables: vec![],
+                cause: "selected source MCP ownership could not be determined",
+            })?
+        } else {
+            false
+        });
+    }
+    Ok(())
+}
+
 pub struct LoadedSourceOccurrence {
     pub source: SourceOccurrence,
     pub view: std::sync::Arc<String>,
     pub requires_config_bind: bool,
+    pub mcp_ownership_snapshot: Option<bool>,
 }
 
 /// Retain one bounded canonical read while keeping every native logical origin.
@@ -410,6 +466,7 @@ pub fn read_opencode_sources(
             source,
             view,
             requires_config_bind: false,
+            mcp_ownership_snapshot: None,
         });
     }
     Ok(loaded)
@@ -485,7 +542,7 @@ pub fn plan_loaded_opencode_sources(
     )
 }
 pub fn plan_loaded_opencode_sources_relocated(
-    sources: Vec<LoadedSourceOccurrence>,
+    mut sources: Vec<LoadedSourceOccurrence>,
     cwd: &Path,
     home: &Path,
     lookup: &dyn Fn(SourceLane, &Path, &str) -> Option<String>,
@@ -526,7 +583,9 @@ pub fn plan_loaded_opencode_sources_relocated(
                 cause,
             })?;
     }
+    snapshot_freshell_mcp_ownership_after_budget(&mut sources)?;
     for (ordinal, loaded) in sources.into_iter().enumerate() {
+        let user_owns_freshell_mcp = loaded.mcp_ownership_snapshot.unwrap_or(false);
         let source = loaded.source;
         let original_form = source.lane != SourceLane::Inline
             && canonical_occurrences[&source.canonical_source] > 1;
@@ -656,6 +715,7 @@ pub fn plan_loaded_opencode_sources_relocated(
             requires_config_bind: loaded.requires_config_bind,
             instance_cwd: cwd.into(),
             configured_resources: Vec::new(),
+            user_owns_freshell_mcp,
         };
         let (resources, names) =
             super::opencode_resources::select(&planned, home, global.as_deref(), &|name| {
@@ -1448,9 +1508,19 @@ mod tests {
         )
         .expect("without a matching package script, a bare Bun file operand remains selectable");
 
+        assert!(
+            plan[0]
+                .configured_resources
+                .contains(&workspace.join("mcp.js").canonicalize().unwrap()),
+            "selected Bun script resources were {:?}",
+            plan[0].configured_resources
+        );
         assert!(plan[0]
             .configured_resources
-            .contains(&workspace.join("mcp.js").canonicalize().unwrap()));
+            .contains(&workspace.join("package.json").canonicalize().unwrap()));
+        assert!(!plan[0]
+            .configured_resources
+            .contains(&workspace.canonicalize().unwrap()));
     }
 
     #[test]
@@ -1494,9 +1564,19 @@ mod tests {
         )
         .expect("Bun treats an explicit ./ operand as a source file");
 
+        assert!(
+            plan[0]
+                .configured_resources
+                .contains(&workspace.join("mcp.js").canonicalize().unwrap()),
+            "selected Bun script resources were {:?}",
+            plan[0].configured_resources
+        );
         assert!(plan[0]
             .configured_resources
-            .contains(&workspace.join("mcp.js").canonicalize().unwrap()));
+            .contains(&workspace.join("package.json").canonicalize().unwrap()));
+        assert!(!plan[0]
+            .configured_resources
+            .contains(&workspace.canonicalize().unwrap()));
     }
 
     #[test]

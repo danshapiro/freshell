@@ -10363,6 +10363,7 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             .into_iter()
             .map(|lane| LoadedSourceOccurrence {
                 requires_config_bind: false,
+                mcp_ownership_snapshot: None,
                 source: SourceOccurrence {
                     logical_path: workspace.join(if lane == SourceLane::Main {
                         "opencode.json"

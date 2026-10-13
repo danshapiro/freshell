@@ -259,19 +259,22 @@ fn nested_fields(
                             "OpenCode mcp.script"
                         };
                     for (index, argument) in command.iter().enumerate() {
+                        let bun_run_file = is_bun_run_file_operand(&command, index);
                         let script_file = if script_runtime {
                             script_index.is_some_and(|script| {
                                 index > 0
                                     && index <= script
                                     && is_script_path(argument)
                                     && !is_bun_run_bare_operand(&command, index)
+                                    && !bun_run_file
                             })
                         } else {
                             index == 0 && is_script_path(argument)
                         };
                         let script_operand = script_runtime
                             && script_index == Some(index)
-                            && !is_bun_run_bare_operand(&command, index);
+                            && !is_bun_run_bare_operand(&command, index)
+                            && !bun_run_file;
                         if index == 0 && is_explicit_command_path(argument) {
                             if is_script_path(argument) {
                                 let field = if is_node_script_path(argument) {
@@ -291,6 +294,8 @@ fn nested_fields(
                         let script = &command[script_index];
                         if is_bun_run_bare_operand(&command, script_index) {
                             result.push(("OpenCode bun run operand", script.clone()));
+                        } else if is_bun_run_file_operand(&command, script_index) {
+                            result.push(("OpenCode bun run file", script.clone()));
                         }
                     }
                 }
@@ -365,6 +370,22 @@ fn is_bun_run_bare_operand(command: &[String], index: usize) -> bool {
     executable == "bun"
         && command.get(1).is_some_and(|argument| argument == "run")
         && is_bare_bun_script_name(argument)
+}
+
+fn is_bun_run_file_operand(command: &[String], index: usize) -> bool {
+    let Some(executable) = command
+        .first()
+        .and_then(|executable| Path::new(executable).file_name())
+    else {
+        return false;
+    };
+    let executable = executable.to_string_lossy().to_ascii_lowercase();
+    let executable = executable.strip_suffix(".exe").unwrap_or(&executable);
+    executable == "bun"
+        && command.get(1).is_some_and(|argument| argument == "run")
+        && command
+            .get(index)
+            .is_some_and(|argument| is_node_script_path(argument))
 }
 
 fn is_bare_bun_script_name(argument: &str) -> bool {
@@ -472,6 +493,7 @@ fn is_mcp_command_path_field(field: &str) -> bool {
             | "OpenCode mcp.node-direct-script"
             | "OpenCode mcp.shebang-script"
             | "OpenCode mcp.shebang-node-script"
+            | "OpenCode bun run file"
     )
 }
 
@@ -1761,12 +1783,8 @@ pub fn select(
     let mut resource_path_bytes = 0usize;
     let mut variables = std::collections::BTreeSet::new();
     let raw = source.references.unexpanded_source();
-    let skip_owned_freshell_mcp = source.source.lane == super::sources::SourceLane::Main
-        && !freshell_platform::opencode_config::source_owns_freshell_mcp(
-            raw,
-            &source.source.logical_path,
-        )
-        .map_err(|_| fail("OpenCode resource", "project MCP ownership check failed"))?;
+    let skip_owned_freshell_mcp =
+        source.source.lane == super::sources::SourceLane::Main && !source.user_owns_freshell_mcp;
     let mut selections = fields(raw).map_err(|cause| fail("OpenCode resource", cause))?;
     selections.extend(
         nested_fields(
@@ -1877,8 +1895,10 @@ pub fn select(
                     continue;
                 }
             }
-            field = if is_script_path(&spelling) {
-                "OpenCode mcp.node-script"
+            field = if is_node_script_path(&spelling) {
+                "OpenCode bun run file"
+            } else if is_script_path(&spelling) {
+                "OpenCode mcp.script"
             } else {
                 "OpenCode mcp.command"
             };
@@ -2055,6 +2075,33 @@ pub fn select(
                 .parent()
                 .ok_or_else(|| fail(field, "command has no containing scope"))?;
             let dependency_scope = direct_script_dependency_scope(command_parent, home);
+            if field == "OpenCode bun run file" {
+                insert_resource(
+                    &mut result,
+                    &mut resource_path_bytes,
+                    canonical.clone(),
+                    field,
+                    declaring,
+                )?;
+                insert_installed_package_ancestor_resources(
+                    &canonical,
+                    home,
+                    declaring,
+                    &mut result,
+                    &mut resource_path_bytes,
+                    field,
+                )?;
+                insert_direct_script_dependencies(
+                    &canonical,
+                    &dependency_scope,
+                    declaring,
+                    &mut result,
+                    &mut resource_path_bytes,
+                    field,
+                    ScriptDependencyRuntime::Node,
+                )?;
+                continue;
+            }
             if let Some(package_root) = command_parent
                 .ancestors()
                 .take_while(|ancestor| *ancestor != home && ancestor.parent().is_some())

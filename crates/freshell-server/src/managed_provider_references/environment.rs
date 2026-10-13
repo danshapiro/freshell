@@ -260,6 +260,7 @@ mod tests {
         let loaded = || {
             vec![LoadedSourceOccurrence {
                 requires_config_bind: false,
+                mcp_ownership_snapshot: None,
                 source: SourceOccurrence {
                     logical_path: config.clone(),
                     canonical_source: config.clone(),
@@ -328,6 +329,7 @@ mod tests {
                 .plan_sources(
                     vec![LoadedSourceOccurrence {
                         requires_config_bind: false,
+                        mcp_ownership_snapshot: None,
                         source: SourceOccurrence {
                             logical_path: config.clone(),
                             canonical_source: config,
@@ -387,6 +389,7 @@ mod tests {
             .plan_sources(
                 vec![LoadedSourceOccurrence {
                     requires_config_bind: false,
+                    mcp_ownership_snapshot: None,
                     source: SourceOccurrence {
                         logical_path: config.clone(),
                         canonical_source: config,

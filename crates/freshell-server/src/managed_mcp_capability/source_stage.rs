@@ -3044,12 +3044,7 @@ pub(super) fn stage(
             return Err("selected configuration discovery role is unrecorded".into());
         }
         if source.source.lane == SourceLane::Main {
-            manifest.user_owns_freshell_mcp |=
-                freshell_platform::opencode_config::source_owns_freshell_mcp(
-                    source.references.unexpanded_source(),
-                    &source.source.logical_path,
-                )
-                .map_err(|error| error.to_string())?;
+            manifest.user_owns_freshell_mcp |= source.user_owns_freshell_mcp;
         }
         view_budget
             .charge(source.references.unexpanded_source())
@@ -3447,6 +3442,70 @@ pub(super) fn describe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_mcp_ownership_survives_sidecar_cleanup_after_resource_selection() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let config_dir = workspace.join(".opencode");
+        let config = config_dir.join("opencode.json");
+        let sidecar = config_dir.join(".freshell-mcp-state.json");
+        let stage_root = owned.path().join("stage");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir(&stage_root).unwrap();
+        let command = serde_json::json!(["node", "/opt/freshell-mcp/server.js"]);
+        std::fs::write(
+            &config,
+            serde_json::json!({"mcp":{"freshell":{"command":command}}}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            &sidecar,
+            serde_json::json!({"createdEntry":true,"ownedCommand":command}).to_string(),
+        )
+        .unwrap();
+
+        let plan = crate::managed_provider_references::sources::plan_opencode_sources(
+            vec![
+                crate::managed_provider_references::sources::SourceOccurrence {
+                    logical_path: config.clone(),
+                    canonical_source: config.clone(),
+                    lane: crate::managed_provider_references::sources::SourceLane::Main,
+                    role: crate::managed_provider_references::sources::DiscoveryRole::Workspace,
+                },
+            ],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .unwrap();
+        assert!(plan[0].configured_resources.is_empty());
+
+        // Ordinary OpenCode terminal cleanup can remove this after selection.
+        std::fs::remove_file(&sidecar).unwrap();
+        stage(
+            &stage_root,
+            &home,
+            &workspace,
+            &plan,
+            super::super::OpencodeEphemeralInput {
+                config_root: Some(&home.join(".config/opencode")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let manifest: freshell_platform::opencode_recipe::SourceManifest = serde_json::from_slice(
+            &std::fs::read(stage_root.join(".freshell/input-manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !manifest.user_owns_freshell_mcp,
+            "staging must keep the generated-entry ownership decision paired with resource selection"
+        );
+    }
 
     #[test]
     fn accepted_source_view_rejects_actual_oversize_before_reading_or_prior_mutation() {
