@@ -568,6 +568,7 @@ const OWNERSHIP_CONTENT: &[u8] = b"freshell-provider-publication-v1\n";
 const JOURNAL_FILE: &str = ".manifest.json";
 const JOURNAL_TEMP_FILE: &str = ".manifest.tmp";
 const COMMITTED_FILE: &str = ".committed";
+const COMMITTED_CONTENT: &[u8] = b"committed\n";
 const CLEANUP_FILE: &str = ".cleanup-started";
 const CLEANUP_TEMP_FILE: &str = ".cleanup-started.tmp";
 const CLEANUP_CONTENT: &[u8] = b"cleanup-started\n";
@@ -580,6 +581,9 @@ thread_local! {
         std::cell::RefCell::new(Vec::new())
     };
     static PUBLICATION_JOURNAL_WRITES: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static PUBLICATION_JOURNAL_ENTRY_COMPARISONS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
 }
@@ -607,7 +611,7 @@ fn emit_publication_recovery_completed(report: &PublicationRecoveryReport) {
     eprintln!("{event}");
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 enum PublicationJournalEntry {
     Leaf {
         relative: PathBuf,
@@ -619,6 +623,98 @@ enum PublicationJournalEntry {
         relative: PathBuf,
         backup_id: usize,
     },
+}
+
+impl PartialEq for PublicationJournalEntry {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(test)]
+        PUBLICATION_JOURNAL_ENTRY_COMPARISONS.with(|comparisons| {
+            comparisons.set(comparisons.get() + 1);
+        });
+        match (self, other) {
+            (
+                Self::Leaf {
+                    relative: left_relative,
+                    backup_id: left_backup_id,
+                    had_original: left_had_original,
+                },
+                Self::Leaf {
+                    relative: right_relative,
+                    backup_id: right_backup_id,
+                    had_original: right_had_original,
+                },
+            ) => {
+                left_relative == right_relative
+                    && left_backup_id == right_backup_id
+                    && left_had_original == right_had_original
+            }
+            (Self::CreatedDirectory(left), Self::CreatedDirectory(right)) => left == right,
+            (
+                Self::Obsolete {
+                    relative: left_relative,
+                    backup_id: left_backup_id,
+                },
+                Self::Obsolete {
+                    relative: right_relative,
+                    backup_id: right_backup_id,
+                },
+            ) => left_relative == right_relative && left_backup_id == right_backup_id,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for PublicationJournalEntry {}
+
+impl PartialOrd for PublicationJournalEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PublicationJournalEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+
+        #[cfg(test)]
+        PUBLICATION_JOURNAL_ENTRY_COMPARISONS.with(|comparisons| {
+            comparisons.set(comparisons.get() + 1);
+        });
+        match (self, other) {
+            (
+                Self::Leaf {
+                    relative: left_relative,
+                    backup_id: left_backup_id,
+                    had_original: left_had_original,
+                },
+                Self::Leaf {
+                    relative: right_relative,
+                    backup_id: right_backup_id,
+                    had_original: right_had_original,
+                },
+            ) => left_relative
+                .cmp(right_relative)
+                .then_with(|| left_backup_id.cmp(right_backup_id))
+                .then_with(|| left_had_original.cmp(right_had_original)),
+            (Self::CreatedDirectory(left), Self::CreatedDirectory(right)) => left.cmp(right),
+            (
+                Self::Obsolete {
+                    relative: left_relative,
+                    backup_id: left_backup_id,
+                },
+                Self::Obsolete {
+                    relative: right_relative,
+                    backup_id: right_backup_id,
+                },
+            ) => left_relative
+                .cmp(right_relative)
+                .then_with(|| left_backup_id.cmp(right_backup_id)),
+            (Self::Leaf { .. }, _) => Ordering::Less,
+            (Self::CreatedDirectory(_), Self::Leaf { .. }) => Ordering::Greater,
+            (Self::CreatedDirectory(_), Self::Obsolete { .. }) => Ordering::Less,
+            (Self::Obsolete { .. }, _) => Ordering::Greater,
+        }
+    }
 }
 
 fn publication_paths(
@@ -1085,6 +1181,72 @@ fn remove_recovered_leaf(path: &Path) -> Result<(), CopyError> {
     }
 }
 
+fn validate_recovery_parent_directories(
+    destination_root: &Path,
+    relative: &Path,
+) -> Result<Option<PathBuf>, CopyError> {
+    let destination = destination_root.join(relative);
+    let parent = destination.parent().ok_or_else(|| {
+        error(
+            relative,
+            "recover_publication",
+            "journal destination has no parent",
+        )
+    })?;
+    let components = relative
+        .parent()
+        .into_iter()
+        .flat_map(Path::ancestors)
+        .filter(|path| !path.as_os_str().is_empty())
+        .collect::<Vec<_>>();
+    for component in components.into_iter().rev() {
+        match fs::symlink_metadata(destination_root.join(component)) {
+            Ok(parent_metadata)
+                if parent_metadata.is_dir() && !parent_metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(error(
+                    relative,
+                    "recover_publication",
+                    "journal parent is not a physical directory",
+                ));
+            }
+            Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(cause) => {
+                return Err(io_error(relative, "inspect_recovery_parent", cause));
+            }
+        }
+    }
+    Ok(Some(parent.to_owned()))
+}
+
+fn has_publication_committed_marker(backup_root: &Path) -> Result<bool, CopyError> {
+    let path = backup_root.join(COMMITTED_FILE);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(cause) => {
+            return Err(io_error(Path::new(""), "inspect_publication_commit", cause));
+        }
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(error(
+            Path::new(""),
+            "recover_publication",
+            "publication commit marker is invalid",
+        ));
+    }
+    let bytes = fs::read(&path)
+        .map_err(|cause| io_error(Path::new(""), "read_publication_commit", cause))?;
+    if bytes != COMMITTED_CONTENT {
+        return Err(error(
+            Path::new(""),
+            "recover_publication",
+            "publication commit marker is invalid",
+        ));
+    }
+    Ok(true)
+}
+
 fn recover_interrupted_publications(
     destination_root: &Path,
 ) -> Result<PublicationRecoveryReport, CopyError> {
@@ -1133,8 +1295,8 @@ fn recover_interrupted_publications(
             )
         })?;
         let stage_root = destination_root.join(format!("{STAGE_PREFIX}{suffix}"));
-        let committed = path_exists(&backup_root.join(COMMITTED_FILE))?
-            || has_publication_cleanup_marker(&backup_root)?;
+        let cleanup_marker = has_publication_cleanup_marker(&backup_root)?;
+        let committed = cleanup_marker || has_publication_committed_marker(&backup_root)?;
         if committed {
             cleanup_committed_publication(destination_root, &stage_root, &backup_root)?;
             report.committed += 1;
@@ -1180,39 +1342,15 @@ fn recover_interrupted_publications(
                     let backup = backup_path(&backup_root, *backup_id);
                     match fs::symlink_metadata(&backup) {
                         Ok(backup_metadata) => {
-                            let parent = destination.parent().ok_or_else(|| {
-                                error(
-                                    relative,
-                                    "recover_publication",
-                                    "journal destination has no parent",
-                                )
-                            })?;
-                            for component in relative
-                                .parent()
-                                .into_iter()
-                                .flat_map(Path::ancestors)
-                                .filter(|path| !path.as_os_str().is_empty())
-                            {
-                                match fs::symlink_metadata(destination_root.join(component)) {
-                                    Ok(parent_metadata)
-                                        if parent_metadata.is_dir()
-                                            && !parent_metadata.file_type().is_symlink() => {}
-                                    Ok(_) => {
-                                        return Err(error(
-                                            relative,
-                                            "recover_publication",
-                                            "journal parent is not a physical directory",
-                                        ));
-                                    }
-                                    Err(cause) => {
-                                        return Err(io_error(
-                                            relative,
-                                            "inspect_recovery_parent",
-                                            cause,
-                                        ));
-                                    }
-                                }
-                            }
+                            let parent =
+                                validate_recovery_parent_directories(destination_root, relative)?
+                                    .ok_or_else(|| {
+                                    error(
+                                        relative,
+                                        "recover_publication",
+                                        "journal parent is missing",
+                                    )
+                                })?;
                             match fs::symlink_metadata(&destination) {
                                 Ok(destination_metadata)
                                     if matches!(
@@ -1243,7 +1381,7 @@ fn recover_interrupted_publications(
                                 io_error(relative, "restore_recovery_backup", cause)
                             })?;
                             report.restored_paths += 1;
-                            sync_directory_chain(destination_root, parent)?;
+                            sync_directory_chain(destination_root, &parent)?;
                         }
                         Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {
                             if matches!(entry, PublicationJournalEntry::Leaf { .. })
@@ -1254,7 +1392,14 @@ fn recover_interrupted_publications(
                                     Err(stage_error)
                                         if stage_error.kind() == std::io::ErrorKind::NotFound =>
                                     {
-                                        remove_recovered_leaf(&destination)?;
+                                        if validate_recovery_parent_directories(
+                                            destination_root,
+                                            relative,
+                                        )?
+                                        .is_some()
+                                        {
+                                            remove_recovered_leaf(&destination)?;
+                                        }
                                     }
                                     Err(stage_error) => {
                                         return Err(io_error(
@@ -1343,13 +1488,19 @@ impl Publication {
         destination_root: &Path,
         entries: &[PublicationJournalEntry],
     ) -> Result<(), CopyError> {
-        let initial_len = self.journal_entries.len();
+        let mut known_entries = self
+            .journal_entries
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut changed = false;
         for entry in entries {
-            if !self.journal_entries.contains(entry) {
+            if known_entries.insert(entry.clone()) {
                 self.journal_entries.push(entry.clone());
+                changed = true;
             }
         }
-        if self.journal_entries.len() == initial_len {
+        if !changed {
             return Ok(());
         }
         write_publication_journal(destination_root, &self.backup.0, &self.journal_entries)
@@ -1390,7 +1541,7 @@ impl Publication {
             .write(true)
             .open(&temporary)
             .map_err(|cause| io_error(Path::new(""), "create_publication_commit", cause))?;
-        file.write_all(b"committed\n")
+        file.write_all(COMMITTED_CONTENT)
             .map_err(|cause| io_error(Path::new(""), "write_publication_commit", cause))?;
         file.sync_all()
             .map_err(|cause| io_error(Path::new(""), "sync_publication_commit", cause))?;
@@ -2283,6 +2434,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[ignore = "process-kill recovery test; run only through scripts/sandbox-test.sh"]
     fn abrupt_termination_during_replacement_keeps_existing_leaf() {
         const CHILD_ROOT: &str = "FRESHELL_PROVIDER_PUBLICATION_CHILD_ROOT";
         const PUBLISH_REACHED: &str = "publisher-reached";
@@ -2320,6 +2472,7 @@ mod tests {
             .args([
                 "--exact",
                 "provider_environment::tests::abrupt_termination_during_replacement_keeps_existing_leaf",
+                "--ignored",
                 "--nocapture",
             ])
             .env(CHILD_ROOT, root.path())
@@ -2345,6 +2498,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[ignore = "process-kill recovery test; run only through scripts/sandbox-test.sh"]
     fn abrupt_termination_after_partial_publish_recovers_prior_home_before_retry() {
         const CHILD_ROOT: &str = "FRESHELL_PROVIDER_MULTI_PUBLICATION_CHILD_ROOT";
         const PARTIAL_PUBLISH_REACHED: &str = "partial-publish-reached";
@@ -2395,6 +2549,7 @@ mod tests {
                 .args([
                     "--exact",
                     "provider_environment::tests::abrupt_termination_after_partial_publish_recovers_prior_home_before_retry",
+                    "--ignored",
                     "--nocapture",
                 ])
                 .env(CHILD_ROOT, root.path())
@@ -2648,6 +2803,186 @@ mod tests {
         assert_eq!(events[0]["restored_paths"], 1);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn recovery_refuses_to_remove_missing_backup_leaf_through_symlinked_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let outside = root.path().join("outside");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let sentinel = outside.join("sentinel");
+        fs::write(&sentinel, b"external-data").unwrap();
+
+        let backup = home.join(format!("{BACKUP_PREFIX}missing-backup-symlink-parent"));
+        fs::create_dir_all(backup.join(OLD_FILES_DIR)).unwrap();
+        write_publication_owner_marker(&home, &backup).unwrap();
+        let entry = PublicationJournalEntry::Leaf {
+            relative: "nested/sentinel".into(),
+            backup_id: 0,
+            had_original: false,
+        };
+        write_publication_journal(&home, &backup, std::slice::from_ref(&entry)).unwrap();
+        symlink(&outside, home.join("nested")).unwrap();
+
+        let result = recover_environment(&home);
+
+        assert_eq!(fs::read(&sentinel).unwrap(), b"external-data");
+        assert!(result.is_err(), "symlinked parents must block leaf removal");
+        assert!(backup.join(JOURNAL_FILE).is_file());
+        assert_eq!(
+            read_publication_journal(&backup.join(JOURNAL_FILE)).unwrap(),
+            vec![entry]
+        );
+        assert!(has_publication_owner_marker(&backup).unwrap());
+    }
+
+    #[test]
+    fn recovery_treats_missing_parent_as_absent_for_missing_backup_leaf() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let backup = home.join(format!("{BACKUP_PREFIX}missing-parent"));
+        fs::create_dir_all(backup.join(OLD_FILES_DIR)).unwrap();
+        write_publication_owner_marker(&home, &backup).unwrap();
+        let entry = PublicationJournalEntry::Leaf {
+            relative: "nested/new-leaf".into(),
+            backup_id: 0,
+            had_original: false,
+        };
+        write_publication_journal(&home, &backup, std::slice::from_ref(&entry)).unwrap();
+
+        recover_environment(&home).unwrap();
+
+        assert!(!home.join("nested").exists());
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn recovery_rejects_invalid_committed_markers_and_preserves_rollback_evidence() {
+        fn assert_invalid_marker(create_marker: impl FnOnce(&Path, &Path)) {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("home");
+            fs::create_dir(&home).unwrap();
+            fs::write(home.join("config.json"), b"published-value").unwrap();
+            let backup = home.join(format!("{BACKUP_PREFIX}invalid-commit-marker"));
+            fs::create_dir_all(backup.join(OLD_FILES_DIR)).unwrap();
+            write_publication_owner_marker(&home, &backup).unwrap();
+            fs::write(backup_path(&backup, 0), b"prior-value").unwrap();
+            let entry = PublicationJournalEntry::Leaf {
+                relative: "config.json".into(),
+                backup_id: 0,
+                had_original: true,
+            };
+            write_publication_journal(&home, &backup, std::slice::from_ref(&entry)).unwrap();
+            let marker_target = root.path().join("external-marker-target");
+            fs::write(&marker_target, b"external-marker-data").unwrap();
+            let marker = backup.join(COMMITTED_FILE);
+            create_marker(&marker, &marker_target);
+
+            let result = recover_environment(&home);
+
+            assert!(
+                result.is_err(),
+                "invalid committed marker must stop recovery"
+            );
+            assert_eq!(
+                fs::read(home.join("config.json")).unwrap(),
+                b"published-value"
+            );
+            assert_eq!(fs::read(backup_path(&backup, 0)).unwrap(), b"prior-value");
+            assert_eq!(
+                read_publication_journal(&backup.join(JOURNAL_FILE)).unwrap(),
+                vec![entry]
+            );
+            assert!(has_publication_owner_marker(&backup).unwrap());
+            assert_eq!(fs::read(&marker_target).unwrap(), b"external-marker-data");
+            assert!(fs::symlink_metadata(&marker).is_ok());
+        }
+
+        assert_invalid_marker(|marker, _| fs::write(marker, b"").unwrap());
+        assert_invalid_marker(|marker, _| fs::write(marker, b"not committed\n").unwrap());
+        assert_invalid_marker(|marker, _| fs::create_dir(marker).unwrap());
+        #[cfg(unix)]
+        assert_invalid_marker(|marker, target| symlink(target, marker).unwrap());
+    }
+
+    #[test]
+    fn recovery_accepts_the_marker_written_by_publication_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir(&home).unwrap();
+        fs::write(home.join("config.json"), b"published-value").unwrap();
+        let backup = home.join(format!("{BACKUP_PREFIX}valid-commit-marker"));
+        fs::create_dir_all(backup.join(OLD_FILES_DIR)).unwrap();
+        write_publication_owner_marker(&home, &backup).unwrap();
+        fs::write(backup_path(&backup, 0), b"prior-value").unwrap();
+        write_publication_journal(
+            &home,
+            &backup,
+            &[PublicationJournalEntry::Leaf {
+                relative: "config.json".into(),
+                backup_id: 0,
+                had_original: true,
+            }],
+        )
+        .unwrap();
+        let publication = Publication {
+            backup: TemporaryProjection(backup.clone()),
+            created: Vec::new(),
+            replaced: Vec::new(),
+            journal_entries: Vec::new(),
+            next_backup_id: 0,
+            committed: false,
+        };
+        publication.write_committed_marker(&home).unwrap();
+        std::mem::forget(publication);
+        assert_eq!(
+            fs::read(backup.join(COMMITTED_FILE)).unwrap(),
+            COMMITTED_CONTENT
+        );
+
+        recover_environment(&home).unwrap();
+
+        assert_eq!(
+            fs::read(home.join("config.json")).unwrap(),
+            b"published-value"
+        );
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn recovery_uses_durable_cleanup_marker_before_older_commit_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir(&home).unwrap();
+        fs::write(home.join("config.json"), b"published-value").unwrap();
+        let backup = home.join(format!("{BACKUP_PREFIX}cleanup-marker-precedence"));
+        fs::create_dir_all(backup.join(OLD_FILES_DIR)).unwrap();
+        write_publication_owner_marker(&home, &backup).unwrap();
+        fs::write(backup_path(&backup, 0), b"prior-value").unwrap();
+        write_publication_journal(
+            &home,
+            &backup,
+            &[PublicationJournalEntry::Leaf {
+                relative: "config.json".into(),
+                backup_id: 0,
+                had_original: true,
+            }],
+        )
+        .unwrap();
+        fs::write(backup.join(COMMITTED_FILE), b"malformed older marker").unwrap();
+        fs::write(backup.join(CLEANUP_FILE), CLEANUP_CONTENT).unwrap();
+
+        recover_environment(&home).unwrap();
+
+        assert_eq!(
+            fs::read(home.join("config.json")).unwrap(),
+            b"published-value"
+        );
+        assert!(!backup.exists());
+    }
+
     #[test]
     fn obsolete_path_batch_writes_one_journal_and_rolls_back_all_paths() {
         let root = tempfile::tempdir().unwrap();
@@ -2685,8 +3020,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn obsolete_path_journal_membership_scales_with_comparison_count() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let source = root.path().join("source");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("new"), b"new").unwrap();
+        let stale = (0..1024)
+            .map(|index| PathBuf::from(format!("old-{index:04}")))
+            .collect::<Vec<_>>();
+        for path in &stale {
+            fs::write(home.join(path), b"previous").unwrap();
+        }
+
+        let mut publication = stage_environment(
+            &[selection(&source.join("new"), "new")],
+            &home,
+            &[],
+            Default::default(),
+        )
+        .unwrap();
+        let duplicated_stale = stale
+            .iter()
+            .chain(stale.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        PUBLICATION_JOURNAL_WRITES.with(|writes| writes.set(0));
+        PUBLICATION_JOURNAL_ENTRY_COMPARISONS.with(|comparisons| comparisons.set(0));
+        publication
+            .remove_obsolete_batch(&duplicated_stale)
+            .unwrap();
+        let journal_writes = PUBLICATION_JOURNAL_WRITES.with(std::cell::Cell::get);
+        let comparisons = PUBLICATION_JOURNAL_ENTRY_COMPARISONS.with(std::cell::Cell::get);
+        assert_eq!(
+            journal_writes, 1,
+            "the batch must durably write the journal once"
+        );
+        assert!(
+            comparisons <= stale.len() * 64,
+            "journal deduplication compared entries {comparisons} times for {} unique paths",
+            stale.len()
+        );
+
+        drop(publication);
+        assert!(!home.join("new").exists());
+        for path in stale {
+            assert_eq!(fs::read(home.join(path)).unwrap(), b"previous");
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "process-kill recovery test; run only through scripts/sandbox-test.sh"]
     fn checkpoint_timeout_cleanup_kills_and_reaps_child() {
         let child = ChildGuard(Command::new("sleep").arg("2").spawn().unwrap());
         let pid = child.0.id();
