@@ -1292,6 +1292,9 @@ impl Supervisor {
                         freshell_runtime_protocol::RuntimeDiagnosticCode::CodexAppServerStartFailed,
                     ) => Some("CODEX_APP_SERVER_START_FAILED"),
                     Some(
+                        freshell_runtime_protocol::RuntimeDiagnosticCode::CodexProxyStartFailed,
+                    ) => Some("CODEX_PROXY_START_FAILED"),
+                    Some(
                         freshell_runtime_protocol::RuntimeDiagnosticCode::FreshAgentProviderStartFailed,
                     ) if handle.fresh_agent().is_some_and(|agent| {
                         agent.provider == freshell_runtime_protocol::FreshProvider::Codex
@@ -5174,6 +5177,7 @@ mod codex_pre_worker_retry_tests {
     #[derive(Clone, Copy)]
     enum FirstGrantOutcome {
         CodexAppServerStartFailed,
+        CodexProxyStartFailed,
         FreshAgentProviderStartFailed,
         WorkerMayHaveStarted,
     }
@@ -5181,6 +5185,7 @@ mod codex_pre_worker_retry_tests {
     #[derive(Clone, Copy)]
     enum HostOutcome {
         CodexAppServerStartFailed,
+        CodexProxyStartFailed,
         FreshAgentProviderStartFailed,
         WorkerMayHaveStarted,
         Running,
@@ -5233,6 +5238,7 @@ mod codex_pre_worker_retry_tests {
                 FirstGrantOutcome::CodexAppServerStartFailed => {
                     HostOutcome::CodexAppServerStartFailed
                 }
+                FirstGrantOutcome::CodexProxyStartFailed => HostOutcome::CodexProxyStartFailed,
                 FirstGrantOutcome::FreshAgentProviderStartFailed => {
                     HostOutcome::FreshAgentProviderStartFailed
                 }
@@ -5490,6 +5496,11 @@ mod codex_pre_worker_retry_tests {
                             "synthetic-private-codex-output-marker",
                         )
                         .with_diagnostic_code(RuntimeDiagnosticCode::CodexAppServerStartFailed)),
+                        HostOutcome::CodexProxyStartFailed => Err(RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            "synthetic-private-codex-proxy-output-marker",
+                        )
+                        .with_diagnostic_code(RuntimeDiagnosticCode::CodexProxyStartFailed)),
                         HostOutcome::FreshAgentProviderStartFailed => Err(RuntimeError::new(
                             RuntimeErrorCode::HostUnreachable,
                             "hosted fresh-agent provider failed to start",
@@ -5742,6 +5753,46 @@ mod codex_pre_worker_retry_tests {
         );
         assert!(failure["data"].get("errorMessage").is_none());
         assert!(!lifecycle.contains("synthetic-private-codex-output-marker"));
+    }
+
+    #[tokio::test]
+    async fn verified_codex_proxy_pre_worker_failure_allows_one_ordinary_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FakeBackend::new(FirstGrantOutcome::CodexProxyStartFailed));
+        let supervisor = supervisor(dir.path(), Arc::clone(&backend));
+        let soul = SoulId::new();
+
+        let error = supervisor
+            .launch(RequestId::new(), launch_request(soul.clone()))
+            .await
+            .expect_err("the injected pre-worker Codex proxy failure should surface");
+        assert_eq!(error.code, RuntimeErrorCode::HostUnreachable);
+        assert_eq!(
+            error.diagnostic_code,
+            Some(RuntimeDiagnosticCode::CodexProxyStartFailed)
+        );
+        let failed_attempt = supervisor.registry.inventory().await.unwrap();
+        assert_eq!(failed_attempt.len(), 1);
+        assert_eq!(failed_attempt[0].launch_state, LaunchState::Failed);
+        assert_eq!(
+            failed_attempt[0].cleanup_state,
+            freshell_runtime_protocol::CleanupState::VerifiedEmpty
+        );
+
+        let replacement = supervisor
+            .launch(RequestId::new(), launch_request(soul))
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "a verified pre-worker proxy failure should permit a new ordinary launch: {:?}",
+                    error.code
+                )
+            });
+        assert_eq!(replacement.view.launch_state, LaunchState::Running);
+        assert_eq!(replacement.worker_launch_count, 1);
+        assert_eq!(backend.counts.creates.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.counts.grants.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.counts.workers.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
