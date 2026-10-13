@@ -1120,6 +1120,9 @@ mod tests {
         let home = owned.path().join("home");
         let workspace = owned.path().join("workspace");
         let tools = owned.path().join("outside-tools");
+        let host_command_dir = owned.path().join("host-system-bin");
+        let host_command = host_command_dir.join("env");
+        let unrelated_host_command = host_command_dir.join("unrelated-tool");
         let absolute_script = tools.join("absolute-mcp.js");
         let relative_script = workspace.join("scripts/relative-mcp.js");
         let env_script = tools.join("env-mcp.js");
@@ -1134,10 +1137,13 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&tools).unwrap();
+        std::fs::create_dir_all(&host_command_dir).unwrap();
         std::fs::create_dir_all(relative_script.parent().unwrap()).unwrap();
         std::fs::create_dir_all(cwd_script.parent().unwrap()).unwrap();
         for script in [
             &absolute_script,
+            &host_command,
+            &unrelated_host_command,
             &relative_script,
             &env_script,
             &symlink_target,
@@ -1158,6 +1164,11 @@ mod tests {
                     "absolute": {
                         "type": "local",
                         "command": ["node", absolute_script],
+                        "enabled": true,
+                    },
+                    "absolute-runtime": {
+                        "type": "local",
+                        "command": [host_command],
                         "enabled": true,
                     },
                     "relative": {
@@ -1243,6 +1254,18 @@ mod tests {
                 script.display()
             );
         }
+        assert!(
+            selected.contains(&host_command.canonicalize().unwrap()),
+            "an absolute MCP runtime executable remains available to the managed child"
+        );
+        assert!(
+            !selected.contains(&host_command_dir.canonicalize().unwrap()),
+            "an absolute system executable must not select its unbounded containing directory"
+        );
+        assert!(
+            !selected.contains(&unrelated_host_command.canonicalize().unwrap()),
+            "an absolute system executable must not copy unrelated sibling commands"
+        );
         assert!(
             !selected.contains(&trailing_decoy_script.canonicalize().unwrap()),
             "arguments after the selected script are values, not additional scripts"

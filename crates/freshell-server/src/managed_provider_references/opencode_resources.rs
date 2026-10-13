@@ -932,6 +932,34 @@ pub fn select(
                 canonical.clone(),
                 field,
             )?;
+            let command_parent = canonical
+                .parent()
+                .ok_or_else(|| fail(field, "command has no containing scope"))?;
+            if let Some(package_root) = command_parent
+                .ancestors()
+                .take_while(|ancestor| *ancestor != home && ancestor.parent().is_some())
+                .find(|ancestor| ancestor.join("package.json").is_file())
+            {
+                let package_root = package_root.to_owned();
+                insert_resource(
+                    &mut result,
+                    &mut resource_path_bytes,
+                    package_root.clone(),
+                    field,
+                )?;
+                insert_installed_package_ancestor_resources(
+                    &package_root,
+                    home,
+                    declaring,
+                    &mut result,
+                    &mut resource_path_bytes,
+                    field,
+                )?;
+            }
+            // Without a nearby package manifest, the executable is the only
+            // bounded resource we can infer. Selecting its arbitrary parent
+            // can copy system directories such as /usr/bin into the runtime.
+            continue;
         }
         if field == "OpenCode skills.paths" || field == "OpenCode mcp.cwd" {
             if !canonical.is_dir() {
@@ -954,12 +982,7 @@ pub fn select(
         if global.is_some_and(|global| path.starts_with(global.join("plugins"))) {
             continue;
         }
-        let mut scope = if field == "OpenCode mcp.command" {
-            canonical
-                .parent()
-                .ok_or_else(|| fail(field, "command has no containing scope"))?
-                .to_owned()
-        } else if canonical.is_dir() {
+        let mut scope = if canonical.is_dir() {
             path.clone()
         } else {
             path.parent()
@@ -978,9 +1001,6 @@ pub fn select(
             }
         }
         if scope == home || scope == Path::new("/") {
-            if field == "OpenCode mcp.command" {
-                continue;
-            }
             return Err(fail(field, "select a bounded plugin or package directory"));
         }
         insert_resource(&mut result, &mut resource_path_bytes, scope.clone(), field)?;
