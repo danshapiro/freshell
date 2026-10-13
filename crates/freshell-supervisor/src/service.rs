@@ -1287,13 +1287,25 @@ impl Supervisor {
         {
             Ok(accepted) => accepted,
             Err(error) => {
-                if error.diagnostic_code
-                    == Some(
+                let codex_pre_worker_failure = match error.diagnostic_code {
+                    Some(
                         freshell_runtime_protocol::RuntimeDiagnosticCode::CodexAppServerStartFailed,
+                    ) => Some("CODEX_APP_SERVER_START_FAILED"),
+                    Some(
+                        freshell_runtime_protocol::RuntimeDiagnosticCode::FreshAgentProviderStartFailed,
+                    ) if handle.fresh_agent().is_some_and(|agent| {
+                        agent.provider == freshell_runtime_protocol::FreshProvider::Codex
+                    }) => Some("FRESH_AGENT_PROVIDER_START_FAILED"),
+                    _ => None,
+                };
+                if let Some(failure_reason) = codex_pre_worker_failure {
+                    self.settle_known_codex_pre_worker_failure(
+                        &prepared,
+                        &handle,
+                        &grant,
+                        failure_reason,
                     )
-                {
-                    self.settle_known_codex_pre_worker_failure(&prepared, &handle, &grant)
-                        .await;
+                    .await;
                 }
                 return Err(self.activation_failure(
                     &prepared,
@@ -1525,6 +1537,7 @@ impl Supervisor {
         prepared: &PreparedLaunch,
         handle: &crate::registry::OwnedRuntimeHandle,
         grant: &ExecutionGrantRecord,
+        failure_reason: &'static str,
     ) {
         let codex_workload = handle
             .terminal()
@@ -1551,7 +1564,7 @@ impl Supervisor {
                     "intentRevision":prepared.intent_revision,
                     "executionGeneration":grant.execution_generation,
                     "controlEpoch":grant.control_epoch,
-                    "failureReason":"CODEX_APP_SERVER_START_FAILED",
+                    "failureReason":failure_reason,
                     "cleanup":"verified_empty",
                 }),
             ),
@@ -1576,8 +1589,8 @@ impl Supervisor {
         }
     }
 
-    /// A body-free Codex app-server readiness failure is emitted before the
-    /// host invokes the PTY spawn effect. Reclaim only that incarnation's
+    /// A classified Codex pre-worker provider-start failure is emitted before
+    /// the worker can be trusted to exist. Reclaim only that incarnation's
     /// exact owned container, and only after a backend inspection proves it
     /// empty. Docker stop/kill applies to every helper in that container too.
     async fn stop_and_verify_empty_codex_runtime(
@@ -5147,8 +5160,8 @@ mod codex_pre_worker_retry_tests {
     use super::*;
     use crate::backend::{BackendCreated, BackendInspection, BackendRuntimeState};
     use freshell_runtime_protocol::{
-        DockerDaemonId, LaunchRequest, NativeIdentityObservation, NativeIdentitySource,
-        RuntimeDiagnosticCode, RuntimeProfile,
+        DockerDaemonId, FreshAgentProviderStartDiagnostic, LaunchRequest,
+        NativeIdentityObservation, NativeIdentitySource, RuntimeDiagnosticCode, RuntimeProfile,
     };
     use std::{
         collections::HashMap,
@@ -5161,12 +5174,14 @@ mod codex_pre_worker_retry_tests {
     #[derive(Clone, Copy)]
     enum FirstGrantOutcome {
         CodexAppServerStartFailed,
+        FreshAgentProviderStartFailed,
         WorkerMayHaveStarted,
     }
 
     #[derive(Clone, Copy)]
     enum HostOutcome {
         CodexAppServerStartFailed,
+        FreshAgentProviderStartFailed,
         WorkerMayHaveStarted,
         Running,
     }
@@ -5194,6 +5209,8 @@ mod codex_pre_worker_retry_tests {
         counts: Arc<Counts>,
         runtimes: StdMutex<HashMap<String, RuntimeRecord>>,
         stop_targets: StdMutex<Vec<(IncarnationId, String)>>,
+        empty_targets: StdMutex<Vec<(IncarnationId, String)>>,
+        cleanup_steps: StdMutex<Vec<(String, IncarnationId, String)>>,
     }
 
     impl FakeBackend {
@@ -5203,6 +5220,8 @@ mod codex_pre_worker_retry_tests {
                 counts: Arc::new(Counts::default()),
                 runtimes: StdMutex::new(HashMap::new()),
                 stop_targets: StdMutex::new(Vec::new()),
+                empty_targets: StdMutex::new(Vec::new()),
+                cleanup_steps: StdMutex::new(Vec::new()),
             }
         }
 
@@ -5213,6 +5232,9 @@ mod codex_pre_worker_retry_tests {
             match self.first_grant {
                 FirstGrantOutcome::CodexAppServerStartFailed => {
                     HostOutcome::CodexAppServerStartFailed
+                }
+                FirstGrantOutcome::FreshAgentProviderStartFailed => {
+                    HostOutcome::FreshAgentProviderStartFailed
                 }
                 FirstGrantOutcome::WorkerMayHaveStarted => HostOutcome::WorkerMayHaveStarted,
             }
@@ -5356,6 +5378,11 @@ mod codex_pre_worker_retry_tests {
                 handle.incarnation_id().clone(),
                 handle.container_id().to_owned(),
             ));
+            self.cleanup_steps.lock().unwrap().push((
+                "request_stop".into(),
+                handle.incarnation_id().clone(),
+                handle.container_id().to_owned(),
+            ));
             self.stop_exact(handle).await
         }
 
@@ -5372,6 +5399,15 @@ mod codex_pre_worker_retry_tests {
             handle: &crate::registry::OwnedRuntimeHandle,
         ) -> Result<bool, BackendError> {
             self.counts.empty_checks.fetch_add(1, Ordering::SeqCst);
+            self.empty_targets.lock().unwrap().push((
+                handle.incarnation_id().clone(),
+                handle.container_id().to_owned(),
+            ));
+            self.cleanup_steps.lock().unwrap().push((
+                "verify_empty".into(),
+                handle.incarnation_id().clone(),
+                handle.container_id().to_owned(),
+            ));
             Ok(matches!(
                 self.runtime_state(handle)?,
                 BackendRuntimeState::Missing
@@ -5454,6 +5490,14 @@ mod codex_pre_worker_retry_tests {
                             "synthetic-private-codex-output-marker",
                         )
                         .with_diagnostic_code(RuntimeDiagnosticCode::CodexAppServerStartFailed)),
+                        HostOutcome::FreshAgentProviderStartFailed => Err(RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            "hosted fresh-agent provider failed to start",
+                        )
+                        .with_diagnostic_code(RuntimeDiagnosticCode::FreshAgentProviderStartFailed)
+                        .with_fresh_agent_provider_start_diagnostic(
+                            FreshAgentProviderStartDiagnostic::Authentication,
+                        )),
                         HostOutcome::WorkerMayHaveStarted => {
                             counts.possible_workers.fetch_add(1, Ordering::SeqCst);
                             return;
@@ -5572,6 +5616,40 @@ mod codex_pre_worker_retry_tests {
         .unwrap()
     }
 
+    fn fresh_agent_launch_request(soul_id: SoulId, provider: &str) -> LaunchRequest {
+        let session_type = match provider {
+            "codex" => "freshcodex",
+            "claude" => "freshclaude",
+            _ => panic!("unsupported fresh-agent fixture provider: {provider}"),
+        };
+        serde_json::from_value(serde_json::json!({
+            "soulId": soul_id,
+            "provider": provider,
+            "providerStoreId": format!("synthetic-{provider}-store"),
+            "creationSeedRef": format!("synthetic-{provider}-create"),
+            "limits": {
+                "cpuMilli": 500,
+                "memoryBytes": 67108864,
+                "swapBytes": 0,
+                "pidsMax": 32
+            },
+            "profile": RuntimeProfile::Custom,
+            "projectKey": "fresh-agent-pre-worker-retry",
+            "freshAgent": {
+                "sessionId": format!("synthetic-{provider}-session"),
+                "provider": provider,
+                "sessionType": session_type,
+                "runtimeVariant": "owned-test-variant",
+                "providerStoreId": format!("synthetic-{provider}-store"),
+                "cwd": "/workspace",
+                "workspacePath": "/workspace",
+                "runAsUid": 65534,
+                "runAsGid": 0
+            }
+        }))
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn verified_codex_pre_worker_failure_allows_one_ordinary_replacement() {
         let dir = tempfile::tempdir().unwrap();
@@ -5664,6 +5742,111 @@ mod codex_pre_worker_retry_tests {
         );
         assert!(failure["data"].get("errorMessage").is_none());
         assert!(!lifecycle.contains("synthetic-private-codex-output-marker"));
+    }
+
+    #[tokio::test]
+    async fn fresh_agent_codex_provider_start_failure_settles_after_exact_empty_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FakeBackend::new(
+            FirstGrantOutcome::FreshAgentProviderStartFailed,
+        ));
+        let supervisor = supervisor(dir.path(), Arc::clone(&backend));
+        let soul = SoulId::new();
+
+        let error = supervisor
+            .launch(RequestId::new(), fresh_agent_launch_request(soul, "codex"))
+            .await
+            .expect_err("the injected fresh Codex provider start failure should surface");
+        assert_eq!(error.code, RuntimeErrorCode::HostUnreachable);
+        assert_eq!(
+            error.diagnostic_code,
+            Some(RuntimeDiagnosticCode::FreshAgentProviderStartFailed)
+        );
+        let views = supervisor.registry.inventory().await.unwrap();
+        assert_eq!(views.len(), 1);
+        let failed = &views[0];
+        assert_eq!(failed.launch_state, LaunchState::Failed);
+        assert_eq!(
+            failed.cleanup_state,
+            freshell_runtime_protocol::CleanupState::VerifiedEmpty
+        );
+        let exact_target = (
+            failed.incarnation_id.clone(),
+            failed.container_id.clone().unwrap(),
+        );
+        assert_eq!(
+            backend.stop_targets.lock().unwrap().as_slice(),
+            &[exact_target.clone()]
+        );
+        assert_eq!(
+            backend.empty_targets.lock().unwrap().as_slice(),
+            &[exact_target.clone(), exact_target.clone()]
+        );
+        assert_eq!(
+            backend.cleanup_steps.lock().unwrap().as_slice(),
+            &[
+                (
+                    "verify_empty".into(),
+                    exact_target.0.clone(),
+                    exact_target.1.clone()
+                ),
+                (
+                    "request_stop".into(),
+                    exact_target.0.clone(),
+                    exact_target.1.clone()
+                ),
+                (
+                    "verify_empty".into(),
+                    exact_target.0.clone(),
+                    exact_target.1.clone()
+                ),
+            ]
+        );
+
+        let conn = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        let (writer_claims, reservations): (u64, u64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM writer_claims WHERE incarnation_id=?1), (SELECT COUNT(*) FROM admission_reservations WHERE incarnation_id=?1)",
+                [failed.incarnation_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(writer_claims, 0);
+        assert_eq!(reservations, 0);
+        let lifecycle = std::fs::read_to_string(&supervisor.config.lifecycle_log).unwrap();
+        let settled = lifecycle
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|event| event["event"] == "supervisor.codex_pre_worker_failure_settled")
+            .expect("the verified failure has a structured settlement event");
+        assert_eq!(
+            settled["data"]["failureReason"],
+            "FRESH_AGENT_PROVIDER_START_FAILED"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_agent_non_codex_provider_start_failure_skips_codex_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FakeBackend::new(
+            FirstGrantOutcome::FreshAgentProviderStartFailed,
+        ));
+        let supervisor = supervisor(dir.path(), Arc::clone(&backend));
+
+        let error = supervisor
+            .launch(
+                RequestId::new(),
+                fresh_agent_launch_request(SoulId::new(), "claude"),
+            )
+            .await
+            .expect_err("the injected fresh Claude provider start failure should surface");
+        assert_eq!(
+            error.diagnostic_code,
+            Some(RuntimeDiagnosticCode::FreshAgentProviderStartFailed)
+        );
+        assert_eq!(backend.counts.stop_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.counts.empty_checks.load(Ordering::SeqCst), 0);
+        assert!(backend.stop_targets.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
