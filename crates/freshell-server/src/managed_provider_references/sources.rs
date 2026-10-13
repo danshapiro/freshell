@@ -1127,6 +1127,9 @@ mod tests {
         let workspace_symlink = workspace.join("scripts/symlinked-mcp.js");
         let cwd_script = workspace.join("mcp-cwd/cwd-mcp.js");
         let extensionless_script = tools.join("extensionless-mcp");
+        let extensionless_args_script = tools.join("extensionless-with-args");
+        let preload_script = tools.join("preload.js");
+        let trailing_decoy_script = tools.join("trailing-decoy.js");
         let missing_disabled_script = tools.join("missing-disabled.js");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&workspace).unwrap();
@@ -1140,6 +1143,9 @@ mod tests {
             &symlink_target,
             &cwd_script,
             &extensionless_script,
+            &extensionless_args_script,
+            &preload_script,
+            &trailing_decoy_script,
         ] {
             std::fs::write(script, "process.stdout.write('mcp fixture')\n").unwrap();
         }
@@ -1180,6 +1186,16 @@ mod tests {
                         "command": ["node", extensionless_script],
                         "enabled": true,
                     },
+                    "extensionless-with-trailing-options": {
+                        "type": "local",
+                        "command": ["node", extensionless_args_script, "--config", "prod"],
+                        "enabled": true,
+                    },
+                    "extensionless-after-runtime-option": {
+                        "type": "local",
+                        "command": ["node", "--require", preload_script, extensionless_args_script, "--config", trailing_decoy_script],
+                        "enabled": true,
+                    },
                     "package": {
                         "type": "local",
                         "command": ["npx", "-y", "@example/mcp-server"],
@@ -1218,6 +1234,8 @@ mod tests {
             &symlink_target,
             &env_script,
             &extensionless_script,
+            &extensionless_args_script,
+            &preload_script,
         ] {
             assert!(
                 selected.contains(&script.canonicalize().unwrap()),
@@ -1225,6 +1243,10 @@ mod tests {
                 script.display()
             );
         }
+        assert!(
+            !selected.contains(&trailing_decoy_script.canonicalize().unwrap()),
+            "arguments after the selected script are values, not additional scripts"
+        );
         assert!(
             selected.contains(&cwd_script.parent().unwrap().canonicalize().unwrap()),
             "the selected local MCP cwd carries scripts below it"

@@ -238,27 +238,26 @@ fn nested_fields(raw: &str, tui: bool) -> Result<Vec<(&'static str, String)>, &'
                     && command[0] == "node"
                     && command[1] == FRESHELL_IMAGE_MCP_SERVER_PATH;
                 if !image_command {
+                    let script_index = script_operand_index(&command);
+                    let script_runtime =
+                        command_uses_script_runtime(command.first().map(String::as_str));
                     for (index, argument) in command.iter().enumerate() {
-                        if (index == 0 && is_explicit_command_path(argument))
-                            || is_script_path(argument)
-                        {
+                        let script_file = if script_runtime {
+                            script_index.is_some_and(|script| {
+                                index > 0 && index <= script && is_script_path(argument)
+                            })
+                        } else {
+                            is_script_path(argument)
+                        };
+                        if (index == 0 && is_explicit_command_path(argument)) || script_file {
                             result.push(("OpenCode mcp.command", argument.clone()));
                         }
                     }
-                    let inline_code = command.iter().any(|argument| {
-                        matches!(argument.as_str(), "-e" | "-c" | "--eval" | "--print")
-                    });
-                    let bare_script_arguments = command
-                        .iter()
-                        .skip(1)
-                        .filter(|argument| !argument.starts_with('-') && !argument.is_empty())
-                        .collect::<Vec<_>>();
-                    if command_uses_script_runtime(command.first().map(String::as_str))
-                        && !inline_code
-                        && bare_script_arguments.len() == 1
-                        && !is_script_path(bare_script_arguments[0])
-                    {
-                        result.push(("OpenCode mcp.command", bare_script_arguments[0].clone()));
+                    if let Some(script_index) = script_index {
+                        let script = &command[script_index];
+                        if !is_script_path(script) {
+                            result.push(("OpenCode mcp.command", script.clone()));
+                        }
                     }
                 }
             }
@@ -341,6 +340,111 @@ fn command_uses_script_runtime(executable: Option<&str>) -> bool {
             | "pwsh"
             | "powershell"
     )
+}
+
+fn script_operand_index(command: &[String]) -> Option<usize> {
+    let executable = command
+        .first()?
+        .rsplit(['/', '\\'])
+        .next()?
+        .to_ascii_lowercase();
+    let executable = executable.strip_suffix(".exe").unwrap_or(&executable);
+    if !command_uses_script_runtime(Some(executable)) {
+        return None;
+    }
+    let mut index = 1;
+    if matches!(executable, "bun" | "deno") && command.get(index).is_some_and(|arg| arg == "run") {
+        index += 1;
+    }
+    while index < command.len() {
+        let argument = command[index].as_str();
+        if argument == "--" {
+            return command
+                .get(index + 1)
+                .filter(|argument| !argument.is_empty())
+                .map(|_| index + 1);
+        }
+        let option = argument.split_once('=').map_or(argument, |(name, _)| name);
+        if matches!(executable, "node" | "nodejs" | "bun" | "tsx" | "ts-node") {
+            if matches!(option, "-e" | "--eval" | "-p" | "--print") {
+                return None;
+            }
+            if matches!(
+                option,
+                "-r" | "--require"
+                    | "--import"
+                    | "--loader"
+                    | "--experimental-loader"
+                    | "--conditions"
+                    | "--title"
+                    | "--redirect-warnings"
+                    | "--diagnostic-dir"
+                    | "--env-file"
+                    | "--env-file-if-exists"
+                    | "--watch-path"
+                    | "--tsconfig"
+            ) && !argument.contains('=')
+            {
+                index = (index + 2).min(command.len());
+                continue;
+            }
+        } else if matches!(executable, "python" | "python3") {
+            if matches!(argument, "-c" | "-m") {
+                return None;
+            }
+            if matches!(argument, "-W" | "-X") {
+                index = (index + 2).min(command.len());
+                continue;
+            }
+            if argument == "-" {
+                return None;
+            }
+        } else if executable == "ruby" {
+            if argument == "-e" {
+                return None;
+            }
+            if matches!(argument, "-r" | "-I" | "-C" | "-E" | "-F") {
+                index = (index + 2).min(command.len());
+                continue;
+            }
+        } else if matches!(executable, "bash" | "sh" | "zsh") {
+            if argument == "-c" {
+                return None;
+            }
+            if matches!(
+                argument,
+                "-o" | "+o" | "-O" | "+O" | "--rcfile" | "--init-file"
+            ) {
+                index = (index + 2).min(command.len());
+                continue;
+            }
+        } else if matches!(executable, "pwsh" | "powershell") {
+            if matches!(argument.to_ascii_lowercase().as_str(), "-command" | "-c") {
+                return None;
+            }
+            if matches!(argument.to_ascii_lowercase().as_str(), "-file" | "-f") {
+                return (index + 1 < command.len()).then_some(index + 1);
+            }
+            if matches!(
+                argument.to_ascii_lowercase().as_str(),
+                "-executionpolicy"
+                    | "-workingdirectory"
+                    | "-inputformat"
+                    | "-outputformat"
+                    | "-configurationname"
+                    | "-configurationfile"
+            ) {
+                index = (index + 2).min(command.len());
+                continue;
+            }
+        }
+        if argument.starts_with('-') || argument.is_empty() {
+            index += 1;
+            continue;
+        }
+        return Some(index);
+    }
+    None
 }
 
 fn resource_array(

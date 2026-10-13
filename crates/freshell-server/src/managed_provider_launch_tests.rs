@@ -3777,9 +3777,11 @@ export default {{id:'closed-shared-{label}',async tui(api,options){{
     )
     .unwrap();
     let mcp_cwd_receipt = fixture.join("workspace/native-mcp-cwd-consumed.txt");
-    std::fs::write(mcp_cwd.join("server.cjs"), format!(r#"const fs=require('node:fs'),readline=require('node:readline');
-fs.writeFileSync({},fs.readFileSync('resource','utf8')+':'+require('native-mcp-dependency'));
-readline.createInterface({{input:process.stdin}}).on('line',line=>{{const q=JSON.parse(line);if(q.id===undefined)return;const result=q.method==='initialize'?{{protocolVersion:q.params.protocolVersion,capabilities:{{tools:{{}}}},serverInfo:{{name:'closed-cwd-probe',version:'1'}}}}:q.method==='tools/list'?{{tools:[]}}:{{}};process.stdout.write(JSON.stringify({{jsonrpc:'2.0',id:q.id,result}})+'\n');}});
+    let external_mcp_command = external.join("extensionless-mcp-server");
+    std::fs::write(&external_mcp_command, format!(r#"const fs=require('node:fs'),readline=require('node:readline'),path=require('node:path');
+const requireFromCwd=require('node:module').createRequire(path.join(process.cwd(),'mcp-cwd-entry.cjs'));
+const receipt={};
+readline.createInterface({{input:process.stdin}}).on('line',line=>{{const q=JSON.parse(line);if(q.id===undefined)return;let result={{}};if(q.method==='initialize'){{fs.writeFileSync(receipt,JSON.stringify({{arguments:process.argv.slice(2),resource:fs.readFileSync('resource','utf8')+':'+requireFromCwd('native-mcp-dependency')}}));result={{protocolVersion:q.params.protocolVersion,capabilities:{{tools:{{}}}},serverInfo:{{name:'closed-cwd-probe',version:'1'}}}};}}else if(q.method==='tools/list'){{result={{tools:[]}};}}process.stdout.write(JSON.stringify({{jsonrpc:'2.0',id:q.id,result}})+'\n');}});
 "#,serde_json::to_string(&mcp_cwd_receipt).unwrap())).unwrap();
     let external_receipt = fixture.join("workspace/native-external-consumed.json");
     let external_plugin = r#"import fs from 'node:fs';import crypto from 'node:crypto';import path from 'node:path';import {execFileSync} from 'node:child_process';
@@ -3793,7 +3795,7 @@ export default async (input,options)=>({config:async(config)=>{
    if(!skill)throw Error('selected native skill unavailable');
    const output=execFileSync(path.join(path.dirname(skill.location),'scripts/run'));
    await input.client._client.get({url:'/mcp'});
-   const mcp=digest(fs.readFileSync(options.mcpReceipt));
+   const mcp=JSON.parse(fs.readFileSync(options.mcpReceipt,'utf8'));
    fs.writeFileSync(options.receipt,JSON.stringify({adjacent:digest(adjacent),child:digest(child),parent:digest(parent),resource:digest(fs.readFileSync(new URL('./resource.txt',import.meta.url))),instruction:digest(fs.readFileSync(options.instruction)),selected:config.instructions.includes(options.instruction),nativeLiveViews:config.agent.liveCapacity.description==='native-live-capacity-nonce',nativeSkill:true,skillContent:digest(skill.content),skillExecution:digest(output),nativeMcpCwd:mcp}));
   } catch(error) {fs.writeFileSync(options.receipt+'.failure',JSON.stringify({operation:'native_skill_consumer',type:error instanceof TypeError?'TypeError':error.code==='ENOENT'?'ENOENT':'native_skill_unavailable'}));}
  },0);
@@ -3803,8 +3805,7 @@ export default async (input,options)=>({config:async(config)=>{
     let mut original: Value =
         serde_json::from_slice(&std::fs::read(&original_config).unwrap()).unwrap();
     original["plugin"].as_array_mut().unwrap().push(json!([reqwest::Url::from_file_path(package.join("index.mjs")).unwrap().to_string(), {"receipt":external_receipt,"instruction":external_instruction,"mcpReceipt":mcp_cwd_receipt}]));
-    original["mcp"]["closed-cwd-probe"] =
-        json!({"type":"local","command":["node","server.cjs"],"cwd":"~/mcp-cwd"});
+    original["mcp"]["closed-cwd-probe"] = json!({"type":"local","command":["node",external_mcp_command,"--config","prod"],"cwd":"~/mcp-cwd"});
     original["instructions"] = json!([external_instruction]);
     original["skills"] = json!({"paths":[selected_skills,"../../scenarios/external-native-resources/selected-skills"]});
     // Native ConfigParse/jsonc-parser keeps only the final resource member.
@@ -3828,7 +3829,7 @@ export default async (input,options)=>({config:async(config)=>{
     );
     std::fs::write(&original_config, duplicate_resources.as_bytes()).unwrap();
     let original_bytes = std::fs::read(&original_config).unwrap();
-    let expected_external = json!({"adjacent":format!("{:x}",Sha256::digest(b"native-adjacent-import")),"child":format!("{:x}",Sha256::digest(b"native-child-dependency")),"parent":format!("{:x}",Sha256::digest(b"native-parent-dependency")),"resource":format!("{:x}",Sha256::digest(b"native-adjacent-resource")),"instruction":format!("{:x}",Sha256::digest(b"native-external-instruction")),"selected":true,"nativeLiveViews":true,"nativeSkill":true,"skillContent":format!("{:x}",Sha256::digest(b"Execute the adjacent synthetic resources.\n")),"skillExecution":format!("{:x}",Sha256::digest(b"native-skill-resource:native-skill-dependency")),"nativeMcpCwd":format!("{:x}",Sha256::digest(b"native-mcp-resource:native-mcp-dependency"))});
+    let expected_external = json!({"adjacent":format!("{:x}",Sha256::digest(b"native-adjacent-import")),"child":format!("{:x}",Sha256::digest(b"native-child-dependency")),"parent":format!("{:x}",Sha256::digest(b"native-parent-dependency")),"resource":format!("{:x}",Sha256::digest(b"native-adjacent-resource")),"instruction":format!("{:x}",Sha256::digest(b"native-external-instruction")),"selected":true,"nativeLiveViews":true,"nativeSkill":true,"skillContent":format!("{:x}",Sha256::digest(b"Execute the adjacent synthetic resources.\n")),"skillExecution":format!("{:x}",Sha256::digest(b"native-skill-resource:native-skill-dependency")),"nativeMcpCwd":{"arguments":["--config","prod"],"resource":"native-mcp-resource:native-mcp-dependency"}});
     // Five logical native sources share three immutable 16 MiB raw views.
     // Their 48 MiB retained controller views fit its simultaneous profile;
     // the host must not turn 80 MiB of sequential reads into a live limit.
