@@ -221,14 +221,15 @@ drop-in, plus `freshell-supervisor.service`):
 **Post-deploy verification checklist:**
 
 1. Health: `curl -fsS http://127.0.0.1:3001/api/health` → `"ready": true`.
-2. Feature present AND unblocked: with the auth token,
+2. Feature present AND scan completed: with the auth token,
    `GET /api/runtime/readiness` answers `200` — a `404` means the running
    binary was built WITHOUT the feature; rebuild with the command above
    and restart again — AND the response's `readiness.initialScanState`
    (the fields are nested under `readiness`) is `"complete"` with an
-   empty `readiness.blockedSubsystems` list: the handler answers `200`
-   even when startup recovery of existing souls is blocked, so the status
-   code alone is not readiness.
+   empty `readiness.blockedSubsystems` list. This proves the scan
+   completed without subsystem errors, NOT that every soul can reattach —
+   an individually blocked soul is a per-soul outcome that does not enter
+   `blockedSubsystems`, which is why step 4 checks each soul directly.
 3. Units: `systemctl --user is-active freshell-rust.service
    freshell-supervisor.service` → both `active`.
 4. Existing souls: capture the post-restart inventory to a SEPARATE file
@@ -252,6 +253,13 @@ drop-in, plus `freshell-supervisor.service`):
    normal (a client reconnect creating a new durable terminal, or another
    client's new pane) — identify which pane or session each one belongs
    to before assuming it is yours or that it is a replacement.
+   Then check the souls INDIVIDUALLY: for each baseline soul (pull the
+   soul IDs from the container labels in the capture, or list
+   `GET /api/runtime/souls` and match by `containerId`),
+   `GET /api/runtime/souls/<soul_id>` reports `"launchState": "running"`
+   — a baseline soul whose launchState is anything else (blocked, lost,
+   stopped) cannot reattach and needs the supervisor journal and that
+   soul's record investigated before the deploy is called good.
 5. New-soul probe: create a terminal pane in a real workspace that is NOT
    the operator home itself (a subdirectory of it is fine) — when the
    workspace equals the operator home, the supervisor deliberately omits
@@ -274,6 +282,7 @@ drop-in, plus `freshell-supervisor.service`):
    TOK=$(grep -E '^AUTH_TOKEN=' "$CHECKOUT/.env" | cut -d= -f2-)
    umask 077
    printf 'x-auth-token: %s\n' "$TOK" > "$D/hdr"   # header file, not argv
+   trap 'rm -f "$D/hdr"' EXIT   # the token file must not survive ANY exit
    # create the probe pane (example); record terminalId from the response:
    curl -s -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
      -d '{"mode":"shell","cwd":"<a real workspace outside the operator home>","name":"home-mount probe"}' \
@@ -290,9 +299,12 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
    If the unit's environment (not the checkout's `.env`) is what supplies
    the token on your installation, read `TOK` from there instead. The
    header-file form keeps the token out of process argument lists
-   (visible via `/proc/*/cmdline`); it is still the full-scope token — the
-   OneCLI route below is the preferred, scope-limited form for anything
-   but a one-off operator probe.
+   (visible via `/proc/*/cmdline`) and the `trap` scrubs it on every exit
+   path. This direct form is a deliberate, one-off exception for a human
+   operator at the host console; it uses the full-scope checkout token,
+   whereas every routine or agent-driven runtime API call must use the
+   scope-limited OneCLI grant instead (see
+   [managed-runtime-rollout.md](managed-runtime-rollout.md)).
 
     Then confirm the probe container carries the operator-home bind and the
     `FRESHELL_OPERATOR_HOME_MOUNT=1` marker env (`docker inspect`), and that
@@ -337,8 +349,9 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
     procedure (its grant is scoped to the server host and `/api/runtime/*`
     and injects `x-auth-token` — see
     [managed-runtime-rollout.md](managed-runtime-rollout.md)); that is the
-    preferred path for anything but a one-off operator probe, because the
-    raw checkout token authorizes the broader API. The stop is
+    policy path for routine and agent-driven calls. The direct form below
+    is the same one-off operator-console exception documented in step 5 —
+    the same `trap` scrubbing rules apply. The stop is
     intent-revision-guarded, and HTTP 200 alone proves nothing — the
     response's `outcome` must be `verified_empty` (other outcomes such as
     `termination_unconfirmed` or `blocked_ownership` mean the soul is NOT
@@ -347,6 +360,8 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
 
     ```bash
     set -euo pipefail   # a failed check must halt BEFORE the stop request
+    D=<the step-5 private directory>
+    trap 'rm -f "$D/hdr"' EXIT   # scrub the token file on every exit path
     SOUL_ID=$(cat "$D/probe-soul-id.txt")
     TID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["data"]["terminalId"])' "$D/probe-tab.json")
     # Identity re-check FIRST; with set -e its failure aborts the block
@@ -365,18 +380,31 @@ print("identity ok:", s.get("terminalId"))' "$TID"
 o=json.load(sys.stdin)
 assert o.get("outcome")=="verified_empty", o
 print("stopped:", o["outcome"])'
-    rm -rf "$D"   # contains the token header file; runs only on success
+    rm -rf "$D"   # runs only on success; the trap already removed the header
     ```
 
-    If the block aborts before `verified_empty`, `$D` is deliberately
-    left in place — the saved soul ID and header are what the recheck-and-
-    retry needs; delete `$D` manually once the probe soul is resolved.
+    If the block aborts before `verified_empty`, the token header is
+    already gone (the `trap` removed it) while the non-secret probe
+    records — the soul ID and the tab response — remain in `$D` for the
+    documented recheck-and-retry; delete `$D` manually once the probe
+    soul is resolved.
 
    Do NOT `docker stop` the container directly — the supervisor treats an
    externally stopped container as an unexpected exit and runs its
    automatic recovery path, which may recreate the soul or mark a session
    without a durable resume path as lost. Leaving the probe soul running
    is also fine; it is inert.
+ 8. Browser-path check (required when the web client was redeployed): the
+   REST probe in step 5 deliberately bypasses WebSocket capability
+   negotiation, so it can pass while a stale browser client still creates
+   host-side panes. Hard-refresh the web client, create a terminal pane
+   FROM THE UI, and confirm that pane also gets a soul: snapshot
+   `GET /api/runtime/souls` before and after, and a newly appeared soul
+   matching the moment of pane creation is the pass; no new soul (and no
+   host-side process instead) means the client is stale or not
+   negotiating `managedRuntimeV1` — rebuild/redeploy the client and
+   hard-refresh again. Close the test pane (and stop its soul per step 7
+   if desired).
 
 ## Launch the native Windows client
 
