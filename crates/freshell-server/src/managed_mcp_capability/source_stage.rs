@@ -1152,6 +1152,51 @@ mod configured_resource_tests {
     }
 
     #[test]
+    fn direct_node_script_falls_back_to_index_for_directory_package_main_dot() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let external = owned.path().join("external");
+        let command = external.join("mcp/bin/start");
+        let package = external.join("mcp/helpers");
+        let manifest = package.join("package.json");
+        let index = package.join("index.js");
+        std::fs::create_dir_all(command.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "#!/usr/bin/env node\nprocess.stdout.write(require('../helpers'))\n",
+        )
+        .unwrap();
+        std::fs::write(&manifest, r#"{"main":"."}"#).unwrap();
+        std::fs::write(
+            &index,
+            "module.exports = 'directory index fallback loaded\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (plan, provider_command) =
+            plan_and_stage_direct_mcp_command(owned.path(), &home, &workspace, &command);
+        assert!(plan[0]
+            .configured_resources
+            .contains(&manifest.canonicalize().unwrap()));
+        assert!(plan[0]
+            .configured_resources
+            .contains(&index.canonicalize().unwrap()));
+        let hidden_external = owned.path().join("external-hidden");
+        std::fs::rename(&external, &hidden_external).unwrap();
+        let output = execute_selected_resource(&provider_command).unwrap();
+        std::fs::rename(&hidden_external, &external).unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"directory index fallback loaded\n");
+    }
+
+    #[test]
     fn direct_python_shebang_loads_sibling_module_after_all_copies() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1211,6 +1256,42 @@ mod configured_resource_tests {
         let output = execute_with_home_hidden(owned.path(), &home, &provider_command);
         assert!(output.status.success(), "{:?}", output.stderr);
         assert_eq!(output.stdout, b"nested package helper loaded\n");
+    }
+
+    #[test]
+    fn direct_python_multiline_package_import_loads_nested_module_after_all_copies() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let tools = home.join("tools");
+        let package = tools.join("pkg");
+        let command = tools.join("start");
+        let helper = package.join("helper.py");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "#!/usr/bin/env python3\nimport pkg\nprint(pkg.helper.VALUE)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("__init__.py"),
+            "from . import (\n    helper,\n)\n",
+        )
+        .unwrap();
+        std::fs::write(&helper, "VALUE = 'multiline package helper loaded'\n").unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (plan, provider_command) =
+            plan_and_stage_direct_mcp_command(owned.path(), &home, &workspace, &command);
+        assert!(plan[0]
+            .configured_resources
+            .contains(&helper.canonicalize().unwrap()));
+        let output = execute_with_home_hidden(owned.path(), &home, &provider_command);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"multiline package helper loaded\n");
     }
 
     #[test]

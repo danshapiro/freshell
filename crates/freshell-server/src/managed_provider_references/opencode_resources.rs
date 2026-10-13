@@ -859,7 +859,11 @@ fn resolve_node_relative_module(
     parent: &Path,
     specifier: &str,
 ) -> Result<Option<Vec<PathBuf>>, &'static str> {
-    fn resolve(base: &Path, depth: usize) -> Result<Option<Vec<PathBuf>>, &'static str> {
+    fn resolve(
+        base: &Path,
+        depth: usize,
+        visited_directories: &std::collections::BTreeSet<PathBuf>,
+    ) -> Result<Option<Vec<PathBuf>>, &'static str> {
         const EXTENSIONS: [&str; 8] = ["js", "mjs", "cjs", "json", "node", "ts", "mts", "cts"];
         if depth > 8 {
             return Err("direct MCP Node package main resolution exceeds its depth bound");
@@ -879,9 +883,16 @@ fn resolve_node_relative_module(
             return Ok(None);
         }
 
+        let canonical_directory = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_owned());
+        if visited_directories.contains(&canonical_directory) {
+            return Ok(None);
+        }
+        let mut next_visited_directories = visited_directories.clone();
+        next_visited_directories.insert(canonical_directory);
+
         let package = read_node_package_manifest(base)?;
         if let Some((manifest, Some(main))) = package.as_ref() {
-            if let Some(mut files) = resolve(main, depth + 1)? {
+            if let Some(mut files) = resolve(main, depth + 1, &next_visited_directories)? {
                 files.insert(0, manifest.clone());
                 return Ok(Some(files));
             }
@@ -900,7 +911,54 @@ fn resolve_node_relative_module(
         Ok(None)
     }
 
-    resolve(&parent.join(specifier), 0)
+    resolve(
+        &parent.join(specifier),
+        0,
+        &std::collections::BTreeSet::new(),
+    )
+}
+
+fn python_import_statements(source: &str) -> Vec<String> {
+    fn parenthesis_delta(source: &str) -> isize {
+        source.chars().fold(0, |depth, character| match character {
+            '(' => depth + 1,
+            ')' => depth - 1,
+            _ => depth,
+        })
+    }
+
+    let mut statements = Vec::new();
+    let mut pending: Option<(String, isize)> = None;
+    for raw_line in source.lines() {
+        let line = raw_line.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((statement, depth)) = &mut pending {
+            statement.push(' ');
+            statement.push_str(line);
+            *depth += parenthesis_delta(line);
+            if *depth <= 0 {
+                statements.push(std::mem::take(statement));
+                pending = None;
+            }
+            continue;
+        }
+        let is_parenthesized_import = line.starts_with("from ")
+            && line
+                .split_once(" import ")
+                .is_some_and(|(_, imported)| imported.trim_start().starts_with('('));
+        let depth = parenthesis_delta(line);
+        if is_parenthesized_import && depth > 0 {
+            pending = Some((line.to_owned(), depth));
+        } else {
+            statements.push(line.to_owned());
+        }
+    }
+    if let Some((statement, _)) = pending {
+        statements.push(statement);
+    }
+    statements
 }
 
 fn python_import_specifiers(source: &str) -> std::collections::BTreeSet<String> {
@@ -924,8 +982,8 @@ fn python_import_specifiers(source: &str) -> std::collections::BTreeSet<String> 
     }
 
     let mut result = std::collections::BTreeSet::new();
-    for line in source.lines() {
-        let statement = line.split('#').next().unwrap_or_default().trim();
+    for statement in python_import_statements(source) {
+        let statement = statement.trim();
         if let Some(imports) = statement.strip_prefix("import ") {
             for item in imports.split(',') {
                 let name = item.split_ascii_whitespace().next().unwrap_or_default();
