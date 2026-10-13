@@ -5966,7 +5966,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           if (msg.terminalId === tid) {
             if (contentRef.current?.soulId && msg.recoverySummary) {
               const status = managedTerminalPaneStatus({
-                ...contentRef.current, recoverySummary: msg.recoverySummary,
+                ...contentRef.current, runtimeStatus: msg.status, recoverySummary: msg.recoverySummary,
               }, msg.status === 'running' || msg.status === 'recovering' ? msg.status : 'exited')
               updateContent({ status, runtimeStatus: msg.status, recoverySummary: msg.recoverySummary })
               const statusTab = tabRef.current

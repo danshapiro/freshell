@@ -34,6 +34,48 @@ mod configured_resource_tests {
         }
     }
 
+    fn copy_selected_units_through_provider(
+        owned_root: &Path,
+        units: &[(
+            std::path::PathBuf,
+            freshell_runtime_protocol::ProviderResourceMount,
+        )],
+    ) -> std::path::PathBuf {
+        let stage = owned_root.join("stage");
+        let stage_selections = units
+            .iter()
+            .map(|(source, mount)| CopySelection {
+                source: source.clone(),
+                destination_relative: mount.stage_relative_path.clone().into(),
+            })
+            .collect::<Vec<_>>();
+        copy_environment(&stage_selections, &stage, &[], Default::default()).unwrap();
+
+        let host = owned_root.join("host");
+        let host_selections = units
+            .iter()
+            .map(|(_, mount)| CopySelection {
+                source: stage.join(&mount.stage_relative_path),
+                destination_relative: mount.provider_relative_path.clone().into(),
+            })
+            .collect::<Vec<_>>();
+        copy_environment(&host_selections, &host, &[], Default::default()).unwrap();
+
+        let provider = owned_root.join("provider");
+        let provider_selections = units
+            .iter()
+            .map(|(_, mount)| CopySelection {
+                source: host.join(&mount.provider_relative_path),
+                destination_relative: Path::new(&mount.effective_destination)
+                    .strip_prefix(owned_root)
+                    .unwrap()
+                    .to_path_buf(),
+            })
+            .collect::<Vec<_>>();
+        copy_environment(&provider_selections, &provider, &[], Default::default()).unwrap();
+        provider
+    }
+
     #[test]
     fn managed_provider_keeps_external_indexed_payloads_out_of_persistent_generation() {
         fn tree_contains_bytes(path: &Path, expected: &[u8]) -> bool {
@@ -580,6 +622,164 @@ mod configured_resource_tests {
                 0o644
             );
         }
+    }
+
+    #[test]
+    fn absolute_mcp_executable_runs_after_all_resource_copies() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let external = owned.path().join("external");
+        let command = external.join("mcp-executable");
+        for path in [&home, &workspace, &external] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(
+            &command,
+            "#!/bin/sh\nprintf 'absolute MCP executable started\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = workspace.join("opencode.json");
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "mcp": {
+                    "absolute": { "type": "local", "command": [command] },
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config,
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Workspace,
+            }],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .unwrap();
+        let canonical_command = command.canonicalize().unwrap();
+        assert!(plan[0].configured_resources.contains(&canonical_command));
+        assert!(!plan[0]
+            .configured_resources
+            .contains(&external.canonicalize().unwrap()));
+
+        let units = resource_units(
+            &home,
+            &home.join(".config/opencode"),
+            &workspace,
+            &plan,
+            None,
+        )
+        .unwrap();
+        let provider = copy_selected_units_through_provider(owned.path(), &units);
+        let provider_command = provider.join(command.strip_prefix(owned.path()).unwrap());
+        assert_ne!(
+            std::fs::metadata(&provider_command)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o100,
+            0,
+            "the managed command must remain executable by its owner after every provider resource copy"
+        );
+        let hidden = owned.path().join("external-hidden");
+        std::fs::rename(&external, &hidden).unwrap();
+        let output = execute_selected_resource(&provider_command);
+        std::fs::rename(&hidden, &external).unwrap();
+        let output = output.unwrap();
+        assert!(
+            output.status.success(),
+            "the copied absolute MCP command must start: {:?}",
+            output.stderr
+        );
+        assert_eq!(output.stdout, b"absolute MCP executable started\n");
+    }
+
+    #[test]
+    fn standalone_mcp_script_imports_sibling_after_all_resource_copies() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let external = owned.path().join("external");
+        let command = external.join("server.js");
+        let helper = external.join("handler.js");
+        for path in [&home, &workspace, &external] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(&command, "process.stdout.write(require('./handler.js'))\n").unwrap();
+        std::fs::write(&helper, "module.exports = 'sibling MCP helper loaded'\n").unwrap();
+        let config = workspace.join("opencode.json");
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "mcp": {
+                    "standalone": {
+                        "type": "local",
+                        "command": ["node", command],
+                    },
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config,
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Workspace,
+            }],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .unwrap();
+        let canonical_external = external.canonicalize().unwrap();
+        assert!(
+            plan[0].configured_resources.contains(&canonical_external),
+            "a standalone script must select its bounded sibling-import directory"
+        );
+        let units = resource_units(
+            &home,
+            &home.join(".config/opencode"),
+            &workspace,
+            &plan,
+            None,
+        )
+        .unwrap();
+        let provider = copy_selected_units_through_provider(owned.path(), &units);
+        let provider_command = provider.join(command.strip_prefix(owned.path()).unwrap());
+        let provider_helper = provider.join(helper.strip_prefix(owned.path()).unwrap());
+        assert!(
+            provider_helper.is_file(),
+            "the sibling import must be copied"
+        );
+
+        let hidden = owned.path().join("external-hidden");
+        std::fs::rename(&external, &hidden).unwrap();
+        let output = std::process::Command::new("node")
+            .arg(&provider_command)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .output();
+        std::fs::rename(&hidden, &external).unwrap();
+        let output = output.unwrap();
+        assert!(
+            output.status.success(),
+            "the staged MCP script must load its copied sibling: {:?}",
+            output.stderr
+        );
+        assert_eq!(output.stdout, b"sibling MCP helper loaded");
     }
 
     #[test]

@@ -1155,6 +1155,16 @@ mod tests {
         ] {
             std::fs::write(script, "process.stdout.write('mcp fixture')\n").unwrap();
         }
+        std::fs::write(&host_command, "#!/bin/sh\nprintf 'mcp fixture\\n'\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&host_command, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let direct_command = std::process::Command::new(&host_command).output();
+        assert!(
+            direct_command
+                .as_ref()
+                .is_ok_and(|output| output.status.success() && output.stdout == b"mcp fixture\n"),
+            "the absolute MCP executable fixture must actually start: {direct_command:?}"
+        );
         std::os::unix::fs::symlink(&symlink_target, &workspace_symlink).unwrap();
         let config = workspace.join("opencode.json");
         std::fs::write(
@@ -1248,9 +1258,13 @@ mod tests {
             &extensionless_args_script,
             &preload_script,
         ] {
+            let canonical_script = script.canonicalize().unwrap();
             assert!(
-                selected.contains(&script.canonicalize().unwrap()),
-                "enabled local MCP command file must be available to the managed child: {}",
+                selected.iter().any(|resource| {
+                    resource == &canonical_script
+                        || (resource.is_dir() && canonical_script.starts_with(resource))
+                }),
+                "enabled local MCP command script must be available through its selected resource: {}",
                 script.display()
             );
         }
@@ -1530,7 +1544,7 @@ mod tests {
 
         assert!(plan[0]
             .configured_resources
-            .contains(&local_script.canonicalize().unwrap()));
+            .contains(&external.canonicalize().unwrap()));
         assert!(!plan[0]
             .configured_resources
             .iter()

@@ -386,6 +386,34 @@ describe('TerminalView exited-pane error banner', () => {
     expect(store.getState().tabs.tabs[0]).toMatchObject({ status, runtimeStatus, recoverySummary: summary })
   })
 
+  it('lets a fresh live recovery summary clear a previously blocked pane and tab status', async () => {
+    const { store, paneContent } = makeStore({ mode: 'codex', status: 'error', recoveryState: 'blocked' })
+    act(() => store.dispatch(updateTab({ id: TAB, updates: {
+      soulId: 'managed-soul',
+      runtimeStatus: 'blocked',
+      recoverySummary: paneContent.recoverySummary,
+    } })))
+    act(() => store.dispatch(updatePaneContent({ tabId: TAB, paneId: PANE, content: {
+      ...paneContent,
+      terminalId: 'retained-managed',
+      streamId: 'retained-epoch',
+      runtimeStatus: 'blocked',
+    } })))
+    await renderPane(store, paneState(store))
+
+    const liveSummary = { ...paneContent.recoverySummary!, recoveryState: 'live' as const }
+    act(() => messageHandler!({ type: 'terminal.status', terminalId: 'retained-managed',
+      status: 'running', recoverySummary: liveSummary }))
+
+    expect(paneState(store)).toMatchObject({
+      status: 'running', runtimeStatus: 'running', recoverySummary: liveSummary,
+      terminalId: 'retained-managed', streamId: 'retained-epoch',
+    })
+    expect(store.getState().tabs.tabs[0]).toMatchObject({
+      status: 'running', runtimeStatus: 'running', recoverySummary: liveSummary,
+    })
+  })
+
   it.each([
     ['blocked', 'error'], ['lost', 'error'], ['stopped', 'exited'],
   ] as const)('keeps an authoritative %s final status when an unqualified running frame arrives later', async (recoveryState, status) => {

@@ -252,9 +252,14 @@ fn nested_fields(raw: &str, tui: bool) -> Result<Vec<(&'static str, String)>, &'
                                     && !is_bun_run_bare_operand(&command, index)
                             })
                         } else {
-                            is_script_path(argument)
+                            index == 0 && is_script_path(argument)
                         };
-                        if (index == 0 && is_explicit_command_path(argument)) || script_file {
+                        let script_operand = script_runtime
+                            && script_index == Some(index)
+                            && !is_bun_run_bare_operand(&command, index);
+                        if script_file || script_operand {
+                            result.push(("OpenCode mcp.script", argument.clone()));
+                        } else if index == 0 && is_explicit_command_path(argument) {
                             result.push(("OpenCode mcp.command", argument.clone()));
                         }
                     }
@@ -262,8 +267,6 @@ fn nested_fields(raw: &str, tui: bool) -> Result<Vec<(&'static str, String)>, &'
                         let script = &command[script_index];
                         if is_bun_run_bare_operand(&command, script_index) {
                             result.push(("OpenCode bun run operand", script.clone()));
-                        } else if !is_script_path(script) {
-                            result.push(("OpenCode mcp.command", script.clone()));
                         }
                     }
                 }
@@ -769,7 +772,11 @@ pub fn select(
                     continue;
                 }
             }
-            field = "OpenCode mcp.command";
+            field = if is_script_path(&spelling) {
+                "OpenCode mcp.script"
+            } else {
+                "OpenCode mcp.command"
+            };
         }
         if field != "OpenCode attention.sounds"
             && field != "OpenCode mcp.cwd"
@@ -795,7 +802,10 @@ pub fn select(
             } else {
                 continue;
             } // Native package identity remains native.
-        } else if field == "OpenCode mcp.cwd" || field == "OpenCode mcp.command" {
+        } else if field == "OpenCode mcp.cwd"
+            || field == "OpenCode mcp.command"
+            || field == "OpenCode mcp.script"
+        {
             // Native path.resolve(instance cwd, raw): no HOME or URL expansion.
             PathBuf::from(&spelling)
         } else {
@@ -866,7 +876,7 @@ pub fn select(
                     .join(path);
             } else if field == "OpenCode skills.paths" || field == "OpenCode mcp.cwd" {
                 path = source.instance_cwd.join(path);
-            } else if field == "OpenCode mcp.command" {
+            } else if field == "OpenCode mcp.command" || field == "OpenCode mcp.script" {
                 path = if let Some(working_dir) = &current_mcp_working_dir {
                     working_dir.join(path)
                 } else {
@@ -891,6 +901,7 @@ pub fn select(
             "OpenCode skills.paths"
                 | "OpenCode mcp.cwd"
                 | "OpenCode mcp.command"
+                | "OpenCode mcp.script"
                 | "OpenCode attention.sounds"
         ) {
             // Native resolution resolution normalizes .. before deciding
@@ -906,11 +917,11 @@ pub fn select(
             insert_resource(&mut result, &mut resource_path_bytes, path, field)?;
             continue;
         }
-        if field == "OpenCode mcp.command" {
+        if field == "OpenCode mcp.command" || field == "OpenCode mcp.script" {
             if !canonical.is_file() {
                 return Err(fail(
                     field,
-                    "selected command resource is not a regular file",
+                    "selected MCP command file is not a regular file",
                 ));
             }
             // The server's selected cwd is already copied as a directory.
@@ -924,14 +935,6 @@ pub fn select(
             {
                 continue;
             }
-            // Retain the exact executable/script path as well as its bounded
-            // package closure below when it belongs to an installed package.
-            insert_resource(
-                &mut result,
-                &mut resource_path_bytes,
-                canonical.clone(),
-                field,
-            )?;
             let command_parent = canonical
                 .parent()
                 .ok_or_else(|| fail(field, "command has no containing scope"))?;
@@ -955,10 +958,33 @@ pub fn select(
                     &mut resource_path_bytes,
                     field,
                 )?;
+                continue;
             }
-            // Without a nearby package manifest, the executable is the only
-            // bounded resource we can infer. Selecting its arbitrary parent
-            // can copy system directories such as /usr/bin into the runtime.
+            if field == "OpenCode mcp.script" {
+                let canonical_home = std::fs::canonicalize(home).ok();
+                if command_parent == Path::new("/")
+                    || canonical_home.as_deref() == Some(command_parent)
+                {
+                    return Err(fail(
+                        field,
+                        "standalone MCP script requires copying an unbounded account or system directory",
+                    ));
+                }
+                // A standalone script may import sibling files without a
+                // package manifest. Copy its containing directory as the
+                // bounded module-resolution unit; copy_environment enforces
+                // the shared entry and byte caps before publication.
+                insert_resource(
+                    &mut result,
+                    &mut resource_path_bytes,
+                    command_parent.to_owned(),
+                    field,
+                )?;
+                continue;
+            }
+            // A runtime executable without a package manifest is an exact-file
+            // resource. Selecting its parent could copy system directories.
+            insert_resource(&mut result, &mut resource_path_bytes, canonical, field)?;
             continue;
         }
         if field == "OpenCode skills.paths" || field == "OpenCode mcp.cwd" {
