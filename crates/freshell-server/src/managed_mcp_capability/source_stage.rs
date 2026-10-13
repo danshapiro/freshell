@@ -2155,6 +2155,7 @@ mod configured_resource_tests {
         assert_eq!(output.stdout, b"preload loaded");
     }
 
+    #[cfg(unix)]
     #[test]
     fn external_bun_run_file_keeps_computed_sibling_assets_after_all_copies() {
         let owned = tempfile::tempdir().unwrap();
@@ -2162,20 +2163,36 @@ mod configured_resource_tests {
         let external = owned.path().join("external");
         let workspace = external.join("project");
         let tools = external.join("tools");
+        let local_package = workspace.join("packages/local-package");
+        let local_package_link = external.join("node_modules/local-package");
         let server = tools.join("server.mjs");
         let schema = external.join("schema.json");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&tools).unwrap();
+        std::fs::create_dir_all(&local_package).unwrap();
+        std::fs::create_dir_all(local_package_link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("../project/packages/local-package", &local_package_link)
+            .unwrap();
         std::fs::write(
             workspace.join("workspace-data.txt"),
             "workspace stays mounted\n",
         )
         .unwrap();
+        std::fs::write(
+            local_package.join("package.json"),
+            r#"{"type":"module","exports":"./index.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            local_package.join("index.js"),
+            "export const marker = 'workspace-linked-package';\n",
+        )
+        .unwrap();
         std::fs::write(external.join("package.json"), r#"{"type":"module"}"#).unwrap();
         std::fs::write(
             &server,
-            "import { readFileSync } from 'node:fs';\nimport path from 'node:path';\nimport { fileURLToPath } from 'node:url';\nconst scriptDir = path.dirname(fileURLToPath(import.meta.url));\nprocess.stdout.write(readFileSync(path.join(scriptDir, '../schema.json'), 'utf8'));\n",
+            "import { readFileSync } from 'node:fs';\nimport path from 'node:path';\nimport { fileURLToPath } from 'node:url';\nimport { marker } from 'local-package';\nconst scriptDir = path.dirname(fileURLToPath(import.meta.url));\nprocess.stdout.write(marker + ':' + readFileSync(path.join(scriptDir, '../schema.json'), 'utf8'));\n",
         )
         .unwrap();
         std::fs::write(&schema, "computed sibling schema loaded\n").unwrap();
@@ -2225,6 +2242,7 @@ mod configured_resource_tests {
         let mut units = units;
         filter_workspace_from_enclosing_resource_units(
             &mut units,
+            "opencode",
             &workspace,
             filtered.path(),
             &[],
@@ -2255,7 +2273,201 @@ mod configured_resource_tests {
         std::fs::rename(&hidden, &external).unwrap();
         let output = output.unwrap();
         assert!(output.status.success(), "{:?}", output.stderr);
-        assert_eq!(output.stdout, b"computed sibling schema loaded\n");
+        assert_eq!(
+            output.stdout,
+            b"workspace-linked-package:computed sibling schema loaded\n"
+        );
+    }
+
+    #[test]
+    fn filtering_shared_home_and_workspace_resource_keeps_one_copy_source() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let external = home.join("external");
+        let workspace = external.join("project");
+        let tools = external.join("tools");
+        let server = tools.join("server.mjs");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::write(&server, "process.stdout.write('ok');\n").unwrap();
+        std::fs::write(external.join("package.json"), r#"{"type":"module"}"#).unwrap();
+        let config = workspace.join(".opencode/opencode.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "mcp": { "shared-package": { "type": "local", "command": [
+                    "bun", "run", server.to_string_lossy()
+                ] } },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config,
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Workspace,
+            }],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .unwrap();
+        let mut units = resource_units(
+            &home,
+            &home.join(".config/opencode"),
+            &workspace,
+            &plan,
+            None,
+        )
+        .unwrap();
+        let canonical_package = external.canonicalize().unwrap();
+        let shared_stage_path = units
+            .iter()
+            .find(|(source, _)| source == &canonical_package)
+            .expect("the package resource must be selected")
+            .1
+            .stage_relative_path
+            .clone();
+        assert_eq!(
+            units
+                .iter()
+                .filter(|(_, mount)| mount.stage_relative_path == shared_stage_path)
+                .count(),
+            2,
+            "the package is exposed as HOME and workspace aliases"
+        );
+        let filtered = tempfile::tempdir_in(owned.path()).unwrap();
+        filter_workspace_from_enclosing_resource_units(
+            &mut units,
+            "opencode",
+            &workspace,
+            filtered.path(),
+            &[],
+        )
+        .unwrap();
+
+        let selections = resource_copy_selections(&units).unwrap();
+        assert_eq!(
+            selections.len(),
+            2,
+            "the shared package and selected workspace config are each copied once"
+        );
+        let aliases = units
+            .iter()
+            .filter(|(_, mount)| mount.stage_relative_path == shared_stage_path)
+            .map(|(source, _)| source)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            aliases[0], aliases[1],
+            "both aliases share one filtered source"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_filter_copy_failure_emits_structured_controller_event() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<std::collections::BTreeMap<String, String>>>>);
+        impl tracing::field::Visit for Capture {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .last_mut()
+                    .unwrap()
+                    .insert(field.name().into(), format!("{value:?}"));
+            }
+
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .last_mut()
+                    .unwrap()
+                    .insert(field.name().into(), value.into());
+            }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0.lock().unwrap().push(Default::default());
+                event.record(&mut self.clone());
+            }
+        }
+
+        let owned = tempfile::tempdir().unwrap();
+        let resource = owned.path().join("external");
+        let workspace = resource.join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::os::unix::fs::symlink("missing-target", resource.join("dangling-resource")).unwrap();
+        let stage_path = ".freshell/resource-units/root-test";
+        let mut units = vec![(
+            resource,
+            freshell_runtime_protocol::ProviderResourceMount {
+                stage_relative_path: stage_path.into(),
+                provider_relative_path: ".freshell/provider-roots/root-test".into(),
+                logical_destination: "/tmp/external".into(),
+                effective_destination: "/tmp/external".into(),
+                kind: freshell_runtime_protocol::ProviderResourceKind::Directory,
+            },
+        )];
+        let capture = Capture::default();
+        let dispatcher =
+            tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
+
+        let error = tracing::dispatcher::with_default(&dispatcher, || {
+            filter_workspace_from_enclosing_resource_units(
+                &mut units,
+                "opencode",
+                &workspace,
+                &owned.path().join("filtered"),
+                &[],
+            )
+        })
+        .unwrap_err();
+
+        assert!(error.contains("failed to bound enclosing provider resource"));
+        let events = capture.0.lock().unwrap();
+        let failed = events
+            .iter()
+            .find(|fields| {
+                fields
+                    .get("event")
+                    .is_some_and(|event| event.contains("provider.environment.copy.failed"))
+            })
+            .expect("filtering failures emit the standard copy failure event");
+        assert!(failed
+            .get("stage")
+            .is_some_and(|value| value.contains("controller")));
+        assert!(failed
+            .get("provider")
+            .is_some_and(|value| value.contains("opencode")));
+        assert!(failed
+            .get("resource_stage_path")
+            .is_some_and(|value| value.contains(stage_path)));
+        assert!(failed
+            .get("resource_source_leaf")
+            .is_some_and(|value| value.contains("external")));
+        assert!(failed
+            .get("relative_path")
+            .is_some_and(|value| value.contains("resource/dangling-resource")));
+        assert!(failed.contains_key("operation"));
+        assert!(failed.contains_key("corrective_message"));
+        let serialized = format!("{events:?}");
+        assert!(
+            !serialized.contains(&owned.path().to_string_lossy().to_string()),
+            "structured resource failures must not log physical source paths"
+        );
     }
 
     #[test]
@@ -3145,11 +3357,14 @@ pub(super) fn filter_workspace_from_enclosing_resource_units(
         std::path::PathBuf,
         freshell_runtime_protocol::ProviderResourceMount,
     )],
+    provider: &str,
     workspace: &Path,
     scratch_root: &Path,
     excluded_canonical_sources: &[std::path::PathBuf],
 ) -> Result<(), String> {
-    use freshell_platform::provider_environment::{copy_environment, CopySelection};
+    use freshell_platform::provider_environment::{
+        copy_environment_excluding_subtree, CopySelection,
+    };
     use freshell_runtime_protocol::ProviderResourceKind;
 
     if units.is_empty() {
@@ -3157,6 +3372,7 @@ pub(super) fn filter_workspace_from_enclosing_resource_units(
     }
     let canonical_workspace = std::fs::canonicalize(workspace)
         .map_err(|_| "managed provider workspace is unavailable for resource staging")?;
+    let mut filtered_sources = BTreeMap::<std::path::PathBuf, std::path::PathBuf>::new();
     for (index, (source, mount)) in units.iter_mut().enumerate() {
         if mount.kind != ProviderResourceKind::Directory {
             continue;
@@ -3168,21 +3384,77 @@ pub(super) fn filter_workspace_from_enclosing_resource_units(
         {
             continue;
         }
+        if let Some(filtered_source) = filtered_sources.get(&canonical_source) {
+            *source = filtered_source.clone();
+            continue;
+        }
 
-        let mut exclusions = excluded_canonical_sources.to_vec();
-        exclusions.push(canonical_workspace.clone());
         let destination_root = scratch_root.join(index.to_string());
-        copy_environment(
+        let resource_source_leaf = source
+            .file_name()
+            .map(|leaf| leaf.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let resource_destination_leaf = Path::new(&mount.logical_destination)
+            .file_name()
+            .map(|leaf| leaf.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let started = std::time::Instant::now();
+        tracing::info!(
+            event = "provider.environment.copy.started",
+            stage = "controller",
+            provider,
+            resource_stage_path = %mount.stage_relative_path,
+            resource_source_leaf,
+            resource_destination_leaf,
+            "Copying bounded provider resource with nested workspace excluded"
+        );
+        let report = copy_environment_excluding_subtree(
             &[CopySelection {
                 source: source.clone(),
                 destination_relative: "resource".into(),
             }],
             &destination_root,
-            &exclusions,
+            excluded_canonical_sources,
+            &canonical_workspace,
             Default::default(),
-        )
-        .map_err(|error| format!("failed to bound enclosing provider resource: {error}"))?;
-        *source = destination_root.join("resource");
+        );
+        let report = match report {
+            Ok(report) => report,
+            Err(error) => {
+                tracing::error!(
+                    event = "provider.environment.copy.failed",
+                    stage = "controller",
+                    provider,
+                    operation = error.operation,
+                    relative_path = %error.relative_path.display(),
+                    resource_stage_path = %mount.stage_relative_path,
+                    resource_source_leaf,
+                    resource_destination_leaf,
+                    limit_kind = error.limit_kind,
+                    observed = error.observed,
+                    permitted = error.permitted,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    corrective_message = %error.corrective_message
+                );
+                return Err(format!(
+                    "failed to bound enclosing provider resource: {error}"
+                ));
+            }
+        };
+        tracing::info!(
+            event = "provider.environment.copy.completed",
+            stage = "controller",
+            provider,
+            resource_stage_path = %mount.stage_relative_path,
+            resource_source_leaf,
+            resource_destination_leaf,
+            entries = report.entries,
+            bytes = report.bytes,
+            elapsed_ms = started.elapsed().as_millis() as u64
+        );
+        let filtered_source = destination_root.join("resource");
+        filtered_sources.insert(canonical_source, filtered_source.clone());
+        *source = filtered_source;
     }
     Ok(())
 }

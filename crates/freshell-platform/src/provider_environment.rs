@@ -125,6 +125,8 @@ struct Plan {
     mappings: BTreeMap<PathBuf, PathBuf>,
     pending: VecDeque<(PathBuf, PathBuf, usize)>,
     exclusions: Vec<PathBuf>,
+    excluded_subtree: Option<PathBuf>,
+    included_subtree_aliases: BTreeSet<PathBuf>,
     counted_files: BTreeSet<PathBuf>,
     bytes: u64,
     metadata_bytes: u64,
@@ -134,9 +136,44 @@ struct Plan {
 const MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
 impl Plan {
     fn excluded(&self, source: &Path) -> bool {
-        self.exclusions
-            .iter()
-            .any(|path| source == path || source.starts_with(path))
+        self.exclusions.iter().any(|path| {
+            if source != path && !source.starts_with(path) {
+                return false;
+            }
+            let included_alias = self.excluded_subtree.as_ref() == Some(path)
+                && self
+                    .included_subtree_aliases
+                    .iter()
+                    .any(|root| source == root || source.starts_with(root));
+            !included_alias
+        })
+    }
+    fn is_alias_into_excluded_subtree(&self, source: &Path) -> bool {
+        let Some(excluded_subtree) = &self.excluded_subtree else {
+            return false;
+        };
+        if !source.starts_with(excluded_subtree) {
+            return false;
+        }
+        !self.exclusions.iter().any(|exclusion| {
+            exclusion != excluded_subtree && (source == exclusion || source.starts_with(exclusion))
+        })
+    }
+    fn materialize_excluded_subtree_alias(
+        &mut self,
+        source: PathBuf,
+        destination: PathBuf,
+        depth: usize,
+    ) -> Result<(), CopyError> {
+        if let Some(mapped) = self.mapped(&source)? {
+            if mapped != destination {
+                return self.claim(destination, Node::Link(mapped));
+            }
+            return Ok(());
+        }
+        self.included_subtree_aliases.insert(source.clone());
+        self.add_mapping(source.clone(), destination.clone())?;
+        self.enqueue(source, destination, depth)
     }
     fn resolve_destination(&self, path: &Path, include_leaf: bool) -> Result<PathBuf, CopyError> {
         let mut current = path.to_owned();
@@ -162,7 +199,19 @@ impl Plan {
         ))
     }
     fn mapped(&self, source: &Path) -> Result<Option<PathBuf>, CopyError> {
+        let inside_excluded_subtree = self
+            .excluded_subtree
+            .as_ref()
+            .is_some_and(|excluded| source == excluded || source.starts_with(excluded));
         for root in source.ancestors() {
+            if inside_excluded_subtree
+                && !self
+                    .excluded_subtree
+                    .as_ref()
+                    .is_some_and(|excluded| root == excluded || root.starts_with(excluded))
+            {
+                continue;
+            }
             if let Some(destination) = self.mappings.get(root) {
                 return self
                     .resolve_destination(
@@ -250,7 +299,14 @@ impl Plan {
         // selected-resource entry budget or cause their bytes to be read.
         let canonical =
             fs::canonicalize(&source).map_err(|cause| io_error(&path, "resolve", cause))?;
-        if self.excluded(&canonical) {
+        let workspace_alias = if self.excluded(&canonical) {
+            let metadata =
+                fs::symlink_metadata(&source).map_err(|cause| io_error(&path, "inspect", cause))?;
+            metadata.file_type().is_symlink() && self.is_alias_into_excluded_subtree(&canonical)
+        } else {
+            false
+        };
+        if self.excluded(&canonical) && !workspace_alias {
             return Ok(());
         }
         bound(
@@ -440,6 +496,13 @@ impl Plan {
         let canonical =
             fs::canonicalize(&source).map_err(|cause| io_error(&path, "resolve", cause))?;
         if self.excluded(&canonical) {
+            if metadata.file_type().is_symlink() && self.is_alias_into_excluded_subtree(&canonical)
+            {
+                let next_depth = depth
+                    .checked_add(1)
+                    .ok_or_else(|| error(&path, "plan", "depth accounting overflow"))?;
+                return self.materialize_excluded_subtree_alias(canonical, path, next_depth);
+            }
             return Ok(());
         }
         if !metadata.file_type().is_symlink() {
@@ -585,6 +648,40 @@ fn copy_environment_with_account_home(
         limits,
         account_home,
         &[],
+        None,
+    )
+}
+
+/// Copies a selected resource while omitting one nested tree. Symlink aliases
+/// inside the selected resource that target that tree are materialized at the
+/// alias path, subject to the same copy limits and every other exclusion.
+pub fn copy_environment_excluding_subtree(
+    selections: &[CopySelection],
+    destination_root: &Path,
+    excluded_canonical_sources: &[PathBuf],
+    excluded_subtree: &Path,
+    limits: CopyLimits,
+) -> Result<CopyReport, CopyError> {
+    let excluded_subtree = fs::canonicalize(excluded_subtree).map_err(|cause| {
+        io_error(
+            Path::new("excluded-subtree"),
+            "resolve_excluded_subtree",
+            cause,
+        )
+    })?;
+    let mut exclusions = excluded_canonical_sources.to_vec();
+    if !exclusions.contains(&excluded_subtree) {
+        exclusions.push(excluded_subtree.clone());
+    }
+    let account_home = std::env::var_os("HOME").and_then(|home| fs::canonicalize(home).ok());
+    copy_environment_projection(
+        selections,
+        destination_root,
+        &exclusions,
+        limits,
+        account_home,
+        &[],
+        Some(excluded_subtree),
     )
 }
 
@@ -605,6 +702,7 @@ pub fn copy_environment_for_mounts(
         limits,
         account_home,
         mounted_roots,
+        None,
     )
 }
 
@@ -615,6 +713,7 @@ fn copy_environment_projection(
     limits: CopyLimits,
     account_home: Option<PathBuf>,
     mounted_roots: &[PathBuf],
+    excluded_subtree: Option<PathBuf>,
 ) -> Result<CopyReport, CopyError> {
     bound(
         Path::new(""),
@@ -636,6 +735,8 @@ fn copy_environment_projection(
         mappings: BTreeMap::new(),
         pending: VecDeque::new(),
         exclusions: excluded_canonical_sources.to_vec(),
+        excluded_subtree,
+        included_subtree_aliases: BTreeSet::new(),
         counted_files: BTreeSet::new(),
         bytes: 0,
         metadata_bytes: 0,
@@ -1261,6 +1362,72 @@ mod tests {
         assert_eq!(identity(&home.join("sibling")), before_sibling);
         assert_eq!(fs::read(home.join("sibling")).unwrap(), b"sibling-nonce");
         assert_eq!(fs::read_dir(&home).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn excluding_nested_tree_materializes_only_selected_alias_targets() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let package = source.join("external");
+        let workspace = source.join("project");
+        let selected_package = workspace.join("packages/local-package");
+        let manifest = r#"{"name":"local-package"}"#;
+        let module = "export const value = 1;\n";
+        fs::create_dir_all(package.join("node_modules")).unwrap();
+        fs::create_dir_all(&selected_package).unwrap();
+        fs::write(workspace.join("private-project-data"), "must stay excluded").unwrap();
+        fs::write(selected_package.join("package.json"), manifest).unwrap();
+        fs::write(selected_package.join("index.js"), module).unwrap();
+        symlink(
+            "../../project/packages/local-package",
+            package.join("node_modules/local-package"),
+        )
+        .unwrap();
+        let destination = root.path().join("provider");
+
+        let report = copy_environment_excluding_subtree(
+            &[selection(&package, "package")],
+            &destination,
+            &[],
+            &workspace,
+            CopyLimits::default(),
+        )
+        .unwrap();
+
+        let materialized = destination.join("package/node_modules/local-package");
+        assert!(materialized.join("package.json").is_file());
+        assert_eq!(
+            fs::read_to_string(materialized.join("index.js")).unwrap(),
+            module
+        );
+        assert!(
+            !destination
+                .join("package/project/private-project-data")
+                .exists(),
+            "ordinary workspace files remain excluded"
+        );
+        assert_eq!(
+            report.bytes,
+            (manifest.len() + module.len()) as u64,
+            "the enclosing workspace itself is not charged or copied"
+        );
+
+        let credential_excluded = root.path().join("credential-excluded-provider");
+        copy_environment_excluding_subtree(
+            &[selection(&package, "package")],
+            &credential_excluded,
+            &[selected_package.canonicalize().unwrap()],
+            &workspace,
+            CopyLimits::default(),
+        )
+        .unwrap();
+        assert!(
+            !credential_excluded
+                .join("package/node_modules/local-package")
+                .exists(),
+            "the nested-tree allowance must not override another exclusion"
+        );
     }
 
     #[cfg(unix)]

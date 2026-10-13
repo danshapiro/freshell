@@ -1737,6 +1737,7 @@ fn stage_provider_root(
                 let scratch = tempfile::tempdir_in(parent).map_err(|error| error.to_string())?;
                 source_stage::filter_workspace_from_enclosing_resource_units(
                     &mut units,
+                    provider,
                     opencode_input
                         .workspace
                         .or(opencode_input.cwd)

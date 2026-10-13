@@ -1878,7 +1878,9 @@ fn copy_provider_config_references_with_ownership(
     final_home: &Path,
     run_as: (u32, u32),
 ) -> Result<(), String> {
-    use freshell_platform::provider_environment::{copy_environment, CopySelection};
+    use freshell_platform::provider_environment::{
+        copy_environment_excluding_subtree, CopySelection,
+    };
     use freshell_runtime_protocol::ProviderConfigRoot;
     context.validate(provider).map_err(|error| error.message)?;
     let mut selections = provider_config_references(context)
@@ -1952,6 +1954,7 @@ fn copy_provider_config_references_with_ownership(
         }
     }
     let mut _filtered_resource_sources = Vec::new();
+    let mut filtered_resource_sources = std::collections::BTreeMap::<PathBuf, PathBuf>::new();
     for (resource_index, unit) in context
         .prepared_inputs
         .iter()
@@ -1981,22 +1984,72 @@ fn copy_provider_config_references_with_ownership(
         if canonical_nested_workspace == canonical_source {
             continue;
         }
+        if let Some(filtered_source) = filtered_resource_sources.get(&canonical_source) {
+            selection.source = filtered_source.clone();
+            continue;
+        }
 
-        let mut resource_exclusions = excluded.clone();
-        resource_exclusions.push(canonical_nested_workspace);
         let scratch = tempfile::tempdir().map_err(|error| error.to_string())?;
         let destination_root = scratch.path().join("filtered-resource");
-        copy_environment(
+        let resource_source_leaf = selection
+            .source
+            .file_name()
+            .map(|leaf| leaf.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let resource_destination_leaf = Path::new(&unit.logical_destination)
+            .file_name()
+            .map(|leaf| leaf.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let started = std::time::Instant::now();
+        emit_environment_event(serde_json::json!({
+            "severity": "info", "event": "provider.environment.copy.started",
+            "stage": "session_host", "provider": provider,
+            "resource_stage_path": unit.stage_relative_path,
+            "resource_source_leaf": resource_source_leaf,
+            "resource_destination_leaf": resource_destination_leaf
+        }));
+        let report = copy_environment_excluding_subtree(
             &[CopySelection {
                 source: selection.source.clone(),
                 destination_relative: "resource".into(),
             }],
             &destination_root,
-            &resource_exclusions,
+            &excluded,
+            &canonical_nested_workspace,
             Default::default(),
-        )
-        .map_err(|error| format!("failed to exclude workspace from provider resource: {error}"))?;
+        );
+        let report = match report {
+            Ok(report) => report,
+            Err(error) => {
+                emit_environment_event(serde_json::json!({
+                    "severity": "error", "event": "provider.environment.copy.failed",
+                    "stage": "session_host", "provider": provider,
+                    "operation": error.operation,
+                    "relative_path": error.relative_path,
+                    "resource_stage_path": unit.stage_relative_path,
+                    "resource_source_leaf": resource_source_leaf,
+                    "resource_destination_leaf": resource_destination_leaf,
+                    "limit_kind": error.limit_kind, "observed": error.observed,
+                    "permitted": error.permitted,
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                    "corrective_message": error.corrective_message
+                }));
+                return Err(format!(
+                    "failed to exclude workspace from provider resource: {error}"
+                ));
+            }
+        };
+        emit_environment_event(serde_json::json!({
+            "severity": "info", "event": "provider.environment.copy.completed",
+            "stage": "session_host", "provider": provider,
+            "resource_stage_path": unit.stage_relative_path,
+            "resource_source_leaf": resource_source_leaf,
+            "resource_destination_leaf": resource_destination_leaf,
+            "entries": report.entries, "bytes": report.bytes,
+            "elapsed_ms": started.elapsed().as_millis() as u64
+        }));
         selection.source = destination_root.join("resource");
+        filtered_resource_sources.insert(canonical_source, selection.source.clone());
         _filtered_resource_sources.push(scratch);
     }
     let mounted = if provider_home == final_home {
@@ -5717,6 +5770,107 @@ mod tests {
             .unwrap()
             .contains("repair"));
         assert!(event["elapsed_ms"].as_u64().is_some());
+
+        #[cfg(unix)]
+        {
+            let filtered = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::provider_config_workspace_filter_failure_emits_safe_jsonl",
+                    "--nocapture",
+                ])
+                .output()
+                .unwrap();
+            assert!(filtered.status.success(), "{filtered:?}");
+            let event = std::str::from_utf8(&filtered.stderr)
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|event| {
+                    event["event"] == "provider.environment.copy.failed"
+                        && event["stage"] == "session_host"
+                })
+                .expect("nested-workspace filtering failures emit the standard copy failure event");
+            assert_eq!(event["provider"], "opencode");
+            assert_eq!(event["operation"], "resolve");
+            assert_eq!(event["relative_path"], "resource/dangling-resource");
+            assert_eq!(
+                event["resource_stage_path"],
+                ".freshell/resource-units/root-test"
+            );
+            assert_eq!(event["resource_source_leaf"], "root-test");
+            assert_eq!(event["resource_destination_leaf"], "external");
+            assert!(event["corrective_message"]
+                .as_str()
+                .unwrap()
+                .contains("repair"));
+            assert!(event["elapsed_ms"].as_u64().is_some());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_config_workspace_filter_failure_emits_safe_jsonl() {
+        use freshell_runtime_protocol::*;
+
+        let owned = tempfile::tempdir().unwrap();
+        let external = owned.path().join("external");
+        let workspace = external.join("project");
+        let user_root = owned.path().join("source");
+        let unit = user_root.join(".freshell/resource-units/root-test");
+        std::fs::create_dir_all(unit.join("project")).unwrap();
+        std::os::unix::fs::symlink("missing-target", unit.join("dangling-resource")).unwrap();
+        let capability = McpCapabilityReference {
+            grant_id: format!("grant-{}", uuid::Uuid::new_v4()),
+            endpoint: "http://host.docker.internal:1234".into(),
+            provider_relative_path: ".freshell/mcp-capability.json".into(),
+            host_gateway_address: None,
+        };
+        let context = ProviderLaunchContext {
+            config: vec![],
+            preparation: ProviderPreparation::Opencode {
+                project_config: vec![],
+                tui_config: None,
+                tui_source: None,
+                inline_config: false,
+            },
+            prepared_inputs: Some(PreparedProviderInputs {
+                generation_id: capability.grant_id.clone(),
+                initial_auth_reservation: None,
+                manifest: ProviderInputManifestReference {
+                    relative_path: ".freshell/input-manifest.json".into(),
+                    sha256: "a".repeat(64),
+                    source_count: 0,
+                    alias_count: 0,
+                    recipe_count: 0,
+                },
+                config_binds: vec![],
+                indexed_files: None,
+                resource_mounts: vec![ProviderResourceMount {
+                    stage_relative_path: ".freshell/resource-units/root-test".into(),
+                    provider_relative_path: ".freshell/provider-roots/root-test".into(),
+                    logical_destination: external.to_string_lossy().into_owned(),
+                    effective_destination: external.to_string_lossy().into_owned(),
+                    kind: ProviderResourceKind::Directory,
+                }],
+            }),
+            mcp_capability: Some(capability),
+        };
+
+        let error = copy_provider_config_references(
+            &context,
+            "opencode",
+            &workspace,
+            &user_root,
+            &owned.path().join("provider-home"),
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("failed to exclude workspace from provider resource"),
+            "{error}"
+        );
     }
 
     #[test]
