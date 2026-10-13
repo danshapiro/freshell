@@ -8978,18 +8978,28 @@ async fn refresh_managed_output_and_associate(
     if state.registry.managed_descriptor(terminal_id).is_none() {
         return Ok(());
     }
-    let result = tokio::time::timeout(
+    let result = match tokio::time::timeout(
         std::time::Duration::from_millis(500),
         state
             .registry
             .refresh_managed_output(terminal_id, max_bytes),
     )
     .await
-    .map_err(|_| freshell_terminal::registry::ManagedOutputRefreshError {
-        message: "managed output read timed out".into(),
-        lifecycle_changed: false,
-    })
-    .and_then(|read| read);
+    {
+        Ok(read) => read,
+        Err(_) => {
+            let lifecycle_changed = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                state.registry.observe_managed_lifecycle(terminal_id),
+            )
+            .await
+            .unwrap_or(false);
+            Err(freshell_terminal::registry::ManagedOutputRefreshError {
+                message: "managed output read timed out".into(),
+                lifecycle_changed,
+            })
+        }
+    };
     let read = match result {
         Ok(read) => {
             state
@@ -13332,6 +13342,7 @@ mod managed_output_order_tests {
         lifecycle: Option<ManagedLifecycle>,
         exit_code: Option<i64>,
         native_session_id: Option<String>,
+        read_pending: bool,
         read_error: Option<String>,
         error_lifecycle: Option<ManagedLifecycle>,
     }
@@ -13395,6 +13406,9 @@ mod managed_output_order_tests {
             after: i64,
             _: u64,
         ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
+            if self.read_pending {
+                return Box::pin(std::future::pending());
+            }
             if let Some(error) = &self.read_error {
                 let error = error.clone();
                 return Box::pin(async move { Err(error) });
@@ -13429,6 +13443,49 @@ mod managed_output_order_tests {
         }
     }
 
+    fn install_blocked_read_controller(
+        state: &WsState,
+        suffix: &str,
+        read_pending: bool,
+        read_error: Option<&str>,
+    ) -> String {
+        let terminal_id = format!("T-managed-{suffix}");
+        state.registry.register_managed(ManagedTerminalDescriptor {
+            soul_id: format!("soul-{suffix}"),
+            incarnation_id: format!("incarnation-{suffix}"),
+            terminal_id: terminal_id.clone(),
+            stream_id: format!("S-managed-{suffix}"),
+            mode: "opencode".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: Some(format!("ses-{suffix}")),
+            create_request_id: Some(format!("req-{suffix}")),
+        });
+        let blocked_lifecycle = ManagedLifecycle {
+            state: ManagedLifecycleState::Blocked,
+            recovery_summary: Some(freshell_protocol::ManagedRecoverySummary {
+                desired_state: "running".into(),
+                recovery_state: "blocked".into(),
+                reason: Some("host_unreachable".into()),
+                attempt_id: Some(format!("attempt-{suffix}")),
+                incident_id: Some(format!("incident-{suffix}")),
+                durability_state: "retained".into(),
+                allocation_state: "retained".into(),
+            }),
+        };
+        state
+            .registry
+            .set_managed_controller(Some(Arc::new(ExitedOpenCodeRead {
+                final_head: 0,
+                lifecycle: None,
+                exit_code: None,
+                native_session_id: None,
+                read_pending,
+                read_error: read_error.map(str::to_owned),
+                error_lifecycle: Some(blocked_lifecycle),
+            })));
+        terminal_id
+    }
+
     #[tokio::test]
     async fn native_identity_and_exit_in_one_read_bind_before_exit() {
         let state = super::pane_reconcile_gate_tests::state();
@@ -13450,6 +13507,7 @@ mod managed_output_order_tests {
                 lifecycle: None,
                 exit_code: Some(17),
                 native_session_id: Some("ses-short-lived".into()),
+                read_pending: false,
                 read_error: None,
                 error_lifecycle: None,
             })));
@@ -13498,6 +13556,7 @@ mod managed_output_order_tests {
                 lifecycle: None,
                 exit_code: Some(17),
                 native_session_id: Some("ses-short-lived".into()),
+                read_pending: false,
                 read_error: None,
                 error_lifecycle: None,
             })));
@@ -13555,6 +13614,7 @@ mod managed_output_order_tests {
                 }),
                 exit_code: None,
                 native_session_id: None,
+                read_pending: false,
                 read_error: None,
                 error_lifecycle: None,
             })));
@@ -13588,43 +13648,16 @@ mod managed_output_order_tests {
     #[tokio::test]
     async fn managed_cached_final_lifecycle_broadcasts_when_output_read_fails() {
         let state = super::pane_reconcile_gate_tests::state();
-        let terminal_id = "T-managed-blocked-read-error";
+        let terminal_id = install_blocked_read_controller(
+            &state,
+            "blocked-read-error",
+            false,
+            Some("managed output read failed"),
+        );
         let mut events = state.broadcast_tx.subscribe();
-        state.registry.register_managed(ManagedTerminalDescriptor {
-            soul_id: "soul-blocked-read-error".into(),
-            incarnation_id: "incarnation-blocked-read-error".into(),
-            terminal_id: terminal_id.into(),
-            stream_id: "S-managed-blocked-read-error".into(),
-            mode: "opencode".into(),
-            cwd: "/workspace".into(),
-            resume_session_id: Some("ses-blocked-read-error".into()),
-            create_request_id: Some("req-blocked-read-error".into()),
-        });
-        let blocked_lifecycle = ManagedLifecycle {
-            state: ManagedLifecycleState::Blocked,
-            recovery_summary: Some(freshell_protocol::ManagedRecoverySummary {
-                desired_state: "running".into(),
-                recovery_state: "blocked".into(),
-                reason: Some("host_unreachable".into()),
-                attempt_id: Some("attempt-blocked-read-error".into()),
-                incident_id: Some("incident-blocked-read-error".into()),
-                durability_state: "retained".into(),
-                allocation_state: "retained".into(),
-            }),
-        };
-        state
-            .registry
-            .set_managed_controller(Some(Arc::new(ExitedOpenCodeRead {
-                final_head: 0,
-                lifecycle: None,
-                exit_code: None,
-                native_session_id: None,
-                read_error: Some("managed output read failed".into()),
-                error_lifecycle: Some(blocked_lifecycle),
-            })));
 
         assert!(
-            refresh_managed_output_and_associate(&state, terminal_id, 1024)
+            refresh_managed_output_and_associate(&state, &terminal_id, 1024)
                 .await
                 .unwrap_err()
                 .contains("managed output read failed")
@@ -13640,7 +13673,41 @@ mod managed_output_order_tests {
         );
 
         assert!(
-            refresh_managed_output_and_associate(&state, terminal_id, 1024)
+            refresh_managed_output_and_associate(&state, &terminal_id, 1024)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn managed_cached_final_lifecycle_broadcasts_when_output_read_times_out() {
+        let state = super::pane_reconcile_gate_tests::state();
+        let terminal_id =
+            install_blocked_read_controller(&state, "blocked-read-timeout", true, None);
+        let mut events = state.broadcast_tx.subscribe();
+
+        assert!(
+            refresh_managed_output_and_associate(&state, &terminal_id, 1024)
+                .await
+                .unwrap_err()
+                .contains("timed out")
+        );
+        assert_eq!(
+            state.registry.directory()[0].runtime_status,
+            Some(freshell_protocol::RuntimeStatus::Blocked)
+        );
+        let changed: serde_json::Value = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            changed,
+            serde_json::json!({ "type": "terminals.changed", "revision": 1 })
+        );
+
+        assert!(
+            refresh_managed_output_and_associate(&state, &terminal_id, 1024)
                 .await
                 .is_err()
         );

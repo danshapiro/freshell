@@ -22,6 +22,7 @@ async fn managed_socket_windows(
             lifecycle: None,
             exit_code: Some(17),
             native_session_id: Some("ses-short-lived".into()),
+            read_pending: false,
             read_error: None,
             error_lifecycle: None,
         })));

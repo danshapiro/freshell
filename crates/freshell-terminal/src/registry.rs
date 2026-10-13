@@ -5061,6 +5061,25 @@ impl TerminalRegistry {
         Ok(read)
     }
 
+    /// Refresh a managed terminal's cached lifecycle without reading retained
+    /// output. This is used when the output transport times out before its
+    /// error path can publish the controller's cached recovery verdict.
+    pub async fn observe_managed_lifecycle(&self, terminal_id: &str) -> bool {
+        let Some(terminal) = self.managed_descriptor(terminal_id) else {
+            return false;
+        };
+        let controller = self
+            .managed_controller
+            .read()
+            .expect("managed controller lock")
+            .clone();
+        let Some(controller) = controller else {
+            return false;
+        };
+        let lifecycle = controller.lifecycle_observation(&terminal).await;
+        self.publish_managed_lifecycle(terminal_id, lifecycle)
+    }
+
     /// Managed equivalent of `finish_pty_exit`: the OS process is already
     /// gone and the supervisor-owned enclosure has been stopped; retain the
     /// facade/replay tail but mark it exited and tell attached viewers once.
