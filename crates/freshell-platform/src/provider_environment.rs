@@ -1699,6 +1699,7 @@ impl EnvironmentPublication {
             relative: PathBuf,
             path: PathBuf,
             backup_id: usize,
+            next_backup_id: usize,
         }
 
         let mut unique = BTreeSet::new();
@@ -1780,10 +1781,14 @@ impl EnvironmentPublication {
             let backup_id = first_backup_id
                 .checked_add(candidates.len())
                 .ok_or_else(|| error(&relative, "remove_obsolete", "backup id overflow"))?;
+            let next_backup_id = backup_id
+                .checked_add(1)
+                .ok_or_else(|| error(&relative, "remove_obsolete", "backup id overflow"))?;
             candidates.push(Candidate {
                 relative: relative.clone(),
                 path,
                 backup_id,
+                next_backup_id,
             });
             scheduled.insert(relative);
         }
@@ -1822,6 +1827,9 @@ impl EnvironmentPublication {
             })?;
             fs::rename(&candidate.path, &backup)
                 .map_err(|cause| io_error(&candidate.relative, "retain_obsolete", cause))?;
+            // A successful move consumes this ID even if a later path fails.
+            // Advance before the next fallible operation so retries cannot reuse it.
+            publication.next_backup_id = candidate.next_backup_id;
             publication
                 .replaced
                 .push((candidate.path.clone(), backup.clone()));
@@ -1830,9 +1838,6 @@ impl EnvironmentPublication {
             }
             sync_directory_chain(&self.root, backup_parent)?;
         }
-        publication.next_backup_id = first_backup_id
-            .checked_add(candidates.len())
-            .ok_or_else(|| error(Path::new(""), "remove_obsolete", "backup id overflow"))?;
         Ok(())
     }
     pub fn created_paths(&self) -> &[PathBuf] {
@@ -3051,6 +3056,47 @@ mod tests {
         for path in stale {
             assert_eq!(fs::read(home.join(path)).unwrap(), b"previous");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retrying_partial_obsolete_batch_preserves_prior_backup_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let source = root.path().join("source");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&source).unwrap();
+        fs::write(home.join("old-a"), b"A").unwrap();
+        fs::write(home.join("old-b"), b"B").unwrap();
+        fs::write(source.join("new"), b"new").unwrap();
+
+        let mut publication = stage_environment(
+            &[selection(&source.join("new"), "new")],
+            &home,
+            &[],
+            Default::default(),
+        )
+        .unwrap();
+        let backup_root = publication.rollback.as_ref().unwrap().backup.0.clone();
+        let first_backup = backup_path(&backup_root, 1);
+        let obstructed_backup = backup_path(&backup_root, 2);
+        fs::create_dir(&obstructed_backup).unwrap();
+        let obsolete = [PathBuf::from("old-a"), PathBuf::from("old-b")];
+
+        assert!(publication.remove_obsolete_batch(&obsolete).is_err());
+        assert!(!home.join("old-a").exists());
+        assert_eq!(fs::read(&first_backup).unwrap(), b"A");
+        assert_eq!(fs::read(home.join("old-b")).unwrap(), b"B");
+
+        fs::remove_dir(&obstructed_backup).unwrap();
+        publication.remove_obsolete_batch(&obsolete).unwrap();
+        assert_eq!(fs::read(&first_backup).unwrap(), b"A");
+        assert_eq!(fs::read(backup_path(&backup_root, 2)).unwrap(), b"B");
+
+        drop(publication);
+        assert_eq!(fs::read(home.join("old-a")).unwrap(), b"A");
+        assert_eq!(fs::read(home.join("old-b")).unwrap(), b"B");
+        assert!(!home.join("new").exists());
     }
 
     #[test]

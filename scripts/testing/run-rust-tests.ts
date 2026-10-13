@@ -79,7 +79,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     ...process.env,
     FRESHELL_SERVER_BIN: binary,
   }
-  return runChild(cargo, ['test', '--workspace', '--locked', ...forwarded], env)
+  const testExitCode = await runChild(cargo, ['test', '--workspace', '--locked', ...forwarded], env)
+  if (testExitCode !== 0 || forwarded.length > 0) return testExitCode
+
+  // The destructive provider-recovery parents stay ignored in ordinary host
+  // Cargo runs. Schedule their exact selector in the disposable runtime suite
+  // after the full workspace run so the normal Rust gate covers crash recovery.
+  return runChild('bash', [
+    'scripts/sandbox-test.sh',
+    '--runtime-suite',
+    'pnpm exec tsx scripts/testing/provider-crash-recovery-tests.ts',
+  ], env)
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
