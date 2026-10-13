@@ -101,11 +101,27 @@ mod configured_resource_tests {
         workspace: &Path,
         command: &Path,
     ) -> (Vec<PlannedSourceOccurrence>, std::path::PathBuf) {
+        plan_and_stage_mcp_command_for_resource(
+            owned_root,
+            home,
+            workspace,
+            &[command.to_string_lossy().into_owned()],
+            command,
+        )
+    }
+
+    fn plan_and_stage_mcp_command_for_resource(
+        owned_root: &Path,
+        home: &Path,
+        workspace: &Path,
+        command: &[String],
+        selected_resource: &Path,
+    ) -> (Vec<PlannedSourceOccurrence>, std::path::PathBuf) {
         let config = workspace.join("opencode.json");
         std::fs::write(
             &config,
             serde_json::json!({
-                "mcp": { "direct": { "type": "local", "command": [command] } },
+                "mcp": { "direct": { "type": "local", "command": command } },
             })
             .to_string(),
         )
@@ -124,12 +140,12 @@ mod configured_resource_tests {
         .unwrap();
         let units =
             resource_units(home, &home.join(".config/opencode"), workspace, &plan, None).unwrap();
-        let command = command.canonicalize().unwrap();
+        let selected_resource = selected_resource.canonicalize().unwrap();
         let mount = units
             .iter()
-            .find(|(source, _)| source == &command)
+            .find(|(source, _)| source == &selected_resource)
             .map(|(_, mount)| mount)
-            .expect("the direct MCP command must be in the resource plan");
+            .expect("the selected MCP script must be in the resource plan");
         let effective_destination = Path::new(&mount.effective_destination);
         let provider_relative = effective_destination
             .strip_prefix(owned_root)
@@ -1064,6 +1080,90 @@ mod configured_resource_tests {
     }
 
     #[test]
+    fn node_command_script_in_home_keeps_home_node_modules_after_all_copies() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let command = home.join("mcp.js");
+        let dependency = home.join("node_modules/home-fixture/index.js");
+        std::fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(&command, "process.stdout.write(require('home-fixture'))\n").unwrap();
+        std::fs::write(
+            &dependency,
+            "module.exports = 'runtime node_modules loaded\\n'\n",
+        )
+        .unwrap();
+
+        let command_args = vec!["node".to_owned(), command.to_string_lossy().into_owned()];
+        let (plan, provider_script) = plan_and_stage_mcp_command_for_resource(
+            owned.path(),
+            &home,
+            &workspace,
+            &command_args,
+            &command,
+        );
+        assert!(plan[0]
+            .configured_resources
+            .contains(&home.join("node_modules").canonicalize().unwrap()));
+        assert!(plan[0]
+            .configured_resources
+            .contains(&command.canonicalize().unwrap()));
+        assert!(!plan[0]
+            .configured_resources
+            .contains(&home.canonicalize().unwrap()));
+
+        let hidden_home = owned.path().join("home-hidden");
+        std::fs::rename(&home, &hidden_home).unwrap();
+        let output = std::process::Command::new("node")
+            .arg(&provider_script)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .output();
+        std::fs::rename(&hidden_home, &home).unwrap();
+        let output = output.unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"runtime node_modules loaded\n");
+    }
+
+    #[test]
+    fn node_shebang_javascript_script_in_home_keeps_home_node_modules_after_all_copies() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let command = home.join("mcp.js");
+        let dependency = home.join("node_modules/home-fixture/index.js");
+        std::fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "#!/usr/bin/env node\nprocess.stdout.write(require('home-fixture'))\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &dependency,
+            "module.exports = 'javascript shebang node_modules loaded\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (plan, provider_command) =
+            plan_and_stage_direct_mcp_command(owned.path(), &home, &workspace, &command);
+        assert!(plan[0]
+            .configured_resources
+            .contains(&home.join("node_modules").canonicalize().unwrap()));
+        assert!(!plan[0]
+            .configured_resources
+            .contains(&home.canonicalize().unwrap()));
+
+        let output = execute_with_home_hidden(owned.path(), &home, &provider_command);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"javascript shebang node_modules loaded\n");
+    }
+
+    #[test]
     fn direct_node_script_loads_parent_relative_module_after_all_copies() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1411,6 +1511,33 @@ mod configured_resource_tests {
             "#!/bin/sh\nSCRIPT_DIR=$(dirname \"$0\")\ncat \"$SCRIPT_DIR/data.bin\"\n",
         )
         .unwrap();
+        let expected = [0, 0xff, 0x81, b'R', b'I', b'F', b'F'];
+        std::fs::write(&data, expected).unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (plan, provider_command) =
+            plan_and_stage_direct_mcp_command(owned.path(), &home, &workspace, &command);
+        assert!(plan[0]
+            .configured_resources
+            .contains(&data.canonicalize().unwrap()));
+        let output = execute_with_home_hidden(owned.path(), &home, &provider_command);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, expected);
+    }
+
+    #[test]
+    fn shell_shebang_keeps_binary_support_resource_from_inline_dirname_expression() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let tools = home.join("tools");
+        let command = tools.join("start");
+        let data = tools.join("data.bin");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(&command, "#!/bin/sh\ncat \"$(dirname \"$0\")/data.bin\"\n").unwrap();
         let expected = [0, 0xff, 0x81, b'R', b'I', b'F', b'F'];
         std::fs::write(&data, expected).unwrap();
         std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();

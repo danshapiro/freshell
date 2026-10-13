@@ -480,16 +480,6 @@ fn is_mcp_script_field(field: &str) -> bool {
     )
 }
 
-fn is_mcp_direct_script_field(field: &str) -> bool {
-    matches!(
-        field,
-        "OpenCode mcp.direct-script"
-            | "OpenCode mcp.node-direct-script"
-            | "OpenCode mcp.shebang-script"
-            | "OpenCode mcp.shebang-node-script"
-    )
-}
-
 fn is_mcp_node_script_field(field: &str) -> bool {
     matches!(
         field,
@@ -685,24 +675,26 @@ fn shell_directory_relative_paths(
     directory_variables: &std::collections::BTreeSet<String>,
 ) -> std::collections::BTreeSet<String> {
     let mut result = std::collections::BTreeSet::new();
+    let mut prefixes = std::collections::BTreeSet::new();
     for variable in directory_variables {
-        for prefix in [format!("${variable}/"), format!("${{{variable}}}/")] {
-            let mut remaining = line;
-            while let Some(start) = remaining.find(&prefix) {
-                let suffix = &remaining[start + prefix.len()..];
-                let length = suffix
-                    .find(|character: char| {
-                        character.is_whitespace() || "\"'`;|&)".contains(character)
-                    })
-                    .unwrap_or(suffix.len());
-                let relative = &suffix[..length];
-                if !relative.is_empty() && !relative.contains(['$', '*', '?']) {
-                    result.insert(relative.to_owned());
-                }
-                remaining = &suffix[length..];
-                if remaining.is_empty() {
-                    break;
-                }
+        prefixes.insert(format!("${variable}/"));
+        prefixes.insert(format!("${{{variable}}}/"));
+    }
+    prefixes.insert("$(dirname \"$0\")/".to_owned());
+    for prefix in prefixes {
+        let mut remaining = line;
+        while let Some(start) = remaining.find(&prefix) {
+            let suffix = &remaining[start + prefix.len()..];
+            let length = suffix
+                .find(|character: char| character.is_whitespace() || "\"'`;|&)".contains(character))
+                .unwrap_or(suffix.len());
+            let relative = &suffix[..length];
+            if !relative.is_empty() && !relative.contains(['$', '*', '?']) {
+                result.insert(relative.to_owned());
+            }
+            remaining = &suffix[length..];
+            if remaining.is_empty() {
+                break;
             }
         }
     }
@@ -1935,64 +1927,69 @@ pub fn select(
                 if command_parent == Path::new("/")
                     || canonical_home.as_deref() == Some(command_parent)
                 {
-                    if is_mcp_direct_script_field(field) {
-                        insert_resource(
+                    // HOME and the filesystem root cannot be copied as a
+                    // script's containing directory. Select the entry point
+                    // itself and only its bounded language-specific closure.
+                    insert_resource(
+                        &mut result,
+                        &mut resource_path_bytes,
+                        canonical.clone(),
+                        field,
+                    )?;
+                    if is_mcp_node_script_field(field) {
+                        insert_installed_package_ancestor_resources(
+                            &canonical,
+                            home,
+                            declaring,
                             &mut result,
                             &mut resource_path_bytes,
-                            canonical.clone(),
                             field,
                         )?;
-                        if is_mcp_node_script_field(field) {
-                            insert_direct_script_dependencies(
-                                &canonical,
-                                &dependency_scope,
-                                declaring,
-                                &mut result,
-                                &mut resource_path_bytes,
-                                field,
-                                ScriptDependencyRuntime::Node,
-                            )?;
-                        }
-                        if canonical_home.as_deref() == Some(command_parent)
-                            && is_shell_script(&canonical)
-                        {
-                            insert_shell_script_dependencies(
-                                &canonical,
-                                &dependency_scope,
-                                declaring,
-                                &mut result,
-                                &mut resource_path_bytes,
-                                field,
-                            )?;
-                        }
-                        if is_python_script(&canonical) {
-                            insert_direct_script_dependencies(
-                                &canonical,
-                                &dependency_scope,
-                                declaring,
-                                &mut result,
-                                &mut resource_path_bytes,
-                                field,
-                                ScriptDependencyRuntime::Python,
-                            )?;
-                        }
-                        if is_ruby_script(&canonical) {
-                            insert_direct_script_dependencies(
-                                &canonical,
-                                &dependency_scope,
-                                declaring,
-                                &mut result,
-                                &mut resource_path_bytes,
-                                field,
-                                ScriptDependencyRuntime::Ruby,
-                            )?;
-                        }
-                        continue;
+                        insert_direct_script_dependencies(
+                            &canonical,
+                            &dependency_scope,
+                            declaring,
+                            &mut result,
+                            &mut resource_path_bytes,
+                            field,
+                            ScriptDependencyRuntime::Node,
+                        )?;
                     }
-                    return Err(fail(
-                        field,
-                        "standalone MCP script requires copying an unbounded account or system directory",
-                    ));
+                    if canonical_home.as_deref() == Some(command_parent)
+                        && is_shell_script(&canonical)
+                    {
+                        insert_shell_script_dependencies(
+                            &canonical,
+                            &dependency_scope,
+                            declaring,
+                            &mut result,
+                            &mut resource_path_bytes,
+                            field,
+                        )?;
+                    }
+                    if is_python_script(&canonical) {
+                        insert_direct_script_dependencies(
+                            &canonical,
+                            &dependency_scope,
+                            declaring,
+                            &mut result,
+                            &mut resource_path_bytes,
+                            field,
+                            ScriptDependencyRuntime::Python,
+                        )?;
+                    }
+                    if is_ruby_script(&canonical) {
+                        insert_direct_script_dependencies(
+                            &canonical,
+                            &dependency_scope,
+                            declaring,
+                            &mut result,
+                            &mut resource_path_bytes,
+                            field,
+                            ScriptDependencyRuntime::Ruby,
+                        )?;
+                    }
+                    continue;
                 }
                 if is_mcp_node_script_field(field) {
                     insert_installed_package_ancestor_resources(
