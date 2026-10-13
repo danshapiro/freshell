@@ -1147,6 +1147,56 @@ describe('App WS bootstrap recovery', () => {
     },
   )
 
+  it('summarizes mixed managed pane outcomes independent of terminal inventory order', async () => {
+    const store = createStore({
+      tabs: [{ id: 'inventory-mixed-tab', mode: 'opencode', status: 'running' }],
+      panes: {
+        layouts: {
+          'inventory-mixed-tab': {
+            type: 'split', id: 'inventory-mixed-split', direction: 'horizontal', sizes: [50, 50], children: [
+              {
+                type: 'leaf', id: 'inventory-mixed-lost-pane', content: {
+                  kind: 'terminal', mode: 'opencode', status: 'running', terminalId: 'inventory-mixed-lost-terminal',
+                  streamId: 'inventory-mixed-lost-stream', createRequestId: 'inventory-mixed-lost-create',
+                  soulId: 'inventory-mixed-lost-soul',
+                },
+              },
+              {
+                type: 'leaf', id: 'inventory-mixed-live-pane', content: {
+                  kind: 'terminal', mode: 'opencode', status: 'running', terminalId: 'inventory-mixed-live-terminal',
+                  streamId: 'inventory-mixed-live-stream', createRequestId: 'inventory-mixed-live-create',
+                  soulId: 'inventory-mixed-live-soul',
+                },
+              },
+            ],
+          },
+        },
+        activePane: { 'inventory-mixed-tab': 'inventory-mixed-live-pane' },
+      },
+    })
+    render(<Provider store={store}><App /></Provider>)
+    await waitFor(() => expect(messageHandler).toBeTypeOf('function'))
+
+    const lost = {
+      terminalId: 'inventory-mixed-lost-terminal', mode: 'opencode', status: 'exited', runtimeStatus: 'exited',
+      soulId: 'inventory-mixed-lost-soul', incarnationId: 'inventory-mixed-lost-incarnation',
+      recoverySummary: {
+        desiredState: 'running', recoveryState: 'lost', durabilityState: 'live_only', allocationState: 'degraded',
+      },
+    }
+    const live = {
+      terminalId: 'inventory-mixed-live-terminal', mode: 'opencode', status: 'running', runtimeStatus: 'running',
+      soulId: 'inventory-mixed-live-soul', incarnationId: 'inventory-mixed-live-incarnation',
+    }
+    const deliver = (terminals: Array<typeof lost | typeof live>) =>
+      act(() => messageHandler?.({ type: 'terminal.inventory', terminals }))
+
+    deliver([lost, live])
+    expect(store.getState().tabs.tabs.find(tab => tab.id === 'inventory-mixed-tab')?.status).toBe('error')
+    deliver([live, lost])
+    expect(store.getState().tabs.tabs.find(tab => tab.id === 'inventory-mixed-tab')?.status).toBe('error')
+  })
+
   it('recovers an OpenCode sessionRef from inventory before clearing a stale live handle', async () => {
     const store = createStore({
       tabs: [{

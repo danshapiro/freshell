@@ -110,7 +110,12 @@ import { updateSettingsLocal } from '@/store/settingsSlice'
 import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
 import { clearAllReconcilePendingPanes, clearDeadSessionAdjudication, clearDeadTerminals, clearReconcileWarming, clearTerminalLiveHandles, setReconcilePendingPanes, updatePaneContent } from '@/store/panesSlice'
 import { collectPaneEntries } from '@/lib/pane-utils'
-import { isRetainedManagedTerminal, managedTerminalProjection, managedTerminalResumePaneStatus } from '@/lib/managed-terminal.js'
+import {
+  aggregateTerminalTabStatus,
+  isRetainedManagedTerminal,
+  managedTerminalProjection,
+  managedTerminalResumePaneStatus,
+} from '@/lib/managed-terminal.js'
 import { addTerminalFreshRecoveryRequestId, addTerminalRestoreRequestId, setPaneReconcileActive } from '@/lib/terminal-restore'
 import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
 import { foldTerminalInventoryTitles } from '@/lib/terminal-inventory-titles'
@@ -1621,6 +1626,7 @@ export default function App() {
         }
         if (msg.type === 'terminal.inventory') {
           const terminals = Array.isArray(msg.terminals) ? msg.terminals : []
+          const tabsWithManagedInventory = new Set<string>()
           const terminalMeta = Array.isArray(msg.terminalMeta) ? msg.terminalMeta : []
           const terminalMetaRequestedAt = Date.now()
           const previousTerminalMeta = appStore.getState().terminalMeta?.byTerminalId ?? {}
@@ -1661,10 +1667,18 @@ export default function App() {
                   }
                 }
                 if (matchedTerminal) {
-                  dispatch(updateTab({ id: tabId, updates: { status: managedStatus } }))
+                  tabsWithManagedInventory.add(tabId)
                 }
               }
             }
+          }
+          for (const tabId of tabsWithManagedInventory) {
+            const layout = appStore.getState().panes.layouts[tabId]
+            if (!layout) continue
+            const status = aggregateTerminalTabStatus(collectPaneEntries(layout).flatMap(({ content }) => (
+              content.kind === 'terminal' ? [content.status] : []
+            )))
+            if (status) dispatch(updateTab({ id: tabId, updates: { status } }))
           }
           const liveIds = terminals
             .filter((t: any) => t.status === 'running' || isRetainedManagedTerminal(t))

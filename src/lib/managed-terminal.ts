@@ -21,6 +21,14 @@ export function managedTerminalResumePaneStatus(terminal: ManagedRuntimeProjecti
   return managedTerminalPaneStatus(terminal, fallback)
 }
 
+/** Summarize a split tab from every terminal pane in a stable severity order. */
+export function aggregateTerminalTabStatus(statuses: readonly TerminalStatus[]): TerminalStatus | undefined {
+  for (const status of ['error', 'recovering', 'running', 'creating', 'exited'] as const) {
+    if (statuses.includes(status)) return status
+  }
+  return undefined
+}
+
 export function managedTerminalRecoveryLabel(terminal: ManagedRuntimeProjectionFields): string | undefined {
   if (!terminal.soulId) return undefined
   switch (terminal.recoverySummary?.recoveryState) {
