@@ -217,7 +217,15 @@ async fn validate_dir(
 }
 
 fn is_checkpoint_home(path: &Path) -> bool {
-    crate::checkpoints::is_account_home_checkpoint_path(path)
+    is_checkpoint_home_with_lookup(path, &crate::checkpoints::account_home_for_directory)
+}
+
+fn is_checkpoint_home_with_lookup(
+    path: &Path,
+    account_home_for_directory: &(dyn Fn(&Path) -> Result<PathBuf, String> + Send + Sync),
+) -> bool {
+    crate::checkpoints::account_home_checkpoint_path_with_lookup(path, account_home_for_directory)
+        .unwrap_or(true)
 }
 
 /// `GET /api/files/read?path=<p>` \u2192 `{ content, size, modifiedAt }` (`files-router.ts:85`).
@@ -1503,6 +1511,17 @@ mod tests {
         let value = body_json(response).await;
         assert_eq!(value["valid"], true);
         assert_eq!(value["checkpointWorkspaceEligible"], false);
+    }
+
+    #[test]
+    fn picker_scope_is_ineligible_when_owner_account_cannot_be_resolved() {
+        let workspace = tempfile::tempdir().unwrap();
+        let account_lookup = |_path: &Path| Err("synthetic NSS lookup failure".to_string());
+
+        assert!(is_checkpoint_home_with_lookup(
+            workspace.path(),
+            &account_lookup
+        ));
     }
 
     /// Node's `normalizeUserPath` runs `path.posix.resolve` on POSIX inputs

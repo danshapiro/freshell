@@ -3008,23 +3008,14 @@ fn recognized_account_homes(server_home: Option<&Path>) -> Vec<PathBuf> {
     homes
 }
 
-fn is_account_home_checkpoint_scope(path: &Path, server_home: &Path) -> bool {
-    is_account_home_checkpoint_path_with_server_home(path, Some(server_home))
-}
-
-pub(crate) fn is_account_home_checkpoint_path(path: &Path) -> bool {
-    is_account_home_checkpoint_path_with_server_home(path, None)
-}
-
-fn is_account_home_checkpoint_path_with_server_home(
+pub(crate) fn account_home_checkpoint_path_with_lookup(
     path: &Path,
-    server_home: Option<&Path>,
-) -> bool {
-    let Ok(path) = std::fs::canonicalize(path) else {
-        return false;
-    };
-    let homes = recognized_account_homes(server_home);
-    is_account_home_for_owner(&path, &homes, &account_home_for_directory).unwrap_or(false)
+    account_home_for_directory: &(dyn Fn(&Path) -> Result<PathBuf, String> + Send + Sync),
+) -> Result<bool, String> {
+    let path = std::fs::canonicalize(path)
+        .map_err(|error| format!("checkpoint workspace cannot be resolved: {error}"))?;
+    let homes = recognized_account_homes(None);
+    is_account_home_for_owner(&path, &homes, account_home_for_directory)
 }
 
 fn is_recognized_account_home(path: &Path, homes: &[PathBuf]) -> bool {
@@ -3044,7 +3035,7 @@ fn is_account_home_for_owner(
 }
 
 #[cfg(unix)]
-fn account_home_for_directory(path: &Path) -> Result<PathBuf, String> {
+pub(crate) fn account_home_for_directory(path: &Path) -> Result<PathBuf, String> {
     use std::ffi::{CStr, OsString};
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::MetadataExt;
@@ -3093,7 +3084,7 @@ fn account_home_for_directory(path: &Path) -> Result<PathBuf, String> {
 }
 
 #[cfg(windows)]
-fn account_home_for_directory(path: &Path) -> Result<PathBuf, String> {
+pub(crate) fn account_home_for_directory(path: &Path) -> Result<PathBuf, String> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HLOCAL};
     use windows_sys::Win32::Security::Authorization::{
@@ -3269,7 +3260,7 @@ fn account_home_for_directory(path: &Path) -> Result<PathBuf, String> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn account_home_for_directory(_path: &Path) -> Result<PathBuf, String> {
+pub(crate) fn account_home_for_directory(_path: &Path) -> Result<PathBuf, String> {
     Err("workspace owner account-home lookup is unavailable on this platform".into())
 }
 
@@ -3365,23 +3356,9 @@ async fn resolve_checkpoint_workspace_with_account_home(
                 candidate: candidate.clone(),
                 reason,
             })?;
-        if is_account_home_checkpoint_scope(&selected, server_home) {
-            return Err(CheckpointWorkspaceUnavailable {
-                candidate,
-                reason: "account home cannot be used as a code checkpoint workspace".to_string(),
-            });
-        }
         let selected_home =
             match is_account_home_for_owner(&selected, &homes, account_home_for_directory) {
-                Ok(is_home) => Some(is_home),
-                Err(_reason)
-                    if matches!(
-                        provenance.as_str(),
-                        "directory-picker" | "legacy-checkpoint"
-                    ) =>
-                {
-                    None
-                }
+                Ok(is_home) => is_home,
                 Err(reason) => {
                     return Err(CheckpointWorkspaceUnavailable {
                         candidate,
@@ -3389,7 +3366,7 @@ async fn resolve_checkpoint_workspace_with_account_home(
                     });
                 }
             };
-        if selected_home == Some(true) {
+        if selected_home {
             return Err(CheckpointWorkspaceUnavailable {
                 candidate,
                 reason: "account home cannot be used as a code checkpoint workspace".to_string(),
@@ -3404,12 +3381,6 @@ async fn resolve_checkpoint_workspace_with_account_home(
         let path = match git_checkout_root(&selected).await {
             Ok(Some(root)) if provenance == "directory-picker" && root == selected => selected,
             Ok(Some(root)) => {
-                if selected_home.is_none() {
-                    return Err(CheckpointWorkspaceUnavailable {
-                        candidate,
-                        reason: "workspace account scope is unknown; the selected directory cannot be widened to its Git root".into(),
-                    });
-                }
                 match is_account_home_for_owner(&root, &homes, account_home_for_directory) {
                     Ok(true) => {
                         return Err(CheckpointWorkspaceUnavailable {
@@ -7078,6 +7049,41 @@ mod tests {
         .expect_err("a picker-confirmed passwd-entry home is never a checkpoint scope");
 
         assert!(error.reason.contains("account home"), "{}", error.reason);
+    }
+
+    #[tokio::test]
+    async fn picker_scope_is_unavailable_when_owner_home_cannot_be_resolved() {
+        let owned = tempfile::tempdir().unwrap();
+        let server_home = owned.path().join("managed-home");
+        let selected = owned.path().join("unknown-account-home");
+        tokio::fs::create_dir_all(&server_home).await.unwrap();
+        tokio::fs::create_dir_all(&selected).await.unwrap();
+        let account_home_for_directory =
+            |_path: &Path| Err("synthetic NSS lookup failure".to_string());
+        let intent = json!({
+            "path": selected,
+            "provenance": "directory-picker",
+        });
+
+        let error = resolve_checkpoint_workspace_with_account_home(
+            &server_home,
+            intent["path"].as_str().map(Path::new).unwrap(),
+            Some(&intent),
+            &account_home_for_directory,
+        )
+        .await
+        .expect_err("an unknown owner home must not become a non-Git snapshot scope");
+
+        assert!(
+            error.reason.contains("account scope is unknown"),
+            "{}",
+            error.reason
+        );
+        assert!(
+            error.reason.contains("synthetic NSS lookup failure"),
+            "{}",
+            error.reason
+        );
     }
 
     #[tokio::test]
