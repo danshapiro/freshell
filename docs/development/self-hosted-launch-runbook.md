@@ -109,12 +109,29 @@ the procedure mid-way and leave the service down. Two sequences:
   the short skew window.
 - Strict (changes that must never skew): `systemctl --user stop
   freshell-supervisor.service` (the server stops with it via the `Requires=`
-  coupling), build, then `systemctl --user start freshell-supervisor.service
-  freshell-rust.service` — start BOTH units: `Requires=` pulls the
-  supervisor in when the server starts, but starting the supervisor alone
-  does not start its dependent server, so starting only the supervisor
-  would leave the web server down. No soul can be created during the
-  build. This is a full outage for the duration of the build.
+  coupling), build, then start in socket order: start BOTH units —
+  `Requires=` pulls the supervisor in when the server starts, but starting
+  the supervisor alone does not start its dependent server, so starting
+  only the supervisor would leave the web server down. The supervisor
+  unit is `Type=simple`, so systemd considers it "started" BEFORE its
+  control socket exists (the socket binds after startup reconciliation);
+  the server needs that socket. After starting the supervisor, wait for
+  the socket before relying on the server, or start the server in a
+  second command once the socket is live:
+
+  ```bash
+  systemctl --user start freshell-supervisor.service
+  until [ -S "$HOME/.freshell/managed-runtime/control/supervisor.sock" ]; do
+    sleep 1
+  done
+  systemctl --user start freshell-rust.service
+  ```
+
+  If the server unit fails its first start in the race window, that is
+  this socket ordering, not a bad build — wait for the socket and start
+  it again (repeated immediate failures can also trip the unit's start
+  limit). No soul can be created during the build. This is a full outage
+  for the duration of the build.
 
 - The server's soul controller is strictly opt-in (`default = []` in
   `crates/freshell-server/Cargo.toml`). Setting `FRESHELL_MANAGED_RUNTIME_V1=1`
@@ -231,7 +248,11 @@ drop-in, plus `freshell-supervisor.service`):
    an individually blocked soul is a per-soul outcome that does not enter
    `blockedSubsystems`, which is why step 4 checks each soul directly.
 3. Units: `systemctl --user is-active freshell-rust.service
-   freshell-supervisor.service` → both `active`.
+   freshell-supervisor.service` → both `active`, and the supervisor's
+   control socket
+   (`~/.freshell/managed-runtime/control/supervisor.sock`) exists with
+   mode `0600` — the supervisor unit is `Type=simple`, so "active" does
+   not by itself prove the socket is up.
 4. Existing souls: capture the post-restart inventory to a SEPARATE file
    in the same private run directory and compare it against the preserved
    baseline — do NOT re-run the pre-restart command as-is, which would
@@ -442,15 +463,34 @@ print("identity ok:", s.get("terminalId"))' "$TID"
 o=json.load(sys.stdin)
 assert o.get("outcome")=="verified_empty", o
 print("stopped:", o["outcome"])'
-    rm -rf "$D"   # runs only on success; the trap already removed the header
+    # Stop the browser-check soul the same way BEFORE deleting its
+    # workspace (closing the pane only detaches; the soul keeps running):
+    if [ -n "${BWS:-}" ]; then
+      BS_ID=$(curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
+        | python3 -c 'import json,sys
+souls=json.load(sys.stdin)["souls"]
+hits=[s for s in souls if s.get("terminalCwd")==sys.argv[1] and s.get("launchState")=="running"]
+print(hits[0]["soulId"] if hits else "")' "$BWS")
+      if [ -n "$BS_ID" ]; then
+        BREV=$(curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls/$BS_ID \
+          | python3 -c 'import json,sys;print(json.load(sys.stdin)["soul"]["intentRevision"])')
+        curl -s -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
+          -d "{\"requestId\":\"probe-cleanup\",\"expectedIntentRevision\":$BREV}" \
+          http://127.0.0.1:3001/api/runtime/souls/$BS_ID/stop \
+          | python3 -c 'import json,sys
+o=json.load(sys.stdin)
+assert o.get("outcome")=="verified_empty", o
+print("stopped browser soul:", o["outcome"])'
+      fi
+    fi
+    rm -rf "$D" "$WS" "${BWS:-}"   # runs only on success; trap removed the header
     ```
 
     If the block aborts before `verified_empty`, the token header is
     already gone (the `trap` removed it) while the non-secret probe
     records — the soul ID and the tab response — remain in `$D` for the
     documented recheck-and-retry; delete `$D`, `$WS`, and `$BWS`
-    manually once the probe souls are resolved. On success, also remove
-    the workspaces: `rm -rf "$D" "$WS" "$BWS"`.
+    manually once BOTH probe souls are resolved.
 
    Do NOT `docker stop` a probe container directly — the supervisor
    treats an externally stopped container as an unexpected exit and runs
