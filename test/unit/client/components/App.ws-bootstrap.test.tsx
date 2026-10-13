@@ -1097,6 +1097,56 @@ describe('App WS bootstrap recovery', () => {
     expect(store.getState().tabs.tabs.find(tab => tab.id === 'inventory-live-tab')?.status).toBe('running')
   })
 
+  it.each([
+    { recoveryState: 'blocked', runtimeStatus: 'blocked', expectedStatus: 'error' },
+    { recoveryState: 'lost', runtimeStatus: 'exited', expectedStatus: 'error' },
+    { recoveryState: 'stopped', runtimeStatus: 'exited', expectedStatus: 'exited' },
+  ] as const)(
+    'persists the final $recoveryState managed status from a disconnected terminal inventory',
+    async ({ recoveryState, runtimeStatus, expectedStatus }) => {
+      const store = createStore({
+        tabs: [{ id: `inventory-${recoveryState}-tab`, mode: 'opencode', status: 'running' }],
+        panes: {
+          layouts: {
+            [`inventory-${recoveryState}-tab`]: {
+              type: 'leaf', id: `inventory-${recoveryState}-pane`, content: {
+                kind: 'terminal', mode: 'opencode', status: 'running',
+                terminalId: `inventory-${recoveryState}-terminal`,
+                streamId: `inventory-${recoveryState}-stream`,
+                createRequestId: `inventory-${recoveryState}-create`,
+                soulId: `inventory-${recoveryState}-soul`,
+              },
+            },
+          },
+          activePane: { [`inventory-${recoveryState}-tab`]: `inventory-${recoveryState}-pane` },
+        },
+      })
+      render(<Provider store={store}><App /></Provider>)
+      await waitFor(() => expect(messageHandler).toBeTypeOf('function'))
+
+      act(() => messageHandler?.({
+        type: 'terminal.inventory',
+        terminals: [{
+          terminalId: `inventory-${recoveryState}-terminal`, mode: 'opencode', status: 'exited',
+          runtimeStatus, soulId: `inventory-${recoveryState}-soul`, incarnationId: `inventory-${recoveryState}-incarnation`,
+          recoverySummary: {
+            desiredState: recoveryState === 'stopped' ? 'stopped' : 'running',
+            recoveryState,
+            durabilityState: 'live_only',
+            allocationState: 'degraded',
+          },
+        }],
+      }))
+
+      const layout = store.getState().panes.layouts[`inventory-${recoveryState}-tab`]
+      expect(layout.type).toBe('leaf')
+      if (layout.type !== 'leaf') throw new Error('expected a leaf pane')
+      expect(layout.content.status).toBe(expectedStatus)
+      expect(store.getState().tabs.tabs.find(tab => tab.id === `inventory-${recoveryState}-tab`)?.status)
+        .toBe(expectedStatus)
+    },
+  )
+
   it('recovers an OpenCode sessionRef from inventory before clearing a stale live handle', async () => {
     const store = createStore({
       tabs: [{

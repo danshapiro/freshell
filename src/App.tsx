@@ -1660,7 +1660,7 @@ export default function App() {
                     } }))
                   }
                 }
-                if (matchedTerminal && isLive) {
+                if (matchedTerminal) {
                   dispatch(updateTab({ id: tabId, updates: { status: managedStatus } }))
                 }
               }
