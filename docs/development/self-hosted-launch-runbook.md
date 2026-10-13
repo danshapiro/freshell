@@ -657,7 +657,13 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
 
     ```bash
     : "${PROBE_ROOT:=$(mktemp -d ~/freshell-probe.XXXXXX)}"
-    chmod 0770 "$PROBE_ROOT"   # only ever chmods a directory this run made
+    # An environment-inherited PROBE_ROOT is only trusted after the same
+    # pattern check the cleanup guard applies — never chmod (or later
+    # rm -rf) an unvalidated directory:
+    case "$PROBE_ROOT" in
+      "$HOME"/freshell-probe.*) chmod 0770 "$PROBE_ROOT" ;;
+      *) echo "REFUSING: PROBE_ROOT=$PROBE_ROOT is not a freshell-probe run root"; exit 1 ;;
+    esac
     BWS=$(mktemp -d "$PROBE_ROOT/bws.XXXXXX")   # unique per run
     chmod 0770 "$BWS"   # same in-soul-shell access requirement as $WS
     echo "BWS=$BWS" >> "$D/run.env"
@@ -762,7 +768,7 @@ print("UI pane is managed:", rows[-1]["soulId"])' "$BWS"
         [ -n "$VAL" ] || continue
         VAL=$(realpath -e "$VAL") || { echo "$V: path does not exist"; exit 1; }
         case "$VAL" in
-          "$HOME"/freshell-probe.*/ws.*|"$HOME"/freshell-probe.*/bws.*) printf -v "$V" '%s' "$VAL" ;;
+          "$HOME"/freshell-probe.*) printf -v "$V" '%s' "$VAL" ;;
           *) echo "REFUSING: $V=$VAL is not under a freshell-probe run root — resolve manually"; exit 1 ;;
         esac
       done
@@ -803,12 +809,12 @@ PY
     # against this run's layout BEFORE any stop request or deletion. A
     # mistaken variable pointing at a real workspace (one managed soul in
     # it) would otherwise stop that live session AND rm -rf its files:
-    for V in WS BWS; do
+    for V in WS BWS PROBE_ROOT; do
       eval "VAL=\${$V:-}"
       [ -n "$VAL" ] || continue
       VAL=$(realpath -e "$VAL") || { echo "$V: path does not exist"; exit 1; }
       case "$VAL" in
-        "$HOME"/freshell-probe.*/ws.*|"$HOME"/freshell-probe.*/bws.*) printf -v "$V" '%s' "$VAL" ;;
+        "$HOME"/freshell-probe.*) printf -v "$V" '%s' "$VAL" ;;
         *) echo "REFUSING: $V=$VAL is not under a freshell-probe run root — resolve manually"; exit 1 ;;
       esac
     done
@@ -916,6 +922,13 @@ print("" if cur is None else cur)')
         if [ "$CUR" = "$BWS" ]; then break; fi
         sleep 2
       done
+      if [ "$CUR" != "$BWS" ]; then
+        # The save state is unknown — a still-in-flight picker save could
+        # re-point the default AFTER our restore, into a deleted dir. Do
+        # not proceed; wait for the save to settle and re-run cleanup:
+        echo "OpenCode default never settled on the probe path — the picker's async save may still be in flight; wait, then re-run this step"
+        exit 1
+      fi
     fi
     # Then the restore itself — JSON-safe (a path containing
     # quotes/backslashes must not corrupt the request; a null CLEARS a
