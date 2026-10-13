@@ -608,6 +608,48 @@ fn insert_resource(
     Ok(())
 }
 
+fn insert_installed_package_ancestor_resources(
+    scope: &Path,
+    home: &Path,
+    declaring: &Path,
+    result: &mut std::collections::BTreeSet<PathBuf>,
+    resource_path_bytes: &mut usize,
+    field: &'static str,
+) -> Result<(), ResourceError> {
+    for ancestor in scope.parent().into_iter().flat_map(Path::ancestors) {
+        if ancestor == Path::new("/") {
+            break;
+        }
+        for name in [
+            "node_modules",
+            "package.json",
+            "package-lock.json",
+            "bun.lock",
+            "bun.lockb",
+            "pnpm-lock.yaml",
+        ] {
+            let candidate = ancestor.join(name);
+            match std::fs::symlink_metadata(&candidate) {
+                Ok(_) => {
+                    checked(&candidate, field, declaring)?;
+                    insert_resource(result, resource_path_bytes, candidate, field)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    return Err(ResourceError {
+                        field,
+                        cause: "installed plugin lookup context is unavailable",
+                    })
+                }
+            }
+        }
+        if ancestor == home {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// Return complete ordinary units and native installed ancestor lookup units.
 /// Exact mounts retain native field spellings and their declaring origins.
 pub fn select(
@@ -713,7 +755,15 @@ pub fn select(
                     insert_resource(
                         &mut result,
                         &mut resource_path_bytes,
-                        package_root,
+                        package_root.clone(),
+                        "OpenCode mcp.command",
+                    )?;
+                    insert_installed_package_ancestor_resources(
+                        &package_root,
+                        home,
+                        declaring,
+                        &mut result,
+                        &mut resource_path_bytes,
                         "OpenCode mcp.command",
                     )?;
                     continue;
@@ -934,37 +984,14 @@ pub fn select(
             return Err(fail(field, "select a bounded plugin or package directory"));
         }
         insert_resource(&mut result, &mut resource_path_bytes, scope.clone(), field)?;
-        for ancestor in scope.parent().into_iter().flat_map(Path::ancestors) {
-            if ancestor == Path::new("/") {
-                break;
-            }
-            for name in [
-                "node_modules",
-                "package.json",
-                "package-lock.json",
-                "bun.lock",
-                "bun.lockb",
-                "pnpm-lock.yaml",
-            ] {
-                let candidate = ancestor.join(name);
-                match std::fs::symlink_metadata(&candidate) {
-                    Ok(_) => {
-                        checked(&candidate, field, declaring)?;
-                        insert_resource(&mut result, &mut resource_path_bytes, candidate, field)?;
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(_) => {
-                        return Err(fail(
-                            field,
-                            "installed plugin lookup context is unavailable",
-                        ))
-                    }
-                }
-            }
-            if ancestor == home {
-                break;
-            }
-        }
+        insert_installed_package_ancestor_resources(
+            &scope,
+            home,
+            declaring,
+            &mut result,
+            &mut resource_path_bytes,
+            field,
+        )?;
     }
     Ok((
         result.into_iter().collect(),

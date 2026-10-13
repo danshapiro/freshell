@@ -477,6 +477,133 @@ mod configured_resource_tests {
     }
 
     #[test]
+    fn bun_package_script_dependency_in_parent_node_modules_runs_after_both_copies() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let external = owned.path().join("external");
+        let package = external.join("mcp-package");
+        let nested_cwd = package.join("nested");
+        let dependency = external.join("node_modules/parent-dependency");
+        for path in [&home, &workspace, &nested_cwd, &dependency] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"scripts":{"mcp.js":"node ./server.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("server.js"),
+            "process.stdout.write(require('parent-dependency'))\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dependency.join("index.js"),
+            "module.exports='parent dependency loaded'\n",
+        )
+        .unwrap();
+        let config = workspace.join("opencode.json");
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "mcp": {
+                    "package-script": {
+                        "type": "local",
+                        "cwd": nested_cwd,
+                        "command": ["bun", "run", "mcp.js"],
+                    },
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config,
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Workspace,
+            }],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .unwrap();
+        let selected = &plan[0].configured_resources;
+        assert!(selected.contains(&package.canonicalize().unwrap()));
+        assert!(selected.contains(&external.join("node_modules").canonicalize().unwrap()));
+        assert!(!selected.contains(&nested_cwd.canonicalize().unwrap()));
+
+        let units = resource_units(
+            &home,
+            &home.join(".config/opencode"),
+            &workspace,
+            &plan,
+            None,
+        )
+        .unwrap();
+        let stage = owned.path().join("stage");
+        let host = owned.path().join("host");
+        let stage_selections = units
+            .iter()
+            .map(|(source, mount)| CopySelection {
+                source: source.clone(),
+                destination_relative: mount.stage_relative_path.clone().into(),
+            })
+            .collect::<Vec<_>>();
+        copy_environment(&stage_selections, &stage, &[], Default::default()).unwrap();
+        let host_selections = units
+            .iter()
+            .map(|(_, mount)| CopySelection {
+                source: stage.join(&mount.stage_relative_path),
+                destination_relative: mount.provider_relative_path.clone().into(),
+            })
+            .collect::<Vec<_>>();
+        copy_environment(&host_selections, &host, &[], Default::default()).unwrap();
+
+        // Managed mounts retain the selected resources' original relative
+        // topology, so package resolution can walk from the package into its
+        // parent's node_modules directory.
+        let provider = owned.path().join("provider");
+        let provider_selections = units
+            .iter()
+            .map(|(_, mount)| CopySelection {
+                source: host.join(&mount.provider_relative_path),
+                destination_relative: Path::new(&mount.effective_destination)
+                    .strip_prefix(owned.path())
+                    .unwrap()
+                    .to_path_buf(),
+            })
+            .collect::<Vec<_>>();
+        copy_environment(&provider_selections, &provider, &[], Default::default()).unwrap();
+        let staged_package = provider.join(package.strip_prefix(owned.path()).unwrap());
+        let staged_manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(staged_package.join("package.json")).unwrap())
+                .unwrap();
+        let staged_script = staged_manifest["scripts"]["mcp.js"].as_str().unwrap();
+        let hidden = owned.path().join("hidden-external");
+        std::fs::rename(&external, &hidden).unwrap();
+        // Execute the package manifest's actual command after both copy
+        // stages, without making the Rust test depend on a host Bun install.
+        let output = std::process::Command::new("sh")
+            .args(["-c", staged_script])
+            .current_dir(&staged_package)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .output()
+            .unwrap();
+        std::fs::rename(&hidden, &external).unwrap();
+        assert!(
+            output.status.success(),
+            "the staged Bun package script must resolve its parent-installed dependency: {:?}",
+            output.stderr
+        );
+        assert_eq!(output.stdout, b"parent dependency loaded");
+    }
+
+    #[test]
     fn managed_provider_nested_attention_and_literal_tilde_keep_native_origins_after_both_copies() {
         for scenario in ["nested", "top-replacement", "tilde"] {
             let owned = tempfile::tempdir().unwrap();
