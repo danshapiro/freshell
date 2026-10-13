@@ -121,9 +121,12 @@ if [ "${SPID:-0}" -gt 0 ] 2>/dev/null; then
 fi
 if [ -z "$TOK" ]; then
   TOK=$(python3 - "$CHECKOUT/.env" <<'PY'
-import re,sys
+import os,re,sys
+path=sys.argv[1]
+if not os.path.exists(path): sys.exit(0)   # no .env — token comes from
+                                           # the unit's EnvironmentFile
 last=None
-for line in open(sys.argv[1]):
+for line in open(path):
     m=re.match(r'^\s*(?:export\s+)?AUTH_TOKEN\s*=\s*(.*)$', line.rstrip("\n"))
     if m: last=m.group(1)
 if last is None: sys.exit(0)
@@ -135,11 +138,18 @@ else:
 PY
 )
 fi
-test -n "$TOK" || { echo "AUTH_TOKEN not found — extract it manually"; exit 1; }
 umask 077
-printf 'x-auth-token: %s\n' "$TOK" > "$RUN/hdr"
+if [ -n "$TOK" ]; then
+  printf 'x-auth-token: %s\n' "$TOK" > "$RUN/hdr"
+else
+  # Dead server + token only in the unit's EnvironmentFiles: DEFER token
+  # acquisition to step 5 (the server is alive by then) rather than
+  # aborting — the API-less capture below still records the containers:
+  echo "AUTH_TOKEN unresolvable while the server is down — container-count capture only; step 5 re-acquires the token" >&2
+  : > "$RUN/desired-running.txt"
+fi
 trap 'rm -f "${RUN:-/nonexistent}/hdr"' EXIT   # ${RUN:-} survives set -u
-if curl -s -o /dev/null -w '%{http_code}' -H @"$RUN/hdr" \
+if [ -f "$RUN/hdr" ] && curl -s -o /dev/null -w '%{http_code}' -H @"$RUN/hdr" \
      http://127.0.0.1:3001/api/runtime/readiness | grep -q 200; then
   curl -s -H @"$RUN/hdr" http://127.0.0.1:3001/api/runtime/souls \
     | python3 -c 'import json,sys
@@ -184,12 +194,16 @@ the procedure mid-way and leave the service down. Two sequences:
   systemctl --user start freshell-supervisor.service
   SOCK="$HOME/.freshell/managed-runtime/control/supervisor.sock"
   # Two failure detectors: supervisor-unit LIVENESS (fast — a dead unit
-  # ends the wait immediately) and a generous absolute CAP (stall — a
-  # live-but-wedged process must not hang the redeploy forever).
-  # Reconciliation sizing is configurable, so no formula is exact; the
-  # 3600s default exceeds any sane inventory, and operators with extreme
-  # configs can raise it:
-  CAP=${FRESHELL_PROBE_SOCKET_WAIT_SECONDS:-3600}
+  # ends the wait immediately) and an inventory-sized absolute CAP
+  # (stall — a live-but-wedged process must not hang the redeploy
+  # forever). Worst-case reconciliation is 900s per soul at four-way
+  # concurrency (225s effective each); double that for margin and floor
+  # at an hour. Operators with extreme configs can override the env var:
+  N=$(wc -l < "$RUN/desired-running.txt" 2>/dev/null || echo 0)
+  [ "$N" -gt 0 ] || N=$(wc -l < "$RUN/souls-before.txt" 2>/dev/null || echo 0)
+  WC=$(( N * 225 * 2 ))
+  [ "$WC" -ge 3600 ] || WC=3600
+  CAP=${FRESHELL_PROBE_SOCKET_WAIT_SECONDS:-$WC}
   WAITED=0
   while true; do
     # CONNECT-probe, not a file test: a stopped supervisor leaves its old
