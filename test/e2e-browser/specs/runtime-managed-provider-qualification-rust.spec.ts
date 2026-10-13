@@ -69,6 +69,16 @@ type ProviderDefinition = {
   nativeIdPattern: RegExp
 }
 
+type ProviderPaneSetupStage =
+  | 'existing_panes'
+  | 'picker_open'
+  | 'provider_selection'
+  | 'directory_dialog'
+  | 'pane_creation'
+  | 'terminal_visible'
+  | 'managed_runtime_view'
+  | 'ready'
+
 function providerDefinitions(): ProviderDefinition[] {
   const rawSelection = process.env[QUALIFICATION_PROVIDER_SELECTION_ENV]?.trim()
   if (!rawSelection) {
@@ -307,27 +317,36 @@ async function createProviderPane(
   rig: ManagedFixtureRig,
   tabId: string,
   definition: ProviderDefinition,
+  onStage?: (stage: ProviderPaneSetupStage) => void,
 ): Promise<{ paneId: string; terminalId: string; view: ManagedRuntimeView }> {
+  onStage?.('existing_panes')
   const priorPaneIds = new Set(
     leavesByMode(await harness.getPaneLayout(tabId), definition.provider).map((leaf) => leaf.id),
   )
+  onStage?.('picker_open')
   const picker = await openPanePicker(page)
+  onStage?.('provider_selection')
   await picker.getByRole('button', { name: definition.pickerName }).click({ force: true })
+  onStage?.('directory_dialog')
   const directory = page.getByRole('combobox', { name: definition.directoryName })
   await expect(directory).toBeVisible({ timeout: 15_000 })
   await directory.fill(rig.repoRoot)
   await directory.press('Enter')
 
+  onStage?.('pane_creation')
   const leaf = await waitForValue(`${definition.provider} picker-created pane`, async () => (
     leavesByMode(await harness.getPaneLayout(tabId), definition.provider)
       .find((candidate) => !priorPaneIds.has(candidate.id) && candidate.content?.terminalId)
   ), 120_000)
+  onStage?.('terminal_visible')
   await page.locator(`[data-pane-id="${leaf.id}"] .xterm:visible`)
     .waitFor({ state: 'visible', timeout: 120_000 })
+  onStage?.('managed_runtime_view')
   const view = await waitForValue(`${definition.provider} managed runtime view`, async () => {
     const candidate = await rig.runningViewForTerminal(leaf.content.terminalId)
     return candidate?.containerId ? candidate : null
   }, 120_000)
+  onStage?.('ready')
   return { paneId: leaf.id, terminalId: leaf.content.terminalId, view }
 }
 
@@ -588,8 +607,9 @@ test.describe.serial('ordinary managed-provider use', () => {
       const failedProviders: string[] = []
       for (const definition of definitions) {
         let created: Awaited<ReturnType<typeof createProviderPane>> | undefined
+        let paneSetupStage: ProviderPaneSetupStage | null = null
         try {
-          created = await createProviderPane(page, harness, rig, tabId, definition)
+          created = await createProviderPane(page, harness, rig, tabId, definition, stage => { paneSetupStage = stage })
           if (definition.provider === 'amplifier') {
             throw new Error('Amplifier is excluded from the ordinary terminal smoke')
           }
@@ -611,6 +631,7 @@ test.describe.serial('ordinary managed-provider use', () => {
           console.error(JSON.stringify({ severity: 'error', event: 'durable_souls.ordinary_turn_failed',
             lane: 'terminal', provider: definition.provider,
             errorName: error instanceof Error ? error.name : 'UnknownError', terminalFacts,
+            paneSetupFailureStage: created ? null : paneSetupStage,
             ordinaryTurnFailureStage: error instanceof OrdinaryTerminalTurnError ? error.stage : null,
             ordinaryTurnFacts: error instanceof OrdinaryTerminalTurnError ? error.facts : null }))
         }
