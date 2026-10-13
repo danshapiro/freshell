@@ -3,12 +3,12 @@ use crate::opencode_transfer::OpenCodeTransferStageReferences;
 use crate::recovery_retry::{self, RecoveryRetry, TransientRecoveryFailure};
 use freshell_runtime_protocol::{
     AllocationState, CleanupState, DesiredState, DockerDaemonId, DurabilityState, FixtureKind,
-    FreshAgentLaunchSpec, FreshAgentTurnSettings, GrantId, HostBootId, IncarnationId, IncidentId,
-    InstallationId, LaunchNonce, LaunchState, LostSoulRepairTarget, NoticeId,
-    OpenCodeAdoptionBaseline, OpenCodeTransferDescriptor, RecoveryAttemptId, RecoveryBlockReason,
-    RecoveryPath, RecoveryState, RecoveryTrigger, RequestId, RestoreLostSoulsRequest, ResumeSpec,
-    RuntimeLimits, RuntimeProfile, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec,
-    ViewIntentRequest,
+    FreshAgentLaunchSpec, FreshAgentTurnSettings, FreshProvider, GrantId, HostBootId,
+    IncarnationId, IncidentId, InstallationId, LaunchNonce, LaunchState, LostSoulRepairTarget,
+    NoticeId, OpenCodeAdoptionBaseline, OpenCodeTransferDescriptor, RecoveryAttemptId,
+    RecoveryBlockReason, RecoveryPath, RecoveryState, RecoveryTrigger, RequestId,
+    RestoreLostSoulsRequest, ResumeSpec, RuntimeLimits, RuntimeProfile, RuntimeView, SoulId,
+    StopOutcome, TerminalLaunchSpec, ViewIntentRequest,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -1135,6 +1135,120 @@ impl Registry {
             tx.commit()?;
             Ok(ExecutionGrantRecord { control_epoch, execution_generation: generation, grant_id, host_boot_id })
         }).await
+    }
+
+    /// Settle a Codex grant that the session host positively rejected before
+    /// it could spawn the PTY worker. The caller must first stop the exact
+    /// owned runtime and prove it empty; this transaction then rechecks the
+    /// grant and intent fences before releasing the incarnation's claims.
+    pub(crate) async fn fail_codex_pre_worker_start(
+        &self,
+        handle: OwnedRuntimeHandle,
+        expected_intent_revision: u64,
+        grant: ExecutionGrantRecord,
+    ) -> Result<(), RegistryError> {
+        if grant.control_epoch != self.control_epoch() {
+            return Err(RegistryError::StaleControlEpoch {
+                expected: grant.control_epoch,
+                current: self.control_epoch(),
+            });
+        }
+        if !handle
+            .terminal()
+            .is_some_and(|terminal| terminal.mode == "codex")
+            && !handle
+                .fresh_agent()
+                .is_some_and(|agent| agent.provider == FreshProvider::Codex)
+        {
+            return Err(RegistryError::InvalidState(
+                "pre-worker Codex failure does not own a Codex workload".into(),
+            ));
+        }
+
+        let installation = self.installation_id().clone();
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current = load_owned_handle(&tx, installation, handle.incarnation_id())?;
+            if current.soul_id != handle.soul_id
+                || current.provider_store_id != handle.provider_store_id
+                || current.launch_nonce != handle.launch_nonce
+                || current.daemon_id != handle.daemon_id
+                || current.container_id != handle.container_id
+                || current.image_ref != handle.image_ref
+                || current.runtime_dir != handle.runtime_dir
+                || current.host_binary_path != handle.host_binary_path
+                || current.immutable_config_digest != handle.immutable_config_digest
+                || current.launch_policy != handle.launch_policy
+                || current.requested_limits != handle.requested_limits
+                || current.fixture != handle.fixture
+                || current.terminal != handle.terminal
+                || current.fresh_agent != handle.fresh_agent
+                || current.provider_volume_name != handle.provider_volume_name
+            {
+                return Err(RegistryError::InvalidState(
+                    "pre-worker Codex runtime ownership changed".into(),
+                ));
+            }
+
+            let (launch_state, cleanup_state, host_boot_id, execution_generation, grant_id, provider, desired_state, intent_revision): (
+                String,
+                String,
+                Option<String>,
+                u64,
+                Option<String>,
+                String,
+                String,
+                u64,
+            ) = tx.query_row(
+                "SELECT i.launch_state,i.cleanup_state,i.host_boot_id,i.execution_generation,i.grant_id,s.provider,s.desired_state,s.intent_revision FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id WHERE i.incarnation_id=?1",
+                params![handle.incarnation_id().as_str()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)),
+            )?;
+            if launch_state != "starting"
+                || cleanup_state != "none"
+                || host_boot_id.as_deref() != Some(grant.host_boot_id.as_str())
+                || execution_generation != grant.execution_generation
+                || grant_id.as_deref() != Some(grant.grant_id.as_str())
+                || provider != "codex"
+                || desired_state != "running"
+                || intent_revision != expected_intent_revision
+            {
+                return Err(RegistryError::InvalidState(
+                    "pre-worker Codex grant or intent changed before settlement".into(),
+                ));
+            }
+
+            let now = now_millis();
+            let changed = tx.execute(
+                "UPDATE incarnations SET launch_state='failed',cleanup_state='verified_empty',updated_at=?1 WHERE incarnation_id=?2 AND launch_state='starting' AND cleanup_state='none' AND host_boot_id=?3 AND execution_generation=?4 AND grant_id=?5 AND EXISTS (SELECT 1 FROM souls WHERE soul_id=incarnations.soul_id AND provider='codex' AND desired_state='running' AND intent_revision=?6)",
+                params![now, handle.incarnation_id().as_str(), grant.host_boot_id.as_str(), grant.execution_generation, grant.grant_id.as_str(), expected_intent_revision],
+            )?;
+            if changed != 1 {
+                return Err(RegistryError::InvalidState(
+                    "pre-worker Codex incarnation changed during settlement".into(),
+                ));
+            }
+            let commands_changed = tx.execute(
+                "UPDATE commands SET state='failed',updated_at=?1 WHERE incarnation_id=?2 AND state='starting'",
+                params![now, handle.incarnation_id().as_str()],
+            )?;
+            if commands_changed == 0 {
+                return Err(RegistryError::InvalidState(
+                    "pre-worker Codex launch command is no longer starting".into(),
+                ));
+            }
+            tx.execute(
+                "DELETE FROM writer_claims WHERE incarnation_id=?1",
+                params![handle.incarnation_id().as_str()],
+            )?;
+            tx.execute(
+                "DELETE FROM admission_reservations WHERE incarnation_id=?1",
+                params![handle.incarnation_id().as_str()],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn mark_running(&self, incarnation_id: IncarnationId) -> Result<(), RegistryError> {

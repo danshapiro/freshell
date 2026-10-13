@@ -1281,12 +1281,28 @@ impl Supervisor {
             .map_err(|error| {
                 self.activation_failure(&prepared, state, "enable_long_lived_runtime", error)
             })?;
-        let mut accepted = self
+        let mut accepted = match self
             .send_grant(&handle, &workload, &authenticated, &grant)
             .await
-            .map_err(|error| {
-                self.activation_failure(&prepared, state, "deliver_execution_grant", error)
-            })?;
+        {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                if error.diagnostic_code
+                    == Some(
+                        freshell_runtime_protocol::RuntimeDiagnosticCode::CodexAppServerStartFailed,
+                    )
+                {
+                    self.settle_known_codex_pre_worker_failure(&prepared, &handle, &grant)
+                        .await;
+                }
+                return Err(self.activation_failure(
+                    &prepared,
+                    state,
+                    "deliver_execution_grant",
+                    error,
+                ));
+            }
+        };
         let native_context = self
             .registry
             .recovery_context(workload.soul_id.clone())
@@ -1502,6 +1518,177 @@ impl Supervisor {
             activation_failure_data(prepared, state, stage, &error),
         );
         error
+    }
+
+    async fn settle_known_codex_pre_worker_failure(
+        &self,
+        prepared: &PreparedLaunch,
+        handle: &crate::registry::OwnedRuntimeHandle,
+        grant: &ExecutionGrantRecord,
+    ) {
+        let codex_workload = handle
+            .terminal()
+            .is_some_and(|terminal| terminal.mode == "codex")
+            || handle.fresh_agent().is_some_and(|agent| {
+                agent.provider == freshell_runtime_protocol::FreshProvider::Codex
+            });
+        if !codex_workload || !self.stop_and_verify_empty_codex_runtime(handle).await {
+            return;
+        }
+
+        match self
+            .registry
+            .fail_codex_pre_worker_start(handle.clone(), prepared.intent_revision, grant.clone())
+            .await
+        {
+            Ok(()) => append_event(
+                &self.config.lifecycle_log,
+                "supervisor.codex_pre_worker_failure_settled",
+                serde_json::json!({
+                    "severity":"info",
+                    "soulId":handle.soul_id(),
+                    "incarnationId":handle.incarnation_id(),
+                    "intentRevision":prepared.intent_revision,
+                    "executionGeneration":grant.execution_generation,
+                    "controlEpoch":grant.control_epoch,
+                    "failureReason":"CODEX_APP_SERVER_START_FAILED",
+                    "cleanup":"verified_empty",
+                }),
+            ),
+            Err(error) => {
+                let registry_error = map_registry(error);
+                append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.codex_pre_worker_failure_settlement_deferred",
+                    serde_json::json!({
+                        "severity":"warning",
+                        "soulId":handle.soul_id(),
+                        "incarnationId":handle.incarnation_id(),
+                        "intentRevision":prepared.intent_revision,
+                        "executionGeneration":grant.execution_generation,
+                        "controlEpoch":grant.control_epoch,
+                        "reason":"registry_fence_changed",
+                        "errorCode":registry_error.code,
+                        "cleanup":"verified_empty",
+                    }),
+                );
+            }
+        }
+    }
+
+    /// A body-free Codex app-server readiness failure is emitted before the
+    /// host invokes the PTY spawn effect. Reclaim only that incarnation's
+    /// exact owned container, and only after a backend inspection proves it
+    /// empty. Docker stop/kill applies to every helper in that container too.
+    async fn stop_and_verify_empty_codex_runtime(
+        &self,
+        handle: &crate::registry::OwnedRuntimeHandle,
+    ) -> bool {
+        let initial = self
+            .verify_empty_before_classified(handle, Instant::now() + Duration::from_secs(3))
+            .await;
+        match initial {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(failure) => {
+                self.codex_cleanup_stage_failed(handle, "initial_empty_inspection", &failure);
+                return false;
+            }
+        }
+
+        match tokio::time::timeout(Duration::from_secs(3), self.backend.request_stop(handle, 2))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => self.codex_cleanup_stage_failed(
+                handle,
+                "graceful_stop",
+                &ClassifiedFailure::backend(error),
+            ),
+            Err(_) => self.codex_cleanup_stage_failed(
+                handle,
+                "graceful_stop",
+                &ClassifiedFailure::timeout(RuntimeError::new(
+                    RuntimeErrorCode::BackendUnavailable,
+                    "Codex pre-worker cleanup stop timed out",
+                )),
+            ),
+        }
+
+        match self
+            .verify_empty_with_budget_classified(handle, Duration::from_secs(3))
+            .await
+        {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(failure) => {
+                self.codex_cleanup_stage_failed(handle, "graceful_empty_inspection", &failure);
+            }
+        }
+
+        match tokio::time::timeout(Duration::from_secs(3), self.backend.force_stop(handle)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => self.codex_cleanup_stage_failed(
+                handle,
+                "force_stop",
+                &ClassifiedFailure::backend(error),
+            ),
+            Err(_) => self.codex_cleanup_stage_failed(
+                handle,
+                "force_stop",
+                &ClassifiedFailure::timeout(RuntimeError::new(
+                    RuntimeErrorCode::BackendUnavailable,
+                    "Codex pre-worker cleanup force stop timed out",
+                )),
+            ),
+        }
+
+        match self
+            .verify_empty_with_budget_classified(handle, Duration::from_secs(3))
+            .await
+        {
+            Ok(true) => true,
+            Ok(false) => {
+                self.codex_cleanup_stage_failed(
+                    handle,
+                    "force_empty_inspection",
+                    &ClassifiedFailure {
+                        error: RuntimeError::new(
+                            RuntimeErrorCode::BackendUnavailable,
+                            "runtime remained active after exact cleanup",
+                        ),
+                        category: "not_empty",
+                        http_status: None,
+                    },
+                );
+                false
+            }
+            Err(failure) => {
+                self.codex_cleanup_stage_failed(handle, "force_empty_inspection", &failure);
+                false
+            }
+        }
+    }
+
+    fn codex_cleanup_stage_failed(
+        &self,
+        handle: &crate::registry::OwnedRuntimeHandle,
+        stage: &str,
+        failure: &ClassifiedFailure,
+    ) {
+        append_event(
+            &self.config.lifecycle_log,
+            "supervisor.codex_pre_worker_cleanup_stage_failed",
+            serde_json::json!({
+                "severity":"warning",
+                "soulId":handle.soul_id(),
+                "incarnationId":handle.incarnation_id(),
+                "stage":stage,
+                "errorCategory":failure.category,
+                "errorCode":failure.error.code,
+                "httpStatus":failure.http_status,
+            }),
+        );
     }
 
     async fn terminal_input(
@@ -4952,6 +5139,564 @@ mod activation_backend_diagnostic_tests {
             "host binary: ***REDACTED***"
         );
         assert!(!text.contains(prepared.launch_nonce.as_str()));
+    }
+}
+
+#[cfg(test)]
+mod codex_pre_worker_retry_tests {
+    use super::*;
+    use crate::backend::{BackendCreated, BackendInspection, BackendRuntimeState};
+    use freshell_runtime_protocol::{
+        DockerDaemonId, LaunchRequest, NativeIdentityObservation, NativeIdentitySource,
+        RuntimeDiagnosticCode, RuntimeProfile,
+    };
+    use std::{
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex as StdMutex,
+        },
+    };
+
+    #[derive(Clone, Copy)]
+    enum FirstGrantOutcome {
+        CodexAppServerStartFailed,
+        WorkerMayHaveStarted,
+    }
+
+    #[derive(Clone, Copy)]
+    enum HostOutcome {
+        CodexAppServerStartFailed,
+        WorkerMayHaveStarted,
+        Running,
+    }
+
+    struct RuntimeRecord {
+        incarnation_id: IncarnationId,
+        state: BackendRuntimeState,
+        attempt: usize,
+        host: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    #[derive(Default)]
+    struct Counts {
+        creates: AtomicUsize,
+        grants: AtomicUsize,
+        workers: AtomicUsize,
+        possible_workers: AtomicUsize,
+        stop_requests: AtomicUsize,
+        force_stops: AtomicUsize,
+        empty_checks: AtomicUsize,
+    }
+
+    struct FakeBackend {
+        first_grant: FirstGrantOutcome,
+        counts: Arc<Counts>,
+        runtimes: StdMutex<HashMap<String, RuntimeRecord>>,
+        stop_targets: StdMutex<Vec<(IncarnationId, String)>>,
+    }
+
+    impl FakeBackend {
+        fn new(first_grant: FirstGrantOutcome) -> Self {
+            Self {
+                first_grant,
+                counts: Arc::new(Counts::default()),
+                runtimes: StdMutex::new(HashMap::new()),
+                stop_targets: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn outcome_for(&self, attempt: usize) -> HostOutcome {
+            if attempt != 1 {
+                return HostOutcome::Running;
+            }
+            match self.first_grant {
+                FirstGrantOutcome::CodexAppServerStartFailed => {
+                    HostOutcome::CodexAppServerStartFailed
+                }
+                FirstGrantOutcome::WorkerMayHaveStarted => HostOutcome::WorkerMayHaveStarted,
+            }
+        }
+
+        fn runtime_state(
+            &self,
+            handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<BackendRuntimeState, BackendError> {
+            let runtimes = self.runtimes.lock().unwrap();
+            let record = runtimes
+                .get(handle.container_id())
+                .ok_or_else(|| BackendError::OwnershipMismatch("unknown test container".into()))?;
+            if &record.incarnation_id != handle.incarnation_id() {
+                return Err(BackendError::OwnershipMismatch(
+                    "test container incarnation changed".into(),
+                ));
+            }
+            Ok(record.state)
+        }
+
+        async fn stop_exact(
+            &self,
+            handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<(), BackendError> {
+            let host = {
+                let mut runtimes = self.runtimes.lock().unwrap();
+                let record = runtimes.get_mut(handle.container_id()).ok_or_else(|| {
+                    BackendError::OwnershipMismatch("unknown test container".into())
+                })?;
+                if &record.incarnation_id != handle.incarnation_id() {
+                    return Err(BackendError::OwnershipMismatch(
+                        "test container incarnation changed".into(),
+                    ));
+                }
+                record.host.take()
+            };
+            if let Some(host) = host {
+                host.abort();
+                let _ = host.await;
+            }
+            self.runtimes
+                .lock()
+                .unwrap()
+                .get_mut(handle.container_id())
+                .expect("checked test container")
+                .state = BackendRuntimeState::Exited;
+            Ok(())
+        }
+    }
+
+    impl Drop for FakeBackend {
+        fn drop(&mut self) {
+            for record in self.runtimes.get_mut().unwrap().values_mut() {
+                if let Some(host) = record.host.take() {
+                    host.abort();
+                }
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeBackend for FakeBackend {
+        async fn create_stopped(
+            &self,
+            spec: &CreateRuntimeSpec,
+        ) -> Result<BackendCreated, BackendError> {
+            let attempt = self.counts.creates.fetch_add(1, Ordering::SeqCst) + 1;
+            let container_id = format!("{:064x}", attempt);
+            self.runtimes.lock().unwrap().insert(
+                container_id.clone(),
+                RuntimeRecord {
+                    incarnation_id: spec.incarnation_id.clone(),
+                    state: BackendRuntimeState::Created,
+                    attempt,
+                    host: None,
+                },
+            );
+            Ok(BackendCreated {
+                daemon_id: DockerDaemonId::new(),
+                container_id,
+                immutable_config_digest: format!("fake-runtime-config-{attempt}"),
+            })
+        }
+
+        async fn start_host(
+            &self,
+            handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<(), BackendError> {
+            let (attempt, limits) = {
+                let mut runtimes = self.runtimes.lock().unwrap();
+                let record = runtimes.get_mut(handle.container_id()).ok_or_else(|| {
+                    BackendError::OwnershipMismatch("unknown test container".into())
+                })?;
+                if &record.incarnation_id != handle.incarnation_id() {
+                    return Err(BackendError::OwnershipMismatch(
+                        "test container incarnation changed".into(),
+                    ));
+                }
+                record.state = BackendRuntimeState::Running;
+                (record.attempt, handle.requested_limits())
+            };
+            let socket_path = handle.runtime_dir().join("host.sock");
+            let listener = UnixListener::bind(&socket_path)
+                .map_err(|error| BackendError::Unavailable(error.to_string()))?;
+            let secret = std::fs::read(handle.runtime_dir().join("secret"))
+                .map_err(|error| BackendError::Unavailable(error.to_string()))?;
+            let incarnation = handle.incarnation_id().clone();
+            let outcome = self.outcome_for(attempt);
+            let counts = Arc::clone(&self.counts);
+            let host = tokio::spawn(async move {
+                serve_fake_host(listener, secret, incarnation, limits, outcome, counts).await;
+            });
+            self.runtimes
+                .lock()
+                .unwrap()
+                .get_mut(handle.container_id())
+                .expect("checked test container")
+                .host = Some(host);
+            Ok(())
+        }
+
+        async fn inspect(
+            &self,
+            handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<BackendInspection, BackendError> {
+            Ok(BackendInspection {
+                state: self.runtime_state(handle)?,
+                configured_limits: handle.requested_limits(),
+            })
+        }
+
+        async fn request_stop(
+            &self,
+            handle: &crate::registry::OwnedRuntimeHandle,
+            grace_seconds: u64,
+        ) -> Result<(), BackendError> {
+            assert_eq!(grace_seconds, 2);
+            self.counts.stop_requests.fetch_add(1, Ordering::SeqCst);
+            self.stop_targets.lock().unwrap().push((
+                handle.incarnation_id().clone(),
+                handle.container_id().to_owned(),
+            ));
+            self.stop_exact(handle).await
+        }
+
+        async fn force_stop(
+            &self,
+            handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<(), BackendError> {
+            self.counts.force_stops.fetch_add(1, Ordering::SeqCst);
+            self.stop_exact(handle).await
+        }
+
+        async fn verify_empty(
+            &self,
+            handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<bool, BackendError> {
+            self.counts.empty_checks.fetch_add(1, Ordering::SeqCst);
+            Ok(matches!(
+                self.runtime_state(handle)?,
+                BackendRuntimeState::Missing
+                    | BackendRuntimeState::Created
+                    | BackendRuntimeState::Exited
+                    | BackendRuntimeState::Dead
+            ))
+        }
+
+        async fn list_known(
+            &self,
+            handles: &[crate::registry::OwnedRuntimeHandle],
+        ) -> Result<Vec<(IncarnationId, BackendInspection)>, BackendError> {
+            let mut result = Vec::with_capacity(handles.len());
+            for handle in handles {
+                result.push((handle.incarnation_id().clone(), self.inspect(handle).await?));
+            }
+            Ok(result)
+        }
+
+        async fn read_limits(
+            &self,
+            handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<RuntimeLimits, BackendError> {
+            Ok(handle.requested_limits())
+        }
+
+        async fn enable_long_lived(
+            &self,
+            _handle: &crate::registry::OwnedRuntimeHandle,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    async fn serve_fake_host(
+        listener: UnixListener,
+        secret: Vec<u8>,
+        incarnation: IncarnationId,
+        limits: RuntimeLimits,
+        outcome: HostOutcome,
+        counts: Arc<Counts>,
+    ) {
+        let boot = HostBootId::new();
+        let mut grant_epoch = 0;
+        let mut execution_generation = 0;
+        let mut observation = None;
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(request) = read_frame::<_, Envelope<HostCommand>>(&mut socket).await else {
+                return;
+            };
+            let result = match request.body {
+                HostCommand::Hello {
+                    incarnation_id: requested_incarnation,
+                    challenge,
+                } => {
+                    if requested_incarnation != incarnation {
+                        return;
+                    }
+                    Ok(HostResult::Hello {
+                        proof: host_proof(&secret, &challenge, &boot, &incarnation),
+                        host_boot_id: boot.clone(),
+                        capabilities: vec!["native-identity-observation-v1".into()],
+                        effective_limits: limits,
+                    })
+                }
+                HostCommand::GrantExecution {
+                    control_epoch,
+                    execution_generation: generation,
+                    native_identity_launch,
+                    ..
+                } => {
+                    counts.grants.fetch_add(1, Ordering::SeqCst);
+                    match outcome {
+                        HostOutcome::CodexAppServerStartFailed => Err(RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            "synthetic-private-codex-output-marker",
+                        )
+                        .with_diagnostic_code(RuntimeDiagnosticCode::CodexAppServerStartFailed)),
+                        HostOutcome::WorkerMayHaveStarted => {
+                            counts.possible_workers.fetch_add(1, Ordering::SeqCst);
+                            return;
+                        }
+                        HostOutcome::Running => {
+                            let Some(launch) = native_identity_launch else {
+                                return;
+                            };
+                            if launch.incarnation_id != incarnation {
+                                return;
+                            }
+                            grant_epoch = control_epoch;
+                            execution_generation = generation;
+                            let current = NativeIdentityObservation {
+                                native_session_id: "synthetic-codex-session".into(),
+                                incarnation_id: incarnation.clone(),
+                                launch_nonce: launch.launch_nonce,
+                                evidence_revision: launch.evidence_revision,
+                                source: NativeIdentitySource::CodexAppServer,
+                                evidence_digest: "b".repeat(64),
+                            };
+                            observation = Some(current.clone());
+                            counts.workers.fetch_add(1, Ordering::SeqCst);
+                            Ok(HostResult::GrantAccepted {
+                                host_boot_id: boot.clone(),
+                                worker_pid: 42,
+                                worker_launch_count: 1,
+                                fixture_evidence: serde_json::json!({}),
+                                native_session_id: Some(current.native_session_id.clone()),
+                                native_identity_observation: Some(current),
+                                opencode_transfer_receipt: None,
+                                opencode_adoption: Default::default(),
+                            })
+                        }
+                    }
+                }
+                HostCommand::Status { .. } => Ok(HostResult::Status {
+                    host_boot_id: boot.clone(),
+                    worker_pid: Some(42),
+                    worker_launch_count: 1,
+                    max_control_epoch: grant_epoch,
+                    max_execution_generation: execution_generation,
+                    fixture_evidence: serde_json::json!({}),
+                    exited: false,
+                    native_session_id: observation
+                        .as_ref()
+                        .map(|value| value.native_session_id.clone()),
+                    native_identity_observation: observation.clone(),
+                    opencode_transfer_receipt: None,
+                    opencode_adoption: Default::default(),
+                }),
+                _ => return,
+            };
+            if write_frame(
+                &mut socket,
+                &HostReply {
+                    request_id: request.request_id,
+                    result,
+                },
+            )
+            .await
+            .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    fn supervisor(dir: &Path, backend: Arc<FakeBackend>) -> Supervisor {
+        Supervisor::new(
+            Registry::open(dir.join("registry"), None).unwrap(),
+            backend,
+            SupervisorConfig {
+                runtime_root: dir.join("runtime"),
+                control_socket_path: dir.join("control.sock"),
+                host_binary_path: std::env::current_exe().unwrap(),
+                image_ref: format!("sha256:{}", "a".repeat(64)),
+                test_run_id: "codex-pre-worker-retry".into(),
+                control_secret: "synthetic-pre-worker-control-secret".into(),
+                lifecycle_log: dir.join("lifecycle.jsonl"),
+                admission: AdmissionPolicy::default(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn launch_request(soul_id: SoulId) -> LaunchRequest {
+        serde_json::from_value(serde_json::json!({
+            "soulId": soul_id,
+            "provider": "codex",
+            "providerStoreId": "synthetic-codex-store",
+            "creationSeedRef": "synthetic-codex-create",
+            "nativeSessionId": "synthetic-codex-session",
+            "limits": {
+                "cpuMilli": 500,
+                "memoryBytes": 67108864,
+                "swapBytes": 0,
+                "pidsMax": 32
+            },
+            "profile": RuntimeProfile::Custom,
+            "projectKey": "codex-pre-worker-retry",
+            "terminal": {
+                "terminalId": "synthetic-codex-terminal",
+                "streamId": "synthetic-codex-stream",
+                "mode": "codex",
+                "program": "codex",
+                "cwd": "/workspace",
+                "workspacePath": "/workspace",
+                "runAsUid": 65534,
+                "runAsGid": 0,
+                "cols": 80,
+                "rows": 24,
+                "projectKey": "codex-pre-worker-retry"
+            }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn verified_codex_pre_worker_failure_allows_one_ordinary_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FakeBackend::new(
+            FirstGrantOutcome::CodexAppServerStartFailed,
+        ));
+        let supervisor = supervisor(dir.path(), Arc::clone(&backend));
+        let soul = SoulId::new();
+
+        let error = supervisor
+            .launch(RequestId::new(), launch_request(soul.clone()))
+            .await
+            .expect_err("the injected pre-worker Codex startup failure should surface");
+        assert_eq!(error.code, RuntimeErrorCode::HostUnreachable);
+        assert_eq!(
+            error.diagnostic_code,
+            Some(RuntimeDiagnosticCode::CodexAppServerStartFailed)
+        );
+        let failed_attempt = supervisor.registry.inventory().await.unwrap();
+        assert_eq!(failed_attempt.len(), 1);
+        assert_eq!(failed_attempt[0].launch_state, LaunchState::Failed);
+        assert_eq!(
+            failed_attempt[0].cleanup_state,
+            freshell_runtime_protocol::CleanupState::VerifiedEmpty
+        );
+        let conn = rusqlite::Connection::open(supervisor.registry.database_path()).unwrap();
+        let (command_state, writer_claims, reservations): (String, u64, u64) = conn
+            .query_row(
+                "SELECT (SELECT state FROM commands WHERE incarnation_id=?1), (SELECT COUNT(*) FROM writer_claims WHERE incarnation_id=?1), (SELECT COUNT(*) FROM admission_reservations WHERE incarnation_id=?1)",
+                [failed_attempt[0].incarnation_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(command_state, "failed");
+        assert_eq!(writer_claims, 0);
+        assert_eq!(reservations, 0);
+
+        let result = supervisor
+            .launch(RequestId::new(), launch_request(soul.clone()))
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "a verified pre-worker failure should permit a new ordinary launch: {:?}",
+                    error.code
+                )
+            });
+        assert_eq!(result.view.launch_state, LaunchState::Running);
+        assert_eq!(result.worker_launch_count, 1);
+        assert_eq!(backend.counts.creates.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.counts.grants.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.counts.workers.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.counts.possible_workers.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.counts.stop_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.counts.force_stops.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.counts.empty_checks.load(Ordering::SeqCst), 2);
+
+        let views = supervisor.registry.inventory().await.unwrap();
+        assert_eq!(views.len(), 2);
+        let failed = views
+            .iter()
+            .find(|view| view.incarnation_id != result.view.incarnation_id)
+            .unwrap();
+        assert_eq!(failed.launch_state, LaunchState::Failed);
+        assert_eq!(
+            failed.cleanup_state,
+            freshell_runtime_protocol::CleanupState::VerifiedEmpty
+        );
+        assert_eq!(
+            backend.stop_targets.lock().unwrap().as_slice(),
+            &[(
+                failed.incarnation_id.clone(),
+                failed.container_id.clone().unwrap(),
+            )]
+        );
+
+        let lifecycle = std::fs::read_to_string(&supervisor.config.lifecycle_log).unwrap();
+        let events = lifecycle
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let failure = events
+            .iter()
+            .find(|event| event["event"] == "supervisor.activation_failed")
+            .expect("the failure retains its existing lifecycle event");
+        assert_eq!(failure["data"]["stage"], "deliver_execution_grant");
+        assert_eq!(failure["data"]["launchState"], "starting");
+        assert_eq!(
+            failure["data"]["failureReason"],
+            "CODEX_APP_SERVER_START_FAILED"
+        );
+        assert!(failure["data"].get("errorMessage").is_none());
+        assert!(!lifecycle.contains("synthetic-private-codex-output-marker"));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_codex_grant_keeps_the_incarnation_non_replaceable() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FakeBackend::new(FirstGrantOutcome::WorkerMayHaveStarted));
+        let supervisor = supervisor(dir.path(), Arc::clone(&backend));
+        let soul = SoulId::new();
+
+        let error = supervisor
+            .launch(RequestId::new(), launch_request(soul.clone()))
+            .await
+            .expect_err("the fake host drops an ambiguous grant response");
+        assert_eq!(error.code, RuntimeErrorCode::HostUnreachable);
+        assert_eq!(
+            error.diagnostic_code,
+            Some(RuntimeDiagnosticCode::HostCommandFrameFailed)
+        );
+        let retry = supervisor
+            .launch(RequestId::new(), launch_request(soul))
+            .await
+            .expect_err("uncertain worker existence must retain the active incarnation");
+        assert_ne!(retry.code, RuntimeErrorCode::HostUnreachable);
+        assert_eq!(backend.counts.creates.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.counts.grants.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.counts.workers.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.counts.possible_workers.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.counts.stop_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.counts.force_stops.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.counts.empty_checks.load(Ordering::SeqCst), 0);
+        let views = supervisor.registry.inventory().await.unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].launch_state, LaunchState::Starting);
     }
 }
 
