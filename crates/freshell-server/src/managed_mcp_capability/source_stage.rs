@@ -1197,12 +1197,13 @@ mod configured_resource_tests {
         let home = owned.path().join("home");
         let workspace = owned.path().join("workspace");
         let command = home.join("mcp.js");
-        let schema = home.join("schema.json");
+        let schema = home.join("assets/schema.json");
         std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(schema.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(
             &command,
-            "#!/usr/bin/env node\nconst fs = require('node:fs');\nconst path = require('node:path');\nprocess.stdout.write(fs.readFileSync(path.join(__dirname, 'schema.json'), 'utf8'));\n",
+            "#!/usr/bin/env node\nconst fs = require('node:fs');\nconst path = require('node:path');\nprocess.stdout.write(fs.readFileSync(path.join(__dirname, 'assets', 'schema.json'), 'utf8'));\n",
         )
         .unwrap();
         std::fs::write(&schema, "path.join schema loaded\n").unwrap();
@@ -1306,6 +1307,142 @@ mod configured_resource_tests {
         let output = execute_node_with_home_hidden(owned.path(), &home, &provider_script);
         assert!(output.status.success(), "{:?}", output.stderr);
         assert_eq!(output.stdout, b"extensionless module loaded\n");
+    }
+
+    #[test]
+    fn direct_node_script_keeps_imported_symlink_alias_after_all_resource_copies() {
+        use std::os::unix::fs::symlink;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let command = home.join("mcp.js");
+        let helper = home.join("helper.js");
+        let helper_target = home.join("shared/helper.js");
+        let helper_directory = home.join("linked-dir");
+        let helper_directory_target = home.join("shared-dir");
+        let helper_directory_index = helper_directory.join("index.js");
+        let helper_directory_index_target = helper_directory_target.join("index.js");
+        std::fs::create_dir_all(helper_target.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&helper_directory_target).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "process.stdout.write(require('./helper.js') + require('./linked-dir'))\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &helper_target,
+            "module.exports = 'symlinked file loaded|'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &helper_directory_index_target,
+            "module.exports = 'symlinked directory loaded\\n'\n",
+        )
+        .unwrap();
+        symlink(&helper_target, &helper).unwrap();
+        symlink(&helper_directory_target, &helper_directory).unwrap();
+
+        let command_args = vec!["node".to_owned(), command.to_string_lossy().into_owned()];
+        let (plan, provider_script) = plan_and_stage_mcp_command_for_resource(
+            owned.path(),
+            &home,
+            &workspace,
+            &command_args,
+            &command,
+        );
+        assert!(
+            plan[0].configured_resources.contains(&helper),
+            "the Node closure must preserve the imported symlink alias"
+        );
+        assert!(plan[0]
+            .configured_resources
+            .contains(&helper_target.canonicalize().unwrap()));
+        assert!(
+            plan[0]
+                .configured_resources
+                .contains(&helper_directory_index),
+            "the Node closure must preserve the imported path through a symlinked directory"
+        );
+        assert!(plan[0]
+            .configured_resources
+            .contains(&helper_directory_index_target.canonicalize().unwrap()));
+
+        let output = execute_node_with_home_hidden(owned.path(), &home, &provider_script);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(
+            output.stdout,
+            b"symlinked file loaded|symlinked directory loaded\n"
+        );
+    }
+
+    #[test]
+    fn versioned_python_command_stages_script_and_sibling_after_all_resource_copies() {
+        use std::os::unix::fs::symlink;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let command = home.join("mcp.py");
+        let helper = home.join("helper.py");
+        let bin = owned.path().join("bin");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(&command, "import helper\nprint(helper.VALUE)\n").unwrap();
+        std::fs::write(&helper, "VALUE = 'versioned command loaded'\n").unwrap();
+
+        let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+        let interpreter = std::env::split_paths(&inherited_path)
+            .map(|directory| directory.join("python3"))
+            .find(|candidate| candidate.is_file())
+            .expect("python3 is required by the existing direct Python script test");
+        symlink(
+            std::fs::canonicalize(interpreter).unwrap(),
+            bin.join("python3.12"),
+        )
+        .unwrap();
+
+        let command_args = vec![
+            "python3.12".to_owned(),
+            command.to_string_lossy().into_owned(),
+        ];
+        let (plan, provider_script) = plan_and_stage_mcp_command_for_resource(
+            owned.path(),
+            &home,
+            &workspace,
+            &command_args,
+            &command,
+        );
+        for required in [&command, &helper] {
+            assert!(
+                plan[0]
+                    .configured_resources
+                    .contains(&required.canonicalize().unwrap()),
+                "the versioned Python command closure omitted {}",
+                required.display()
+            );
+        }
+        assert!(!plan[0]
+            .configured_resources
+            .contains(&home.canonicalize().unwrap()));
+
+        let hidden_home = owned.path().join("home-hidden");
+        std::fs::rename(&home, &hidden_home).unwrap();
+        let search_path = std::iter::once(bin.clone())
+            .chain(std::env::split_paths(&inherited_path))
+            .collect::<Vec<_>>();
+        let search_path = std::env::join_paths(search_path).unwrap();
+        let output = std::process::Command::new("python3.12")
+            .arg(&provider_script)
+            .env_clear()
+            .env("PATH", search_path)
+            .output();
+        std::fs::rename(&hidden_home, &home).unwrap();
+        let output = output.unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"versioned command loaded\n");
     }
 
     #[test]
@@ -1491,7 +1628,7 @@ mod configured_resource_tests {
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(
             &command,
-            "#!/bin/sh\ncd \"$(dirname \"$0\")\"; exec node server.js\n",
+            "#!/bin/sh\ncd \"$(dirname \"$0\")\" && exec node server.js\n",
         )
         .unwrap();
         std::fs::write(

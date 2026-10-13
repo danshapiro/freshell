@@ -468,6 +468,16 @@ fn bun_package_script_root(
     Ok(None)
 }
 
+fn is_python_interpreter_name(name: &str) -> bool {
+    matches!(name, "python" | "python2" | "python3")
+        || name.strip_prefix("python").is_some_and(|version| {
+            !version.is_empty()
+                && version.split('.').all(|component| {
+                    !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        })
+}
+
 fn command_uses_script_runtime(executable: Option<&str>) -> bool {
     let Some(executable) = executable.and_then(|executable| Path::new(executable).file_name())
     else {
@@ -483,15 +493,13 @@ fn command_uses_script_runtime(executable: Option<&str>) -> bool {
             | "deno"
             | "tsx"
             | "ts-node"
-            | "python"
-            | "python3"
             | "ruby"
             | "bash"
             | "sh"
             | "zsh"
             | "pwsh"
             | "powershell"
-    )
+    ) || is_python_interpreter_name(executable)
 }
 
 fn command_uses_node_module_resolution(executable: Option<&str>) -> bool {
@@ -604,23 +612,13 @@ fn is_shell_script(path: &Path) -> bool {
 }
 
 fn is_python_script(path: &Path) -> bool {
-    fn is_python_interpreter(name: &str) -> bool {
-        matches!(name, "python" | "python2" | "python3")
-            || name.strip_prefix("python").is_some_and(|version| {
-                !version.is_empty()
-                    && version.split('.').all(|component| {
-                        !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
-                    })
-            })
-    }
-
     path.extension().is_some_and(|extension| {
         matches!(
             extension.to_string_lossy().to_ascii_lowercase().as_str(),
             "py" | "pyw"
         )
     }) || shebang_interpreter_names(path)
-        .is_some_and(|names| names.iter().any(|name| is_python_interpreter(name)))
+        .is_some_and(|names| names.iter().any(|name| is_python_interpreter_name(name)))
 }
 
 fn is_ruby_script(path: &Path) -> bool {
@@ -668,9 +666,10 @@ fn shell_changes_to_script_directory(line: &str) -> Option<&str> {
     if remainder.is_empty() {
         return Some("");
     }
+    let remainder = remainder.trim_start();
     remainder
-        .trim_start()
-        .strip_prefix(';')
+        .strip_prefix("&&")
+        .or_else(|| remainder.strip_prefix(';'))
         .map(str::trim_start)
 }
 
@@ -1008,23 +1007,46 @@ fn node_relative_resource_specifiers(
                 Some(JavaScriptToken::Punctuation(b','))
             )
         {
-            if let Some(JavaScriptToken::String(Some(specifier))) = tokens.get(index + 4) {
-                let is_closed = matches!(
-                    tokens.get(index + 5),
-                    Some(JavaScriptToken::Punctuation(b')'))
-                ) || (matches!(
-                    tokens.get(index + 5),
-                    Some(JavaScriptToken::Punctuation(b','))
-                ) && matches!(
-                    tokens.get(index + 6),
-                    Some(JavaScriptToken::Punctuation(b')'))
-                ));
-                if is_closed
-                    && !specifier.is_empty()
-                    && !Path::new(specifier).is_absolute()
-                    && !specifier.contains(['?', '#', '\\', '$', '*'])
-                {
-                    result.insert(specifier.clone());
+            let mut cursor = index + 4;
+            let mut components = Vec::new();
+            let is_closed = loop {
+                if let Some(JavaScriptToken::String(Some(component))) = tokens.get(cursor) {
+                    components.push(component.as_str());
+                    cursor += 1;
+                } else {
+                    break false;
+                }
+                match tokens.get(cursor) {
+                    Some(JavaScriptToken::Punctuation(b')')) => break true,
+                    Some(JavaScriptToken::Punctuation(b',')) => {
+                        cursor += 1;
+                        if matches!(tokens.get(cursor), Some(JavaScriptToken::Punctuation(b')'))) {
+                            break true;
+                        }
+                    }
+                    _ => break false,
+                }
+            };
+            if is_closed && !components.is_empty() {
+                let mut relative = PathBuf::new();
+                let safe = components.iter().all(|component| {
+                    if component.is_empty() || component.contains(['?', '#', '\\', '$', '*']) {
+                        return false;
+                    }
+                    let path = Path::new(component);
+                    if path.components().any(|part| {
+                        matches!(
+                            part,
+                            std::path::Component::Prefix(_) | std::path::Component::RootDir
+                        )
+                    }) {
+                        return false;
+                    }
+                    relative.push(path);
+                    true
+                });
+                if safe && !relative.as_os_str().is_empty() {
+                    result.insert(relative.to_string_lossy().into_owned());
                 }
             }
         }
@@ -1521,6 +1543,20 @@ fn insert_direct_script_dependencies(
                     "direct MCP dependency escapes its selected script scope",
                 ));
             }
+            let alias = freshell_platform::opencode_config::lexical_path(&candidate.path);
+            if alias != dependency {
+                if !alias.starts_with(scope) {
+                    return Err(fail(
+                        "direct MCP dependency alias escapes its selected script scope",
+                    ));
+                }
+                if checked(&alias, field, declaring)? != dependency {
+                    return Err(fail(
+                        "direct MCP dependency changed while resolving its alias",
+                    ));
+                }
+                insert_resource(result, resource_path_bytes, alias, field, declaring)?;
+            }
             insert_resource(
                 result,
                 resource_path_bytes,
@@ -1715,7 +1751,7 @@ fn script_operand_index(command: &[String]) -> Option<usize> {
                 index = (index + 2).min(command.len());
                 continue;
             }
-        } else if matches!(executable, "python" | "python3") {
+        } else if is_python_interpreter_name(executable) {
             if matches!(argument, "-c" | "-m") {
                 return None;
             }
