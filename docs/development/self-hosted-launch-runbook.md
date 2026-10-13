@@ -57,6 +57,13 @@ launches the Rust binary directly — its `ExecStart` is the
 no dependency preparation; prepare the checkout once on that machine as
 above, and the service restores the server after restarts.
 
+On a managed-runtime instance (systemd topology, see "Redeploy managed
+runtime" below), do NOT recover a dead server with
+`scripts/launch-rust.sh`: it rebuilds `freshell-server` WITHOUT the
+`managed-runtime-v1` feature and would overwrite the feature-enabled
+binary, silently reverting the instance to host-side terminals. Use the
+redeploy procedure in that section instead.
+
 ## Prepare the operator home (managed-runtime souls)
 
 Managed-runtime souls mount the operator home read-only so config `{file:}`
@@ -164,19 +171,37 @@ drop-in, plus `freshell-supervisor.service`):
    seconds of the restart — that is a client reconnecting and a durable
    terminal pane reattaching, not an old soul being replaced; the
    pre-restart containers must keep their uptimes.
-5. New-soul probe: create a terminal pane in a real workspace and confirm a
-   NEW `freshell-incarnation-*` container appears (`docker ps`), that it
+5. New-soul probe: create a terminal pane in a real workspace that is NOT
+   the operator home itself (a subdirectory of it is fine) — when the
+   workspace equals the operator home, the supervisor deliberately omits
+   the separate home bind (the workspace bind already provides it), so the
+   checks below do not apply to that launch. Confirm a NEW
+   `freshell-incarnation-*` container appears (`docker ps`), that it
    carries the operator-home bind and the
    `FRESHELL_OPERATOR_HOME_MOUNT=1` marker env (`docker inspect`), and that
-   its session host emitted one `operator_home_readiness` event
-   (`docker exec <container> cat /run/freshell/host-lifecycle.jsonl`). Close
-   the probe pane afterward. The probe soul is NOT auto-collected: the
-   server's idle reaper explicitly skips managed terminals (their lifetime
-   is supervisor-owned) and the supervisor has no idle reaper, so the
-   container persists as a durable background session — the same lifecycle
-   as any closed pane's soul. To remove it immediately, `docker stop` the
-   container; a later reattach mints a new incarnation rather than resuming
-   it.
+   its session host emitted an `operator_home_readiness` event
+   (`docker exec <container> cat /run/freshell/host-lifecycle.jsonl`)
+   whose payload reports `"present":true` and
+   `"home_root_traversable_by_child":true` — the event is emitted with its
+   findings even when the home is missing or unreadable, so its mere
+   presence is NOT proof of readiness. Close the probe pane afterward.
+6. Artifact freshness (after a binary or image redeploy): the new probe
+   container's image (`docker inspect <container> --format '{{.Image}}'`)
+   equals the `sha256:` ID recorded in `~/.config/freshell/managed-runtime.env`,
+   and both units' `ExecMainStartTimestamp` postdates the artifacts you just
+   built.
+7. Probe cleanup: the probe soul is NOT auto-collected — the server's
+   idle reaper explicitly skips managed terminals (their lifetime is
+   supervisor-owned) and the supervisor has no idle reaper, so the
+   container persists as a durable background session. To remove it
+   immediately, stop the soul through the fenced runtime API:
+   `POST /api/runtime/souls/<soul_id>/stop` (find the soul ID with
+   `GET /api/runtime/souls`, or read the container's `com.freshell.soul-id`
+   docker label). Do NOT `docker stop` the container directly — the
+   supervisor treats an externally stopped container as an unexpected exit
+   and runs its automatic recovery path, which may recreate the soul or
+   mark a session without a durable resume path as lost. Leaving the probe
+   soul running is also fine; it is inert.
 
 ## Launch the native Windows client
 
