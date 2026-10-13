@@ -429,7 +429,7 @@ test.describe.serial('ordinary fresh-agent use', () => {
           stage: 'creating',
           createCompleted: false,
           composerFilled: false,
-          assistantBaselineRead: false,
+          assistantBaselineKnownEmpty: false,
           composerSubmitted: false,
           sendObserved: false,
           turnCompleteObserved: false,
@@ -452,9 +452,10 @@ test.describe.serial('ordinary fresh-agent use', () => {
           progress.stage = 'filling_composer'
           await composer.fill('Without using tools, briefly confirm you are ready.')
           progress.composerFilled = true
-          progress.stage = 'reading_assistant_baseline'
-          const assistantTextBaseline = (await assistantResponseDomFacts(page, created.paneId)).textCharacters
-          progress.assistantBaselineRead = true
+          // actualCreate allocates a new FreshAgent session with no prior
+          // turns, so its assistant-response baseline is exactly empty.
+          progress.assistantBaselineKnownEmpty = true
+          const assistantTextBaseline = 0
           turnReceivedCursor = wire.received.length
           const sendCursor = wire.sent.length
           progress.stage = 'pressing_enter'
