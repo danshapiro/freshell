@@ -139,6 +139,82 @@ describe('managed provider tmpfs', () => {
   })
 })
 
+describe('managed operator home mount', () => {
+  const operatorHome = '/tmp/owned/operator-home'
+  const operatorBind = `${operatorHome}:${operatorHome}:ro`
+  const baseTmpfs = { '/tmp': 'rw,noexec,nosuid,nodev,size=128m' }
+  const maskTmpfs = {
+    [`${operatorHome}/.freshell`]: '',
+    [`${operatorHome}/.amplifier/onecli`]: '',
+    [`${operatorHome}/.config/gcloud`]: '',
+  }
+
+  function brokerWithOperatorHome() {
+    return new RestrictedDockerBroker({
+      realSocketPath: '/tmp/owned/docker.sock',
+      proxySocketPath: '/tmp/owned/broker.sock',
+      runtimeRootPrefix: '/tmp/owned/r',
+      allowedHostBinaryPaths: new Set(['/tmp/owned/freshell-session-host']),
+      allowedImageRefs: new Set(['sha256:fixture-image']),
+      allowTerminalWorkloads: true,
+      allowedWorkspaceRoots: new Set(['/workspace']),
+      allowedProviderUserRoots: new Set(['/home/fixture/.claude']),
+      allowedOperatorHomeRoots: new Set([operatorHome]),
+      testRunId: 'run-one',
+      logPath: '/tmp/owned/broker.jsonl',
+    })
+  }
+
+  it('accepts the same-path read-only home bind and its three secret-mask tmpfs destinations', () => {
+    const validate = (body: Buffer): { ok: boolean } => (
+      brokerWithOperatorHome() as unknown as { validateCreate(body: Buffer): { ok: boolean } }
+    ).validateCreate(body)
+    const binds = [...ordinaryBinds, actorBind, operatorBind]
+
+    expect(validate(createBody(binds, { ...baseTmpfs, ...maskTmpfs })).ok).toBe(true)
+    expect(validate(createBody(binds, { ...baseTmpfs, [`${operatorHome}/.freshell`]: '' })).ok).toBe(true)
+  })
+
+  it('refuses the home bind without an admitted root, a writable bind, or a non-root destination', () => {
+    const admitted = (body: Buffer): { ok: boolean } => (
+      brokerWithOperatorHome() as unknown as { validateCreate(body: Buffer): { ok: boolean } }
+    ).validateCreate(body)
+    const unadmitted = (body: Buffer): { ok: boolean } => (
+      broker() as unknown as { validateCreate(body: Buffer): { ok: boolean } }
+    ).validateCreate(body)
+
+    expect(unadmitted(createBody([...ordinaryBinds, actorBind, operatorBind], baseTmpfs)).ok).toBe(false)
+    expect(admitted(createBody([...ordinaryBinds, actorBind, `${operatorHome}:${operatorHome}:rw`], baseTmpfs)).ok).toBe(false)
+    expect(admitted(createBody([
+      ...ordinaryBinds, actorBind, `${operatorHome}:/run/freshell-home:ro`,
+    ], baseTmpfs)).ok).toBe(false)
+    expect(admitted(createBody([
+      ...ordinaryBinds, actorBind, `${operatorHome}/.amplifier:${operatorHome}/.amplifier:ro`,
+    ], baseTmpfs)).ok).toBe(false)
+  })
+
+  it('refuses secret-mask tmpfs destinations outside the admitted home or with non-empty options', () => {
+    const validate = (body: Buffer): { ok: boolean } => (
+      brokerWithOperatorHome() as unknown as { validateCreate(body: Buffer): { ok: boolean } }
+    ).validateCreate(body)
+    const binds = [...ordinaryBinds, actorBind, operatorBind]
+
+    expect(validate(createBody(binds, {
+      ...baseTmpfs,
+      ...maskTmpfs,
+      [`${operatorHome}/.freshell`]: 'rw,mode=0755',
+    })).ok).toBe(false)
+    expect(validate(createBody(binds, {
+      ...baseTmpfs,
+      [`${operatorHome}/.ssh/authorized_keys`]: '',
+    })).ok).toBe(false)
+    expect(validate(createBody(binds, {
+      ...baseTmpfs,
+      [`${operatorHome}/../other-home/.freshell`]: '',
+    })).ok).toBe(false)
+  })
+})
+
 describe('managed provider host gateway', () => {
   it('accepts the rootless daemon mapping to a local host address', () => {
     const validate = (body: Buffer): { ok: boolean } => (

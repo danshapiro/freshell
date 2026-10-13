@@ -21,7 +21,7 @@ async fn run() -> Result<(), String> {
     freshell_agent_runtime::process_qualification_policy()?;
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) != Some("serve") {
-        return Err("usage: freshell-supervisor serve --registry-root PATH --control-socket PATH --control-secret-file PATH --docker-socket PATH --runtime-root PATH --host-binary PATH --image-ref sha256:... --test-run-id ID [--installation-id ID]".into());
+        return Err("usage: freshell-supervisor serve --registry-root PATH --control-socket PATH --control-secret-file PATH --docker-socket PATH --runtime-root PATH --host-binary PATH --image-ref sha256:... --test-run-id ID [--installation-id ID] [--operator-home PATH]".into());
     }
     let rest = &args[2..];
     let registry_root = PathBuf::from(required_arg(rest, "--registry-root")?);
@@ -37,6 +37,9 @@ async fn run() -> Result<(), String> {
         .map(InstallationId::parse)
         .transpose()
         .map_err(|e| e.to_string())?;
+    if let Some(operator_home) = optional_arg(rest, "--operator-home") {
+        std::env::set_var("FRESHELL_SUPERVISOR_OPERATOR_HOME", operator_home);
+    }
     let defaults = AdmissionPolicy::default();
     let admission = AdmissionPolicy {
         installation: AdmissionBudget::new(

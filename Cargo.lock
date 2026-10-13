@@ -1526,6 +1526,7 @@ dependencies = [
 name = "freshell-supervisor"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chrono",
  "freshell-agent-runtime",
