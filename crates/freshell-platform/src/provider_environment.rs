@@ -827,7 +827,7 @@ fn encode_relative_path(path: &Path) -> Result<String, CopyError> {
 }
 
 fn decode_relative_path(encoded: &str) -> Option<PathBuf> {
-    if encoded.len() % 2 != 0 {
+    if !encoded.len().is_multiple_of(2) {
         return None;
     }
     let mut bytes = Vec::with_capacity(encoded.len() / 2);
