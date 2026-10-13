@@ -177,16 +177,13 @@ the procedure mid-way and leave the service down. Two sequences:
   ```bash
   systemctl --user start freshell-supervisor.service
   SOCK="$HOME/.freshell/managed-runtime/control/supervisor.sock"
-  # The supervisor binds its socket only AFTER startup reconciliation,
-  # which runs up to 180s per soul at four-way concurrency. Size the
-  # bound from the DESIRED-RUNNING inventory (the reconciliation work
-  # list — including souls with no running container), falling back to
-  # the container count when the API was unavailable: 45s/soul
-  # effective + a 5-minute margin:
-  N=$(wc -l < "$RUN/desired-running.txt" 2>/dev/null || echo 0)
-  [ "$N" -gt 0 ] || N=$(wc -l < "$RUN/souls-before.txt" 2>/dev/null || echo 0)
-  BOUND=$(( N * 45 + 300 ))
-  for i in $(seq 1 "$BOUND"); do
+  # The supervisor binds its socket only AFTER startup reconciliation, and
+  # reconciliation sizing is CONFIGURABLE (FRESHELL_RUNTIME_STARTUP_CONCURRENCY,
+  # per-soul timeout up to 900s, plus pending loss cleanup) — so no fixed
+  # formula can bound it reliably. Wait on supervisor-unit LIVENESS as the
+  # failure detector instead: a healthy-but-slow supervisor is not a
+  # failure, a dead unit is:
+  while true; do
     # CONNECT-probe, not a file test: a stopped supervisor leaves its old
     # socket FILE on disk, so [ -S ... ] passes on a dead listener:
     if python3 -c 'import socket,sys
@@ -197,25 +194,19 @@ except OSError: sys.exit(1)' "$SOCK" 2>/dev/null; then
     fi
     systemctl --user is-active freshell-supervisor.service >/dev/null \
       || { echo "supervisor unit is not active"; exit 1; }
-    sleep 1
+    sleep 5
   done
-  # The loop alone proves nothing if it exhausted — verify before starting:
-  python3 -c 'import socket,sys
-s=socket.socket(socket.AF_UNIX); s.settimeout(1)
-try: s.connect(sys.argv[1])
-except OSError: sys.exit(1)' "$SOCK" 2>/dev/null \
-    || { echo "supervisor socket never became live"; exit 1; }
   systemctl --user start freshell-rust.service
   ```
 
   The connect-probe waits for a LIVE listener (a stale file fails the
-  connect), fails fast if the supervisor unit dies, and the final probe
-  refuses to start the server if the socket never came up. If the server
-  unit fails its first start in a race window, that is this socket
-  ordering, not a bad build — wait for the live socket and start it again
-  (repeated immediate failures can also trip the unit's start limit). No
-  soul can be created during the build. This is a full outage for the
-  duration of the build.
+  connect) and the unit-liveness check is the real failure detector — the
+  loop ends when the socket appears or the supervisor dies, whatever the
+  reconciliation duration. If the server unit fails its first start in a
+  race window, that is this socket ordering, not a bad build — wait for
+  the live socket and start it again (repeated immediate failures can
+  also trip the unit's start limit). No soul can be created during the
+  build. This is a full outage for the duration of the build.
 
 - The server's soul controller is strictly opt-in (`default = []` in
   `crates/freshell-server/Cargo.toml`). Setting `FRESHELL_MANAGED_RUNTIME_V1=1`
@@ -357,6 +348,18 @@ drop-in, plus `freshell-supervisor.service`):
     sees):
 
     ```bash
+    # If the preliminary capture fell back to an empty list (featureless
+    # or stopped server), refresh it NOW from the freshly deployed API —
+    # an empty sweep would otherwise pass vacuously:
+    if [ ! -s "$RUN/desired-running.txt" ]; then
+      curl -s -H @"$RUN/hdr" http://127.0.0.1:3001/api/runtime/souls \
+        | python3 -c 'import json,sys
+souls=json.load(sys.stdin)["souls"]
+for s in souls:
+    if s.get("desiredState")=="running":
+        print(s["soulId"])' > "$RUN/desired-running.txt"
+    fi
+    echo "sweeping $(wc -l < "$RUN/desired-running.txt") desired-running soul(s)"
     while read -r SID; do
       [ -n "$SID" ] || continue
       curl -s -H @"$RUN/hdr" "http://127.0.0.1:3001/api/runtime/souls/$SID" \
@@ -371,10 +374,9 @@ print("ok:", sys.argv[1])' "$SID"
     A blocked or lost `recoveryState` can hide behind a `"running"`
     `launchState` — that is why both fields are asserted. Any failure here
     needs the supervisor journal and that soul's record investigated
-    before the deploy is called good. If the preliminary capture fell back
-    to an empty `desired-running.txt` (featureless or stopped server), the
-    per-soul sweep is unavailable — re-run it after the deploy against the
-    freshly served soul list.
+    before the deploy is called good. A zero-soul sweep after a
+    SUCCESSFUL refresh is a legitimate empty instance — but the printed
+    count makes that visible instead of vacuous.
 5. New-soul probe: create a terminal pane in a real workspace that is NOT
    the operator home itself (a subdirectory of it is fine) — when the
    workspace equals the operator home, the supervisor deliberately omits
@@ -393,14 +395,16 @@ print("ok:", sys.argv[1])' "$SID"
    ```bash
    set -euo pipefail   # a failed step must halt, not continue half-named
    D=$(mktemp -d)   # private per-run directory
-   mkdir -p ~/scratch
-   chmod 0770 ~/scratch   # the in-soul provider (65534:0) must traverse
-                           # EVERY path component down to the workspace —
-                           # a 0700 ~/scratch fails the probe for reasons
-                           # unrelated to the redeployed runtime
-   WS=$(mktemp -d ~/scratch/home-mount-probe.XXXXXX)   # unique probe workspace
-   chmod 0770 "$WS"   # group-traversable + group-writable, or the probe
-                      # terminal cannot use its own workspace
+   # Probe workspaces live under a FRESH per-run root directly under the
+   # home root (group-traversable after the host prep) — never chmod a
+   # pre-existing directory like ~/scratch, which may hold unrelated
+   # data; we only ever change permissions of directories this run
+   # created:
+   PROBE_ROOT=$(mktemp -d ~/freshell-probe.XXXXXX)
+   chmod 0770 "$PROBE_ROOT"   # the in-soul provider (65534:0) must
+                               # traverse and write what we create
+   WS=$(mktemp -d "$PROBE_ROOT/ws.XXXXXX")   # unique probe workspace
+   chmod 0770 "$WS"
    CHECKOUT=$(systemctl --user show freshell-rust.service -p WorkingDirectory --value)
    # Token source: the server's INITIAL environment first (exact for
    # unit-supplied tokens), then a fallback parse of the checkout's .env
@@ -430,7 +434,9 @@ PY
    test -n "$TOK" || { echo "AUTH_TOKEN not found — extract it manually"; exit 1; }
    umask 077
    printf 'x-auth-token: %s\n' "$TOK" > "$D/hdr"   # header file, not argv
-   trap 'rm -f "$D/hdr"' EXIT   # the token file must not survive ANY exit
+   # ONE EXIT trap per shell: this REPLACES the preliminary capture's
+   # trap, so scrub BOTH token headers here or $RUN/hdr would leak:
+   trap 'rm -f "$RUN/hdr" "$D/hdr"' EXIT
     printf 'D=%q\nWS=%q\nCHECKOUT=%q\n' "$D" "$WS" "$CHECKOUT" > "$D/run.env"
     # create the probe pane (example); record terminalId from the response:
    curl -s -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
@@ -463,7 +469,7 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
    reload: a pointer can be overwritten by a concurrent probe run whose
    records are self-consistent, and loading it would stop the wrong soul.
    Recovery is by YOUR unique workspace only — locate it by timestamp
-   (`ls -dt ~/scratch/home-mount-probe.*`), pick the one that is yours
+   (`ls -dt ~/freshell-probe.*/ws.*`), pick the one that is yours
    (you know when you ran the probe; inspect the directory if unsure),
    and recover purely from it: the soul whose `terminalCwd` equals that
    workspace IS your probe (workspace uniqueness is the identity proof),
@@ -513,7 +519,9 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
     redeploy could match:
 
     ```bash
-    BWS=$(mktemp -d ~/scratch/browser-path-check.XXXXXX)   # unique per run
+    : "${PROBE_ROOT:=$(mktemp -d ~/freshell-probe.XXXXXX)}"
+    chmod 0770 "$PROBE_ROOT"   # only ever chmods a directory this run made
+    BWS=$(mktemp -d "$PROBE_ROOT/bws.XXXXXX")   # unique per run
     chmod 0770 "$BWS"   # same in-soul-shell access requirement as $WS
     echo "BWS=$BWS" >> "$D/run.env"
     # ...hard-refresh the web client, create a terminal pane at $BWS...
@@ -564,8 +572,8 @@ print("UI pane is managed:", hits[0]["soulId"])' "$BWS"
       # otherwise its soul is reported below but deliberately left
       # running rather than guessed at:
       if [ -z "${WS:-}" ]; then
-        ls -dt ~/scratch/home-mount-probe.* 2>/dev/null || true
-        ls -dt ~/scratch/browser-path-check.* 2>/dev/null || true
+        ls -dt ~/freshell-probe.*/ws.* 2>/dev/null || true
+        ls -dt ~/freshell-probe.*/bws.* 2>/dev/null || true
         echo "export WS=<your probe workspace>, and BWS=<your browser-check workspace> if applicable, then re-run"
         exit 1
       fi
@@ -597,15 +605,16 @@ PY
       test -n "$TOK" || { echo "AUTH_TOKEN not found — extract it manually"; exit 1; }
       umask 077; printf 'x-auth-token: %s\n' "$TOK" > "$D/hdr"
     fi
-    trap 'rm -f "$D/hdr"' EXIT   # scrub the token file on every exit path
+    trap 'rm -f "$RUN/hdr" "$D/hdr"' EXIT   # BOTH token headers, every exit path
     if [ -z "${SOUL_ID:-}" ]; then
       # Recovery mode: derive the probe soul from the unique workspace —
       # no independent terminalId check applies here; WS uniqueness IS
       # the identity proof. (Requires WS; a known $D alone is NOT enough —
       # its records are only trustworthy alongside this shell's own step 5.)
       if [ -z "${WS:-}" ]; then
-        ls -dt ~/scratch/home-mount-probe.* 2>/dev/null || true
-        echo "export WS=<your workspace from the list above>, then re-run"
+        ls -dt ~/freshell-probe.*/ws.* 2>/dev/null || true
+        ls -dt ~/freshell-probe.*/bws.* 2>/dev/null || true
+        echo "export WS=<your probe workspace>, and BWS=<your browser-check workspace> if applicable, then re-run"
         exit 1
       fi
       PROBE=$(curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
@@ -665,7 +674,8 @@ print("stopped browser soul:", o["outcome"])'
         fi
       fi
     fi
-    rm -rf "$D" "$WS" "${BWS:-}"   # runs only on success; trap removed the header
+    rm -rf "$D" "${PROBE_ROOT:-}" "$WS" "${BWS:-}"   # success only; both
+    # token headers were already scrubbed by the trap
     ```
 
     If the block aborts before `verified_empty`, the token header is
