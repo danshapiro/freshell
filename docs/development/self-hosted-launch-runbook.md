@@ -281,11 +281,16 @@ drop-in, plus `freshell-supervisor.service`):
    D=$(mktemp -d)   # private per-run directory
    mkdir -p ~/scratch
    WS=$(mktemp -d ~/scratch/home-mount-probe.XXXXXX)   # unique probe workspace
+   chmod 0770 "$WS"   # the in-soul shell runs as 65534:0 — group-traversable
+                      # and group-writable is required or the probe terminal
+                      # cannot use its own workspace
    CHECKOUT=$(systemctl --user show freshell-rust.service -p WorkingDirectory --value)
    TOK=$(grep -E '^AUTH_TOKEN=' "$CHECKOUT/.env" | cut -d= -f2-)
    umask 077
    printf 'x-auth-token: %s\n' "$TOK" > "$D/hdr"   # header file, not argv
    trap 'rm -f "$D/hdr"' EXIT   # the token file must not survive ANY exit
+   printf 'D=%q\nWS=%q\nCHECKOUT=%q\n' "$D" "$WS" "$CHECKOUT" > "$D/run.env"
+   echo "$D" > "$HOME/.freshell/managed-runtime-probe-dir"   # recovery pointer
    # create the probe pane (example); record terminalId from the response:
    curl -s -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
      -d '{"mode":"shell","cwd":"'"$WS"'","name":"home-mount probe"}' \
@@ -310,14 +315,17 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
    [managed-runtime-rollout.md](managed-runtime-rollout.md)).
 
    Run steps 5-8 in ONE shell session: the private directory `$D`, the
-   probe workspace `$WS`, and their records persist between them. If the
-   shell is lost, do NOT guess at recovery from any shared state: the
-   probe soul is re-derivable only by its unique workspace — find the
-   soul whose `terminalCwd` equals `$WS` in `GET /api/runtime/souls` and
-   stop it with the same fenced request, then delete the directories by
-   hand. The probe workspace under `~/scratch/` is unique per run
-   (`mktemp -d`), which is also what makes workspace-based matching safe
-   from cross-run and cross-operator confusion.
+   probe workspace `$WS`, and their records persist between them, and
+   `$D/run.env` plus the `~/.freshell/managed-runtime-probe-dir` pointer
+   let a later block reload them (see step 8's recovery lines). If the
+   shell is lost or a check aborts under `set -e`, the FILES survive —
+   only the variables die — so recovery is: open a new shell, then either
+   source the pointer's `run.env`, or, when concurrent probe runs make
+   the pointer untrustworthy, locate YOUR workspace by timestamp
+   (`ls -dt ~/scratch/home-mount-probe.*`) and recover purely from it:
+   the soul whose `terminalCwd` equals that workspace IS your probe
+   (workspace uniqueness is the identity proof), so apply the same
+   fenced stop to that soul directly and delete the directories by hand.
 
     Then confirm the probe container carries the operator-home bind and the
     `FRESHELL_OPERATOR_HOME_MOUNT=1` marker env (`docker inspect`), and that
@@ -361,6 +369,8 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
 
     ```bash
     BWS=$(mktemp -d ~/scratch/browser-path-check.XXXXXX)   # unique per run
+    chmod 0770 "$BWS"   # same in-soul-shell access requirement as $WS
+    echo "BWS=$BWS" >> "$D/run.env"
     # ...hard-refresh the web client, create a terminal pane at $BWS...
     curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
       | python3 -c 'import json,sys
@@ -400,6 +410,12 @@ print("UI pane is managed:", hits[0]["soulId"])' "$BWS"
 
     ```bash
     set -euo pipefail   # a failed check must halt BEFORE the stop request
+    # Reload this run's records if the shell died between steps (files
+    # survive a set -e abort; only the variables die):
+    if [ -z "${D:-}" ] && [ -f "$HOME/.freshell/managed-runtime-probe-dir" ]; then
+      . "$(cat "$HOME/.freshell/managed-runtime-probe-dir")/run.env"
+    fi
+    : "${D:?no run records — use the workspace-timestamp recovery above}"
     CHECKOUT=$(systemctl --user show freshell-rust.service -p WorkingDirectory --value)
     # Self-healing retry: the trap removed the header on the previous exit;
     # recreate it (0600) only when missing:
