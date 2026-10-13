@@ -704,13 +704,21 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
     printf 'BWS=%q\n' "$BWS" >> "$D/run.env"
     # The directory picker PERSISTS the chosen path as OpenCode's default
     # cwd (the confirm handler patches settings) — record the current
-    # default so step 8 can restore it:
-    curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" http://127.0.0.1:3001/api/settings \
-      | python3 -c 'import json,sys
-d=json.load(sys.stdin)
+    # default (VERIFIED read: an error response must not masquerade as
+    # an empty saved default):
+    SETTINGS_CODE=$(curl -s --connect-timeout 5 --max-time 10 \
+      -o "$D/settings.json" -w '%{http_code}' -H @"$D/hdr" \
+      http://127.0.0.1:3001/api/settings)
+    grep -q '^2' <<<"$SETTINGS_CODE" || { echo "settings read failed (HTTP $SETTINGS_CODE)"; exit 1; }
+    python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+assert isinstance(d, dict), "malformed settings response"
 d=d.get("data",d)
-print((d.get("codingCli") or {}).get("providers",{}).get("opencode",{}).get("cwd") or "")' \
-      > "$D/old-opencode-cwd.txt"
+cc=d.get("codingCli")
+assert isinstance(cc, dict), "malformed settings response: no codingCli"
+cur=(cc.get("providers") or {}).get("opencode",{}).get("cwd")
+print("" if cur is None else cur)' "$D/settings.json" > "$D/old-opencode-cwd.txt"
+    rm -f "$D/settings.json"   # the response can carry secrets — do not keep it
     # Hard-refresh the web client, then in the UI: open the pane picker
     # and choose OPENCODE specifically — the only managed-enabled
     # coding-CLI provider in the current release (Claude, Codex, and
@@ -1080,12 +1088,21 @@ sys.exit(0 if cur==sys.argv[1] else 1)' "$OLD" \
       # was lost with the shell, so the original value is unrecoverable.
       # If the current default still points at $BWS, clearing it is the
       # only safe option — otherwise deleting $BWS would leave OpenCode
-      # defaulting into a deleted directory:
-      CUR=$(curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" http://127.0.0.1:3001/api/settings \
-        | python3 -c 'import json,sys
-d=json.load(sys.stdin); d=d.get("data",d)
-cur=(d.get("codingCli") or {}).get("providers",{}).get("opencode",{}).get("cwd")
-print("" if cur is None else cur)')
+      # defaulting into a deleted directory (VERIFIED read: an error
+      # response must not masquerade as a changed default):
+      SETTINGS_CODE=$(curl -s --connect-timeout 5 --max-time 10 \
+        -o "$D/settings.json" -w '%{http_code}' -H @"$D/hdr" \
+        http://127.0.0.1:3001/api/settings)
+      grep -q '^2' <<<"$SETTINGS_CODE" || { echo "settings read failed (HTTP $SETTINGS_CODE)"; exit 1; }
+      CUR=$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+assert isinstance(d, dict), "malformed settings response"
+d=d.get("data",d)
+cc=d.get("codingCli")
+assert isinstance(cc, dict), "malformed settings response: no codingCli"
+cur=(cc.get("providers") or {}).get("opencode",{}).get("cwd")
+print("" if cur is None else cur)' "$D/settings.json")
+      rm -f "$D/settings.json"   # the response can carry secrets
       if [ "$CUR" = "$BWS" ]; then
         BODY=$(python3 -c 'import json;print(json.dumps({"codingCli":{"providers":{"opencode":{"cwd":None}}}}))')
         CODE=$(curl -s --connect-timeout 5 --max-time 30 -o "$D/settings-clear.out" -w '%{http_code}' -X PATCH \
@@ -1101,27 +1118,49 @@ print("" if cur is None else cur)')
     rm -rf "$D" "$WS" "${BWS:-}"
     # POST-DELETION SWEEP: the client's settings save is unawaited, so a
     # late landing can set the default to the now-DELETED $BWS after all
-    # the pre-restore checks passed. Give it a moment, re-read (verified),
-    # and clear the default if it landed on the probe path:
+    # the pre-restore checks passed. The sweep reads into a FRESH PRIVATE
+    # dir (the response can carry secrets; a fixed /tmp path would be
+    # shared between concurrent runs and left behind on failure) and
+    # needs a live token header — after a lost shell, mint both:
     if [ -n "${BWS:-}" ]; then
       sleep 3
-      SETTINGS_CODE=$(curl -s --connect-timeout 5 --max-time 10 \
-        -o "/tmp/freshell-settings-sweep.json" -w '%{http_code}' -H @"$RUN/hdr" \
-        http://127.0.0.1:3001/api/settings 2>/dev/null) || SETTINGS_CODE=000
-      if grep -q '^2' <<<"$SETTINGS_CODE" 2>/dev/null; then
-        SWEEP_CWD=$(python3 -c 'import json,sys
-d=json.load(open(sys.argv[1])); d=d.get("data",d)
-cur=((d.get("codingCli") or {}).get("providers",{}).get("opencode",{}) or {}).get("cwd")
-print("" if cur is None else cur)' /tmp/freshell-settings-sweep.json 2>/dev/null) || SWEEP_CWD=""
-        if [ "$SWEEP_CWD" = "$BWS" ]; then
-          BODY=$(python3 -c 'import json;print(json.dumps({"codingCli":{"providers":{"opencode":{"cwd":None}}}}))')
-          curl -s --connect-timeout 5 --max-time 30 -X PATCH -H @"$RUN/hdr" \
-            -H "Content-Type: application/json" -d "$BODY" \
-            http://127.0.0.1:3001/api/settings > /dev/null
-          echo "NOTE: a late picker save re-pointed OpenCode at the deleted probe dir — cleared; set your default in Settings"
+      SWEEP_DIR=$(mktemp -d)
+      umask 077
+      if [ ! -f "${RUN:-/nonexistent}/hdr" ]; then
+        SPID=$(systemctl --user show freshell-rust.service -p MainPID --value)
+        TOK=""
+        if [ "${SPID:-0}" -gt 0 ] 2>/dev/null; then
+          TOK=$(tr '\0' '\n' < "/proc/$SPID/environ" | sed -n 's/^AUTH_TOKEN=//p' || true)
         fi
-        rm -f /tmp/freshell-settings-sweep.json
+        if [ -n "$TOK" ]; then
+          printf 'x-auth-token: %s\n' "$TOK" > "$SWEEP_DIR/hdr"
+        fi
       fi
+      HDR="${RUN:-$SWEEP_DIR}/hdr"
+      if [ -f "$HDR" ]; then
+        SETTINGS_CODE=$(curl -s --connect-timeout 5 --max-time 10 \
+          -o "$SWEEP_DIR/settings.json" -w '%{http_code}' -H @"$HDR" \
+          http://127.0.0.1:3001/api/settings) || SETTINGS_CODE=000
+        if grep -q '^2' <<<"$SETTINGS_CODE"; then
+          SWEEP_CWD=$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1])); d=d.get("data",d)
+cc=d.get("codingCli")
+assert isinstance(cc, dict), "malformed settings response"
+cur=((cc.get("providers") or {}).get("opencode",{}) or {}).get("cwd")
+print("" if cur is None else cur)' "$SWEEP_DIR/settings.json") || SWEEP_CWD=""
+          if [ "$SWEEP_CWD" = "$BWS" ]; then
+            BODY=$(python3 -c 'import json;print(json.dumps({"codingCli":{"providers":{"opencode":{"cwd":None}}}}))')
+            PATCH_CODE=$(curl -s --connect-timeout 5 --max-time 30 \
+              -o "$SWEEP_DIR/patch.out" -w '%{http_code}' -X PATCH -H @"$HDR" \
+              -H "Content-Type: application/json" -d "$BODY" \
+              http://127.0.0.1:3001/api/settings)
+            grep -q '^2' <<<"$PATCH_CODE" \
+              || { echo "late-save clear FAILED (HTTP $PATCH_CODE) — clear Settings → Coding CLI → OpenCode manually"; rm -rf "$SWEEP_DIR"; exit 1; }
+            echo "NOTE: a late picker save re-pointed OpenCode at the deleted probe dir — cleared; set your default in Settings"
+          fi
+        fi
+      fi
+      rm -rf "$SWEEP_DIR"
     fi
     rm -f "${RUN:-/nonexistent}/hdr" "$D/hdr" 2>/dev/null   # scrub last —
     # the sweep above needed $RUN/hdr; the trap alone only fires at shell
