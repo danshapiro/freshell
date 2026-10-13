@@ -36,6 +36,7 @@ FROM ubuntu@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987
 ARG CLAUDE_CODE_VERSION=2.1.263
 ARG CODEX_VERSION=0.147.0
 ARG OPENCODE_VERSION=1.18.21
+ARG BUN_VERSION=1.4.3
 ARG AMPLIFIER_APP_CLI_COMMIT=1873aa980535c99a743b17172e4231833f6c8741
 ARG AMPLIFIER_UV_VERSION=0.8.22
 ARG AMPLIFIER_PROVIDER_VLLM_COMMIT=e1846e907b0ce90b3e8748346244e548fa0d3241
@@ -51,6 +52,7 @@ RUN apt-get update \
       "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
       "@openai/codex@${CODEX_VERSION}" \
       "opencode-ai@${OPENCODE_VERSION}" \
+      "bun@${BUN_VERSION}" \
  && python3 -m venv /opt/uv \
  && /opt/uv/bin/pip install --no-cache-dir "uv==${AMPLIFIER_UV_VERSION}" \
  && git clone --filter=blob:none https://github.com/microsoft/amplifier-app-cli /opt/amplifier-src \
@@ -69,6 +71,7 @@ RUN apt-get update \
  && claude --version | grep -F "${CLAUDE_CODE_VERSION}" \
  && codex --version | grep -F "${CODEX_VERSION}" \
  && opencode --version | grep -Fx "${OPENCODE_VERSION}" \
+ && bun --version | grep -Fx "${BUN_VERSION}" \
  && /opt/amplifier-src/.venv/bin/python -c 'import importlib.metadata as m; assert m.version("amplifier-app-cli") == "0.1.1"' \
  && /opt/amplifier-src/.venv/bin/python -c 'import importlib.metadata as m; assert m.version("openai") == "2.8.1"; assert m.version("openai-harmony") == "0.0.8"; assert m.version("amplifier-module-provider-vllm") == "1.0.0"' \
  && /lib/x86_64-linux-gnu/libc.so.6 | grep -F '2.39'
