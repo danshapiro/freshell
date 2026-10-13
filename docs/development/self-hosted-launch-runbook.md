@@ -811,28 +811,47 @@ PY
     fi
     trap 'rm -f "${RUN:-/nonexistent}/hdr" "${D:-/nonexistent}/hdr"' EXIT   # BOTH headers, every exit path, set -u-safe
     # DESTRUCTIVE-PATH GUARD (both the normal and recovery flows pass
-    # through here): canonicalize every probe path, pattern-match it
-    # against the freshell-probe layout, AND tie WS/BWS/PROBE_ROOT to ONE
-    # shared root — validating them independently would let a mixed-up
-    # recovery export stop another run's soul and delete its directories:
+    # through here). Canonicalize every probe path and tie them together:
+    # PROBE_ROOT must BE a freshell-probe run root; WS and BWS must be
+    # workspaces DIRECTLY UNDER that same root; D must be a mktemp-style
+    # records directory carrying this run's probe records. Validating the
+    # paths independently would let a mixed-up recovery export stop
+    # another run's soul and delete its files:
     GUARD_ROOT=""
-    for V in WS BWS PROBE_ROOT; do
+    if [ -n "${PROBE_ROOT:-}" ]; then
+      PROBE_ROOT=$(realpath -e "$PROBE_ROOT") || { echo "PROBE_ROOT: path does not exist"; exit 1; }
+      case "$PROBE_ROOT" in
+        "$HOME"/freshell-probe.*) GUARD_ROOT="$PROBE_ROOT" ;;
+        *) echo "REFUSING: PROBE_ROOT=$PROBE_ROOT is not a freshell-probe run root"; exit 1 ;;
+      esac
+    fi
+    for V in WS BWS; do
       eval "VAL=\${$V:-}"
       [ -n "$VAL" ] || continue
       VAL=$(realpath -e "$VAL") || { echo "$V: path does not exist"; exit 1; }
       PARENT=$(dirname "$VAL")
       case "$PARENT" in
         "$HOME"/freshell-probe.*) ;;
-        *) echo "REFUSING: $V=$VAL is not a freshell-probe workspace/root — resolve manually"; exit 1 ;;
+        *) echo "REFUSING: $V=$VAL is not a freshell-probe workspace — resolve manually"; exit 1 ;;
       esac
       if [ -z "$GUARD_ROOT" ]; then
         GUARD_ROOT="$PARENT"
       elif [ "$PARENT" != "$GUARD_ROOT" ]; then
-        echo "REFUSING: $V=$VAL belongs to a different probe root than the earlier paths — resolve manually"
+        echo "REFUSING: $V=$VAL belongs to a different probe root than the other paths — resolve manually"
         exit 1
       fi
       printf -v "$V" '%s' "$VAL"
     done
+    if [ -n "${D:-}" ]; then
+      case "$D" in
+        /tmp/tmp.*) ;;
+        *) echo "REFUSING: D=$D is not a mktemp records directory"; exit 1 ;;
+      esac
+      if [ ! -f "$D/probe-soul-id.txt" ] && [ ! -f "$D/run.env" ]; then
+        echo "REFUSING: D=$D carries no probe records — resolve manually"
+        exit 1
+      fi
+    fi
     if [ -z "${SOUL_ID:-}" ]; then
       # Recovery mode: derive the probe soul from the unique workspace —
       # no independent terminalId check applies here; WS uniqueness IS
