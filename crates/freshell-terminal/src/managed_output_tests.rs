@@ -520,6 +520,62 @@ fn managed_completion_after_ended_lifecycle_publishes_the_observed_exit_code() {
 }
 
 #[test]
+fn managed_unknown_completion_after_ended_lifecycle_notifies_attached_viewer_once() {
+    let (registry, _) = fixture();
+    let (sink, seen) = collect_messages();
+    assert!(
+        registry
+            .attach(
+                "terminal-stable",
+                79,
+                sink,
+                Some("unknown-completion-after-lifecycle".into()),
+                206,
+                false,
+                false,
+                None,
+                None,
+                None,
+                PacedAttachOptions::default(),
+            )
+            .found
+    );
+    seen.lock().unwrap().clear();
+
+    registry.publish_managed_lifecycle(
+        "terminal-stable",
+        Some(lifecycle_with_recovery_state(
+            ManagedLifecycleState::Ended,
+            "lost",
+            "running",
+        )),
+    );
+    assert!(!seen
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| matches!(frame, ServerMessage::TerminalExit(_))));
+
+    assert!(registry.finish_managed_completion("terminal-stable", None));
+    {
+        let frames = seen.lock().unwrap();
+        assert!(frames.iter().any(|frame| matches!(frame,
+            ServerMessage::TerminalExit(exit)
+                if exit.exit_code == -1
+                    && exit.exit_code_available == Some(false)
+                    && exit.managed_retained == Some(true))));
+    }
+
+    seen.lock().unwrap().clear();
+    assert!(registry.finish_managed_completion("terminal-stable", None));
+    assert!(!seen
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| matches!(frame, ServerMessage::TerminalExit(_))));
+}
+
+#[test]
 fn managed_blocked_lifecycle_can_transition_through_recovery_back_to_running() {
     let (registry, _) = fixture();
     registry.publish_managed_lifecycle(

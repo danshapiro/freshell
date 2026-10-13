@@ -583,6 +583,9 @@ struct TerminalShared {
     managed_identity: Option<(String, String)>,
     managed_lifecycle: Option<ManagedLifecycle>,
     managed_exit_code_available: Option<bool>,
+    /// Whether a completion event has already been fanned out to attached viewers.
+    /// Lifecycle-only final states set code availability without notifying exits.
+    managed_exit_notified: bool,
     managed_output_failure: Option<String>,
     /// The exit code from the last `terminal.exit` fan-out (kill or natural exit).
     /// `None` while `status == Running`. Kept so a client that attaches AFTER the
@@ -948,6 +951,36 @@ pub struct ManagedOutputRead {
     pub native_session_id: Option<String>,
     pub chunks: Vec<ManagedOutputChunk>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedOutputRefreshError {
+    pub message: String,
+    /// A cached lifecycle verdict changed even though retained output was unreadable.
+    pub lifecycle_changed: bool,
+}
+
+impl From<String> for ManagedOutputRefreshError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            lifecycle_changed: false,
+        }
+    }
+}
+
+impl From<&str> for ManagedOutputRefreshError {
+    fn from(message: &str) -> Self {
+        Self::from(message.to_string())
+    }
+}
+
+impl std::fmt::Display for ManagedOutputRefreshError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ManagedOutputRefreshError {}
 
 /// Async control seam implemented by `freshell-server` with
 /// `freshell-runtime-client`. Keeping the trait here lets the existing registry
@@ -2472,6 +2505,7 @@ impl TerminalRegistry {
             managed_identity: None,
             managed_lifecycle: None,
             managed_exit_code_available: None,
+            managed_exit_notified: false,
             managed_output_failure: None,
             terminal_id: terminal_id.clone(),
             stream_id: stream_id.clone(),
@@ -4691,6 +4725,7 @@ impl TerminalRegistry {
             )),
             managed_lifecycle: None,
             managed_exit_code_available: None,
+            managed_exit_notified: false,
             managed_output_failure: None,
             terminal_id: descriptor.terminal_id.clone(),
             stream_id: descriptor.stream_id.clone(),
@@ -4869,7 +4904,7 @@ impl TerminalRegistry {
         &self,
         terminal_id: &str,
         max_bytes: u64,
-    ) -> Result<ManagedOutputRead, String> {
+    ) -> Result<ManagedOutputRead, ManagedOutputRefreshError> {
         let (terminal, flag) = {
             let inner = self.inner.lock().expect("registry lock");
             let handle = inner
@@ -4917,11 +4952,14 @@ impl TerminalRegistry {
         {
             Ok(read) => read,
             Err(error) => {
-                self.publish_managed_lifecycle(
+                let lifecycle_changed = self.publish_managed_lifecycle(
                     terminal_id,
                     controller.lifecycle_observation(&terminal).await,
                 );
-                return Err(error);
+                return Err(ManagedOutputRefreshError {
+                    message: error,
+                    lifecycle_changed,
+                });
             }
         };
         let mut announcements = Vec::new();
@@ -5049,6 +5087,7 @@ impl TerminalRegistry {
                 state.status = TerminalRunStatus::Running;
                 state.exit_code = None;
                 state.managed_exit_code_available = None;
+                state.managed_exit_notified = false;
             }
             ManagedLifecycleState::Blocked | ManagedLifecycleState::Ended => {
                 state.status = TerminalRunStatus::Exited;
@@ -5117,17 +5156,18 @@ impl TerminalRegistry {
             Arc::clone(&handle.shared)
         };
         let mut state = shared.lock().expect("terminal lock");
-        if state.status == TerminalRunStatus::Exited {
+        if state.status == TerminalRunStatus::Exited && state.managed_exit_notified {
             match (state.managed_exit_code_available, code) {
                 (Some(true), _) | (Some(false), None) => return true,
-                // A lifecycle-only final verdict has no exit-code evidence.
-                // Allow a later completion observation to publish the code.
+                // Allow a later completion observation to publish a known code
+                // after a lifecycle-only verdict or an unknown-code completion.
                 (Some(false), Some(_)) | (None, _) => {}
             }
         }
         state.status = TerminalRunStatus::Exited;
         state.exit_code = Some(exit_code);
         state.managed_exit_code_available = Some(code.is_some());
+        state.managed_exit_notified = true;
         let now = now_ms();
         state.last_activity_at = now;
         state.last_output_activity_at = now;
@@ -5203,6 +5243,7 @@ impl TerminalRegistry {
             managed_identity: None,
             managed_lifecycle: None,
             managed_exit_code_available: None,
+            managed_exit_notified: false,
             managed_output_failure: None,
             terminal_id: opts.terminal_id.clone(),
             stream_id: opts.stream_id,
