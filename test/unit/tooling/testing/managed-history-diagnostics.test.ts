@@ -192,7 +192,7 @@ async function historyCallback(fault?: HistoryFault, startup: 'presentation' | '
     press: async () => {
       const item = current(), content = state.panes.layouts[item.tabId].content
       const request = { type: 'freshAgent.create', requestId: content.createRequestId, tabId: item.tabId,
-        sessionType: content.sessionType, provider: content.provider }
+        paneId: item.paneId, sessionType: content.sessionType, provider: content.provider }
       if (startupFault === 'create-tab') request.tabId = 'other-tab'
       frame(request)
       const ack: { sessionRef?: { provider: string, sessionId: string } } & Record<string, unknown> = { type: 'freshAgent.created', requestId: content.createRequestId,
@@ -252,6 +252,8 @@ async function historyCallback(fault?: HistoryFault, startup: 'presentation' | '
         sendCount++
         content.sessionId = item.view.nativeSessionId
         content.sessionRef = { provider: content.provider, sessionId: item.view.nativeSessionId }
+        // The real fixture waits for this presentation-id completion edge before opening History.
+        framereceived({ payload: JSON.stringify({ type: 'freshAgent.turn.complete', sessionId: item.sessionId }) })
       },
     } : locator }),
     evaluate: async (operation: any, argument: any) => {
