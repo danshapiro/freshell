@@ -259,8 +259,13 @@ fn workload_mounts(
         let source = if let Some(source) = staged_source {
             source
         } else {
-            std::fs::canonicalize(&secret.source_path)
-                .map_err(|error| format!("provider secret reference: {error}"))?
+            std::fs::canonicalize(&secret.source_path).map_err(|error| {
+                format!(
+                    "provider secret reference {} ({:?}): {error}",
+                    index + 1,
+                    secret.profile
+                )
+            })?
         };
         if !source.is_file() || !source_is_staged && source != Path::new(&secret.source_path) {
             return Err("provider secret reference must be a canonical regular file".into());
@@ -1039,6 +1044,39 @@ mod provider_secret_tests {
         let durable = serde_json::to_string(&launch).unwrap();
         assert!(durable.contains(&canonical_grant.to_string_lossy().to_string()));
         assert!(!durable.contains("fixture-secret-bytes"));
+    }
+
+    #[test]
+    fn missing_provider_secret_reports_its_profile_without_exposing_the_source_path() {
+        use freshell_runtime_protocol::{ProviderSecretProfile, ProviderSecretReference};
+
+        let owned = tempfile::tempdir().unwrap();
+        let workspace = owned.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let missing = owned.path().join("private/opencode.env");
+        let error = match workload_mounts(
+            WorkloadPaths {
+                workspace_path: workspace.to_str().unwrap(),
+                cwd_path: workspace.to_str().unwrap(),
+                git_common_path: None,
+            },
+            &[],
+            &[ProviderSecretReference {
+                provider_relative_path: None,
+                source_path: missing.to_string_lossy().into_owned(),
+                profile: ProviderSecretProfile::OpencodeOnecliEnvironment,
+            }],
+            None,
+            "opencode",
+            MountPurpose::Create,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a missing grant must prevent provider launch"),
+        };
+
+        assert!(error.contains("OpencodeOnecliEnvironment"), "{error}");
+        assert!(error.contains("No such file or directory"), "{error}");
+        assert!(!error.contains(&missing.to_string_lossy().to_string()));
     }
 
     #[cfg(unix)]
