@@ -125,20 +125,29 @@ the procedure mid-way and leave the service down. Two sequences:
   for i in $(seq 1 60); do
     # CONNECT-probe, not a file test: a stopped supervisor leaves its old
     # socket FILE on disk, so [ -S ... ] passes on a dead listener:
-    python3 -c 'import socket,sys
+    if python3 -c 'import socket,sys
 s=socket.socket(socket.AF_UNIX); s.settimeout(1)
 try: s.connect(sys.argv[1])
-except OSError: sys.exit(1)' "$SOCK" 2>/dev/null && break
+except OSError: sys.exit(1)' "$SOCK" 2>/dev/null; then
+      break
+    fi
     systemctl --user is-active freshell-supervisor.service >/dev/null \
       || { echo "supervisor unit is not active"; exit 1; }
     sleep 1
   done
+  # The loop alone proves nothing if it exhausted — verify before starting:
+  python3 -c 'import socket,sys
+s=socket.socket(socket.AF_UNIX); s.settimeout(1)
+try: s.connect(sys.argv[1])
+except OSError: sys.exit(1)' "$SOCK" 2>/dev/null \
+    || { echo "supervisor socket never became live"; exit 1; }
   systemctl --user start freshell-rust.service
   ```
 
   The connect-probe waits for a LIVE listener (a stale file fails the
-  connect), fails fast if the supervisor unit dies, and is bounded. If the
-  server unit fails its first start in a race window, that is this socket
+  connect), fails fast if the supervisor unit dies, and the final probe
+  refuses to start the server if the socket never came up. If the server
+  unit fails its first start in a race window, that is this socket
   ordering, not a bad build — wait for the live socket and start it again
   (repeated immediate failures can also trip the unit's start limit). No
   soul can be created during the build. This is a full outage for the
@@ -323,17 +332,12 @@ drop-in, plus `freshell-supervisor.service`):
                       # and group-writable is required or the probe terminal
                       # cannot use its own workspace
    CHECKOUT=$(systemctl --user show freshell-rust.service -p WorkingDirectory --value)
-   # Robust dotenv extraction (the server accepts `export AUTH_TOKEN=`,
-   # quoted values, and inline comments on unquoted values — a bare
-   # `grep AUTH_TOKEN= | cut` mangles all three):
-   TOK=$(python3 -c 'import re,sys
-m=re.search(r"^\s*(?:export\s+)?AUTH_TOKEN\s*=\s*(.*)$", open(sys.argv[1]).read(), re.M)
-v=m.group(1).strip()
-if v[:1] in (chr(34),chr(39)):
-    v=v[1:-1] if v[-1:]==v[0] else v
-else:
-    v=v.split(chr(35))[0].strip()
-print(v)' "$CHECKOUT/.env")
+   # The token the RUNNING server actually validates against — read from
+   # its own environment, not by re-parsing .env (the server's dotenv
+   # accepts export prefixes, quotes, and comment forms that naive
+   # grep/cut extraction mangles):
+   SPID=$(systemctl --user show freshell-rust.service -p MainPID --value)
+   TOK=$(tr '\0' '\n' < "/proc/$SPID/environ" | sed -n 's/^AUTH_TOKEN=//p')
    umask 077
    printf 'x-auth-token: %s\n' "$TOK" > "$D/hdr"   # header file, not argv
    trap 'rm -f "$D/hdr"' EXIT   # the token file must not survive ANY exit
@@ -352,13 +356,14 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
    ```
 
    If the unit's environment (not the checkout's `.env`) is what supplies
-   the token on your installation, read `TOK` from there instead. The
-   header-file form keeps the token out of process argument lists
-   (visible via `/proc/*/cmdline`) and the `trap` scrubs it on every exit
-   path. This direct form is a deliberate, one-off exception for a human
-   operator at the host console; it uses the full-scope checkout token,
-   whereas every routine or agent-driven runtime API call must use the
-   scope-limited OneCLI grant instead (see
+   the token on your installation, the `/proc` read above already picks
+   that up — it reads the server's effective environment, whatever its
+   source. The header-file form keeps the token out of process argument
+   lists (visible via `/proc/*/cmdline`) and the `trap` scrubs it on
+   every exit path. This direct form is a deliberate, one-off exception
+   for a human operator at the host console; it uses the full-scope
+   checkout token, whereas every routine or agent-driven runtime API call
+   must use the scope-limited OneCLI grant instead (see
    [managed-runtime-rollout.md](managed-runtime-rollout.md)).
 
    Run steps 5-8 in ONE shell session: the private directory `$D`, the
@@ -464,26 +469,24 @@ print("UI pane is managed:", hits[0]["soulId"])' "$BWS"
     if [ -z "${D:-}" ]; then
       # Lost-shell recovery — deliberately NOT pointer-based (a concurrent
       # run's records are self-consistent and would stop the wrong soul).
-      # $WS is the identity proof; export it from YOUR workspace listing:
+      # $WS is the identity proof; export it from YOUR workspace listing.
+      # If your run included the step-7 browser check, export BWS too —
+      # otherwise its soul is reported below but deliberately left
+      # running rather than guessed at:
       if [ -z "${WS:-}" ]; then
         ls -dt ~/scratch/home-mount-probe.* 2>/dev/null || true
-        echo "export WS=<your workspace from the list above>, then re-run"
+        ls -dt ~/scratch/browser-path-check.* 2>/dev/null || true
+        echo "export WS=<your probe workspace>, and BWS=<your browser-check workspace> if applicable, then re-run"
         exit 1
       fi
       D=$(mktemp -d)   # fresh records dir for the recovery run
     fi
     # Self-healing token header: the trap removed it on the previous exit;
-    # recreate it (0600) only when missing, with the same robust dotenv
-    # extraction as step 5:
+    # recreate it (0600) only when missing, reading the token from the
+    # RUNNING server's environment exactly as step 5 does:
     if [ ! -f "$D/hdr" ]; then
-      TOK=$(python3 -c 'import re,sys
-m=re.search(r"^\s*(?:export\s+)?AUTH_TOKEN\s*=\s*(.*)$", open(sys.argv[1]).read(), re.M)
-v=m.group(1).strip()
-if v[:1] in (chr(34),chr(39)):
-    v=v[1:-1] if v[-1:]==v[0] else v
-else:
-    v=v.split(chr(35))[0].strip()
-print(v)' "$CHECKOUT/.env")
+      SPID=$(systemctl --user show freshell-rust.service -p MainPID --value)
+      TOK=$(tr '\0' '\n' < "/proc/$SPID/environ" | sed -n 's/^AUTH_TOKEN=//p')
       umask 077; printf 'x-auth-token: %s\n' "$TOK" > "$D/hdr"
     fi
     trap 'rm -f "$D/hdr"' EXIT   # scrub the token file on every exit path
@@ -502,7 +505,8 @@ print(v)' "$CHECKOUT/.env")
 souls=json.load(sys.stdin)["souls"]
 hits=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
 assert hits, "no soul for this workspace — nothing to stop"
-print(hits[0]["soulId"], hits[0]["intentRevision"], hits[0]["terminalId"])' "$WS")
+s=hits[-1]   # newest incarnation (inventory is oldest-first)
+print(s["soulId"], s["intentRevision"], s["terminalId"])' "$WS")
       read -r SOUL_ID REV TID <<< "$PROBE"
     else
       TID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["data"]["terminalId"])' "$D/probe-tab.json")
@@ -528,15 +532,20 @@ print("stopped:", o["outcome"])'
     # Look it up by workspace in ANY launchState — a blocked or exited
     # probe soul still must not be orphaned against a deleted workspace:
     if [ -n "${BWS:-}" ]; then
+      # Select the NEWEST record for this workspace (the inventory lists
+      # incarnations oldest first, so after a recovery the newest entry is
+      # the live one; an older stopped incarnation may also match):
       BS=$(curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
         | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
 hits=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
-print((hits[0]["soulId"], hits[0]["intentRevision"], hits[0]["launchState"]) if hits else "")' "$BWS")
+if hits:
+    s=hits[-1]
+    print(s["soulId"], s["intentRevision"], s["launchState"])
+else:
+    print("")' "$BWS")
       if [ -n "$BS" ]; then
-        BS_ID=$(cut -d" " -f1 <<<"$BS")
-        BS_REV=$(cut -d" " -f2 <<<"$BS")
-        BS_STATE=$(cut -d" " -f3 <<<"$BS")
+        read -r BS_ID BS_REV BS_STATE <<< "$BS"
         if [ "$BS_STATE" != "stopped" ]; then
           curl -s -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
             -d "{\"requestId\":\"probe-cleanup\",\"expectedIntentRevision\":$BS_REV}" \
