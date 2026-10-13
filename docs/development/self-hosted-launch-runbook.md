@@ -398,8 +398,12 @@ drop-in, plus `freshell-supervisor.service`):
    completed without subsystem errors, NOT that every soul can reattach —
    an individually blocked soul is a per-soul outcome that does not enter
    `blockedSubsystems`, which is why step 4 checks each soul directly.
-3. Units: `systemctl --user is-active freshell-rust.service
-   freshell-supervisor.service` → both `active`, and the supervisor's
+3. Units: `is-active` with MULTIPLE units succeeds if at least ONE is
+   active, so check each separately and assert both outputs are
+   `active`:
+   `systemctl --user is-active freshell-rust.service` and
+   `systemctl --user is-active freshell-supervisor.service` → each
+   `active`, and the supervisor's
    control socket
    (`~/.freshell/managed-runtime/control/supervisor.sock`) is LIVE —
    connect-probe it as in the strict sequence, because the supervisor unit
@@ -867,7 +871,7 @@ PY
     done
     if [ -n "${D:-}" ]; then
       case "$D" in
-        /tmp/tmp.*) ;;
+        "${TMPDIR:-/tmp}"/tmp.*) ;;   # mktemp honors $TMPDIR when set
         *) echo "REFUSING: D=$D is not a mktemp records directory"; exit 1 ;;
       esac
       if [ "${RECOVERY_MINTED:-0}" != "1" ]; then
@@ -879,7 +883,10 @@ PY
         # its self-consistent SOUL_ID/TID) with another run's WS would
         # otherwise stop the old run's soul and delete the new workspace:
         if [ -n "${WS:-}" ] && [ -f "$D/run.env" ]; then
-          RECORDED_WS=$(sed -n 's/^WS=//p' "$D/run.env" | tail -1)
+          # Source the file to UNESCAPE the %q-encoded values — a raw
+          # text read would compare escaped bytes against the real path
+          # and false-refuse any path with spaces:
+          RECORDED_WS=$(bash -c '. "$1"; printf "%s" "${WS:-}"' _ "$D/run.env")
           if [ -n "$RECORDED_WS" ] && [ "$RECORDED_WS" != "$WS" ]; then
             echo "REFUSING: D=$D records workspace $RECORDED_WS, but WS=$WS — mixed runs; resolve manually"
             exit 1
