@@ -152,12 +152,18 @@ mod configured_resource_tests {
         let units =
             resource_units(home, &home.join(".config/opencode"), workspace, &plan, None).unwrap();
         let selected_resource = selected_resource.canonicalize().unwrap();
-        let mount = units
+        let effective_destination = units
             .iter()
-            .find(|(source, _)| source == &selected_resource)
-            .map(|(_, mount)| mount)
+            .find(|(source, _)| {
+                source == &selected_resource
+                    || (source.is_dir() && selected_resource.starts_with(source))
+            })
+            .map(|(source, mount)| {
+                Path::new(&mount.effective_destination)
+                    .join(selected_resource.strip_prefix(source).unwrap())
+            })
             .expect("the selected MCP script must be in the resource plan");
-        let effective_destination = Path::new(&mount.effective_destination);
+        let effective_destination = effective_destination.as_path();
         let provider_relative = effective_destination
             .strip_prefix(owned_root)
             .map(Path::to_path_buf)
@@ -2080,6 +2086,131 @@ mod configured_resource_tests {
             output.stderr
         );
         assert_eq!(output.stdout, b"parent dependency loaded");
+    }
+
+    #[test]
+    fn bun_run_file_preserves_preload_module_operand_after_all_copies() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let preload_package = owned.path().join("external/preload-package");
+        let package = owned.path().join("external/server-package");
+        let preload = preload_package.join("preload.mjs");
+        let server = package.join("server.mjs");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&preload_package).unwrap();
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(&preload, "globalThis.fixturePreloadLoaded = true;\n").unwrap();
+        std::fs::write(
+            &server,
+            "if (!globalThis.fixturePreloadLoaded) process.exit(7); process.stdout.write('preload loaded');\n",
+        )
+        .unwrap();
+        let command = vec![
+            "bun".to_owned(),
+            "run".to_owned(),
+            "--import".to_owned(),
+            preload.to_string_lossy().into_owned(),
+            server.to_string_lossy().into_owned(),
+        ];
+
+        let (plan, provider_server) = plan_and_stage_mcp_command_for_resource(
+            owned.path(),
+            &home,
+            &workspace,
+            &command,
+            &server,
+        );
+        let canonical_preload = preload.canonicalize().unwrap();
+        assert!(
+            plan[0].configured_resources.iter().any(|selected| {
+                selected == &canonical_preload
+                    || (selected.is_dir() && canonical_preload.starts_with(selected))
+            }),
+            "Bun's --import preload module must be selected as a configured resource"
+        );
+
+        let hidden = owned.path().join("external-hidden");
+        std::fs::rename(owned.path().join("external"), &hidden).unwrap();
+        let provider_preload = provider_server
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("preload-package/preload.mjs");
+        assert!(
+            provider_preload.is_file(),
+            "the preload must survive both copies"
+        );
+        let output = std::process::Command::new("node")
+            .arg("--import")
+            .arg(provider_preload)
+            .arg(&provider_server)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .output();
+        std::fs::rename(&hidden, owned.path().join("external")).unwrap();
+        let output = output.unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"preload loaded");
+    }
+
+    #[test]
+    fn external_bun_run_file_keeps_computed_sibling_assets_after_all_copies() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let external = owned.path().join("external");
+        let workspace = external.join("project");
+        let package = external.join("mcp-package");
+        let server = package.join("server.mjs");
+        let schema = package.join("schema.json");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(external.join("package.json"), r#"{"type":"module"}"#).unwrap();
+        std::fs::write(
+            &server,
+            "import { readFileSync } from 'node:fs';\nimport path from 'node:path';\nimport { fileURLToPath } from 'node:url';\nconst scriptDir = path.dirname(fileURLToPath(import.meta.url));\nprocess.stdout.write(readFileSync(path.join(scriptDir, 'schema.json'), 'utf8'));\n",
+        )
+        .unwrap();
+        std::fs::write(&schema, "computed sibling schema loaded\n").unwrap();
+        let command = vec![
+            "bun".to_owned(),
+            "run".to_owned(),
+            server.to_string_lossy().into_owned(),
+        ];
+
+        let (plan, provider_server) = plan_and_stage_mcp_command_for_resource(
+            owned.path(),
+            &home,
+            &workspace,
+            &command,
+            &server,
+        );
+        assert!(
+            plan[0]
+                .configured_resources
+                .contains(&package.canonicalize().unwrap()),
+            "an external Bun script must retain its bounded package directory for computed resources"
+        );
+        assert!(
+            !plan[0]
+                .configured_resources
+                .contains(&external.canonicalize().unwrap()),
+            "resource closure must not widen to the unrelated external parent"
+        );
+
+        let hidden = owned.path().join("external-hidden");
+        std::fs::rename(&external, &hidden).unwrap();
+        let output = std::process::Command::new("node")
+            .arg(&provider_server)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .output();
+        std::fs::rename(&hidden, &external).unwrap();
+        let output = output.unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"computed sibling schema loaded\n");
     }
 
     #[test]

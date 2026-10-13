@@ -259,7 +259,8 @@ fn nested_fields(
                             "OpenCode mcp.script"
                         };
                     for (index, argument) in command.iter().enumerate() {
-                        let bun_run_file = is_bun_run_file_operand(&command, index);
+                        let bun_run_file =
+                            script_index == Some(index) && is_bun_run_file_operand(&command, index);
                         let script_file = if script_runtime {
                             script_index.is_some_and(|script| {
                                 index > 0
@@ -386,6 +387,34 @@ fn is_bun_run_file_operand(command: &[String], index: usize) -> bool {
         && command
             .get(index)
             .is_some_and(|argument| is_node_script_path(argument))
+}
+
+fn bun_run_file_resource_scope(
+    command_parent: &Path,
+    home: &Path,
+    instance_cwd: &Path,
+) -> Option<PathBuf> {
+    let canonical_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_owned());
+    let canonical_cwd =
+        std::fs::canonicalize(instance_cwd).unwrap_or_else(|_| instance_cwd.to_owned());
+    let package_root = command_parent
+        .ancestors()
+        .take_while(|ancestor| *ancestor != canonical_home && ancestor.parent().is_some())
+        .find(|ancestor| ancestor.join("package.json").is_file());
+    let is_bounded = |scope: &Path| {
+        scope != Path::new("/")
+            && scope != canonical_home
+            && !scope.starts_with(&canonical_cwd)
+            && !canonical_cwd.starts_with(scope)
+    };
+
+    // Prefer the package boundary, but fall back to the script's own directory
+    // if the package also contains the mounted project. A script inside the
+    // launch cwd already has its files from the workspace mount.
+    package_root
+        .filter(|scope| is_bounded(scope))
+        .or_else(|| is_bounded(command_parent).then_some(command_parent))
+        .map(Path::to_owned)
 }
 
 fn is_bare_bun_script_name(argument: &str) -> bool {
@@ -2076,13 +2105,6 @@ pub fn select(
                 .ok_or_else(|| fail(field, "command has no containing scope"))?;
             let dependency_scope = direct_script_dependency_scope(command_parent, home);
             if field == "OpenCode bun run file" {
-                insert_resource(
-                    &mut result,
-                    &mut resource_path_bytes,
-                    canonical.clone(),
-                    field,
-                    declaring,
-                )?;
                 insert_installed_package_ancestor_resources(
                     &canonical,
                     home,
@@ -2100,6 +2122,44 @@ pub fn select(
                     field,
                     ScriptDependencyRuntime::Node,
                 )?;
+                if let Some(resource_scope) =
+                    bun_run_file_resource_scope(command_parent, home, &source.instance_cwd)
+                {
+                    // Bun scripts can compute local asset paths at runtime, so
+                    // preserve their bounded package (or containing) directory.
+                    // Static dependencies outside that directory remain exact
+                    // selected resources, while covered children travel once
+                    // in the complete directory unit.
+                    let covered = result
+                        .iter()
+                        .filter(|path| {
+                            path.as_path() != resource_scope && path.starts_with(&resource_scope)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for path in covered {
+                        result.remove(&path);
+                        resource_path_bytes =
+                            resource_path_bytes.saturating_sub(path.as_os_str().len());
+                    }
+                    insert_resource(
+                        &mut result,
+                        &mut resource_path_bytes,
+                        resource_scope,
+                        field,
+                        declaring,
+                    )?;
+                } else {
+                    // HOME, system roots, and the mounted project are not
+                    // bounded external copy units. Keep exact/static closure.
+                    insert_resource(
+                        &mut result,
+                        &mut resource_path_bytes,
+                        canonical,
+                        field,
+                        declaring,
+                    )?;
+                }
                 continue;
             }
             if let Some(package_root) = command_parent
