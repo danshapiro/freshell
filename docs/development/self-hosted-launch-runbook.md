@@ -413,21 +413,43 @@ drop-in, plus `freshell-supervisor.service`):
     sees):
 
     ```bash
-    # The server is ALIVE now, so its environment is the authoritative
-    # token source — always re-acquire and REWRITE the header (a header
-    # minted while the server was down may carry a stale .env value that
-    # the unit's EnvironmentFile actually overrides):
+    # The server is ALIVE now — re-acquire the token (live environment
+    # first; the .env dotenv fallback second, because a server that
+    # loads its token from the checkout's .env never exposes it in
+    # /proc/<pid>/environ) and REWRITE the header: one minted while the
+    # server was down may carry a stale .env value the unit's
+    # EnvironmentFile actually overrides:
     SPID=$(systemctl --user show freshell-rust.service -p MainPID --value)
     TOK=""
     if [ "${SPID:-0}" -gt 0 ] 2>/dev/null; then
       TOK=$(tr '\0' '\n' < "/proc/$SPID/environ" | sed -n 's/^AUTH_TOKEN=//p' || true)
     fi
+    if [ -z "$TOK" ]; then
+      TOK=$(python3 - "$(systemctl --user show freshell-rust.service -p WorkingDirectory --value)/.env" <<'PY'
+import os,re,sys
+path=sys.argv[1]
+if not os.path.exists(path): sys.exit(0)
+last=None
+for line in open(path):
+    m=re.match(r'^\s*(?:export\s+)?AUTH_TOKEN\s*=\s*(.*)$', line.rstrip("\n"))
+    if m: last=m.group(1)
+if last is None: sys.exit(0)
+if last[:1] in ('"',"'"):
+    end=last.find(last[0],1)
+    print(last[1:end] if end>0 else last[1:])
+else:
+    print(re.split(r'\s#', last.strip(), 1)[0].strip())
+PY
+)
+    fi
     test -n "$TOK" \
       || { echo "AUTH_TOKEN unresolvable even with the server running — extract it manually"; exit 1; }
     umask 077; printf 'x-auth-token: %s\n' "$TOK" > "$RUN/hdr"
-    # Always re-fetch the DEPLOYED registry's soul list (this also fills
-    # the API-less fallback's empty desired-running baseline — an empty
-    # sweep would otherwise pass vacuously):
+    # Fetch the DEPLOYED registry's soul list into a SEPARATE file — the
+    # pre-restart baseline must survive, because a soul that DISAPPEARED
+    # from the registry is exactly what the sweep must catch (this also
+    # fills the API-less fallback's empty baseline — an empty sweep
+    # would otherwise pass vacuously):
     curl -s -H @"$RUN/hdr" http://127.0.0.1:3001/api/runtime/souls \
       | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
@@ -438,7 +460,7 @@ for s in souls:
 souls=json.load(sys.stdin)["souls"]
 for s in souls:
     if s.get("desiredState")=="running":
-        print(s["soulId"])' > "$RUN/desired-running.txt"
+        print(s["soulId"])' > "$RUN/desired-running-after.txt"
     # POSITIVE ownership check for EVERY baseline container: its
     # (soul, container) pair must appear in the deployed registry with a
     # RUNNING incarnation — a registry swap or restore leaves containers
@@ -452,16 +474,19 @@ for s in souls:
       grep -q "^$SID $CID running$" "$RUN/souls-all.txt" \
         || { echo "ORPHANED container — ($SID, $CID) has no running row in the deployed registry"; exit 1; }
     done < "$RUN/souls-before.txt"
-    echo "sweeping $(wc -l < "$RUN/desired-running.txt") desired-running soul(s)"
-    while read -r SID; do
+    echo "sweeping $(sort -u "$RUN/desired-running.txt" "$RUN/desired-running-after.txt" | wc -l) desired-running soul(s) (baseline ∪ deployed)"
+    sort -u "$RUN/desired-running.txt" "$RUN/desired-running-after.txt" \
+      | while read -r SID; do
       [ -n "$SID" ] || continue
       curl -s -H @"$RUN/hdr" "http://127.0.0.1:3001/api/runtime/souls/$SID" \
         | python3 -c 'import json,sys
-s=json.load(sys.stdin)["soul"]
+o=json.load(sys.stdin)
+s=o.get("soul")
+assert s is not None, ("SOUL GONE from the deployed registry", sys.argv[1], o)
 ls=s.get("launchState"); rs=s.get("recoveryState")
 assert ls=="running" and rs not in ("blocked","lost"), (sys.argv[1], ls, rs)
 print("ok:", sys.argv[1])' "$SID"
-    done < "$RUN/desired-running.txt"
+    done
     ```
 
     A blocked or lost `recoveryState` can hide behind a `"running"`
