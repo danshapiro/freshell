@@ -2166,6 +2166,7 @@ mod configured_resource_tests {
         let local_package = workspace.join("packages/local-package");
         let local_package_link = external.join("node_modules/local-package");
         let server = tools.join("server.mjs");
+        let workspace_worker = tools.join("workspace-worker.mjs");
         let schema = external.join("schema.json");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&workspace).unwrap();
@@ -2174,6 +2175,11 @@ mod configured_resource_tests {
         std::fs::create_dir_all(local_package_link.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink("../project/packages/local-package", &local_package_link)
             .unwrap();
+        std::os::unix::fs::symlink(
+            "../project/packages/local-package/worker.mjs",
+            &workspace_worker,
+        )
+        .unwrap();
         std::fs::write(
             workspace.join("workspace-data.txt"),
             "workspace stays mounted\n",
@@ -2189,10 +2195,20 @@ mod configured_resource_tests {
             "export const marker = 'workspace-linked-package';\n",
         )
         .unwrap();
+        std::fs::write(
+            local_package.join("schema.json"),
+            r#"{"nonce":"workspace-script-sibling-loaded"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            local_package.join("worker.mjs"),
+            "import { readFileSync } from 'node:fs';\nconst schema = JSON.parse(readFileSync(new URL('./schema.json', import.meta.url), 'utf8'));\nexport const sibling = schema.nonce;\n",
+        )
+        .unwrap();
         std::fs::write(external.join("package.json"), r#"{"type":"module"}"#).unwrap();
         std::fs::write(
             &server,
-            "import { readFileSync } from 'node:fs';\nimport path from 'node:path';\nimport { fileURLToPath } from 'node:url';\nimport { marker } from 'local-package';\nconst scriptDir = path.dirname(fileURLToPath(import.meta.url));\nprocess.stdout.write(marker + ':' + readFileSync(path.join(scriptDir, '../schema.json'), 'utf8'));\n",
+            "import { readFileSync } from 'node:fs';\nimport path from 'node:path';\nimport { fileURLToPath } from 'node:url';\nimport { marker } from 'local-package';\nimport { sibling } from './workspace-worker.mjs';\nconst scriptDir = path.dirname(fileURLToPath(import.meta.url));\nprocess.stdout.write(marker + ':' + sibling + ':' + readFileSync(path.join(scriptDir, '../schema.json'), 'utf8'));\n",
         )
         .unwrap();
         std::fs::write(&schema, "computed sibling schema loaded\n").unwrap();
@@ -2275,7 +2291,7 @@ mod configured_resource_tests {
         assert!(output.status.success(), "{:?}", output.stderr);
         assert_eq!(
             output.stdout,
-            b"workspace-linked-package:computed sibling schema loaded\n"
+            b"workspace-linked-package:workspace-script-sibling-loaded:computed sibling schema loaded\n"
         );
     }
 

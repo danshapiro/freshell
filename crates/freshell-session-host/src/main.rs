@@ -4613,9 +4613,25 @@ mod tests {
         let unit = user_root.join(".freshell/resource-units/root-0");
         let provider_home = owned.path().join("home");
         let provider_resource = provider_home.join(".freshell/provider-roots/root-0");
+        let linked_package = unit.join("project/packages/worker-package");
         std::fs::create_dir_all(unit.join("tools")).unwrap();
-        std::fs::create_dir_all(unit.join("project")).unwrap();
-        std::fs::write(unit.join("tools/server.mjs"), "export {};\n").unwrap();
+        std::fs::create_dir_all(&linked_package).unwrap();
+        std::os::unix::fs::symlink(
+            "../project/packages/worker-package/server.mjs",
+            unit.join("tools/server.mjs"),
+        )
+        .unwrap();
+        std::fs::write(linked_package.join("package.json"), r#"{"type":"module"}"#).unwrap();
+        std::fs::write(
+            linked_package.join("schema.json"),
+            r#"{"nonce":"session-host-linked-sibling-loaded"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            linked_package.join("server.mjs"),
+            "import { readFileSync } from 'node:fs';\nconst schema = JSON.parse(readFileSync(new URL('./schema.json', import.meta.url), 'utf8'));\nprocess.stdout.write(schema.nonce + '\\n');\n",
+        )
+        .unwrap();
         std::fs::write(unit.join("schema.json"), "package asset\n").unwrap();
         std::fs::write(
             unit.join("project/workspace-data.txt"),
@@ -4680,6 +4696,18 @@ mod tests {
             !provider_resource.join("project").exists(),
             "session-host projection must not copy workspace data from a stale package unit"
         );
+
+        let hidden = owned.path().join("source-hidden");
+        std::fs::rename(&user_root, &hidden).unwrap();
+        let output = std::process::Command::new("node")
+            .arg(provider_resource.join("tools/server.mjs"))
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .output();
+        std::fs::rename(&hidden, &user_root).unwrap();
+        let output = output.unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"session-host-linked-sibling-loaded\n");
     }
 
     #[test]

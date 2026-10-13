@@ -126,7 +126,7 @@ struct Plan {
     pending: VecDeque<(PathBuf, PathBuf, usize)>,
     exclusions: Vec<PathBuf>,
     excluded_subtree: Option<PathBuf>,
-    included_subtree_aliases: BTreeSet<PathBuf>,
+    included_subtree_resources: BTreeSet<PathBuf>,
     counted_files: BTreeSet<PathBuf>,
     bytes: u64,
     metadata_bytes: u64,
@@ -142,7 +142,7 @@ impl Plan {
             }
             let included_alias = self.excluded_subtree.as_ref() == Some(path)
                 && self
-                    .included_subtree_aliases
+                    .included_subtree_resources
                     .iter()
                     .any(|root| source == root || source.starts_with(root));
             !included_alias
@@ -159,21 +159,23 @@ impl Plan {
             exclusion != excluded_subtree && (source == exclusion || source.starts_with(exclusion))
         })
     }
+    fn include_selected_subtree_resource(&mut self, source: &Path) {
+        if self
+            .excluded_subtree
+            .as_ref()
+            .is_some_and(|excluded| source == excluded || source.starts_with(excluded))
+        {
+            self.included_subtree_resources.insert(source.to_owned());
+        }
+    }
     fn materialize_excluded_subtree_alias(
         &mut self,
         source: PathBuf,
         destination: PathBuf,
         depth: usize,
     ) -> Result<(), CopyError> {
-        if let Some(mapped) = self.mapped(&source)? {
-            if mapped != destination {
-                return self.claim(destination, Node::Link(mapped));
-            }
-            return Ok(());
-        }
-        self.included_subtree_aliases.insert(source.clone());
-        self.add_mapping(source.clone(), destination.clone())?;
-        self.enqueue(source, destination, depth)
+        let mapped = self.external_resource(&source, &destination, depth)?;
+        self.claim(destination, Node::Link(mapped))
     }
     fn resolve_destination(&self, path: &Path, include_leaf: bool) -> Result<PathBuf, CopyError> {
         let mut current = path.to_owned();
@@ -382,11 +384,32 @@ impl Plan {
                 }
             }
         }
+        if let Some(excluded_subtree) = self
+            .excluded_subtree
+            .as_ref()
+            .filter(|excluded| target == *excluded || target.starts_with(*excluded))
+        {
+            if target == excluded_subtree {
+                return Err(error(
+                    path,
+                    "select_resource_scope",
+                    "a link to the entire excluded workspace cannot be copied as a bounded dependency; select a package or smaller resource",
+                ));
+            }
+            if resource == *excluded_subtree || !resource.starts_with(excluded_subtree) {
+                resource = target
+                    .parent()
+                    .filter(|parent| *parent != excluded_subtree)
+                    .map(Path::to_owned)
+                    .unwrap_or_else(|| target.to_owned());
+            }
+        }
         if resource == Path::new("/") || self.account_home.as_deref() == Some(resource.as_path()) {
             return Err(error(path,"select_resource_scope","an external resource cannot infer the entire account home or filesystem root; select a complete resource/package directory with its own scope"));
         }
         let destination = Path::new(".freshell/resources/tree")
             .join(resource.strip_prefix(Path::new("/")).unwrap_or(&resource));
+        self.include_selected_subtree_resource(&resource);
         if metadata.is_file() && resource == target {
             self.add_mapping(target.to_owned(), destination.clone())?;
             self.enqueue(target.to_owned(), destination, depth)?;
@@ -405,6 +428,7 @@ impl Plan {
                     .map_err(|cause| io_error(path, "resolve_lookup_context", cause))?;
                 let destination = Path::new(".freshell/resources/tree")
                     .join(modules.strip_prefix("/").unwrap_or(&modules));
+                self.include_selected_subtree_resource(&canonical);
                 self.directory_mapping(&canonical, &destination, depth)?;
             }
             let package = ancestor.join("package.json");
@@ -413,6 +437,7 @@ impl Plan {
                     .map_err(|cause| io_error(path, "resolve_package_scope", cause))?;
                 let destination = Path::new(".freshell/resources/tree")
                     .join(package.strip_prefix("/").unwrap_or(&package));
+                self.include_selected_subtree_resource(&canonical);
                 if let Some(mapped) = self.mapped(&canonical)? {
                     if mapped != destination {
                         self.claim(destination, Node::Link(mapped))?;
@@ -736,7 +761,7 @@ fn copy_environment_projection(
         pending: VecDeque::new(),
         exclusions: excluded_canonical_sources.to_vec(),
         excluded_subtree,
-        included_subtree_aliases: BTreeSet::new(),
+        included_subtree_resources: BTreeSet::new(),
         counted_files: BTreeSet::new(),
         bytes: 0,
         metadata_bytes: 0,
@@ -1428,6 +1453,89 @@ mod tests {
                 .exists(),
             "the nested-tree allowance must not override another exclusion"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn excluded_workspace_file_alias_keeps_its_sibling_package_resources() {
+        let root = tempfile::tempdir().unwrap();
+        let external = root.path().join("external");
+        let workspace = external.join("project");
+        let worker_package = workspace.join("packages/worker-package");
+        let tools = external.join("tools");
+        fs::create_dir_all(&worker_package).unwrap();
+        fs::create_dir_all(&tools).unwrap();
+        fs::write(external.join("package.json"), r#"{"type":"module"}"#).unwrap();
+        fs::write(
+            worker_package.join("schema.json"),
+            r#"{"nonce":"linked-file-sibling-loaded"}"#,
+        )
+        .unwrap();
+        fs::write(
+            worker_package.join("worker.mjs"),
+            "import { readFileSync } from 'node:fs';\nconst schema = JSON.parse(readFileSync(new URL('./schema.json', import.meta.url), 'utf8'));\nexport const nonce = schema.nonce;\n",
+        )
+        .unwrap();
+        symlink(
+            "../project/packages/worker-package/worker.mjs",
+            tools.join("worker-link.mjs"),
+        )
+        .unwrap();
+        fs::write(
+            tools.join("server.mjs"),
+            "import { nonce } from './worker-link.mjs';\nprocess.stdout.write(nonce + '\\n');\n",
+        )
+        .unwrap();
+
+        let destination = root.path().join("provider");
+        copy_environment_excluding_subtree(
+            &[selection(&external, "resource")],
+            &destination,
+            &[],
+            &workspace,
+            CopyLimits::default(),
+        )
+        .unwrap();
+        let copied_server = destination.join("resource/tools/server.mjs");
+        let hidden = root.path().join("external-hidden");
+        fs::rename(&external, &hidden).unwrap();
+        let output = Command::new("node")
+            .arg(&copied_server)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .output();
+        fs::rename(&hidden, &external).unwrap();
+        let output = output.unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"linked-file-sibling-loaded\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn excluded_workspace_root_alias_fails_without_copying_the_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let external = root.path().join("external");
+        let workspace = external.join("project");
+        fs::create_dir_all(workspace.join("packages")).unwrap();
+        fs::create_dir_all(external.join("node_modules")).unwrap();
+        fs::write(workspace.join("private-project-data"), "do not copy").unwrap();
+        symlink("../project", external.join("node_modules/workspace")).unwrap();
+        let destination = root.path().join("provider");
+
+        let error = copy_environment_excluding_subtree(
+            &[selection(&external, "resource")],
+            &destination,
+            &[],
+            &workspace,
+            CopyLimits::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.operation, "select_resource_scope");
+        assert!(error
+            .corrective_message
+            .contains("entire excluded workspace"));
+        assert!(!destination.exists(), "a rejected graph is never published");
     }
 
     #[cfg(unix)]
