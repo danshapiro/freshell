@@ -579,6 +579,7 @@ describe('closed managed environment fixture inputs', () => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'frs-supervisor-input-'))
     const repository = path.join(directory, 'repository'), home = path.join(directory, 'home')
     const xdg = path.join(home, 'fixture-xdg'), workspace = path.join(directory, 'workspace')
+    const providerInputs = path.join(directory, 'selected-provider-inputs')
     const grant = path.join(directory, 'grant.env'), socket = path.join(directory, 'daemon.sock')
     const previousDockerHost = process.env.DOCKER_HOST
     const daemon = http.createServer((_request, response) => response.writeHead(500).end())
@@ -589,6 +590,7 @@ describe('closed managed environment fixture inputs', () => {
       await fs.mkdir(path.join(xdg, 'opencode'), { recursive: true })
       await fs.chmod(home, 0o700)
       await fs.mkdir(workspace)
+      await fs.mkdir(providerInputs)
       await fs.writeFile(grant, 'synthetic-closed-grant', { mode: 0o600 })
       const host = path.join(directory, 'host')
       await fs.writeFile(host, 'owned fixture host artifact')
@@ -596,7 +598,7 @@ describe('closed managed environment fixture inputs', () => {
       process.env.DOCKER_HOST = `unix://${socket}`
       const rig = new ManagedRuntimeBrowserRig(repository, 2, { HOME: home, XDG_CONFIG_HOME: xdg },
         { HOME: home, XDG_CONFIG_HOME: xdg }, 'test', { enabledProviders: ['opencode'] }, home,
-        { workspaceRoots: [workspace], bootstrapFiles: [grant], defaultCwd: workspace })
+        { workspaceRoots: [workspace], providerInputRoots: [providerInputs], bootstrapFiles: [grant], defaultCwd: workspace })
       harness = rig.runtime
       useOwnedHarnessArtifacts(harness, host)
       await harness.prepare()
@@ -606,6 +608,7 @@ describe('closed managed environment fixture inputs', () => {
       expect(fakeDocker.supervisorCommands).toHaveLength(1)
       const dispatched = fakeDocker.supervisorCommands[0]
       expect(dispatched).toContain(`${workspace}:${workspace}:ro`)
+      expect(dispatched).toContain(`${providerInputs}:${providerInputs}:ro`)
       expect(dispatched).toContain(`${grant}:${grant}:ro`)
       expect(dispatched).toContain(`HOME=${home}`)
       expect(dispatched).toContain(`XDG_CONFIG_HOME=${xdg}`)

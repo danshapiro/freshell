@@ -1184,7 +1184,8 @@ export async function runManagedEnvironmentTarget() {
       FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: '', FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: '' }
     rig = new ManagedRuntimeBrowserRig(repoRoot, 2, { ...environment, FRESHELL_MANAGED_ENVIRONMENT_FIXTURE_ONLY: '1' },
       environment, 'release', { enabledProviders: ['opencode'] }, home,
-      { workspaceRoots: [workspace], bootstrapFiles: [grants.grants.opencode], defaultCwd: workspace })
+      { workspaceRoots: [workspace], providerInputRoots: [managedEnvironmentFixtureLayout(root).resources],
+        bootstrapFiles: [grants.grants.opencode], defaultCwd: workspace })
     const selected = await configure(root, nonce, rig.runtime.candidateSha, rig.runtime.runId)
     await rig.start()
     webIdentity = await processIdentity(rig.web.processEvidence())

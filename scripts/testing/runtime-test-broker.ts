@@ -130,6 +130,7 @@ export type BrokerEvent = {
   targetPath?: string
   preparationStageRoot?: string
   selectedWorkspaceRoots?: string[]
+  selectedProviderInputRoots?: string[]
   destructive: boolean
   unsafeAttempt: boolean
 }
@@ -142,6 +143,7 @@ export type RestrictedDockerBrokerPolicy = {
   allowedImageRefs: Set<string>
   allowTerminalWorkloads?: boolean
   allowedWorkspaceRoots?: Set<string>
+  allowedProviderInputRoots?: Set<string>
   allowedProviderUserRoots?: Set<string>
   allowedBootstrapFiles?: Set<string>
   allowedHostGatewayAddresses?: Set<string>
@@ -245,6 +247,7 @@ export class RestrictedDockerBroker {
       && path.normalize(value) === value && !/[\x00-\x1f\x7f]/.test(value)
       && (value === input.workspacePath || isStrictDescendant(value, input.workspacePath)
         || mappedProviderDestination(value)
+        || this.isAllowedProviderInputPath(value)
         || [...this.policy.allowedProviderUserRoots ?? []].some((root) => value === root || isStrictDescendant(value, root)))
     const unit = (value: string, prefix: string, file = false) => typeof value === 'string'
       && new RegExp(`^${prefix}/[a-zA-Z0-9_-]{1,128}${file ? '/source' : ''}$`).test(value)
@@ -317,6 +320,7 @@ export class RestrictedDockerBroker {
     const destination = (value: string) => path.isAbsolute(value) && path.normalize(value) === value
       && !/[\x00-\x1f\x7f]/.test(value)
       && (this.isAllowedWorkspacePath(value)
+        || this.isAllowedProviderInputPath(value)
         || mappedProviderDestination(value)
         || [...this.policy.allowedProviderUserRoots ?? []].some((root) => value === root || isStrictDescendant(value, root)))
     const targets = new Set<string>()
@@ -1394,6 +1398,8 @@ export class RestrictedDockerBroker {
         preparationStageRoot: diagnosticPath(error.preparationStageRoot),
         selectedWorkspaceRoots: [...this.policy.allowedWorkspaceRoots ?? []]
           .filter(root => diagnosticPath(root) !== undefined),
+        selectedProviderInputRoots: [...this.policy.allowedProviderInputRoots ?? []]
+          .filter(root => diagnosticPath(root) !== undefined),
       } : {}
       this.record({ method: 'POST', url, decision: 'block', reason: `fixture publication unavailable at ${phase}: ${category}`,
         ...target, destructive: false, unsafeAttempt: false })
@@ -1495,6 +1501,14 @@ export class RestrictedDockerBroker {
 
   private isAllowedWorkspacePath(candidate: string): boolean {
     const roots = this.policy.allowedWorkspaceRoots ?? new Set<string>()
+    for (const root of roots) {
+      if (candidate === root || isStrictDescendant(candidate, root)) return true
+    }
+    return false
+  }
+
+  private isAllowedProviderInputPath(candidate: string): boolean {
+    const roots = this.policy.allowedProviderInputRoots ?? new Set<string>()
     for (const root of roots) {
       if (candidate === root || isStrictDescendant(candidate, root)) return true
     }

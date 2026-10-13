@@ -1069,14 +1069,31 @@ describe('fixed indexed publisher broker',()=>{
         expect(forwarded).toHaveLength(before)
         const diagnostic = instance.eventsSnapshot().find(event => event.reason === 'fixture publication unavailable at prepared_authorization: target_root')
         expect(diagnostic).toMatchObject({ targetPath: destination, preparationStageRoot: input.stageRoot,
-          selectedWorkspaceRoots: ['/workspace'] })
+          selectedWorkspaceRoots: ['/workspace'], selectedProviderInputRoots: ['/selected-provider-inputs'] })
         const events = JSON.stringify(instance.eventsSnapshot())
         expect(events).not.toContain('PRIVATE_SCOPE_CONTENT_SENTINEL')
         expect(events).not.toContain('PRIVATE_CONFIG_CONTENT_SENTINEL')
         expect(instance.receipts()).toEqual([])
-      }, undefined, true)
+      }, undefined, true, new Set(['/selected-provider-inputs']))
     },
   )
+  it('authorizes selected external provider input targets without authorizing them as workspaces', async () => {
+    await withHttpBroker(async ({ request, broker: instance }) => {
+      const selectedRoot = '/selected-provider-inputs'
+      const input = { ...publisherAuthorization(), resourceMounts: [{
+        providerRelativePath: '.freshell/provider-roots/fixture-mcp',
+        effectiveDestination: path.join(selectedRoot, 'fixture-mcp'),
+        kind: 'directory' as const,
+      }] }
+      const selectedAsWorkspace = createBody([
+        ...ordinaryBinds.slice(0, 3),
+        `${selectedRoot}:${selectedRoot}:rw`,
+      ])
+      const result = await request('POST', '/v1.47/containers/create?name=external-input-as-workspace', JSON.parse(selectedAsWorkspace.toString()))
+      expect(result.status).toBe(403)
+      expect(() => instance.authorizePreparedInputs(input)).not.toThrow()
+    }, undefined, false, new Set(['/selected-provider-inputs']))
+  })
   it.each(['exited', 'running', 'foreign-owner', 'changed-image', 'changed-host', 'foreign-capability'] as const)(
     'qualifies a replacement publication against its retained owner (%s)', async (state) => {
       await withHttpBroker(async ({ directory, request, forwarded, broker: instance, setRuntimeRunning }) => {
@@ -1546,7 +1563,8 @@ describe('fixed indexed publisher broker',()=>{
   });
 });
 
-async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>,gateways?:Set<string>, physicalStage = false) {
+async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>,gateways?:Set<string>, physicalStage = false,
+  allowedProviderInputRoots = new Set<string>()) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'frs-broker-history-'))
   const socket = path.join(dir, 'docker.sock')
   const proxy = path.join(dir, 'broker.sock')
@@ -1642,6 +1660,7 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
     allowedImageRefs: new Set(['sha256:fixture-image', 'sha256:other-approved-image']),
     allowTerminalWorkloads: true,
     allowedWorkspaceRoots: new Set(['/workspace']),
+    allowedProviderInputRoots,
     testRunId: 'run-one',
     logPath: path.join(dir, 'broker.jsonl'),
   })

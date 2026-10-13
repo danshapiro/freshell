@@ -98,6 +98,7 @@ export function phase2BootstrapFiles(
 
 export type RuntimeFixtureInputs = {
   workspaceRoots: string[]
+  providerInputRoots?: string[]
   bootstrapFiles: string[]
 }
 
@@ -164,7 +165,9 @@ export class RuntimeHarness {
     fixtureInputs?: RuntimeFixtureInputs) {
     this.repoRoot = fs.realpathSync(repoRoot)
     this.fixtureInputs = fixtureInputs && {
-      workspaceRoots: [...fixtureInputs.workspaceRoots], bootstrapFiles: [...fixtureInputs.bootstrapFiles],
+      workspaceRoots: [...fixtureInputs.workspaceRoots],
+      providerInputRoots: fixtureInputs.providerInputRoots ? [...fixtureInputs.providerInputRoots] : undefined,
+      bootstrapFiles: [...fixtureInputs.bootstrapFiles],
     }
     this.phase = phase
     this.runId = runId
@@ -240,6 +243,7 @@ export class RuntimeHarness {
       allowedImageRefs: new Set([this.imageRef]),
       allowTerminalWorkloads: this.phase >= 2,
       allowedWorkspaceRoots: new Set(this.phase >= 2 ? this.phase2WorkspaceRoots() : []),
+      allowedProviderInputRoots: new Set(this.phase >= 2 ? this.phase2ProviderInputRoots() : []),
       allowedProviderUserRoots: new Set(this.phase >= 2 ? this.phase2ProviderUserRoots() : []),
       allowedBootstrapFiles: new Set(this.phase >= 2 ? this.phase2BootstrapFiles() : []),
       testRunId: this.runId,
@@ -475,6 +479,10 @@ export class RuntimeHarness {
       }
       for (const root of this.phase2WorkspaceRoots()) {
         if (root === this.testRoot || root === this.buildDir) continue
+        args.push('-v', `${root}:${root}:ro`)
+      }
+      for (const root of this.phase2ProviderInputRoots()) {
+        if (root === this.testRoot || root === this.buildDir || this.phase2WorkspaceRoots().includes(root)) continue
         args.push('-v', `${root}:${root}:ro`)
       }
     }
@@ -1110,6 +1118,12 @@ export class RuntimeHarness {
       roots.add(fs.realpathSync(path.isAbsolute(common) ? common : path.join(this.repoRoot, common)))
     } catch {}
     return [...roots]
+  }
+
+  private phase2ProviderInputRoots(): string[] {
+    if (!this.fixtureInputs?.providerInputRoots) return []
+    return this.fixtureInputs.providerInputRoots.map(selected =>
+      validateOwnedFixturePath(selected, 'directory', 'provider input fixture root'))
   }
 
   private phase2ProviderUserRoots(): string[] {
