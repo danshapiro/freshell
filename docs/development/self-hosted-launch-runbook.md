@@ -96,6 +96,61 @@ cargo build --release -p freshell-server -p freshell-supervisor \
   -p freshell-session-host --features freshell-server/managed-runtime-v1
 ```
 
+**Preliminary: capture the baseline.** Before restarting anything,
+capture two snapshots into a private per-run directory (fixed `/tmp`
+paths would let a second run overwrite the first run's baseline before
+its comparison): the RUNNING containers (their IDs and exact start
+times) and the DESIRED-RUNNING soul IDs — the supervisor reconciles
+every desired-running soul, including ones with no running container, so
+that second list is what sizes the strict-sequence wait and the
+post-deploy soul sweep:
+
+```bash
+set -euo pipefail
+RUN=$(mktemp -d)   # private per-run dir for the survival snapshots
+docker ps -q --filter name=incarnation | xargs -r docker inspect \
+  --format '{{.Id}} {{.Name}} {{.State.StartedAt}}' | sort | tee "$RUN/souls-before.txt"
+CHECKOUT=$(systemctl --user show freshell-rust.service -p WorkingDirectory --value)
+SPID=$(systemctl --user show freshell-rust.service -p MainPID --value)
+TOK=$(tr '\0' '\n' < "/proc/$SPID/environ" | sed -n 's/^AUTH_TOKEN=//p')
+if [ -z "$TOK" ]; then
+  TOK=$(python3 - "$CHECKOUT/.env" <<'PY'
+import re,sys
+last=None
+for line in open(sys.argv[1]):
+    m=re.match(r'^\s*(?:export\s+)?AUTH_TOKEN\s*=\s*(.*)$', line.rstrip("\n"))
+    if m: last=m.group(1)
+if last is None: sys.exit(0)
+if last[:1] in ('"',"'"):
+    end=last.find(last[0],1)
+    print(last[1:end] if end>0 else last[1:])
+else:
+    print(re.split(r'\s#', last.strip(), 1)[0].strip())
+PY
+)
+fi
+test -n "$TOK" || { echo "AUTH_TOKEN not found — extract it manually"; exit 1; }
+umask 077
+printf 'x-auth-token: %s\n' "$TOK" > "$RUN/hdr"
+trap 'rm -f "$RUN/hdr"' EXIT
+if curl -s -o /dev/null -w '%{http_code}' -H @"$RUN/hdr" \
+     http://127.0.0.1:3001/api/runtime/readiness | grep -q 200; then
+  curl -s -H @"$RUN/hdr" http://127.0.0.1:3001/api/runtime/souls \
+    | python3 -c 'import json,sys
+souls=json.load(sys.stdin)["souls"]
+for s in souls:
+    if s.get("desiredState")=="running":
+        print(s["soulId"])' > "$RUN/desired-running.txt"
+else
+  echo "runtime API unavailable (featureless or stopped server) — container count only" >&2
+  : > "$RUN/desired-running.txt"
+fi
+```
+
+An empty container snapshot is VALID (zero running souls); an empty
+`desired-running.txt` from the API-less fallback only narrows the
+strict-sequence estimate (see below).
+
 Sequence the build and restart deliberately: the build rewrites
 `target/release/freshell-session-host` in place, and the running supervisor
 bind-mounts that path into every NEW soul — so a soul created between the
@@ -123,10 +178,13 @@ the procedure mid-way and leave the service down. Two sequences:
   systemctl --user start freshell-supervisor.service
   SOCK="$HOME/.freshell/managed-runtime/control/supervisor.sock"
   # The supervisor binds its socket only AFTER startup reconciliation,
-  # which runs up to 180s per soul at four-way concurrency — size the
-  # bound from the actual inventory (the pre-restart capture) instead of
-  # a fixed guess: 45s/soul effective + a 5-minute margin:
-  N=$(wc -l < "$RUN/souls-before.txt" 2>/dev/null || echo 0)
+  # which runs up to 180s per soul at four-way concurrency. Size the
+  # bound from the DESIRED-RUNNING inventory (the reconciliation work
+  # list — including souls with no running container), falling back to
+  # the container count when the API was unavailable: 45s/soul
+  # effective + a 5-minute margin:
+  N=$(wc -l < "$RUN/desired-running.txt" 2>/dev/null || echo 0)
+  [ "$N" -gt 0 ] || N=$(wc -l < "$RUN/souls-before.txt" 2>/dev/null || echo 0)
   BOUND=$(( N * 45 + 300 ))
   for i in $(seq 1 "$BOUND"); do
     # CONNECT-probe, not a file test: a stopped supervisor leaves its old
@@ -223,23 +281,9 @@ drop-in, plus `freshell-supervisor.service`):
   `PORT=3002`, while this host's installed unit serves `PORT=3001`. The
   commands below use 3001 — substitute the port the deployed unit actually
   sets.
-- Before restarting, capture the soul inventory so the post-deploy checks
-  can prove nothing was replaced — in a private per-run directory (fixed
-  `/tmp` paths would let a second run overwrite the first run's baseline
-  before its comparison), recording container IDs AND their exact start
-  times (`State.StartedAt`, not `docker ps`'s `CreatedAt`, which is the
-  creation time and would not reveal a stop-and-restart of the same
-  container):
-
-  ```bash
-  set -euo pipefail   # a Docker failure must halt the procedure
-  RUN=$(mktemp -d)    # private per-run dir for the survival snapshots
-  docker ps -q --filter name=incarnation | xargs -r docker inspect \
-    --format '{{.Id}} {{.Name}} {{.State.StartedAt}}' | sort | tee "$RUN/souls-before.txt"
-  ```
-
-  An empty baseline is VALID (zero running souls) — `xargs -r` keeps the
-  empty capture successful; only an actual Docker failure halts here.
+- The soul-inventory baselines were already captured in the preliminary
+  step above (`$RUN/souls-before.txt` and `$RUN/desired-running.txt`); the
+  post-deploy checks in the checklist compare against those.
 
 **What a restart does:**
 
@@ -298,24 +342,39 @@ drop-in, plus `freshell-supervisor.service`):
    comm -13 "$RUN/souls-before.txt" "$RUN/souls-after.txt"   # new containers (expected)
    ```
 
-   The `test -z` matters: `comm` exits successfully even when it prints
-   missing containers, so `set -e` alone would not enforce the empty
-   result. A non-empty `LOST` is a failure — a baseline container is gone
-   or was restarted with a new `StartedAt`. The final `comm` lists
-   containers that appeared after the restart; on a busy instance that is
-   normal (a client reconnect creating a new durable terminal, or another
-   client's new pane) — identify which pane or session each one belongs
-   to before assuming it is yours or that it is a replacement.
-   Then check the souls INDIVIDUALLY: for each baseline container in the
-   capture, read its soul ID with
-   `docker inspect <cid> --format '{{index .Config.Labels "com.freshell.soul-id"}}'`
-   (or list `GET /api/runtime/souls` and match by `containerId`);
-   `GET /api/runtime/souls/<soul_id>` reports BOTH `"launchState":
-   "running"` AND a `recoveryState` that is neither `"blocked"` nor
-   `"lost"` — those are `recoveryState` values, so `launchState` can
-   stay `"running"` while the soul cannot reattach; a blocked or lost
-   soul needs the supervisor journal and its record investigated before
-   the deploy is called good.
+    The `test -z` matters: `comm` exits successfully even when it prints
+    missing containers, so `set -e` alone would not enforce the empty
+    result. A non-empty `LOST` is a failure — a baseline container is gone
+    or was restarted with a new `StartedAt`. The final `comm` lists
+    containers that appeared after the restart; on a busy instance that is
+    normal (a client reconnect creating a new durable terminal, or another
+    client's new pane) — identify which pane or session each one belongs
+    to before assuming it is yours or that it is a replacement.
+    Then check the souls INDIVIDUALLY, over the DESIRED-RUNNING list from
+    the preliminary capture — not just the containers (a desired-running
+    soul with no running container at capture time still had to
+    reconcile, and it is exactly the kind the container comparison never
+    sees):
+
+    ```bash
+    while read -r SID; do
+      [ -n "$SID" ] || continue
+      curl -s -H @"$RUN/hdr" "http://127.0.0.1:3001/api/runtime/souls/$SID" \
+        | python3 -c 'import json,sys
+s=json.load(sys.stdin)["soul"]
+ls=s.get("launchState"); rs=s.get("recoveryState")
+assert ls=="running" and rs not in ("blocked","lost"), (sys.argv[1], ls, rs)
+print("ok:", sys.argv[1])' "$SID"
+    done < "$RUN/desired-running.txt"
+    ```
+
+    A blocked or lost `recoveryState` can hide behind a `"running"`
+    `launchState` — that is why both fields are asserted. Any failure here
+    needs the supervisor journal and that soul's record investigated
+    before the deploy is called good. If the preliminary capture fell back
+    to an empty `desired-running.txt` (featureless or stopped server), the
+    per-soul sweep is unavailable — re-run it after the deploy against the
+    freshly served soul list.
 5. New-soul probe: create a terminal pane in a real workspace that is NOT
    the operator home itself (a subdirectory of it is fine) — when the
    workspace equals the operator home, the supervisor deliberately omits
