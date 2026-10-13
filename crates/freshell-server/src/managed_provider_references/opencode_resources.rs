@@ -462,6 +462,8 @@ fn is_mcp_command_path_field(field: &str) -> bool {
             | "OpenCode mcp.node-script"
             | "OpenCode mcp.direct-script"
             | "OpenCode mcp.node-direct-script"
+            | "OpenCode mcp.shebang-script"
+            | "OpenCode mcp.shebang-node-script"
     )
 }
 
@@ -472,21 +474,456 @@ fn is_mcp_script_field(field: &str) -> bool {
             | "OpenCode mcp.node-script"
             | "OpenCode mcp.direct-script"
             | "OpenCode mcp.node-direct-script"
+            | "OpenCode mcp.shebang-script"
+            | "OpenCode mcp.shebang-node-script"
     )
 }
 
 fn is_mcp_direct_script_field(field: &str) -> bool {
     matches!(
         field,
-        "OpenCode mcp.direct-script" | "OpenCode mcp.node-direct-script"
+        "OpenCode mcp.direct-script"
+            | "OpenCode mcp.node-direct-script"
+            | "OpenCode mcp.shebang-script"
+            | "OpenCode mcp.shebang-node-script"
     )
 }
 
 fn is_mcp_node_script_field(field: &str) -> bool {
     matches!(
         field,
-        "OpenCode mcp.node-script" | "OpenCode mcp.node-direct-script"
+        "OpenCode mcp.node-script"
+            | "OpenCode mcp.node-direct-script"
+            | "OpenCode mcp.shebang-node-script"
     )
+}
+
+fn is_mcp_shebang_script_field(field: &str) -> bool {
+    matches!(
+        field,
+        "OpenCode mcp.shebang-script" | "OpenCode mcp.shebang-node-script"
+    )
+}
+
+fn shebang_interpreter_names(path: &Path) -> Option<Vec<String>> {
+    let mut prefix = [0; 4096];
+    let file = std::fs::File::open(path).ok()?;
+    let length = file.take(prefix.len() as u64).read(&mut prefix).ok()?;
+    let first_line = prefix[..length].split(|byte| *byte == b'\n').next()?;
+    let shebang = first_line.strip_prefix(b"#!")?;
+    Some(
+        std::str::from_utf8(shebang)
+            .ok()?
+            .split_ascii_whitespace()
+            .filter_map(|part| Path::new(part).file_name())
+            .map(|part| part.to_string_lossy().to_ascii_lowercase())
+            .collect(),
+    )
+}
+
+fn shebang_script_field(path: &Path) -> Option<&'static str> {
+    let interpreter_names = shebang_interpreter_names(path)?;
+    if interpreter_names
+        .iter()
+        .any(|name| matches!(name.as_str(), "node" | "nodejs" | "bun" | "deno"))
+    {
+        Some("OpenCode mcp.shebang-node-script")
+    } else {
+        Some("OpenCode mcp.shebang-script")
+    }
+}
+
+fn is_shell_script(path: &Path) -> bool {
+    if path
+        .extension()
+        .is_some_and(|extension| extension.to_string_lossy().eq_ignore_ascii_case("sh"))
+    {
+        return true;
+    }
+    shebang_interpreter_names(path).is_some_and(|names| {
+        names.iter().any(|name| {
+            matches!(
+                name.as_str(),
+                "sh" | "bash" | "dash" | "zsh" | "ksh" | "ash"
+            )
+        })
+    })
+}
+
+fn shell_directory_variables(source: &str) -> std::collections::BTreeSet<String> {
+    source
+        .lines()
+        .filter_map(|line| {
+            let line = line
+                .trim_start()
+                .strip_prefix("export ")
+                .unwrap_or(line.trim_start());
+            let (name, value) = line.split_once('=')?;
+            let valid_name = !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+            (valid_name && value.contains("dirname") && value.contains("$0"))
+                .then(|| name.to_owned())
+        })
+        .collect()
+}
+
+fn shell_source_operand(line: &str) -> Option<String> {
+    let line = line.trim_start();
+    let rest = if let Some(rest) = line.strip_prefix("source") {
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        rest
+    } else if let Some(rest) = line.strip_prefix('.') {
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        rest
+    } else {
+        return None;
+    }
+    .trim_start();
+    let first = rest.chars().next()?;
+    if first == '\'' || first == '"' {
+        let end = rest[1..].find(first)? + 1;
+        Some(rest[1..end].to_owned())
+    } else {
+        rest.split(|character: char| character.is_whitespace() || ";|&".contains(character))
+            .next()
+            .filter(|operand| !operand.is_empty())
+            .map(str::to_owned)
+    }
+}
+
+fn shell_source_path(
+    script_parent: &Path,
+    operand: &str,
+    directory_variables: &std::collections::BTreeSet<String>,
+) -> Result<Option<PathBuf>, &'static str> {
+    if operand.starts_with('/') {
+        return Ok(None);
+    }
+    let mut relative = operand;
+    if let Some(variable) = operand.strip_prefix("${") {
+        let Some((name, suffix)) = variable.split_once('}') else {
+            return Ok(None);
+        };
+        if !directory_variables.contains(name) {
+            return Err("direct MCP shell script has an unresolved dynamic source path");
+        }
+        relative = suffix.strip_prefix('/').unwrap_or(suffix);
+    } else if let Some(variable) = operand.strip_prefix('$') {
+        let (name, suffix) = variable
+            .split_once('/')
+            .ok_or("direct MCP shell script has an unresolved dynamic source path")?;
+        if !directory_variables.contains(name) {
+            return Err("direct MCP shell script has an unresolved dynamic source path");
+        }
+        relative = suffix;
+    }
+    if relative.is_empty() || relative.contains(['$', '*', '?']) {
+        return Err("direct MCP shell script has an unresolved dynamic source path");
+    }
+    Ok(Some(script_parent.join(relative)))
+}
+
+fn shell_directory_relative_paths(
+    line: &str,
+    directory_variables: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<String> {
+    let mut result = std::collections::BTreeSet::new();
+    for variable in directory_variables {
+        for prefix in [format!("${variable}/"), format!("${{{variable}}}/")] {
+            let mut remaining = line;
+            while let Some(start) = remaining.find(&prefix) {
+                let suffix = &remaining[start + prefix.len()..];
+                let length = suffix
+                    .find(|character: char| {
+                        character.is_whitespace() || "\"'`;|&)".contains(character)
+                    })
+                    .unwrap_or(suffix.len());
+                let relative = &suffix[..length];
+                if !relative.is_empty() && !relative.contains(['$', '*', '?']) {
+                    result.insert(relative.to_owned());
+                }
+                remaining = &suffix[length..];
+                if remaining.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+    result
+}
+
+enum JavaScriptToken {
+    Identifier(String),
+    String(Option<String>),
+    Punctuation(u8),
+}
+
+fn javascript_tokens(source: &str) -> Result<Vec<JavaScriptToken>, &'static str> {
+    const MAX_TOKENS: usize = 100_000;
+    let bytes = source.as_bytes();
+    let mut at = 0usize;
+    let mut result = Vec::new();
+    while at < bytes.len() {
+        if bytes[at].is_ascii_whitespace() {
+            at += 1;
+            continue;
+        }
+        if bytes.get(at..at + 2) == Some(b"//") {
+            while bytes.get(at).is_some_and(|byte| *byte != b'\n') {
+                at += 1;
+            }
+            continue;
+        }
+        if bytes.get(at..at + 2) == Some(b"/*") {
+            at += 2;
+            while at < bytes.len() && bytes.get(at..at + 2) != Some(b"*/") {
+                at += 1;
+            }
+            if at == bytes.len() {
+                return Err("direct MCP Node script has an incomplete comment");
+            }
+            at += 2;
+            continue;
+        }
+        let start = at;
+        let byte = bytes[at];
+        if byte == b'\'' || byte == b'"' {
+            let quote = byte;
+            at += 1;
+            let content_start = at;
+            let mut escaped = false;
+            while at < bytes.len() && bytes[at] != quote {
+                if bytes[at] == b'\\' {
+                    escaped = true;
+                    at = (at + 2).min(bytes.len());
+                } else {
+                    at += 1;
+                }
+            }
+            if at == bytes.len() {
+                return Err("direct MCP Node script has an unterminated string");
+            }
+            let value = (!escaped).then(|| source[content_start..at].to_owned());
+            at += 1;
+            result.push(JavaScriptToken::String(value));
+        } else if byte == b'`' {
+            at += 1;
+            while at < bytes.len() && bytes[at] != b'`' {
+                if bytes[at] == b'\\' {
+                    at = (at + 2).min(bytes.len());
+                } else {
+                    at += 1;
+                }
+            }
+            if at == bytes.len() {
+                return Err("direct MCP Node script has an unterminated template string");
+            }
+            at += 1;
+            result.push(JavaScriptToken::String(None));
+        } else if byte == b'_' || byte == b'$' || byte.is_ascii_alphabetic() {
+            at += 1;
+            while bytes
+                .get(at)
+                .is_some_and(|byte| *byte == b'_' || *byte == b'$' || byte.is_ascii_alphanumeric())
+            {
+                at += 1;
+            }
+            result.push(JavaScriptToken::Identifier(source[start..at].to_owned()));
+        } else {
+            at += 1;
+            result.push(JavaScriptToken::Punctuation(byte));
+        }
+        if result.len() > MAX_TOKENS {
+            return Err("direct MCP Node dependency scan exceeds its token bound");
+        }
+    }
+    Ok(result)
+}
+
+fn node_relative_module_specifiers(source: &str) -> Result<Vec<String>, &'static str> {
+    let tokens = javascript_tokens(source)?;
+    let mut result = std::collections::BTreeSet::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let module = match token {
+            JavaScriptToken::Identifier(name) if name == "require" || name == "import" => {
+                match tokens.get(index + 1) {
+                    Some(JavaScriptToken::Punctuation(b'(')) => tokens.get(index + 2),
+                    Some(JavaScriptToken::String(_)) if name == "import" => tokens.get(index + 1),
+                    _ => None,
+                }
+            }
+            JavaScriptToken::Identifier(name) if name == "from" => tokens.get(index + 1),
+            _ => None,
+        };
+        if let Some(JavaScriptToken::String(Some(specifier))) = module {
+            if specifier.starts_with("./") || specifier.starts_with("../") {
+                result.insert(specifier.clone());
+            }
+        }
+    }
+    Ok(result.into_iter().collect())
+}
+
+fn resolve_node_relative_module(parent: &Path, specifier: &str) -> Option<PathBuf> {
+    let base = parent.join(specifier);
+    let mut candidates = vec![base.clone()];
+    if base.extension().is_none() {
+        for extension in ["js", "mjs", "cjs", "json", "node", "ts", "mts", "cts"] {
+            candidates.push(base.with_extension(extension));
+        }
+    }
+    if base.is_dir() {
+        for index in ["index.js", "index.mjs", "index.cjs", "index.json"] {
+            candidates.push(base.join(index));
+        }
+    }
+    candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+fn insert_node_script_dependencies(
+    script: &Path,
+    scope: &Path,
+    declaring: &Path,
+    result: &mut std::collections::BTreeSet<PathBuf>,
+    resource_path_bytes: &mut usize,
+    field: &'static str,
+) -> Result<(), ResourceError> {
+    const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
+    const MAX_SCRIPT_FILES: usize = 256;
+    let fail = |cause| ResourceError { field, cause };
+    let mut pending = vec![script.to_owned()];
+    let mut visited = std::collections::BTreeSet::new();
+    let mut total_bytes = 0u64;
+    while let Some(current) = pending.pop() {
+        let canonical = checked(&current, field, declaring)?;
+        if !canonical.is_file() || !visited.insert(canonical.clone()) {
+            continue;
+        }
+        if visited.len() > MAX_SCRIPT_FILES {
+            return Err(fail(
+                "direct MCP Node dependency closure exceeds its entry bound",
+            ));
+        }
+        let metadata = std::fs::metadata(&canonical)
+            .map_err(|_| fail("direct MCP Node script metadata unavailable"))?;
+        total_bytes = total_bytes.saturating_add(metadata.len());
+        if metadata.len() > MAX_SCRIPT_BYTES || total_bytes > MAX_SCRIPT_BYTES {
+            return Err(fail(
+                "direct MCP Node dependency closure exceeds its byte bound",
+            ));
+        }
+        if !canonical.extension().is_none_or(|extension| {
+            is_node_script_path(&format!("file.{}", extension.to_string_lossy()))
+        }) {
+            continue;
+        }
+        let source = std::fs::read_to_string(&canonical)
+            .map_err(|_| fail("direct MCP Node script is not readable UTF-8"))?;
+        let script_parent = canonical
+            .parent()
+            .ok_or_else(|| fail("direct MCP Node script has no containing directory"))?;
+        for specifier in node_relative_module_specifiers(&source).map_err(fail)? {
+            let candidate = resolve_node_relative_module(script_parent, &specifier)
+                .ok_or_else(|| fail("direct MCP Node relative module is missing"))?;
+            let dependency = checked(&candidate, field, declaring)?;
+            if !dependency.is_file() {
+                return Err(fail("direct MCP Node module is not a regular file"));
+            }
+            if !dependency.starts_with(scope) {
+                return Err(fail(
+                    "direct MCP Node module escapes its selected script scope",
+                ));
+            }
+            insert_resource(result, resource_path_bytes, dependency.clone(), field)?;
+            pending.push(dependency);
+        }
+    }
+    Ok(())
+}
+
+fn insert_shell_script_dependencies(
+    script: &Path,
+    scope: &Path,
+    declaring: &Path,
+    result: &mut std::collections::BTreeSet<PathBuf>,
+    resource_path_bytes: &mut usize,
+    field: &'static str,
+) -> Result<(), ResourceError> {
+    const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
+    const MAX_SCRIPT_FILES: usize = 256;
+    let fail = |cause| ResourceError { field, cause };
+    let mut pending = vec![script.to_owned()];
+    let mut visited = std::collections::BTreeSet::new();
+    let mut total_bytes = 0u64;
+    while let Some(current) = pending.pop() {
+        let canonical = checked(&current, field, declaring)?;
+        if !canonical.is_file() || !visited.insert(canonical.clone()) {
+            continue;
+        }
+        if visited.len() > MAX_SCRIPT_FILES {
+            return Err(fail(
+                "direct MCP shell dependency closure exceeds its entry bound",
+            ));
+        }
+        let metadata = std::fs::metadata(&canonical)
+            .map_err(|_| fail("direct MCP shell script metadata unavailable"))?;
+        total_bytes = total_bytes.saturating_add(metadata.len());
+        if metadata.len() > MAX_SCRIPT_BYTES || total_bytes > MAX_SCRIPT_BYTES {
+            return Err(fail(
+                "direct MCP shell dependency closure exceeds its byte bound",
+            ));
+        }
+        let source = std::fs::read_to_string(&canonical)
+            .map_err(|_| fail("direct MCP shell script is not readable UTF-8"))?;
+        let directory_variables = shell_directory_variables(&source);
+        if directory_variables.len() > 128 {
+            return Err(fail(
+                "direct MCP shell dependency closure exceeds its variable bound",
+            ));
+        }
+        let script_parent = canonical
+            .parent()
+            .ok_or_else(|| fail("direct MCP shell script has no containing directory"))?;
+        for line in source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+        {
+            let mut candidates = std::collections::BTreeSet::new();
+            if let Some(operand) = shell_source_operand(line) {
+                if let Some(candidate) =
+                    shell_source_path(script_parent, &operand, &directory_variables)
+                        .map_err(fail)?
+                {
+                    candidates.insert(candidate);
+                }
+            }
+            candidates.extend(
+                shell_directory_relative_paths(line, &directory_variables)
+                    .into_iter()
+                    .map(|relative| script_parent.join(relative)),
+            );
+            for candidate in candidates {
+                let dependency = checked(&candidate, field, declaring)?;
+                if !dependency.is_file() {
+                    return Err(fail("direct MCP shell source is not a regular file"));
+                }
+                if !dependency.starts_with(scope) {
+                    return Err(fail(
+                        "direct MCP shell source escapes its selected script scope",
+                    ));
+                }
+                insert_resource(result, resource_path_bytes, dependency.clone(), field)?;
+                pending.push(dependency);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn script_operand_index(command: &[String]) -> Option<usize> {
@@ -976,6 +1413,11 @@ pub fn select(
             path = freshell_platform::opencode_config::lexical_path(&path);
         }
         let canonical = checked(&path, field, declaring)?;
+        if field == "OpenCode mcp.command" {
+            if let Some(script_field) = shebang_script_field(&canonical) {
+                field = script_field;
+            }
+        }
         variables.extend(names.into_inner());
         if field == "OpenCode instructions" || field == "OpenCode attention.sounds" {
             if !canonical.is_file() {
@@ -1027,13 +1469,77 @@ pub fn select(
                 )?;
                 continue;
             }
+            if is_mcp_shebang_script_field(field) {
+                insert_resource(
+                    &mut result,
+                    &mut resource_path_bytes,
+                    canonical.clone(),
+                    field,
+                )?;
+                if is_mcp_node_script_field(field) {
+                    insert_installed_package_ancestor_resources(
+                        command_parent,
+                        home,
+                        declaring,
+                        &mut result,
+                        &mut resource_path_bytes,
+                        field,
+                    )?;
+                    insert_node_script_dependencies(
+                        &canonical,
+                        command_parent,
+                        declaring,
+                        &mut result,
+                        &mut resource_path_bytes,
+                        field,
+                    )?;
+                }
+                if is_shell_script(&canonical) {
+                    insert_shell_script_dependencies(
+                        &canonical,
+                        command_parent,
+                        declaring,
+                        &mut result,
+                        &mut resource_path_bytes,
+                        field,
+                    )?;
+                }
+                continue;
+            }
             if is_mcp_script_field(field) {
                 let canonical_home = std::fs::canonicalize(home).ok();
                 if command_parent == Path::new("/")
                     || canonical_home.as_deref() == Some(command_parent)
                 {
                     if is_mcp_direct_script_field(field) {
-                        insert_resource(&mut result, &mut resource_path_bytes, canonical, field)?;
+                        insert_resource(
+                            &mut result,
+                            &mut resource_path_bytes,
+                            canonical.clone(),
+                            field,
+                        )?;
+                        if is_mcp_node_script_field(field) {
+                            insert_node_script_dependencies(
+                                &canonical,
+                                command_parent,
+                                declaring,
+                                &mut result,
+                                &mut resource_path_bytes,
+                                field,
+                            )?;
+                        }
+                        if canonical_home.as_deref() == Some(command_parent)
+                            && is_shell_script(&canonical)
+                        {
+                            insert_shell_script_dependencies(
+                                &canonical,
+                                command_parent,
+                                declaring,
+                                &mut result,
+                                &mut resource_path_bytes,
+                                field,
+                            )?;
+                        }
                         continue;
                     }
                     return Err(fail(

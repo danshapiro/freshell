@@ -630,7 +630,7 @@ mod configured_resource_tests {
     }
 
     #[test]
-    fn absolute_mcp_executable_runs_after_all_resource_copies() {
+    fn absolute_mcp_shebang_command_runs_after_all_resource_copies() {
         use std::os::unix::fs::PermissionsExt;
 
         let owned = tempfile::tempdir().unwrap();
@@ -719,9 +719,90 @@ mod configured_resource_tests {
         let command = home.join("mcp.sh");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&workspace).unwrap();
+        let helper = home.join("helper.sh");
         std::fs::write(
             &command,
-            "#!/bin/sh\nprintf 'home MCP executable started\\n'\n",
+            "#!/bin/sh\nSCRIPT_DIR=$(dirname \"$0\")\n. \"$SCRIPT_DIR/helper.sh\"\nprintf '%s\\n' \"$MCP_HELPER_RESULT\"\n",
+        )
+        .unwrap();
+        std::fs::write(&helper, "MCP_HELPER_RESULT='home sibling helper loaded'\n").unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = workspace.join("opencode.json");
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "mcp": { "direct": { "type": "local", "command": [command] } },
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config,
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Workspace,
+            }],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .unwrap();
+        assert!(plan[0]
+            .configured_resources
+            .contains(&command.canonicalize().unwrap()));
+        assert!(plan[0]
+            .configured_resources
+            .contains(&helper.canonicalize().unwrap()),
+            "a direct script in HOME must retain its explicitly sourced sibling without selecting all of HOME");
+        assert!(!plan[0]
+            .configured_resources
+            .contains(&home.canonicalize().unwrap()));
+
+        let units = resource_units(
+            &home,
+            &home.join(".config/opencode"),
+            &workspace,
+            &plan,
+            None,
+        )
+        .unwrap();
+        let provider = copy_selected_units_through_provider(owned.path(), &units);
+        let provider_command = provider.join(".provider-home/mcp.sh");
+        let hidden_home = owned.path().join("home-hidden");
+        std::fs::rename(&home, &hidden_home).unwrap();
+        let output = execute_selected_resource(&provider_command);
+        std::fs::rename(&hidden_home, &home).unwrap();
+        let output = output.unwrap();
+        assert!(
+            output.status.success(),
+            "the direct executable selected under HOME must still start: {:?}",
+            output.stderr
+        );
+        assert_eq!(output.stdout, b"home sibling helper loaded\n");
+    }
+
+    #[test]
+    fn extensionless_mcp_shebang_script_loads_sibling_after_all_resource_copies() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let tools = home.join("tools");
+        let command = tools.join("start");
+        let helper = tools.join("helper.sh");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "#!/bin/sh\nSCRIPT_DIR=$(dirname \"$0\")\n. \"$SCRIPT_DIR/helper.sh\"\nprintf '%s\\n' \"$MCP_HELPER_RESULT\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &helper,
+            "MCP_HELPER_RESULT='extensionless sibling helper loaded'\n",
         )
         .unwrap();
         std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -750,6 +831,90 @@ mod configured_resource_tests {
         assert!(plan[0]
             .configured_resources
             .contains(&command.canonicalize().unwrap()));
+        assert!(
+            plan[0]
+                .configured_resources
+                .contains(&helper.canonicalize().unwrap()),
+            "an extensionless executable shebang command must retain its sourced sibling"
+        );
+        assert!(
+            !plan[0]
+                .configured_resources
+                .contains(&tools.canonicalize().unwrap()),
+            "a direct command must not copy unrelated siblings from its containing directory"
+        );
+
+        let units = resource_units(
+            &home,
+            &home.join(".config/opencode"),
+            &workspace,
+            &plan,
+            None,
+        )
+        .unwrap();
+        let provider = copy_selected_units_through_provider(owned.path(), &units);
+        let provider_command = provider.join(".provider-home/tools/start");
+        let hidden_home = owned.path().join("home-hidden");
+        std::fs::rename(&home, &hidden_home).unwrap();
+        let output = execute_selected_resource(&provider_command);
+        std::fs::rename(&hidden_home, &home).unwrap();
+        let output = output.unwrap();
+        assert!(
+            output.status.success(),
+            "the extensionless managed shebang command must load its sibling helper: {:?}",
+            output.stderr
+        );
+        assert_eq!(output.stdout, b"extensionless sibling helper loaded\n");
+    }
+
+    #[test]
+    fn direct_node_script_in_home_loads_relative_module_after_all_resource_copies() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let command = home.join("start");
+        let helper = home.join("helper.js");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "#!/usr/bin/env node\nprocess.stdout.write(require('./helper.js'))\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &helper,
+            "module.exports = 'node sibling helper loaded\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = workspace.join("opencode.json");
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "mcp": { "direct": { "type": "local", "command": [command] } },
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config,
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Workspace,
+            }],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .unwrap();
+        assert!(plan[0]
+            .configured_resources
+            .contains(&helper.canonicalize().unwrap()),
+            "an account-home Node script must retain its imported sibling without selecting all of HOME");
         assert!(!plan[0]
             .configured_resources
             .contains(&home.canonicalize().unwrap()));
@@ -763,7 +928,7 @@ mod configured_resource_tests {
         )
         .unwrap();
         let provider = copy_selected_units_through_provider(owned.path(), &units);
-        let provider_command = provider.join(".provider-home/mcp.sh");
+        let provider_command = provider.join(".provider-home/start");
         let hidden_home = owned.path().join("home-hidden");
         std::fs::rename(&home, &hidden_home).unwrap();
         let output = execute_selected_resource(&provider_command);
@@ -771,10 +936,10 @@ mod configured_resource_tests {
         let output = output.unwrap();
         assert!(
             output.status.success(),
-            "the direct executable selected under HOME must still start: {:?}",
+            "the managed Node command must load its selected relative module: {:?}",
             output.stderr
         );
-        assert_eq!(output.stdout, b"home MCP executable started\n");
+        assert_eq!(output.stdout, b"node sibling helper loaded\n");
     }
 
     #[test]
@@ -1411,11 +1576,7 @@ mod configured_resource_tests {
             let projected = host.join(&unit.1.provider_relative_path).join("probe");
             let hidden = owned.path().join("hidden-original-skills");
             std::fs::rename(&skill_root, &hidden).unwrap();
-            let output = std::process::Command::new(projected.join("scripts/run"))
-                .env_clear()
-                .env("PATH", std::env::var_os("PATH").unwrap())
-                .output()
-                .unwrap();
+            let output = execute_selected_resource(&projected.join("scripts/run")).unwrap();
             std::fs::rename(&hidden, &skill_root).unwrap();
             assert!(output.status.success(), "copied selected skill executable must consume installed dependencies and adjacent resources");
             assert_eq!(output.stdout, b"skill-resource:skill-dependency");

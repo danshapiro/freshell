@@ -212,6 +212,12 @@ test(healthyTitle, async ({ page }, info) => {
       terminalId, bun: true, dependency: fixture.expectedNonce, resource: fixture.expectedNonce,
       absoluteReference: fixture.expectedNonce, relativeReference: fixture.expectedNonce, executableMode: '0711',
     } })
+  let directMcpReceipt: any
+  await expect.poll(async () => {
+    directMcpReceipt = await readReceipt(page, `${pane.cwd}/.managed-fixture/direct-mcp-receipt.json`)
+    return directMcpReceipt
+  }, { timeout: 120_000 }).toMatchObject({ expectedNonce: fixture.expectedNonce, helper: fixture.expectedNonce, cwd: pane.cwd })
+  expect(directMcpReceipt.scriptPath).toMatch(/\/direct-mcp\/server\.js$/)
   expect(receipt.soulId).toBeTruthy()
   expect(receipt.incarnationId).toBeTruthy()
   expect(receipt.nativeSessionId).toBeTruthy()
