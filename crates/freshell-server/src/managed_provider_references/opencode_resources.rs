@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 const FRESHELL_IMAGE_MCP_SERVER_PATH: &str = "/opt/freshell-mcp/server.js";
 const MAX_BUN_PACKAGE_JSON_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_NODE_PACKAGE_JSON_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Copy)]
 enum Token {
@@ -551,16 +552,23 @@ fn is_shell_script(path: &Path) -> bool {
 }
 
 fn is_python_script(path: &Path) -> bool {
+    fn is_python_interpreter(name: &str) -> bool {
+        matches!(name, "python" | "python2" | "python3")
+            || name.strip_prefix("python").is_some_and(|version| {
+                !version.is_empty()
+                    && version.split('.').all(|component| {
+                        !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+            })
+    }
+
     path.extension().is_some_and(|extension| {
         matches!(
             extension.to_string_lossy().to_ascii_lowercase().as_str(),
             "py" | "pyw"
         )
-    }) || shebang_interpreter_names(path).is_some_and(|names| {
-        names
-            .iter()
-            .any(|name| matches!(name.as_str(), "python" | "python2" | "python3"))
-    })
+    }) || shebang_interpreter_names(path)
+        .is_some_and(|names| names.iter().any(|name| is_python_interpreter(name)))
 }
 
 fn is_ruby_script(path: &Path) -> bool {
@@ -813,29 +821,106 @@ fn node_relative_module_specifiers(source: &str) -> Result<Vec<String>, &'static
     Ok(result.into_iter().collect())
 }
 
-fn resolve_node_relative_module(parent: &Path, specifier: &str) -> Option<PathBuf> {
-    let base = parent.join(specifier);
-    let mut candidates = vec![base.clone()];
-    if base.extension().is_none() {
-        for extension in ["js", "mjs", "cjs", "json", "node", "ts", "mts", "cts"] {
-            candidates.push(base.with_extension(extension));
-        }
+fn read_node_package_manifest(
+    directory: &Path,
+) -> Result<Option<(PathBuf, Option<PathBuf>)>, &'static str> {
+    let manifest = directory.join("package.json");
+    let metadata = match std::fs::metadata(&manifest) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("direct MCP Node package.json metadata is unavailable"),
+    };
+    if !metadata.is_file() {
+        return Err("direct MCP Node package.json is not a regular file");
     }
-    if base.is_dir() {
+    if metadata.len() > MAX_NODE_PACKAGE_JSON_BYTES {
+        return Err("direct MCP Node package.json exceeds its read limit");
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::fs::File::open(&manifest)
+        .map_err(|_| "direct MCP Node package.json is unreadable")?
+        .take(MAX_NODE_PACKAGE_JSON_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "direct MCP Node package.json could not be read")?;
+    if bytes.len() as u64 > MAX_NODE_PACKAGE_JSON_BYTES {
+        return Err("direct MCP Node package.json exceeds its read limit");
+    }
+    let package: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| "direct MCP Node package.json is not valid JSON")?;
+    let main = package
+        .get("main")
+        .and_then(serde_json::Value::as_str)
+        .filter(|main| !main.is_empty())
+        .map(|main| directory.join(main));
+    Ok(Some((manifest, main)))
+}
+
+fn resolve_node_relative_module(
+    parent: &Path,
+    specifier: &str,
+) -> Result<Option<Vec<PathBuf>>, &'static str> {
+    fn resolve(base: &Path, depth: usize) -> Result<Option<Vec<PathBuf>>, &'static str> {
+        const EXTENSIONS: [&str; 8] = ["js", "mjs", "cjs", "json", "node", "ts", "mts", "cts"];
+        if depth > 8 {
+            return Err("direct MCP Node package main resolution exceeds its depth bound");
+        }
+        if base.is_file() {
+            return Ok(Some(vec![base.to_owned()]));
+        }
+        if base.extension().is_none() {
+            for extension in EXTENSIONS {
+                let candidate = base.with_extension(extension);
+                if candidate.is_file() {
+                    return Ok(Some(vec![candidate]));
+                }
+            }
+        }
+        if !base.is_dir() {
+            return Ok(None);
+        }
+
+        let package = read_node_package_manifest(base)?;
+        if let Some((manifest, Some(main))) = package.as_ref() {
+            if let Some(mut files) = resolve(main, depth + 1)? {
+                files.insert(0, manifest.clone());
+                return Ok(Some(files));
+            }
+        }
+
         for index in ["index.js", "index.mjs", "index.cjs", "index.json"] {
-            candidates.push(base.join(index));
+            let candidate = base.join(index);
+            if candidate.is_file() {
+                let mut files = vec![candidate];
+                if let Some((manifest, _)) = package {
+                    files.insert(0, manifest);
+                }
+                return Ok(Some(files));
+            }
         }
+        Ok(None)
     }
-    candidates.into_iter().find(|candidate| candidate.is_file())
+
+    resolve(&parent.join(specifier), 0)
 }
 
 fn python_import_specifiers(source: &str) -> std::collections::BTreeSet<String> {
-    fn is_static_module_name(name: &str) -> bool {
+    fn is_identifier(name: &str) -> bool {
         !name.is_empty()
-            && !name.starts_with('.')
             && name
                 .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.')
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    }
+
+    fn is_module_name(name: &str, allow_relative: bool) -> bool {
+        let dots = name.bytes().take_while(|byte| *byte == b'.').count();
+        if dots > 0 {
+            if !allow_relative {
+                return false;
+            }
+            let remainder = &name[dots..];
+            return remainder.is_empty() || remainder.split('.').all(is_identifier);
+        }
+        !name.is_empty() && name.split('.').all(is_identifier)
     }
 
     let mut result = std::collections::BTreeSet::new();
@@ -844,7 +929,7 @@ fn python_import_specifiers(source: &str) -> std::collections::BTreeSet<String> 
         if let Some(imports) = statement.strip_prefix("import ") {
             for item in imports.split(',') {
                 let name = item.split_ascii_whitespace().next().unwrap_or_default();
-                if is_static_module_name(name) {
+                if is_module_name(name, false) {
                     result.insert(name.to_owned());
                 }
             }
@@ -853,22 +938,34 @@ fn python_import_specifiers(source: &str) -> std::collections::BTreeSet<String> 
                 continue;
             };
             let module = module.trim();
-            if !is_static_module_name(module) {
+            if !is_module_name(module, true) {
+                continue;
+            }
+            let imported = imported
+                .trim()
+                .trim_start_matches('(')
+                .trim_end_matches(')');
+            if module.bytes().all(|byte| byte == b'.') {
+                for item in imported.split(',') {
+                    let name = item
+                        .trim()
+                        .split_ascii_whitespace()
+                        .next()
+                        .unwrap_or_default();
+                    if is_identifier(name) {
+                        result.insert(format!("{module}{name}"));
+                    }
+                }
                 continue;
             }
             result.insert(module.to_owned());
-            for item in imported
-                .trim()
-                .trim_start_matches('(')
-                .trim_end_matches(')')
-                .split(',')
-            {
+            for item in imported.split(',') {
                 let name = item
                     .trim()
                     .split_ascii_whitespace()
                     .next()
                     .unwrap_or_default();
-                if is_static_module_name(name) {
+                if is_identifier(name) {
                     result.insert(format!("{module}.{name}"));
                 }
             }
@@ -878,7 +975,20 @@ fn python_import_specifiers(source: &str) -> std::collections::BTreeSet<String> 
 }
 
 fn resolve_python_local_modules(parent: &Path, specifier: &str) -> Vec<PathBuf> {
-    let components = specifier.split('.').collect::<Vec<_>>();
+    let relative_levels = specifier.bytes().take_while(|byte| *byte == b'.').count();
+    let module = &specifier[relative_levels..];
+    let root = if relative_levels == 0 {
+        parent
+    } else if let Some(root) = parent.ancestors().nth(relative_levels - 1) {
+        root
+    } else {
+        return Vec::new();
+    };
+    let components = if module.is_empty() {
+        Vec::new()
+    } else {
+        module.split('.').collect::<Vec<_>>()
+    };
     if components
         .iter()
         .any(|component| component.is_empty() || component.contains(['/', '\\']))
@@ -886,7 +996,7 @@ fn resolve_python_local_modules(parent: &Path, specifier: &str) -> Vec<PathBuf> 
         return Vec::new();
     }
     let mut result = std::collections::BTreeSet::new();
-    let mut package = parent.to_owned();
+    let mut package = root.to_owned();
     for component in &components[..components.len().saturating_sub(1)] {
         package.push(component);
         let init = package.join("__init__.py");
@@ -894,15 +1004,20 @@ fn resolve_python_local_modules(parent: &Path, specifier: &str) -> Vec<PathBuf> 
             result.insert(init);
         }
     }
-    let mut module = parent.to_owned();
+    let mut module_path = root.to_owned();
     for component in &components {
-        module.push(component);
+        module_path.push(component);
     }
-    for candidate in [
-        module.with_extension("py"),
-        module.with_extension("pyw"),
-        module.join("__init__.py"),
-    ] {
+    let candidates = if components.is_empty() {
+        vec![root.join("__init__.py")]
+    } else {
+        vec![
+            module_path.with_extension("py"),
+            module_path.with_extension("pyw"),
+            module_path.join("__init__.py"),
+        ]
+    };
+    for candidate in candidates {
         if candidate.is_file() {
             result.insert(candidate);
         }
@@ -969,13 +1084,15 @@ fn direct_script_dependency_paths(
     runtime: ScriptDependencyRuntime,
 ) -> Result<Vec<PathBuf>, &'static str> {
     match runtime {
-        ScriptDependencyRuntime::Node => node_relative_module_specifiers(source)?
-            .into_iter()
-            .map(|specifier| {
-                resolve_node_relative_module(parent, &specifier)
-                    .ok_or("direct MCP Node relative module is missing")
-            })
-            .collect(),
+        ScriptDependencyRuntime::Node => {
+            let mut result = Vec::new();
+            for specifier in node_relative_module_specifiers(source)? {
+                let mut files = resolve_node_relative_module(parent, &specifier)?
+                    .ok_or("direct MCP Node relative module is missing")?;
+                result.append(&mut files);
+            }
+            Ok(result)
+        }
         ScriptDependencyRuntime::Python => Ok(python_import_specifiers(source)
             .into_iter()
             .flat_map(|specifier| resolve_python_local_modules(parent, &specifier))
