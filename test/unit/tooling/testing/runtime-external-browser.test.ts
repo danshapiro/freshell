@@ -1006,7 +1006,7 @@ describe('body-free ordinary-turn Cloud diagnostics', () => {
       const reporter = new runner.default()
       const testCase = { id: 'ordinary-turn-codex', location: {
         file: 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts',
-      } } as any
+      }, title: 'each selected terminal provider completes one ordinary turn' } as any
       reporter.onStdOut(`${JSON.stringify({
         severity: 'error', event: 'durable_souls.ordinary_turn_failed', lane: 'terminal', provider: 'codex',
         paneSetupFailureStage: 'managed_runtime_view', ordinaryTurnFailureStage: null,
@@ -1040,7 +1040,7 @@ describe('body-free ordinary-turn Cloud diagnostics', () => {
       const reporter = new runner.default()
       const testCase = { id: 'ordinary-turn-freshcodex', location: {
         file: 'test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts',
-      } } as any
+      }, title: 'each selected fresh-agent mode completes one ordinary turn' } as any
       const event = JSON.stringify({
         severity: 'error', event: 'durable_souls.ordinary_turn_failed', lane: 'fresh-agent', mode: 'freshcodex',
         stage: 'waiting_for_composer', createCompleted: true, composerFilled: false,
@@ -1075,6 +1075,94 @@ describe('body-free ordinary-turn Cloud diagnostics', () => {
       for (const sentinel of ['private-assistant-sentinel', 'private-provider-output-sentinel', 'private-readiness-sentinel']) {
         expect(JSON.stringify(forwarded)).not.toContain(sentinel)
       }
+    } finally {
+      write.mockRestore()
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it('forwards only fixed setup stages from the exact managed-provider ordinary-turn test', () => {
+    for (const [key, value] of Object.entries(descriptor)) vi.stubEnv(key, value)
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+    try {
+      const reporter = new runner.default()
+      const testCase = { id: 'ordinary-turn-setup-failure', location: {
+        file: 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts',
+      }, title: 'each selected terminal provider completes one ordinary turn' } as any
+      reporter.onStdOut(`${JSON.stringify({
+        severity: 'error', event: 'durable_souls.ordinary_setup_failed', lane: 'terminal', stage: 'harness_ready',
+        error: 'private-exception-sentinel', stack: 'private-stack-sentinel', readiness: { text: 'private-readiness-sentinel' },
+      })}\n${JSON.stringify({
+        severity: 'error', event: 'durable_souls.ordinary_setup_failed', lane: 'terminal', stage: 'private-stage-sentinel',
+      })}\n`, testCase)
+
+      expect(write).toHaveBeenCalledOnce()
+      const forwarded = JSON.parse(String(write.mock.calls[0][0]))
+      expect(forwarded).toEqual({
+        severity: 'info', runId: descriptor.FRESHELL_RUNTIME_EXTERNAL_RUN_ID,
+        candidateSha: descriptor.FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA,
+        event: 'managed_external_ordinary_turn', id: 'ordinary-turn-setup-failure',
+        file: 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts',
+        sourceEvent: 'durable_souls.ordinary_setup_failed', outcome: 'failed', lane: 'terminal',
+        setupFailureStage: 'harness_ready',
+      })
+      const serialized = JSON.stringify(forwarded)
+      for (const sentinel of ['private-exception-sentinel', 'private-stack-sentinel', 'private-readiness-sentinel']) {
+        expect(serialized).not.toContain(sentinel)
+      }
+    } finally {
+      write.mockRestore()
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it('flushes one valid buffered final diagnostic line when the selected test ends', () => {
+    for (const [key, value] of Object.entries(descriptor)) vi.stubEnv(key, value)
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+    try {
+      const reporter = new runner.default()
+      const testCase = { id: 'ordinary-turn-final-line', location: {
+        file: 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts',
+      }, title: 'each selected terminal provider completes one ordinary turn', titlePath: () => [
+        'runtime-managed-provider-qualification-rust.spec.ts', 'ordinary managed-provider use',
+        'each selected terminal provider completes one ordinary turn',
+      ] } as any
+      reporter.onStdOut(`${JSON.stringify({ event: 'durable_souls.ordinary_turn_completed', lane: 'terminal', provider: 'codex' })}`, testCase)
+      reporter.onTestEnd(testCase, { status: 'passed' } as any)
+
+      const forwarded = write.mock.calls.map(([line]) => JSON.parse(String(line)))
+      expect(forwarded.map(event => event.event)).toEqual([
+        'managed_external_ordinary_turn', 'managed_external_case',
+      ])
+      expect(forwarded[0]).toMatchObject({
+        event: 'managed_external_ordinary_turn', sourceEvent: 'durable_souls.ordinary_turn_completed',
+        provider: 'codex', outcome: 'completed',
+      })
+    } finally {
+      write.mockRestore()
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it('does not forward ordinary diagnostics from another test title or spec', () => {
+    for (const [key, value] of Object.entries(descriptor)) vi.stubEnv(key, value)
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+    try {
+      const reporter = new runner.default()
+      const line = `${JSON.stringify({ event: 'durable_souls.ordinary_turn_completed', lane: 'terminal', provider: 'codex' })}\n`
+      reporter.onStdOut(line, { id: 'wrong-title', location: {
+        file: 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts',
+      }, title: 'a different test title' } as any)
+      reporter.onStdOut(line, { id: 'wrong-spec', location: {
+        file: 'test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts',
+      }, title: 'each selected fresh-agent mode completes one ordinary turn' } as any)
+      reporter.onStdOut(`${JSON.stringify({
+        event: 'durable_souls.ordinary_setup_failed', lane: 'terminal', stage: 'runtime_start',
+      })}\n`, { id: 'wrong-setup-spec', location: {
+        file: 'test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts',
+      }, title: 'each selected fresh-agent mode completes one ordinary turn' } as any)
+
+      expect(write).not.toHaveBeenCalled()
     } finally {
       write.mockRestore()
       vi.unstubAllEnvs()

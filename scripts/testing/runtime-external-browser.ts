@@ -2059,6 +2059,8 @@ type HistoryDiagnostic = z.infer<typeof HistoryDiagnosticSchema>
 const OrdinaryTerminalProviderSchema = z.enum(['claude', 'codex', 'opencode'])
 const OrdinaryTerminalSetupStageSchema = z.enum(['existing_panes', 'picker_open', 'provider_selection',
   'directory_dialog', 'pane_creation', 'terminal_visible', 'managed_runtime_view', 'ready'])
+const OrdinaryTerminalSmokeSetupStageSchema = z.enum(['provider_definitions', 'runtime_construction', 'runtime_start',
+  'browser_script', 'page_navigation', 'harness_ready', 'connection_ready', 'active_tab'])
 const OrdinaryTerminalTurnStageSchema = z.enum(['attach_ready', 'turn_completion'])
 const OrdinaryTerminalFactsSchema = z.object({
   available: z.boolean(), provider: OrdinaryTerminalProviderSchema.optional(),
@@ -2071,6 +2073,8 @@ const OrdinaryTerminalTurnFactsSchema = z.object({
 const OrdinaryTerminalDiagnosticSchema = z.discriminatedUnion('event', [
   z.object({ event: z.literal('durable_souls.ordinary_turn_completed'), lane: z.literal('terminal'),
     provider: OrdinaryTerminalProviderSchema }),
+  z.object({ event: z.literal('durable_souls.ordinary_setup_failed'), lane: z.literal('terminal'),
+    stage: OrdinaryTerminalSmokeSetupStageSchema }),
   z.object({ event: z.literal('durable_souls.ordinary_turn_failed'), lane: z.literal('terminal'),
     provider: OrdinaryTerminalProviderSchema, paneSetupFailureStage: OrdinaryTerminalSetupStageSchema.nullable().optional(),
     ordinaryTurnFailureStage: OrdinaryTerminalTurnStageSchema.nullable().optional(),
@@ -2103,6 +2107,27 @@ const OrdinaryFreshDiagnosticSchema = z.union([
     providerEvents: OrdinaryFreshProviderEventsSchema }),
 ])
 type ManagedOrdinaryDiagnostic = z.infer<typeof OrdinaryTerminalDiagnosticSchema> | z.infer<typeof OrdinaryFreshDiagnosticSchema>
+
+const ORDINARY_TERMINAL_SPEC = 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts'
+const ORDINARY_TERMINAL_TITLE = 'each selected terminal provider completes one ordinary turn'
+const ORDINARY_FRESH_AGENT_SPEC = 'test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts'
+const ORDINARY_FRESH_AGENT_TITLE = 'each selected fresh-agent mode completes one ordinary turn'
+type OrdinaryTurnTarget = { file: string; lane: 'terminal' | 'fresh-agent' }
+
+function matchesOrdinaryTest(test: TestCase, file: string, title: string): boolean {
+  const normalizedFile = test.location.file.replaceAll('\\', '/')
+  return test.title === title && (normalizedFile === file || normalizedFile.endsWith(`/${file}`))
+}
+
+function ordinaryTurnTarget(test: TestCase): OrdinaryTurnTarget | undefined {
+  if (matchesOrdinaryTest(test, ORDINARY_TERMINAL_SPEC, ORDINARY_TERMINAL_TITLE)) {
+    return { file: ORDINARY_TERMINAL_SPEC, lane: 'terminal' }
+  }
+  if (matchesOrdinaryTest(test, ORDINARY_FRESH_AGENT_SPEC, ORDINARY_FRESH_AGENT_TITLE)) {
+    return { file: ORDINARY_FRESH_AGENT_SPEC, lane: 'fresh-agent' }
+  }
+  return undefined
+}
 
 /** Parse only bounded, body-free observations from the two ordinary-turn smoke specs. */
 export function parseManagedOrdinaryTurnDiagnosticText(text: string): ManagedOrdinaryDiagnostic[] {
@@ -2331,6 +2356,35 @@ export default class ManagedExternalExecutionReporter implements Reporter {
     process.stdout.write(`${HISTORY_DIAGNOSTIC_PREFIX}${JSON.stringify({ severity: 'info',
       runId: this.descriptor.runId, candidateSha: this.descriptor.candidateSha, id: test.id, ...event })}\n`)
   }
+  private forwardOrdinaryTurnText(test: TestCase, state: { buffer: string; count: number }, text: string,
+    target: OrdinaryTurnTarget): void {
+    for (const source of parseManagedOrdinaryTurnDiagnosticText(text)) {
+      if (source.lane !== target.lane || state.count >= 16) continue
+      state.count += 1
+      const common = { event: 'managed_external_ordinary_turn', id: test.id, file: target.file,
+        sourceEvent: source.event, outcome: source.event.endsWith('_failed') ? 'failed' : 'completed', lane: source.lane }
+      if (source.event === 'durable_souls.ordinary_setup_failed') {
+        this.emit({ ...common, setupFailureStage: source.stage })
+      } else if (source.lane === 'terminal' && source.event === 'durable_souls.ordinary_turn_failed') {
+        this.emit({ ...common, provider: source.provider,
+          paneSetupFailureStage: source.paneSetupFailureStage ?? null,
+          ordinaryTurnFailureStage: source.ordinaryTurnFailureStage ?? null,
+          terminalFacts: source.terminalFacts ?? { available: false },
+          ordinaryTurnFacts: source.ordinaryTurnFacts ?? null })
+      } else if (source.lane === 'terminal') {
+        this.emit({ ...common, provider: source.provider })
+      } else if (source.event === 'durable_souls.ordinary_turn_failed') {
+        this.emit({ ...common, mode: source.mode, stage: source.stage,
+          createCompleted: source.createCompleted, composerFilled: source.composerFilled,
+          assistantBaselineKnownEmpty: source.assistantBaselineKnownEmpty, composerSubmitted: source.composerSubmitted,
+          sendObserved: source.sendObserved, turnCompleteObserved: source.turnCompleteObserved,
+          assistantTextDisplayed: source.assistantTextDisplayed, assistantDom: source.assistantDom,
+          providerEvents: source.providerEvents })
+      } else {
+        this.emit({ ...common, mode: source.mode })
+      }
+    }
+  }
   onStdOut(chunk: string | Buffer, test?: TestCase, _result?: TestResult): void {
     if (!test) return
     const fileName = path.basename(test.location.file)
@@ -2351,38 +2405,15 @@ export default class ManagedExternalExecutionReporter implements Reporter {
       }
       return
     }
-    if (fileName !== 'runtime-managed-provider-qualification-rust.spec.ts'
-      && fileName !== 'runtime-fresh-agent-qualification-rust.spec.ts') return
+    const target = ordinaryTurnTarget(test)
+    if (!target) return
 
     const state = this.ordinaryTurns.get(test.id) ?? { buffer: '', count: 0 }
     this.ordinaryTurns.set(test.id, state)
     state.buffer = (state.buffer + String(chunk)).slice(-16_384)
     const lines = state.buffer.split('\n')
     state.buffer = lines.pop()!
-    const file = `test/e2e-browser/specs/${fileName}`
-    for (const source of parseManagedOrdinaryTurnDiagnosticText(lines.join('\n'))) {
-      if (state.count++ >= 16) continue
-      const common = { event: 'managed_external_ordinary_turn', id: test.id, file,
-        sourceEvent: source.event, outcome: source.event.endsWith('_failed') ? 'failed' : 'completed', lane: source.lane }
-      if (source.lane === 'terminal' && source.event === 'durable_souls.ordinary_turn_failed') {
-        this.emit({ ...common, provider: source.provider,
-          paneSetupFailureStage: source.paneSetupFailureStage ?? null,
-          ordinaryTurnFailureStage: source.ordinaryTurnFailureStage ?? null,
-          terminalFacts: source.terminalFacts ?? { available: false },
-          ordinaryTurnFacts: source.ordinaryTurnFacts ?? null })
-      } else if (source.lane === 'terminal') {
-        this.emit({ ...common, provider: source.provider })
-      } else if (source.event === 'durable_souls.ordinary_turn_failed') {
-        this.emit({ ...common, mode: source.mode, stage: source.stage,
-          createCompleted: source.createCompleted, composerFilled: source.composerFilled,
-          assistantBaselineKnownEmpty: source.assistantBaselineKnownEmpty, composerSubmitted: source.composerSubmitted,
-          sendObserved: source.sendObserved, turnCompleteObserved: source.turnCompleteObserved,
-          assistantTextDisplayed: source.assistantTextDisplayed, assistantDom: source.assistantDom,
-          providerEvents: source.providerEvents })
-      } else {
-        this.emit({ ...common, mode: source.mode })
-      }
-    }
+    this.forwardOrdinaryTurnText(test, state, lines.join('\n'), target)
   }
   onStepBegin(test: TestCase, _result: TestResult, step: TestStep): void {
     const state = this.history.get(test.id)
@@ -2395,6 +2426,11 @@ export default class ManagedExternalExecutionReporter implements Reporter {
         callsite: history.callsite, status: result.status as 'failed' | 'timedOut' | 'interrupted',
         errorCategory: result.status === 'timedOut' ? 'timeout' : result.status === 'interrupted' ? 'interrupted'
           : history.active?.errorCategory ?? 'operation-error', diagnosticLimitReached: history.count >= 256 })
+    }
+    const target = ordinaryTurnTarget(test), ordinary = this.ordinaryTurns.get(test.id)
+    if (target && ordinary?.buffer) {
+      this.forwardOrdinaryTurnText(test, ordinary, ordinary.buffer, target)
+      ordinary.buffer = ''
     }
     this.history.delete(test.id)
     this.ordinaryTurns.delete(test.id)

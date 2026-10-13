@@ -54,6 +54,8 @@ import {
 const LIVE_ENV = 'FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE'
 const AMPLIFIER_MODEL = 'glm-5.3'
 const AMPLIFIER_EFFORT = 'provider-default'
+type OrdinaryTerminalSetupFailureStage = 'provider_definitions' | 'runtime_construction' | 'runtime_start'
+  | 'browser_script' | 'page_navigation' | 'harness_ready' | 'connection_ready' | 'active_tab'
 
 type ProviderDefinition = {
   provider: 'claude' | 'codex' | 'opencode' | 'amplifier'
@@ -579,31 +581,41 @@ test.describe.serial('ordinary managed-provider use', () => {
       `set ${LIVE_ENV}=1 explicitly for an ordinary live-provider smoke`,
     )
     test.setTimeout(3_600_000)
-    const definitions = providerDefinitions()
-    const rig = createManagedRuntimeBrowserRig(
-      process.cwd(),
-      5,
-      {},
-      { FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '750' },
-      'release',
-      {
-        enabledProviders: definitions.map((definition) => definition.provider),
-        providerSettings: Object.fromEntries(definitions.map((definition) => [
-          definition.provider,
-          { model: definition.model, effort: definition.reasoningEffort },
-        ])),
-      },
-    )
+    let setupFailureStage: OrdinaryTerminalSetupFailureStage | null = 'provider_definitions'
+    let rig: ReturnType<typeof createManagedRuntimeBrowserRig> | undefined
     try {
+      const definitions = providerDefinitions()
+      setupFailureStage = 'runtime_construction'
+      rig = createManagedRuntimeBrowserRig(
+        process.cwd(),
+        5,
+        {},
+        { FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '750' },
+        'release',
+        {
+          enabledProviders: definitions.map((definition) => definition.provider),
+          providerSettings: Object.fromEntries(definitions.map((definition) => [
+            definition.provider,
+            { model: definition.model, effort: definition.reasoningEffort },
+          ])),
+        },
+      )
+      setupFailureStage = 'runtime_start'
       const info = await rig.start()
+      setupFailureStage = 'browser_script'
       await page.addInitScript(buildTerminalOrdinaryTurnBrowserScript())
+      setupFailureStage = 'page_navigation'
       await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
       const harness = new TestHarness(page)
+      setupFailureStage = 'harness_ready'
       await harness.waitForHarness()
+      setupFailureStage = 'connection_ready'
       await harness.waitForConnection()
+      setupFailureStage = 'active_tab'
       const tabId = await harness.getActiveTabId()
       if (!tabId) throw new Error('ordinary provider smoke has no active tab')
 
+      setupFailureStage = null
       const failedProviders: string[] = []
       for (const definition of definitions) {
         let created: Awaited<ReturnType<typeof createProviderPane>> | undefined
@@ -637,9 +649,17 @@ test.describe.serial('ordinary managed-provider use', () => {
         }
       }
       expect(failedProviders, `ordinary terminal turn failed for: ${failedProviders.join(', ')}`).toEqual([])
+    } catch (error) {
+      if (setupFailureStage !== null) {
+        console.info(JSON.stringify({ severity: 'error', event: 'durable_souls.ordinary_setup_failed',
+          lane: 'terminal', stage: setupFailureStage }))
+      }
+      throw error
     } finally {
-      const cleanup = await rig.stop()
-      expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
+      if (rig) {
+        const cleanup = await rig.stop()
+        expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
+      }
     }
   })
 })
