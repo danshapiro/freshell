@@ -156,7 +156,7 @@ impl HostedFreshAgentProxy {
             .request_id
             .as_deref()
             .and_then(|value| RequestId::parse(value.to_string()).ok())
-            .unwrap_or_else(RequestId::new);
+            .unwrap_or_default();
         let result = match self
             .resolve_soul(&provider, session_type, &session_id)
             .await
@@ -337,7 +337,7 @@ impl HostedFreshAgentProxy {
                     .request_id
                     .as_deref()
                     .and_then(|value| RequestId::parse(value.to_string()).ok())
-                    .unwrap_or_else(RequestId::new);
+                    .unwrap_or_default();
                 let result = match self
                     .resolve_soul(&message.provider, message.session_type, &message.session_id)
                     .await
@@ -372,7 +372,7 @@ impl HostedFreshAgentProxy {
                     .request_id
                     .as_deref()
                     .and_then(|value| RequestId::parse(value.to_string()).ok())
-                    .unwrap_or_else(RequestId::new);
+                    .unwrap_or_default();
                 let result = match self
                     .resolve_soul(&provider, session_type, &session_id)
                     .await
