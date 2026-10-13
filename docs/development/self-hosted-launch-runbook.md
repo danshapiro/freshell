@@ -375,7 +375,19 @@ drop-in, plus `freshell-supervisor.service`):
     ```bash
     # If the preliminary capture fell back to an empty list (featureless
     # or stopped server), refresh it NOW from the freshly deployed API —
-    # an empty sweep would otherwise pass vacuously:
+    # an empty sweep would otherwise pass vacuously. The server is alive
+    # at this point, so if the deferred-token path left no $RUN/hdr,
+    # re-acquire the token here exactly as the preliminary step does:
+    if [ ! -f "$RUN/hdr" ]; then
+      SPID=$(systemctl --user show freshell-rust.service -p MainPID --value)
+      TOK=""
+      if [ "${SPID:-0}" -gt 0 ] 2>/dev/null; then
+        TOK=$(tr '\0' '\n' < "/proc/$SPID/environ" | sed -n 's/^AUTH_TOKEN=//p' || true)
+      fi
+      test -n "$TOK" \
+        || { echo "AUTH_TOKEN unresolvable even with the server running — extract it manually"; exit 1; }
+      umask 077; printf 'x-auth-token: %s\n' "$TOK" > "$RUN/hdr"
+    fi
     if [ ! -s "$RUN/desired-running.txt" ]; then
       curl -s -H @"$RUN/hdr" http://127.0.0.1:3001/api/runtime/souls \
         | python3 -c 'import json,sys
@@ -401,7 +413,13 @@ print("ok:", sys.argv[1])' "$SID"
     needs the supervisor journal and that soul's record investigated
     before the deploy is called good. A zero-soul sweep after a
     SUCCESSFUL refresh is a legitimate empty instance — but the printed
-    count makes that visible instead of vacuous.
+    count makes that visible instead of vacuous. HONEST LIMITATION of the
+    API-less fallback: with no pre-restart API, no soul-ID baseline
+    exists — the post-restart list is compared against nothing, so this
+    sweep cannot detect a registry swap (old containers surviving while
+    the new registry reports zero souls). The container-level survival
+    check still applies; if a registry change is even plausible in your
+    deploy, re-capture and re-verify after the server is up.
 5. New-soul probe: create a terminal pane in a real workspace that is NOT
    the operator home itself (a subdirectory of it is fine) — when the
    workspace equals the operator home, the supervisor deliberately omits
@@ -558,8 +576,11 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
     curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
       | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
-hits=[s for s in souls if s.get("terminalCwd")==sys.argv[1] and s.get("launchState")=="running"]
-assert hits, "no managed soul for the UI pane — client is stale or not negotiating"
+hits=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
+# EXACTLY one soul per probe workspace; two hits means this workspace was
+# reused by an earlier attempt — refuse rather than pick arbitrarily:
+assert len(hits)==1, ("workspace ambiguous (mint a fresh BWS and retry)", hits)
+assert hits[0].get("launchState")=="running", "soul not running — client took the host-side route?"
 print("UI pane is managed:", hits[0]["soulId"])' "$BWS"
     ```
 
@@ -654,8 +675,11 @@ PY
         | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
 hits=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
-assert hits, "no soul for this workspace — nothing to stop"
-s=hits[-1]   # newest incarnation (inventory is oldest-first)
+# The API returns ONE record per soul (its current incarnation), so a
+# unique probe workspace must match exactly one record; ambiguity means
+# workspace reuse — refuse rather than pick arbitrarily:
+assert len(hits)==1, ("workspace ambiguous — do not stop anything; resolve manually", hits)
+s=hits[0]
 print(s["soulId"], s["intentRevision"], s["terminalId"])' "$WS")
       read -r SOUL_ID REV TID <<< "$PROBE"
     else
@@ -689,8 +713,10 @@ print("stopped:", o["outcome"])'
         | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
 hits=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
+# exactly one soul per probe workspace; refuse on ambiguity:
+assert len(hits)<=1, ("workspace ambiguous — do not stop anything; resolve manually", hits)
 if hits:
-    s=hits[-1]
+    s=hits[0]
     print(s["soulId"], s["intentRevision"], s["launchState"])
 else:
     print("")' "$BWS")
