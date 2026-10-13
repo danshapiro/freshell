@@ -827,6 +827,61 @@ mod configured_resource_tests {
     }
 
     #[test]
+    fn absolute_mcp_symlink_command_preserves_launch_alias_after_resource_copies() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let command = home.join("mcp.sh");
+        let target = home.join("tools/start.sh");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(&target, "#!/bin/sh\nprintf 'symlink command started\\n'\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink("tools/start.sh", &command).unwrap();
+        let config = workspace.join("opencode.json");
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "mcp": { "direct": { "type": "local", "command": [command] } },
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config,
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Workspace,
+            }],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .unwrap();
+        assert!(
+            plan[0].configured_resources.contains(&command),
+            "the absolute command alias must remain available at the configured launch path"
+        );
+        let units = resource_units(
+            &home,
+            &home.join(".config/opencode"),
+            &workspace,
+            &plan,
+            None,
+        )
+        .unwrap();
+        let provider = copy_selected_units_through_provider(owned.path(), &units);
+        let provider_command = provider.join(".provider-home/mcp.sh");
+        let output = execute_with_home_hidden(owned.path(), &home, &provider_command);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"symlink command started\n");
+    }
+
+    #[test]
     fn direct_executable_script_in_home_runs_after_all_resource_copies() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1060,6 +1115,42 @@ mod configured_resource_tests {
     }
 
     #[test]
+    fn direct_node_script_in_home_keeps_path_join_data_after_all_resource_copies() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let command = home.join("mcp.js");
+        let schema = home.join("schema.json");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "#!/usr/bin/env node\nconst fs = require('node:fs');\nconst path = require('node:path');\nprocess.stdout.write(fs.readFileSync(path.join(__dirname, 'schema.json'), 'utf8'));\n",
+        )
+        .unwrap();
+        std::fs::write(&schema, "path.join schema loaded\n").unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (plan, provider_script) =
+            plan_and_stage_direct_mcp_command(owned.path(), &home, &workspace, &command);
+        assert!(
+            plan[0]
+                .configured_resources
+                .contains(&schema.canonicalize().unwrap()),
+            "a statically named sibling read with path.join(__dirname, ...) must be selected"
+        );
+        assert!(!plan[0]
+            .configured_resources
+            .contains(&home.canonicalize().unwrap()));
+
+        let output = execute_with_home_hidden(owned.path(), &home, &provider_script);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"path.join schema loaded\n");
+    }
+
+    #[test]
     fn direct_node_script_in_home_keeps_home_node_modules_after_all_copies() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1227,6 +1318,43 @@ mod configured_resource_tests {
         let output = execute_with_home_hidden(owned.path(), &home, &provider_command);
         assert!(output.status.success(), "{:?}", output.stderr);
         assert_eq!(output.stdout, b"sibling-loaded:package-loaded\n");
+    }
+
+    #[test]
+    fn home_shell_wrapper_stages_node_script_after_changing_to_its_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let command = home.join("start");
+        let server = home.join("server.js");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "#!/bin/sh\ncd \"$(dirname \"$0\")\"; exec node server.js\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &server,
+            "process.stdout.write('cd-relative server started\\n');\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (plan, provider_command) =
+            plan_and_stage_direct_mcp_command(owned.path(), &home, &workspace, &command);
+        assert!(
+            plan[0]
+                .configured_resources
+                .contains(&server.canonicalize().unwrap()),
+            "a Node file run after cd to the wrapper directory must be selected"
+        );
+
+        let output = execute_with_home_hidden(owned.path(), &home, &provider_command);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"cd-relative server started\n");
     }
 
     #[test]

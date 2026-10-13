@@ -661,6 +661,72 @@ fn shell_directory_variables(source: &str) -> std::collections::BTreeSet<String>
         .collect()
 }
 
+fn shell_changes_to_script_directory(line: &str) -> Option<&str> {
+    const CD_TO_SCRIPT_DIRECTORY: &str = "cd \"$(dirname \"$0\")\"";
+    let line = line.trim_start();
+    let remainder = line.strip_prefix(CD_TO_SCRIPT_DIRECTORY)?;
+    if remainder.is_empty() {
+        return Some("");
+    }
+    remainder
+        .trim_start()
+        .strip_prefix(';')
+        .map(str::trim_start)
+}
+
+fn shell_executable_name(token: &str) -> String {
+    let token = token.trim_matches(['"', '\'']);
+    let name = Path::new(token)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    name.strip_suffix(".exe").unwrap_or(&name).to_owned()
+}
+
+fn shell_node_script_operand(line: &str) -> Option<String> {
+    let words = line
+        .split_ascii_whitespace()
+        .map(|word| word.trim_matches(['"', '\'']))
+        .collect::<Vec<_>>();
+    let node_index = words
+        .iter()
+        .position(|word| matches!(shell_executable_name(word).as_str(), "node" | "nodejs"))?;
+    let mut index = node_index + 1;
+    const NODE_OPTIONS_WITH_VALUE: [&str; 8] = [
+        "-r",
+        "--require",
+        "--import",
+        "--loader",
+        "--experimental-loader",
+        "--conditions",
+        "--env-file",
+        "--inspect-port",
+    ];
+    while let Some(argument) = words.get(index) {
+        if *argument == "--" {
+            index += 1;
+            break;
+        }
+        if NODE_OPTIONS_WITH_VALUE.contains(argument) {
+            index += 2;
+            continue;
+        }
+        if argument.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    let argument = words.get(index)?.trim_end_matches([';', '&']);
+    let path = Path::new(argument);
+    (!path.is_absolute()
+        && !argument.is_empty()
+        && !argument.contains(['$', '*', '?'])
+        && is_node_script_path(argument))
+    .then(|| argument.to_owned())
+}
+
 fn shell_source_operand(line: &str) -> Option<String> {
     let line = line.trim_start();
     let rest = if let Some(rest) = line.strip_prefix("source") {
@@ -764,16 +830,6 @@ fn shell_directory_relative_paths(
 }
 
 fn shell_line_invokes_node(line: &str) -> bool {
-    fn executable_name(token: &str) -> String {
-        let token = token.trim_matches(['"', '\'']);
-        let name = Path::new(token)
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_ascii_lowercase();
-        name.strip_suffix(".exe").unwrap_or(&name).to_owned()
-    }
-
     let words = line
         .split_ascii_whitespace()
         .map(|word| word.trim_matches(['"', '\'']))
@@ -789,7 +845,7 @@ fn shell_line_invokes_node(line: &str) -> bool {
     let Some(executable) = words.get(index) else {
         return false;
     };
-    match executable_name(executable).as_str() {
+    match shell_executable_name(executable).as_str() {
         "node" | "nodejs" => return true,
         "env" => index += 1,
         _ => return false,
@@ -812,7 +868,7 @@ fn shell_line_invokes_node(line: &str) -> bool {
             index += 1;
             continue;
         }
-        return matches!(executable_name(argument).as_str(), "node" | "nodejs");
+        return matches!(shell_executable_name(argument).as_str(), "node" | "nodejs");
     }
     false
 }
@@ -934,7 +990,44 @@ fn node_relative_resource_specifiers(
 ) -> Result<std::collections::BTreeSet<String>, &'static str> {
     let tokens = javascript_tokens(source)?;
     let mut result = std::collections::BTreeSet::new();
-    for index in 0..tokens.len().saturating_sub(10) {
+    for index in 0..tokens.len() {
+        if index >= 2
+            && matches!(tokens.get(index - 2), Some(JavaScriptToken::Identifier(_)))
+            && matches!(
+                tokens.get(index - 1),
+                Some(JavaScriptToken::Punctuation(b'.'))
+            )
+            && matches!(tokens.get(index), Some(JavaScriptToken::Identifier(name)) if name == "join")
+            && matches!(
+                tokens.get(index + 1),
+                Some(JavaScriptToken::Punctuation(b'('))
+            )
+            && matches!(tokens.get(index + 2), Some(JavaScriptToken::Identifier(name)) if name == "__dirname")
+            && matches!(
+                tokens.get(index + 3),
+                Some(JavaScriptToken::Punctuation(b','))
+            )
+        {
+            if let Some(JavaScriptToken::String(Some(specifier))) = tokens.get(index + 4) {
+                let is_closed = matches!(
+                    tokens.get(index + 5),
+                    Some(JavaScriptToken::Punctuation(b')'))
+                ) || (matches!(
+                    tokens.get(index + 5),
+                    Some(JavaScriptToken::Punctuation(b','))
+                ) && matches!(
+                    tokens.get(index + 6),
+                    Some(JavaScriptToken::Punctuation(b')'))
+                ));
+                if is_closed
+                    && !specifier.is_empty()
+                    && !Path::new(specifier).is_absolute()
+                    && !specifier.contains(['?', '#', '\\', '$', '*'])
+                {
+                    result.insert(specifier.clone());
+                }
+            }
+        }
         let Some(JavaScriptToken::Identifier(new_keyword)) = tokens.get(index) else {
             continue;
         };
@@ -1468,10 +1561,20 @@ fn insert_shell_script_dependencies(
         let script_parent = canonical
             .parent()
             .ok_or_else(|| fail("direct MCP shell script has no containing directory"))?;
+        let mut working_directory_is_script_parent = false;
         for line in source
             .lines()
             .filter(|line| !line.trim_start().starts_with('#'))
         {
+            let node_line = if let Some(remainder) = shell_changes_to_script_directory(line) {
+                working_directory_is_script_parent = true;
+                remainder
+            } else {
+                if line.trim_start().starts_with("cd ") {
+                    working_directory_is_script_parent = false;
+                }
+                line
+            };
             let mut candidates = std::collections::BTreeMap::new();
             if let Some(operand) = shell_source_operand(line) {
                 if let Some(candidate) =
@@ -1481,13 +1584,21 @@ fn insert_shell_script_dependencies(
                     candidates.insert(candidate, (true, false));
                 }
             }
-            let invokes_node = shell_line_invokes_node(line);
+            let invokes_node = shell_line_invokes_node(node_line);
             for relative in shell_directory_relative_paths(line, &directory_variables) {
                 let parse_as_node_script = invokes_node && is_node_script_path(&relative);
                 candidates
                     .entry(script_parent.join(relative))
                     .and_modify(|kind: &mut (bool, bool)| kind.1 |= parse_as_node_script)
                     .or_insert((false, parse_as_node_script));
+            }
+            if working_directory_is_script_parent && invokes_node {
+                if let Some(relative) = shell_node_script_operand(node_line) {
+                    candidates
+                        .entry(script_parent.join(relative))
+                        .and_modify(|kind: &mut (bool, bool)| kind.1 = true)
+                        .or_insert((false, true));
+                }
             }
             for (candidate, (parse_as_script, parse_as_node_script)) in candidates {
                 let dependency = checked(&candidate, field, declaring)?;
@@ -2103,6 +2214,21 @@ pub fn select(
                 .is_some_and(|working_dir| canonical.starts_with(working_dir))
             {
                 continue;
+            }
+            if path != canonical
+                && std::fs::symlink_metadata(&path)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                // The provider must have both the resolved target used for
+                // dependency discovery and the original command alias used
+                // by OpenCode's launch argv.
+                insert_resource(
+                    &mut result,
+                    &mut resource_path_bytes,
+                    path.clone(),
+                    field,
+                    declaring,
+                )?;
             }
             let command_parent = canonical
                 .parent()
