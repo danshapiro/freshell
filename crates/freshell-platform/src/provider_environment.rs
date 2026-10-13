@@ -589,6 +589,48 @@ thread_local! {
     static PUBLICATION_LEAF_JOURNAL_PATH_COMPARISONS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    static PUBLICATION_SYNC_FAILURE_PATHS: std::cell::RefCell<Vec<PathBuf>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+    static PUBLICATION_ROLLBACK_RESTORE_FAILURE_PATH: std::cell::RefCell<Option<PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
+    static PUBLICATION_AFTER_OBSOLETE_SCAN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn take_publication_sync_failure(path: &Path) -> bool {
+    PUBLICATION_SYNC_FAILURE_PATHS.with(|failures| {
+        let mut failures = failures.borrow_mut();
+        let Some(index) = failures.iter().position(|candidate| candidate == path) else {
+            return false;
+        };
+        failures.remove(index);
+        true
+    })
+}
+
+#[cfg(test)]
+fn take_publication_rollback_restore_failure(path: &Path) -> bool {
+    PUBLICATION_ROLLBACK_RESTORE_FAILURE_PATH.with(|failure| {
+        let mut failure = failure.borrow_mut();
+        if failure.as_deref() == Some(path) {
+            failure.take();
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(test)]
+fn run_publication_after_obsolete_scan_hook() {
+    let hook = PUBLICATION_AFTER_OBSOLETE_SCAN_HOOK.with(|hook| hook.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 #[derive(Default)]
@@ -878,6 +920,14 @@ fn write_publication_journal(
 fn sync_directory_chain(root: &Path, directory: &Path) -> Result<(), CopyError> {
     let mut current = directory;
     loop {
+        #[cfg(test)]
+        if take_publication_sync_failure(current) {
+            return Err(io_error(
+                Path::new(""),
+                "sync_publication",
+                std::io::Error::other("injected directory sync failure"),
+            ));
+        }
         File::open(current)
             .and_then(|handle| handle.sync_all())
             .map_err(|cause| io_error(Path::new(""), "sync_publication", cause))?;
@@ -1412,6 +1462,49 @@ fn recover_interrupted_publications(
                                         ));
                                     }
                                 }
+                            } else if had_original {
+                                if validate_recovery_parent_directories(destination_root, relative)?
+                                    .is_none()
+                                {
+                                    return Err(error(
+                                        relative,
+                                        "recover_publication",
+                                        "recorded original and its destination parent are missing; retain recovery evidence and repair the HOME before retrying",
+                                    ));
+                                }
+                                match fs::symlink_metadata(&destination) {
+                                    Ok(metadata)
+                                        if metadata.is_dir()
+                                            && !metadata.file_type().is_symlink() =>
+                                    {
+                                        return Err(error(
+                                            relative,
+                                            "recover_publication",
+                                            "recorded original destination conflicts with a directory; retain recovery evidence and repair the HOME before retrying",
+                                        ));
+                                    }
+                                    Ok(_) => {
+                                        // A prior recovery may have restored this path and then
+                                        // stopped before removing its transaction directory.
+                                    }
+                                    Err(destination_error)
+                                        if destination_error.kind()
+                                            == std::io::ErrorKind::NotFound =>
+                                    {
+                                        return Err(error(
+                                            relative,
+                                            "recover_publication",
+                                            "recorded original is missing from both backup and destination; retain recovery evidence and repair the HOME before retrying",
+                                        ));
+                                    }
+                                    Err(destination_error) => {
+                                        return Err(io_error(
+                                            relative,
+                                            "inspect_recovery_destination",
+                                            destination_error,
+                                        ));
+                                    }
+                                }
                             }
                         }
                         Err(cause) => {
@@ -1503,7 +1596,9 @@ impl Publication {
                 changed = true;
             }
         }
-        if !changed {
+        // A retry may reuse an already-journaled backup ID after an earlier
+        // journal sync failed. Re-publish the nonempty batch before moving it.
+        if !changed && entries.is_empty() {
             return Ok(());
         }
         write_publication_journal(destination_root, &self.backup.0, &self.journal_entries)
@@ -1553,7 +1648,37 @@ impl Publication {
         write_publication_journal(destination_root, &self.backup.0, &self.journal_entries)
     }
 
-    fn write_committed_marker(&self, destination_root: &Path) -> Result<(), CopyError> {
+    fn remove_committed_marker_and_confirm_absent(
+        &self,
+        destination_root: &Path,
+    ) -> Result<(), CopyError> {
+        let path = self.backup.0.join(COMMITTED_FILE);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {}
+            Err(cause) => {
+                return Err(io_error(Path::new(""), "remove_publication_commit", cause));
+            }
+        }
+        match fs::symlink_metadata(&path) {
+            Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(error(
+                    Path::new(""),
+                    "remove_publication_commit",
+                    "commit marker is still present; retain recovery evidence and retry",
+                ));
+            }
+            Err(cause) => {
+                return Err(io_error(Path::new(""), "inspect_publication_commit", cause));
+            }
+        }
+        // Rollback is safe only after the marker's absence has been synced
+        // through the transaction directory and destination root.
+        sync_directory_chain(destination_root, &self.backup.0)
+    }
+
+    fn write_committed_marker(&mut self, destination_root: &Path) -> Result<(), CopyError> {
         let temporary = self.backup.0.join(format!("{COMMITTED_FILE}.tmp"));
         let path = self.backup.0.join(COMMITTED_FILE);
         let mut file = OpenOptions::new()
@@ -1569,7 +1694,29 @@ impl Publication {
         drop(file);
         fs::rename(&temporary, &path)
             .map_err(|cause| io_error(Path::new(""), "publish_publication_commit", cause))?;
-        sync_directory_chain(destination_root, &self.backup.0)
+        self.commit_marker_published = true;
+        match sync_directory_chain(destination_root, &self.backup.0) {
+            Ok(()) => Ok(()),
+            Err(mut sync_error) => {
+                match self.remove_committed_marker_and_confirm_absent(destination_root) {
+                    Ok(()) => {
+                        self.commit_marker_published = false;
+                        sync_error.corrective_message = format!(
+                        "commit marker sync failed; its removal was durably confirmed, so rollback is safe ({})",
+                        sync_error.corrective_message
+                    );
+                        Err(sync_error)
+                    }
+                    Err(marker_error) => {
+                        sync_error.corrective_message = format!(
+                        "commit marker durability is uncertain; rollback was skipped and transaction evidence was retained because marker removal could not be durably confirmed ({})",
+                        marker_error.corrective_message
+                    );
+                        Err(sync_error)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1581,6 +1728,8 @@ struct Publication {
     replaced: Vec<(PathBuf, PathBuf)>,
     journal_entries: Vec<PublicationJournalEntry>,
     next_backup_id: usize,
+    obsolete_directories: Vec<PathBuf>,
+    commit_marker_published: bool,
     committed: bool,
 }
 impl Drop for Publication {
@@ -1614,6 +1763,20 @@ impl Drop for Publication {
                     )
                 })?;
                 let stage_root = root.join(format!("{STAGE_PREFIX}{suffix}"));
+                for relative in &self.obsolete_directories {
+                    match fs::remove_dir(root.join(relative)) {
+                        Ok(()) => {}
+                        Err(cause)
+                            if cause.kind() == std::io::ErrorKind::NotFound
+                                || cause.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+                        Err(cause) => {
+                            eprintln!(
+                                "{}",
+                                serde_json::json!({"severity":"error","event":"provider.environment.obsolete_directory_cleanup.failed","operation":"remove_empty_obsolete_directory","relative_path":relative,"error_kind":format!("{:?}",cause.kind()),"os_error":cause.raw_os_error()})
+                            );
+                        }
+                    }
+                }
                 cleanup_committed_publication(root, &stage_root, &self.backup.0)
             })();
             if let Err(cause) = cleanup {
@@ -1624,6 +1787,16 @@ impl Drop for Publication {
             }
             // Do not let TemporaryProjection::drop use an unjournaled recursive
             // delete after a cleanup error. Recovery can safely retry later.
+            self.backup.0 = PathBuf::new();
+            return;
+        }
+        if self.commit_marker_published {
+            eprintln!(
+                "{}",
+                serde_json::json!({"severity":"error","event":"provider.environment.commit_durability_uncertain","operation":"publish_publication_commit","corrective_message":"commit marker durability could not be confirmed; recovery will choose from the retained marker, journal, and backups"})
+            );
+            // The marker may or may not be durable. Leave all evidence intact
+            // so restart-time recovery can select rollback or commit safely.
             self.backup.0 = PathBuf::new();
             return;
         }
@@ -1644,7 +1817,15 @@ impl Drop for Publication {
         }
         let mut failed = false;
         for (destination, backup) in self.replaced.iter().rev() {
-            if let Err(cause) = fs::rename(backup, destination) {
+            #[cfg(test)]
+            let result = if take_publication_rollback_restore_failure(destination) {
+                Err(std::io::Error::other("injected rollback restore failure"))
+            } else {
+                fs::rename(backup, destination)
+            };
+            #[cfg(not(test))]
+            let result = fs::rename(backup, destination);
+            if let Err(cause) = result {
                 failed = true;
                 eprintln!(
                     "{}",
@@ -1691,14 +1872,13 @@ impl EnvironmentPublication {
         self.remove_obsolete_batch(&[relative.to_owned()])
     }
 
-    /// Retain a set of stale managed paths under one durable journal update.
-    /// Paths are removed deepest-first and recorded parent-first so recovery
-    /// can rebuild a removed directory before restoring its children.
+    /// Retain stale managed leaves under one durable journal update. Empty
+    /// directories stay in place until commit and are removed non-recursively.
     pub fn remove_obsolete_batch(&mut self, relatives: &[PathBuf]) -> Result<(), CopyError> {
         struct Candidate {
             relative: PathBuf,
             path: PathBuf,
-            backup_id: usize,
+            backup_id: Option<usize>,
         }
 
         let mut unique = BTreeSet::new();
@@ -1723,6 +1903,27 @@ impl EnvironmentPublication {
 
         let mut candidates = Vec::new();
         let mut scheduled = BTreeSet::new();
+        let backup_root = self
+            .rollback
+            .as_ref()
+            .map(|publication| publication.backup.0.clone());
+        let pending_obsolete_ids = self
+            .rollback
+            .as_ref()
+            .map(|publication| {
+                publication
+                    .journal_entries
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        PublicationJournalEntry::Obsolete {
+                            relative,
+                            backup_id,
+                        } => Some((relative.clone(), *backup_id)),
+                        _ => None,
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
         let mut next_backup_id = self
             .rollback
             .as_ref()
@@ -1761,7 +1962,8 @@ impl EnvironmentPublication {
                 Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(cause) => return Err(io_error(&relative, "inspect_obsolete", cause)),
             };
-            if stat.is_dir() && !stat.file_type().is_symlink() {
+            let is_directory = stat.is_dir() && !stat.file_type().is_symlink();
+            if is_directory {
                 let mut empty_after_scheduled_removals = true;
                 for entry in fs::read_dir(&path)
                     .map_err(|cause| io_error(&relative, "inspect_obsolete", cause))?
@@ -1777,10 +1979,37 @@ impl EnvironmentPublication {
                     continue;
                 }
             }
-            let backup_id = next_backup_id;
-            next_backup_id = backup_id
-                .checked_add(1)
-                .ok_or_else(|| error(&relative, "remove_obsolete", "backup id overflow"))?;
+            let backup_id = if is_directory {
+                None
+            } else if let Some(backup_id) = pending_obsolete_ids.get(&relative).copied() {
+                let Some(backup_root) = backup_root.as_deref() else {
+                    return Err(error(
+                        &relative,
+                        "remove_obsolete",
+                        "new root has no previous projection",
+                    ));
+                };
+                let reserved_backup = backup_path(backup_root, backup_id);
+                match fs::symlink_metadata(&reserved_backup) {
+                    Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => Some(backup_id),
+                    Ok(_) => {
+                        return Err(error(
+                            &relative,
+                            "remove_obsolete",
+                            "previously reserved backup slot is occupied; recover the publication before retrying this path",
+                        ));
+                    }
+                    Err(cause) => {
+                        return Err(io_error(&relative, "inspect_obsolete_backup", cause));
+                    }
+                }
+            } else {
+                let backup_id = next_backup_id;
+                next_backup_id = backup_id
+                    .checked_add(1)
+                    .ok_or_else(|| error(&relative, "remove_obsolete", "backup id overflow"))?;
+                Some(backup_id)
+            };
             candidates.push(Candidate {
                 relative: relative.clone(),
                 path,
@@ -1791,6 +2020,9 @@ impl EnvironmentPublication {
         if candidates.is_empty() {
             return Ok(());
         }
+
+        #[cfg(test)]
+        run_publication_after_obsolete_scan_hook();
 
         let publication = self.rollback.as_mut().ok_or_else(|| {
             error(
@@ -1806,15 +2038,36 @@ impl EnvironmentPublication {
         let journal_entries = candidates
             .iter()
             .rev()
-            .map(|candidate| PublicationJournalEntry::Obsolete {
-                relative: candidate.relative.clone(),
-                backup_id: candidate.backup_id,
+            .filter_map(|candidate| {
+                candidate
+                    .backup_id
+                    .map(|backup_id| PublicationJournalEntry::Obsolete {
+                        relative: candidate.relative.clone(),
+                        backup_id,
+                    })
             })
             .collect::<Vec<_>>();
         publication.record_journal_entries(&self.root, &journal_entries)?;
+        publication.obsolete_directories.extend(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.backup_id.is_none())
+                .map(|candidate| candidate.relative.clone()),
+        );
+        publication.obsolete_directories.sort_by(|left, right| {
+            right
+                .components()
+                .count()
+                .cmp(&left.components().count())
+                .then_with(|| left.cmp(right))
+        });
+        publication.obsolete_directories.dedup();
 
-        for candidate in &candidates {
-            let backup = backup_path(&publication.backup.0, candidate.backup_id);
+        for (candidate, backup_id) in candidates
+            .iter()
+            .filter_map(|candidate| candidate.backup_id.map(|backup_id| (candidate, backup_id)))
+        {
+            let backup = backup_path(&publication.backup.0, backup_id);
             let backup_parent = backup.parent().ok_or_else(|| {
                 error(
                     &candidate.relative,
@@ -2227,6 +2480,8 @@ fn stage_environment_with_publisher(
             replaced: Vec::new(),
             journal_entries,
             next_backup_id,
+            obsolete_directories: Vec::new(),
+            commit_marker_published: false,
             committed: false,
         };
         write_publication_journal(
@@ -2894,6 +3149,219 @@ mod tests {
     }
 
     #[test]
+    fn recovery_refuses_to_discard_missing_originals_and_keeps_transaction_evidence() {
+        let cases = [
+            (
+                "missing-leaf-original",
+                PublicationJournalEntry::Leaf {
+                    relative: "config.json".into(),
+                    backup_id: 0,
+                    had_original: true,
+                },
+            ),
+            (
+                "missing-obsolete-original-parent",
+                PublicationJournalEntry::Obsolete {
+                    relative: "nested/stale.json".into(),
+                    backup_id: 0,
+                },
+            ),
+        ];
+
+        for (transaction, entry) in cases {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("home");
+            fs::create_dir(&home).unwrap();
+            let backup = home.join(format!("{BACKUP_PREFIX}{transaction}"));
+            fs::create_dir_all(backup.join(OLD_FILES_DIR)).unwrap();
+            write_publication_owner_marker(&home, &backup).unwrap();
+            write_publication_journal(&home, &backup, std::slice::from_ref(&entry)).unwrap();
+
+            let result = recover_environment(&home);
+
+            assert!(result.is_err(), "missing original must stop recovery");
+            assert!(backup.is_dir(), "transaction evidence must be retained");
+            assert_eq!(
+                read_publication_journal(&backup.join(JOURNAL_FILE)).unwrap(),
+                vec![entry]
+            );
+            assert!(has_publication_owner_marker(&backup).unwrap());
+        }
+    }
+
+    #[test]
+    fn recovery_accepts_missing_backup_when_original_destination_is_already_present() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir_all(home.join("nested")).unwrap();
+        fs::write(home.join("config.json"), b"restored leaf").unwrap();
+        fs::write(home.join("nested/stale.json"), b"restored obsolete").unwrap();
+        let backup = home.join(format!("{BACKUP_PREFIX}already-restored"));
+        fs::create_dir_all(backup.join(OLD_FILES_DIR)).unwrap();
+        write_publication_owner_marker(&home, &backup).unwrap();
+        let entries = [
+            PublicationJournalEntry::Leaf {
+                relative: "config.json".into(),
+                backup_id: 0,
+                had_original: true,
+            },
+            PublicationJournalEntry::Obsolete {
+                relative: "nested/stale.json".into(),
+                backup_id: 1,
+            },
+        ];
+        write_publication_journal(&home, &backup, &entries).unwrap();
+
+        recover_environment(&home).unwrap();
+
+        assert_eq!(
+            fs::read(home.join("config.json")).unwrap(),
+            b"restored leaf"
+        );
+        assert_eq!(
+            fs::read(home.join("nested/stale.json")).unwrap(),
+            b"restored obsolete"
+        );
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn recovery_refuses_directory_as_missing_backup_leaf_and_keeps_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir_all(home.join("config.json")).unwrap();
+        let backup = home.join(format!("{BACKUP_PREFIX}directory-at-leaf"));
+        fs::create_dir_all(backup.join(OLD_FILES_DIR)).unwrap();
+        write_publication_owner_marker(&home, &backup).unwrap();
+        let entry = PublicationJournalEntry::Leaf {
+            relative: "config.json".into(),
+            backup_id: 0,
+            had_original: true,
+        };
+        write_publication_journal(&home, &backup, std::slice::from_ref(&entry)).unwrap();
+
+        assert!(recover_environment(&home).is_err());
+
+        assert!(home.join("config.json").is_dir());
+        assert_eq!(
+            read_publication_journal(&backup.join(JOURNAL_FILE)).unwrap(),
+            vec![entry]
+        );
+        assert!(has_publication_owner_marker(&backup).unwrap());
+    }
+
+    #[test]
+    fn committed_marker_sync_and_rollback_failure_recover_originals() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let source = root.path().join("source");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&source).unwrap();
+        for name in ["a-first", "z-last"] {
+            fs::write(source.join(name), format!("new-{name}")).unwrap();
+            fs::write(home.join(name), format!("prior-{name}")).unwrap();
+        }
+        let publication = stage_environment(
+            &[
+                selection(&source.join("a-first"), "a-first"),
+                selection(&source.join("z-last"), "z-last"),
+            ],
+            &home,
+            &[],
+            Default::default(),
+        )
+        .unwrap();
+        let backup = publication.rollback.as_ref().unwrap().backup.0.clone();
+        PUBLICATION_SYNC_FAILURE_PATHS.with(|failures| failures.borrow_mut().push(home.clone()));
+        PUBLICATION_ROLLBACK_RESTORE_FAILURE_PATH
+            .with(|failure| *failure.borrow_mut() = Some(home.join("z-last")));
+
+        let result = publication.commit();
+
+        assert!(
+            result.is_err(),
+            "injected marker sync failure must be returned"
+        );
+        assert_eq!(fs::read(home.join("a-first")).unwrap(), b"prior-a-first");
+        assert_eq!(fs::read(home.join("z-last")).unwrap(), b"new-z-last");
+        assert!(
+            backup.is_dir(),
+            "failed restore must retain recovery evidence"
+        );
+        assert!(backup.join(JOURNAL_FILE).is_file());
+        assert!(has_publication_owner_marker(&backup).unwrap());
+
+        recover_environment(&home).unwrap();
+
+        assert_eq!(fs::read(home.join("a-first")).unwrap(), b"prior-a-first");
+        assert_eq!(fs::read(home.join("z-last")).unwrap(), b"prior-z-last");
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn commit_marker_pre_rename_failure_rolls_back() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let source = root.path().join("source");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("config.json"), b"new").unwrap();
+        fs::write(home.join("config.json"), b"original").unwrap();
+        let publication = stage_environment(
+            &[selection(&source.join("config.json"), "config.json")],
+            &home,
+            &[],
+            Default::default(),
+        )
+        .unwrap();
+        let backup = publication.rollback.as_ref().unwrap().backup.0.clone();
+        fs::create_dir(backup.join(format!("{COMMITTED_FILE}.tmp"))).unwrap();
+
+        assert!(publication.commit().is_err());
+
+        assert_eq!(fs::read(home.join("config.json")).unwrap(), b"original");
+        assert!(
+            !backup.exists(),
+            "pre-marker failure should roll back cleanly"
+        );
+    }
+
+    #[test]
+    fn uncertain_commit_marker_removal_keeps_backups_until_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let source = root.path().join("source");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("config.json"), b"new").unwrap();
+        fs::write(home.join("config.json"), b"original").unwrap();
+        let publication = stage_environment(
+            &[selection(&source.join("config.json"), "config.json")],
+            &home,
+            &[],
+            Default::default(),
+        )
+        .unwrap();
+        let backup = publication.rollback.as_ref().unwrap().backup.0.clone();
+        PUBLICATION_SYNC_FAILURE_PATHS.with(|failures| {
+            failures.borrow_mut().extend([home.clone(), home.clone()]);
+        });
+
+        assert!(publication.commit().is_err());
+
+        assert!(!backup.join(COMMITTED_FILE).exists());
+        assert_eq!(fs::read(home.join("config.json")).unwrap(), b"new");
+        assert_eq!(fs::read(backup_path(&backup, 0)).unwrap(), b"original");
+        assert!(backup.join(JOURNAL_FILE).is_file());
+        assert!(has_publication_owner_marker(&backup).unwrap());
+
+        recover_environment(&home).unwrap();
+
+        assert_eq!(fs::read(home.join("config.json")).unwrap(), b"original");
+        assert!(!backup.exists());
+    }
+
+    #[test]
     fn recovery_rejects_invalid_committed_markers_and_preserves_rollback_evidence() {
         fn assert_invalid_marker(create_marker: impl FnOnce(&Path, &Path)) {
             let root = tempfile::tempdir().unwrap();
@@ -2962,12 +3430,14 @@ mod tests {
             }],
         )
         .unwrap();
-        let publication = Publication {
+        let mut publication = Publication {
             backup: TemporaryProjection(backup.clone()),
             created: Vec::new(),
             replaced: Vec::new(),
             journal_entries: Vec::new(),
             next_backup_id: 0,
+            obsolete_directories: Vec::new(),
+            commit_marker_published: false,
             committed: false,
         };
         publication.write_committed_marker(&home).unwrap();
@@ -3052,6 +3522,68 @@ mod tests {
         assert!(!home.join("new").exists());
         for path in stale {
             assert_eq!(fs::read(home.join(path)).unwrap(), b"previous");
+        }
+    }
+
+    #[test]
+    fn obsolete_directory_cleanup_preserves_concurrent_untracked_children() {
+        for commit in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("home");
+            let source = root.path().join("source");
+            fs::create_dir(&home).unwrap();
+            fs::create_dir(&source).unwrap();
+            fs::create_dir_all(home.join("stale")).unwrap();
+            fs::write(home.join("stale/managed.json"), b"managed original").unwrap();
+            fs::create_dir(home.join("empty-stale")).unwrap();
+            fs::write(source.join("new.json"), b"new").unwrap();
+            let concurrent_file = home.join("stale/untracked.json");
+            let mut publication = stage_environment(
+                &[selection(&source.join("new.json"), "new.json")],
+                &home,
+                &[],
+                Default::default(),
+            )
+            .unwrap();
+            let concurrent_file_for_hook = concurrent_file.clone();
+            PUBLICATION_AFTER_OBSOLETE_SCAN_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    fs::write(concurrent_file_for_hook, b"untracked original")
+                        .expect("inject concurrent untracked child after scan");
+                }));
+            });
+
+            publication
+                .remove_obsolete_batch(&[
+                    PathBuf::from("stale/managed.json"),
+                    PathBuf::from("stale"),
+                    PathBuf::from("empty-stale"),
+                ])
+                .unwrap();
+
+            if commit {
+                publication.commit().unwrap();
+                assert!(
+                    !home.join("stale/managed.json").exists(),
+                    "commit removes the explicitly managed stale leaf"
+                );
+                assert!(
+                    !home.join("empty-stale").exists(),
+                    "commit removes directories that are still empty"
+                );
+            } else {
+                drop(publication);
+                assert_eq!(
+                    fs::read(home.join("stale/managed.json")).unwrap(),
+                    b"managed original"
+                );
+                assert!(home.join("empty-stale").is_dir());
+            }
+            assert_eq!(
+                fs::read(&concurrent_file).unwrap(),
+                b"untracked original",
+                "the untracked child must survive both commit and rollback"
+            );
         }
     }
 
