@@ -1197,6 +1197,96 @@ describe('App WS bootstrap recovery', () => {
     expect(store.getState().tabs.tabs.find(tab => tab.id === 'inventory-mixed-tab')?.status).toBe('error')
   })
 
+  it('keeps an exited managed inventory row exited when runtime metadata is absent', async () => {
+    const store = createStore({
+      tabs: [{ id: 'inventory-exited-metadata-tab', mode: 'opencode', status: 'running' }],
+      panes: {
+        layouts: {
+          'inventory-exited-metadata-tab': {
+            type: 'leaf', id: 'inventory-exited-metadata-pane', content: {
+              kind: 'terminal', mode: 'opencode', status: 'running',
+              terminalId: 'inventory-exited-metadata-terminal',
+              streamId: 'inventory-exited-metadata-stream',
+              createRequestId: 'inventory-exited-metadata-create',
+              soulId: 'inventory-exited-metadata-soul',
+              launchFailure: { code: 'LAUNCH_FAILED', message: 'old launch failed', retryable: true },
+            },
+          },
+        },
+        activePane: { 'inventory-exited-metadata-tab': 'inventory-exited-metadata-pane' },
+      },
+    })
+    render(<Provider store={store}><App /></Provider>)
+    await waitFor(() => expect(messageHandler).toBeTypeOf('function'))
+
+    act(() => messageHandler?.({
+      type: 'terminal.inventory',
+      terminals: [{
+        terminalId: 'inventory-exited-metadata-terminal', mode: 'opencode', status: 'exited',
+        soulId: 'inventory-exited-metadata-soul',
+      }],
+    }))
+
+    const layout = store.getState().panes.layouts['inventory-exited-metadata-tab']
+    expect(layout.type).toBe('leaf')
+    if (layout.type !== 'leaf') throw new Error('expected a leaf pane')
+    expect(layout.content.status).toBe('exited')
+    expect(layout.content.launchFailure).toEqual({ code: 'LAUNCH_FAILED', message: 'old launch failed', retryable: true })
+    expect(store.getState().tabs.tabs.find(tab => tab.id === 'inventory-exited-metadata-tab')?.status).toBe('exited')
+  })
+
+  it('recomputes the tab summary after inventory clears a stale sibling pane', async () => {
+    const store = createStore({
+      tabs: [{ id: 'inventory-stale-sibling-tab', mode: 'opencode', status: 'error' }],
+      panes: {
+        layouts: {
+          'inventory-stale-sibling-tab': {
+            type: 'split', id: 'inventory-stale-sibling-split', direction: 'horizontal', sizes: [50, 50], children: [
+              {
+                type: 'leaf', id: 'inventory-stale-managed-pane', content: {
+                  kind: 'terminal', mode: 'opencode', status: 'error',
+                  terminalId: 'inventory-stale-managed-terminal',
+                  streamId: 'inventory-stale-managed-stream',
+                  createRequestId: 'inventory-stale-managed-create',
+                  soulId: 'inventory-stale-managed-soul',
+                },
+              },
+              {
+                type: 'leaf', id: 'inventory-stale-sibling-pane', content: {
+                  kind: 'terminal', mode: 'shell', status: 'error', shell: 'system',
+                  terminalId: 'inventory-stale-sibling-terminal',
+                  streamId: 'inventory-stale-sibling-stream',
+                  createRequestId: 'inventory-stale-sibling-create',
+                },
+              },
+            ],
+          },
+        },
+        activePane: { 'inventory-stale-sibling-tab': 'inventory-stale-managed-pane' },
+      },
+    })
+    render(<Provider store={store}><App /></Provider>)
+    await waitFor(() => expect(messageHandler).toBeTypeOf('function'))
+
+    act(() => messageHandler?.({
+      type: 'terminal.inventory',
+      terminals: [{
+        terminalId: 'inventory-stale-managed-terminal', mode: 'opencode', status: 'running',
+        runtimeStatus: 'running', soulId: 'inventory-stale-managed-soul',
+        incarnationId: 'inventory-stale-managed-incarnation',
+      }],
+    }))
+
+    const layout = store.getState().panes.layouts['inventory-stale-sibling-tab']
+    expect(layout.type).toBe('split')
+    if (layout.type !== 'split') throw new Error('expected a split pane')
+    const staleSibling = layout.children[1]
+    expect(staleSibling.type).toBe('leaf')
+    if (staleSibling.type !== 'leaf') throw new Error('expected a stale sibling leaf')
+    expect(staleSibling.content.status).toBe('creating')
+    expect(store.getState().tabs.tabs.find(tab => tab.id === 'inventory-stale-sibling-tab')?.status).toBe('running')
+  })
+
   it('recovers an OpenCode sessionRef from inventory before clearing a stale live handle', async () => {
     const store = createStore({
       tabs: [{

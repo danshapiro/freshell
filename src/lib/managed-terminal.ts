@@ -12,8 +12,10 @@ export function managedTerminalPaneStatus(terminal: ManagedRuntimeProjectionFiel
 }
 
 /** Status for a pane reconstructed from a retained managed terminal projection. */
-export function managedTerminalResumePaneStatus(terminal: ManagedRuntimeProjectionFields): TerminalStatus {
-  const fallback = terminal.runtimeStatus === 'exited'
+export function managedTerminalResumePaneStatus(
+  terminal: ManagedRuntimeProjectionFields & { status?: 'running' | 'exited' },
+): TerminalStatus {
+  const fallback = terminal.runtimeStatus === 'exited' || terminal.status === 'exited'
     ? 'exited'
     : terminal.runtimeStatus === 'recovering'
       ? 'recovering'

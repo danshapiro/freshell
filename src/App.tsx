@@ -1672,14 +1672,6 @@ export default function App() {
               }
             }
           }
-          for (const tabId of tabsWithManagedInventory) {
-            const layout = appStore.getState().panes.layouts[tabId]
-            if (!layout) continue
-            const status = aggregateTerminalTabStatus(collectPaneEntries(layout).flatMap(({ content }) => (
-              content.kind === 'terminal' ? [content.status] : []
-            )))
-            if (status) dispatch(updateTab({ id: tabId, updates: { status } }))
-          }
           const liveIds = terminals
             .filter((t: any) => t.status === 'running' || isRetainedManagedTerminal(t))
             .map((t: any) => t.terminalId as string)
@@ -1692,6 +1684,14 @@ export default function App() {
           // fallback census if the reconcile later fails).
           if (!paneReconcileActiveRef.current) {
             runDestructiveTerminalCensus(liveIds)
+          }
+          for (const tabId of tabsWithManagedInventory) {
+            const layout = appStore.getState().panes.layouts[tabId]
+            if (!layout) continue
+            const status = aggregateTerminalTabStatus(collectPaneEntries(layout).flatMap(({ content }) => (
+              content.kind === 'terminal' ? [content.status] : []
+            )))
+            if (status) dispatch(updateTab({ id: tabId, updates: { status } }))
           }
           dispatch(setTerminalMetaSnapshot({ terminals: terminalMeta, requestedAt: terminalMetaRequestedAt }))
           dispatch(patchSessionRunningStateFromTerminalMeta({
