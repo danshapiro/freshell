@@ -422,16 +422,18 @@ async fn post_session_metadata(
             })),
         )
             .into_response(),
-        Ok((provider, session_id, session_type, session_type_source, checkpoint_workspace)) => {
+        Ok(post) => {
             match apply_session_metadata_with_checkpoint_workspace(
                 &state.store,
                 &state.broadcast_tx,
                 &state.sessions_revision,
-                &provider,
-                &session_id,
-                &session_type,
-                session_type_source.as_deref(),
-                checkpoint_workspace.as_ref(),
+                SessionMetadataUpdate {
+                    provider: &post.provider,
+                    session_id: &post.session_id,
+                    session_type: &post.session_type,
+                    session_type_source: post.session_type_source.as_deref(),
+                    checkpoint_workspace: post.checkpoint_workspace.as_ref(),
+                },
             )
             .await
             {
@@ -464,40 +466,51 @@ pub async fn apply_session_metadata(
         store,
         broadcast_tx,
         sessions_revision,
-        provider,
-        session_id,
-        session_type,
-        session_type_source,
-        None,
+        SessionMetadataUpdate {
+            provider,
+            session_id,
+            session_type,
+            session_type_source,
+            checkpoint_workspace: None,
+        },
     )
     .await
+}
+
+struct SessionMetadataUpdate<'a> {
+    provider: &'a str,
+    session_id: &'a str,
+    session_type: &'a str,
+    session_type_source: Option<&'a str>,
+    checkpoint_workspace: Option<&'a Value>,
 }
 
 async fn apply_session_metadata_with_checkpoint_workspace(
     store: &SessionMetadataStore,
     broadcast_tx: &tokio::sync::broadcast::Sender<String>,
     sessions_revision: &std::sync::atomic::AtomicI64,
-    provider: &str,
-    session_id: &str,
-    session_type: &str,
-    session_type_source: Option<&str>,
-    checkpoint_workspace: Option<&Value>,
+    update: SessionMetadataUpdate<'_>,
 ) -> std::io::Result<bool> {
-    let changed = match checkpoint_workspace {
+    let changed = match update.checkpoint_workspace {
         Some(workspace) => {
             store
                 .set_with_checkpoint_workspace(
-                    provider,
-                    session_id,
-                    session_type,
-                    session_type_source,
+                    update.provider,
+                    update.session_id,
+                    update.session_type,
+                    update.session_type_source,
                     Some(workspace),
                 )
                 .await?
         }
         None => {
             store
-                .set(provider, session_id, session_type, session_type_source)
+                .set(
+                    update.provider,
+                    update.session_id,
+                    update.session_type,
+                    update.session_type_source,
+                )
                 .await?
         }
     };
@@ -521,9 +534,15 @@ async fn apply_session_metadata_with_checkpoint_workspace(
 /// zod-issue-shaped `{path, message}` objects on failure (schema-approximate — the
 /// reference's exact zod issue shape is not part of any client contract this port must
 /// match; the client only reads the top-level `error` string on a 400).
-fn validate_post_body(
-    body: &Value,
-) -> Result<(String, String, String, Option<String>, Option<Value>), Vec<Value>> {
+struct ValidatedSessionMetadataPost {
+    provider: String,
+    session_id: String,
+    session_type: String,
+    session_type_source: Option<String>,
+    checkpoint_workspace: Option<Value>,
+}
+
+fn validate_post_body(body: &Value) -> Result<ValidatedSessionMetadataPost, Vec<Value>> {
     let mut issues = Vec::new();
 
     let provider = body.get("provider").and_then(Value::as_str);
@@ -594,15 +613,15 @@ fn validate_post_body(
         return Err(issues);
     }
 
-    Ok((
-        provider.unwrap().to_string(),
-        session_id.unwrap().to_string(),
-        session_type.unwrap().to_string(),
-        session_type_source
+    Ok(ValidatedSessionMetadataPost {
+        provider: provider.unwrap().to_string(),
+        session_id: session_id.unwrap().to_string(),
+        session_type: session_type.unwrap().to_string(),
+        session_type_source: session_type_source
             .and_then(Value::as_str)
             .map(str::to_string),
-        checkpoint_workspace_value,
-    ))
+        checkpoint_workspace: checkpoint_workspace_value,
+    })
 }
 
 #[cfg(test)]
