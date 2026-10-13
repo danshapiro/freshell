@@ -141,14 +141,18 @@ drop-in, plus `freshell-supervisor.service`):
 3. Units: `systemctl --user is-active freshell-rust.service
    freshell-supervisor.service` → both `active`.
 4. Existing souls: `docker ps --filter name=incarnation` shows the same
-   containers with unchanged uptimes.
+   containers with unchanged uptimes. A NEW container may appear within
+   seconds of the restart — that is a client reconnecting and a durable
+   terminal pane reattaching, not an old soul being replaced; the
+   pre-restart containers must keep their uptimes.
 5. New-soul probe: create a terminal pane in a real workspace and confirm a
    NEW `freshell-incarnation-*` container appears (`docker ps`), that it
    carries the operator-home bind and the
    `FRESHELL_OPERATOR_HOME_MOUNT=1` marker env (`docker inspect`), and that
    its session host emitted one `operator_home_readiness` event
    (`docker exec <container> cat /run/freshell/host-lifecycle.jsonl`). Close
-   the probe pane afterward.
+   the probe pane afterward; its container is collected by the idle
+   reaper after the idle timeout, not immediately on close.
 
 ## Launch the native Windows client
 
