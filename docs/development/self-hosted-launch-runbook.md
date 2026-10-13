@@ -117,17 +117,28 @@ post-deploy soul sweep:
 ```bash
 set -euo pipefail
 RUN=$(mktemp -d)   # private per-run dir for the survival snapshots
-# Pin the Docker CLI to the SAME daemon socket the supervisor uses (its
-# unit passes --docker-socket %t/docker.sock, the user runtime dir). A
-# machine with a second Docker daemon would otherwise capture against
-# the wrong one and the survival check would pass vacuously. DOCKER_CONTEXT
-# must go too — it takes precedence over DOCKER_HOST:
+# Pin the Docker CLI to the SAME daemon socket the supervisor's unit
+# actually names (its --docker-socket argument, with systemd specifiers
+# %t = the user runtime dir and %h = the home expanded) — a site-specific
+# unit may point elsewhere, and a machine with a second Docker daemon
+# would otherwise capture against the wrong one, passing the survival
+# check vacuously. DOCKER_CONTEXT must go too — it precedes DOCKER_HOST:
 unset DOCKER_CONTEXT || true
-export DOCKER_HOST="unix://${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
+UNIT_ARGS=$(systemctl --user cat freshell-supervisor.service | tr ' ' '\n')
+DSOCK=$(sed -n 's/^--docker-socket=\?//p' <<<"$UNIT_ARGS" | head -1)
+DSOCK=${DSOCK//%t/${XDG_RUNTIME_DIR:-/run/user/$(id -u)}}
+DSOCK=${DSOCK//%h/$HOME}
+DSOCK=${DSOCK:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock}
+export DOCKER_HOST="unix://$DSOCK"
+# Same for the registry root the soul inventory reads (used below):
+REGROOT=$(sed -n 's/^--registry-root=\?//p' <<<"$UNIT_ARGS" | head -1)
+REGROOT=${REGROOT//%t/${XDG_RUNTIME_DIR:-/run/user/$(id -u)}}
+REGROOT=${REGROOT//%h/$HOME}
+REGROOT=${REGROOT:-$HOME/.freshell/managed-runtime/registry}
 # Scope the capture to THIS installation: the daemon may host containers
 # from other Freshell installations with the same name shape, and the
 # installation label is the only discriminator:
-INSTALL_ID=$(sqlite3 "$HOME/.freshell/managed-runtime/registry/runtime.sqlite3" \
+INSTALL_ID=$(sqlite3 "$REGROOT/runtime.sqlite3" \
   "select installation_id from installation")
 test -n "$INSTALL_ID" || { echo "cannot read installation id from the registry"; exit 1; }
 echo "$INSTALL_ID" > "$RUN/installation-id"
@@ -187,7 +198,7 @@ else
   # REGISTRY is readable directly, and it is the authority on desired
   # state. Read the baseline from sqlite so a desired-running soul with
   # no running container is not invisible to every later check:
-  sqlite3 "$HOME/.freshell/managed-runtime/registry/runtime.sqlite3" \
+  sqlite3 "$REGROOT/runtime.sqlite3" \
     "select soul_id from souls where desired_state='running'" \
     > "$RUN/desired-running.txt" 2>/dev/null \
     || { echo "cannot read the registry sqlite — locate desired-running souls manually"; exit 1; }
@@ -727,7 +738,31 @@ print("" if cur is None else cur)' "$D/settings.json" > "$D/old-opencode-cwd.txt
     # correctly deployed client). A plain shell pane will NOT do either:
     # shell panes skip the directory step and always take the default
     # workspace. OpenCode's directory step has a free-text PATH INPUT:
-    # type the absolute $BWS path there and confirm. Then WAIT (bounded):
+    # type the absolute $BWS path there and confirm. If the picker
+    # REJECTS the path (the directory is validated against the
+    # `allowedFilePaths` setting — a deployment whose allowed roots
+    # exclude $HOME will 403 the probe root), mint the probe root under
+    # an allowed root instead and record it so the cleanup guard
+    # validates against the RECORDED root:
+    ALLOWED=$(curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" \
+      http://127.0.0.1:3001/api/settings \
+      | python3 -c 'import json,sys
+d=json.load(sys.stdin); d=d.get("data",d)
+for r in (d.get("allowedFilePaths") or []):
+    print(r)')
+    if ! printf '%s\n' "$ALLOWED" | grep -q "^$HOME"; then
+      FIRST_ALLOWED=$(head -1 <<<"$ALLOWED")
+      if [ -n "$FIRST_ALLOWED" ]; then
+        PROBE_ROOT=$(mktemp -d "$FIRST_ALLOWED/freshell-probe.XXXXXX")
+        chmod 0770 "$PROBE_ROOT"
+        printf 'PROBE_ROOT=%q\n' "$PROBE_ROOT" >> "$D/run.env"
+        rm -rf "$BWS"
+        BWS=$(mktemp -d "$PROBE_ROOT/bws.XXXXXX")
+        chmod 0770 "$BWS"
+        printf 'BWS=%q\n' "$BWS" >> "$D/run.env"
+      fi
+    fi
+    # Then WAIT (bounded):
     # the confirmation dispatches a UI update, terminal.create goes out
     # from a React effect, and the managed launch is asynchronous — so
     # the soul may not exist the instant you confirm. Poll up to ~120s:
@@ -862,24 +897,52 @@ PY
     GUARD_ROOT=""
     if [ -n "${PROBE_ROOT:-}" ]; then
       PROBE_ROOT=$(realpath -e "$PROBE_ROOT") || { echo "PROBE_ROOT: path does not exist"; exit 1; }
-      case "$PROBE_ROOT" in
-        "$HOME"/freshell-probe.*) GUARD_ROOT="$PROBE_ROOT" ;;
-        *) echo "REFUSING: PROBE_ROOT=$PROBE_ROOT is not a freshell-probe run root"; exit 1 ;;
-      esac
+      # Ownership when records exist: the root must be the one THIS run
+      # recorded in run.env (which may live under an allowed root other
+      # than $HOME); without records (recovery), fall back to the
+      # $HOME/freshell-probe.* pattern:
+      if [ -f "${D:-/nonexistent}/run.env" ]; then
+        RECORDED_ROOT=$(bash -c '. "$1"; printf "%s" "${PROBE_ROOT:-}"' _ "${D:-}/run.env")
+        if [ -n "$RECORDED_ROOT" ] && [ "$RECORDED_ROOT" != "$PROBE_ROOT" ]; then
+          echo "REFUSING: PROBE_ROOT=$PROBE_ROOT is not the root this run recorded ($RECORDED_ROOT)"
+          exit 1
+        fi
+        case "$(basename "$PROBE_ROOT")" in
+          freshell-probe.*) GUARD_ROOT="$PROBE_ROOT" ;;
+          *) echo "REFUSING: PROBE_ROOT=$PROBE_ROOT is not a freshell-probe run root"; exit 1 ;;
+        esac
+      else
+        case "$PROBE_ROOT" in
+          "$HOME"/freshell-probe.*) GUARD_ROOT="$PROBE_ROOT" ;;
+          *) echo "REFUSING: PROBE_ROOT=$PROBE_ROOT is not a freshell-probe run root"; exit 1 ;;
+        esac
+      fi
     fi
     for V in WS BWS; do
       eval "VAL=\${$V:-}"
       [ -n "$VAL" ] || continue
       VAL=$(realpath -e "$VAL") || { echo "$V: path does not exist"; exit 1; }
       PARENT=$(dirname "$VAL")
+      if [ -n "$GUARD_ROOT" ]; then
+        # Records exist: the workspace must sit directly under the root
+        # this run recorded:
+        if [ "$PARENT" != "$GUARD_ROOT" ]; then
+          echo "REFUSING: $V=$VAL is not under this run's probe root $GUARD_ROOT — resolve manually"
+          exit 1
+        fi
+      else
       case "$PARENT" in
         "$HOME"/freshell-probe.*) ;;
         *) echo "REFUSING: $V=$VAL is not a freshell-probe workspace — resolve manually"; exit 1 ;;
       esac
-      # A case-pattern `*` matches `/` too — pin the depth: the parent's
-      # own parent must be EXACTLY the home, so a path nested deeper
-      # under a probe-named directory cannot pass:
-      if [ "$(dirname "$PARENT")" != "$HOME" ]; then
+      fi
+      # A case-pattern `*` matches `/` too — pin the depth IN THE
+      # PATTERN BRANCH ONLY (records-path workspaces already proved
+      # their parent is the recorded root, which may sit under an
+      # allowed root away from $HOME): the parent's own parent must be
+      # EXACTLY the home, so a path nested deeper under a probe-named
+      # directory cannot pass:
+      if [ -z "$GUARD_ROOT" ] && [ "$(dirname "$PARENT")" != "$HOME" ]; then
         echo "REFUSING: $V=$VAL is nested below $PARENT — workspaces sit directly under the probe root"
         exit 1
       fi
