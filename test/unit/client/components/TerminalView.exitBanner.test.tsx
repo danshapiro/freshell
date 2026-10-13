@@ -355,6 +355,22 @@ describe('TerminalView exited-pane error banner', () => {
     expect(paneState(store)).toMatchObject({terminalId:'retained-managed',streamId:'retained-epoch',createRequestId:REQ,status:'exited',soulId:'managed-soul'})
   })
 
+  it('preserves a managed recovery error when retained exit arrives without its projection', async () => {
+    const { store, paneContent } = makeStore({ mode: 'opencode', status: 'error', managed: true, withSessionRef: false })
+    act(() => store.dispatch(updatePaneContent({ tabId: TAB, paneId: PANE, content: {
+      ...paneContent, terminalId: 'retained-managed', streamId: 'retained-epoch',
+    } })))
+    await renderPane(store, paneState(store))
+
+    act(() => messageHandler!({ type: 'terminal.exit', terminalId: 'retained-managed',
+      exitCode: -1, managedRetained: true, exitCodeAvailable: false }))
+
+    expect(paneState(store)).toMatchObject({
+      terminalId: 'retained-managed', streamId: 'retained-epoch', status: 'error', soulId: 'managed-soul',
+    })
+    expect(store.getState().tabs.tabs[0]).toMatchObject({ status: 'error' })
+  })
+
   it('does not display a compatibility exit code when managed completion reports it unavailable', async () => {
     const {store,paneContent}=makeStore({mode:'codex',status:'running',managed:true,
       lifecycle:{lastTerminalId:'retained-managed',exit:{exitCode:9,at:Date.now()}}})

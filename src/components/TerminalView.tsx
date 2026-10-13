@@ -6054,7 +6054,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
             discardPendingInput('terminal_gone')
             const terminal = contentRef.current
-            const status = managedTerminalPaneStatus(terminal ?? {}, 'exited')
+            // A retained exit can race the recovery projection on reconnect.
+            // Keep an already-rendered managed failure visible when this frame
+            // has no supervisor summary to replace it with.
+            const statusFallback = terminal?.status === 'error' ? 'error' : 'exited'
+            const status = managedTerminalPaneStatus(terminal ?? {}, statusFallback)
             const runtimeStatus = terminal?.runtimeStatus === 'blocked'
               || terminal?.recoverySummary?.recoveryState === 'blocked'
               ? 'blocked'
