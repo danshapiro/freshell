@@ -4145,6 +4145,8 @@ fn refresh_provider_config_worker(args: &[String]) -> Result<(), String> {
 }
 
 fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<(), String> {
+    freshell_platform::provider_environment::recover_environment(provider_home)
+        .map_err(|error| error.to_string())?;
     let destinations: Vec<String> = serde_json::from_slice(
         &std::fs::read(stage.join("manifest.json")).map_err(|error| error.to_string())?,
     )
@@ -4222,13 +4224,13 @@ fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<()
     let mut publication=freshell_platform::provider_environment::stage_environment(&selections,provider_home,&[],Default::default()).inspect_err(|error| {
         emit_environment_event(serde_json::json!({"severity":"error","event":"provider.environment.copy.failed","stage":"provider_publication","provider":provider,"relative_path":error.relative_path,"operation":error.operation,"limit_kind":error.limit_kind,"corrective_message":error.corrective_message}));
     }).map_err(|error|error.to_string())?;
-    let mut stale = previous.difference(&current).collect::<Vec<_>>();
-    stale.sort_by_key(|path| std::cmp::Reverse(Path::new(path).components().count()));
-    for relative in stale {
-        publication
-            .remove_obsolete(Path::new(relative))
-            .map_err(|error| error.to_string())?;
-    }
+    let stale = previous
+        .difference(&current)
+        .map(|relative| PathBuf::from(relative.as_str()))
+        .collect::<Vec<_>>();
+    publication
+        .remove_obsolete_batch(&stale)
+        .map_err(|error| error.to_string())?;
     let report = publication.commit().map_err(|error| error.to_string())?;
     emit_environment_event(
         serde_json::json!({"severity":"info","event":"provider.environment.copy.completed","stage":"provider_publication","provider":provider,"entries":report.entries,"bytes":report.bytes}),
@@ -12219,6 +12221,110 @@ console.log('actual library export/import/full-row reader and Node semantic bind
         assert_eq!(
             std::fs::read(home.join("skills/sibling")).unwrap(),
             b"sibling-nonce"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "process-kill recovery test; run only through scripts/sandbox-test.sh"]
+    fn provider_config_refresh_recovers_manifest_before_removing_stale_paths() {
+        use std::{
+            os::unix::process::ExitStatusExt,
+            process::{Child, Command},
+        };
+        const ROOT_ENV: &str = "FRESHELL_PROVIDER_CONFIG_CRASH_ROOT";
+        const PUBLISH_REACHED: &str = "provider-manifest-published";
+
+        if let Some(root) = std::env::var_os(ROOT_ENV) {
+            let root = PathBuf::from(root);
+            let home = root.join("home");
+            let source = root.join("interrupted-manifest.json");
+            let reached = root.join(PUBLISH_REACHED);
+            std::fs::write(&source, r#"["managed/intermediate"]"#).unwrap();
+            let _ = freshell_platform::provider_environment::stage_environment_with_publication(
+                &[freshell_platform::provider_environment::CopySelection {
+                    source,
+                    destination_relative: PROVIDER_PROJECTION_MANIFEST.into(),
+                }],
+                &home,
+                &[],
+                Default::default(),
+                |from, to| {
+                    std::fs::rename(from, to)?;
+                    std::fs::write(&reached, b"published").unwrap();
+                    loop {
+                        std::thread::park_timeout(std::time::Duration::from_secs(10));
+                    }
+                },
+            );
+            panic!("child should be killed after replacing the projection manifest");
+        }
+
+        struct ChildGuard(Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(home.join("managed")).unwrap();
+        std::fs::write(home.join("managed/old"), b"prior-managed-file").unwrap();
+        std::fs::write(
+            home.join(PROVIDER_PROJECTION_MANIFEST),
+            r#"["managed","managed/old"]"#,
+        )
+        .unwrap();
+
+        let mut child = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::provider_config_refresh_recovers_manifest_before_removing_stale_paths",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(ROOT_ENV, root.path())
+                .spawn()
+                .unwrap(),
+        );
+        let reached = root.path().join(PUBLISH_REACHED);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !reached.exists() {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                panic!("publisher exited before replacing the manifest: {status}");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "publisher did not replace the manifest before timeout"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        child.0.kill().unwrap();
+        assert_eq!(child.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+
+        let stage = root.path().join("next-stage");
+        std::fs::create_dir_all(stage.join("projection/managed")).unwrap();
+        std::fs::write(stage.join("manifest.json"), r#"["managed/new"]"#).unwrap();
+        std::fs::write(
+            stage.join("projection").join(PROVIDER_PROJECTION_MANIFEST),
+            r#"["managed/new"]"#,
+        )
+        .unwrap();
+        std::fs::write(stage.join("projection/managed/new"), b"new-managed-file").unwrap();
+
+        apply_staged_provider_config(&stage, &home).unwrap();
+
+        assert!(!home.join("managed/old").exists());
+        assert_eq!(
+            std::fs::read(home.join("managed/new")).unwrap(),
+            b"new-managed-file"
+        );
+        assert_eq!(
+            read_projection_manifest(&home).unwrap(),
+            ["managed/new".to_owned()].into_iter().collect()
         );
     }
 
