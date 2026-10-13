@@ -543,58 +543,49 @@ test('History reopening preserves a non-Git picker workspace for later rewind', 
   await verifyPickerWorkspaceReopensForRewind(page, fixture.nonGitWorkspacePath, 'one.txt', 'non-Git')
 })
 
-test('History reopening preserves an explicitly selected HOME workspace for later rewind', async ({ page }) => {
-  test.setTimeout(360_000)
-  await verifyPickerWorkspaceReopensForRewind(page, fixture.syntheticHomePath, 'checkpoint-home-file.txt', 'HOME')
-})
-
-test('picker-confirmed HOME captures and restores a harmless home file', async ({ page }) => {
+test('picker-confirmed HOME sets launch cwd without creating a checkpoint scope', async ({ page }) => {
   test.setTimeout(240_000)
   await verifyTarget(page)
   const homeFile = `${fixture.syntheticHomePath}/checkpoint-home-file.txt`
   await targetWrite(page, homeFile, 'home file before checkpoint\n')
   const { paneRoot, content } = await launchCodex(page, fixture.syntheticHomePath)
   expect(content.initialCwd).toBe(fixture.syntheticHomePath)
-  expect(content.checkpointWorkspace).toEqual({
-    path: fixture.syntheticHomePath,
-    provenance: 'directory-picker',
-  })
+  expect(content.checkpointWorkspace).toBeUndefined()
   const marker = `checkpoint home ${fixture.expectedNonce}`
-  const turn = await sendThroughComposer(page, paneRoot, marker,
-    { path: fixture.syntheticHomePath, provenance: 'directory-picker' })
-  expect(turn.outcome).toMatchObject({ status: 'available', workspace: {
-    path: fixture.syntheticHomePath, provenance: 'directory-picker',
-  } })
-  expect(turn.outcome.checkpointId).toMatch(/^[a-f0-9]{40}$/)
-  await expect(turn.row.getByRole('status', { name: 'Code rewind available for this message' }))
-    .toBeVisible()
+  const turn = await sendThroughComposer(page, paneRoot, marker, undefined)
+  expect(turn.outcome).toMatchObject({ status: 'unavailable', code: 'workspace_unavailable' })
+  expect(turn.outcome.reason).toContain('account home')
+  await expect(turn.row.getByRole('note', { name: 'Code rewind unavailable for this message' }))
+    .toContainText('account home')
+  await turn.row.hover()
+  await expect(turn.row.getByRole('button', { name: 'Rewind unavailable for this message' }))
+    .toBeDisabled()
   await assertNativeUserIdentity(page, turn.outcome, turn.accepted.submittedTurnId, marker)
 
-  const query = new URLSearchParams({
-    cwd: fixture.syntheticHomePath,
-    workspacePath: fixture.syntheticHomePath,
-    workspaceProvenance: 'directory-picker',
-  })
-  const listUrl = `${paired!.targetUrl}/api/fresh-agent/checkpoints?${query}`
-  const capturedList = await page.request.get(listUrl, { headers, timeout: 30_000 })
-  expect(capturedList.ok()).toBe(true)
-  expect(await capturedList.json()).toMatchObject({
-    checkpoints: [expect.objectContaining({ id: turn.outcome.checkpointId })],
-  })
-
   await targetWrite(page, homeFile, 'home file changed after send\n')
-  await turn.row.hover()
-  const rewindNotice = expect(paneRoot.getByRole('alert').filter({ hasText: /Code rewound to before:/ }))
-    .toContainText('Automatic pre-turn snapshot', { timeout: 30_000 })
-  const dialogAccepted = page.waitForEvent('dialog').then(dialog => dialog.accept())
-  await turn.row.getByRole('button', { name: 'Rewind code to here' }).click()
-  await Promise.all([dialogAccepted, rewindNotice])
-  await expect.poll(() => targetRead(page, homeFile)).toBe('home file before checkpoint\n')
+  await flushLayoutAndReload(page)
+  const reopened = await currentFreshAgent(page)
+  expect(reopened.content.initialCwd).toBe(fixture.syntheticHomePath)
+  expect(reopened.content.checkpointWorkspace).toBeUndefined()
+  expect(reopened.content.checkpointOutcomes).toEqual(expect.arrayContaining([
+    expect.objectContaining({
+      requestId: turn.sent.requestId,
+      status: 'unavailable',
+      code: 'workspace_unavailable',
+    }),
+  ]))
+  const restoredRow = page.locator('[data-context="fresh-agent"]').last()
+    .locator('article[data-turn-role="user"]', { hasText: marker })
+  await expect(restoredRow.getByRole('note', { name: 'Code rewind unavailable for this message' }))
+    .toContainText('account home')
 
+  const query = new URLSearchParams({ cwd: fixture.syntheticHomePath })
+  const listUrl = `${paired!.targetUrl}/api/fresh-agent/checkpoints?${query}`
   const list = await page.request.get(listUrl, { headers, timeout: 30_000 })
   expect(list.ok()).toBe(true)
-  expect(await list.json()).toMatchObject({ checkpoints: [expect.objectContaining({ id: turn.outcome.checkpointId })] })
+  expect(await list.json()).toMatchObject({ checkpoints: [] })
   const workspaceKey = createHash('sha1').update(resolve(fixture.syntheticHomePath)).digest('hex').slice(0, 16)
   expect(await targetRead(page,
-    `${fixture.syntheticHomePath}/.freshell/checkpoints/${workspaceKey}.git/HEAD`)).toBeTruthy()
+    `${fixture.syntheticHomePath}/.freshell/checkpoints/${workspaceKey}.git/HEAD`)).toBeUndefined()
+  expect(await targetRead(page, homeFile)).toBe('home file changed after send\n')
 })

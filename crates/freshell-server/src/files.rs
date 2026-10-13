@@ -200,10 +200,13 @@ async fn validate_dir(
                 .unwrap_or(false)
         })
         .unwrap_or(false);
-    // This flag answers whether an explicit directory-picker selection can
-    // define a snapshot scope. Automatic capture still rejects an unselected
-    // account home in the checkpoint workspace resolver.
-    let checkpoint_workspace_eligible = is_dir;
+    // Account homes select a launch cwd only. Canonicalize both sides so a
+    // symlink to HOME cannot turn it into an explicit snapshot scope.
+    let checkpoint_workspace_eligible = is_dir
+        && resolved
+            .fs_path
+            .as_deref()
+            .is_some_and(|path| !is_checkpoint_home(Path::new(path)));
 
     Json(json!({
         "valid": is_dir,
@@ -211,6 +214,24 @@ async fn validate_dir(
         "checkpointWorkspaceEligible": checkpoint_workspace_eligible,
     }))
     .into_response()
+}
+
+fn is_checkpoint_home(path: &Path) -> bool {
+    let Some(selected) = std::fs::canonicalize(path).ok() else {
+        return false;
+    };
+
+    let mut home_candidates = crate::session_directory::provider_home()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if let Some(configured_home) = std::env::var_os("FRESHELL_HOME") {
+        home_candidates.push(PathBuf::from(configured_home));
+    }
+
+    home_candidates
+        .iter()
+        .filter_map(|home| std::fs::canonicalize(home).ok())
+        .any(|home| home == selected)
 }
 
 /// `GET /api/files/read?path=<p>` \u2192 `{ content, size, modifiedAt }` (`files-router.ts:85`).
@@ -1419,19 +1440,54 @@ mod tests {
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn review_r6_validate_dir_allows_explicit_account_home_scope() {
+    async fn validate_dir_keeps_account_home_as_launch_directory_only() {
         let _guard = env_lock();
-        let home = std::env::var("HOME").expect("test environment has HOME");
+        let home = tempfile::tempdir().unwrap();
+        let home_path = home.path().to_string_lossy().into_owned();
+        let project = home.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", Some(home_path.as_str())),
+            ("FRESHELL_HOME", None),
+            ("USERPROFILE", None),
+        ]);
         let response = validate_dir(
             State(test_state()),
             auth_headers(),
-            Json(json!({ "path": home })),
+            Json(json!({ "path": home_path })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = body_json(response).await;
+        assert_eq!(value["valid"], true);
+        assert_eq!(value["checkpointWorkspaceEligible"], false);
+
+        let response = validate_dir(
+            State(test_state()),
+            auth_headers(),
+            Json(json!({ "path": project })),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let value = body_json(response).await;
         assert_eq!(value["valid"], true);
         assert_eq!(value["checkpointWorkspaceEligible"], true);
+
+        #[cfg(unix)]
+        {
+            let home_alias = home.path().join("home-alias");
+            std::os::unix::fs::symlink(home.path(), &home_alias).unwrap();
+            let response = validate_dir(
+                State(test_state()),
+                auth_headers(),
+                Json(json!({ "path": home_alias })),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = body_json(response).await;
+            assert_eq!(value["valid"], true);
+            assert_eq!(value["checkpointWorkspaceEligible"], false);
+        }
     }
 
     /// Node's `normalizeUserPath` runs `path.posix.resolve` on POSIX inputs

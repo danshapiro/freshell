@@ -3007,6 +3007,15 @@ fn recognized_account_homes(server_home: Option<&Path>) -> Vec<PathBuf> {
     homes
 }
 
+fn is_account_home_checkpoint_scope(path: &Path, server_home: &Path) -> bool {
+    if std::fs::canonicalize(server_home).is_ok_and(|home| home == path) {
+        return true;
+    }
+    crate::session_directory::provider_home()
+        .and_then(|home| std::fs::canonicalize(home).ok())
+        .is_some_and(|home| home == path)
+}
+
 fn is_recognized_account_home(path: &Path, homes: &[PathBuf]) -> bool {
     homes.iter().any(|home| home == path)
 }
@@ -3345,6 +3354,12 @@ async fn resolve_checkpoint_workspace_with_account_home(
                 candidate: candidate.clone(),
                 reason,
             })?;
+        if is_account_home_checkpoint_scope(&selected, server_home) {
+            return Err(CheckpointWorkspaceUnavailable {
+                candidate,
+                reason: "account home cannot be used as a code checkpoint workspace".to_string(),
+            });
+        }
         if provenance == "legacy-checkpoint" {
             return Ok(ResolvedCheckpointWorkspace {
                 path: selected,
@@ -7007,23 +7022,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn review_r6_explicit_picker_account_home_is_a_valid_scope() {
+    async fn explicit_picker_account_home_is_not_a_checkpoint_scope() {
         let home = tempfile::tempdir().unwrap();
         let intent = json!({
             "path": home.path(),
             "provenance": "directory-picker",
         });
 
-        let resolved = resolve_checkpoint_workspace(home.path(), home.path(), Some(&intent))
+        let error = resolve_checkpoint_workspace(home.path(), home.path(), Some(&intent))
             .await
-            .expect("explicit directory-picker selection defines the account-home scope");
+            .expect_err("an account-home picker choice only defines launch cwd");
 
-        assert_eq!(resolved.path, home.path().canonicalize().unwrap());
-        assert_eq!(resolved.provenance, "directory-picker");
+        assert!(error.reason.contains("account home"), "{}", error.reason);
     }
 
     #[tokio::test]
-    async fn explicit_picker_home_keeps_exact_scope_when_git_root_is_its_parent() {
+    async fn explicit_picker_home_is_rejected_even_when_git_root_is_its_parent() {
         let owned = tempfile::tempdir().unwrap();
         let home = owned.path().join("home");
         tokio::fs::create_dir(&home).await.unwrap();
@@ -7033,11 +7047,11 @@ mod tests {
             "provenance": "directory-picker",
         });
 
-        let resolved = resolve_checkpoint_workspace(&home, &home, Some(&intent))
+        let error = resolve_checkpoint_workspace(&home, &home, Some(&intent))
             .await
-            .expect("explicit account-home selection is an eligible scope");
+            .expect_err("a Git parent must not turn account HOME into a snapshot scope");
 
-        assert_eq!(resolved.path, home.canonicalize().unwrap());
+        assert!(error.reason.contains("account home"), "{}", error.reason);
     }
 
     #[tokio::test]
@@ -7287,7 +7301,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_picker_home_is_snapshotted_without_the_internal_store() {
+    async fn explicit_picker_home_is_rejected_without_creating_checkpoint_storage() {
         let home_dir = tempfile::tempdir().unwrap();
         tokio::fs::write(home_dir.path().join("private.txt"), "private")
             .await
@@ -7307,67 +7321,20 @@ mod tests {
         .await;
 
         let status = response.status();
-        let entry = body_json(response).await;
-        assert_eq!(status, StatusCode::OK, "{entry}");
-        assert_eq!(entry["workspace"]["path"], json!(home_dir.path()));
-        assert_eq!(entry["workspace"]["provenance"], json!("directory-picker"));
-        let checkpoint_id = entry["id"].as_str().unwrap().to_string();
-
-        tokio::fs::write(home_dir.path().join("private.txt"), "changed after capture")
-            .await
-            .unwrap();
-        restore_checkpoint(home_dir.path(), home_dir.path(), &checkpoint_id)
-            .await
-            .expect("the selected HOME checkpoint restores");
-        assert_eq!(
-            tokio::fs::read_to_string(home_dir.path().join("private.txt"))
+        let error = body_json(response).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+        assert_eq!(error["code"], json!("workspace_unavailable"));
+        assert!(error["error"].as_str().unwrap().contains("account home"));
+        assert!(
+            !tokio::fs::try_exists(home_dir.path().join(".freshell/checkpoints"))
                 .await
-                .unwrap(),
-            "private"
+                .unwrap()
         );
-
-        let list_params = HashMap::from([
-            (
-                "cwd".to_string(),
-                home_dir.path().to_string_lossy().into_owned(),
-            ),
-            (
-                "workspacePath".to_string(),
-                home_dir.path().to_string_lossy().into_owned(),
-            ),
-            (
-                "workspaceProvenance".to_string(),
-                "directory-picker".to_string(),
-            ),
-        ]);
-        let listed = get_checkpoints(
-            State(state(home_dir.path())),
-            headers_with_token("tok"),
-            Query(list_params),
-        )
-        .await;
-        assert_eq!(listed.status(), StatusCode::OK);
-        let listed = body_json(listed).await;
-        assert!(listed["checkpoints"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|checkpoint| { checkpoint["id"].as_str() == Some(checkpoint_id.as_str()) }));
-
-        let git_dir = checkpoint_git_dir(home_dir.path(), home_dir.path());
-        let index = checkpoint_index_entries(&git_dir, &git_dir.join("index"))
-            .await
-            .expect("published picker-home checkpoint index is readable");
-        assert!(index.iter().any(|entry| entry.path == b"private.txt"));
-        assert!(!index.iter().any(|entry| {
-            entry.path.starts_with(b".freshell/checkpoints/")
-                || entry.path == b".freshell/checkpoints"
-        }));
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn explicit_picker_home_symlink_excludes_internal_store_and_rejects_store_scope() {
+    async fn explicit_picker_home_symlink_is_rejected_without_creating_checkpoint_storage() {
         let owned = tempfile::tempdir().unwrap();
         let home = owned.path().join("actual-home");
         let alias = owned.path().join("home-alias");
@@ -7391,18 +7358,14 @@ mod tests {
         .await;
 
         let status = response.status();
-        let entry = body_json(response).await;
-        assert_eq!(status, StatusCode::OK, "{entry}");
-        let git_dir = checkpoint_git_dir(&alias, &home);
-        let index = checkpoint_index_entries(&git_dir, &git_dir.join("index"))
+        let error = body_json(response).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+        assert_eq!(error["code"], json!("workspace_unavailable"));
+        assert!(!tokio::fs::try_exists(home.join(".freshell/checkpoints"))
             .await
-            .expect("published aliased-home checkpoint index is readable");
-        assert!(index.iter().any(|entry| entry.path == b"private.txt"));
-        assert!(!index.iter().any(|entry| {
-            entry.path.starts_with(b".freshell/checkpoints/")
-                || entry.path == b".freshell/checkpoints"
-        }));
+            .unwrap());
 
+        let git_dir = checkpoint_git_dir(&alias, &home);
         let nested_workspace = home.join(".freshell/checkpoints/nested-workspace");
         tokio::fs::create_dir_all(&nested_workspace).await.unwrap();
         let canonical_nested = tokio::fs::canonicalize(&nested_workspace).await.unwrap();
@@ -7413,7 +7376,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn explicit_picker_home_excludes_checkpoint_store_through_in_home_freshell_symlink() {
+    async fn checkpoint_storage_exclusion_follows_in_home_freshell_symlink() {
         let owned = tempfile::tempdir().unwrap();
         let home = owned.path().join("home");
         let real_freshell_dir = home.join("runtime-state");
@@ -7421,40 +7384,18 @@ mod tests {
         tokio::fs::write(real_freshell_dir.join("unrelated-state.txt"), "keep")
             .await
             .unwrap();
-        tokio::fs::write(home.join("private.txt"), "private")
-            .await
-            .unwrap();
         std::os::unix::fs::symlink(&real_freshell_dir, home.join(".freshell")).unwrap();
-        let workspace = home.canonicalize().unwrap();
+        let project = home.join("project");
+        tokio::fs::create_dir(&project).await.unwrap();
+        let git_dir = checkpoint_git_dir(&home, &project);
+        tokio::fs::create_dir_all(&git_dir).await.unwrap();
+        let stored_workspace = git_dir.join("nested-workspace");
+        tokio::fs::create_dir_all(&stored_workspace).await.unwrap();
+        let canonical_nested = tokio::fs::canonicalize(&stored_workspace).await.unwrap();
 
-        let response = post_checkpoint(
-            State(state(&home)),
-            headers_with_token("tok"),
-            Json(json!({
-                "cwd": workspace,
-                "workspace": {
-                    "path": workspace,
-                    "provenance": "directory-picker",
-                },
-            })),
-        )
-        .await;
-        let status = response.status();
-        let entry = body_json(response).await;
-        assert_eq!(status, StatusCode::OK, "{entry}");
-
-        let git_dir = checkpoint_git_dir(&home, &home);
-        let index = checkpoint_index_entries(&git_dir, &git_dir.join("index"))
-            .await
-            .expect("published picker-home checkpoint index is readable");
-        assert!(index.iter().any(|entry| entry.path == b"private.txt"));
-        assert!(index
-            .iter()
-            .any(|entry| entry.path == b"runtime-state/unrelated-state.txt"));
-        assert!(!index.iter().any(|entry| {
-            entry.path.starts_with(b"runtime-state/checkpoints/")
-                || entry.path == b"runtime-state/checkpoints"
-        }));
+        let error = checkpoint_storage_exclusion(&git_dir, &canonical_nested)
+            .expect_err("a workspace below the symlinked checkpoint store must be rejected");
+        assert!(error.contains("overlaps Freshell checkpoint storage"));
     }
 
     #[tokio::test]
