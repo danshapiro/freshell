@@ -182,15 +182,13 @@ drop-in, plus `freshell-supervisor.service`):
   container):
 
   ```bash
-  set -o pipefail
+  set -euo pipefail   # a Docker failure must halt the procedure
   docker ps -q --filter name=incarnation | xargs -r docker inspect \
-    --format '{{.Id}} {{.Name}} {{.State.StartedAt}}' | tee /tmp/souls-before.txt
-  test -s /tmp/souls-before.txt || echo "CAPTURE FAILED — do not proceed"
+    --format '{{.Id}} {{.Name}} {{.State.StartedAt}}' | sort | tee /tmp/souls-before.txt
   ```
 
-  `pipefail` plus the non-empty check matter: without them a Docker
-  failure could leave an empty baseline that the later comparison
-  "passes" while proving nothing.
+  An empty baseline is VALID (zero running souls) — `xargs -r` keeps the
+  empty capture successful; only an actual Docker failure halts here.
 
 **What a restart does:**
 
@@ -229,13 +227,23 @@ drop-in, plus `freshell-supervisor.service`):
    so the status code alone is not readiness.
 3. Units: `systemctl --user is-active freshell-rust.service
    freshell-supervisor.service` → both `active`.
-4. Existing souls: re-run the pre-restart capture command and compare with
-   `/tmp/souls-before.txt` — every captured container ID is still running
-   with the SAME `State.StartedAt` (a changed `StartedAt` means the
-   container was stopped and restarted; a missing ID means it was lost). A
-   container absent from the capture may appear within seconds of the
-   restart: that is a client reconnecting and a durable terminal pane
-   reattaching, not an old soul being replaced.
+4. Existing souls: capture the post-restart inventory to a SEPARATE file
+   and compare it against the preserved baseline — do NOT re-run the
+   pre-restart command as-is, which would overwrite `/tmp/souls-before.txt`
+   and compare the file against itself:
+
+   ```bash
+   docker ps -q --filter name=incarnation | xargs -r docker inspect \
+     --format '{{.Id}} {{.Name}} {{.State.StartedAt}}' | sort > /tmp/souls-after.txt
+   comm -23 /tmp/souls-before.txt /tmp/souls-after.txt   # must be EMPTY
+   comm -13 /tmp/souls-before.txt /tmp/souls-after.txt    # new containers (expected)
+   ```
+
+   A non-empty first `comm` is a failure: a baseline container is gone or
+   was restarted with a new `StartedAt`. The second `comm` lists
+   containers that appeared after the restart — that is a client
+   reconnecting and a durable terminal pane reattaching, not an old soul
+   being replaced.
 5. New-soul probe: create a terminal pane in a real workspace that is NOT
    the operator home itself (a subdirectory of it is fine) — when the
    workspace equals the operator home, the supervisor deliberately omits
