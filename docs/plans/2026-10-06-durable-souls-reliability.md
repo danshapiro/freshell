@@ -733,11 +733,23 @@ Run: `git diff --cached --check`
 
 Expected: the staged diff contains only the reviewed smoke test changes and any directly required product fix. Commit with a focused message; do not include external run evidence or credentials.
 
-- [ ] **Step 6: Run the final configured full-suite gate**
+- [ ] **Step 6: Run the final browser checks after the Stage 5 review loop**
 
-Run after Task 8 and Task 9 commits: `pnpm run test`, using the configured `FRESHELL_VITEST_BACKEND` and `FRESHELL_E2E_BACKEND`. Agent-launched Cloud lanes must set `GCLOUD_ROBOT_REQUIRE=1` and use the configured robot identity; do not silently change backends or treat skipped/zero-match cases as coverage.
+Run these exact selected cases on the final candidate after Stage 5 is complete:
 
-Expected: the coordinated full suite passes on the final committed candidate, excluding only failures recorded in the baseline ledger with reproduction evidence at `base_ref`. Record the exact command, commit, and result in the run ledger before Stage 5.
+Run: `FRESHELL_RUNTIME_SYNTHETIC_RESUME=1 GCLOUD_ROBOT_REQUIRE=1 pnpm exec tsx scripts/testing/runtime-external-browser.ts --spec test/e2e-browser/specs/runtime-terminal-continuity-rust.spec.ts --grep 'synthetic interrupted ordinary Stop preserves history$'`
+
+Run: `FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_PROVIDERS=claude,codex,opencode GCLOUD_ROBOT_REQUIRE=1 pnpm exec tsx scripts/testing/runtime-external-browser.ts --spec test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts --grep 'each selected terminal provider completes one ordinary turn$'`
+
+Run: `FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_MODES=freshclaude,freshcodex,freshopencode GCLOUD_ROBOT_REQUIRE=1 pnpm exec tsx scripts/testing/runtime-external-browser.ts --spec test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts --grep 'each selected fresh-agent mode completes one ordinary turn$'`
+
+Expected: all three selected cases execute and pass on the final candidate; the six selected terminal/FreshAgent modes and the interrupted-Stop case retain their existing Task 8/9 evidence requirements. If Stage 5 fixes change the candidate, run these checks after the final review loop, against the resulting final candidate.
+
+- [ ] **Step 7: Run the final configured full-suite gate**
+
+Run after Task 8 and Task 9 commits, the Stage 5 review loop, and Step 6: `pnpm run test`, using the configured `FRESHELL_VITEST_BACKEND` and `FRESHELL_E2E_BACKEND`. Agent-launched Cloud lanes must set `GCLOUD_ROBOT_REQUIRE=1` and use the configured robot identity; do not silently change backends or treat skipped/zero-match cases as coverage.
+
+Expected: the coordinated full suite passes on the final committed HEAD after the browser checks and Stage 5, excluding only failures recorded in the baseline ledger with reproduction evidence at `base_ref`. Record the exact command, commit, and result in the run ledger.
 
 ## Acceptance and self-review map
 
