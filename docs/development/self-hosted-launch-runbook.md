@@ -324,6 +324,11 @@ drop-in, plus `freshell-supervisor.service`):
   `freshell-supervisor.service`. Restarting the SUPERVISOR therefore also
   restarts the server in the same transaction — one
   `systemctl --user restart freshell-supervisor.service` redeploys both.
+  BEWARE: any server-unit restart terminates the server's RETAINED Codex
+  sidecars (see the restart-effects list below — the unit has no
+  `KillMode` override, so systemd's control-group kill defeats the
+  server's deliberate SAFE-11 retention); in-flight Codex conversations
+  are lost.
   The same `Type=simple` socket race as the strict sequence applies here:
   the server may start before the supervisor rebinds its control socket
   and come up failed; the unit's `Restart=on-failure` retries can then
@@ -843,10 +848,13 @@ PY
         *) echo "REFUSING: $V=$VAL is not a freshell-probe workspace — resolve manually"; exit 1 ;;
       esac
       # A NAME pattern is not ownership: a real workspace could sit under
-      # a freshell-probe-named directory. Probe workspaces contain NO
-      # visible (non-dotfile) content — refuse anything with user files:
-      if [ -n "$(find "$VAL" -mindepth 1 -maxdepth 2 -not -name '.*' -print -quit 2>/dev/null)" ]; then
-        echo "REFUSING: $V=$VAL contains visible files — probe workspaces are empty; resolve manually"
+      # a freshell-probe-named directory. Probe workspaces are created
+      # EMPTY and stay empty (in-soul provider state lives in the soul
+      # volume, not the workspace) — refuse ANY content, dotfiles
+      # included, so a mistaken selection holding e.g. only an .env is
+      # still caught:
+      if [ -n "$(find "$VAL" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+        echo "REFUSING: $V=$VAL is not empty — probe workspaces are empty; resolve manually"
         exit 1
       fi
       if [ -z "$GUARD_ROOT" ]; then
@@ -1047,7 +1055,7 @@ print("" if cur is None else cur)')
     if [ -n "${PROBE_ROOT:-}" ]; then
       UNEXPECTED=""
       shopt -s nullglob
-      for ENTRY in "$PROBE_ROOT"/* "$PROBE_ROOT"/.[!.]*; do
+      for ENTRY in "$PROBE_ROOT"/* "$PROBE_ROOT"/.[!.]* "$PROBE_ROOT"/..?*; do
         case "$ENTRY" in
           "$WS"|"$BWS") ;;
           *) UNEXPECTED="$UNEXPECTED $ENTRY" ;;
