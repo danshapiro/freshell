@@ -76,6 +76,7 @@ writeFileSync(receiptPath, JSON.stringify({
   bun: typeof Bun === 'object',
   bunVersion: Bun.version,
   launchCwd: process.cwd(),
+  bunCommandCwd: process.env.npm_config_local_prefix,
   configuredCwd: process.env.FRESHELL_EXPECTED_MCP_CWD,
   executable: process.execPath,
   scriptPath: new URL(import.meta.url).pathname,
@@ -1224,7 +1225,8 @@ export async function runManagedEnvironmentTarget() {
     assert.equal(preflightMcp.dependency, nonce, 'MCP must load its dependency from the staged parent node_modules')
     assert.equal(preflightMcp.bun, true, 'OpenCode must run the local MCP package script under Bun')
     assert.equal(preflightMcp.bunVersion, '1.4.3', 'Managed OpenCode MCP must use the pinned Bun runtime')
-    assert.equal(preflightMcp.launchCwd, selected.mcpNested, 'OpenCode must honor the nested MCP cwd')
+    assert.equal(preflightMcp.launchCwd, selected.mcpPackage, 'Bun runs a package script from its package root')
+    assert.equal(preflightMcp.bunCommandCwd, selected.mcpNested, 'OpenCode must launch Bun from the configured nested MCP cwd')
     assert.equal(preflightMcp.configuredCwd, selected.mcpNested)
     assert(preflightMcp.scriptPath.endsWith('/fixture-mcp/server.mjs'))
     const preflightView = await poll('genuine managed preflight native identity', () =>
@@ -1325,7 +1327,8 @@ export async function runManagedEnvironmentTarget() {
         assert.equal(mcpServer.dependency, nonce, 'OpenCode MCP must load the staged parent dependency')
         assert.equal(mcpServer.bun, true, 'OpenCode must run the local MCP package script under Bun')
         assert.equal(mcpServer.bunVersion, '1.4.3', 'Managed OpenCode MCP must use the pinned Bun runtime')
-        assert.equal(mcpServer.launchCwd, selected.mcpNested, 'OpenCode must honor the nested MCP cwd')
+        assert.equal(mcpServer.launchCwd, selected.mcpPackage, 'Bun runs a package script from its package root')
+        assert.equal(mcpServer.bunCommandCwd, selected.mcpNested, 'OpenCode must launch Bun from the configured nested MCP cwd')
         assert.equal(mcpServer.configuredCwd, selected.mcpNested)
         assert(mcpServer.scriptPath.endsWith('/fixture-mcp/server.mjs'))
         const stage = await stageProof(rig!, view, nonce)
