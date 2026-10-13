@@ -8,18 +8,19 @@ use freshell_runtime_protocol::{
     write_frame, AcknowledgeViewProjectionRequest, AdminCommand, AdminReply, AdminResult,
     CanonicalOwnerChoice, ControlRole, Envelope, FreshAgentCapture, FreshAgentCaptureRequest,
     FreshAgentCompactRequest, FreshAgentForkRequest, FreshAgentInterruptRequest,
-    FreshAgentReadEventsRequest, FreshAgentResolveRequest, FreshAgentRollbackDirection,
-    FreshAgentRollbackMode, FreshAgentRollbackRequest, FreshAgentSendRequest, IncidentId,
-    IncidentSummaryRequest, LaunchRequest, LossIncidentSummary, LostSoulRepairTarget,
-    ManagedRolloutMode, MigrationPlan, MigrationPlanRequest, NoticeDeliveryState, NoticeId,
-    NoticeReceiptRequest, OpenCodeTransferAction, OpenCodeTransferDescriptor,
-    OpenCodeTransferResult, PendingNoticesRequest, PendingViewProjectionsRequest, RecoverRequest,
-    RecoveryProbeRequest, RecoveryTrigger, RepairAudit, RepairRequest, RequestId,
-    RestoreLostSoulsRequest, RestoreLostSoulsResult, RuntimeError, RuntimeErrorCode,
-    RuntimeInventorySnapshot, RuntimeMetricsRequest, RuntimeMetricsSnapshot, RuntimeNotice,
-    RuntimeView, SoulId, StopOutcome, StopRequest, TerminalInputRequest, TerminalReadOutputRequest,
-    TerminalResizeRequest, UpdateLimitsRequest, UpdateLimitsResult, UpdateViewVisibilityRequest,
-    UpsertViewIntentRequest, ViewIntent, ViewProjectionEvent, CONTROL_PROTOCOL_VERSION,
+    FreshAgentProviderStartDiagnostic, FreshAgentReadEventsRequest, FreshAgentResolveRequest,
+    FreshAgentRollbackDirection, FreshAgentRollbackMode, FreshAgentRollbackRequest,
+    FreshAgentSendRequest, IncidentId, IncidentSummaryRequest, LaunchRequest, LossIncidentSummary,
+    LostSoulRepairTarget, ManagedRolloutMode, MigrationPlan, MigrationPlanRequest,
+    NoticeDeliveryState, NoticeId, NoticeReceiptRequest, OpenCodeTransferAction,
+    OpenCodeTransferDescriptor, OpenCodeTransferResult, PendingNoticesRequest,
+    PendingViewProjectionsRequest, RecoverRequest, RecoveryProbeRequest, RecoveryTrigger,
+    RepairAudit, RepairRequest, RequestId, RestoreLostSoulsRequest, RestoreLostSoulsResult,
+    RuntimeDiagnosticCode, RuntimeError, RuntimeErrorCode, RuntimeInventorySnapshot,
+    RuntimeMetricsRequest, RuntimeMetricsSnapshot, RuntimeNotice, RuntimeView, SoulId, StopOutcome,
+    StopRequest, TerminalInputRequest, TerminalReadOutputRequest, TerminalResizeRequest,
+    UpdateLimitsRequest, UpdateLimitsResult, UpdateViewVisibilityRequest, UpsertViewIntentRequest,
+    ViewIntent, ViewProjectionEvent, CONTROL_PROTOCOL_VERSION,
 };
 use std::{path::PathBuf, sync::Arc};
 use tokio::{net::UnixStream, sync::RwLock};
@@ -30,8 +31,13 @@ pub enum ClientError {
     Io(#[from] std::io::Error),
     #[error("runtime supervisor protocol failed: {0}")]
     Protocol(String),
-    #[error("runtime supervisor rejected request: {0:?}: {1}")]
-    Runtime(RuntimeErrorCode, String),
+    #[error("runtime supervisor rejected request: {code:?}: {message}")]
+    Runtime {
+        code: RuntimeErrorCode,
+        message: String,
+        diagnostic_code: Option<RuntimeDiagnosticCode>,
+        fresh_agent_provider_start_diagnostic: Option<FreshAgentProviderStartDiagnostic>,
+    },
     #[error("runtime supervisor returned an unexpected result")]
     UnexpectedResult,
 }
@@ -39,7 +45,28 @@ pub enum ClientError {
 impl ClientError {
     pub fn runtime_code(&self) -> Option<RuntimeErrorCode> {
         match self {
-            Self::Runtime(code, _) => Some(*code),
+            Self::Runtime { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
+
+    pub fn diagnostic_code(&self) -> Option<RuntimeDiagnosticCode> {
+        match self {
+            Self::Runtime {
+                diagnostic_code, ..
+            } => *diagnostic_code,
+            _ => None,
+        }
+    }
+
+    pub fn fresh_agent_provider_start_diagnostic(
+        &self,
+    ) -> Option<FreshAgentProviderStartDiagnostic> {
+        match self {
+            Self::Runtime {
+                fresh_agent_provider_start_diagnostic,
+                ..
+            } => *fresh_agent_provider_start_diagnostic,
             _ => None,
         }
     }
@@ -575,9 +602,14 @@ impl RuntimeClient {
             canonical_owners,
             expected_control_epoch: Some(self.current_epoch().await?),
         };
-        request.validate_payload().map_err(|error| {
-            ClientError::Runtime(RuntimeErrorCode::InvalidRequest, error.message)
-        })?;
+        request
+            .validate_payload()
+            .map_err(|error| ClientError::Runtime {
+                code: RuntimeErrorCode::InvalidRequest,
+                message: error.message,
+                diagnostic_code: None,
+                fresh_agent_provider_start_diagnostic: None,
+            })?;
         let original = request.clone();
         match self
             .request(request_id.clone(), AdminCommand::RestoreLostSouls(request))
@@ -1281,7 +1313,12 @@ impl RuntimeClient {
 }
 
 fn runtime_error(error: RuntimeError) -> ClientError {
-    ClientError::Runtime(error.code, error.message)
+    ClientError::Runtime {
+        code: error.code,
+        message: error.message,
+        diagnostic_code: error.diagnostic_code,
+        fresh_agent_provider_start_diagnostic: error.fresh_agent_provider_start_diagnostic,
+    }
 }
 
 #[cfg(test)]
@@ -1291,6 +1328,30 @@ mod tests {
         read_frame, write_frame, AdminReply, AdminResult, InstallationId,
     };
     use tokio::net::UnixListener;
+
+    #[test]
+    fn client_error_preserves_typed_provider_start_diagnostics() {
+        let error = runtime_error(
+            RuntimeError::new(RuntimeErrorCode::HostUnreachable, "private provider detail")
+                .with_diagnostic_code(RuntimeDiagnosticCode::FreshAgentProviderStartFailed)
+                .with_fresh_agent_provider_start_diagnostic(
+                    FreshAgentProviderStartDiagnostic::Authentication,
+                ),
+        );
+
+        assert_eq!(
+            error.runtime_code(),
+            Some(RuntimeErrorCode::HostUnreachable)
+        );
+        assert_eq!(
+            error.diagnostic_code(),
+            Some(RuntimeDiagnosticCode::FreshAgentProviderStartFailed)
+        );
+        assert_eq!(
+            error.fresh_agent_provider_start_diagnostic(),
+            Some(FreshAgentProviderStartDiagnostic::Authentication)
+        );
+    }
 
     #[tokio::test]
     async fn durable_souls_scoped_reply_uses_existing_epoch_retry_and_rejects_substitution() {
@@ -1585,7 +1646,7 @@ mod tests {
             assert_refreshed_read(kind, &requests);
             assert_eq!(cached, Some(2));
             assert!(
-                matches!(actual, Err(ClientError::Runtime(RuntimeErrorCode::StaleControlEpoch, message)) if message == "changed again")
+                matches!(actual, Err(ClientError::Runtime { code: RuntimeErrorCode::StaleControlEpoch, message, .. }) if message == "changed again")
             );
         }
     }
@@ -1604,7 +1665,7 @@ mod tests {
                 .await;
                 assert_cached_read(kind, &requests, cached);
                 assert!(
-                    matches!(actual, Err(ClientError::Runtime(actual_code, message)) if actual_code == code && message == "original refusal")
+                    matches!(actual, Err(ClientError::Runtime { code: actual_code, message, .. }) if actual_code == code && message == "original refusal")
                 );
             }
         }
@@ -1632,7 +1693,7 @@ mod tests {
             assert!(matches!(requests[1].body, AdminCommand::Health));
             assert_eq!(cached, Some(1));
             assert!(
-                matches!(actual, Err(ClientError::Runtime(RuntimeErrorCode::UnauthorizedRole, message)) if message == "health refused")
+                matches!(actual, Err(ClientError::Runtime { code: RuntimeErrorCode::UnauthorizedRole, message, .. }) if message == "health refused")
             );
         }
     }

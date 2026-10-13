@@ -159,7 +159,7 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
                 .as_ref()
                 .map(|value| value.session_id.as_str()),
         );
-        self.create(message).await?;
+        self.create(message).await.map_err(|_| ())?;
         Ok(HostedRestCreated { session_id })
     }
 

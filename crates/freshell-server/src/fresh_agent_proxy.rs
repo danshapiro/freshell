@@ -18,9 +18,10 @@ use freshell_protocol::{
 use freshell_runtime_client::RuntimeClient;
 use freshell_runtime_protocol::{
     AgentEvent, DesiredState, FreshAgentFixtureTransport, FreshAgentLaunchSpec,
-    FreshAgentRollbackDirection, FreshAgentRollbackMode, FreshProvider, LaunchRequest,
-    ProviderBootstrapFile, RequestId, RuntimeErrorCode, RuntimeLimits, RuntimeProfile, SoulId,
-    StopOutcome, ViewIntentKind, ViewIntentRequest, ViewVisibilityIntent,
+    FreshAgentProviderStartDiagnostic, FreshAgentRollbackDirection, FreshAgentRollbackMode,
+    FreshProvider, LaunchRequest, ProviderBootstrapFile, RequestId, RuntimeDiagnosticCode,
+    RuntimeErrorCode, RuntimeLimits, RuntimeProfile, SoulId, StopOutcome, ViewIntentKind,
+    ViewIntentRequest, ViewVisibilityIntent,
 };
 use freshell_ws::hosted_fresh_agent::{HostedFreshAgentCommand, HostedFreshAgentGateway};
 use sha2::{Digest, Sha256};
@@ -59,6 +60,18 @@ struct RollbackInvocation {
     mode: Option<freshell_protocol::RollbackMode>,
     turn_id: Option<String>,
     cwd: Option<String>,
+}
+
+#[derive(Debug)]
+enum FreshAgentCreateFailure {
+    Unavailable,
+    ProviderStart(FreshAgentProviderStartDiagnostic),
+}
+
+impl From<()> for FreshAgentCreateFailure {
+    fn from((): ()) -> Self {
+        Self::Unavailable
+    }
 }
 
 #[derive(Clone)]
@@ -114,12 +127,25 @@ impl HostedFreshAgentProxy {
         match command {
             HostedFreshAgentCommand::Create(message) => {
                 let request_id = message.request_id.clone();
-                if self.create(message).await.is_err() {
-                    tracing::warn!(request_id, "fresh_agent.create.failed");
+                if let Err(failure) = self.create(message).await {
+                    let (code, message) = match failure {
+                        FreshAgentCreateFailure::ProviderStart(diagnostic) => (
+                            "FRESH_AGENT_PROVIDER_START_FAILED",
+                            format!(
+                                "hosted fresh-agent provider failed to start (startup diagnostic: {})",
+                                diagnostic.as_str()
+                            ),
+                        ),
+                        FreshAgentCreateFailure::Unavailable => (
+                            "FRESH_AGENT_CREATE_FAILED",
+                            "managed fresh-agent host could not be created".to_string(),
+                        ),
+                    };
+                    tracing::warn!(request_id, code, "fresh_agent.create.failed");
                     self.send(ServerMessage::FreshAgentCreateFailed(
                         FreshAgentCreateFailed {
-                            code: "FRESH_AGENT_CREATE_FAILED".into(),
-                            message: "managed fresh-agent host could not be created".into(),
+                            code: code.into(),
+                            message,
                             request_id,
                             retryable: Some(true),
                             owner_kind: None,
@@ -386,7 +412,7 @@ impl HostedFreshAgentProxy {
     async fn create(
         self: &Arc<Self>,
         message: freshell_protocol::FreshAgentCreate,
-    ) -> Result<(), ()> {
+    ) -> Result<(), FreshAgentCreateFailure> {
         let provider =
             fresh_provider(&message.provider, message.session_type).ok_or_else(|| {
                 tracing::warn!(
@@ -410,7 +436,7 @@ impl HostedFreshAgentProxy {
                 provider = provider.as_str(),
                 session_type = session_type.as_str()
             );
-            return Err(());
+            return Err(FreshAgentCreateFailure::Unavailable);
         }
         if let Some(session_ref) = message.session_ref.as_ref() {
             if session_ref.provider != public_provider {
@@ -421,7 +447,7 @@ impl HostedFreshAgentProxy {
                     provider = provider.as_str(),
                     session_type = session_type_wire(message.session_type).as_str()
                 );
-                return Err(());
+                return Err(FreshAgentCreateFailure::Unavailable);
             }
             let inventory = self.client.inventory().await.map_err(|error| {
                 let runtime_code = error
@@ -667,9 +693,18 @@ impl HostedFreshAgentProxy {
                     crate::managed_mcp_capability::revoke_mcp_capability(&mcp_capability.grant_id);
                 let runtime_code = error.runtime_code().and_then(|code| serde_json::to_value(code).ok())
                     .and_then(|value| value.as_str().map(str::to_owned));
+                let provider_start_diagnostic = error.fresh_agent_provider_start_diagnostic();
                 tracing::warn!(event="fresh_agent.create.launch_failed", reason=create_client_error_reason(&error),
                     runtime_code=runtime_code.as_deref().unwrap_or("none"), request_id=message.request_id.as_str(),
-                    provider=provider.as_str(), session_type=session_type.as_str(), soul_id=%soul);
+                    provider=provider.as_str(), session_type=session_type.as_str(), soul_id=%soul,
+                    provider_start_diagnostic=provider_start_diagnostic.map(FreshAgentProviderStartDiagnostic::as_str).unwrap_or("none"));
+                match (error.diagnostic_code(), provider_start_diagnostic) {
+                    (
+                        Some(RuntimeDiagnosticCode::FreshAgentProviderStartFailed),
+                        Some(diagnostic),
+                    ) => FreshAgentCreateFailure::ProviderStart(diagnostic),
+                    _ => FreshAgentCreateFailure::Unavailable,
+                }
             })?;
         let naming_projection = match message.naming_handle.as_deref() {
             Some(handle) if !handle.trim().is_empty() => {
@@ -1268,7 +1303,7 @@ fn create_client_error_reason(error: &freshell_runtime_client::ClientError) -> &
     match error {
         ClientError::Io(_) => "supervisor_io",
         ClientError::Protocol(_) => "supervisor_protocol",
-        ClientError::Runtime(_, _) => "runtime_rejection",
+        ClientError::Runtime { .. } => "runtime_rejection",
         ClientError::UnexpectedResult => "unexpected_supervisor_result",
     }
 }

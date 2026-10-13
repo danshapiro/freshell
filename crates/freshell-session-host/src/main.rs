@@ -1127,7 +1127,8 @@ fn map_fresh_agent_open_error(
                 "hosted fresh-agent provider failed to start (startup diagnostic: {diagnostic})"
             ),
         )
-        .with_diagnostic_code(RuntimeDiagnosticCode::FreshAgentProviderStartFailed),
+        .with_diagnostic_code(RuntimeDiagnosticCode::FreshAgentProviderStartFailed)
+        .with_fresh_agent_provider_start_diagnostic(diagnostic.into()),
         _ => RuntimeError::new(
             RuntimeErrorCode::HostUnreachable,
             "hosted fresh-agent provider failed to start",
@@ -5205,7 +5206,9 @@ mod tests {
     #[test]
     fn fresh_agent_open_errors_expose_only_a_closed_failure_category() {
         use freshell_agent_runtime::host_actor::{ActorError, ProviderStartDiagnostic};
-        use freshell_runtime_protocol::{RuntimeDiagnosticCode, RuntimeErrorCode};
+        use freshell_runtime_protocol::{
+            FreshAgentProviderStartDiagnostic, RuntimeDiagnosticCode, RuntimeErrorCode,
+        };
 
         let provider_start = super::map_fresh_agent_open_error(ActorError::ProviderStartFailed {
             diagnostic: ProviderStartDiagnostic::Authentication,
@@ -5214,6 +5217,10 @@ mod tests {
         assert_eq!(
             provider_start.diagnostic_code,
             Some(RuntimeDiagnosticCode::FreshAgentProviderStartFailed)
+        );
+        assert_eq!(
+            provider_start.fresh_agent_provider_start_diagnostic,
+            Some(FreshAgentProviderStartDiagnostic::Authentication)
         );
         assert_eq!(
             provider_start.message,

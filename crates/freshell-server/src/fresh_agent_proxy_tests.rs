@@ -2,7 +2,8 @@ use super::*;
 use freshell_protocol::{FreshAgentFork, FreshAgentRecoveryStop};
 use freshell_runtime_protocol::{
     read_frame, write_frame, AdminCommand, AdminReply, AdminResult, ControlRole, Envelope,
-    FreshAgentForkResult, InstallationId, RuntimeErrorCode,
+    FreshAgentForkResult, FreshAgentProviderStartDiagnostic, InstallationId, RuntimeDiagnosticCode,
+    RuntimeErrorCode,
 };
 use tokio::net::UnixListener;
 
@@ -642,6 +643,85 @@ async fn create_failure_trace_launch_rejection() {
     );
     assert!(!format!("{event:?}").contains("private-launch-failure-body"));
     assert!(!event.fields.contains_key("error"));
+}
+
+#[tokio::test]
+async fn create_provider_start_failure_keeps_only_the_safe_category_on_the_wire() {
+    if create_failure_trace_child(
+        "provider-start-frame",
+        "fresh_agent_proxy::tests::create_provider_start_failure_keeps_only_the_safe_category_on_the_wire",
+    ) {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("typed-supervisor.sock");
+    let secret = root.path().join("control-secret");
+    std::fs::write(&secret, "0123456789abcdef").unwrap();
+    crate::managed_mcp_capability::configure("0.0.0.0", 39483, &socket, &secret).unwrap();
+    let listener = UnixListener::bind(&socket).unwrap();
+    let supervisor = tokio::spawn(async move {
+        for index in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            let result = match request.body {
+                AdminCommand::Health if index == 0 => Ok(AdminResult::Health {
+                    control_epoch: 77,
+                    installation_id: InstallationId::new(),
+                }),
+                AdminCommand::Launch(_) if index == 1 => {
+                    Err(freshell_runtime_protocol::RuntimeError::new(
+                        RuntimeErrorCode::HostUnreachable,
+                        "private-launch-failure-body",
+                    )
+                    .with_diagnostic_code(RuntimeDiagnosticCode::FreshAgentProviderStartFailed)
+                    .with_fresh_agent_provider_start_diagnostic(
+                        FreshAgentProviderStartDiagnostic::Authentication,
+                    ))
+                }
+                other => panic!("unexpected provider-start test request {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: request.request_id,
+                    result,
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let (broadcast, mut receiver) = broadcast::channel(8);
+    let proxy = Arc::new(HostedFreshAgentProxy {
+        client: RuntimeClient::new(&socket, "0123456789abcdef"),
+        broadcast: Arc::new(broadcast),
+        aliases: Mutex::new(HashMap::new()),
+        presentation_routes: Mutex::new(HashMap::new()),
+        pollers: Mutex::new(HashSet::new()),
+        fixture_modes: HashSet::from(["freshclaude".to_string()]),
+        naming: OnceLock::new(),
+    });
+    let create = serde_json::from_value(serde_json::json!({
+        "requestId": "provider-start-auth-owned",
+        "provider": "claude",
+        "sessionType": "freshclaude",
+        "cwd": root.path(),
+    }))
+    .unwrap();
+    proxy.handle(HostedFreshAgentCommand::Create(create)).await;
+    tokio::time::timeout(Duration::from_secs(5), supervisor)
+        .await
+        .expect("supervisor should receive the failed launch")
+        .unwrap();
+
+    let frame: serde_json::Value = serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
+    assert_eq!(frame["type"], "freshAgent.create.failed");
+    assert_eq!(frame["code"], "FRESH_AGENT_PROVIDER_START_FAILED");
+    assert_eq!(
+        frame["message"],
+        "hosted fresh-agent provider failed to start (startup diagnostic: authentication)"
+    );
+    assert!(!frame.to_string().contains("private-launch-failure-body"));
 }
 
 #[cfg(feature = "managed-fresh-agent-fixtures")]
@@ -1442,24 +1522,30 @@ async fn managed_provider_fork_rekeys_the_same_soul_without_launch_or_stop() {
 fn semantic_operation_failures_keep_typed_public_codes() {
     use freshell_runtime_client::ClientError;
     assert_eq!(
-        operation_error_code(&ClientError::Runtime(
-            RuntimeErrorCode::UnsupportedOperation,
-            "redacted".into(),
-        )),
+        operation_error_code(&ClientError::Runtime {
+            code: RuntimeErrorCode::UnsupportedOperation,
+            message: "redacted".into(),
+            diagnostic_code: None,
+            fresh_agent_provider_start_diagnostic: None,
+        }),
         "UNSUPPORTED_CAPABILITY"
     );
     assert_eq!(
-        operation_error_code(&ClientError::Runtime(
-            RuntimeErrorCode::CommandAmbiguous,
-            "redacted".into(),
-        )),
+        operation_error_code(&ClientError::Runtime {
+            code: RuntimeErrorCode::CommandAmbiguous,
+            message: "redacted".into(),
+            diagnostic_code: None,
+            fresh_agent_provider_start_diagnostic: None,
+        }),
         "COMMAND_AMBIGUOUS"
     );
     assert_eq!(
-        operation_error_code(&ClientError::Runtime(
-            RuntimeErrorCode::OperationImplementationUnavailable,
-            "redacted".into(),
-        )),
+        operation_error_code(&ClientError::Runtime {
+            code: RuntimeErrorCode::OperationImplementationUnavailable,
+            message: "redacted".into(),
+            diagnostic_code: None,
+            fresh_agent_provider_start_diagnostic: None,
+        }),
         "IMPLEMENTATION_UNAVAILABLE"
     );
 }

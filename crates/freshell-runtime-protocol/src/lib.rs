@@ -1186,6 +1186,35 @@ pub enum RuntimeDiagnosticCode {
     FreshAgentProviderStartFailed,
 }
 
+/// A closed, body-free reason that a managed fresh-agent provider did not
+/// start. This crosses the runtime boundary only after provider error text
+/// has been reduced to one of these fixed categories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FreshAgentProviderStartDiagnostic {
+    Authentication,
+    Arguments,
+    Listener,
+    Configuration,
+    Network,
+    Unclassified,
+    NoDiagnostic,
+}
+
+impl FreshAgentProviderStartDiagnostic {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication",
+            Self::Arguments => "arguments",
+            Self::Listener => "listener",
+            Self::Configuration => "configuration",
+            Self::Network => "network",
+            Self::Unclassified => "unclassified",
+            Self::NoDiagnostic => "no-diagnostic",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeLimits {
@@ -3094,6 +3123,8 @@ pub struct RuntimeError {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostic_code: Option<RuntimeDiagnosticCode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_agent_provider_start_diagnostic: Option<FreshAgentProviderStartDiagnostic>,
 }
 
 impl RuntimeError {
@@ -3102,11 +3133,20 @@ impl RuntimeError {
             code,
             message: message.into(),
             diagnostic_code: None,
+            fresh_agent_provider_start_diagnostic: None,
         }
     }
 
     pub fn with_diagnostic_code(mut self, diagnostic_code: RuntimeDiagnosticCode) -> Self {
         self.diagnostic_code = Some(diagnostic_code);
+        self
+    }
+
+    pub fn with_fresh_agent_provider_start_diagnostic(
+        mut self,
+        diagnostic: FreshAgentProviderStartDiagnostic,
+    ) -> Self {
+        self.fresh_agent_provider_start_diagnostic = Some(diagnostic);
         self
     }
 }
@@ -4481,10 +4521,18 @@ mod tests {
             RuntimeErrorCode::HostUnreachable,
             "hosted fresh-agent provider failed to start (startup diagnostic: authentication)",
         )
-        .with_diagnostic_code(RuntimeDiagnosticCode::FreshAgentProviderStartFailed);
+        .with_diagnostic_code(RuntimeDiagnosticCode::FreshAgentProviderStartFailed)
+        .with_fresh_agent_provider_start_diagnostic(
+            FreshAgentProviderStartDiagnostic::Authentication,
+        );
+        let encoded_provider_start = serde_json::to_value(provider_start).unwrap();
         assert_eq!(
-            serde_json::to_value(provider_start).unwrap()["diagnosticCode"],
+            encoded_provider_start["diagnosticCode"],
             "FRESH_AGENT_PROVIDER_START_FAILED"
+        );
+        assert_eq!(
+            encoded_provider_start["freshAgentProviderStartDiagnostic"],
+            "authentication"
         );
 
         let old_payload = serde_json::json!({
@@ -4493,6 +4541,7 @@ mod tests {
         });
         let decoded: RuntimeError = serde_json::from_value(old_payload).unwrap();
         assert_eq!(decoded.diagnostic_code, None);
+        assert_eq!(decoded.fresh_agent_provider_start_diagnostic, None);
 
         let undecorated = serde_json::to_value(RuntimeError::new(
             RuntimeErrorCode::HostUnreachable,
@@ -4500,6 +4549,9 @@ mod tests {
         ))
         .unwrap();
         assert!(undecorated.get("diagnosticCode").is_none());
+        assert!(undecorated
+            .get("freshAgentProviderStartDiagnostic")
+            .is_none());
     }
 
     #[test]

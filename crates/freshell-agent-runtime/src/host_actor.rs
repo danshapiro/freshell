@@ -366,6 +366,23 @@ impl std::fmt::Display for ProviderStartDiagnostic {
     }
 }
 
+impl From<ProviderStartDiagnostic>
+    for freshell_runtime_protocol::FreshAgentProviderStartDiagnostic
+{
+    fn from(diagnostic: ProviderStartDiagnostic) -> Self {
+        use freshell_runtime_protocol::FreshAgentProviderStartDiagnostic as RuntimeDiagnostic;
+        match diagnostic {
+            ProviderStartDiagnostic::Authentication => RuntimeDiagnostic::Authentication,
+            ProviderStartDiagnostic::Arguments => RuntimeDiagnostic::Arguments,
+            ProviderStartDiagnostic::Listener => RuntimeDiagnostic::Listener,
+            ProviderStartDiagnostic::Configuration => RuntimeDiagnostic::Configuration,
+            ProviderStartDiagnostic::Network => RuntimeDiagnostic::Network,
+            ProviderStartDiagnostic::Unclassified => RuntimeDiagnostic::Unclassified,
+            ProviderStartDiagnostic::NoDiagnostic => RuntimeDiagnostic::NoDiagnostic,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PersistedCommand {
