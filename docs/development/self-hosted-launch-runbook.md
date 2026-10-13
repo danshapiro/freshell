@@ -123,10 +123,12 @@ the procedure mid-way and leave the service down. Two sequences:
   systemctl --user start freshell-supervisor.service
   SOCK="$HOME/.freshell/managed-runtime/control/supervisor.sock"
   # The supervisor binds its socket only AFTER startup reconciliation,
-  # which can take minutes (default 180s per soul, four concurrent
-  # recoveries — ten souls can legitimately take ~8 minutes). Bound the
-  # wait generously (900s), not tightly:
-  for i in $(seq 1 900); do
+  # which runs up to 180s per soul at four-way concurrency — size the
+  # bound from the actual inventory (the pre-restart capture) instead of
+  # a fixed guess: 45s/soul effective + a 5-minute margin:
+  N=$(wc -l < "$RUN/souls-before.txt" 2>/dev/null || echo 0)
+  BOUND=$(( N * 45 + 300 ))
+  for i in $(seq 1 "$BOUND"); do
     # CONNECT-probe, not a file test: a stopped supervisor leaves its old
     # socket FILE on disk, so [ -S ... ] passes on a dead listener:
     if python3 -c 'import socket,sys
@@ -333,10 +335,13 @@ drop-in, plus `freshell-supervisor.service`):
    set -euo pipefail   # a failed step must halt, not continue half-named
    D=$(mktemp -d)   # private per-run directory
    mkdir -p ~/scratch
+   chmod 0770 ~/scratch   # the in-soul provider (65534:0) must traverse
+                           # EVERY path component down to the workspace —
+                           # a 0700 ~/scratch fails the probe for reasons
+                           # unrelated to the redeployed runtime
    WS=$(mktemp -d ~/scratch/home-mount-probe.XXXXXX)   # unique probe workspace
-   chmod 0770 "$WS"   # the in-soul shell runs as 65534:0 — group-traversable
-                      # and group-writable is required or the probe terminal
-                      # cannot use its own workspace
+   chmod 0770 "$WS"   # group-traversable + group-writable, or the probe
+                      # terminal cannot use its own workspace
    CHECKOUT=$(systemctl --user show freshell-rust.service -p WorkingDirectory --value)
    # Token source: the server's INITIAL environment first (exact for
    # unit-supplied tokens), then a fallback parse of the checkout's .env
