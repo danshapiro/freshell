@@ -46,7 +46,7 @@ import { ManagedRuntimeInventorySnapshotSchema, type ManagedRuntimeInventorySnap
 import type { RuntimeWriterClaimFacts, ManagedMigrationFacts, ManagedStopResult, ManagedStopCompletionFacts } from './runtime-sandbox.js'
 import { pathToFileURL } from 'node:url'
 import WebSocket from 'ws'
-import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
+import { ErrorCode, WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
 import type { ExactRuntimeHandle, ManagedRuntimeView, ManagedOpenCodeAdoptionStatus, FixtureNativeState, RuntimeHostFacts, RuntimeOwnerOperationRequest } from './runtime-sandbox.js'
 import type { InterruptedOrdinaryStopFacts, InterruptedOrdinaryStopCrashFacts } from './runtime-sandbox.js'
 import type { NativeChallengeKind, NativeToolEvidence, SyntheticOpenCodeChallenge, SyntheticOpenCodeSourceFacts, SyntheticOpenCodeHistoryFacts } from './runtime-sandbox.js'
@@ -2066,11 +2066,23 @@ const OrdinaryTerminalFactsSchema = z.object({
   available: z.boolean(), provider: OrdinaryTerminalProviderSchema.optional(),
   providerProcessPresent: z.boolean().optional(), nativeSessionIdPresent: z.boolean().optional(),
 })
+const ManagedViewProbeSchema = z.object({
+  terminalCreateResult: z.enum(['created', 'error', 'no_reply']),
+  createSent: z.boolean(), wireErrorCode: ErrorCode.optional(),
+  inventoryRead: z.enum(['ok', 'failed']),
+  matchingRowCount: z.number().int().nonnegative().max(10_000),
+  matchingRows: z.array(z.object({
+    launchState: z.enum(['prepared', 'created', 'starting', 'running', 'stopping', 'stopped', 'failed', 'unknown']),
+    providerMatch: z.boolean(), containerIdPresent: z.boolean(),
+  }).strict()).max(8),
+}).strict()
 const OrdinaryTerminalTurnFactsSchema = z.object({
   inputSeen: z.boolean(), activitySeen: z.boolean(), outputSeen: z.boolean(),
   outputFrameCount: z.number().int().nonnegative().max(10000), completionSeen: z.boolean(),
 })
 const OrdinaryTerminalDiagnosticSchema = z.discriminatedUnion('event', [
+  z.object({ event: z.literal('durable_souls.managed_view_probe'), lane: z.literal('terminal'),
+    provider: z.literal('codex'), probe: ManagedViewProbeSchema }),
   z.object({ event: z.literal('durable_souls.ordinary_turn_completed'), lane: z.literal('terminal'),
     provider: OrdinaryTerminalProviderSchema }),
   z.object({ event: z.literal('durable_souls.ordinary_setup_failed'), lane: z.literal('terminal'),
@@ -2362,9 +2374,12 @@ export default class ManagedExternalExecutionReporter implements Reporter {
       if (source.lane !== target.lane || state.count >= 16) continue
       state.count += 1
       const common = { event: 'managed_external_ordinary_turn', id: test.id, file: target.file,
-        sourceEvent: source.event, outcome: source.event.endsWith('_failed') ? 'failed' : 'completed', lane: source.lane }
+        sourceEvent: source.event, outcome: source.event === 'durable_souls.ordinary_turn_completed'
+          ? 'completed' : 'failed', lane: source.lane }
       if (source.event === 'durable_souls.ordinary_setup_failed') {
         this.emit({ ...common, setupFailureStage: source.stage })
+      } else if (source.event === 'durable_souls.managed_view_probe') {
+        this.emit({ ...common, provider: source.provider, managedViewProbe: source.probe })
       } else if (source.lane === 'terminal' && source.event === 'durable_souls.ordinary_turn_failed') {
         this.emit({ ...common, provider: source.provider,
           paneSetupFailureStage: source.paneSetupFailureStage ?? null,

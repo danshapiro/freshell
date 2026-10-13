@@ -31,6 +31,7 @@ import {
   type Task2RetainedBrowserPhase,
 } from '../../../scripts/testing/task002-config-legacy-fixtures.js'
 import { ExternalManagedRuntimeRig, resolveManagedExternalDescriptor } from '../../../scripts/testing/runtime-external-browser.js'
+import { projectManagedViewProbe } from '../../../scripts/testing/managed-view-probe.js'
 import { task2RetainedPublicContext, type Task2RetainedPublicContext } from '../../../scripts/testing/task002-retained-fixture.js'
 import { managedRecoveryBlockedMessage } from '../../../src/lib/managed-runtime-recovery-message.js'
 import {
@@ -320,6 +321,7 @@ async function createProviderPane(
   tabId: string,
   definition: ProviderDefinition,
   onStage?: (stage: ProviderPaneSetupStage) => void,
+  onManagedViewTimeout?: (target: { terminalId: string; createRequestId: string }) => Promise<void>,
 ): Promise<{ paneId: string; terminalId: string; view: ManagedRuntimeView }> {
   onStage?.('existing_panes')
   const priorPaneIds = new Set(
@@ -344,12 +346,22 @@ async function createProviderPane(
   await page.locator(`[data-pane-id="${leaf.id}"] .xterm:visible`)
     .waitFor({ state: 'visible', timeout: 120_000 })
   onStage?.('managed_runtime_view')
-  const view = await waitForValue(`${definition.provider} managed runtime view`, async () => {
-    const candidate = await rig.runningViewForTerminal(leaf.content.terminalId)
-    return candidate?.containerId ? candidate : null
-  }, 120_000)
+  const terminalId = leaf.content.terminalId as string
+  let view: ManagedRuntimeView
+  try {
+    view = await waitForValue(`${definition.provider} managed runtime view`, async () => {
+      const candidate = await rig.runningViewForTerminal(terminalId)
+      return candidate?.containerId ? candidate : null
+    }, 120_000)
+  } catch (error) {
+    try {
+      await onManagedViewTimeout?.({ terminalId,
+        createRequestId: typeof leaf.content.createRequestId === 'string' ? leaf.content.createRequestId : '' })
+    } catch { /* diagnostic failures must preserve the managed-view timeout */ }
+    throw error
+  }
   onStage?.('ready')
-  return { paneId: leaf.id, terminalId: leaf.content.terminalId, view }
+  return { paneId: leaf.id, terminalId, view }
 }
 
 function limitEvidence(view: ManagedRuntimeView, actual: ManagedTerminalStartupFacts['limits']): ProviderQualificationRow['limitEvidence'] {
@@ -621,7 +633,27 @@ test.describe.serial('ordinary managed-provider use', () => {
         let created: Awaited<ReturnType<typeof createProviderPane>> | undefined
         let paneSetupStage: ProviderPaneSetupStage | null = null
         try {
-          created = await createProviderPane(page, harness, rig, tabId, definition, stage => { paneSetupStage = stage })
+          const onManagedViewTimeout = definition.provider === 'codex'
+            ? async ({ terminalId, createRequestId }: { terminalId: string; createRequestId: string }) => {
+              try {
+                const [sentMessages, receivedMessages] = await Promise.all([
+                  harness.getSentWsMessages(), harness.getReceivedWsMessages(),
+                ])
+                let inventoryRead: 'ok' | 'failed' = 'failed'
+                let inventory: unknown
+                try {
+                  inventory = await rig!.inventory()
+                  inventoryRead = 'ok'
+                } catch { /* retain the create observation when owner inventory is unavailable */ }
+                const probe = projectManagedViewProbe({ terminalId, createRequestId, provider: 'codex',
+                  sentMessages, receivedMessages, inventoryRead, inventory })
+                console.error(JSON.stringify({ severity: 'error', event: 'durable_souls.managed_view_probe',
+                  lane: 'terminal', provider: 'codex', probe }))
+              } catch { /* diagnostic failures must preserve the managed-view timeout */ }
+            }
+            : undefined
+          created = await createProviderPane(page, harness, rig, tabId, definition,
+            stage => { paneSetupStage = stage }, onManagedViewTimeout)
           if (definition.provider === 'amplifier') {
             throw new Error('Amplifier is excluded from the ordinary terminal smoke')
           }

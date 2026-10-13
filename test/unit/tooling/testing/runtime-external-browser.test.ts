@@ -26,6 +26,7 @@ vi.mock('../../../e2e-browser/helpers/fixtures.js', () => ({
 
 import { runSelectedProviderQualification } from '../../../../scripts/testing/runtime-provider-qualification.js'
 import { runSelectedFreshAgentQualification } from '../../../../scripts/testing/runtime-fresh-agent-qualification.js'
+import { projectManagedViewProbe } from '../../../../scripts/testing/managed-view-probe.js'
 
 import { playwright, campaignGate } from '../../../../scripts/testing/runtime-landing-campaign.js'
 import * as runner from '../../../../scripts/testing/runtime-external-browser.js'
@@ -999,6 +1000,50 @@ describe('candidate-bound Cloud execution events', () => {
 })
 
 describe('body-free ordinary-turn Cloud diagnostics', () => {
+  it('forwards the Codex managed-view probe only for the exact terminal smoke', () => {
+    for (const [key, value] of Object.entries(descriptor)) vi.stubEnv(key, value)
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+    try {
+      const reporter = new runner.default()
+      const testCase = { id: 'ordinary-turn-codex-probe', location: {
+        file: 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts',
+      }, title: 'each selected terminal provider completes one ordinary turn' } as any
+      const probe = projectManagedViewProbe({
+        terminalId: 'private-terminal-id-sentinel', createRequestId: 'private-request-id-sentinel', provider: 'codex',
+        sentMessages: [{ type: 'terminal.create', requestId: 'private-request-id-sentinel' }],
+        receivedMessages: [], inventoryRead: 'ok',
+        inventory: [{ terminalId: 'private-terminal-id-sentinel', launchState: 'starting', provider: 'codex',
+          containerId: 'a'.repeat(64), soulId: 'private-soul-id-sentinel' }],
+      })
+      reporter.onStdOut(`${JSON.stringify({ severity: 'error', event: 'durable_souls.managed_view_probe',
+        lane: 'terminal', provider: 'codex', probe, prompt: 'private-prompt-sentinel' })}\n`, testCase)
+      reporter.onStdOut(`${JSON.stringify({ event: 'durable_souls.managed_view_probe', lane: 'terminal',
+        provider: 'claude', probe })}\n`, testCase)
+      reporter.onStdOut(`${JSON.stringify({ event: 'durable_souls.managed_view_probe', lane: 'terminal',
+        provider: 'codex', probe })}\n`, { ...testCase, id: 'wrong-title', title: 'different title' } as any)
+
+      expect(write).toHaveBeenCalledOnce()
+      const forwarded = JSON.parse(String(write.mock.calls[0][0]))
+      expect(forwarded).toEqual({
+        severity: 'info', runId: descriptor.FRESHELL_RUNTIME_EXTERNAL_RUN_ID,
+        candidateSha: descriptor.FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA,
+        event: 'managed_external_ordinary_turn', id: 'ordinary-turn-codex-probe',
+        file: 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts',
+        sourceEvent: 'durable_souls.managed_view_probe', outcome: 'failed', lane: 'terminal', provider: 'codex',
+        managedViewProbe: {
+          terminalCreateResult: 'no_reply', createSent: true, inventoryRead: 'ok', matchingRowCount: 1,
+          matchingRows: [{ launchState: 'starting', providerMatch: true, containerIdPresent: true }],
+        },
+      })
+      const serialized = JSON.stringify(forwarded)
+      for (const sentinel of ['private-terminal-id-sentinel', 'private-request-id-sentinel',
+        'private-soul-id-sentinel', 'private-prompt-sentinel']) expect(serialized).not.toContain(sentinel)
+    } finally {
+      write.mockRestore()
+      vi.unstubAllEnvs()
+    }
+  })
+
   it('forwards only the fixed setup stage and safe facts from the selected terminal smoke', () => {
     for (const [key, value] of Object.entries(descriptor)) vi.stubEnv(key, value)
     const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
@@ -1232,6 +1277,78 @@ describe('body-free ordinary-turn Cloud diagnostics', () => {
       write.mockRestore()
       vi.unstubAllEnvs()
     }
+  })
+})
+
+describe('body-free managed-view probe projection', () => {
+  it('keeps only matching create outcome and fixed inventory facts', () => {
+    const probe = projectManagedViewProbe({
+      terminalId: 'private-terminal-id-sentinel',
+      createRequestId: 'private-request-id-sentinel',
+      provider: 'codex',
+      sentMessages: [{ type: 'terminal.create', requestId: 'private-request-id-sentinel' }],
+      receivedMessages: [{ type: 'error', requestId: 'private-request-id-sentinel', code: 'PTY_SPAWN_FAILED',
+        message: 'private-error-message-sentinel', terminalId: 'private-error-terminal-sentinel' }],
+      inventoryRead: 'ok',
+      inventory: [
+        { terminalId: 'other-terminal', launchState: 'running', provider: 'codex', containerId: 'a'.repeat(64) },
+        { terminalId: 'private-terminal-id-sentinel', launchState: 'failed', provider: 'codex',
+          containerId: 'b'.repeat(64), soulId: 'private-soul-id-sentinel' },
+        { terminalId: 'private-terminal-id-sentinel', launchState: 'private-launch-state-sentinel',
+          provider: 'private-provider-sentinel', containerId: '', nativeSessionId: 'private-session-id-sentinel' },
+      ],
+    })
+
+    expect(probe).toEqual({
+      terminalCreateResult: 'error', createSent: true, wireErrorCode: 'PTY_SPAWN_FAILED',
+      inventoryRead: 'ok', matchingRowCount: 2,
+      matchingRows: [
+        { launchState: 'failed', providerMatch: true, containerIdPresent: true },
+        { launchState: 'unknown', providerMatch: false, containerIdPresent: false },
+      ],
+    })
+    const serialized = JSON.stringify(probe)
+    for (const sentinel of [
+      'private-terminal-id-sentinel', 'private-request-id-sentinel', 'private-error-message-sentinel',
+      'private-error-terminal-sentinel', 'private-soul-id-sentinel', 'private-launch-state-sentinel',
+      'private-provider-sentinel', 'private-session-id-sentinel',
+    ]) expect(serialized).not.toContain(sentinel)
+  })
+
+  it('keeps matching create errors while omitting unknown wire codes', () => {
+    const probe = projectManagedViewProbe({
+      terminalId: 'target-terminal', createRequestId: 'target-request', provider: 'codex',
+      sentMessages: [{ type: 'terminal.create', requestId: 'target-request' }],
+      receivedMessages: [{ type: 'error', requestId: 'target-request', code: 'private-wire-code-sentinel',
+        message: 'private-wire-message-sentinel' }],
+      inventoryRead: 'failed', inventory: null,
+    })
+
+    expect(probe).toEqual({
+      terminalCreateResult: 'error', createSent: true,
+      inventoryRead: 'failed', matchingRowCount: 0, matchingRows: [],
+    })
+    expect(JSON.stringify(probe)).not.toContain('private-wire-code-sentinel')
+    expect(JSON.stringify(probe)).not.toContain('private-wire-message-sentinel')
+  })
+
+  it('caps exact matches and includes only a bounded row projection', () => {
+    const probe = projectManagedViewProbe({
+      terminalId: 'target-terminal', createRequestId: 'target-request', provider: 'codex',
+      sentMessages: [{ type: 'terminal.create', requestId: 'another-request' }],
+      receivedMessages: [{ type: 'terminal.created', requestId: 'another-request' }],
+      inventoryRead: 'ok',
+      inventory: Array.from({ length: 10_005 }, (_, index) => ({ terminalId: 'target-terminal',
+        launchState: index % 2 ? 'running' : 'starting', provider: 'codex', containerId: 'c'.repeat(64),
+        soulId: `private-soul-${index}` })),
+    })
+
+    expect(probe.terminalCreateResult).toBe('no_reply')
+    expect(probe.createSent).toBe(false)
+    expect(probe.matchingRowCount).toBe(10_000)
+    expect(probe.matchingRows).toHaveLength(8)
+    expect(probe.matchingRows[0]).toEqual({ launchState: 'starting', providerMatch: true, containerIdPresent: true })
+    expect(JSON.stringify(probe)).not.toContain('private-soul-')
   })
 })
 
