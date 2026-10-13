@@ -121,17 +121,28 @@ the procedure mid-way and leave the service down. Two sequences:
 
   ```bash
   systemctl --user start freshell-supervisor.service
-  until [ -S "$HOME/.freshell/managed-runtime/control/supervisor.sock" ]; do
+  SOCK="$HOME/.freshell/managed-runtime/control/supervisor.sock"
+  for i in $(seq 1 60); do
+    # CONNECT-probe, not a file test: a stopped supervisor leaves its old
+    # socket FILE on disk, so [ -S ... ] passes on a dead listener:
+    python3 -c 'import socket,sys
+s=socket.socket(socket.AF_UNIX); s.settimeout(1)
+try: s.connect(sys.argv[1])
+except OSError: sys.exit(1)' "$SOCK" 2>/dev/null && break
+    systemctl --user is-active freshell-supervisor.service >/dev/null \
+      || { echo "supervisor unit is not active"; exit 1; }
     sleep 1
   done
   systemctl --user start freshell-rust.service
   ```
 
-  If the server unit fails its first start in the race window, that is
-  this socket ordering, not a bad build — wait for the socket and start
-  it again (repeated immediate failures can also trip the unit's start
-  limit). No soul can be created during the build. This is a full outage
-  for the duration of the build.
+  The connect-probe waits for a LIVE listener (a stale file fails the
+  connect), fails fast if the supervisor unit dies, and is bounded. If the
+  server unit fails its first start in a race window, that is this socket
+  ordering, not a bad build — wait for the live socket and start it again
+  (repeated immediate failures can also trip the unit's start limit). No
+  soul can be created during the build. This is a full outage for the
+  duration of the build.
 
 - The server's soul controller is strictly opt-in (`default = []` in
   `crates/freshell-server/Cargo.toml`). Setting `FRESHELL_MANAGED_RUNTIME_V1=1`
@@ -173,6 +184,11 @@ drop-in, plus `freshell-supervisor.service`):
   `freshell-supervisor.service`. Restarting the SUPERVISOR therefore also
   restarts the server in the same transaction — one
   `systemctl --user restart freshell-supervisor.service` redeploys both.
+  The same `Type=simple` socket race as the strict sequence applies here:
+  the server may start before the supervisor rebinds its control socket
+  and come up failed. If the server unit is not `active` after the
+  coupled bounce, connect-probe the socket as in the strict sequence and
+  `systemctl --user start freshell-rust.service` once it is live.
 - Restarting the server alone (`systemctl --user restart
   freshell-rust.service`) leaves the supervisor running. Use this for
   server-only changes.
@@ -250,9 +266,10 @@ drop-in, plus `freshell-supervisor.service`):
 3. Units: `systemctl --user is-active freshell-rust.service
    freshell-supervisor.service` → both `active`, and the supervisor's
    control socket
-   (`~/.freshell/managed-runtime/control/supervisor.sock`) exists with
-   mode `0600` — the supervisor unit is `Type=simple`, so "active" does
-   not by itself prove the socket is up.
+   (`~/.freshell/managed-runtime/control/supervisor.sock`) is LIVE —
+   connect-probe it as in the strict sequence, because the supervisor unit
+   is `Type=simple` and a stopped supervisor leaves its old socket file
+   on disk.
 4. Existing souls: capture the post-restart inventory to a SEPARATE file
    in the same private run directory and compare it against the preserved
    baseline — do NOT re-run the pre-restart command as-is, which would
@@ -306,13 +323,22 @@ drop-in, plus `freshell-supervisor.service`):
                       # and group-writable is required or the probe terminal
                       # cannot use its own workspace
    CHECKOUT=$(systemctl --user show freshell-rust.service -p WorkingDirectory --value)
-   TOK=$(grep -E '^AUTH_TOKEN=' "$CHECKOUT/.env" | cut -d= -f2-)
+   # Robust dotenv extraction (the server accepts `export AUTH_TOKEN=`,
+   # quoted values, and inline comments on unquoted values — a bare
+   # `grep AUTH_TOKEN= | cut` mangles all three):
+   TOK=$(python3 -c 'import re,sys
+m=re.search(r"^\s*(?:export\s+)?AUTH_TOKEN\s*=\s*(.*)$", open(sys.argv[1]).read(), re.M)
+v=m.group(1).strip()
+if v[:1] in (chr(34),chr(39)):
+    v=v[1:-1] if v[-1:]==v[0] else v
+else:
+    v=v.split(chr(35))[0].strip()
+print(v)' "$CHECKOUT/.env")
    umask 077
    printf 'x-auth-token: %s\n' "$TOK" > "$D/hdr"   # header file, not argv
    trap 'rm -f "$D/hdr"' EXIT   # the token file must not survive ANY exit
-   printf 'D=%q\nWS=%q\nCHECKOUT=%q\n' "$D" "$WS" "$CHECKOUT" > "$D/run.env"
-   echo "$D" > "$HOME/.freshell/managed-runtime-probe-dir"   # recovery pointer
-   # create the probe pane (example); record terminalId from the response:
+    printf 'D=%q\nWS=%q\nCHECKOUT=%q\n' "$D" "$WS" "$CHECKOUT" > "$D/run.env"
+    # create the probe pane (example); record terminalId from the response:
    curl -s -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
      -d '{"mode":"shell","cwd":"'"$WS"'","name":"home-mount probe"}' \
      http://127.0.0.1:3001/api/tabs | tee "$D/probe-tab.json"
@@ -336,17 +362,20 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
    [managed-runtime-rollout.md](managed-runtime-rollout.md)).
 
    Run steps 5-8 in ONE shell session: the private directory `$D`, the
-   probe workspace `$WS`, and their records persist between them, and
-   `$D/run.env` plus the `~/.freshell/managed-runtime-probe-dir` pointer
-   let a later block reload them (see step 8's recovery lines). If the
+   probe workspace `$WS`, and their records persist between them. If the
    shell is lost or a check aborts under `set -e`, the FILES survive —
-   only the variables die — so recovery is: open a new shell, then either
-   source the pointer's `run.env`, or, when concurrent probe runs make
-   the pointer untrustworthy, locate YOUR workspace by timestamp
-   (`ls -dt ~/scratch/home-mount-probe.*`) and recover purely from it:
-   the soul whose `terminalCwd` equals that workspace IS your probe
-   (workspace uniqueness is the identity proof), so apply the same
-   fenced stop to that soul directly and delete the directories by hand.
+   only the variables die. There is deliberately NO shared pointer file to
+   reload: a pointer can be overwritten by a concurrent probe run whose
+   records are self-consistent, and loading it would stop the wrong soul.
+   Recovery is by YOUR unique workspace only — locate it by timestamp
+   (`ls -dt ~/scratch/home-mount-probe.*`), pick the one that is yours
+   (you know when you ran the probe; inspect the directory if unsure),
+   and recover purely from it: the soul whose `terminalCwd` equals that
+   workspace IS your probe (workspace uniqueness is the identity proof),
+   so apply the same fenced stop to that soul directly, then delete the
+   directories by hand. If you cannot identify your workspace with
+   certainty, do not stop anything — leave the probe soul running (it is
+   inert) rather than risk stopping another run's session.
 
     Then confirm the probe container carries the operator-home bind and the
     `FRESHELL_OPERATOR_HOME_MOUNT=1` marker env (`docker inspect`), and that
@@ -431,31 +460,62 @@ print("UI pane is managed:", hits[0]["soulId"])' "$BWS"
 
     ```bash
     set -euo pipefail   # a failed check must halt BEFORE the stop request
-    # Reload this run's records if the shell died between steps (files
-    # survive a set -e abort; only the variables die):
-    if [ -z "${D:-}" ] && [ -f "$HOME/.freshell/managed-runtime-probe-dir" ]; then
-      . "$(cat "$HOME/.freshell/managed-runtime-probe-dir")/run.env"
-    fi
-    : "${D:?no run records — use the workspace-timestamp recovery above}"
     CHECKOUT=$(systemctl --user show freshell-rust.service -p WorkingDirectory --value)
-    # Self-healing retry: the trap removed the header on the previous exit;
-    # recreate it (0600) only when missing:
+    if [ -z "${D:-}" ]; then
+      # Lost-shell recovery — deliberately NOT pointer-based (a concurrent
+      # run's records are self-consistent and would stop the wrong soul).
+      # $WS is the identity proof; export it from YOUR workspace listing:
+      if [ -z "${WS:-}" ]; then
+        ls -dt ~/scratch/home-mount-probe.* 2>/dev/null || true
+        echo "export WS=<your workspace from the list above>, then re-run"
+        exit 1
+      fi
+      D=$(mktemp -d)   # fresh records dir for the recovery run
+    fi
+    # Self-healing token header: the trap removed it on the previous exit;
+    # recreate it (0600) only when missing, with the same robust dotenv
+    # extraction as step 5:
     if [ ! -f "$D/hdr" ]; then
-      TOK=$(grep -E '^AUTH_TOKEN=' "$CHECKOUT/.env" | cut -d= -f2-)
+      TOK=$(python3 -c 'import re,sys
+m=re.search(r"^\s*(?:export\s+)?AUTH_TOKEN\s*=\s*(.*)$", open(sys.argv[1]).read(), re.M)
+v=m.group(1).strip()
+if v[:1] in (chr(34),chr(39)):
+    v=v[1:-1] if v[-1:]==v[0] else v
+else:
+    v=v.split(chr(35))[0].strip()
+print(v)' "$CHECKOUT/.env")
       umask 077; printf 'x-auth-token: %s\n' "$TOK" > "$D/hdr"
     fi
     trap 'rm -f "$D/hdr"' EXIT   # scrub the token file on every exit path
-    SOUL_ID=$(cat "$D/probe-soul-id.txt")
-    TID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["data"]["terminalId"])' "$D/probe-tab.json")
-    # Identity re-check FIRST; with set -e its failure aborts the block
-    # before the revision fetch and the stop request are ever reached:
-    curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls/$SOUL_ID \
-      | python3 -c 'import json,sys
+    if [ -z "${SOUL_ID:-}" ]; then
+      # Recovery mode: derive the probe soul from the unique workspace —
+      # no independent terminalId check applies here; WS uniqueness IS
+      # the identity proof. (Requires WS; a known $D alone is NOT enough —
+      # its records are only trustworthy alongside this shell's own step 5.)
+      if [ -z "${WS:-}" ]; then
+        ls -dt ~/scratch/home-mount-probe.* 2>/dev/null || true
+        echo "export WS=<your workspace from the list above>, then re-run"
+        exit 1
+      fi
+      PROBE=$(curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
+        | python3 -c 'import json,sys
+souls=json.load(sys.stdin)["souls"]
+hits=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
+assert hits, "no soul for this workspace — nothing to stop"
+print(hits[0]["soulId"], hits[0]["intentRevision"], hits[0]["terminalId"])' "$WS")
+      read -r SOUL_ID REV TID <<< "$PROBE"
+    else
+      TID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["data"]["terminalId"])' "$D/probe-tab.json")
+      # Identity re-check FIRST; with set -e its failure aborts the block
+      # before the revision fetch and the stop request are ever reached:
+      curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls/$SOUL_ID \
+        | python3 -c 'import json,sys
 s=json.load(sys.stdin)["soul"]
 assert s.get("terminalId")==sys.argv[1], ("SOUL/PROBE MISMATCH", s)
 print("identity ok:", s.get("terminalId"))' "$TID"
-    REV=$(curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls/$SOUL_ID \
-      | python3 -c 'import json,sys;print(json.load(sys.stdin)["soul"]["intentRevision"])')
+      REV=$(curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls/$SOUL_ID \
+        | python3 -c 'import json,sys;print(json.load(sys.stdin)["soul"]["intentRevision"])')
+    fi
     curl -s -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
       -d "{\"requestId\":\"probe-cleanup\",\"expectedIntentRevision\":$REV}" \
       http://127.0.0.1:3001/api/runtime/souls/$SOUL_ID/stop \
@@ -464,23 +524,28 @@ o=json.load(sys.stdin)
 assert o.get("outcome")=="verified_empty", o
 print("stopped:", o["outcome"])'
     # Stop the browser-check soul the same way BEFORE deleting its
-    # workspace (closing the pane only detaches; the soul keeps running):
+    # workspace (closing the pane only detaches; the soul keeps running).
+    # Look it up by workspace in ANY launchState — a blocked or exited
+    # probe soul still must not be orphaned against a deleted workspace:
     if [ -n "${BWS:-}" ]; then
-      BS_ID=$(curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
+      BS=$(curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
         | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
-hits=[s for s in souls if s.get("terminalCwd")==sys.argv[1] and s.get("launchState")=="running"]
-print(hits[0]["soulId"] if hits else "")' "$BWS")
-      if [ -n "$BS_ID" ]; then
-        BREV=$(curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls/$BS_ID \
-          | python3 -c 'import json,sys;print(json.load(sys.stdin)["soul"]["intentRevision"])')
-        curl -s -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
-          -d "{\"requestId\":\"probe-cleanup\",\"expectedIntentRevision\":$BREV}" \
-          http://127.0.0.1:3001/api/runtime/souls/$BS_ID/stop \
-          | python3 -c 'import json,sys
+hits=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
+print((hits[0]["soulId"], hits[0]["intentRevision"], hits[0]["launchState"]) if hits else "")' "$BWS")
+      if [ -n "$BS" ]; then
+        BS_ID=$(cut -d" " -f1 <<<"$BS")
+        BS_REV=$(cut -d" " -f2 <<<"$BS")
+        BS_STATE=$(cut -d" " -f3 <<<"$BS")
+        if [ "$BS_STATE" != "stopped" ]; then
+          curl -s -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
+            -d "{\"requestId\":\"probe-cleanup\",\"expectedIntentRevision\":$BS_REV}" \
+            http://127.0.0.1:3001/api/runtime/souls/$BS_ID/stop \
+            | python3 -c 'import json,sys
 o=json.load(sys.stdin)
 assert o.get("outcome")=="verified_empty", o
 print("stopped browser soul:", o["outcome"])'
+        fi
       fi
     fi
     rm -rf "$D" "$WS" "${BWS:-}"   # runs only on success; trap removed the header
