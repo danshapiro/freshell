@@ -128,13 +128,13 @@ unset DOCKER_CONTEXT || true
 # `--flag value` and `--flag=value` forms (splitting on spaces would
 # separate the flag from its value and yield empty matches):
 UNIT_CAT=$(systemctl --user cat freshell-supervisor.service)
-DSOCK=$(grep -oP '(?<=--docker-socket[= ])\S+' <<<"$UNIT_CAT" | head -1)
+DSOCK=$(grep -oP '(?<=--docker-socket[= ])\S+' <<<"$UNIT_CAT" | tail -1)   # tail: a drop-in that resets ExecStart comes LAST in cat output
 DSOCK=${DSOCK//%t/${XDG_RUNTIME_DIR:-/run/user/$(id -u)}}
 DSOCK=${DSOCK//%h/$HOME}
 DSOCK=${DSOCK:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock}
 export DOCKER_HOST="unix://$DSOCK"
 # Same for the registry root the soul inventory reads (used below):
-REGROOT=$(grep -oP '(?<=--registry-root[= ])\S+' <<<"$UNIT_CAT" | head -1)
+REGROOT=$(grep -oP '(?<=--registry-root[= ])\S+' <<<"$UNIT_CAT" | tail -1)   # tail: drop-in resets win
 REGROOT=${REGROOT//%t/${XDG_RUNTIME_DIR:-/run/user/$(id -u)}}
 REGROOT=${REGROOT//%h/$HOME}
 REGROOT=${REGROOT:-$HOME/.freshell/managed-runtime/registry}
@@ -244,7 +244,7 @@ the procedure mid-way and leave the service down. Two sequences:
   # The control socket path comes from the INSTALLED unit (a
   # site-specific --control-socket must not defeat this wait):
   SOCK=$(grep -oP '(?<=--control-socket[= ])\S+' \
-    <(systemctl --user cat freshell-supervisor.service) | head -1)
+    <(systemctl --user cat freshell-supervisor.service) | tail -1)   # tail: a drop-in that resets ExecStart comes LAST
   SOCK=${SOCK//%t/${XDG_RUNTIME_DIR:-/run/user/$(id -u)}}
   SOCK=${SOCK//%h/$HOME}
   SOCK=${SOCK:-$HOME/.freshell/managed-runtime/control/supervisor.sock}
@@ -759,7 +759,19 @@ print("" if cur is None else cur)' "$D/settings.json" > "$D/old-opencode-cwd.txt
 d=json.load(sys.stdin); d=d.get("data",d)
 for r in (d.get("allowedFilePaths") or []):
     print(r)')
-    if ! printf '%s\n' "$ALLOWED" | grep -q "^$HOME"; then
+    # Is the probe path itself PERMITTED? An allowed entry A permits the
+    # probe path when the path starts with A — e.g. allowed=["/home/dan/work"]
+    # does NOT permit $HOME/freshell-probe.* even though the entry sits
+    # under $HOME; allowed=["/home"] DOES. A grep for "^$HOME" answers
+    # the wrong question for both cases:
+    PROBE_PATH_OK=0
+    while read -r A; do
+      [ -n "$A" ] || continue
+      case "$HOME/freshell-probe.probe" in
+        "$A"*) PROBE_PATH_OK=1; break ;;
+      esac
+    done <<<"$ALLOWED"
+    if [ "$PROBE_PATH_OK" != 1 ]; then
       FIRST_ALLOWED=$(head -1 <<<"$ALLOWED")
       if [ -n "$FIRST_ALLOWED" ]; then
         # Keep PROBE_ROOT (and the REST probe's WS) where it is — mint a
