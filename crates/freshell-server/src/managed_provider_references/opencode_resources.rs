@@ -709,27 +709,57 @@ fn shell_directory_relative_paths(
 }
 
 fn shell_line_invokes_node(line: &str) -> bool {
-    let mut command = line.trim_start();
-    while let Some(rest) = command
-        .strip_prefix("exec ")
-        .or_else(|| command.strip_prefix("command "))
-    {
-        command = rest.trim_start();
+    fn executable_name(token: &str) -> String {
+        let token = token.trim_matches(['"', '\'']);
+        let name = Path::new(token)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        name.strip_suffix(".exe").unwrap_or(&name).to_owned()
     }
-    let executable = command
+
+    let words = line
         .split_ascii_whitespace()
-        .next()
-        .unwrap_or_default()
-        .trim_matches(['"', '\'']);
-    let name = Path::new(executable)
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_ascii_lowercase();
-    matches!(
-        name.strip_suffix(".exe").unwrap_or(&name),
-        "node" | "nodejs"
-    )
+        .map(|word| word.trim_matches(['"', '\'']))
+        .collect::<Vec<_>>();
+    let mut index = 0;
+    while let Some(word) = words.get(index) {
+        if matches!(*word, "exec" | "command") || word.contains('=') {
+            index += 1;
+        } else {
+            break;
+        }
+    }
+    let Some(executable) = words.get(index) else {
+        return false;
+    };
+    match executable_name(executable).as_str() {
+        "node" | "nodejs" => return true,
+        "env" => index += 1,
+        _ => return false,
+    }
+
+    while let Some(argument) = words.get(index) {
+        if matches!(*argument, "-S" | "--split-string") {
+            return words
+                .get(index + 1)
+                .is_some_and(|command| shell_line_invokes_node(command));
+        }
+        if let Some(command) = argument.strip_prefix("--split-string=") {
+            return shell_line_invokes_node(command);
+        }
+        if matches!(*argument, "-u" | "--unset" | "-C" | "--chdir" | "--argv0") {
+            index += 2;
+            continue;
+        }
+        if argument.starts_with('-') || argument.contains('=') {
+            index += 1;
+            continue;
+        }
+        return matches!(executable_name(argument).as_str(), "node" | "nodejs");
+    }
+    false
 }
 
 enum JavaScriptToken {
@@ -876,10 +906,16 @@ fn node_relative_resource_specifiers(
                 Some(JavaScriptToken::Punctuation(b'.'))
             )
             && matches!(tokens.get(index + 9), Some(JavaScriptToken::Identifier(name)) if name == "url")
-            && matches!(
+            && (matches!(
                 tokens.get(index + 10),
                 Some(JavaScriptToken::Punctuation(b')'))
-            );
+            ) || (matches!(
+                tokens.get(index + 10),
+                Some(JavaScriptToken::Punctuation(b','))
+            ) && matches!(
+                tokens.get(index + 11),
+                Some(JavaScriptToken::Punctuation(b')'))
+            )));
         if new_keyword == "new"
             && url_constructor == "URL"
             && is_import_meta_url

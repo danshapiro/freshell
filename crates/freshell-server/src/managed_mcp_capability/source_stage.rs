@@ -1101,7 +1101,7 @@ mod configured_resource_tests {
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(
             &command,
-            "import { readFileSync } from 'node:fs';\nprocess.stdout.write(readFileSync(new URL('./schema.json', import.meta.url), 'utf8'));\n",
+            "import { readFileSync } from 'node:fs';\nprocess.stdout.write(readFileSync(new URL('./schema.json', import.meta.url,), 'utf8'));\n",
         )
         .unwrap();
         std::fs::write(&schema, "static schema loaded\n").unwrap();
@@ -1182,7 +1182,7 @@ mod configured_resource_tests {
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(
             &command,
-            "#!/bin/sh\nSCRIPT_DIR=$(dirname \"$0\")\nexec node \"$SCRIPT_DIR/server.js\"\n",
+            "#!/bin/sh\nSCRIPT_DIR=$(dirname \"$0\")\nexec env node \"$SCRIPT_DIR/server.js\"\n",
         )
         .unwrap();
         std::fs::write(
