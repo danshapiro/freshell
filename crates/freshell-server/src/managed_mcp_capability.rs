@@ -1670,6 +1670,7 @@ fn stage_provider_root(
                 .iter()
                 .map(|reference| PathBuf::from(&reference.source_path)),
         );
+        let mut _filtered_resource_sources = None;
         let mut retained_resource_sources = None;
         if let Some(plan) = opencode_input.source_plan {
             // Indexed payloads remain exclusively in the private input volume,
@@ -1732,6 +1733,19 @@ fn stage_provider_root(
             } else {
                 None
             };
+            if !units.is_empty() {
+                let scratch = tempfile::tempdir_in(parent).map_err(|error| error.to_string())?;
+                source_stage::filter_workspace_from_enclosing_resource_units(
+                    &mut units,
+                    opencode_input
+                        .workspace
+                        .or(opencode_input.cwd)
+                        .unwrap_or(home),
+                    scratch.path(),
+                    &excluded,
+                )?;
+                _filtered_resource_sources = Some(scratch);
+            }
             selections.extend(source_stage::resource_copy_selections(&units)?);
             let descriptors = units
                 .into_iter()
@@ -11765,6 +11779,112 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             .unwrap(),
             direct
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_opencode_package_resource_scope_excludes_workspace_during_controller_stage() {
+        use crate::managed_provider_references::sources::*;
+        use freshell_platform::opencode_recipe::DiscoveryRole;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let external = owned.path().join("external");
+        let workspace = external.join("project");
+        let tools = external.join("tools");
+        let server = tools.join("server.mjs");
+        let config = workspace.join(".opencode/opencode.json");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(workspace.join("workspace-data.txt"), "mounted project\n").unwrap();
+        std::fs::write(external.join("package.json"), r#"{"type":"module"}"#).unwrap();
+        std::fs::write(
+            &server,
+            "import {readFileSync} from 'node:fs';import path from 'node:path';import {fileURLToPath} from 'node:url';const dir=path.dirname(fileURLToPath(import.meta.url));process.stdout.write(readFileSync(path.join(dir,'../schema.json'),'utf8'));\n",
+        )
+        .unwrap();
+        std::fs::write(external.join("schema.json"), "controller package asset\n").unwrap();
+        let command = vec![
+            "bun".to_owned(),
+            "run".to_owned(),
+            server.to_string_lossy().into_owned(),
+        ];
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "mcp": { "computed-asset": { "type": "local", "command": command } },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config,
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Workspace,
+            }],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .unwrap();
+        let capabilities = owned.path().join("capabilities");
+        std::fs::create_dir(&capabilities).unwrap();
+        let staged = stage_provider_root(
+            &capabilities,
+            "grant-opencode-package-resource",
+            "opencode",
+            &home,
+            &[],
+            OpencodeEphemeralInput {
+                cwd: Some(&workspace),
+                workspace: Some(&workspace),
+                source_plan: Some(&plan),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        let mounts: Vec<freshell_runtime_protocol::ProviderResourceMount> = serde_json::from_slice(
+            &std::fs::read(staged.join(".freshell/resource-mounts.json")).unwrap(),
+        )
+        .unwrap();
+        let package_mount = mounts
+            .iter()
+            .find(|mount| mount.logical_destination == external.to_string_lossy())
+            .expect("the external Bun package root must be staged");
+        let package_stage = staged.join(&package_mount.stage_relative_path);
+        assert!(package_stage.join("tools/server.mjs").is_file());
+        assert_eq!(
+            std::fs::read_to_string(package_stage.join("schema.json")).unwrap(),
+            "controller package asset\n"
+        );
+        assert!(
+            !package_stage.join("project").exists(),
+            "the controller package resource must exclude the mounted workspace"
+        );
+        let workspace_config = mounts
+            .iter()
+            .find(|mount| {
+                mount.logical_destination == workspace.join(".opencode").to_string_lossy()
+            })
+            .expect("the selected workspace OpenCode directory must retain its own mount");
+        assert!(staged
+            .join(&workspace_config.stage_relative_path)
+            .join("opencode.json")
+            .is_file());
+
+        let hidden = owned.path().join("external-hidden");
+        std::fs::rename(&external, &hidden).unwrap();
+        let output = std::process::Command::new("node")
+            .arg(package_stage.join("tools/server.mjs"))
+            .output()
+            .unwrap();
+        std::fs::rename(&hidden, &external).unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"controller package asset\n");
     }
 
     #[test]

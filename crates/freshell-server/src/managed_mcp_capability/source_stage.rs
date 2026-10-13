@@ -2161,16 +2161,21 @@ mod configured_resource_tests {
         let home = owned.path().join("home");
         let external = owned.path().join("external");
         let workspace = external.join("project");
-        let package = external.join("mcp-package");
-        let server = package.join("server.mjs");
-        let schema = package.join("schema.json");
+        let tools = external.join("tools");
+        let server = tools.join("server.mjs");
+        let schema = external.join("schema.json");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::create_dir_all(&package).unwrap();
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::write(
+            workspace.join("workspace-data.txt"),
+            "workspace stays mounted\n",
+        )
+        .unwrap();
         std::fs::write(external.join("package.json"), r#"{"type":"module"}"#).unwrap();
         std::fs::write(
             &server,
-            "import { readFileSync } from 'node:fs';\nimport path from 'node:path';\nimport { fileURLToPath } from 'node:url';\nconst scriptDir = path.dirname(fileURLToPath(import.meta.url));\nprocess.stdout.write(readFileSync(path.join(scriptDir, 'schema.json'), 'utf8'));\n",
+            "import { readFileSync } from 'node:fs';\nimport path from 'node:path';\nimport { fileURLToPath } from 'node:url';\nconst scriptDir = path.dirname(fileURLToPath(import.meta.url));\nprocess.stdout.write(readFileSync(path.join(scriptDir, '../schema.json'), 'utf8'));\n",
         )
         .unwrap();
         std::fs::write(&schema, "computed sibling schema loaded\n").unwrap();
@@ -2180,24 +2185,64 @@ mod configured_resource_tests {
             server.to_string_lossy().into_owned(),
         ];
 
-        let (plan, provider_server) = plan_and_stage_mcp_command_for_resource(
-            owned.path(),
-            &home,
+        let config = workspace.join(".opencode/opencode.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "mcp": { "computed-asset": { "type": "local", "command": command } },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config,
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Workspace,
+            }],
             &workspace,
-            &command,
-            &server,
-        );
+            &home,
+            &|_, _, _| None,
+        )
+        .unwrap();
         assert!(
             plan[0]
                 .configured_resources
-                .contains(&package.canonicalize().unwrap()),
+                .contains(&external.canonicalize().unwrap()),
             "an external Bun script must retain its bounded package directory for computed resources"
         );
+        let units = resource_units(
+            &home,
+            &home.join(".config/opencode"),
+            &workspace,
+            &plan,
+            None,
+        )
+        .unwrap();
+        let filtered = tempfile::tempdir_in(owned.path()).unwrap();
+        let mut units = units;
+        filter_workspace_from_enclosing_resource_units(
+            &mut units,
+            &workspace,
+            filtered.path(),
+            &[],
+        )
+        .unwrap();
+        let provider = copy_selected_units_through_provider(owned.path(), &units);
+        let provider_server = provider
+            .join(external.strip_prefix(owned.path()).unwrap())
+            .join("tools/server.mjs");
+        let provider_workspace = provider.join(workspace.strip_prefix(owned.path()).unwrap());
+        assert!(provider_server.is_file());
         assert!(
-            !plan[0]
-                .configured_resources
-                .contains(&external.canonicalize().unwrap()),
-            "resource closure must not widen to the unrelated external parent"
+            !provider_workspace.join("workspace-data.txt").exists(),
+            "the enclosing package copy must leave workspace data out"
+        );
+        assert!(
+            provider_workspace.join(".opencode/opencode.json").is_file(),
+            "a separately selected workspace config must survive the package exclusion: {units:?}"
         );
 
         let hidden = owned.path().join("external-hidden");
@@ -3089,6 +3134,57 @@ pub(super) fn resource_copy_selections(
         }
     }
     Ok(selections)
+}
+
+/// Keep a package resource that contains the mounted workspace without
+/// copying the workspace into the package unit. Each unit is filtered before
+/// the aggregate staging copy, so independently selected workspace resources
+/// remain eligible for their own resource mounts.
+pub(super) fn filter_workspace_from_enclosing_resource_units(
+    units: &mut [(
+        std::path::PathBuf,
+        freshell_runtime_protocol::ProviderResourceMount,
+    )],
+    workspace: &Path,
+    scratch_root: &Path,
+    excluded_canonical_sources: &[std::path::PathBuf],
+) -> Result<(), String> {
+    use freshell_platform::provider_environment::{copy_environment, CopySelection};
+    use freshell_runtime_protocol::ProviderResourceKind;
+
+    if units.is_empty() {
+        return Ok(());
+    }
+    let canonical_workspace = std::fs::canonicalize(workspace)
+        .map_err(|_| "managed provider workspace is unavailable for resource staging")?;
+    for (index, (source, mount)) in units.iter_mut().enumerate() {
+        if mount.kind != ProviderResourceKind::Directory {
+            continue;
+        }
+        let canonical_source = std::fs::canonicalize(&*source)
+            .map_err(|_| "selected OpenCode resource stage source is unavailable")?;
+        if canonical_workspace == canonical_source
+            || !canonical_workspace.starts_with(&canonical_source)
+        {
+            continue;
+        }
+
+        let mut exclusions = excluded_canonical_sources.to_vec();
+        exclusions.push(canonical_workspace.clone());
+        let destination_root = scratch_root.join(index.to_string());
+        copy_environment(
+            &[CopySelection {
+                source: source.clone(),
+                destination_relative: "resource".into(),
+            }],
+            &destination_root,
+            &exclusions,
+            Default::default(),
+        )
+        .map_err(|error| format!("failed to bound enclosing provider resource: {error}"))?;
+        *source = destination_root.join("resource");
+    }
+    Ok(())
 }
 
 pub(super) fn current_source_for_resource_mount(

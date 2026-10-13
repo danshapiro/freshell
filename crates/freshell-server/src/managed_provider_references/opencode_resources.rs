@@ -397,20 +397,24 @@ fn bun_run_file_resource_scope(
     let canonical_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_owned());
     let canonical_cwd =
         std::fs::canonicalize(instance_cwd).unwrap_or_else(|_| instance_cwd.to_owned());
+    // Scripts that live in the mounted project already travel with that
+    // workspace. An external script may still be packaged beneath a directory
+    // that contains the project, so that ancestor package remains useful as a
+    // resource scope; the copy stage excludes the workspace subtree itself.
+    if command_parent.starts_with(&canonical_cwd) {
+        return None;
+    }
     let package_root = command_parent
         .ancestors()
         .take_while(|ancestor| *ancestor != canonical_home && ancestor.parent().is_some())
         .find(|ancestor| ancestor.join("package.json").is_file());
     let is_bounded = |scope: &Path| {
-        scope != Path::new("/")
-            && scope != canonical_home
-            && !scope.starts_with(&canonical_cwd)
-            && !canonical_cwd.starts_with(scope)
+        scope != Path::new("/") && scope != canonical_home && !scope.starts_with(&canonical_cwd)
     };
 
-    // Prefer the package boundary, but fall back to the script's own directory
-    // if the package also contains the mounted project. A script inside the
-    // launch cwd already has its files from the workspace mount.
+    // Prefer the nearest package boundary, even when it contains the mounted
+    // project. The caller preserves computed package assets while excluding
+    // that separately mounted workspace subtree.
     package_root
         .filter(|scope| is_bounded(scope))
         .or_else(|| is_bounded(command_parent).then_some(command_parent))

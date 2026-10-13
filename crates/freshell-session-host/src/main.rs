@@ -1853,6 +1853,22 @@ fn copy_environment_with_events_for_mounts(
     Ok(report)
 }
 
+fn workspace_suffix_under_resource(resource_root: &Path, workspace: &Path) -> Option<PathBuf> {
+    let suffix = workspace
+        .strip_prefix(resource_root)
+        .ok()
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            let resource_root = std::fs::canonicalize(resource_root).ok()?;
+            let workspace = std::fs::canonicalize(workspace).ok()?;
+            workspace
+                .strip_prefix(resource_root)
+                .ok()
+                .map(Path::to_path_buf)
+        })?;
+    (!suffix.as_os_str().is_empty()).then(|| suffix.to_path_buf())
+}
+
 fn copy_provider_config_references_with_ownership(
     context: &freshell_runtime_protocol::ProviderLaunchContext,
     provider: &str,
@@ -1862,7 +1878,7 @@ fn copy_provider_config_references_with_ownership(
     final_home: &Path,
     run_as: (u32, u32),
 ) -> Result<(), String> {
-    use freshell_platform::provider_environment::CopySelection;
+    use freshell_platform::provider_environment::{copy_environment, CopySelection};
     use freshell_runtime_protocol::ProviderConfigRoot;
     context.validate(provider).map_err(|error| error.message)?;
     let mut selections = provider_config_references(context)
@@ -1934,6 +1950,54 @@ fn copy_provider_config_references_with_ownership(
                 }
             }
         }
+    }
+    let mut _filtered_resource_sources = Vec::new();
+    for (resource_index, unit) in context
+        .prepared_inputs
+        .iter()
+        .flat_map(|inputs| &inputs.resource_mounts)
+        .enumerate()
+    {
+        let resource_selection_index = config_selection_count + resource_index;
+        let selection = selections
+            .get_mut(resource_selection_index)
+            .ok_or("provider resource selection is incomplete")?;
+        if unit.kind != freshell_runtime_protocol::ProviderResourceKind::Directory {
+            continue;
+        }
+        let Some(workspace_suffix) =
+            workspace_suffix_under_resource(Path::new(&unit.logical_destination), workspace)
+        else {
+            continue;
+        };
+        let nested_workspace = selection.source.join(workspace_suffix);
+        let Ok(canonical_nested_workspace) = std::fs::canonicalize(&nested_workspace) else {
+            // A current controller stage has already filtered this subtree.
+            continue;
+        };
+        let Ok(canonical_source) = std::fs::canonicalize(&selection.source) else {
+            return Err("selected provider resource source is unavailable".into());
+        };
+        if canonical_nested_workspace == canonical_source {
+            continue;
+        }
+
+        let mut resource_exclusions = excluded.clone();
+        resource_exclusions.push(canonical_nested_workspace);
+        let scratch = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let destination_root = scratch.path().join("filtered-resource");
+        copy_environment(
+            &[CopySelection {
+                source: selection.source.clone(),
+                destination_relative: "resource".into(),
+            }],
+            &destination_root,
+            &resource_exclusions,
+            Default::default(),
+        )
+        .map_err(|error| format!("failed to exclude workspace from provider resource: {error}"))?;
+        selection.source = destination_root.join("resource");
+        _filtered_resource_sources.push(scratch);
     }
     let mounted = if provider_home == final_home {
         resource_mount_roots(context)
@@ -4483,6 +4547,85 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(native.join(link).join("transport-only/nonce")).unwrap(),
             "cross-root-refreshed-nonce"
+        );
+    }
+
+    #[test]
+    fn provider_config_resource_projection_excludes_workspace_nested_in_package_root() {
+        use freshell_runtime_protocol::*;
+        let owned = tempfile::tempdir().unwrap();
+        let user_root = owned.path().join("source");
+        let package = owned.path().join("external");
+        let workspace = package.join("project");
+        let unit = user_root.join(".freshell/resource-units/root-0");
+        let provider_home = owned.path().join("home");
+        let provider_resource = provider_home.join(".freshell/provider-roots/root-0");
+        std::fs::create_dir_all(unit.join("tools")).unwrap();
+        std::fs::create_dir_all(unit.join("project")).unwrap();
+        std::fs::write(unit.join("tools/server.mjs"), "export {};\n").unwrap();
+        std::fs::write(unit.join("schema.json"), "package asset\n").unwrap();
+        std::fs::write(
+            unit.join("project/workspace-data.txt"),
+            "mounted workspace\n",
+        )
+        .unwrap();
+        let capability = McpCapabilityReference {
+            grant_id: format!("grant-{}", uuid::Uuid::new_v4()),
+            endpoint: "http://host.docker.internal:1234".into(),
+            provider_relative_path: ".freshell/mcp-capability.json".into(),
+            host_gateway_address: None,
+        };
+        let context = ProviderLaunchContext {
+            config: vec![],
+            preparation: ProviderPreparation::Opencode {
+                project_config: vec![],
+                tui_config: None,
+                tui_source: None,
+                inline_config: false,
+            },
+            prepared_inputs: Some(PreparedProviderInputs {
+                generation_id: capability.grant_id.clone(),
+                initial_auth_reservation: None,
+                manifest: ProviderInputManifestReference {
+                    relative_path: ".freshell/input-manifest.json".into(),
+                    sha256: "a".repeat(64),
+                    source_count: 0,
+                    alias_count: 0,
+                    recipe_count: 0,
+                },
+                config_binds: vec![],
+                indexed_files: None,
+                resource_mounts: vec![ProviderResourceMount {
+                    stage_relative_path: ".freshell/resource-units/root-0".into(),
+                    provider_relative_path: ".freshell/provider-roots/root-0".into(),
+                    logical_destination: package.to_string_lossy().into_owned(),
+                    effective_destination: package.to_string_lossy().into_owned(),
+                    kind: ProviderResourceKind::Directory,
+                }],
+            }),
+            mcp_capability: Some(capability),
+        };
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+
+        copy_provider_config_references(
+            &context,
+            "opencode",
+            &workspace,
+            &user_root,
+            &provider_home,
+            uid,
+            gid,
+        )
+        .unwrap();
+
+        assert!(provider_resource.join("tools/server.mjs").is_file());
+        assert_eq!(
+            std::fs::read_to_string(provider_resource.join("schema.json")).unwrap(),
+            "package asset\n"
+        );
+        assert!(
+            !provider_resource.join("project").exists(),
+            "session-host projection must not copy workspace data from a stale package unit"
         );
     }
 
