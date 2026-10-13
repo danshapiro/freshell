@@ -217,21 +217,7 @@ async fn validate_dir(
 }
 
 fn is_checkpoint_home(path: &Path) -> bool {
-    let Some(selected) = std::fs::canonicalize(path).ok() else {
-        return false;
-    };
-
-    let mut home_candidates = crate::session_directory::provider_home()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if let Some(configured_home) = std::env::var_os("FRESHELL_HOME") {
-        home_candidates.push(PathBuf::from(configured_home));
-    }
-
-    home_candidates
-        .iter()
-        .filter_map(|home| std::fs::canonicalize(home).ok())
-        .any(|home| home == selected)
+    crate::checkpoints::is_account_home_checkpoint_path(path)
 }
 
 /// `GET /api/files/read?path=<p>` \u2192 `{ content, size, modifiedAt }` (`files-router.ts:85`).
@@ -1488,6 +1474,35 @@ mod tests {
             assert_eq!(value["valid"], true);
             assert_eq!(value["checkpointWorkspaceEligible"], false);
         }
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn validate_dir_excludes_passwd_home_when_home_env_is_redirected() {
+        let _guard = env_lock();
+        let redirected_home = tempfile::tempdir().unwrap();
+        let redirected_home_path = redirected_home.path().to_string_lossy().into_owned();
+        let account_home =
+            std::fs::canonicalize(crate::session_directory::passwd_entry_home()).unwrap();
+        let account_home_path = account_home.to_string_lossy().into_owned();
+        let _env = EnvGuard::set(&[
+            ("HOME", Some(redirected_home_path.as_str())),
+            ("FRESHELL_HOME", None),
+            ("USERPROFILE", None),
+        ]);
+
+        let response = validate_dir(
+            State(test_state()),
+            auth_headers(),
+            Json(json!({ "path": account_home_path })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = body_json(response).await;
+        assert_eq!(value["valid"], true);
+        assert_eq!(value["checkpointWorkspaceEligible"], false);
     }
 
     /// Node's `normalizeUserPath` runs `path.posix.resolve` on POSIX inputs

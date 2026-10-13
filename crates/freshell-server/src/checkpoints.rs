@@ -2999,6 +2999,7 @@ fn recognized_account_homes(server_home: Option<&Path>) -> Vec<PathBuf> {
         "CODEX_HOME",
         "OPENCODE_CONFIG_DIR",
         "FRESHELL_AMPLIFIER_HOME",
+        "FRESHELL_HOME",
     ] {
         if let Some(value) = std::env::var_os(variable) {
             add_existing(Path::new(&value));
@@ -3008,12 +3009,22 @@ fn recognized_account_homes(server_home: Option<&Path>) -> Vec<PathBuf> {
 }
 
 fn is_account_home_checkpoint_scope(path: &Path, server_home: &Path) -> bool {
-    if std::fs::canonicalize(server_home).is_ok_and(|home| home == path) {
-        return true;
-    }
-    crate::session_directory::provider_home()
-        .and_then(|home| std::fs::canonicalize(home).ok())
-        .is_some_and(|home| home == path)
+    is_account_home_checkpoint_path_with_server_home(path, Some(server_home))
+}
+
+pub(crate) fn is_account_home_checkpoint_path(path: &Path) -> bool {
+    is_account_home_checkpoint_path_with_server_home(path, None)
+}
+
+fn is_account_home_checkpoint_path_with_server_home(
+    path: &Path,
+    server_home: Option<&Path>,
+) -> bool {
+    let Ok(path) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let homes = recognized_account_homes(server_home);
+    is_account_home_for_owner(&path, &homes, &account_home_for_directory).unwrap_or(false)
 }
 
 fn is_recognized_account_home(path: &Path, homes: &[PathBuf]) -> bool {
@@ -3360,16 +3371,17 @@ async fn resolve_checkpoint_workspace_with_account_home(
                 reason: "account home cannot be used as a code checkpoint workspace".to_string(),
             });
         }
-        if provenance == "legacy-checkpoint" {
-            return Ok(ResolvedCheckpointWorkspace {
-                path: selected,
-                provenance,
-            });
-        }
         let selected_home =
             match is_account_home_for_owner(&selected, &homes, account_home_for_directory) {
                 Ok(is_home) => Some(is_home),
-                Err(_reason) if provenance == "directory-picker" => None,
+                Err(_reason)
+                    if matches!(
+                        provenance.as_str(),
+                        "directory-picker" | "legacy-checkpoint"
+                    ) =>
+                {
+                    None
+                }
                 Err(reason) => {
                     return Err(CheckpointWorkspaceUnavailable {
                         candidate,
@@ -3377,17 +3389,16 @@ async fn resolve_checkpoint_workspace_with_account_home(
                     });
                 }
             };
-        if provenance == "directory-picker" && selected_home == Some(true) {
-            return Ok(ResolvedCheckpointWorkspace {
-                path: selected,
-                provenance,
-            });
-        }
         if selected_home == Some(true) {
             return Err(CheckpointWorkspaceUnavailable {
                 candidate,
-                reason: "account home cannot be used as an inferred code checkpoint workspace"
-                    .to_string(),
+                reason: "account home cannot be used as a code checkpoint workspace".to_string(),
+            });
+        }
+        if provenance == "legacy-checkpoint" {
+            return Ok(ResolvedCheckpointWorkspace {
+                path: selected,
+                provenance,
             });
         }
         let path = match git_checkout_root(&selected).await {
@@ -7032,6 +7043,39 @@ mod tests {
         let error = resolve_checkpoint_workspace(home.path(), home.path(), Some(&intent))
             .await
             .expect_err("an account-home picker choice only defines launch cwd");
+
+        assert!(error.reason.contains("account home"), "{}", error.reason);
+    }
+
+    #[tokio::test]
+    async fn picker_owner_account_home_is_rejected_when_configured_home_differs() {
+        let owned = tempfile::tempdir().unwrap();
+        let configured_home = owned.path().join("managed-home");
+        let account_home = owned.path().join("account-home");
+        tokio::fs::create_dir_all(&configured_home).await.unwrap();
+        tokio::fs::create_dir_all(&account_home).await.unwrap();
+        let account_home = account_home.canonicalize().unwrap();
+        let owner_home = account_home.clone();
+        let account_home_for_directory = move |path: &Path| {
+            if path == owner_home {
+                Ok(owner_home.clone())
+            } else {
+                Err("synthetic owner has no resolvable home".to_string())
+            }
+        };
+        let intent = json!({
+            "path": account_home,
+            "provenance": "directory-picker",
+        });
+
+        let error = resolve_checkpoint_workspace_with_account_home(
+            &configured_home,
+            intent["path"].as_str().map(Path::new).unwrap(),
+            Some(&intent),
+            &account_home_for_directory,
+        )
+        .await
+        .expect_err("a picker-confirmed passwd-entry home is never a checkpoint scope");
 
         assert!(error.reason.contains("account home"), "{}", error.reason);
     }
