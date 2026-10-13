@@ -183,6 +183,7 @@ mod tests {
                     logical_destination: "/outside/credential".into(),
                     effective_destination: "/outside/credential".into(),
                 }],
+                staged_source_paths: None,
             }),
         };
         let descriptors = mount_descriptors(&mounts, "owned-provider").unwrap();

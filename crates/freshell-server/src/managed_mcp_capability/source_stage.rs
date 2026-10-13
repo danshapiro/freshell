@@ -35,6 +35,69 @@ mod configured_resource_tests {
     }
 
     #[test]
+    fn managed_provider_stages_external_indexed_config_payloads_in_the_private_generation() {
+        use crate::managed_mcp_capability::OpencodeEphemeralInput;
+        use crate::managed_provider_references::sources::{
+            plan_opencode_sources, DiscoveryRole, SourceOccurrence,
+        };
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let external = owned.path().join("external");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        let selected = external.join("absolute-rule.txt");
+        std::fs::write(&selected, "external prompt payload").unwrap();
+        let config = home.join("opencode.json");
+        let raw = serde_json::json!({"agent":{"fixture":{"prompt":format!("{{file:{}}}", selected.display())}}}).to_string();
+        std::fs::write(&config, &raw).unwrap();
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config.clone(),
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Home,
+            }],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .unwrap();
+        let stage_root = owned.path().join("provider-generation");
+        std::fs::create_dir(&stage_root).unwrap();
+
+        stage(
+            &stage_root,
+            &home,
+            &workspace,
+            &plan,
+            OpencodeEphemeralInput::default(),
+        )
+        .unwrap();
+
+        std::fs::rename(&external, owned.path().join("external-hidden")).unwrap();
+        assert_eq!(
+            std::fs::read(stage_root.join(".freshell/indexed-source-files/source-0")).unwrap(),
+            b"external prompt payload",
+            "the supervisor must receive selected bytes from the private generation, not the original host path"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(stage_root.join(".freshell/indexed-source-files/source-0"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
     fn managed_provider_duplicate_resource_members_select_only_native_winners_after_both_copies() {
         use std::os::unix::fs::PermissionsExt;
         let owned = match std::env::var_os("FRESHELL_TEST_EXECUTABLE_TMP_DIR") {
@@ -1309,9 +1372,67 @@ pub(super) fn stage(
             canonical_source,
         });
     }
+    stage_indexed_sources(root, &manifest.files)?;
     let metadata = freshell_runtime_protocol::bounded_json_bytes(&manifest, 64 * 1024 * 1024)
         .map_err(|_| "source manifest metadata profile exceeded")?;
     write_private_bytes(&root.join(".freshell/input-manifest.json"), &metadata)
+}
+
+fn stage_indexed_sources(root: &Path, files: &[SelectedSourceFile]) -> Result<(), String> {
+    use std::io::Read;
+    let source_root = root.join(".freshell/indexed-source-files");
+    private_directory(&source_root)?;
+    let mut total_bytes = 0u64;
+    for (expected, source) in files.iter().enumerate() {
+        if usize::from(source.source_id) != expected {
+            return Err("source indexes are not contiguous".into());
+        }
+        let path = Path::new(&source.canonical_source);
+        let canonical = std::fs::canonicalize(path)
+            .map_err(|_| "selected configuration payload is unavailable before staging")?;
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|_| "selected configuration payload metadata is unavailable")?;
+        if canonical != path || !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err("selected configuration payload must be a canonical regular file".into());
+        }
+        let file = std::fs::File::open(path)
+            .map_err(|_| "selected configuration payload cannot be opened for staging")?;
+        let opened = file
+            .metadata()
+            .map_err(|_| "selected configuration payload metadata is unavailable")?;
+        if !opened.is_file()
+            || opened.len() > freshell_platform::provider_input_exchange::MAX_FILE_BYTES
+        {
+            return Err("selected configuration payload exceeds the indexed file profile".into());
+        }
+        total_bytes = total_bytes
+            .checked_add(opened.len())
+            .filter(|bytes| *bytes <= freshell_platform::provider_input_exchange::MAX_TOTAL_BYTES)
+            .ok_or("selected configuration payloads exceed the indexed total profile")?;
+        let mut bytes = Vec::with_capacity(opened.len() as usize);
+        file.take(freshell_platform::provider_input_exchange::MAX_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "selected configuration payload cannot be read for staging")?;
+        if bytes.len() as u64 > freshell_platform::provider_input_exchange::MAX_FILE_BYTES
+            || bytes.len() as u64 != opened.len()
+        {
+            return Err(
+                "selected configuration payload changed or exceeded its indexed profile".into(),
+            );
+        }
+        let current = std::fs::canonicalize(path)
+            .map_err(|_| "selected configuration payload changed during staging")?;
+        let current_metadata = std::fs::symlink_metadata(path)
+            .map_err(|_| "selected configuration payload changed during staging")?;
+        if current != canonical || current_metadata.file_type().is_symlink() {
+            return Err("selected configuration payload changed during staging".into());
+        }
+        let destination = root.join(freshell_runtime_protocol::indexed_source_stage_path(
+            source.source_id,
+        ));
+        write_private_bytes(&destination, &bytes)?;
+    }
+    Ok(())
 }
 
 pub(super) struct DescriptionRoots<'a> {
@@ -1606,6 +1727,13 @@ pub(super) fn describe(
         indexed_files: (!sources.is_empty()).then(|| IndexedProviderFiles {
             volume_name: indexed_provider_volume_name(soul, &capability.grant_id),
             aliases,
+            staged_source_paths: Some(
+                (0..sources.len())
+                    .map(|source_id| {
+                        freshell_runtime_protocol::indexed_source_stage_path(source_id as u16)
+                    })
+                    .collect(),
+            ),
         }),
     };
     inputs

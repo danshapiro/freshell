@@ -74,6 +74,7 @@ fn context(soul: &SoulId, ordinal: usize) -> ProviderLaunchContext {
                     logical_destination: "/home/freshell/provider/.freshell/references/0".into(),
                     effective_destination: "/home/freshell/provider/.freshell/references/0".into(),
                 }],
+                staged_source_paths: None,
             }),
         }),
     }

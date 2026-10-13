@@ -643,6 +643,7 @@ async fn provider_native_auth_nested_callback_uses_current_attempt_without_reloc
                     effective_destination: format!("/fixture/source-{index}"),
                 })
                 .collect(),
+            staged_source_paths: None,
         }),
     });
     let references = (0..6)

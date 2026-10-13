@@ -188,6 +188,16 @@ pub struct IndexedProviderFiles {
     pub volume_name: String,
     #[serde(default)]
     pub aliases: Vec<IndexedProviderFileAlias>,
+    /// Paths inside the private prepared generation used to source indexed
+    /// payloads when the original host paths are outside the runtime host.
+    /// Missing is retained for older persisted launch specifications.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub staged_source_paths: Option<Vec<String>>,
+}
+
+pub fn indexed_source_stage_path(source_id: u16) -> String {
+    format!(".freshell/indexed-source-files/source-{source_id}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -335,6 +345,13 @@ impl PreparedProviderInputs {
                 })
                 || files.aliases.len() > 256
                 || files.aliases.len() != self.manifest.alias_count as usize
+                || files.staged_source_paths.as_ref().is_some_and(|paths| {
+                    paths.len() != self.manifest.source_count as usize
+                        || paths
+                            .iter()
+                            .enumerate()
+                            .any(|(id, path)| path != &indexed_source_stage_path(id as u16))
+                })
             {
                 return Err(invalid("indexed file publication"));
             }
@@ -606,6 +623,7 @@ mod tests {
                         effective_destination: "/fixture/other".into(),
                     },
                 ],
+                staged_source_paths: None,
             }),
         }
     }
@@ -668,6 +686,28 @@ mod tests {
             value.validate(Some(&capability())).is_err(),
             "different approved sources must never win by mount order"
         );
+    }
+    #[test]
+    fn provider_prepared_indexed_source_paths_are_fixed_and_match_the_source_count() {
+        let mut value = prepared();
+        value.indexed_files.as_mut().unwrap().staged_source_paths = Some(vec![
+            ".freshell/indexed-source-files/source-0".into(),
+            ".freshell/indexed-source-files/source-1".into(),
+        ]);
+        value.validate(Some(&capability())).unwrap();
+
+        value
+            .indexed_files
+            .as_mut()
+            .unwrap()
+            .staged_source_paths
+            .as_mut()
+            .unwrap()[1] = ".freshell/indexed-source-files/../outside".into();
+        assert!(value.validate(Some(&capability())).is_err());
+
+        value.indexed_files.as_mut().unwrap().staged_source_paths =
+            Some(vec![".freshell/indexed-source-files/source-0".into()]);
+        assert!(value.validate(Some(&capability())).is_err());
     }
     #[test]
     fn provider_prepared_mounts_preserve_home_and_control_parents() {

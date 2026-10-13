@@ -688,6 +688,7 @@ mod tests {
                             &capability.grant_id,
                         ),
                         aliases: vec![],
+                        staged_source_paths: None,
                     }),
                 }),
             };
@@ -1839,6 +1840,7 @@ mod tests {
                 indexed_files: Some(IndexedProviderFiles {
                     volume_name: indexed_provider_volume_name(&SoulId::new(), &capability.grant_id),
                     aliases: vec![],
+                    staged_source_paths: None,
                 }),
             }),
             preparation: ProviderPreparation::Opencode {

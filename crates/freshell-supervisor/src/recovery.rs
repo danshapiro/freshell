@@ -2609,6 +2609,7 @@ mod tests {
                     &generation,
                 ),
                 aliases: vec![],
+                staged_source_paths: None,
             }),
         });
         let complete = freshell_runtime_protocol::PreparedProviderContext {

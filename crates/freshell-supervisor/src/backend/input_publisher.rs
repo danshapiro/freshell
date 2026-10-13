@@ -77,6 +77,30 @@ fn labels(spec: &CreateRuntimeSpec, generation: &str) -> Value {
         "com.freshell.input-generation":generation})
 }
 
+fn indexed_payload_sources(
+    mounts: &docker::TerminalMounts,
+    source_count: usize,
+) -> Result<Vec<PathBuf>, BackendError> {
+    let mut sources = vec![None; source_count];
+    for (reference_index, source_id) in &mounts.indexed_secret_sources {
+        let source = mounts
+            .provider_secret_files
+            .get(*reference_index)
+            .cloned()
+            .ok_or_else(|| fail("input publisher source index unavailable"))?;
+        let target = sources
+            .get_mut(usize::from(*source_id))
+            .ok_or_else(|| fail("input publisher source ID unavailable"))?;
+        if target.replace(source).is_some() {
+            return Err(fail("input publisher source ID is duplicated"));
+        }
+    }
+    sources
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| fail("input publisher indexed source set is incomplete"))
+}
+
 fn filter_query(value: Value) -> String {
     serde_json::to_vec(&value)
         .expect("finite Docker filter")
@@ -595,11 +619,7 @@ impl DockerEngineBackend {
         inputs
             .validate_references(references)
             .map_err(|_| fail("input publisher source identity mismatch"))?;
-        let sources = references
-            .iter()
-            .filter(|reference| reference.profile.is_configuration_file())
-            .map(|reference| PathBuf::from(&reference.source_path))
-            .collect::<Vec<_>>();
+        let sources = indexed_payload_sources(mounts, inputs.manifest.source_count as usize)?;
         let soul = spec.soul_id.to_string();
         {
             let held = self
@@ -1142,6 +1162,36 @@ impl DockerEngineBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indexed_payload_publication_uses_the_prepared_source_paths_in_source_id_order() {
+        let mounts = docker::TerminalMounts {
+            workspace: "/workspace".into(),
+            git_common_dir: None,
+            provider_bootstrap_files: vec![],
+            provider_secret_files: vec![
+                "/onecli.env".into(),
+                "/private-generation/source-1".into(),
+                "/private-generation/source-0".into(),
+            ],
+            indexed_secret_sources: BTreeMap::from([(1, 1), (2, 0)]),
+            provider_user_root: None,
+            mcp_capability_file: None,
+            input_manifest: None,
+            config_binds: vec![],
+            resource_mounts: vec![],
+            indexed_files: None,
+        };
+
+        assert_eq!(
+            indexed_payload_sources(&mounts, 2).unwrap(),
+            vec![
+                PathBuf::from("/private-generation/source-0"),
+                PathBuf::from("/private-generation/source-1"),
+            ]
+        );
+        assert!(indexed_payload_sources(&mounts, 3).is_err());
+    }
 
     #[tokio::test]
     async fn provider_input_publisher_commit_without_indexed_descriptor_needs_no_daemon() {

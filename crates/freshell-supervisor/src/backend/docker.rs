@@ -155,6 +155,28 @@ fn workload_mounts(
         return Err("terminal cwd must be inside the approved workspace".into());
     }
     reject_management_path(&workspace)?;
+    let provider_user_root =
+        if let Some(capability) = context.and_then(|context| context.mcp_capability.as_ref()) {
+            Some(staged_provider_root_for(
+                &capability_directory_for(purpose)?,
+                &capability.grant_id,
+                purpose,
+            )?)
+        } else if context.is_some() {
+            let home = std::env::var_os("HOME");
+            let user_root_exists = home.as_ref().is_some_and(|home| {
+                provider_user_root_path(Path::new(home), provider).is_some_and(|path| path.exists())
+            });
+            if let Some(home) = home.as_ref().filter(|_| user_root_exists) {
+                Some(approved_user_provider_root(Path::new(home), provider)?)
+            } else if context.is_some_and(user_provider_config_referenced) {
+                return Err("referenced provider user root is unavailable".into());
+            } else {
+                None
+            }
+        } else {
+            None
+        };
     let git_common_dir = git_common_path
         .map(|raw| -> Result<PathBuf, String> {
             let canonical = canonical_dir(Path::new(raw), "git common dir")?;
@@ -187,6 +209,10 @@ fn workload_mounts(
     let indexed = context
         .and_then(|context| context.prepared_inputs.as_ref())
         .is_some_and(|inputs| inputs.indexed_files.is_some());
+    let staged_source_paths = context
+        .and_then(|context| context.prepared_inputs.as_ref())
+        .and_then(|inputs| inputs.indexed_files.as_ref())
+        .and_then(|files| files.staged_source_paths.as_deref());
     let mut source_id = 0u16;
     for (index, secret) in secret_references.iter().enumerate() {
         if purpose == MountPurpose::Adopt {
@@ -197,9 +223,46 @@ fn workload_mounts(
             }
             continue;
         }
-        let source = std::fs::canonicalize(&secret.source_path)
-            .map_err(|error| format!("provider secret reference: {error}"))?;
-        if !source.is_file() || source != Path::new(&secret.source_path) {
+        let staged_source = if secret.profile.is_configuration_file() {
+            staged_source_paths
+                .and_then(|paths| paths.get(usize::from(source_id)))
+                .map(|relative| -> Result<PathBuf, String> {
+                    let root = provider_user_root
+                        .as_deref()
+                        .ok_or("prepared indexed source root is unavailable")?;
+                    let path = root.join(relative);
+                    let canonical = std::fs::canonicalize(&path)
+                        .map_err(|error| format!("prepared indexed source: {error}"))?;
+                    let metadata = std::fs::symlink_metadata(&path)
+                        .map_err(|error| format!("prepared indexed source metadata: {error}"))?;
+                    if canonical != path || !metadata.is_file() || metadata.file_type().is_symlink()
+                    {
+                        return Err(
+                            "prepared indexed source must be a canonical regular file".into()
+                        );
+                    }
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let mode = metadata.permissions().mode();
+                        if mode & 0o007 != 0 || mode & 0o020 != 0 {
+                            return Err("prepared indexed source must be private".into());
+                        }
+                    }
+                    Ok(canonical)
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let source_is_staged = staged_source.is_some();
+        let source = if let Some(source) = staged_source {
+            source
+        } else {
+            std::fs::canonicalize(&secret.source_path)
+                .map_err(|error| format!("provider secret reference: {error}"))?
+        };
+        if !source.is_file() || !source_is_staged && source != Path::new(&secret.source_path) {
             return Err("provider secret reference must be a canonical regular file".into());
         }
         #[cfg(unix)]
@@ -216,35 +279,15 @@ fn workload_mounts(
                 return Err("provider OneCLI grant must be private".into());
             }
         }
-        reject_management_path(&source)?;
+        if !source_is_staged {
+            reject_management_path(&source)?;
+        }
         provider_secret_files.push(source);
         if indexed && secret.profile.is_configuration_file() {
             indexed_secret_sources.insert(index, source_id);
             source_id += 1;
         }
     }
-    let provider_user_root =
-        if let Some(capability) = context.and_then(|context| context.mcp_capability.as_ref()) {
-            Some(staged_provider_root_for(
-                &capability_directory_for(purpose)?,
-                &capability.grant_id,
-                purpose,
-            )?)
-        } else if context.is_some() {
-            let home = std::env::var_os("HOME");
-            let user_root_exists = home.as_ref().is_some_and(|home| {
-                provider_user_root_path(Path::new(home), provider).is_some_and(|path| path.exists())
-            });
-            if let Some(home) = home.as_ref().filter(|_| user_root_exists) {
-                Some(approved_user_provider_root(Path::new(home), provider)?)
-            } else if context.is_some_and(user_provider_config_referenced) {
-                return Err("referenced provider user root is unavailable".into());
-            } else {
-                None
-            }
-        } else {
-            None
-        };
     let mcp_capability_file = context
         .and_then(|context| context.mcp_capability.as_ref())
         .map(|capability| {
@@ -996,5 +1039,113 @@ mod provider_secret_tests {
         let durable = serde_json::to_string(&launch).unwrap();
         assert!(durable.contains(&canonical_grant.to_string_lossy().to_string()));
         assert!(!durable.contains("fixture-secret-bytes"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn indexed_configuration_reference_uses_its_private_generation_source() {
+        const CHILD: &str = "FRESHELL_INDEXED_STAGED_SOURCE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new("/usr/bin/timeout")
+                .args(["--kill-after=1s", "20s"])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backend::docker::provider_secret_tests::indexed_configuration_reference_uses_its_private_generation_source",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated indexed source mapping failed");
+            return;
+        }
+
+        use freshell_runtime_protocol::{
+            IndexedProviderFiles, McpCapabilityReference, PreparedProviderInputs,
+            ProviderInputManifestReference, ProviderLaunchContext, ProviderPreparation,
+            ProviderSecretProfile, ProviderSecretReference,
+        };
+        use sha2::{Digest, Sha256};
+        use std::collections::BTreeMap;
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let capabilities = owned.path().join("mcp-capabilities");
+        let stage = owned.path().join("provider-roots/grant-indexed");
+        let workspace = owned.path().join("workspace");
+        let indexed_source = stage.join(".freshell/indexed-source-files/source-0");
+        std::fs::create_dir_all(&capabilities).unwrap();
+        std::fs::create_dir_all(stage.join(".freshell/indexed-source-files")).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let manifest = b"{}";
+        std::fs::write(stage.join(".freshell/input-manifest.json"), manifest).unwrap();
+        std::fs::write(&indexed_source, b"staged prompt payload").unwrap();
+        std::fs::set_permissions(&indexed_source, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let capability = McpCapabilityReference {
+            grant_id: "grant-indexed".into(),
+            endpoint: "http://host.docker.internal:3344".into(),
+            provider_relative_path: ".freshell/mcp-capability.json".into(),
+            host_gateway_address: None,
+        };
+        let capability_file = capabilities.join("grant-indexed.json");
+        std::fs::write(&capability_file, b"{}").unwrap();
+        std::fs::set_permissions(&capability_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::env::set_var("FRESHELL_RUNTIME_CAPABILITY_DIR", &capabilities);
+        let context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Opencode {
+                project_config: vec![],
+                tui_config: None,
+                tui_source: None,
+                inline_config: false,
+            },
+            config: vec![],
+            mcp_capability: Some(capability.clone()),
+            prepared_inputs: Some(PreparedProviderInputs {
+                generation_id: capability.grant_id.clone(),
+                initial_auth_reservation: None,
+                manifest: ProviderInputManifestReference {
+                    relative_path: ".freshell/input-manifest.json".into(),
+                    sha256: format!("{:x}", Sha256::digest(manifest)),
+                    source_count: 1,
+                    alias_count: 0,
+                    recipe_count: 0,
+                },
+                config_binds: vec![],
+                resource_mounts: vec![],
+                indexed_files: Some(IndexedProviderFiles {
+                    volume_name: "freshell-inputs-aaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                    aliases: vec![],
+                    staged_source_paths: Some(vec![
+                        freshell_runtime_protocol::indexed_source_stage_path(0),
+                    ]),
+                }),
+            }),
+        };
+        context.validate("opencode").unwrap();
+        let workspace = std::fs::canonicalize(workspace)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+            "terminalId":"terminal-indexed-source","streamId":"stream-indexed-source",
+            "mode":"opencode","program":"opencode","cwd":workspace.clone(),"workspacePath":workspace,
+            "runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"indexed-source",
+            "providerLaunchContext":context
+        })).unwrap();
+        terminal.provider_secret_references = vec![ProviderSecretReference {
+            source_path: owned
+                .path()
+                .join("host-only/original-prompt.txt")
+                .display()
+                .to_string(),
+            profile: ProviderSecretProfile::OpencodeConfigurationFile,
+            provider_relative_path: Some(".freshell/references/0".into()),
+        }];
+
+        let mounts = terminal_mounts(&terminal).unwrap();
+
+        assert_eq!(mounts.provider_secret_files, vec![indexed_source]);
+        assert_eq!(mounts.indexed_secret_sources, BTreeMap::from([(0, 0)]));
     }
 }
