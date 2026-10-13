@@ -5032,17 +5032,17 @@ impl TerminalRegistry {
         &self,
         terminal_id: &str,
         lifecycle: Option<ManagedLifecycle>,
-    ) {
+    ) -> bool {
         let Some(lifecycle) = lifecycle else {
-            return;
+            return false;
         };
         let Some(shared) = self.shared_for(terminal_id) else {
-            return;
+            return false;
         };
         let mut state = shared.lock().expect("terminal lock");
         if state.managed_identity.is_none() || state.managed_lifecycle.as_ref() == Some(&lifecycle)
         {
-            return;
+            return false;
         }
         match lifecycle.state {
             ManagedLifecycleState::Running | ManagedLifecycleState::Recovering => {
@@ -5052,6 +5052,10 @@ impl TerminalRegistry {
             }
             ManagedLifecycleState::Blocked | ManagedLifecycleState::Ended => {
                 state.status = TerminalRunStatus::Exited;
+                if state.managed_exit_code_available != Some(true) {
+                    state.exit_code = Some(-1);
+                    state.managed_exit_code_available = Some(false);
+                }
             }
         }
         let summary = lifecycle.recovery_summary.clone();
@@ -5069,6 +5073,7 @@ impl TerminalRegistry {
         for subscriber in state.subscribers.values() {
             (subscriber.sink)(message.clone());
         }
+        true
     }
 
     /// Error cause is classified before storage/logging; shared by every socket.

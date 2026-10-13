@@ -8394,8 +8394,9 @@ use crate::terminal_meta::record_for_create as terminal_meta_record_for_create;
 /// revision}` to every authenticated connection via the broadcast bus.
 ///
 /// Wired call sites mirror the reference: `terminal.create` success/failed-delivery
-/// (`ws:2553`/`ws:2570`) and valid `terminal.kill` (`ws:2988`). NOT wired: the
-/// natural-exit path — the original broadcasts on exit only for
+/// (`ws:2553`/`ws:2570`), valid `terminal.kill` (`ws:2988`), and managed lifecycle
+/// projection changes so terminal-list views see final recovery status. NOT wired:
+/// a plain local PTY natural-exit path — the original broadcasts on exit only for
 /// `recoverableForRestore` terminals (`ws:571-578`, session-repair subsystem,
 /// unported), and the live capture (`port/oracle/robustness/exit-orig.json`) shows
 /// no `terminals.changed` on a plain exit. `recoverableTerminalIds` never applies
@@ -9016,7 +9017,7 @@ async fn refresh_managed_output_and_associate(
         crate::opencode_association::associate_managed_session(state, terminal_id, session_id)
             .await;
     }
-    state
+    let lifecycle_changed = state
         .registry
         .publish_managed_lifecycle(terminal_id, read.lifecycle);
     let delivered = state
@@ -9045,6 +9046,9 @@ async fn refresh_managed_output_and_associate(
         if delivered >= read.head_seq {
             state.registry.finish_managed_exit(terminal_id, exit_code);
         }
+    }
+    if lifecycle_changed {
+        broadcast_terminals_changed(state);
     }
     Ok(())
 }
@@ -13312,12 +13316,15 @@ mod pane_reconcile_gate_tests {
 mod managed_output_order_tests {
     use super::*;
     use freshell_terminal::registry::{
-        ManagedOutputChunk, ManagedOutputRead, ManagedTerminalController,
-        ManagedTerminalDescriptor, ManagedTerminalFuture,
+        ManagedLifecycle, ManagedLifecycleState, ManagedOutputChunk, ManagedOutputRead,
+        ManagedTerminalController, ManagedTerminalDescriptor, ManagedTerminalFuture,
     };
 
     struct ExitedOpenCodeRead {
         final_head: i64,
+        lifecycle: Option<ManagedLifecycle>,
+        exit_code: Option<i64>,
+        native_session_id: Option<String>,
     }
 
     impl ManagedTerminalController for ExitedOpenCodeRead {
@@ -13374,7 +13381,7 @@ mod managed_output_order_tests {
         ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
             Box::pin(async move {
                 Ok(ManagedOutputRead {
-                    lifecycle: None,
+                    lifecycle: self.lifecycle.clone(),
                     completion: None,
                     stream_epoch: Some("S-managed-short-lived".into()),
                     incarnation_id: Some("incarnation-short-lived".into()),
@@ -13382,8 +13389,8 @@ mod managed_output_order_tests {
                     truncated: false,
                     retained_from_seq: 1,
                     head_seq: self.final_head,
-                    exit_code: Some(17),
-                    native_session_id: Some("ses-short-lived".into()),
+                    exit_code: self.exit_code,
+                    native_session_id: self.native_session_id.clone(),
                     chunks: if after < self.final_head {
                         vec![ManagedOutputChunk {
                             seq_start: after + 1,
@@ -13418,7 +13425,12 @@ mod managed_output_order_tests {
         });
         state
             .registry
-            .set_managed_controller(Some(Arc::new(ExitedOpenCodeRead { final_head: 1 })));
+            .set_managed_controller(Some(Arc::new(ExitedOpenCodeRead {
+                final_head: 1,
+                lifecycle: None,
+                exit_code: Some(17),
+                native_session_id: Some("ses-short-lived".into()),
+            })));
 
         refresh_managed_output_and_associate(&state, terminal_id, 1024)
             .await
@@ -13459,7 +13471,12 @@ mod managed_output_order_tests {
         });
         state
             .registry
-            .set_managed_controller(Some(Arc::new(ExitedOpenCodeRead { final_head: 3 })));
+            .set_managed_controller(Some(Arc::new(ExitedOpenCodeRead {
+                final_head: 3,
+                lifecycle: None,
+                exit_code: Some(17),
+                native_session_id: Some("ses-short-lived".into()),
+            })));
         for delivered in 1..=3 {
             refresh_managed_output_and_associate(&state, terminal, 65536)
                 .await
@@ -13479,6 +13496,67 @@ mod managed_output_order_tests {
             );
         }
         assert_eq!(state.registry.directory()[0].snapshot.len(), 3 * 65536);
+    }
+
+    #[tokio::test]
+    async fn managed_final_lifecycle_broadcasts_terminal_directory_changes_once() {
+        let state = super::pane_reconcile_gate_tests::state();
+        let terminal_id = "T-managed-blocked";
+        let mut events = state.broadcast_tx.subscribe();
+        state.registry.register_managed(ManagedTerminalDescriptor {
+            soul_id: "soul-blocked".into(),
+            incarnation_id: "incarnation-blocked".into(),
+            terminal_id: terminal_id.into(),
+            stream_id: "S-managed-blocked".into(),
+            mode: "opencode".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: Some("ses-blocked".into()),
+            create_request_id: Some("req-blocked".into()),
+        });
+        state
+            .registry
+            .set_managed_controller(Some(Arc::new(ExitedOpenCodeRead {
+                final_head: 1,
+                lifecycle: Some(ManagedLifecycle {
+                    state: ManagedLifecycleState::Blocked,
+                    recovery_summary: Some(freshell_protocol::ManagedRecoverySummary {
+                        desired_state: "running".into(),
+                        recovery_state: "blocked".into(),
+                        reason: Some("provider preparation failed".into()),
+                        attempt_id: Some("attempt-blocked".into()),
+                        incident_id: Some("incident-blocked".into()),
+                        durability_state: "retained".into(),
+                        allocation_state: "retained".into(),
+                    }),
+                }),
+                exit_code: None,
+                native_session_id: None,
+            })));
+
+        refresh_managed_output_and_associate(&state, terminal_id, 1024)
+            .await
+            .expect("lifecycle refresh succeeds");
+        assert_eq!(
+            state.registry.directory()[0].status,
+            freshell_protocol::TerminalRunStatus::Exited
+        );
+        assert_eq!(
+            state.registry.directory()[0].runtime_status,
+            Some(freshell_protocol::RuntimeStatus::Blocked)
+        );
+        let changed: serde_json::Value = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            changed,
+            serde_json::json!({ "type": "terminals.changed", "revision": 1 })
+        );
+
+        refresh_managed_output_and_associate(&state, terminal_id, 1024)
+            .await
+            .expect("unchanged lifecycle refresh succeeds");
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     include!("managed_retained_socket_tests.rs");

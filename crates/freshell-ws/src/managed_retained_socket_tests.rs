@@ -17,7 +17,12 @@ async fn managed_socket_windows(
     });
     state
         .registry
-        .set_managed_controller(Some(Arc::new(ExitedOpenCodeRead { final_head })));
+        .set_managed_controller(Some(Arc::new(ExitedOpenCodeRead {
+            final_head,
+            lifecycle: None,
+            exit_code: Some(17),
+            native_session_id: Some("ses-short-lived".into()),
+        })));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/ws", listener.local_addr().unwrap());
     let token = state.auth_token.to_string();

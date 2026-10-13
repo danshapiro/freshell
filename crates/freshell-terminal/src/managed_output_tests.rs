@@ -467,7 +467,9 @@ fn final_managed_lifecycle_marks_facade_exited_without_inventing_exit_code() {
             ServerMessage::TerminalOutput(output) if output.data.contains("retained final output"))));
         assert!(frames.iter().any(|frame| matches!(frame,
             ServerMessage::TerminalExit(exit)
-                if exit.managed_retained == Some(true) && exit.exit_code_available.is_none())));
+                if exit.managed_retained == Some(true)
+                    && exit.exit_code == -1
+                    && exit.exit_code_available == Some(false))));
     }
 }
 
