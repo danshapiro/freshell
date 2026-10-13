@@ -8,6 +8,10 @@ import { constants as osConstants } from 'node:os'
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url))
 const PROJECT_ROOT = path.resolve(SCRIPT_DIR, '../..')
 
+export function shouldRunProviderCrashRecoveryGate(platform: NodeJS.Platform, forwardedArgs: readonly string[]): boolean {
+  return platform !== 'win32' && forwardedArgs.length === 0
+}
+
 function log(severity: 'info' | 'error', event: string, fields: Record<string, unknown> = {}): void {
   const stream = severity === 'error' ? process.stderr : process.stdout
   stream.write(`${JSON.stringify({ severity, event, timestamp: new Date().toISOString(), ...fields })}\n`)
@@ -80,7 +84,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     FRESHELL_SERVER_BIN: binary,
   }
   const testExitCode = await runChild(cargo, ['test', '--workspace', '--locked', ...forwarded], env)
-  if (testExitCode !== 0 || forwarded.length > 0) return testExitCode
+  if (testExitCode !== 0 || !shouldRunProviderCrashRecoveryGate(process.platform, forwarded)) return testExitCode
 
   // The destructive provider-recovery parents stay ignored in ordinary host
   // Cargo runs. Schedule their exact selector in the disposable runtime suite
