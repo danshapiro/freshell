@@ -1218,7 +1218,19 @@ mod tests {
         std::fs::write(&host_command, "#!/bin/sh\nprintf 'mcp fixture\\n'\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&host_command, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let direct_command = std::process::Command::new(&host_command).output();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let direct_command = loop {
+            let result = std::process::Command::new(&host_command).output();
+            if result
+                .as_ref()
+                .is_err_and(|error| error.raw_os_error() == Some(libc::ETXTBSY))
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            }
+            break result;
+        };
         assert!(
             direct_command
                 .as_ref()
