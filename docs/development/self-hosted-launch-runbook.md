@@ -111,8 +111,14 @@ RUN=$(mktemp -d)   # private per-run dir for the survival snapshots
 docker ps -q --filter name=incarnation | xargs -r docker inspect \
   --format '{{.Id}} {{.Name}} {{.State.StartedAt}}' | sort | tee "$RUN/souls-before.txt"
 CHECKOUT=$(systemctl --user show freshell-rust.service -p WorkingDirectory --value)
+# The server may be DEAD at this point (this procedure is also the
+# recovery path for a dead managed server): MainPID=0 then, and reading
+# /proc/0/environ would abort under set -e — guard it:
 SPID=$(systemctl --user show freshell-rust.service -p MainPID --value)
-TOK=$(tr '\0' '\n' < "/proc/$SPID/environ" | sed -n 's/^AUTH_TOKEN=//p')
+TOK=""
+if [ "${SPID:-0}" -gt 0 ] 2>/dev/null; then
+  TOK=$(tr '\0' '\n' < "/proc/$SPID/environ" | sed -n 's/^AUTH_TOKEN=//p' || true)
+fi
 if [ -z "$TOK" ]; then
   TOK=$(python3 - "$CHECKOUT/.env" <<'PY'
 import re,sys
@@ -132,7 +138,7 @@ fi
 test -n "$TOK" || { echo "AUTH_TOKEN not found — extract it manually"; exit 1; }
 umask 077
 printf 'x-auth-token: %s\n' "$TOK" > "$RUN/hdr"
-trap 'rm -f "$RUN/hdr"' EXIT
+trap 'rm -f "${RUN:-/nonexistent}/hdr"' EXIT   # ${RUN:-} survives set -u
 if curl -s -o /dev/null -w '%{http_code}' -H @"$RUN/hdr" \
      http://127.0.0.1:3001/api/runtime/readiness | grep -q 200; then
   curl -s -H @"$RUN/hdr" http://127.0.0.1:3001/api/runtime/souls \
@@ -177,12 +183,14 @@ the procedure mid-way and leave the service down. Two sequences:
   ```bash
   systemctl --user start freshell-supervisor.service
   SOCK="$HOME/.freshell/managed-runtime/control/supervisor.sock"
-  # The supervisor binds its socket only AFTER startup reconciliation, and
-  # reconciliation sizing is CONFIGURABLE (FRESHELL_RUNTIME_STARTUP_CONCURRENCY,
-  # per-soul timeout up to 900s, plus pending loss cleanup) — so no fixed
-  # formula can bound it reliably. Wait on supervisor-unit LIVENESS as the
-  # failure detector instead: a healthy-but-slow supervisor is not a
-  # failure, a dead unit is:
+  # Two failure detectors: supervisor-unit LIVENESS (fast — a dead unit
+  # ends the wait immediately) and a generous absolute CAP (stall — a
+  # live-but-wedged process must not hang the redeploy forever).
+  # Reconciliation sizing is configurable, so no formula is exact; the
+  # 3600s default exceeds any sane inventory, and operators with extreme
+  # configs can raise it:
+  CAP=${FRESHELL_PROBE_SOCKET_WAIT_SECONDS:-3600}
+  WAITED=0
   while true; do
     # CONNECT-probe, not a file test: a stopped supervisor leaves its old
     # socket FILE on disk, so [ -S ... ] passes on a dead listener:
@@ -194,19 +202,22 @@ except OSError: sys.exit(1)' "$SOCK" 2>/dev/null; then
     fi
     systemctl --user is-active freshell-supervisor.service >/dev/null \
       || { echo "supervisor unit is not active"; exit 1; }
-    sleep 5
+    [ "$WAITED" -lt "$CAP" ] || {
+      echo "supervisor alive but socket not bound after ${WAITED}s — check its journal:"
+      journalctl --user -u freshell-supervisor.service -n 30 --no-pager
+      echo "if your config legitimately needs longer, raise FRESHELL_PROBE_SOCKET_WAIT_SECONDS"
+      exit 1
+    }
+    WAITED=$((WAITED + 5)); sleep 5
   done
   systemctl --user start freshell-rust.service
   ```
 
-  The connect-probe waits for a LIVE listener (a stale file fails the
-  connect) and the unit-liveness check is the real failure detector — the
-  loop ends when the socket appears or the supervisor dies, whatever the
-  reconciliation duration. If the server unit fails its first start in a
-  race window, that is this socket ordering, not a bad build — wait for
-  the live socket and start it again (repeated immediate failures can
-  also trip the unit's start limit). No soul can be created during the
-  build. This is a full outage for the duration of the build.
+  If the server unit fails its first start in a race window, that is this
+  socket ordering, not a bad build — wait for the live socket and start
+  it again (repeated immediate failures can also trip the unit's start
+  limit). No soul can be created during the build. This is a full outage
+  for the duration of the build.
 
 - The server's soul controller is strictly opt-in (`default = []` in
   `crates/freshell-server/Cargo.toml`). Setting `FRESHELL_MANAGED_RUNTIME_V1=1`
@@ -411,11 +422,14 @@ print("ok:", sys.argv[1])' "$SID"
    # following the server's dotenv rules for the common forms (fully
    # quoted values, quoted-then-comment, unquoted with a
    # whitespace-preceded `#` comment; `v#x` keeps the `#` literally).
-   # NOTE: /proc/<pid>/environ does NOT contain variables dotenvy loaded
-   # at runtime — that is exactly why the .env fallback exists.
-   SPID=$(systemctl --user show freshell-rust.service -p MainPID --value)
-   TOK=$(tr '\0' '\n' < "/proc/$SPID/environ" | sed -n 's/^AUTH_TOKEN=//p')
-   if [ -z "$TOK" ]; then
+    # NOTE: /proc/<pid>/environ does NOT contain variables dotenvy loaded
+    # at runtime — that is exactly why the .env fallback exists.
+    SPID=$(systemctl --user show freshell-rust.service -p MainPID --value)
+    TOK=""
+    if [ "${SPID:-0}" -gt 0 ] 2>/dev/null; then
+      TOK=$(tr '\0' '\n' < "/proc/$SPID/environ" | sed -n 's/^AUTH_TOKEN=//p' || true)
+    fi
+    if [ -z "$TOK" ]; then
      TOK=$(python3 - "$CHECKOUT/.env" <<'PY'
 import re,sys
 last=None
@@ -435,8 +449,10 @@ PY
    umask 077
    printf 'x-auth-token: %s\n' "$TOK" > "$D/hdr"   # header file, not argv
    # ONE EXIT trap per shell: this REPLACES the preliminary capture's
-   # trap, so scrub BOTH token headers here or $RUN/hdr would leak:
-   trap 'rm -f "$RUN/hdr" "$D/hdr"' EXIT
+   # trap, so scrub BOTH token headers here or $RUN/hdr would leak (the
+   # ${VAR:-} defaults keep the trap functional under set -u even in a
+   # lost-shell recovery where RUN is unset):
+   trap 'rm -f "${RUN:-/nonexistent}/hdr" "${D:-/nonexistent}/hdr"' EXIT
     printf 'D=%q\nWS=%q\nCHECKOUT=%q\n' "$D" "$WS" "$CHECKOUT" > "$D/run.env"
     # create the probe pane (example); record terminalId from the response:
    curl -s -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
@@ -585,7 +601,10 @@ print("UI pane is managed:", hits[0]["soulId"])' "$BWS"
     # hard non-empty assert):
     if [ ! -f "$D/hdr" ]; then
       SPID=$(systemctl --user show freshell-rust.service -p MainPID --value)
-      TOK=$(tr '\0' '\n' < "/proc/$SPID/environ" | sed -n 's/^AUTH_TOKEN=//p')
+      TOK=""
+      if [ "${SPID:-0}" -gt 0 ] 2>/dev/null; then
+        TOK=$(tr '\0' '\n' < "/proc/$SPID/environ" | sed -n 's/^AUTH_TOKEN=//p' || true)
+      fi
       if [ -z "$TOK" ]; then
         TOK=$(python3 - "$CHECKOUT/.env" <<'PY'
 import re,sys
@@ -605,7 +624,7 @@ PY
       test -n "$TOK" || { echo "AUTH_TOKEN not found — extract it manually"; exit 1; }
       umask 077; printf 'x-auth-token: %s\n' "$TOK" > "$D/hdr"
     fi
-    trap 'rm -f "$RUN/hdr" "$D/hdr"' EXIT   # BOTH token headers, every exit path
+    trap 'rm -f "${RUN:-/nonexistent}/hdr" "${D:-/nonexistent}/hdr"' EXIT   # BOTH headers, every exit path, set -u-safe
     if [ -z "${SOUL_ID:-}" ]; then
       # Recovery mode: derive the probe soul from the unique workspace —
       # no independent terminalId check applies here; WS uniqueness IS
