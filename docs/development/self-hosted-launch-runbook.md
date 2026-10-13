@@ -124,14 +124,17 @@ RUN=$(mktemp -d)   # private per-run dir for the survival snapshots
 # would otherwise capture against the wrong one, passing the survival
 # check vacuously. DOCKER_CONTEXT must go too — it precedes DOCKER_HOST:
 unset DOCKER_CONTEXT || true
-UNIT_ARGS=$(systemctl --user cat freshell-supervisor.service | tr ' ' '\n')
-DSOCK=$(sed -n 's/^--docker-socket=\?//p' <<<"$UNIT_ARGS" | head -1)
+# Extract flag values with a lookbehind that accepts BOTH the
+# `--flag value` and `--flag=value` forms (splitting on spaces would
+# separate the flag from its value and yield empty matches):
+UNIT_CAT=$(systemctl --user cat freshell-supervisor.service)
+DSOCK=$(grep -oP '(?<=--docker-socket[= ])\S+' <<<"$UNIT_CAT" | head -1)
 DSOCK=${DSOCK//%t/${XDG_RUNTIME_DIR:-/run/user/$(id -u)}}
 DSOCK=${DSOCK//%h/$HOME}
 DSOCK=${DSOCK:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock}
 export DOCKER_HOST="unix://$DSOCK"
 # Same for the registry root the soul inventory reads (used below):
-REGROOT=$(sed -n 's/^--registry-root=\?//p' <<<"$UNIT_ARGS" | head -1)
+REGROOT=$(grep -oP '(?<=--registry-root[= ])\S+' <<<"$UNIT_CAT" | head -1)
 REGROOT=${REGROOT//%t/${XDG_RUNTIME_DIR:-/run/user/$(id -u)}}
 REGROOT=${REGROOT//%h/$HOME}
 REGROOT=${REGROOT:-$HOME/.freshell/managed-runtime/registry}
@@ -238,7 +241,13 @@ the procedure mid-way and leave the service down. Two sequences:
 
   ```bash
   systemctl --user start freshell-supervisor.service
-  SOCK="$HOME/.freshell/managed-runtime/control/supervisor.sock"
+  # The control socket path comes from the INSTALLED unit (a
+  # site-specific --control-socket must not defeat this wait):
+  SOCK=$(grep -oP '(?<=--control-socket[= ])\S+' \
+    <(systemctl --user cat freshell-supervisor.service) | head -1)
+  SOCK=${SOCK//%t/${XDG_RUNTIME_DIR:-/run/user/$(id -u)}}
+  SOCK=${SOCK//%h/$HOME}
+  SOCK=${SOCK:-$HOME/.freshell/managed-runtime/control/supervisor.sock}
   # Two failure detectors: supervisor-unit LIVENESS (fast — a dead unit
   # ends the wait immediately) and an inventory-sized absolute CAP
   # (stall — a live-but-wedged process must not hang the redeploy
@@ -753,11 +762,13 @@ for r in (d.get("allowedFilePaths") or []):
     if ! printf '%s\n' "$ALLOWED" | grep -q "^$HOME"; then
       FIRST_ALLOWED=$(head -1 <<<"$ALLOWED")
       if [ -n "$FIRST_ALLOWED" ]; then
-        PROBE_ROOT=$(mktemp -d "$FIRST_ALLOWED/freshell-probe.XXXXXX")
-        chmod 0770 "$PROBE_ROOT"
-        printf 'PROBE_ROOT=%q\n' "$PROBE_ROOT" >> "$D/run.env"
+        # Keep PROBE_ROOT (and the REST probe's WS) where it is — mint a
+        # SEPARATE browser root under the allowed root and record it:
+        BROWSER_ROOT=$(mktemp -d "$FIRST_ALLOWED/freshell-probe.XXXXXX")
+        chmod 0770 "$BROWSER_ROOT"
+        printf 'BROWSER_ROOT=%q\n' "$BROWSER_ROOT" >> "$D/run.env"
         rm -rf "$BWS"
-        BWS=$(mktemp -d "$PROBE_ROOT/bws.XXXXXX")
+        BWS=$(mktemp -d "$BROWSER_ROOT/bws.XXXXXX")
         chmod 0770 "$BWS"
         printf 'BWS=%q\n' "$BWS" >> "$D/run.env"
       fi
@@ -849,8 +860,8 @@ print("UI pane is managed:", rows[-1]["soulId"])' "$BWS"
         eval "VAL=\${$V:-}"
         [ -n "$VAL" ] || continue
         VAL=$(realpath -e "$VAL") || { echo "$V: path does not exist"; exit 1; }
-        case "$VAL" in
-          "$HOME"/freshell-probe.*) printf -v "$V" '%s' "$VAL" ;;
+        case "$(basename "$(dirname "$VAL")")" in
+          freshell-probe.*) printf -v "$V" '%s' "$VAL" ;;
           *) echo "REFUSING: $V=$VAL is not under a freshell-probe run root — resolve manually"; exit 1 ;;
         esac
       done
@@ -923,28 +934,32 @@ PY
       [ -n "$VAL" ] || continue
       VAL=$(realpath -e "$VAL") || { echo "$V: path does not exist"; exit 1; }
       PARENT=$(dirname "$VAL")
-      if [ -n "$GUARD_ROOT" ]; then
-        # Records exist: the workspace must sit directly under the root
-        # this run recorded:
-        if [ "$PARENT" != "$GUARD_ROOT" ]; then
-          echo "REFUSING: $V=$VAL is not under this run's probe root $GUARD_ROOT — resolve manually"
+      if [ -n "${GUARD_ROOT:-}" ]; then
+        # Records exist: WS must sit under the recorded PROBE_ROOT and
+        # BWS under the recorded BROWSER_ROOT (when the allowed-roots
+        # fallback minted one) — per-variable roots, never a shared one:
+        if [ -f "${D:-/nonexistent}/run.env" ]; then
+          case "$V" in
+            WS) WANT_ROOT=$(bash -c '. "$1"; printf "%s" "${PROBE_ROOT:-}"' _ "${D:-}/run.env") ;;
+            BWS) WANT_ROOT=$(bash -c '. "$1"; printf "%s" "${BROWSER_ROOT:-${PROBE_ROOT:-}}"' _ "${D:-}/run.env") ;;
+          esac
+        fi
+        WANT_ROOT="${WANT_ROOT:-$GUARD_ROOT}"
+        if [ "$PARENT" != "$WANT_ROOT" ]; then
+          echo "REFUSING: $V=$VAL is not under this run's recorded root for it ($WANT_ROOT) — resolve manually"
           exit 1
         fi
       else
-      case "$PARENT" in
-        "$HOME"/freshell-probe.*) ;;
-        *) echo "REFUSING: $V=$VAL is not a freshell-probe workspace — resolve manually"; exit 1 ;;
+      # Recovery (no records): the workspace's parent must BE a
+      # freshell-probe root by BASENAME — anchored anywhere (an
+      # allowed-roots deployment puts the browser probe outside $HOME).
+      # The emptiness check and the interactive confirm below still
+      # apply; a real directory named freshell-probe.* is the residual
+      # risk the confirm step exists to catch:
+      case "$(basename "$PARENT")" in
+        freshell-probe.*) ;;
+        *) echo "REFUSING: $V=$VAL is not under a freshell-probe run root — resolve manually"; exit 1 ;;
       esac
-      fi
-      # A case-pattern `*` matches `/` too — pin the depth IN THE
-      # PATTERN BRANCH ONLY (records-path workspaces already proved
-      # their parent is the recorded root, which may sit under an
-      # allowed root away from $HOME): the parent's own parent must be
-      # EXACTLY the home, so a path nested deeper under a probe-named
-      # directory cannot pass:
-      if [ -z "$GUARD_ROOT" ] && [ "$(dirname "$PARENT")" != "$HOME" ]; then
-        echo "REFUSING: $V=$VAL is nested below $PARENT — workspaces sit directly under the probe root"
-        exit 1
       fi
       # A NAME pattern is not ownership: a real workspace could sit under
       # a freshell-probe-named directory. Probe workspaces are created
@@ -956,11 +971,13 @@ PY
         echo "REFUSING: $V=$VAL is not empty — probe workspaces are empty; resolve manually"
         exit 1
       fi
+      # The records path above already tied each workspace to its OWN
+      # recorded root (PROBE_ROOT for WS, BROWSER_ROOT for BWS) — no
+      # cross-variable sharing rule applies; the recovery path anchors
+      # by basename above. Only remember the first parent for any later
+      # recovery-mode checks:
       if [ -z "$GUARD_ROOT" ]; then
         GUARD_ROOT="$PARENT"
-      elif [ "$PARENT" != "$GUARD_ROOT" ]; then
-        echo "REFUSING: $V=$VAL belongs to a different probe root than the other paths — resolve manually"
-        exit 1
       fi
       printf -v "$V" '%s' "$VAL"
     done
@@ -1275,6 +1292,12 @@ print("" if cur is None else cur)' "$SWEEP_DIR/settings.json") \
       else
         echo "probe root kept — it contains unexpected entries:$UNEXPECTED"
       fi
+    fi
+    # The allowed-roots fallback's browser root (when this run minted
+    # one and it is empty after the workspace deletion):
+    if [ -n "${BROWSER_ROOT:-}" ] && [ -d "$BROWSER_ROOT" ] \
+       && [ -z "$(find "$BROWSER_ROOT" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+      rm -rf "$BROWSER_ROOT"
     fi
     ```
 
