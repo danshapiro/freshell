@@ -733,13 +733,19 @@ Run: `git diff --cached --check`
 
 Expected: the staged diff contains only the reviewed smoke test changes and any directly required product fix. Commit with a focused message; do not include external run evidence or credentials.
 
+- [ ] **Step 6: Run the final configured full-suite gate**
+
+Run after Task 8 and Task 9 commits: `pnpm run test`, using the configured `FRESHELL_VITEST_BACKEND` and `FRESHELL_E2E_BACKEND`. Agent-launched Cloud lanes must set `GCLOUD_ROBOT_REQUIRE=1` and use the configured robot identity; do not silently change backends or treat skipped/zero-match cases as coverage.
+
+Expected: the coordinated full suite passes on the final committed candidate, excluding only failures recorded in the baseline ledger with reproduction evidence at `base_ref`. Record the exact command, commit, and result in the run ledger before Stage 5.
+
 ## Acceptance and self-review map
 
 | User obligation | Tasks | Observable evidence |
 | --- | --- | --- |
 | Fix diagnosed durable-souls defects and preserve meaningful regressions | 1–8 | Existing source repair tests, affected browser cases, configured full-suite gate and independent review |
 | Avoid false loss conclusions from missing/unreadable identity or storage | 3, 4, 8 | Existing behavior tests reject unknown or incomplete evidence without treating it as absence |
-| Fix configuration, blocked recovery, retry and interrupted Stop behavior | 2, 5, 6, 8 | Provider-identity config tests, retry tests, and actual selected config/legacy/Stop browser cases |
+| Fix configuration, blocked recovery, retry and interrupted Stop behavior | 2, 5, 6, 8 | Provider-identity config tests, retry tests, and the selected interrupted-Stop browser case; config/legacy transition browser cases are outside the accepted manual-porting scope |
 | Make normal use work across six selected modes | 9 | One completed ordinary response per selected terminal and fresh-agent mode; exact cleanup |
 | Skip Amplifier and Kilroy live work | 9 | No Amplifier/Kilroy model, credential or qualification operation; existing code/tests preserved |
 | Allow manual session porting if transition changes a native session | Global 3, 9 | No automatic import or same-native-session-across-restart claim; limitation stated plainly |
