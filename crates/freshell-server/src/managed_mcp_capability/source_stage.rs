@@ -2295,6 +2295,99 @@ mod configured_resource_tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn controller_filters_workspace_reached_through_package_symlink() {
+        let owned = tempfile::tempdir().unwrap();
+        let package = owned.path().join("external");
+        let workspace = owned.path().join("checkout/project");
+        let filtered = tempfile::tempdir_in(owned.path()).unwrap();
+        std::fs::create_dir_all(package.join("node_modules")).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("index.mjs"),
+            "export const nonce = 'separately-mounted-workspace-loaded';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join("workspace-data.txt"),
+            "private workspace data\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&workspace, package.join("project")).unwrap();
+        std::os::unix::fs::symlink("../project", package.join("node_modules/project")).unwrap();
+        std::fs::write(package.join("package.json"), r#"{"type":"module"}"#).unwrap();
+        std::fs::write(
+            package.join("server.mjs"),
+            "import { nonce } from './node_modules/project/index.mjs';\nprocess.stdout.write(nonce + '\\n');\n",
+        )
+        .unwrap();
+        let mount = freshell_runtime_protocol::ProviderResourceMount {
+            stage_relative_path: ".freshell/resource-units/root-symlink".into(),
+            provider_relative_path: ".freshell/provider-roots/root-symlink".into(),
+            logical_destination: package.to_string_lossy().into_owned(),
+            effective_destination: package.to_string_lossy().into_owned(),
+            kind: freshell_runtime_protocol::ProviderResourceKind::Directory,
+        };
+        let mut units = vec![(package.clone(), mount)];
+
+        filter_workspace_from_enclosing_resource_units(
+            &mut units,
+            "opencode",
+            &workspace,
+            filtered.path(),
+            &[],
+        )
+        .unwrap();
+
+        assert_ne!(units[0].0, package, "the symlinked workspace is filtered");
+        let filtered_package = &units[0].0;
+        assert!(std::fs::symlink_metadata(filtered_package.join("project"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::canonicalize(filtered_package.join("project")).unwrap(),
+            workspace.canonicalize().unwrap(),
+            "the separately mounted workspace remains reachable through its alias"
+        );
+        let output = std::process::Command::new("node")
+            .arg(filtered_package.join("server.mjs"))
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"separately-mounted-workspace-loaded\n");
+
+        let final_stage = filtered.path().join("managed-stage");
+        freshell_platform::provider_environment::copy_environment_excluding_subtree(
+            &[freshell_platform::provider_environment::CopySelection {
+                source: filtered_package.clone(),
+                destination_relative: "resource".into(),
+            }],
+            &final_stage,
+            &[],
+            &workspace,
+            Default::default(),
+        )
+        .unwrap();
+        let final_package = final_stage.join("resource");
+        assert_eq!(
+            std::fs::canonicalize(final_package.join("project")).unwrap(),
+            workspace.canonicalize().unwrap(),
+            "the final controller stage preserves the separate workspace link"
+        );
+        let output = std::process::Command::new("node")
+            .arg(final_package.join("server.mjs"))
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"separately-mounted-workspace-loaded\n");
+    }
+
     #[test]
     fn filtering_shared_home_and_workspace_resource_keeps_one_copy_source() {
         let owned = tempfile::tempdir().unwrap();
@@ -3395,9 +3488,12 @@ pub(super) fn filter_workspace_from_enclosing_resource_units(
         }
         let canonical_source = std::fs::canonicalize(&*source)
             .map_err(|_| "selected OpenCode resource stage source is unavailable")?;
-        if canonical_workspace == canonical_source
-            || !canonical_workspace.starts_with(&canonical_source)
-        {
+        if canonical_workspace == canonical_source {
+            continue;
+        }
+        let contains_workspace = canonical_workspace.starts_with(&canonical_source)
+            || resource_contains_workspace_alias(&canonical_source, &canonical_workspace)?;
+        if !contains_workspace {
             continue;
         }
         if let Some(filtered_source) = filtered_sources.get(&canonical_source) {
@@ -3473,6 +3569,52 @@ pub(super) fn filter_workspace_from_enclosing_resource_units(
         *source = filtered_source;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn resource_contains_workspace_alias(source: &Path, workspace: &Path) -> Result<bool, String> {
+    let limits = freshell_platform::provider_environment::CopyLimits::default();
+    let mut pending = vec![(source.to_owned(), 0usize)];
+    let mut entries = 0usize;
+    while let Some((directory, depth)) = pending.pop() {
+        if depth > limits.max_depth {
+            return Err("selected OpenCode resource exceeds the directory depth limit while checking workspace aliases".into());
+        }
+        let children = std::fs::read_dir(&directory).map_err(|_| {
+            "selected OpenCode resource could not be inspected for workspace aliases"
+        })?;
+        for child in children {
+            let child = child.map_err(|_| {
+                "selected OpenCode resource could not be inspected for workspace aliases"
+            })?;
+            entries = entries
+                .checked_add(1)
+                .ok_or("selected OpenCode resource entry accounting overflow")?;
+            if entries > limits.max_entries {
+                return Err("selected OpenCode resource exceeds the entry limit while checking workspace aliases".into());
+            }
+            let path = child.path();
+            let file_type = child.file_type().map_err(|_| {
+                "selected OpenCode resource could not be inspected for workspace aliases"
+            })?;
+            if file_type.is_symlink() {
+                let target = std::fs::canonicalize(&path).map_err(|_| {
+                    "selected OpenCode resource contains a symbolic link that cannot be resolved"
+                })?;
+                if target == workspace || target.starts_with(workspace) {
+                    return Ok(true);
+                }
+            } else if file_type.is_dir() {
+                pending.push((path, depth + 1));
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(not(unix))]
+fn resource_contains_workspace_alias(_source: &Path, _workspace: &Path) -> Result<bool, String> {
+    Ok(false)
 }
 
 pub(super) fn current_source_for_resource_mount(

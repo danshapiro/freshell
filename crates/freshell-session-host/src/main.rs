@@ -1823,19 +1823,62 @@ fn copy_environment_with_events_for_mounts(
     freshell_platform::provider_environment::CopyReport,
     freshell_platform::provider_environment::CopyError,
 > {
+    copy_environment_with_events_using(stage, provider, selections, || {
+        freshell_platform::provider_environment::copy_environment_for_mounts(
+            selections,
+            destination,
+            excluded,
+            Default::default(),
+            mounted_directories,
+        )
+    })
+}
+
+fn copy_environment_with_events_excluding_subtree_for_mounts(
+    stage: &str,
+    provider: &str,
+    selections: &[freshell_platform::provider_environment::CopySelection],
+    destination: &Path,
+    excluded: &[PathBuf],
+    excluded_subtree: &Path,
+    mounted_directories: &[PathBuf],
+) -> Result<
+    freshell_platform::provider_environment::CopyReport,
+    freshell_platform::provider_environment::CopyError,
+> {
+    copy_environment_with_events_using(stage, provider, selections, || {
+        freshell_platform::provider_environment::copy_environment_excluding_subtree_for_mounts(
+            selections,
+            destination,
+            excluded,
+            excluded_subtree,
+            Default::default(),
+            mounted_directories,
+        )
+    })
+}
+
+fn copy_environment_with_events_using<F>(
+    stage: &str,
+    provider: &str,
+    selections: &[freshell_platform::provider_environment::CopySelection],
+    copy: F,
+) -> Result<
+    freshell_platform::provider_environment::CopyReport,
+    freshell_platform::provider_environment::CopyError,
+>
+where
+    F: FnOnce() -> Result<
+        freshell_platform::provider_environment::CopyReport,
+        freshell_platform::provider_environment::CopyError,
+    >,
+{
     let started = std::time::Instant::now();
     emit_environment_event(serde_json::json!({
         "severity": "info", "event": "provider.environment.copy.started",
         "stage": stage, "provider": provider, "selections": selections.len()
     }));
-    let report = freshell_platform::provider_environment::copy_environment_for_mounts(
-        selections,
-        destination,
-        excluded,
-        Default::default(),
-        mounted_directories,
-    )
-    .inspect_err(|error| {
+    let report = copy().inspect_err(|error| {
         emit_environment_event(serde_json::json!({
             "severity": "error", "event": "provider.environment.copy.failed",
             "stage": stage, "provider": provider,
@@ -2052,19 +2095,47 @@ fn copy_provider_config_references_with_ownership(
         filtered_resource_sources.insert(canonical_source, selection.source.clone());
         _filtered_resource_sources.push(scratch);
     }
+    for (resource_index, _) in context
+        .prepared_inputs
+        .iter()
+        .flat_map(|inputs| &inputs.resource_mounts)
+        .enumerate()
+    {
+        let resource_selection_index = config_selection_count + resource_index;
+        let selection = selections
+            .get_mut(resource_selection_index)
+            .ok_or("provider resource selection is incomplete")?;
+        if let Ok(canonical_source) = std::fs::canonicalize(&selection.source) {
+            if let Some(filtered_source) = filtered_resource_sources.get(&canonical_source) {
+                selection.source = filtered_source.clone();
+            }
+        }
+    }
     let mounted = if provider_home == final_home {
         resource_mount_roots(context)
     } else {
         Vec::new()
     };
-    let report = copy_environment_with_events_for_mounts(
-        "session_host",
-        provider,
-        &selections,
-        provider_home,
-        &excluded,
-        &mounted,
-    )
+    let report = if provider == "opencode" {
+        copy_environment_with_events_excluding_subtree_for_mounts(
+            "session_host",
+            provider,
+            &selections,
+            provider_home,
+            &excluded,
+            workspace,
+            &mounted,
+        )
+    } else {
+        copy_environment_with_events_for_mounts(
+            "session_host",
+            provider,
+            &selections,
+            provider_home,
+            &excluded,
+            &mounted,
+        )
+    }
     .map_err(|error| error.to_string())?;
     let projected = report
         .projected_paths
@@ -4614,6 +4685,7 @@ mod tests {
         let provider_home = owned.path().join("home");
         let provider_resource = provider_home.join(".freshell/provider-roots/root-0");
         let linked_package = unit.join("project/packages/worker-package");
+        std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(unit.join("tools")).unwrap();
         std::fs::create_dir_all(&linked_package).unwrap();
         std::os::unix::fs::symlink(
@@ -4664,13 +4736,22 @@ mod tests {
                 },
                 config_binds: vec![],
                 indexed_files: None,
-                resource_mounts: vec![ProviderResourceMount {
-                    stage_relative_path: ".freshell/resource-units/root-0".into(),
-                    provider_relative_path: ".freshell/provider-roots/root-0".into(),
-                    logical_destination: package.to_string_lossy().into_owned(),
-                    effective_destination: package.to_string_lossy().into_owned(),
-                    kind: ProviderResourceKind::Directory,
-                }],
+                resource_mounts: vec![
+                    ProviderResourceMount {
+                        stage_relative_path: ".freshell/resource-units/root-0".into(),
+                        provider_relative_path: ".freshell/provider-roots/root-0".into(),
+                        logical_destination: package.to_string_lossy().into_owned(),
+                        effective_destination: package.to_string_lossy().into_owned(),
+                        kind: ProviderResourceKind::Directory,
+                    },
+                    ProviderResourceMount {
+                        stage_relative_path: ".freshell/resource-units/root-0".into(),
+                        provider_relative_path: ".freshell/provider-roots/root-0".into(),
+                        logical_destination: "/home/freshell/.config/opencode".into(),
+                        effective_destination: "/home/freshell/provider/.config/opencode".into(),
+                        kind: ProviderResourceKind::Directory,
+                    },
+                ],
             }),
             mcp_capability: Some(capability),
         };

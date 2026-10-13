@@ -119,6 +119,7 @@ enum Node {
     Directory(PathBuf),
     File(PathBuf, u32, u64),
     Link(PathBuf),
+    MountedLink(PathBuf),
 }
 struct Plan {
     nodes: BTreeMap<PathBuf, Node>,
@@ -174,6 +175,17 @@ impl Plan {
         destination: PathBuf,
         depth: usize,
     ) -> Result<(), CopyError> {
+        if self.is_alias_into_excluded_subtree(&source)
+            && self
+                .excluded_subtree
+                .as_deref()
+                .is_some_and(|excluded| source == excluded || source.parent() == Some(excluded))
+        {
+            // The managed runtime mounts the workspace at its original absolute
+            // path. Keep root aliases pointed at that mount instead of
+            // materializing an unbounded workspace as a package dependency.
+            return self.claim(destination, Node::MountedLink(source));
+        }
         let mapped = self.external_resource(&source, &destination, depth)?;
         self.claim(destination, Node::Link(mapped))
     }
@@ -261,9 +273,10 @@ impl Plan {
             .ok_or_else(|| error(&path, "plan", "entry accounting overflow"))?;
         bound(&path, "entries", entries, self.limits.max_entries as u64)?;
         let source_bytes = match &node {
-            Node::Directory(source) | Node::File(source, ..) | Node::Link(source) => {
-                source.as_os_str().len() as u64
-            }
+            Node::Directory(source)
+            | Node::File(source, ..)
+            | Node::Link(source)
+            | Node::MountedLink(source) => source.as_os_str().len() as u64,
         };
         self.metadata_bytes = self
             .metadata_bytes
@@ -689,14 +702,37 @@ fn copy_environment_with_account_home(
 }
 
 /// Copies a selected resource while omitting one nested tree. Symlink aliases
-/// inside the selected resource that target that tree are materialized at the
-/// alias path, subject to the same copy limits and every other exclusion.
+/// into bounded subresources are materialized at the alias path; aliases to the
+/// excluded tree root or one of its top-level files remain absolute links to its
+/// separately mounted workspace. A child selected directly remains bounded to
+/// that child. All other exclusions still apply.
 pub fn copy_environment_excluding_subtree(
     selections: &[CopySelection],
     destination_root: &Path,
     excluded_canonical_sources: &[PathBuf],
     excluded_subtree: &Path,
     limits: CopyLimits,
+) -> Result<CopyReport, CopyError> {
+    copy_environment_excluding_subtree_for_mounts(
+        selections,
+        destination_root,
+        excluded_canonical_sources,
+        excluded_subtree,
+        limits,
+        &[],
+    )
+}
+
+/// Exclusion-aware projection for a runtime with separately mounted resource
+/// roots. Aliases at the excluded workspace root remain absolute links to that
+/// mount, while mounted roots retain their existing publication behavior.
+pub fn copy_environment_excluding_subtree_for_mounts(
+    selections: &[CopySelection],
+    destination_root: &Path,
+    excluded_canonical_sources: &[PathBuf],
+    excluded_subtree: &Path,
+    limits: CopyLimits,
+    mounted_roots: &[PathBuf],
 ) -> Result<CopyReport, CopyError> {
     let excluded_subtree = fs::canonicalize(excluded_subtree).map_err(|cause| {
         io_error(
@@ -716,7 +752,7 @@ pub fn copy_environment_excluding_subtree(
         &exclusions,
         limits,
         account_home,
-        &[],
+        mounted_roots,
         Some(excluded_subtree),
     )
 }
@@ -809,6 +845,16 @@ fn copy_environment_projection(
             .map_err(|cause| io_error(path, "select", cause))?;
         let canonical = fs::canonicalize(&selection.source)
             .map_err(|cause| io_error(path, "resolve_selection", cause))?;
+        if plan
+            .excluded_subtree
+            .as_deref()
+            .is_some_and(|excluded| canonical != excluded && canonical.starts_with(excluded))
+        {
+            // A specifically selected child remains an independent bounded
+            // resource even when its containing workspace is separately
+            // mounted and excluded from enclosing package resources.
+            plan.include_selected_subtree_resource(&canonical);
+        }
         if plan.excluded(&canonical) {
             return Err(error(path,"select","selected resource is excluded native state or a credential source; keep native state in its store and use managed references for credentials"));
         }
@@ -964,6 +1010,17 @@ fn copy_environment_projection(
                 } else {
                     relative_link(relative.parent().unwrap_or(Path::new("")), target)
                 };
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(target, &destination)
+                    .map_err(|cause| io_error(relative, "create_link", cause))?;
+                #[cfg(not(unix))]
+                return Err(error(
+                    relative,
+                    "create_link",
+                    "symbolic resource projection requires Unix",
+                ));
+            }
+            Node::MountedLink(target) => {
                 #[cfg(unix)]
                 std::os::unix::fs::symlink(target, &destination)
                     .map_err(|cause| io_error(relative, "create_link", cause))?;
@@ -1551,7 +1608,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn excluded_workspace_root_file_alias_requires_a_bounded_resource_scope() {
+    fn excluded_workspace_root_file_alias_uses_the_separately_mounted_workspace() {
         let root = tempfile::tempdir().unwrap();
         let external = root.path().join("external");
         let workspace = external.join("project");
@@ -1577,50 +1634,115 @@ mod tests {
         .unwrap();
 
         let destination = root.path().join("provider");
-        let error = copy_environment_excluding_subtree(
+        copy_environment_excluding_subtree(
             &[selection(&external, "resource")],
             &destination,
             &[],
             &workspace,
             CopyLimits::default(),
         )
-        .unwrap_err();
-        assert_eq!(error.operation, "select_resource_scope");
-        assert!(error
-            .corrective_message
-            .contains("bounded sibling-resource scope"));
-        assert!(
-            !destination.exists(),
-            "an ambiguous workspace-root resource is rejected before publication"
+        .unwrap();
+        let copied_root = destination.join("resource");
+        assert_eq!(
+            fs::canonicalize(copied_root.join("tools/worker-link.mjs")).unwrap(),
+            workspace.join("worker.mjs").canonicalize().unwrap(),
+            "the linked script resolves through the separately mounted workspace"
         );
+        assert!(
+            !copied_root.join("project").exists(),
+            "the workspace is not copied under the package resource"
+        );
+        let output = Command::new("node")
+            .arg(copied_root.join("tools/server.mjs"))
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"workspace-root-sibling-loaded\n");
     }
 
     #[cfg(unix)]
     #[test]
-    fn excluded_workspace_root_alias_fails_without_copying_the_workspace() {
+    fn excluded_workspace_root_alias_uses_the_separately_mounted_workspace() {
         let root = tempfile::tempdir().unwrap();
         let external = root.path().join("external");
         let workspace = external.join("project");
         fs::create_dir_all(workspace.join("packages")).unwrap();
         fs::create_dir_all(external.join("node_modules")).unwrap();
         fs::write(workspace.join("private-project-data"), "do not copy").unwrap();
+        fs::write(
+            workspace.join("index.mjs"),
+            "export const nonce = 'workspace-root-package-loaded';\n",
+        )
+        .unwrap();
         symlink("../project", external.join("node_modules/workspace")).unwrap();
+        fs::write(external.join("package.json"), r#"{"type":"module"}"#).unwrap();
+        fs::write(
+            external.join("server.mjs"),
+            "import { nonce } from './node_modules/workspace/index.mjs';\nprocess.stdout.write(nonce + '\\n');\n",
+        )
+        .unwrap();
         let destination = root.path().join("provider");
 
-        let error = copy_environment_excluding_subtree(
+        copy_environment_excluding_subtree(
             &[selection(&external, "resource")],
             &destination,
             &[],
             &workspace,
             CopyLimits::default(),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(error.operation, "select_resource_scope");
-        assert!(error
-            .corrective_message
-            .contains("entire excluded workspace"));
-        assert!(!destination.exists(), "a rejected graph is never published");
+        let copied_root = destination.join("resource");
+        assert_eq!(
+            fs::canonicalize(copied_root.join("node_modules/workspace")).unwrap(),
+            workspace.canonicalize().unwrap(),
+            "the local package alias must resolve to the separately mounted workspace"
+        );
+        assert!(
+            !copied_root.join("project/private-project-data").exists(),
+            "the excluded workspace is not copied as a package dependency"
+        );
+        let output = Command::new("node")
+            .arg(copied_root.join("server.mjs"))
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"workspace-root-package-loaded\n");
+    }
+
+    #[test]
+    fn excluded_workspace_keeps_explicitly_selected_child_resources() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("selected-config.json"), "selected config").unwrap();
+        fs::write(workspace.join("unselected-workspace-data"), "keep out").unwrap();
+        let destination = root.path().join("provider");
+
+        copy_environment_excluding_subtree(
+            &[selection(
+                &workspace.join("selected-config.json"),
+                "config.json",
+            )],
+            &destination,
+            &[],
+            &workspace,
+            CopyLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination.join("config.json")).unwrap(),
+            "selected config"
+        );
+        assert!(
+            !destination.join("unselected-workspace-data").exists(),
+            "an explicitly selected child does not widen into its workspace"
+        );
     }
 
     #[cfg(unix)]

@@ -1977,7 +1977,21 @@ fn stage_provider_root(
             provider,
             selections = selections.len()
         );
-        let report = copy_environment(&selections, &temporary, &excluded, CopyLimits::default())
+        let copy_result = if provider == "opencode" {
+            freshell_platform::provider_environment::copy_environment_excluding_subtree(
+                &selections,
+                &temporary,
+                &excluded,
+                opencode_input
+                    .workspace
+                    .or(opencode_input.cwd)
+                    .unwrap_or(home),
+                CopyLimits::default(),
+            )
+        } else {
+            copy_environment(&selections, &temporary, &excluded, CopyLimits::default())
+        };
+        let report = copy_result
             .map_err(|error| {
                 let failing_selection = selections.iter().find(|selection| {
                     error
