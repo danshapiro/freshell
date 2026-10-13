@@ -41,11 +41,17 @@ process.stdout.write(JSON.stringify(await observeOpenCodeParitySelection(...proc
         freshell: { type: 'local', command: ['actual-mcp', 'argument'] } } }))
       else await fs.unlink(projected).catch(() => {})
       const spec = pathToFileURL(managed ? packageRoot : entry).href
-      await fs.writeFile(selectedTui, JSON.stringify({ theme: 'selected', plugin: ['file:///selected/user-plugin.js', spec] }))
+      const selectedTuiConfig = `{
+  // OpenCode accepts JSONC, including comments and trailing commas.
+  "theme": "selected",
+  "plugin": ["file:///selected/user-plugin.js", ${JSON.stringify(spec)},],
+}`
+      await fs.writeFile(selectedTui, selectedTuiConfig)
       const observed = inspect()
       expect(JSON.parse(observed.projectedProjectConfig)).toEqual(userConfig)
       expect(observed.rebindPlugin).toMatchObject({ spec, hello: true, sessionId: 'ses_parity' })
-      expect(JSON.parse(observed.tuiConfig)).toEqual({ theme: 'selected', plugin: ['file:///selected/user-plugin.js', spec] })
+      expect(observed.tuiConfig).toBe(selectedTuiConfig)
+      expect(observed.tuiConfigParsed).toEqual({ theme: 'selected', plugin: ['file:///selected/user-plugin.js', spec] })
     }
     const configuredBridge = { ...userConfig, mcp: { ...userConfig.mcp,
       freshell: { type: 'local', command: ['selected-user-bridge'] } } }
@@ -63,6 +69,16 @@ it('classifies owned provider publication failures without retaining error bodie
     'null', 'false', '[]', 'not-json',
     JSON.stringify({ event: 'provider.projection.transaction.started', stage: 'stage' }),
     JSON.stringify({ event: 'provider.projection.transaction.failed', stage: 'publish', cause: `provider transaction install .config/${secret}: Invalid cross-device link (os error 18)` }),
+    JSON.stringify({ event: 'provider.opencode.resource.directory_selected', field: 'OpenCode mcp.cwd',
+      resource_leaf: 'workspace', source_config_leaf: 'opencode.json', source_config_parent_leaf: '.opencode',
+      source_config_grandparent_leaf: 'project', resource_parent_leaf: 'parent',
+      resource_grandparent_leaf: 'grandparent' }),
+    JSON.stringify({ event: 'provider.environment.copy.failed', provider: 'opencode', operation: 'plan',
+      relative_path: '.freshell/resource-units/root-0/target/debug/deps', resource_source_scope: 'external',
+      resource_source_leaf: 'selected-resource', resource_source_origin: 'configured_resource',
+      resource_source_lane: 'main', resource_source_config_leaf: 'opencode.jsonc',
+      resource_source_config_scope: 'provider_config',
+      limit_kind: 'entries', observed: 100_001, permitted: 100_000 }),
     JSON.stringify({ event: 'session_host.fatal', error: `provider refresh control ${secret}` }),
     JSON.stringify({ event: 'session_host.fatal', error: secret }),
   ].join('\n')
@@ -74,6 +90,19 @@ it('classifies owned provider publication failures without retaining error bodie
   expect(diagnostic.transactionEvents).toEqual([
     { event: 'provider.projection.transaction.started', stage: 'stage' },
     { event: 'provider.projection.transaction.failed', stage: 'publish' },
+  ])
+  expect(diagnostic.resourceCopyFailures).toEqual([{
+    provider: 'opencode', operation: 'plan',
+    relativePath: '.freshell/resource-units/root-0/target/debug/deps',
+    sourceScope: 'external', sourceLeaf: 'selected-resource',
+    sourceOrigin: 'configured_resource', sourceLane: 'main', sourceConfigLeaf: 'opencode.jsonc',
+    sourceConfigScope: 'provider_config',
+    limitKind: 'entries', observed: 100_001, permitted: 100_000,
+  }])
+  expect(diagnostic.directoryResourceSelections).toEqual([
+    { field: 'OpenCode mcp.cwd', resourceLeaf: 'workspace', sourceConfigLeaf: 'opencode.json',
+      sourceConfigParentLeaf: '.opencode', sourceConfigGrandparentLeaf: 'project', resourceParentLeaf: 'parent',
+      resourceGrandparentLeaf: 'grandparent' },
   ])
   expect(JSON.stringify(diagnostic)).not.toContain(secret)
 })

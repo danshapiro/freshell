@@ -1551,4 +1551,90 @@ mod tests {
             .any(|path| path.starts_with("/opt/freshell-mcp")
                 || path == Path::new("/opt/package.json")));
     }
+
+    #[test]
+    fn generated_project_freshell_mcp_is_not_selected_but_user_replacement_is() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let checkout = owned.path().join("freshell-checkout");
+        let config = workspace.join(".opencode/opencode.json");
+        let state = workspace.join(".opencode/.freshell-mcp-state.json");
+        let loader = checkout.join("node_modules/tsx/dist/loader.mjs");
+        let server = checkout.join("tools/freshell-mcp/server.ts");
+        let user_root = owned.path().join("user-mcp");
+        let user_script = user_root.join("server.mjs");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(loader.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(server.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&user_root).unwrap();
+        std::fs::write(
+            checkout.join("package.json"),
+            r#"{"name":"freshell","type":"module"}"#,
+        )
+        .unwrap();
+        std::fs::write(&loader, "export {}\n").unwrap();
+        std::fs::write(&server, "export {}\n").unwrap();
+        std::fs::write(&user_script, "export {}\n").unwrap();
+        let owned_command = serde_json::json!([
+            "node",
+            "--import",
+            loader.to_string_lossy(),
+            server.to_string_lossy()
+        ]);
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "mcp": {"freshell": {"type": "local", "command": owned_command}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            &state,
+            serde_json::json!({"createdEntry": true, "ownedCommand": owned_command}).to_string(),
+        )
+        .unwrap();
+
+        let plan_for = || {
+            plan_opencode_sources(
+                vec![SourceOccurrence {
+                    logical_path: config.clone(),
+                    canonical_source: config.clone(),
+                    lane: SourceLane::Main,
+                    role: DiscoveryRole::Workspace,
+                }],
+                &workspace,
+                &home,
+                &|_, _, _| None,
+            )
+            .unwrap()
+        };
+
+        let generated = plan_for();
+        assert!(
+            !generated[0]
+                .configured_resources
+                .iter()
+                .any(|path| path.starts_with(&checkout)),
+            "managed OpenCode already provides Freshell MCP from its runtime image"
+        );
+
+        let user_command = serde_json::json!(["node", user_script]);
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "mcp": {"freshell": {"type": "local", "command": user_command}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let replaced = plan_for();
+        let canonical_user_root = user_root.canonicalize().unwrap();
+        assert!(replaced[0]
+            .configured_resources
+            .iter()
+            .any(|path| path == &canonical_user_root || path.starts_with(&canonical_user_root)));
+    }
 }

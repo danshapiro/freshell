@@ -13,8 +13,69 @@ const argv = process.argv.slice(2)
 const cwd = process.cwd()
 const launchId = randomUUID()
 
+function parseJsonc(raw) {
+  const chars = [...raw]
+  let stripped = ''
+  let inString = false
+  for (let i = 0; i < chars.length;) {
+    const current = chars[i]
+    if (inString) {
+      stripped += current
+      if (current === '\\' && i + 1 < chars.length) stripped += chars[++i]
+      else if (current === '"') inString = false
+      i++
+    } else if (current === '"') {
+      inString = true
+      stripped += current
+      i++
+    } else if (current === '/' && chars[i + 1] === '/') {
+      stripped += '  '
+      i += 2
+      while (i < chars.length && chars[i] !== '\n' && chars[i] !== '\r') {
+        stripped += ' '
+        i++
+      }
+    } else if (current === '/' && chars[i + 1] === '*') {
+      stripped += '  '
+      i += 2
+      let closed = false
+      while (i < chars.length) {
+        if (chars[i] === '*' && chars[i + 1] === '/') {
+          stripped += '  '
+          i += 2
+          closed = true
+          break
+        }
+        stripped += chars[i] === '\n' || chars[i] === '\r' ? chars[i] : ' '
+        i++
+      }
+      if (!closed) throw new SyntaxError('unterminated JSONC block comment')
+    } else {
+      stripped += current
+      i++
+    }
+  }
+
+  const withoutTrailingCommas = [...stripped]
+  inString = false
+  for (let i = 0; i < withoutTrailingCommas.length; i++) {
+    const current = withoutTrailingCommas[i]
+    if (inString) {
+      if (current === '\\') i++
+      else if (current === '"') inString = false
+    } else if (current === '"') {
+      inString = true
+    } else if (current === ',') {
+      let next = i + 1
+      while (next < withoutTrailingCommas.length && /\s/.test(withoutTrailingCommas[next])) next++
+      if (withoutTrailingCommas[next] === '}' || withoutTrailingCommas[next] === ']') withoutTrailingCommas[i] = ' '
+    }
+  }
+  return JSON.parse(withoutTrailingCommas.join(''))
+}
+
 function readJson(file) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')) } catch { return null }
+  try { return parseJsonc(fs.readFileSync(file, 'utf8')) } catch { return null }
 }
 
 function existing(relative) {
@@ -135,7 +196,7 @@ export async function observeOpenCodeParitySelection(providerHome, workspace, tu
     if (Object.keys(project.mcp).length === 0) delete project.mcp;
   }
   const tuiConfig = tuiPath ? fs.readFileSync(tuiPath, 'utf8') : null;
-  const tui = tuiConfig ? JSON.parse(tuiConfig) : null;
+  const tui = tuiConfig ? parseJsonc(tuiConfig) : null;
   const spec = tui?.plugin?.find(value => typeof value === 'string'
     && (value.endsWith('/freshell-rebind-plugin.ts') || value.endsWith('/.freshell/opencode')));
   let rebindPlugin = null;
@@ -159,6 +220,7 @@ export async function observeOpenCodeParitySelection(providerHome, workspace, tu
   return {
     projectedProjectConfig: project ? JSON.stringify(project) : null,
     tuiConfig,
+    tuiConfigParsed: tui,
     rebindPlugin,
   };
 }
@@ -188,6 +250,7 @@ async function runProvider() {
   const selectedConfigReferences = provider === 'opencode'
     ? (() => {
       const selected = readJson(path.join(providerHome, 'opencode.jsonc'))?.agent?.parity
+      if (selected?.prompt == null && selected?.description == null) return []
       return [selected?.prompt, selected?.description].map(value => {
         if (typeof value !== 'string') throw new Error('configured file reference missing')
         return value.replace(/\{file:([^}]+)\}/g, (_match, file) => fs.readFileSync(path.resolve(providerHome, file), 'utf8'))

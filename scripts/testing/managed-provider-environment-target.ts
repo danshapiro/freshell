@@ -115,11 +115,14 @@ process.stdin.on('data', (chunk) => {
 })
 `
 
-const directMcpServerSource = String.raw`const fs = require('node:fs')
+const directMcpServerSource = String.raw`import fs from 'node:fs'
+import sibling from './helper.mjs'
+import dependency from 'managed-direct-fixture-dependency'
+const schema = JSON.parse(fs.readFileSync(new URL('./schema.json', import.meta.url), 'utf8'))
 const [receiptPath, expectedNonce] = process.argv.slice(2)
 if (!receiptPath || !expectedNonce) process.exit(12)
 fs.writeFileSync(receiptPath, JSON.stringify({ expectedNonce, helper: process.env.MANAGED_DIRECT_MCP_HELPER,
-  cwd: process.cwd(), scriptPath: process.argv[1] }))
+  sibling, dependency, schemaNonce: schema.nonce, cwd: process.cwd(), scriptPath: process.argv[1] }))
 let buffered = ''
 process.stdin.setEncoding('utf8')
 process.stdin.on('data', chunk => {
@@ -300,6 +303,8 @@ async function configure(root: string, nonce: string, candidateSha: string, runI
   await fs.mkdir(mcpNested, { recursive: true, mode: 0o755 })
   await fs.mkdir(directMcp, { recursive: true, mode: 0o755 })
   await fs.mkdir(mcpParentDependency, { recursive: true, mode: 0o755 })
+  const directMcpDependency = path.join(directMcp, 'node_modules/managed-direct-fixture-dependency')
+  await fs.mkdir(directMcpDependency, { recursive: true, mode: 0o755 })
   await fs.mkdir(path.join(xdg, 'opencode'), { recursive: true, mode: 0o755 })
   await fs.chmod(home, 0o700)
   await fs.chmod(root, 0o751)
@@ -339,12 +344,20 @@ export default {id:'managed-environment-tui',async tui(api,options){
   await fs.writeFile(path.join(mcpPackage, 'server.mjs'), managedMcpServerSource)
   const directCommand = path.join(directMcp, 'start')
   await fs.writeFile(directCommand,
-    '#!/bin/sh\nSCRIPT_DIR=$(dirname "$0")\n. "$SCRIPT_DIR/helper.sh"\nexec node "$SCRIPT_DIR/server.js" "$@"\n',
+    '#!/bin/sh\nSCRIPT_DIR=$(dirname "$0")\n. "$SCRIPT_DIR/helper.sh"\nexec node "$SCRIPT_DIR/server.mjs" "$@"\n',
     { mode: 0o751 })
   await fs.chmod(directCommand, 0o751)
   await fs.writeFile(path.join(directMcp, 'helper.sh'),
     `export MANAGED_DIRECT_MCP_HELPER='${nonce}'\n`)
-  await fs.writeFile(path.join(directMcp, 'server.js'), directMcpServerSource)
+  await fs.writeFile(path.join(directMcp, 'helper.mjs'), `export default ${JSON.stringify(nonce)};\n`)
+  await fs.writeFile(path.join(directMcp, 'schema.json'), JSON.stringify({ nonce }))
+  await writeJson(path.join(directMcpDependency, 'package.json'), {
+    name: 'managed-direct-fixture-dependency',
+    type: 'module',
+    exports: './index.mjs',
+  })
+  await fs.writeFile(path.join(directMcpDependency, 'index.mjs'), `export default ${JSON.stringify(nonce)};\n`)
+  await fs.writeFile(path.join(directMcp, 'server.mjs'), directMcpServerSource)
   await writeJson(path.join(mcpParentDependency, 'package.json'), {
     name: 'managed-fixture-mcp-dependency',
     type: 'module',
@@ -1288,13 +1301,17 @@ export async function runManagedEnvironmentTarget() {
       readJson(path.join(selected.workspace, 'preflight/.managed-fixture/direct-mcp-receipt.json')))
     assert.equal(preflightDirectMcp.expectedNonce, nonce)
     assert.equal(preflightDirectMcp.helper, nonce)
-    assert(preflightDirectMcp.scriptPath.endsWith('/direct-mcp/server.js'))
+    assert.equal(preflightDirectMcp.sibling, nonce)
+    assert.equal(preflightDirectMcp.dependency, nonce)
+    assert.equal(preflightDirectMcp.schemaNonce, nonce)
+    assert(preflightDirectMcp.scriptPath.endsWith('/direct-mcp/server.mjs'))
     const preflightView = await poll('genuine managed preflight native identity', () =>
       observeManagedEnvironmentNativeIdentity(rig!, created.terminalId, preflightChild.nativeSessionId))
     assert((await terminalDirectory(rig)).some(row => row.terminalId === created.terminalId))
     assert.deepEqual(await webChildren(rig), [], 'Managed child must belong to the disposable session host, not the host web process')
     proof.preflight = { terminalId: created.terminalId, soulId: preflightView.soulId, incarnationId: preflightView.incarnationId,
-      stage: await stageProof(rig, preflightView, nonce), child: preflightChild, mcpServer: preflightMcp }
+      stage: await stageProof(rig, preflightView, nonce), child: preflightChild, mcpServer: preflightMcp,
+      directMcpServer: preflightDirectMcp }
     const toolHome = path.join(root, 'tools')
     await fs.mkdir(toolHome, { mode: 0o700 })
     const tool = path.join(toolHome, 'cloudflared')
@@ -1395,7 +1412,10 @@ export async function runManagedEnvironmentTarget() {
           readJson(path.join(cwd, '.managed-fixture/direct-mcp-receipt.json')))
         assert.equal(directMcpServer.expectedNonce, nonce)
         assert.equal(directMcpServer.helper, nonce)
-        assert(directMcpServer.scriptPath.endsWith('/direct-mcp/server.js'))
+        assert.equal(directMcpServer.sibling, nonce)
+        assert.equal(directMcpServer.dependency, nonce)
+        assert.equal(directMcpServer.schemaNonce, nonce)
+        assert(directMcpServer.scriptPath.endsWith('/direct-mcp/server.mjs'))
         const stage = await stageProof(rig!, view, nonce)
         const receipt = { ...fixture, terminalId: view.terminalId, soulId: view.soulId, incarnationId: view.incarnationId,
           nativeSessionId: view.nativeSessionId, stage, child, mcpServer, directMcpServer }

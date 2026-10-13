@@ -701,11 +701,12 @@ describe('Component Edge Cases', () => {
           expect(screen.getByRole('button', { name: 'Kill' })).toBeEnabled()
           fireEvent.click(screen.getByRole('button', { name: 'Attach' }))
           const [tab] = store.getState().tabs.tabs
-          expect(tab).toMatchObject({ soulId: 'retained-soul', mode: 'codex', status: 'exited' })
+          const expectedStatus = runtimeStatus === 'blocked' ? 'error' : 'exited'
+          expect(tab).toMatchObject({ soulId: 'retained-soul', mode: 'codex', status: expectedStatus })
           expect(store.getState().tabs.activeTabId).toBe(tab.id)
           expect(store.getState().panes.layouts[tab.id]).toMatchObject({
             type: 'leaf',
-            content: { terminalId: 'retained-terminal', soulId: 'retained-soul', status: 'exited', runtimeStatus },
+            content: { terminalId: 'retained-terminal', soulId: 'retained-soul', status: expectedStatus, runtimeStatus },
           })
         },
       )

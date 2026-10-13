@@ -172,7 +172,11 @@ fn selected_string(raw: &str) -> Result<Option<String>, &'static str> {
         .map(Some)
         .map_err(|_| "invalid selected resource path")
 }
-fn nested_fields(raw: &str, tui: bool) -> Result<Vec<(&'static str, String)>, &'static str> {
+fn nested_fields(
+    raw: &str,
+    tui: bool,
+    skip_owned_freshell_mcp: bool,
+) -> Result<Vec<(&'static str, String)>, &'static str> {
     let top = object_members(raw, 0)?;
     let mut result = Vec::new();
     if tui {
@@ -209,6 +213,9 @@ fn nested_fields(raw: &str, tui: bool) -> Result<Vec<(&'static str, String)>, &'
             let name = serde_json::from_str::<String>(&mcp[name])
                 .map_err(|_| "invalid selected MCP server name")?;
             if names.insert(name.clone()) {
+                if skip_owned_freshell_mcp && name == "freshell" {
+                    continue;
+                }
                 winners.push((name, range));
             }
         }
@@ -701,6 +708,30 @@ fn shell_directory_relative_paths(
     result
 }
 
+fn shell_line_invokes_node(line: &str) -> bool {
+    let mut command = line.trim_start();
+    while let Some(rest) = command
+        .strip_prefix("exec ")
+        .or_else(|| command.strip_prefix("command "))
+    {
+        command = rest.trim_start();
+    }
+    let executable = command
+        .split_ascii_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(['"', '\'']);
+    let name = Path::new(executable)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    matches!(
+        name.strip_suffix(".exe").unwrap_or(&name),
+        "node" | "nodejs"
+    )
+}
+
 enum JavaScriptToken {
     Identifier(String),
     String(Option<String>),
@@ -811,6 +842,54 @@ fn node_relative_module_specifiers(source: &str) -> Result<Vec<String>, &'static
         }
     }
     Ok(result.into_iter().collect())
+}
+
+fn node_relative_resource_specifiers(
+    source: &str,
+) -> Result<std::collections::BTreeSet<String>, &'static str> {
+    let tokens = javascript_tokens(source)?;
+    let mut result = std::collections::BTreeSet::new();
+    for index in 0..tokens.len().saturating_sub(10) {
+        let Some(JavaScriptToken::Identifier(new_keyword)) = tokens.get(index) else {
+            continue;
+        };
+        let Some(JavaScriptToken::Identifier(url_constructor)) = tokens.get(index + 1) else {
+            continue;
+        };
+        let Some(JavaScriptToken::Punctuation(b'(')) = tokens.get(index + 2) else {
+            continue;
+        };
+        let Some(JavaScriptToken::String(Some(specifier))) = tokens.get(index + 3) else {
+            continue;
+        };
+        let is_import_meta_url = matches!(
+            tokens.get(index + 4),
+            Some(JavaScriptToken::Punctuation(b','))
+        ) && matches!(tokens.get(index + 5), Some(JavaScriptToken::Identifier(name)) if name == "import")
+            && matches!(
+                tokens.get(index + 6),
+                Some(JavaScriptToken::Punctuation(b'.'))
+            )
+            && matches!(tokens.get(index + 7), Some(JavaScriptToken::Identifier(name)) if name == "meta")
+            && matches!(
+                tokens.get(index + 8),
+                Some(JavaScriptToken::Punctuation(b'.'))
+            )
+            && matches!(tokens.get(index + 9), Some(JavaScriptToken::Identifier(name)) if name == "url")
+            && matches!(
+                tokens.get(index + 10),
+                Some(JavaScriptToken::Punctuation(b')'))
+            );
+        if new_keyword == "new"
+            && url_constructor == "URL"
+            && is_import_meta_url
+            && (specifier.starts_with("./") || specifier.starts_with("../"))
+            && !specifier.contains(['?', '#', '\\', '$'])
+        {
+            result.insert(specifier.clone());
+        }
+    }
+    Ok(result)
 }
 
 fn read_node_package_manifest(
@@ -1135,13 +1214,18 @@ fn direct_script_dependency_paths(
 ) -> Result<Vec<PathBuf>, &'static str> {
     match runtime {
         ScriptDependencyRuntime::Node => {
-            let mut result = Vec::new();
+            let mut result = std::collections::BTreeSet::new();
             for specifier in node_relative_module_specifiers(source)? {
-                let mut files = resolve_node_relative_module(parent, &specifier)?
+                let files = resolve_node_relative_module(parent, &specifier)?
                     .ok_or("direct MCP Node relative module is missing")?;
-                result.append(&mut files);
+                result.extend(files);
             }
-            Ok(result)
+            result.extend(
+                node_relative_resource_specifiers(source)?
+                    .into_iter()
+                    .map(|specifier| parent.join(specifier)),
+            );
+            Ok(result.into_iter().collect())
         }
         ScriptDependencyRuntime::Python => Ok(python_import_specifiers(source)
             .into_iter()
@@ -1224,7 +1308,13 @@ fn insert_direct_script_dependencies(
                     "direct MCP dependency escapes its selected script scope",
                 ));
             }
-            insert_resource(result, resource_path_bytes, dependency.clone(), field)?;
+            insert_resource(
+                result,
+                resource_path_bytes,
+                dependency.clone(),
+                field,
+                declaring,
+            )?;
             pending.push(dependency);
         }
     }
@@ -1292,15 +1382,18 @@ fn insert_shell_script_dependencies(
                     shell_source_path(script_parent, &operand, &directory_variables)
                         .map_err(fail)?
                 {
-                    candidates.insert(candidate, true);
+                    candidates.insert(candidate, (true, false));
                 }
             }
+            let invokes_node = shell_line_invokes_node(line);
             for relative in shell_directory_relative_paths(line, &directory_variables) {
+                let parse_as_node_script = invokes_node && is_node_script_path(&relative);
                 candidates
                     .entry(script_parent.join(relative))
-                    .or_insert(false);
+                    .and_modify(|kind: &mut (bool, bool)| kind.1 |= parse_as_node_script)
+                    .or_insert((false, parse_as_node_script));
             }
-            for (candidate, parse_as_script) in candidates {
+            for (candidate, (parse_as_script, parse_as_node_script)) in candidates {
                 let dependency = checked(&candidate, field, declaring)?;
                 if !dependency.is_file() {
                     return Err(fail("direct MCP shell source is not a regular file"));
@@ -1310,7 +1403,32 @@ fn insert_shell_script_dependencies(
                         "direct MCP shell source escapes its selected script scope",
                     ));
                 }
-                insert_resource(result, resource_path_bytes, dependency.clone(), field)?;
+                insert_resource(
+                    result,
+                    resource_path_bytes,
+                    dependency.clone(),
+                    field,
+                    declaring,
+                )?;
+                if parse_as_node_script {
+                    insert_installed_package_ancestor_resources(
+                        &dependency,
+                        scope,
+                        declaring,
+                        result,
+                        resource_path_bytes,
+                        field,
+                    )?;
+                    insert_direct_script_dependencies(
+                        &dependency,
+                        scope,
+                        declaring,
+                        result,
+                        resource_path_bytes,
+                        field,
+                        ScriptDependencyRuntime::Node,
+                    )?;
+                }
                 pending.push((dependency, parse_as_script));
             }
         }
@@ -1496,7 +1614,40 @@ fn insert_resource(
     resource_path_bytes: &mut usize,
     path: PathBuf,
     field: &'static str,
+    declaring: &Path,
 ) -> Result<(), ResourceError> {
+    if path.is_dir() {
+        let resource_leaf = path
+            .file_name()
+            .map(|leaf| leaf.to_string_lossy().into_owned());
+        tracing::info!(
+            event = "provider.opencode.resource.directory_selected",
+            field,
+            resource_leaf,
+            source_config_leaf = declaring
+                .file_name()
+                .map(|leaf| leaf.to_string_lossy().into_owned()),
+            source_config_parent_leaf = declaring
+                .parent()
+                .and_then(Path::file_name)
+                .map(|leaf| leaf.to_string_lossy().into_owned()),
+            source_config_grandparent_leaf = declaring
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .map(|leaf| leaf.to_string_lossy().into_owned()),
+            resource_parent_leaf = path
+                .parent()
+                .and_then(Path::file_name)
+                .map(|leaf| leaf.to_string_lossy().into_owned()),
+            resource_grandparent_leaf = path
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .map(|leaf| leaf.to_string_lossy().into_owned()),
+            "Selected OpenCode directory resource"
+        );
+    }
     if !result.contains(&path) {
         let bytes = path.as_os_str().len();
         if result.len() >= 100_000
@@ -1537,7 +1688,7 @@ fn insert_installed_package_ancestor_resources(
             match std::fs::symlink_metadata(&candidate) {
                 Ok(_) => {
                     checked(&candidate, field, declaring)?;
-                    insert_resource(result, resource_path_bytes, candidate, field)?;
+                    insert_resource(result, resource_path_bytes, candidate, field, declaring)?;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => {
@@ -1569,10 +1720,21 @@ pub fn select(
     let mut resource_path_bytes = 0usize;
     let mut variables = std::collections::BTreeSet::new();
     let raw = source.references.unexpanded_source();
+    let skip_owned_freshell_mcp = source.source.lane == super::sources::SourceLane::Main
+        && !freshell_platform::opencode_config::source_owns_freshell_mcp(
+            raw,
+            &source.source.logical_path,
+            &source.instance_cwd,
+        )
+        .map_err(|_| fail("OpenCode resource", "project MCP ownership check failed"))?;
     let mut selections = fields(raw).map_err(|cause| fail("OpenCode resource", cause))?;
     selections.extend(
-        nested_fields(raw, source.source.lane == super::sources::SourceLane::Tui)
-            .map_err(|cause| fail("OpenCode resource", cause))?,
+        nested_fields(
+            raw,
+            source.source.lane == super::sources::SourceLane::Tui,
+            skip_owned_freshell_mcp,
+        )
+        .map_err(|cause| fail("OpenCode resource", cause))?,
     );
     let mut current_mcp_working_dir: Option<PathBuf> = None;
     let mut current_mcp_resource_path: Option<PathBuf> = None;
@@ -1662,6 +1824,7 @@ pub fn select(
                         &mut resource_path_bytes,
                         package_root.clone(),
                         "OpenCode mcp.command",
+                        declaring,
                     )?;
                     insert_installed_package_ancestor_resources(
                         &package_root,
@@ -1751,7 +1914,13 @@ pub fn select(
                     if !canonical.is_file() {
                         return Err(fail(field, "selected file resource is not a regular file"));
                     }
-                    insert_resource(&mut result, &mut resource_path_bytes, selected, field)?;
+                    insert_resource(
+                        &mut result,
+                        &mut resource_path_bytes,
+                        selected,
+                        field,
+                        declaring,
+                    )?;
                     matched = true;
                 }
                 if matched {
@@ -1815,7 +1984,13 @@ pub fn select(
             if !canonical.is_file() {
                 return Err(fail(field, "selected file resource is not a regular file"));
             }
-            insert_resource(&mut result, &mut resource_path_bytes, path, field)?;
+            insert_resource(
+                &mut result,
+                &mut resource_path_bytes,
+                path,
+                field,
+                declaring,
+            )?;
             continue;
         }
         if is_mcp_command_path_field(field) {
@@ -1851,6 +2026,7 @@ pub fn select(
                     &mut resource_path_bytes,
                     package_root.clone(),
                     field,
+                    declaring,
                 )?;
                 insert_installed_package_ancestor_resources(
                     &package_root,
@@ -1868,6 +2044,7 @@ pub fn select(
                     &mut resource_path_bytes,
                     canonical.clone(),
                     field,
+                    declaring,
                 )?;
                 if is_mcp_node_script_field(field) {
                     insert_installed_package_ancestor_resources(
@@ -1935,6 +2112,7 @@ pub fn select(
                         &mut resource_path_bytes,
                         canonical.clone(),
                         field,
+                        declaring,
                     )?;
                     if is_mcp_node_script_field(field) {
                         insert_installed_package_ancestor_resources(
@@ -2010,12 +2188,19 @@ pub fn select(
                     &mut resource_path_bytes,
                     command_parent.to_owned(),
                     field,
+                    declaring,
                 )?;
                 continue;
             }
             // A runtime executable without a package manifest is an exact-file
             // resource. Selecting its parent could copy system directories.
-            insert_resource(&mut result, &mut resource_path_bytes, canonical, field)?;
+            insert_resource(
+                &mut result,
+                &mut resource_path_bytes,
+                canonical,
+                field,
+                declaring,
+            )?;
             continue;
         }
         if field == "OpenCode skills.paths" || field == "OpenCode mcp.cwd" {
@@ -2029,7 +2214,13 @@ pub fn select(
                 current_mcp_working_dir = Some(canonical);
                 current_mcp_resource_path = Some(path.clone());
             }
-            insert_resource(&mut result, &mut resource_path_bytes, path, field)?;
+            insert_resource(
+                &mut result,
+                &mut resource_path_bytes,
+                path,
+                field,
+                declaring,
+            )?;
             continue;
         }
         // The native global plugin discovery unit is already selected in the
@@ -2060,7 +2251,13 @@ pub fn select(
         if scope == home || scope == Path::new("/") {
             return Err(fail(field, "select a bounded plugin or package directory"));
         }
-        insert_resource(&mut result, &mut resource_path_bytes, scope.clone(), field)?;
+        insert_resource(
+            &mut result,
+            &mut resource_path_bytes,
+            scope.clone(),
+            field,
+            declaring,
+        )?;
         insert_installed_package_ancestor_resources(
             &scope,
             home,

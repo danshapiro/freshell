@@ -1061,6 +1061,42 @@ describe('App WS bootstrap recovery', () => {
     expect(layout.content).toMatchObject({terminalId:'retained-managed',streamId:'retained-epoch',createRequestId:'retained-create',status:'exited'})
   })
 
+  it('clears a stale managed launch failure when inventory confirms the retained terminal is live', async () => {
+    const store = createStore({
+      tabs: [{ id: 'inventory-live-tab', mode: 'opencode', status: 'error' }],
+      panes: {
+        layouts: {
+          'inventory-live-tab': {
+            type: 'leaf', id: 'inventory-live-pane', content: {
+              kind: 'terminal', mode: 'opencode', status: 'error',
+              terminalId: 'inventory-live-terminal', streamId: 'inventory-live-stream',
+              createRequestId: 'inventory-live-create', soulId: 'inventory-live-soul',
+              launchFailure: { code: 'LAUNCH_FAILED', message: 'old launch failed', retryable: true },
+            },
+          },
+        },
+        activePane: { 'inventory-live-tab': 'inventory-live-pane' },
+      },
+    })
+    render(<Provider store={store}><App /></Provider>)
+    await waitFor(() => expect(messageHandler).toBeTypeOf('function'))
+
+    act(() => messageHandler?.({
+      type: 'terminal.inventory',
+      terminals: [{
+        terminalId: 'inventory-live-terminal', mode: 'opencode', status: 'running',
+        runtimeStatus: 'running', soulId: 'inventory-live-soul', incarnationId: 'inventory-live-incarnation',
+      }],
+    }))
+
+    const layout = store.getState().panes.layouts['inventory-live-tab']
+    expect(layout.type).toBe('leaf')
+    if (layout.type !== 'leaf') throw new Error('expected a leaf pane')
+    expect(layout.content).toMatchObject({ status: 'running', runtimeStatus: 'running' })
+    expect(layout.content.launchFailure).toBeUndefined()
+    expect(store.getState().tabs.tabs.find(tab => tab.id === 'inventory-live-tab')?.status).toBe('running')
+  })
+
   it('recovers an OpenCode sessionRef from inventory before clearing a stale live handle', async () => {
     const store = createStore({
       tabs: [{

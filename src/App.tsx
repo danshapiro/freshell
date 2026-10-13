@@ -8,7 +8,7 @@ import {
   patchSessionRunningStateFromTerminalMeta,
   resetWsSnapshotReceived,
 } from '@/store/sessionsSlice'
-import { addTab, closeTab, reopenClosedTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
+import { addTab, closeTab, reopenClosedTab, switchToNextTab, switchToPrevTab, updateTab } from '@/store/tabsSlice'
 import {
   ApiError,
   api,
@@ -110,7 +110,7 @@ import { updateSettingsLocal } from '@/store/settingsSlice'
 import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
 import { clearAllReconcilePendingPanes, clearDeadSessionAdjudication, clearDeadTerminals, clearReconcileWarming, clearTerminalLiveHandles, setReconcilePendingPanes, updatePaneContent } from '@/store/panesSlice'
 import { collectPaneEntries } from '@/lib/pane-utils'
-import { isRetainedManagedTerminal, managedTerminalProjection } from '@/lib/managed-terminal.js'
+import { isRetainedManagedTerminal, managedTerminalProjection, managedTerminalResumePaneStatus } from '@/lib/managed-terminal.js'
 import { addTerminalFreshRecoveryRequestId, addTerminalRestoreRequestId, setPaneReconcileActive } from '@/lib/terminal-restore'
 import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
 import { foldTerminalInventoryTitles } from '@/lib/terminal-inventory-titles'
@@ -1645,15 +1645,23 @@ export default function App() {
               })
             }
             if (isRetainedManagedTerminal(terminal)) {
+              const managedStatus = managedTerminalResumePaneStatus(terminal)
+              const isLive = managedStatus === 'running' || managedStatus === 'recovering'
               for (const [tabId, layout] of Object.entries(appStore.getState().panes.layouts)) {
+                let matchedTerminal = false
                 for (const { paneId, content } of collectPaneEntries(layout)) {
                   if (content.kind === 'terminal' && content.terminalId === terminal.terminalId) {
+                    matchedTerminal = true
                     dispatch(updatePaneContent({ tabId, paneId, content: {
                       ...content,
                       ...managedTerminalProjection(terminal),
-                      ...(terminal.status === 'exited' ? { status: 'exited' } : {}),
+                      status: managedStatus,
+                      ...(isLive ? { launchFailure: undefined } : {}),
                     } }))
                   }
+                }
+                if (matchedTerminal && isLive) {
+                  dispatch(updateTab({ id: tabId, updates: { status: managedStatus } }))
                 }
               }
             }

@@ -46,6 +46,34 @@ export function providerParityFailureDiagnostics(logs: string) {
     }
   }
   return {
+    directoryResourceSelections: events.filter(value => value.event === 'provider.opencode.resource.directory_selected')
+      .slice(-32).map(value => ({
+        field: typeof value.field === 'string' ? value.field : undefined,
+        resourceLeaf: typeof value.resource_leaf === 'string' ? value.resource_leaf : undefined,
+        sourceConfigLeaf: typeof value.source_config_leaf === 'string' ? value.source_config_leaf : undefined,
+        sourceConfigParentLeaf: typeof value.source_config_parent_leaf === 'string'
+          ? value.source_config_parent_leaf : undefined,
+        sourceConfigGrandparentLeaf: typeof value.source_config_grandparent_leaf === 'string'
+          ? value.source_config_grandparent_leaf : undefined,
+        resourceParentLeaf: typeof value.resource_parent_leaf === 'string' ? value.resource_parent_leaf : undefined,
+        resourceGrandparentLeaf: typeof value.resource_grandparent_leaf === 'string'
+          ? value.resource_grandparent_leaf : undefined,
+      })),
+    resourceCopyFailures: events.filter(value => value.event === 'provider.environment.copy.failed')
+      .slice(-16).map(value => ({
+        provider: typeof value.provider === 'string' ? value.provider : undefined,
+        operation: typeof value.operation === 'string' ? value.operation : undefined,
+        relativePath: typeof value.relative_path === 'string' ? value.relative_path : undefined,
+        sourceScope: typeof value.resource_source_scope === 'string' ? value.resource_source_scope : undefined,
+        sourceLeaf: typeof value.resource_source_leaf === 'string' ? value.resource_source_leaf : undefined,
+        sourceOrigin: typeof value.resource_source_origin === 'string' ? value.resource_source_origin : undefined,
+        sourceLane: typeof value.resource_source_lane === 'string' ? value.resource_source_lane : undefined,
+        sourceConfigLeaf: typeof value.resource_source_config_leaf === 'string' ? value.resource_source_config_leaf : undefined,
+        sourceConfigScope: typeof value.resource_source_config_scope === 'string' ? value.resource_source_config_scope : undefined,
+        limitKind: typeof value.limit_kind === 'string' ? value.limit_kind : undefined,
+        observed: typeof value.observed === 'number' ? value.observed : undefined,
+        permitted: typeof value.permitted === 'number' ? value.permitted : undefined,
+      })),
     transactionEvents: events.flatMap(value => {
       return ['provider.projection.transaction.started', 'provider.projection.transaction.failed',
           'provider.projection.transaction.rollback', 'provider.projection.transaction.committed'].includes(value.event)

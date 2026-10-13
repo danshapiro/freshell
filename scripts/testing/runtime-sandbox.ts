@@ -473,7 +473,10 @@ export class RuntimeHarness {
       '-v', `${volumeName}:/var/lib/freshell-supervisor:rw`,
     ]
     if (this.phase >= 2) {
-      if (this.fixtureInputs && this.providerFixtureHome !== undefined) {
+      if (this.providerFixtureHome !== undefined) {
+        // The supervisor resolves provider configuration-file references in
+        // this explicitly supplied synthetic HOME before it can mount them
+        // into a workload. Keep ambient host homes unmounted.
         const home = validateOwnedFixturePath(this.providerFixtureHome, 'directory', 'provider fixture root')
         args.push('-v', `${home}:${home}:ro`)
       }
