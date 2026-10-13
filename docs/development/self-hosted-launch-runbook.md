@@ -83,9 +83,10 @@ confirms the home root's group traversal afterward.
 
 ## Redeploy managed runtime (build, units, restart effects)
 
-The managed runtime spans three binaries, a pinned workload image, one opt-in
-feature flag, and two systemd user units. A server-only rebuild or restart is
-NOT enough to change soul behavior — and a plain rebuild silently loses it.
+The managed runtime spans three binaries, a pinned workload image, the web
+client, one opt-in feature flag, and two systemd user units. A server-only
+rebuild or restart is NOT enough to change soul behavior — and a plain
+rebuild silently loses it.
 
 **Build surface.** Build all three binaries from the repo root when any of
 them changes:
@@ -118,6 +119,12 @@ cargo build --release -p freshell-server -p freshell-supervisor \
   `freshell-supervisor.service` (the unit reads the file at start). New
   souls use the new image; running souls keep theirs until their next
   incarnation.
+- The WEB CLIENT is a fifth deploy surface: the server serves `dist/client`
+  from disk, and only a client that negotiates `managedRuntimeV1` can create
+  managed terminal panes — so an old client can make the new-soul probe
+  unachievable. When the client changed (or on a fresh checkout), run
+  `pnpm run build:client`; the running server picks it up on the next
+  browser hard refresh, with no restart.
 
 **Units and restart coupling.** With the systemd topology
 (`installers/systemd/freshell-rust.service` + its `managed-runtime.conf`
@@ -137,8 +144,15 @@ drop-in, plus `freshell-supervisor.service`):
   commands below use 3001 — substitute the port the deployed unit actually
   sets.
 - Before restarting, capture the soul inventory so the post-deploy checks
-  can prove nothing was replaced:
-  `docker ps --filter name=incarnation --format '{{.ID}}\t{{.Names}}' | tee /tmp/souls-before.txt`.
+  can prove nothing was replaced — record container IDs AND their exact
+  start times (`State.StartedAt`, not `docker ps`'s `CreatedAt`, which is
+  the creation time and would not reveal a stop-and-restart of the same
+  container):
+
+  ```bash
+  docker ps -q --filter name=incarnation | xargs docker inspect \
+    --format '{{.Id}} {{.Name}} {{.State.StartedAt}}' | tee /tmp/souls-before.txt
+  ```
 
 **What a restart does:**
 
@@ -152,17 +166,18 @@ drop-in, plus `freshell-supervisor.service`):
   managed runtime live this includes SHELL panes — `shell` mode routes
   through souls, so shells survive the restart and reattach like any other
   soul-backed pane.
-- **Host-side terminals end — and the client reconciles them.** Only
-  terminals the server hosts as its own child processes die with it: panes
-  created while the feature was missing (they silently spawned host-side),
-  panes from clients that did not negotiate `managedRuntimeV1`, and host-run
-  CLI panes. The process and any unsaved in-flight state are gone, but the
-  panes do not sit as exited terminals: on reconnect the client's reconcile
-  handshake replaces a lost shell with a fresh terminal automatically
-  (shells are stateless by design) and respawns a CLI pane with a durable
-  session from the CLI's own storage (`claude --resume`, `codex resume`,
-  opencode's session picker are the manual fallbacks when there is nothing
-  durable to resume).
+- **Host-side terminals and sidecars end — and the client reconciles
+  them.** Only processes the server hosts as its own children die with it:
+  panes created while the feature was missing (they silently spawned
+  host-side), panes from clients that did not negotiate
+  `managedRuntimeV1`, host-run CLI panes, and any host-side fresh-agent
+  sidecar processes. The process and any unsaved in-flight state are gone,
+  but the panes do not sit as exited terminals: on reconnect the client's
+  reconcile handshake replaces a lost shell with a fresh terminal
+  automatically (shells are stateless by design) and respawns a CLI pane
+  with a durable session from the CLI's own storage (`claude --resume`,
+  `codex resume`, opencode's session picker are the manual fallbacks when
+  there is nothing durable to resume).
 
 **Post-deploy verification checklist:**
 
@@ -173,10 +188,10 @@ drop-in, plus `freshell-supervisor.service`):
    and restart again.
 3. Units: `systemctl --user is-active freshell-rust.service
    freshell-supervisor.service` → both `active`.
-4. Existing souls: every container in the pre-restart capture is still
-   running with its original start time (`docker ps` with
-   `{{.Names}}\t{{.CreatedAt}}`-style output, or `State.StartedAt` via
-   `docker inspect`) — a captured container missing afterward was lost. A
+4. Existing souls: re-run the pre-restart capture command and compare with
+   `/tmp/souls-before.txt` — every captured container ID is still running
+   with the SAME `State.StartedAt` (a changed `StartedAt` means the
+   container was stopped and restarted; a missing ID means it was lost). A
    container absent from the capture may appear within seconds of the
    restart: that is a client reconnecting and a durable terminal pane
    reattaching, not an old soul being replaced.
@@ -184,45 +199,77 @@ drop-in, plus `freshell-supervisor.service`):
    the operator home itself (a subdirectory of it is fine) — when the
    workspace equals the operator home, the supervisor deliberately omits
    the separate home bind (the workspace bind already provides it), so the
-   checks below do not apply to that launch. Confirm a NEW
-   `freshell-incarnation-*` container appears (`docker ps`), that it
-   carries the operator-home bind and the
+   checks below do not apply to that launch. RECORD THE PROBE'S OWN
+   IDENTITY before doing anything else — other clients may create souls
+   concurrently, so "the newest container" is not a safe selector, and the
+   stop request's revision guard protects against staleness, not against
+   stopping the wrong soul:
+
+   ```bash
+   docker ps -q --filter name=incarnation | sort > /tmp/probe-pre.txt
+   # ...create the probe pane now (for example via the REST tab API or the
+   # UI), then within seconds:
+   docker ps -q --filter name=incarnation | sort > /tmp/probe-post.txt
+   comm -13 /tmp/probe-pre.txt /tmp/probe-post.txt > /tmp/probe-new.txt
+   ```
+
+   If `/tmp/probe-new.txt` names more than one container, disambiguate by
+   the workspace: the probe container's mounts include the probe
+   workspace's directory as a bind
+   (`docker inspect <cid> --format '{{range .Mounts}}{{.Source}} {{end}}'`),
+   then overwrite `/tmp/probe-new.txt` with the single chosen ID.
+   Record the chosen container and its soul ID:
+
+   ```bash
+   CID=$(cat /tmp/probe-new.txt)
+   docker inspect $CID --format '{{index .Config.Labels "com.freshell.soul-id"}}' \
+     | tee /tmp/probe-soul-id.txt
+   ```
+
+   Then confirm the probe container carries the operator-home bind and the
    `FRESHELL_OPERATOR_HOME_MOUNT=1` marker env (`docker inspect`), and that
    its session host emitted an `operator_home_readiness` event
-   (`docker exec <container> cat /run/freshell/host-lifecycle.jsonl`)
-   whose payload reports `"present":true` and
+   (`docker exec $CID cat /run/freshell/host-lifecycle.jsonl`) whose
+   payload reports `"present":true` and
    `"home_root_traversable_by_child":true` — the event is emitted with its
    findings even when the home is missing or unreadable, so its mere
    presence is NOT proof of readiness. Close the probe pane afterward.
-6. Artifact freshness, per changed surface: the new probe container's image
-   (`docker inspect <container> --format '{{.Image}}'`) equals the
-   `sha256:` ID recorded in `~/.config/freshell/managed-runtime.env`, and
-   every unit you restarted shows an `ExecMainStartTimestamp`
-   (`systemctl --user show <unit> -p ExecMainStartTimestamp`) that
-   postdates the artifact it was restarted to deploy. On a server-only
-   restart the supervisor's timestamp legitimately predates the new server
-   build — only compare the units that were actually bounced.
+ 6. Artifact freshness, per changed surface — timestamps alone don't prove
+   the units run the binaries you just built (an installed unit can point
+   at another checkout or an older executable), so verify the running
+   processes and mounts directly: for each restarted unit,
+   `readlink /proc/$(systemctl --user show <unit> -p MainPID --value)/exe`
+   resolves to the freshly built binary path in THIS checkout (and its
+   file mtime postdates your build); the new probe container's image
+   (`docker inspect $CID --format '{{.Image}}'`) equals the `sha256:` ID
+   recorded in `~/.config/freshell/managed-runtime.env`; and the probe
+   container's `/runtime/freshell-session-host` mount source
+   (`docker inspect $CID --format '{{json .Mounts}}'`) is the freshly built
+   `target/release/freshell-session-host` in this checkout. On a
+   server-only restart the supervisor's process legitimately still runs its
+   earlier binary — only compare the units that were actually bounced.
 7. Probe cleanup: the probe soul is NOT auto-collected — the server's
    idle reaper explicitly skips managed terminals (their lifetime is
    supervisor-owned) and the supervisor has no idle reaper, so the
    container persists as a durable background session. To remove it
-   immediately, stop the soul through the fenced runtime API (find the
-   soul ID with `GET /api/runtime/souls`, or read the container's
-   `com.freshell.soul-id` docker label). Protected runtime API calls go
-   through OneCLI per the rollout procedure (its grant is scoped to the
-   server host and `/api/runtime/*` and injects `x-auth-token` — see
+   immediately, stop the soul recorded in step 5 — never a soul picked
+   fresh from `docker ps` at cleanup time — through the fenced runtime
+   API. Protected runtime API calls go through OneCLI per the rollout
+   procedure (its grant is scoped to the server host and `/api/runtime/*`
+   and injects `x-auth-token` — see
    [managed-runtime-rollout.md](managed-runtime-rollout.md)); the direct
    form below is the equivalent for an operator holding the checkout's
    token. The stop is intent-revision-guarded, and HTTP 200 alone proves
    nothing — the response's `outcome` must be `verified_empty` (other
    outcomes such as `termination_unconfirmed` or `blocked_ownership` mean
-   the soul is NOT confirmed stopped; re-check `GET /api/runtime/souls/$SOUL_ID`
-   and retry with the new revision if needed):
+   the soul is NOT confirmed stopped; re-check
+   `GET /api/runtime/souls/$SOUL_ID` and retry with the new revision if
+   needed):
 
    ```bash
    TOK=$(grep -E '^AUTH_TOKEN=' /home/dan/code/freshell/.env | cut -d= -f2-)
-   SOUL_ID=$(docker inspect <container> \
-     --format '{{index .Config.Labels "com.freshell.soul-id"}}')
+   CID=$(cat /tmp/probe-new.txt)
+   SOUL_ID=$(cat /tmp/probe-soul-id.txt)
    REV=$(curl -s -H "x-auth-token: $TOK" \
      http://127.0.0.1:3001/api/runtime/souls/$SOUL_ID \
      | python3 -c 'import json,sys;print(json.load(sys.stdin)["soul"]["intentRevision"])')
