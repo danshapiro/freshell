@@ -15,6 +15,10 @@ import {
 } from '../../../scripts/testing/fresh-agent-qualification-selection.js'
 import { FRESH_AGENT_QUALIFICATION_LIVE_ENV } from '../../../scripts/testing/runtime-fresh-agent-qualification.js'
 import { findFreshAgentCreateOutcome } from '../../../scripts/testing/fresh-agent-create-result.js'
+import {
+  freshAgentAssistantResponseFacts,
+  freshAgentTurnCompletionStatus,
+} from '../../../scripts/testing/fresh-agent-ordinary-turn.js'
 import { test } from '../helpers/fixtures.js'
 import { createManagedRuntimeBrowserRig, openFreshHistorySession, splitFreshBrowserPane, observeFreshMcpIngress, type ManagedRuntimeView, type ManagedFixtureRig } from '../helpers/managed-runtime.js'
 import { observeOwnedFreshBrowserPane, stageOwnedFreshBrowserProfile } from '../../../scripts/testing/runtime-external-browser.js'
@@ -147,9 +151,8 @@ function ordinaryFreshAgentEventFacts(frames: readonly any[]) {
     turnOutcomes }
 }
 
-async function assistantTextCharacterCounts(page: Page, paneId: string): Promise<number[]> {
-  return page.locator(`[data-pane-id="${paneId}"] [data-turn-role="assistant"]`)
-    .evaluateAll((turns) => turns.map((turn) => turn.textContent?.length ?? 0))
+async function assistantResponseDomFacts(page: Page, paneId: string): Promise<{ rows: number; textCharacters: number }> {
+  return page.locator(`[data-pane-id="${paneId}"]`).evaluate(freshAgentAssistantResponseFacts)
 }
 
 async function paneFor(page: Page, observation: Parameters<typeof observeOwnedFreshBrowserPane>[0]) {
@@ -384,7 +387,7 @@ test.describe.serial('ordinary fresh-agent use', () => {
             .getByRole('textbox', { name: 'Chat message input' })
           await expect(composer).toBeEnabled({ timeout: 60_000 })
           await composer.fill('Without using tools, briefly confirm you are ready.')
-          const assistantTextBaseline = await assistantTextCharacterCounts(page, created.paneId)
+          const assistantTextBaseline = (await assistantResponseDomFacts(page, created.paneId)).textCharacters
           turnReceivedCursor = wire.received.length
           const sendCursor = wire.sent.length
           await composer.press('Enter')
@@ -403,14 +406,16 @@ test.describe.serial('ordinary fresh-agent use', () => {
             if (turnFrames.some((frame) => frame.event?.type === 'freshAgent.error')) {
               throw new Error('fresh-agent turn emitted a correlated provider error')
             }
-            const completed = turnFrames.some((frame) => frame.event?.type === 'freshAgent.turn.complete')
+            const completionStatus = freshAgentTurnCompletionStatus(turnFrames)
+            if (completionStatus === 'failed') {
+              throw new Error('fresh-agent turn completed with an unsuccessful provider outcome')
+            }
+            const completed = completionStatus === 'completed'
             if (completed) {
               progress.turnCompleteObserved = true
             }
-            const currentAssistantText = await assistantTextCharacterCounts(page, created.paneId)
-            const assistantTextDisplayed = currentAssistantText.some((characters, index) => (
-              characters > (assistantTextBaseline[index] ?? 0)
-            ))
+            const currentAssistantText = await assistantResponseDomFacts(page, created.paneId)
+            const assistantTextDisplayed = currentAssistantText.textCharacters > assistantTextBaseline
             if (assistantTextDisplayed) progress.assistantTextDisplayed = true
             return completed && assistantTextDisplayed ? true : null
           }, 240_000)
@@ -421,9 +426,7 @@ test.describe.serial('ordinary fresh-agent use', () => {
           let assistantDom = { available: false, rows: 0, textCharacters: 0 }
           if (paneId) {
             try {
-              assistantDom = await page.locator(`[data-pane-id="${paneId}"] [data-turn-role="assistant"]`)
-                .evaluateAll((turns) => ({ available: true, rows: turns.length,
-                  textCharacters: turns.reduce((total, turn) => total + (turn.textContent?.length ?? 0), 0) }))
+              assistantDom = { available: true, ...await assistantResponseDomFacts(page, paneId) }
             } catch { /* preserve the ordinary-turn failure */ }
           }
           console.error(JSON.stringify({ severity: 'error', event: 'durable_souls.ordinary_turn_failed',
