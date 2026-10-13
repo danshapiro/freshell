@@ -2987,30 +2987,270 @@ fn recognized_account_homes(server_home: Option<&Path>) -> Vec<PathBuf> {
     if let Some(server_home) = server_home {
         add_existing(server_home);
     }
-    for variable in ["HOME", "USERPROFILE"] {
+    if let Some(user_home) = std::env::home_dir() {
+        add_existing(&user_home);
+        for directory in [".claude", ".codex", ".opencode", ".amplifier"] {
+            add_existing(&user_home.join(directory));
+        }
+    }
+    for variable in [
+        "CLAUDE_HOME",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "OPENCODE_CONFIG_DIR",
+        "FRESHELL_AMPLIFIER_HOME",
+    ] {
         if let Some(value) = std::env::var_os(variable) {
             add_existing(Path::new(&value));
         }
-    }
-    #[cfg(unix)]
-    if let Ok(passwd) = std::fs::read_to_string("/etc/passwd") {
-        for line in passwd.lines() {
-            let fields = line.split(':').collect::<Vec<_>>();
-            if fields.len() >= 6 && !fields[5].is_empty() {
-                add_existing(Path::new(fields[5]));
-            }
-        }
-    }
-    #[cfg(windows)]
-    if let (Some(drive), Some(path)) = (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH"))
-    {
-        add_existing(&PathBuf::from(drive).join(path));
     }
     homes
 }
 
 fn is_recognized_account_home(path: &Path, homes: &[PathBuf]) -> bool {
     homes.iter().any(|home| home == path)
+}
+
+fn is_account_home_for_owner(
+    path: &Path,
+    known_homes: &[PathBuf],
+    account_home_for_directory: &(dyn Fn(&Path) -> Result<PathBuf, String> + Send + Sync),
+) -> Result<bool, String> {
+    if is_recognized_account_home(path, known_homes) {
+        return Ok(true);
+    }
+    let owner_home = account_home_for_directory(path)?;
+    Ok(owner_home == path)
+}
+
+#[cfg(unix)]
+fn account_home_for_directory(path: &Path) -> Result<PathBuf, String> {
+    use std::ffi::{CStr, OsString};
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let owner = std::fs::metadata(path)
+        .map_err(|error| format!("workspace owner cannot be read: {error}"))?
+        .uid();
+    let mut capacity = 16 * 1024;
+    loop {
+        let mut account: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut buffer = vec![0u8; capacity];
+        let mut result = std::ptr::null_mut();
+        let status = unsafe {
+            libc::getpwuid_r(
+                owner,
+                &mut account,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status == libc::ERANGE {
+            if capacity >= 1024 * 1024 {
+                return Err("workspace owner's account record exceeds the lookup bound".into());
+            }
+            capacity *= 2;
+            continue;
+        }
+        if status != 0 {
+            return Err(format!(
+                "workspace owner's account home cannot be resolved (getpwuid_r status={status})"
+            ));
+        }
+        if result.is_null() || account.pw_dir.is_null() {
+            return Err("workspace owner's account has no resolvable home directory".into());
+        }
+        let home = unsafe { CStr::from_ptr(account.pw_dir) };
+        if home.to_bytes().is_empty() {
+            return Err("workspace owner's account has an empty home directory".into());
+        }
+        let home = PathBuf::from(OsString::from_vec(home.to_bytes().to_vec()));
+        return std::fs::canonicalize(&home).map_err(|error| {
+            format!("workspace owner's account home cannot be resolved: {error}")
+        });
+    }
+}
+
+#[cfg(windows)]
+fn account_home_for_directory(path: &Path) -> Result<PathBuf, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HLOCAL};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
+    use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
+        REG_EXPAND_SZ, REG_SZ,
+    };
+
+    struct LocalAllocation(HLOCAL);
+    impl Drop for LocalAllocation {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    LocalFree(self.0);
+                }
+            }
+        }
+    }
+    struct RegistryKey(HKEY);
+    impl Drop for RegistryKey {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    RegCloseKey(self.0);
+                }
+            }
+        }
+    }
+    fn wide_string(pointer: *const u16) -> Result<String, String> {
+        if pointer.is_null() {
+            return Err("Windows account-home lookup returned an empty value".into());
+        }
+        let mut length = 0usize;
+        while length < 4096 && unsafe { *pointer.add(length) } != 0 {
+            length += 1;
+        }
+        if length == 4096 {
+            return Err("Windows account-home lookup exceeded its string bound".into());
+        }
+        String::from_utf16(unsafe { std::slice::from_raw_parts(pointer, length) })
+            .map_err(|_| "Windows account-home lookup returned invalid UTF-16".into())
+    }
+
+    let path_wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut owner_sid: PSID = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            path_wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner_sid,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(format!(
+            "workspace owner SID cannot be read (Windows error {status})"
+        ));
+    }
+    let _descriptor = LocalAllocation(descriptor.cast());
+    let mut sid_string = std::ptr::null_mut();
+    if unsafe { ConvertSidToStringSidW(owner_sid, &mut sid_string) } == 0 {
+        return Err("workspace owner SID cannot be formatted".into());
+    }
+    let _sid_string = LocalAllocation(sid_string.cast());
+    let sid = wide_string(sid_string)?;
+    let profile_key =
+        format!("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\{sid}");
+    let profile_key = profile_key
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut raw_key: HKEY = std::ptr::null_mut();
+    let status = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            profile_key.as_ptr(),
+            0,
+            KEY_READ,
+            &mut raw_key,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(format!(
+            "workspace owner SID has no readable Windows profile record (error {status})"
+        ));
+    }
+    let profile_key = RegistryKey(raw_key);
+    let value_name = "ProfileImagePath"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut value_type = 0;
+    let mut byte_length = 0;
+    let status = unsafe {
+        RegQueryValueExW(
+            profile_key.0,
+            value_name.as_ptr(),
+            std::ptr::null(),
+            &mut value_type,
+            std::ptr::null_mut(),
+            &mut byte_length,
+        )
+    };
+    if status != ERROR_SUCCESS
+        || byte_length == 0
+        || byte_length > 64 * 1024
+        || byte_length % 2 != 0
+    {
+        return Err(format!(
+            "workspace owner Windows profile path cannot be read (error {status})"
+        ));
+    }
+    if value_type != REG_SZ && value_type != REG_EXPAND_SZ {
+        return Err("workspace owner Windows profile path has an unsupported registry type".into());
+    }
+    let mut value = vec![0u16; byte_length as usize / 2];
+    let status = unsafe {
+        RegQueryValueExW(
+            profile_key.0,
+            value_name.as_ptr(),
+            std::ptr::null(),
+            &mut value_type,
+            value.as_mut_ptr().cast(),
+            &mut byte_length,
+        )
+    };
+    if status != ERROR_SUCCESS || byte_length as usize > value.len() * 2 {
+        return Err(format!(
+            "workspace owner Windows profile path read failed (error {status})"
+        ));
+    }
+    value.truncate(byte_length as usize / 2);
+    while value.last() == Some(&0) {
+        value.pop();
+    }
+    let profile = String::from_utf16(&value)
+        .map_err(|_| "workspace owner Windows profile path is invalid UTF-16".to_string())?;
+    let profile = if value_type == REG_EXPAND_SZ {
+        let source = profile.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        let required =
+            unsafe { ExpandEnvironmentStringsW(source.as_ptr(), std::ptr::null_mut(), 0) };
+        if required == 0 || required > 32 * 1024 {
+            return Err("workspace owner Windows profile path cannot be expanded".into());
+        }
+        let mut expanded = vec![0u16; required as usize];
+        let written =
+            unsafe { ExpandEnvironmentStringsW(source.as_ptr(), expanded.as_mut_ptr(), required) };
+        if written == 0 || written > required {
+            return Err("workspace owner Windows profile path expansion failed".into());
+        }
+        expanded.truncate(written.saturating_sub(1) as usize);
+        String::from_utf16(&expanded).map_err(|_| {
+            "workspace owner Windows profile path expansion is invalid UTF-16".to_string()
+        })?
+    } else {
+        profile
+    };
+    std::fs::canonicalize(PathBuf::from(profile))
+        .map_err(|error| format!("workspace owner Windows profile cannot be resolved: {error}"))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn account_home_for_directory(_path: &Path) -> Result<PathBuf, String> {
+    Err("workspace owner account-home lookup is unavailable on this platform".into())
 }
 
 async fn canonical_workspace(path: &Path) -> Result<PathBuf, String> {
@@ -3025,17 +3265,58 @@ async fn canonical_workspace(path: &Path) -> Result<PathBuf, String> {
         .map_err(|error| format!("workspace cannot be resolved: {error}"))
 }
 
-async fn git_checkout_root(path: &Path) -> Option<PathBuf> {
-    let output = run_git(&["rev-parse", "--show-toplevel"], Some(path))
+async fn git_checkout_root(path: &Path) -> Result<Option<PathBuf>, String> {
+    let output = match run_git(&["rev-parse", "--show-toplevel"], Some(path)).await {
+        Ok(output) => output,
+        Err(error) if error.contains("not a git repository") => {
+            if has_git_marker_in_ancestors(path)? {
+                return Err(error);
+            }
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    tokio::fs::canonicalize(output.trim())
         .await
-        .ok()?;
-    tokio::fs::canonicalize(output.trim()).await.ok()
+        .map(Some)
+        .map_err(|error| format!("Git reported a checkout root that cannot be resolved: {error}"))
+}
+
+fn has_git_marker_in_ancestors(path: &Path) -> Result<bool, String> {
+    for ancestor in path.ancestors() {
+        match std::fs::symlink_metadata(ancestor.join(".git")) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Git checkout marker cannot be inspected at {}: {error}",
+                    ancestor.display()
+                ));
+            }
+        }
+    }
+    Ok(false)
 }
 
 async fn resolve_checkpoint_workspace(
     server_home: &Path,
     launch_cwd: &Path,
     intent: Option<&Value>,
+) -> Result<ResolvedCheckpointWorkspace, CheckpointWorkspaceUnavailable> {
+    resolve_checkpoint_workspace_with_account_home(
+        server_home,
+        launch_cwd,
+        intent,
+        &account_home_for_directory,
+    )
+    .await
+}
+
+async fn resolve_checkpoint_workspace_with_account_home(
+    server_home: &Path,
+    launch_cwd: &Path,
+    intent: Option<&Value>,
+    account_home_for_directory: &(dyn Fn(&Path) -> Result<PathBuf, String> + Send + Sync),
 ) -> Result<ResolvedCheckpointWorkspace, CheckpointWorkspaceUnavailable> {
     let candidate = intent
         .and_then(|workspace| workspace.get("path"))
@@ -3064,26 +3345,70 @@ async fn resolve_checkpoint_workspace(
                 candidate: candidate.clone(),
                 reason,
             })?;
-        let explicitly_selected_home =
-            provenance == "directory-picker" && is_recognized_account_home(&selected, &homes);
-        if is_recognized_account_home(&selected, &homes) && !explicitly_selected_home {
-            return Err(CheckpointWorkspaceUnavailable {
-                candidate,
-                reason: "account home cannot be used as a code checkpoint workspace".to_string(),
+        if provenance == "legacy-checkpoint" {
+            return Ok(ResolvedCheckpointWorkspace {
+                path: selected,
+                provenance,
             });
         }
-        let path = if provenance == "legacy-checkpoint" || explicitly_selected_home {
-            selected
-        } else {
-            git_checkout_root(&selected).await.unwrap_or(selected)
-        };
-        if is_recognized_account_home(&path, &homes) && !explicitly_selected_home {
+        let selected_home =
+            match is_account_home_for_owner(&selected, &homes, account_home_for_directory) {
+                Ok(is_home) => Some(is_home),
+                Err(_reason) if provenance == "directory-picker" => None,
+                Err(reason) => {
+                    return Err(CheckpointWorkspaceUnavailable {
+                        candidate,
+                        reason: format!("workspace account scope is unknown: {reason}"),
+                    });
+                }
+            };
+        if provenance == "directory-picker" && selected_home == Some(true) {
+            return Ok(ResolvedCheckpointWorkspace {
+                path: selected,
+                provenance,
+            });
+        }
+        if selected_home == Some(true) {
             return Err(CheckpointWorkspaceUnavailable {
                 candidate,
                 reason: "account home cannot be used as an inferred code checkpoint workspace"
                     .to_string(),
             });
         }
+        let path = match git_checkout_root(&selected).await {
+            Ok(Some(root)) if provenance == "directory-picker" && root == selected => selected,
+            Ok(Some(root)) => {
+                if selected_home.is_none() {
+                    return Err(CheckpointWorkspaceUnavailable {
+                        candidate,
+                        reason: "workspace account scope is unknown; the selected directory cannot be widened to its Git root".into(),
+                    });
+                }
+                match is_account_home_for_owner(&root, &homes, account_home_for_directory) {
+                    Ok(true) => {
+                        return Err(CheckpointWorkspaceUnavailable {
+                            candidate,
+                            reason: "account home cannot be used as an inferred code checkpoint workspace".into(),
+                        });
+                    }
+                    Ok(false) => root,
+                    Err(reason) => {
+                        return Err(CheckpointWorkspaceUnavailable {
+                            candidate,
+                            reason: format!("Git checkout account scope is unknown: {reason}"),
+                        });
+                    }
+                }
+            }
+            Ok(None) if provenance == "directory-picker" => selected,
+            Ok(None) => {
+                return Err(CheckpointWorkspaceUnavailable {
+                    candidate,
+                    reason: "the selected session checkout is no longer a Git project".into(),
+                });
+            }
+            Err(reason) => return Err(CheckpointWorkspaceUnavailable { candidate, reason }),
+        };
         return Ok(ResolvedCheckpointWorkspace { path, provenance });
     }
 
@@ -3094,25 +3419,49 @@ async fn resolve_checkpoint_workspace(
                 candidate: candidate.clone(),
                 reason,
             })?;
-    if is_recognized_account_home(&launch, &homes) {
-        return Err(CheckpointWorkspaceUnavailable {
-            candidate,
-            reason: "account home has no selected code checkpoint workspace".to_string(),
-        });
+    match is_account_home_for_owner(&launch, &homes, account_home_for_directory) {
+        Ok(true) => {
+            return Err(CheckpointWorkspaceUnavailable {
+                candidate,
+                reason: "account home has no selected code checkpoint workspace".to_string(),
+            });
+        }
+        Ok(false) => {}
+        Err(reason) => {
+            return Err(CheckpointWorkspaceUnavailable {
+                candidate,
+                reason: format!("workspace account scope is unknown: {reason}"),
+            });
+        }
     }
-    let root = git_checkout_root(&launch)
-        .await
-        .ok_or_else(|| CheckpointWorkspaceUnavailable {
-            candidate: candidate.clone(),
-            reason: "no explicit workspace or Git project root is available".to_string(),
-        })?;
+    let root = match git_checkout_root(&launch).await {
+        Ok(Some(root)) => root,
+        Ok(None) => {
+            return Err(CheckpointWorkspaceUnavailable {
+                candidate: candidate.clone(),
+                reason: "no explicit workspace or Git project root is available".to_string(),
+            });
+        }
+        Err(reason) => {
+            return Err(CheckpointWorkspaceUnavailable { candidate, reason });
+        }
+    };
     let path = root;
-    if is_recognized_account_home(&path, &homes) {
-        return Err(CheckpointWorkspaceUnavailable {
-            candidate,
-            reason: "account home cannot be used as an inferred code checkpoint workspace"
-                .to_string(),
-        });
+    match is_account_home_for_owner(&path, &homes, account_home_for_directory) {
+        Ok(true) => {
+            return Err(CheckpointWorkspaceUnavailable {
+                candidate,
+                reason: "account home cannot be used as an inferred code checkpoint workspace"
+                    .to_string(),
+            });
+        }
+        Ok(false) => {}
+        Err(reason) => {
+            return Err(CheckpointWorkspaceUnavailable {
+                candidate,
+                reason: format!("Git checkout account scope is unknown: {reason}"),
+            });
+        }
     }
     Ok(ResolvedCheckpointWorkspace {
         path,
@@ -3564,12 +3913,14 @@ fn checkpoint_storage_exclusion(
     let home = storage.parent().and_then(Path::parent).ok_or_else(|| {
         "checkpoint operation resolve-storage failed: storage path has no home anchor".to_string()
     })?;
-    let canonical_home = std::fs::canonicalize(home).map_err(|_| {
+    std::fs::canonicalize(home).map_err(|_| {
         "checkpoint operation resolve-storage failed: home anchor cannot be resolved".to_string()
     })?;
-    // Canonicalize the home anchor so aliases compare against the canonical
-    // workspace, then retain the logical suffix for Git's pathspec.
-    let storage = canonical_home.join(".freshell").join("checkpoints");
+    // Resolve the actual directory after following links in either the home
+    // alias or `.freshell`; Git traverses the target's real in-worktree path.
+    let storage = std::fs::canonicalize(storage).map_err(|error| {
+        format!("checkpoint operation resolve-storage failed: checkpoint directory cannot be resolved: {error}")
+    })?;
     if work_tree.starts_with(&storage) {
         return Err(
             "checkpoint operation resolve-storage failed: workspace overlaps Freshell checkpoint storage"
@@ -4704,10 +5055,14 @@ async fn get_checkpoints(
         let candidate_for_home_check = tokio::fs::canonicalize(&legacy_path)
             .await
             .unwrap_or_else(|_| legacy_path.clone());
-        if !is_recognized_account_home(
+        let known_homes = recognized_account_homes(Some(&state.home));
+        let allow_legacy_scope = is_account_home_for_owner(
             &candidate_for_home_check,
-            &recognized_account_homes(Some(&state.home)),
-        ) {
+            &known_homes,
+            &account_home_for_directory,
+        )
+        .is_ok_and(|is_home| !is_home);
+        if allow_legacy_scope {
             let already_present = workspaces
                 .iter()
                 .any(|workspace| workspace.path == legacy_path);
@@ -6704,6 +7059,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn picker_git_lookup_error_does_not_fall_back_to_a_partial_subdirectory() {
+        let owned = tempfile::tempdir().unwrap();
+        let account_home = owned.path().join("account-home");
+        let selected = account_home.join("project/src");
+        tokio::fs::create_dir_all(&selected).await.unwrap();
+        run_git(&["init", "-q"], Some(&account_home)).await.unwrap();
+        tokio::fs::write(account_home.join(".git/config"), "[core\n")
+            .await
+            .unwrap();
+        let intent = json!({
+            "path": selected,
+            "provenance": "directory-picker",
+        });
+
+        let error = resolve_checkpoint_workspace(owned.path(), &selected, Some(&intent))
+            .await
+            .expect_err("a failed Git lookup must not authorize a partial nested snapshot");
+
+        assert!(
+            error.reason.contains("Git operation rev-parse failed"),
+            "{}",
+            error.reason
+        );
+        assert!(error.reason.contains("bad config line"), "{}", error.reason);
+    }
+
+    #[tokio::test]
+    async fn inferred_foreign_account_home_with_dotfiles_git_is_rejected_by_owner_identity() {
+        let owned = tempfile::tempdir().unwrap();
+        let server_home = owned.path().join("server-profile");
+        let foreign_home = owned.path().join("nss-profile");
+        tokio::fs::create_dir_all(&server_home).await.unwrap();
+        tokio::fs::create_dir_all(&foreign_home).await.unwrap();
+        run_git(&["init", "-q"], Some(&foreign_home)).await.unwrap();
+        let foreign_home = foreign_home.canonicalize().unwrap();
+        let owner_home = foreign_home.clone();
+        let account_home_for_directory = move |path: &Path| {
+            if path == owner_home {
+                Ok(owner_home.clone())
+            } else {
+                Err("synthetic NSS owner has no resolvable home".to_string())
+            }
+        };
+
+        let error = resolve_checkpoint_workspace_with_account_home(
+            &server_home,
+            &foreign_home,
+            None,
+            &account_home_for_directory,
+        )
+        .await
+        .expect_err("a foreign account's dotfiles checkout cannot become an inferred scope");
+
+        assert!(error.reason.contains("account home"), "{}", error.reason);
+    }
+
+    #[tokio::test]
     async fn review_r6_automatic_checkpoint_missing_workspace_is_logged() {
         use tracing::instrument::WithSubscriber;
         use tracing_subscriber::prelude::*;
@@ -6955,6 +7367,52 @@ mod tests {
         let error = checkpoint_storage_exclusion(&git_dir, &canonical_nested)
             .expect_err("the aliased checkpoint store cannot become a workspace");
         assert!(error.contains("overlaps Freshell checkpoint storage"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_picker_home_excludes_checkpoint_store_through_in_home_freshell_symlink() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let real_freshell_dir = home.join("runtime-state");
+        tokio::fs::create_dir_all(&real_freshell_dir).await.unwrap();
+        tokio::fs::write(real_freshell_dir.join("unrelated-state.txt"), "keep")
+            .await
+            .unwrap();
+        tokio::fs::write(home.join("private.txt"), "private")
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(&real_freshell_dir, home.join(".freshell")).unwrap();
+        let workspace = home.canonicalize().unwrap();
+
+        let response = post_checkpoint(
+            State(state(&home)),
+            headers_with_token("tok"),
+            Json(json!({
+                "cwd": workspace,
+                "workspace": {
+                    "path": workspace,
+                    "provenance": "directory-picker",
+                },
+            })),
+        )
+        .await;
+        let status = response.status();
+        let entry = body_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{entry}");
+
+        let git_dir = checkpoint_git_dir(&home, &home);
+        let index = checkpoint_index_entries(&git_dir, &git_dir.join("index"))
+            .await
+            .expect("published picker-home checkpoint index is readable");
+        assert!(index.iter().any(|entry| entry.path == b"private.txt"));
+        assert!(index
+            .iter()
+            .any(|entry| entry.path == b"runtime-state/unrelated-state.txt"));
+        assert!(!index.iter().any(|entry| {
+            entry.path.starts_with(b"runtime-state/checkpoints/")
+                || entry.path == b"runtime-state/checkpoints"
+        }));
     }
 
     #[tokio::test]

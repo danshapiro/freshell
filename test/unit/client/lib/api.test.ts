@@ -983,6 +983,50 @@ describe('searchSessions cursor pagination', () => {
     expect(response.hasMore).toBe(false)
   })
 
+  it('preserves linked-worktree checkout scope for session opens from snapshots and search', async () => {
+    const checkoutPath = '/repo/.worktrees/feature-a'
+    mockFetch
+      .mockResolvedValueOnce(mockJson({
+        items: [{
+          sessionId: 'session-worktree',
+          provider: 'codex',
+          projectPath: '/repo',
+          checkoutPath,
+          cwd: '/home/user',
+          isRunning: false,
+          lastActivityAt: 1_000,
+        }],
+        nextCursor: null,
+        revision: 1,
+      }))
+      .mockResolvedValueOnce(mockJson({
+        items: [{
+          sessionId: 'session-worktree',
+          provider: 'codex',
+          projectPath: '/repo',
+          checkoutPath,
+          cwd: '/home/user',
+          matchedIn: 'title',
+          isRunning: false,
+          lastActivityAt: 1_000,
+        }],
+        nextCursor: null,
+        revision: 2,
+      }))
+
+    const snapshot = await fetchSidebarSessionsSnapshot()
+    const search = await searchSessions({ query: 'worktree' })
+
+    expect(snapshot.projects[0]?.sessions[0]?.checkpointWorkspace).toEqual({
+      path: checkoutPath,
+      provenance: 'resolved-project',
+    })
+    expect(search.results[0]?.checkpointWorkspace).toEqual({
+      path: checkoutPath,
+      provenance: 'resolved-project',
+    })
+  })
+
   it('forwards the cursor to the session-directory request when paginating a search', async () => {
     mockFetch.mockResolvedValueOnce(mockJson({
       items: [],

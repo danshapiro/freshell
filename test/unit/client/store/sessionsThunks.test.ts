@@ -341,6 +341,40 @@ describe('sessionsThunks', () => {
     })
   })
 
+  it('keeps inferred linked-worktree checkpoint scope on search session rows', async () => {
+    searchSessions.mockResolvedValueOnce({
+      results: [{
+        provider: 'codex',
+        sessionId: 'session-worktree',
+        projectPath: '/repo',
+        checkoutPath: '/repo/.worktrees/feature-a',
+        checkpointWorkspace: {
+          path: '/repo/.worktrees/feature-a',
+          provenance: 'resolved-project',
+        },
+        matchedIn: 'title',
+        lastActivityAt: 1_000,
+      }],
+      tier: 'title',
+      query: 'worktree',
+      totalScanned: 1,
+    })
+
+    const store = createStore()
+    store.dispatch(setActiveSessionSurface('sidebar'))
+
+    await store.dispatch(fetchSessionWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+      query: 'worktree',
+    }) as any)
+
+    expect(store.getState().sessions.windows.sidebar.projects[0]?.sessions[0]?.checkpointWorkspace).toEqual({
+      path: '/repo/.worktrees/feature-a',
+      provenance: 'resolved-project',
+    })
+  })
+
   it('keeps tier changes and clearing a non-empty query in the visible search intent', async () => {
     const tierChange = createDeferred<any>()
     const clearSearch = createDeferred<any>()
