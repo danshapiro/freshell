@@ -550,6 +550,38 @@ fn is_shell_script(path: &Path) -> bool {
     })
 }
 
+fn is_python_script(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| {
+        matches!(
+            extension.to_string_lossy().to_ascii_lowercase().as_str(),
+            "py" | "pyw"
+        )
+    }) || shebang_interpreter_names(path).is_some_and(|names| {
+        names
+            .iter()
+            .any(|name| matches!(name.as_str(), "python" | "python2" | "python3"))
+    })
+}
+
+fn is_ruby_script(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.to_string_lossy().eq_ignore_ascii_case("rb"))
+        || shebang_interpreter_names(path)
+            .is_some_and(|names| names.iter().any(|name| name == "ruby"))
+}
+
+fn direct_script_dependency_scope(command_parent: &Path, home: &Path) -> PathBuf {
+    let canonical_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_owned());
+    if canonical_home != Path::new("/") && command_parent.starts_with(&canonical_home) {
+        return canonical_home;
+    }
+    command_parent
+        .parent()
+        .filter(|parent| *parent != Path::new("/"))
+        .unwrap_or(command_parent)
+        .to_owned()
+}
+
 fn shell_directory_variables(source: &str) -> std::collections::BTreeSet<String> {
     source
         .lines()
@@ -585,6 +617,10 @@ fn shell_source_operand(line: &str) -> Option<String> {
         return None;
     }
     .trim_start();
+    if let Some(rest) = rest.strip_prefix("\"$(dirname \"$0\")/") {
+        let end = rest.find('\"')?;
+        return Some(format!("$(dirname \"$0\")/{}", &rest[..end]));
+    }
     let first = rest.chars().next()?;
     if first == '\'' || first == '"' {
         let end = rest[1..].find(first)? + 1;
@@ -604,6 +640,13 @@ fn shell_source_path(
 ) -> Result<Option<PathBuf>, &'static str> {
     if operand.starts_with('/') {
         return Ok(None);
+    }
+    const SCRIPT_DIRECTORY_SUBSTITUTION: &str = "$(dirname \"$0\")/";
+    if let Some(relative) = operand.strip_prefix(SCRIPT_DIRECTORY_SUBSTITUTION) {
+        if relative.is_empty() || relative.contains(['$', '*', '?']) {
+            return Err("direct MCP shell script has an unresolved dynamic source path");
+        }
+        return Ok(Some(script_parent.join(relative)));
     }
     let mut relative = operand;
     if let Some(variable) = operand.strip_prefix("${") {
@@ -786,58 +829,232 @@ fn resolve_node_relative_module(parent: &Path, specifier: &str) -> Option<PathBu
     candidates.into_iter().find(|candidate| candidate.is_file())
 }
 
-fn insert_node_script_dependencies(
+fn python_import_specifiers(source: &str) -> std::collections::BTreeSet<String> {
+    fn is_static_module_name(name: &str) -> bool {
+        !name.is_empty()
+            && !name.starts_with('.')
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.')
+    }
+
+    let mut result = std::collections::BTreeSet::new();
+    for line in source.lines() {
+        let statement = line.split('#').next().unwrap_or_default().trim();
+        if let Some(imports) = statement.strip_prefix("import ") {
+            for item in imports.split(',') {
+                let name = item.split_ascii_whitespace().next().unwrap_or_default();
+                if is_static_module_name(name) {
+                    result.insert(name.to_owned());
+                }
+            }
+        } else if let Some(imports) = statement.strip_prefix("from ") {
+            let Some((module, imported)) = imports.split_once(" import ") else {
+                continue;
+            };
+            let module = module.trim();
+            if !is_static_module_name(module) {
+                continue;
+            }
+            result.insert(module.to_owned());
+            for item in imported
+                .trim()
+                .trim_start_matches('(')
+                .trim_end_matches(')')
+                .split(',')
+            {
+                let name = item
+                    .trim()
+                    .split_ascii_whitespace()
+                    .next()
+                    .unwrap_or_default();
+                if is_static_module_name(name) {
+                    result.insert(format!("{module}.{name}"));
+                }
+            }
+        }
+    }
+    result
+}
+
+fn resolve_python_local_modules(parent: &Path, specifier: &str) -> Vec<PathBuf> {
+    let components = specifier.split('.').collect::<Vec<_>>();
+    if components
+        .iter()
+        .any(|component| component.is_empty() || component.contains(['/', '\\']))
+    {
+        return Vec::new();
+    }
+    let mut result = std::collections::BTreeSet::new();
+    let mut package = parent.to_owned();
+    for component in &components[..components.len().saturating_sub(1)] {
+        package.push(component);
+        let init = package.join("__init__.py");
+        if init.is_file() {
+            result.insert(init);
+        }
+    }
+    let mut module = parent.to_owned();
+    for component in &components {
+        module.push(component);
+    }
+    for candidate in [
+        module.with_extension("py"),
+        module.with_extension("pyw"),
+        module.join("__init__.py"),
+    ] {
+        if candidate.is_file() {
+            result.insert(candidate);
+        }
+    }
+    result.into_iter().collect()
+}
+
+fn ruby_relative_require_specifiers(source: &str) -> Result<Vec<String>, &'static str> {
+    let mut result = std::collections::BTreeSet::new();
+    for line in source.lines() {
+        let statement = line.trim_start();
+        let Some(mut operand) = statement.strip_prefix("require_relative") else {
+            continue;
+        };
+        if operand
+            .chars()
+            .next()
+            .is_some_and(|character| !character.is_ascii_whitespace() && character != '(')
+        {
+            continue;
+        }
+        operand = operand
+            .trim_start()
+            .strip_prefix('(')
+            .unwrap_or(operand.trim_start());
+        operand = operand.trim_start();
+        let Some(quote) = operand
+            .chars()
+            .next()
+            .filter(|quote| matches!(quote, '\'' | '"'))
+        else {
+            return Err("direct MCP Ruby script has a dynamic require_relative path");
+        };
+        let end = operand[1..]
+            .find(quote)
+            .ok_or("direct MCP Ruby script has an unterminated require_relative path")?
+            + 1;
+        let specifier = &operand[1..end];
+        if specifier.is_empty() || specifier.contains(['$', '#', '*', '?']) {
+            return Err("direct MCP Ruby script has a dynamic require_relative path");
+        }
+        result.insert(specifier.to_owned());
+    }
+    Ok(result.into_iter().collect())
+}
+
+fn resolve_ruby_relative_module(parent: &Path, specifier: &str) -> Option<PathBuf> {
+    let base = parent.join(specifier);
+    [base.clone(), base.with_extension("rb")]
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+}
+
+#[derive(Clone, Copy)]
+enum ScriptDependencyRuntime {
+    Node,
+    Python,
+    Ruby,
+}
+
+fn direct_script_dependency_paths(
+    parent: &Path,
+    source: &str,
+    runtime: ScriptDependencyRuntime,
+) -> Result<Vec<PathBuf>, &'static str> {
+    match runtime {
+        ScriptDependencyRuntime::Node => node_relative_module_specifiers(source)?
+            .into_iter()
+            .map(|specifier| {
+                resolve_node_relative_module(parent, &specifier)
+                    .ok_or("direct MCP Node relative module is missing")
+            })
+            .collect(),
+        ScriptDependencyRuntime::Python => Ok(python_import_specifiers(source)
+            .into_iter()
+            .flat_map(|specifier| resolve_python_local_modules(parent, &specifier))
+            .collect()),
+        ScriptDependencyRuntime::Ruby => ruby_relative_require_specifiers(source)?
+            .into_iter()
+            .map(|specifier| {
+                resolve_ruby_relative_module(parent, &specifier)
+                    .ok_or("direct MCP Ruby relative module is missing")
+            })
+            .collect(),
+    }
+}
+
+fn is_script_dependency_source(path: &Path, runtime: ScriptDependencyRuntime) -> bool {
+    let Some(extension) = path.extension() else {
+        return false;
+    };
+    let extension = extension.to_string_lossy();
+    match runtime {
+        ScriptDependencyRuntime::Node => is_node_script_path(&format!("file.{extension}")),
+        ScriptDependencyRuntime::Python => {
+            matches!(extension.to_ascii_lowercase().as_str(), "py" | "pyw")
+        }
+        ScriptDependencyRuntime::Ruby => extension.eq_ignore_ascii_case("rb"),
+    }
+}
+
+fn insert_direct_script_dependencies(
     script: &Path,
     scope: &Path,
     declaring: &Path,
     result: &mut std::collections::BTreeSet<PathBuf>,
     resource_path_bytes: &mut usize,
     field: &'static str,
+    runtime: ScriptDependencyRuntime,
 ) -> Result<(), ResourceError> {
     const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
     const MAX_SCRIPT_FILES: usize = 256;
     let fail = |cause| ResourceError { field, cause };
     let mut pending = vec![script.to_owned()];
     let mut visited = std::collections::BTreeSet::new();
+    let mut parsed = std::collections::BTreeSet::new();
     let mut total_bytes = 0u64;
     while let Some(current) = pending.pop() {
         let canonical = checked(&current, field, declaring)?;
         if !canonical.is_file() || !visited.insert(canonical.clone()) {
             continue;
         }
-        if visited.len() > MAX_SCRIPT_FILES {
+        if current != script && !is_script_dependency_source(&canonical, runtime) {
+            continue;
+        }
+        if !parsed.insert(canonical.clone()) {
+            continue;
+        }
+        if parsed.len() > MAX_SCRIPT_FILES {
             return Err(fail(
-                "direct MCP Node dependency closure exceeds its entry bound",
+                "direct MCP dependency closure exceeds its entry bound",
             ));
         }
         let metadata = std::fs::metadata(&canonical)
-            .map_err(|_| fail("direct MCP Node script metadata unavailable"))?;
+            .map_err(|_| fail("direct MCP script metadata unavailable"))?;
         total_bytes = total_bytes.saturating_add(metadata.len());
         if metadata.len() > MAX_SCRIPT_BYTES || total_bytes > MAX_SCRIPT_BYTES {
-            return Err(fail(
-                "direct MCP Node dependency closure exceeds its byte bound",
-            ));
-        }
-        if !canonical.extension().is_none_or(|extension| {
-            is_node_script_path(&format!("file.{}", extension.to_string_lossy()))
-        }) {
-            continue;
+            return Err(fail("direct MCP dependency closure exceeds its byte bound"));
         }
         let source = std::fs::read_to_string(&canonical)
-            .map_err(|_| fail("direct MCP Node script is not readable UTF-8"))?;
-        let script_parent = canonical
+            .map_err(|_| fail("direct MCP script is not readable UTF-8"))?;
+        let parent = canonical
             .parent()
-            .ok_or_else(|| fail("direct MCP Node script has no containing directory"))?;
-        for specifier in node_relative_module_specifiers(&source).map_err(fail)? {
-            let candidate = resolve_node_relative_module(script_parent, &specifier)
-                .ok_or_else(|| fail("direct MCP Node relative module is missing"))?;
+            .ok_or_else(|| fail("direct MCP script has no containing directory"))?;
+        for candidate in direct_script_dependency_paths(parent, &source, runtime).map_err(fail)? {
             let dependency = checked(&candidate, field, declaring)?;
             if !dependency.is_file() {
-                return Err(fail("direct MCP Node module is not a regular file"));
+                return Err(fail("direct MCP dependency is not a regular file"));
             }
             if !dependency.starts_with(scope) {
                 return Err(fail(
-                    "direct MCP Node module escapes its selected script scope",
+                    "direct MCP dependency escapes its selected script scope",
                 ));
             }
             insert_resource(result, resource_path_bytes, dependency.clone(), field)?;
@@ -858,15 +1075,23 @@ fn insert_shell_script_dependencies(
     const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
     const MAX_SCRIPT_FILES: usize = 256;
     let fail = |cause| ResourceError { field, cause };
-    let mut pending = vec![script.to_owned()];
+    let mut pending = vec![(script.to_owned(), true)];
     let mut visited = std::collections::BTreeSet::new();
+    let mut parsed = std::collections::BTreeSet::new();
     let mut total_bytes = 0u64;
-    while let Some(current) = pending.pop() {
+    while let Some((current, parse_as_script)) = pending.pop() {
         let canonical = checked(&current, field, declaring)?;
-        if !canonical.is_file() || !visited.insert(canonical.clone()) {
+        if !canonical.is_file() {
             continue;
         }
-        if visited.len() > MAX_SCRIPT_FILES {
+        if !visited.insert(canonical.clone()) && !parse_as_script {
+            continue;
+        }
+        let parse_as_script = parse_as_script || is_shell_script(&canonical);
+        if !parse_as_script || !parsed.insert(canonical.clone()) {
+            continue;
+        }
+        if parsed.len() > MAX_SCRIPT_FILES {
             return Err(fail(
                 "direct MCP shell dependency closure exceeds its entry bound",
             ));
@@ -894,21 +1119,21 @@ fn insert_shell_script_dependencies(
             .lines()
             .filter(|line| !line.trim_start().starts_with('#'))
         {
-            let mut candidates = std::collections::BTreeSet::new();
+            let mut candidates = std::collections::BTreeMap::new();
             if let Some(operand) = shell_source_operand(line) {
                 if let Some(candidate) =
                     shell_source_path(script_parent, &operand, &directory_variables)
                         .map_err(fail)?
                 {
-                    candidates.insert(candidate);
+                    candidates.insert(candidate, true);
                 }
             }
-            candidates.extend(
-                shell_directory_relative_paths(line, &directory_variables)
-                    .into_iter()
-                    .map(|relative| script_parent.join(relative)),
-            );
-            for candidate in candidates {
+            for relative in shell_directory_relative_paths(line, &directory_variables) {
+                candidates
+                    .entry(script_parent.join(relative))
+                    .or_insert(false);
+            }
+            for (candidate, parse_as_script) in candidates {
                 let dependency = checked(&candidate, field, declaring)?;
                 if !dependency.is_file() {
                     return Err(fail("direct MCP shell source is not a regular file"));
@@ -919,7 +1144,7 @@ fn insert_shell_script_dependencies(
                     ));
                 }
                 insert_resource(result, resource_path_bytes, dependency.clone(), field)?;
-                pending.push(dependency);
+                pending.push((dependency, parse_as_script));
             }
         }
     }
@@ -1447,6 +1672,7 @@ pub fn select(
             let command_parent = canonical
                 .parent()
                 .ok_or_else(|| fail(field, "command has no containing scope"))?;
+            let dependency_scope = direct_script_dependency_scope(command_parent, home);
             if let Some(package_root) = command_parent
                 .ancestors()
                 .take_while(|ancestor| *ancestor != home && ancestor.parent().is_some())
@@ -1478,30 +1704,53 @@ pub fn select(
                 )?;
                 if is_mcp_node_script_field(field) {
                     insert_installed_package_ancestor_resources(
-                        command_parent,
+                        &canonical,
                         home,
                         declaring,
                         &mut result,
                         &mut resource_path_bytes,
                         field,
                     )?;
-                    insert_node_script_dependencies(
+                    insert_direct_script_dependencies(
                         &canonical,
-                        command_parent,
+                        &dependency_scope,
+                        declaring,
+                        &mut result,
+                        &mut resource_path_bytes,
+                        field,
+                        ScriptDependencyRuntime::Node,
+                    )?;
+                }
+                if is_shell_script(&canonical) {
+                    insert_shell_script_dependencies(
+                        &canonical,
+                        &dependency_scope,
                         declaring,
                         &mut result,
                         &mut resource_path_bytes,
                         field,
                     )?;
                 }
-                if is_shell_script(&canonical) {
-                    insert_shell_script_dependencies(
+                if is_python_script(&canonical) {
+                    insert_direct_script_dependencies(
                         &canonical,
-                        command_parent,
+                        &dependency_scope,
                         declaring,
                         &mut result,
                         &mut resource_path_bytes,
                         field,
+                        ScriptDependencyRuntime::Python,
+                    )?;
+                }
+                if is_ruby_script(&canonical) {
+                    insert_direct_script_dependencies(
+                        &canonical,
+                        &dependency_scope,
+                        declaring,
+                        &mut result,
+                        &mut resource_path_bytes,
+                        field,
+                        ScriptDependencyRuntime::Ruby,
                     )?;
                 }
                 continue;
@@ -1519,13 +1768,14 @@ pub fn select(
                             field,
                         )?;
                         if is_mcp_node_script_field(field) {
-                            insert_node_script_dependencies(
+                            insert_direct_script_dependencies(
                                 &canonical,
-                                command_parent,
+                                &dependency_scope,
                                 declaring,
                                 &mut result,
                                 &mut resource_path_bytes,
                                 field,
+                                ScriptDependencyRuntime::Node,
                             )?;
                         }
                         if canonical_home.as_deref() == Some(command_parent)
@@ -1533,11 +1783,33 @@ pub fn select(
                         {
                             insert_shell_script_dependencies(
                                 &canonical,
-                                command_parent,
+                                &dependency_scope,
                                 declaring,
                                 &mut result,
                                 &mut resource_path_bytes,
                                 field,
+                            )?;
+                        }
+                        if is_python_script(&canonical) {
+                            insert_direct_script_dependencies(
+                                &canonical,
+                                &dependency_scope,
+                                declaring,
+                                &mut result,
+                                &mut resource_path_bytes,
+                                field,
+                                ScriptDependencyRuntime::Python,
+                            )?;
+                        }
+                        if is_ruby_script(&canonical) {
+                            insert_direct_script_dependencies(
+                                &canonical,
+                                &dependency_scope,
+                                declaring,
+                                &mut result,
+                                &mut resource_path_bytes,
+                                field,
+                                ScriptDependencyRuntime::Ruby,
                             )?;
                         }
                         continue;

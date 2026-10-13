@@ -81,6 +81,67 @@ mod configured_resource_tests {
         provider
     }
 
+    fn plan_and_stage_direct_mcp_command(
+        owned_root: &Path,
+        home: &Path,
+        workspace: &Path,
+        command: &Path,
+    ) -> (Vec<PlannedSourceOccurrence>, std::path::PathBuf) {
+        let config = workspace.join("opencode.json");
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "mcp": { "direct": { "type": "local", "command": [command] } },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config,
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Workspace,
+            }],
+            workspace,
+            home,
+            &|_, _, _| None,
+        )
+        .unwrap();
+        let units =
+            resource_units(home, &home.join(".config/opencode"), workspace, &plan, None).unwrap();
+        let command = command.canonicalize().unwrap();
+        let mount = units
+            .iter()
+            .find(|(source, _)| source == &command)
+            .map(|(_, mount)| mount)
+            .expect("the direct MCP command must be in the resource plan");
+        let effective_destination = Path::new(&mount.effective_destination);
+        let provider_relative = effective_destination
+            .strip_prefix(owned_root)
+            .map(Path::to_path_buf)
+            .or_else(|_| {
+                effective_destination
+                    .strip_prefix("/home/freshell/provider")
+                    .map(|relative| Path::new(".provider-home").join(relative))
+            })
+            .expect("the test provider destination must map into the temporary root");
+        let provider = copy_selected_units_through_provider(owned_root, &units);
+        (plan, provider.join(provider_relative))
+    }
+
+    fn execute_with_home_hidden(
+        owned_root: &Path,
+        home: &Path,
+        provider_command: &Path,
+    ) -> std::process::Output {
+        let hidden_home = owned_root.join("home-hidden");
+        std::fs::rename(home, &hidden_home).unwrap();
+        let output = execute_selected_resource(provider_command);
+        std::fs::rename(&hidden_home, home).unwrap();
+        output.unwrap()
+    }
+
     #[test]
     fn managed_provider_keeps_external_indexed_payloads_out_of_persistent_generation() {
         fn tree_contains_bytes(path: &Path, expected: &[u8]) -> bool {
@@ -940,6 +1001,209 @@ mod configured_resource_tests {
             output.stderr
         );
         assert_eq!(output.stdout, b"node sibling helper loaded\n");
+    }
+
+    #[test]
+    fn direct_node_script_in_home_keeps_home_node_modules_after_all_copies() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let command = home.join("start");
+        let dependency = home.join("node_modules/home-fixture/index.js");
+        std::fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "#!/usr/bin/env node\nprocess.stdout.write(require('home-fixture'))\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &dependency,
+            "module.exports = 'home node_modules loaded\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (plan, provider_command) =
+            plan_and_stage_direct_mcp_command(owned.path(), &home, &workspace, &command);
+        assert!(plan[0]
+            .configured_resources
+            .contains(&home.join("node_modules").canonicalize().unwrap()));
+        assert!(!plan[0]
+            .configured_resources
+            .contains(&home.canonicalize().unwrap()));
+
+        let output = execute_with_home_hidden(owned.path(), &home, &provider_command);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"home node_modules loaded\n");
+    }
+
+    #[test]
+    fn direct_node_script_loads_parent_relative_module_after_all_copies() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let external = owned.path().join("external");
+        let command = external.join("mcp/bin/start");
+        let helper = external.join("mcp/lib/helper.js");
+        std::fs::create_dir_all(command.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "#!/usr/bin/env node\nprocess.stdout.write(require('../lib/helper.js'))\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &helper,
+            "module.exports = 'parent-relative module loaded\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (plan, provider_command) =
+            plan_and_stage_direct_mcp_command(owned.path(), &home, &workspace, &command);
+        assert!(plan[0]
+            .configured_resources
+            .contains(&helper.canonicalize().unwrap()));
+        assert!(!plan[0]
+            .configured_resources
+            .contains(&external.join("mcp").canonicalize().unwrap()));
+
+        let hidden_external = owned.path().join("external-hidden");
+        std::fs::rename(&external, &hidden_external).unwrap();
+        let output = execute_selected_resource(&provider_command).unwrap();
+        std::fs::rename(&hidden_external, &external).unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"parent-relative module loaded\n");
+    }
+
+    #[test]
+    fn direct_python_shebang_loads_sibling_module_after_all_copies() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let tools = home.join("tools");
+        let command = tools.join("start");
+        let helper = tools.join("helper.py");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "#!/usr/bin/env python3\nimport helper\nprint(helper.VALUE)\n",
+        )
+        .unwrap();
+        std::fs::write(&helper, "VALUE = 'python sibling loaded'\n").unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (plan, provider_command) =
+            plan_and_stage_direct_mcp_command(owned.path(), &home, &workspace, &command);
+        assert!(plan[0]
+            .configured_resources
+            .contains(&helper.canonicalize().unwrap()));
+        let output = execute_with_home_hidden(owned.path(), &home, &provider_command);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"python sibling loaded\n");
+    }
+
+    #[test]
+    fn direct_ruby_shebang_keeps_relative_module_after_all_copies() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let tools = home.join("tools");
+        let command = tools.join("start");
+        let helper = tools.join("helper.rb");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "#!/usr/bin/env ruby\nrequire_relative 'helper'\nputs VALUE\n",
+        )
+        .unwrap();
+        std::fs::write(&helper, "VALUE = 'ruby sibling loaded'\n").unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (plan, provider_command) =
+            plan_and_stage_direct_mcp_command(owned.path(), &home, &workspace, &command);
+        assert!(plan[0]
+            .configured_resources
+            .contains(&helper.canonicalize().unwrap()));
+        assert!(provider_command.is_file());
+        assert!(provider_command.with_file_name("helper.rb").is_file());
+        assert!(!plan[0]
+            .configured_resources
+            .contains(&home.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn shell_shebang_keeps_binary_support_resources_without_parsing_them() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let tools = home.join("tools");
+        let command = tools.join("start");
+        let data = tools.join("data.bin");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "#!/bin/sh\nSCRIPT_DIR=$(dirname \"$0\")\ncat \"$SCRIPT_DIR/data.bin\"\n",
+        )
+        .unwrap();
+        let expected = [0, 0xff, 0x81, b'R', b'I', b'F', b'F'];
+        std::fs::write(&data, expected).unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (plan, provider_command) =
+            plan_and_stage_direct_mcp_command(owned.path(), &home, &workspace, &command);
+        assert!(plan[0]
+            .configured_resources
+            .contains(&data.canonicalize().unwrap()));
+        let output = execute_with_home_hidden(owned.path(), &home, &provider_command);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, expected);
+    }
+
+    #[test]
+    fn shell_shebang_resolves_nested_quote_dirname_source_expression() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let tools = home.join("tools");
+        let command = tools.join("start");
+        let helper = tools.join("helper.sh");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "#!/bin/bash\nsource \"$(dirname \"$0\")/helper.sh\"\nprintf '%s\\n' \"$VALUE\"\n",
+        )
+        .unwrap();
+        std::fs::write(&helper, "VALUE='nested quote source loaded'\n").unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (plan, provider_command) =
+            plan_and_stage_direct_mcp_command(owned.path(), &home, &workspace, &command);
+        assert!(plan[0]
+            .configured_resources
+            .contains(&helper.canonicalize().unwrap()));
+        let output = execute_with_home_hidden(owned.path(), &home, &provider_command);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"nested quote source loaded\n");
     }
 
     #[test]
