@@ -116,11 +116,16 @@ async function launchCodex(page: import('@playwright/test').Page, workspace: str
   const paneRoot = page.locator('[data-context="fresh-agent"]').last()
   await expect(paneRoot).toBeVisible({ timeout: 30_000 })
   await expect.poll(async () => (await currentFreshAgent(page)).content.initialCwd, { timeout: 30_000 }).toBe(workspace)
-  await expect.poll(async () => (await currentFreshAgent(page)).content.status, { timeout: 120_000 }).toBe('idle')
   await expect.poll(async () => {
     const content = (await currentFreshAgent(page)).content
-    return content.sessionRef?.sessionId ?? content.sessionId
-  }, { timeout: 120_000 }).toBeTruthy()
+    return {
+      status: content.status,
+      sessionId: content.sessionRef?.sessionId ?? content.sessionId ?? null,
+    }
+  }, { timeout: 120_000 }).toMatchObject({
+    status: 'idle',
+    sessionId: expect.any(String),
+  })
   return { paneRoot, harness, ...(await currentFreshAgent(page)) }
 }
 
