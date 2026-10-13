@@ -1243,6 +1243,17 @@ mod tests {
     }
 
     #[cfg(unix)]
+    struct ChildGuard(std::process::Child);
+
+    #[cfg(unix)]
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn abrupt_termination_during_replacement_keeps_existing_leaf() {
         const CHILD_ROOT: &str = "FRESHELL_PROVIDER_PUBLICATION_CHILD_ROOT";
@@ -1276,7 +1287,8 @@ mod tests {
         fs::write(source.join("config.json"), b"replacement").unwrap();
         fs::write(home.join("config.json"), b"original").unwrap();
 
-        let mut child = Command::new(std::env::current_exe().unwrap())
+        let mut child = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "provider_environment::tests::abrupt_termination_during_replacement_keeps_existing_leaf",
@@ -1284,11 +1296,12 @@ mod tests {
             ])
             .env(CHILD_ROOT, root.path())
             .spawn()
-            .unwrap();
+            .unwrap(),
+        );
         let reached = root.path().join(PUBLISH_REACHED);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !reached.exists() {
-            if let Some(status) = child.try_wait().unwrap() {
+            if let Some(status) = child.0.try_wait().unwrap() {
                 panic!("child exited before the publication boundary: {status}");
             }
             assert!(
@@ -1297,9 +1310,25 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        child.kill().unwrap();
-        assert!(!child.wait().unwrap().success());
+        child.0.kill().unwrap();
+        assert!(!child.0.wait().unwrap().success());
         assert_eq!(fs::read(home.join("config.json")).unwrap(), b"original");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn checkpoint_timeout_cleanup_kills_and_reaps_child() {
+        let child = ChildGuard(Command::new("sleep").arg("2").spawn().unwrap());
+        let pid = child.0.id();
+
+        // Model the bounded wait in the parent test reaching its timeout.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        drop(child);
+
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "child must be killed and reaped when the checkpoint wait times out"
+        );
     }
 
     fn selection(source: &Path, destination: &str) -> CopySelection {
