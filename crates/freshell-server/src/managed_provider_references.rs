@@ -659,7 +659,6 @@ async fn prepare_managed_opencode_with_typed_publisher(
                 freshell_platform::opencode_config::source_owns_freshell_mcp(
                     &source.view,
                     &source.source.logical_path,
-                    cwd,
                 )
                 .map(|user_owns| owned || user_owns)
             })

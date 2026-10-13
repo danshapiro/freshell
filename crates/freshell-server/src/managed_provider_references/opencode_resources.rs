@@ -1765,7 +1765,6 @@ pub fn select(
         && !freshell_platform::opencode_config::source_owns_freshell_mcp(
             raw,
             &source.source.logical_path,
-            &source.instance_cwd,
         )
         .map_err(|_| fail("OpenCode resource", "project MCP ownership check failed"))?;
     let mut selections = fields(raw).map_err(|cause| fail("OpenCode resource", cause))?;

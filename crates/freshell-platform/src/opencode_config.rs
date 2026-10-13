@@ -175,21 +175,25 @@ fn validate_mcp_field(value: &Value, path: &Path) -> Result<(), ConfigError> {
 }
 
 /// Inspect the retained, accepted raw view without reading its source again.
-pub fn source_owns_freshell_mcp(
-    raw: &str,
-    path: &Path,
-    project_dir: &Path,
-) -> Result<bool, ConfigError> {
+/// The generated-entry sidecar belongs to the config file's project root, not
+/// necessarily to the provider launch cwd (which may be below that root).
+pub fn source_owns_freshell_mcp(raw: &str, path: &Path) -> Result<bool, ConfigError> {
     let value =
         parse_jsonc_object(raw).ok_or_else(|| ConfigError::Malformed { path: path.into() })?;
     validate_mcp_field(&value, path)?;
+    let project_dir = path
+        .parent()
+        .filter(|directory| {
+            path.file_name() == Some(std::ffi::OsStr::new("opencode.json"))
+                && directory.file_name() == Some(std::ffi::OsStr::new(".opencode"))
+        })
+        .and_then(Path::parent);
     let entry = value
         .get("mcp")
         .and_then(|mcp| mcp.get("freshell"))
         .filter(|entry| !entry.is_null());
     Ok(entry.is_some_and(|entry| {
-        path != project_dir.join(".opencode/opencode.json")
-            || !is_direct_owned_mcp_entry(project_dir, entry)
+        !project_dir.is_some_and(|project_dir| is_direct_owned_mcp_entry(project_dir, entry))
     }))
 }
 

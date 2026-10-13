@@ -1557,6 +1557,7 @@ mod tests {
         let owned = tempfile::tempdir().unwrap();
         let home = owned.path().join("home");
         let workspace = owned.path().join("workspace");
+        let launch_cwd = workspace.join("packages/app");
         let checkout = owned.path().join("freshell-checkout");
         let config = workspace.join(".opencode/opencode.json");
         let state = workspace.join(".opencode/.freshell-mcp-state.json");
@@ -1565,6 +1566,7 @@ mod tests {
         let user_root = owned.path().join("user-mcp");
         let user_script = user_root.join("server.mjs");
         std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&launch_cwd).unwrap();
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         std::fs::create_dir_all(loader.parent().unwrap()).unwrap();
         std::fs::create_dir_all(server.parent().unwrap()).unwrap();
@@ -1605,7 +1607,7 @@ mod tests {
                     lane: SourceLane::Main,
                     role: DiscoveryRole::Workspace,
                 }],
-                &workspace,
+                &launch_cwd,
                 &home,
                 &|_, _, _| None,
             )

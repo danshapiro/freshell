@@ -3048,7 +3048,6 @@ pub(super) fn stage(
                 freshell_platform::opencode_config::source_owns_freshell_mcp(
                     source.references.unexpanded_source(),
                     &source.source.logical_path,
-                    cwd,
                 )
                 .map_err(|error| error.to_string())?;
         }
