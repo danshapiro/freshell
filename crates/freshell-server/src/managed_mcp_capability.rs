@@ -63,6 +63,7 @@ pub(crate) struct OpencodeEphemeralInput<'a> {
     pub launch_context: Option<&'a freshell_runtime_protocol::ProviderLaunchContext>,
     pub frozen_inputs: Option<&'a [String]>,
     pub native_source_flags: Option<&'a [freshell_platform::opencode_recipe::NativeSourceFlag]>,
+    pub prior_resource_mounts: Option<&'a [freshell_runtime_protocol::ProviderResourceMount]>,
     pub rebind_enabled: Option<bool>,
     pub inline_edits: Option<&'a freshell_platform::opencode_config::OwnedConfigEdits>,
 }
@@ -323,6 +324,89 @@ struct CapabilityCallback {
     prior_context: Option<freshell_runtime_protocol::ProviderLaunchContext>,
     #[serde(default)]
     provider_path_inputs: Option<freshell_runtime_protocol::ProviderPathInputs>,
+}
+
+struct ReissuedOpencodeSources {
+    sources: Vec<crate::managed_provider_references::sources::SourceOccurrence>,
+    native_source_flags: Vec<freshell_platform::opencode_recipe::NativeSourceFlag>,
+}
+
+fn selected_opencode_sources_for_reissue(
+    manifest: &freshell_platform::opencode_recipe::SourceManifest,
+) -> Result<ReissuedOpencodeSources, String> {
+    use freshell_platform::opencode_recipe::SourceLane as ManifestLane;
+
+    let mut sources = Vec::new();
+    let mut new_ordinal_by_old = HashMap::new();
+    for (ordinal, source) in manifest.sources.iter().enumerate() {
+        if source.lane == ManifestLane::Inline {
+            continue;
+        }
+        let explicitly_selected = manifest.native_source_flags.iter().any(|flag| {
+            flag.source_ordinal
+                .is_some_and(|value| usize::from(value) == ordinal)
+        });
+        let canonical = match std::fs::canonicalize(&source.logical_path) {
+            Ok(canonical) => canonical,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !explicitly_selected => {
+                // Native discovery can legitimately change while the provider is down.
+                // A missing discovered file is no longer part of the replacement input.
+                continue;
+            }
+            Err(_) => {
+                return Err(format!(
+                    "prior selected configuration source {ordinal} is unavailable; repair it before reissue"
+                ));
+            }
+        };
+        new_ordinal_by_old.insert(ordinal, sources.len());
+        sources.push(
+            crate::managed_provider_references::sources::SourceOccurrence {
+                logical_path: source.logical_path.clone(),
+                canonical_source: canonical,
+                role: source.discovery_role,
+                lane: match source.lane {
+                    ManifestLane::Main => {
+                        crate::managed_provider_references::sources::SourceLane::Main
+                    }
+                    ManifestLane::Tui => {
+                        crate::managed_provider_references::sources::SourceLane::Tui
+                    }
+                    ManifestLane::Inline => {
+                        crate::managed_provider_references::sources::SourceLane::Inline
+                    }
+                },
+            },
+        );
+    }
+
+    let inline_will_be_reinserted = manifest
+        .sources
+        .iter()
+        .any(|source| source.lane == ManifestLane::Inline);
+    let inline_insert_index = sources
+        .iter()
+        .position(|source| {
+            source.lane == crate::managed_provider_references::sources::SourceLane::Tui
+        })
+        .unwrap_or(sources.len());
+    let mut native_source_flags = manifest.native_source_flags.clone();
+    for flag in &mut native_source_flags {
+        let Some(old_ordinal) = flag.source_ordinal else {
+            continue;
+        };
+        let Some(new_ordinal) = new_ordinal_by_old.get(&usize::from(old_ordinal)).copied() else {
+            return Err("prior native source selector references an unavailable source".into());
+        };
+        let new_ordinal = new_ordinal
+            + usize::from(inline_will_be_reinserted && new_ordinal >= inline_insert_index);
+        flag.source_ordinal =
+            Some(u16::try_from(new_ordinal).map_err(|_| "native source ordinal overflow")?);
+    }
+    Ok(ReissuedOpencodeSources {
+        sources,
+        native_source_flags,
+    })
 }
 
 async fn apply_prepared_callback(
@@ -700,18 +784,13 @@ async fn apply_prepared_callback(
             .map(str::to_owned)
             .or_else(|| std::env::var(name).ok())
     };
-    let selected_sources=accepted_manifest.as_ref().map(|manifest|{
-        manifest.sources.iter().enumerate().filter(|(_, source)| source.lane != freshell_platform::opencode_recipe::SourceLane::Inline).map(|(ordinal,source)|{
-            let canonical=std::fs::canonicalize(&source.logical_path)
-                .map_err(|_|format!("prior selected configuration source {ordinal} is unavailable; repair it before reissue"))?;
-            Ok(crate::managed_provider_references::sources::SourceOccurrence {
-                logical_path:source.logical_path.clone(),canonical_source:canonical,role:source.discovery_role,
-                lane:match source.lane {freshell_platform::opencode_recipe::SourceLane::Main=>crate::managed_provider_references::sources::SourceLane::Main,
-                    freshell_platform::opencode_recipe::SourceLane::Tui=>crate::managed_provider_references::sources::SourceLane::Tui,
-                    freshell_platform::opencode_recipe::SourceLane::Inline=>crate::managed_provider_references::sources::SourceLane::Inline},
-            })
-        }).collect::<Result<Vec<_>,String>>()
-    }).transpose()?;
+    let (selected_sources, reissued_native_source_flags) =
+        if let Some(manifest) = &accepted_manifest {
+            let selected = selected_opencode_sources_for_reissue(manifest)?;
+            (Some(selected.sources), Some(selected.native_source_flags))
+        } else {
+            (None, None)
+        };
     let inherited_inline = accepted_manifest
         .as_ref()
         .map(|manifest| {
@@ -742,6 +821,11 @@ async fn apply_prepared_callback(
         })
         .transpose()?
         .flatten();
+    let prior_resource_mounts = callback
+        .prior_context
+        .as_ref()
+        .and_then(|context| context.prepared_inputs.as_ref())
+        .map(|inputs| inputs.resource_mounts.as_slice());
     let prepared = crate::managed_provider_references::prepare_managed_opencode_with_publisher(
         crate::managed_provider_references::OpencodePreparation {
             client,
@@ -763,9 +847,7 @@ async fn apply_prepared_callback(
             selected_resource_roots: accepted_manifest
                 .as_ref()
                 .map(|manifest| manifest.resource_roots.clone()),
-            native_source_flags: accepted_manifest
-                .as_ref()
-                .map(|manifest| manifest.native_source_flags.clone()),
+            native_source_flags: reissued_native_source_flags,
             rebind_enabled: accepted_manifest
                 .as_ref()
                 .map(|manifest| manifest.rebind_enabled),
@@ -777,6 +859,7 @@ async fn apply_prepared_callback(
         |soul, home, context, input| {
             let input = OpencodeEphemeralInput {
                 launch_context: Some(context),
+                prior_resource_mounts,
                 ..input
             };
             let capability = store.issue_replacement_with_inputs(
@@ -1554,6 +1637,7 @@ fn stage_provider_root(
                 .iter()
                 .map(|reference| PathBuf::from(&reference.source_path)),
         );
+        let mut retained_resource_sources = None;
         if let Some(plan) = opencode_input.source_plan {
             // Indexed payloads remain exclusively in the private input volume,
             // even when an ordinary package scope also contains their files.
@@ -1564,7 +1648,7 @@ fn stage_provider_root(
                     .iter()
                     .map(|selection| selection.canonical_source.clone())
             }));
-            let units = source_stage::resource_units(
+            let mut units = source_stage::resource_units(
                 home,
                 &source,
                 opencode_input
@@ -1574,10 +1658,48 @@ fn stage_provider_root(
                 plan,
                 opencode_input.resource_roots,
             )?;
-            selections.extend(units.iter().map(|(source, mount)| CopySelection {
-                source: source.clone(),
-                destination_relative: mount.stage_relative_path.clone().into(),
-            }));
+            retained_resource_sources = if provider == "opencode" && prior_stage.is_some() {
+                let retained = source_stage::merge_recovery_resource_mounts(
+                    &mut units,
+                    opencode_input.prior_resource_mounts.unwrap_or_default(),
+                )?;
+                if retained.is_empty() {
+                    None
+                } else {
+                    let mut directory: Option<PathBuf> = None;
+                    let mut retained_sources = HashMap::<PathBuf, PathBuf>::new();
+                    for (index, mount) in retained.into_iter().enumerate() {
+                        let stage_path = PathBuf::from(&mount.stage_relative_path);
+                        let source = if let Some(source) =
+                            source_stage::current_source_for_resource_mount(&units, &mount)
+                        {
+                            source
+                        } else if let Some(source) = retained_sources.get(&stage_path) {
+                            source.clone()
+                        } else {
+                            let source_root = match &directory {
+                                Some(directory) => directory.clone(),
+                                None => {
+                                    let directory =
+                                        temporary.join(".freshell/retained-resource-sources");
+                                    private_directory(&directory)?;
+                                    directory
+                                }
+                            };
+                            let source = source_root.join(index.to_string());
+                            private_directory(&source)?;
+                            directory = Some(source_root);
+                            retained_sources.insert(stage_path, source.clone());
+                            source
+                        };
+                        units.push((source, mount));
+                    }
+                    directory
+                }
+            } else {
+                None
+            };
+            selections.extend(source_stage::resource_copy_selections(&units)?);
             let descriptors = units
                 .into_iter()
                 .map(|(_, mount)| mount)
@@ -1807,10 +1929,145 @@ fn stage_provider_root(
             provider,
             selections = selections.len()
         );
-        let report=copy_environment(&selections,&temporary,&excluded,CopyLimits::default()).map_err(|error| {
-            tracing::error!(event="provider.environment.copy.failed",stage="controller",provider,operation=error.operation,relative_path=%error.relative_path.display(),limit_kind=error.limit_kind,observed=error.observed,permitted=error.permitted,elapsed_ms=started.elapsed().as_millis() as u64,corrective_message=%error.corrective_message);
-            error.to_string()
-        })?;
+        let report = copy_environment(&selections, &temporary, &excluded, CopyLimits::default())
+            .map_err(|error| {
+                let failing_selection = selections.iter().find(|selection| {
+                    error
+                        .relative_path
+                        .starts_with(&selection.destination_relative)
+                });
+                let resource_source_scope = failing_selection.map(|selection| {
+                    let selected = &selection.source;
+                    let workspace = opencode_input.workspace.or(opencode_input.cwd);
+                    if selected.starts_with(home) {
+                        "provider_home"
+                    } else if workspace.is_some_and(|workspace| selected.starts_with(workspace)) {
+                        "workspace"
+                    } else if selected.starts_with(&source) {
+                        "provider_config"
+                    } else {
+                        "external"
+                    }
+                });
+                let resource_source_leaf = failing_selection
+                    .and_then(|selection| selection.source.file_name())
+                    .map(|leaf| leaf.to_string_lossy().into_owned());
+                let selected_source =
+                    failing_selection.map(|selection| selection.source.as_path());
+                let same_selected_source = |candidate: &Path| {
+                    selected_source.is_some_and(|selected| {
+                        candidate == selected
+                            || std::fs::canonicalize(candidate).ok().as_deref() == Some(selected)
+                    })
+                };
+                let configured_source_origin = opencode_input.source_plan.and_then(|plan| {
+                    plan.iter().find_map(|planned| {
+                        planned
+                            .configured_resources
+                            .iter()
+                            .any(|resource| same_selected_source(resource))
+                            .then(|| {
+                                let lane = match planned.source.lane {
+                                    crate::managed_provider_references::sources::SourceLane::Main => {
+                                        "main"
+                                    }
+                                    crate::managed_provider_references::sources::SourceLane::Tui => {
+                                        "tui"
+                                    }
+                                    crate::managed_provider_references::sources::SourceLane::Inline => {
+                                        "inline"
+                                    }
+                                };
+                                let config_leaf = planned
+                                    .source
+                                    .logical_path
+                                    .file_name()
+                                    .map(|leaf| leaf.to_string_lossy().into_owned());
+                                let config_path = &planned.source.logical_path;
+                                let workspace = opencode_input.workspace.or(opencode_input.cwd);
+                                let scope = if config_path.starts_with(home) {
+                                    "provider_home"
+                                } else if workspace
+                                    .is_some_and(|workspace| config_path.starts_with(workspace))
+                                {
+                                    "workspace"
+                                } else if opencode_input
+                                    .config_root
+                                    .is_some_and(|root| config_path.starts_with(root))
+                                {
+                                    "provider_config"
+                                } else {
+                                    "external"
+                                };
+                                ("configured_resource", Some(lane), config_leaf, scope)
+                            })
+                    })
+                });
+                let discovered_root_origin = opencode_input.resource_roots.and_then(|roots| {
+                    roots
+                        .iter()
+                        .find(|root| same_selected_source(&root.logical_path))
+                        .map(|root| {
+                            let role = match root.role {
+                                crate::managed_provider_references::sources::DiscoveryRole::Global => {
+                                    "global_root"
+                                }
+                                crate::managed_provider_references::sources::DiscoveryRole::Home => {
+                                    "provider_home_root"
+                                }
+                                crate::managed_provider_references::sources::DiscoveryRole::Workspace => {
+                                    "workspace_root"
+                                }
+                                crate::managed_provider_references::sources::DiscoveryRole::Unknown => {
+                                    "unknown_root"
+                                }
+                            };
+                            let root_leaf = root
+                                .logical_path
+                                .file_name()
+                                .map(|leaf| leaf.to_string_lossy().into_owned());
+                            (role, root_leaf)
+                        })
+                });
+                let (
+                    resource_source_origin,
+                    resource_source_lane,
+                    resource_source_config_leaf,
+                    resource_source_config_scope,
+                ) = configured_source_origin
+                    .map(|(origin, lane, config_leaf, config_scope)| {
+                        (origin, lane, config_leaf, Some(config_scope))
+                    })
+                    .unwrap_or_else(|| {
+                        discovered_root_origin
+                            .map(|(origin, root_leaf)| (origin, None, root_leaf, None))
+                            .unwrap_or(("unclassified", None, None, None))
+                    });
+                tracing::error!(
+                    event = "provider.environment.copy.failed",
+                    stage = "controller",
+                    provider,
+                    operation = error.operation,
+                    relative_path = %error.relative_path.display(),
+                    resource_source_scope,
+                    resource_source_leaf,
+                    resource_source_origin,
+                    resource_source_lane,
+                    resource_source_config_leaf,
+                    resource_source_config_scope,
+                    limit_kind = error.limit_kind,
+                    observed = error.observed,
+                    permitted = error.permitted,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    corrective_message = %error.corrective_message
+                );
+                error.to_string()
+            })?;
+        if let Some(directory) = retained_resource_sources {
+            std::fs::remove_dir_all(directory).map_err(|error| {
+                format!("retained provider resource staging cleanup failed: {error}")
+            })?;
+        }
         tracing::info!(
             event = "provider.environment.copy.completed",
             stage = "controller",
@@ -3312,6 +3569,149 @@ fn execute_copied_script(path: &Path) -> std::io::Result<std::process::Output> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn opencode_source_view(
+        logical_path: PathBuf,
+        lane: freshell_platform::opencode_recipe::SourceLane,
+        ordinal: usize,
+    ) -> freshell_platform::opencode_recipe::SourceView {
+        use freshell_platform::opencode_recipe::{DiscoveryRole, SourceView};
+
+        SourceView {
+            logical_path,
+            discovery_role: DiscoveryRole::Workspace,
+            native_destination: None,
+            lane,
+            unexpanded_relative_path: format!("sources/{ordinal}.json"),
+            template_relative_path: format!("sources/{ordinal}.json"),
+            template_sha256: None,
+            generated_name: None,
+            occurrences: vec![],
+            referenced_variables: vec![],
+            path_variables: vec![],
+            original_form: false,
+        }
+    }
+
+    fn opencode_manifest(
+        sources: Vec<(PathBuf, freshell_platform::opencode_recipe::SourceLane)>,
+        native_source_flags: Vec<freshell_platform::opencode_recipe::NativeSourceFlag>,
+    ) -> freshell_platform::opencode_recipe::SourceManifest {
+        freshell_platform::opencode_recipe::SourceManifest {
+            version: 1,
+            cwd: PathBuf::from("/workspace"),
+            original_home: PathBuf::from("/home/original"),
+            global_config_root: None,
+            sources: sources
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, (path, lane))| opencode_source_view(path, lane, ordinal))
+                .collect(),
+            files: vec![],
+            frozen_inputs: vec![],
+            user_owns_freshell_mcp: false,
+            native_source_flags,
+            resource_roots: vec![],
+            rebind_enabled: true,
+            inline_edits: Default::default(),
+        }
+    }
+
+    #[test]
+    fn opencode_reissue_omits_a_removed_discovered_source() {
+        let owned = tempfile::tempdir().unwrap();
+        let removed_source = owned.path().join("opencode.json");
+        let manifest = opencode_manifest(
+            vec![(
+                removed_source.clone(),
+                freshell_platform::opencode_recipe::SourceLane::Main,
+            )],
+            vec![],
+        );
+
+        let selected = selected_opencode_sources_for_reissue(&manifest).unwrap();
+
+        assert!(selected.sources.is_empty());
+    }
+
+    #[test]
+    fn opencode_reissue_still_requires_a_removed_explicit_source() {
+        let owned = tempfile::tempdir().unwrap();
+        let removed_source = owned.path().join("selected.json");
+        let manifest = opencode_manifest(
+            vec![(
+                removed_source,
+                freshell_platform::opencode_recipe::SourceLane::Main,
+            )],
+            vec![freshell_platform::opencode_recipe::NativeSourceFlag {
+                kind: freshell_platform::opencode_recipe::NativeSourceFlagKind::Main,
+                runtime_destination: "/provider/selected.json".into(),
+                source_ordinal: Some(0),
+            }],
+        );
+
+        let error = selected_opencode_sources_for_reissue(&manifest)
+            .err()
+            .expect("a removed explicit source must block reissue");
+
+        assert_eq!(
+            error,
+            "prior selected configuration source 0 is unavailable; repair it before reissue"
+        );
+    }
+
+    #[test]
+    fn opencode_reissue_does_not_ignore_non_missing_source_errors() {
+        let owned = tempfile::tempdir().unwrap();
+        let parent_file = owned.path().join("not-a-directory");
+        std::fs::write(&parent_file, "file").unwrap();
+        let manifest = opencode_manifest(
+            vec![(
+                parent_file.join("selected.json"),
+                freshell_platform::opencode_recipe::SourceLane::Main,
+            )],
+            vec![],
+        );
+
+        let error = selected_opencode_sources_for_reissue(&manifest)
+            .err()
+            .expect("non-missing filesystem errors must block reissue");
+
+        assert_eq!(
+            error,
+            "prior selected configuration source 0 is unavailable; repair it before reissue"
+        );
+    }
+
+    #[test]
+    fn opencode_reissue_remaps_native_selector_after_removing_prior_sources() {
+        use freshell_platform::opencode_recipe::{
+            NativeSourceFlag, NativeSourceFlagKind, SourceLane,
+        };
+
+        let owned = tempfile::tempdir().unwrap();
+        let removed_source = owned.path().join("removed.json");
+        let tui_source = owned.path().join("tui.jsonc");
+        std::fs::write(&tui_source, r#"{"theme":"dark"}"#).unwrap();
+        let manifest = opencode_manifest(
+            vec![
+                (removed_source, SourceLane::Main),
+                (PathBuf::from("OPENCODE_CONFIG_CONTENT"), SourceLane::Inline),
+                (tui_source.clone(), SourceLane::Tui),
+            ],
+            vec![NativeSourceFlag {
+                kind: NativeSourceFlagKind::Tui,
+                runtime_destination: "/provider/tui.jsonc".into(),
+                source_ordinal: Some(2),
+            }],
+        );
+
+        let selected = selected_opencode_sources_for_reissue(&manifest).unwrap();
+
+        assert_eq!(selected.sources.len(), 1);
+        assert_eq!(selected.sources[0].logical_path, tui_source);
+        assert_eq!(selected.native_source_flags[0].source_ordinal, Some(1));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

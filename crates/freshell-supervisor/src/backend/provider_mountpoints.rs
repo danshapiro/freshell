@@ -161,7 +161,7 @@ impl DockerEngineBackend {
         daemon: &DockerDaemonId,
     ) -> Result<(), BackendError> {
         let selected = selections(mounts)?;
-        if selected.is_empty() {
+        if selected.is_empty() && spec.prior_provider_owner.is_none() {
             return Ok(());
         }
         if spec.initial_input_reservation.is_none() {
@@ -333,10 +333,31 @@ impl DockerEngineBackend {
                     .read_exact(&mut acknowledgement)
                     .await
                     .map_err(|_| fail("provider mountpoint acknowledgement unavailable"))?;
-                if &acknowledgement != b"ok" {
-                    return Err(fail("provider mountpoint acknowledgement invalid"));
+                match &acknowledgement {
+                    b"ok" => Ok(()),
+                    b"er" => {
+                        let mut length = [0; 4];
+                        stream
+                            .read_exact(&mut length)
+                            .await
+                            .map_err(|_| fail("provider mountpoint failure reason unavailable"))?;
+                        let length = u32::from_be_bytes(length) as usize;
+                        if length == 0 || length > 4096 {
+                            return Err(fail("provider mountpoint failure reason exceeds limit"));
+                        }
+                        let mut reason = vec![0; length];
+                        stream
+                            .read_exact(&mut reason)
+                            .await
+                            .map_err(|_| fail("provider mountpoint failure reason incomplete"))?;
+                        let reason = std::str::from_utf8(&reason)
+                            .map_err(|_| fail("provider mountpoint failure reason invalid"))?;
+                        Err(BackendError::Unavailable(format!(
+                            "provider mountpoint preparation failed: {reason}"
+                        )))
+                    }
+                    _ => Err(fail("provider mountpoint acknowledgement invalid")),
                 }
-                Ok(())
             };
             let wait = async {
                 let response = self
@@ -354,7 +375,9 @@ impl DockerEngineBackend {
                 }
                 Ok(())
             };
-            tokio::try_join!(exchange, wait)?;
+            let (exchange_result, wait_result) = tokio::join!(exchange, wait);
+            exchange_result?;
+            wait_result?;
             if self.daemon_id().await? != *target.daemon {
                 return Err(fail(
                     "provider mountpoint daemon changed before main create",
@@ -398,6 +421,7 @@ mod tests {
         for mode in [
             "prepared",
             "empty",
+            "preparation-error",
             "lost-create-ack",
             "wrong-caps",
             "cleanup-still-present",
@@ -478,6 +502,7 @@ mod tests {
                                             let path=home.join(entry.relative_path);std::fs::create_dir_all(path.parent().unwrap()).unwrap();
                                             if entry.directory {std::fs::create_dir_all(path).unwrap();} else {std::fs::File::create(path).unwrap();}
                                         }
+                                        if mode=="preparation-error" {channel.write_all(b"er").await.unwrap();channel.write_u32(31).await.unwrap();channel.write_all(b"test preparation failure reason").await.unwrap();return;}
                                         channel.write_all(b"ok").await.unwrap();
                                     }));
                                     (204,json!({}))
@@ -537,7 +562,16 @@ mod tests {
                 matches!(mode, "prepared" | "empty"),
                 "{mode}: candidate preparation must settle with exact owned absence: {result:?}"
             );
-            if matches!(mode, "prepared" | "empty" | "lost-create-ack" | "timeout") {
+            if mode == "preparation-error" {
+                assert!(
+                    format!("{result:?}").contains("test preparation failure reason"),
+                    "the helper's bounded failure reason must reach the caller: {result:?}"
+                );
+            }
+            if matches!(
+                mode,
+                "prepared" | "empty" | "preparation-error" | "lost-create-ack" | "timeout"
+            ) {
                 assert!(helper.is_none());
                 assert!(removed.load(std::sync::atomic::Ordering::SeqCst));
             }

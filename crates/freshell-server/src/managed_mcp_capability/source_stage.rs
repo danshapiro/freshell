@@ -1080,6 +1080,101 @@ mod configured_resource_tests {
     }
 
     #[test]
+    fn direct_node_script_in_home_keeps_static_import_meta_url_data_after_all_copies() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let command = home.join("mcp.mjs");
+        let schema = home.join("schema.json");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "import { readFileSync } from 'node:fs';\nprocess.stdout.write(readFileSync(new URL('./schema.json', import.meta.url), 'utf8'));\n",
+        )
+        .unwrap();
+        std::fs::write(&schema, "static schema loaded\n").unwrap();
+
+        let (plan, provider_script) =
+            plan_and_stage_direct_mcp_command(owned.path(), &home, &workspace, &command);
+        assert!(plan[0]
+            .configured_resources
+            .contains(&schema.canonicalize().unwrap()));
+        assert!(!plan[0]
+            .configured_resources
+            .contains(&home.canonicalize().unwrap()));
+
+        let hidden_home = owned.path().join("home-hidden");
+        std::fs::rename(&home, &hidden_home).unwrap();
+        let output = std::process::Command::new("node")
+            .arg(&provider_script)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .output();
+        std::fs::rename(&hidden_home, &home).unwrap();
+        let output = output.unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"static schema loaded\n");
+    }
+
+    #[test]
+    fn shell_mcp_wrapper_stages_and_runs_node_server_module_closure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let tools = home.join("tools");
+        let command = tools.join("start");
+        let server = tools.join("server.js");
+        let helper = tools.join("helper.cjs");
+        let package = tools.join("node_modules/shell-fixture");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "#!/bin/sh\nSCRIPT_DIR=$(dirname \"$0\")\nexec node \"$SCRIPT_DIR/server.js\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &server,
+            "const helper = require('./helper.cjs');\nconst installed = require('shell-fixture');\nprocess.stdout.write(`${helper}:${installed}\\n`);\n",
+        )
+        .unwrap();
+        std::fs::write(&helper, "module.exports = 'sibling-loaded';\n").unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"name":"shell-fixture","main":"index.cjs"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("index.cjs"),
+            "module.exports = 'package-loaded';\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (plan, provider_command) =
+            plan_and_stage_direct_mcp_command(owned.path(), &home, &workspace, &command);
+        for required in [&command, &server, &helper, &tools.join("node_modules")] {
+            assert!(
+                plan[0]
+                    .configured_resources
+                    .contains(&required.canonicalize().unwrap()),
+                "shell-launched Node closure omitted {}",
+                required.display()
+            );
+        }
+        assert!(!plan[0]
+            .configured_resources
+            .contains(&home.canonicalize().unwrap()));
+
+        let output = execute_with_home_hidden(owned.path(), &home, &provider_command);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"sibling-loaded:package-loaded\n");
+    }
+
+    #[test]
     fn node_command_script_in_home_keeps_home_node_modules_after_all_copies() {
         let owned = tempfile::tempdir().unwrap();
         let home = owned.path().join("home");
@@ -2360,6 +2455,184 @@ mod configured_resource_tests {
         );
         assert_eq!(std::fs::read_to_string(config).unwrap(), raw);
     }
+
+    #[test]
+    fn resource_mount_identity_does_not_shift_when_another_root_is_added() {
+        use freshell_platform::opencode_recipe::{DiscoveryRole, DiscoveryRoot};
+
+        let owned = tempfile::tempdir().unwrap();
+        let extra = owned.path().join("a-extra-resource");
+        let home = owned.path().join("z-provider-home");
+        let global = home.join(".config/opencode");
+        let workspace = owned.path().join("workspace");
+        for path in [&extra, &global, &workspace] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let global_root = DiscoveryRoot {
+            logical_path: global.clone(),
+            role: DiscoveryRole::Global,
+        };
+        let extra_root = DiscoveryRoot {
+            logical_path: extra,
+            role: DiscoveryRole::Home,
+        };
+
+        let before = resource_units(
+            &home,
+            &global,
+            &workspace,
+            &[],
+            Some(std::slice::from_ref(&global_root)),
+        )
+        .unwrap();
+        let after = resource_units(
+            &home,
+            &global,
+            &workspace,
+            &[],
+            Some(&[extra_root, global_root]),
+        )
+        .unwrap();
+        let before_global = before
+            .iter()
+            .find(|(_, mount)| mount.logical_destination.ends_with("/.config/opencode"))
+            .unwrap();
+        let after_global = after
+            .iter()
+            .find(|(_, mount)| mount.logical_destination.ends_with("/.config/opencode"))
+            .unwrap();
+        assert_eq!(
+            before_global.1.provider_relative_path, after_global.1.provider_relative_path,
+            "adding a different resource root must not reassign the provider-owned subpath"
+        );
+    }
+
+    #[test]
+    fn recovery_reuses_matching_home_mount_and_retains_dropped_home_directories() {
+        use freshell_runtime_protocol::{ProviderResourceKind, ProviderResourceMount};
+
+        let previous = ProviderResourceMount {
+            stage_relative_path: ".freshell/resource-units/root-legacy".into(),
+            provider_relative_path: ".freshell/provider-roots/root-legacy".into(),
+            logical_destination: "/home/freshell/provider/.config/opencode".into(),
+            effective_destination: "/home/freshell/provider/.config/opencode".into(),
+            kind: ProviderResourceKind::Directory,
+        };
+        let mut current = vec![(
+            "/synthetic/current-opencode-root".into(),
+            ProviderResourceMount {
+                stage_relative_path: ".freshell/resource-units/root-new".into(),
+                provider_relative_path: ".freshell/provider-roots/root-new".into(),
+                logical_destination: previous.logical_destination.clone(),
+                effective_destination: previous.effective_destination.clone(),
+                kind: ProviderResourceKind::Directory,
+            },
+        )];
+        let retained =
+            merge_recovery_resource_mounts(&mut current, std::slice::from_ref(&previous)).unwrap();
+        assert_eq!(
+            current[0].1.stage_relative_path,
+            previous.stage_relative_path
+        );
+        assert_eq!(
+            current[0].1.provider_relative_path,
+            previous.provider_relative_path
+        );
+        assert!(
+            retained.is_empty(),
+            "the current alias already retains this root"
+        );
+
+        let mut no_current_roots = Vec::new();
+        let retained =
+            merge_recovery_resource_mounts(&mut no_current_roots, std::slice::from_ref(&previous))
+                .unwrap();
+        assert_eq!(retained, vec![previous]);
+    }
+
+    #[test]
+    fn recovery_rejects_nested_retained_and_current_directory_mounts() {
+        use freshell_runtime_protocol::{ProviderResourceKind, ProviderResourceMount};
+
+        let mount = |name: &str, destination: &str| ProviderResourceMount {
+            stage_relative_path: format!(".freshell/resource-units/{name}"),
+            provider_relative_path: format!(".freshell/provider-roots/{name}"),
+            logical_destination: destination.into(),
+            effective_destination: destination.into(),
+            kind: ProviderResourceKind::Directory,
+        };
+
+        for (current_destination, previous_destination) in [
+            (
+                "/home/freshell/provider/.config/opencode/plugins",
+                "/home/freshell/provider/.config/opencode",
+            ),
+            (
+                "/home/freshell/provider/.config/opencode",
+                "/home/freshell/provider/.config/opencode/plugins",
+            ),
+        ] {
+            let previous = mount("previous", previous_destination);
+            let mut current = vec![(
+                "/synthetic/current-resource".into(),
+                mount("current", current_destination),
+            )];
+            let error =
+                merge_recovery_resource_mounts(&mut current, std::slice::from_ref(&previous))
+                    .expect_err("nested directory mount roots must preserve the prior generation");
+            assert!(error.contains("overlapping") && error.contains("reprepare"));
+        }
+
+        let previous = mount("previous", "/home/freshell/provider/.config/opencode");
+        let mut prefix_sibling = vec![(
+            "/synthetic/current-resource".into(),
+            mount("current", "/home/freshell/provider/.config/opencode-extra"),
+        )];
+        let retained =
+            merge_recovery_resource_mounts(&mut prefix_sibling, std::slice::from_ref(&previous))
+                .unwrap();
+        assert_eq!(retained, vec![previous]);
+    }
+
+    #[test]
+    fn recovery_resource_copy_selections_deduplicate_shared_alias_subpaths() {
+        use freshell_runtime_protocol::{ProviderResourceKind, ProviderResourceMount};
+
+        let owned = tempfile::tempdir().unwrap();
+        let source = owned.path().join("shared");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("resource.txt"), "shared-resource").unwrap();
+        let mount = |destination: &str| ProviderResourceMount {
+            stage_relative_path: ".freshell/resource-units/root-shared".into(),
+            provider_relative_path: ".freshell/provider-roots/root-shared".into(),
+            logical_destination: destination.into(),
+            effective_destination: destination.into(),
+            kind: ProviderResourceKind::Directory,
+        };
+        let mut aliases = vec![(source, mount("/workspace/current"))];
+        let prior = mount("/home/freshell/provider/.config/opencode");
+        let retained =
+            merge_recovery_resource_mounts(&mut aliases, std::slice::from_ref(&prior)).unwrap();
+        assert_eq!(retained, vec![prior]);
+        let source = current_source_for_resource_mount(&aliases, &retained[0])
+            .expect("the selected alias already supplies this physical subpath");
+        aliases.push((source, retained[0].clone()));
+
+        let selections = resource_copy_selections(&aliases).unwrap();
+        assert_eq!(aliases.len(), 2, "both aliases must remain mountable");
+        assert_eq!(selections.len(), 1, "the shared staged tree is copied once");
+        let stage = owned.path().join("stage");
+        copy_environment(&selections, &stage, &[], Default::default()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(
+                stage
+                    .join(".freshell/resource-units/root-shared")
+                    .join("resource.txt")
+            )
+            .unwrap(),
+            "shared-resource"
+        );
+    }
 }
 
 /// Selected discovery roots are complete writable units, independent of the
@@ -2378,6 +2651,7 @@ pub(super) fn resource_units(
     String,
 > {
     use freshell_runtime_protocol::{ProviderResourceKind, ProviderResourceMount};
+    use sha2::{Digest, Sha256};
     let mut roots = BTreeMap::new();
     for root in accepted_roots.unwrap_or_default() {
         if root.role == crate::managed_provider_references::sources::DiscoveryRole::Unknown {
@@ -2435,19 +2709,27 @@ pub(super) fn resource_units(
         }
     }
     let mut units = Vec::new();
-    let mut identities = BTreeMap::new();
+    let mut identities = BTreeMap::<std::path::PathBuf, String>::new();
     for ((logical, role), canonical) in roots {
-        let next = identities.len();
-        let ordinal = *identities.entry(canonical.clone()).or_insert(next);
+        let name = if let Some(name) = identities.get(&canonical) {
+            name.clone()
+        } else {
+            let canonical_text = canonical
+                .to_str()
+                .ok_or("selected OpenCode resource root is not UTF-8")?;
+            let name = format!("root-{:x}", Sha256::digest(canonical_text.as_bytes()));
+            identities.insert(canonical.clone(), name.clone());
+            name
+        };
         let kind = if canonical.is_file() {
             ProviderResourceKind::File
         } else {
             ProviderResourceKind::Directory
         };
         let name = if kind == ProviderResourceKind::File {
-            format!("root-{ordinal}/source")
+            format!("{name}/source")
         } else {
-            format!("root-{ordinal}")
+            name
         };
         let destination = freshell_platform::opencode_config::lexical_path(
             &crate::managed_provider_references::sources::runtime_directory_destination(
@@ -2484,6 +2766,165 @@ pub(super) fn resource_units(
         ));
     }
     Ok(units)
+}
+
+/// Preserve managed OpenCode HOME aliases across recovery. Resource contents
+/// live under provider-volume subpaths, so dropping a no-longer-selected alias
+/// would hide provider-created files left beside the previously selected data.
+pub(super) fn merge_recovery_resource_mounts(
+    current: &mut [(
+        std::path::PathBuf,
+        freshell_runtime_protocol::ProviderResourceMount,
+    )],
+    previous: &[freshell_runtime_protocol::ProviderResourceMount],
+) -> Result<Vec<freshell_runtime_protocol::ProviderResourceMount>, String> {
+    use freshell_runtime_protocol::{ProviderResourceKind, ProviderResourceMount};
+    const PROVIDER_HOME: &str = "/home/freshell/provider";
+
+    fn paired_resource_paths(mount: &ProviderResourceMount) -> bool {
+        let Some(stage) = mount
+            .stage_relative_path
+            .strip_prefix(".freshell/resource-units/")
+        else {
+            return false;
+        };
+        let Some(provider) = mount
+            .provider_relative_path
+            .strip_prefix(".freshell/provider-roots/")
+        else {
+            return false;
+        };
+        stage == provider
+            && !stage.is_empty()
+            && [
+                Path::new(&mount.stage_relative_path),
+                Path::new(&mount.provider_relative_path),
+            ]
+            .iter()
+            .all(|path| {
+                !path.is_absolute()
+                    && path
+                        .components()
+                        .all(|part| matches!(part, std::path::Component::Normal(_)))
+            })
+    }
+
+    for (_, mount) in current.iter_mut() {
+        if let Some(prior) = previous
+            .iter()
+            .find(|prior| prior.effective_destination == mount.effective_destination)
+        {
+            if prior.kind != mount.kind || !paired_resource_paths(prior) {
+                return Err(
+                    "prior OpenCode resource mount changed type or identity; retain inputs and reprepare"
+                        .into(),
+                );
+            }
+            mount.stage_relative_path = prior.stage_relative_path.clone();
+            mount.provider_relative_path = prior.provider_relative_path.clone();
+        }
+    }
+
+    let current_destinations = current
+        .iter()
+        .map(|(_, mount)| mount.effective_destination.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut retained_destinations = std::collections::HashSet::new();
+    let mut retained = Vec::new();
+    for prior in previous {
+        if current_destinations.contains(prior.effective_destination.as_str())
+            || prior.kind != ProviderResourceKind::Directory
+            || !Path::new(&prior.effective_destination).starts_with(PROVIDER_HOME)
+        {
+            continue;
+        }
+        if !paired_resource_paths(prior) {
+            return Err(
+                "prior OpenCode resource mount identity is invalid; retain inputs and reprepare"
+                    .into(),
+            );
+        }
+        if retained_destinations.insert(prior.effective_destination.clone()) {
+            retained.push(prior.clone());
+        }
+    }
+    let merged = current
+        .iter()
+        .map(|(_, mount)| mount)
+        .chain(retained.iter())
+        .collect::<Vec<_>>();
+    for (index, left) in merged.iter().enumerate() {
+        if left.kind != ProviderResourceKind::Directory {
+            continue;
+        }
+        for right in merged.iter().skip(index + 1) {
+            if right.kind != ProviderResourceKind::Directory
+                || left.effective_destination == right.effective_destination
+            {
+                continue;
+            }
+            let left_path = Path::new(&left.effective_destination);
+            let right_path = Path::new(&right.effective_destination);
+            if left_path.starts_with(right_path) || right_path.starts_with(left_path) {
+                return Err(
+                    "overlapping retained OpenCode resource mount destinations; retain inputs and reprepare"
+                        .into(),
+                );
+            }
+        }
+    }
+    Ok(retained)
+}
+
+/// Build one physical staging copy per accepted resource subpath while leaving
+/// every logical alias descriptor available for the runtime mount plan.
+pub(super) fn resource_copy_selections(
+    units: &[(
+        std::path::PathBuf,
+        freshell_runtime_protocol::ProviderResourceMount,
+    )],
+) -> Result<Vec<freshell_platform::provider_environment::CopySelection>, String> {
+    use freshell_platform::provider_environment::CopySelection;
+    let mut sources = BTreeMap::<std::path::PathBuf, std::path::PathBuf>::new();
+    let mut selections = Vec::new();
+    for (source, mount) in units {
+        let destination = Path::new(&mount.stage_relative_path).to_owned();
+        let canonical = std::fs::canonicalize(source)
+            .map_err(|_| "selected OpenCode resource stage source is unavailable")?;
+        match sources.get(&destination) {
+            Some(prior) if prior == &canonical => continue,
+            Some(_) => {
+                return Err(
+                    "shared OpenCode resource subpath has conflicting sources; retain inputs and reprepare"
+                        .into(),
+                )
+            }
+            None => {
+                sources.insert(destination.clone(), canonical);
+                selections.push(CopySelection {
+                    source: source.clone(),
+                    destination_relative: destination,
+                });
+            }
+        }
+    }
+    Ok(selections)
+}
+
+pub(super) fn current_source_for_resource_mount(
+    current: &[(
+        std::path::PathBuf,
+        freshell_runtime_protocol::ProviderResourceMount,
+    )],
+    mount: &freshell_runtime_protocol::ProviderResourceMount,
+) -> Option<std::path::PathBuf> {
+    current
+        .iter()
+        .find(|(_, candidate)| {
+            candidate.stage_relative_path == mount.stage_relative_path
+                && candidate.provider_relative_path == mount.provider_relative_path
+        })
+        .map(|(source, _)| source.clone())
 }
 
 pub(super) fn read_source_view(root: &Path, relative: &str) -> Result<String, String> {

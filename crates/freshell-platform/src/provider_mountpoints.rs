@@ -2,11 +2,29 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+const RESOURCE_ROOTS: &str = ".freshell/provider-roots";
+const RESOURCE_PLACEHOLDER_MANIFEST: &str = ".freshell/provider-resource-mountpoints.json";
+const MAX_PLACEHOLDER_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Mountpoint {
     pub relative_path: String,
     pub directory: bool,
+}
+
+fn write_result(
+    writer: &mut impl std::io::Write,
+    result: Result<(), &'static str>,
+) -> std::io::Result<()> {
+    match result {
+        Ok(()) => writer.write_all(b"ok"),
+        Err(reason) => {
+            writer.write_all(b"er")?;
+            writer.write_all(&(reason.len() as u32).to_be_bytes())?;
+            writer.write_all(reason.as_bytes())
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -21,10 +39,11 @@ fn prepare_for_identity(
     gid: u32,
 ) -> Result<(), &'static str> {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     };
     let mut paths = BTreeMap::new();
+    let mut current_resource_files = BTreeSet::new();
     let mut bytes = 0usize;
     for entry in selected {
         let relative = Path::new(&entry.relative_path);
@@ -52,6 +71,12 @@ fn prepare_for_identity(
         {
             return Err("provider mountpoint kinds conflict");
         }
+        if !entry.directory
+            && relative.starts_with(RESOURCE_ROOTS)
+            && relative.components().count() > Path::new(RESOURCE_ROOTS).components().count()
+        {
+            current_resource_files.insert(relative.to_owned());
+        }
         if paths.len() > 100_000 {
             return Err("provider mountpoint entry profile exceeded");
         }
@@ -61,6 +86,9 @@ fn prepare_for_identity(
         if bytes > 64 * 1024 * 1024 {
             return Err("provider mountpoint metadata profile exceeded");
         }
+    }
+    if paths.insert(Path::new(".freshell").to_owned(), true) == Some(false) {
+        return Err("provider mountpoint kinds conflict");
     }
     let metadata =
         std::fs::symlink_metadata(home).map_err(|_| "provider HOME mountpoint unavailable")?;
@@ -85,6 +113,35 @@ fn prepare_for_identity(
     } else if metadata.uid() != uid || metadata.gid() != gid {
         return Err("provider HOME ownership changed");
     }
+    let previous_resource_files = read_resource_placeholder_manifest(home, uid, gid)?;
+    let mut retired = Vec::new();
+    for relative in previous_resource_files.difference(&current_resource_files) {
+        verify_owned_physical_parents(home, relative, uid, gid)?;
+        match std::fs::symlink_metadata(home.join(relative)) {
+            Ok(metadata)
+                if !metadata.file_type().is_symlink()
+                    && metadata.is_file()
+                    && metadata.uid() == uid
+                    && metadata.gid() == gid
+                    && metadata.len() == 0 => retired.push(relative.clone()),
+            Ok(metadata)
+                if !metadata.file_type().is_symlink()
+                    && metadata.is_file()
+                    && metadata.uid() == uid
+                    && metadata.gid() == gid => {
+                return Err(
+                    "retired provider resource mountpoint is not empty; retain inputs and reprepare",
+                )
+            }
+            Ok(_) => {
+                return Err(
+                    "retired provider resource mountpoint kind or ownership changed; retain inputs and reprepare",
+                )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("retired provider resource mountpoint inspection failed"),
+        }
+    }
     // Inspection precedes every mutation, so a conflicting retained leaf never
     // causes a partially populated preparation or ownership adoption.
     for (relative, directory) in &paths {
@@ -104,9 +161,10 @@ fn prepare_for_identity(
         }
     }
     let mut created = Vec::new();
+    let mut created_resource_files = BTreeSet::new();
     let result = (|| {
         for (relative, directory) in paths {
-            let path = home.join(relative);
+            let path = home.join(&relative);
             if std::fs::symlink_metadata(&path).is_ok() {
                 continue;
             }
@@ -122,9 +180,41 @@ fn prepare_for_identity(
                     .mode(0o600)
                     .open(&path)
                     .map_err(|_| "provider file mountpoint creation failed")?;
+                if !directory
+                    && Path::new(&relative).starts_with(RESOURCE_ROOTS)
+                    && Path::new(&relative).components().count()
+                        > Path::new(RESOURCE_ROOTS).components().count()
+                {
+                    created_resource_files.insert(relative.clone());
+                }
             }
             created.push(path);
         }
+        for relative in &retired {
+            let path = home.join(relative);
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|_| "retired provider resource mountpoint changed during preparation")?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.uid() != uid
+                || metadata.gid() != gid
+                || metadata.len() != 0
+            {
+                return Err("retired provider resource mountpoint changed during preparation");
+            }
+            std::fs::remove_file(&path)
+                .map_err(|_| "retired provider resource mountpoint removal failed")?;
+        }
+        let retained_resource_files = previous_resource_files
+            .intersection(&current_resource_files)
+            .cloned()
+            .chain(created_resource_files.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        // The fixed helper intentionally has CHOWN but not DAC_OVERRIDE. Write
+        // the manifest while it can still traverse a root-owned initial HOME;
+        // transferring HOME ownership first makes mode-0700 directories
+        // inaccessible to the helper's still-root identity.
+        write_resource_placeholder_manifest(home, &retained_resource_files, uid, gid, initial)?;
         for path in created
             .iter()
             .rev()
@@ -152,9 +242,171 @@ fn prepare_for_identity(
 }
 
 #[cfg(unix)]
+fn read_resource_placeholder_manifest(
+    home: &Path,
+    uid: u32,
+    gid: u32,
+) -> Result<std::collections::BTreeSet<std::path::PathBuf>, &'static str> {
+    use std::os::unix::fs::MetadataExt;
+    let path = home.join(RESOURCE_PLACEHOLDER_MANIFEST);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(_) => return Err("provider resource mountpoint metadata unavailable"),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != uid
+        || metadata.gid() != gid
+        || metadata.len() > MAX_PLACEHOLDER_MANIFEST_BYTES
+    {
+        return Err("provider resource mountpoint metadata changed or exceeds its profile");
+    }
+    let bytes =
+        std::fs::read(&path).map_err(|_| "provider resource mountpoint metadata unavailable")?;
+    let entries: Vec<String> = serde_json::from_slice(&bytes)
+        .map_err(|_| "provider resource mountpoint metadata invalid")?;
+    let mut result = std::collections::BTreeSet::new();
+    for entry in entries {
+        let relative = std::path::PathBuf::from(&entry);
+        if relative.as_os_str().is_empty()
+            || !relative.starts_with(RESOURCE_ROOTS)
+            || relative.components().count()
+                <= std::path::Path::new(RESOURCE_ROOTS).components().count()
+            || relative
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            || !result.insert(relative)
+        {
+            return Err("provider resource mountpoint metadata invalid");
+        }
+    }
+    Ok(result)
+}
+
+#[cfg(unix)]
+fn verify_owned_physical_parents(
+    home: &Path,
+    relative: &Path,
+    uid: u32,
+    gid: u32,
+) -> Result<(), &'static str> {
+    use std::os::unix::fs::MetadataExt;
+    let mut parent = home.to_owned();
+    for component in relative.parent().into_iter().flat_map(Path::components) {
+        parent.push(component.as_os_str());
+        match std::fs::symlink_metadata(&parent) {
+            Ok(metadata)
+                if !metadata.file_type().is_symlink()
+                    && metadata.is_dir()
+                    && metadata.uid() == uid
+                    && metadata.gid() == gid => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            _ => return Err("retired provider resource mountpoint parent changed"),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_resource_placeholder_manifest(
+    home: &Path,
+    entries: &std::collections::BTreeSet<std::path::PathBuf>,
+    uid: u32,
+    gid: u32,
+    allow_initial_root_parent: bool,
+) -> Result<(), &'static str> {
+    use std::{
+        io::Write,
+        os::unix::{
+            ffi::OsStrExt,
+            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        },
+        sync::atomic::{AtomicU64, Ordering},
+    };
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let serialized = entries
+        .iter()
+        .map(|entry| {
+            entry
+                .to_str()
+                .ok_or("provider resource mountpoint metadata invalid")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let bytes = serde_json::to_vec(&serialized)
+        .map_err(|_| "provider resource mountpoint metadata serialization failed")?;
+    if bytes.len() as u64 > MAX_PLACEHOLDER_MANIFEST_BYTES {
+        return Err("provider resource mountpoint metadata profile exceeded");
+    }
+    let parent = home.join(".freshell");
+    let parent_metadata =
+        std::fs::symlink_metadata(&parent).map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => {
+                "provider resource mountpoint metadata parent missing after preparation"
+            }
+            std::io::ErrorKind::PermissionDenied => {
+                "provider resource mountpoint metadata parent inaccessible"
+            }
+            _ => "provider resource mountpoint metadata parent inspection failed",
+        })?;
+    let expected_owner = parent_metadata.uid() == uid && parent_metadata.gid() == gid;
+    let initial_root_owner =
+        allow_initial_root_parent && parent_metadata.uid() == 0 && parent_metadata.gid() == 0;
+    if parent_metadata.file_type().is_symlink()
+        || !parent_metadata.is_dir()
+        || !(expected_owner || initial_root_owner)
+    {
+        return Err("provider resource mountpoint metadata parent changed");
+    }
+    let manifest = home.join(RESOURCE_PLACEHOLDER_MANIFEST);
+    for _ in 0..8 {
+        let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".provider-resource-mountpoints-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                let result = (|| {
+                    file.write_all(&bytes)
+                        .map_err(|_| "provider resource mountpoint metadata write failed")?;
+                    file.sync_all()
+                        .map_err(|_| "provider resource mountpoint metadata sync failed")?;
+                    std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600))
+                        .map_err(|_| "provider resource mountpoint metadata permissions failed")?;
+                    let name = std::ffi::CString::new(candidate.as_os_str().as_bytes())
+                        .map_err(|_| "provider resource mountpoint metadata path invalid")?;
+                    if unsafe { libc::lchown(name.as_ptr(), uid, gid) } != 0 {
+                        return Err("provider resource mountpoint metadata ownership failed");
+                    }
+                    std::fs::rename(&candidate, &manifest)
+                        .map_err(|_| "provider resource mountpoint metadata publish failed")?;
+                    std::fs::File::open(&parent)
+                        .and_then(|directory| directory.sync_all())
+                        .map_err(|_| "provider resource mountpoint metadata parent sync failed")?;
+                    Ok(())
+                })();
+                if result.is_err() {
+                    let _ = std::fs::remove_file(&candidate);
+                }
+                return result;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err("provider resource mountpoint metadata temporary unavailable"),
+        }
+    }
+    Err("provider resource mountpoint metadata temporary unavailable")
+}
+
+#[cfg(unix)]
 pub fn serve(home: &Path, socket: &Path) -> Result<(), &'static str> {
     use std::{
-        io::{Read, Write},
+        io::Read,
         os::unix::{fs::MetadataExt, net::UnixStream},
     };
     let root =
@@ -192,10 +444,10 @@ pub fn serve(home: &Path, socket: &Path) -> Result<(), &'static str> {
         .map_err(|_| "provider mountpoint request incomplete")?;
     let selected: Vec<Mountpoint> =
         serde_json::from_slice(&bytes).map_err(|_| "provider mountpoint metadata invalid")?;
-    prepare(home, &selected)?;
-    stream
-        .write_all(b"ok")
-        .map_err(|_| "provider mountpoint acknowledgement failed")
+    let prepared = prepare(home, &selected);
+    write_result(&mut stream, prepared)
+        .map_err(|_| "provider mountpoint acknowledgement failed")?;
+    prepared
 }
 
 #[cfg(all(test, unix))]
@@ -235,6 +487,84 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             "retained-owned-file"
+        );
+    }
+
+    #[test]
+    fn provider_mountpoints_remove_only_retired_empty_resource_placeholders() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let root = ".freshell/provider-roots/project";
+        let file = format!("{root}/opencode.json");
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        prepare_for_identity(
+            &home,
+            &[
+                Mountpoint {
+                    relative_path: root.into(),
+                    directory: true,
+                },
+                Mountpoint {
+                    relative_path: file.clone(),
+                    directory: false,
+                },
+            ],
+            uid,
+            gid,
+        )
+        .unwrap();
+        let placeholder = home.join(&file);
+        let unrelated_empty = home.join(root).join("user-empty.json");
+        std::fs::write(&unrelated_empty, b"").unwrap();
+        assert_eq!(std::fs::metadata(&placeholder).unwrap().len(), 0);
+
+        prepare_for_identity(&home, &[], uid, gid).unwrap();
+        assert!(!placeholder.exists());
+        assert!(unrelated_empty.exists());
+        assert!(home.join(root).is_dir());
+
+        prepare_for_identity(
+            &home,
+            &[
+                Mountpoint {
+                    relative_path: root.into(),
+                    directory: true,
+                },
+                Mountpoint {
+                    relative_path: file.clone(),
+                    directory: false,
+                },
+            ],
+            uid,
+            gid,
+        )
+        .unwrap();
+        std::fs::write(&placeholder, b"provider-owned").unwrap();
+        let error = prepare_for_identity(
+            &home,
+            &[Mountpoint {
+                relative_path: root.into(),
+                directory: true,
+            }],
+            uid,
+            gid,
+        )
+        .expect_err("retirement must not delete nonempty provider data");
+        assert!(error.contains("not empty"));
+        assert_eq!(std::fs::read(&placeholder).unwrap(), b"provider-owned");
+    }
+
+    #[test]
+    fn provider_mountpoint_failure_acknowledgement_carries_its_static_reason() {
+        let mut encoded = Vec::new();
+        write_result(&mut encoded, Err("preparation refused safely")).unwrap();
+        assert_eq!(&encoded[..2], b"er");
+        let length = u32::from_be_bytes(encoded[2..6].try_into().unwrap()) as usize;
+        assert_eq!(length, encoded.len() - 6);
+        assert_eq!(
+            std::str::from_utf8(&encoded[6..]).unwrap(),
+            "preparation refused safely"
         );
     }
 
