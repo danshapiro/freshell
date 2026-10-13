@@ -65,6 +65,55 @@ server.listen(listenPort, listenHost, () => {
 })
 `
 
+const managedMcpServerSource = String.raw`import { writeFileSync } from 'node:fs'
+import dependency from 'managed-fixture-mcp-dependency'
+
+const [receiptPath, expectedNonce] = process.argv.slice(2)
+if (!receiptPath || !expectedNonce) process.exit(12)
+writeFileSync(receiptPath, JSON.stringify({
+  expectedNonce,
+  dependency,
+  bun: typeof Bun === 'object',
+  bunVersion: Bun.version,
+  launchCwd: process.cwd(),
+  configuredCwd: process.env.FRESHELL_EXPECTED_MCP_CWD,
+  executable: process.execPath,
+  scriptPath: new URL(import.meta.url).pathname,
+}))
+
+let buffered = ''
+process.stdin.setEncoding('utf8')
+process.stdin.on('data', (chunk) => {
+  buffered += chunk
+  while (true) {
+    const boundary = buffered.indexOf('\n')
+    if (boundary < 0) break
+    const line = buffered.slice(0, boundary)
+    buffered = buffered.slice(boundary + 1)
+    let request
+    try { request = JSON.parse(line) } catch { continue }
+    if (!request || !Object.hasOwn(request, 'id')) continue
+    let result
+    if (request.method === 'initialize') {
+      result = {
+        protocolVersion: request.params?.protocolVersion ?? '2024-11-05',
+        capabilities: { tools: {} },
+        serverInfo: { name: 'freshell-managed-bun-fixture', version: '1.0.0' },
+      }
+    } else if (request.method === 'tools/list') {
+      result = { tools: [{ name: 'fixture_probe', description: 'Managed Bun launch proof', inputSchema: { type: 'object', properties: {} } }] }
+    } else if (request.method === 'ping') {
+      result = {}
+    } else {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id,
+        error: { code: -32601, message: 'Method not found' } }) + '\n')
+      continue
+    }
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\n')
+  }
+})
+`
+
 export function resolveManagedProviderEnvironmentTargetMode(args: string[]): ManagedProviderEnvironmentTargetMode {
   if (args.length === 0) return 'managed-environment'
   if (args.length === 1 && args[0] === '--checkpoint') return 'code-checkpoint'
@@ -203,7 +252,12 @@ async function webChildren(rig: ManagedRuntimeBrowserRig): Promise<number[]> {
 async function configure(root: string, nonce: string, candidateSha: string, runId: string) {
   const home = path.join(root, 'home'), xdg = path.join(home, 'fixture-xdg'), workspace = path.join(root, 'workspace')
   const resources = path.join(workspace, 'selected-resources'), plugin = path.join(resources, 'fixture-plugin')
+  const mcpPackage = path.join(resources, 'fixture-mcp')
+  const mcpNested = path.join(mcpPackage, 'nested')
+  const mcpParentDependency = path.join(resources, 'node_modules/managed-fixture-mcp-dependency')
   await fs.mkdir(path.join(plugin, 'node_modules/managed-fixture-dependency'), { recursive: true, mode: 0o755 })
+  await fs.mkdir(mcpNested, { recursive: true, mode: 0o755 })
+  await fs.mkdir(mcpParentDependency, { recursive: true, mode: 0o755 })
   await fs.mkdir(path.join(xdg, 'opencode'), { recursive: true, mode: 0o755 })
   await fs.chmod(home, 0o700)
   await fs.chmod(root, 0o751)
@@ -236,6 +290,17 @@ export default {id:'managed-environment-tui',async tui(api,options){
  const receipt={...options,terminalId:process.env.FRESHELL_TERMINAL_ID,nativeSessionId:result.data.id,bun:typeof Bun==='object',bunVersion:Bun.version,bunExecutable:process.execPath,opencodeVersion:api.app.version,dependency,resource,absoluteReference:configuration.data.agent.fixtureAbsolute.prompt,relativeReference:configuration.data.agent.fixtureRelative.prompt,executableMode:(fs.statSync(command).mode&511).toString(8).padStart(4,'0'),pid:process.pid,createdAt:new Date().toISOString()};
  fs.writeFileSync(path.join(cwd,'.managed-fixture/child-receipt.json'),JSON.stringify(receipt));const marker='MANAGED_ENV_OUTPUT '+output.resource;process.stdout.write('\\n'+marker+'\\n');api.ui.toast.show({message:marker,duration:180000});
 }};`)
+  await writeJson(path.join(mcpPackage, 'package.json'), {
+    type: 'module',
+    scripts: { 'mcp.js': 'bun ./server.mjs' },
+  })
+  await fs.writeFile(path.join(mcpPackage, 'server.mjs'), managedMcpServerSource)
+  await writeJson(path.join(mcpParentDependency, 'package.json'), {
+    name: 'managed-fixture-mcp-dependency',
+    type: 'module',
+    exports: './index.mjs',
+  })
+  await fs.writeFile(path.join(mcpParentDependency, 'index.mjs'), `export default ${JSON.stringify(nonce)};`)
   const absoluteRule = path.join(resources, 'absolute-rule.txt')
   await fs.writeFile(absoluteRule, nonce, { mode: 0o600 })
   const options = { expectedNonce: nonce, candidateSha, runId }
@@ -247,10 +312,21 @@ export default {id:'managed-environment-tui',async tui(api,options){
     await fs.chmod(cwd, 0o777)
     await fs.chmod(path.join(cwd, '.managed-fixture'), 0o777)
     await fs.writeFile(path.join(cwd, 'rules.txt'), nonce, { mode: 0o600 })
+    const mcpReceipt = path.join(cwd, '.managed-fixture/mcp-receipt.json')
     await writeJson(path.join(cwd, 'opencode.json'), { agent: { fixtureRelative: {
-      prompt: `{file:./${scenario === 'missing-reference' ? 'missing-selected.txt' : 'rules.txt'}}` } } })
+      prompt: `{file:./${scenario === 'missing-reference' ? 'missing-selected.txt' : 'rules.txt'}}` } },
+      mcp: {
+        managed_fixture: {
+          type: 'local',
+          command: ['bun', 'run', 'mcp.js', mcpReceipt, nonce],
+          cwd: mcpNested,
+          enabled: true,
+          environment: { FRESHELL_EXPECTED_MCP_CWD: mcpNested },
+        },
+      },
+    })
   }
-  return { home, xdg, workspace, command }
+  return { home, xdg, workspace, command, mcpPackage, mcpNested }
 }
 
 async function socketCreate(rig: ManagedRuntimeBrowserRig, requestId: string, mode: 'shell' | 'opencode', cwd: string,
@@ -939,7 +1015,7 @@ export async function runCodeCheckpointTarget() {
     assert.equal(paired?.kind, 'code-checkpoint')
     const browserSpec = 'test/e2e-browser/specs/code-checkpoint-workspace-external.spec.ts'
     cloudEnvironment.FRESHELL_E2E_CLOUD_DISPATCH_RECEIPT = cloudDispatchReceiptPath
-    browser = spawn('pnpm', ['run', 'test:e2e', '--shards=1', '--project=chromium-external-target', browserSpec], {
+    browser = spawn('pnpm', ['run', 'test:e2e', '--shards=1', '--workers=1', '--project=chromium-external-target', browserSpec], {
       cwd: repoRoot, env: cloudEnvironment, stdio: ['ignore', 'pipe', 'pipe'], detached: true,
     })
     browser.stdout!.on('data', chunk => browserSummaryCapture.write(chunk))
@@ -954,8 +1030,8 @@ export async function runCodeCheckpointTarget() {
     const browserExit = await bounded(browserJoin, 120_000, 'configured Cloud checkpoint browser final join')
     assert.equal(browserExit.code, 0, 'Configured Cloud checkpoint browser acceptance failed')
     const browserSummary = browserSummaryCapture.finish()
-    assert.equal(browserSummary.executedCases, 3, 'Configured Cloud must execute all three checkpoint browser cases')
-    assert.equal(browserSummary.passedCases, 3, 'Every configured checkpoint browser case must pass')
+    assert.equal(browserSummary.executedCases, 6, 'Configured Cloud must execute all six checkpoint browser cases')
+    assert.equal(browserSummary.passedCases, 6, 'Every configured checkpoint browser case must pass')
     assert.equal(browserSummary.failedCases, 0)
     assert.equal(browserSummary.skippedCases, 0)
     assert.equal(browserSummary.interruptedCases, 0)
@@ -1142,12 +1218,20 @@ export async function runManagedEnvironmentTarget() {
     assert.equal(preflightChild.runId, rig.runtime.runId)
     assert.equal(preflightChild.expectedNonce, nonce)
     assert.equal(preflightChild.bun, true)
+    const preflightMcp = await poll('OpenCode starts the nested Bun package-script MCP', async () =>
+      readJson(path.join(selected.workspace, 'preflight/.managed-fixture/mcp-receipt.json')))
+    assert.equal(preflightMcp.expectedNonce, nonce)
+    assert.equal(preflightMcp.dependency, nonce, 'MCP must load its dependency from the staged parent node_modules')
+    assert.equal(preflightMcp.bun, true, 'OpenCode must run the local MCP package script under Bun')
+    assert.equal(preflightMcp.launchCwd, selected.mcpNested, 'OpenCode must honor the nested MCP cwd')
+    assert.equal(preflightMcp.configuredCwd, selected.mcpNested)
+    assert(preflightMcp.scriptPath.endsWith('/fixture-mcp/server.mjs'))
     const preflightView = await poll('genuine managed preflight native identity', () =>
       observeManagedEnvironmentNativeIdentity(rig!, created.terminalId, preflightChild.nativeSessionId))
     assert((await terminalDirectory(rig)).some(row => row.terminalId === created.terminalId))
     assert.deepEqual(await webChildren(rig), [], 'Managed child must belong to the disposable session host, not the host web process')
     proof.preflight = { terminalId: created.terminalId, soulId: preflightView.soulId, incarnationId: preflightView.incarnationId,
-      stage: await stageProof(rig, preflightView, nonce), child: preflightChild }
+      stage: await stageProof(rig, preflightView, nonce), child: preflightChild, mcpServer: preflightMcp }
     const toolHome = path.join(root, 'tools')
     await fs.mkdir(toolHome, { mode: 0o700 })
     const tool = path.join(toolHome, 'cloudflared')
@@ -1234,9 +1318,17 @@ export async function runManagedEnvironmentTarget() {
         assert.equal(child.expectedNonce, nonce); assert.equal(child.candidateSha, fixture.candidateSha); assert.equal(child.runId, fixture.runId)
         assert.equal(child.bun, true); assert.equal(child.opencodeVersion, '1.18.21'); assert.match(child.bunExecutable, /opencode/)
         assert.equal(child.executableMode, '0711')
+        const mcpServer = await poll('Cloud OpenCode starts the nested Bun package-script MCP', async () =>
+          readJson(path.join(cwd, '.managed-fixture/mcp-receipt.json')))
+        assert.equal(mcpServer.expectedNonce, nonce)
+        assert.equal(mcpServer.dependency, nonce, 'OpenCode MCP must load the staged parent dependency')
+        assert.equal(mcpServer.bun, true, 'OpenCode must run the local MCP package script under Bun')
+        assert.equal(mcpServer.launchCwd, selected.mcpNested, 'OpenCode must honor the nested MCP cwd')
+        assert.equal(mcpServer.configuredCwd, selected.mcpNested)
+        assert(mcpServer.scriptPath.endsWith('/fixture-mcp/server.mjs'))
         const stage = await stageProof(rig!, view, nonce)
         const receipt = { ...fixture, terminalId: view.terminalId, soulId: view.soulId, incarnationId: view.incarnationId,
-          nativeSessionId: view.nativeSessionId, stage, child }
+          nativeSessionId: view.nativeSessionId, stage, child, mcpServer }
         await writeJson(path.join(cwd, '.managed-fixture/target-receipt.json'), receipt)
         proof.healthy = receipt
         } },
