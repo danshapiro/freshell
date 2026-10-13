@@ -356,15 +356,16 @@ impl Plan {
         }
         let metadata =
             fs::metadata(target).map_err(|cause| io_error(path, "inspect_link_target", cause))?;
+        let is_script = matches!(
+            target.extension().and_then(|ext| ext.to_str()),
+            Some("js" | "mjs" | "cjs" | "ts" | "tsx")
+        );
         let mut resource = target.to_owned();
         if metadata.is_file() {
             let parent = target.parent().ok_or_else(|| {
                 error(path, "plan", "linked resource has no containing directory")
             })?;
-            if matches!(
-                target.extension().and_then(|ext| ext.to_str()),
-                Some("js" | "mjs" | "cjs" | "ts" | "tsx")
-            ) {
+            if is_script {
                 resource = parent.to_owned();
             }
             for ancestor in parent.ancestors() {
@@ -397,6 +398,16 @@ impl Plan {
                 ));
             }
             if resource == *excluded_subtree || !resource.starts_with(excluded_subtree) {
+                if metadata.is_file()
+                    && is_script
+                    && target.parent() == Some(excluded_subtree.as_path())
+                {
+                    return Err(error(
+                        path,
+                        "select_resource_scope",
+                        "a script linked directly from the excluded workspace root has no bounded sibling-resource scope; place the script and its required files in a package directory or select a smaller resource",
+                    ));
+                }
                 resource = target
                     .parent()
                     .filter(|parent| *parent != excluded_subtree)
@@ -1319,6 +1330,34 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn execute_fixture_with_transient_text_file_busy_retry(
+        path: &Path,
+    ) -> std::io::Result<std::process::Output> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            match Command::new(path).output() {
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ETXTBSY)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Ok(output)
+                    if !output.status.success()
+                        && output
+                            .stderr
+                            .windows(b"Text file busy".len())
+                            .any(|window| window == b"Text file busy")
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                result => return result,
+            }
+        }
+    }
+
     #[test]
     fn failed_stage_creation_never_removes_a_preexisting_directory() {
         let root = tempfile::tempdir().unwrap();
@@ -1512,6 +1551,52 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn excluded_workspace_root_file_alias_requires_a_bounded_resource_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let external = root.path().join("external");
+        let workspace = external.join("project");
+        let tools = external.join("tools");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&tools).unwrap();
+        fs::write(external.join("package.json"), r#"{"type":"module"}"#).unwrap();
+        fs::write(
+            workspace.join("schema.json"),
+            r#"{"nonce":"workspace-root-sibling-loaded"}"#,
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("worker.mjs"),
+            "import { readFileSync } from 'node:fs';\nconst schema = JSON.parse(readFileSync(new URL('./schema.json', import.meta.url), 'utf8'));\nexport const nonce = schema.nonce;\n",
+        )
+        .unwrap();
+        symlink("../project/worker.mjs", tools.join("worker-link.mjs")).unwrap();
+        fs::write(
+            tools.join("server.mjs"),
+            "import { nonce } from './worker-link.mjs';\nprocess.stdout.write(nonce + '\\n');\n",
+        )
+        .unwrap();
+
+        let destination = root.path().join("provider");
+        let error = copy_environment_excluding_subtree(
+            &[selection(&external, "resource")],
+            &destination,
+            &[],
+            &workspace,
+            CopyLimits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.operation, "select_resource_scope");
+        assert!(error
+            .corrective_message
+            .contains("bounded sibling-resource scope"));
+        assert!(
+            !destination.exists(),
+            "an ambiguous workspace-root resource is rejected before publication"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn excluded_workspace_root_alias_fails_without_copying_the_workspace() {
         let root = tempfile::tempdir().unwrap();
         let external = root.path().join("external");
@@ -1569,9 +1654,10 @@ mod tests {
                 CopyLimits::default(),
             )
             .unwrap();
-            let output = Command::new(home.join("skills/fixture/scripts/run"))
-                .output()
-                .unwrap();
+            let output = execute_fixture_with_transient_text_file_busy_retry(
+                &home.join("skills/fixture/scripts/run"),
+            )
+            .unwrap();
             assert!(output.status.success(), "{output:?}");
             assert_eq!(output.stdout, b"resource-nonce\nasset-nonce\n");
             assert_eq!(
