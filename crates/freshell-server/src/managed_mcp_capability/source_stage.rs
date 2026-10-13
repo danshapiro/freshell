@@ -198,6 +198,22 @@ mod configured_resource_tests {
         output.unwrap()
     }
 
+    fn execute_node_with_home_hidden(
+        owned_root: &Path,
+        home: &Path,
+        provider_script: &Path,
+    ) -> std::process::Output {
+        let hidden_home = owned_root.join("home-hidden");
+        std::fs::rename(home, &hidden_home).unwrap();
+        let output = std::process::Command::new("node")
+            .arg(provider_script)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .output();
+        std::fs::rename(&hidden_home, home).unwrap();
+        output.unwrap()
+    }
+
     #[test]
     fn managed_provider_keeps_external_indexed_payloads_out_of_persistent_generation() {
         fn tree_contains_bytes(path: &Path, expected: &[u8]) -> bool {
@@ -882,6 +898,65 @@ mod configured_resource_tests {
     }
 
     #[test]
+    fn mcp_cwd_does_not_hide_absolute_command_symlink_alias() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let project = workspace.join("project");
+        let command = home.join("mcp.sh");
+        let target = project.join("start.sh");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            &target,
+            "#!/bin/sh\nprintf 'cwd symlink command started\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink("../workspace/project/start.sh", &command).unwrap();
+        let config = workspace.join("opencode.json");
+        let raw = format!(
+            r#"{{"mcp":{{"direct":{{"type":"local","cwd":{},"command":[{}]}}}}}}"#,
+            serde_json::to_string(project.to_str().unwrap()).unwrap(),
+            serde_json::to_string(command.to_str().unwrap()).unwrap(),
+        );
+        std::fs::write(&config, raw).unwrap();
+
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config,
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Workspace,
+            }],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .unwrap();
+        assert!(
+            plan[0].configured_resources.contains(&command),
+            "mcp.cwd may cover the resolved target but must not remove the configured HOME alias"
+        );
+
+        let units = resource_units(
+            &home,
+            &home.join(".config/opencode"),
+            &workspace,
+            &plan,
+            None,
+        )
+        .unwrap();
+        let provider = copy_selected_units_through_provider(owned.path(), &units);
+        let provider_command = provider.join(".provider-home/mcp.sh");
+        let output = execute_with_home_hidden(owned.path(), &home, &provider_command);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"cwd symlink command started\n");
+    }
+
+    #[test]
     fn direct_executable_script_in_home_runs_after_all_resource_copies() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1148,6 +1223,89 @@ mod configured_resource_tests {
         let output = execute_with_home_hidden(owned.path(), &home, &provider_script);
         assert!(output.status.success(), "{:?}", output.stderr);
         assert_eq!(output.stdout, b"path.join schema loaded\n");
+    }
+
+    #[test]
+    fn direct_node_script_in_nested_home_directory_keeps_relative_module_closure() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let command = home.join("mcp/bin/server.js");
+        let helper = home.join("mcp/lib/helper.js");
+        let nested = home.join("mcp/lib/nested.js");
+        std::fs::create_dir_all(command.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "process.stdout.write(require('../lib/helper.js'))\n",
+        )
+        .unwrap();
+        std::fs::write(&helper, "module.exports = require('./nested.js')\n").unwrap();
+        std::fs::write(&nested, "module.exports = 'nested module loaded\\n'\n").unwrap();
+
+        let command_args = vec!["node".to_owned(), command.to_string_lossy().into_owned()];
+        let (plan, provider_script) = plan_and_stage_mcp_command_for_resource(
+            owned.path(),
+            &home,
+            &workspace,
+            &command_args,
+            &command,
+        );
+        for required in [&helper, &nested] {
+            assert!(
+                plan[0]
+                    .configured_resources
+                    .contains(&required.canonicalize().unwrap()),
+                "the nested Node command closure omitted {}",
+                required.display()
+            );
+        }
+
+        let output = execute_node_with_home_hidden(owned.path(), &home, &provider_script);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"nested module loaded\n");
+    }
+
+    #[test]
+    fn direct_node_script_recurses_into_extensionless_imported_module() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let command = home.join("mcp.js");
+        let helper = home.join("helper");
+        let nested = home.join("nested.js");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(&command, "process.stdout.write(require('./helper'))\n").unwrap();
+        std::fs::write(&helper, "module.exports = require('./nested.js')\n").unwrap();
+        std::fs::write(
+            &nested,
+            "module.exports = 'extensionless module loaded\\n'\n",
+        )
+        .unwrap();
+
+        let command_args = vec!["node".to_owned(), command.to_string_lossy().into_owned()];
+        let (plan, provider_script) = plan_and_stage_mcp_command_for_resource(
+            owned.path(),
+            &home,
+            &workspace,
+            &command_args,
+            &command,
+        );
+        for required in [&helper, &nested] {
+            assert!(
+                plan[0]
+                    .configured_resources
+                    .contains(&required.canonicalize().unwrap()),
+                "the Node scanner omitted {} from the imported closure",
+                required.display()
+            );
+        }
+
+        let output = execute_node_with_home_hidden(owned.path(), &home, &provider_script);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"extensionless module loaded\n");
     }
 
     #[test]

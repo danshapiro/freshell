@@ -1391,35 +1391,64 @@ enum ScriptDependencyRuntime {
     Ruby,
 }
 
+struct ScriptDependencyPath {
+    path: PathBuf,
+    parse_as_script: bool,
+}
+
 fn direct_script_dependency_paths(
     parent: &Path,
     source: &str,
     runtime: ScriptDependencyRuntime,
-) -> Result<Vec<PathBuf>, &'static str> {
+) -> Result<Vec<ScriptDependencyPath>, &'static str> {
     match runtime {
         ScriptDependencyRuntime::Node => {
-            let mut result = std::collections::BTreeSet::new();
-            for specifier in node_relative_module_specifiers(source)? {
-                let files = resolve_node_relative_module(parent, &specifier)?
-                    .ok_or("direct MCP Node relative module is missing")?;
-                result.extend(files);
+            let mut result = std::collections::BTreeMap::<PathBuf, bool>::new();
+            {
+                let mut record = |path: PathBuf, imported_module: bool| {
+                    let parse_as_script = is_script_dependency_source(&path, runtime)
+                        || (imported_module && path.extension().is_none());
+                    result
+                        .entry(path)
+                        .and_modify(|selected| *selected |= parse_as_script)
+                        .or_insert(parse_as_script);
+                };
+                for specifier in node_relative_module_specifiers(source)? {
+                    let files = resolve_node_relative_module(parent, &specifier)?
+                        .ok_or("direct MCP Node relative module is missing")?;
+                    for file in files {
+                        record(file, true);
+                    }
+                }
+                for specifier in node_relative_resource_specifiers(source)? {
+                    record(parent.join(specifier), false);
+                }
             }
-            result.extend(
-                node_relative_resource_specifiers(source)?
-                    .into_iter()
-                    .map(|specifier| parent.join(specifier)),
-            );
-            Ok(result.into_iter().collect())
+            Ok(result
+                .into_iter()
+                .map(|(path, parse_as_script)| ScriptDependencyPath {
+                    path,
+                    parse_as_script,
+                })
+                .collect())
         }
         ScriptDependencyRuntime::Python => Ok(python_import_specifiers(source)
             .into_iter()
             .flat_map(|specifier| resolve_python_local_modules(parent, &specifier))
+            .map(|path| ScriptDependencyPath {
+                parse_as_script: is_script_dependency_source(&path, runtime),
+                path,
+            })
             .collect()),
         ScriptDependencyRuntime::Ruby => ruby_relative_require_specifiers(source)?
             .into_iter()
             .map(|specifier| {
-                resolve_ruby_relative_module(parent, &specifier)
-                    .ok_or("direct MCP Ruby relative module is missing")
+                let path = resolve_ruby_relative_module(parent, &specifier)
+                    .ok_or("direct MCP Ruby relative module is missing")?;
+                Ok(ScriptDependencyPath {
+                    parse_as_script: is_script_dependency_source(&path, runtime),
+                    path,
+                })
             })
             .collect(),
     }
@@ -1460,9 +1489,6 @@ fn insert_direct_script_dependencies(
         if !canonical.is_file() || !visited.insert(canonical.clone()) {
             continue;
         }
-        if current != script && !is_script_dependency_source(&canonical, runtime) {
-            continue;
-        }
         if !parsed.insert(canonical.clone()) {
             continue;
         }
@@ -1483,7 +1509,7 @@ fn insert_direct_script_dependencies(
             .parent()
             .ok_or_else(|| fail("direct MCP script has no containing directory"))?;
         for candidate in direct_script_dependency_paths(parent, &source, runtime).map_err(fail)? {
-            let dependency = checked(&candidate, field, declaring)?;
+            let dependency = checked(&candidate.path, field, declaring)?;
             let dependency_is_file = dependency.is_file();
             if !dependency_is_file && !dependency.is_dir() {
                 return Err(fail(
@@ -1502,7 +1528,7 @@ fn insert_direct_script_dependencies(
                 field,
                 declaring,
             )?;
-            if dependency_is_file {
+            if dependency_is_file && candidate.parse_as_script {
                 pending.push(dependency);
             }
         }
@@ -2209,12 +2235,6 @@ pub fn select(
             // besides being redundant, that shape cannot be authorized by the
             // closed launch fixture. Canonical resolution keeps symlinks that
             // escape the cwd on the explicit-resource path below.
-            if current_mcp_working_dir
-                .as_ref()
-                .is_some_and(|working_dir| canonical.starts_with(working_dir))
-            {
-                continue;
-            }
             if path != canonical
                 && std::fs::symlink_metadata(&path)
                     .is_ok_and(|metadata| metadata.file_type().is_symlink())
@@ -2229,6 +2249,12 @@ pub fn select(
                     field,
                     declaring,
                 )?;
+            }
+            if current_mcp_working_dir
+                .as_ref()
+                .is_some_and(|working_dir| canonical.starts_with(working_dir))
+            {
+                continue;
             }
             let command_parent = canonical
                 .parent()
@@ -2454,6 +2480,15 @@ pub fn select(
                         &mut result,
                         &mut resource_path_bytes,
                         field,
+                    )?;
+                    insert_direct_script_dependencies(
+                        &canonical,
+                        &dependency_scope,
+                        declaring,
+                        &mut result,
+                        &mut resource_path_bytes,
+                        field,
+                        ScriptDependencyRuntime::Node,
                     )?;
                 }
                 // A standalone script may import sibling files without a
