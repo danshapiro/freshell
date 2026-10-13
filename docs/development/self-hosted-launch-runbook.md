@@ -108,6 +108,11 @@ post-deploy soul sweep:
 ```bash
 set -euo pipefail
 RUN=$(mktemp -d)   # private per-run dir for the survival snapshots
+# Pin the Docker CLI to the SAME daemon socket the supervisor uses (its
+# unit passes --docker-socket %t/docker.sock, the user runtime dir). A
+# machine with a second Docker daemon would otherwise capture against
+# the wrong one and the survival check would pass vacuously:
+export DOCKER_HOST="unix://${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
 # Scope the capture to THIS installation: the daemon may host containers
 # from other Freshell installations with the same name shape, and the
 # installation label is the only discriminator:
@@ -205,26 +210,28 @@ the procedure mid-way and leave the service down. Two sequences:
   # Two failure detectors: supervisor-unit LIVENESS (fast — a dead unit
   # ends the wait immediately) and an inventory-sized absolute CAP
   # (stall — a live-but-wedged process must not hang the redeploy
-  # forever). Read the EFFECTIVE concurrency the way the supervisor
-  # does: unit Environment= lines and its EnvironmentFiles, then the
-  # supervisor's own 1..16 clamp (0 or garbage become 1/defaults, never
-  # a division by zero). Worst case is N * 900s / C, doubled for
-  # margin, floored at an hour; extreme configs can override the env
-  # var. The if-forms below are load-bearing under set -e: an
-  # `&&`-short-circuit as the loop's last command would make the LOOP
-  # return 1 and abort the whole sequence:
+  # forever). Read the EFFECTIVE concurrency in systemd's own precedence
+  # order — the user manager's inherited environment first, then the
+  # unit's Environment= lines, then its EnvironmentFile= values (systemd
+  # applies the FILE later, so it WINS) — then mirror the supervisor's
+  # own 1..16 clamp (0 or garbage become 1/defaults, never a division
+  # by zero). Worst case is N * 900s / C, doubled for margin, floored at
+  # an hour; extreme configs can override the env var. The if-forms are
+  # load-bearing under set -e: an `&&`-short-circuit as the loop's last
+  # command would make the LOOP return 1 and abort the whole sequence:
   C=""
+  V=$(systemctl --user show-environment 2>/dev/null \
+        | sed -n 's/^FRESHELL_RUNTIME_STARTUP_CONCURRENCY=//p' | tail -1)
+  if [ -n "$V" ]; then C="$V"; fi
   V=$(systemctl --user show freshell-supervisor.service -p Environment --value 2>/dev/null \
         | tr ' ' '\n' | sed -n 's/^FRESHELL_RUNTIME_STARTUP_CONCURRENCY=//p' | tail -1)
   if [ -n "$V" ]; then C="$V"; fi
-  if [ -z "$C" ]; then
-    for EF in $(systemctl --user show freshell-supervisor.service \
-                  -p EnvironmentFiles --value | tr ' ' '\n' \
-                  | sed 's/(.*//' | grep -v '^$'); do
-      V=$(sed -n 's/^FRESHELL_RUNTIME_STARTUP_CONCURRENCY=//p' "$EF" 2>/dev/null | tail -1)
-      if [ -n "$V" ]; then C="$V"; fi
-    done
-  fi
+  for EF in $(systemctl --user show freshell-supervisor.service \
+                -p EnvironmentFiles --value | tr ' ' '\n' \
+                | sed 's/(.*//' | grep -v '^$'); do
+    V=$(sed -n 's/^FRESHELL_RUNTIME_STARTUP_CONCURRENCY=//p' "$EF" 2>/dev/null | tail -1)
+    if [ -n "$V" ]; then C="$V"; fi
+  done
   case "$C" in ''|*[!0-9]*) C=4;; esac   # absent/garbage -> supervisor default
   [ "$C" -ge 1 ] 2>/dev/null || C=1      # supervisor clamps to 1..16 — mirror it
   [ "$C" -le 16 ] 2>/dev/null || C=16
@@ -380,7 +387,9 @@ drop-in, plus `freshell-supervisor.service`):
    overwrite the baseline and compare the file against itself:
 
    ```bash
-   docker ps -q --filter name=incarnation | xargs -r docker inspect \
+   docker ps -q --filter name=incarnation \
+     --filter label=com.freshell.installation-id="$(cat "$RUN/installation-id")" \
+     | xargs -r docker inspect \
      --format '{{.Id}} {{.Name}} {{.State.StartedAt}}' | sort > "$RUN/souls-after.txt"
    LOST=$(comm -23 "$RUN/souls-before.txt" "$RUN/souls-after.txt")
    test -z "$LOST" || { echo "SOULS LOST/RESTARTED:"; echo "$LOST"; exit 1; }
@@ -620,7 +629,12 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
     BWS=$(mktemp -d "$PROBE_ROOT/bws.XXXXXX")   # unique per run
     chmod 0770 "$BWS"   # same in-soul-shell access requirement as $WS
     echo "BWS=$BWS" >> "$D/run.env"
-    # ...hard-refresh the web client, create a terminal pane at $BWS...
+    # Hard-refresh the web client, then in the UI: open the pane picker
+    # and choose a coding-CLI provider (or a fresh-agent type) — NOT a
+    # plain shell: shell panes skip the directory step and always take
+    # the default workspace, which would fail this check for the wrong
+    # reason. The provider's directory step has a free-text PATH INPUT:
+    # type the absolute $BWS path there and confirm. Then:
     curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
       | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
