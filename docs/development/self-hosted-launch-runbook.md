@@ -762,7 +762,7 @@ print("UI pane is managed:", rows[-1]["soulId"])' "$BWS"
         [ -n "$VAL" ] || continue
         VAL=$(realpath -e "$VAL") || { echo "$V: path does not exist"; exit 1; }
         case "$VAL" in
-          "$HOME"/freshell-probe.*/ws.*|"$HOME"/freshell-probe.*/bws.*) eval "$V=\$VAL" ;;
+          "$HOME"/freshell-probe.*/ws.*|"$HOME"/freshell-probe.*/bws.*) printf -v "$V" '%s' "$VAL" ;;
           *) echo "REFUSING: $V=$VAL is not under a freshell-probe run root — resolve manually"; exit 1 ;;
         esac
       done
@@ -798,6 +798,20 @@ PY
       umask 077; printf 'x-auth-token: %s\n' "$TOK" > "$D/hdr"
     fi
     trap 'rm -f "${RUN:-/nonexistent}/hdr" "${D:-/nonexistent}/hdr"' EXIT   # BOTH headers, every exit path, set -u-safe
+    # DESTRUCTIVE-PATH GUARD (both the normal and recovery flows pass
+    # through here): canonicalize and pattern-match every probe path
+    # against this run's layout BEFORE any stop request or deletion. A
+    # mistaken variable pointing at a real workspace (one managed soul in
+    # it) would otherwise stop that live session AND rm -rf its files:
+    for V in WS BWS; do
+      eval "VAL=\${$V:-}"
+      [ -n "$VAL" ] || continue
+      VAL=$(realpath -e "$VAL") || { echo "$V: path does not exist"; exit 1; }
+      case "$VAL" in
+        "$HOME"/freshell-probe.*/ws.*|"$HOME"/freshell-probe.*/bws.*) printf -v "$V" '%s' "$VAL" ;;
+        *) echo "REFUSING: $V=$VAL is not under a freshell-probe run root — resolve manually"; exit 1 ;;
+      esac
+    done
     if [ -z "${SOUL_ID:-}" ]; then
       # Recovery mode: derive the probe soul from the unique workspace —
       # no independent terminalId check applies here; WS uniqueness IS
@@ -877,22 +891,36 @@ else:
         # unresolved intent — refuse rather than report success:
         { echo "browser-check soul has no container but state=$BS_STATE — resolve manually before deleting $BWS"; exit 1; }
       elif [ "$BS_STATE" != "stopped" ] || [ "$BS_DESIRED" != "stopped" ]; then
-          curl -s -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
-            -d "{\"requestId\":\"probe-cleanup\",\"expectedIntentRevision\":$BS_REV}" \
-            http://127.0.0.1:3001/api/runtime/souls/$BS_ID/stop \
-            | python3 -c 'import json,sys
+        curl -s -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
+          -d "{\"requestId\":\"probe-cleanup\",\"expectedIntentRevision\":$BS_REV}" \
+          http://127.0.0.1:3001/api/runtime/souls/$BS_ID/stop \
+          | python3 -c 'import json,sys
 o=json.load(sys.stdin)
 assert o.get("outcome")=="verified_empty", o
 print("stopped browser soul:", o["outcome"])'
-        fi
       fi
     fi
     # Restore OpenCode's default cwd that the directory step overwrote
-    # (only when the browser check ran — $BWS set). Build the JSON with
-    # json.dumps (a path containing quotes/backslashes must not corrupt
-    # the request; a null CLEARS a previously-absent default), CHECK the
-    # HTTP status, and VERIFY the saved value by re-reading it — curl
-    # succeeds as a shell command even on a 4xx/5xx:
+    # (only when the browser check ran — $BWS set). The picker's settings
+    # save is an UNAWAITED async request — first WAIT (bounded) for it to
+    # land (the visible default becomes $BWS), or the delayed save could
+    # arrive AFTER this restore and re-point the default at the
+    # about-to-be-deleted workspace:
+    if [ -n "${BWS:-}" ]; then
+      for i in $(seq 1 15); do
+        CUR=$(curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" http://127.0.0.1:3001/api/settings \
+          | python3 -c 'import json,sys
+d=json.load(sys.stdin); d=d.get("data",d)
+cur=(d.get("codingCli") or {}).get("providers",{}).get("opencode",{}).get("cwd")
+print("" if cur is None else cur)')
+        if [ "$CUR" = "$BWS" ]; then break; fi
+        sleep 2
+      done
+    fi
+    # Then the restore itself — JSON-safe (a path containing
+    # quotes/backslashes must not corrupt the request; a null CLEARS a
+    # previously-absent default), HTTP-status-checked, and VERIFIED by
+    # re-reading it — curl succeeds as a shell command even on a 4xx/5xx:
     if [ -n "${BWS:-}" ] && [ -f "$D/old-opencode-cwd.txt" ]; then
       OLD=$(cat "$D/old-opencode-cwd.txt")
       BODY=$(python3 -c 'import json,sys
