@@ -150,6 +150,44 @@ process.stdin.on('data', chunk => {
 })
 `
 
+function directHomeAppendMcpServerSource(outputName: string): string {
+  const outputUrl = `new URL(${JSON.stringify(`./${outputName}`)}, import.meta.url)`
+  return `import fs from 'node:fs'
+const [receiptPath, expectedNonce] = process.argv.slice(2)
+if (!receiptPath || !expectedNonce) process.exit(12)
+let appendError
+try { fs.appendFileSync(${outputUrl}, '|' + expectedNonce) }
+catch (error) { appendError = error.code ?? error.message ?? String(error) }
+const output = fs.readFileSync(${outputUrl}, 'utf8')
+fs.writeFileSync(receiptPath, JSON.stringify({ expectedNonce, appendError, output, scriptPath: process.argv[1] }))
+let buffered = ''
+process.stdin.setEncoding('utf8')
+process.stdin.on('data', chunk => {
+  buffered += chunk
+  while (true) {
+    const boundary = buffered.indexOf('\\n')
+    if (boundary < 0) break
+    const line = buffered.slice(0, boundary)
+    buffered = buffered.slice(boundary + 1)
+    let request
+    try { request = JSON.parse(line) } catch { continue }
+    if (!request || !Object.hasOwn(request, 'id')) continue
+    let result
+    if (request.method === 'initialize') result = { protocolVersion: request.params?.protocolVersion ?? '2024-11-05',
+      capabilities: { tools: {} }, serverInfo: { name: 'freshell-home-append-fixture', version: '1.0.0' } }
+    else if (request.method === 'tools/list') result = { tools: [] }
+    else if (request.method === 'ping') result = {}
+    else {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id,
+        error: { code: -32601, message: 'Method not found' } }) + '\\n')
+      continue
+    }
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\\n')
+  }
+})
+`
+}
+
 export function resolveManagedProviderEnvironmentTargetMode(args: string[]): ManagedProviderEnvironmentTargetMode {
   if (args.length === 0) return 'managed-environment'
   if (args.length === 1 && args[0] === '--checkpoint') return 'code-checkpoint'
@@ -376,6 +414,11 @@ export default {id:'managed-environment-tui',async tui(api,options){
     await fs.chmod(path.join(cwd, '.managed-fixture'), 0o777)
     await fs.writeFile(path.join(cwd, 'rules.txt'), nonce, { mode: 0o600 })
     const mcpReceipt = path.join(cwd, '.managed-fixture/mcp-receipt.json')
+    const homeAppendScript = path.join(home, `direct-home-${scenario}.mjs`)
+    const homeAppendOutput = `direct-home-${scenario}.txt`
+    const homeAppendReceipt = path.join(cwd, '.managed-fixture/direct-home-mcp-receipt.json')
+    await fs.writeFile(homeAppendScript, directHomeAppendMcpServerSource(homeAppendOutput))
+    await fs.writeFile(path.join(home, homeAppendOutput), `initial-${nonce}`)
     await writeJson(path.join(cwd, 'opencode.json'), { agent: { fixtureRelative: {
       prompt: `{file:./${scenario === 'missing-reference' ? 'missing-selected.txt' : 'rules.txt'}}` } },
       mcp: {
@@ -389,6 +432,11 @@ export default {id:'managed-environment-tui',async tui(api,options){
         direct_script_fixture: {
           type: 'local',
           command: [directCommand, path.join(cwd, '.managed-fixture/direct-mcp-receipt.json'), nonce],
+          enabled: true,
+        },
+        direct_home_append_fixture: {
+          type: 'local',
+          command: ['node', homeAppendScript, homeAppendReceipt, nonce],
           enabled: true,
         },
       },
@@ -1305,13 +1353,19 @@ export async function runManagedEnvironmentTarget() {
     assert.equal(preflightDirectMcp.dependency, nonce)
     assert.equal(preflightDirectMcp.schemaNonce, nonce)
     assert(preflightDirectMcp.scriptPath.endsWith('/direct-mcp/server.mjs'))
+    const preflightHomeAppend = await poll('OpenCode starts the direct HOME MCP and it appends its sibling output', async () =>
+      readJson(path.join(selected.workspace, 'preflight/.managed-fixture/direct-home-mcp-receipt.json')))
+    assert.equal(preflightHomeAppend.expectedNonce, nonce)
+    assert.equal(preflightHomeAppend.appendError, undefined, 'the staged HOME-level append target must be writable')
+    assert.equal(preflightHomeAppend.output, `initial-${nonce}|${nonce}`)
+    assert(preflightHomeAppend.scriptPath.endsWith('/direct-home-preflight.mjs'))
     const preflightView = await poll('genuine managed preflight native identity', () =>
       observeManagedEnvironmentNativeIdentity(rig!, created.terminalId, preflightChild.nativeSessionId))
     assert((await terminalDirectory(rig)).some(row => row.terminalId === created.terminalId))
     assert.deepEqual(await webChildren(rig), [], 'Managed child must belong to the disposable session host, not the host web process')
     proof.preflight = { terminalId: created.terminalId, soulId: preflightView.soulId, incarnationId: preflightView.incarnationId,
       stage: await stageProof(rig, preflightView, nonce), child: preflightChild, mcpServer: preflightMcp,
-      directMcpServer: preflightDirectMcp }
+      directMcpServer: preflightDirectMcp, directHomeAppendMcp: preflightHomeAppend }
     const toolHome = path.join(root, 'tools')
     await fs.mkdir(toolHome, { mode: 0o700 })
     const tool = path.join(toolHome, 'cloudflared')
@@ -1416,9 +1470,15 @@ export async function runManagedEnvironmentTarget() {
         assert.equal(directMcpServer.dependency, nonce)
         assert.equal(directMcpServer.schemaNonce, nonce)
         assert(directMcpServer.scriptPath.endsWith('/direct-mcp/server.mjs'))
+        const directHomeAppendMcp = await poll('Cloud OpenCode appends through its direct HOME MCP', async () =>
+          readJson(path.join(cwd, '.managed-fixture/direct-home-mcp-receipt.json')))
+        assert.equal(directHomeAppendMcp.expectedNonce, nonce)
+        assert.equal(directHomeAppendMcp.appendError, undefined, 'the managed HOME sibling mount must permit append')
+        assert.equal(directHomeAppendMcp.output, `initial-${nonce}|${nonce}`)
+        assert(directHomeAppendMcp.scriptPath.endsWith('/direct-home-healthy.mjs'))
         const stage = await stageProof(rig!, view, nonce)
         const receipt = { ...fixture, terminalId: view.terminalId, soulId: view.soulId, incarnationId: view.incarnationId,
-          nativeSessionId: view.nativeSessionId, stage, child, mcpServer, directMcpServer }
+          nativeSessionId: view.nativeSessionId, stage, child, mcpServer, directMcpServer, directHomeAppendMcp }
         await writeJson(path.join(cwd, '.managed-fixture/target-receipt.json'), receipt)
         proof.healthy = receipt
         } },
