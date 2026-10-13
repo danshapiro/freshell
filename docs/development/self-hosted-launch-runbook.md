@@ -196,12 +196,21 @@ the procedure mid-way and leave the service down. Two sequences:
   # Two failure detectors: supervisor-unit LIVENESS (fast — a dead unit
   # ends the wait immediately) and an inventory-sized absolute CAP
   # (stall — a live-but-wedged process must not hang the redeploy
-  # forever). Worst-case reconciliation is 900s per soul at four-way
-  # concurrency (225s effective each); double that for margin and floor
-  # at an hour. Operators with extreme configs can override the env var:
+  # forever). Size from the ACTUAL effective concurrency: read
+  # FRESHELL_RUNTIME_STARTUP_CONCURRENCY from the supervisor unit's
+  # environment files (default 4), and use the documented 900s per-soul
+  # reconciliation ceiling: worst-case N*900/C seconds, doubled for
+  # margin, floored at an hour. Extreme configs can override the env var:
+  C=4
+  for EF in $(systemctl --user show freshell-supervisor.service \
+                -p EnvironmentFiles --value | tr ' ' '\n' \
+                | sed 's/(.*//' | grep -v '^$'); do
+    V=$(sed -n 's/^FRESHELL_RUNTIME_STARTUP_CONCURRENCY=//p' "$EF" 2>/dev/null | tail -1)
+    [ -n "$V" ] && C="$V"
+  done
   N=$(wc -l < "$RUN/desired-running.txt" 2>/dev/null || echo 0)
   [ "$N" -gt 0 ] || N=$(wc -l < "$RUN/souls-before.txt" 2>/dev/null || echo 0)
-  WC=$(( N * 225 * 2 ))
+  WC=$(( N * 900 / C * 2 ))
   [ "$WC" -ge 3600 ] || WC=3600
   CAP=${FRESHELL_PROBE_SOCKET_WAIT_SECONDS:-$WC}
   WAITED=0
@@ -393,8 +402,25 @@ drop-in, plus `freshell-supervisor.service`):
         | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
 for s in souls:
+    print(s["soulId"])' > "$RUN/souls-all.txt"
+      curl -s -H @"$RUN/hdr" http://127.0.0.1:3001/api/runtime/souls \
+        | python3 -c 'import json,sys
+souls=json.load(sys.stdin)["souls"]
+for s in souls:
     if s.get("desiredState")=="running":
         print(s["soulId"])' > "$RUN/desired-running.txt"
+      # POSITIVE orphan check for the API-less fallback: every baseline
+      # container's soul must exist in the DEPLOYED registry — a registry
+      # swap leaves the containers running but owned by nothing:
+      while read -r CIDLINE; do
+        CID=${CIDLINE%% *}
+        [ -n "$CID" ] || continue
+        SID=$(docker inspect "$CID" \
+          --format '{{index .Config.Labels "com.freshell.soul-id"}}' 2>/dev/null || true)
+        [ -n "$SID" ] || continue
+        grep -qx "$SID" "$RUN/souls-all.txt" \
+          || { echo "ORPHANED container — soul $SID not in the deployed registry: $CID"; exit 1; }
+      done < "$RUN/souls-before.txt"
     fi
     echo "sweeping $(wc -l < "$RUN/desired-running.txt") desired-running soul(s)"
     while read -r SID; do
@@ -576,12 +602,16 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
     curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
       | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
-hits=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
-# EXACTLY one soul per probe workspace; two hits means this workspace was
-# reused by an earlier attempt — refuse rather than pick arbitrarily:
-assert len(hits)==1, ("workspace ambiguous (mint a fresh BWS and retry)", hits)
-assert hits[0].get("launchState")=="running", "soul not running — client took the host-side route?"
-print("UI pane is managed:", hits[0]["soulId"])' "$BWS"
+rows=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
+# The inventory returns ONE ROW PER INCARNATION (recovered souls keep
+# their old rows); the invariant is exactly one SOUL per probe
+# workspace. Group by soulId, refuse on ambiguity, and inspect the
+# NEWEST incarnation row (the list is creation-ordered):
+sids={r["soulId"] for r in rows}
+assert len(sids)==1, ("workspace ambiguous (mint a fresh BWS and retry)", rows)
+cur=rows[-1]
+assert cur.get("launchState")=="running", "soul not running — client took the host-side route?"
+print("UI pane is managed:", cur["soulId"])' "$BWS"
     ```
 
     If the assertion fails, the client is stale or not negotiating
@@ -674,12 +704,13 @@ PY
       PROBE=$(curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
         | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
-hits=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
-# The API returns ONE record per soul (its current incarnation), so a
-# unique probe workspace must match exactly one record; ambiguity means
-# workspace reuse — refuse rather than pick arbitrarily:
-assert len(hits)==1, ("workspace ambiguous — do not stop anything; resolve manually", hits)
-s=hits[0]
+rows=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
+# One row per INCARNATION; the invariant is exactly one SOUL per probe
+# workspace — group by soulId, refuse on ambiguity, act on the NEWEST
+# incarnation row (creation-ordered list):
+sids={r["soulId"] for r in rows}
+assert len(sids)==1, ("workspace ambiguous — do not stop anything; resolve manually", rows)
+s=rows[-1]
 print(s["soulId"], s["intentRevision"], s["terminalId"])' "$WS")
       read -r SOUL_ID REV TID <<< "$PROBE"
     else
@@ -712,11 +743,13 @@ print("stopped:", o["outcome"])'
       BS=$(curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
         | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
-hits=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
-# exactly one soul per probe workspace; refuse on ambiguity:
-assert len(hits)<=1, ("workspace ambiguous — do not stop anything; resolve manually", hits)
-if hits:
-    s=hits[0]
+rows=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
+# One row per INCARNATION; exactly one SOUL per probe workspace; act on
+# the NEWEST incarnation row (creation-ordered list):
+sids={r["soulId"] for r in rows}
+assert len(sids)<=1, ("workspace ambiguous — do not stop anything; resolve manually", rows)
+if rows:
+    s=rows[-1]
     print(s["soulId"], s["intentRevision"], s["launchState"])
 else:
     print("")' "$BWS")
