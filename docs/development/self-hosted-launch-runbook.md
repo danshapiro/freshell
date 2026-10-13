@@ -88,8 +88,17 @@ client, one opt-in feature flag, and two systemd user units. A server-only
 rebuild or restart is NOT enough to change soul behavior — and a plain
 rebuild silently loses it.
 
-**Build surface.** Build all three binaries from the repo root when any of
-them changes:
+**Establish the deployment checkout FIRST.** The units run binaries from
+THEIR configured paths — not from whatever directory you happen to be
+in. Read them (`systemctl --user show freshell-rust.service -p
+WorkingDirectory --value` and the supervisor unit's `ExecStart` path,
+typically `%h/code/freshell`), and run the build from THAT checkout.
+Artifacts built anywhere else (a dev worktree, a scratch clone) are
+never started by the units — a mistake you would otherwise discover only
+after restarting production.
+
+**Build surface.** Build all three binaries from the deployment checkout
+when any of them changes:
 
 ```bash
 cargo build --release -p freshell-server -p freshell-supervisor \
@@ -684,7 +693,7 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
     esac
     BWS=$(mktemp -d "$PROBE_ROOT/bws.XXXXXX")   # unique per run
     chmod 0770 "$BWS"   # same in-soul-shell access requirement as $WS
-    echo "BWS=$BWS" >> "$D/run.env"
+    printf 'BWS=%q\n' "$BWS" >> "$D/run.env"
     # The directory picker PERSISTS the chosen path as OpenCode's default
     # cwd (the confirm handler patches settings) — record the current
     # default so step 8 can restore it:
@@ -1017,6 +1026,16 @@ print("" if cur is None else cur)')
     # re-reading it — curl succeeds as a shell command even on a 4xx/5xx:
     if [ -n "${BWS:-}" ] && [ -f "$D/old-opencode-cwd.txt" ]; then
       OLD=$(cat "$D/old-opencode-cwd.txt")
+      # Restore ONLY if the setting still points at THIS probe's path —
+      # a newer user choice made after our read must not be overwritten:
+      CURNOW=$(curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" http://127.0.0.1:3001/api/settings \
+        | python3 -c 'import json,sys
+d=json.load(sys.stdin); d=d.get("data",d)
+cur=(d.get("codingCli") or {}).get("providers",{}).get("opencode",{}).get("cwd")
+print("" if cur is None else cur)')
+      if [ "$CURNOW" != "$BWS" ]; then
+        echo "OpenCode default no longer points at the probe path (now '$CURNOW') — leaving the newer value alone"
+      else
       BODY=$(python3 -c 'import json,sys
 old=sys.argv[1] or None
 print(json.dumps({"codingCli":{"providers":{"opencode":{"cwd":old}}}}))' "$OLD")
@@ -1032,6 +1051,7 @@ cur=(d.get("codingCli") or {}).get("providers",{}).get("opencode",{}).get("cwd")
 cur="" if cur is None else cur
 sys.exit(0 if cur==sys.argv[1] else 1)' "$OLD" \
         || { echo "settings restore did not stick (expected OpenCode cwd '$OLD') — fix Settings → Coding CLI → OpenCode manually BEFORE deleting the probe dirs"; exit 1; }
+      fi
     elif [ -n "${BWS:-}" ]; then
       # RECOVERY MODE: the original $D (with the saved pre-check default)
       # was lost with the shell, so the original value is unrecoverable.
