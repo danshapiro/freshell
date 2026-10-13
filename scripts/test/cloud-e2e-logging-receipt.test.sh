@@ -27,7 +27,15 @@ case "$*" in
     exit 0 ;;
   *"run jobs delete"*) exit 0 ;;
   *"run jobs execute"*) echo "Execution [exec-json-receipt] has successfully completed." ;;
-  *"executions logs read"*) echo "  4 passed (12.3s)" ;;
+  *"executions logs read"*)
+    count_file="$STUB_CAPTURE/logs.count"
+    count="$(cat "$count_file" 2>/dev/null || echo 0)"; count=$((count + 1)); echo "$count" > "$count_file"
+    if [ "${STUB_DELAY_SUMMARY_ONCE:-0}" = 1 ] && [ "$count" -eq 1 ]; then
+      echo "[e2e-entrypoint] Shard 1/2 assignment: focused fixture"
+    else
+      echo "[e2e-entrypoint] Shard 1/2 assignment: focused fixture"
+      echo "  4 passed (12.3s)"
+    fi ;;
   *"logging read"*)
     case "$*" in
       *'labels."run.googleapis.com/execution_name"="exec-json-receipt"'*) ;;
@@ -40,6 +48,7 @@ case "$*" in
     if [ "${STUB_DELAY_ONCE:-0}" = 1 ] && [ "$count" -eq 1 ]; then echo '[]'; else printf '%s\n' "$STUB_LOGGING_JSON"; fi ;;
   *"executions describe"*)
     case "$*" in
+      *completionTime*) echo "2026-10-13T00:00:01Z" ;;
       *failedCount*) echo 0 ;;
       *succeededCount*) echo "${STUB_SUCCEEDED:-2}" ;;
     esac ;;
@@ -93,7 +102,8 @@ if ! grep -Fxq '  --grep=focused smoke' "$WORK/capture/run-env.yaml" \
   cat "$WORK/capture/run-env.yaml"; exit 1
 fi
 
-OUT="$(env PATH="$WORK/bin:$PATH" STUB_CAPTURE="$WORK/capture" STUB_DELAY_ONCE=1 STUB_LOGGING_JSON="$records_no_retry" GCLOUD_IDENT=stub@example.invalid "$SCRIPT" run --cloud --shards=2 2>&1)" || {
+rm -f "$WORK/capture/logs.count"
+OUT="$(env PATH="$WORK/bin:$PATH" STUB_CAPTURE="$WORK/capture" STUB_DELAY_ONCE=1 STUB_DELAY_SUMMARY_ONCE=1 STUB_LOGGING_JSON="$records_no_retry" GCLOUD_IDENT=stub@example.invalid "$SCRIPT" run --cloud --shards=2 2>&1)" || {
   echo "FAIL: delayed structured receipt run failed"; echo "$OUT"; exit 1
 }
 if ! grep -q "All tasks completed successfully" <<< "$OUT"; then
@@ -101,6 +111,9 @@ if ! grep -q "All tasks completed successfully" <<< "$OUT"; then
 fi
 if [ "$(cat "$WORK/capture/logging.count")" -lt 2 ]; then
   echo "FAIL: wrapper did not retry delayed Cloud Logging receipt ingestion"; cat "$WORK/capture/gcloud.args"; exit 1
+fi
+if [ "$(cat "$WORK/capture/logs.count")" -lt 2 ] || ! grep -q "4 passed (12.3s)" <<< "$OUT"; then
+  echo "FAIL: wrapper did not retry its display-log read until the Playwright footer arrived"; echo "$OUT"; cat "$WORK/capture/gcloud.args"; exit 1
 fi
 if ! grep -Fq 'labels."run.googleapis.com/execution_name"="exec-json-receipt"' "$WORK/capture/gcloud.args" \
   || grep -Fq 'labels.execution_name' "$WORK/capture/gcloud.args"; then

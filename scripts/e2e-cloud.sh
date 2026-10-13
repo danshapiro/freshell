@@ -796,13 +796,34 @@ cmd_run() {
   # Capture to a variable so we can print the full output AND extract a
   # per-shard summary, even when some shards fail.
   echo "[e2e-cloud] Fetching logs..."
-  local log_output
-  if ! log_output=$(gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" 2>&1); then
+  local log_output="" summary_lines="" display_log_unavailable=false summary_footer_present=false
+  local summary_attempt
+  for summary_attempt in 1 2 3 4 5; do
+    if log_output=$(gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" 2>&1); then
+      summary_lines=$(printf '%s\n' "$log_output" | node "$ROOT/scripts/testing/e2e-cloud-log-summary.mjs")
+      display_log_unavailable=false
+      if printf '%s\n' "$summary_lines" | grep -Eq '^[[:space:]]+[0-9]+ (failed|passed|skipped|interrupted)\b'; then
+        summary_footer_present=true
+      fi
+      if $summary_footer_present || $playwright_dry_run; then
+        break
+      fi
+    else
+      log_output=""
+      display_log_unavailable=true
+    fi
+    if [ "$summary_attempt" -lt 5 ]; then
+      echo "[e2e-cloud] Waiting for Playwright display-log summary (attempt ${summary_attempt}/5)." >&2
+      sleep 3
+    fi
+  done
+  if $display_log_unavailable; then
     # This human formatter exposes textPayload only. It remains useful for
     # display, but never decides whether retry evidence exists; that decision
     # comes from the required jsonPayload query below.
-    echo "[e2e-cloud] WARNING: could not read display logs: $log_output" >&2
-    log_output=""
+    echo "[e2e-cloud] WARNING: could not read display logs after five attempts." >&2
+  elif ! $summary_footer_present && ! $playwright_dry_run; then
+    echo "[e2e-cloud] WARNING: Playwright summary footer was not present in display logs after five attempts." >&2
   fi
 
   # Print logs from every shard. Retry traces are retained as bounded base64
@@ -870,7 +891,7 @@ cmd_run() {
   # the footer's pass/fail/skip counts.
   echo ""
   echo "[e2e-cloud] Per-shard summary:"
-  printf '%s\n' "$log_output" | node "$ROOT/scripts/testing/e2e-cloud-log-summary.mjs"
+  printf '%s\n' "$summary_lines"
 
   # Check execution status — transient describe errors right after
   # `execute --wait` are a real flake class, so retry briefly; a PERMANENT
