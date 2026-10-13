@@ -5044,10 +5044,15 @@ impl TerminalRegistry {
         {
             return;
         }
-        if lifecycle.state == ManagedLifecycleState::Running {
-            state.status = TerminalRunStatus::Running;
-            state.exit_code = None;
-            state.managed_exit_code_available = None;
+        match lifecycle.state {
+            ManagedLifecycleState::Running | ManagedLifecycleState::Recovering => {
+                state.status = TerminalRunStatus::Running;
+                state.exit_code = None;
+                state.managed_exit_code_available = None;
+            }
+            ManagedLifecycleState::Blocked | ManagedLifecycleState::Ended => {
+                state.status = TerminalRunStatus::Exited;
+            }
         }
         let summary = lifecycle.recovery_summary.clone();
         let message = ServerMessage::TerminalStatus(freshell_protocol::TerminalStatus {
@@ -5108,7 +5113,12 @@ impl TerminalRegistry {
         };
         let mut state = shared.lock().expect("terminal lock");
         if state.status == TerminalRunStatus::Exited {
-            return true;
+            match (state.managed_exit_code_available, code) {
+                (Some(true), _) | (Some(false), None) => return true,
+                // A lifecycle-only final verdict has no exit-code evidence.
+                // Allow a later completion observation to publish the code.
+                (Some(false), Some(_)) | (None, _) => {}
+            }
         }
         state.status = TerminalRunStatus::Exited;
         state.exit_code = Some(exit_code);
