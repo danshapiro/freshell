@@ -122,7 +122,11 @@ the procedure mid-way and leave the service down. Two sequences:
   ```bash
   systemctl --user start freshell-supervisor.service
   SOCK="$HOME/.freshell/managed-runtime/control/supervisor.sock"
-  for i in $(seq 1 60); do
+  # The supervisor binds its socket only AFTER startup reconciliation,
+  # which can take minutes (default 180s per soul, four concurrent
+  # recoveries — ten souls can legitimately take ~8 minutes). Bound the
+  # wait generously (900s), not tightly:
+  for i in $(seq 1 900); do
     # CONNECT-probe, not a file test: a stopped supervisor leaves its old
     # socket FILE on disk, so [ -S ... ] passes on a dead listener:
     if python3 -c 'import socket,sys
@@ -304,10 +308,12 @@ drop-in, plus `freshell-supervisor.service`):
    capture, read its soul ID with
    `docker inspect <cid> --format '{{index .Config.Labels "com.freshell.soul-id"}}'`
    (or list `GET /api/runtime/souls` and match by `containerId`);
-   `GET /api/runtime/souls/<soul_id>` reports `"launchState": "running"`
-   — a baseline soul whose launchState is anything else (blocked, lost,
-   stopped) cannot reattach and needs the supervisor journal and that
-   soul's record investigated before the deploy is called good.
+   `GET /api/runtime/souls/<soul_id>` reports BOTH `"launchState":
+   "running"` AND a `recoveryState` that is neither `"blocked"` nor
+   `"lost"` — those are `recoveryState` values, so `launchState` can
+   stay `"running"` while the soul cannot reattach; a blocked or lost
+   soul needs the supervisor journal and its record investigated before
+   the deploy is called good.
 5. New-soul probe: create a terminal pane in a real workspace that is NOT
    the operator home itself (a subdirectory of it is fine) — when the
    workspace equals the operator home, the supervisor deliberately omits
@@ -332,12 +338,32 @@ drop-in, plus `freshell-supervisor.service`):
                       # and group-writable is required or the probe terminal
                       # cannot use its own workspace
    CHECKOUT=$(systemctl --user show freshell-rust.service -p WorkingDirectory --value)
-   # The token the RUNNING server actually validates against — read from
-   # its own environment, not by re-parsing .env (the server's dotenv
-   # accepts export prefixes, quotes, and comment forms that naive
-   # grep/cut extraction mangles):
+   # Token source: the server's INITIAL environment first (exact for
+   # unit-supplied tokens), then a fallback parse of the checkout's .env
+   # following the server's dotenv rules for the common forms (fully
+   # quoted values, quoted-then-comment, unquoted with a
+   # whitespace-preceded `#` comment; `v#x` keeps the `#` literally).
+   # NOTE: /proc/<pid>/environ does NOT contain variables dotenvy loaded
+   # at runtime — that is exactly why the .env fallback exists.
    SPID=$(systemctl --user show freshell-rust.service -p MainPID --value)
    TOK=$(tr '\0' '\n' < "/proc/$SPID/environ" | sed -n 's/^AUTH_TOKEN=//p')
+   if [ -z "$TOK" ]; then
+     TOK=$(python3 - "$CHECKOUT/.env" <<'PY'
+import re,sys
+last=None
+for line in open(sys.argv[1]):
+    m=re.match(r'^\s*(?:export\s+)?AUTH_TOKEN\s*=\s*(.*)$', line.rstrip("\n"))
+    if m: last=m.group(1)
+if last is None: sys.exit(0)
+if last[:1] in ('"',"'"):
+    end=last.find(last[0],1)
+    print(last[1:end] if end>0 else last[1:])
+else:
+    print(re.split(r'\s#', last.strip(), 1)[0].strip())
+PY
+)
+   fi
+   test -n "$TOK" || { echo "AUTH_TOKEN not found — extract it manually"; exit 1; }
    umask 077
    printf 'x-auth-token: %s\n' "$TOK" > "$D/hdr"   # header file, not argv
    trap 'rm -f "$D/hdr"' EXIT   # the token file must not survive ANY exit
@@ -482,11 +508,29 @@ print("UI pane is managed:", hits[0]["soulId"])' "$BWS"
       D=$(mktemp -d)   # fresh records dir for the recovery run
     fi
     # Self-healing token header: the trap removed it on the previous exit;
-    # recreate it (0600) only when missing, reading the token from the
-    # RUNNING server's environment exactly as step 5 does:
+    # recreate it (0600) only when missing, extracting the token exactly
+    # as step 5 does (initial environment first, .env dotenv fallback,
+    # hard non-empty assert):
     if [ ! -f "$D/hdr" ]; then
       SPID=$(systemctl --user show freshell-rust.service -p MainPID --value)
       TOK=$(tr '\0' '\n' < "/proc/$SPID/environ" | sed -n 's/^AUTH_TOKEN=//p')
+      if [ -z "$TOK" ]; then
+        TOK=$(python3 - "$CHECKOUT/.env" <<'PY'
+import re,sys
+last=None
+for line in open(sys.argv[1]):
+    m=re.match(r'^\s*(?:export\s+)?AUTH_TOKEN\s*=\s*(.*)$', line.rstrip("\n"))
+    if m: last=m.group(1)
+if last is None: sys.exit(0)
+if last[:1] in ('"',"'"):
+    end=last.find(last[0],1)
+    print(last[1:end] if end>0 else last[1:])
+else:
+    print(re.split(r'\s#', last.strip(), 1)[0].strip())
+PY
+)
+      fi
+      test -n "$TOK" || { echo "AUTH_TOKEN not found — extract it manually"; exit 1; }
       umask 077; printf 'x-auth-token: %s\n' "$TOK" > "$D/hdr"
     fi
     trap 'rm -f "$D/hdr"' EXIT   # scrub the token file on every exit path
