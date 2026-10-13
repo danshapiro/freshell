@@ -43,9 +43,9 @@ Fix the durable-souls problems identified in the diagnosis and make ordinary use
 
 Tasks 1–7 below are completed source work; their task sections retain the specific files and historical checks. Historical source reports and receipts remain useful context but do not replace checks on the joined candidate.
 
-The remaining browser verification uses the already-built external managed-runtime runner and its existing config/legacy/Stop specs. If a behavior regression is found, change only its owning source and tests. The six-mode smoke belongs in the existing managed-provider and fresh-agent browser specs, reusing their isolated rig, mode selection, and configured credentials. It proves an ordinary launch and one completed response per selected mode; it does not publish a qualification receipt or assert recovery after a crash.
+The remaining browser verification uses the already-built external managed-runtime runner and the selected ordinary-Stop and six-mode smoke cases in the existing managed-runtime and fresh-agent specs. If a behavior regression is found, change only its owning source and tests. The six-mode smoke reuses the isolated rig, mode selection, and configured credentials. It proves an ordinary launch and one completed response per selected mode; it does not publish a qualification receipt or assert recovery after a crash.
 
-The current candidate's provider-free Fresh History browser check has passed. The remaining work is the selected config/legacy/Stop browser cases, the six-mode ordinary-use smoke, the final configured full-suite gate and independent review. No production backup, deployment packet, real-session import, transition rehearsal or all-mode campaign is part of this repair.
+The current candidate's provider-free Fresh History browser check and selected interrupted-Stop browser case have passed. The config/legacy retry case was not admitted because its candidate-bound fixture manifest is absent; it is outside the user's accepted transition scope. Remaining work is the six-mode ordinary-use smoke, the final configured full-suite gate and independent review. No production backup, deployment packet, real-session import, transition rehearsal or all-mode campaign is part of this repair.
 
 ## Completed source work and current remaining work
 
@@ -652,9 +652,9 @@ If changed, also stage the three contextual UI files and required README/mock up
 
 **Interfaces:**
 - Consumes: the clean current candidate and its already-built isolated managed-runtime/browser images, configured Cloud backend, existing exact owner and cleanup interfaces.
-- Produces: positive results for the selected existing synthetic config-retry, legacy-runtime-retry and interrupted-Stop browser cases, with exact owned cleanup. The provider-free Fresh History browser check already passed on candidate `0779df04e9e03d87c0b607d65653c219c8958c82`.
+- Produces: a positive result for the selected existing synthetic interrupted-Stop browser case, with exact owned cleanup. Config and legacy-runtime transition retries are omitted under the accepted manual-porting scope. The provider-free Fresh History browser check already passed on candidate `0779df04e9e03d87c0b607d65653c219c8958c82`.
 
-- [ ] **Step 1: Confirm the candidate and shared test coordinator are ready**
+- [x] **Step 1: Confirm the candidate and shared test coordinator are ready**
 
 Run: `git status --short --branch`
 
@@ -662,29 +662,27 @@ Run: `pnpm run test:status`
 
 Expected: the candidate worktree is clean and the shared coordinator is idle before dispatch.
 
-- [ ] **Step 2: Run the selected config and legacy-runtime browser cases**
+- [x] **Step 2: Exclude transition-retry cases under the accepted scope**
 
-Run: `FRESHELL_RUNTIME_SYNTHETIC_RESUME=1 GCLOUD_ROBOT_REQUIRE=1 pnpm exec tsx scripts/testing/runtime-external-browser.ts --spec test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts --grep 'synthetic config-blocked exact retry$|synthetic legacy retained-runtime exact retry$'`
+The configured runner rejected this selector before owner/job creation because the candidate-bound Task 2 fixture manifest is absent. The selected cases exercise runtime transition/retry state; the user accepted not requiring exact transition behavior and manual session porting later. No transition test is a delivery gate.
 
-Expected: exactly the two selected cases execute and pass on the configured Cloud backend; the owner confirms cleanup.
-
-- [ ] **Step 3: Run the interrupted-Stop browser case**
+- [x] **Step 3: Run the interrupted-Stop browser case**
 
 Run: `FRESHELL_RUNTIME_SYNTHETIC_RESUME=1 GCLOUD_ROBOT_REQUIRE=1 pnpm exec tsx scripts/testing/runtime-external-browser.ts --spec test/e2e-browser/specs/runtime-terminal-continuity-rust.spec.ts --grep 'synthetic interrupted ordinary Stop preserves history$'`
 
-Expected: the selected case executes and passes; the owned runtime and cloud job are verified absent. These synthetic checks do not invoke live models or certify native-session continuity.
+Expected: the selected case executes and passes; the owned runtime and cloud job are verified absent. These synthetic checks do not invoke live models or certify native-session continuity. On candidate `93fb42e1db6007f5d1dd78dc7558e2118d642756`, run `b028dc91-e985-43ee-832e-9564431df53c` passed and exact cleanup was verified.
 
-- [ ] **Step 4: Fix any reproduced failure and rerun only affected cases**
+- [x] **Step 4: Fix any reproduced in-scope failure and rerun only affected cases**
 
-Use structured diagnostics to identify the failing behavior. Add a regression that exercises it, fix the owning path, run the focused test, refactor while green, then rerun the affected selection. Do not expand the task into a transition or real-session campaign.
+No in-scope failure was reproduced. The excluded selector stopped at admission before creating any test owner or Cloud job; it did not exercise application behavior.
 
-- [ ] **Step 5: Review and commit any repair**
+- [x] **Step 5: Review and commit any repair**
 
 Run: `git diff --check`
 
 Run: `git status --short --branch`
 
-Expected: only inspected task files are changed; commit any source/test repair with a focused message. If no behavior repair is needed, record that fact and make no empty commit.
+No source/test repair was needed for Task 8, so no empty commit was made. The run result and scope decision are recorded above.
 
 ### Task 9: Smoke-test ordinary use in the six selected modes
 
@@ -699,7 +697,7 @@ Expected: only inspected task files are changed; commit any source/test repair w
 
 - [ ] **Step 1: Add the focused behavior checks**
 
-Add one separately selectable browser case to each existing live spec. Each selected mode creates an isolated pane, sends one bounded prompt requesting a unique harmless response, and waits for the actual completed response. `freshAgent.send.accepted`, pane allocation, process presence or a requested session ID alone do not count as completion. Do not crash/restart the host or provider, compare native session IDs across incarnations, test pending approval, or import existing sessions.
+Add one separately selectable browser case to each existing live spec. Each selected mode creates an isolated pane and sends one bounded harmless prompt. For FreshAgent, require a `freshAgent.turn.complete` event for the sent session received after that send and newly displayed nonempty assistant text in that pane; do not require exact model wording. For terminal mode, which has no equivalent completion event, require its unique response marker to appear on the selected terminal stream. `freshAgent.send.accepted`, pane allocation, process presence or a requested session ID alone do not count as completion. Do not crash/restart the host or provider, compare native session IDs across incarnations, test pending approval, or import existing sessions.
 
 - [ ] **Step 2: Run the focused cases against the configured backend**
 
