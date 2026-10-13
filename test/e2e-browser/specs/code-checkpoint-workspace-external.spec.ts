@@ -282,7 +282,7 @@ async function openSessionFromHistory(
   await projectHeader.click()
   const historyRow = page.locator(`[data-context="history-session"][data-session-id="${sessionId}"]`)
   await expect(historyRow).toBeVisible({ timeout: 30_000 })
-  await historyRow.getByRole('button', { name: 'Open session' }).click()
+  await historyRow.getByRole('button', { name: 'Open session', exact: true }).click()
 
   const reopenedPane = page.locator('[data-context="fresh-agent"]').last()
   await expect.poll(async () => (await currentFreshAgent(page)).content.checkpointWorkspace)
@@ -423,7 +423,7 @@ test('Git workspace sends retain per-turn success and failure, then restore the 
     .toEqual(durable?.map(turn => `${turn.id}:user`))
 })
 
-test('opening a linked-worktree session from History rewinds its resolved checkout', async ({ page }) => {
+test('opening a linked-worktree session from History preserves picker scope and rewinds its checkout', async ({ page }) => {
   test.setTimeout(360_000)
   await verifyTarget(page)
   const checkout = fixture.linkedWorktreePath
@@ -447,6 +447,7 @@ test('opening a linked-worktree session from History rewinds its resolved checko
     projectPath: string
     checkoutPath?: string
     cwd?: string
+    checkpointWorkspace?: { path: string; provenance: string }
   }
   let directoryItem: DirectoryItem | undefined
   await expect.poll(async () => {
@@ -463,11 +464,11 @@ test('opening a linked-worktree session from History rewinds its resolved checko
     projectPath: fixture.syntheticWorkspacePath,
     checkoutPath: checkout,
     cwd: launchDirectory,
+    checkpointWorkspace: { path: launchDirectory, provenance: 'directory-picker' },
   })
 
-  // History must open from its directory projection; keeping the seed pane
-  // open would exercise the already-open-pane path and preserve its explicit
-  // picker scope instead of testing ordinary session restoration.
+  // History must restore the persisted picker scope from its directory
+  // projection; keeping the seed pane open would exercise only live pane state.
   await closePaneForContent(paneRoot)
   await expect(page.locator('[data-context="fresh-agent"]')).toHaveCount(0, { timeout: 30_000 })
   await page.locator('button[title="Projects (Ctrl+B P)"]').click()
@@ -476,10 +477,10 @@ test('opening a linked-worktree session from History rewinds its resolved checko
   await projectHeader.click()
   const historyRow = page.locator(`[data-context="history-session"][data-session-id="${sessionId}"]`)
   await expect(historyRow).toBeVisible({ timeout: 30_000 })
-  await historyRow.getByRole('button', { name: 'Open session' }).click()
+  await historyRow.getByRole('button', { name: 'Open session', exact: true }).click()
 
   await expect.poll(async () => (await currentFreshAgent(page)).content.checkpointWorkspace)
-    .toEqual({ path: checkout, provenance: 'resolved-project' })
+    .toEqual({ path: launchDirectory, provenance: 'directory-picker' })
   const reopenedPane = page.locator('[data-context="fresh-agent"]').last()
   const beforeMain = 'main before linked-worktree rewind\n'
   const beforeNested = 'nested before linked-worktree rewind\n'
@@ -488,12 +489,12 @@ test('opening a linked-worktree session from History rewinds its resolved checko
 
   const turnText = `linked-worktree resolved-scope rewind ${fixture.expectedNonce}`
   const turn = await sendThroughComposer(page, reopenedPane, turnText, {
-    path: checkout,
-    provenance: 'resolved-project',
+    path: launchDirectory,
+    provenance: 'directory-picker',
   })
   expect(turn.outcome).toMatchObject({
     status: 'available',
-    workspace: { path: checkout, provenance: 'resolved-project' },
+    workspace: { path: checkout, provenance: 'directory-picker' },
   })
   expect(turn.outcome.checkpointId).toMatch(/^[a-f0-9]{40}$/)
 
@@ -563,9 +564,9 @@ test('picker-confirmed HOME sets launch cwd without creating a checkpoint scope'
   const marker = `checkpoint home ${fixture.expectedNonce}`
   const turn = await sendThroughComposer(page, paneRoot, marker, undefined)
   expect(turn.outcome).toMatchObject({ status: 'unavailable', code: 'workspace_unavailable' })
-  expect(turn.outcome.reason).toContain('account home')
+  expect(turn.outcome.reason).toContain('No eligible code workspace')
   await expect(turn.row.getByRole('note', { name: 'Code rewind unavailable for this message' }))
-    .toContainText('account home')
+    .toContainText('rewind is unavailable')
   await turn.row.hover()
   await expect(turn.row.getByRole('button', { name: 'Rewind unavailable for this message' }))
     .toBeDisabled()
@@ -586,7 +587,7 @@ test('picker-confirmed HOME sets launch cwd without creating a checkpoint scope'
   const restoredRow = page.locator('[data-context="fresh-agent"]').last()
     .locator('article[data-turn-role="user"]', { hasText: marker })
   await expect(restoredRow.getByRole('note', { name: 'Code rewind unavailable for this message' }))
-    .toContainText('account home')
+    .toContainText('rewind is unavailable')
 
   const query = new URLSearchParams({ cwd: fixture.syntheticHomePath })
   const listUrl = `${paired!.targetUrl}/api/fresh-agent/checkpoints?${query}`

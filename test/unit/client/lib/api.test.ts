@@ -983,8 +983,12 @@ describe('searchSessions cursor pagination', () => {
     expect(response.hasMore).toBe(false)
   })
 
-  it('preserves linked-worktree checkout scope for session opens from snapshots and search', async () => {
+  it('preserves an explicitly picked linked-worktree subdirectory from snapshots and search', async () => {
     const checkoutPath = '/repo/.worktrees/feature-a'
+    const workspace = {
+      path: `${checkoutPath}/nested`,
+      provenance: 'directory-picker' as const,
+    }
     mockFetch
       .mockResolvedValueOnce(mockJson({
         items: [{
@@ -992,6 +996,7 @@ describe('searchSessions cursor pagination', () => {
           provider: 'codex',
           projectPath: '/repo',
           checkoutPath,
+          checkpointWorkspace: workspace,
           cwd: '/home/user',
           isRunning: false,
           lastActivityAt: 1_000,
@@ -1005,6 +1010,7 @@ describe('searchSessions cursor pagination', () => {
           provider: 'codex',
           projectPath: '/repo',
           checkoutPath,
+          checkpointWorkspace: workspace,
           cwd: '/home/user',
           matchedIn: 'title',
           isRunning: false,
@@ -1017,14 +1023,8 @@ describe('searchSessions cursor pagination', () => {
     const snapshot = await fetchSidebarSessionsSnapshot()
     const search = await searchSessions({ query: 'worktree' })
 
-    expect(snapshot.projects[0]?.sessions[0]?.checkpointWorkspace).toEqual({
-      path: checkoutPath,
-      provenance: 'resolved-project',
-    })
-    expect(search.results[0]?.checkpointWorkspace).toEqual({
-      path: checkoutPath,
-      provenance: 'resolved-project',
-    })
+    expect(snapshot.projects[0]?.sessions[0]?.checkpointWorkspace).toEqual(workspace)
+    expect(search.results[0]?.checkpointWorkspace).toEqual(workspace)
   })
 
   it('uses the resolved project path when an ordinary session launch cwd differs', async () => {
@@ -1073,13 +1073,15 @@ describe('searchSessions cursor pagination', () => {
   })
 
   it('restores an explicitly selected non-Git workspace from snapshots and search', async () => {
+    const checkoutPath = '/repo/.worktrees/feature-a'
     const workspace = { path: '/tmp/non-git-workspace', provenance: 'directory-picker' as const }
     const item = {
       sessionId: 'session-non-git',
       provider: 'codex',
-      projectPath: '/tmp/non-git-workspace',
+      projectPath: '/repo',
+      checkoutPath,
       checkpointWorkspace: workspace,
-      cwd: '/tmp/non-git-workspace',
+      cwd: checkoutPath,
       isRunning: false,
       lastActivityAt: 1_000,
     }
@@ -1089,6 +1091,31 @@ describe('searchSessions cursor pagination', () => {
 
     const snapshot = await fetchSidebarSessionsSnapshot()
     const search = await searchSessions({ query: 'non-git' })
+
+    expect(snapshot.projects[0]?.sessions[0]?.checkpointWorkspace).toEqual(workspace)
+    expect(search.results[0]?.checkpointWorkspace).toEqual(workspace)
+    expect(snapshot.projects[0]?.sessions[0]?.checkoutPath).toBe(checkoutPath)
+    expect(search.results[0]?.checkoutPath).toBe(checkoutPath)
+  })
+
+  it('does not treat a cwd-fallback checkoutPath as proof that a picked workspace belongs to Git', async () => {
+    const workspace = { path: '/home/user/non-git-project', provenance: 'directory-picker' as const }
+    const item = {
+      sessionId: 'session-cwd-fallback',
+      provider: 'codex',
+      projectPath: '/repo',
+      checkoutPath: '/home/user',
+      checkpointWorkspace: workspace,
+      cwd: '/home/user',
+      isRunning: false,
+      lastActivityAt: 1_000,
+    }
+    mockFetch
+      .mockResolvedValueOnce(mockJson({ items: [item], nextCursor: null, revision: 1 }))
+      .mockResolvedValueOnce(mockJson({ items: [item], nextCursor: null, revision: 2 }))
+
+    const snapshot = await fetchSidebarSessionsSnapshot()
+    const search = await searchSessions({ query: 'cwd fallback' })
 
     expect(snapshot.projects[0]?.sessions[0]?.checkpointWorkspace).toEqual(workspace)
     expect(search.results[0]?.checkpointWorkspace).toEqual(workspace)

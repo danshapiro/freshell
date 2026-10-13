@@ -132,7 +132,7 @@ describe('browser selection non-vacuity', () => {
       FRESHELL_E2E_TARGET_TOKEN: 'synthetic-selection-token' })
     const selected = listedProjects(paired, cloudConfig, ['--project=chromium-external-target', spec])
     expect(selected.labels).toEqual(['chromium-external-target'])
-    expect(selected.tests).toBe(4)
+    expect(selected.tests).toBe(5)
     expect(selected.files).toBe(1)
     expect([...listedSpecFiles(selected.output)]).toEqual([spec])
     const ordinaryExplicit = spawnSync(process.execPath, [playwrightCli, 'test', '--config', cloudConfig,

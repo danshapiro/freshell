@@ -875,11 +875,14 @@ function groupDirectoryItemsAsProjects(
 function checkpointWorkspaceForDirectoryItem(
   item: Pick<ReadModelSessionDirectoryItem, 'checkoutPath' | 'projectPath' | 'checkpointWorkspace'>,
 ): FreshAgentCheckpointWorkspace | undefined {
+  // The picked scope is independent of launch cwd. `checkoutPath` is a
+  // presentation value that can fall back to cwd, so it cannot override a
+  // separately persisted picker choice.
+  const explicitWorkspace = normalizeFreshAgentCheckpointWorkspace(item.checkpointWorkspace)
+  if (explicitWorkspace?.provenance === 'directory-picker') return explicitWorkspace
   if (item.checkoutPath) {
     return normalizeFreshAgentCheckpointWorkspace({ path: item.checkoutPath, provenance: 'resolved-project' })
   }
-  const explicitWorkspace = normalizeFreshAgentCheckpointWorkspace(item.checkpointWorkspace)
-  if (explicitWorkspace?.provenance === 'directory-picker') return explicitWorkspace
   const path = item.projectPath
   if (!path || path === 'unknown' || path.startsWith('terminal:')) return undefined
   return normalizeFreshAgentCheckpointWorkspace({ path, provenance: 'resolved-project' })
