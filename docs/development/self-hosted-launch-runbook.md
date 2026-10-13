@@ -176,15 +176,18 @@ drop-in, plus `freshell-supervisor.service`):
   commands below use 3001 — substitute the port the deployed unit actually
   sets.
 - Before restarting, capture the soul inventory so the post-deploy checks
-  can prove nothing was replaced — record container IDs AND their exact
-  start times (`State.StartedAt`, not `docker ps`'s `CreatedAt`, which is
-  the creation time and would not reveal a stop-and-restart of the same
+  can prove nothing was replaced — in a private per-run directory (fixed
+  `/tmp` paths would let a second run overwrite the first run's baseline
+  before its comparison), recording container IDs AND their exact start
+  times (`State.StartedAt`, not `docker ps`'s `CreatedAt`, which is the
+  creation time and would not reveal a stop-and-restart of the same
   container):
 
   ```bash
   set -euo pipefail   # a Docker failure must halt the procedure
+  RUN=$(mktemp -d)    # private per-run dir for the survival snapshots
   docker ps -q --filter name=incarnation | xargs -r docker inspect \
-    --format '{{.Id}} {{.Name}} {{.State.StartedAt}}' | sort | tee /tmp/souls-before.txt
+    --format '{{.Id}} {{.Name}} {{.State.StartedAt}}' | sort | tee "$RUN/souls-before.txt"
   ```
 
   An empty baseline is VALID (zero running souls) — `xargs -r` keeps the
@@ -221,29 +224,34 @@ drop-in, plus `freshell-supervisor.service`):
 2. Feature present AND unblocked: with the auth token,
    `GET /api/runtime/readiness` answers `200` — a `404` means the running
    binary was built WITHOUT the feature; rebuild with the command above
-   and restart again — AND the response's `initialScanState` is
-   `"complete"` with an empty `blockedSubsystems` list: the handler
-   answers `200` even when startup recovery of existing souls is blocked,
-   so the status code alone is not readiness.
+   and restart again — AND the response's `readiness.initialScanState`
+   (the fields are nested under `readiness`) is `"complete"` with an
+   empty `readiness.blockedSubsystems` list: the handler answers `200`
+   even when startup recovery of existing souls is blocked, so the status
+   code alone is not readiness.
 3. Units: `systemctl --user is-active freshell-rust.service
    freshell-supervisor.service` → both `active`.
 4. Existing souls: capture the post-restart inventory to a SEPARATE file
-   and compare it against the preserved baseline — do NOT re-run the
-   pre-restart command as-is, which would overwrite `/tmp/souls-before.txt`
-   and compare the file against itself:
+   in the same private run directory and compare it against the preserved
+   baseline — do NOT re-run the pre-restart command as-is, which would
+   overwrite the baseline and compare the file against itself:
 
    ```bash
    docker ps -q --filter name=incarnation | xargs -r docker inspect \
-     --format '{{.Id}} {{.Name}} {{.State.StartedAt}}' | sort > /tmp/souls-after.txt
-   comm -23 /tmp/souls-before.txt /tmp/souls-after.txt   # must be EMPTY
-   comm -13 /tmp/souls-before.txt /tmp/souls-after.txt    # new containers (expected)
+     --format '{{.Id}} {{.Name}} {{.State.StartedAt}}' | sort > "$RUN/souls-after.txt"
+   LOST=$(comm -23 "$RUN/souls-before.txt" "$RUN/souls-after.txt")
+   test -z "$LOST" || { echo "SOULS LOST/RESTARTED:"; echo "$LOST"; exit 1; }
+   comm -13 "$RUN/souls-before.txt" "$RUN/souls-after.txt"   # new containers (expected)
    ```
 
-   A non-empty first `comm` is a failure: a baseline container is gone or
-   was restarted with a new `StartedAt`. The second `comm` lists
-   containers that appeared after the restart — that is a client
-   reconnecting and a durable terminal pane reattaching, not an old soul
-   being replaced.
+   The `test -z` matters: `comm` exits successfully even when it prints
+   missing containers, so `set -e` alone would not enforce the empty
+   result. A non-empty `LOST` is a failure — a baseline container is gone
+   or was restarted with a new `StartedAt`. The final `comm` lists
+   containers that appeared after the restart; on a busy instance that is
+   normal (a client reconnect creating a new durable terminal, or another
+   client's new pane) — identify which pane or session each one belongs
+   to before assuming it is yours or that it is a replacement.
 5. New-soul probe: create a terminal pane in a real workspace that is NOT
    the operator home itself (a subdirectory of it is fine) — when the
    workspace equals the operator home, the supervisor deliberately omits
