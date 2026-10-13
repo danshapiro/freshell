@@ -1043,7 +1043,7 @@ mod provider_secret_tests {
 
     #[cfg(unix)]
     #[test]
-    fn indexed_configuration_reference_uses_its_private_generation_source() {
+    fn indexed_configuration_reference_uses_original_path_and_preserves_legacy_staged_sources() {
         const CHILD: &str = "FRESHELL_INDEXED_STAGED_SOURCE_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new("/usr/bin/timeout")
@@ -1051,7 +1051,7 @@ mod provider_secret_tests {
                 .arg(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "backend::docker::provider_secret_tests::indexed_configuration_reference_uses_its_private_generation_source",
+                    "backend::docker::provider_secret_tests::indexed_configuration_reference_uses_original_path_and_preserves_legacy_staged_sources",
                     "--nocapture",
                 ])
                 .env(CHILD, "1")
@@ -1075,13 +1075,17 @@ mod provider_secret_tests {
         let stage = owned.path().join("provider-roots/grant-indexed");
         let workspace = owned.path().join("workspace");
         let indexed_source = stage.join(".freshell/indexed-source-files/source-0");
+        let original_source = owned.path().join("host-only/original-prompt.txt");
         std::fs::create_dir_all(&capabilities).unwrap();
         std::fs::create_dir_all(stage.join(".freshell/indexed-source-files")).unwrap();
         std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(original_source.parent().unwrap()).unwrap();
         let manifest = b"{}";
         std::fs::write(stage.join(".freshell/input-manifest.json"), manifest).unwrap();
         std::fs::write(&indexed_source, b"staged prompt payload").unwrap();
         std::fs::set_permissions(&indexed_source, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::fs::write(&original_source, b"original prompt payload").unwrap();
+        let original_source = std::fs::canonicalize(original_source).unwrap();
         let capability = McpCapabilityReference {
             grant_id: "grant-indexed".into(),
             endpoint: "http://host.docker.internal:3344".into(),
@@ -1116,9 +1120,7 @@ mod provider_secret_tests {
                 indexed_files: Some(IndexedProviderFiles {
                     volume_name: "freshell-inputs-aaaaaaaaaaaaaaaaaaaaaaaa".into(),
                     aliases: vec![],
-                    staged_source_paths: Some(vec![
-                        freshell_runtime_protocol::indexed_source_stage_path(0),
-                    ]),
+                    staged_source_paths: None,
                 }),
             }),
         };
@@ -1134,18 +1136,32 @@ mod provider_secret_tests {
             "providerLaunchContext":context
         })).unwrap();
         terminal.provider_secret_references = vec![ProviderSecretReference {
-            source_path: owned
-                .path()
-                .join("host-only/original-prompt.txt")
-                .display()
-                .to_string(),
+            source_path: original_source.display().to_string(),
             profile: ProviderSecretProfile::OpencodeConfigurationFile,
             provider_relative_path: Some(".freshell/references/0".into()),
         }];
 
         let mounts = terminal_mounts(&terminal).unwrap();
 
-        assert_eq!(mounts.provider_secret_files, vec![indexed_source]);
+        assert_eq!(mounts.provider_secret_files, vec![original_source]);
         assert_eq!(mounts.indexed_secret_sources, BTreeMap::from([(0, 0)]));
+
+        let mut legacy = terminal;
+        legacy
+            .provider_launch_context
+            .as_mut()
+            .unwrap()
+            .prepared_inputs
+            .as_mut()
+            .unwrap()
+            .indexed_files
+            .as_mut()
+            .unwrap()
+            .staged_source_paths =
+            Some(vec![freshell_runtime_protocol::indexed_source_stage_path(
+                0,
+            )]);
+        let legacy_mounts = terminal_mounts(&legacy).unwrap();
+        assert_eq!(legacy_mounts.provider_secret_files, vec![indexed_source]);
     }
 }

@@ -10,6 +10,71 @@ fn fail(cause: &'static str) -> BackendError {
     BackendError::Unavailable(cause.into())
 }
 
+fn source_io_failure(
+    source_id: usize,
+    path: &Path,
+    operation: &'static str,
+    error: std::io::Error,
+) -> BackendError {
+    tracing::error!(
+        event = "provider.input.source.failed",
+        stage = "input_publication",
+        source_id,
+        operation,
+        source_path = %path.display(),
+        error_kind = ?error.kind(),
+        os_error = error.raw_os_error(),
+        error = %error,
+    );
+    BackendError::Unavailable(format!(
+        "provider input source {} failed during {operation}: {error}",
+        path.display()
+    ))
+}
+
+fn source_state_failure(
+    source_id: usize,
+    path: &Path,
+    operation: &'static str,
+    reason: &'static str,
+) -> BackendError {
+    tracing::error!(
+        event = "provider.input.source.failed",
+        stage = "input_publication",
+        source_id,
+        operation,
+        source_path = %path.display(),
+        failure = reason,
+    );
+    BackendError::Unavailable(format!(
+        "provider input source {} failed during {operation}: {reason}",
+        path.display()
+    ))
+}
+
+fn source_limit_failure(
+    source_id: usize,
+    path: &Path,
+    operation: &'static str,
+    observed: u64,
+    permitted: u64,
+) -> BackendError {
+    tracing::error!(
+        event = "provider.input.source.failed",
+        stage = "input_publication",
+        source_id,
+        operation,
+        source_path = %path.display(),
+        failure = "payload_exceeds_profile",
+        observed,
+        permitted,
+    );
+    BackendError::Unavailable(format!(
+        "provider input source {} exceeded its profile during {operation}: {observed} bytes, permitted {permitted}",
+        path.display()
+    ))
+}
+
 pub(super) struct HeldPublisher {
     soul: String,
     incarnation: String,
@@ -142,34 +207,65 @@ fn environment(value: &Value) -> Option<BTreeMap<&str, &str>> {
 }
 
 async fn open_approved_source(
+    source_id: usize,
     path: &Path,
     remaining: u64,
 ) -> Result<tokio::io::Take<tokio::fs::File>, BackendError> {
-    if std::fs::canonicalize(path).map_err(|_| fail("approved input source unavailable"))? != path {
-        return Err(fail("approved input source selection changed"));
+    if std::fs::canonicalize(path)
+        .map_err(|error| source_io_failure(source_id, path, "canonicalize", error))?
+        != path
+    {
+        return Err(source_state_failure(
+            source_id,
+            path,
+            "canonicalize",
+            "selected path changed",
+        ));
     }
     let limit = MAX_FILE_BYTES.min(remaining);
     let metadata = tokio::fs::metadata(path)
         .await
-        .map_err(|_| fail("approved input source metadata failed"))?;
+        .map_err(|error| source_io_failure(source_id, path, "metadata", error))?;
     if !metadata.is_file() {
-        return Err(fail("approved input source is not regular"));
+        return Err(source_state_failure(
+            source_id,
+            path,
+            "metadata",
+            "source is not a regular file",
+        ));
     }
     if metadata.len() > limit {
-        return Err(fail("approved input source actual bytes exceed profile"));
+        return Err(source_limit_failure(
+            source_id,
+            path,
+            "preflight",
+            metadata.len(),
+            limit,
+        ));
     }
     let file = tokio::fs::File::open(path)
         .await
-        .map_err(|_| fail("approved input source read failed"))?;
+        .map_err(|error| source_io_failure(source_id, path, "open", error))?;
     let opened = file
         .metadata()
         .await
-        .map_err(|_| fail("approved input source metadata failed"))?;
+        .map_err(|error| source_io_failure(source_id, path, "opened_metadata", error))?;
     if !opened.is_file() {
-        return Err(fail("approved input source is not regular"));
+        return Err(source_state_failure(
+            source_id,
+            path,
+            "opened_metadata",
+            "source is not a regular file",
+        ));
     }
     if opened.len() > limit {
-        return Err(fail("approved input source actual bytes exceed profile"));
+        return Err(source_limit_failure(
+            source_id,
+            path,
+            "opened_preflight",
+            opened.len(),
+            limit,
+        ));
     }
     Ok(file.take(limit + 1))
 }
@@ -810,7 +906,8 @@ impl DockerEngineBackend {
             let mut total = 0u64;
             for (source_id, path) in sources.iter().enumerate() {
                 let mut file =
-                    open_approved_source(path, MAX_TOTAL_BYTES.saturating_sub(total)).await?;
+                    open_approved_source(source_id, path, MAX_TOTAL_BYTES.saturating_sub(total))
+                        .await?;
                 request(
                     &mut stream,
                     &Request::Open {
@@ -825,14 +922,29 @@ impl DockerEngineBackend {
                     let read = file
                         .read(&mut chunk)
                         .await
-                        .map_err(|_| fail("approved input source read failed"))?;
+                        .map_err(|error| source_io_failure(source_id, path, "read", error))?;
                     if read == 0 {
                         break;
                     }
                     count += read as u64;
                     total += read as u64;
-                    if count > MAX_FILE_BYTES || total > MAX_TOTAL_BYTES {
-                        return Err(fail("approved input source actual bytes exceed profile"));
+                    if count > MAX_FILE_BYTES {
+                        return Err(source_limit_failure(
+                            source_id,
+                            path,
+                            "stream",
+                            count,
+                            MAX_FILE_BYTES,
+                        ));
+                    }
+                    if total > MAX_TOTAL_BYTES {
+                        return Err(source_limit_failure(
+                            source_id,
+                            path,
+                            "stream_total",
+                            total,
+                            MAX_TOTAL_BYTES,
+                        ));
                     }
                     request(
                         &mut stream,
@@ -1163,6 +1275,58 @@ impl DockerEngineBackend {
 mod tests {
     use super::*;
 
+    #[derive(Clone)]
+    struct CapturedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_input_source_failure_logs_path_and_filesystem_cause_without_contents() {
+        let owned = tempfile::tempdir().unwrap();
+        let source = owned.path().join("selected-secret-file");
+        std::fs::write(&source, "NEVER_LOG_THIS_SECRET_CONTENT").unwrap();
+        std::fs::remove_file(&source).unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(CapturedLogWriter(captured.clone()))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let error = open_approved_source(0, &source, MAX_TOTAL_BYTES)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains(&source.display().to_string()));
+        assert!(error.to_string().contains("No such file or directory"));
+        let captured = captured.lock().unwrap();
+        let event: serde_json::Value = serde_json::from_slice(&captured).unwrap();
+        assert_eq!(event["fields"]["event"], "provider.input.source.failed");
+        assert_eq!(event["fields"]["source_id"], 0);
+        assert_eq!(event["fields"]["source_path"], source.display().to_string());
+        assert_eq!(event["fields"]["operation"], "canonicalize");
+        assert_eq!(event["fields"]["error_kind"], "NotFound");
+        assert!(!String::from_utf8_lossy(&captured).contains("NEVER_LOG_THIS_SECRET_CONTENT"));
+    }
+
     #[test]
     fn indexed_payload_publication_uses_the_prepared_source_paths_in_source_id_order() {
         let mounts = docker::TerminalMounts {
@@ -1257,7 +1421,7 @@ mod tests {
             )
             .unwrap();
             drop(file);
-            let result = open_approved_source(&source, remaining).await;
+            let result = open_approved_source(0, &source, remaining).await;
             let rejected = match result {
                 Err(error) => {
                     assert!(error.to_string().contains("exceed"));
@@ -1279,7 +1443,9 @@ mod tests {
         let file = std::fs::File::create(&source).unwrap();
         file.set_len(MAX_FILE_BYTES).unwrap();
         drop(file);
-        let mut reader = open_approved_source(&source, MAX_FILE_BYTES).await.unwrap();
+        let mut reader = open_approved_source(0, &source, MAX_FILE_BYTES)
+            .await
+            .unwrap();
         let mut bytes = [0; MAX_CHUNK_BYTES];
         let mut observed = 0u64;
         loop {
@@ -1293,12 +1459,12 @@ mod tests {
         assert_eq!(observed, MAX_FILE_BYTES);
 
         std::fs::write(&source, []).unwrap();
-        let mut reader = open_approved_source(&source, 0).await.unwrap();
+        let mut reader = open_approved_source(0, &source, 0).await.unwrap();
         assert_eq!(reader.read(&mut [0]).await.unwrap(), 0);
 
         // Growth after acceptance remains bounded by the same one-byte
         // lookahead used by the publisher's streaming count checks.
-        let mut reader = open_approved_source(&source, 1).await.unwrap();
+        let mut reader = open_approved_source(0, &source, 1).await.unwrap();
         std::fs::OpenOptions::new()
             .write(true)
             .open(&source)

@@ -35,7 +35,22 @@ mod configured_resource_tests {
     }
 
     #[test]
-    fn managed_provider_stages_external_indexed_config_payloads_in_the_private_generation() {
+    fn managed_provider_keeps_external_indexed_payloads_out_of_persistent_generation() {
+        fn tree_contains_bytes(path: &Path, expected: &[u8]) -> bool {
+            std::fs::read_dir(path).unwrap().any(|entry| {
+                let entry = entry.unwrap();
+                let metadata = entry.metadata().unwrap();
+                if metadata.is_dir() {
+                    tree_contains_bytes(&entry.path(), expected)
+                } else {
+                    std::fs::read(entry.path())
+                        .unwrap()
+                        .windows(expected.len())
+                        .any(|window| window == expected)
+                }
+            })
+        }
+
         use crate::managed_mcp_capability::OpencodeEphemeralInput;
         use crate::managed_provider_references::sources::{
             plan_opencode_sources, DiscoveryRole, SourceOccurrence,
@@ -49,7 +64,7 @@ mod configured_resource_tests {
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&external).unwrap();
         let selected = external.join("absolute-rule.txt");
-        std::fs::write(&selected, "external prompt payload").unwrap();
+        std::fs::write(&selected, "PRIVATE_CONFIG_REFERENCE_CONTENT").unwrap();
         let config = home.join("opencode.json");
         let raw = serde_json::json!({"agent":{"fixture":{"prompt":format!("{{file:{}}}", selected.display())}}}).to_string();
         std::fs::write(&config, &raw).unwrap();
@@ -77,24 +92,52 @@ mod configured_resource_tests {
         )
         .unwrap();
 
-        std::fs::rename(&external, owned.path().join("external-hidden")).unwrap();
-        assert_eq!(
-            std::fs::read(stage_root.join(".freshell/indexed-source-files/source-0")).unwrap(),
-            b"external prompt payload",
-            "the supervisor must receive selected bytes from the private generation, not the original host path"
+        assert!(
+            selected.is_file(),
+            "the durable grant remains a path reference"
         );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(stage_root.join(".freshell/indexed-source-files/source-0"))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600
-            );
-        }
+        assert!(
+            !stage_root.join(".freshell/indexed-source-files").exists(),
+            "referenced file contents must flow through the existing tmpfs publisher, not persist in the provider generation"
+        );
+        assert!(
+            !tree_contains_bytes(&stage_root, b"PRIVATE_CONFIG_REFERENCE_CONTENT"),
+            "referenced bytes must not be copied elsewhere in the persistent provider generation"
+        );
+
+        std::fs::write(stage_root.join(".freshell/resource-mounts.json"), b"[]").unwrap();
+        let secret_references = [freshell_runtime_protocol::ProviderSecretReference {
+            source_path: selected.display().to_string(),
+            profile: freshell_runtime_protocol::ProviderSecretProfile::OpencodeConfigurationFile,
+            provider_relative_path: Some(".freshell/references/0".into()),
+        }];
+        let capability = freshell_runtime_protocol::McpCapabilityReference {
+            grant_id: "grant-indexed-source".into(),
+            endpoint: "http://host.docker.internal:3344".into(),
+            provider_relative_path: ".freshell/mcp-capability.json".into(),
+            host_gateway_address: None,
+        };
+        let prepared = describe(
+            DescriptionRoots {
+                root: &stage_root,
+                home: &home,
+                config_root: None,
+                workspace: &workspace,
+            },
+            &plan,
+            &freshell_runtime_protocol::SoulId::parse("soul-indexed-source").unwrap(),
+            &capability,
+            None,
+            &secret_references,
+        )
+        .unwrap();
+        prepared.validate_references(&secret_references).unwrap();
+        assert!(prepared
+            .indexed_files
+            .as_ref()
+            .unwrap()
+            .staged_source_paths
+            .is_none());
     }
 
     #[test]
@@ -1372,67 +1415,9 @@ pub(super) fn stage(
             canonical_source,
         });
     }
-    stage_indexed_sources(root, &manifest.files)?;
     let metadata = freshell_runtime_protocol::bounded_json_bytes(&manifest, 64 * 1024 * 1024)
         .map_err(|_| "source manifest metadata profile exceeded")?;
     write_private_bytes(&root.join(".freshell/input-manifest.json"), &metadata)
-}
-
-fn stage_indexed_sources(root: &Path, files: &[SelectedSourceFile]) -> Result<(), String> {
-    use std::io::Read;
-    let source_root = root.join(".freshell/indexed-source-files");
-    private_directory(&source_root)?;
-    let mut total_bytes = 0u64;
-    for (expected, source) in files.iter().enumerate() {
-        if usize::from(source.source_id) != expected {
-            return Err("source indexes are not contiguous".into());
-        }
-        let path = Path::new(&source.canonical_source);
-        let canonical = std::fs::canonicalize(path)
-            .map_err(|_| "selected configuration payload is unavailable before staging")?;
-        let metadata = std::fs::symlink_metadata(path)
-            .map_err(|_| "selected configuration payload metadata is unavailable")?;
-        if canonical != path || !metadata.is_file() || metadata.file_type().is_symlink() {
-            return Err("selected configuration payload must be a canonical regular file".into());
-        }
-        let file = std::fs::File::open(path)
-            .map_err(|_| "selected configuration payload cannot be opened for staging")?;
-        let opened = file
-            .metadata()
-            .map_err(|_| "selected configuration payload metadata is unavailable")?;
-        if !opened.is_file()
-            || opened.len() > freshell_platform::provider_input_exchange::MAX_FILE_BYTES
-        {
-            return Err("selected configuration payload exceeds the indexed file profile".into());
-        }
-        total_bytes = total_bytes
-            .checked_add(opened.len())
-            .filter(|bytes| *bytes <= freshell_platform::provider_input_exchange::MAX_TOTAL_BYTES)
-            .ok_or("selected configuration payloads exceed the indexed total profile")?;
-        let mut bytes = Vec::with_capacity(opened.len() as usize);
-        file.take(freshell_platform::provider_input_exchange::MAX_FILE_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| "selected configuration payload cannot be read for staging")?;
-        if bytes.len() as u64 > freshell_platform::provider_input_exchange::MAX_FILE_BYTES
-            || bytes.len() as u64 != opened.len()
-        {
-            return Err(
-                "selected configuration payload changed or exceeded its indexed profile".into(),
-            );
-        }
-        let current = std::fs::canonicalize(path)
-            .map_err(|_| "selected configuration payload changed during staging")?;
-        let current_metadata = std::fs::symlink_metadata(path)
-            .map_err(|_| "selected configuration payload changed during staging")?;
-        if current != canonical || current_metadata.file_type().is_symlink() {
-            return Err("selected configuration payload changed during staging".into());
-        }
-        let destination = root.join(freshell_runtime_protocol::indexed_source_stage_path(
-            source.source_id,
-        ));
-        write_private_bytes(&destination, &bytes)?;
-    }
-    Ok(())
 }
 
 pub(super) struct DescriptionRoots<'a> {
@@ -1727,13 +1712,12 @@ pub(super) fn describe(
         indexed_files: (!sources.is_empty()).then(|| IndexedProviderFiles {
             volume_name: indexed_provider_volume_name(soul, &capability.grant_id),
             aliases,
-            staged_source_paths: Some(
-                (0..sources.len())
-                    .map(|source_id| {
-                        freshell_runtime_protocol::indexed_source_stage_path(source_id as u16)
-                    })
-                    .collect(),
-            ),
+            // New launches keep only the original configuration file path in
+            // ProviderSecretReference. The supervisor streams bytes directly
+            // into the provider's bounded tmpfs input volume; duplicating the
+            // payload in this durable generation could persist credentials.
+            // `Some(...)` remains supported when adopting older descriptors.
+            staged_source_paths: None,
         }),
     };
     inputs
