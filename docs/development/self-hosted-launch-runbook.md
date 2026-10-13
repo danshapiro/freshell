@@ -253,9 +253,10 @@ drop-in, plus `freshell-supervisor.service`):
    normal (a client reconnect creating a new durable terminal, or another
    client's new pane) — identify which pane or session each one belongs
    to before assuming it is yours or that it is a replacement.
-   Then check the souls INDIVIDUALLY: for each baseline soul (pull the
-   soul IDs from the container labels in the capture, or list
-   `GET /api/runtime/souls` and match by `containerId`),
+   Then check the souls INDIVIDUALLY: for each baseline container in the
+   capture, read its soul ID with
+   `docker inspect <cid> --format '{{index .Config.Labels "com.freshell.soul-id"}}'`
+   (or list `GET /api/runtime/souls` and match by `containerId`);
    `GET /api/runtime/souls/<soul_id>` reports `"launchState": "running"`
    — a baseline soul whose launchState is anything else (blocked, lost,
    stopped) cannot reattach and needs the supervisor journal and that
@@ -278,7 +279,8 @@ drop-in, plus `freshell-supervisor.service`):
    ```bash
    set -euo pipefail   # a failed step must halt, not continue half-named
    D=$(mktemp -d)   # private per-run directory
-   echo "$D" > "$HOME/.freshell/managed-runtime-probe-dir"   # recovery pointer
+   mkdir -p ~/scratch
+   WS=$(mktemp -d ~/scratch/home-mount-probe.XXXXXX)   # unique probe workspace
    CHECKOUT=$(systemctl --user show freshell-rust.service -p WorkingDirectory --value)
    TOK=$(grep -E '^AUTH_TOKEN=' "$CHECKOUT/.env" | cut -d= -f2-)
    umask 077
@@ -286,7 +288,7 @@ drop-in, plus `freshell-supervisor.service`):
    trap 'rm -f "$D/hdr"' EXIT   # the token file must not survive ANY exit
    # create the probe pane (example); record terminalId from the response:
    curl -s -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
-     -d '{"mode":"shell","cwd":"<a real workspace outside the operator home>","name":"home-mount probe"}' \
+     -d '{"mode":"shell","cwd":"'"$WS"'","name":"home-mount probe"}' \
      http://127.0.0.1:3001/api/tabs | tee "$D/probe-tab.json"
    TID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["data"]["terminalId"])' "$D/probe-tab.json")
    SOUL_ID=$(curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
@@ -307,9 +309,15 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
    scope-limited OneCLI grant instead (see
    [managed-runtime-rollout.md](managed-runtime-rollout.md)).
 
-   Run steps 5-7 in ONE shell session: the private directory `$D` and its
-   records persist between them. If the shell is lost, the pointer file
-   `~/.freshell/managed-runtime-probe-dir` names the directory.
+   Run steps 5-8 in ONE shell session: the private directory `$D`, the
+   probe workspace `$WS`, and their records persist between them. If the
+   shell is lost, do NOT guess at recovery from any shared state: the
+   probe soul is re-derivable only by its unique workspace — find the
+   soul whose `terminalCwd` equals `$WS` in `GET /api/runtime/souls` and
+   stop it with the same fenced request, then delete the directories by
+   hand. The probe workspace under `~/scratch/` is unique per run
+   (`mktemp -d`), which is also what makes workspace-based matching safe
+   from cross-run and cross-operator confusion.
 
     Then confirm the probe container carries the operator-home bind and the
     `FRESHELL_OPERATOR_HOME_MOUNT=1` marker env (`docker inspect`), and that
@@ -341,15 +349,42 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
     the new bytes; a soul created before it keeps the old inode). On a
     server-only restart the supervisor's process legitimately still runs
     its earlier binary — only compare the units that were actually bounced.
- 7. Probe cleanup: the probe soul is NOT auto-collected — the server's
-    idle reaper explicitly skips managed terminals (their lifetime is
-    supervisor-owned) and the supervisor has no idle reaper, so the
-    container persists as a durable background session. To remove it
-    immediately, stop the soul recorded in step 5 — never a soul picked
-    fresh from `docker ps` at cleanup time — and RE-VERIFY the identity
-    immediately before stopping: `GET /api/runtime/souls/$SOUL_ID` must
-    still report the probe's `terminalId` (the one saved in `$D`); if it
-    does not match, stop — you are about to stop someone else's session.
+ 7. Browser-path check (required on EVERY managed-runtime redeploy — not
+    only after a client redeploy: any reconnected client can be stale): the
+    REST probe in step 5 deliberately bypasses WebSocket capability
+    negotiation, so it can pass while a stale browser client still creates
+    host-side panes. Run it BEFORE the cleanup step so the probe records
+    and token header still exist. Hard-refresh the web client, create a
+    terminal pane FROM THE UI in a fresh unique workspace minted for this
+    run — never a reused fixed path, which a stale soul from an earlier
+    redeploy could match:
+
+    ```bash
+    BWS=$(mktemp -d ~/scratch/browser-path-check.XXXXXX)   # unique per run
+    # ...hard-refresh the web client, create a terminal pane at $BWS...
+    curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
+      | python3 -c 'import json,sys
+souls=json.load(sys.stdin)["souls"]
+hits=[s for s in souls if s.get("terminalCwd")==sys.argv[1] and s.get("launchState")=="running"]
+assert hits, "no managed soul for the UI pane — client is stale or not negotiating"
+print("UI pane is managed:", hits[0]["soulId"])' "$BWS"
+    ```
+
+    If the assertion fails, the client is stale or not negotiating
+    `managedRuntimeV1` — rebuild/redeploy the client and hard-refresh
+    again. Close the test pane.
+ 8. Probe cleanup (LAST): probe souls are NOT auto-collected — the
+    server's idle reaper explicitly skips managed terminals (their
+    lifetime is supervisor-owned) and the supervisor has no idle reaper,
+    so the containers persist as durable background sessions. To remove
+    them, stop each through the fenced runtime API. For the REST probe
+    soul, use the records from step 5 — never a soul picked fresh from
+    `docker ps` at cleanup time — and RE-VERIFY the identity immediately
+    before stopping: `GET /api/runtime/souls/$SOUL_ID` must still report
+    the probe's `terminalId` (the one saved in `$D`); if it does not
+    match, stop — you are about to stop someone else's session. For the
+    browser-check soul, locate it by its unique workspace
+    (`terminalCwd == $BWS`) the same way step 7 did.
     Protected runtime API calls go through OneCLI per the rollout
     procedure (its grant is scoped to the server host and `/api/runtime/*`
     and injects `x-auth-token` — see
@@ -365,7 +400,6 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
 
     ```bash
     set -euo pipefail   # a failed check must halt BEFORE the stop request
-    D=${D:-$(cat "$HOME/.freshell/managed-runtime-probe-dir")}
     CHECKOUT=$(systemctl --user show freshell-rust.service -p WorkingDirectory --value)
     # Self-healing retry: the trap removed the header on the previous exit;
     # recreate it (0600) only when missing:
@@ -398,37 +432,15 @@ print("stopped:", o["outcome"])'
     If the block aborts before `verified_empty`, the token header is
     already gone (the `trap` removed it) while the non-secret probe
     records — the soul ID and the tab response — remain in `$D` for the
-    documented recheck-and-retry; delete `$D` manually once the probe
-    soul is resolved.
+    documented recheck-and-retry; delete `$D`, `$WS`, and `$BWS`
+    manually once the probe souls are resolved. On success, also remove
+    the workspaces: `rm -rf "$D" "$WS" "$BWS"`.
 
-   Do NOT `docker stop` the container directly — the supervisor treats an
-   externally stopped container as an unexpected exit and runs its
-   automatic recovery path, which may recreate the soul or mark a session
-   without a durable resume path as lost. Leaving the probe soul running
-   is also fine; it is inert.
- 8. Browser-path check (required on EVERY managed-runtime redeploy — not
-   only after a client redeploy: any reconnected client can be stale): the
-   REST probe in step 5 deliberately bypasses WebSocket capability
-   negotiation, so it can pass while a stale browser client still creates
-   host-side panes. Hard-refresh the web client, then create a terminal
-   pane FROM THE UI in a distinctive throwaway workspace used only by
-   this check (for example `mkdir -p ~/scratch/browser-path-check` and
-   point the pane at it). Prove that exact pane is managed by matching
-   its workspace, not its timing — a soul appearing "around the same
-   moment" proves nothing under concurrency:
-
-   ```bash
-   curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
-     | python3 -c 'import json,sys
-souls=json.load(sys.stdin)["souls"]
-hits=[s for s in souls if s.get("terminalCwd")==sys.argv[1] and s.get("launchState")=="running"]
-assert hits, "no managed soul for the UI pane — client is stale or not negotiating"
-print("UI pane is managed:", hits[0]["soulId"])' ~/scratch/browser-path-check
-   ```
-
-   If the assertion fails, the client is stale or not negotiating
-   `managedRuntimeV1` — rebuild/redeploy the client and hard-refresh
-   again. Close the test pane (and stop its soul per step 7 if desired).
+   Do NOT `docker stop` a probe container directly — the supervisor
+   treats an externally stopped container as an unexpected exit and runs
+   its automatic recovery path, which may recreate the soul or mark a
+   session without a durable resume path as lost. Leaving a probe soul
+   running is also fine; it is inert.
 
 ## Launch the native Windows client
 
