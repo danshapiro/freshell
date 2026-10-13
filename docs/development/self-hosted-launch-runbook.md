@@ -323,9 +323,13 @@ drop-in, plus `freshell-supervisor.service`):
   `systemctl --user restart freshell-supervisor.service` redeploys both.
   The same `Type=simple` socket race as the strict sequence applies here:
   the server may start before the supervisor rebinds its control socket
-  and come up failed. If the server unit is not `active` after the
-  coupled bounce, connect-probe the socket as in the strict sequence and
-  `systemctl --user start freshell-rust.service` once it is live.
+  and come up failed; the unit's `Restart=on-failure` retries can then
+  trip systemd's start-rate limit, after which a plain `start` is
+  REFUSED. If the server unit is not `active` after the coupled bounce:
+  connect-probe the socket as in the strict sequence, then
+  `systemctl --user reset-failed freshell-rust.service` (clears the
+  rate-limit counter) and `systemctl --user start freshell-rust.service`
+  once it is live.
 - Restarting the server alone (`systemctl --user restart
   freshell-rust.service`) leaves the supervisor running. Use this for
   server-only changes.
@@ -657,9 +661,11 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
 
     ```bash
     : "${PROBE_ROOT:=$(mktemp -d ~/freshell-probe.XXXXXX)}"
-    # An environment-inherited PROBE_ROOT is only trusted after the same
-    # pattern check the cleanup guard applies — never chmod (or later
-    # rm -rf) an unvalidated directory:
+    # An environment-inherited PROBE_ROOT is only trusted after
+    # canonicalization (defeat symlinks — chmod follows them) and the
+    # pattern check:
+    PROBE_ROOT=$(realpath -e "$PROBE_ROOT") \
+      || { echo "PROBE_ROOT: path does not exist"; exit 1; }
     case "$PROBE_ROOT" in
       "$HOME"/freshell-probe.*) chmod 0770 "$PROBE_ROOT" ;;
       *) echo "REFUSING: PROBE_ROOT=$PROBE_ROOT is not a freshell-probe run root"; exit 1 ;;
@@ -805,18 +811,27 @@ PY
     fi
     trap 'rm -f "${RUN:-/nonexistent}/hdr" "${D:-/nonexistent}/hdr"' EXIT   # BOTH headers, every exit path, set -u-safe
     # DESTRUCTIVE-PATH GUARD (both the normal and recovery flows pass
-    # through here): canonicalize and pattern-match every probe path
-    # against this run's layout BEFORE any stop request or deletion. A
-    # mistaken variable pointing at a real workspace (one managed soul in
-    # it) would otherwise stop that live session AND rm -rf its files:
+    # through here): canonicalize every probe path, pattern-match it
+    # against the freshell-probe layout, AND tie WS/BWS/PROBE_ROOT to ONE
+    # shared root — validating them independently would let a mixed-up
+    # recovery export stop another run's soul and delete its directories:
+    GUARD_ROOT=""
     for V in WS BWS PROBE_ROOT; do
       eval "VAL=\${$V:-}"
       [ -n "$VAL" ] || continue
       VAL=$(realpath -e "$VAL") || { echo "$V: path does not exist"; exit 1; }
-      case "$VAL" in
-        "$HOME"/freshell-probe.*) printf -v "$V" '%s' "$VAL" ;;
-        *) echo "REFUSING: $V=$VAL is not under a freshell-probe run root — resolve manually"; exit 1 ;;
+      PARENT=$(dirname "$VAL")
+      case "$PARENT" in
+        "$HOME"/freshell-probe.*) ;;
+        *) echo "REFUSING: $V=$VAL is not a freshell-probe workspace/root — resolve manually"; exit 1 ;;
       esac
+      if [ -z "$GUARD_ROOT" ]; then
+        GUARD_ROOT="$PARENT"
+      elif [ "$PARENT" != "$GUARD_ROOT" ]; then
+        echo "REFUSING: $V=$VAL belongs to a different probe root than the earlier paths — resolve manually"
+        exit 1
+      fi
+      printf -v "$V" '%s' "$VAL"
     done
     if [ -z "${SOUL_ID:-}" ]; then
       # Recovery mode: derive the probe soul from the unique workspace —
@@ -971,8 +986,10 @@ print("" if cur is None else cur)')
         echo "NOTE: the pre-check OpenCode default was lost with the lost shell — set your preferred default in Settings → Coding CLI → OpenCode"
       fi
     fi
-    rm -rf "$D" "${PROBE_ROOT:-}" "$WS" "${BWS:-}"   # success only; both
-    # token headers were already scrubbed by the trap
+    rm -f "${RUN:-/nonexistent}/hdr" "$D/hdr"   # scrub NOW; the trap only
+    # fires at shell EXIT, which is too late for $RUN/hdr in a still-
+    # living interactive shell
+    rm -rf "$D" "${PROBE_ROOT:-}" "$WS" "${BWS:-}"   # success only
     ```
 
     If the block aborts before `verified_empty`, the token header is
