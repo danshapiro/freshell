@@ -683,7 +683,7 @@ print((d.get("codingCli") or {}).get("providers",{}).get("opencode",{}).get("cwd
     # from a React effect, and the managed launch is asynchronous — so
     # the soul may not exist the instant you confirm. Poll up to ~120s:
     for i in $(seq 1 60); do
-      if curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
+      if curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
         | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
 rows=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
@@ -695,8 +695,9 @@ sys.exit(0 if len(sids)==1 and rows[-1].get("launchState")=="running" else 1)' "
       fi
       sleep 2
     done
-    # Final assert with a clear diagnosis when the wait ran out:
-    curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
+    # Final assert with a clear diagnosis when the wait ran out (the
+    # --max-time flags are what make the poll actually bounded):
+    curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
       | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
 rows=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
@@ -751,6 +752,20 @@ print("UI pane is managed:", rows[-1]["soulId"])' "$BWS"
         echo "export WS=<your probe workspace>, and BWS=<your browser-check workspace> if applicable, then re-run"
         exit 1
       fi
+      # DESTRUCTIVE-PATH GUARD: canonicalize and pattern-match BOTH paths
+      # against this run's probe layout before any stop request or
+      # deletion. A mistaken export pointing at a real workspace (one
+      # managed soul in it) would otherwise stop that live session AND
+      # rm -rf its project files:
+      for V in WS BWS; do
+        eval "VAL=\${$V:-}"
+        [ -n "$VAL" ] || continue
+        VAL=$(realpath -e "$VAL") || { echo "$V: path does not exist"; exit 1; }
+        case "$VAL" in
+          "$HOME"/freshell-probe.*/ws.*|"$HOME"/freshell-probe.*/bws.*) eval "$V=\$VAL" ;;
+          *) echo "REFUSING: $V=$VAL is not under a freshell-probe run root — resolve manually"; exit 1 ;;
+        esac
+      done
       D=$(mktemp -d)   # fresh records dir for the recovery run
     fi
     # Self-healing token header: the trap removed it on the previous exit;
@@ -851,11 +866,17 @@ else:
         { echo "browser-check soul disappeared from the registry before cleanup — investigate before deleting $BWS"; exit 1; }
       fi
       read -r BS_ID BS_REV BS_STATE BS_CID <<< "$BS"
+      # An EXITED incarnation can still be desired-running (eligible for
+      # recovery) — only a committed stop intent makes it safe to delete
+      # the workspace, so require desiredState=="stopped" too:
+      BS_DESIRED=$(curl -s --max-time 10 -H @"$D/hdr" \
+        "http://127.0.0.1:3001/api/runtime/souls/$BS_ID" \
+        | python3 -c 'import json,sys;print(json.load(sys.stdin)["soul"].get("desiredState") or "")')
       if [ "$BS_CID" = "-" ]; then
         # No container handle (e.g. a prepared replacement incarnation):
         # unresolved intent — refuse rather than report success:
         { echo "browser-check soul has no container but state=$BS_STATE — resolve manually before deleting $BWS"; exit 1; }
-      elif [ "$BS_STATE" != "stopped" ]; then
+      elif [ "$BS_STATE" != "stopped" ] || [ "$BS_DESIRED" != "stopped" ]; then
           curl -s -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
             -d "{\"requestId\":\"probe-cleanup\",\"expectedIntentRevision\":$BS_REV}" \
             http://127.0.0.1:3001/api/runtime/souls/$BS_ID/stop \
@@ -889,6 +910,25 @@ cur=(d.get("codingCli") or {}).get("providers",{}).get("opencode",{}).get("cwd")
 cur="" if cur is None else cur
 sys.exit(0 if cur==sys.argv[1] else 1)' "$OLD" \
         || { echo "settings restore did not stick (expected OpenCode cwd '$OLD') — fix Settings → Coding CLI → OpenCode manually BEFORE deleting the probe dirs"; exit 1; }
+    elif [ -n "${BWS:-}" ]; then
+      # RECOVERY MODE: the original $D (with the saved pre-check default)
+      # was lost with the shell, so the original value is unrecoverable.
+      # If the current default still points at $BWS, clearing it is the
+      # only safe option — otherwise deleting $BWS would leave OpenCode
+      # defaulting into a deleted directory:
+      CUR=$(curl -s --max-time 10 -H @"$D/hdr" http://127.0.0.1:3001/api/settings \
+        | python3 -c 'import json,sys
+d=json.load(sys.stdin); d=d.get("data",d)
+cur=(d.get("codingCli") or {}).get("providers",{}).get("opencode",{}).get("cwd")
+print("" if cur is None else cur)')
+      if [ "$CUR" = "$BWS" ]; then
+        BODY=$(python3 -c 'import json;print(json.dumps({"codingCli":{"providers":{"opencode":{"cwd":None}}}}))')
+        CODE=$(curl -s -o "$D/settings-clear.out" -w '%{http_code}' -X PATCH \
+          -H @"$D/hdr" -H "Content-Type: application/json" -d "$BODY" \
+          http://127.0.0.1:3001/api/settings)
+        grep -q '^2' <<<"$CODE" || { echo "clearing OpenCode default failed (HTTP $CODE)"; exit 1; }
+        echo "NOTE: the pre-check OpenCode default was lost with the lost shell — set your preferred default in Settings → Coding CLI → OpenCode"
+      fi
     fi
     rm -rf "$D" "${PROBE_ROOT:-}" "$WS" "${BWS:-}"   # success only; both
     # token headers were already scrubbed by the trap
