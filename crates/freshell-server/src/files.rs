@@ -222,7 +222,7 @@ fn is_checkpoint_home(path: &Path) -> bool {
 
 fn is_checkpoint_home_with_lookup(
     path: &Path,
-    account_home_for_directory: &(dyn Fn(&Path) -> Result<PathBuf, String> + Send + Sync),
+    account_home_for_directory: &crate::checkpoints::AccountHomeForDirectory,
 ) -> bool {
     crate::checkpoints::account_home_checkpoint_path_with_lookup(path, account_home_for_directory)
         .unwrap_or(true)
@@ -1521,6 +1521,17 @@ mod tests {
         assert!(is_checkpoint_home_with_lookup(
             workspace.path(),
             &account_lookup
+        ));
+    }
+
+    #[test]
+    fn picker_scope_stays_eligible_for_an_owner_without_a_user_profile() {
+        let workspace = tempfile::tempdir().unwrap();
+        let no_user_profile = |_path: &Path| Ok(None);
+
+        assert!(!is_checkpoint_home_with_lookup(
+            workspace.path(),
+            &no_user_profile
         ));
     }
 

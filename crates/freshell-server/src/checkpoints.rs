@@ -3010,13 +3010,16 @@ fn recognized_account_homes(server_home: Option<&Path>) -> Vec<PathBuf> {
 
 pub(crate) fn account_home_checkpoint_path_with_lookup(
     path: &Path,
-    account_home_for_directory: &(dyn Fn(&Path) -> Result<PathBuf, String> + Send + Sync),
+    account_home_for_directory: &AccountHomeForDirectory,
 ) -> Result<bool, String> {
     let path = std::fs::canonicalize(path)
         .map_err(|error| format!("checkpoint workspace cannot be resolved: {error}"))?;
     let homes = recognized_account_homes(None);
     is_account_home_for_owner(&path, &homes, account_home_for_directory)
 }
+
+pub(crate) type AccountHomeForDirectory =
+    dyn Fn(&Path) -> Result<Option<PathBuf>, String> + Send + Sync;
 
 fn is_recognized_account_home(path: &Path, homes: &[PathBuf]) -> bool {
     homes.iter().any(|home| home == path)
@@ -3025,17 +3028,19 @@ fn is_recognized_account_home(path: &Path, homes: &[PathBuf]) -> bool {
 fn is_account_home_for_owner(
     path: &Path,
     known_homes: &[PathBuf],
-    account_home_for_directory: &(dyn Fn(&Path) -> Result<PathBuf, String> + Send + Sync),
+    account_home_for_directory: &AccountHomeForDirectory,
 ) -> Result<bool, String> {
     if is_recognized_account_home(path, known_homes) {
         return Ok(true);
     }
-    let owner_home = account_home_for_directory(path)?;
+    let Some(owner_home) = account_home_for_directory(path)? else {
+        return Ok(false);
+    };
     Ok(owner_home == path)
 }
 
 #[cfg(unix)]
-pub(crate) fn account_home_for_directory(path: &Path) -> Result<PathBuf, String> {
+pub(crate) fn account_home_for_directory(path: &Path) -> Result<Option<PathBuf>, String> {
     use std::ffi::{CStr, OsString};
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::MetadataExt;
@@ -3077,20 +3082,24 @@ pub(crate) fn account_home_for_directory(path: &Path) -> Result<PathBuf, String>
             return Err("workspace owner's account has an empty home directory".into());
         }
         let home = PathBuf::from(OsString::from_vec(home.to_bytes().to_vec()));
-        return std::fs::canonicalize(&home).map_err(|error| {
+        return std::fs::canonicalize(&home).map(Some).map_err(|error| {
             format!("workspace owner's account home cannot be resolved: {error}")
         });
     }
 }
 
 #[cfg(windows)]
-pub(crate) fn account_home_for_directory(path: &Path) -> Result<PathBuf, String> {
+pub(crate) fn account_home_for_directory(path: &Path) -> Result<Option<PathBuf>, String> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HLOCAL};
+    use windows_sys::Win32::Foundation::{GetLastError, LocalFree, ERROR_SUCCESS, HLOCAL};
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
     };
-    use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
+    use windows_sys::Win32::Security::{
+        LookupAccountSidW, SidTypeAlias, SidTypeComputer, SidTypeDomain, SidTypeGroup,
+        SidTypeUnknown, SidTypeUser, SidTypeWellKnownGroup, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID,
+    };
     use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
     use windows_sys::Win32::System::Registry::{
         RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
@@ -3157,6 +3166,48 @@ pub(crate) fn account_home_for_directory(path: &Path) -> Result<PathBuf, String>
         ));
     }
     let _descriptor = LocalAllocation(descriptor.cast());
+
+    // A directory may be owned by a Windows group (for example, the local
+    // Administrators group). Groups do not have user profiles, so a missing
+    // ProfileList entry for those SIDs means "not a home", not an unresolved
+    // home. Keep lookup failures and unsupported SID kinds distinct so user
+    // profile paths still fail closed when they cannot be verified.
+    let mut owner_name = vec![0u16; 1024];
+    let mut owner_name_length = owner_name.len() as u32;
+    let mut domain_name = vec![0u16; 1024];
+    let mut domain_name_length = domain_name.len() as u32;
+    let mut sid_type = SidTypeUnknown;
+    if unsafe {
+        LookupAccountSidW(
+            std::ptr::null(),
+            owner_sid,
+            owner_name.as_mut_ptr(),
+            &mut owner_name_length,
+            domain_name.as_mut_ptr(),
+            &mut domain_name_length,
+            &mut sid_type,
+        )
+    } == 0
+    {
+        let error = unsafe { GetLastError() };
+        return Err(format!(
+            "workspace owner account type cannot be resolved (Windows error {error})"
+        ));
+    }
+    if sid_type != SidTypeUser {
+        if sid_type == SidTypeAlias
+            || sid_type == SidTypeComputer
+            || sid_type == SidTypeDomain
+            || sid_type == SidTypeGroup
+            || sid_type == SidTypeWellKnownGroup
+        {
+            return Ok(None);
+        }
+        return Err(format!(
+            "workspace owner SID has an unsupported account type ({sid_type})"
+        ));
+    }
+
     let mut sid_string = std::ptr::null_mut();
     if unsafe { ConvertSidToStringSidW(owner_sid, &mut sid_string) } == 0 {
         return Err("workspace owner SID cannot be formatted".into());
@@ -3256,11 +3307,12 @@ pub(crate) fn account_home_for_directory(path: &Path) -> Result<PathBuf, String>
         profile
     };
     std::fs::canonicalize(PathBuf::from(profile))
+        .map(Some)
         .map_err(|error| format!("workspace owner Windows profile cannot be resolved: {error}"))
 }
 
 #[cfg(not(any(unix, windows)))]
-pub(crate) fn account_home_for_directory(_path: &Path) -> Result<PathBuf, String> {
+pub(crate) fn account_home_for_directory(_path: &Path) -> Result<Option<PathBuf>, String> {
     Err("workspace owner account-home lookup is unavailable on this platform".into())
 }
 
@@ -3327,7 +3379,7 @@ async fn resolve_checkpoint_workspace_with_account_home(
     server_home: &Path,
     launch_cwd: &Path,
     intent: Option<&Value>,
-    account_home_for_directory: &(dyn Fn(&Path) -> Result<PathBuf, String> + Send + Sync),
+    account_home_for_directory: &AccountHomeForDirectory,
 ) -> Result<ResolvedCheckpointWorkspace, CheckpointWorkspaceUnavailable> {
     let candidate = intent
         .and_then(|workspace| workspace.get("path"))
@@ -7029,7 +7081,7 @@ mod tests {
         let owner_home = account_home.clone();
         let account_home_for_directory = move |path: &Path| {
             if path == owner_home {
-                Ok(owner_home.clone())
+                Ok(Some(owner_home.clone()))
             } else {
                 Err("synthetic owner has no resolvable home".to_string())
             }
@@ -7084,6 +7136,35 @@ mod tests {
             "{}",
             error.reason
         );
+    }
+
+    #[tokio::test]
+    async fn picked_non_git_scope_without_a_user_profile_remains_valid() {
+        let owned = tempfile::tempdir().unwrap();
+        let server_home = owned.path().join("managed-home");
+        let workspace = owned.path().join("group-owned-project");
+        tokio::fs::create_dir_all(&server_home).await.unwrap();
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        let account_home_for_directory = |_path: &Path| Ok(None);
+        let intent = json!({
+            "path": workspace,
+            "provenance": "directory-picker",
+        });
+
+        let resolved = resolve_checkpoint_workspace_with_account_home(
+            &server_home,
+            intent["path"].as_str().map(Path::new).unwrap(),
+            Some(&intent),
+            &account_home_for_directory,
+        )
+        .await
+        .expect("a group-owned non-Git project has no user-home profile to reject");
+
+        assert_eq!(
+            resolved.path,
+            PathBuf::from(intent["path"].as_str().unwrap())
+        );
+        assert_eq!(resolved.provenance, "directory-picker");
     }
 
     #[tokio::test]
@@ -7161,7 +7242,7 @@ mod tests {
         let owner_home = foreign_home.clone();
         let account_home_for_directory = move |path: &Path| {
             if path == owner_home {
-                Ok(owner_home.clone())
+                Ok(Some(owner_home.clone()))
             } else {
                 Err("synthetic NSS owner has no resolvable home".to_string())
             }
