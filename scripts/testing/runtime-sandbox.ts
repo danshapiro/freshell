@@ -430,7 +430,7 @@ export class RuntimeHarness {
     // Linux Unix-domain sockets have a small sun_path budget. Runtime paths
     // include a long incarnation UUID plus `/host.sock`, so keep the durable
     // runtime root intentionally short and deterministic across restarts.
-    const runtimeKey = `${scenarioId.slice(0, 6)}-${createHash('sha256').update(scenarioId).digest('hex').slice(0, 8)}`
+    const runtimeKey = `${scenarioId.slice(0, 5)}-${createHash('sha256').update(scenarioId).digest('hex').slice(0, 8)}`
     const runtimeRoot = path.join(this.testRoot, 'r', runtimeKey, 'x')
     fs.mkdirSync(controlDir, { recursive: true, mode: 0o700 })
     fs.mkdirSync(runtimeRoot, { recursive: true, mode: 0o700 })

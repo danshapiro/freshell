@@ -134,8 +134,6 @@ export function providerParityCommands(workspace: string): Record<string, string
   ]))
   return {
     ...commands,
-    OPENCODE_DISABLE_PROJECT_CONFIG: '1',
-    OPENCODE_CONFIG_DIR: path.join(workspace, '.opencode'),
     OPENCODE_CONFIG: path.join(workspace, 'opencode.jsonc'),
   }
 }

@@ -442,6 +442,10 @@ process.stdout.write(JSON.stringify({rootExists:fs.existsSync(root),fileExists:f
     // The worker environment selects installed commands and owned OpenCode roots.
     const providerEnvironment = providerParityCommands(path.join(rig.runtime.testRoot, 'workspace'))
     inheritedProviderEnvironment = Object.fromEntries(Object.keys(providerEnvironment).map(key => [key, process.env[key]]))
+    for (const key of ['OPENCODE_CONFIG_DIR', 'OPENCODE_DISABLE_PROJECT_CONFIG']) {
+      inheritedProviderEnvironment[key] = process.env[key]
+      delete process.env[key]
+    }
     Object.assign(process.env, providerEnvironment)
     await rig.start()
     // prepare() recreates this run's root. Populate the project afterwards so
@@ -833,7 +837,7 @@ process.stdout.write(JSON.stringify({uid:process.getuid(),gid:process.getgid(),c
     fs.writeFileSync(path.join(xdgConfigHome, 'opencode/new-provider.jsonc'), '{"replacement":true}\n')
     fs.writeFileSync(path.join(xdgConfigHome, 'opencode/opencode.jsonc'), '{"replacementOriginal":true}\n')
     fs.rmSync(path.join(xdgConfigHome, 'opencode/plugins/parity-plugin.js'))
-    fs.rmSync(path.join(workspace, '.opencode/opencode.json'))
+    fs.rmSync(path.join(workspace, '.opencode'), { recursive: true, force: true })
     const editedTui = '{ // changed before replacement\n  "theme": "light"\n}\n'
     fs.writeFileSync(path.join(xdgConfigHome, 'opencode/tui.jsonc'), editedTui)
     rig.runtime.killOwnedRuntimeExact(before.containerId)

@@ -329,6 +329,7 @@ struct CapabilityCallback {
 struct ReissuedOpencodeSources {
     sources: Vec<crate::managed_provider_references::sources::SourceOccurrence>,
     native_source_flags: Vec<freshell_platform::opencode_recipe::NativeSourceFlag>,
+    resource_roots: Vec<freshell_platform::opencode_recipe::DiscoveryRoot>,
 }
 
 fn selected_opencode_sources_for_reissue(
@@ -403,9 +404,39 @@ fn selected_opencode_sources_for_reissue(
         flag.source_ordinal =
             Some(u16::try_from(new_ordinal).map_err(|_| "native source ordinal overflow")?);
     }
+    let mut resource_roots = Vec::new();
+    for root in &manifest.resource_roots {
+        let logical_path = freshell_platform::opencode_config::lexical_path(&root.logical_path);
+        let explicitly_selected = manifest.native_source_flags.iter().any(|flag| {
+            flag.kind == freshell_platform::opencode_recipe::NativeSourceFlagKind::Directory
+                && Path::new(&flag.runtime_destination) == logical_path
+        });
+        match std::fs::canonicalize(&root.logical_path) {
+            Ok(canonical) if canonical.is_dir() => resource_roots.push(root.clone()),
+            Ok(_) => {
+                return Err(
+                    "prior selected OpenCode resource root is not a directory; repair it before reissue"
+                        .into(),
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !explicitly_selected => {
+                // A discovered resource root can disappear while the provider is
+                // stopped. Reissue from the roots that still exist; explicit
+                // OPENCODE_CONFIG_DIR remains a user-selected required input.
+                continue;
+            }
+            Err(_) => {
+                return Err(
+                    "prior selected OpenCode resource root is unavailable; repair it before reissue"
+                        .into(),
+                );
+            }
+        }
+    }
     Ok(ReissuedOpencodeSources {
         sources,
         native_source_flags,
+        resource_roots,
     })
 }
 
@@ -784,12 +815,16 @@ async fn apply_prepared_callback(
             .map(str::to_owned)
             .or_else(|| std::env::var(name).ok())
     };
-    let (selected_sources, reissued_native_source_flags) =
+    let (selected_sources, reissued_native_source_flags, selected_resource_roots) =
         if let Some(manifest) = &accepted_manifest {
             let selected = selected_opencode_sources_for_reissue(manifest)?;
-            (Some(selected.sources), Some(selected.native_source_flags))
+            (
+                Some(selected.sources),
+                Some(selected.native_source_flags),
+                Some(selected.resource_roots),
+            )
         } else {
-            (None, None)
+            (None, None, None)
         };
     let inherited_inline = accepted_manifest
         .as_ref()
@@ -844,9 +879,7 @@ async fn apply_prepared_callback(
             ),
             selected_sources,
             accepted_global_root: accepted_manifest.as_ref().map(|manifest| manifest.global_config_root.clone().ok_or_else(|| "accepted global configuration root is unrecorded; retain prior inputs and reprepare before dispatch".to_string())).transpose()?,
-            selected_resource_roots: accepted_manifest
-                .as_ref()
-                .map(|manifest| manifest.resource_roots.clone()),
+            selected_resource_roots,
             native_source_flags: reissued_native_source_flags,
             rebind_enabled: accepted_manifest
                 .as_ref()
@@ -3632,6 +3665,64 @@ mod tests {
         let selected = selected_opencode_sources_for_reissue(&manifest).unwrap();
 
         assert!(selected.sources.is_empty());
+    }
+
+    #[test]
+    fn opencode_reissue_omits_removed_discovered_resource_roots() {
+        use freshell_platform::opencode_recipe::{DiscoveryRole, DiscoveryRoot};
+
+        let owned = tempfile::tempdir().unwrap();
+        let removed_root = owned.path().join("removed-project/.opencode");
+        let retained_root = owned.path().join("retained-project/.opencode");
+        std::fs::create_dir_all(&retained_root).unwrap();
+        let mut manifest = opencode_manifest(vec![], vec![]);
+        manifest.resource_roots = vec![
+            DiscoveryRoot {
+                logical_path: removed_root,
+                role: DiscoveryRole::Workspace,
+            },
+            DiscoveryRoot {
+                logical_path: retained_root.clone(),
+                role: DiscoveryRole::Workspace,
+            },
+        ];
+
+        let selected = selected_opencode_sources_for_reissue(&manifest).unwrap();
+
+        assert_eq!(selected.resource_roots.len(), 1);
+        assert_eq!(selected.resource_roots[0].logical_path, retained_root);
+        assert!(selected.resource_roots[0].role == DiscoveryRole::Workspace);
+    }
+
+    #[test]
+    fn opencode_reissue_still_requires_a_removed_explicit_resource_root() {
+        use freshell_platform::opencode_recipe::{
+            DiscoveryRole, DiscoveryRoot, NativeSourceFlag, NativeSourceFlagKind,
+        };
+
+        let owned = tempfile::tempdir().unwrap();
+        let removed_root = owned.path().join("selected-config-dir");
+        let mut manifest = opencode_manifest(
+            vec![],
+            vec![NativeSourceFlag {
+                kind: NativeSourceFlagKind::Directory,
+                runtime_destination: removed_root.to_string_lossy().into_owned(),
+                source_ordinal: None,
+            }],
+        );
+        manifest.resource_roots = vec![DiscoveryRoot {
+            logical_path: removed_root,
+            role: DiscoveryRole::Workspace,
+        }];
+
+        let error = selected_opencode_sources_for_reissue(&manifest)
+            .err()
+            .expect("a removed explicit config directory must block reissue");
+
+        assert_eq!(
+            error,
+            "prior selected OpenCode resource root is unavailable; repair it before reissue"
+        );
     }
 
     #[test]
