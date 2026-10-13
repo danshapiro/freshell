@@ -664,6 +664,7 @@ enum PublicationJournalEntry {
         had_original: bool,
     },
     CreatedDirectory(PathBuf),
+    ObsoleteDirectory(PathBuf),
     Obsolete {
         relative: PathBuf,
         backup_id: usize,
@@ -694,6 +695,7 @@ impl PartialEq for PublicationJournalEntry {
                     && left_had_original == right_had_original
             }
             (Self::CreatedDirectory(left), Self::CreatedDirectory(right)) => left == right,
+            (Self::ObsoleteDirectory(left), Self::ObsoleteDirectory(right)) => left == right,
             (
                 Self::Obsolete {
                     relative: left_relative,
@@ -742,6 +744,7 @@ impl Ord for PublicationJournalEntry {
                 .then_with(|| left_backup_id.cmp(right_backup_id))
                 .then_with(|| left_had_original.cmp(right_had_original)),
             (Self::CreatedDirectory(left), Self::CreatedDirectory(right)) => left.cmp(right),
+            (Self::ObsoleteDirectory(left), Self::ObsoleteDirectory(right)) => left.cmp(right),
             (
                 Self::Obsolete {
                     relative: left_relative,
@@ -756,7 +759,13 @@ impl Ord for PublicationJournalEntry {
                 .then_with(|| left_backup_id.cmp(right_backup_id)),
             (Self::Leaf { .. }, _) => Ordering::Less,
             (Self::CreatedDirectory(_), Self::Leaf { .. }) => Ordering::Greater,
-            (Self::CreatedDirectory(_), Self::Obsolete { .. }) => Ordering::Less,
+            (Self::CreatedDirectory(_), Self::ObsoleteDirectory(_) | Self::Obsolete { .. }) => {
+                Ordering::Less
+            }
+            (Self::ObsoleteDirectory(_), Self::Leaf { .. } | Self::CreatedDirectory(_)) => {
+                Ordering::Greater
+            }
+            (Self::ObsoleteDirectory(_), Self::Obsolete { .. }) => Ordering::Less,
             (Self::Obsolete { .. }, _) => Ordering::Greater,
         }
     }
@@ -861,6 +870,10 @@ fn journal_entry_value(entry: &PublicationJournalEntry) -> Result<serde_json::Va
         })),
         PublicationJournalEntry::CreatedDirectory(path) => Ok(serde_json::json!({
             "kind": "created_directory",
+            "pathHex": encode_relative_path(path)?,
+        })),
+        PublicationJournalEntry::ObsoleteDirectory(path) => Ok(serde_json::json!({
+            "kind": "obsolete_directory",
             "pathHex": encode_relative_path(path)?,
         })),
         PublicationJournalEntry::Obsolete {
@@ -1043,6 +1056,7 @@ fn read_publication_journal(path: &Path) -> Result<Vec<PublicationJournalEntry>,
                     })?,
             },
             "created_directory" => PublicationJournalEntry::CreatedDirectory(path),
+            "obsolete_directory" => PublicationJournalEntry::ObsoleteDirectory(path),
             "obsolete" => PublicationJournalEntry::Obsolete {
                 relative: path,
                 backup_id: entry
@@ -1219,6 +1233,79 @@ fn cleanup_committed_publication(
     cleanup_committed_publication_with_hook(destination_root, stage_root, backup_root, || Ok(()))
 }
 
+fn remove_committed_obsolete_directory(
+    destination_root: &Path,
+    relative: &Path,
+) -> Result<(), CopyError> {
+    let Some(parent) = validate_recovery_parent_directories(destination_root, relative)? else {
+        return Ok(());
+    };
+    let path = destination_root.join(relative);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            match fs::remove_dir(&path) {
+                Ok(()) => sync_directory_chain(destination_root, &parent),
+                Err(cause)
+                    if cause.kind() == std::io::ErrorKind::NotFound
+                        || cause.kind() == std::io::ErrorKind::DirectoryNotEmpty =>
+                {
+                    Ok(())
+                }
+                Err(cause) => Err(io_error(
+                    relative,
+                    "remove_recovered_obsolete_directory",
+                    cause,
+                )),
+            }
+        }
+        // Preserve anything that replaced the old empty directory while the
+        // committed transaction waited for recovery.
+        Ok(_) => Ok(()),
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(cause) => Err(io_error(
+            relative,
+            "inspect_recovered_obsolete_directory",
+            cause,
+        )),
+    }
+}
+
+fn recover_committed_obsolete_directories(
+    destination_root: &Path,
+    backup_root: &Path,
+) -> Result<(), CopyError> {
+    let journal_path = backup_root.join(JOURNAL_FILE);
+    let entries = match fs::symlink_metadata(&journal_path) {
+        Ok(_) => read_publication_journal(&journal_path)?,
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(cause) => {
+            return Err(io_error(
+                Path::new(""),
+                "inspect_publication_journal",
+                cause,
+            ));
+        }
+    };
+    let mut obsolete_directories = entries
+        .into_iter()
+        .filter_map(|entry| match entry {
+            PublicationJournalEntry::ObsoleteDirectory(relative) => Some(relative),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    obsolete_directories.sort_by(|left, right| {
+        right
+            .components()
+            .count()
+            .cmp(&left.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    for relative in obsolete_directories {
+        remove_committed_obsolete_directory(destination_root, &relative)?;
+    }
+    Ok(())
+}
+
 fn remove_recovered_leaf(path: &Path) -> Result<(), CopyError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Err(error(
@@ -1351,6 +1438,7 @@ fn recover_interrupted_publications(
         let cleanup_marker = has_publication_cleanup_marker(&backup_root)?;
         let committed = cleanup_marker || has_publication_committed_marker(&backup_root)?;
         if committed {
+            recover_committed_obsolete_directories(destination_root, &backup_root)?;
             cleanup_committed_publication(destination_root, &stage_root, &backup_root)?;
             report.committed += 1;
             continue;
@@ -1377,6 +1465,7 @@ fn recover_interrupted_publications(
                 PublicationJournalEntry::CreatedDirectory(relative) => {
                     created_directories.push(relative.clone());
                 }
+                PublicationJournalEntry::ObsoleteDirectory(_) => {}
                 PublicationJournalEntry::Leaf {
                     relative,
                     backup_id,
@@ -1389,7 +1478,8 @@ fn recover_interrupted_publications(
                     let had_original = match entry {
                         PublicationJournalEntry::Leaf { had_original, .. } => *had_original,
                         PublicationJournalEntry::Obsolete { .. } => true,
-                        PublicationJournalEntry::CreatedDirectory(_) => unreachable!(),
+                        PublicationJournalEntry::CreatedDirectory(_)
+                        | PublicationJournalEntry::ObsoleteDirectory(_) => unreachable!(),
                     };
                     let destination = destination_root.join(relative);
                     let backup = backup_path(&backup_root, *backup_id);
@@ -2038,13 +2128,12 @@ impl EnvironmentPublication {
         let journal_entries = candidates
             .iter()
             .rev()
-            .filter_map(|candidate| {
-                candidate
-                    .backup_id
-                    .map(|backup_id| PublicationJournalEntry::Obsolete {
-                        relative: candidate.relative.clone(),
-                        backup_id,
-                    })
+            .map(|candidate| match candidate.backup_id {
+                Some(backup_id) => PublicationJournalEntry::Obsolete {
+                    relative: candidate.relative.clone(),
+                    backup_id,
+                },
+                None => PublicationJournalEntry::ObsoleteDirectory(candidate.relative.clone()),
             })
             .collect::<Vec<_>>();
         publication.record_journal_entries(&self.root, &journal_entries)?;
@@ -3454,6 +3543,92 @@ mod tests {
             b"published-value"
         );
         assert!(!backup.exists());
+    }
+
+    fn interrupt_obsolete_directory_publication(home: &Path, source: &Path, committed: bool) {
+        fs::create_dir_all(source).unwrap();
+        fs::write(source.join("new"), b"new-value").unwrap();
+        fs::create_dir_all(home.join("stale/empty")).unwrap();
+        fs::create_dir_all(home.join("unrelated")).unwrap();
+        fs::write(home.join("unrelated/sentinel"), b"keep-value").unwrap();
+
+        let mut publication = stage_environment(
+            &[selection(&source.join("new"), "selected/new")],
+            home,
+            &[],
+            Default::default(),
+        )
+        .unwrap();
+        publication
+            .remove_obsolete_batch(&["stale".into(), "stale/empty".into()])
+            .unwrap();
+        if committed {
+            let root = publication.root.clone();
+            let rollback = publication.rollback.as_mut().unwrap();
+            rollback.write_committed_marker(&root).unwrap();
+            rollback.committed = true;
+        }
+        // Model a process stop after the durable publication state is on disk,
+        // without running either in-process Drop cleanup path.
+        std::mem::forget(publication);
+    }
+
+    #[test]
+    fn committed_recovery_removes_empty_obsolete_directories_after_interruption() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let source = root.path().join("source");
+        fs::create_dir(&home).unwrap();
+        interrupt_obsolete_directory_publication(&home, &source, true);
+
+        recover_environment(&home).unwrap();
+
+        assert!(!home.join("stale").exists());
+        assert_eq!(fs::read(home.join("selected/new")).unwrap(), b"new-value");
+        assert_eq!(
+            fs::read(home.join("unrelated/sentinel")).unwrap(),
+            b"keep-value"
+        );
+        assert!(!fs::read_dir(&home).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(BACKUP_PREFIX)));
+    }
+
+    #[test]
+    fn rollback_recovery_preserves_empty_obsolete_directories_after_interruption() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let source = root.path().join("source");
+        fs::create_dir(&home).unwrap();
+        interrupt_obsolete_directory_publication(&home, &source, false);
+
+        recover_environment(&home).unwrap();
+
+        assert!(home.join("stale/empty").is_dir());
+        assert!(!home.join("selected").exists());
+        assert_eq!(
+            fs::read(home.join("unrelated/sentinel")).unwrap(),
+            b"keep-value"
+        );
+    }
+
+    #[test]
+    fn committed_recovery_preserves_repopulated_obsolete_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let source = root.path().join("source");
+        fs::create_dir(&home).unwrap();
+        interrupt_obsolete_directory_publication(&home, &source, true);
+        fs::write(home.join("stale/empty/new-user-file"), b"keep-value").unwrap();
+
+        recover_environment(&home).unwrap();
+
+        assert_eq!(
+            fs::read(home.join("stale/empty/new-user-file")).unwrap(),
+            b"keep-value"
+        );
     }
 
     #[test]
