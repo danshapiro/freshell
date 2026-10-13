@@ -106,9 +106,12 @@ and server. Two sequences:
   the short skew window.
 - Strict (changes that must never skew): `systemctl --user stop
   freshell-supervisor.service` (the server stops with it via the `Requires=`
-  coupling), build, then `systemctl --user start
-  freshell-supervisor.service` — no soul can be created during the build.
-  This is a full outage for the duration of the build.
+  coupling), build, then `systemctl --user start freshell-supervisor.service
+  freshell-rust.service` — start BOTH units: `Requires=` pulls the
+  supervisor in when the server starts, but starting the supervisor alone
+  does not start its dependent server, so starting only the supervisor
+  would leave the web server down. No soul can be created during the
+  build. This is a full outage for the duration of the build.
 
 - The server's soul controller is strictly opt-in (`default = []` in
   `crates/freshell-server/Cargo.toml`). Setting `FRESHELL_MANAGED_RUNTIME_V1=1`
@@ -134,11 +137,13 @@ and server. Two sequences:
   souls use the new image; running souls keep theirs until their next
   incarnation.
 - The WEB CLIENT is a fifth deploy surface: the server serves `dist/client`
-  from disk, and only a client that negotiates `managedRuntimeV1` can create
-  managed terminal panes — so an old client can make the new-soul probe
-  unachievable. When the client changed (or on a fresh checkout), run
-  `pnpm run build:client`; the running server picks it up on the next
-  browser hard refresh, with no restart.
+  from disk, and only a browser client that negotiates `managedRuntimeV1`
+  gets managed terminal panes for panes it creates — so a stale client
+  serves its users host-side panes. (The REST probe below is NOT affected:
+  `POST /api/tabs` picks managed routing from the server's controller, with
+  no WebSocket negotiation involved.) When the client changed (or on a
+  fresh checkout), run `pnpm run build:client`; the running server picks
+  it up on the next browser hard refresh, with no restart.
 
 **Units and restart coupling.** With the systemd topology
 (`installers/systemd/freshell-rust.service` + its `managed-runtime.conf`
@@ -259,10 +264,15 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")=="'$TID'"))' \
     freshly built artifact in this checkout. After an image redeploy: the
     new probe container's image (`docker inspect $CID --format
     '{{.Image}}'`) equals the `sha256:` ID recorded in
-    `~/.config/freshell/managed-runtime.env`. After a session-host
+    `~/.config/freshell/managed-runtime.env`.     After a session-host
     redeploy: the probe container's `/runtime/freshell-session-host`
     mount source (`docker inspect $CID --format '{{json .Mounts}}'`) is
-    this checkout's `target/release/freshell-session-host`. On a
+    this checkout's `target/release/freshell-session-host`, AND the
+    mounted bytes are the built candidate —
+    `docker exec $CID sha256sum /runtime/freshell-session-host` equals
+    `sha256sum $CHECKOUT/target/release/freshell-session-host` (the mount
+    is a bind of the build output, so a soul created after the build runs
+    the new bytes; a soul created before it keeps the old inode). On a
     server-only restart the supervisor's process legitimately still runs
     its earlier binary — only compare the units that were actually bounced.
  7. Probe cleanup: the probe soul is NOT auto-collected — the server's
