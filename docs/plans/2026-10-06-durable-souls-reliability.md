@@ -748,7 +748,7 @@ Expected: the coordinated full suite passes on the final committed candidate, ex
 | Fix configuration, blocked recovery, retry and interrupted Stop behavior | 2, 5, 6, 8 | Provider-identity config tests, retry tests, and the selected interrupted-Stop browser case; config/legacy transition browser cases are outside the accepted manual-porting scope |
 | Make normal use work across six selected modes | 9 | One completed ordinary response per selected terminal and fresh-agent mode; exact cleanup |
 | Skip Amplifier and Kilroy live work | 9 | No Amplifier/Kilroy model, credential or qualification operation; existing code/tests preserved |
-| Allow manual session porting if transition changes a native session | Global 3, 9 | No automatic import or same-native-session-across-restart claim; limitation stated plainly |
+| Allow manual session porting if transition changes a native session | Global 3, 9 | No automatic startup or transition import; selected OpenCode resume remains available on demand, with no same-native-session-across-restart claim |
 | Keep verification proportional to the threat model | all | Behavior tests, clear diagnostics, no certification campaign or audit subsystem |
 
 The user's current request appears once above. Tasks 1–7 and prior receipts describe completed history; current code and the latest scope control remaining work. The former six-mode crash/recall campaign and deployment/backup preparation are removed from the remaining gates, not reported as completed. Full-suite and independent delta review remain required by the-usual workflow.

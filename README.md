@@ -234,7 +234,7 @@ Freshell indexes local session history and can launch terminals for these coding
 | **Amplifier** | Yes | Yes | `~/.amplifier` |
 
 Enable/disable providers and set defaults in the Settings UI or via `~/.freshell/config.json`.
-OpenCode sessions are discovered directly from OpenCode's local session database, so existing OpenCode work can be resumed from freshell without importing anything manually.
+OpenCode sessions are discovered directly from OpenCode's local session database, so you can resume a selected session from freshell on demand. Freshell does not import existing sessions automatically at startup or during runtime transitions.
 
 OpenCode permissions are controlled by the OpenCode configuration for the OS user running freshell. Freshell does not set `OPENCODE_PERMISSION` or pass `--dangerously-skip-permissions` for OpenCode sessions; OS filesystem permissions remain the hard boundary.
 
