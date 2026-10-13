@@ -111,7 +111,9 @@ RUN=$(mktemp -d)   # private per-run dir for the survival snapshots
 # Pin the Docker CLI to the SAME daemon socket the supervisor uses (its
 # unit passes --docker-socket %t/docker.sock, the user runtime dir). A
 # machine with a second Docker daemon would otherwise capture against
-# the wrong one and the survival check would pass vacuously:
+# the wrong one and the survival check would pass vacuously. DOCKER_CONTEXT
+# must go too — it takes precedence over DOCKER_HOST:
+unset DOCKER_CONTEXT || true
 export DOCKER_HOST="unix://${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
 # Scope the capture to THIS installation: the daemon may host containers
 # from other Freshell installations with the same name shape, and the
@@ -411,48 +413,45 @@ drop-in, plus `freshell-supervisor.service`):
     sees):
 
     ```bash
-    # If the preliminary capture fell back to an empty list (featureless
-    # or stopped server), refresh it NOW from the freshly deployed API —
-    # an empty sweep would otherwise pass vacuously. The server is alive
-    # at this point, so if the deferred-token path left no $RUN/hdr,
-    # re-acquire the token here exactly as the preliminary step does:
-    if [ ! -f "$RUN/hdr" ]; then
-      SPID=$(systemctl --user show freshell-rust.service -p MainPID --value)
-      TOK=""
-      if [ "${SPID:-0}" -gt 0 ] 2>/dev/null; then
-        TOK=$(tr '\0' '\n' < "/proc/$SPID/environ" | sed -n 's/^AUTH_TOKEN=//p' || true)
-      fi
-      test -n "$TOK" \
-        || { echo "AUTH_TOKEN unresolvable even with the server running — extract it manually"; exit 1; }
-      umask 077; printf 'x-auth-token: %s\n' "$TOK" > "$RUN/hdr"
+    # The server is ALIVE now, so its environment is the authoritative
+    # token source — always re-acquire and REWRITE the header (a header
+    # minted while the server was down may carry a stale .env value that
+    # the unit's EnvironmentFile actually overrides):
+    SPID=$(systemctl --user show freshell-rust.service -p MainPID --value)
+    TOK=""
+    if [ "${SPID:-0}" -gt 0 ] 2>/dev/null; then
+      TOK=$(tr '\0' '\n' < "/proc/$SPID/environ" | sed -n 's/^AUTH_TOKEN=//p' || true)
     fi
-    if [ ! -s "$RUN/desired-running.txt" ]; then
-      curl -s -H @"$RUN/hdr" http://127.0.0.1:3001/api/runtime/souls \
-        | python3 -c 'import json,sys
+    test -n "$TOK" \
+      || { echo "AUTH_TOKEN unresolvable even with the server running — extract it manually"; exit 1; }
+    umask 077; printf 'x-auth-token: %s\n' "$TOK" > "$RUN/hdr"
+    # Always re-fetch the DEPLOYED registry's soul list (this also fills
+    # the API-less fallback's empty desired-running baseline — an empty
+    # sweep would otherwise pass vacuously):
+    curl -s -H @"$RUN/hdr" http://127.0.0.1:3001/api/runtime/souls \
+      | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
 for s in souls:
-    print(s["soulId"], s.get("containerId") or "")' > "$RUN/souls-all.txt"
-      curl -s -H @"$RUN/hdr" http://127.0.0.1:3001/api/runtime/souls \
-        | python3 -c 'import json,sys
+    print(s["soulId"], s.get("containerId") or "-", s.get("launchState") or "-")' > "$RUN/souls-all.txt"
+    curl -s -H @"$RUN/hdr" http://127.0.0.1:3001/api/runtime/souls \
+      | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
 for s in souls:
     if s.get("desiredState")=="running":
         print(s["soulId"])' > "$RUN/desired-running.txt"
-      # POSITIVE orphan check for the API-less fallback: every baseline
-      # container's soul must exist in the DEPLOYED registry — a registry
-      # swap leaves the containers running but owned by nothing:
-      while read -r CIDLINE; do
-        CID=${CIDLINE%% *}
-        [ -n "$CID" ] || continue
-        SID=$(docker inspect "$CID" \
-          --format '{{index .Config.Labels "com.freshell.soul-id"}}') \
-          || { echo "docker inspect failed for baseline container $CID"; exit 1; }
-        # Ownership is per (soul, incarnation, container): match the
-        # PAIR against the deployed registry, not the soul id alone:
-        grep -q "^$SID $CID$" "$RUN/souls-all.txt" \
-          || { echo "ORPHANED container — ($SID, $CID) not owned by the deployed registry"; exit 1; }
-      done < "$RUN/souls-before.txt"
-    fi
+    # POSITIVE ownership check for EVERY baseline container: its
+    # (soul, container) pair must appear in the deployed registry with a
+    # RUNNING incarnation — a registry swap or restore leaves containers
+    # running but owned by nothing (or by a historical stopped row):
+    while read -r CIDLINE; do
+      CID=${CIDLINE%% *}
+      [ -n "$CID" ] || continue
+      SID=$(docker inspect "$CID" \
+        --format '{{index .Config.Labels "com.freshell.soul-id"}}') \
+        || { echo "docker inspect failed for baseline container $CID"; exit 1; }
+      grep -q "^$SID $CID running$" "$RUN/souls-all.txt" \
+        || { echo "ORPHANED container — ($SID, $CID) has no running row in the deployed registry"; exit 1; }
+    done < "$RUN/souls-before.txt"
     echo "sweeping $(wc -l < "$RUN/desired-running.txt") desired-running soul(s)"
     while read -r SID; do
       [ -n "$SID" ] || continue
@@ -468,15 +467,13 @@ print("ok:", sys.argv[1])' "$SID"
     A blocked or lost `recoveryState` can hide behind a `"running"`
     `launchState` — that is why both fields are asserted. Any failure here
     needs the supervisor journal and that soul's record investigated
-    before the deploy is called good. A zero-soul sweep after a
-    SUCCESSFUL refresh is a legitimate empty instance — but the printed
-    count makes that visible instead of vacuous. HONEST LIMITATION of the
-    API-less fallback: with no pre-restart API, no soul-ID baseline
-    exists — the post-restart list is compared against nothing, so this
-    sweep cannot detect a registry swap (old containers surviving while
-    the new registry reports zero souls). The container-level survival
-    check still applies; if a registry change is even plausible in your
-    deploy, re-capture and re-verify after the server is up.
+    before the deploy is called good. A zero-soul sweep is a legitimate
+    empty instance — but the printed count makes that visible instead of
+    vacuous. The earlier API-less-fallback limitation (no pre-restart
+    soul-ID baseline) is now covered positively: the ownership check
+    above proves every baseline container has a RUNNING row in the
+    DEPLOYED registry, which is what detects a registry swap even without
+    a pre-restart baseline.
 5. New-soul probe: create a terminal pane in a real workspace that is NOT
    the operator home itself (a subdirectory of it is fine) — when the
    workspace equals the operator home, the supervisor deliberately omits
@@ -630,10 +627,13 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
     chmod 0770 "$BWS"   # same in-soul-shell access requirement as $WS
     echo "BWS=$BWS" >> "$D/run.env"
     # Hard-refresh the web client, then in the UI: open the pane picker
-    # and choose a coding-CLI provider (or a fresh-agent type) — NOT a
-    # plain shell: shell panes skip the directory step and always take
-    # the default workspace, which would fail this check for the wrong
-    # reason. The provider's directory step has a free-text PATH INPUT:
+    # and choose OPENCODE specifically — the only managed-enabled
+    # coding-CLI provider in the current release (Claude, Codex, and
+    # Amplifier are pending live qualification and the fresh-agent modes
+    # are release-disabled, so choosing those fails this check on a
+    # correctly deployed client). A plain shell pane will NOT do either:
+    # shell panes skip the directory step and always take the default
+    # workspace. OpenCode's directory step has a free-text PATH INPUT:
     # type the absolute $BWS path there and confirm. Then:
     curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
       | python3 -c 'import json,sys
@@ -773,9 +773,6 @@ print("stopped:", o["outcome"])'
     # Look it up by workspace in ANY launchState — a blocked or exited
     # probe soul still must not be orphaned against a deleted workspace:
     if [ -n "${BWS:-}" ]; then
-      # Select the NEWEST record for this workspace (the inventory lists
-      # incarnations oldest first, so after a recovery the newest entry is
-      # the live one; an older stopped incarnation may also match):
       BS=$(curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
         | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
@@ -787,12 +784,17 @@ sids={r["soulId"] for r in rows}
 assert len(sids)<=1, ("workspace ambiguous — do not stop anything; resolve manually", rows)
 if rows:
     s=rows[-1]
-    print(s["soulId"], s["intentRevision"], s["launchState"])
+    print(s["soulId"], s["intentRevision"], s["launchState"], s.get("containerId") or "-")
 else:
     print("")' "$BWS")
       if [ -n "$BS" ]; then
-        read -r BS_ID BS_REV BS_STATE <<< "$BS"
-        if [ "$BS_STATE" != "stopped" ]; then
+        read -r BS_ID BS_REV BS_STATE BS_CID <<< "$BS"
+        if [ "$BS_CID" = "-" ]; then
+          # A probe that failed before container creation owns no
+          # container — there is nothing to stop; the supervisor has
+          # no live handle for it:
+          echo "browser probe soul has no container — nothing to stop"
+        elif [ "$BS_STATE" != "stopped" ]; then
           curl -s -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
             -d "{\"requestId\":\"probe-cleanup\",\"expectedIntentRevision\":$BS_REV}" \
             http://127.0.0.1:3001/api/runtime/souls/$BS_ID/stop \
