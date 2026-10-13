@@ -136,6 +136,9 @@ drop-in, plus `freshell-supervisor.service`):
   `PORT=3002`, while this host's installed unit serves `PORT=3001`. The
   commands below use 3001 — substitute the port the deployed unit actually
   sets.
+- Before restarting, capture the soul inventory so the post-deploy checks
+  can prove nothing was replaced:
+  `docker ps --filter name=incarnation --format '{{.Names}}\t{{.Status}}' | tee /tmp/souls-before.txt`.
 
 **What a restart does:**
 
@@ -167,10 +170,11 @@ drop-in, plus `freshell-supervisor.service`):
 3. Units: `systemctl --user is-active freshell-rust.service
    freshell-supervisor.service` → both `active`.
 4. Existing souls: `docker ps --filter name=incarnation` shows the same
-   containers with unchanged uptimes. A NEW container may appear within
-   seconds of the restart — that is a client reconnecting and a durable
-   terminal pane reattaching, not an old soul being replaced; the
-   pre-restart containers must keep their uptimes.
+   containers as the pre-restart capture (step above) with unchanged
+   uptimes — a container missing from the capture was lost, and a NEW
+   container may appear within seconds of the restart: that is a client
+   reconnecting and a durable terminal pane reattaching, not an old soul
+   being replaced; the pre-restart containers must keep their uptimes.
 5. New-soul probe: create a terminal pane in a real workspace that is NOT
    the operator home itself (a subdirectory of it is fine) — when the
    workspace equals the operator home, the supervisor deliberately omits
@@ -194,14 +198,28 @@ drop-in, plus `freshell-supervisor.service`):
    idle reaper explicitly skips managed terminals (their lifetime is
    supervisor-owned) and the supervisor has no idle reaper, so the
    container persists as a durable background session. To remove it
-   immediately, stop the soul through the fenced runtime API:
-   `POST /api/runtime/souls/<soul_id>/stop` (find the soul ID with
-   `GET /api/runtime/souls`, or read the container's `com.freshell.soul-id`
-   docker label). Do NOT `docker stop` the container directly — the
-   supervisor treats an externally stopped container as an unexpected exit
-   and runs its automatic recovery path, which may recreate the soul or
-   mark a session without a durable resume path as lost. Leaving the probe
-   soul running is also fine; it is inert.
+   immediately, stop the soul through the fenced runtime API (find the
+   soul ID with `GET /api/runtime/souls`, or read the container's
+   `com.freshell.soul-id` docker label), then send the intent-revision-
+   guarded stop with the auth token:
+
+   ```bash
+   SOUL_ID=$(docker inspect <container> \
+     --format '{{index .Config.Labels "com.freshell.soul-id"}}')
+   REV=$(curl -s -H "x-auth-token: $TOK" \
+     http://127.0.0.1:3001/api/runtime/souls/$SOUL_ID \
+     | python3 -c 'import json,sys;print(json.load(sys.stdin)["soul"]["intentRevision"])')
+   curl -s -X POST -H "x-auth-token: $TOK" \
+     -H "Content-Type: application/json" \
+     -d "{\"requestId\":\"probe-cleanup\",\"expectedIntentRevision\":$REV}" \
+     http://127.0.0.1:3001/api/runtime/souls/$SOUL_ID/stop
+   ```
+
+   Do NOT `docker stop` the container directly — the supervisor treats an
+   externally stopped container as an unexpected exit and runs its
+   automatic recovery path, which may recreate the soul or mark a session
+   without a durable resume path as lost. Leaving the probe soul running
+   is also fine; it is inert.
 
 ## Launch the native Windows client
 
