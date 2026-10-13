@@ -244,7 +244,10 @@ fn nested_fields(raw: &str, tui: bool) -> Result<Vec<(&'static str, String)>, &'
                     for (index, argument) in command.iter().enumerate() {
                         let script_file = if script_runtime {
                             script_index.is_some_and(|script| {
-                                index > 0 && index <= script && is_script_path(argument)
+                                index > 0
+                                    && index <= script
+                                    && is_script_path(argument)
+                                    && !is_bun_package_script_operand(&command, index)
                             })
                         } else {
                             is_script_path(argument)
@@ -255,7 +258,9 @@ fn nested_fields(raw: &str, tui: bool) -> Result<Vec<(&'static str, String)>, &'
                     }
                     if let Some(script_index) = script_index {
                         let script = &command[script_index];
-                        if !is_script_path(script) {
+                        if !is_script_path(script)
+                            && !is_bun_package_script_operand(&command, script_index)
+                        {
                             result.push(("OpenCode mcp.command", script.clone()));
                         }
                     }
@@ -314,6 +319,27 @@ fn is_script_path(argument: &str) -> bool {
             "js" | "mjs" | "cjs" | "ts" | "mts" | "cts" | "py" | "sh" | "rb"
         )
     })
+}
+
+fn is_bun_package_script_operand(command: &[String], index: usize) -> bool {
+    let Some(executable) = command
+        .first()
+        .and_then(|executable| Path::new(executable).file_name())
+    else {
+        return false;
+    };
+    let executable = executable.to_string_lossy().to_ascii_lowercase();
+    let executable = executable.strip_suffix(".exe").unwrap_or(&executable);
+    let Some(argument) = command.get(index) else {
+        return false;
+    };
+    executable == "bun"
+        && command.get(1).is_some_and(|argument| argument == "run")
+        && !argument.starts_with('-')
+        && !argument.starts_with('.')
+        && !Path::new(argument).is_absolute()
+        && !argument.contains(['/', '\\'])
+        && !is_script_path(argument)
 }
 
 fn command_uses_script_runtime(executable: Option<&str>) -> bool {

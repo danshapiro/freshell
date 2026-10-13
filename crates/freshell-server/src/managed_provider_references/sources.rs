@@ -1266,6 +1266,58 @@ mod tests {
     }
 
     #[test]
+    fn review_r7_bun_package_script_is_not_mistaken_for_a_file_path() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let package = owned.path().join("outside-mcp-package");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"scripts":{"mcp":"node ./server.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(package.join("server.js"), "process.exit(0)\n").unwrap();
+
+        let config = workspace.join("opencode.json");
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "mcp": {
+                    "package-script": {
+                        "type": "local",
+                        "cwd": package,
+                        "command": ["bun", "run", "mcp"],
+                    },
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config,
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Workspace,
+            }],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .expect("bun run <package-script> is a command, not a path to copy");
+
+        let selected = &plan[0].configured_resources;
+        assert!(selected.contains(&package.canonicalize().unwrap()));
+        assert!(package.join("package.json").is_file());
+        assert!(package.join("server.js").is_file());
+        assert!(!selected.contains(&workspace.join("mcp")));
+    }
+
+    #[test]
     fn freshell_image_mcp_command_is_not_selected_as_a_host_resource() {
         let owned = tempfile::tempdir().unwrap();
         let home = owned.path().join("home");
