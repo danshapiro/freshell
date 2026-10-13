@@ -3021,6 +3021,26 @@ pub(crate) fn account_home_checkpoint_path_with_lookup(
 pub(crate) type AccountHomeForDirectory =
     dyn Fn(&Path) -> Result<Option<PathBuf>, String> + Send + Sync;
 
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy)]
+enum WindowsAccountOwnerKind {
+    User,
+    KnownNonUser,
+}
+
+#[cfg(any(windows, test))]
+fn windows_account_home_for_owner_kind(
+    owner_kind: WindowsAccountOwnerKind,
+    profile: Option<PathBuf>,
+) -> Result<Option<PathBuf>, String> {
+    match owner_kind {
+        WindowsAccountOwnerKind::User => profile
+            .map(Some)
+            .ok_or_else(|| "workspace owner SID has no readable Windows profile record".into()),
+        WindowsAccountOwnerKind::KnownNonUser => Ok(profile),
+    }
+}
+
 fn is_recognized_account_home(path: &Path, homes: &[PathBuf]) -> bool {
     homes.iter().any(|home| home == path)
 }
@@ -3091,7 +3111,9 @@ pub(crate) fn account_home_for_directory(path: &Path) -> Result<Option<PathBuf>,
 #[cfg(windows)]
 pub(crate) fn account_home_for_directory(path: &Path) -> Result<Option<PathBuf>, String> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{GetLastError, LocalFree, ERROR_SUCCESS, HLOCAL};
+    use windows_sys::Win32::Foundation::{
+        GetLastError, LocalFree, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, HLOCAL,
+    };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
     };
@@ -3167,11 +3189,10 @@ pub(crate) fn account_home_for_directory(path: &Path) -> Result<Option<PathBuf>,
     }
     let _descriptor = LocalAllocation(descriptor.cast());
 
-    // A directory may be owned by a Windows group (for example, the local
-    // Administrators group). Groups do not have user profiles, so a missing
-    // ProfileList entry for those SIDs means "not a home", not an unresolved
-    // home. Keep lookup failures and unsupported SID kinds distinct so user
-    // profile paths still fail closed when they cannot be verified.
+    // A directory may be owned by a Windows group, which normally has no
+    // profile. Some well-known group SIDs (notably SYSTEM) do have registered
+    // profiles, so inspect ProfileList for every recognized SID type before
+    // deciding that a known non-user owner has no profile.
     let mut owner_name = vec![0u16; 1024];
     let mut owner_name_length = owner_name.len() as u32;
     let mut domain_name = vec![0u16; 1024];
@@ -3194,20 +3215,20 @@ pub(crate) fn account_home_for_directory(path: &Path) -> Result<Option<PathBuf>,
             "workspace owner account type cannot be resolved (Windows error {error})"
         ));
     }
-    if sid_type != SidTypeUser {
-        if sid_type == SidTypeAlias
-            || sid_type == SidTypeComputer
-            || sid_type == SidTypeDomain
-            || sid_type == SidTypeGroup
-            || sid_type == SidTypeWellKnownGroup
-        {
-            return Ok(None);
-        }
+    let owner_kind = if sid_type == SidTypeUser {
+        WindowsAccountOwnerKind::User
+    } else if sid_type == SidTypeAlias
+        || sid_type == SidTypeComputer
+        || sid_type == SidTypeDomain
+        || sid_type == SidTypeGroup
+        || sid_type == SidTypeWellKnownGroup
+    {
+        WindowsAccountOwnerKind::KnownNonUser
+    } else {
         return Err(format!(
             "workspace owner SID has an unsupported account type ({sid_type})"
         ));
-    }
-
+    };
     let mut sid_string = std::ptr::null_mut();
     if unsafe { ConvertSidToStringSidW(owner_sid, &mut sid_string) } == 0 {
         return Err("workspace owner SID cannot be formatted".into());
@@ -3231,6 +3252,11 @@ pub(crate) fn account_home_for_directory(path: &Path) -> Result<Option<PathBuf>,
         )
     };
     if status != ERROR_SUCCESS {
+        if matches!(owner_kind, WindowsAccountOwnerKind::KnownNonUser)
+            && (status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND)
+        {
+            return windows_account_home_for_owner_kind(owner_kind, None);
+        }
         return Err(format!(
             "workspace owner SID has no readable Windows profile record (error {status})"
         ));
@@ -3306,9 +3332,9 @@ pub(crate) fn account_home_for_directory(path: &Path) -> Result<Option<PathBuf>,
     } else {
         profile
     };
-    std::fs::canonicalize(PathBuf::from(profile))
-        .map(Some)
-        .map_err(|error| format!("workspace owner Windows profile cannot be resolved: {error}"))
+    let profile = std::fs::canonicalize(PathBuf::from(profile))
+        .map_err(|error| format!("workspace owner Windows profile cannot be resolved: {error}"))?;
+    windows_account_home_for_owner_kind(owner_kind, Some(profile))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -7165,6 +7191,43 @@ mod tests {
             PathBuf::from(intent["path"].as_str().unwrap())
         );
         assert_eq!(resolved.provenance, "directory-picker");
+    }
+
+    #[test]
+    fn windows_well_known_group_with_a_profile_entry_is_still_an_account_home() {
+        let profile = tempfile::tempdir().unwrap();
+        let profile_path = profile.path().to_path_buf();
+
+        let resolved_home = windows_account_home_for_owner_kind(
+            WindowsAccountOwnerKind::KnownNonUser,
+            Some(profile_path.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved_home,
+            Some(profile_path.clone()),
+            "a well-known group SID such as SYSTEM can still have a registered profile"
+        );
+        let resolved_home = resolved_home.unwrap();
+        let lookup = move |_path: &Path| Ok(Some(resolved_home.clone()));
+        assert!(
+            account_home_checkpoint_path_with_lookup(profile.path(), &lookup).unwrap(),
+            "a selected path matching that registered profile must remain ineligible"
+        );
+    }
+
+    #[test]
+    fn windows_known_non_user_without_a_profile_remains_a_valid_workspace_owner() {
+        assert_eq!(
+            windows_account_home_for_owner_kind(WindowsAccountOwnerKind::KnownNonUser, None)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn windows_user_without_a_profile_fails_closed() {
+        assert!(windows_account_home_for_owner_kind(WindowsAccountOwnerKind::User, None).is_err());
     }
 
     #[tokio::test]
