@@ -464,6 +464,30 @@ describe('launch-time INVALID_TERMINAL_ID bounded retry', () => {
     expect(screen.queryByTestId('terminal-launch-failure-card')).not.toBeInTheDocument()
   })
 
+  it('clears a stale launch-failure card when the current terminal reports running', async () => {
+    const failure = { code: 'LAUNCH_FAILED' as const, message: 'Previous create attempt failed', retryable: true }
+    const { store, paneContent } = makeStore({
+      mode: 'opencode',
+      status: 'error',
+      terminalId: 'terminal-retried-live',
+      soulId: 'managed-soul-retried-live',
+      launchFailure: failure,
+    })
+    await renderPane(store, paneContent)
+    expect(screen.getByTestId('terminal-launch-failure-card')).toBeInTheDocument()
+
+    await act(async () => messageHandler!({
+      type: 'terminal.status',
+      terminalId: 'terminal-retried-live',
+      status: 'running',
+    }))
+
+    const content = (store.getState().panes.layouts[TAB] as { content: TerminalPaneContent }).content
+    expect(content.status).toBe('running')
+    expect(content.launchFailure).toBeUndefined()
+    expect(screen.queryByTestId('terminal-launch-failure-card')).not.toBeInTheDocument()
+  })
+
   it.each(['ordinary-mode', 'no-managed-capability', 'different-request'] as const)(
     'does not retain preparation metadata outside its active managed request: %s', async (control) => {
       wsMocks.getServerCapabilities.mockReturnValue({ managedRuntimeV1: control !== 'no-managed-capability' })

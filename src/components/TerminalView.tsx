@@ -667,6 +667,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     const content = root ? findPaneContent(root, paneId) : null
     return content?.kind === 'terminal' ? content.closeError : undefined
   })
+  const storedLaunchFailure = useAppSelector((s) => {
+    const root = s.panes.layouts[tabId]
+    const content = root ? findPaneContent(root, paneId) : null
+    return content?.kind === 'terminal' ? content.launchFailure : undefined
+  })
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const tabHasSinglePane = useAppSelector((s) => s.panes.layouts[tabId]?.type === 'leaf')
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
@@ -5968,7 +5973,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               const status = managedTerminalPaneStatus({
                 ...contentRef.current, runtimeStatus: msg.status, recoverySummary: msg.recoverySummary,
               }, msg.status === 'running' || msg.status === 'recovering' ? msg.status : 'exited')
-              updateContent({ status, runtimeStatus: msg.status, recoverySummary: msg.recoverySummary })
+              updateContent({
+                status,
+                runtimeStatus: msg.status,
+                recoverySummary: msg.recoverySummary,
+                ...(status === 'running' || status === 'recovering' ? { launchFailure: undefined } : {}),
+              })
               const statusTab = tabRef.current
               if (statusTab) dispatch(updateTab({ id: statusTab.id, updates: {
                 status,
@@ -5978,7 +5988,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             } else if (msg.status === 'running' || msg.status === 'recovering') {
               const terminal = contentRef.current
               const status = managedTerminalPaneStatus(terminal ?? {}, msg.status)
-              updateContent({ status })
+              updateContent({
+                status,
+                ...(status === 'running' || status === 'recovering' ? { launchFailure: undefined } : {}),
+              })
               const statusTab = tabRef.current
               if (statusTab) dispatch(updateTab({ id: statusTab.id, updates: {
                 status,
@@ -7372,7 +7385,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // Managed recovery and owner divergence own the current decision. An old
   // launch failure must not add a competing alert or obsolete retry action.
   const typedLaunchFailure = !managedRecoveryDecision && freshAgentOwnerDivergence === null
-    ? terminalContent.launchFailure
+    ? storedLaunchFailure
     : undefined
 
   const retryLaunch = () => {
@@ -7390,7 +7403,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
 
   const attachToNamedTerminal = () => {
     if (managedRecoveryDecision) return
-    const terminalId = terminalContent.launchFailure?.terminalId
+    const terminalId = storedLaunchFailure?.terminalId
     if (!terminalId) return
     dispatch(applyReattachToLiveTerminal({ tabId, paneId, terminalId }))
   }

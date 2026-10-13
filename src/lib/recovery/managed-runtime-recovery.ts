@@ -179,6 +179,12 @@ function updateExistingContent(
     return {
       ...existing,
       ...definedOnly(managedContent),
+      // An authoritative live/recovering supervisor projection proves a
+      // prior launch refusal was superseded by a successful retry. Clear its
+      // volatile card payload so it cannot render over the current terminal.
+      ...(managedContent.status === 'running' || managedContent.status === 'recovering'
+        ? { launchFailure: undefined }
+        : {}),
       ...(preserveLiveStreamId ? { streamId: existing.streamId } : {}),
       // Preserve a user pane's stable create key when the supervisor record
       // predates that field. Otherwise use the authoritative managed key.

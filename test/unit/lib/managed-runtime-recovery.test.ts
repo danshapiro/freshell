@@ -245,6 +245,37 @@ describe('managed runtime recovery merge', () => {
     expect(content.initialCwd).toBe('/workspace/real')
   })
 
+  it('clears a stale typed launch failure when the supervisor reports the managed terminal live', () => {
+    const state = baseState()
+    state.panes.layouts['user-tab'].content = {
+      kind: 'terminal',
+      createRequestId: 'create-one',
+      terminalId: 'terminal-one',
+      streamId: 'stream-one',
+      status: 'error',
+      mode: 'opencode',
+      shell: 'system',
+      soulId: 'soul-one',
+      launchFailure: { code: 'LAUNCH_FAILED', message: 'Previous create attempt failed', retryable: true },
+    }
+    const store = storeWithState(state)
+    const liveSnapshot = snapshot([soul({ launchState: 'running', recoveryState: 'live' })])
+    const plan = buildManagedRuntimeMergePlan(liveSnapshot, store.getState() as any)
+
+    expect(plan.updates).toHaveLength(1)
+    expect(plan.updates[0].content).toMatchObject({
+      status: 'running',
+      runtimeStatus: 'running',
+      recoverySummary: { recoveryState: 'live' },
+    })
+    expect((plan.updates[0].content as any).launchFailure).toBeUndefined()
+
+    applyManagedRuntimeMergePlan(store as any, plan)
+    const content = (store.getState().panes.layouts['user-tab'] as any).content
+    expect(content.status).toBe('running')
+    expect(content.launchFailure).toBeUndefined()
+  })
+
   it('preserves the live host stream epoch when a same-terminal inventory refresh arrives', () => {
     const state = baseState()
     state.panes.layouts['user-tab'].content = {
