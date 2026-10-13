@@ -38,6 +38,33 @@ describe('FreshAgent ordinary-turn smoke evidence', () => {
     ])).toBe('completed')
   })
 
+  it('rejects an outcome-less Codex completion because that edge also signals failed turns', () => {
+    expect(freshAgentTurnCompletionStatus([
+      {
+        type: 'freshAgent.event',
+        provider: 'codex',
+        event: { type: 'freshAgent.turn.complete' },
+      },
+    ])).toBe('failed')
+  })
+
+  it('accepts Codex only when its provider outcome explicitly succeeded', () => {
+    expect(freshAgentTurnCompletionStatus([
+      {
+        type: 'freshAgent.event',
+        provider: 'codex',
+        event: { type: 'freshAgent.turn.complete', outcome: 'completed' },
+      },
+    ])).toBe('completed')
+    expect(freshAgentTurnCompletionStatus([
+      {
+        type: 'freshAgent.event',
+        provider: 'codex',
+        event: { type: 'freshAgent.turn.complete', outcome: 'failed' },
+      },
+    ])).toBe('failed')
+  })
+
   it.each(['provider_error', 'idle_timeout', 'sidecar_lost', 'request_failed', 'unknown']) (
     'rejects a completion with outcome %s', (outcome) => {
       expect(freshAgentTurnCompletionStatus([

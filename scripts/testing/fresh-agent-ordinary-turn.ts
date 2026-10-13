@@ -1,5 +1,6 @@
 export type FreshAgentOrdinaryTurnFrame = {
   type?: unknown
+  provider?: unknown
   event?: Record<string, unknown>
 }
 
@@ -17,14 +18,18 @@ export function freshAgentAssistantResponseFacts(root: ParentNode): { rows: numb
   }
 }
 
-/** Older providers omit outcome; when present it must explicitly say completed. */
+/** Codex completion is an attention edge for every ended turn, so require its outcome. */
 export function freshAgentTurnCompletionStatus(
   frames: readonly FreshAgentOrdinaryTurnFrame[],
 ): FreshAgentTurnCompletionStatus {
   const completions = frames.filter((frame) => frame?.type === 'freshAgent.event'
     && frame.event?.type === 'freshAgent.turn.complete')
   if (completions.length === 0) return 'absent'
-  if (completions.some(({ event }) => event && Object.prototype.hasOwnProperty.call(event, 'outcome')
-    && event.outcome !== 'completed')) return 'failed'
+  if (completions.some(({ event, provider }) => {
+    if (event && Object.prototype.hasOwnProperty.call(event, 'outcome')) {
+      return event.outcome !== 'completed'
+    }
+    return provider === 'codex'
+  })) return 'failed'
   return 'completed'
 }

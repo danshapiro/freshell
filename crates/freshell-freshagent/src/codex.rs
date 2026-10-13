@@ -10960,10 +10960,15 @@ fn adapter_event_to_frame(event: &CodexAdapterEvent, thread_id: &str) -> Option<
             }
             Value::Object(map)
         }
-        CodexAdapterEvent::TurnComplete { session_id, at } => json!({
+        CodexAdapterEvent::TurnComplete {
+            session_id,
+            at,
+            outcome,
+        } => json!({
             "type": "freshAgent.turn.complete",
             "sessionId": session_id,
             "at": at,
+            "outcome": outcome.as_str(),
         }),
         CodexAdapterEvent::Status { session_id, status } => json!({
             "type": "freshAgent.status",
@@ -11008,6 +11013,7 @@ fn mint_synthesized_attention_edge(
     let event = CodexAdapterEvent::TurnComplete {
         session_id: thread_id.to_string(),
         at,
+        outcome: freshell_codex::CodexTurnOutcome::Unknown,
     };
     if let Some(frame) = adapter_event_to_frame(&event, thread_id) {
         let _ = broadcast_tx.send(frame);
@@ -11745,6 +11751,7 @@ pub(crate) mod tests {
             &CodexAdapterEvent::TurnComplete {
                 session_id: "t-1".into(),
                 at: 42,
+                outcome: freshell_codex::CodexTurnOutcome::Completed,
             },
             "t-1",
         )
@@ -11756,6 +11763,22 @@ pub(crate) mod tests {
         assert_eq!(wire["sessionId"], "t-1");
         assert_eq!(wire["event"]["type"], "freshAgent.turn.complete");
         assert_eq!(wire["event"]["at"], 42);
+        assert_eq!(wire["event"]["outcome"], "completed");
+    }
+
+    #[test]
+    fn failed_turn_complete_frames_keep_the_unsuccessful_outcome() {
+        let frame = adapter_event_to_frame(
+            &CodexAdapterEvent::TurnComplete {
+                session_id: "t-1".into(),
+                at: 43,
+                outcome: freshell_codex::CodexTurnOutcome::Failed,
+            },
+            "t-1",
+        )
+        .unwrap();
+        let wire: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(wire["event"]["outcome"], "failed");
     }
 
     #[test]
