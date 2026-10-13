@@ -174,8 +174,15 @@ for s in souls:
     if s.get("desiredState")=="running":
         print(s["soulId"])' > "$RUN/desired-running.txt"
 else
-  echo "runtime API unavailable (featureless or stopped server) — container count only" >&2
-  : > "$RUN/desired-running.txt"
+  # API unavailable (featureless or stopped server) — but the supervisor's
+  # REGISTRY is readable directly, and it is the authority on desired
+  # state. Read the baseline from sqlite so a desired-running soul with
+  # no running container is not invisible to every later check:
+  sqlite3 "$HOME/.freshell/managed-runtime/registry/runtime.sqlite3" \
+    "select soul_id from souls where desired_state='running'" \
+    > "$RUN/desired-running.txt" 2>/dev/null \
+    || { echo "cannot read the registry sqlite — locate desired-running souls manually"; exit 1; }
+  echo "runtime API unavailable — desired-running baseline read from the registry sqlite ($(wc -l < "$RUN/desired-running.txt") souls)" >&2
 fi
 ```
 
@@ -664,10 +671,11 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
       | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
 rows=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
-# The registry stores one row per incarnation, but the API collapses to
-# the LATEST row per soul — so normally one row per soul. The grouping
-# below stays robust either way: exactly one SOUL must match the probe
-# workspace; refuse on ambiguity and act on the last matching row:
+# The registry stores one row per incarnation (the API collapses to the
+# latest row per soul in the current server). The grouping below is
+# deliberately robust under EITHER shape: exactly one SOUL must match
+# the probe workspace; refuse on ambiguity and act on the last matching
+# row:
 sids={r["soulId"] for r in rows}
 assert len(sids)==1, ("workspace ambiguous (mint a fresh BWS and retry)", rows)
 cur=rows[-1]
@@ -766,9 +774,9 @@ PY
         | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
 rows=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
-# The API collapses per-incarnation rows to the latest per soul; the
-# grouping stays robust either way — exactly one SOUL per probe
-# workspace, refuse on ambiguity, act on the last matching row:
+# The grouping is deliberately robust whether the API returns collapsed
+# (latest-per-soul) rows or full per-incarnation rows: exactly one SOUL
+# per probe workspace, refuse on ambiguity, act on the last matching row:
 sids={r["soulId"] for r in rows}
 assert len(sids)==1, ("workspace ambiguous — do not stop anything; resolve manually", rows)
 s=rows[-1]
@@ -802,9 +810,9 @@ print("stopped:", o["outcome"])'
         | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
 rows=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
-# The API collapses per-incarnation rows to the latest per soul; the
-# grouping stays robust either way — exactly one SOUL per probe
-# workspace, act on the last matching row:
+# The grouping is deliberately robust whether the API returns collapsed
+# (latest-per-soul) rows or full per-incarnation rows: exactly one SOUL
+# per probe workspace, act on the last matching row:
 sids={r["soulId"] for r in rows}
 assert len(sids)<=1, ("workspace ambiguous — do not stop anything; resolve manually", rows)
 if rows:
@@ -812,14 +820,18 @@ if rows:
     print(s["soulId"], s["intentRevision"], s["launchState"], s.get("containerId") or "-")
 else:
     print("")' "$BWS")
-      if [ -n "$BS" ]; then
-        read -r BS_ID BS_REV BS_STATE BS_CID <<< "$BS"
-        if [ "$BS_CID" = "-" ]; then
-          # A probe that failed before container creation owns no
-          # container — there is nothing to stop; the supervisor has
-          # no live handle for it:
-          echo "browser probe soul has no container — nothing to stop"
-        elif [ "$BS_STATE" != "stopped" ]; then
+      if [ -z "$BS" ]; then
+        # Step 7 VERIFIED a running soul in this workspace; a row that
+        # vanished since is an anomaly, not success — do not delete the
+        # workspace while the soul's intent is unresolved:
+        { echo "browser-check soul disappeared from the registry before cleanup — investigate before deleting $BWS"; exit 1; }
+      fi
+      read -r BS_ID BS_REV BS_STATE BS_CID <<< "$BS"
+      if [ "$BS_CID" = "-" ]; then
+        # No container handle (e.g. a prepared replacement incarnation):
+        # unresolved intent — refuse rather than report success:
+        { echo "browser-check soul has no container but state=$BS_STATE — resolve manually before deleting $BWS"; exit 1; }
+      elif [ "$BS_STATE" != "stopped" ]; then
           curl -s -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
             -d "{\"requestId\":\"probe-cleanup\",\"expectedIntentRevision\":$BS_REV}" \
             http://127.0.0.1:3001/api/runtime/souls/$BS_ID/stop \
