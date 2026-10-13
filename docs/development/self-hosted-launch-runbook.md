@@ -253,7 +253,15 @@ the procedure mid-way and leave the service down. Two sequences:
     V=$(sed -n 's/^FRESHELL_RUNTIME_STARTUP_CONCURRENCY=//p' "$EF" 2>/dev/null | tail -1)
     if [ -n "$V" ]; then C="$V"; fi
   done
+  # Systemd EnvironmentFile values may be QUOTED ("1"), and bash
+  # arithmetic treats leading zeroes as OCTAL (08 is an error) — strip
+  # quotes, validate digits, then force base 10:
+  case "$C" in
+    \"*\") C=${C#\"}; C=${C%\"} ;;
+    \'*\') C=${C#\'}; C=${C%\'} ;;
+  esac
   case "$C" in ''|*[!0-9]*) C=4;; esac   # absent/garbage -> supervisor default
+  C=$((10#$C))                            # defeat octal interpretation
   [ "$C" -ge 1 ] 2>/dev/null || C=1      # supervisor clamps to 1..16 — mirror it
   [ "$C" -le 16 ] 2>/dev/null || C=16
   # Count UNIQUE soul IDs: the inventory stores per-incarnation rows, so
@@ -1012,12 +1020,13 @@ print("" if cur is None else cur)')
         if [ "$CUR" = "$BWS" ]; then break; fi
         sleep 2
       done
-      if [ "$CUR" != "$BWS" ]; then
-        # The save state is unknown — a still-in-flight picker save could
-        # re-point the default AFTER our restore, into a deleted dir. Do
-        # not proceed; wait for the save to settle and re-run cleanup:
-        echo "OpenCode default never settled on the probe path — the picker's async save may still be in flight; wait, then re-run this step"
-        exit 1
+      # Branch on what the default settled to — cleanup is NEVER wedged:
+      #   $BWS        -> the picker's save landed; the restore below puts
+      #                  back the recorded default.
+      #   $OLD        -> already the desired value; nothing to do.
+      #   anything else -> a NEWER user choice won the race; leave it.
+      if [ "$CUR" != "$BWS" ] && [ -f "$D/old-opencode-cwd.txt" ] && [ "$CUR" != "$(cat "$D/old-opencode-cwd.txt")" ]; then
+        echo "OpenCode default was changed to a newer value ('$CUR') after the probe — leaving it untouched"
       fi
     fi
     # Then the restore itself — JSON-safe (a path containing
