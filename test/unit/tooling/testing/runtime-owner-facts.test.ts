@@ -63,6 +63,7 @@ describe('same transaction qualification Stop completion', () => {
     await fsp.mkdir(root)
     await fsp.writeFile(path.join(root, 'host-state.json'), JSON.stringify({ hostBootId: current.hostBootId }))
     const database = path.join(root, 'runtime.sqlite3'), calls = path.join(root, 'calls.jsonl'), hold = path.join(root, 'hold-read')
+    const readClosed = path.join(root, 'probe-read-closed')
     const runningEnclosure = path.join(root, 'running-enclosure')
     const db = new DatabaseSync(database)
     db.exec(`CREATE TABLE souls(soul_id TEXT,provider TEXT,provider_store_id TEXT,native_session_id TEXT,intent_revision INTEGER,desired_state TEXT);
@@ -87,7 +88,7 @@ describe('same transaction qualification Stop completion', () => {
     // External Docker and supervisor-admin IO use the fixture database. The
     // actual owner/client/helper execute the real read-only SQLite projection.
     await fsp.writeFile(path.join(root, 'docker'), `#!${process.execPath}\nconst fs=require('node:fs'),cp=require('node:child_process'),a=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(a)+'\\n');
-if(a[0]==='exec'){const limit=setTimeout(()=>process.exit(2),5000);const read=()=>{if(fs.existsSync(${JSON.stringify(hold)})){setTimeout(read,10);return;}clearTimeout(limit);const p=a.indexOf('python3');process.stdout.write(cp.execFileSync('python3',['-c',a[p+2].replaceAll('/var/lib/freshell-supervisor/runtime.sqlite3',${JSON.stringify(database)}),...a.slice(p+3)],{encoding:'utf8'}));};read();}
+if(a[0]==='exec'){const limit=setTimeout(()=>process.exit(2),5000);const read=()=>{if(fs.existsSync(${JSON.stringify(hold)})){setTimeout(read,10);return;}clearTimeout(limit);const p=a.indexOf('python3');try{process.stdout.write(cp.execFileSync('python3',['-c',a[p+2].replaceAll('/var/lib/freshell-supervisor/runtime.sqlite3',${JSON.stringify(database)}),...a.slice(p+3)],{encoding:'utf8'}));}finally{fs.appendFileSync(${JSON.stringify(readClosed)},'closed\\n');}};read();}
 else if(a[0]==='ps')process.stdout.write('${current.containerId}');
 else if(a[0]==='inspect'){const{DatabaseSync}=require('node:sqlite'),d=new DatabaseSync(${JSON.stringify(database)});process.stdout.write(JSON.stringify([{Id:'${current.containerId}',State:{Running:fs.existsSync(${JSON.stringify(runningEnclosure)})||d.prepare('SELECT launch_state FROM incarnations').get().launch_state!=='stopped'}}]));d.close();}
 else process.exit(1);\n`, { mode: 0o700 })
@@ -128,11 +129,13 @@ else process.exit(1);\n`, { mode: 0o700 })
     const client = new external.ExternalManagedRuntimeRig({ ...descriptor, baseUrl: `http://127.0.0.1:${address.port}` })
     const complete = () => db.exec("UPDATE ordinary_stops SET outcome='verified_empty',settled=1,revoke_pending=0; UPDATE incarnations SET launch_state='stopped',cleanup_state='verified_empty'; DELETE FROM writer_claims")
     const waitForProbe = async () => {
-      for (let attempt = 0; attempt < 200; attempt++) {
-        if (requests.some(request => request.action === 'stop-completion-facts') && fs.existsSync(calls)) return
+      for (let attempt = 0; attempt < 2_000; attempt++) {
+        const probeCount = requests.filter(request => request.action === 'stop-completion-facts').length
+        const completedReads = fs.existsSync(readClosed) ? fs.readFileSync(readClosed, 'utf8').trim().split('\n').filter(Boolean).length : 0
+        if (probeCount > 0 && completedReads >= probeCount) return
         await new Promise(resolve => setTimeout(resolve, 5))
       }
-      throw new Error('actual owner observation was not invoked')
+      throw new Error('actual owner SQLite read did not close')
     }
     return { rig, client, current, db, view, complete, waitForProbe, stopCount: () => stopCount, requests, calls, hold, runningEnclosure,
       close: async () => {
@@ -206,6 +209,7 @@ else process.exit(1);\n`, { mode: 0o700 })
         await new Promise(resolve => setTimeout(resolve, 5))
       }
       expect(f.requests.filter(request => request.action === 'stop-completion-facts').length).toBeGreaterThan(priorReads)
+      await f.waitForProbe()
       expect(published).toBe(false)
       f.db.exec('UPDATE ordinary_stops SET settled=1,revoke_pending=0')
       await expect(result).resolves.toMatchObject({ completion: { outcome: 'verified_empty', settled: true, revokePending: false } })
