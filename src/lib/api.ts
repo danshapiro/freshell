@@ -834,9 +834,7 @@ function groupDirectoryItemsAsProjects(
     // pre-SESSION-05 behavior.
     ...(projectColors?.[projectPath] ? { color: projectColors[projectPath] } : {}),
     sessions: sessions.map((item) => {
-      const checkpointWorkspace = normalizeFreshAgentCheckpointWorkspace(
-        item.checkoutPath ? { path: item.checkoutPath, provenance: 'resolved-project' } : undefined,
-      )
+      const checkpointWorkspace = checkpointWorkspaceForDirectoryItem(item)
       return {
         provider: item.provider,
         sessionId: item.sessionId,
@@ -872,6 +870,14 @@ function groupDirectoryItemsAsProjects(
       }
     }),
   }))
+}
+
+function checkpointWorkspaceForDirectoryItem(
+  item: Pick<ReadModelSessionDirectoryItem, 'checkoutPath' | 'projectPath'>,
+): FreshAgentCheckpointWorkspace | undefined {
+  const path = item.checkoutPath || item.projectPath
+  if (!path || path === 'unknown' || path.startsWith('terminal:')) return undefined
+  return normalizeFreshAgentCheckpointWorkspace({ path, provenance: 'resolved-project' })
 }
 
 export async function setSessionMetadata(
@@ -1122,9 +1128,7 @@ export async function searchSessions(options: SearchOptions): Promise<SearchResp
 
   const response: SearchResponse = {
     results: page.items.map((item) => {
-      const checkpointWorkspace = normalizeFreshAgentCheckpointWorkspace(
-        item.checkoutPath ? { path: item.checkoutPath, provenance: 'resolved-project' } : undefined,
-      )
+      const checkpointWorkspace = checkpointWorkspaceForDirectoryItem(item)
       return {
         sessionId: item.sessionId,
         provider: item.provider,

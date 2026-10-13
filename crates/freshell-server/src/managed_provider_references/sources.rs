@@ -1318,6 +1318,151 @@ mod tests {
     }
 
     #[test]
+    fn review_r8_bun_package_script_name_with_extension_uses_nearest_manifest() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let package = owned.path().join("outside-mcp-package");
+        let nested = package.join("nested");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"scripts":{"mcp.js":"node ./server.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(package.join("server.js"), "process.exit(0)\n").unwrap();
+
+        let config = workspace.join("opencode.json");
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "mcp": {
+                    "package-script": {
+                        "type": "local",
+                        "cwd": nested,
+                        "command": ["bun", "run", "mcp.js"],
+                    },
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config,
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Workspace,
+            }],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .expect("bun run gives the matching package script precedence over a same-named file");
+
+        assert!(plan[0]
+            .configured_resources
+            .contains(&package.canonicalize().unwrap()));
+        assert!(!plan[0]
+            .configured_resources
+            .contains(&nested.canonicalize().unwrap()));
+        assert!(package.join("package.json").is_file());
+        assert!(package.join("server.js").is_file());
+        assert!(!package.join("mcp.js").exists());
+    }
+
+    #[test]
+    fn bun_run_bare_script_file_remains_a_resource_without_matching_package_script() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("package.json"), r#"{"scripts":{}}"#).unwrap();
+        std::fs::write(workspace.join("mcp.js"), "process.exit(0)\n").unwrap();
+        let config = workspace.join("opencode.json");
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "mcp": {
+                    "file-command": {
+                        "type": "local",
+                        "command": ["bun", "run", "mcp.js"],
+                    },
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config,
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Workspace,
+            }],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .expect("without a matching package script, a bare Bun file operand remains selectable");
+
+        assert!(plan[0]
+            .configured_resources
+            .contains(&workspace.join("mcp.js").canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn bun_run_explicit_relative_file_wins_over_same_named_package_script() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("package.json"),
+            r#"{"scripts":{"mcp.js":"echo package-script"}}"#,
+        )
+        .unwrap();
+        std::fs::write(workspace.join("mcp.js"), "process.exit(0)\n").unwrap();
+        let config = workspace.join("opencode.json");
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "mcp": {
+                    "file-command": {
+                        "type": "local",
+                        "command": ["bun", "run", "./mcp.js"],
+                    },
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config,
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Workspace,
+            }],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .expect("Bun treats an explicit ./ operand as a source file");
+
+        assert!(plan[0]
+            .configured_resources
+            .contains(&workspace.join("mcp.js").canonicalize().unwrap()));
+    }
+
+    #[test]
     fn freshell_image_mcp_command_is_not_selected_as_a_host_resource() {
         let owned = tempfile::tempdir().unwrap();
         let home = owned.path().join("home");

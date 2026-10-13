@@ -1,9 +1,11 @@
 //! Finite native ordinary resource fields. Keep raw documents and every
 //! unrelated string intact; these selections are paths, never private payloads.
 use super::sources::PlannedSourceOccurrence;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 const FRESHELL_IMAGE_MCP_SERVER_PATH: &str = "/opt/freshell-mcp/server.js";
+const MAX_BUN_PACKAGE_JSON_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 enum Token {
@@ -247,7 +249,7 @@ fn nested_fields(raw: &str, tui: bool) -> Result<Vec<(&'static str, String)>, &'
                                 index > 0
                                     && index <= script
                                     && is_script_path(argument)
-                                    && !is_bun_package_script_operand(&command, index)
+                                    && !is_bun_run_bare_operand(&command, index)
                             })
                         } else {
                             is_script_path(argument)
@@ -258,9 +260,9 @@ fn nested_fields(raw: &str, tui: bool) -> Result<Vec<(&'static str, String)>, &'
                     }
                     if let Some(script_index) = script_index {
                         let script = &command[script_index];
-                        if !is_script_path(script)
-                            && !is_bun_package_script_operand(&command, script_index)
-                        {
+                        if is_bun_run_bare_operand(&command, script_index) {
+                            result.push(("OpenCode bun run operand", script.clone()));
+                        } else if !is_script_path(script) {
                             result.push(("OpenCode mcp.command", script.clone()));
                         }
                     }
@@ -321,7 +323,7 @@ fn is_script_path(argument: &str) -> bool {
     })
 }
 
-fn is_bun_package_script_operand(command: &[String], index: usize) -> bool {
+fn is_bun_run_bare_operand(command: &[String], index: usize) -> bool {
     let Some(executable) = command
         .first()
         .and_then(|executable| Path::new(executable).file_name())
@@ -335,11 +337,54 @@ fn is_bun_package_script_operand(command: &[String], index: usize) -> bool {
     };
     executable == "bun"
         && command.get(1).is_some_and(|argument| argument == "run")
-        && !argument.starts_with('-')
-        && !argument.starts_with('.')
+        && is_bare_bun_script_name(argument)
+}
+
+fn is_bare_bun_script_name(argument: &str) -> bool {
+    !argument.is_empty()
+        && !argument.starts_with(['-', '.'])
         && !Path::new(argument).is_absolute()
         && !argument.contains(['/', '\\'])
-        && !is_script_path(argument)
+}
+
+fn bun_package_script_root(
+    working_dir: &Path,
+    script_name: &str,
+) -> Result<Option<PathBuf>, &'static str> {
+    for directory in working_dir.ancestors().take(64) {
+        if directory == Path::new("/") {
+            break;
+        }
+        let manifest = directory.join("package.json");
+        let metadata = match std::fs::metadata(&manifest) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err("Bun package.json is unavailable"),
+        };
+        if !metadata.is_file() {
+            return Err("Bun package.json is not a regular file");
+        }
+        if metadata.len() > MAX_BUN_PACKAGE_JSON_BYTES {
+            return Err("Bun package.json exceeds the 16 MiB script lookup limit");
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        std::fs::File::open(&manifest)
+            .map_err(|_| "Bun package.json is unreadable")?
+            .take(MAX_BUN_PACKAGE_JSON_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "Bun package.json could not be read")?;
+        if bytes.len() as u64 > MAX_BUN_PACKAGE_JSON_BYTES {
+            return Err("Bun package.json exceeds the 16 MiB script lookup limit");
+        }
+        let package: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| "Bun package.json is not valid JSON")?;
+        let has_script = package
+            .get("scripts")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|scripts| scripts.contains_key(script_name));
+        return Ok(has_script.then(|| directory.to_path_buf()));
+    }
+    Ok(None)
 }
 
 fn command_uses_script_runtime(executable: Option<&str>) -> bool {
@@ -541,6 +586,28 @@ fn checked(path: &Path, field: &'static str, _source: &Path) -> Result<PathBuf, 
     Ok(canonical)
 }
 
+fn insert_resource(
+    result: &mut std::collections::BTreeSet<PathBuf>,
+    resource_path_bytes: &mut usize,
+    path: PathBuf,
+    field: &'static str,
+) -> Result<(), ResourceError> {
+    if !result.contains(&path) {
+        let bytes = path.as_os_str().len();
+        if result.len() >= 100_000
+            || bytes > (64 * 1024 * 1024usize).saturating_sub(*resource_path_bytes)
+        {
+            return Err(ResourceError {
+                field,
+                cause: "configured resource selection exceeds shared entry or metadata profile",
+            });
+        }
+        *resource_path_bytes += bytes;
+        result.insert(path);
+    }
+    Ok(())
+}
+
 /// Return complete ordinary units and native installed ancestor lookup units.
 /// Exact mounts retain native field spellings and their declaring origins.
 pub fn select(
@@ -553,22 +620,6 @@ pub fn select(
     let fail = |field: &'static str, cause: &'static str| ResourceError { field, cause };
     let mut result = std::collections::BTreeSet::new();
     let mut resource_path_bytes = 0usize;
-    let mut insert = |path: PathBuf, field| {
-        if !result.contains(&path) {
-            let bytes = path.as_os_str().len();
-            if result.len() >= 100_000
-                || bytes > (64 * 1024 * 1024usize).saturating_sub(resource_path_bytes)
-            {
-                return Err(fail(
-                    field,
-                    "configured resource selection exceeds shared entry or metadata profile",
-                ));
-            }
-            resource_path_bytes += bytes;
-            result.insert(path);
-        }
-        Ok(())
-    };
     let mut variables = std::collections::BTreeSet::new();
     let raw = source.references.unexpanded_source();
     let mut selections = fields(raw).map_err(|cause| fail("OpenCode resource", cause))?;
@@ -577,9 +628,12 @@ pub fn select(
             .map_err(|cause| fail("OpenCode resource", cause))?,
     );
     let mut current_mcp_working_dir: Option<PathBuf> = None;
+    let mut current_mcp_resource_path: Option<PathBuf> = None;
     for (field, spelling) in selections {
+        let mut field = field;
         if field == "OpenCode mcp.entry" {
             current_mcp_working_dir = None;
+            current_mcp_resource_path = None;
             continue;
         }
         // Private file-token payloads already use the accepted grant plan.
@@ -616,6 +670,56 @@ pub fn select(
         }
         if introduced_file.get() {
             continue;
+        }
+        if field == "OpenCode bun run operand" {
+            let working_dir = current_mcp_resource_path
+                .as_deref()
+                .unwrap_or(&source.instance_cwd);
+            if is_bare_bun_script_name(&spelling) {
+                if let Some(package_root) = bun_package_script_root(working_dir, &spelling)
+                    .map_err(|cause| fail("OpenCode mcp.command", cause))?
+                {
+                    let canonical_package_root =
+                        checked(&package_root, "OpenCode mcp.command", declaring)?;
+                    if !canonical_package_root.is_dir() {
+                        return Err(fail(
+                            "OpenCode mcp.command",
+                            "Bun package script root is not a directory",
+                        ));
+                    }
+                    let canonical_home = std::fs::canonicalize(home).ok();
+                    let canonical_working_dir = current_mcp_working_dir
+                        .clone()
+                        .or_else(|| std::fs::canonicalize(working_dir).ok());
+                    if canonical_package_root == Path::new("/")
+                        || (canonical_home.as_deref() == Some(canonical_package_root.as_path())
+                            && canonical_working_dir.as_deref()
+                                != Some(canonical_package_root.as_path()))
+                    {
+                        return Err(fail(
+                            "OpenCode mcp.command",
+                            "Bun package script requires copying an unbounded account or system root",
+                        ));
+                    }
+                    if let Some(cwd_resource_path) = &current_mcp_resource_path {
+                        if cwd_resource_path != &package_root
+                            && cwd_resource_path.starts_with(&package_root)
+                            && result.remove(cwd_resource_path)
+                        {
+                            resource_path_bytes = resource_path_bytes
+                                .saturating_sub(cwd_resource_path.as_os_str().len());
+                        }
+                    }
+                    insert_resource(
+                        &mut result,
+                        &mut resource_path_bytes,
+                        package_root,
+                        "OpenCode mcp.command",
+                    )?;
+                    continue;
+                }
+            }
+            field = "OpenCode mcp.command";
         }
         if field != "OpenCode attention.sounds"
             && field != "OpenCode mcp.cwd"
@@ -688,7 +792,7 @@ pub fn select(
                     if !canonical.is_file() {
                         return Err(fail(field, "selected file resource is not a regular file"));
                     }
-                    insert(selected, field)?;
+                    insert_resource(&mut result, &mut resource_path_bytes, selected, field)?;
                     matched = true;
                 }
                 if matched {
@@ -749,7 +853,7 @@ pub fn select(
             if !canonical.is_file() {
                 return Err(fail(field, "selected file resource is not a regular file"));
             }
-            insert(path, field)?;
+            insert_resource(&mut result, &mut resource_path_bytes, path, field)?;
             continue;
         }
         if field == "OpenCode mcp.command" {
@@ -772,7 +876,12 @@ pub fn select(
             }
             // Retain the exact executable/script path as well as its bounded
             // package closure below when it belongs to an installed package.
-            insert(canonical.clone(), field)?;
+            insert_resource(
+                &mut result,
+                &mut resource_path_bytes,
+                canonical.clone(),
+                field,
+            )?;
         }
         if field == "OpenCode skills.paths" || field == "OpenCode mcp.cwd" {
             if !canonical.is_dir() {
@@ -783,8 +892,9 @@ pub fn select(
             }
             if field == "OpenCode mcp.cwd" {
                 current_mcp_working_dir = Some(canonical);
+                current_mcp_resource_path = Some(path.clone());
             }
-            insert(path, field)?;
+            insert_resource(&mut result, &mut resource_path_bytes, path, field)?;
             continue;
         }
         // The native global plugin discovery unit is already selected in the
@@ -823,7 +933,7 @@ pub fn select(
             }
             return Err(fail(field, "select a bounded plugin or package directory"));
         }
-        insert(scope.clone(), field)?;
+        insert_resource(&mut result, &mut resource_path_bytes, scope.clone(), field)?;
         for ancestor in scope.parent().into_iter().flat_map(Path::ancestors) {
             if ancestor == Path::new("/") {
                 break;
@@ -840,7 +950,7 @@ pub fn select(
                 match std::fs::symlink_metadata(&candidate) {
                     Ok(_) => {
                         checked(&candidate, field, declaring)?;
-                        insert(candidate, field)?;
+                        insert_resource(&mut result, &mut resource_path_bytes, candidate, field)?;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(_) => {

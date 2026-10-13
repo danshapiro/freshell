@@ -1027,6 +1027,51 @@ describe('searchSessions cursor pagination', () => {
     })
   })
 
+  it('uses the resolved project path when an ordinary session launch cwd differs', async () => {
+    const items = [
+      {
+        sessionId: 'session-ordinary',
+        provider: 'codex',
+        projectPath: '/repo',
+        cwd: '/home/user',
+        isRunning: false,
+        lastActivityAt: 1_000,
+      },
+      {
+        sessionId: 'session-unknown',
+        provider: 'codex',
+        projectPath: 'unknown',
+        isRunning: false,
+        lastActivityAt: 900,
+      },
+      {
+        sessionId: 'terminal-only',
+        provider: 'codex',
+        projectPath: 'terminal:term-42',
+        liveTerminalOnly: true,
+        isRunning: true,
+        lastActivityAt: 800,
+      },
+    ]
+    mockFetch
+      .mockResolvedValueOnce(mockJson({ items, nextCursor: null, revision: 1 }))
+      .mockResolvedValueOnce(mockJson({ items, nextCursor: null, revision: 2 }))
+
+    const snapshot = await fetchSidebarSessionsSnapshot()
+    const search = await searchSessions({ query: 'ordinary' })
+    const ordinarySnapshot = snapshot.projects
+      .flatMap((project) => project.sessions)
+      .find((session) => session.sessionId === 'session-ordinary')
+    const terminalSearch = search.results.find((session) => session.sessionId === 'terminal-only')
+
+    expect(ordinarySnapshot?.checkpointWorkspace).toEqual({ path: '/repo', provenance: 'resolved-project' })
+    expect(search.results.find((session) => session.sessionId === 'session-ordinary')?.checkpointWorkspace)
+      .toEqual({ path: '/repo', provenance: 'resolved-project' })
+    expect(snapshot.projects.flatMap((project) => project.sessions)
+      .find((session) => session.sessionId === 'session-unknown')?.checkpointWorkspace).toBeUndefined()
+    expect(terminalSearch?.checkpointWorkspace).toBeUndefined()
+  })
+
   it('forwards the cursor to the session-directory request when paginating a search', async () => {
     mockFetch.mockResolvedValueOnce(mockJson({
       items: [],
