@@ -678,21 +678,33 @@ print((d.get("codingCli") or {}).get("providers",{}).get("opencode",{}).get("cwd
     # correctly deployed client). A plain shell pane will NOT do either:
     # shell panes skip the directory step and always take the default
     # workspace. OpenCode's directory step has a free-text PATH INPUT:
-    # type the absolute $BWS path there and confirm. Then:
+    # type the absolute $BWS path there and confirm. Then WAIT (bounded):
+    # the confirmation dispatches a UI update, terminal.create goes out
+    # from a React effect, and the managed launch is asynchronous — so
+    # the soul may not exist the instant you confirm. Poll up to ~120s:
+    for i in $(seq 1 60); do
+      if curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
+        | python3 -c 'import json,sys
+souls=json.load(sys.stdin)["souls"]
+rows=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
+sids={r["soulId"] for r in rows}
+assert len(sids)<=1, ("workspace ambiguous (mint a fresh BWS and retry)", rows)
+sys.exit(0 if len(sids)==1 and rows[-1].get("launchState")=="running" else 1)' "$BWS"; then
+        echo "UI pane is managed (after $((i*2))s)"
+        break
+      fi
+      sleep 2
+    done
+    # Final assert with a clear diagnosis when the wait ran out:
     curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
       | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
 rows=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
-# The registry stores one row per incarnation (the API collapses to the
-# latest row per soul in the current server). The grouping below is
-# deliberately robust under EITHER shape: exactly one SOUL must match
-# the probe workspace; refuse on ambiguity and act on the last matching
-# row:
 sids={r["soulId"] for r in rows}
-assert len(sids)==1, ("workspace ambiguous (mint a fresh BWS and retry)", rows)
-cur=rows[-1]
-assert cur.get("launchState")=="running", "soul not running — client took the host-side route?"
-print("UI pane is managed:", cur["soulId"])' "$BWS"
+assert len(sids)<=1, ("workspace ambiguous (mint a fresh BWS and retry)", rows)
+assert rows and rows[-1].get("launchState")=="running", \
+  "no running managed soul for the UI pane after ~120s — client stale or not negotiating"
+print("UI pane is managed:", rows[-1]["soulId"])' "$BWS"
     ```
 
     If the assertion fails, the client is stale or not negotiating
@@ -855,16 +867,28 @@ print("stopped browser soul:", o["outcome"])'
       fi
     fi
     # Restore OpenCode's default cwd that the directory step overwrote
-    # (only when the browser check ran — $BWS set):
+    # (only when the browser check ran — $BWS set). Build the JSON with
+    # json.dumps (a path containing quotes/backslashes must not corrupt
+    # the request; a null CLEARS a previously-absent default), CHECK the
+    # HTTP status, and VERIFY the saved value by re-reading it — curl
+    # succeeds as a shell command even on a 4xx/5xx:
     if [ -n "${BWS:-}" ] && [ -f "$D/old-opencode-cwd.txt" ]; then
       OLD=$(cat "$D/old-opencode-cwd.txt")
-      if [ -n "$OLD" ]; then
-        curl -s -X PATCH -H @"$D/hdr" -H "Content-Type: application/json" \
-          -d '{"codingCli":{"providers":{"opencode":{"cwd":"'"$OLD"'"}}}}' \
-          http://127.0.0.1:3001/api/settings > /dev/null
-      else
-        echo "OpenCode had no default cwd — clear the probe path in Settings → Coding CLI → OpenCode"
-      fi
+      BODY=$(python3 -c 'import json,sys
+old=sys.argv[1] or None
+print(json.dumps({"codingCli":{"providers":{"opencode":{"cwd":old}}}}))' "$OLD")
+      CODE=$(curl -s -o "$D/settings-restore.out" -w '%{http_code}' -X PATCH \
+        -H @"$D/hdr" -H "Content-Type: application/json" -d "$BODY" \
+        http://127.0.0.1:3001/api/settings)
+      grep -q '^2' <<<"$CODE" \
+        || { echo "settings restore failed (HTTP $CODE):"; cat "$D/settings-restore.out"; exit 1; }
+      curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/settings \
+        | python3 -c 'import json,sys
+d=json.load(sys.stdin); d=d.get("data",d)
+cur=(d.get("codingCli") or {}).get("providers",{}).get("opencode",{}).get("cwd")
+cur="" if cur is None else cur
+sys.exit(0 if cur==sys.argv[1] else 1)' "$OLD" \
+        || { echo "settings restore did not stick (expected OpenCode cwd '$OLD') — fix Settings → Coding CLI → OpenCode manually BEFORE deleting the probe dirs"; exit 1; }
     fi
     rm -rf "$D" "${PROBE_ROOT:-}" "$WS" "${BWS:-}"   # success only; both
     # token headers were already scrubbed by the trap
