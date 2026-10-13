@@ -41,12 +41,13 @@ pub mod signal;
 pub enum TrackerEffect<R> {
     /// `*.activity.updated` — `{ upsert, remove }`.
     Changed { upsert: Vec<R>, remove: Vec<String> },
-    /// `terminal.turn.complete` — one per real positive turn end.
+    /// `terminal.turn.complete` — one per recorded terminal turn end.
     TurnComplete {
         terminal_id: String,
         session_id: Option<String>,
         at: i64,
         completion_seq: i64,
+        outcome: Option<freshell_protocol::TerminalTurnOutcome>,
     },
     /// Amplifier only: force-read the events tail (missed-signal failsafe).
     ForceRead { terminal_id: String, at: i64 },

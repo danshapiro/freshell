@@ -257,6 +257,7 @@ impl ClaudeActivityTracker {
                 session_id: state.session_id.clone(),
                 at,
                 completion_seq: seq,
+                outcome: None,
             });
         }
         state.last_observed_at = at;
@@ -380,6 +381,7 @@ impl ClaudeActivityTracker {
                 .and_then(|s| s.session_id.clone()),
             at,
             completion_seq: seq,
+            outcome: None,
         });
         effects
     }

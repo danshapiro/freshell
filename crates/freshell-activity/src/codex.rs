@@ -64,7 +64,7 @@
 
 use std::collections::HashMap;
 
-use freshell_protocol::{CodexActivityRecord, CodexPhase};
+use freshell_protocol::{CodexActivityRecord, CodexPhase, TerminalTurnOutcome};
 
 use crate::ledger::TurnCompletionLedger;
 use crate::signal::{
@@ -769,7 +769,22 @@ impl CodexActivityTracker {
                 state.swallow_next_reconcile_clear = true;
             }
         }
-        self.effects_after_transition(terminal_id, previous, completions)
+        let outcome = match status {
+            Some("completed") => Some(TerminalTurnOutcome::Completed),
+            Some("failed") => Some(TerminalTurnOutcome::Failed),
+            _ => None,
+        };
+        let mut effects = self.effects_after_transition(terminal_id, previous, completions);
+        for effect in &mut effects {
+            if let TrackerEffect::TurnComplete {
+                outcome: completion_outcome,
+                ..
+            } = effect
+            {
+                *completion_outcome = outcome;
+            }
+        }
+        effects
     }
 
     /// Approval-request pause (managed lane). Thread-scoped like turn events;
@@ -880,6 +895,7 @@ impl CodexActivityTracker {
                 session_id,
                 at,
                 completion_seq,
+                outcome: None,
             });
         }
         effects
@@ -1925,6 +1941,25 @@ mod tests {
         assert!(!again
             .iter()
             .any(|e| matches!(e, TrackerEffect::TurnComplete { .. })));
+    }
+
+    #[test]
+    fn proxy_completion_preserves_completed_and_failed_outcomes() {
+        for (status, expected) in [
+            ("completed", TerminalTurnOutcome::Completed),
+            ("failed", TerminalTurnOutcome::Failed),
+        ] {
+            let mut tracker = CodexActivityTracker::new();
+            tracker.track_terminal("t", Some("sess"), 1_000);
+            tracker.note_proxy_turn_started("t", "sess", Some("turn-1"), 2_000);
+            let effects =
+                tracker.note_proxy_turn_completed("t", "sess", Some("turn-1"), Some(status), 3_000);
+            let outcome = effects.iter().find_map(|effect| match effect {
+                TrackerEffect::TurnComplete { outcome, .. } => *outcome,
+                _ => None,
+            });
+            assert_eq!(outcome, Some(expected));
+        }
     }
 
     #[test]

@@ -324,6 +324,7 @@ export const TerminalTurnCompleteSchema = z.object({
   terminalId: z.string().min(1),
   provider: z.enum(['opencode', 'claude', 'codex', 'amplifier']),
   sessionId: z.string().min(1).optional(),
+  outcome: z.enum(['completed', 'failed']).optional(),
   at: z.number().int().nonnegative(),
   completionSeq: z.number().int().positive(),
 })

@@ -2,6 +2,7 @@ import { randomUUID, createHash } from 'node:crypto'
 import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
 
@@ -47,6 +48,95 @@ async function readNativeTranscript(path, allowMissing = false) {
   } finally { await file?.close() }
 }
 
+async function scanNativeTranscript(path, { allowMissing = false, expectedSessionId } = {}) {
+  const invalid = (reason) => Object.assign(new Error(reason), { code: 'NATIVE_TRANSCRIPT_INVALID' })
+  let file
+  try {
+    file = await open(path, 'r')
+  } catch (error) {
+    if (error?.code === 'ENOENT' && allowMissing) {
+      return { hasDeferredOperation: false, messageCount: 0, sessionIdentityMatches: true }
+    }
+    throw error
+  }
+
+  const pending = new Set()
+  const identity = (metadata) => [metadata.dev, metadata.ino, metadata.size, metadata.mtimeNs, metadata.ctimeNs].join(':')
+  const decoder = new StringDecoder('utf8')
+  let buffer = ''
+  let bytesRead = 0n
+  let lastByte = null
+  let malformedToolUse = false
+  let latestDeferredMarkerSeen = false
+  let latestDeferredToolUseID = null
+  let latestDeferredToolUseValid = false
+  let latestDeferredToolUseMatched = false
+  let messageCount = 0
+  let sessionIdentityMatches = true
+
+  const consumeLine = (line) => {
+    if (!line.trim()) return
+    const row = JSON.parse(line)
+
+    if (latestDeferredToolUseID !== null
+      && line.includes('"tool_use_id":"' + latestDeferredToolUseID + '"')) {
+      latestDeferredToolUseMatched = true
+    }
+
+    if (expectedSessionId !== undefined && ['user', 'assistant'].includes(row.type)) {
+      messageCount += 1
+      if (row.sessionId !== expectedSessionId) sessionIdentityMatches = false
+    }
+
+    for (const block of Array.isArray(row.message?.content) ? row.message.content : []) {
+      if (row.type === 'assistant' && block.type === 'tool_use') {
+        if (typeof block.id !== 'string' || !block.id) malformedToolUse = true
+        else pending.add(block.id)
+      } else if (row.type === 'user' && block.type === 'tool_result') {
+        pending.delete(block.tool_use_id)
+      }
+    }
+
+    if (row.type === 'attachment' && row.attachment?.type === 'hook_deferred_tool') {
+      latestDeferredMarkerSeen = true
+      latestDeferredToolUseID = row.attachment.toolUseID
+      latestDeferredToolUseValid = typeof latestDeferredToolUseID === 'string' && latestDeferredToolUseID.length > 0
+      latestDeferredToolUseMatched = false
+    }
+  }
+
+  try {
+    const before = await file.stat({ bigint: true })
+    if (!before.isFile()) throw invalid('invalid native transcript file')
+    const stream = file.createReadStream({ start: 0, autoClose: false })
+    for await (const chunk of stream) {
+      bytesRead += BigInt(chunk.length)
+      if (chunk.length) lastByte = chunk.at(-1)
+      buffer += decoder.write(chunk)
+      let boundary
+      while ((boundary = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, boundary)
+        buffer = buffer.slice(boundary + 1)
+        consumeLine(line)
+      }
+    }
+    buffer += decoder.end()
+    if (buffer.length > 0) throw invalid('native transcript changed or has incomplete EOF')
+
+    const after = await file.stat({ bigint: true })
+    const current = await stat(path, { bigint: true })
+    if (identity(before) !== identity(after) || identity(after) !== identity(current)
+      || bytesRead !== after.size || (bytesRead ? lastByte !== 10 : !allowMissing)) {
+      throw invalid('native transcript changed or has incomplete EOF')
+    }
+
+    const hasDeferredOperation = malformedToolUse || pending.size > 0
+      || (latestDeferredMarkerSeen
+        && (!latestDeferredToolUseValid || !latestDeferredToolUseMatched))
+    return { hasDeferredOperation, messageCount, sessionIdentityMatches }
+  } finally { await file.close() }
+}
+
 /** Whether the pinned native loader has an unfinished operation on first
  * input. This never qualifies a checkpoint or proves an effect outcome. */
 export async function inspectNativeForkSource(recipe, childSessionId) {
@@ -76,24 +166,7 @@ export async function inspectNativeForkSource(recipe, childSessionId) {
   return { rows: kept, lines: kept.map(row => JSON.stringify(row)) }
 }
 
-export async function nativeTranscriptHasDeferredOperation({ path, allowMissing = false, parentFork, nativeSessionId }) {
-  let transcript
-  try {
-    transcript = await readNativeTranscript(path, allowMissing && !parentFork)
-    if (parentFork) {
-      const messages = transcript.rows.filter(row => ['user', 'assistant'].includes(row.type))
-      if (!messages.length || messages.some(row => row.sessionId !== nativeSessionId)) {
-        throw new Error('native fork child has no complete current history')
-      }
-    }
-  }
-  catch (error) {
-    if (error?.code !== 'ENOENT' || !parentFork || parentFork.childTranscript !== path) throw error
-    transcript = await inspectNativeForkSource(parentFork, nativeSessionId)
-  }
-  const { rows, lines } = transcript
-  // A crash or a batch can leave native tool requests without the supported
-  // solo checkpoint. Ordinary input must not ask the loader to replay them.
+function hasDeferredOperationInTranscript({ rows, lines }) {
   const pending = new Set()
   for (const row of rows) {
     for (const block of Array.isArray(row.message?.content) ? row.message.content : []) {
@@ -111,6 +184,27 @@ export async function nativeTranscriptHasDeferredOperation({ path, allowMissing 
   const toolUseID = rows[index].attachment.toolUseID
   return typeof toolUseID !== 'string' || !toolUseID
     || !lines.slice(index + 1).some((line) => line.includes('"tool_use_id":"' + toolUseID + '"'))
+}
+
+export async function nativeTranscriptHasDeferredOperation({ path, allowMissing = false, parentFork, nativeSessionId }) {
+  let transcript
+  try {
+    transcript = await scanNativeTranscript(path, {
+      allowMissing: allowMissing && !parentFork,
+      expectedSessionId: parentFork ? nativeSessionId : undefined,
+    })
+    if (parentFork) {
+      if (!transcript.messageCount || !transcript.sessionIdentityMatches) {
+        throw new Error('native fork child has no complete current history')
+      }
+    }
+  }
+  catch (error) {
+    if (error?.code !== 'ENOENT' || !parentFork || parentFork.childTranscript !== path) throw error
+    transcript = await inspectNativeForkSource(parentFork, nativeSessionId)
+    return hasDeferredOperationInTranscript(transcript)
+  }
+  return transcript.hasDeferredOperation
 }
 
 /** Native parser only: a persisted card or an attachment without its original

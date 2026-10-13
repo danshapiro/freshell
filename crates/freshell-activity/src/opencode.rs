@@ -274,6 +274,7 @@ impl OpencodeActivityTracker {
                     session_id: Some(own),
                     at: completed_at,
                     completion_seq: seq,
+                    outcome: None,
                 }]
             }
             Ownership::AwaitingAssociation { previous_known, .. } => {
@@ -775,6 +776,7 @@ fn reduce_idle_edge(
                     session_id: Some(own),
                     at,
                     completion_seq: seq,
+                    outcome: None,
                 });
             }
             effects
@@ -1032,6 +1034,7 @@ fn reduce_snapshot(
                         session_id: Some(own),
                         at,
                         completion_seq: seq,
+                        outcome: None,
                     });
                 }
                 effects
@@ -1201,6 +1204,7 @@ mod tests {
             session_id: Some(session_id.to_string()),
             at,
             completion_seq: seq,
+            outcome: None,
         }
     }
 

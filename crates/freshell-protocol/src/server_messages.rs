@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use crate::common::{
     AgentProvider, AmplifierActivityRecord, ClaudeActivityRecord, CodexActivityRecord,
     CodexDurability, ErrorCode, OpencodeActivityRecord, SessionLocator, TerminalMetaRecord,
-    TurnCompletionSnapshot,
+    TerminalTurnOutcome, TurnCompletionSnapshot,
 };
 use crate::session_names::{SessionNameRecord, SessionNameRef, SessionNameUpdated};
 use crate::settings::ServerSettings;
@@ -1720,6 +1720,8 @@ pub struct TerminalTurnComplete {
     pub terminal_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<TerminalTurnOutcome>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

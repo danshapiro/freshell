@@ -368,6 +368,16 @@ fn rich_server_messages() {
         other => panic!("expected TerminalTurnComplete, got {other:?}"),
     }
 
+    // terminal.turn.complete — preserve a provider-reported Codex outcome.
+    let wire = r#"{"type":"terminal.turn.complete","at":2,"completionSeq":6,"outcome":"failed","provider":"codex","terminalId":"t2"}"#;
+    match server_roundtrip(wire, "terminal.turn.complete") {
+        ServerMessage::TerminalTurnComplete(t) => {
+            assert_eq!(t.provider, AgentProvider::Codex);
+            assert_eq!(t.outcome, Some(TerminalTurnOutcome::Failed));
+        }
+        other => panic!("expected TerminalTurnComplete, got {other:?}"),
+    }
+
     // terminal.status — auto-resume `recovering` with the typed retry-budget
     // fields (council 7w4h/xkhx: attempt/maxAttempts/exitCode are FIELDS, the
     // reason prose is purely presentational and never parsed by the client).

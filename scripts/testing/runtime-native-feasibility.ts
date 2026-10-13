@@ -394,6 +394,7 @@ export function stageSdkInitFieldFault(source: string): string {
         } }
       const fieldFault = /^\/tmp\/f[a-z0-9]+\/[a-f0-9]{8}-[a-f0-9]{3}\/(freshclaude|kilroy)-(missing-native-id|placeholder-id)-workspace$/.exec(req.cwd || '')
       if (fieldFault) {
+        const { readFile } = await import('node:fs/promises')
         const control = JSON.parse(await readFile(join(req.cwd, 'native-init-field-fault-control.json'), 'utf8'))
         if (req.resumeSessionId || launch?.requestedNativeSessionId !== null || !launch?.launchNonce || !launch?.incarnationId
           || control.mode !== fieldFault[1] || control.caseId !== fieldFault[2]

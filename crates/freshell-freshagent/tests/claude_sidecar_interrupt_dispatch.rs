@@ -61,6 +61,7 @@ fn real_sidecar_dispatches_interrupt_frames_to_handle_interrupt() {
         "native-session-channel.mjs",
         "native-process.mjs",
         "native-checkpoint-state.mjs",
+        "native-profile-digest.mjs",
         "monotonic-clock.mjs",
         "permission-channel.mjs",
         "session-settings.mjs",

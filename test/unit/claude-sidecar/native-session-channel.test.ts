@@ -179,7 +179,7 @@ describe('managed native startup channel', () => {
       const workspace = join(ownedRoot, `${mode}-${caseId}-workspace`)
       await mkdir(workspace, { recursive: true })
       const modules = ['index.mjs', 'native-session-channel.mjs', 'native-process.mjs', 'native-checkpoint-state.mjs',
-        'monotonic-clock.mjs', 'permission-channel.mjs', 'session-settings.mjs', 'turn-complete-gate.mjs']
+        'monotonic-clock.mjs', 'native-profile-digest.mjs', 'permission-channel.mjs', 'session-settings.mjs', 'turn-complete-gate.mjs']
       const producer = await readFile(resolve('crates/freshell-claude-sidecar/index.mjs'), 'utf8')
       for (const module of modules) await writeFile(join(directory, module), module === 'index.mjs'
         ? stageSdkInitFieldFault(producer) : await readFile(resolve('crates/freshell-claude-sidecar', module), 'utf8'))
@@ -202,7 +202,7 @@ describe('managed native startup channel', () => {
           await new Promise(resolve => setTimeout(resolve, 10))
         }
         const init = frames.find(frame => frame.type === 'sdk.session.init')
-        expect(init).toBeDefined()
+        expect(init, `received sidecar frame types: ${frames.map(frame => frame.type).join(', ')}`).toBeDefined()
         expect(init.cliSessionId).toBe(caseId === 'missing-native-id' ? undefined : init.sessionId)
         const captured = JSON.parse(await readFile(join(workspace, 'native-init-field-fault-observation.json'), 'utf8'))
         expect(captured.actualNativeSessionId).toBe(root)

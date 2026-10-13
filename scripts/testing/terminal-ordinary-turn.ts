@@ -161,7 +161,8 @@ export function reduceTerminalOrdinaryTurnFrames(
     if (outputFrameCount === 0
       || frame.type !== 'terminal.turn.complete'
       || frame.terminalId !== baseline.terminalId
-      || frame.provider !== baseline.provider) continue
+      || frame.provider !== baseline.provider
+      || (baseline.provider === 'codex' && frame.outcome !== 'completed')) continue
     const completion = sequence(frame.completionSeq, false)
     if (completion !== null && completion > baseline.completionSeq) {
       completionSeq = completionSeq === null ? completion : Math.max(completionSeq, completion)

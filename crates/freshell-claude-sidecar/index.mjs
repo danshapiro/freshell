@@ -76,8 +76,8 @@
 
 import { createInterface } from 'node:readline'
 import { createHash, randomBytes } from 'node:crypto'
-import { readFile, readdir, lstat } from 'node:fs/promises'
 import { isAbsolute, join, resolve } from 'node:path'
+import { nativeProfileDigest } from './native-profile-digest.mjs'
 import { configureSession, userMessageContent, resultErrorMessage } from './session-settings.mjs'
 import { createTurnCompleteGate } from './turn-complete-gate.mjs'
 import { nextMonotonic } from './monotonic-clock.mjs'
@@ -122,43 +122,6 @@ function createClaudeSdkCleanEnv(env = process.env) {
   const { CLAUDECODE: _c, ANTHROPIC_API_KEY: apiKey, FRESHELL_CLAUDE_ONECLI_API_KEY: onecliApiKey, ...cleanEnv } = env
   if (onecliApiKey === '1' && apiKey) cleanEnv.ANTHROPIC_API_KEY = apiKey
   return cleanEnv
-}
-
-// Bind only the selected native profile, excluding rotating grant/auth files.
-// These are known settings/plugin resources, never a native identity search.
-async function nativeProfileDigest(req, settings) {
-  const digest = createHash('sha256')
-  digest.update(JSON.stringify({ cwd: req.cwd ?? null, model: settings.model ?? null,
-    effort: settings.effort ?? null, permissionMode: settings.permissionMode ?? null,
-    plugins: req.plugins ?? [] }))
-  const userDirectory = process.env.CLAUDE_CONFIG_DIR ?? join(process.env.HOME ?? '', '.claude')
-  const projectDirectory = join(resolve(req.cwd ?? process.cwd()), '.claude')
-  let bytesRead = 0
-  async function addFile(path) {
-    try {
-      const bytes = await readFile(path)
-      bytesRead += bytes.length
-      if (bytesRead > 32 * 1024 * 1024) throw new Error('selected native profile exceeds bounded read')
-      digest.update(path).update('\0').update(bytes).update('\0')
-    } catch (error) {
-      if (error?.code !== 'ENOENT') throw error
-      digest.update(path).update('\0absent\0')
-    }
-  }
-  for (const path of [join(userDirectory, 'settings.json'), join(projectDirectory, 'settings.json'),
-    join(projectDirectory, 'settings.local.json')]) await addFile(path)
-  async function addPlugin(directory) {
-    for (const name of (await readdir(directory)).sort()) {
-      if (name === '.git') continue
-      const path = join(directory, name)
-      const metadata = await lstat(path)
-      if (metadata.isDirectory()) await addPlugin(path)
-      else if (metadata.isFile()) await addFile(path)
-      else throw new Error('selected native plugin resource is unsupported')
-    }
-  }
-  for (const plugin of req.plugins ?? []) await addPlugin(plugin)
-  return digest.digest('hex')
 }
 
 // Hold an original operation that reaches its native hook or permission

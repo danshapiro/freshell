@@ -106,10 +106,36 @@ describe('body-free terminal ordinary-turn reduction', () => {
     const summary = reduceTerminalOrdinaryTurnFrames([
       { type: 'codex.activity.updated', upsert: [{ terminalId: codexTarget.terminalId, phase: 'pending' }] },
       output(codexTarget.terminalId, codexTarget.streamId, 4),
-      complete('codex', codexTarget.terminalId, 1),
+      { ...complete('codex', codexTarget.terminalId, 1), outcome: 'completed' },
     ], captureTerminalOrdinaryTurnBaseline([], codexTarget))
 
     expect(summary).toMatchObject({ activitySeen: true, outputSeen: true, completionSeen: true })
+  })
+
+  it('accepts Codex completion only when the outcome explicitly succeeded', () => {
+    const codexTarget = { provider: 'codex', terminalId: 'codex-1', streamId: 'codex-stream' } as const
+    const frames = [
+      { type: 'codex.activity.updated', upsert: [{ terminalId: codexTarget.terminalId, phase: 'busy' }] },
+      output(codexTarget.terminalId, codexTarget.streamId, 4),
+    ]
+    const codexBaseline = captureTerminalOrdinaryTurnBaseline([], codexTarget)
+
+    const failed = reduceTerminalOrdinaryTurnFrames([
+      ...frames,
+      { ...complete('codex', codexTarget.terminalId, 1), outcome: 'failed' },
+    ], codexBaseline)
+    const unavailable = reduceTerminalOrdinaryTurnFrames([
+      ...frames,
+      complete('codex', codexTarget.terminalId, 1),
+    ], codexBaseline)
+    const completed = reduceTerminalOrdinaryTurnFrames([
+      ...frames,
+      { ...complete('codex', codexTarget.terminalId, 1), outcome: 'completed' },
+    ], codexBaseline)
+
+    expect(failed).toMatchObject({ outputSeen: true, completionSeen: false, completionSeq: null })
+    expect(unavailable).toMatchObject({ outputSeen: true, completionSeen: false, completionSeq: null })
+    expect(completed).toMatchObject({ outputSeen: true, completionSeen: true, completionSeq: 1 })
   })
 
   it('counts a nonempty output batch without retaining its body or segment data', () => {

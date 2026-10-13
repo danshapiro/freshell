@@ -5605,6 +5605,13 @@
         "completionSeq": {
           "type": "number"
         },
+        "outcome": {
+          "enum": [
+            "completed",
+            "failed"
+          ],
+          "type": "string"
+        },
         "provider": {
           "enum": [
             "codex",

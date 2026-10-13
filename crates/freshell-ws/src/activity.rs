@@ -48,7 +48,7 @@ use freshell_protocol::{
     AgentProvider, AmplifierActivityRecord, AmplifierActivityUpdated, ClaudeActivityRecord,
     ClaudeActivityUpdated, CodexActivityRecord, CodexActivityUpdated, OpencodeActivityRecord,
     OpencodeActivityUpdated, ServerMessage, TerminalIdle, TerminalIdleReason, TerminalTurnComplete,
-    TurnCompletionSnapshot,
+    TerminalTurnOutcome, TurnCompletionSnapshot,
 };
 use freshell_terminal::ActivityEvent;
 
@@ -2051,6 +2051,7 @@ fn claude_frames(
                 session_id,
                 at,
                 completion_seq,
+                outcome,
             } => {
                 idle.note_turn_boundary(&terminal_id, at);
                 frames.push(turn_complete_frame(
@@ -2059,6 +2060,7 @@ fn claude_frames(
                     session_id,
                     at,
                     completion_seq,
+                    outcome,
                 ));
             }
             // #606: the deadman's verify request — the hub answers it from
@@ -2110,6 +2112,7 @@ fn codex_frames(
                 session_id,
                 at,
                 completion_seq,
+                outcome,
             } => {
                 idle.note_turn_boundary(&terminal_id, at);
                 frames.push(turn_complete_frame(
@@ -2118,6 +2121,7 @@ fn codex_frames(
                     session_id,
                     at,
                     completion_seq,
+                    outcome,
                 ));
             }
             TrackerEffect::ForceRead { terminal_id, .. } => force_reads.push(terminal_id),
@@ -2166,6 +2170,7 @@ fn opencode_frames(
                 session_id,
                 at,
                 completion_seq,
+                outcome,
             } => {
                 idle.note_turn_boundary(&terminal_id, at);
                 frames.push(turn_complete_frame(
@@ -2174,6 +2179,7 @@ fn opencode_frames(
                     session_id,
                     at,
                     completion_seq,
+                    outcome,
                 ));
             }
             TrackerEffect::AttentionBoundary { terminal_id, at } => {
@@ -2224,6 +2230,7 @@ fn amplifier_frames(
                 session_id,
                 at,
                 completion_seq,
+                outcome,
             } => {
                 idle.note_turn_boundary(&terminal_id, at);
                 frames.push(turn_complete_frame(
@@ -2232,6 +2239,7 @@ fn amplifier_frames(
                     session_id,
                     at,
                     completion_seq,
+                    outcome,
                 ));
             }
             TrackerEffect::ForceRead { terminal_id, .. } => force_reads.push(terminal_id),
@@ -2267,6 +2275,7 @@ fn turn_complete_frame(
     session_id: Option<String>,
     at: i64,
     completion_seq: i64,
+    outcome: Option<TerminalTurnOutcome>,
 ) -> ServerMessage {
     ServerMessage::TerminalTurnComplete(TerminalTurnComplete {
         at,
@@ -2274,6 +2283,7 @@ fn turn_complete_frame(
         provider,
         terminal_id,
         session_id,
+        outcome,
     })
 }
 
@@ -4551,6 +4561,48 @@ mod tests {
     }
 
     /// Write a rollout line and return the (dir-guard, path).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_codex_proxy_completion_preserves_its_outcome_on_wire() {
+        let (hub, mut rx) = hub();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "failed-terminal".into(),
+                mode: "codex".into(),
+                resume_session_id: Some("failed-thread".into()),
+                at: crate::terminal::now_ms(),
+            },
+        );
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |value| {
+            value["upsert"][0]["terminalId"] == "failed-terminal"
+        })
+        .await
+        .expect("initial activity update");
+
+        hub.note_codex_proxy_turn(
+            "failed-terminal",
+            "failed-thread",
+            Some("turn-1"),
+            None,
+            false,
+        );
+        hub.note_codex_proxy_turn(
+            "failed-terminal",
+            "failed-thread",
+            Some("turn-1"),
+            Some("failed"),
+            true,
+        );
+
+        let complete = next_frame_matching(&mut rx, "terminal.turn.complete", 3_000, |value| {
+            value["terminalId"] == "failed-terminal"
+        })
+        .await
+        .expect("failed turn completion");
+        assert_eq!(complete["provider"], "codex");
+        assert_eq!(complete["outcome"], "failed");
+    }
+
     fn codex_rollout_fixture(lines: &[String]) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("rollout-2026-07-25T08-00-00-sess-1.jsonl");

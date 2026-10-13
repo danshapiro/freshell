@@ -9094,6 +9094,13 @@
           "maximum": 9007199254740991,
           "type": "integer"
         },
+        "outcome": {
+          "enum": [
+            "completed",
+            "failed"
+          ],
+          "type": "string"
+        },
         "provider": {
           "enum": [
             "opencode",
