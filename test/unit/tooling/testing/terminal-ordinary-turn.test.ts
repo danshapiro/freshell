@@ -28,7 +28,12 @@ function output(terminalId: string = target.terminalId, streamId: string = targe
 }
 
 function complete(provider: string = target.provider, terminalId: string = target.terminalId, completionSeq = 8) {
-  return { type: 'terminal.turn.complete', provider, terminalId, completionSeq, at: 1 }
+  return { type: 'terminal.turn.complete', provider, terminalId, completionSeq, at: 1, outcome: 'completed' }
+}
+
+function completeWithoutOutcome(provider: string = target.provider, terminalId: string = target.terminalId, completionSeq = 8) {
+  const { outcome: _outcome, ...frame } = complete(provider, terminalId, completionSeq)
+  return frame
 }
 
 describe('body-free terminal ordinary-turn reduction', () => {
@@ -126,7 +131,7 @@ describe('body-free terminal ordinary-turn reduction', () => {
     ], codexBaseline)
     const unavailable = reduceTerminalOrdinaryTurnFrames([
       ...frames,
-      complete('codex', codexTarget.terminalId, 1),
+      completeWithoutOutcome('codex', codexTarget.terminalId, 1),
     ], codexBaseline)
     const completed = reduceTerminalOrdinaryTurnFrames([
       ...frames,
@@ -143,6 +148,35 @@ describe('body-free terminal ordinary-turn reduction', () => {
     expect(completed).toMatchObject({ outputSeen: true, completionSeen: true, completionSeq: 1 })
     expect(completedAfterProvisional).toMatchObject({ outputSeen: true, completionSeen: true, completionSeq: 1 })
   })
+
+  it.each(['claude', 'codex', 'opencode'] as const)(
+    'requires an explicit successful outcome for %s completion', (provider) => {
+      const providerTarget = { provider, terminalId: `${provider}-1`, streamId: `${provider}-stream` } as const
+      const shared = [
+        activity(provider, providerTarget.terminalId),
+        output(providerTarget.terminalId, providerTarget.streamId, 4),
+      ]
+      const providerBaseline = captureTerminalOrdinaryTurnBaseline([], providerTarget)
+
+      const missing = reduceTerminalOrdinaryTurnFrames([
+        ...shared,
+        completeWithoutOutcome(provider, providerTarget.terminalId, 1),
+      ], providerBaseline)
+      const failed = reduceTerminalOrdinaryTurnFrames([
+        ...shared,
+        { ...complete(provider, providerTarget.terminalId, 1), outcome: 'failed' },
+      ], providerBaseline)
+      const completed = reduceTerminalOrdinaryTurnFrames([
+        ...shared,
+        { ...complete(provider, providerTarget.terminalId, 1), outcome: 'completed' },
+      ], providerBaseline)
+
+      expect(missing).toMatchObject({ outputSeen: true, completionSeen: false, completionSeq: null })
+      expect(failed).toMatchObject({ outputSeen: true, completionSeen: false, completionSeq: null })
+      expect(completed).toMatchObject({ outputSeen: true, completionSeen: true, completionSeq: 1 })
+      expect(JSON.stringify(completed)).not.toContain('data')
+    },
+  )
 
   it('counts a nonempty output batch without retaining its body or segment data', () => {
     const batch = {

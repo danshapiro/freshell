@@ -267,6 +267,13 @@ fn project(view: &RuntimeView, history: &Value) -> Option<DirItem> {
         .map(|s| s.chars().take(160).collect::<String>());
     let last_activity_at =
         history["extensions"][provider]["nativeHistoryActivity"]["at"].as_i64()?;
+    let managed_history_search = normalized_managed_history_search(
+        provider,
+        turns,
+        history["extensions"][provider]["nativeHistoryRetention"]["partial"]
+            .as_bool()
+            .unwrap_or(false),
+    );
     let indexed = IndexedSession {
         session_id: native_id.into(),
         legacy_session_id: None,
@@ -287,9 +294,67 @@ fn project(view: &RuntimeView, history: &Value) -> Option<DirItem> {
         token_usage: None,
     };
     let mut item = dir_item_from_indexed_with_source_files(&indexed, Vec::new());
+    item.managed_history_search = Some(managed_history_search);
     item.session_type = Some(session_type.into());
     item.is_running = running(view);
     Some(item)
+}
+
+fn normalized_managed_history_search(
+    provider: &str,
+    turns: &[Value],
+    partial: bool,
+) -> ManagedHistorySearch {
+    let mut messages = Vec::new();
+    for turn in turns {
+        if provider == "codex" {
+            for item in turn["items"].as_array().into_iter().flatten() {
+                let (role, text) = match item["type"].as_str() {
+                    Some("userMessage") => ("user", normalized_text_parts(&item["content"])),
+                    Some("agentMessage") => (
+                        "assistant",
+                        item["text"].as_str().unwrap_or_default().to_owned(),
+                    ),
+                    _ => continue,
+                };
+                if !text.trim().is_empty() {
+                    messages.push(ManagedSearchMessage { role, text });
+                }
+            }
+            continue;
+        }
+
+        let role = match turn["role"].as_str() {
+            Some("user") => "user",
+            Some("assistant") => "assistant",
+            _ => continue,
+        };
+        let text = turn["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|item| item["kind"] == "text")
+            .filter_map(|item| item["text"].as_str())
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.is_empty() {
+            messages.push(ManagedSearchMessage { role, text });
+        }
+    }
+    ManagedHistorySearch { messages, partial }
+}
+
+fn normalized_text_parts(parts: &Value) -> String {
+    parts
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|part| matches!(part["type"].as_str(), Some("input_text" | "text")))
+        .filter_map(|part| part["text"].as_str())
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(all(test, unix))]
@@ -312,6 +377,7 @@ mod tests {
     #[derive(Default)]
     struct NativeBackend {
         history_home: Option<PathBuf>,
+        history_overrides: HashMap<String, Value>,
         mismatch: bool,
         reads: Arc<std::sync::atomic::AtomicUsize>,
         turn_counts: Arc<std::sync::Mutex<Vec<usize>>>,
@@ -332,12 +398,15 @@ mod tests {
                 tokio::time::sleep(READ_BUDGET + Duration::from_secs(1)).await;
             }
             assert_eq!(handle.fresh_agent().unwrap().provider.as_str(), provider);
-            let mut snapshot = freshell_freshagent::native_history::read(
-                provider,
-                self.history_home.as_deref().expect("owned native fixture"),
-                native_id,
-            )
-            .map_err(BackendError::Unavailable)?;
+            let mut snapshot = match self.history_overrides.get(native_id) {
+                Some(snapshot) => snapshot.clone(),
+                None => freshell_freshagent::native_history::read(
+                    provider,
+                    self.history_home.as_deref().expect("owned native fixture"),
+                    native_id,
+                )
+                .map_err(BackendError::Unavailable)?,
+            };
             self.turn_counts
                 .lock()
                 .unwrap()
@@ -657,6 +726,139 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), 200);
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn managed_history_search_uses_normalized_messages_for_supported_providers() {
+        let root = tempfile::tempdir().unwrap();
+        let web = tempfile::tempdir().unwrap();
+        let cwd = root.path().to_string_lossy().into_owned();
+        let registry = Registry::open(root.path(), None).unwrap();
+        let providers = [
+            ("claude", "freshclaude", "managed-claude-search"),
+            ("codex", "freshcodex", "managed-codex-search"),
+            ("opencode", "freshopencode", "managed-opencode-search"),
+        ];
+        let mut history_overrides = HashMap::new();
+        for (provider, session_type, native_id) in providers {
+            let view = register_in(
+                &registry,
+                root.path(),
+                provider,
+                session_type,
+                native_id,
+                &cwd,
+            )
+            .await;
+            let user_marker = format!("managed-user-{provider}-marker");
+            let assistant_marker = format!("managed-assistant-{provider}-marker");
+            let turns = match provider {
+                "claude" => json!([
+                    {"role":"user","items":[{"kind":"text","text":user_marker}]},
+                    {"role":"assistant","items":[{"kind":"text","text":assistant_marker}]}
+                ]),
+                "codex" => json!([
+                    {"items":[{"type":"userMessage","content":[{"type":"input_text","text":user_marker}]}]},
+                    {"items":[{"type":"agentMessage","text":assistant_marker}]}
+                ]),
+                "opencode" => json!([
+                    {"role":"user","items":[{"kind":"text","text":user_marker}]},
+                    {"role":"assistant","items":[{"kind":"text","text":assistant_marker}]}
+                ]),
+                _ => unreachable!(),
+            };
+            let history = json!({
+                "threadId":native_id,
+                "provider":provider,
+                "summary":"synthetic managed search fixture",
+                "turns":turns,
+                "extensions":{
+                    provider:{
+                        "nativeHistoryActivity":{"at":1791712801000i64},
+                        "nativeHistoryRetention":{"partial":provider == "opencode","omittedNativeTurns":1,"omittedItems":0,"omittedBodies":0}
+                    }
+                },
+                "managedDirectory":{
+                    "incarnationId":view.incarnation_id,
+                    "cwd":cwd,
+                    "gitCommonDir":format!("{cwd}/.git"),
+                    "sessionType":session_type
+                }
+            });
+            assert_eq!(
+                history["extensions"][provider]["nativeHistoryRetention"]["partial"],
+                provider == "opencode",
+                "{provider} retention fixture"
+            );
+            history_overrides.insert(native_id.to_string(), history);
+        }
+        let backend = Arc::new(NativeBackend {
+            history_overrides,
+            ..Default::default()
+        });
+        let (socket, control) = start_control(root.path(), registry, backend.clone()).await;
+        let app = Router::new()
+            .route(
+                "/api/session-directory",
+                axum::routing::get(session_directory),
+            )
+            .with_state(directory_state(web.path()))
+            .layer(axum::Extension(Cache::default()))
+            .layer(axum::Extension(RuntimeClient::new(
+                socket,
+                "test-control-secret",
+            )));
+
+        for (provider, _, _) in providers {
+            let user_marker = format!("managed-user-{provider}-marker");
+            let assistant_marker = format!("managed-assistant-{provider}-marker");
+            let users = directory_query(
+                app.clone(),
+                &format!("&query={user_marker}&tier=userMessages"),
+            )
+            .await;
+            assert_eq!(users["items"][0]["matchedIn"], "userMessage", "{provider}");
+            assert!(users["items"][0]["snippet"]
+                .as_str()
+                .unwrap()
+                .contains(&user_marker));
+            assert!(!users["items"][0].to_string().contains(&assistant_marker));
+            assert!(users["items"][0].get("managedSearchMessages").is_none());
+            assert!(
+                users.get("partial").is_some(),
+                "OpenCode retention omits native history, so every directory-wide content search must disclose partial results: {provider}"
+            );
+
+            let full_text = directory_query(
+                app.clone(),
+                &format!("&query={assistant_marker}&tier=fullText"),
+            )
+            .await;
+            assert_eq!(
+                full_text["items"][0]["matchedIn"], "assistantMessage",
+                "{provider}"
+            );
+            assert!(full_text["items"][0]["snippet"]
+                .as_str()
+                .unwrap()
+                .contains(&assistant_marker));
+            assert!(!full_text["items"][0].to_string().contains(&user_marker));
+            assert!(full_text["items"][0].get("managedSearchMessages").is_none());
+            assert!(full_text.get("partial").is_some());
+
+            let assistant_only = directory_query(
+                app.clone(),
+                &format!("&query={assistant_marker}&tier=userMessages"),
+            )
+            .await;
+            assert!(
+                assistant_only["items"].as_array().unwrap().is_empty(),
+                "{provider}"
+            );
+            assert!(assistant_only.get("partial").is_some());
+        }
+        assert_eq!(backend.reads.load(std::sync::atomic::Ordering::SeqCst), 3);
+        control.abort();
     }
 
     #[tokio::test]

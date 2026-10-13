@@ -31,7 +31,9 @@
 //     { type:'sdk.assistant',           sessionId, content, model }
 //     { type:'sdk.stream',              sessionId, event, parentToolUseId }
 //     { type:'sdk.result',              sessionId, result, durationMs, costUsd, usage }
-//     { type:'sdk.turn.complete',       sessionId, at }                   // EVERY result (any subtype) except
+//     { type:'sdk.turn.complete',       sessionId, at, outcome }          // every provider result has a fixed
+//                                                                          // completed/failed category; pending-result
+//                                                                          // EOF is failed (the error text stays private)
 //                                  the interrupted turn's own (an accepted user interrupt's mark consumes
 //                                  it — turn-complete-gate.mjs); also minted from consumeStream's finally
 //                                  when a turn ends with NO result frame (stream exception or natural EOF
@@ -417,12 +419,13 @@ async function handleSdkMessage(sessionId, msg) {
       if (failure) emit({ type: 'sdk.error', sessionId, message: failure, turnFailure: true })
       // Unified attention edge: any turn end rings unless this result is the
       // interrupted turn's own (the SDK contract orders the settle receipt
-      // before it). No outcome rides the wire — the client treats all ends
-      // identically.
+      // before it). The additive outcome is a fixed category only; provider
+      // error details remain on the existing error path.
       if (st.turnCompleteGate.resultEmitsAttention()) {
         const at = nextMonotonic(st.lastTurnCompleteAt, Date.now())
         st.lastTurnCompleteAt = at
-        emit({ type: 'sdk.turn.complete', sessionId, at })
+        const outcome = msg.subtype === 'success' && msg.is_error !== true ? 'completed' : 'failed'
+        emit({ type: 'sdk.turn.complete', sessionId, at, outcome })
       }
       break
     }
@@ -490,7 +493,7 @@ async function consumeStream(sessionId, sdkQuery) {
     if (st && st.pendingResults > 0 && !st.abort.signal.aborted && st.turnCompleteGate.resultEmitsAttention()) {
       const at = nextMonotonic(st.lastTurnCompleteAt, Date.now())
       st.lastTurnCompleteAt = at
-      emit({ type: 'sdk.turn.complete', sessionId, at })
+      emit({ type: 'sdk.turn.complete', sessionId, at, outcome: 'failed' })
     }
     // Mirror SdkBridge: an aborted session surfaces sdk.exit; a natural end
     // surfaces an idle status. NEITHER is a completion chime, so a mid-turn

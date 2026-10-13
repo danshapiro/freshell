@@ -46,6 +46,7 @@ function createFreshAgentPaneStore(seenActionTypes: string[] = []) {
     reducer: {
       freshAgent: freshAgentReducer,
       panes: panesReducer,
+      turnCompletion: turnCompletionReducer,
     },
     preloadedState: {
       panes: emptyPanesState(),
@@ -548,12 +549,13 @@ describe('fresh-agent-ws', () => {
       sessionId,
       sessionType: 'freshcodex',
       provider: 'codex',
-      event: { type: 'freshAgent.turn.complete', sessionId, at: 1_700_000_000_000 },
+      event: { type: 'freshAgent.turn.complete', sessionId, at: 1_700_000_000_000, outcome: 'failed' },
     })).toBe(true)
     expect(actionTypes.filter((type) => type === 'turnCompletion/recordTurnComplete')).toHaveLength(1)
     expect(actionTypes.filter((type) => type.startsWith('turnCompletion/'))).toEqual([
       'turnCompletion/recordTurnComplete',
     ])
+    expect(store.getState().turnCompletion.pendingEvents[0]).toMatchObject({ outcome: 'failed' })
     // The status fold itself stays untouched by the companion: still 'stuck',
     // still not streaming.
     const after = store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`]

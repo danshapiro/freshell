@@ -20,7 +20,7 @@ export function freshAgentAssistantResponseFacts(root: ParentNode): { rows: numb
   }
 }
 
-/** Validate completion evidence against the selected provider; Codex requires an explicit outcome. */
+/** Validate completion evidence against the selected provider; every provider requires explicit success. */
 export function freshAgentTurnCompletionStatus(
   frames: readonly FreshAgentOrdinaryTurnFrame[],
   expectedProvider: FreshAgentOrdinaryTurnProvider,
@@ -30,10 +30,7 @@ export function freshAgentTurnCompletionStatus(
   if (completions.length === 0) return 'absent'
   if (completions.some(({ event, provider }) => {
     if (provider !== undefined && provider !== expectedProvider) return true
-    if (event && Object.prototype.hasOwnProperty.call(event, 'outcome')) {
-      return event.outcome !== 'completed'
-    }
-    return expectedProvider === 'codex'
+    return event?.outcome !== 'completed'
   })) return 'failed'
   return 'completed'
 }

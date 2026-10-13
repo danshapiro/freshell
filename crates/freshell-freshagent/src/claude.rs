@@ -11695,12 +11695,14 @@ pub(crate) mod tests {
         // The sidecar's unified turn-complete attention edge (minted for EVERY
         // result subtype except a user-interrupted turn's own), normalized to
         // freshAgent.turn.complete.
-        let line = json!({ "type": "sdk.turn.complete", "sessionId": "s-1", "at": 42 });
+        let line = json!({ "type": "sdk.turn.complete", "sessionId": "s-1", "at": 42,
+            "outcome":"completed" });
         let frame = sdk_line_to_frame(&line, "s-1", "freshclaude").unwrap();
         let wire: Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(wire["type"], "freshAgent.event");
         assert_eq!(wire["event"]["type"], "freshAgent.turn.complete");
         assert_eq!(wire["event"]["at"], 42);
+        assert_eq!(wire["event"]["outcome"], "completed");
     }
 
     /// Delta-review round 5 (AGENT-06): the `sdk.question.request` →

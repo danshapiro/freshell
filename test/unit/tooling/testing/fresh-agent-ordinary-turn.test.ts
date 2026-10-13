@@ -29,10 +29,10 @@ describe('FreshAgent ordinary-turn smoke evidence', () => {
     expect(freshAgentAssistantResponseFacts(pane)).toEqual({ rows: 1, textCharacters: 0 })
   })
 
-  it('keeps outcome optional for expected Claude and OpenCode completions', () => {
+  it('requires an explicit successful outcome for Claude and OpenCode completions', () => {
     expect(freshAgentTurnCompletionStatus([
       { type: 'freshAgent.event', event: { type: 'freshAgent.turn.complete' } },
-    ], 'opencode')).toBe('completed')
+    ], 'opencode')).toBe('failed')
     expect(freshAgentTurnCompletionStatus([
       {
         type: 'freshAgent.event',
@@ -49,8 +49,22 @@ describe('FreshAgent ordinary-turn smoke evidence', () => {
     ], 'claude')).toBe('completed')
     expect(freshAgentTurnCompletionStatus([
       { type: 'freshAgent.event', provider: 'claude', event: { type: 'freshAgent.turn.complete' } },
-    ], 'claude')).toBe('completed')
+    ], 'claude')).toBe('failed')
   })
+
+  it.each(['claude', 'codex', 'opencode'] as const)(
+    'requires an explicit successful outcome for %s fresh-agent completion', (provider) => {
+      const frame = (outcome?: string) => ({
+        type: 'freshAgent.event',
+        provider,
+        event: { type: 'freshAgent.turn.complete', ...(outcome === undefined ? {} : { outcome }) },
+      })
+
+      expect(freshAgentTurnCompletionStatus([frame()], provider)).toBe('failed')
+      expect(freshAgentTurnCompletionStatus([frame('failed')], provider)).toBe('failed')
+      expect(freshAgentTurnCompletionStatus([frame('completed')], provider)).toBe('completed')
+    },
+  )
 
   it('rejects a Codex completion without provider or outcome evidence', () => {
     expect(freshAgentTurnCompletionStatus([
