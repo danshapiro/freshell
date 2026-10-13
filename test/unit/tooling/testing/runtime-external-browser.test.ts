@@ -884,7 +884,17 @@ describe('owned Cloud launcher diagnostics', () => {
     const owner = new ManagedRuntimeOwner(() => { throw new Error('unused web') }, fixtureRepoRoot)
     const artifactPath = path.join(owner.runtime.evidenceDir, 'cloud-launcher-output.json')
     const privateBody = 'private-cloud-command-body'
-    await fsp.writeFile(path.join(directory, 'pnpm'), `#!${process.execPath}\nif(process.argv.includes('--version'))console.log('10.34.5');else{console.log('${privateBody}');console.error('exact execution image observation is unavailable');process.exitCode=73}`, { mode: 0o700 })
+    const fakePnpm = `#!${process.execPath}
+if (process.argv.includes('--version')) {
+  console.log('10.34.5')
+} else {
+  console.log('${privateBody}')
+  console.error('exact execution image observation is unavailable')
+  // Keep the child alive long enough for its executable and cwd to be observed.
+  setTimeout(() => { process.exitCode = 73 }, 1_000)
+}
+`
+    await fsp.writeFile(path.join(directory, 'pnpm'), fakePnpm, { mode: 0o700 })
     const lifecycle = new runner.ManagedExternalBrowserLifecycle(process.cwd(), { PATH: directory })
     Object.assign(lifecycle, { owner, descriptor: { ...runner.resolveManagedExternalDescriptor(descriptor)!,
       runId: owner.runtime.runId, candidateSha: owner.runtime.candidateSha }, tunnel: { assertAlive() {}, async stop() {} } })
