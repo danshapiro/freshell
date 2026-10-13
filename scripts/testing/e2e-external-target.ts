@@ -17,6 +17,7 @@ export type CodeCheckpointFixture = {
   candidateSha: string
   runId: string
   syntheticWorkspacePath: string
+  linkedWorktreePath: string
   syntheticHomePath: string
   nonGitWorkspacePath: string
   restrictedUid: number
@@ -55,7 +56,7 @@ export function resolvePairedExternalFixture(
   try { value = JSON.parse(env[matching]!) } catch { fail('fixture JSON') }
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail('fixture JSON')
   const paths = kind === 'managed-environment' ? ['remoteWorkspacePath']
-    : ['syntheticWorkspacePath', 'syntheticHomePath', 'nonGitWorkspacePath']
+    : ['syntheticWorkspacePath', 'linkedWorktreePath', 'syntheticHomePath', 'nonGitWorkspacePath']
   const fields = ['candidateSha', 'runId', 'expectedNonce', ...paths, ...(kind === 'code-checkpoint' ? ['restrictedUid'] : [])]
   if (Object.keys(value).length !== fields.length || Object.keys(value).some(key => !fields.includes(key))) fail('fixture fields')
   if (typeof value.candidateSha !== 'string' || !/^[a-f0-9]{40}$/.test(value.candidateSha)) fail('candidate SHA')

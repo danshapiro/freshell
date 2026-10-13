@@ -123,6 +123,7 @@ describe('browser selection non-vacuity', () => {
     expect(listedSpecFiles(ordinary.output).has(spec)).toBe(false)
     const fixture = JSON.stringify({ candidateSha: 'a'.repeat(40), runId: '11111111-1111-4111-8111-111111111111',
       syntheticWorkspacePath: '/tmp/selected-checkpoint-fixture/project',
+      linkedWorktreePath: '/tmp/selected-checkpoint-fixture/linked-worktree',
       syntheticHomePath: '/tmp/selected-checkpoint-fixture/home',
       nonGitWorkspacePath: '/tmp/selected-checkpoint-fixture/non-git', restrictedUid: 65534,
       expectedNonce: 'selection-checkpoint-nonce' })
@@ -131,7 +132,7 @@ describe('browser selection non-vacuity', () => {
       FRESHELL_E2E_TARGET_TOKEN: 'synthetic-selection-token' })
     const selected = listedProjects(paired, cloudConfig, ['--project=chromium-external-target', spec])
     expect(selected.labels).toEqual(['chromium-external-target'])
-    expect(selected.tests).toBe(3)
+    expect(selected.tests).toBe(4)
     expect(selected.files).toBe(1)
     expect([...listedSpecFiles(selected.output)]).toEqual([spec])
     const ordinaryExplicit = spawnSync(process.execPath, [playwrightCli, 'test', '--config', cloudConfig,

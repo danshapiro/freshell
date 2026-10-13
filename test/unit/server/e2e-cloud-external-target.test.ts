@@ -11,7 +11,8 @@ const targetToken = 'synthetic token: quote " newline\nvalue'
 const managedFixture = { candidateSha: 'a'.repeat(40), runId: '11111111-1111-4111-8111-111111111111',
   remoteWorkspacePath: '/tmp/synthetic/workspace', expectedNonce: 'synthetic-environment-nonce' }
 const checkpointFixture = { candidateSha: 'a'.repeat(40), runId: managedFixture.runId,
-  syntheticWorkspacePath: '/tmp/synthetic/workspace', syntheticHomePath: '/tmp/synthetic/home',
+  syntheticWorkspacePath: '/tmp/synthetic/workspace', linkedWorktreePath: '/tmp/synthetic/linked-worktree',
+  syntheticHomePath: '/tmp/synthetic/home',
   nonGitWorkspacePath: '/tmp/synthetic/non-git', restrictedUid: 65534, expectedNonce: 'synthetic-checkpoint-nonce' }
 
 async function dispatch(overrides: Record<string, string | undefined>) {

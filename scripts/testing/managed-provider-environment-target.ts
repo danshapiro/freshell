@@ -333,6 +333,7 @@ const capabilities = status.match(/^CapEff:\s+([0-9a-f]+)$/m)?.[1]
 assert.equal(capabilities, '0000000000000000', 'fixture UID B must have no effective capabilities')
 
 const project = path.join(root, 'project')
+const linkedWorktree = path.join(root, 'linked-worktree')
 const home = path.join(root, 'home')
 const storage = path.join(root, 'storage')
 const control = path.join(root, 'control')
@@ -366,15 +367,21 @@ assert.deepEqual([fs.lstatSync(deniedDirectory).uid, mode(deniedDirectory)], [0,
 
 fs.mkdirSync(control, { recursive: true, mode: 0o700 })
 fs.mkdirSync(path.join(project, '.freshell-checkpoint-fixture'), { recursive: true, mode: 0o700 })
+fs.mkdirSync(path.join(project, 'nested'), { recursive: true, mode: 0o755 })
 fs.writeFileSync(path.join(project, 'main.rs'), 'main before checkpoint\n')
 fs.writeFileSync(path.join(project, 'notes.txt'), 'notes before checkpoint\n')
+fs.writeFileSync(path.join(project, 'nested/rewind.txt'), 'nested before checkpoint\n')
 fs.writeFileSync(path.join(project, 'run.sh'), '#!/bin/sh\necho before\n', { mode: 0o755 })
 fs.symlinkSync('main.rs', path.join(project, 'main-link'))
 execFileSync('git', ['init', '-q'], { cwd: project, stdio: 'ignore' })
 execFileSync('git', ['config', 'user.name', 'Freshell checkpoint fixture'], { cwd: project, stdio: 'ignore' })
 execFileSync('git', ['config', 'user.email', 'fixture@example.invalid'], { cwd: project, stdio: 'ignore' })
-execFileSync('git', ['add', '--', '.gitignore', 'main.rs', 'notes.txt', 'run.sh', 'main-link'], { cwd: project, stdio: 'ignore' })
+execFileSync('git', ['add', '--', '.gitignore', 'main.rs', 'notes.txt', 'run.sh', 'main-link', 'nested/rewind.txt'], { cwd: project, stdio: 'ignore' })
 execFileSync('git', ['commit', '-q', '-m', 'synthetic checkpoint fixture'], { cwd: project, stdio: 'ignore' })
+execFileSync('git', ['worktree', 'add', '-q', '-b', 'checkpoint-e2e-linked-worktree', linkedWorktree, 'HEAD'], {
+  cwd: project,
+  stdio: 'ignore',
+})
 
 const nonGit = path.join(root, 'non-git')
 fs.mkdirSync(nonGit, { mode: 0o755 })
@@ -719,6 +726,7 @@ export async function runCodeCheckpointTarget() {
     candidateSha,
     runId,
     syntheticWorkspacePath: path.join(checkpointFixtureRoot, 'project'),
+    linkedWorktreePath: path.join(checkpointFixtureRoot, 'linked-worktree'),
     syntheticHomePath: path.join(checkpointFixtureRoot, 'home'),
     nonGitWorkspacePath: path.join(checkpointFixtureRoot, 'non-git'),
     restrictedUid: identity.uid,

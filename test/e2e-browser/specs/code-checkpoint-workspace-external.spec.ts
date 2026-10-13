@@ -128,7 +128,7 @@ async function sendThroughComposer(
   page: import('@playwright/test').Page,
   paneRoot: import('@playwright/test').Locator,
   text: string,
-  expectedWorkspace: { path: string; provenance: 'directory-picker' } | undefined,
+  expectedWorkspace: { path: string; provenance: 'directory-picker' | 'resolved-project' } | undefined,
 ) {
   await expect.poll(async () => (await currentFreshAgent(page)).content.status, { timeout: 60_000 }).toBe('idle')
   const baseline = await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.().length ?? 0)
@@ -164,7 +164,8 @@ async function sendThroughComposer(
     // The send barrier's first outcome is deliberately pre-forward and may
     // not yet know Codex's persisted user row. Require the later updated
     // native-linked projection before treating the per-turn result as ready.
-    return outcome?.nativeTurnId === accepted.submittedTurnId
+    return outcome !== undefined
+      && outcome.nativeTurnId === accepted.submittedTurnId
       && outcome.displayTurnId === `${accepted.submittedTurnId}:row-0`
   }, { timeout: 120_000 }).toBe(true)
   expect(outcome!.requestId).toBe(sent.requestId)
@@ -332,6 +333,94 @@ test('Git workspace sends retain per-turn success and failure, then restore the 
     .toEqual([first.outcome.nativeTurnId, second.outcome.nativeTurnId])
   expect(durable?.map(turn => turn.items.find(item => item.type === 'userMessage')?.id))
     .toEqual(durable?.map(turn => `${turn.id}:user`))
+})
+
+test('opening a linked-worktree session from History rewinds its resolved checkout', async ({ page }) => {
+  test.setTimeout(360_000)
+  await verifyTarget(page)
+  const checkout = fixture.linkedWorktreePath
+  const launchDirectory = `${checkout}/nested`
+  const sessionText = `linked-worktree history session ${fixture.expectedNonce}`
+  await targetWrite(page, `${checkout}/main.rs`, 'main before history checkpoint\n')
+  await targetWrite(page, `${launchDirectory}/rewind.txt`, 'nested before history checkpoint\n')
+
+  const { paneRoot } = await launchCodex(page, launchDirectory)
+  const initial = await currentFreshAgent(page)
+  const sessionId = initial.content.sessionRef?.sessionId ?? initial.content.sessionId
+  expect(initial.content.checkpointWorkspace).toEqual({ path: launchDirectory, provenance: 'directory-picker' })
+  expect(sessionId).toEqual(expect.any(String))
+  await sendThroughComposer(page, paneRoot, sessionText, {
+    path: launchDirectory,
+    provenance: 'directory-picker',
+  })
+
+  type DirectoryItem = {
+    sessionId: string
+    projectPath: string
+    checkoutPath?: string
+    cwd?: string
+  }
+  let directoryItem: DirectoryItem | undefined
+  await expect.poll(async () => {
+    const response = await page.request.get(
+      `${paired!.targetUrl}/api/session-directory?priority=visible&limit=50`,
+      { headers },
+    )
+    expect(response.ok()).toBe(true)
+    const payload = await response.json() as { items: DirectoryItem[] }
+    directoryItem = payload.items.find((item) => item.sessionId === sessionId)
+    return directoryItem
+  }, { timeout: 60_000, intervals: [500, 1000, 2000] }).toBeTruthy()
+  expect(directoryItem).toMatchObject({
+    projectPath: fixture.syntheticWorkspacePath,
+    checkoutPath: checkout,
+    cwd: launchDirectory,
+  })
+
+  // History must open from its directory projection; keeping the seed pane
+  // open would exercise the already-open-pane path and preserve its explicit
+  // picker scope instead of testing ordinary session restoration.
+  await paneRoot.getByRole('button', { name: 'Close pane' }).click()
+  await expect(page.locator('[data-context="fresh-agent"]')).toHaveCount(0, { timeout: 30_000 })
+  await page.locator('button[title="Projects (Ctrl+B P)"]').click()
+  const projectHeader = page.locator(`[data-project-path="${fixture.syntheticWorkspacePath}"]`)
+  await expect(projectHeader).toBeVisible({ timeout: 30_000 })
+  await projectHeader.click()
+  const historyRow = page.locator(`[data-context="history-session"][data-session-id="${sessionId}"]`)
+  await expect(historyRow).toBeVisible({ timeout: 30_000 })
+  await historyRow.getByRole('button', { name: 'Open session' }).click()
+
+  await expect.poll(async () => (await currentFreshAgent(page)).content.checkpointWorkspace)
+    .toEqual({ path: checkout, provenance: 'resolved-project' })
+  const reopenedPane = page.locator('[data-context="fresh-agent"]').last()
+  const beforeMain = 'main before linked-worktree rewind\n'
+  const beforeNested = 'nested before linked-worktree rewind\n'
+  await targetWrite(page, `${checkout}/main.rs`, beforeMain)
+  await targetWrite(page, `${launchDirectory}/rewind.txt`, beforeNested)
+
+  const turnText = `linked-worktree resolved-scope rewind ${fixture.expectedNonce}`
+  const turn = await sendThroughComposer(page, reopenedPane, turnText, {
+    path: checkout,
+    provenance: 'resolved-project',
+  })
+  expect(turn.outcome).toMatchObject({
+    status: 'available',
+    workspace: { path: checkout, provenance: 'resolved-project' },
+  })
+  expect(turn.outcome.checkpointId).toMatch(/^[a-f0-9]{40}$/)
+
+  await targetWrite(page, `${checkout}/main.rs`, 'main changed after linked-worktree turn\n')
+  await targetWrite(page, `${launchDirectory}/rewind.txt`, 'nested changed after linked-worktree turn\n')
+  await turn.row.hover()
+  const rewind = turn.row.getByRole('button', { name: 'Rewind code to here' })
+  await expect(rewind).toBeEnabled()
+  const rewindNotice = expect(reopenedPane.getByRole('alert').filter({ hasText: /Code rewound to before:/ }))
+    .toContainText('Automatic pre-turn snapshot', { timeout: 30_000 })
+  const dialogAccepted = page.waitForEvent('dialog').then((dialog) => dialog.accept())
+  await rewind.click()
+  await Promise.all([dialogAccepted, rewindNotice])
+  await expect.poll(() => targetRead(page, `${checkout}/main.rs`)).toBe(beforeMain)
+  await expect.poll(() => targetRead(page, `${launchDirectory}/rewind.txt`)).toBe(beforeNested)
 })
 
 test('picker-confirmed non-Git workspace captures and restores all selected files', async ({ page }) => {
