@@ -913,6 +913,7 @@ enum JavaScriptToken {
     String(Option<String>),
     Regex,
     Punctuation(u8),
+    TemplateBoundary,
 }
 
 fn javascript_control_header_closes(tokens: &[JavaScriptToken]) -> bool {
@@ -1000,7 +1001,9 @@ fn javascript_regex_can_start_after(tokens: &[JavaScriptToken]) -> bool {
                     | "yield"
             )
         }
-        Some(JavaScriptToken::String(_) | JavaScriptToken::Regex) => false,
+        Some(
+            JavaScriptToken::String(_) | JavaScriptToken::Regex | JavaScriptToken::TemplateBoundary,
+        ) => false,
     }
 }
 
@@ -1036,12 +1039,74 @@ fn javascript_regex_end(bytes: &[u8], start: usize) -> Result<Option<usize>, &'s
     Ok(None)
 }
 
-fn javascript_tokens(source: &str) -> Result<Vec<JavaScriptToken>, &'static str> {
-    const MAX_TOKENS: usize = 100_000;
+const MAX_JAVASCRIPT_TOKENS: usize = 100_000;
+const MAX_JAVASCRIPT_TEMPLATE_DEPTH: usize = 64;
+
+fn push_javascript_token(
+    tokens: &mut Vec<JavaScriptToken>,
+    token: JavaScriptToken,
+    token_count: &mut usize,
+) -> Result<(), &'static str> {
+    *token_count += 1;
+    if *token_count > MAX_JAVASCRIPT_TOKENS {
+        return Err("direct MCP Node dependency scan exceeds its token bound");
+    }
+    tokens.push(token);
+    Ok(())
+}
+
+fn javascript_template_tokens(
+    source: &str,
+    start: usize,
+    depth: usize,
+    token_count: &mut usize,
+) -> Result<(Vec<JavaScriptToken>, usize), &'static str> {
+    if depth >= MAX_JAVASCRIPT_TEMPLATE_DEPTH {
+        return Err("direct MCP Node dependency scan exceeds its template nesting bound");
+    }
     let bytes = source.as_bytes();
-    let mut at = 0usize;
+    let mut at = start + 1;
     let mut result = Vec::new();
     while at < bytes.len() {
+        if bytes[at] == b'\\' {
+            at = (at + 2).min(bytes.len());
+        } else if bytes[at] == b'`' {
+            at += 1;
+            push_javascript_token(&mut result, JavaScriptToken::String(None), token_count)?;
+            return Ok((result, at));
+        } else if bytes.get(at..at + 2) == Some(b"${") {
+            push_javascript_token(&mut result, JavaScriptToken::TemplateBoundary, token_count)?;
+            let expression_start = at + 2;
+            let (expression, expression_end) =
+                javascript_tokens_inner(source, expression_start, true, depth + 1, token_count)?;
+            if bytes.get(expression_end) != Some(&b'}') {
+                return Err("direct MCP Node script has an incomplete template expression");
+            }
+            result.extend(expression);
+            push_javascript_token(&mut result, JavaScriptToken::TemplateBoundary, token_count)?;
+            at = expression_end + 1;
+        } else {
+            at += 1;
+        }
+    }
+    Err("direct MCP Node script has an unterminated template string")
+}
+
+fn javascript_tokens_inner(
+    source: &str,
+    start: usize,
+    stop_at_template_expression_end: bool,
+    template_depth: usize,
+    token_count: &mut usize,
+) -> Result<(Vec<JavaScriptToken>, usize), &'static str> {
+    let bytes = source.as_bytes();
+    let mut at = start;
+    let mut result = Vec::new();
+    let mut brace_depth = 0usize;
+    while at < bytes.len() {
+        if stop_at_template_expression_end && bytes[at] == b'}' && brace_depth == 0 {
+            return Ok((result, at));
+        }
         if bytes[at].is_ascii_whitespace() {
             at += 1;
             continue;
@@ -1083,28 +1148,23 @@ fn javascript_tokens(source: &str) -> Result<Vec<JavaScriptToken>, &'static str>
             }
             let value = (!escaped).then(|| source[content_start..at].to_owned());
             at += 1;
-            result.push(JavaScriptToken::String(value));
+            push_javascript_token(&mut result, JavaScriptToken::String(value), token_count)?;
         } else if byte == b'`' {
-            at += 1;
-            while at < bytes.len() && bytes[at] != b'`' {
-                if bytes[at] == b'\\' {
-                    at = (at + 2).min(bytes.len());
-                } else {
-                    at += 1;
-                }
-            }
-            if at == bytes.len() {
-                return Err("direct MCP Node script has an unterminated template string");
-            }
-            at += 1;
-            result.push(JavaScriptToken::String(None));
+            let (template_tokens, template_end) =
+                javascript_template_tokens(source, at, template_depth, token_count)?;
+            result.extend(template_tokens);
+            at = template_end;
         } else if byte == b'/' && javascript_regex_can_start_after(&result) {
             if let Some(end) = javascript_regex_end(bytes, at)? {
                 at = end;
-                result.push(JavaScriptToken::Regex);
+                push_javascript_token(&mut result, JavaScriptToken::Regex, token_count)?;
             } else {
                 at += 1;
-                result.push(JavaScriptToken::Punctuation(byte));
+                push_javascript_token(
+                    &mut result,
+                    JavaScriptToken::Punctuation(byte),
+                    token_count,
+                )?;
             }
         } else if byte == b'_' || byte == b'$' || byte.is_ascii_alphabetic() {
             at += 1;
@@ -1114,16 +1174,31 @@ fn javascript_tokens(source: &str) -> Result<Vec<JavaScriptToken>, &'static str>
             {
                 at += 1;
             }
-            result.push(JavaScriptToken::Identifier(source[start..at].to_owned()));
+            push_javascript_token(
+                &mut result,
+                JavaScriptToken::Identifier(source[start..at].to_owned()),
+                token_count,
+            )?;
         } else {
+            if byte == b'{' {
+                brace_depth += 1;
+            } else if byte == b'}' {
+                brace_depth = brace_depth.saturating_sub(1);
+            }
             at += 1;
-            result.push(JavaScriptToken::Punctuation(byte));
-        }
-        if result.len() > MAX_TOKENS {
-            return Err("direct MCP Node dependency scan exceeds its token bound");
+            push_javascript_token(&mut result, JavaScriptToken::Punctuation(byte), token_count)?;
         }
     }
-    Ok(result)
+    if stop_at_template_expression_end {
+        Err("direct MCP Node script has an incomplete template expression")
+    } else {
+        Ok((result, at))
+    }
+}
+
+fn javascript_tokens(source: &str) -> Result<Vec<JavaScriptToken>, &'static str> {
+    let mut token_count = 0;
+    javascript_tokens_inner(source, 0, false, 0, &mut token_count).map(|(tokens, _)| tokens)
 }
 
 fn node_relative_module_specifiers(source: &str) -> Result<Vec<String>, &'static str> {
@@ -1586,6 +1661,7 @@ struct ScriptDependencyPath {
 
 fn direct_script_dependency_paths(
     parent: &Path,
+    entry_point_import_root: &Path,
     source: &str,
     runtime: ScriptDependencyRuntime,
 ) -> Result<Vec<ScriptDependencyPath>, &'static str> {
@@ -1622,7 +1698,14 @@ fn direct_script_dependency_paths(
         }
         ScriptDependencyRuntime::Python => Ok(python_import_specifiers(source)
             .into_iter()
-            .flat_map(|specifier| resolve_python_local_modules(parent, &specifier))
+            .flat_map(|specifier| {
+                let import_root = if specifier.starts_with('.') {
+                    parent
+                } else {
+                    entry_point_import_root
+                };
+                resolve_python_local_modules(import_root, &specifier)
+            })
             .map(|path| ScriptDependencyPath {
                 parse_as_script: is_script_dependency_source(&path, runtime),
                 path,
@@ -1668,6 +1751,11 @@ fn insert_direct_script_dependencies(
     const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
     const MAX_SCRIPT_FILES: usize = 256;
     let fail = |cause| ResourceError { field, cause };
+    let entry_point = checked(script, field, declaring).map_err(|error| fail(error.cause))?;
+    let entry_point_import_root = entry_point
+        .parent()
+        .ok_or_else(|| fail("direct MCP script has no entry-point import root"))?
+        .to_owned();
     let mut pending = vec![script.to_owned()];
     let mut visited = std::collections::BTreeSet::new();
     let mut parsed = std::collections::BTreeSet::new();
@@ -1696,7 +1784,10 @@ fn insert_direct_script_dependencies(
         let parent = canonical
             .parent()
             .ok_or_else(|| fail("direct MCP script has no containing directory"))?;
-        for candidate in direct_script_dependency_paths(parent, &source, runtime).map_err(fail)? {
+        for candidate in
+            direct_script_dependency_paths(parent, &entry_point_import_root, &source, runtime)
+                .map_err(fail)?
+        {
             let dependency = checked(&candidate.path, field, declaring)?;
             let dependency_is_file = dependency.is_file();
             if !dependency_is_file && !dependency.is_dir() {

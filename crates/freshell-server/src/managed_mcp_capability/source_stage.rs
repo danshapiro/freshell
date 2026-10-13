@@ -1220,6 +1220,36 @@ process.stdout.write(require('./helper.js'))
     }
 
     #[test]
+    fn direct_node_script_scans_template_expression_relative_import_after_all_copies() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let command = home.join("mcp.js");
+        let helper = home.join("helper.js");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "process.stdout.write(`raw require('./missing.js') ${`nested ${({ helper: require('./helper.js') }).helper}`}`)\n",
+        )
+        .unwrap();
+        std::fs::write(&helper, "module.exports = 'template helper loaded\\n'\n").unwrap();
+
+        let (plan, provider_script) =
+            plan_and_stage_direct_mcp_command(owned.path(), &home, &workspace, &command);
+        assert!(plan[0]
+            .configured_resources
+            .contains(&helper.canonicalize().unwrap()));
+
+        let output = execute_node_with_home_hidden(owned.path(), &home, &provider_script);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(
+            output.stdout,
+            b"raw require('./missing.js') nested template helper loaded\n"
+        );
+    }
+
+    #[test]
     fn direct_node_script_in_home_keeps_path_join_data_after_all_resource_copies() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2041,6 +2071,41 @@ process.stdout.write(require('./helper.js'))
         let output = execute_with_home_hidden(owned.path(), &home, &provider_command);
         assert!(output.status.success(), "{:?}", output.stderr);
         assert_eq!(output.stdout, b"nested package helper loaded\n");
+    }
+
+    #[test]
+    fn direct_python_absolute_package_import_uses_entry_point_import_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let package = home.join("pkg");
+        let command = home.join("start");
+        let helper = package.join("helper.py");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "#!/usr/bin/env python3\nimport pkg\nprint(pkg.helper.VALUE)\n",
+        )
+        .unwrap();
+        std::fs::write(package.join("__init__.py"), "from pkg import helper\n").unwrap();
+        std::fs::write(&helper, "VALUE = 'absolute package helper loaded'\n").unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (plan, provider_command) =
+            plan_and_stage_direct_mcp_command(owned.path(), &home, &workspace, &command);
+        assert!(plan[0]
+            .configured_resources
+            .contains(&helper.canonicalize().unwrap()));
+        assert!(!plan[0]
+            .configured_resources
+            .contains(&home.canonicalize().unwrap()));
+
+        let output = execute_with_home_hidden(owned.path(), &home, &provider_command);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"absolute package helper loaded\n");
     }
 
     #[test]
