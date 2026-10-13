@@ -779,6 +779,7 @@ print("UI pane is managed:", rows[-1]["soulId"])' "$BWS"
         esac
       done
       D=$(mktemp -d)   # fresh records dir for the recovery run
+      RECOVERY_MINTED=1   # exempt from the records check (it is empty BY DESIGN)
     fi
     # Self-healing token header: the trap removed it on the previous exit;
     # recreate it (0600) only when missing, extracting the token exactly
@@ -847,9 +848,21 @@ PY
         /tmp/tmp.*) ;;
         *) echo "REFUSING: D=$D is not a mktemp records directory"; exit 1 ;;
       esac
-      if [ ! -f "$D/probe-soul-id.txt" ] && [ ! -f "$D/run.env" ]; then
-        echo "REFUSING: D=$D carries no probe records — resolve manually"
-        exit 1
+      if [ "${RECOVERY_MINTED:-0}" != "1" ]; then
+        if [ ! -f "$D/probe-soul-id.txt" ] && [ ! -f "$D/run.env" ]; then
+          echo "REFUSING: D=$D carries no probe records — resolve manually"
+          exit 1
+        fi
+        # TIE the records to THIS run's workspace: mixing one run's D (and
+        # its self-consistent SOUL_ID/TID) with another run's WS would
+        # otherwise stop the old run's soul and delete the new workspace:
+        if [ -n "${WS:-}" ] && [ -f "$D/run.env" ]; then
+          RECORDED_WS=$(sed -n 's/^WS=//p' "$D/run.env" | tail -1)
+          if [ -n "$RECORDED_WS" ] && [ "$RECORDED_WS" != "$WS" ]; then
+            echo "REFUSING: D=$D records workspace $RECORDED_WS, but WS=$WS — mixed runs; resolve manually"
+            exit 1
+          fi
+        fi
       fi
     fi
     if [ -z "${SOUL_ID:-}" ]; then
