@@ -32,6 +32,7 @@ import {
 } from '../../../scripts/testing/task002-config-legacy-fixtures.js'
 import { ExternalManagedRuntimeRig, resolveManagedExternalDescriptor } from '../../../scripts/testing/runtime-external-browser.js'
 import { projectManagedViewProbe } from '../../../scripts/testing/managed-view-probe.js'
+import { projectPaneCreationProbe } from '../../../scripts/testing/pane-creation-probe.js'
 import { task2RetainedPublicContext, type Task2RetainedPublicContext } from '../../../scripts/testing/task002-retained-fixture.js'
 import { managedRecoveryBlockedMessage } from '../../../src/lib/managed-runtime-recovery-message.js'
 import {
@@ -314,6 +315,26 @@ async function paneNativeId(
   return typeof content?.sessionRef?.sessionId === 'string' ? content.sessionRef.sessionId : null
 }
 
+async function reportPaneCreationProbe(
+  harness: TestHarness,
+  rig: ManagedFixtureRig,
+  target: { terminalId: string | null; createRequestId: string | null },
+): Promise<void> {
+  const [sentMessages, receivedMessages] = await Promise.all([
+    harness.getSentWsMessages(), harness.getReceivedWsMessages(),
+  ])
+  let inventoryRead: 'ok' | 'failed' = 'failed'
+  let inventory: unknown
+  try {
+    inventory = await rig.inventory()
+    inventoryRead = 'ok'
+  } catch { /* retain the request/reply observation when owner inventory is unavailable */ }
+  const probe = projectPaneCreationProbe({ ...target, provider: 'codex',
+    sentMessages, receivedMessages, inventoryRead, inventory })
+  console.error(JSON.stringify({ severity: 'error', event: 'durable_souls.pane_creation_probe',
+    lane: 'terminal', provider: 'codex', probe }))
+}
+
 async function createProviderPane(
   page: Page,
   harness: TestHarness,
@@ -321,6 +342,7 @@ async function createProviderPane(
   tabId: string,
   definition: ProviderDefinition,
   onStage?: (stage: ProviderPaneSetupStage) => void,
+  onPaneCreationTimeout?: (target: { terminalId: string | null; createRequestId: string | null }) => Promise<void>,
   onManagedViewTimeout?: (target: { terminalId: string; createRequestId: string }) => Promise<void>,
 ): Promise<{ paneId: string; terminalId: string; view: ManagedRuntimeView }> {
   onStage?.('existing_panes')
@@ -338,10 +360,27 @@ async function createProviderPane(
   await directory.press('Enter')
 
   onStage?.('pane_creation')
-  const leaf = await waitForValue(`${definition.provider} picker-created pane`, async () => (
-    leavesByMode(await harness.getPaneLayout(tabId), definition.provider)
-      .find((candidate) => !priorPaneIds.has(candidate.id) && candidate.content?.terminalId)
-  ), 120_000)
+  let leaf: any
+  try {
+    leaf = await waitForValue(`${definition.provider} picker-created pane`, async () => (
+      leavesByMode(await harness.getPaneLayout(tabId), definition.provider)
+        .find((candidate) => !priorPaneIds.has(candidate.id) && candidate.content?.terminalId)
+    ), 120_000)
+  } catch (error) {
+    if (onPaneCreationTimeout) {
+      try {
+        const pendingPane = leavesByMode(await harness.getPaneLayout(tabId), definition.provider)
+          .find((candidate) => !priorPaneIds.has(candidate.id))
+        await onPaneCreationTimeout({
+          terminalId: typeof pendingPane?.content?.terminalId === 'string' && pendingPane.content.terminalId
+            ? pendingPane.content.terminalId : null,
+          createRequestId: typeof pendingPane?.content?.createRequestId === 'string' && pendingPane.content.createRequestId
+            ? pendingPane.content.createRequestId : null,
+        })
+      } catch { /* diagnostic failures must preserve the pane-creation timeout */ }
+    }
+    throw error
+  }
   onStage?.('terminal_visible')
   await page.locator(`[data-pane-id="${leaf.id}"] .xterm:visible`)
     .waitFor({ state: 'visible', timeout: 120_000 })
@@ -633,6 +672,11 @@ test.describe.serial('ordinary managed-provider use', () => {
         let created: Awaited<ReturnType<typeof createProviderPane>> | undefined
         let paneSetupStage: ProviderPaneSetupStage | null = null
         try {
+          const onPaneCreationTimeout = definition.provider === 'codex'
+            ? (target: { terminalId: string | null; createRequestId: string | null }) => (
+              reportPaneCreationProbe(harness, rig!, target)
+            )
+            : undefined
           const onManagedViewTimeout = definition.provider === 'codex'
             ? async ({ terminalId, createRequestId }: { terminalId: string; createRequestId: string }) => {
               try {
@@ -653,7 +697,7 @@ test.describe.serial('ordinary managed-provider use', () => {
             }
             : undefined
           created = await createProviderPane(page, harness, rig, tabId, definition,
-            stage => { paneSetupStage = stage }, onManagedViewTimeout)
+            stage => { paneSetupStage = stage }, onPaneCreationTimeout, onManagedViewTimeout)
           if (definition.provider === 'amplifier') {
             throw new Error('Amplifier is excluded from the ordinary terminal smoke')
           }

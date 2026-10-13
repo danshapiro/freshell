@@ -1000,6 +1000,47 @@ describe('candidate-bound Cloud execution events', () => {
 })
 
 describe('body-free ordinary-turn Cloud diagnostics', () => {
+  it('forwards only the request-correlated Codex pane-creation probe for the exact terminal smoke', () => {
+    for (const [key, value] of Object.entries(descriptor)) vi.stubEnv(key, value)
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+    try {
+      const reporter = new runner.default()
+      const testCase = { id: 'ordinary-turn-codex-pane-create-probe', location: {
+        file: 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts',
+      }, title: 'each selected terminal provider completes one ordinary turn' } as any
+      const probe = {
+        terminalCreateResult: 'created', inventoryRead: 'ok', matchingRowCount: 1,
+        matchingRows: [{ launchState: 'starting', providerMatch: true, containerIdPresent: true }],
+      }
+      const safeEvent = { severity: 'error', event: 'durable_souls.pane_creation_probe',
+        lane: 'terminal', provider: 'codex', probe }
+      reporter.onStdOut(`${JSON.stringify(safeEvent)}\n`, testCase)
+      reporter.onStdOut(`${JSON.stringify({ ...safeEvent,
+        probe: { ...probe, createRequestId: 'private-request-id-sentinel',
+          terminalId: 'private-terminal-id-sentinel', message: 'private-message-sentinel' } })}\n`, testCase)
+      reporter.onStdOut(`${JSON.stringify({ ...safeEvent, prompt: 'private-prompt-sentinel' })}\n`, testCase)
+
+      expect(write).toHaveBeenCalledOnce()
+      const forwarded = JSON.parse(String(write.mock.calls[0][0]))
+      expect(forwarded).toEqual({
+        severity: 'info', runId: descriptor.FRESHELL_RUNTIME_EXTERNAL_RUN_ID,
+        candidateSha: descriptor.FRESHELL_RUNTIME_EXTERNAL_CANDIDATE_SHA,
+        event: 'managed_external_ordinary_turn', id: 'ordinary-turn-codex-pane-create-probe',
+        file: 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts',
+        sourceEvent: 'durable_souls.pane_creation_probe', outcome: 'failed', lane: 'terminal',
+        provider: 'codex', paneCreationProbe: probe,
+      })
+      const serialized = JSON.stringify(forwarded)
+      for (const sentinel of [
+        'private-request-id-sentinel', 'private-terminal-id-sentinel', 'private-message-sentinel',
+        'private-prompt-sentinel',
+      ]) expect(serialized).not.toContain(sentinel)
+    } finally {
+      write.mockRestore()
+      vi.unstubAllEnvs()
+    }
+  })
+
   it('forwards the Codex managed-view probe only for the exact terminal smoke', () => {
     for (const [key, value] of Object.entries(descriptor)) vi.stubEnv(key, value)
     const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)

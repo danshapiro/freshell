@@ -2076,11 +2076,23 @@ const ManagedViewProbeSchema = z.object({
     providerMatch: z.boolean(), containerIdPresent: z.boolean(),
   }).strict()).max(8),
 }).strict()
+const PaneCreationProbeSchema = z.object({
+  terminalCreateResult: z.enum(['request_id_missing', 'request_not_observed', 'no_reply', 'created', 'error']),
+  wireErrorCode: ErrorCode.optional(),
+  inventoryRead: z.enum(['ok', 'failed']),
+  matchingRowCount: z.number().int().nonnegative().max(10_000),
+  matchingRows: z.array(z.object({
+    launchState: z.enum(['prepared', 'created', 'starting', 'running', 'stopping', 'stopped', 'failed', 'unknown']),
+    providerMatch: z.boolean(), containerIdPresent: z.boolean(),
+  }).strict()).max(8),
+}).strict()
 const OrdinaryTerminalTurnFactsSchema = z.object({
   inputSeen: z.boolean(), activitySeen: z.boolean(), outputSeen: z.boolean(),
   outputFrameCount: z.number().int().nonnegative().max(10000), completionSeen: z.boolean(),
 })
 const OrdinaryTerminalDiagnosticSchema = z.discriminatedUnion('event', [
+  z.object({ severity: z.literal('error'), event: z.literal('durable_souls.pane_creation_probe'),
+    lane: z.literal('terminal'), provider: z.literal('codex'), probe: PaneCreationProbeSchema }).strict(),
   z.object({ event: z.literal('durable_souls.managed_view_probe'), lane: z.literal('terminal'),
     provider: z.literal('codex'), probe: ManagedViewProbeSchema }),
   z.object({ event: z.literal('durable_souls.ordinary_turn_completed'), lane: z.literal('terminal'),
@@ -2378,6 +2390,8 @@ export default class ManagedExternalExecutionReporter implements Reporter {
           ? 'completed' : 'failed', lane: source.lane }
       if (source.event === 'durable_souls.ordinary_setup_failed') {
         this.emit({ ...common, setupFailureStage: source.stage })
+      } else if (source.event === 'durable_souls.pane_creation_probe') {
+        this.emit({ ...common, provider: source.provider, paneCreationProbe: source.probe })
       } else if (source.event === 'durable_souls.managed_view_probe') {
         this.emit({ ...common, provider: source.provider, managedViewProbe: source.probe })
       } else if (source.lane === 'terminal' && source.event === 'durable_souls.ordinary_turn_failed') {
