@@ -165,9 +165,9 @@ else
   : > "$RUN/desired-running.txt"
 fi
 trap 'rm -f "${RUN:-/nonexistent}/hdr"' EXIT   # ${RUN:-} survives set -u
-if [ -f "$RUN/hdr" ] && curl -s -o /dev/null -w '%{http_code}' -H @"$RUN/hdr" \
+if [ -f "$RUN/hdr" ] && curl -s --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}' -H @"$RUN/hdr" \
      http://127.0.0.1:3001/api/runtime/readiness | grep -q 200; then
-  curl -s -H @"$RUN/hdr" http://127.0.0.1:3001/api/runtime/souls \
+  curl -s --connect-timeout 5 --max-time 10 -H @"$RUN/hdr" http://127.0.0.1:3001/api/runtime/souls \
     | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
 for s in souls:
@@ -464,12 +464,12 @@ PY
     # from the registry is exactly what the sweep must catch (this also
     # fills the API-less fallback's empty baseline — an empty sweep
     # would otherwise pass vacuously):
-    curl -s -H @"$RUN/hdr" http://127.0.0.1:3001/api/runtime/souls \
+    curl -s --connect-timeout 5 --max-time 10 -H @"$RUN/hdr" http://127.0.0.1:3001/api/runtime/souls \
       | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
 for s in souls:
     print(s["soulId"], s.get("containerId") or "-", s.get("launchState") or "-")' > "$RUN/souls-all.txt"
-    curl -s -H @"$RUN/hdr" http://127.0.0.1:3001/api/runtime/souls \
+    curl -s --connect-timeout 5 --max-time 10 -H @"$RUN/hdr" http://127.0.0.1:3001/api/runtime/souls \
       | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
 for s in souls:
@@ -492,7 +492,7 @@ for s in souls:
     sort -u "$RUN/desired-running.txt" "$RUN/desired-running-after.txt" \
       | while read -r SID; do
       [ -n "$SID" ] || continue
-      curl -s -H @"$RUN/hdr" "http://127.0.0.1:3001/api/runtime/souls/$SID" \
+      curl -s --connect-timeout 5 --max-time 10 -H @"$RUN/hdr" "http://127.0.0.1:3001/api/runtime/souls/$SID" \
         | python3 -c 'import json,sys
 o=json.load(sys.stdin)
 s=o.get("soul")
@@ -580,11 +580,11 @@ PY
    trap 'rm -f "${RUN:-/nonexistent}/hdr" "${D:-/nonexistent}/hdr"' EXIT
     printf 'D=%q\nWS=%q\nCHECKOUT=%q\n' "$D" "$WS" "$CHECKOUT" > "$D/run.env"
     # create the probe pane (example); record terminalId from the response:
-   curl -s -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
+   curl -s --connect-timeout 5 --max-time 30 -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
      -d '{"mode":"shell","cwd":"'"$WS"'","name":"home-mount probe"}' \
      http://127.0.0.1:3001/api/tabs | tee "$D/probe-tab.json"
    TID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["data"]["terminalId"])' "$D/probe-tab.json")
-   SOUL_ID=$(curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
+   SOUL_ID=$(curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
      | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
 print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$TID" \
@@ -676,7 +676,7 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
     # The directory picker PERSISTS the chosen path as OpenCode's default
     # cwd (the confirm handler patches settings) — record the current
     # default so step 8 can restore it:
-    curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/settings \
+    curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" http://127.0.0.1:3001/api/settings \
       | python3 -c 'import json,sys
 d=json.load(sys.stdin)
 d=d.get("data",d)
@@ -694,7 +694,8 @@ print((d.get("codingCli") or {}).get("providers",{}).get("opencode",{}).get("cwd
     # the confirmation dispatches a UI update, terminal.create goes out
     # from a React effect, and the managed launch is asynchronous — so
     # the soul may not exist the instant you confirm. Poll up to ~120s:
-    for i in $(seq 1 60); do
+    POLL_DEADLINE=$((SECONDS + 120))
+    while [ "$SECONDS" -lt "$POLL_DEADLINE" ]; do
       if curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
         | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
@@ -702,7 +703,7 @@ rows=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
 sids={r["soulId"] for r in rows}
 assert len(sids)<=1, ("workspace ambiguous (mint a fresh BWS and retry)", rows)
 sys.exit(0 if len(sids)==1 and rows[-1].get("launchState")=="running" else 1)' "$BWS"; then
-        echo "UI pane is managed (after $((i*2))s)"
+        echo "UI pane is managed (after $((SECONDS - POLL_DEADLINE + 120))s)"
         break
       fi
       sleep 2
@@ -835,6 +836,13 @@ PY
         "$HOME"/freshell-probe.*) ;;
         *) echo "REFUSING: $V=$VAL is not a freshell-probe workspace — resolve manually"; exit 1 ;;
       esac
+      # A NAME pattern is not ownership: a real workspace could sit under
+      # a freshell-probe-named directory. Probe workspaces contain NO
+      # visible (non-dotfile) content — refuse anything with user files:
+      if [ -n "$(find "$VAL" -mindepth 1 -maxdepth 2 -not -name '.*' -print -quit 2>/dev/null)" ]; then
+        echo "REFUSING: $V=$VAL contains visible files — probe workspaces are empty; resolve manually"
+        exit 1
+      fi
       if [ -z "$GUARD_ROOT" ]; then
         GUARD_ROOT="$PARENT"
       elif [ "$PARENT" != "$GUARD_ROOT" ]; then
@@ -876,7 +884,7 @@ PY
         echo "export WS=<your probe workspace>, and BWS=<your browser-check workspace> if applicable, then re-run"
         exit 1
       fi
-      PROBE=$(curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
+      PROBE=$(curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
         | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
 rows=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
@@ -888,19 +896,24 @@ assert len(sids)==1, ("workspace ambiguous — do not stop anything; resolve man
 s=rows[-1]
 print(s["soulId"], s["intentRevision"], s["terminalId"])' "$WS")
       read -r SOUL_ID REV TID <<< "$PROBE"
+      # CONFIRM the matched record is really the throwaway probe — the
+      # final human check before a destructive stop:
+      echo "Recovery matched: soul=$SOUL_ID terminal=$TID workspace=$WS"
+      read -r -p "Stop and delete this PROBE soul? Type 'yes' to confirm: " CONFIRM
+      [ "$CONFIRM" = "yes" ] || { echo "aborted — nothing stopped, nothing deleted"; exit 1; }
     else
       TID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["data"]["terminalId"])' "$D/probe-tab.json")
       # Identity re-check FIRST; with set -e its failure aborts the block
       # before the revision fetch and the stop request are ever reached:
-      curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls/$SOUL_ID \
+      curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls/$SOUL_ID \
         | python3 -c 'import json,sys
 s=json.load(sys.stdin)["soul"]
 assert s.get("terminalId")==sys.argv[1], ("SOUL/PROBE MISMATCH", s)
 print("identity ok:", s.get("terminalId"))' "$TID"
-      REV=$(curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls/$SOUL_ID \
+      REV=$(curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls/$SOUL_ID \
         | python3 -c 'import json,sys;print(json.load(sys.stdin)["soul"]["intentRevision"])')
     fi
-    curl -s -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
+    curl -s --connect-timeout 5 --max-time 30 -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
       -d "{\"requestId\":\"probe-cleanup\",\"expectedIntentRevision\":$REV}" \
       http://127.0.0.1:3001/api/runtime/souls/$SOUL_ID/stop \
       | python3 -c 'import json,sys
@@ -912,7 +925,7 @@ print("stopped:", o["outcome"])'
     # Look it up by workspace in ANY launchState — a blocked or exited
     # probe soul still must not be orphaned against a deleted workspace:
     if [ -n "${BWS:-}" ]; then
-      BS=$(curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
+      BS=$(curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
         | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
 rows=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
@@ -936,7 +949,7 @@ else:
       # An EXITED incarnation can still be desired-running (eligible for
       # recovery) — only a committed stop intent makes it safe to delete
       # the workspace, so require desiredState=="stopped" too:
-      BS_DESIRED=$(curl -s --max-time 10 -H @"$D/hdr" \
+      BS_DESIRED=$(curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" \
         "http://127.0.0.1:3001/api/runtime/souls/$BS_ID" \
         | python3 -c 'import json,sys;print(json.load(sys.stdin)["soul"].get("desiredState") or "")')
       if [ "$BS_CID" = "-" ]; then
@@ -944,7 +957,7 @@ else:
         # unresolved intent — refuse rather than report success:
         { echo "browser-check soul has no container but state=$BS_STATE — resolve manually before deleting $BWS"; exit 1; }
       elif [ "$BS_STATE" != "stopped" ] || [ "$BS_DESIRED" != "stopped" ]; then
-        curl -s -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
+        curl -s --connect-timeout 5 --max-time 30 -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
           -d "{\"requestId\":\"probe-cleanup\",\"expectedIntentRevision\":$BS_REV}" \
           http://127.0.0.1:3001/api/runtime/souls/$BS_ID/stop \
           | python3 -c 'import json,sys
@@ -986,12 +999,12 @@ print("" if cur is None else cur)')
       BODY=$(python3 -c 'import json,sys
 old=sys.argv[1] or None
 print(json.dumps({"codingCli":{"providers":{"opencode":{"cwd":old}}}}))' "$OLD")
-      CODE=$(curl -s -o "$D/settings-restore.out" -w '%{http_code}' -X PATCH \
+      CODE=$(curl -s --connect-timeout 5 --max-time 30 -o "$D/settings-restore.out" -w '%{http_code}' -X PATCH \
         -H @"$D/hdr" -H "Content-Type: application/json" -d "$BODY" \
         http://127.0.0.1:3001/api/settings)
       grep -q '^2' <<<"$CODE" \
         || { echo "settings restore failed (HTTP $CODE):"; cat "$D/settings-restore.out"; exit 1; }
-      curl -s -H @"$D/hdr" http://127.0.0.1:3001/api/settings \
+      curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" http://127.0.0.1:3001/api/settings \
         | python3 -c 'import json,sys
 d=json.load(sys.stdin); d=d.get("data",d)
 cur=(d.get("codingCli") or {}).get("providers",{}).get("opencode",{}).get("cwd")
@@ -1004,14 +1017,14 @@ sys.exit(0 if cur==sys.argv[1] else 1)' "$OLD" \
       # If the current default still points at $BWS, clearing it is the
       # only safe option — otherwise deleting $BWS would leave OpenCode
       # defaulting into a deleted directory:
-      CUR=$(curl -s --max-time 10 -H @"$D/hdr" http://127.0.0.1:3001/api/settings \
+      CUR=$(curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" http://127.0.0.1:3001/api/settings \
         | python3 -c 'import json,sys
 d=json.load(sys.stdin); d=d.get("data",d)
 cur=(d.get("codingCli") or {}).get("providers",{}).get("opencode",{}).get("cwd")
 print("" if cur is None else cur)')
       if [ "$CUR" = "$BWS" ]; then
         BODY=$(python3 -c 'import json;print(json.dumps({"codingCli":{"providers":{"opencode":{"cwd":None}}}}))')
-        CODE=$(curl -s -o "$D/settings-clear.out" -w '%{http_code}' -X PATCH \
+        CODE=$(curl -s --connect-timeout 5 --max-time 30 -o "$D/settings-clear.out" -w '%{http_code}' -X PATCH \
           -H @"$D/hdr" -H "Content-Type: application/json" -d "$BODY" \
           http://127.0.0.1:3001/api/settings)
         grep -q '^2' <<<"$CODE" || { echo "clearing OpenCode default failed (HTTP $CODE)"; exit 1; }
