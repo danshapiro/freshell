@@ -503,7 +503,7 @@ test.describe.serial('ordinary fresh-agent use', () => {
             if (turnFrames.some((frame) => frame.event?.type === 'freshAgent.error')) {
               throw new Error('fresh-agent turn emitted a correlated provider error')
             }
-            const completionStatus = freshAgentTurnCompletionStatus(turnFrames)
+            const completionStatus = freshAgentTurnCompletionStatus(turnFrames, definition.provider)
             if (completionStatus === 'failed') {
               throw new Error('fresh-agent turn completed with an unsuccessful provider outcome')
             }

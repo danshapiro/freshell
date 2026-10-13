@@ -4,6 +4,8 @@ export type FreshAgentOrdinaryTurnFrame = {
   event?: Record<string, unknown>
 }
 
+export type FreshAgentOrdinaryTurnProvider = 'claude' | 'codex' | 'opencode'
+
 export type FreshAgentTurnCompletionStatus = 'absent' | 'completed' | 'failed'
 
 /** Safe browser evidence: count only rendered assistant transcript rows. */
@@ -18,18 +20,20 @@ export function freshAgentAssistantResponseFacts(root: ParentNode): { rows: numb
   }
 }
 
-/** Codex completion is an attention edge for every ended turn, so require its outcome. */
+/** Validate completion evidence against the selected provider; Codex requires an explicit outcome. */
 export function freshAgentTurnCompletionStatus(
   frames: readonly FreshAgentOrdinaryTurnFrame[],
+  expectedProvider: FreshAgentOrdinaryTurnProvider,
 ): FreshAgentTurnCompletionStatus {
   const completions = frames.filter((frame) => frame?.type === 'freshAgent.event'
     && frame.event?.type === 'freshAgent.turn.complete')
   if (completions.length === 0) return 'absent'
   if (completions.some(({ event, provider }) => {
+    if (provider !== undefined && provider !== expectedProvider) return true
     if (event && Object.prototype.hasOwnProperty.call(event, 'outcome')) {
       return event.outcome !== 'completed'
     }
-    return provider === 'codex'
+    return expectedProvider === 'codex'
   })) return 'failed'
   return 'completed'
 }

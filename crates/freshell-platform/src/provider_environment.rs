@@ -586,6 +586,9 @@ thread_local! {
     static PUBLICATION_JOURNAL_ENTRY_COMPARISONS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    static PUBLICATION_LEAF_JOURNAL_PATH_COMPARISONS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
 }
 
 #[derive(Default)]
@@ -1510,15 +1513,33 @@ impl Publication {
         &mut self,
         destination_root: &Path,
         relative: &Path,
+        leaf_journal_indices: &[usize],
         had_original: bool,
     ) -> Result<(), CopyError> {
-        let entry = self
-            .journal_entries
-            .iter_mut()
-            .find(|entry| {
-                matches!(entry, PublicationJournalEntry::Leaf { relative: path, .. } if path == relative)
+        let index_position = leaf_journal_indices
+            .binary_search_by(|journal_index| {
+                #[cfg(test)]
+                PUBLICATION_LEAF_JOURNAL_PATH_COMPARISONS.with(|comparisons| {
+                    comparisons.set(comparisons.get() + 1);
+                });
+                let PublicationJournalEntry::Leaf {
+                    relative: journal_relative,
+                    ..
+                } = &self.journal_entries[*journal_index]
+                else {
+                    unreachable!("leaf journal index contains only leaves")
+                };
+                journal_relative.as_path().cmp(relative)
             })
-            .ok_or_else(|| error(relative, "write_journal", "published leaf is absent from the journal"))?;
+            .map_err(|_| {
+                error(
+                    relative,
+                    "write_journal",
+                    "published leaf is absent from the journal",
+                )
+            })?;
+        let entry_index = leaf_journal_indices[index_position];
+        let entry = &mut self.journal_entries[entry_index];
         if let PublicationJournalEntry::Leaf {
             had_original: previous,
             ..
@@ -2211,6 +2232,17 @@ fn stage_environment_with_publisher(
             &publication.backup.0,
             &publication.journal_entries,
         )?;
+        // The journal was built by walking `plan.nodes`, a BTreeMap ordered
+        // by relative path. Filtering that order keeps the leaf index sorted
+        // while preserving the durable journal's original entry order.
+        let leaf_journal_indices = publication
+            .journal_entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                matches!(entry, PublicationJournalEntry::Leaf { .. }).then_some(index)
+            })
+            .collect::<Vec<_>>();
         let old_files = publication.backup.0.join(OLD_FILES_DIR);
         fs::create_dir(&old_files)
             .map_err(|cause| io_error(Path::new(""), "create_publication_backups", cause))?;
@@ -2238,6 +2270,7 @@ fn stage_environment_with_publisher(
                 publication.set_leaf_had_original(
                     destination_root,
                     relative,
+                    &leaf_journal_indices,
                     existing.is_some(),
                 )?;
                 if existing.is_some() {
@@ -3069,6 +3102,35 @@ mod tests {
         for path in stale {
             assert_eq!(fs::read(home.join(path)).unwrap(), b"previous");
         }
+    }
+
+    #[test]
+    fn existing_leaf_journal_membership_scales_with_lookup_steps() {
+        const LEAF_COUNT: usize = 512;
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let source = root.path().join("source");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&source).unwrap();
+        let selections = (0..LEAF_COUNT)
+            .map(|index| {
+                let name = format!("leaf-{index:04}");
+                let source_leaf = source.join(&name);
+                fs::write(&source_leaf, b"new").unwrap();
+                fs::write(home.join(&name), b"previous").unwrap();
+                selection(&source_leaf, &name)
+            })
+            .collect::<Vec<_>>();
+
+        PUBLICATION_LEAF_JOURNAL_PATH_COMPARISONS.with(|comparisons| comparisons.set(0));
+        copy_environment_with_account_home(&selections, &home, &[], Default::default(), None)
+            .unwrap();
+        let comparisons = PUBLICATION_LEAF_JOURNAL_PATH_COMPARISONS.with(std::cell::Cell::get);
+
+        assert!(
+            comparisons <= LEAF_COUNT * 16,
+            "existing-leaf journal lookup compared paths {comparisons} times for {LEAF_COUNT} leaves"
+        );
     }
 
     #[cfg(target_os = "linux")]

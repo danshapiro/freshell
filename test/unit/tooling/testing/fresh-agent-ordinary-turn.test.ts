@@ -29,53 +29,82 @@ describe('FreshAgent ordinary-turn smoke evidence', () => {
     expect(freshAgentAssistantResponseFacts(pane)).toEqual({ rows: 1, textCharacters: 0 })
   })
 
-  it('accepts a legacy completion without an outcome and a successful OpenCode outcome', () => {
+  it('keeps outcome optional for expected Claude and OpenCode completions', () => {
     expect(freshAgentTurnCompletionStatus([
       { type: 'freshAgent.event', event: { type: 'freshAgent.turn.complete' } },
-    ])).toBe('completed')
-    expect(freshAgentTurnCompletionStatus([
-      { type: 'freshAgent.event', event: { type: 'freshAgent.turn.complete', outcome: 'completed' } },
-    ])).toBe('completed')
-  })
-
-  it('rejects an outcome-less Codex completion because that edge also signals failed turns', () => {
+    ], 'opencode')).toBe('completed')
     expect(freshAgentTurnCompletionStatus([
       {
         type: 'freshAgent.event',
-        provider: 'codex',
-        event: { type: 'freshAgent.turn.complete' },
+        provider: 'opencode',
+        event: { type: 'freshAgent.turn.complete', outcome: 'completed' },
       },
-    ])).toBe('failed')
+    ], 'opencode')).toBe('completed')
+    expect(freshAgentTurnCompletionStatus([
+      {
+        type: 'freshAgent.event',
+        provider: 'claude',
+        event: { type: 'freshAgent.turn.complete', outcome: 'completed' },
+      },
+    ], 'claude')).toBe('completed')
+    expect(freshAgentTurnCompletionStatus([
+      { type: 'freshAgent.event', provider: 'claude', event: { type: 'freshAgent.turn.complete' } },
+    ], 'claude')).toBe('completed')
   })
 
-  it('accepts Codex only when its provider outcome explicitly succeeded', () => {
+  it('rejects a Codex completion without provider or outcome evidence', () => {
+    expect(freshAgentTurnCompletionStatus([
+      {
+        type: 'freshAgent.event',
+        event: { type: 'freshAgent.turn.complete' },
+      },
+    ], 'codex')).toBe('failed')
+  })
+
+  it('accepts Codex only when its outcome explicitly succeeded', () => {
     expect(freshAgentTurnCompletionStatus([
       {
         type: 'freshAgent.event',
         provider: 'codex',
         event: { type: 'freshAgent.turn.complete', outcome: 'completed' },
       },
-    ])).toBe('completed')
+    ], 'codex')).toBe('completed')
+    expect(freshAgentTurnCompletionStatus([
+      {
+        type: 'freshAgent.event',
+        event: { type: 'freshAgent.turn.complete', outcome: 'completed' },
+      },
+    ], 'codex')).toBe('completed')
     expect(freshAgentTurnCompletionStatus([
       {
         type: 'freshAgent.event',
         provider: 'codex',
         event: { type: 'freshAgent.turn.complete', outcome: 'failed' },
       },
-    ])).toBe('failed')
+    ], 'codex')).toBe('failed')
+  })
+
+  it('rejects a completion that names a provider other than the selected provider', () => {
+    expect(freshAgentTurnCompletionStatus([
+      {
+        type: 'freshAgent.event',
+        provider: 'claude',
+        event: { type: 'freshAgent.turn.complete', outcome: 'completed' },
+      },
+    ], 'codex')).toBe('failed')
   })
 
   it.each(['provider_error', 'idle_timeout', 'sidecar_lost', 'request_failed', 'unknown']) (
     'rejects a completion with outcome %s', (outcome) => {
       expect(freshAgentTurnCompletionStatus([
         { type: 'freshAgent.event', event: { type: 'freshAgent.turn.complete', outcome } },
-      ])).toBe('failed')
+      ], 'opencode')).toBe('failed')
     },
   )
 
   it('does not treat a different event as turn completion', () => {
     expect(freshAgentTurnCompletionStatus([
       { type: 'freshAgent.event', event: { type: 'freshAgent.session.snapshot' } },
-    ])).toBe('absent')
+    ], 'opencode')).toBe('absent')
   })
 })
