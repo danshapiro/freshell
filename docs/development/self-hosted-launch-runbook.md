@@ -876,6 +876,13 @@ PY
         "$HOME"/freshell-probe.*) ;;
         *) echo "REFUSING: $V=$VAL is not a freshell-probe workspace — resolve manually"; exit 1 ;;
       esac
+      # A case-pattern `*` matches `/` too — pin the depth: the parent's
+      # own parent must be EXACTLY the home, so a path nested deeper
+      # under a probe-named directory cannot pass:
+      if [ "$(dirname "$PARENT")" != "$HOME" ]; then
+        echo "REFUSING: $V=$VAL is nested below $PARENT — workspaces sit directly under the probe root"
+        exit 1
+      fi
       # A NAME pattern is not ownership: a real workspace could sit under
       # a freshell-probe-named directory. Probe workspaces are created
       # EMPTY and stay empty (in-soul provider state lives in the soul
@@ -1126,39 +1133,64 @@ print("" if cur is None else cur)' "$D/settings.json")
       sleep 3
       SWEEP_DIR=$(mktemp -d)
       umask 077
-      if [ ! -f "${RUN:-/nonexistent}/hdr" ]; then
+      HDR="${RUN:-/nonexistent}/hdr"
+      if [ ! -f "$HDR" ]; then
+        # Re-mint the token with the SAME two-source extraction the rest
+        # of the procedure uses — a server that loaded its token from
+        # .env never exposes it in /proc:
         SPID=$(systemctl --user show freshell-rust.service -p MainPID --value)
         TOK=""
         if [ "${SPID:-0}" -gt 0 ] 2>/dev/null; then
           TOK=$(tr '\0' '\n' < "/proc/$SPID/environ" | sed -n 's/^AUTH_TOKEN=//p' || true)
         fi
+        if [ -z "$TOK" ]; then
+          SWEEP_CHECKOUT=$(systemctl --user show freshell-rust.service -p WorkingDirectory --value)
+          TOK=$(python3 - "$SWEEP_CHECKOUT/.env" <<'PY'
+import os,re,sys
+path=sys.argv[1]
+if not os.path.exists(path): sys.exit(0)
+last=None
+for line in open(path):
+    m=re.match(r'^\s*(?:export\s+)?AUTH_TOKEN\s*=\s*(.*)$', line.rstrip("\n"))
+    if m: last=m.group(1)
+if last is None: sys.exit(0)
+if last[:1] in ('"',"'"):
+    end=last.find(last[0],1)
+    print(last[1:end] if end>0 else last[1:])
+else:
+    print(re.split(r'\s#', last.strip(), 1)[0].strip())
+PY
+)
+        fi
         if [ -n "$TOK" ]; then
           printf 'x-auth-token: %s\n' "$TOK" > "$SWEEP_DIR/hdr"
+          HDR="$SWEEP_DIR/hdr"
         fi
       fi
-      HDR="${RUN:-$SWEEP_DIR}/hdr"
-      if [ -f "$HDR" ]; then
-        SETTINGS_CODE=$(curl -s --connect-timeout 5 --max-time 10 \
-          -o "$SWEEP_DIR/settings.json" -w '%{http_code}' -H @"$HDR" \
-          http://127.0.0.1:3001/api/settings) || SETTINGS_CODE=000
-        if grep -q '^2' <<<"$SETTINGS_CODE"; then
-          SWEEP_CWD=$(python3 -c 'import json,sys
+      # The sweep is the LAST verification gate — it fails closed:
+      [ -f "$HDR" ] \
+        || { echo "sweep cannot run (no token) — check Settings → Coding CLI → OpenCode manually; the default may point at the deleted probe dir"; rm -rf "$SWEEP_DIR"; exit 1; }
+      SETTINGS_CODE=$(curl -s --connect-timeout 5 --max-time 10 \
+        -o "$SWEEP_DIR/settings.json" -w '%{http_code}' -H @"$HDR" \
+        http://127.0.0.1:3001/api/settings) || SETTINGS_CODE=000
+      grep -q '^2' <<<"$SETTINGS_CODE" \
+        || { echo "sweep settings read FAILED (HTTP $SETTINGS_CODE) — check Settings → Coding CLI → OpenCode manually"; rm -rf "$SWEEP_DIR"; exit 1; }
+      SWEEP_CWD=$(python3 -c 'import json,sys
 d=json.load(open(sys.argv[1])); d=d.get("data",d)
 cc=d.get("codingCli")
 assert isinstance(cc, dict), "malformed settings response"
 cur=((cc.get("providers") or {}).get("opencode",{}) or {}).get("cwd")
-print("" if cur is None else cur)' "$SWEEP_DIR/settings.json") || SWEEP_CWD=""
-          if [ "$SWEEP_CWD" = "$BWS" ]; then
-            BODY=$(python3 -c 'import json;print(json.dumps({"codingCli":{"providers":{"opencode":{"cwd":None}}}}))')
-            PATCH_CODE=$(curl -s --connect-timeout 5 --max-time 30 \
-              -o "$SWEEP_DIR/patch.out" -w '%{http_code}' -X PATCH -H @"$HDR" \
-              -H "Content-Type: application/json" -d "$BODY" \
-              http://127.0.0.1:3001/api/settings)
-            grep -q '^2' <<<"$PATCH_CODE" \
-              || { echo "late-save clear FAILED (HTTP $PATCH_CODE) — clear Settings → Coding CLI → OpenCode manually"; rm -rf "$SWEEP_DIR"; exit 1; }
-            echo "NOTE: a late picker save re-pointed OpenCode at the deleted probe dir — cleared; set your default in Settings"
-          fi
-        fi
+print("" if cur is None else cur)' "$SWEEP_DIR/settings.json") \
+        || { echo "sweep got a malformed settings response — check Settings → Coding CLI → OpenCode manually"; rm -rf "$SWEEP_DIR"; exit 1; }
+      if [ "$SWEEP_CWD" = "$BWS" ]; then
+        BODY=$(python3 -c 'import json;print(json.dumps({"codingCli":{"providers":{"opencode":{"cwd":None}}}}))')
+        PATCH_CODE=$(curl -s --connect-timeout 5 --max-time 30 \
+          -o "$SWEEP_DIR/patch.out" -w '%{http_code}' -X PATCH -H @"$HDR" \
+          -H "Content-Type: application/json" -d "$BODY" \
+          http://127.0.0.1:3001/api/settings)
+        grep -q '^2' <<<"$PATCH_CODE" \
+          || { echo "late-save clear FAILED (HTTP $PATCH_CODE) — clear Settings → Coding CLI → OpenCode manually"; rm -rf "$SWEEP_DIR"; exit 1; }
+        echo "NOTE: a late picker save re-pointed OpenCode at the deleted probe dir — cleared; set your default in Settings"
       fi
       rm -rf "$SWEEP_DIR"
     fi
