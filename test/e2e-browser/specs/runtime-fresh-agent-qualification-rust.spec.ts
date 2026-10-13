@@ -151,6 +151,81 @@ function ordinaryFreshAgentEventFacts(frames: readonly any[]) {
     turnOutcomes }
 }
 
+/**
+ * A bounded failure-time view of the selected pane. This intentionally
+ * projects only readiness booleans and fixed status enums; it never returns
+ * session identifiers, errors, model settings, transcript text, or provider
+ * output.
+ */
+function ordinaryFreshAgentReadinessFacts(input: { paneId: string; attachSessionIds: string[] }) {
+  const { paneId, attachSessionIds } = input
+  const harness = (window as any).__FRESHELL_TEST_HARNESS__
+  const state = harness?.getState?.()
+  const findPane = (node: any): any => node?.type === 'leaf'
+    ? node.id === paneId ? node : null
+    : node?.children?.map(findPane).find(Boolean) ?? null
+  const pane = Object.values(state?.panes?.layouts ?? {}).map(findPane).find(Boolean) as any
+  const content = pane?.content
+  const session = content?.sessionId
+    ? Object.values(state?.freshAgent?.sessions ?? {}).find((candidate: any) => (
+      candidate?.sessionId === content.sessionId
+      && candidate?.sessionType === content.sessionType
+      && candidate?.provider === content.provider
+    )) as any
+    : undefined
+  const paneRoot = Array.from(document.querySelectorAll<HTMLElement>('[data-pane-id]'))
+    .find((element) => element.dataset.paneId === paneId)
+  const composer = paneRoot?.querySelector<HTMLTextAreaElement>('[aria-label="Chat message input"]')
+  const enumValue = (value: unknown, allowed: readonly string[]) => (
+    typeof value === 'string' && allowed.includes(value) ? value : value == null ? 'missing' : 'other'
+  )
+  const snapshot = session?.snapshot
+  const snapshotSend = snapshot?.capabilities?.send
+  const snapshotProviderState = snapshot?.extensions?.[content?.provider]
+  const recoveryState = content?.recoverySummary?.recoveryState
+  const owner = Object.values(state?.freshAgent?.runtimeOwners ?? {}).find((candidate: any) => (
+    candidate?.provider === content?.provider && candidate?.sessionId === content?.sessionId
+  )) as any
+  const sessionStatus = session?.status ?? content?.status
+  const paneSessionMatchesState = typeof content?.sessionId === 'string' && session?.sessionId === content.sessionId
+  return {
+    paneFound: Boolean(pane),
+    paneStatus: enumValue(content?.status, ['idle', 'creating', 'starting', 'connected', 'running', 'busy', 'create-failed', 'exited', 'stuck']),
+    paneSessionPresent: typeof content?.sessionId === 'string',
+    sessionStatePresent: Boolean(session),
+    paneSessionMatchesState,
+    sessionStatus: enumValue(sessionStatus, ['creating', 'starting', 'connected', 'running', 'idle', 'compacting', 'exited', 'stuck']),
+    sessionEnded: sessionStatus === 'exited' || sessionStatus === 'create-failed',
+    sessionLost: session?.lost === true,
+    sessionHistoryLoaded: typeof session?.historyLoaded === 'boolean' ? session.historyLoaded : null,
+    sessionHasLatestTurn: session?.latestTurnId !== undefined,
+    sessionRestoreFailurePresent: Boolean(session?.restoreFailureCode || session?.restoreFailureMessage),
+    snapshotPresent: Boolean(snapshot),
+    snapshotThreadMatchesPane: typeof content?.sessionId === 'string' && snapshot?.threadId === content.sessionId,
+    snapshotSessionMatchesPane: typeof content?.sessionId === 'string' && snapshot?.sessionId === content.sessionId,
+    snapshotCanSend: typeof snapshotSend === 'boolean' ? snapshotSend : null,
+    snapshotStatus: enumValue(snapshot?.status, ['idle', 'running', 'busy', 'compacting', 'exited', 'error']),
+    snapshotHistoryOnly: snapshotProviderState?.ownerKind === 'vacant'
+      || (snapshotProviderState?.nativeHistoryAvailable === true && snapshotProviderState?.statusFromLiveState !== true),
+    snapshotNativeHistoryAvailable: typeof snapshotProviderState?.nativeHistoryAvailable === 'boolean'
+      ? snapshotProviderState.nativeHistoryAvailable : null,
+    snapshotStatusFromLiveState: typeof snapshotProviderState?.statusFromLiveState === 'boolean'
+      ? snapshotProviderState.statusFromLiveState : null,
+    recoveryState: enumValue(recoveryState, ['running', 'recovering', 'blocked', 'lost', 'stopped']),
+    recoveryDesiredState: enumValue(content?.recoverySummary?.desiredState, ['running', 'stopped']),
+    ownerKind: enumValue(owner?.ownerKind, ['fresh-agent', 'terminal', 'vacant']),
+    ownerTransition: enumValue(owner?.transition, ['committed', 'handoff-started', 'handoff-failed']),
+    ownerFenced: owner?.fenced === true,
+    attachCount: attachSessionIds.length,
+    attachTargetsPaneSession: typeof content?.sessionId === 'string' && attachSessionIds.includes(content.sessionId),
+    composerPresent: Boolean(composer),
+    composerDisabled: composer ? composer.disabled : null,
+    connectionStatus: enumValue(state?.connection?.status, ['disconnected', 'connecting', 'connected', 'ready']),
+    networkEffectsSuppressed: harness?.isAllFreshAgentNetworkEffectsSuppressed?.() === true
+      || harness?.isFreshAgentNetworkEffectsSuppressed?.(paneId) === true,
+  }
+}
+
 async function assistantResponseDomFacts(page: Page, paneId: string): Promise<{ rows: number; textCharacters: number }> {
   return page.locator(`[data-pane-id="${paneId}"]`).evaluate(freshAgentAssistantResponseFacts)
 }
@@ -365,9 +440,11 @@ test.describe.serial('ordinary fresh-agent use', () => {
       const failedModes: string[] = []
       for (const definition of definitions) {
         const createReceivedCursor = wire.received.length
+        const createSentCursor = wire.sent.length
         let turnReceivedCursor = createReceivedCursor
         let paneId: string | undefined
         const progress = {
+          stage: 'creating',
           createCompleted: false,
           composerSubmitted: false,
           sendObserved: false,
@@ -378,6 +455,7 @@ test.describe.serial('ordinary fresh-agent use', () => {
           const created = await actualCreate(page, rig, definition, wire)
           paneId = created.paneId
           progress.createCompleted = true
+          progress.stage = 'pane_created'
           const allocationSessionIds = new Set([
             created.reply.sessionId,
             created.sessionId,
@@ -385,13 +463,17 @@ test.describe.serial('ordinary fresh-agent use', () => {
           ])
           const composer = page.locator(`[data-pane-id="${created.paneId}"]`)
             .getByRole('textbox', { name: 'Chat message input' })
+          progress.stage = 'waiting_for_composer'
           await expect(composer).toBeEnabled({ timeout: 60_000 })
+          progress.stage = 'composer_ready'
           await composer.fill('Without using tools, briefly confirm you are ready.')
           const assistantTextBaseline = (await assistantResponseDomFacts(page, created.paneId)).textCharacters
           turnReceivedCursor = wire.received.length
           const sendCursor = wire.sent.length
+          progress.stage = 'sending'
           await composer.press('Enter')
           progress.composerSubmitted = true
+          progress.stage = 'waiting_for_send_frame'
           const sent = await waitFor('actual fresh-agent composer send', () => wire.sent
             .slice(sendCursor)
             .find((frame) => frame.type === 'freshAgent.send') ?? null)
@@ -419,6 +501,7 @@ test.describe.serial('ordinary fresh-agent use', () => {
             if (assistantTextDisplayed) progress.assistantTextDisplayed = true
             return completed && assistantTextDisplayed ? true : null
           }, 240_000)
+          progress.stage = 'completed'
           console.info(JSON.stringify({ severity: 'info', event: 'durable_souls.ordinary_turn_completed',
             lane: 'fresh-agent', mode: definition.mode }))
         } catch (error) {
@@ -429,10 +512,17 @@ test.describe.serial('ordinary fresh-agent use', () => {
               assistantDom = { available: true, ...await assistantResponseDomFacts(page, paneId) }
             } catch { /* preserve the ordinary-turn failure */ }
           }
+          let readiness = null
+          if (paneId) {
+            const attachSessionIds = wire.sent.slice(createSentCursor)
+              .filter((frame) => frame?.type === 'freshAgent.attach' && typeof frame.sessionId === 'string')
+              .map((frame) => frame.sessionId as string)
+            try { readiness = await page.evaluate(ordinaryFreshAgentReadinessFacts, { paneId, attachSessionIds }) } catch { /* preserve the ordinary-turn failure */ }
+          }
           console.error(JSON.stringify({ severity: 'error', event: 'durable_souls.ordinary_turn_failed',
             lane: 'fresh-agent', mode: definition.mode,
             errorName: error instanceof Error ? error.name : 'UnknownError',
-            providerEvents: ordinaryFreshAgentEventFacts(wire.received.slice(createReceivedCursor)), assistantDom,
+            providerEvents: ordinaryFreshAgentEventFacts(wire.received.slice(createReceivedCursor)), assistantDom, readiness,
             ...progress }))
         }
       }
