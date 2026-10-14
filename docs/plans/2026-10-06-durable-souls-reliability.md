@@ -7,7 +7,7 @@
 ## User Request
 
 ### Requested result
-Complete the planned durable-souls repair, including ordinary use in the six selected modes, and carry the-usual workflow through its final recap. Reconcile the run record against the actual artifacts before continuing.
+Complete Stage 4 of the planned durable-souls repair, including ordinary use in the six selected modes, then stop before beginning Stage 5. Reconcile the run record against the actual artifacts before continuing.
 
 ### Explicit constraints
 - Use the-usual workflow and a dedicated worktree; fix test failures found in this repair and continue.
@@ -18,6 +18,7 @@ Complete the planned durable-souls repair, including ordinary use in the six sel
 - Do not inspect provider-result files, Cloud launcher output, provider output, terminal snapshots, prompts, or response bodies.
 - For Stage 5 Fresh Eyes, use the runner's `--gpt` option because other models are unavailable; this is the user's explicit exception to the different-model-family preference.
 - Do not make changes to the rubric while its example wording remains under discussion.
+- The user approved `--local` for the six exact Task 9 ordinary-turn selectors because the selected specs are excluded from Cloud; run them separately and stop before Stage 5.
 
 ### Accepted tradeoffs and residuals
 - Existing provider sessions may not survive a runtime transition; manual porting may be needed later.
@@ -702,13 +703,23 @@ No source/test repair was needed for Task 8, so no empty commit was made. The ru
 
 Add one separately selectable browser case to each existing live spec. Each selected mode creates an isolated pane and sends one bounded harmless prompt. For FreshAgent, require a `freshAgent.turn.complete` event for the sent session received after that send and newly displayed nonempty assistant text in that pane; do not require exact model wording or return transcript text to the test runner. For terminal mode, capture the selected terminal's stream and sequence baseline, then reduce post-send WebSocket frames in the browser and require provider-specific activity, nonempty output on that same terminal and stream beyond the baseline, and a `terminal.turn.complete` whose completion sequence advanced beyond the baseline. Return only booleans, counts, and sequence metadata; never read or return terminal snapshot text or output bytes. This proves activity, new output, and a normal turn boundary, but not semantic answer success because the terminal completion event has no success outcome. `freshAgent.send.accepted`, pane allocation, process presence, a requested session ID, or activity without fresh output and completion do not count as completion. Do not crash/restart the host or provider, compare native session IDs across incarnations, test pending approval, or import existing sessions.
 
-- [ ] **Step 2: Run the focused cases against the configured backend**
+- [ ] **Step 2: Run the six focused cases locally**
 
-Run: `FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_PROVIDERS=claude,codex,opencode GCLOUD_ROBOT_REQUIRE=1 pnpm exec tsx scripts/testing/runtime-external-browser.ts --spec test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts --grep 'each selected terminal provider completes one ordinary turn$'`
+These specs are listed in `LOCAL_ONLY_SPECS` and excluded by the Cloud configuration. The user approved `--local` for the six selected mode checks. Run one mode at a time so each has its own result and cleanup receipt.
 
-Run: `FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_MODES=freshclaude,freshcodex,freshopencode GCLOUD_ROBOT_REQUIRE=1 pnpm exec tsx scripts/testing/runtime-external-browser.ts --spec test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts --grep 'each selected fresh-agent mode completes one ordinary turn$'`
+Run: `FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_MODES=freshopencode pnpm run test:e2e --local --project=chromium test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts --grep 'each selected fresh-agent mode completes one ordinary turn$'`
 
-Expected: both selected browser cases execute and pass; each logs one body-free completion event per selected mode and closes all owned resources. No global campaign status or certification is produced.
+Run: `FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_MODES=freshclaude pnpm run test:e2e --local --project=chromium test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts --grep 'each selected fresh-agent mode completes one ordinary turn$'`
+
+Run: `FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_MODES=freshcodex pnpm run test:e2e --local --project=chromium test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts --grep 'each selected fresh-agent mode completes one ordinary turn$'`
+
+Run: `FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_PROVIDERS=claude pnpm run test:e2e --local --project=chromium test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts --grep 'each selected terminal provider completes one ordinary turn$'`
+
+Run: `FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_PROVIDERS=codex pnpm run test:e2e --local --project=chromium test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts --grep 'each selected terminal provider completes one ordinary turn$'`
+
+Run: `FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_PROVIDERS=opencode pnpm run test:e2e --local --project=chromium test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts --grep 'each selected terminal provider completes one ordinary turn$'`
+
+Expected: all six selected browser cases execute and pass, each records one body-free completion event, and all owned resources close cleanly. No global campaign status or certification is produced.
 
 - [ ] **Step 3: Diagnose and repair any ordinary-use failure**
 
