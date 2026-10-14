@@ -862,6 +862,11 @@ const ExternalRuntimeViewSchema: z.ZodType<ManagedRuntimeView> = z.object({
 }).passthrough()
 const ExternalCleanupSchema = z.object({ ok: z.boolean(), errors: z.array(z.string()) }).strict()
 const CompletedOwnerOperationSchema = z.object({ completed: z.literal(true) }).strict()
+const OPENCODE_ONECLI_REFERENCE_KEYS = [
+  'FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE',
+  'FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE',
+  'FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE',
+] as const
 const ExternalOwnerRegistrationSchema = z.object({ phase: z.number().int().min(2).max(5),
   enabledProviders: z.array(z.string().min(1)), freshAgentModes: z.array(z.string().min(1)),
   fixtureFreshAgentModes: z.array(z.string().min(1)) }).strict()
@@ -2932,18 +2937,23 @@ export function createExternalManagedWebFactory(selection: ExternalBrowserSelect
   } : {}
   const spec = path.basename(selection.spec)
   const selected = qualificationSelections(selection, environment, retainedArtifacts)
-  const opencodeAuthFileKey = 'FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE'
   const selectedFreshOpenCode = spec === 'runtime-fresh-agent-qualification-rust.spec.ts'
     && selected.modes.includes('freshopencode') && !retainedArtifacts
   const selectedFreshOpenCodeOrdinaryTurn = selectedFreshOpenCode
     && selection.grep === 'each selected fresh-agent mode completes one ordinary turn$'
-  const selectedFreshOpenCodeAuthFile = selectedFreshOpenCodeOrdinaryTurn ? environment[opencodeAuthFileKey] : undefined
-  const preserveFreshOpenCodeAuthFile = typeof selectedFreshOpenCodeAuthFile === 'string' && selectedFreshOpenCodeAuthFile.length > 0
-  if (preserveFreshOpenCodeAuthFile) preset[opencodeAuthFileKey] = selectedFreshOpenCodeAuthFile
+  const preservedFreshOpenCodeReferenceKeys = new Set<string>(
+    selectedFreshOpenCodeOrdinaryTurn ? OPENCODE_ONECLI_REFERENCE_KEYS : [],
+  )
+  const selectedFreshOpenCodeReferences = Object.fromEntries([...preservedFreshOpenCodeReferenceKeys].map(key => {
+    const value = environment[key]?.trim()
+    if (!value) throw new Error('FreshOpenCode ordinary-turn selection requires ENV, AUTH, and CA OneCLI grant references')
+    return [key, value]
+  }))
+  Object.assign(preset, selectedFreshOpenCodeReferences)
   const freshBootstrap = new Set<string>(selected.modes.filter(mode => mode !== 'freshopencode').map(mode => mode === 'freshcodex' ? 'CODEX' : 'CLAUDE'))
   const unselectedFreshBootstrap = !retainedArtifacts && spec === 'runtime-fresh-agent-qualification-rust.spec.ts'
     ? ['CLAUDE', 'CODEX', 'OPENCODE', 'AMPLIFIER'].filter(provider => !freshBootstrap.has(provider)
-      && !(provider === 'OPENCODE' && preserveFreshOpenCodeAuthFile)).map(provider => `FRESHELL_MANAGED_${provider}_`) : []
+      && !(provider === 'OPENCODE' && preservedFreshOpenCodeReferenceKeys.size > 0)).map(provider => `FRESHELL_MANAGED_${provider}_`) : []
   const claudeStartup = !retainedArtifacts && spec === 'runtime-managed-provider-qualification-rust.spec.ts'
     && selected.providers.includes('claude')
   const amplifierProfile = !retainedArtifacts && spec === 'runtime-managed-provider-qualification-rust.spec.ts'
@@ -2966,9 +2976,9 @@ export function createExternalManagedWebFactory(selection: ExternalBrowserSelect
       for (const prefix of [...unselectedFreshBootstrap, 'OPENCODE_API_KEY']) stripEnvPrefixes.add(prefix)
     }
     if (selectedFreshOpenCode) {
-      if (preserveFreshOpenCodeAuthFile) {
+      if (preservedFreshOpenCodeReferenceKeys.size > 0) {
         for (const key of new Set([...Object.keys(environment), ...Object.keys(env)])) {
-          if (key.startsWith('FRESHELL_MANAGED_OPENCODE_') && key !== opencodeAuthFileKey) stripEnvPrefixes.add(key)
+          if (key.startsWith('FRESHELL_MANAGED_OPENCODE_') && !preservedFreshOpenCodeReferenceKeys.has(key)) stripEnvPrefixes.add(key)
         }
       } else {
         stripEnvPrefixes.add('FRESHELL_MANAGED_OPENCODE_')
@@ -3042,7 +3052,7 @@ export function createExternalManagedRuntimeOwner(root: string, selection: Exter
       fixtureFreshAgentModes: deterministic ? modes : [] }, undefined, {
       bootstrapProviders: deterministic || retainedArtifacts ? [] : sourceSelection ? ['opencode']
         : selected.providers.length ? selected.providers : modes.length
-          ? [...new Set(modes.filter(mode => mode !== 'freshopencode').map(mode => mode === 'freshcodex' ? 'codex' as const : 'claude' as const))]
+          ? [...new Set(modes.map(mode => mode === 'freshcodex' ? 'codex' as const : mode === 'freshopencode' ? 'opencode' as const : 'claude' as const))]
           : ['claude', 'codex', 'opencode', 'amplifier'],
     })
 }

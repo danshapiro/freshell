@@ -290,7 +290,7 @@ describe('selected production owner registration', () => {
       }, { ...environment, FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_PROVIDERS: selected }, () => { throw new Error('unused') })).toThrow()
     } finally { vi.restoreAllMocks() }
   })
-  it('admits combined fresh modes, enables their real server transport and excludes paid OpenCode bootstrap', async () => {
+  it('admits combined fresh modes and stages each selected provider grant', async () => {
     let options!: RuntimeWebConstructOptions
     const selection = { spec: 'test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts' }
     const environment = { FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE: '1',
@@ -299,7 +299,7 @@ describe('selected production owner registration', () => {
       input => { options = input; return { start: async () => ({}) } as any })
     expect(owned.fixtureRegistrationFacts()).toEqual({ phase: 5, enabledProviders: [],
       freshAgentModes: ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'], fixtureFreshAgentModes: [] })
-    expect((owned.runtime as any).ownerIsolation.bootstrapProviders).toEqual(['claude', 'codex'])
+    expect((owned.runtime as any).ownerIsolation.bootstrapProviders).toEqual(['claude', 'codex', 'opencode'])
     const selectedReferences = await Promise.all(['CLAUDE', 'CODEX'].map(async family => {
       const file = path.join(fixtureRepoRoot, `${family}.env`)
       await fsp.writeFile(file, 'FIXTURE_REFERENCE=selected\n', { mode: 0o600 })
@@ -308,7 +308,12 @@ describe('selected production owner registration', () => {
       vi.stubEnv(`FRESHELL_MANAGED_${family}_ONECLI_CA_FILE`, undefined)
       return file
     }))
-    vi.stubEnv('FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE', '/unselected/unreadable')
+    const opencodeReferences = await Promise.all(['ENV', 'AUTH', 'CA'].map(async suffix => {
+      const file = path.join(fixtureRepoRoot, `OPENCODE.${suffix.toLowerCase()}`)
+      await fsp.writeFile(file, 'FIXTURE_REFERENCE=selected\n', { mode: 0o600 })
+      vi.stubEnv(`FRESHELL_MANAGED_OPENCODE_ONECLI_${suffix}_FILE`, file)
+      return file
+    }))
     vi.stubEnv('FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE', '/unselected/unreadable')
     vi.spyOn(owned.runtime, 'prepare').mockResolvedValue(undefined)
     vi.spyOn(owned as any, 'buildManagedServer').mockReturnValue('/unused/server')
@@ -317,7 +322,7 @@ describe('selected production owner registration', () => {
     vi.spyOn(owned.runtime, 'recordFreshAgentQualificationBuild').mockReturnValue(undefined)
     vi.spyOn(owned.runtime, 'startSupervisor').mockResolvedValue({ controlSocket: '/unused/socket', controlSecretFile: '/unused/secret' } as SupervisorInstance)
     try {
-      expect((owned.runtime as any).phase2BootstrapFiles()).toEqual(selectedReferences)
+      expect((owned.runtime as any).phase2BootstrapFiles()).toEqual([...selectedReferences, ...opencodeReferences])
       await owned.start()
       expect(options.env).toMatchObject({ FRESHELL_MANAGED_RUNTIME_V1: '1', FRESHELL_MANAGED_FRESH_AGENT_V1: '1', KILROY_ENABLED: '1' })
       expect(options.env).not.toHaveProperty('FRESHELL_MANAGED_FRESH_AGENT_FIXTURE_MODES')
@@ -338,19 +343,19 @@ describe('selected production owner registration', () => {
     const owner = runner.createExternalManagedRuntimeOwner(fixtureRepoRoot, {
       spec: 'test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts', mode,
     }, {}, () => { throw new Error('web unused') })
-    expect((owner.runtime as any).ownerIsolation.bootstrapProviders).toEqual(mode === 'freshopencode' ? [] : [mode === 'freshcodex' ? 'codex' : 'claude'])
+    expect((owner.runtime as any).ownerIsolation.bootstrapProviders).toEqual(mode === 'freshopencode' ? ['opencode'] : [mode === 'freshcodex' ? 'codex' : 'claude'])
     expect(owner.fixtureRegistrationFacts().fixtureFreshAgentModes).toEqual([])
-    if (mode === 'freshopencode') {
-      vi.stubEnv('FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE', '/unit/unreadable')
-      try { expect((owner.runtime as any).phase2BootstrapFiles()).toEqual([]) } finally { vi.unstubAllEnvs() }
-    }
   })
-  it('preserves the FreshOpenCode auth-file reference only for the exact three-mode ordinary-turn selection', () => {
+  it('preserves all selected FreshOpenCode OneCLI references only for the exact ordinary-turn selection', () => {
     let actual!: RuntimeWebConstructOptions
+    const environmentFile = '/unit/opencode-environment-reference.env'
     const authFile = '/unit/opencode-auth-reference.json'
+    const caFile = '/unit/opencode-ca-reference.pem'
     const environment = { FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE: '1',
       FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_MODES: 'freshclaude,freshcodex,freshopencode',
-      FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: authFile }
+      FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: environmentFile,
+      FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: authFile,
+      FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: caFile }
     const factory = runner.createExternalManagedWebFactory({
       spec: 'test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts',
       grep: 'each selected fresh-agent mode completes one ordinary turn$',
@@ -358,8 +363,8 @@ describe('selected production owner registration', () => {
     const env = { FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: authFile,
       OPENAI_API_KEY: 'unit-sentinel', OPENCODE_API_KEY: 'unit-sentinel',
       ANTHROPIC_API_KEY: 'unit-sentinel', GEMINI_API_KEY: 'unit-sentinel',
-      FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: '/unit/unrelated-opencode-env-reference',
-      FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: '/unit/unrelated-opencode-ca-reference',
+      FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: environmentFile,
+      FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: caFile,
       FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION: 'allow',
       FRESHELL_MANAGED_AMPLIFIER_ONECLI_AUTH_FILE: '/unit/unrelated-amplifier-reference',
       HTTP_PROXY: 'http://unit.invalid', HTTPS_PROXY: 'http://unit.invalid', ALL_PROXY: 'http://unit.invalid',
@@ -367,10 +372,17 @@ describe('selected production owner registration', () => {
       NODE_EXTRA_CA_CERTS: '/unit/unrelated-extra-ca', SSL_CERT_FILE: '/unit/unrelated-ca-file',
       SSL_CERT_DIR: '/unit/unrelated-ca-dir', FRESHELL_RUNTIME_CONTROL_SOCKET: '/owned/control' }
     factory({ repoRoot: fixtureRepoRoot, env, setupHome: async () => {} } as RuntimeWebConstructOptions)
-    expect(actual.env.FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE).toBe(authFile)
+    expect(actual.env).toMatchObject({
+      FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: environmentFile,
+      FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: authFile,
+      FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: caFile,
+    })
     const observed = { ...env, ...actual.env }
     stripRuntimeWebEnvironment(observed, actual)
-    expect(observed).toEqual({ FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: authFile,
+    expect(observed).toEqual({
+      FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: environmentFile,
+      FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: authFile,
+      FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: caFile,
       FRESHELL_RUNTIME_CONTROL_SOCKET: '/owned/control' })
     expect(actual.providerFreeFixture).not.toBe(true)
   })
