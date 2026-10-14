@@ -120,8 +120,8 @@ describe('release qualification cannot pass by omission', () => {
 describe('release-scope audit covers the advertised provider set', () => {
   it('rejects an uncertified provider named only in the managed release scope', () => {
     const manifest = loadCapabilityManifest(repoRoot)
-    manifest.releaseScope!.managedTerminalProviders!.push('claude')
-    expect(capabilityClaimViolations(manifest).join(' ')).toMatch(/releaseScope.*claude|claude.*releaseScope/)
+    manifest.releaseScope!.managedTerminalProviders!.push('kimi')
+    expect(capabilityClaimViolations(manifest).join(' ')).toMatch(/releaseScope.*kimi|kimi.*releaseScope/)
   })
 
   it('rejects an unknown provider at a managed doorway', () => {
