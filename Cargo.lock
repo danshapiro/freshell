@@ -1422,6 +1422,7 @@ dependencies = [
 name = "freshell-runtime-protocol"
 version = "0.1.0"
 dependencies = [
+ "freshell-platform",
  "hmac",
  "serde",
  "serde_json",
