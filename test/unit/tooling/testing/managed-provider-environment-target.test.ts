@@ -53,6 +53,7 @@ describe('managed provider environment target mode', () => {
     expect(incidents).toHaveLength(1)
     expect(incidents[0]).toMatchObject({
       runtimeErrorCode: 'BackendUnavailable',
+      runtimeErrorClass: 'supervisor_rejected',
       providerPreparationFailure: {
         code: 'SELECTED_REFERENCE_UNAVAILABLE', stage: 'configuration', operation: 'resolve', cause: 'permission_denied',
       },

@@ -149,6 +149,15 @@ export function summarizeRuntimeErrorCode(message: string): typeof runtimeErrorC
   return runtimeErrorCodes.find(code => rejection.startsWith(`${code}:`))
 }
 
+export function summarizeRuntimeErrorClass(message: string):
+  'supervisor_io' | 'supervisor_protocol' | 'supervisor_rejected' | 'supervisor_unexpected_reply' | undefined {
+  if (message.includes('runtime supervisor I/O failed: ')) return 'supervisor_io'
+  if (message.includes('runtime supervisor protocol failed: ')) return 'supervisor_protocol'
+  if (message.includes('runtime supervisor rejected request: ')) return 'supervisor_rejected'
+  if (message.includes('runtime supervisor returned an unexpected result')) return 'supervisor_unexpected_reply'
+  return undefined
+}
+
 export function summarizeRustServerLogEvents(raw: string): Array<{
   level: string
   event?: string
@@ -246,6 +255,7 @@ export function assertManagedTerminalCreated(owner: ManagedCreateOwner,
     const errno = response.message.match(/\(os error (\d{1,4})\)/)
     const osError = errno ? Number(errno[1]) : undefined
     const runtimeErrorCode = summarizeRuntimeErrorCode(response.message)
+    const runtimeErrorClass = summarizeRuntimeErrorClass(response.message)
     const reason = failureReasons.find(value => response.message.includes(value)) ?? inputReason
       ?? (filesystemLabel && osError !== undefined ? `${filesystemLabel} filesystem error` : 'UNKNOWN')
     const code = ErrorCode.safeParse(response.code)
@@ -309,6 +319,7 @@ export function assertManagedTerminalCreated(owner: ManagedCreateOwner,
       severity: 'error', event: 'managed_environment.create_failed', code: code.success ? code.data : 'UNKNOWN', reason, ...(osError === undefined ? {} : { osError }),
       serverLogEvents,
       ...(runtimeErrorCode ? { runtimeErrorCode } : {}),
+      ...(runtimeErrorClass ? { runtimeErrorClass } : {}),
       ...(response.providerPreparationFailure
         ? { providerPreparationFailure: summarizeProviderPreparationFailure(response.providerPreparationFailure) }
         : {}),
