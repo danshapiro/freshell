@@ -1301,16 +1301,23 @@ fn node_relative_resource_specifiers(
     source: &str,
 ) -> Result<std::collections::BTreeMap<String, bool>, &'static str> {
     let tokens = javascript_tokens(source)?;
-    let scope_ids = javascript_token_scope_ids(&tokens)?;
+    let scopes = javascript_lexical_scopes(&tokens)?;
     let (output_destinations, output_destination_variables) =
-        node_output_destination_mask(&tokens, &scope_ids)?;
-    let binding_declarations = node_variable_binding_declaration_counts(&tokens, &scope_ids);
-    let ambiguous_output_variables = node_ambiguous_output_variables(
+        node_output_destination_mask(&tokens, &scopes.token_scope_ids)?;
+    let binding_declarations = node_variable_binding_declaration_counts(&tokens, &scopes);
+    let mut binding_resolver = JavaScriptBindingResolver::new(&scopes, &binding_declarations);
+    let mut output_destination_bindings = std::collections::BTreeSet::new();
+    for (name, reference_scope) in &output_destination_variables {
+        if let Some(binding_scope) = binding_resolver.resolve(name, *reference_scope)? {
+            output_destination_bindings.insert((name.clone(), binding_scope));
+        }
+    }
+    let ambiguous_output_bindings = node_ambiguous_output_bindings(
         &tokens,
-        &scope_ids,
+        &scopes,
         &output_destinations,
-        &output_destination_variables,
-    );
+        &mut binding_resolver,
+    )?;
     let mut result = std::collections::BTreeMap::<String, bool>::new();
     for index in 0..tokens.len() {
         if index >= 2
@@ -1415,16 +1422,14 @@ fn node_relative_resource_specifiers(
                 tokens.get(index + 11),
                 Some(JavaScriptToken::Punctuation(b')'))
             )));
-        let is_bound_output_destination = index >= 3
-            && matches!(
-                tokens.get(index - 1),
-                Some(JavaScriptToken::Punctuation(b'='))
-            )
-            && matches!(tokens.get(index - 2), Some(JavaScriptToken::Identifier(name))
-                if output_destination_variables.contains(&(name.clone(), scope_ids[index]))
-                    && binding_declarations.get(&(name.clone(), scope_ids[index])) == Some(&1)
-                    && !ambiguous_output_variables.contains(&(name.clone(), scope_ids[index])))
-            && matches!(tokens.get(index - 3), Some(JavaScriptToken::Identifier(keyword)) if matches!(keyword.as_str(), "const" | "let" | "var"));
+        let is_bound_output_destination = node_simple_url_binding_declaration(
+            &tokens, index, &scopes,
+        )
+        .is_some_and(|(name, binding_scope)| {
+            output_destination_bindings.contains(&(name.clone(), binding_scope))
+                && binding_declarations.get(&(name.clone(), binding_scope)) == Some(&1)
+                && !ambiguous_output_bindings.contains(&(name, binding_scope))
+        });
         let is_output_destination = output_destinations[index] || is_bound_output_destination;
         if new_keyword == "new"
             && url_constructor == "URL"
@@ -1442,87 +1447,436 @@ fn node_relative_resource_specifiers(
     Ok(result)
 }
 
-fn javascript_token_scope_ids(tokens: &[JavaScriptToken]) -> Result<Vec<usize>, &'static str> {
+struct JavaScriptScopes {
+    token_scope_ids: Vec<usize>,
+    parent_scope_ids: Vec<Option<usize>>,
+    function_scope_ids: std::collections::BTreeSet<usize>,
+    parameter_names: std::collections::BTreeMap<usize, std::collections::BTreeSet<String>>,
+    parameter_token_indices: std::collections::BTreeSet<usize>,
+}
+
+impl JavaScriptScopes {
+    fn function_scope_for(&self, mut scope_id: usize) -> usize {
+        loop {
+            if self.function_scope_ids.contains(&scope_id) {
+                return scope_id;
+            }
+            scope_id = self.parent_scope_ids[scope_id].unwrap_or(0);
+        }
+    }
+}
+
+fn javascript_matching_open_parentheses(tokens: &[JavaScriptToken]) -> Vec<Option<usize>> {
+    let mut openings = Vec::new();
+    let mut matching_openings = vec![None; tokens.len()];
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            JavaScriptToken::Punctuation(b'(') => openings.push(index),
+            JavaScriptToken::Punctuation(b')') => {
+                if let Some(opening) = openings.pop() {
+                    matching_openings[index] = Some(opening);
+                }
+            }
+            _ => {}
+        }
+    }
+    matching_openings
+}
+
+fn javascript_arrow_parameter_range(
+    tokens: &[JavaScriptToken],
+    arrow_index: usize,
+    matching_openings: &[Option<usize>],
+) -> Option<std::ops::Range<usize>> {
+    let previous_index = arrow_index.checked_sub(1)?;
+    match tokens.get(previous_index) {
+        Some(JavaScriptToken::Identifier(_)) => Some(previous_index..arrow_index),
+        Some(JavaScriptToken::Punctuation(b')')) => {
+            let opening = matching_openings.get(previous_index).copied().flatten()?;
+            Some(opening + 1..previous_index)
+        }
+        _ => None,
+    }
+}
+
+fn javascript_scope_header(
+    tokens: &[JavaScriptToken],
+    brace_index: usize,
+    matching_openings: &[Option<usize>],
+) -> (bool, Option<std::ops::Range<usize>>) {
+    if brace_index >= 2
+        && matches!(
+            tokens.get(brace_index - 1),
+            Some(JavaScriptToken::Punctuation(b'>'))
+        )
+        && matches!(
+            tokens.get(brace_index - 2),
+            Some(JavaScriptToken::Punctuation(b'='))
+        )
+    {
+        return (
+            true,
+            javascript_arrow_parameter_range(tokens, brace_index - 2, matching_openings),
+        );
+    }
+
+    if brace_index == 0
+        || !matches!(
+            tokens.get(brace_index - 1),
+            Some(JavaScriptToken::Punctuation(b')'))
+        )
+    {
+        return (false, None);
+    }
+    let close = brace_index - 1;
+    let Some(open) = matching_openings.get(close).copied().flatten() else {
+        return (false, None);
+    };
+    let parameters = Some(open + 1..close);
+    match open.checked_sub(1).and_then(|index| tokens.get(index)) {
+        Some(JavaScriptToken::Identifier(keyword)) if keyword == "catch" => (false, parameters),
+        Some(JavaScriptToken::Identifier(keyword))
+            if matches!(keyword.as_str(), "if" | "for" | "while" | "switch" | "with") =>
+        {
+            (false, None)
+        }
+        Some(JavaScriptToken::Identifier(_)) | Some(JavaScriptToken::String(_)) => {
+            (true, parameters)
+        }
+        Some(JavaScriptToken::Punctuation(b']' | b')')) => (true, parameters),
+        _ => (false, None),
+    }
+}
+
+fn javascript_add_parameter_names(
+    tokens: &[JavaScriptToken],
+    scope_id: usize,
+    parameter_range: std::ops::Range<usize>,
+    parameter_names: &mut std::collections::BTreeMap<usize, std::collections::BTreeSet<String>>,
+    parameter_token_indices: &mut std::collections::BTreeSet<usize>,
+    inspection_budget: &mut usize,
+) -> Result<(), &'static str> {
+    for index in parameter_range {
+        *inspection_budget = inspection_budget.saturating_sub(1);
+        if *inspection_budget == 0 {
+            return Err("direct MCP Node parameter scan exceeds its token bound");
+        }
+        if let Some(JavaScriptToken::Identifier(name)) = tokens.get(index) {
+            parameter_names
+                .entry(scope_id)
+                .or_default()
+                .insert(name.clone());
+            parameter_token_indices.insert(index);
+        }
+    }
+    Ok(())
+}
+
+fn javascript_lexical_scopes(tokens: &[JavaScriptToken]) -> Result<JavaScriptScopes, &'static str> {
+    let matching_openings = javascript_matching_open_parentheses(tokens);
+    let mut token_scope_ids = Vec::with_capacity(tokens.len());
+    let mut parent_scope_ids = vec![None];
+    let mut function_scope_ids = std::collections::BTreeSet::from([0]);
+    let mut parameter_names = std::collections::BTreeMap::new();
+    let mut parameter_token_indices = std::collections::BTreeSet::new();
     let mut scope_stack = Vec::new();
-    let mut scope_ids = Vec::with_capacity(tokens.len());
+    let mut parameter_inspection_budget = MAX_JAVASCRIPT_TOKENS;
+
     for (index, token) in tokens.iter().enumerate() {
         if matches!(token, JavaScriptToken::Punctuation(b'}')) && scope_stack.pop().is_none() {
             return Err("direct MCP Node script has an unmatched closing brace");
         }
-        scope_ids.push(scope_stack.last().copied().unwrap_or(0));
+        token_scope_ids.push(scope_stack.last().copied().unwrap_or(0));
         if matches!(token, JavaScriptToken::Punctuation(b'{')) {
-            // Reserve zero for the top-level scope and give each brace scope a
-            // unique token-derived identity. This deliberately treats nested
-            // blocks as separate scopes, so uncertain captures remain read-only.
-            scope_stack.push(index + 1);
+            let (is_function_scope, parameters) =
+                javascript_scope_header(tokens, index, &matching_openings);
+            let parent_scope = scope_stack.last().copied().unwrap_or(0);
+            let new_scope = parent_scope_ids.len();
+            parent_scope_ids.push(Some(parent_scope));
+            if is_function_scope {
+                function_scope_ids.insert(new_scope);
+            }
+            if let Some(parameters) = parameters {
+                javascript_add_parameter_names(
+                    tokens,
+                    new_scope,
+                    parameters,
+                    &mut parameter_names,
+                    &mut parameter_token_indices,
+                    &mut parameter_inspection_budget,
+                )?;
+            }
+            scope_stack.push(new_scope);
         }
     }
     if !scope_stack.is_empty() {
         return Err("direct MCP Node script has an unmatched opening brace");
     }
-    Ok(scope_ids)
+
+    // A concise arrow expression has no brace scope in the token stream. Add
+    // its parameters to the containing scope so a same-name output is treated
+    // as shadowed (conservatively for other expressions in that scope too).
+    for (index, scope_id) in token_scope_ids
+        .iter()
+        .enumerate()
+        .skip(1)
+        .take(tokens.len().saturating_sub(2))
+    {
+        if !matches!(tokens.get(index), Some(JavaScriptToken::Punctuation(b'=')))
+            || !matches!(
+                tokens.get(index + 1),
+                Some(JavaScriptToken::Punctuation(b'>'))
+            )
+            || matches!(
+                tokens.get(index + 2),
+                Some(JavaScriptToken::Punctuation(b'{'))
+            )
+        {
+            continue;
+        }
+        if let Some(parameters) =
+            javascript_arrow_parameter_range(tokens, index, &matching_openings)
+        {
+            let scope_id = *scope_id;
+            javascript_add_parameter_names(
+                tokens,
+                scope_id,
+                parameters,
+                &mut parameter_names,
+                &mut parameter_token_indices,
+                &mut parameter_inspection_budget,
+            )?;
+        }
+    }
+
+    Ok(JavaScriptScopes {
+        token_scope_ids,
+        parent_scope_ids,
+        function_scope_ids,
+        parameter_names,
+        parameter_token_indices,
+    })
+}
+
+fn node_variable_binding_scope(kind: &str, scope_id: usize, scopes: &JavaScriptScopes) -> usize {
+    if kind == "var" {
+        scopes.function_scope_for(scope_id)
+    } else {
+        scope_id
+    }
 }
 
 fn node_variable_binding_declaration_counts(
     tokens: &[JavaScriptToken],
-    scope_ids: &[usize],
+    scopes: &JavaScriptScopes,
 ) -> std::collections::BTreeMap<(String, usize), usize> {
     let mut declarations = std::collections::BTreeMap::new();
     for index in 0..tokens.len().saturating_sub(1) {
-        if !matches!(tokens.get(index), Some(JavaScriptToken::Identifier(keyword)) if matches!(keyword.as_str(), "const" | "let" | "var"))
-        {
+        let Some(JavaScriptToken::Identifier(kind)) = tokens.get(index) else {
+            continue;
+        };
+        if !matches!(kind.as_str(), "const" | "let" | "var") {
             continue;
         }
         let Some(JavaScriptToken::Identifier(name)) = tokens.get(index + 1) else {
             continue;
         };
-        let key = (name.clone(), scope_ids[index]);
-        *declarations.entry(key).or_insert(0) += 1;
+        let scope_id = node_variable_binding_scope(kind, scopes.token_scope_ids[index], scopes);
+        *declarations.entry((name.clone(), scope_id)).or_insert(0) += 1;
+    }
+    for (scope_id, names) in &scopes.parameter_names {
+        for name in names {
+            *declarations.entry((name.clone(), *scope_id)).or_insert(0) += 1;
+        }
     }
     declarations
 }
 
-fn node_ambiguous_output_variables(
+struct JavaScriptBindingResolver<'a> {
+    scopes: &'a JavaScriptScopes,
+    declarations: &'a std::collections::BTreeMap<(String, usize), usize>,
+    resolved: std::collections::BTreeMap<(String, usize), Option<usize>>,
+    inspection_budget: usize,
+}
+
+impl<'a> JavaScriptBindingResolver<'a> {
+    fn new(
+        scopes: &'a JavaScriptScopes,
+        declarations: &'a std::collections::BTreeMap<(String, usize), usize>,
+    ) -> Self {
+        Self {
+            scopes,
+            declarations,
+            resolved: std::collections::BTreeMap::new(),
+            inspection_budget: MAX_JAVASCRIPT_TOKENS,
+        }
+    }
+
+    fn resolve(&mut self, name: &str, mut scope_id: usize) -> Result<Option<usize>, &'static str> {
+        let cache_key = (name.to_owned(), scope_id);
+        if let Some(resolved) = self.resolved.get(&cache_key) {
+            return Ok(*resolved);
+        }
+        let result = loop {
+            self.inspection_budget = self.inspection_budget.saturating_sub(1);
+            if self.inspection_budget == 0 {
+                return Err("direct MCP Node binding resolution exceeds its token bound");
+            }
+            if self.declarations.contains_key(&(name.to_owned(), scope_id)) {
+                break Some(scope_id);
+            }
+            let Some(parent_scope) = self.scopes.parent_scope_ids[scope_id] else {
+                break None;
+            };
+            scope_id = parent_scope;
+        };
+        self.resolved.insert(cache_key, result);
+        Ok(result)
+    }
+}
+
+fn node_simple_url_binding_declaration(
     tokens: &[JavaScriptToken],
-    scope_ids: &[usize],
+    index: usize,
+    scopes: &JavaScriptScopes,
+) -> Option<(String, usize)> {
+    if index < 3
+        || !matches!(
+            tokens.get(index - 1),
+            Some(JavaScriptToken::Punctuation(b'='))
+        )
+    {
+        return None;
+    }
+    let Some(JavaScriptToken::Identifier(name)) = tokens.get(index - 2) else {
+        return None;
+    };
+    let Some(JavaScriptToken::Identifier(kind)) = tokens.get(index - 3) else {
+        return None;
+    };
+    if !matches!(kind.as_str(), "const" | "let" | "var") {
+        return None;
+    }
+    Some((
+        name.clone(),
+        node_variable_binding_scope(kind, scopes.token_scope_ids[index], scopes),
+    ))
+}
+
+fn node_ambiguous_output_bindings(
+    tokens: &[JavaScriptToken],
+    scopes: &JavaScriptScopes,
     output_destinations: &[bool],
-    output_destination_variables: &std::collections::BTreeSet<(String, usize)>,
-) -> std::collections::BTreeSet<(String, usize)> {
+    resolver: &mut JavaScriptBindingResolver<'_>,
+) -> Result<std::collections::BTreeSet<(String, usize)>, &'static str> {
     let mut ambiguous = std::collections::BTreeSet::new();
     for (index, token) in tokens.iter().enumerate() {
         let JavaScriptToken::Identifier(name) = token else {
             continue;
         };
-        let key = (name.clone(), scope_ids[index]);
-        if !output_destination_variables.contains(&key) || output_destinations[index] {
+        if output_destinations[index]
+            || scopes.parameter_token_indices.contains(&index)
+            || is_javascript_variable_declaration_name(tokens, index)
+            || matches!(
+                tokens.get(index.checked_sub(1).unwrap_or(usize::MAX)),
+                Some(JavaScriptToken::Punctuation(b'.'))
+            )
+            || matches!(
+                tokens.get(index + 1),
+                Some(JavaScriptToken::Punctuation(b':'))
+            )
+            || javascript_is_safe_property_read(tokens, index)
+        {
             continue;
         }
-        let is_url_binding_declaration = index >= 1
-            && matches!(tokens.get(index - 1), Some(JavaScriptToken::Identifier(keyword)) if matches!(keyword.as_str(), "const" | "let" | "var"))
-            && matches!(
-                tokens.get(index + 1),
-                Some(JavaScriptToken::Punctuation(b'='))
-            )
-            && matches!(tokens.get(index + 2), Some(JavaScriptToken::Identifier(keyword)) if keyword == "new")
-            && matches!(tokens.get(index + 3), Some(JavaScriptToken::Identifier(constructor)) if constructor == "URL")
-            && matches!(
-                tokens.get(index + 4),
-                Some(JavaScriptToken::Punctuation(b'('))
-            );
-        if !is_url_binding_declaration {
-            // A second use outside a recognized output argument may reassign
-            // or mutate the URL. Keep the selected input read-only when this
-            // bounded scanner cannot prove the binding stays stable.
-            ambiguous.insert(key);
+        if let Some(binding_scope) = resolver.resolve(name, scopes.token_scope_ids[index])? {
+            ambiguous.insert((name.clone(), binding_scope));
         }
     }
-    ambiguous
+    Ok(ambiguous)
 }
+
+fn is_javascript_variable_declaration_name(tokens: &[JavaScriptToken], index: usize) -> bool {
+    index > 0
+        && matches!(
+            tokens.get(index - 1),
+            Some(JavaScriptToken::Identifier(keyword))
+                if matches!(keyword.as_str(), "const" | "let" | "var")
+        )
+}
+
+fn javascript_is_safe_property_read(tokens: &[JavaScriptToken], index: usize) -> bool {
+    if !matches!(
+        tokens.get(index + 1),
+        Some(JavaScriptToken::Punctuation(b'.'))
+    ) || !matches!(tokens.get(index + 2), Some(JavaScriptToken::Identifier(_)))
+    {
+        return false;
+    }
+
+    let mut expression_start = index;
+    while expression_start > 0
+        && matches!(
+            tokens.get(expression_start - 1),
+            Some(JavaScriptToken::Punctuation(b'('))
+        )
+    {
+        expression_start -= 1;
+    }
+    if matches!(
+        tokens.get(expression_start.checked_sub(1).unwrap_or(usize::MAX)),
+        Some(JavaScriptToken::Identifier(keyword)) if keyword == "delete"
+    ) || matches!(
+        (
+            tokens.get(expression_start.checked_sub(2).unwrap_or(usize::MAX)),
+            tokens.get(expression_start.checked_sub(1).unwrap_or(usize::MAX)),
+        ),
+        (
+            Some(JavaScriptToken::Punctuation(b'+' | b'-')),
+            Some(JavaScriptToken::Punctuation(b'+' | b'-')),
+        )
+    ) {
+        return false;
+    }
+
+    let mut expression_end = index + 3;
+    while matches!(
+        tokens.get(expression_end),
+        Some(JavaScriptToken::Punctuation(b')'))
+    ) {
+        expression_end += 1;
+    }
+    if matches!(
+        tokens.get(expression_end),
+        Some(JavaScriptToken::Punctuation(
+            b'(' | b'['
+                | b'.'
+                | b'+'
+                | b'-'
+                | b'*'
+                | b'/'
+                | b'%'
+                | b'&'
+                | b'|'
+                | b'^'
+                | b'<'
+                | b'>'
+                | b'='
+        ))
+    ) {
+        return false;
+    }
+    true
+}
+
+type JavaScriptBindingKey = (String, usize);
+type JavaScriptOutputDestinationAnalysis =
+    (Vec<bool>, std::collections::BTreeSet<JavaScriptBindingKey>);
 
 fn node_output_destination_mask(
     tokens: &[JavaScriptToken],
     scope_ids: &[usize],
-) -> Result<(Vec<bool>, std::collections::BTreeSet<(String, usize)>), &'static str> {
+) -> Result<JavaScriptOutputDestinationAnalysis, &'static str> {
     const OUTPUT_CALLS: [(&str, usize); 15] = [
         ("appendFile", 0),
         ("appendFileSync", 0),

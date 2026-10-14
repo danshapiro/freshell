@@ -1537,6 +1537,11 @@ process.stdout.write(require('./helper.js'))
         let append_output = home.join("existing-output.txt");
         let append_url_output = home.join("existing-url-output.txt");
         let append_variable_url_output = home.join("existing-url-variable-output.txt");
+        let append_nested_url_output = home.join("existing-nested-url-variable-output.txt");
+        let append_deleted_property_url_output =
+            home.join("existing-deleted-property-url-output.txt");
+        let append_parenthesized_property_url_output =
+            home.join("existing-parenthesized-property-url-output.txt");
         let append_let_variable_url_output = home.join("existing-let-url-variable-output.txt");
         let append_var_variable_url_output = home.join("existing-var-url-variable-output.txt");
         let reassigned_url_output = home.join("existing-reassigned-url-output.txt");
@@ -1547,12 +1552,32 @@ process.stdout.write(require('./helper.js'))
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(
             &command,
-            "import fs from 'node:fs';\nimport path from 'node:path';\nimport { fileURLToPath } from 'node:url';\nconst __dirname = path.dirname(fileURLToPath(import.meta.url));\nfs.writeFileSync(path.join(__dirname, 'generated-path.json'), 'path output');\nfs.writeFileSync(new URL('./generated-url.json', import.meta.url), 'url output');\nfs.appendFileSync(path.join(__dirname, 'existing-output.txt'), ' appended');\nfs.appendFileSync(new URL('./existing-url-output.txt', import.meta.url), ' appended');\nconst stateUrl = new URL('./existing-url-variable-output.txt', import.meta.url);\nfs.appendFileSync(stateUrl, ' appended');\nlet letUrl = new URL('./existing-let-url-variable-output.txt', import.meta.url);\nfs.appendFileSync(letUrl, ' appended');\nvar varUrl = new URL('./existing-var-url-variable-output.txt', import.meta.url);\nfs.appendFileSync(varUrl, ' appended');\nlet reassignedUrl = new URL('./existing-reassigned-url-output.txt', import.meta.url);\nreassignedUrl = new URL('./existing-reassigned-url-output.txt', import.meta.url);\nfs.appendFileSync(reassignedUrl, ' appended');\nconst url = new URL('./existing-unrelated-url-output.txt', import.meta.url);\nfunction writeParameter(url) { fs.appendFileSync(url, ' appended'); }\nfs.copyFileSync(path.join(__dirname, 'copy-source.txt'), path.join(__dirname, 'copy-output.txt'));\nprocess.stdout.write(__dirname + '\\n');\n",
+            "import fs from 'node:fs';\nimport path from 'node:path';\nimport { fileURLToPath } from 'node:url';\nconst __dirname = path.dirname(fileURLToPath(import.meta.url));\nfs.writeFileSync(path.join(__dirname, 'generated-path.json'), 'path output');\nfs.writeFileSync(new URL('./generated-url.json', import.meta.url), 'url output');\nfs.appendFileSync(path.join(__dirname, 'existing-output.txt'), ' appended');\nfs.appendFileSync(new URL('./existing-url-output.txt', import.meta.url), ' appended');\nconst stateUrl = new URL('./existing-url-variable-output.txt', import.meta.url);\nconsole.error(stateUrl.href);\nfs.appendFileSync(stateUrl, ' appended');\nconst nestedStateUrl = new URL('./existing-nested-url-variable-output.txt', import.meta.url);\nif (true) { fs.appendFileSync(nestedStateUrl, ' appended'); }\nconst deletedPropertyUrl = new URL('./existing-deleted-property-url-output.txt', import.meta.url);\ndelete deletedPropertyUrl.href;\nfs.appendFileSync(deletedPropertyUrl, ' appended');\nlet letUrl = new URL('./existing-let-url-variable-output.txt', import.meta.url);\nfs.appendFileSync(letUrl, ' appended');\nvar varUrl = new URL('./existing-var-url-variable-output.txt', import.meta.url);\nfs.appendFileSync(varUrl, ' appended');\nlet reassignedUrl = new URL('./existing-reassigned-url-output.txt', import.meta.url);\nreassignedUrl = new URL('./existing-reassigned-url-output.txt', import.meta.url);\nfs.appendFileSync(reassignedUrl, ' appended');\nconst url = new URL('./existing-unrelated-url-output.txt', import.meta.url);\nfunction writeParameter(url) { fs.appendFileSync(url, ' appended'); }\nfs.copyFileSync(path.join(__dirname, 'copy-source.txt'), path.join(__dirname, 'copy-output.txt'));\nprocess.stdout.write(__dirname + '\\n');\n",
+        )
+        .unwrap();
+        let mut command_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&command)
+            .unwrap();
+        std::io::Write::write_all(
+            &mut command_file,
+            b"\nconst parenthesizedPropertyUrl = new URL('./existing-parenthesized-property-url-output.txt', import.meta.url);\n(parenthesizedPropertyUrl.href) = new URL('./existing-unrelated-url-output.txt', import.meta.url).href;\nfs.appendFileSync(parenthesizedPropertyUrl, ' appended');\n",
         )
         .unwrap();
         std::fs::write(&append_output, "existing").unwrap();
         std::fs::write(&append_url_output, "url existing").unwrap();
         std::fs::write(&append_variable_url_output, "url variable existing").unwrap();
+        std::fs::write(&append_nested_url_output, "nested url variable existing").unwrap();
+        std::fs::write(
+            &append_deleted_property_url_output,
+            "deleted property URL existing",
+        )
+        .unwrap();
+        std::fs::write(
+            &append_parenthesized_property_url_output,
+            "parenthesized property URL existing",
+        )
+        .unwrap();
         std::fs::write(&append_let_variable_url_output, "let url variable existing").unwrap();
         std::fs::write(&append_var_variable_url_output, "var url variable existing").unwrap();
         std::fs::write(&reassigned_url_output, "reassigned url existing").unwrap();
@@ -1575,6 +1600,8 @@ process.stdout.write(require('./helper.js'))
         for output in [
             &append_url_output,
             &append_variable_url_output,
+            &append_nested_url_output,
+            &append_parenthesized_property_url_output,
             &append_let_variable_url_output,
             &append_var_variable_url_output,
             &reassigned_url_output,
@@ -1605,6 +1632,7 @@ process.stdout.write(require('./helper.js'))
             &append_output,
             &append_url_output,
             &append_variable_url_output,
+            &append_nested_url_output,
             &append_let_variable_url_output,
             &append_var_variable_url_output,
         ] {
@@ -1620,7 +1648,11 @@ process.stdout.write(require('./helper.js'))
                 !mounts.is_empty(),
                 "existing static output must be an exact file mount"
             );
-            assert!(mounts.iter().all(|(_, mount)| mount.writable));
+            assert!(
+                mounts.iter().all(|(_, mount)| mount.writable),
+                "{} should be writable for a direct URL output",
+                output.display()
+            );
         }
         let unrelated_url_mounts = units
             .iter()
@@ -1631,6 +1663,31 @@ process.stdout.write(require('./helper.js'))
             .collect::<Vec<_>>();
         assert!(!unrelated_url_mounts.is_empty());
         assert!(unrelated_url_mounts
+            .iter()
+            .all(|(_, mount)| !mount.writable));
+        let deleted_property_url_mounts = units
+            .iter()
+            .filter(|(source, mount)| {
+                source == &append_deleted_property_url_output.canonicalize().unwrap()
+                    && mount.kind == freshell_runtime_protocol::ProviderResourceKind::File
+            })
+            .collect::<Vec<_>>();
+        assert!(!deleted_property_url_mounts.is_empty());
+        assert!(deleted_property_url_mounts
+            .iter()
+            .all(|(_, mount)| !mount.writable));
+        let parenthesized_property_url_mounts = units
+            .iter()
+            .filter(|(source, mount)| {
+                source
+                    == &append_parenthesized_property_url_output
+                        .canonicalize()
+                        .unwrap()
+                    && mount.kind == freshell_runtime_protocol::ProviderResourceKind::File
+            })
+            .collect::<Vec<_>>();
+        assert!(!parenthesized_property_url_mounts.is_empty());
+        assert!(parenthesized_property_url_mounts
             .iter()
             .all(|(_, mount)| !mount.writable));
         let reassigned_url_mounts = units
