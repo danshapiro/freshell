@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   freshAgentAssistantResponseFacts,
+  freshAgentAssistantTextAppeared,
   freshAgentTurnCompletionStatus,
 } from '../../../../scripts/testing/fresh-agent-ordinary-turn.js'
 
@@ -20,6 +21,17 @@ describe('FreshAgent ordinary-turn smoke evidence', () => {
     ].join('')
 
     expect(freshAgentAssistantResponseFacts(pane)).toEqual({ rows: 1, textCharacters: 6 })
+  })
+
+  it('requires new assistant text beyond an observed pre-send pane baseline', () => {
+    const pane = document.createElement('div')
+    pane.innerHTML = '<div data-turn-role="assistant"><div class="fresh-agent-transcript-copy"><div data-markdown-body>existing text</div></div></div>'
+    const baseline = freshAgentAssistantResponseFacts(pane)
+
+    expect(freshAgentAssistantTextAppeared(baseline, freshAgentAssistantResponseFacts(pane))).toBe(false)
+
+    pane.querySelector('[data-markdown-body]')!.textContent += ' added text'
+    expect(freshAgentAssistantTextAppeared(baseline, freshAgentAssistantResponseFacts(pane))).toBe(true)
   })
 
   it('does not count thinking text as an assistant answer', () => {

@@ -8,6 +8,10 @@ export type FreshAgentOrdinaryTurnProvider = 'claude' | 'codex' | 'opencode'
 
 export type FreshAgentTurnCompletionStatus = 'absent' | 'completed' | 'failed'
 
+export type FreshAgentAssistantTextFacts = {
+  textCharacters: number
+}
+
 /** Safe browser evidence: count only rendered assistant transcript rows. */
 export function freshAgentAssistantResponseFacts(root: ParentNode): { rows: number; textCharacters: number } {
   const turns = root.querySelectorAll('[data-turn-role="assistant"]')
@@ -18,6 +22,14 @@ export function freshAgentAssistantResponseFacts(root: ParentNode): { rows: numb
     rows: turns.length,
     textCharacters: bodies.reduce((total, body) => total + (body.textContent?.trim().length ?? 0), 0),
   }
+}
+
+/** Existing assistant text counts only when the observed pane grows after send. */
+export function freshAgentAssistantTextAppeared(
+  baseline: FreshAgentAssistantTextFacts,
+  current: FreshAgentAssistantTextFacts,
+): boolean {
+  return current.textCharacters > baseline.textCharacters
 }
 
 /** Validate completion evidence against the selected provider; every provider requires explicit success. */

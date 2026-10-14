@@ -21,6 +21,7 @@ import {
 } from '../helpers/fresh-agent-browser-wire-observer.js'
 import {
   freshAgentAssistantResponseFacts,
+  freshAgentAssistantTextAppeared,
   freshAgentTurnCompletionStatus,
 } from '../../../scripts/testing/fresh-agent-ordinary-turn.js'
 import { test } from '../helpers/fixtures.js'
@@ -454,7 +455,7 @@ test.describe.serial('ordinary fresh-agent use', () => {
           stage: 'creating',
           createCompleted: false,
           composerFilled: false,
-          assistantBaselineKnownEmpty: false,
+          assistantBaselineCaptured: false,
           composerSubmitted: false,
           sendObserved: false,
           turnCompleteObserved: false,
@@ -477,10 +478,8 @@ test.describe.serial('ordinary fresh-agent use', () => {
           progress.stage = 'filling_composer'
           await composer.fill('Without using tools, briefly confirm you are ready.')
           progress.composerFilled = true
-          // actualCreate allocates a new FreshAgent session with no prior
-          // turns, so its assistant-response baseline is exactly empty.
-          progress.assistantBaselineKnownEmpty = true
-          const assistantTextBaseline = 0
+          const assistantTextBaseline = await assistantResponseDomFacts(page, created.paneId)
+          progress.assistantBaselineCaptured = true
           turnReceivedCursor = wire.received.length
           const sendCursor = wire.sent.length
           progress.stage = 'pressing_enter'
@@ -512,7 +511,7 @@ test.describe.serial('ordinary fresh-agent use', () => {
               progress.turnCompleteObserved = true
             }
             const currentAssistantText = await assistantResponseDomFacts(page, created.paneId)
-            const assistantTextDisplayed = currentAssistantText.textCharacters > assistantTextBaseline
+            const assistantTextDisplayed = freshAgentAssistantTextAppeared(assistantTextBaseline, currentAssistantText)
             if (assistantTextDisplayed) progress.assistantTextDisplayed = true
             return completed && assistantTextDisplayed ? true : null
           }, 240_000)
