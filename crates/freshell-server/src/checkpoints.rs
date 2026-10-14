@@ -267,6 +267,20 @@ pub struct CheckpointService {
     volatile_outcomes: StdMutex<BTreeMap<String, StoredCheckpointOutcome>>,
     #[cfg(test)]
     test_capture_attempt_override: StdMutex<Option<CaptureAttempt>>,
+    #[cfg(test)]
+    test_auto_budget_override: StdMutex<Option<Duration>>,
+    #[cfg(test)]
+    test_explicit_budget_override: StdMutex<Option<Duration>>,
+    #[cfg(test)]
+    test_cooldown_override: StdMutex<Option<Duration>>,
+    #[cfg(test)]
+    test_clock_advance: StdMutex<Duration>,
+    #[cfg(test)]
+    test_capture_delays: StdMutex<std::collections::VecDeque<Duration>>,
+    #[cfg(test)]
+    test_capture_calls: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    test_capture_entered: tokio::sync::Notify,
 }
 
 tokio::task_local! {
@@ -282,6 +296,8 @@ struct CheckpointCaptureControl {
     jobs: StdMutex<Vec<Arc<WindowsJob>>>,
     #[cfg(test)]
     test_settlement_gate: StdMutex<Option<Arc<TestSettlementGate>>>,
+    #[cfg(test)]
+    test_cancel_notify: tokio::sync::Notify,
 }
 
 #[cfg(test)]
@@ -377,6 +393,8 @@ impl CheckpointCaptureControl {
 
     async fn cancel_processes(&self) -> std::io::Result<()> {
         self.cancelled.store(true, Ordering::SeqCst);
+        #[cfg(test)]
+        self.test_cancel_notify.notify_one();
         #[cfg(unix)]
         {
             let groups = self
@@ -793,7 +811,70 @@ impl CheckpointService {
             volatile_outcomes: StdMutex::new(BTreeMap::new()),
             #[cfg(test)]
             test_capture_attempt_override: StdMutex::new(None),
+            #[cfg(test)]
+            test_auto_budget_override: StdMutex::new(None),
+            #[cfg(test)]
+            test_explicit_budget_override: StdMutex::new(None),
+            #[cfg(test)]
+            test_cooldown_override: StdMutex::new(None),
+            #[cfg(test)]
+            test_clock_advance: StdMutex::new(Duration::ZERO),
+            #[cfg(test)]
+            test_capture_delays: StdMutex::new(std::collections::VecDeque::new()),
+            #[cfg(test)]
+            test_capture_calls: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            test_capture_entered: tokio::sync::Notify::new(),
         }
+    }
+
+    fn automatic_capture_budget(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(budget) = *self
+            .test_auto_budget_override
+            .lock()
+            .expect("automatic checkpoint budget mutex poisoned")
+        {
+            return budget;
+        }
+        CHECKPOINT_AUTO_BUDGET
+    }
+
+    fn explicit_capture_budget(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(budget) = *self
+            .test_explicit_budget_override
+            .lock()
+            .expect("explicit checkpoint budget mutex poisoned")
+        {
+            return budget;
+        }
+        CHECKPOINT_EXPLICIT_BUDGET
+    }
+
+    fn timeout_cooldown(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(cooldown) = *self
+            .test_cooldown_override
+            .lock()
+            .expect("checkpoint cooldown mutex poisoned")
+        {
+            return cooldown;
+        }
+        CHECKPOINT_TIMEOUT_COOLDOWN
+    }
+
+    fn checkpoint_monotonic_now(&self) -> Instant {
+        #[cfg(test)]
+        {
+            return Instant::now()
+                + *self
+                    .test_clock_advance
+                    .lock()
+                    .expect("checkpoint test clock mutex poisoned");
+        }
+        #[cfg(not(test))]
+        Instant::now()
     }
 
     pub fn start_observer(self: &Arc<Self>) {
@@ -1525,7 +1606,7 @@ impl CheckpointService {
     }
 
     fn active_cooldown(&self, workspace: &Path) -> Option<Duration> {
-        let now = Instant::now();
+        let now = self.checkpoint_monotonic_now();
         let mut cooldowns = self
             .cooldowns
             .lock()
@@ -1537,7 +1618,7 @@ impl CheckpointService {
     }
 
     fn establish_cooldown(&self, workspace: &Path) {
-        let now = Instant::now();
+        let now = self.checkpoint_monotonic_now();
         let mut cooldowns = self
             .cooldowns
             .lock()
@@ -1546,7 +1627,7 @@ impl CheckpointService {
         cooldowns.insert(
             workspace.to_path_buf(),
             CheckpointCooldown {
-                expires_at: now + CHECKPOINT_TIMEOUT_COOLDOWN,
+                expires_at: now + self.timeout_cooldown(),
             },
         );
         while cooldowns.len() > CHECKPOINT_COOLDOWN_LIMIT {
@@ -1691,7 +1772,8 @@ impl CheckpointService {
                 .await
             },
         ));
-        let remaining = CHECKPOINT_AUTO_BUDGET.saturating_sub(started_at.elapsed());
+        let automatic_budget = self.automatic_capture_budget();
+        let remaining = automatic_budget.saturating_sub(started_at.elapsed());
         let workspace = match tokio::time::timeout(remaining, &mut resolve_task).await {
             Ok(Ok(Ok(workspace))) => workspace,
             Ok(Ok(Err(error))) => {
@@ -1792,7 +1874,7 @@ impl CheckpointService {
             );
         }
 
-        let remaining = CHECKPOINT_AUTO_BUDGET.saturating_sub(started_at.elapsed());
+        let remaining = automatic_budget.saturating_sub(started_at.elapsed());
         if remaining.is_zero() {
             log_automatic_checkpoint_failure(
                 Some(request_id),
@@ -1830,7 +1912,7 @@ impl CheckpointService {
                 );
             }
         };
-        let remaining = CHECKPOINT_AUTO_BUDGET.saturating_sub(started_at.elapsed());
+        let remaining = automatic_budget.saturating_sub(started_at.elapsed());
         if remaining.is_zero() {
             drop(lock);
             log_automatic_checkpoint_failure(
@@ -2041,7 +2123,7 @@ impl CheckpointService {
         label: String,
         request_id: Option<String>,
     ) -> Result<(Value, ResolvedCheckpointWorkspace), ExplicitCaptureError> {
-        let deadline = Instant::now() + CHECKPOINT_EXPLICIT_BUDGET;
+        let deadline = Instant::now() + self.explicit_capture_budget();
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let cancellation_guard = CaptureRequestCancellation { sender: cancel_tx };
         let service = Arc::clone(self);
@@ -2238,6 +2320,12 @@ impl CheckpointService {
         mut cancellation: Option<watch::Receiver<bool>>,
     ) -> CaptureAttempt {
         #[cfg(test)]
+        self.test_capture_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(test)]
+        self.test_capture_entered.notify_one();
+
+        #[cfg(test)]
         if let Some(attempt) = self
             .test_capture_attempt_override
             .lock()
@@ -2256,7 +2344,30 @@ impl CheckpointService {
         let label = label.to_string();
         let request_id_owned = request_id.to_string();
         let task_control = Arc::clone(&control);
+        #[cfg(test)]
+        let task_control_for_delay = Arc::clone(&task_control);
+        #[cfg(test)]
+        let test_delay = self
+            .test_capture_delays
+            .lock()
+            .expect("checkpoint test capture delay queue poisoned")
+            .pop_front()
+            .unwrap_or(Duration::ZERO);
         let mut task = tokio::spawn(CHECKPOINT_CAPTURE_CONTEXT.scope(task_control, async move {
+            #[cfg(test)]
+            if !test_delay.is_zero() {
+                let cancelled = task_control_for_delay.test_cancel_notify.notified();
+                tokio::pin!(cancelled);
+                if task_control_for_delay.cancelled.load(Ordering::SeqCst) {
+                    return Err("checkpoint test capture delay was cancelled".to_string());
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(test_delay) => {}
+                    _ = &mut cancelled => {
+                        return Err("checkpoint test capture delay was cancelled".to_string());
+                    }
+                }
+            }
             create_checkpoint(
                 &home,
                 &workspace_path,
@@ -5388,6 +5499,75 @@ mod tests {
         }
     }
 
+    fn checkpoint_policy_send(
+        workspace: &Path,
+        request_id: &str,
+        attempt_id: &str,
+    ) -> FreshAgentSend {
+        let path = workspace.to_string_lossy().into_owned();
+        let mut send = review_r6_send(Some(path), Some(workspace), request_id);
+        send.checkpoint_intent
+            .as_mut()
+            .expect("test send has checkpoint intent")
+            .logical_attempt_id = attempt_id.to_string();
+        send
+    }
+
+    fn checkpoint_test_service(home: &Path) -> Arc<CheckpointService> {
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(32);
+        Arc::new(CheckpointService::new(
+            Arc::new(home.to_path_buf()),
+            Arc::new(broadcast_tx),
+        ))
+    }
+
+    async fn initialize_checkpoint_workspace(workspace: &Path) {
+        tokio::fs::create_dir_all(workspace).await.unwrap();
+        tokio::fs::write(workspace.join("source.txt"), "checkpoint source\n")
+            .await
+            .unwrap();
+        run_git(&["init", "-q"], Some(workspace)).await.unwrap();
+    }
+
+    async fn run_checkpoint_policy_send(
+        service: Arc<CheckpointService>,
+        send: FreshAgentSend,
+    ) -> (Value, usize, Duration) {
+        use freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier;
+        use std::sync::atomic::AtomicUsize;
+
+        let mut outcomes = service.broadcast_tx.subscribe();
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let dispatched = Arc::clone(&dispatches);
+        let started = Instant::now();
+        service
+            .clone()
+            .barrier_and_forward(
+                send,
+                Box::pin(async move {
+                    dispatched.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+            .await;
+        let elapsed = started.elapsed();
+        let frame = tokio::time::timeout(Duration::from_secs(2), outcomes.recv())
+            .await
+            .expect("checkpoint outcome should be broadcast promptly")
+            .expect("checkpoint outcome should not be lost");
+        (
+            serde_json::from_str(&frame).unwrap(),
+            dispatches.load(Ordering::SeqCst),
+            elapsed,
+        )
+    }
+
+    async fn published_checkpoint_entries(
+        service: &CheckpointService,
+        workspace: &Path,
+    ) -> Vec<Value> {
+        list_checkpoints(&service.home, workspace).await.unwrap()
+    }
+
     fn headers_with_token(token: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert("x-auth-token", token.parse().unwrap());
@@ -7449,6 +7629,494 @@ mod tests {
         assert!(!serde_json::to_string(&*events)
             .unwrap()
             .contains("private prompt marker"));
+    }
+
+    #[tokio::test]
+    async fn capture_timeout_establishes_cooldown() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        initialize_checkpoint_workspace(workspace.path()).await;
+        let service = checkpoint_test_service(home.path());
+        *service.test_auto_budget_override.lock().unwrap() = Some(Duration::from_millis(40));
+        service
+            .test_capture_delays
+            .lock()
+            .unwrap()
+            .push_back(Duration::from_secs(5));
+
+        let (outcome, dispatches, _) = run_checkpoint_policy_send(
+            Arc::clone(&service),
+            checkpoint_policy_send(workspace.path(), "timeout-send", "timeout-attempt"),
+        )
+        .await;
+
+        assert_eq!(outcome["status"], "unavailable");
+        assert_eq!(outcome["code"], "capture_timeout");
+        assert_eq!(dispatches, 1, "the failed snapshot must not block the send");
+        assert_eq!(service.test_capture_calls.load(Ordering::SeqCst), 1);
+        assert!(service.active_cooldown(workspace.path()).is_some());
+        assert!(published_checkpoint_entries(&service, workspace.path())
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn cooldown_sends_immediately_without_capture() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let service = checkpoint_test_service(home.path());
+        service.establish_cooldown(workspace.path());
+
+        let (outcome, dispatches, elapsed) = run_checkpoint_policy_send(
+            Arc::clone(&service),
+            checkpoint_policy_send(workspace.path(), "cooldown-send", "cooldown-attempt"),
+        )
+        .await;
+
+        assert_eq!(outcome["status"], "unavailable");
+        assert_eq!(outcome["code"], "capture_timeout_cooldown");
+        assert_eq!(dispatches, 1);
+        assert_eq!(service.test_capture_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "cooldown should not repeat the capture wait: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cooldown_scope_change_attempts_capture() {
+        let home = tempfile::tempdir().unwrap();
+        let timed_out_workspace = tempfile::tempdir().unwrap();
+        let changed_workspace = tempfile::tempdir().unwrap();
+        initialize_checkpoint_workspace(changed_workspace.path()).await;
+        let service = checkpoint_test_service(home.path());
+        service.establish_cooldown(timed_out_workspace.path());
+
+        let (outcome, dispatches, _) = run_checkpoint_policy_send(
+            Arc::clone(&service),
+            checkpoint_policy_send(
+                changed_workspace.path(),
+                "changed-scope-send",
+                "changed-scope-attempt",
+            ),
+        )
+        .await;
+
+        assert_eq!(outcome["status"], "available");
+        assert_eq!(dispatches, 1);
+        assert_eq!(service.test_capture_calls.load(Ordering::SeqCst), 1);
+        assert!(service
+            .active_cooldown(timed_out_workspace.path())
+            .is_some());
+        assert!(service.active_cooldown(changed_workspace.path()).is_none());
+        assert_eq!(
+            published_checkpoint_entries(&service, changed_workspace.path())
+                .await
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_capture_bypasses_cooldown() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        initialize_checkpoint_workspace(workspace.path()).await;
+        let service = checkpoint_test_service(home.path());
+        service.establish_cooldown(workspace.path());
+
+        let intent = json!({
+            "path": workspace.path().to_string_lossy(),
+            "provenance": "directory-picker"
+        });
+        let result = service
+            .capture_explicit(
+                workspace.path().to_path_buf(),
+                Some(intent),
+                "explicit retry".into(),
+                Some("explicit-cooldown-retry".into()),
+            )
+            .await;
+
+        let (entry, _) = match result {
+            Ok(value) => value,
+            Err(_) => panic!("explicit capture should attempt and publish during cooldown"),
+        };
+        assert!(entry["id"].as_str().is_some());
+        assert_eq!(service.test_capture_calls.load(Ordering::SeqCst), 1);
+        assert!(service.active_cooldown(workspace.path()).is_none());
+        assert_eq!(
+            published_checkpoint_entries(&service, workspace.path())
+                .await
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn repaired_scope_needs_published_success() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        initialize_checkpoint_workspace(workspace.path()).await;
+        let service = checkpoint_test_service(home.path());
+        *service.test_auto_budget_override.lock().unwrap() = Some(Duration::from_millis(40));
+        service
+            .test_capture_delays
+            .lock()
+            .unwrap()
+            .push_back(Duration::from_secs(5));
+
+        let failed_send =
+            checkpoint_policy_send(workspace.path(), "repair-timeout", "repair-attempt-1");
+        let (first, first_dispatches, _) =
+            run_checkpoint_policy_send(Arc::clone(&service), failed_send.clone()).await;
+        assert_eq!(first["code"], "capture_timeout");
+        assert_eq!(first_dispatches, 1);
+
+        tokio::fs::write(workspace.path().join("source.txt"), "repaired source\n")
+            .await
+            .unwrap();
+        let (during_cooldown, second_dispatches, _) = run_checkpoint_policy_send(
+            Arc::clone(&service),
+            checkpoint_policy_send(
+                workspace.path(),
+                "repair-during-cooldown",
+                "repair-attempt-2",
+            ),
+        )
+        .await;
+        assert_eq!(during_cooldown["code"], "capture_timeout_cooldown");
+        assert_eq!(second_dispatches, 1);
+        assert_eq!(service.test_capture_calls.load(Ordering::SeqCst), 1);
+        assert!(published_checkpoint_entries(&service, workspace.path())
+            .await
+            .is_empty());
+
+        let intent = json!({
+            "path": workspace.path().to_string_lossy(),
+            "provenance": "directory-picker"
+        });
+        let explicit = service
+            .capture_explicit(
+                workspace.path().to_path_buf(),
+                Some(intent),
+                "repaired retry".into(),
+                Some("repair-explicit".into()),
+            )
+            .await;
+        assert!(
+            explicit.is_ok(),
+            "a successful explicit retry publishes a complete target"
+        );
+        assert!(service.active_cooldown(workspace.path()).is_none());
+        assert_eq!(
+            published_checkpoint_entries(&service, workspace.path())
+                .await
+                .len(),
+            1
+        );
+        *service.test_auto_budget_override.lock().unwrap() = Some(Duration::from_secs(3));
+
+        let (after_publish, third_dispatches, _) = run_checkpoint_policy_send(
+            Arc::clone(&service),
+            checkpoint_policy_send(workspace.path(), "repair-after-publish", "repair-attempt-3"),
+        )
+        .await;
+        assert_eq!(after_publish["status"], "available");
+        assert_eq!(third_dispatches, 1);
+        assert_eq!(service.test_capture_calls.load(Ordering::SeqCst), 3);
+        let prior = service
+            .find_outcome(&checkpoint_attempt_key(&failed_send, "repair-attempt-1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            prior.outcome.status,
+            FreshAgentCheckpointStatus::Unavailable
+        );
+        assert_eq!(prior.outcome.code.as_deref(), Some("capture_timeout"));
+    }
+
+    #[tokio::test]
+    async fn cooldown_expiry_retries() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        initialize_checkpoint_workspace(workspace.path()).await;
+        let service = checkpoint_test_service(home.path());
+        service.establish_cooldown(workspace.path());
+        *service.test_clock_advance.lock().unwrap() += Duration::from_secs(61);
+
+        let (outcome, dispatches, _) = run_checkpoint_policy_send(
+            Arc::clone(&service),
+            checkpoint_policy_send(
+                workspace.path(),
+                "cooldown-expired",
+                "cooldown-expired-attempt",
+            ),
+        )
+        .await;
+
+        assert_eq!(outcome["status"], "available");
+        assert_eq!(dispatches, 1);
+        assert_eq!(service.test_capture_calls.load(Ordering::SeqCst), 1);
+        assert!(service.active_cooldown(workspace.path()).is_none());
+        assert_eq!(
+            published_checkpoint_entries(&service, workspace.path())
+                .await
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_longer_budget_bootstraps_complete_index() {
+        assert_eq!(CHECKPOINT_AUTO_BUDGET, Duration::from_secs(15));
+        assert_eq!(CHECKPOINT_EXPLICIT_BUDGET, Duration::from_secs(120));
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        initialize_checkpoint_workspace(workspace.path()).await;
+        let service = checkpoint_test_service(home.path());
+        service
+            .test_capture_delays
+            .lock()
+            .unwrap()
+            .extend([Duration::from_secs(20), Duration::from_secs(20)]);
+
+        let (automatic, dispatches, _) = run_checkpoint_policy_send(
+            Arc::clone(&service),
+            checkpoint_policy_send(
+                workspace.path(),
+                "bootstrap-auto-timeout",
+                "bootstrap-attempt-1",
+            ),
+        )
+        .await;
+        assert_eq!(automatic["code"], "capture_timeout");
+        assert_eq!(dispatches, 1);
+        assert!(published_checkpoint_entries(&service, workspace.path())
+            .await
+            .is_empty());
+        assert!(!checkpoint_git_dir(&service.home, workspace.path())
+            .join("index")
+            .exists());
+
+        let intent = json!({
+            "path": workspace.path().to_string_lossy(),
+            "provenance": "directory-picker"
+        });
+        let (first_entry, _) = match service
+            .capture_explicit(
+                workspace.path().to_path_buf(),
+                Some(intent),
+                "longer first-index capture".into(),
+                Some("bootstrap-explicit".into()),
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(_) => {
+                panic!("the explicit 120-second budget should finish the delayed first capture")
+            }
+        };
+        let first_id = first_entry["id"].as_str().unwrap().to_string();
+        let index_path = checkpoint_git_dir(&service.home, workspace.path()).join("index");
+        assert!(tokio::fs::metadata(&index_path).await.is_ok());
+        assert_eq!(
+            published_checkpoint_entries(&service, workspace.path())
+                .await
+                .len(),
+            1
+        );
+
+        tokio::fs::write(
+            workspace.path().join("source.txt"),
+            "mutated after capture\n",
+        )
+        .await
+        .unwrap();
+        restore_checkpoint(&service.home, workspace.path(), &first_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(workspace.path().join("source.txt"))
+                .await
+                .unwrap(),
+            "checkpoint source\n"
+        );
+
+        let (after_bootstrap, next_dispatches, elapsed) = run_checkpoint_policy_send(
+            Arc::clone(&service),
+            checkpoint_policy_send(
+                workspace.path(),
+                "bootstrap-auto-success",
+                "bootstrap-attempt-2",
+            ),
+        )
+        .await;
+        assert_eq!(after_bootstrap["status"], "available");
+        assert_eq!(next_dispatches, 1);
+        assert!(
+            elapsed < CHECKPOINT_AUTO_BUDGET,
+            "the published index should permit a fast automatic capture: {elapsed:?}"
+        );
+        assert_eq!(service.test_capture_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            published_checkpoint_entries(&service, workspace.path())
+                .await
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn lock_wait_timeout_does_not_establish_cooldown() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        initialize_checkpoint_workspace(workspace.path()).await;
+        let service = checkpoint_test_service(home.path());
+        *service.test_auto_budget_override.lock().unwrap() = Some(Duration::from_millis(50));
+        let holder = service
+            .lock_workspace(workspace.path(), Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let (timed_out, dispatches, _) = run_checkpoint_policy_send(
+            Arc::clone(&service),
+            checkpoint_policy_send(workspace.path(), "lock-wait-timeout", "lock-attempt-1"),
+        )
+        .await;
+        assert_eq!(timed_out["code"], "workspace_lock_timeout");
+        assert_eq!(dispatches, 1);
+        assert_eq!(service.test_capture_calls.load(Ordering::SeqCst), 0);
+        assert!(service.active_cooldown(workspace.path()).is_none());
+        drop(holder);
+
+        *service.test_auto_budget_override.lock().unwrap() = Some(Duration::from_secs(3));
+        let (after_wait, next_dispatches, _) = run_checkpoint_policy_send(
+            Arc::clone(&service),
+            checkpoint_policy_send(workspace.path(), "lock-released", "lock-attempt-2"),
+        )
+        .await;
+        assert_eq!(after_wait["status"], "available");
+        assert_eq!(next_dispatches, 1);
+        assert_eq!(service.test_capture_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_lock_wait_timeout_does_not_renew_cooldown() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let service = checkpoint_test_service(home.path());
+        *service.test_explicit_budget_override.lock().unwrap() = Some(Duration::from_millis(50));
+        service.establish_cooldown(workspace.path());
+        let before = service.cooldowns.lock().unwrap()[workspace.path()].expires_at;
+        let holder = service
+            .lock_workspace(workspace.path(), Duration::from_secs(1))
+            .await
+            .unwrap();
+        let intent = json!({
+            "path": workspace.path().to_string_lossy(),
+            "provenance": "directory-picker"
+        });
+
+        let error = service
+            .capture_explicit(
+                workspace.path().to_path_buf(),
+                Some(intent),
+                "blocked explicit retry".into(),
+                Some("explicit-lock-timeout".into()),
+            )
+            .await
+            .expect_err("explicit lock wait should time out");
+        assert!(matches!(error, ExplicitCaptureError::WorkspaceBusy(_)));
+        assert_eq!(
+            service.cooldowns.lock().unwrap()[workspace.path()].expires_at,
+            before
+        );
+        assert!(service.active_cooldown(workspace.path()).is_some());
+        assert_eq!(service.test_capture_calls.load(Ordering::SeqCst), 0);
+        drop(holder);
+    }
+
+    #[tokio::test]
+    async fn healthy_holder_and_next_pane_capture_after_waiter_timeout() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        initialize_checkpoint_workspace(workspace.path()).await;
+        let service = checkpoint_test_service(home.path());
+        *service.test_auto_budget_override.lock().unwrap() = Some(Duration::from_millis(50));
+        service
+            .test_capture_delays
+            .lock()
+            .unwrap()
+            .push_back(Duration::from_millis(250));
+        let holder_workspace = ResolvedCheckpointWorkspace {
+            path: canonical_workspace(workspace.path()).await.unwrap(),
+            provenance: "directory-picker".to_string(),
+        };
+        let holder_service = Arc::clone(&service);
+        let holder_path = workspace.path().to_path_buf();
+        let capture_entered = service.test_capture_entered.notified();
+        tokio::pin!(capture_entered);
+        let holder = tokio::spawn(async move {
+            let lock = holder_service
+                .lock_workspace(&holder_path, Duration::from_secs(1))
+                .await
+                .unwrap();
+            let result = holder_service
+                .capture_with_budget(
+                    &holder_workspace,
+                    "healthy holder",
+                    "healthy-holder-request",
+                    Duration::from_secs(2),
+                    None,
+                )
+                .await;
+            drop(lock);
+            result
+        });
+        tokio::time::timeout(Duration::from_secs(1), &mut capture_entered)
+            .await
+            .expect("healthy holder should enter capture while retaining its lock");
+
+        let (waiter, waiter_dispatches, _) = run_checkpoint_policy_send(
+            Arc::clone(&service),
+            checkpoint_policy_send(workspace.path(), "waiter-times-out", "waiter-attempt"),
+        )
+        .await;
+        assert_eq!(waiter["code"], "workspace_lock_timeout");
+        assert_eq!(waiter_dispatches, 1);
+        assert!(service.active_cooldown(workspace.path()).is_none());
+
+        match tokio::time::timeout(Duration::from_secs(3), holder)
+            .await
+            .expect("healthy capture should finish after the independent waiter timed out")
+            .expect("healthy holder task should complete")
+        {
+            CaptureAttempt::Published(_) => {}
+            _ => panic!("healthy holder must publish its complete target"),
+        }
+        assert_eq!(
+            published_checkpoint_entries(&service, workspace.path())
+                .await
+                .len(),
+            1
+        );
+
+        *service.test_auto_budget_override.lock().unwrap() = Some(Duration::from_secs(3));
+        let (next_pane, next_dispatches, _) = run_checkpoint_policy_send(
+            Arc::clone(&service),
+            checkpoint_policy_send(
+                workspace.path(),
+                "next-pane-after-waiter",
+                "next-pane-attempt",
+            ),
+        )
+        .await;
+        assert_eq!(next_pane["status"], "available");
+        assert_eq!(next_dispatches, 1);
+        assert_eq!(service.test_capture_calls.load(Ordering::SeqCst), 2);
+        assert!(service.active_cooldown(workspace.path()).is_none());
     }
 
     #[tokio::test]
