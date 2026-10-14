@@ -831,32 +831,82 @@ for r in (afp or []):
       fi
       if [ -n "$FIRST_ALLOWED" ]; then
         # Keep PROBE_ROOT (and the REST probe's WS) where it is — mint a
-        # SEPARATE browser root under the allowed root and record it:
-        BROWSER_ROOT=$(mktemp -d "$FIRST_ALLOWED/freshell-probe.XXXXXX")
-        chmod 0770 "$BROWSER_ROOT"
-        printf 'BROWSER_ROOT=%q\n' "$BROWSER_ROOT" >> "$D/run.env"
-        rm -rf "$BWS"
-        BWS=$(mktemp -d "$BROWSER_ROOT/bws.XXXXXX")
-        chmod 0770 "$BWS"
-        printf 'BWS=%q\n' "$BWS" >> "$D/run.env"
+        # SEPARATE browser root under the first WRITABLE allowed root (a
+        # valid list may start with read-only roots):
+        BROWSER_ROOT=""
+        while read -r A; do
+          A=${A/#\~/$HOME}
+          case "$A" in
+            /*) if BROWSER_ROOT=$(mktemp -d "$A/freshell-probe.XXXXXX" 2>/dev/null); then break; fi ;;
+          esac
+        done <<<"$ALLOWED"
+        if [ -n "$BROWSER_ROOT" ]; then
+          chmod 0770 "$BROWSER_ROOT"
+          printf 'BROWSER_ROOT=%q\n' "$BROWSER_ROOT" >> "$D/run.env"
+          rm -rf "$BWS"
+          BWS=$(mktemp -d "$BROWSER_ROOT/bws.XXXXXX")
+          chmod 0770 "$BWS"
+          printf 'BWS=%q\n' "$BWS" >> "$D/run.env"
+        fi
       fi
     fi
     # Then WAIT (bounded):
     # the confirmation dispatches a UI update, terminal.create goes out
     # from a React effect, and the managed launch is asynchronous — so
     # the soul may not exist the instant you confirm. Poll up to ~120s:
+    # Snapshot the soul list BEFORE the pane creation — the check must
+    # match a NEW soul (a delta), not any pre-existing one:
+    SOULS_BEFORE=$(curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" \
+      http://127.0.0.1:3001/api/runtime/souls \
+      | python3 -c 'import json,sys
+print(" ".join(x["soulId"] for x in json.load(sys.stdin)["souls"]))')
     # The manual UI step must finish BEFORE the clock starts — create
     # the pane, then press ENTER to start the bounded poll:
     read -r -p "Create the OpenCode pane at $BWS in the hard-refreshed client, then press ENTER to poll: " _
+    # Restore the OpenCode default IMMEDIATELY once the picker's async
+    # save lands, so other clients cannot inherit BWS as their default
+    # during the poll — the confounding window shrinks from minutes to
+    # seconds, and cleanup's restore becomes belt-and-braces:
+    CUR=""
+    for i in $(seq 1 15); do
+      SETTINGS_CODE=$(curl -s --connect-timeout 5 --max-time 10 \
+        -o "$D/settings.json" -w '%{http_code}' -H @"$D/hdr" \
+        http://127.0.0.1:3001/api/settings)
+      if grep -q '^2' <<<"$SETTINGS_CODE"; then
+        CUR=$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+assert isinstance(d, dict), "malformed settings response"
+d=d.get("data",d)
+cc=d.get("codingCli")
+assert isinstance(cc, dict), "malformed settings response: no codingCli"
+cur=(cc.get("providers") or {}).get("opencode",{}).get("cwd")
+print("" if cur is None else cur)' "$D/settings.json" 2>/dev/null) || { rm -f "$D/settings.json"; sleep 2; continue; }
+        rm -f "$D/settings.json"
+        if [ "$CUR" = "$BWS" ]; then break; fi
+      fi
+      sleep 2
+    done
+    if [ "${CUR:-}" = "$BWS" ] && [ -f "$D/old-opencode-cwd.txt" ]; then
+      OLD=$(cat "$D/old-opencode-cwd.txt")
+      BODY=$(python3 -c 'import json,sys
+old=sys.argv[1] or None
+print(json.dumps({"codingCli":{"providers":{"opencode":{"cwd":old}}}}))' "$OLD")
+      CODE=$(curl -s --connect-timeout 5 --max-time 30 -o "$D/settings-restore.out" -w '%{http_code}' \
+        -X PATCH -H @"$D/hdr" -H "Content-Type: application/json" -d "$BODY" \
+        http://127.0.0.1:3001/api/settings)
+      grep -q '^2' <<<"$CODE" || echo "early default restore failed (HTTP $CODE) — cleanup will retry"
+      rm -f "$D/settings-restore.out"
+    fi
     POLL_DEADLINE=$((SECONDS + 120))
     while [ "$SECONDS" -lt "$POLL_DEADLINE" ]; do
       if curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
         | python3 -c 'import json,sys
+before=set(sys.argv[2].split())
 souls=json.load(sys.stdin)["souls"]
-rows=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
+rows=[s for s in souls if s.get("terminalCwd")==sys.argv[1] and s["soulId"] not in before]
 sids={r["soulId"] for r in rows}
 assert len(sids)<=1, ("workspace ambiguous (mint a fresh BWS and retry)", rows)
-sys.exit(0 if len(sids)==1 and rows[-1].get("launchState")=="running" else 1)' "$BWS"; then
+sys.exit(0 if len(sids)==1 and rows[-1].get("launchState")=="running" else 1)' "$BWS" "$SOULS_BEFORE"; then
         echo "UI pane is managed (after $((SECONDS - POLL_DEADLINE + 120))s)"
         break
       fi
@@ -866,13 +916,14 @@ sys.exit(0 if len(sids)==1 and rows[-1].get("launchState")=="running" else 1)' "
     # --max-time flags are what make the poll actually bounded):
     curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
       | python3 -c 'import json,sys
+before=set(sys.argv[2].split())
 souls=json.load(sys.stdin)["souls"]
-rows=[s for s in souls if s.get("terminalCwd")==sys.argv[1]]
+rows=[s for s in souls if s.get("terminalCwd")==sys.argv[1] and s["soulId"] not in before]
 sids={r["soulId"] for r in rows}
 assert len(sids)<=1, ("workspace ambiguous (mint a fresh BWS and retry)", rows)
 assert rows and rows[-1].get("launchState")=="running", \
-  "no running managed soul for the UI pane after ~120s — client stale or not negotiating"
-print("UI pane is managed:", rows[-1]["soulId"])' "$BWS"
+  "no NEW running managed soul for the UI pane after ~120s — client stale or not negotiating"
+print("UI pane is managed:", rows[-1]["soulId"])' "$BWS" "$SOULS_BEFORE"
     ```
 
     If the assertion fails, the client is stale or not negotiating
@@ -1221,6 +1272,7 @@ print("" if cur is None else cur)' "$D/settings.json" 2>/dev/null) || { rm -f "$
         if [ "$CUR" = "$BWS" ]; then break; fi
         sleep 2
       done
+      CUR=${CUR:-}   # every read failing must not trip set -u downstream
       # Branch on what the default settled to — cleanup is NEVER wedged:
       #   $BWS        -> the picker's save landed; the restore below puts
       #                  back the recorded default.
