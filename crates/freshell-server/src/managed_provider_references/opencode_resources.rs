@@ -749,11 +749,38 @@ fn shell_directory_variables(source: &str) -> std::collections::BTreeSet<String>
         .collect()
 }
 
-fn shell_changes_to_script_directory(line: &str) -> Option<&str> {
+fn shell_changes_to_script_directory<'a>(
+    line: &'a str,
+    directory_variables: &std::collections::BTreeSet<String>,
+) -> Option<&'a str> {
     const CD_TO_SCRIPT_DIRECTORY: &str = "cd \"$(dirname \"$0\")\"";
     let line = line.trim_start();
-    let remainder = line.strip_prefix(CD_TO_SCRIPT_DIRECTORY)?;
-    if remainder.is_empty() {
+    if let Some(remainder) = line.strip_prefix(CD_TO_SCRIPT_DIRECTORY) {
+        return shell_command_after_directory_change(remainder);
+    }
+
+    let remainder = line.strip_prefix("cd ")?.trim_start();
+    let (operand, remainder) = if let Some(quoted) = remainder.strip_prefix('"') {
+        let end = quoted.find('"')?;
+        (&quoted[..end], &quoted[end + 1..])
+    } else {
+        let end = remainder
+            .find(|character: char| character.is_whitespace() || ";|&".contains(character))
+            .unwrap_or(remainder.len());
+        (&remainder[..end], &remainder[end..])
+    };
+    let variable = operand
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+        .or_else(|| operand.strip_prefix('$'))?;
+    if !directory_variables.contains(variable) {
+        return None;
+    }
+    shell_command_after_directory_change(remainder)
+}
+
+fn shell_command_after_directory_change(remainder: &str) -> Option<&str> {
+    if remainder.trim().is_empty() {
         return Some("");
     }
     let remainder = remainder.trim_start();
@@ -2813,6 +2840,7 @@ struct DirectScriptResources<'a> {
 struct ShellScriptSelection<'a> {
     default_working_directory: &'a Path,
     covered_directory: Option<&'a Path>,
+    workspace_directory: Option<&'a Path>,
 }
 
 struct ShellScriptResources<'a> {
@@ -3057,6 +3085,8 @@ fn insert_shell_script_dependencies(
     const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
     const MAX_SCRIPT_FILES: usize = 256;
     let fail = |cause| ResourceError { field, cause };
+    let default_working_directory_scope =
+        std::fs::canonicalize(selection.default_working_directory).ok();
     let mut pending = vec![(script.to_owned(), true)];
     let mut visited = std::collections::BTreeSet::new();
     let mut parsed = std::collections::BTreeSet::new();
@@ -3109,7 +3139,9 @@ fn insert_shell_script_dependencies(
                 source_offset += full_line.len();
                 continue;
             }
-            let node_line = if let Some(remainder) = shell_changes_to_script_directory(line) {
+            let node_line = if let Some(remainder) =
+                shell_changes_to_script_directory(line, &directory_variables)
+            {
                 working_directory = Some(script_parent.to_owned());
                 remainder
             } else {
@@ -3228,7 +3260,14 @@ fn insert_shell_script_dependencies(
                 if !dependency.is_file() {
                     return Err(fail("direct MCP shell source is not a regular file"));
                 }
-                if !dependency.starts_with(scope) {
+                if !dependency.starts_with(scope)
+                    && !default_working_directory_scope
+                        .as_ref()
+                        .is_some_and(|directory| dependency.starts_with(directory))
+                    && !selection
+                        .workspace_directory
+                        .is_some_and(|directory| dependency.starts_with(directory))
+                {
                     return Err(fail(
                         "direct MCP shell source escapes its selected script scope",
                     ));
@@ -3278,10 +3317,22 @@ fn insert_shell_script_dependencies(
                 if !dependency.is_file() {
                     return Err(fail("direct MCP Node env file is not a regular file"));
                 }
-                if !dependency.starts_with(scope) {
+                if !dependency.starts_with(scope)
+                    && !default_working_directory_scope
+                        .as_ref()
+                        .is_some_and(|directory| dependency.starts_with(directory))
+                    && !selection
+                        .workspace_directory
+                        .is_some_and(|directory| dependency.starts_with(directory))
+                {
                     return Err(fail(
                         "direct MCP Node env file escapes its selected script scope",
                     ));
+                }
+                if selection.workspace_directory.is_some_and(|workspace| {
+                    canonical.starts_with(workspace) && dependency.starts_with(workspace)
+                }) {
+                    continue;
                 }
                 for (expected_operand, argument_span) in arguments {
                     resources.node_env_files.push(NodeEnvFileSelection {
@@ -3697,6 +3748,7 @@ pub(super) fn select(
 ) -> Result<ResourceSelection, ResourceError> {
     let declaring = &source.logical_path;
     let fail = |field: &'static str, cause: &'static str| ResourceError { field, cause };
+    let workspace_directory = std::fs::canonicalize(instance_cwd).ok();
     let mut result = std::collections::BTreeSet::new();
     let mut resource_path_bytes = 0usize;
     let mut writable_resources = std::collections::BTreeSet::new();
@@ -4117,6 +4169,7 @@ pub(super) fn select(
                         ShellScriptSelection {
                             default_working_directory: working_directory,
                             covered_directory: current_mcp_working_dir.as_deref(),
+                            workspace_directory: workspace_directory.as_deref(),
                         },
                         ShellScriptResources {
                             paths: &mut result,
@@ -4257,6 +4310,7 @@ pub(super) fn select(
                                 .as_deref()
                                 .unwrap_or(instance_cwd),
                             covered_directory: None,
+                            workspace_directory: workspace_directory.as_deref(),
                         },
                         ShellScriptResources {
                             paths: &mut result,
@@ -4346,6 +4400,7 @@ pub(super) fn select(
                                     .as_deref()
                                     .unwrap_or(instance_cwd),
                                 covered_directory: None,
+                                workspace_directory: workspace_directory.as_deref(),
                             },
                             ShellScriptResources {
                                 paths: &mut result,

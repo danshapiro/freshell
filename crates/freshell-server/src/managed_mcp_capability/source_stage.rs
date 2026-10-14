@@ -1497,6 +1497,145 @@ mod configured_resource_tests {
     }
 
     #[test]
+    fn direct_home_mcp_appends_to_a_selected_writable_sibling_with_env_reference() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let mcp = home.join("direct-mcp");
+        let script = home.join("direct-home-preflight.mjs");
+        let output_file = home.join("direct-home-preflight.txt");
+        let env_file = mcp.join(".env");
+        let receipt = workspace.join(".managed-fixture/direct-home-receipt.json");
+        let nonce = "direct-home-mcp-fixture";
+        std::fs::create_dir_all(&mcp).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(receipt.parent().unwrap()).unwrap();
+        std::fs::write(&output_file, format!("initial-{nonce}")).unwrap();
+        std::fs::write(&env_file, format!("FRESHELL_MANAGED_SHARED_ENV={nonce}\n")).unwrap();
+        std::fs::write(
+            &script,
+            format!(
+                "import fs from 'node:fs'\nconst [receiptPath, expectedNonce] = process.argv.slice(2)\nlet appendError\ntry {{ fs.appendFileSync(new URL('./{}', import.meta.url), '|' + expectedNonce) }} catch (error) {{ appendError = error.code ?? error.message }}\nconst output = fs.readFileSync(new URL('./{}', import.meta.url), 'utf8')\nconst envFileOperandRewritten = process.execArgv.some(value => /^--env-file=.*\\/\\.freshell\\/references\\/\\d+$/.test(value))\nconst envValueLoaded = process.env.FRESHELL_MANAGED_SHARED_ENV === expectedNonce\nfs.writeFileSync(receiptPath, JSON.stringify({{ expectedNonce, appendError, output, envFileOperandRewritten, envValueLoaded }}))\n",
+                output_file.file_name().unwrap().to_string_lossy(),
+                output_file.file_name().unwrap().to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        let command = vec![
+            "node".to_owned(),
+            format!("--env-file={}", env_file.display()),
+            script.to_string_lossy().into_owned(),
+            receipt.to_string_lossy().into_owned(),
+            nonce.to_owned(),
+        ];
+        let (plan, provider_script) = plan_and_stage_mcp_command_for_resource(
+            owned.path(),
+            &home,
+            &workspace,
+            &command,
+            &script,
+        );
+        assert!(plan[0]
+            .configured_writable_resources
+            .contains(&output_file.canonicalize().unwrap()));
+        assert!(!plan[0]
+            .configured_resources
+            .contains(&env_file.canonicalize().unwrap()));
+        let selected = &plan[0].references.selections[0];
+        let prepared_config: serde_json::Value =
+            serde_json::from_str(&plan[0].references.template).unwrap();
+        let prepared_arguments = prepared_config["mcp"]["direct"]["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|argument| argument.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            prepared_arguments[1],
+            format!("--env-file={}", selected.runtime_destination)
+        );
+        let map_provider_path = |value: &str| {
+            let runtime_path = value
+                .strip_prefix("/home/freshell/provider/")
+                .map(|relative| {
+                    owned
+                        .path()
+                        .join("provider/.provider-home")
+                        .join(relative)
+                        .to_string_lossy()
+                        .into_owned()
+                });
+            runtime_path
+                .or_else(|| {
+                    Path::new(value)
+                        .starts_with(&workspace)
+                        .then(|| value.to_owned())
+                })
+                .or_else(|| {
+                    Path::new(value)
+                        .strip_prefix(owned.path())
+                        .ok()
+                        .map(|relative| {
+                            owned
+                                .path()
+                                .join("provider")
+                                .join(relative)
+                                .to_string_lossy()
+                                .into_owned()
+                        })
+                })
+                .unwrap_or_else(|| value.to_owned())
+        };
+        let map_provider_argument = |value: &str| {
+            value
+                .split_once('=')
+                .map(|(option, path)| format!("{option}={}", map_provider_path(path)))
+                .unwrap_or_else(|| map_provider_path(value))
+        };
+        let prepared_provider_arguments = prepared_arguments
+            .iter()
+            .map(|argument| map_provider_argument(argument))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            Path::new(&prepared_provider_arguments[2]),
+            provider_script,
+            "the prepared direct HOME MCP command must point at the staged script"
+        );
+        let reference_relative = selected
+            .runtime_destination
+            .strip_prefix("/home/freshell/provider/")
+            .unwrap();
+        let provider_reference = owned
+            .path()
+            .join("provider/.provider-home")
+            .join(reference_relative);
+        std::fs::create_dir_all(provider_reference.parent().unwrap()).unwrap();
+        std::fs::copy(&env_file, &provider_reference).unwrap();
+
+        let hidden_home = owned.path().join("home-hidden");
+        std::fs::rename(&home, &hidden_home).unwrap();
+        let output = std::process::Command::new("node")
+            .args(&prepared_provider_arguments[1..])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .output()
+            .unwrap();
+        std::fs::rename(&hidden_home, &home).unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert!(
+            receipt.is_file(),
+            "prepared arguments did not write the expected provider receipt: {prepared_provider_arguments:?}"
+        );
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(receipt).unwrap()).unwrap();
+        assert_eq!(receipt["expectedNonce"], nonce);
+        assert!(receipt["appendError"].is_null());
+        assert_eq!(receipt["output"], format!("initial-{nonce}|{nonce}"));
+        assert_eq!(receipt["envFileOperandRewritten"], true);
+        assert_eq!(receipt["envValueLoaded"], true);
+    }
+
+    #[test]
     fn direct_node_script_allows_missing_optional_require_resolve_after_all_resource_copies() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1607,6 +1746,310 @@ mod configured_resource_tests {
                 .unwrap();
         assert!(output.status.success(), "{:?}", output.stderr);
         assert_eq!(output.stdout, b"cwd env loaded\n");
+    }
+
+    #[test]
+    fn shell_wrapper_inside_mounted_workspace_does_not_need_a_staged_rewrite() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let mcp_cwd = workspace.join("mcp");
+        let wrapper = mcp_cwd.join("bin/start");
+        let env_file = mcp_cwd.join(".env");
+        std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &wrapper,
+            "#!/bin/sh\nexec node --env-file=.env server.mjs\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            mcp_cwd.join("server.mjs"),
+            "process.stdout.write(process.env.MANAGED_WORKSPACE_ENV || 'missing env');\n",
+        )
+        .unwrap();
+        std::fs::write(&env_file, "MANAGED_WORKSPACE_ENV=workspace-mounted\n").unwrap();
+        let config = workspace.join("opencode.json");
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "mcp": { "workspace": {
+                    "type": "local",
+                    "command": [wrapper],
+                    "cwd": mcp_cwd,
+                } },
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config,
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Workspace,
+            }],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .unwrap();
+        let units = resource_units(
+            &home,
+            &home.join(".config/opencode"),
+            &workspace,
+            &plan,
+            None,
+        )
+        .unwrap();
+        let edits = configured_resource_edits(&units, &plan);
+        assert!(
+            edits.is_ok(),
+            "a workspace-mounted wrapper has no separate resource copy to rewrite: {:?}",
+            edits.as_ref().err()
+        );
+        assert!(edits.unwrap().is_empty());
+        assert!(!plan[0]
+            .configured_resources
+            .contains(&env_file.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn shell_wrapper_can_cd_to_a_script_directory_variable_before_using_env_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let mcp_cwd = home.join("mcp");
+        let script_dir = mcp_cwd.join("bin");
+        let wrapper = script_dir.join("start");
+        std::fs::create_dir_all(&script_dir).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &wrapper,
+            "#!/bin/sh\nSCRIPT_DIR=$(dirname \"$0\")\ncd \"$SCRIPT_DIR\"\nexec node --env-file=.env server.mjs\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            script_dir.join("server.mjs"),
+            "if (process.env.MANAGED_SCRIPT_DIR_ENV !== 'script-dir-secret') process.exit(11);\nprocess.stdout.write('script directory env loaded\\n');\n",
+        )
+        .unwrap();
+        std::fs::write(
+            script_dir.join(".env"),
+            "MANAGED_SCRIPT_DIR_ENV=script-dir-secret\n",
+        )
+        .unwrap();
+
+        let (plan, provider_wrapper) = plan_and_stage_mcp_command_for_resource_with_cwd(
+            owned.path(),
+            &home,
+            &workspace,
+            &[wrapper.to_string_lossy().into_owned()],
+            &wrapper,
+            Some(&mcp_cwd),
+        );
+        assert_eq!(plan[0].references.selections.len(), 1);
+        let reference = owned
+            .path()
+            .join("provider/.provider-home/.freshell/references/0");
+        std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
+        std::fs::copy(script_dir.join(".env"), &reference).unwrap();
+        let wrapper_permissions = std::fs::metadata(&provider_wrapper).unwrap().permissions();
+        let wrapper_source = std::fs::read_to_string(&provider_wrapper).unwrap();
+        std::fs::write(
+            &provider_wrapper,
+            wrapper_source.replace(
+                "/home/freshell/provider/.freshell/references/0",
+                &reference.to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider_wrapper, wrapper_permissions).unwrap();
+        let provider_cwd = provider_wrapper.parent().unwrap().parent().unwrap();
+        let output =
+            execute_selected_resource_with_context(&provider_wrapper, None, Some(provider_cwd))
+                .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"script directory env loaded\n");
+    }
+
+    #[test]
+    fn shell_wrapper_can_use_script_and_env_files_from_its_configured_project_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let project = owned.path().join("project");
+        let wrapper = home.join("bin/start");
+        std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            &wrapper,
+            "#!/bin/sh\nexec node --env-file=.env server.mjs\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            project.join("server.mjs"),
+            "if (process.env.MANAGED_PROJECT_ENV !== 'project-secret') process.exit(11);\nprocess.stdout.write('project cwd env loaded\\n');\n",
+        )
+        .unwrap();
+        std::fs::write(project.join(".env"), "MANAGED_PROJECT_ENV=project-secret\n").unwrap();
+
+        let (plan, provider_wrapper) = plan_and_stage_mcp_command_for_resource_with_cwd(
+            owned.path(),
+            &home,
+            &workspace,
+            &[wrapper.to_string_lossy().into_owned()],
+            &wrapper,
+            Some(&project),
+        );
+        assert_eq!(plan[0].references.selections.len(), 1);
+        let reference = owned
+            .path()
+            .join("provider/.provider-home/.freshell/references/0");
+        std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
+        std::fs::copy(project.join(".env"), &reference).unwrap();
+        let wrapper_permissions = std::fs::metadata(&provider_wrapper).unwrap().permissions();
+        let wrapper_source = std::fs::read_to_string(&provider_wrapper).unwrap();
+        std::fs::write(
+            &provider_wrapper,
+            wrapper_source.replace(
+                "/home/freshell/provider/.freshell/references/0",
+                &reference.to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider_wrapper, wrapper_permissions).unwrap();
+        let units = resource_units(
+            &home,
+            &home.join(".config/opencode"),
+            &workspace,
+            &plan,
+            None,
+        )
+        .unwrap();
+        let project_mount = units
+            .iter()
+            .find(|(source, _)| source == &project.canonicalize().unwrap())
+            .expect("the configured MCP project cwd must be staged");
+        let provider_cwd_relative = Path::new(&project_mount.1.effective_destination)
+            .strip_prefix(owned.path())
+            .map(Path::to_path_buf)
+            .or_else(|_| {
+                Path::new(&project_mount.1.effective_destination)
+                    .strip_prefix("/home/freshell/provider")
+                    .map(|relative| Path::new(".provider-home").join(relative))
+            })
+            .expect("the configured project cwd must map into the provider fixture");
+        let provider_cwd = owned.path().join("provider").join(provider_cwd_relative);
+        let hidden_home = owned.path().join("home-hidden");
+        let hidden_project = owned.path().join("project-hidden");
+        std::fs::rename(&home, &hidden_home).unwrap();
+        std::fs::rename(&project, &hidden_project).unwrap();
+        let output =
+            execute_selected_resource_with_context(&provider_wrapper, None, Some(&provider_cwd))
+                .unwrap();
+        std::fs::rename(&hidden_project, &project).unwrap();
+        std::fs::rename(&hidden_home, &home).unwrap();
+        assert!(
+            output.status.success(),
+            "the home wrapper must launch from its configured project cwd: {:?}",
+            output.stderr
+        );
+        assert_eq!(output.stdout, b"project cwd env loaded\n");
+    }
+
+    #[test]
+    fn shell_wrapper_edits_map_to_a_resource_filtered_around_the_workspace() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let external = owned.path().join("external");
+        let workspace = external.join("workspace");
+        let wrapper = external.join("bin/start");
+        std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            &wrapper,
+            "#!/bin/sh\nexec node --env-file=.env server.mjs\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            external.join("server.mjs"),
+            "process.stdout.write(process.env.MANAGED_FILTERED_ENV || 'missing env');\n",
+        )
+        .unwrap();
+        std::fs::write(
+            external.join(".env"),
+            "MANAGED_FILTERED_ENV=filtered-resource-secret\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join("workspace-only.txt"),
+            "must stay mounted separately",
+        )
+        .unwrap();
+        let config = workspace.join("opencode.json");
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "mcp": { "filtered": {
+                    "type": "local",
+                    "command": [wrapper],
+                    "cwd": external,
+                } },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config,
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Workspace,
+            }],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .unwrap();
+        let mut units = resource_units(
+            &home,
+            &home.join(".config/opencode"),
+            &workspace,
+            &plan,
+            None,
+        )
+        .unwrap();
+        let scratch = owned.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let edits = filter_workspace_from_enclosing_resource_units_with_edits(
+            &mut units,
+            "opencode",
+            &workspace,
+            &scratch,
+            &[],
+            &plan,
+        )
+        .unwrap_or_else(|error| {
+            panic!("filtering a containing resource must preserve the original-to-stage edit mapping: {error}")
+        });
+        assert_eq!(edits.len(), 1);
     }
 
     #[test]
@@ -5729,6 +6172,28 @@ pub(super) fn filter_workspace_from_enclosing_resource_units(
         *source = filtered_source;
     }
     Ok(())
+}
+
+pub(super) fn filter_workspace_from_enclosing_resource_units_with_edits(
+    units: &mut [(
+        std::path::PathBuf,
+        freshell_runtime_protocol::ProviderResourceMount,
+    )],
+    provider: &str,
+    workspace: &Path,
+    scratch_root: &Path,
+    excluded_canonical_sources: &[std::path::PathBuf],
+    plan: &[PlannedSourceOccurrence],
+) -> Result<Vec<StagedResourceEdit>, String> {
+    let edits = configured_resource_edits(units, plan)?;
+    filter_workspace_from_enclosing_resource_units(
+        units,
+        provider,
+        workspace,
+        scratch_root,
+        excluded_canonical_sources,
+    )?;
+    Ok(edits)
 }
 
 #[cfg(unix)]

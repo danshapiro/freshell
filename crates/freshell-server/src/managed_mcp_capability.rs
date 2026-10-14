@@ -1741,19 +1741,22 @@ fn stage_provider_root(
             };
             if !units.is_empty() {
                 let scratch = tempfile::tempdir_in(parent).map_err(|error| error.to_string())?;
-                source_stage::filter_workspace_from_enclosing_resource_units(
-                    &mut units,
-                    provider,
-                    opencode_input
-                        .workspace
-                        .or(opencode_input.cwd)
-                        .unwrap_or(home),
-                    scratch.path(),
-                    &excluded,
-                )?;
+                configured_resource_edits =
+                    source_stage::filter_workspace_from_enclosing_resource_units_with_edits(
+                        &mut units,
+                        provider,
+                        opencode_input
+                            .workspace
+                            .or(opencode_input.cwd)
+                            .unwrap_or(home),
+                        scratch.path(),
+                        &excluded,
+                        plan,
+                    )?;
                 _filtered_resource_sources = Some(scratch);
+            } else {
+                configured_resource_edits = source_stage::configured_resource_edits(&units, plan)?;
             }
-            configured_resource_edits = source_stage::configured_resource_edits(&units, plan)?;
             selections.extend(source_stage::resource_copy_selections(&units)?);
             let descriptors = units
                 .into_iter()
