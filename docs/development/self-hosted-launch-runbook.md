@@ -715,10 +715,16 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
     # pattern check:
     PROBE_ROOT=$(realpath -e "$PROBE_ROOT") \
       || { echo "PROBE_ROOT: path does not exist"; exit 1; }
-    case "$PROBE_ROOT" in
-      "$HOME"/freshell-probe.*) chmod 0770 "$PROBE_ROOT" ;;
-      *) echo "REFUSING: PROBE_ROOT=$PROBE_ROOT is not a freshell-probe run root"; exit 1 ;;
-    esac
+    # Pin depth and basename — a case-pattern `*` matches `/` too, so a
+    # bare "$HOME"/freshell-probe.* would chmod an inherited nested
+    # directory like $HOME/freshell-probe.old/project:
+    if [ "$(dirname "$PROBE_ROOT")" = "$HOME" ] \
+       && case "$(basename "$PROBE_ROOT")" in freshell-probe.*) true ;; *) false ;; esac; then
+      chmod 0770 "$PROBE_ROOT"
+    else
+      echo "REFUSING: PROBE_ROOT=$PROBE_ROOT is not a freshell-probe run root directly under home"
+      exit 1
+    fi
     BWS=$(mktemp -d "$PROBE_ROOT/bws.XXXXXX")   # unique per run
     chmod 0770 "$BWS"   # same in-soul-shell access requirement as $WS
     printf 'BWS=%q\n' "$BWS" >> "$D/run.env"
@@ -753,12 +759,19 @@ print("" if cur is None else cur)' "$D/settings.json" > "$D/old-opencode-cwd.txt
     # exclude $HOME will 403 the probe root), mint the probe root under
     # an allowed root instead and record it so the cleanup guard
     # validates against the RECORDED root:
-    ALLOWED=$(curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" \
-      http://127.0.0.1:3001/api/settings \
-      | python3 -c 'import json,sys
-d=json.load(sys.stdin); d=d.get("data",d)
-for r in (d.get("allowedFilePaths") or []):
-    print(r)')
+    SETTINGS_CODE=$(curl -s --connect-timeout 5 --max-time 10 \
+      -o "$D/settings.json" -w '%{http_code}' -H @"$D/hdr" \
+      http://127.0.0.1:3001/api/settings)
+    grep -q '^2' <<<"$SETTINGS_CODE" || { echo "settings read failed (HTTP $SETTINGS_CODE)"; exit 1; }
+    ALLOWED=$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+assert isinstance(d, dict), "malformed settings response"
+d=d.get("data",d)
+afp=d.get("allowedFilePaths")
+assert afp is None or isinstance(afp, list), "malformed allowedFilePaths"
+for r in (afp or []):
+    print(r)' "$D/settings.json") || { echo "malformed settings response"; exit 1; }
+    rm -f "$D/settings.json"   # the response can carry secrets
     # Is the probe path itself PERMITTED? An allowed entry A permits the
     # probe path when the path starts with A — e.g. allowed=["/home/dan/work"]
     # does NOT permit $HOME/freshell-probe.* even though the entry sits
@@ -767,8 +780,12 @@ for r in (d.get("allowedFilePaths") or []):
     PROBE_PATH_OK=0
     while read -r A; do
       [ -n "$A" ] || continue
+      A=${A/#\~/$HOME}   # the server normalizes ~ roots — mirror it
+      # The server's is_path_allowed requires the probe path to BE the
+      # root or sit under it at a / boundary — a bare string prefix
+      # would wrongly accept /home/dan/freshell for /home/dan/freshell-probe.x:
       case "$HOME/freshell-probe.probe" in
-        "$A"*) PROBE_PATH_OK=1; break ;;
+        "$A"|"$A"/*) PROBE_PATH_OK=1; break ;;
       esac
     done <<<"$ALLOWED"
     if [ "$PROBE_PATH_OK" != 1 ]; then
