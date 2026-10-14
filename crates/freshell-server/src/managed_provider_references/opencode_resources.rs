@@ -1301,7 +1301,8 @@ fn node_relative_resource_specifiers(
     source: &str,
 ) -> Result<std::collections::BTreeMap<String, bool>, &'static str> {
     let tokens = javascript_tokens(source)?;
-    let output_destinations = node_output_destination_mask(&tokens)?;
+    let (output_destinations, output_destination_variables) =
+        node_output_destination_mask(&tokens)?;
     let mut result = std::collections::BTreeMap::<String, bool>::new();
     for index in 0..tokens.len() {
         if index >= 2
@@ -1406,23 +1407,33 @@ fn node_relative_resource_specifiers(
                 tokens.get(index + 11),
                 Some(JavaScriptToken::Punctuation(b')'))
             )));
+        let is_bound_output_destination = index >= 3
+            && matches!(
+                tokens.get(index - 1),
+                Some(JavaScriptToken::Punctuation(b'='))
+            )
+            && matches!(tokens.get(index - 2), Some(JavaScriptToken::Identifier(name)) if output_destination_variables.contains(name))
+            && matches!(tokens.get(index - 3), Some(JavaScriptToken::Identifier(keyword)) if matches!(keyword.as_str(), "const" | "let" | "var"));
+        let is_output_destination = output_destinations[index] || is_bound_output_destination;
         if new_keyword == "new"
             && url_constructor == "URL"
             && is_import_meta_url
             && (specifier.starts_with("./") || specifier.starts_with("../"))
             && !specifier.contains(['?', '#', '\\', '$'])
-            && (!output_destinations[index] || parent.join(specifier).exists())
+            && (!is_output_destination || parent.join(specifier).exists())
         {
             result
                 .entry(specifier.clone())
-                .and_modify(|writable| *writable |= output_destinations[index])
-                .or_insert(output_destinations[index]);
+                .and_modify(|writable| *writable |= is_output_destination)
+                .or_insert(is_output_destination);
         }
     }
     Ok(result)
 }
 
-fn node_output_destination_mask(tokens: &[JavaScriptToken]) -> Result<Vec<bool>, &'static str> {
+fn node_output_destination_mask(
+    tokens: &[JavaScriptToken],
+) -> Result<(Vec<bool>, std::collections::BTreeSet<String>), &'static str> {
     const OUTPUT_CALLS: [(&str, usize); 15] = [
         ("appendFile", 0),
         ("appendFileSync", 0),
@@ -1441,6 +1452,7 @@ fn node_output_destination_mask(tokens: &[JavaScriptToken]) -> Result<Vec<bool>,
         ("symlinkSync", 1),
     ];
     let mut ranges = Vec::new();
+    let mut direct_variables = std::collections::BTreeSet::new();
     let mut inspection_budget = MAX_JAVASCRIPT_TOKENS;
     for (index, token) in tokens.iter().enumerate() {
         let JavaScriptToken::Identifier(name) = token else {
@@ -1499,6 +1511,11 @@ fn node_output_destination_mask(tokens: &[JavaScriptToken]) -> Result<Vec<bool>,
             }
         }
         if let Some(end) = end.filter(|end| *end > start) {
+            if end == start + 1 {
+                if let Some(JavaScriptToken::Identifier(name)) = tokens.get(start) {
+                    direct_variables.insert(name.clone());
+                }
+            }
             ranges.push(start..end);
         }
     }
@@ -1517,7 +1534,7 @@ fn node_output_destination_mask(tokens: &[JavaScriptToken]) -> Result<Vec<bool>,
     for range in merged {
         result[range].fill(true);
     }
-    Ok(result)
+    Ok((result, direct_variables))
 }
 
 fn read_node_package_manifest(

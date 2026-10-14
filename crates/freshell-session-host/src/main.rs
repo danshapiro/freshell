@@ -1809,7 +1809,23 @@ fn copy_environment_with_events(
     freshell_platform::provider_environment::CopyReport,
     freshell_platform::provider_environment::CopyError,
 > {
-    copy_environment_with_events_for_mounts(stage, provider, selections, destination, excluded, &[])
+    copy_environment_with_events_for_mounts(
+        stage,
+        provider,
+        selections,
+        destination,
+        excluded,
+        MountedResourceOptions {
+            mounted_roots: &[],
+            preserve_existing_mounted_files: &[],
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct MountedResourceOptions<'a> {
+    mounted_roots: &'a [PathBuf],
+    preserve_existing_mounted_files: &'a [PathBuf],
 }
 
 fn copy_environment_with_events_for_mounts(
@@ -1818,18 +1834,19 @@ fn copy_environment_with_events_for_mounts(
     selections: &[freshell_platform::provider_environment::CopySelection],
     destination: &Path,
     excluded: &[PathBuf],
-    mounted_directories: &[PathBuf],
+    resource_options: MountedResourceOptions<'_>,
 ) -> Result<
     freshell_platform::provider_environment::CopyReport,
     freshell_platform::provider_environment::CopyError,
 > {
     copy_environment_with_events_using(stage, provider, selections, || {
-        freshell_platform::provider_environment::copy_environment_for_mounts(
+        freshell_platform::provider_environment::copy_environment_for_mounts_preserving_files(
             selections,
             destination,
             excluded,
             Default::default(),
-            mounted_directories,
+            resource_options.mounted_roots,
+            resource_options.preserve_existing_mounted_files,
         )
     })
 }
@@ -1841,19 +1858,20 @@ fn copy_environment_with_events_excluding_subtree_for_mounts(
     destination: &Path,
     excluded: &[PathBuf],
     excluded_subtree: &Path,
-    mounted_directories: &[PathBuf],
+    resource_options: MountedResourceOptions<'_>,
 ) -> Result<
     freshell_platform::provider_environment::CopyReport,
     freshell_platform::provider_environment::CopyError,
 > {
     copy_environment_with_events_using(stage, provider, selections, || {
-        freshell_platform::provider_environment::copy_environment_excluding_subtree_for_mounts(
+        freshell_platform::provider_environment::copy_environment_excluding_subtree_for_mounts_preserving_files(
             selections,
             destination,
             excluded,
             excluded_subtree,
             Default::default(),
-            mounted_directories,
+            resource_options.mounted_roots,
+            resource_options.preserve_existing_mounted_files,
         )
     })
 }
@@ -2116,6 +2134,18 @@ fn copy_provider_config_references_with_ownership(
     } else {
         Vec::new()
     };
+    let preserve_existing_mounted_files = if provider_home == final_home {
+        let previous = read_projection_manifest(final_home)?;
+        writable_resource_mount_roots(context)
+            .into_iter()
+            .filter(|path| {
+                path.to_str()
+                    .is_some_and(|relative| previous.contains(relative))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let report = if provider == "opencode" {
         copy_environment_with_events_excluding_subtree_for_mounts(
             "session_host",
@@ -2124,7 +2154,10 @@ fn copy_provider_config_references_with_ownership(
             provider_home,
             &excluded,
             workspace,
-            &mounted,
+            MountedResourceOptions {
+                mounted_roots: &mounted,
+                preserve_existing_mounted_files: &preserve_existing_mounted_files,
+            },
         )
     } else {
         copy_environment_with_events_for_mounts(
@@ -2133,7 +2166,10 @@ fn copy_provider_config_references_with_ownership(
             &selections,
             provider_home,
             &excluded,
-            &mounted,
+            MountedResourceOptions {
+                mounted_roots: &mounted,
+                preserve_existing_mounted_files: &preserve_existing_mounted_files,
+            },
         )
     }
     .map_err(|error| error.to_string())?;
@@ -2164,6 +2200,20 @@ fn resource_mount_roots(
         .iter()
         .flat_map(|inputs| &inputs.resource_mounts)
         .map(|root| PathBuf::from(&root.provider_relative_path))
+        .collect()
+}
+
+fn writable_resource_mount_roots(
+    context: &freshell_runtime_protocol::ProviderLaunchContext,
+) -> Vec<PathBuf> {
+    context
+        .prepared_inputs
+        .iter()
+        .flat_map(|inputs| &inputs.resource_mounts)
+        .filter(|mount| {
+            mount.kind == freshell_runtime_protocol::ProviderResourceKind::File && mount.writable
+        })
+        .map(|mount| PathBuf::from(&mount.provider_relative_path))
         .collect()
 }
 
@@ -2503,6 +2553,14 @@ fn refresh_provider_config_in_stage(
     let mut protected = private_bound_destinations(context);
     let previous = read_projection_manifest(provider_home)?;
     let current = read_projection_manifest(&projection)?;
+    let preserved_writable_files = writable_resource_mount_roots(context)
+        .into_iter()
+        .filter(|path| {
+            path.to_str()
+                .is_some_and(|relative| previous.contains(relative))
+        })
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
     protected.extend(protected_resource_alias_entries(context, &previous));
     protected.extend(protected_resource_alias_entries(context, &current));
     std::fs::write(
@@ -2518,6 +2576,16 @@ fn refresh_provider_config_in_stage(
     .map_err(|_| "resource mountpoint metadata profile exceeded")?;
     std::fs::write(stage.path().join("resource-mountpoints.json"), mounted)
         .map_err(|_| "resource mountpoint metadata write failed")?;
+    let preserved = freshell_runtime_protocol::bounded_json_bytes(
+        &preserved_writable_files,
+        MAX_PROJECTION_METADATA_BYTES,
+    )
+    .map_err(|_| "preserved writable resource metadata profile exceeded")?;
+    std::fs::write(
+        stage.path().join("preserved-writable-resource-files.json"),
+        preserved,
+    )
+    .map_err(|_| "preserved writable resource metadata write failed")?;
     allow_provider_read_stage(stage.path(), unsafe { libc::getegid() })?;
     apply_staged_provider_config(stage.path(), provider_home)
 }
@@ -2874,6 +2942,24 @@ fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<()
     }) {
         return Err("resource mountpoint metadata has an invalid owned root".into());
     }
+    let preserve_existing_mounted_files: Vec<PathBuf> =
+        match read_projection_metadata(stage, "preserved-writable-resource-files.json")? {
+            Some(bytes) => serde_json::from_slice::<Vec<String>>(&bytes)
+                .map_err(|_| "preserved writable resource metadata invalid")?
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+            None => Vec::new(),
+        };
+    if preserve_existing_mounted_files.iter().any(|path| {
+        !path.starts_with(".freshell/provider-roots")
+            || path
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            || !mounted.contains(path)
+    }) {
+        return Err("preserved writable resource metadata has an invalid exact file".into());
+    }
     publish_provider_projection(ProviderProjection {
         provider: &provider,
         selections: &selections,
@@ -2882,6 +2968,7 @@ fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<()
         current: &current,
         protected: &protected,
         mounted: &mounted,
+        preserve_existing_mounted_files: &preserve_existing_mounted_files,
     })
 }
 
@@ -2893,6 +2980,7 @@ struct ProviderProjection<'a> {
     current: &'a std::collections::BTreeSet<String>,
     protected: &'a std::collections::BTreeSet<String>,
     mounted: &'a [PathBuf],
+    preserve_existing_mounted_files: &'a [PathBuf],
 }
 
 // One provider-owned transaction covers replacement, stale removal and manifest
@@ -2916,6 +3004,7 @@ fn publish_provider_projection_with_manifest(
         current,
         protected,
         mounted,
+        preserve_existing_mounted_files,
     } = projection;
     use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt};
     emit_environment_event(
@@ -3027,7 +3116,10 @@ fn publish_provider_projection_with_manifest(
         let limits = freshell_platform::provider_environment::CopyLimits::default();
         let mut bytes = 0u64;
         for (relative, metadata) in &old {
-            if mounted.contains(&PathBuf::from(relative)) && metadata.is_file() {
+            if mounted.contains(&PathBuf::from(relative))
+                && metadata.is_file()
+                && !preserve_existing_mounted_files.contains(&PathBuf::from(relative))
+            {
                 bytes = bytes
                     .checked_add(metadata.len())
                     .ok_or("provider mounted backup byte accounting overflow")?;
@@ -3119,6 +3211,11 @@ fn publish_provider_projection_with_manifest(
                     return Err(format!(
                         "provider transaction mounted file {relative} must retain a regular inode"
                     ));
+                }
+                if preserve_existing_mounted_files.contains(&PathBuf::from(relative))
+                    && previous.contains(relative)
+                {
+                    continue;
                 }
                 touched_mounts.push(relative.clone());
                 replace_mounted_projection_file(&desired.join(relative), &destination)?;
@@ -4412,6 +4509,7 @@ mod tests {
                 current: &current,
                 protected: &BTreeSet::new(),
                 mounted: &[],
+                preserve_existing_mounted_files: &[],
             },
             |source, _destination| {
                 // This callback occupies only the final publication boundary. The
@@ -4672,6 +4770,108 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(native.join(link).join("transport-only/nonce")).unwrap(),
             "cross-root-refreshed-nonce"
+        );
+    }
+
+    #[test]
+    fn provider_config_recovery_preserves_written_writable_file_and_refreshes_read_only_file() {
+        use freshell_runtime_protocol::*;
+        let owned = tempfile::tempdir().unwrap();
+        let source_root = owned.path().join("source");
+        let user_root = source_root.join("provider");
+        let workspace = owned.path().join("workspace");
+        let home = owned.path().join("home");
+        let writable_source = user_root.join(".freshell/resource-units/writable/source");
+        let readonly_source = user_root.join(".freshell/resource-units/readonly/source");
+        let writable_relative = PathBuf::from(".freshell/provider-roots/writable/source");
+        let readonly_relative = PathBuf::from(".freshell/provider-roots/readonly/source");
+        std::fs::create_dir_all(writable_source.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(readonly_source.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(home.join(writable_relative.parent().unwrap())).unwrap();
+        std::fs::create_dir_all(home.join(readonly_relative.parent().unwrap())).unwrap();
+        std::fs::write(&writable_source, "writable seed").unwrap();
+        std::fs::write(&readonly_source, "readonly seed").unwrap();
+        // Exact-file mounts exist as physical placeholders before initial
+        // publication, just as their Docker volume subpath mounts do.
+        std::fs::write(home.join(&writable_relative), "").unwrap();
+        std::fs::write(home.join(&readonly_relative), "").unwrap();
+        let capability = McpCapabilityReference {
+            grant_id: format!("grant-{}", uuid::Uuid::new_v4()),
+            endpoint: "http://host.docker.internal:1234".into(),
+            provider_relative_path: ".freshell/mcp-capability.json".into(),
+            host_gateway_address: None,
+        };
+        let context = ProviderLaunchContext {
+            config: vec![],
+            preparation: ProviderPreparation::Opencode {
+                project_config: vec![],
+                tui_config: None,
+                tui_source: None,
+                inline_config: false,
+            },
+            prepared_inputs: Some(PreparedProviderInputs {
+                generation_id: capability.grant_id.clone(),
+                initial_auth_reservation: None,
+                manifest: ProviderInputManifestReference {
+                    relative_path: ".freshell/input-manifest.json".into(),
+                    sha256: "a".repeat(64),
+                    source_count: 0,
+                    alias_count: 0,
+                    recipe_count: 0,
+                },
+                config_binds: vec![],
+                indexed_files: None,
+                resource_mounts: vec![
+                    ProviderResourceMount {
+                        stage_relative_path: ".freshell/resource-units/writable/source".into(),
+                        provider_relative_path: writable_relative.to_string_lossy().into_owned(),
+                        logical_destination: "/home/freshell/provider/mcp/state.txt".into(),
+                        effective_destination: "/home/freshell/provider/mcp/state.txt".into(),
+                        kind: ProviderResourceKind::File,
+                        writable: true,
+                    },
+                    ProviderResourceMount {
+                        stage_relative_path: ".freshell/resource-units/readonly/source".into(),
+                        provider_relative_path: readonly_relative.to_string_lossy().into_owned(),
+                        logical_destination: "/home/freshell/provider/mcp/reference.txt".into(),
+                        effective_destination: "/home/freshell/provider/mcp/reference.txt".into(),
+                        kind: ProviderResourceKind::File,
+                        writable: false,
+                    },
+                ],
+            }),
+            mcp_capability: Some(capability),
+        };
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        copy_provider_config_references(
+            &context, "opencode", &workspace, &user_root, &home, uid, gid,
+        )
+        .unwrap();
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(home.join(&writable_relative))
+            .unwrap()
+            .write_all(b" + runtime state")
+            .unwrap();
+        std::fs::write(&writable_source, "refreshed writable seed").unwrap();
+        std::fs::write(&readonly_source, "refreshed readonly seed").unwrap();
+
+        refresh_provider_config_references(
+            &context, "opencode", &workspace, &user_root, &home, uid, gid,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(home.join(&writable_relative)).unwrap(),
+            b"writable seed + runtime state",
+            "replacement must keep the existing writable mount's runtime data"
+        );
+        assert_eq!(
+            std::fs::read(home.join(&readonly_relative)).unwrap(),
+            b"refreshed readonly seed",
+            "read-only inputs still refresh from their selected source"
         );
     }
 

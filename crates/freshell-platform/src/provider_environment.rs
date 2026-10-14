@@ -695,9 +695,10 @@ fn copy_environment_with_account_home(
         destination_root,
         excluded_canonical_sources,
         limits,
-        account_home,
-        &[],
-        None,
+        CopyProjectionOptions {
+            account_home,
+            ..Default::default()
+        },
     )
 }
 
@@ -734,6 +735,28 @@ pub fn copy_environment_excluding_subtree_for_mounts(
     limits: CopyLimits,
     mounted_roots: &[PathBuf],
 ) -> Result<CopyReport, CopyError> {
+    copy_environment_excluding_subtree_for_mounts_preserving_files(
+        selections,
+        destination_root,
+        excluded_canonical_sources,
+        excluded_subtree,
+        limits,
+        mounted_roots,
+        &[],
+    )
+}
+
+/// Exclusion-aware projection that can retain an existing writable exact-file
+/// mount's contents during recovery while still refreshing other mounted inputs.
+pub fn copy_environment_excluding_subtree_for_mounts_preserving_files(
+    selections: &[CopySelection],
+    destination_root: &Path,
+    excluded_canonical_sources: &[PathBuf],
+    excluded_subtree: &Path,
+    limits: CopyLimits,
+    mounted_roots: &[PathBuf],
+    preserve_existing_mounted_files: &[PathBuf],
+) -> Result<CopyReport, CopyError> {
     let excluded_subtree = fs::canonicalize(excluded_subtree).map_err(|cause| {
         io_error(
             Path::new("excluded-subtree"),
@@ -751,9 +774,12 @@ pub fn copy_environment_excluding_subtree_for_mounts(
         destination_root,
         &exclusions,
         limits,
-        account_home,
-        mounted_roots,
-        Some(excluded_subtree),
+        CopyProjectionOptions {
+            account_home,
+            mounted_roots,
+            preserve_existing_mounted_files,
+            excluded_subtree: Some(excluded_subtree),
+        },
     )
 }
 
@@ -766,16 +792,47 @@ pub fn copy_environment_for_mounts(
     limits: CopyLimits,
     mounted_roots: &[PathBuf],
 ) -> Result<CopyReport, CopyError> {
+    copy_environment_for_mounts_preserving_files(
+        selections,
+        destination_root,
+        excluded_canonical_sources,
+        limits,
+        mounted_roots,
+        &[],
+    )
+}
+
+/// Projects mounted resources while retaining selected existing writable file
+/// contents. Missing preserved files still follow normal mount publication.
+pub fn copy_environment_for_mounts_preserving_files(
+    selections: &[CopySelection],
+    destination_root: &Path,
+    excluded_canonical_sources: &[PathBuf],
+    limits: CopyLimits,
+    mounted_roots: &[PathBuf],
+    preserve_existing_mounted_files: &[PathBuf],
+) -> Result<CopyReport, CopyError> {
     let account_home = std::env::var_os("HOME").and_then(|home| fs::canonicalize(home).ok());
     copy_environment_projection(
         selections,
         destination_root,
         excluded_canonical_sources,
         limits,
-        account_home,
-        mounted_roots,
-        None,
+        CopyProjectionOptions {
+            account_home,
+            mounted_roots,
+            preserve_existing_mounted_files,
+            ..Default::default()
+        },
     )
+}
+
+#[derive(Default)]
+struct CopyProjectionOptions<'a> {
+    account_home: Option<PathBuf>,
+    mounted_roots: &'a [PathBuf],
+    preserve_existing_mounted_files: &'a [PathBuf],
+    excluded_subtree: Option<PathBuf>,
 }
 
 fn copy_environment_projection(
@@ -783,10 +840,24 @@ fn copy_environment_projection(
     destination_root: &Path,
     excluded_canonical_sources: &[PathBuf],
     limits: CopyLimits,
-    account_home: Option<PathBuf>,
-    mounted_roots: &[PathBuf],
-    excluded_subtree: Option<PathBuf>,
+    options: CopyProjectionOptions<'_>,
 ) -> Result<CopyReport, CopyError> {
+    let CopyProjectionOptions {
+        account_home,
+        mounted_roots,
+        preserve_existing_mounted_files,
+        excluded_subtree,
+    } = options;
+    if preserve_existing_mounted_files
+        .iter()
+        .any(|path| !mounted_roots.contains(path))
+    {
+        return Err(error(
+            Path::new("mounted-resource"),
+            "validate_preserved_mounts",
+            "preserved exact files must also be declared mounted roots",
+        ));
+    }
     bound(
         Path::new(""),
         "entries",
@@ -1116,6 +1187,11 @@ fn copy_environment_projection(
                 }
                 mode(&destination, 0o700, relative)?;
             } else if mounted_roots.contains(relative) && matches!(node, Node::File(..)) {
+                if preserve_existing_mounted_files.contains(relative)
+                    && preserve_existing_mounted_file(&destination, relative, limits)?
+                {
+                    continue;
+                }
                 let Node::File(_, source_mode, _) = node else {
                     unreachable!()
                 };
@@ -1142,6 +1218,56 @@ fn copy_environment_projection(
         bytes: actual_bytes,
         projected_paths: plan.nodes.into_keys().collect(),
     })
+}
+
+fn preserve_existing_mounted_file(
+    destination: &Path,
+    relative: &Path,
+    limits: CopyLimits,
+) -> Result<bool, CopyError> {
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let metadata = match fs::symlink_metadata(destination) {
+        Ok(metadata) => metadata,
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(cause) => return Err(io_error(relative, "inspect_preserved_mount", cause)),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(error(
+            relative,
+            "inspect_preserved_mount",
+            "preserved mounted resource must be a physical regular file",
+        ));
+    }
+    bound(
+        relative,
+        "file_bytes",
+        metadata.len(),
+        limits.max_file_bytes,
+    )?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let opened = options
+        .open(destination)
+        .map_err(|cause| io_error(relative, "open_preserved_mount", cause))?;
+    let opened_metadata = opened
+        .metadata()
+        .map_err(|cause| io_error(relative, "inspect_preserved_mount", cause))?;
+    #[cfg(unix)]
+    let inode_changed =
+        metadata.dev() != opened_metadata.dev() || metadata.ino() != opened_metadata.ino();
+    #[cfg(not(unix))]
+    let inode_changed = false;
+    if inode_changed || metadata.len() != opened_metadata.len() {
+        return Err(error(
+            relative,
+            "inspect_preserved_mount",
+            "mounted resource changed while recovery inspected its inode",
+        ));
+    }
+    Ok(true)
 }
 
 fn publish_mounted_file(
@@ -1302,6 +1428,64 @@ mod tests {
             alias.read_to_end(&mut observed).unwrap();
             assert_eq!(observed,content,"an existing native file alias must see complete initial and refreshed resource bytes");
         }
+    }
+
+    #[test]
+    fn provider_environment_recovery_keeps_existing_writable_mount_and_refreshes_read_only_mount() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let fixture = tempfile::tempdir().unwrap();
+        let writable_source = fixture.path().join("writable-source");
+        let readonly_source = fixture.path().join("readonly-source");
+        fs::write(&writable_source, b"writable seed").unwrap();
+        fs::write(&readonly_source, b"readonly seed").unwrap();
+        let home = fixture.path().join("provider-home");
+        let writable = PathBuf::from(".freshell/provider-roots/writable/source");
+        let readonly = PathBuf::from(".freshell/provider-roots/readonly/source");
+        fs::create_dir_all(home.join(writable.parent().unwrap())).unwrap();
+        fs::create_dir_all(home.join(readonly.parent().unwrap())).unwrap();
+        fs::write(home.join(&writable), b"").unwrap();
+        fs::write(home.join(&readonly), b"").unwrap();
+        // The provider's native volume alias points at this same exact-file
+        // inode and writes to it while the runtime is alive.
+        let mut native_alias = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(home.join(&writable))
+            .unwrap();
+        let selections = [
+            selection(&writable_source, writable.to_str().unwrap()),
+            selection(&readonly_source, readonly.to_str().unwrap()),
+        ];
+        let mounted = [writable.clone(), readonly.clone()];
+        copy_environment_for_mounts(&selections, &home, &[], CopyLimits::default(), &mounted)
+            .unwrap();
+        native_alias.seek(SeekFrom::End(0)).unwrap();
+        native_alias.write_all(b" + runtime state").unwrap();
+        fs::write(&writable_source, b"refreshed writable seed").unwrap();
+        fs::write(&readonly_source, b"refreshed readonly seed").unwrap();
+
+        copy_environment_for_mounts_preserving_files(
+            &selections,
+            &home,
+            &[],
+            CopyLimits::default(),
+            &mounted,
+            std::slice::from_ref(&writable),
+        )
+        .unwrap();
+
+        native_alias.seek(SeekFrom::Start(0)).unwrap();
+        let mut runtime_state = Vec::new();
+        native_alias.read_to_end(&mut runtime_state).unwrap();
+        assert_eq!(
+            runtime_state, b"writable seed + runtime state",
+            "recovery must retain runtime data in an existing writable mount"
+        );
+        assert_eq!(
+            fs::read(home.join(&readonly)).unwrap(),
+            b"refreshed readonly seed",
+            "ordinary read-only mounted inputs must still refresh"
+        );
     }
 
     #[cfg(unix)]

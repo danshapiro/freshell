@@ -1536,17 +1536,19 @@ process.stdout.write(require('./helper.js'))
         let url_output = home.join("generated-url.json");
         let append_output = home.join("existing-output.txt");
         let append_url_output = home.join("existing-url-output.txt");
+        let append_variable_url_output = home.join("existing-url-variable-output.txt");
         let copy_source = home.join("copy-source.txt");
         let copy_output = home.join("copy-output.txt");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(
             &command,
-            "import fs from 'node:fs';\nimport path from 'node:path';\nimport { fileURLToPath } from 'node:url';\nconst __dirname = path.dirname(fileURLToPath(import.meta.url));\nfs.writeFileSync(path.join(__dirname, 'generated-path.json'), 'path output');\nfs.writeFileSync(new URL('./generated-url.json', import.meta.url), 'url output');\nfs.appendFileSync(path.join(__dirname, 'existing-output.txt'), ' appended');\nfs.appendFileSync(new URL('./existing-url-output.txt', import.meta.url), ' appended');\nfs.copyFileSync(path.join(__dirname, 'copy-source.txt'), path.join(__dirname, 'copy-output.txt'));\nprocess.stdout.write(__dirname + '\\n');\n",
+            "import fs from 'node:fs';\nimport path from 'node:path';\nimport { fileURLToPath } from 'node:url';\nconst __dirname = path.dirname(fileURLToPath(import.meta.url));\nfs.writeFileSync(path.join(__dirname, 'generated-path.json'), 'path output');\nfs.writeFileSync(new URL('./generated-url.json', import.meta.url), 'url output');\nfs.appendFileSync(path.join(__dirname, 'existing-output.txt'), ' appended');\nfs.appendFileSync(new URL('./existing-url-output.txt', import.meta.url), ' appended');\nconst stateUrl = new URL('./existing-url-variable-output.txt', import.meta.url);\nfs.appendFileSync(stateUrl, ' appended');\nfs.copyFileSync(path.join(__dirname, 'copy-source.txt'), path.join(__dirname, 'copy-output.txt'));\nprocess.stdout.write(__dirname + '\\n');\n",
         )
         .unwrap();
         std::fs::write(&append_output, "existing").unwrap();
         std::fs::write(&append_url_output, "url existing").unwrap();
+        std::fs::write(&append_variable_url_output, "url variable existing").unwrap();
         std::fs::write(&copy_source, "copy input").unwrap();
 
         let (plan, provider_script) =
@@ -1562,9 +1564,11 @@ process.stdout.write(require('./helper.js'))
         assert!(plan[0]
             .configured_resources
             .contains(&append_output.canonicalize().unwrap()));
-        assert!(plan[0]
-            .configured_resources
-            .contains(&append_url_output.canonicalize().unwrap()));
+        for output in [&append_url_output, &append_variable_url_output] {
+            assert!(plan[0]
+                .configured_resources
+                .contains(&output.canonicalize().unwrap()));
+        }
         assert!(plan[0]
             .configured_resources
             .contains(&copy_source.canonicalize().unwrap()));
@@ -1582,7 +1586,11 @@ process.stdout.write(require('./helper.js'))
             None,
         )
         .unwrap();
-        for output in [&append_output, &append_url_output] {
+        for output in [
+            &append_output,
+            &append_url_output,
+            &append_variable_url_output,
+        ] {
             let canonical = output.canonicalize().unwrap();
             let mounts = units
                 .iter()
@@ -1622,6 +1630,8 @@ process.stdout.write(require('./helper.js'))
         let staged_url_output = provider_script_directory.join("generated-url.json");
         let staged_append_output = provider_script_directory.join("existing-output.txt");
         let staged_append_url_output = provider_script_directory.join("existing-url-output.txt");
+        let staged_append_variable_url_output =
+            provider_script_directory.join("existing-url-variable-output.txt");
         let staged_copy_output = provider_script_directory.join("copy-output.txt");
         assert_eq!(
             std::fs::read(&staged_path_output).unwrap_or_else(|error| panic!(
@@ -1645,6 +1655,10 @@ process.stdout.write(require('./helper.js'))
         assert_eq!(
             std::fs::read(&staged_append_url_output).unwrap(),
             b"url existing appended"
+        );
+        assert_eq!(
+            std::fs::read(&staged_append_variable_url_output).unwrap(),
+            b"url variable existing appended"
         );
         assert_eq!(std::fs::read(&staged_copy_output).unwrap(), b"copy input");
     }
