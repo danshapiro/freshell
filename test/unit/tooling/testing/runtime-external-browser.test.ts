@@ -2213,6 +2213,28 @@ describe('owned web process lifetime (Node process fixture only)', () => {
       await expect(fsp.stat(`/proc/${pid}`)).rejects.toThrow()
     } finally { await server.stop(); await fsp.rm(directory, { recursive: true }) }
   })
+  it('retains only the finite FreshAgent provider-start diagnostic category', async () => {
+    const { fixture: directory, entry, setup } = await fixture()
+    const safe = { level: 'WARN', fields: { message: 'fresh_agent.create.launch_failed',
+      runtime_code: 'HOST_UNREACHABLE', provider: 'codex', provider_start_diagnostic: 'authentication',
+      transcript: 'provider-body-must-not-persist' } }
+    const unsafe = { level: 'WARN', fields: { message: 'fresh_agent.create.launch_failed',
+      provider_start_diagnostic: 'private credential detail' } }
+    await fsp.writeFile(entry, `process.stderr.write(${JSON.stringify(JSON.stringify(safe) + '\n' + JSON.stringify(unsafe) + '\n')});\n${await fsp.readFile(entry, 'utf8')}`)
+    const diagnostics = vi.fn()
+    const server = new runner.ManagedRuntimeWebServer({ binary: process.execPath, repoRoot: process.cwd(),
+      candidateSha: 'a'.repeat(40), buildDirty: false, setupHome: setup, preserveHomeOnStop: false,
+      env: { NODE_OPTIONS: `--require=${entry}` } }, diagnostics)
+    try {
+      await server.start()
+      await server.stop()
+      const record = diagnostics.mock.calls[0][0]
+      expect(record.facts).toContainEqual({ severity: 'warn', event: 'fresh_agent.create.launch_failed',
+        fields: { runtime_code: 'HOST_UNREACHABLE', provider: 'codex', provider_start_diagnostic: 'authentication' } })
+      expect(JSON.stringify(record)).not.toContain('provider-body-must-not-persist')
+      expect(JSON.stringify(record)).not.toContain('private credential detail')
+    } finally { await server.stop(); await fsp.rm(directory, { recursive: true }) }
+  })
   it('records an authenticated cleanliness refusal before exact owned web cleanup', async () => {
     const { fixture: directory, entry, setup } = await fixture()
     await fsp.writeFile(entry, `require('node:http').createServer((req,res)=>{res.setHeader('content-type','application/json');res.end(JSON.stringify({runtime:'rust',commit:'${'a'.repeat(40)}',buildDirty:true,authToken:'private-admission-secret',transcript:'private-admission-body'}))}).listen(Number(process.env.PORT),'127.0.0.1')`)

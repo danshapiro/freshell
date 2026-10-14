@@ -280,6 +280,10 @@ export type OwnedWebDiagnosticRecord = {
   facts: { severity: string; event: string; fields: Record<string, string | number | boolean> }[]
 }
 
+const SAFE_PROVIDER_START_DIAGNOSTICS = new Set([
+  'authentication', 'arguments', 'listener', 'configuration', 'network', 'unclassified', 'no-diagnostic', 'none',
+])
+
 function ownedWebDiagnosticFacts(output: { stdout: string; stderr: string }, nativeLog?: { text: string; pid: number }): Pick<OwnedWebDiagnosticRecord, 'facts' | 'ignoredLineCount'> {
   const facts: OwnedWebDiagnosticRecord['facts'] = []
   let ignoredLineCount = 0
@@ -302,8 +306,13 @@ function ownedWebDiagnosticFacts(output: { stdout: string; stderr: string }, nat
     const fields: Record<string, string | number | boolean> = {}
     for (const key of ['code', 'runtime_code', 'runtime_error_code', 'soul_id', 'incarnation_id', 'terminal_id',
       'session_id', 'request_id', 'provider', 'session_type', 'outcome', 'reason', 'evidence_revision',
-      'identity_revision', 'control_epoch', 'execution_generation', 'native_session_id', 'host_boot_id']) {
+      'identity_revision', 'control_epoch', 'execution_generation', 'native_session_id', 'host_boot_id',
+      'provider_start_diagnostic']) {
       const value = values[key]
+      if (key === 'provider_start_diagnostic') {
+        if (typeof value === 'string' && SAFE_PROVIDER_START_DIAGNOSTICS.has(value)) fields[key] = value
+        continue
+      }
       if (typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value))
         || (typeof value === 'string' && /^[A-Za-z0-9_.:()/-]{1,256}$/.test(value))) fields[key] = value
     }
