@@ -2118,7 +2118,7 @@ const OrdinaryFreshStageSchema = z.enum(['creating', 'pane_created', 'waiting_fo
   'pressing_enter', 'waiting_for_send_frame', 'completed'])
 const OrdinaryFreshProviderFailureCodeSchema = z.enum(['FRESH_AGENT_CREATE_FAILED', 'FRESH_AGENT_PROVIDER_START_FAILED'])
 const OrdinaryFreshProviderStartupDiagnosticSchema = z.enum(['authentication', 'arguments', 'listener',
-  'configuration', 'network', 'unclassified', 'no-diagnostic'])
+  'configuration', 'network', 'unclassified', 'no-diagnostic', 'none'])
 const OrdinaryFreshCountSchema = z.number().int().nonnegative().max(10000)
 const OrdinaryFreshProviderEventsSchema = z.object({
   counts: z.object({ created: OrdinaryFreshCountSchema, createFailed: OrdinaryFreshCountSchema,
