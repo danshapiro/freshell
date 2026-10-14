@@ -9,6 +9,7 @@ import {
 } from '../../../../scripts/testing/managed-environment-create.js'
 import {
   checkpointTcpForwarderSource,
+  directHomeAppendMcpServerSource,
   externalTargetRead,
   managedHomeAppendFixturePaths,
   managedEnvironmentFixtureLayout,
@@ -151,6 +152,39 @@ describe('managed provider environment target mode', () => {
     expect(paths.output).toBe(path.join(path.dirname(paths.script), 'direct-home-preflight.txt'))
     expect(path.dirname(paths.output)).toBe(path.dirname(paths.script))
     expect(paths.receipt).toBe(path.join(cwd, '.managed-fixture/direct-home-mcp-receipt.json'))
+  })
+
+  it('generates a runnable direct HOME MCP script that appends to its sibling file', async () => {
+    const directory = await fs.mkdtemp(path.join(process.env.TMPDIR ?? '/tmp', 'frs-managed-home-mcp-'))
+    try {
+      const script = path.join(directory, 'server.mjs')
+      const output = path.join(directory, 'sibling.txt')
+      const receipt = path.join(directory, 'receipt.json')
+      await fs.writeFile(script, directHomeAppendMcpServerSource(path.basename(output)))
+      await fs.writeFile(output, 'before')
+
+      const child = spawn(process.execPath, [script, receipt, 'expected-nonce'], {
+        cwd: directory,
+        stdio: ['ignore', 'ignore', 'pipe'],
+      })
+      let stderr = ''
+      child.stderr?.setEncoding('utf8')
+      child.stderr?.on('data', chunk => { stderr += chunk })
+      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+        child.once('error', reject)
+        child.once('close', (code, signal) => resolve({ code, signal }))
+      })
+
+      expect(exit, stderr).toEqual({ code: 0, signal: null })
+      expect(await fs.readFile(output, 'utf8')).toBe('before|expected-nonce')
+      expect(JSON.parse(await fs.readFile(receipt, 'utf8'))).toMatchObject({
+        expectedNonce: 'expected-nonce',
+        output: 'before|expected-nonce',
+        outputExists: true,
+      })
+    } finally {
+      await fs.rm(directory, { recursive: true, force: true })
+    }
   })
 
   it('forwards one fixed TCP target while preserving streamed client data', async () => {

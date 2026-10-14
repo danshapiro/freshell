@@ -193,7 +193,7 @@ process.stdin.on('data', chunk => {
 })
 `
 
-function directHomeAppendMcpServerSource(outputName: string): string {
+export function directHomeAppendMcpServerSource(outputName: string): string {
   const outputUrl = `new URL(${JSON.stringify(`./${outputName}`)}, import.meta.url)`
   return `import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -207,9 +207,9 @@ try { output = fs.readFileSync(${outputUrl}, 'utf8') }
 catch (error) { readError = error.code ?? error.message ?? String(error) }
 const outputPath = fileURLToPath(${outputUrl})
 const outputExists = fs.existsSync(outputPath)
-const siblingMountPresent = (() => { try { return fs.readFileSync('/proc/self/mountinfo', 'utf8').split('\n').some(line => line.includes(outputPath)) } catch { return false } })()
+const siblingMountPresent = (() => { try { return fs.readFileSync('/proc/self/mountinfo', 'utf8').split('\\n').some(line => line.includes(outputPath)) } catch { return false } })()
 const envFileOperandRewritten = process.execArgv.some(value =>
-  /^--env-file=\/home\/freshell\/provider\/\.freshell\/references\/\d+$/.test(value))
+  /^--env-file=\\/home\\/freshell\\/provider\\/\\.freshell\\/references\\/\\d+$/.test(value))
 const envValueLoaded = process.env.FRESHELL_MANAGED_SHARED_ENV === expectedNonce
 fs.writeFileSync(receiptPath, JSON.stringify({ expectedNonce, appendError, readError, output, outputExists,
   siblingMountPresent, scriptPath: process.argv[1], envFileOperandRewritten, envValueLoaded }))
@@ -515,10 +515,12 @@ if [ "$status" -ne 0 ]; then
   has_enoent=false
   has_eacces=false
   has_env_file_error=false
+  has_syntax_error=false
   grep -q 'ENOENT' "$diagnostic" && has_enoent=true
   grep -q 'EACCES' "$diagnostic" && has_eacces=true
   grep -qi 'env file' "$diagnostic" && has_env_file_error=true
-  printf '{"wrapperStarted":true,"nodeExitCode":%s,"stderrHasENOENT":%s,"stderrHasEACCES":%s,"stderrHasEnvFileError":%s}' "$status" "$has_enoent" "$has_eacces" "$has_env_file_error" > "$receipt"
+  grep -q 'SyntaxError' "$diagnostic" && has_syntax_error=true
+  printf '{"wrapperStarted":true,"nodeExitCode":%s,"stderrHasENOENT":%s,"stderrHasEACCES":%s,"stderrHasEnvFileError":%s,"stderrHasSyntaxError":%s}' "$status" "$has_enoent" "$has_eacces" "$has_env_file_error" "$has_syntax_error" > "$receipt"
 fi
 rm -f "$diagnostic"
 exit "$status"
