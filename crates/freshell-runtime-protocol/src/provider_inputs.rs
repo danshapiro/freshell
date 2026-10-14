@@ -182,6 +182,9 @@ pub struct ProviderResourceMount {
     /// resource tree has been copied into the provider HOME.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reference_aliases: Vec<ProviderResourceReferenceAlias>,
+    /// Prior private-reference links to remove from this retained resource.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired_reference_aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -337,11 +340,15 @@ impl PreparedProviderInputs {
             let file = mount.kind == ProviderResourceKind::File;
             total_resource_reference_aliases = total_resource_reference_aliases
                 .checked_add(mount.reference_aliases.len())
+                .and_then(|count| count.checked_add(mount.retired_reference_aliases.len()))
                 .filter(|count| *count <= 256)
                 .ok_or_else(|| invalid("resource reference alias count"))?;
             if (mount.writable && !file)
-                || (!mount.reference_aliases.is_empty() && file)
+                || ((!mount.reference_aliases.is_empty()
+                    || !mount.retired_reference_aliases.is_empty())
+                    && file)
                 || mount.reference_aliases.len() > 256
+                || mount.retired_reference_aliases.len() > 256
                 || !unit_path(&mount.stage_relative_path, ".freshell/resource-units", file)
                 || !unit_path(
                     &mount.provider_relative_path,
@@ -388,6 +395,38 @@ impl PreparedProviderInputs {
                 {
                     return Err(invalid("overlapping resource reference aliases"));
                 }
+            }
+            let mut retired_aliases = std::collections::BTreeSet::new();
+            for alias in &mount.retired_reference_aliases {
+                let relative = Path::new(alias);
+                if alias.len() > 64 * 1024
+                    || alias.is_empty()
+                    || relative.is_absolute()
+                    || relative
+                        .components()
+                        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+                    || !retired_aliases.insert(alias.as_str())
+                {
+                    return Err(invalid("retired resource reference alias"));
+                }
+            }
+            for path in &retired_aliases {
+                let path = Path::new(path);
+                if retired_aliases
+                    .iter()
+                    .any(|other| Path::new(other) != path && Path::new(other).starts_with(path))
+                {
+                    return Err(invalid("overlapping retired resource reference aliases"));
+                }
+            }
+            if aliases.keys().any(|live| {
+                retired_aliases.iter().any(|retired| {
+                    let live = Path::new(live);
+                    let retired = Path::new(retired);
+                    live != retired && (live.starts_with(retired) || retired.starts_with(live))
+                })
+            }) {
+                return Err(invalid("overlapping live and retired resource aliases"));
             }
         }
         if let Some(files) = &self.indexed_files {
@@ -807,11 +846,24 @@ mod tests {
                 relative_path: ".env".into(),
                 reference_index: 1,
             }],
+            retired_reference_aliases: vec![],
         });
         value.validate(Some(&capability())).unwrap();
         let wire = serde_json::to_vec(&value).unwrap();
         let received: PreparedProviderInputs = serde_json::from_slice(&wire).unwrap();
         assert_eq!(received, value);
+
+        let mut replaced_alias = value.clone();
+        replaced_alias.resource_mounts[0].retired_reference_aliases = vec![".env".into()];
+        replaced_alias.validate(Some(&capability())).unwrap();
+        let mut unsafe_retired_alias = value.clone();
+        unsafe_retired_alias.resource_mounts[0].retired_reference_aliases =
+            vec!["nested/../../outside".into()];
+        assert!(unsafe_retired_alias.validate(Some(&capability())).is_err());
+        let mut overlapping_aliases = value.clone();
+        overlapping_aliases.resource_mounts[0].retired_reference_aliases =
+            vec![".env/child".into()];
+        assert!(overlapping_aliases.validate(Some(&capability())).is_err());
 
         for unsafe_path in ["../outside", "nested/../../outside", "/absolute", ""] {
             let mut invalid = value.clone();
@@ -858,6 +910,7 @@ mod tests {
                 kind: ProviderResourceKind::Directory,
                 writable: false,
                 reference_aliases: vec![],
+                retired_reference_aliases: vec![],
             });
             assert!(
                 value.validate(Some(&capability())).is_err(),

@@ -177,6 +177,7 @@ mod tests {
                 kind: ProviderResourceKind::Directory,
                 writable: false,
                 reference_aliases: vec![],
+                retired_reference_aliases: vec![],
             }],
             indexed_files: Some(IndexedProviderFiles {
                 volume_name: "freshell-inputs-aaaaaaaaaaaaaaaaaaaaaaaa".into(),
@@ -245,6 +246,7 @@ mod tests {
                 kind: ProviderResourceKind::File,
                 writable,
                 reference_aliases: vec![],
+                retired_reference_aliases: vec![],
             });
         }
 

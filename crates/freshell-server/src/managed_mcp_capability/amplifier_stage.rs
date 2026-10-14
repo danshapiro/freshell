@@ -144,6 +144,7 @@ pub(super) fn prepare(
         kind: ProviderResourceKind::Directory,
         writable: false,
         reference_aliases: Vec::new(),
+        retired_reference_aliases: vec![],
     });
     Ok(prepared)
 }

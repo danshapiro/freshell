@@ -738,6 +738,7 @@ mod tests {
                 kind: ProviderResourceKind::Directory,
                 writable: false,
                 reference_aliases: vec![],
+                retired_reference_aliases: vec![],
             }],
         };
         let selected = selections(&mounts).unwrap();
@@ -767,6 +768,7 @@ mod tests {
                     kind: ProviderResourceKind::Directory,
                     writable: false,
                     reference_aliases: vec![],
+                    retired_reference_aliases: vec![],
                 },
                 ProviderResourceMount {
                     stage_relative_path: ".freshell/resource-units/root-state/source".into(),
@@ -776,6 +778,7 @@ mod tests {
                     kind: ProviderResourceKind::File,
                     writable: true,
                     reference_aliases: vec![],
+                    retired_reference_aliases: vec![],
                 },
             ],
         };

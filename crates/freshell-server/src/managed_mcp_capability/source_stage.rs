@@ -5170,6 +5170,7 @@ process.stdout.write(require('./helper.js'))
             kind: freshell_runtime_protocol::ProviderResourceKind::Directory,
             writable: false,
             reference_aliases: Vec::new(),
+            retired_reference_aliases: vec![],
         };
         let mut units = vec![(package.clone(), mount)];
 
@@ -5372,6 +5373,7 @@ process.stdout.write(require('./helper.js'))
                 kind: freshell_runtime_protocol::ProviderResourceKind::Directory,
                 writable: false,
                 reference_aliases: Vec::new(),
+                retired_reference_aliases: vec![],
             },
         )];
         let capture = Capture::default();
@@ -5899,7 +5901,9 @@ process.stdout.write(require('./helper.js'))
 
     #[test]
     fn recovery_reuses_matching_home_mount_and_retains_dropped_home_directories() {
-        use freshell_runtime_protocol::{ProviderResourceKind, ProviderResourceMount};
+        use freshell_runtime_protocol::{
+            ProviderResourceKind, ProviderResourceMount, ProviderResourceReferenceAlias,
+        };
 
         let previous = ProviderResourceMount {
             stage_relative_path: ".freshell/resource-units/root-legacy".into(),
@@ -5908,7 +5912,11 @@ process.stdout.write(require('./helper.js'))
             effective_destination: "/home/freshell/provider/.config/opencode".into(),
             kind: ProviderResourceKind::Directory,
             writable: false,
-            reference_aliases: Vec::new(),
+            reference_aliases: vec![ProviderResourceReferenceAlias {
+                relative_path: ".env".into(),
+                reference_index: 0,
+            }],
+            retired_reference_aliases: Vec::new(),
         };
         let mut current = vec![(
             "/synthetic/current-opencode-root".into(),
@@ -5920,6 +5928,7 @@ process.stdout.write(require('./helper.js'))
                 kind: ProviderResourceKind::Directory,
                 writable: false,
                 reference_aliases: Vec::new(),
+                retired_reference_aliases: vec![],
             },
         )];
         let retained =
@@ -5932,6 +5941,8 @@ process.stdout.write(require('./helper.js'))
             current[0].1.provider_relative_path,
             previous.provider_relative_path
         );
+        assert_eq!(current[0].1.reference_aliases, Vec::new());
+        assert_eq!(current[0].1.retired_reference_aliases, vec![".env"]);
         assert!(
             retained.is_empty(),
             "the current alias already retains this root"
@@ -5941,7 +5952,12 @@ process.stdout.write(require('./helper.js'))
         let retained =
             merge_recovery_resource_mounts(&mut no_current_roots, std::slice::from_ref(&previous))
                 .unwrap();
-        assert_eq!(retained, vec![previous]);
+        assert_eq!(retained.len(), 1);
+        assert!(
+            retained[0].reference_aliases.is_empty(),
+            "a retained resource cannot keep a previous generation's private reference index"
+        );
+        assert_eq!(retained[0].retired_reference_aliases, vec![".env"]);
     }
 
     #[test]
@@ -5956,6 +5972,7 @@ process.stdout.write(require('./helper.js'))
             kind: ProviderResourceKind::Directory,
             writable: false,
             reference_aliases: Vec::new(),
+            retired_reference_aliases: vec![],
         };
 
         for (current_destination, previous_destination) in [
@@ -6006,6 +6023,7 @@ process.stdout.write(require('./helper.js'))
             kind: ProviderResourceKind::Directory,
             writable: false,
             reference_aliases: Vec::new(),
+            retired_reference_aliases: vec![],
         };
         let mut aliases = vec![(source, mount("/workspace/current"))];
         let prior = mount("/home/freshell/provider/.config/opencode");
@@ -6191,6 +6209,7 @@ pub(super) fn resource_units(
                 kind,
                 writable,
                 reference_aliases: Vec::new(),
+                retired_reference_aliases: vec![],
             },
         ));
     }
@@ -6251,6 +6270,17 @@ pub(super) fn merge_recovery_resource_mounts(
             }
             mount.stage_relative_path = prior.stage_relative_path.clone();
             mount.provider_relative_path = prior.provider_relative_path.clone();
+            mount
+                .retired_reference_aliases
+                .extend(prior.retired_reference_aliases.iter().cloned());
+            mount.retired_reference_aliases.extend(
+                prior
+                    .reference_aliases
+                    .iter()
+                    .map(|alias| alias.relative_path.clone()),
+            );
+            mount.retired_reference_aliases.sort();
+            mount.retired_reference_aliases.dedup();
         }
     }
 
@@ -6274,7 +6304,17 @@ pub(super) fn merge_recovery_resource_mounts(
             );
         }
         if retained_destinations.insert(prior.effective_destination.clone()) {
-            retained.push(prior.clone());
+            let mut retained_mount = prior.clone();
+            retained_mount.retired_reference_aliases.extend(
+                prior
+                    .reference_aliases
+                    .iter()
+                    .map(|alias| alias.relative_path.clone()),
+            );
+            retained_mount.reference_aliases.clear();
+            retained_mount.retired_reference_aliases.sort();
+            retained_mount.retired_reference_aliases.dedup();
+            retained.push(retained_mount);
         }
     }
     let merged = current
