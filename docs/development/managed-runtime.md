@@ -357,6 +357,30 @@ being silently removed. Native conversation databases and credential sources
 are excluded from ordinary resource copying and continue to use their dedicated
 store or secret-reference paths.
 
+The shared resource copier accepts at most 100,000 entries, 512 MiB of file
+contents in total, 128 MiB for any one file, and 64 directory levels; copied
+metadata is capped at 64 MiB. A selected configuration source is limited to
+16 MiB, with 64 MiB total for simultaneously retained source views. When a
+selected file reference cannot be resolved, preparation reports
+`SELECTED_REFERENCE_UNAVAILABLE` at stage `configuration`, operation
+`resolve`, with the selected field and path in the user-facing detail. Repair
+the named file or its declaring configuration rather than relying on Freshell
+to omit that capability.
+
+For OpenCode, `--env-file` and `--env-file-if-exists` paths selected from an
+enabled local MCP command are handled as private file references. Freshell
+resolves them from the MCP working directory or the selected wrapper's actual
+script directory, excludes the source file from the ordinary resource copy,
+and exposes it inside the provider home under
+`/home/freshell/provider/.freshell/references/<index>`. Direct MCP arguments
+and supported copied shell wrappers point Node at that private file; a wrapper
+that runs from the mounted workspace can use a managed alias in its MCP
+working directory. On recovery, Freshell removes only aliases recorded as its
+own and no longer used by the current configuration. Node reads the file when
+the MCP child starts, so the resulting variables belong to that child. The
+file contents are not copied into ordinary resources, launch configuration,
+registry metadata, or logs.
+
 Modern fresh-agent sends may include a checkpoint attempt ID. The server takes
 and verifies the pre-turn code snapshot for the selected workspace, then
 records an outcome tied to that exact send before forwarding it to the provider.
