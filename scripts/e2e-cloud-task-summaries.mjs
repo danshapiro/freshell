@@ -28,6 +28,7 @@ const emptyShardMarker = '[e2e-entrypoint] No specs assigned to this shard. Expo
 const footerTaskIndexes = new Set()
 const emptyTaskIndexes = new Set()
 const footerLinesByTask = new Map()
+let hasPassedTest = false
 
 for (const [entryIndex, entry] of entries.entries()) {
   const labels = entry?.labels
@@ -58,6 +59,7 @@ for (const [entryIndex, entry] of entries.entries()) {
   }
   if (isFooter) {
     footerTaskIndexes.add(taskIndex)
+    hasPassedTest ||= /\b[1-9][0-9]*\s+passed\b/.test(normalizedTextPayload)
     const lines = footerLinesByTask.get(taskIndex) ?? new Set()
     lines.add(normalizedTextPayload.trim())
     footerLinesByTask.set(taskIndex, lines)
@@ -94,6 +96,7 @@ const summaries = [...accountedTaskIndexes]
 process.stdout.write(`${JSON.stringify({
   execution,
   taskCount: expectedTaskCount,
+  hasPassedTest,
   footerTaskIndexes: [...footerTaskIndexes].sort((left, right) => left - right),
   emptyTaskIndexes: [...emptyTaskIndexes].sort((left, right) => left - right),
   summaries,

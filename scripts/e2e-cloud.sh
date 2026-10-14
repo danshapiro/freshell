@@ -960,6 +960,17 @@ cmd_run() {
     exit 1
   fi
 
+  if ! $playwright_dry_run; then
+    if ! $task_summaries_complete; then
+      echo "[e2e-cloud] ERROR: required task-indexed Playwright summary evidence was not present after five attempts: ${task_summary_error}" >&2
+      exit 1
+    fi
+    if [ "$(jq -r '.hasPassedTest' <<< "$task_summary_receipts")" != "true" ]; then
+      echo "[e2e-cloud] ERROR: Cloud execution completed with no passed Playwright tests; skipped tests and empty shards do not count." >&2
+      exit 1
+    fi
+  fi
+
   # Playwright retries are useful diagnostics, but a task that passes only on
   # retry is not a zero-flake release receipt. The structured evidence above
   # names the exact first failure and durable trace artifact before failing the

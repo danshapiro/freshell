@@ -30,12 +30,16 @@ case "$*" in
   *"executions logs read"*)
     count_file="$STUB_CAPTURE/logs.count"
     count="$(cat "$count_file" 2>/dev/null || echo 0)"; count=$((count + 1)); echo "$count" > "$count_file"
-    if [ "${STUB_EMPTY_SHARDS:-0}" = 1 ]; then
+    if [ "${STUB_SKIPPED_ONLY:-0}" = 1 ]; then
+      echo "[e2e-entrypoint] Shard 1/1 assignment: focused fixture"
+      echo "  3 skipped (1.0s)"
+    elif [ "${STUB_EMPTY_SHARDS:-0}" = 1 ]; then
       echo "[e2e-entrypoint] Shard 1/4 assignment: focused fixture"
       echo "[e2e-entrypoint] Shard 2/4 assignment: focused fixture"
       echo "[e2e-entrypoint] Shard 3/4 assignment: focused fixture"
       echo "[e2e-entrypoint] Shard 4/4 assignment: focused fixture"
       echo "[e2e-entrypoint] No specs assigned to this shard. Exporting zero-test receipt."
+      echo "  3 passed (2.0s)"
     elif [ "${STUB_DELAY_TASK_FOOTER_ONCE:-0}" = 1 ]; then
       echo "[e2e-entrypoint] Shard 1/2 assignment: focused fixture"
       echo "[e2e-entrypoint] Shard 2/2 assignment: focused fixture"
@@ -64,10 +68,18 @@ case "$*" in
     if [[ "$*" == *"textPayload =~"* ]]; then
       count_file="$STUB_CAPTURE/task-footers.count"
       count="$(cat "$count_file" 2>/dev/null || echo 0)"; count=$((count + 1)); echo "$count" > "$count_file"
-      if [ "${STUB_EMPTY_SHARDS:-0}" = 1 ]; then
+      if [ "${STUB_NO_TASK_SUMMARY:-0}" = 1 ]; then
+        echo '[]'
+      elif [ "${STUB_SKIPPED_ONLY:-0}" = 1 ]; then
         cat <<'JSON'
 [
- {"labels":{"run.googleapis.com/execution_name":"exec-json-receipt","run.googleapis.com/task_index":"0"},"textPayload":"[e2e-entrypoint] No specs assigned to this shard. Exporting zero-test receipt."},
+ {"labels":{"run.googleapis.com/execution_name":"exec-json-receipt","run.googleapis.com/task_index":"0"},"textPayload":"  3 skipped (1.0s)"}
+]
+JSON
+      elif [ "${STUB_EMPTY_SHARDS:-0}" = 1 ]; then
+        cat <<'JSON'
+[
+ {"labels":{"run.googleapis.com/execution_name":"exec-json-receipt","run.googleapis.com/task_index":"0"},"textPayload":"  3 passed (2.0s)"},
  {"labels":{"run.googleapis.com/execution_name":"exec-json-receipt","run.googleapis.com/task_index":"1"},"textPayload":"[e2e-entrypoint] No specs assigned to this shard. Exporting zero-test receipt."},
  {"labels":{"run.googleapis.com/execution_name":"exec-json-receipt","run.googleapis.com/task_index":"2"},"textPayload":"[e2e-entrypoint] No specs assigned to this shard. Exporting zero-test receipt."},
  {"labels":{"run.googleapis.com/execution_name":"exec-json-receipt","run.googleapis.com/task_index":"3"},"textPayload":"[e2e-entrypoint] No specs assigned to this shard. Exporting zero-test receipt."}
@@ -236,9 +248,20 @@ EMPTY_SHARDS_OUT="$(env PATH="$WORK/bin:$PATH" STUB_CAPTURE="$WORK/capture" STUB
   echo "FAIL: a narrow multi-task run with empty shards did not accept one zero-retry receipt for each task"; echo "$EMPTY_SHARDS_OUT"; exit 1
 }
 if ! grep -q "All tasks completed successfully" <<< "$EMPTY_SHARDS_OUT" \
-  || grep -Eq '^[[:space:]]+[0-9]+ (failed|passed|skipped|interrupted)\b' <<< "$EMPTY_SHARDS_OUT" \
+  || ! grep -q "3 passed (2.0s)" <<< "$EMPTY_SHARDS_OUT" \
+  || ! grep -q "No specs assigned to this shard" <<< "$EMPTY_SHARDS_OUT" \
   || grep -q "task-indexed Playwright footer or empty-shard evidence" <<< "$EMPTY_SHARDS_OUT"; then
-  echo "FAIL: empty shards without Playwright footers did not retain zero-test completion semantics"; echo "$EMPTY_SHARDS_OUT"; exit 1
+  echo "FAIL: empty shards beside a passing task did not retain completion semantics"; echo "$EMPTY_SHARDS_OUT"; exit 1
+fi
+
+SKIPPED_ONLY_OUT="$(env PATH="$WORK/bin:$PATH" STUB_CAPTURE="$WORK/capture" STUB_SKIPPED_ONLY=1 STUB_LOGGING_JSON="$records_one_task" STUB_SUCCEEDED=1 GCLOUD_IDENT=stub@example.invalid "$SCRIPT" run --cloud --shards=1 2>&1)" && SKIPPED_ONLY_RC=0 || SKIPPED_ONLY_RC=$?
+if [ "$SKIPPED_ONLY_RC" -eq 0 ] || ! grep -q "no passed Playwright tests" <<< "$SKIPPED_ONLY_OUT"; then
+  echo "FAIL: skipped-only Playwright evidence was accepted as a passing Cloud run"; echo "$SKIPPED_ONLY_OUT"; exit 1
+fi
+
+NO_TASK_SUMMARY_OUT="$(env PATH="$WORK/bin:$PATH" STUB_CAPTURE="$WORK/capture" STUB_NO_TASK_SUMMARY=1 STUB_LOGGING_JSON="$records_no_retry" STUB_SUCCEEDED=2 GCLOUD_IDENT=stub@example.invalid "$SCRIPT" run --cloud --shards=2 2>&1)" && NO_TASK_SUMMARY_RC=0 || NO_TASK_SUMMARY_RC=$?
+if [ "$NO_TASK_SUMMARY_RC" -eq 0 ] || ! grep -q "required task-indexed Playwright summary evidence was not present" <<< "$NO_TASK_SUMMARY_OUT"; then
+  echo "FAIL: a Cloud run without complete task-indexed Playwright summaries was accepted"; echo "$NO_TASK_SUMMARY_OUT"; exit 1
 fi
 
 records_retry='[

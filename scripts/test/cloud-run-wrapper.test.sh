@@ -149,7 +149,11 @@ case "$args" in
     exit 0 ;;
   *"logs read"*) echo "  6 passed (4.2s)"; exit 0 ;;
   *"logging read"*)
-    echo '[{"jsonPayload":{"event":"e2e_playwright_task_complete","execution":"exec-stub","taskIndex":0,"taskCount":1,"recoveredRetryCount":0}}]'
+    if [[ "$*" == *"textPayload =~"* ]]; then
+      echo '[{"labels":{"run.googleapis.com/execution_name":"exec-stub","run.googleapis.com/task_index":"0"},"textPayload":"  6 passed (4.2s)"}]'
+    else
+      echo '[{"jsonPayload":{"event":"e2e_playwright_task_complete","execution":"exec-stub","taskIndex":0,"taskCount":1,"recoveredRetryCount":0}}]'
+    fi
     exit 0 ;;
   *) exit 0 ;;
 esac
@@ -373,6 +377,16 @@ case "$*" in
     if [ -n "${STUB2_LOGS:-}" ]; then printf '%s\n' "$STUB2_LOGS"; else echo "  6 passed (4.2s)"; fi
     exit 0 ;;
   *"logging read"*)
+    if [[ "$*" == *"textPayload =~"* ]]; then
+      tasks=$(cat "$STUB2_CAPTURE/tasks" 2>/dev/null || echo 1)
+      printf '['
+      for ((task = 0; task < tasks; task++)); do
+        [ "$task" -gt 0 ] && printf ','
+        printf '{"labels":{"run.googleapis.com/execution_name":"exec-stub-7","run.googleapis.com/task_index":"%s"},"textPayload":"  6 passed (4.2s)"}' "$task"
+      done
+      printf ']\n'
+      exit 0
+    fi
     if [ -n "${STUB2_STRUCTURED_LOGS:-}" ]; then
       printf '%s\n' "$STUB2_STRUCTURED_LOGS"
       exit 0
