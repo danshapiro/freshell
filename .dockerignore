@@ -16,7 +16,11 @@ coverage/
 # suites) but stays OUT of the Cloud Run image deliberately: its tests build
 # and spawn the real Rust server and need a Docker daemon (workload image),
 # neither of which exists in the cloud container. They are covered by LOCAL
-# lanes: the default vitest config (test:unit / base gate / pre-push).
+# lanes: the default vitest config (test:unit / base gate / pre-push) and,
+# on broad cloud QA runs, the automatic local companion phase
+# (scripts/run-standard-tests.ts, suite "client-local-only"), which parses
+# this exclusion list and runs exactly these directories locally, folding
+# the result into the run verdict.
 /test/integration/server/
 
 # Version control and CI

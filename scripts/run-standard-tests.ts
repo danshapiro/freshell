@@ -1,7 +1,8 @@
 #!/usr/bin/env tsx
 
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
+import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { availableParallelism, constants as osConstants, setPriority } from 'node:os'
+import { existsSync, readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -21,7 +22,7 @@ const ELECTRON_VITEST_CONFIG = 'config/vitest/vitest.electron.config.ts'
 const ELECTRON_RUNTIME_VITEST_CONFIG = 'config/vitest/vitest.electron-runtime.config.ts'
 
 export type StandardTestMode = 'desktop' | 'aggressive'
-export type SuiteName = 'client' | 'source-runtime' | 'rust' | 'electron' | 'electron-runtime'
+export type SuiteName = 'client' | 'client-local-only' | 'source-runtime' | 'rust' | 'electron' | 'electron-runtime'
 export type RunPriority = 'normal' | 'background'
 
 export interface StandardTestRun {
@@ -31,6 +32,13 @@ export interface StandardTestRun {
   script?: 'test:source-runtime' | 'test:rust'
   maxWorkers?: string
   priority: RunPriority
+  /**
+   * When set, these path selectors replace the forwarded CLI args for this
+   * vitest run. Used by the cloud backend's local companion phase so it runs
+   * exactly the tests the Cloud Run image excludes, regardless of what the
+   * caller forwarded to the cloud shards.
+   */
+  pathFilters?: string[]
 }
 
 export interface StandardTestPlan {
@@ -90,6 +98,70 @@ export function buildVitestArgs({ configPath, maxWorkers, forwardedArgs }: Vites
   if (configPath) args.push('--config', configPath)
   if (maxWorkers) args.push('--maxWorkers', maxWorkers)
   return [...args, ...forwardedArgs]
+}
+
+/**
+ * Parse .dockerignore content into the list of test directories that are
+ * deliberately excluded from the Cloud Run vitest image (and therefore never
+ * run by the cloud shards). Only plain `test/…` directory exclusions are
+ * tracked; comments, `!` re-includes, and glob patterns are ignored — a glob
+ * exclusion cannot be mapped to a runnable directory and must be handled
+ * manually. First-seen order is preserved.
+ */
+export function parseLocalOnlyTestDirs(dockerignoreText: string): string[] {
+  const dirs: string[] = []
+  for (const rawLine of dockerignoreText.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith('#') || line.startsWith('!')) continue
+    if (line.includes('*')) continue
+    const match = /^\/?(test\/[^\s*?]+?)\/?$/.exec(line)
+    if (!match) continue
+    const dir = match[1]
+    if (!dirs.includes(dir)) dirs.push(dir)
+  }
+  return dirs
+}
+
+/**
+ * Decide which of the cloud-excluded test paths the local companion should
+ * run for this invocation. A broad run (no path selectors) runs every
+ * excluded directory; a focused run runs only the selectors that actually
+ * fall under an excluded directory, and skips the companion entirely when
+ * nothing intersects (the run never claimed that coverage).
+ */
+export function resolveCloudCompanionScope(forwardedArgs: string[], localOnlyDirs: string[]): string[] {
+  const pathArgs = forwardedArgs.filter((arg) => !arg.startsWith('-'))
+  if (pathArgs.length === 0) return [...localOnlyDirs]
+  const scope: string[] = []
+  for (const raw of pathArgs) {
+    const normalized = raw.replace(/\\/g, '/').replace(/^\.\//, '')
+    for (const dir of localOnlyDirs) {
+      if (normalized === dir || normalized.startsWith(`${dir}/`)) {
+        if (!scope.includes(normalized)) scope.push(normalized)
+        break
+      }
+    }
+  }
+  return scope
+}
+
+export function buildCloudCompanionRun({
+  mode,
+  clientWorkers,
+  scope,
+}: {
+  mode: StandardTestMode
+  clientWorkers: string
+  scope: string[]
+}): StandardTestRun {
+  return {
+    name: 'client-local-only',
+    runner: 'vitest',
+    configPath: DEFAULT_VITEST_CONFIG,
+    maxWorkers: clientWorkers,
+    priority: mode === 'aggressive' ? 'normal' : 'background',
+    pathFilters: scope,
+  }
 }
 
 export function resolveScriptPhaseCommand(
@@ -241,12 +313,19 @@ function startRun(run: StandardTestRun, forwardedArgs: string[]): ChildProcess {
   let args: string[]
   let viaShell = false
   if (run.runner === 'vitest') {
-    command = process.execPath
-    args = [VITEST_ENTRYPOINT, ...buildVitestArgs({
+    const vitestArgs = buildVitestArgs({
       configPath: run.configPath,
       maxWorkers: run.maxWorkers,
-      forwardedArgs,
-    })]
+      forwardedArgs: run.pathFilters ?? forwardedArgs,
+    })
+    // Test seam mirroring FRESHELL_VITEST_CLOUD_SCRIPT: lets the process-level
+    // integration test observe the companion without spawning real vitest
+    // (and its cargo/Docker builds).
+    const companionScript = run.name === 'client-local-only'
+      ? process.env.FRESHELL_VITEST_COMPANION_SCRIPT
+      : undefined
+    command = companionScript ?? process.execPath
+    args = companionScript ? vitestArgs : [VITEST_ENTRYPOINT, ...vitestArgs]
   } else {
     const manager = detectProjectManager(PROJECT_ROOT).manager
     const resolved = resolveScriptPhaseCommand(run, forwardedArgs, manager)
@@ -324,6 +403,35 @@ function selectedSuites(forwardedArgs: string[]): Set<SuiteName> | null {
   return requested ? new Set(requested) : null
 }
 
+function isLocalCompanionDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env.FRESHELL_VITEST_LOCAL_COMPANION
+  return raw !== undefined && ['0', 'off', 'false', 'no'].includes(raw.toLowerCase())
+}
+
+function resolveExistingLocalOnlyDirs(): string[] {
+  try {
+    const dockerignoreText = readFileSync(resolve(PROJECT_ROOT, '.dockerignore'), 'utf8')
+    return parseLocalOnlyTestDirs(dockerignoreText)
+      .filter((dir) => existsSync(resolve(PROJECT_ROOT, dir)))
+  } catch {
+    return []
+  }
+}
+
+function dispatchCloudVitest(cloudScript: string, forwardedArgs: string[]): Promise<void> {
+  return new Promise((resolveDispatch, rejectDispatch) => {
+    execFile(
+      cloudScript,
+      ['run', '--cloud', '--config=default', ...forwardedArgs],
+      { stdio: 'inherit', cwd: PROJECT_ROOT, env: process.env },
+      (error) => {
+        if (error) rejectDispatch(error)
+        else resolveDispatch()
+      },
+    )
+  })
+}
+
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
   const { mode, forwardedArgs } = parseCliArgs(argv)
   const requested = selectedSuites(forwardedArgs)
@@ -337,21 +445,66 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       log('warn', 'Git-dependent selectors detected; running all phases locally', { forwardedArgs })
     } else {
       const cloudScript = process.env.FRESHELL_VITEST_CLOUD_SCRIPT || resolve(PROJECT_ROOT, 'scripts/vitest-cloud.sh')
-      log('info', 'Dispatching default Vitest phase to cloud', { cloudScript, forwardedArgs })
-      try {
-        execFileSync(cloudScript, ['run', '--cloud', '--config=default', ...forwardedArgs], {
-          stdio: 'inherit',
-          cwd: PROJECT_ROOT,
-          env: process.env,
+      const resolvedMode = mode ?? (process.env.CI === 'true' || process.env.CI === '1' ? 'aggressive' : 'desktop')
+      const localOnlyDirs = resolveExistingLocalOnlyDirs()
+      const companionScope = resolveCloudCompanionScope(forwardedArgs, localOnlyDirs)
+
+      // The cloud image deliberately excludes some test directories (see
+      // .dockerignore) because their tests need a Docker daemon and a locally
+      // built server. A cloud-only green would silently not cover them, so a
+      // local companion runs exactly those excluded paths and folds into the
+      // verdict. Set FRESHELL_VITEST_LOCAL_COMPANION=off to skip it (loudly).
+      let companionRun: StandardTestRun | null = null
+      if (isLocalCompanionDisabled()) {
+        if (companionScope.length > 0) {
+          log('warn', 'Local companion disabled via FRESHELL_VITEST_LOCAL_COMPANION; a green run does NOT cover the cloud-excluded tests', {
+            skippedScope: companionScope,
+          })
+        }
+      } else if (companionScope.length === 0) {
+        log('info', 'Local companion skipped: no requested selectors intersect the cloud-excluded tests', { localOnlyDirs })
+      } else {
+        const workers = resolveDesktopWorkerPlan(availableParallelism())
+        companionRun = buildCloudCompanionRun({
+          mode: resolvedMode,
+          clientWorkers: workers.clientWorkers,
+          scope: companionScope,
         })
-      } catch {
-        return 1
+        log('info', 'Starting local companion for cloud-excluded tests (runs in parallel with the cloud shards)', {
+          suite: companionRun.name,
+          scope: companionScope,
+        })
       }
+
+      log('info', 'Dispatching default Vitest phase to cloud', { cloudScript, forwardedArgs })
+      // The companion is the only local phase running while the cloud shards
+      // execute, so the sequential artifact-owning phase order below is
+      // preserved (nothing else touches target/ or dist/ concurrently).
+      const [cloudResult, companionResult] = await Promise.allSettled([
+        dispatchCloudVitest(cloudScript, forwardedArgs),
+        companionRun ? runStage([companionRun], []) : Promise.resolve(),
+      ])
+
+      let failed = false
+      if (cloudResult.status === 'rejected') {
+        failed = true
+        log('error', 'Cloud Vitest phase failed', {
+          error: cloudResult.reason instanceof Error ? cloudResult.reason.message : String(cloudResult.reason),
+        })
+      }
+      if (companionResult.status === 'rejected') {
+        failed = true
+        log('error', 'Local companion phase failed; a green cloud run does NOT cover the cloud-excluded tests', {
+          scope: companionScope,
+          error: companionResult.reason instanceof Error ? companionResult.reason.message : String(companionResult.reason),
+        })
+      }
+      if (failed) return 1
 
       const plan = createStandardTestPlan({
         availableParallelism: availableParallelism(),
         ci: process.env.CI === 'true' || process.env.CI === '1',
-        mode,
+        mode: resolvedMode,
         forwardedArgs,
       })
       const localStages = plan.stages.filter((entry) => entry[0]?.name !== 'client')
