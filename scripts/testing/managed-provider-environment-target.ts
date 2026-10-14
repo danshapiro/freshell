@@ -344,6 +344,7 @@ async function configure(root: string, nonce: string, candidateSha: string, runI
   const directMcpDependency = path.join(directMcp, 'node_modules/managed-direct-fixture-dependency')
   await fs.mkdir(directMcpDependency, { recursive: true, mode: 0o755 })
   await fs.mkdir(path.join(xdg, 'opencode'), { recursive: true, mode: 0o755 })
+  await fs.mkdir(path.join(xdg, 'opencode/mcp-servers'), { recursive: true, mode: 0o755 })
   await fs.chmod(home, 0o700)
   await fs.chmod(root, 0o751)
   // Register a known CLI without a managed adapter through the normal HOME
@@ -414,7 +415,7 @@ export default {id:'managed-environment-tui',async tui(api,options){
     await fs.chmod(path.join(cwd, '.managed-fixture'), 0o777)
     await fs.writeFile(path.join(cwd, 'rules.txt'), nonce, { mode: 0o600 })
     const mcpReceipt = path.join(cwd, '.managed-fixture/mcp-receipt.json')
-    const homeAppendScript = path.join(home, `direct-home-${scenario}.mjs`)
+    const homeAppendScript = path.join(xdg, 'opencode/mcp-servers', `direct-home-${scenario}.mjs`)
     const homeAppendOutput = `direct-home-${scenario}.txt`
     const homeAppendReceipt = path.join(cwd, '.managed-fixture/direct-home-mcp-receipt.json')
     await fs.writeFile(homeAppendScript, directHomeAppendMcpServerSource(homeAppendOutput))
