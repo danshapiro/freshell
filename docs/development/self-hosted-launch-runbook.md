@@ -781,15 +781,17 @@ for r in (afp or []):
     while read -r A; do
       [ -n "$A" ] || continue
       A=${A/#\~/$HOME}   # the server normalizes ~ roots — mirror it
-      # The server's is_path_allowed requires the probe path to BE the
-      # root or sit under it at a / boundary — a bare string prefix
-      # would wrongly accept /home/dan/freshell for /home/dan/freshell-probe.x:
-      case "$HOME/freshell-probe.probe" in
+      # Test THIS run's actual $BWS, not a stand-in path: the server's
+      # is_path_allowed requires the path to BE the root or sit under it
+      # at a / boundary — a bare string prefix would wrongly accept
+      # /home/dan/freshell for /home/dan/freshell-probe.x:
+      case "$BWS" in
         "$A"|"$A"/*) PROBE_PATH_OK=1; break ;;
       esac
     done <<<"$ALLOWED"
     if [ "$PROBE_PATH_OK" != 1 ]; then
       FIRST_ALLOWED=$(head -1 <<<"$ALLOWED")
+      FIRST_ALLOWED=${FIRST_ALLOWED/#\~/$HOME}   # expand ~ — quoted mktemp will not
       if [ -n "$FIRST_ALLOWED" ]; then
         # Keep PROBE_ROOT (and the REST probe's WS) where it is — mint a
         # SEPARATE browser root under the allowed root and record it:
@@ -926,7 +928,7 @@ PY
       test -n "$TOK" || { echo "AUTH_TOKEN not found — extract it manually"; exit 1; }
       umask 077; printf 'x-auth-token: %s\n' "$TOK" > "$D/hdr"
     fi
-    trap 'rm -f "${RUN:-/nonexistent}/hdr" "${D:-/nonexistent}/hdr"' EXIT   # BOTH headers, every exit path, set -u-safe
+    trap 'rm -f "${RUN:-/nonexistent}/hdr" "${D:-/nonexistent}/hdr"; [ -n "${SWEEP_DIR:-}" ] && rm -rf "${SWEEP_DIR:-/nonexistent}"' EXIT   # both headers AND any sweep dir minted below (set -u-safe)
     # DESTRUCTIVE-PATH GUARD (both the normal and recovery flows pass
     # through here). Canonicalize every probe path and tie them together:
     # PROBE_ROOT must BE a freshell-probe run root; WS and BWS must be
