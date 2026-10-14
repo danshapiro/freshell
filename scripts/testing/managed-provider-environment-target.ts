@@ -1551,7 +1551,9 @@ export async function runManagedEnvironmentTarget() {
       `workspace external-CWD MCP did not complete its receipt: ${JSON.stringify({ receipt: preflightCwdAliasMcp, mcpStatuses: preflightChild.mcpStatuses, wrapperProbe: preflightChild.wrapperProbe })}`)
     assert.equal(preflightCwdAliasMcp.helper, nonce)
     assert.equal(preflightCwdAliasMcp.envValueLoaded, true)
-    assert.match(preflightCwdAliasMcp.envFileTarget, /^\/home\/freshell\/provider\/\.freshell\/references\/\d+$/)
+    // The path alias resolves through the private indexed source mount, so
+    // realpath returns its read-only secret-mount destination.
+    assert.match(preflightCwdAliasMcp.envFileTarget, /^\/run\/freshell-secrets\/provider-\d+$/)
     assert.equal(preflightCwdAliasMcp.envFileOperand, '--env-file=.env', 'the workspace wrapper must retain its relative operand')
     assert.equal(preflightCwdAliasMcp.cwd, selected.cwdAliasProject)
     assert(preflightCwdAliasMcp.scriptPath.endsWith('/cwd-alias-project/server.mjs'))
@@ -1721,7 +1723,7 @@ export async function runManagedEnvironmentTarget() {
           assert.equal(workspaceCwdAliasMcp.expectedNonce, nonce)
           assert.equal(workspaceCwdAliasMcp.helper, nonce)
           assert.equal(workspaceCwdAliasMcp.envValueLoaded, true)
-          assert.match(workspaceCwdAliasMcp.envFileTarget, /^\/home\/freshell\/provider\/\.freshell\/references\/\d+$/)
+          assert.match(workspaceCwdAliasMcp.envFileTarget, /^\/run\/freshell-secrets\/provider-\d+$/)
           assert.equal(workspaceCwdAliasMcp.envFileOperand, '--env-file=.env', 'the workspace wrapper must retain its relative operand')
           assert.equal(workspaceCwdAliasMcp.cwd, selected.cwdAliasProject)
           assert(workspaceCwdAliasMcp.scriptPath.endsWith('/cwd-alias-project/server.mjs'))
