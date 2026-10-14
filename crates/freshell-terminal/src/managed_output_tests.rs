@@ -3,6 +3,29 @@ use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::task::{Context, Poll, Waker};
 
+#[test]
+fn managed_registration_announces_the_native_activity_lifecycle() {
+    let registry = TerminalRegistry::new();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let capture = events.clone();
+    registry.set_activity_observer(Arc::new(move |event| capture.lock().unwrap().push(event)));
+    registry.register_managed(ManagedTerminalDescriptor {
+        soul_id: "activity-soul".into(),
+        incarnation_id: "activity-incarnation".into(),
+        terminal_id: "activity-terminal".into(),
+        stream_id: "activity-epoch".into(),
+        mode: "opencode".into(),
+        cwd: "/workspace".into(),
+        resume_session_id: Some("ses_native".into()),
+        create_request_id: None,
+    });
+    assert!(
+        matches!(events.lock().unwrap().as_slice(), [ActivityEvent::Created {
+        terminal_id, mode, resume_session_id: Some(session), ..
+    }] if terminal_id == "activity-terminal" && mode == "opencode" && session == "ses_native")
+    );
+}
+
 fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
     future.poll(&mut Context::from_waker(Waker::noop()))
 }
@@ -94,6 +117,7 @@ fn fixture() -> (TerminalRegistry, Arc<Controller>) {
         calls: AtomicUsize::new(0),
         observed: Mutex::new(Vec::new()),
         response: Mutex::new(ManagedOutputRead {
+            opencode_activity: None,
             stream_epoch: Some("epoch-new".into()),
             incarnation_id: Some("incarnation-new".into()),
             reset_required: true,

@@ -59,7 +59,61 @@ pub struct HostedPty {
     amplifier_signal_reader: Mutex<crate::providers::native_identity::AmplifierObservationReader>,
     native_cwd: PathBuf,
     opencode_adoption: Option<Arc<Mutex<OpenCodeAdoptionGate>>>,
+    opencode_activity: Option<crate::opencode_activity::OpencodeActivityRelay>,
     codex: Option<CodexLifecycle>,
+}
+
+#[cfg(all(test, unix))]
+#[path = "managed_opencode_output_tests.rs"]
+mod managed_opencode_output_tests;
+
+pub(crate) async fn write_hosted_input(
+    terminal: &tokio::sync::Mutex<Option<HostedPty>>,
+    request_id: &RequestId,
+    data: &str,
+) -> Result<CommandState, RuntimeError> {
+    let (readiness, epoch) = {
+        let mut terminal = terminal.lock().await;
+        let hosted = terminal.as_mut().ok_or_else(|| {
+            RuntimeError::new(
+                RuntimeErrorCode::UnsupportedWorkload,
+                "incarnation is not a managed terminal",
+            )
+        })?;
+        let Some(relay) = &hosted.opencode_activity else {
+            return hosted.write_input(request_id, data);
+        };
+        if matches!(
+            hosted
+                .commands
+                .existing_disposition(request_id, data.as_bytes())?,
+            Some(BeginDisposition::Completed | BeginDisposition::Ambiguous)
+        ) {
+            return hosted.write_input(request_id, data);
+        }
+        (relay.input_readiness(), hosted.stream_epoch.clone())
+    };
+    // Waiting holds neither the PTY lock nor a command-journal claim. Output,
+    // exit and stop remain available; refused input has never been dispatched.
+    if let Err(error) = readiness.wait().await {
+        tracing::warn!(event="managed_opencode.activity_input_refused",
+            stream_epoch=%epoch, diagnostic_code=?error.diagnostic_code);
+        return Err(error);
+    }
+    let mut terminal = terminal.lock().await;
+    let hosted = terminal.as_mut().ok_or_else(|| {
+        RuntimeError::new(
+            RuntimeErrorCode::UnsupportedWorkload,
+            "incarnation is not a managed terminal",
+        )
+    })?;
+    if hosted.stream_epoch != epoch {
+        return Err(RuntimeError::new(
+            RuntimeErrorCode::OwnershipMismatch,
+            "input source changed while waiting for native activity",
+        ));
+    }
+    hosted.write_input(request_id, data)
 }
 
 impl HostedPty {
@@ -122,6 +176,8 @@ impl HostedPty {
         let exit_code = Arc::new(AtomicI64::new(0));
         let exit_flag = Arc::clone(&exited);
         let exit_value = Arc::clone(&exit_code);
+        let native_exit_notify = Arc::new(tokio::sync::Notify::new());
+        let notify_on_exit = native_exit_notify.clone();
         let codex_sidecar_on_exit = prepared_codex
             .as_ref()
             .map(|prepared| Arc::clone(&prepared.sidecar));
@@ -129,6 +185,7 @@ impl HostedPty {
         let on_exit = Box::new(move |code: i64| {
             exit_value.store(code, Ordering::SeqCst);
             exit_flag.store(true, Ordering::SeqCst);
+            notify_on_exit.notify_one();
             if let (Some(handle), Some(sidecar)) =
                 (runtime_handle.as_ref(), codex_sidecar_on_exit.as_ref())
             {
@@ -327,6 +384,23 @@ impl HostedPty {
         } else {
             None
         };
+        let opencode_activity = if launch.mode == "opencode" {
+            match crate::opencode_activity::endpoint(&launch.args) {
+                Some(endpoint) => Some(crate::opencode_activity::OpencodeActivityRelay::spawn(
+                    launch.terminal_id.clone(),
+                    endpoint,
+                    exited.clone(),
+                    native_exit_notify,
+                )),
+                None => {
+                    tracing::warn!(terminal_id=%launch.terminal_id,
+                        event="managed_opencode.activity_lane_unavailable", reason="missing_loopback_endpoint");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         Ok(Self {
             pty,
             output,
@@ -342,6 +416,7 @@ impl HostedPty {
             amplifier_signal_reader: Mutex::default(),
             native_cwd: PathBuf::from(&launch.cwd),
             opencode_adoption,
+            opencode_activity,
             codex,
         })
     }
@@ -356,8 +431,15 @@ impl HostedPty {
             self.provider_mode.as_str(),
             "claude" | "codex" | "opencode" | "amplifier"
         ) || self.native_identity_observation().is_some();
+        let activity_readiness = self
+            .opencode_activity
+            .as_ref()
+            .map(|relay| relay.input_readiness());
         let disposition =
             begin_input_after_gate(&mut self.commands, request_id, data.as_bytes(), || {
+                if let Some(activity_readiness) = &activity_readiness {
+                    activity_readiness.ensure_ready()?;
+                }
                 if !native_ready {
                     return Err(RuntimeError::new(
                         RuntimeErrorCode::RecoveryBlocked,
@@ -439,10 +521,12 @@ impl HostedPty {
         } else {
             self.native_session_id()
         };
+        batch.opencode_activity = self.opencode_activity.as_ref().map(|relay| relay.read());
         Ok(batch)
     }
 
     pub async fn stop(&mut self) {
+        self.opencode_activity.take();
         self.pty.kill();
         if let Some(codex) = self.codex.take() {
             codex.event_task.abort();

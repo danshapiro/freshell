@@ -531,6 +531,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             }
             if self.recovery_in_flight(&soul_key).await {
                 return Ok(ManagedOutputRead {
+                    opencode_activity: None,
                     stream_epoch: None,
                     incarnation_id: None,
                     reset_required: false,
@@ -557,6 +558,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     self.schedule_recovery(soul, RecoveryTrigger::HostUnreachable)
                         .await;
                     return Ok(ManagedOutputRead {
+                        opencode_activity: None,
                         stream_epoch: None,
                         incarnation_id: None,
                         reset_required: false,
@@ -579,6 +581,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     .await;
             }
             Ok(ManagedOutputRead {
+                opencode_activity: output.opencode_activity,
                 stream_epoch: Some(output.stream_epoch.clone()),
                 incarnation_id: Some(output.incarnation_id.to_string()),
                 // Replacement starts a new durable output epoch. Force the
@@ -1427,6 +1430,7 @@ mod tests {
                                 HostResult::TerminalOutput(RuntimeOutputBatch {
                                     incarnation_id: incarnation.clone(),
                                     terminal_id: "web-retry-terminal".into(),
+                                    opencode_activity: None,
                                     stream_epoch: epoch.clone(),
                                     retained_from_seq: 1,
                                     head_seq: 1,

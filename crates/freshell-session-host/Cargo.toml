@@ -12,6 +12,8 @@ opencode-docker-contract-tests = []
 managed-stop-contract-tests = []
 
 [dependencies]
+freshell-opencode = { path = "../freshell-opencode", features = ["real-transport"] }
+freshell-activity = { path = "../freshell-activity" }
 freshell-agent-runtime = { path = "../freshell-agent-runtime" }
 freshell-freshagent = { path = "../freshell-freshagent" }
 freshell-codex = { path = "../freshell-codex", features = ["real-transport"] }

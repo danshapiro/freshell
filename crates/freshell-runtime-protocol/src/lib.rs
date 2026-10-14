@@ -1187,6 +1187,8 @@ pub enum RuntimeDiagnosticCode {
     ProviderProcessSpawnFailed,
     FreshAgentOpenFailed,
     FreshAgentProviderStartFailed,
+    OpencodeActivityReadyTimeout,
+    OpencodeActivityDisconnected,
 }
 
 /// A closed, body-free reason that a managed fresh-agent provider did not
@@ -2973,6 +2975,10 @@ pub struct RuntimeOutputBatch {
     pub native_session_id: Option<String>,
     #[serde(default)]
     pub frames: Vec<RuntimeOutputFrame>,
+    /// Native activity metadata from the private OpenCode endpoint. Raw
+    /// provider events and HTTP bodies never cross this control boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_activity: Option<freshell_activity::opencode::OpencodeActivityBatch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

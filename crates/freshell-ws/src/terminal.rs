@@ -8698,6 +8698,18 @@ async fn refresh_managed_output_and_associate(
         crate::opencode_association::associate_managed_session(state, terminal_id, session_id)
             .await;
     }
+    if let (Some(hub), Some(epoch), Some(native)) = (
+        state.activity.as_ref(),
+        read.stream_epoch.as_deref(),
+        read.opencode_activity,
+    ) {
+        hub.note_managed_opencode_activity(
+            terminal_id,
+            epoch,
+            read.native_session_id.as_deref(),
+            native,
+        );
+    }
     if let Some(exit_code) = read.exit_code {
         state.registry.finish_managed_exit(terminal_id, exit_code);
     }
@@ -12885,6 +12897,7 @@ mod managed_output_order_tests {
         ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
             Box::pin(async {
                 Ok(ManagedOutputRead {
+                    opencode_activity: None,
                     stream_epoch: Some("S-managed-short-lived".into()),
                     incarnation_id: Some("incarnation-short-lived".into()),
                     reset_required: false,

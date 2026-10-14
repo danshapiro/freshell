@@ -1,5 +1,6 @@
 mod command_journal;
 mod control;
+mod opencode_activity;
 mod output_journal;
 mod provider_secret_resolution;
 mod providers;
@@ -773,14 +774,7 @@ async fn dispatch_with_effects(
                     data,
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
-                    let mut pty = state.pty.lock().await;
-                    let pty = pty.as_mut().ok_or_else(|| {
-                        RuntimeError::new(
-                            RuntimeErrorCode::UnsupportedWorkload,
-                            "incarnation is not a managed terminal",
-                        )
-                    })?;
-                    let state = pty.write_input(&request_id, &data)?;
+                    let state = pty::write_hosted_input(&state.pty, &request_id, &data).await?;
                     Ok(HostResult::TerminalInput { state })
                 }
                 HostCommand::TerminalResize {

@@ -142,6 +142,7 @@ libc = "0.2"
 freshell-supervisor = { path = "../freshell-supervisor" }
 
 [dev-dependencies]
+freshell-activity = { path = "../freshell-activity" }
 # `ServiceExt::oneshot` for in-process axum router handler tests (`sessions.rs`).
 tower = { version = "0.5", features = ["util"] }
 # Isolated temp dirs for `session_metadata.rs`'s store round-trip tests.

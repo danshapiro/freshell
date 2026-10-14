@@ -42,7 +42,9 @@ use freshell_activity::amplifier::{
 use freshell_activity::claude::ClaudeActivityTracker;
 use freshell_activity::codex::CodexActivityTracker;
 use freshell_activity::idle::{IdleGate, IdleGatePhase};
-use freshell_activity::opencode::{OpencodeActivityTracker, OpencodeStatus};
+use freshell_activity::opencode::OpencodeActivityTracker;
+#[cfg(test)]
+use freshell_activity::opencode::OpencodeStatus;
 use freshell_activity::TrackerEffect;
 use freshell_protocol::{
     AgentProvider, AmplifierActivityRecord, AmplifierActivityUpdated, ClaudeActivityRecord,
@@ -125,6 +127,8 @@ pub struct ActivityHubStats {
 }
 
 enum HubEvent {
+    #[cfg(test)]
+    Barrier(tokio::sync::oneshot::Sender<()>),
     Registry(ActivityEvent),
     /// Attach an amplifier events lane (fresh association or resume).
     AmplifierAttach {
@@ -203,53 +207,15 @@ enum HubEvent {
         terminal_id: String,
         base_url: String,
     },
+    ManagedOpencode {
+        terminal_id: String,
+        stream_epoch: String,
+        native_session_id: Option<String>,
+        batch: freshell_activity::opencode::OpencodeActivityBatch,
+    },
 }
 
-/// The opencode SSE lane's event vocabulary ([`crate::opencode_lane`]
-/// produces these from the per-pane sidecar's `/event` stream +
-/// `/session/status` snapshots; the hub routes them into the pure
-/// `OpencodeActivityTracker`).
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum OpencodeLaneEvent {
-    /// `/session/status` snapshot (absence == idle).
-    Snapshot {
-        statuses: Vec<(String, OpencodeStatus)>,
-    },
-    /// `session.created` — folds the parentID chain into the root map.
-    SessionCreated {
-        session_id: String,
-        parent_id: Option<String>,
-    },
-    /// `session.status` edge (busy | retry | idle).
-    Status {
-        session_id: String,
-        status: OpencodeStatus,
-    },
-    /// `session.idle` — the deprecated twin of `session.status{idle}`.
-    SessionIdle { session_id: String },
-    /// `session.error` (and Task 9's abort-marked `message.updated`,
-    /// translated into this same shape).
-    SessionError {
-        session_id: String,
-        error_name: String,
-    },
-    /// `permission.asked` — the turn pauses on a human.
-    PermissionAsked {
-        session_id: String,
-        permission_id: String,
-    },
-    /// `permission.replied` — the pause ends.
-    PermissionReplied { permission_id: String },
-    /// The verify/connect `/session/status` probe failed in a way that
-    /// must NOT read as idle (#603/#604). The hub applies crash semantics
-    /// via [`OpencodeActivityTracker::note_verify_failed`].
-    SnapshotFailed { error: String },
-    /// #608: the authoritative pending-ask listing fetched from GET
-    /// /permission + GET /question (noted only when BOTH succeeded). The
-    /// hub drains any locally-pending id not listed — see
-    /// OpencodeActivityTracker::note_permissions_synced.
-    PermissionsSynced { pending_ids: Vec<String> },
-}
+pub(crate) use freshell_activity::opencode::OpencodeLaneEvent;
 
 struct AmplifierLane {
     tailer: AmplifierEventsTailer,
@@ -324,6 +290,8 @@ struct HubInner {
     /// `OpencodeAttach` (A6), so events from a replaced lane can never
     /// impersonate its successor.
     opencode_lane_next_generation: u64,
+    /// Managed observations have their own sequence, independent of PTY bytes.
+    managed_opencode_cursors: HashMap<String, (String, u64)>,
     /// Task 9: the SSE lane's injected IO seams. `None` until installed
     /// (Task 10 wires the reqwest impls at boot); attach without deps only
     /// retires old lanes.
@@ -483,6 +451,22 @@ impl ActivityHub {
         let _ = self.tx.send(HubEvent::OpencodeBind {
             terminal_id: terminal_id.to_string(),
             session_id: session_id.to_string(),
+        });
+    }
+
+    /// Native observations transported through a managed output read.
+    pub fn note_managed_opencode_activity(
+        &self,
+        terminal_id: &str,
+        stream_epoch: &str,
+        native_session_id: Option<&str>,
+        batch: freshell_activity::opencode::OpencodeActivityBatch,
+    ) {
+        let _ = self.tx.send(HubEvent::ManagedOpencode {
+            terminal_id: terminal_id.into(),
+            stream_epoch: stream_epoch.into(),
+            native_session_id: native_session_id.map(str::to_string),
+            batch,
         });
     }
 
@@ -851,6 +835,10 @@ impl ActivityHub {
 
     fn handle_event(&self, event: HubEvent) {
         match event {
+            #[cfg(test)]
+            HubEvent::Barrier(ack) => {
+                let _ = ack.send(());
+            }
             HubEvent::Registry(event) => self.handle_registry_event(event),
             HubEvent::AmplifierAttach {
                 terminal_id,
@@ -975,65 +963,92 @@ impl ActivityHub {
                     {
                         return;
                     }
-                    let effects = match event {
-                        OpencodeLaneEvent::Snapshot { statuses } => {
-                            inner
-                                .opencode
-                                .note_snapshot(&terminal_id, &statuses, cycle, stream, at)
-                        }
-                        OpencodeLaneEvent::SessionCreated {
-                            session_id,
-                            parent_id,
-                        } => inner.opencode.note_session_created(
-                            &terminal_id,
-                            &session_id,
-                            parent_id.as_deref(),
-                            at,
-                        ),
-                        OpencodeLaneEvent::Status { session_id, status } => inner
-                            .opencode
-                            .note_status(&terminal_id, &session_id, status, cycle, stream, at),
-                        OpencodeLaneEvent::SessionIdle { session_id } => inner
-                            .opencode
-                            .note_session_idle(&terminal_id, &session_id, cycle, stream, at),
-                        OpencodeLaneEvent::SessionError {
-                            session_id,
-                            error_name,
-                        } => inner.opencode.note_error(
-                            &terminal_id,
-                            &session_id,
-                            &error_name,
-                            cycle,
-                            stream,
-                            at,
-                        ),
-                        OpencodeLaneEvent::PermissionAsked {
-                            session_id,
-                            permission_id,
-                        } => inner.opencode.note_permission_asked(
-                            &terminal_id,
-                            &session_id,
-                            &permission_id,
-                            at,
-                        ),
-                        OpencodeLaneEvent::PermissionReplied { permission_id } => inner
-                            .opencode
-                            .note_permission_replied(&terminal_id, &permission_id, at),
-                        OpencodeLaneEvent::SnapshotFailed { error } => {
-                            tracing::error!(
-                                terminal_id = %terminal_id,
-                                %error,
-                                "opencode snapshot probe failed; applying crash semantics (clear busy + attention)"
-                            );
-                            inner.opencode.note_verify_failed(&terminal_id, at)
-                        }
-                        OpencodeLaneEvent::PermissionsSynced { pending_ids } => inner
-                            .opencode
-                            .note_permissions_synced(&terminal_id, &pending_ids, at),
-                    };
+                    let effects = apply_opencode_native_event(
+                        &mut inner.opencode,
+                        &terminal_id,
+                        cycle,
+                        stream,
+                        event,
+                        at,
+                    );
                     // ForceRead only arises from expire()
                     let (frames, _) = opencode_frames(&mut inner.idle, effects);
                     frames
+                };
+                self.emit(frames);
+            }
+            HubEvent::ManagedOpencode {
+                terminal_id,
+                stream_epoch,
+                native_session_id,
+                batch,
+            } => {
+                let at = now_ms();
+                let frames = {
+                    let mut inner = self.inner.lock().expect("activity hub lock");
+                    if inner.modes.get(&terminal_id).map(String::as_str) != Some("opencode") {
+                        return;
+                    }
+                    if stream_epoch.is_empty() || batch.validate().is_err() {
+                        tracing::warn!(
+                            terminal_id,
+                            event = "managed_opencode.activity_batch_refused",
+                            reason = "invalid_source_or_sequence"
+                        );
+                        let effects = inner.opencode.note_verify_failed(&terminal_id, at);
+                        let (frames, _) = opencode_frames(&mut inner.idle, effects);
+                        frames
+                    } else {
+                        let mut frames = Vec::new();
+                        let current = inner.managed_opencode_cursors.get(&terminal_id).cloned();
+                        let same_epoch = current
+                            .as_ref()
+                            .is_some_and(|(epoch, _)| *epoch == stream_epoch);
+                        let mut cursor = if same_epoch {
+                            current.expect("same epoch has cursor").1
+                        } else {
+                            0
+                        };
+                        if !same_epoch {
+                            let effects = inner.opencode.track_terminal(
+                                &terminal_id,
+                                native_session_id.as_deref(),
+                                at,
+                            );
+                            frames.extend(opencode_frames(&mut inner.idle, effects).0);
+                        }
+                        if batch.retained_from_seq > cursor.saturating_add(1) {
+                            tracing::warn!(
+                                terminal_id,
+                                event = "managed_opencode.activity_gap",
+                                expected_seq = cursor.saturating_add(1),
+                                retained_from_seq = batch.retained_from_seq,
+                                head_seq = batch.head_seq
+                            );
+                            let effects = inner.opencode.note_verify_failed(&terminal_id, at);
+                            frames.extend(opencode_frames(&mut inner.idle, effects).0);
+                            cursor = batch.retained_from_seq - 1;
+                        }
+                        for record in batch.events {
+                            if record.seq <= cursor {
+                                continue;
+                            }
+                            let effects = apply_opencode_native_event(
+                                &mut inner.opencode,
+                                &terminal_id,
+                                record.cycle,
+                                record.stream,
+                                record.event,
+                                at,
+                            );
+                            frames.extend(opencode_frames(&mut inner.idle, effects).0);
+                            cursor = record.seq;
+                        }
+                        inner
+                            .managed_opencode_cursors
+                            .insert(terminal_id, (stream_epoch, cursor));
+                        frames
+                    }
                 };
                 self.emit(frames);
             }
@@ -1426,6 +1441,7 @@ impl ActivityHub {
                         inner.quit_intent_lines.remove(&terminal_id);
                         inner.lane_retries.remove(&terminal_id);
                         inner.codex_lanes.remove(&terminal_id);
+                        inner.managed_opencode_cursors.remove(&terminal_id);
                         if let Some((_, lane_task, _)) = inner.opencode_lanes.remove(&terminal_id) {
                             // Stop the SSE lane with its pane; the map removal
                             // ALSO makes any already-enqueued stragglers fail
@@ -1997,6 +2013,53 @@ fn fs_event_is_relevant(event: &notify::Event) -> bool {
         )
 }
 
+fn apply_opencode_native_event(
+    tracker: &mut OpencodeActivityTracker,
+    terminal_id: &str,
+    cycle: u64,
+    stream: u64,
+    event: OpencodeLaneEvent,
+    at: i64,
+) -> Vec<freshell_activity::opencode::OpencodeEffect> {
+    match event {
+        OpencodeLaneEvent::Snapshot { statuses } => {
+            tracker.note_snapshot(terminal_id, &statuses, cycle, stream, at)
+        }
+        OpencodeLaneEvent::SessionCreated {
+            session_id,
+            parent_id,
+        } => tracker.note_session_created(terminal_id, &session_id, parent_id.as_deref(), at),
+        OpencodeLaneEvent::Status { session_id, status } => {
+            tracker.note_status(terminal_id, &session_id, status, cycle, stream, at)
+        }
+        OpencodeLaneEvent::SessionIdle { session_id } => {
+            tracker.note_session_idle(terminal_id, &session_id, cycle, stream, at)
+        }
+        OpencodeLaneEvent::SessionError {
+            session_id,
+            error_name,
+        } => tracker.note_error(terminal_id, &session_id, &error_name, cycle, stream, at),
+        OpencodeLaneEvent::PermissionAsked {
+            session_id,
+            permission_id,
+        } => tracker.note_permission_asked(terminal_id, &session_id, &permission_id, at),
+        OpencodeLaneEvent::PermissionReplied { permission_id } => {
+            tracker.note_permission_replied(terminal_id, &permission_id, at)
+        }
+        OpencodeLaneEvent::SnapshotFailed { error } => {
+            tracing::error!(
+                terminal_id = %terminal_id,
+                %error,
+                "opencode snapshot probe failed; applying crash semantics (clear busy + attention)"
+            );
+            tracker.note_verify_failed(terminal_id, at)
+        }
+        OpencodeLaneEvent::PermissionsSynced { pending_ids } => {
+            tracker.note_permissions_synced(terminal_id, &pending_ids, at)
+        }
+    }
+}
+
 fn hub_next_deadline(inner: &HubInner) -> Option<i64> {
     [
         inner.claude.next_deadline(),
@@ -2292,6 +2355,10 @@ fn turn_complete_frame(
         outcome,
     })
 }
+
+#[cfg(test)]
+#[path = "managed_opencode_activity_tests.rs"]
+mod managed_opencode_activity_tests;
 
 #[cfg(test)]
 mod tests {

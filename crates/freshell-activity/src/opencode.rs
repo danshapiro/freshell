@@ -37,7 +37,8 @@ pub type OpencodeEffect = TrackerEffect<OpencodeActivityRecord>;
 
 /// Session status vocabulary from `/session/status` and the SSE
 /// `session.status` events. `Retry` is busy everywhere (D6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OpencodeStatus {
     Busy,
     Retry,
@@ -2077,5 +2078,91 @@ mod tests {
             tracker.note_session_idle("t1", "ses-b", 1, 1, 200),
             vec![remove(), turn_complete("ses-b", 200, 1)]
         );
+    }
+}
+
+/// The native OpenCode activity lane's event vocabulary. Its transport
+/// produces these from the per-pane sidecar's `/event` stream +
+/// `/session/status` snapshots; the hub routes them into the pure
+/// `OpencodeActivityTracker`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OpencodeLaneEvent {
+    /// `/session/status` snapshot (absence == idle).
+    Snapshot {
+        statuses: Vec<(String, OpencodeStatus)>,
+    },
+    /// `session.created` — folds the parentID chain into the root map.
+    SessionCreated {
+        session_id: String,
+        parent_id: Option<String>,
+    },
+    /// `session.status` edge (busy | retry | idle).
+    Status {
+        session_id: String,
+        status: OpencodeStatus,
+    },
+    /// `session.idle` — the deprecated twin of `session.status{idle}`.
+    SessionIdle { session_id: String },
+    /// `session.error` (and Task 9's abort-marked `message.updated`,
+    /// translated into this same shape).
+    SessionError {
+        session_id: String,
+        error_name: String,
+    },
+    /// `permission.asked` — the turn pauses on a human.
+    PermissionAsked {
+        session_id: String,
+        permission_id: String,
+    },
+    /// `permission.replied` — the pause ends.
+    PermissionReplied { permission_id: String },
+    /// The verify/connect `/session/status` probe failed in a way that
+    /// must NOT read as idle (#603/#604). The hub applies crash semantics
+    /// via [`OpencodeActivityTracker::note_verify_failed`].
+    SnapshotFailed { error: String },
+    /// #608: the authoritative pending-ask listing fetched from GET
+    /// /permission + GET /question (noted only when BOTH succeeded). The
+    /// hub drains any locally-pending id not listed — see
+    /// OpencodeActivityTracker::note_permissions_synced.
+    PermissionsSynced { pending_ids: Vec<String> },
+}
+
+/// Ordered, body-free observations retained by one native provider launch.
+/// The enclosing output batch owns the terminal and source epoch identity.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpencodeActivityBatch {
+    pub retained_from_seq: u64,
+    pub head_seq: u64,
+    pub events: Vec<OpencodeActivityEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpencodeActivityEvent {
+    pub seq: u64,
+    pub cycle: u64,
+    pub stream: u64,
+    pub event: OpencodeLaneEvent,
+}
+
+impl OpencodeActivityBatch {
+    /// Missing retained history is represented by the bounds, never by an
+    /// invented idle edge. A native observation sequence is always contiguous.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.retained_from_seq == 0
+            || self.retained_from_seq > self.head_seq.saturating_add(1)
+            || self.head_seq.checked_sub(self.retained_from_seq - 1)
+                != Some(self.events.len() as u64)
+            || self.events.iter().enumerate().any(|(offset, entry)| {
+                entry.seq != self.retained_from_seq + offset as u64
+                    || entry.cycle == 0
+                    || entry.stream == 0
+            })
+        {
+            return Err("invalid native OpenCode activity sequence");
+        }
+        Ok(())
     }
 }

@@ -164,6 +164,7 @@ impl OutputJournal {
         Ok(RuntimeOutputBatch {
             incarnation_id: self.incarnation_id.clone(),
             terminal_id: self.terminal_id.clone(),
+            opencode_activity: None,
             stream_epoch: self.stream_epoch.clone(),
             retained_from_seq,
             head_seq,
