@@ -1683,6 +1683,10 @@ fn stage_provider_root(
                     .iter()
                     .map(|selection| selection.canonical_source.clone())
             }));
+            excluded.extend(
+                plan.iter()
+                    .flat_map(|source| source.configured_resource_exclusions.iter().cloned()),
+            );
             let mut units = source_stage::resource_units(
                 home,
                 &source,

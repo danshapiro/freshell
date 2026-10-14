@@ -309,10 +309,11 @@ pub struct PlannedSourceOccurrence {
     pub references: super::ResolvedFileReferencePlan,
     pub original_form: bool,
     pub requires_config_bind: bool,
-    pub instance_cwd: PathBuf,
     pub configured_resources: Vec<PathBuf>,
     /// Canonical exact files with statically identified Node write targets.
     pub configured_writable_resources: std::collections::BTreeSet<PathBuf>,
+    /// Selected Node env-file aliases excluded from ordinary resource copies.
+    pub configured_resource_exclusions: std::collections::BTreeSet<PathBuf>,
     /// Captured with the retained source view so later staging does not
     /// reinterpret a generated entry after ordinary-terminal cleanup.
     pub user_owns_freshell_mcp: bool,
@@ -637,6 +638,32 @@ pub fn plan_loaded_opencode_sources_relocated(
             selected.insert(canonical.to_owned(), destination.clone());
             Ok(destination)
         };
+        let selected_resources = super::opencode_resources::select(
+            &source,
+            &loaded.view,
+            cwd,
+            user_owns_freshell_mcp,
+            home,
+            global.as_deref(),
+            &|name| lookup(source.lane, &source.logical_path, name),
+        )
+        .map_err(|error| super::ReferenceError {
+            preparation_failure: None,
+            operation: "select",
+            field: error.field,
+            source_ordinal: ordinal,
+            declaring_source: source.logical_path.clone(),
+            variables: vec![],
+            cause: error.cause,
+        })?;
+        let mut node_env_file_edits = Vec::with_capacity(selected_resources.node_env_files.len());
+        for env_file in &selected_resources.node_env_files {
+            let destination = allocate(&env_file.canonical_source).map_err(fail)?;
+            let replacement = format!("{}{destination}", env_file.option_prefix);
+            let replacement = serde_json::to_string(&replacement)
+                .map_err(|_| fail("selected Node env-file path could not be encoded"))?;
+            node_env_file_edits.push((env_file.argument_span.clone(), replacement));
+        }
         let references = super::resolve_file_references_from_view_relocated(
             &loaded.view,
             Some(loaded.view.clone()),
@@ -653,8 +680,26 @@ pub fn plan_loaded_opencode_sources_relocated(
                 original_form,
                 available_view_bytes: MAX_SIMULTANEOUS_SOURCE_VIEW_BYTES as usize
                     - view_budget.bytes,
+                additional_rewrites: &node_env_file_edits,
             },
         )?;
+        let mut references = references;
+        for env_file in &selected_resources.node_env_files {
+            let runtime_destination = selected
+                .get(&env_file.canonical_source)
+                .cloned()
+                .ok_or_else(|| fail("selected Node env-file reference was not allocated"))?;
+            if !references
+                .selections
+                .iter()
+                .any(|selection| selection.canonical_source == env_file.canonical_source)
+            {
+                references.selections.push(super::FileReferenceSelection {
+                    canonical_source: env_file.canonical_source.clone(),
+                    runtime_destination,
+                });
+            }
+        }
         if original_form {
             if let Some(prior) = result
                 .iter()
@@ -710,31 +755,26 @@ pub fn plan_loaded_opencode_sources_relocated(
                 "combined source recipe, alias, variable or event limit exceeded",
             ));
         }
+        let configured_resource_exclusions = selected_resources
+            .node_env_files
+            .iter()
+            .flat_map(|env_file| {
+                [
+                    env_file.selected_alias.clone(),
+                    env_file.canonical_source.clone(),
+                ]
+            })
+            .collect();
         let mut planned = PlannedSourceOccurrence {
             source,
             references,
             original_form,
             requires_config_bind: loaded.requires_config_bind,
-            instance_cwd: cwd.into(),
-            configured_resources: Vec::new(),
-            configured_writable_resources: Default::default(),
+            configured_resources: selected_resources.resources,
+            configured_writable_resources: selected_resources.writable_resources,
+            configured_resource_exclusions,
             user_owns_freshell_mcp,
         };
-        let selected_resources =
-            super::opencode_resources::select(&planned, home, global.as_deref(), &|name| {
-                lookup(planned.source.lane, &planned.source.logical_path, name)
-            })
-            .map_err(|error| super::ReferenceError {
-                preparation_failure: None,
-                operation: "select",
-                field: error.field,
-                source_ordinal: ordinal,
-                declaring_source: planned.source.logical_path.clone(),
-                variables: vec![],
-                cause: error.cause,
-            })?;
-        planned.configured_resources = selected_resources.resources;
-        planned.configured_writable_resources = selected_resources.writable_resources;
         planned
             .references
             .path_variables
@@ -750,6 +790,64 @@ pub fn plan_loaded_opencode_sources_relocated(
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn managed_provider_env_file_rewrite_survives_generated_config_recipe() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let env_file = home.join("mcp.env");
+        let script = workspace.join("server.js");
+        let payload = workspace.join("rules");
+        std::fs::write(&env_file, "SYNTHETIC_MCP_VALUE=fixture\n").unwrap();
+        std::fs::write(&script, "process.exit(0);\n").unwrap();
+        std::fs::write(&payload, "fixture prompt payload\n").unwrap();
+        let config = workspace.join("opencode.json");
+        let raw = serde_json::json!({
+            "agent": { "fixture": { "prompt": "{env:INSERT}" } },
+            "mcp": {
+                "direct": {
+                    "type": "local",
+                    "command": ["node", format!("--env-file={}", env_file.display()), script],
+                }
+            }
+        })
+        .to_string();
+        std::fs::write(&config, &raw).unwrap();
+
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config,
+                lane: SourceLane::Main,
+                role: DiscoveryRole::Workspace,
+            }],
+            &workspace,
+            &home,
+            &|_, _, name| (name == "INSERT").then(|| "prefix {file:./rules} suffix".into()),
+        )
+        .unwrap();
+        let planned = &plan[0];
+        assert_eq!(planned.references.recipes.len(), 1);
+        let env_selection = planned
+            .references
+            .selections
+            .iter()
+            .find(|selection| selection.canonical_source == env_file.canonicalize().unwrap())
+            .expect("Node env files use an approved managed secret reference");
+        assert!(!planned
+            .configured_resources
+            .contains(&env_file.canonicalize().unwrap()));
+        let recipe: serde_json::Value =
+            serde_json::from_str(&planned.references.recipes[0].unexpanded_source).unwrap();
+        assert_eq!(
+            recipe["mcp"]["direct"]["command"][1],
+            format!("--env-file={}", env_selection.runtime_destination)
+        );
+        assert!(planned.configured_resource_exclusions.contains(&env_file));
+    }
 
     #[test]
     fn managed_provider_references_actual_source_file_growth_rejects_before_reading() {

@@ -1,6 +1,5 @@
 //! Finite native ordinary resource fields. Keep raw documents and every
 //! unrelated string intact; these selections are paths, never private payloads.
-use super::sources::PlannedSourceOccurrence;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -68,7 +67,7 @@ impl Cursor<'_> {
 
 // A finite field visitor rather than decoded/serialized document rewriting.
 // Plugin tuple options (and nested unrelated fields) are never path schemas.
-fn fields(raw: &str) -> Result<Vec<(&'static str, String)>, &'static str> {
+fn fields(raw: &str) -> Result<Vec<SelectedField>, &'static str> {
     // Native JSONC parsing assigns each member in order: only the final
     // spelling owns a configured capability, including escaped duplicate keys.
     // Reuse raw member spans so plugin tuple options and source origins survive.
@@ -100,6 +99,27 @@ fn fields(raw: &str) -> Result<Vec<(&'static str, String)>, &'static str> {
 // Read only member spans: selected nested schemas never deserialize or rewrite
 // an entire source document, nor interpret unrelated command arguments as paths.
 type ObjectMember = (std::ops::Range<usize>, std::ops::Range<usize>);
+
+struct SelectedField {
+    field: &'static str,
+    spelling: String,
+    node_env_file_argument: Option<NodeEnvFileArgument>,
+}
+
+struct NodeEnvFileArgument {
+    raw_span: std::ops::Range<usize>,
+    option_prefix: String,
+}
+
+impl SelectedField {
+    fn new(field: &'static str, spelling: String) -> Self {
+        Self {
+            field,
+            spelling,
+            node_env_file_argument: None,
+        }
+    }
+}
 
 fn object_members(raw: &str, start: usize) -> Result<Vec<ObjectMember>, &'static str> {
     let mut cursor = Cursor { raw, at: start };
@@ -146,19 +166,22 @@ fn member<'a>(
     members: &[(std::ops::Range<usize>, std::ops::Range<usize>)],
     name: &str,
 ) -> Option<&'a str> {
-    members.iter().rev().find_map(|(key, value)| {
+    member_range(raw, members, name).map(|(_, value)| &raw[value.clone()])
+}
+
+fn member_range<'a>(
+    raw: &'a str,
+    members: &'a [ObjectMember],
+    name: &str,
+) -> Option<&'a ObjectMember> {
+    members.iter().rev().find(|(key, _)| {
         // Every ASCII name character can use a six-byte Unicode escape.
         // Bound the finite name before decoding, without excluding valid keys.
-        if key.len() <= 2 + 6 * name.len()
+        key.len() <= 2 + 6 * name.len()
             && serde_json::from_str::<String>(&raw[key.clone()])
                 .ok()
                 .as_deref()
                 == Some(name)
-        {
-            Some(&raw[value.clone()])
-        } else {
-            None
-        }
     })
 }
 fn selected_string(raw: &str) -> Result<Option<String>, &'static str> {
@@ -176,7 +199,7 @@ fn nested_fields(
     raw: &str,
     tui: bool,
     skip_owned_freshell_mcp: bool,
-) -> Result<Vec<(&'static str, String)>, &'static str> {
+) -> Result<Vec<SelectedField>, &'static str> {
     let top = object_members(raw, 0)?;
     let mut result = Vec::new();
     if tui {
@@ -197,14 +220,16 @@ fn nested_fields(
                     if let Some(value) = member(sounds, &entries, name) {
                         if let Some(path) = selected_string(value)?.filter(|path| !path.is_empty())
                         {
-                            result.push(("OpenCode attention.sounds", path));
+                            result.push(SelectedField::new("OpenCode attention.sounds", path));
                         }
                     }
                 }
             }
         }
     }
-    if let Some(mcp) = member(raw, &top, "mcp") {
+    if let Some((_, mcp_range)) = member_range(raw, &top, "mcp") {
+        let mcp_base = mcp_range.start;
+        let mcp = &raw[mcp_range.clone()];
         // Native Object.entries sees only the last value for each decoded
         // server name. Discard overwritten entries before selecting their cwd.
         let mut names = std::collections::BTreeSet::new();
@@ -221,6 +246,7 @@ fn nested_fields(
         }
         drop(names);
         for (name, range) in winners.into_iter().rev() {
+            let entry_base = mcp_base + range.start;
             let entry = &mcp[range];
             let entries = object_members(entry, 0)?;
             if member(entry, &entries, "type")
@@ -233,14 +259,19 @@ fn nested_fields(
             }
             // Keep each server's cwd adjacent to its command references so a
             // different server's cwd cannot accidentally satisfy a missing path.
-            result.push(("OpenCode mcp.entry", String::new()));
+            result.push(SelectedField::new("OpenCode mcp.entry", String::new()));
             if let Some(value) = member(entry, &entries, "cwd") {
                 if let Some(path) = selected_string(value)? {
-                    result.push(("OpenCode mcp.cwd", path));
+                    result.push(SelectedField::new("OpenCode mcp.cwd", path));
                 }
             }
-            if let Some(value) = member(entry, &entries, "command") {
-                let command = string_array(value)?;
+            if let Some((_, command_range)) = member_range(entry, &entries, "command") {
+                let command_raw = &entry[command_range.clone()];
+                let command_spans = string_array_with_spans(command_raw)?;
+                let command = command_spans
+                    .iter()
+                    .map(|(argument, _)| argument.clone())
+                    .collect::<Vec<_>>();
                 // Freshell's exact server command is supplied by the managed
                 // runtime image. Its /opt path is not a host resource to copy.
                 let image_command = name == "freshell"
@@ -289,23 +320,45 @@ fn nested_fields(
                                 } else {
                                     "OpenCode mcp.direct-script"
                                 };
-                                result.push((field, argument.clone()));
+                                result.push(SelectedField::new(field, argument.clone()));
                             } else {
-                                result.push(("OpenCode mcp.command", argument.clone()));
+                                result.push(SelectedField::new(
+                                    "OpenCode mcp.command",
+                                    argument.clone(),
+                                ));
                             }
                         } else if script_file || script_operand {
-                            result.push((node_script_field, argument.clone()));
+                            result.push(SelectedField::new(node_script_field, argument.clone()));
                         }
                     }
-                    for (_, field, spelling) in option_resources {
-                        result.push((field, spelling));
+                    for (index, field, spelling) in option_resources {
+                        let mut selected = SelectedField::new(field, spelling.clone());
+                        if is_mcp_node_option_data_field(field) {
+                            let (argument, span) = command_spans
+                                .get(index)
+                                .ok_or("selected Node env-file argument span unavailable")?;
+                            let option_prefix = argument
+                                .strip_suffix(&spelling)
+                                .ok_or("selected Node env-file option changed during parsing")?
+                                .to_owned();
+                            selected.node_env_file_argument = Some(NodeEnvFileArgument {
+                                raw_span: command_range.start + entry_base + span.start
+                                    ..command_range.start + entry_base + span.end,
+                                option_prefix,
+                            });
+                        }
+                        result.push(selected);
                     }
                     if let Some(script_index) = script_index {
                         let script = &command[script_index];
                         if is_bun_run_bare_operand(&command, script_index) {
-                            result.push(("OpenCode bun run operand", script.clone()));
+                            result.push(SelectedField::new(
+                                "OpenCode bun run operand",
+                                script.clone(),
+                            ));
                         } else if is_bun_run_file_operand(&command, script_index) {
-                            result.push(("OpenCode bun run file", script.clone()));
+                            result
+                                .push(SelectedField::new("OpenCode bun run file", script.clone()));
                         }
                     }
                 }
@@ -315,7 +368,9 @@ fn nested_fields(
     Ok(result)
 }
 
-fn string_array(raw: &str) -> Result<Vec<String>, &'static str> {
+fn string_array_with_spans(
+    raw: &str,
+) -> Result<Vec<(String, std::ops::Range<usize>)>, &'static str> {
     let mut cursor = Cursor { raw, at: 0 };
     if !matches!(cursor.next(), Some(Token::Punctuation(b'['))) {
         return Ok(Vec::new());
@@ -335,10 +390,11 @@ fn string_array(raw: &str) -> Result<Vec<String>, &'static str> {
                 if result.len() >= 100_000 || end - start > 64 * 1024 {
                     return Err("configured resource selection profile exceeded");
                 }
-                result.push(
+                result.push((
                     serde_json::from_str(&cursor.raw[start..end])
                         .map_err(|_| "invalid selected command argument")?,
-                );
+                    start..end,
+                ));
             }
             _ => {}
         }
@@ -1278,10 +1334,29 @@ fn node_relative_module_specifiers(source: &str) -> Result<Vec<String>, &'static
     for (index, token) in tokens.iter().enumerate() {
         let module = match token {
             JavaScriptToken::Identifier(name) if name == "require" || name == "import" => {
-                match tokens.get(index + 1) {
-                    Some(JavaScriptToken::Punctuation(b'(')) => tokens.get(index + 2),
-                    Some(JavaScriptToken::String(_)) if name == "import" => tokens.get(index + 1),
-                    _ => None,
+                let require_resolve = name == "require"
+                    && matches!(
+                        tokens.get(index + 1),
+                        Some(JavaScriptToken::Punctuation(b'.'))
+                    )
+                    && matches!(
+                        tokens.get(index + 2),
+                        Some(JavaScriptToken::Identifier(method)) if method == "resolve"
+                    )
+                    && matches!(
+                        tokens.get(index + 3),
+                        Some(JavaScriptToken::Punctuation(b'('))
+                    );
+                if require_resolve {
+                    tokens.get(index + 4)
+                } else {
+                    match tokens.get(index + 1) {
+                        Some(JavaScriptToken::Punctuation(b'(')) => tokens.get(index + 2),
+                        Some(JavaScriptToken::String(_)) if name == "import" => {
+                            tokens.get(index + 1)
+                        }
+                        _ => None,
+                    }
                 }
             }
             JavaScriptToken::Identifier(name) if name == "from" => tokens.get(index + 1),
@@ -3006,7 +3081,7 @@ fn node_command_option_resources(command: &[String]) -> Vec<(usize, &'static str
 fn resource_array(
     cursor: &mut Cursor<'_>,
     field: &'static str,
-    result: &mut Vec<(&'static str, String)>,
+    result: &mut Vec<SelectedField>,
 ) -> Result<(), &'static str> {
     let mut depth = 1usize;
     let mut tuple_first = false;
@@ -3031,7 +3106,7 @@ fn resource_array(
                 if result.len() >= 100_000 || end - start > 64 * 1024 {
                     return Err("configured resource selection profile exceeded");
                 }
-                result.push((
+                result.push(SelectedField::new(
                     field,
                     serde_json::from_str(&cursor.raw[start..end])
                         .map_err(|_| "invalid selected resource path")?,
@@ -3056,10 +3131,18 @@ pub struct ResourceError {
     pub cause: &'static str,
 }
 
-pub struct ResourceSelection {
+pub(super) struct ResourceSelection {
     pub resources: Vec<PathBuf>,
     pub variables: Vec<String>,
     pub writable_resources: std::collections::BTreeSet<PathBuf>,
+    pub node_env_files: Vec<NodeEnvFileSelection>,
+}
+
+pub(super) struct NodeEnvFileSelection {
+    pub canonical_source: PathBuf,
+    pub selected_alias: PathBuf,
+    pub argument_span: std::ops::Range<usize>,
+    pub option_prefix: String,
 }
 fn checked(path: &Path, field: &'static str, _source: &Path) -> Result<PathBuf, ResourceError> {
     let fail = |cause| ResourceError { field, cause };
@@ -3199,34 +3282,41 @@ fn insert_installed_package_ancestor_resources_covered(
 
 /// Return complete ordinary units and native installed ancestor lookup units.
 /// Exact mounts retain native field spellings and their declaring origins.
-pub fn select(
-    source: &PlannedSourceOccurrence,
+pub(super) fn select(
+    source: &super::sources::SourceOccurrence,
+    raw: &str,
+    instance_cwd: &Path,
+    user_owns_freshell_mcp: bool,
     home: &Path,
     global: Option<&Path>,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ResourceSelection, ResourceError> {
-    let declaring = &source.source.logical_path;
+    let declaring = &source.logical_path;
     let fail = |field: &'static str, cause: &'static str| ResourceError { field, cause };
     let mut result = std::collections::BTreeSet::new();
     let mut resource_path_bytes = 0usize;
     let mut writable_resources = std::collections::BTreeSet::new();
+    let mut node_env_files = Vec::new();
     let mut variables = std::collections::BTreeSet::new();
-    let raw = source.references.unexpanded_source();
     let skip_owned_freshell_mcp =
-        source.source.lane == super::sources::SourceLane::Main && !source.user_owns_freshell_mcp;
+        source.lane == super::sources::SourceLane::Main && !user_owns_freshell_mcp;
     let mut selections = fields(raw).map_err(|cause| fail("OpenCode resource", cause))?;
     selections.extend(
         nested_fields(
             raw,
-            source.source.lane == super::sources::SourceLane::Tui,
+            source.lane == super::sources::SourceLane::Tui,
             skip_owned_freshell_mcp,
         )
         .map_err(|cause| fail("OpenCode resource", cause))?,
     );
     let mut current_mcp_working_dir: Option<PathBuf> = None;
     let mut current_mcp_resource_path: Option<PathBuf> = None;
-    for (field, spelling) in selections {
-        let mut field = field;
+    for selected in selections {
+        let SelectedField {
+            mut field,
+            spelling,
+            node_env_file_argument,
+        } = selected;
         if field == "OpenCode mcp.entry" {
             current_mcp_working_dir = None;
             current_mcp_resource_path = None;
@@ -3268,9 +3358,7 @@ pub fn select(
             continue;
         }
         if field == "OpenCode bun run operand" {
-            let working_dir = current_mcp_resource_path
-                .as_deref()
-                .unwrap_or(&source.instance_cwd);
+            let working_dir = current_mcp_resource_path.as_deref().unwrap_or(instance_cwd);
             if is_bare_bun_script_name(&spelling) {
                 if let Some(package_root) = bun_package_script_root(working_dir, &spelling)
                     .map_err(|cause| fail("OpenCode mcp.command", cause))?
@@ -3383,8 +3471,7 @@ pub fn select(
             let candidates = if path.is_absolute() {
                 vec![path]
             } else {
-                source
-                    .instance_cwd
+                instance_cwd
                     .ancestors()
                     .map(|base| base.join(&path))
                     .collect()
@@ -3427,30 +3514,25 @@ pub fn select(
         }
         if !path.is_absolute() {
             if field == "OpenCode plugin" || field == "OpenCode attention.sounds" {
-                path = declaring
-                    .parent()
-                    .unwrap_or(&source.instance_cwd)
-                    .join(path);
+                path = declaring.parent().unwrap_or(instance_cwd).join(path);
             } else if field == "OpenCode skills.paths" || field == "OpenCode mcp.cwd" {
-                path = source.instance_cwd.join(path);
+                path = instance_cwd.join(path);
             } else if is_mcp_command_resource_field(field) {
                 path = if let Some(working_dir) = &current_mcp_working_dir {
                     working_dir.join(path)
                 } else {
-                    source
-                        .instance_cwd
+                    instance_cwd
                         .ancestors()
                         .map(|base| base.join(&path))
                         .find(|candidate| std::fs::symlink_metadata(candidate).is_ok())
-                        .unwrap_or_else(|| source.instance_cwd.join(path))
+                        .unwrap_or_else(|| instance_cwd.join(path))
                 };
             } else {
-                path = source
-                    .instance_cwd
+                path = instance_cwd
                     .ancestors()
                     .map(|base| base.join(&path))
                     .find(|candidate| std::fs::symlink_metadata(candidate).is_ok())
-                    .unwrap_or_else(|| source.instance_cwd.join(path));
+                    .unwrap_or_else(|| instance_cwd.join(path));
             }
         }
         if matches!(
@@ -3497,29 +3579,15 @@ pub fn select(
                 ));
             }
             if is_mcp_node_option_data_field(field) {
-                let canonical_is_covered = current_mcp_working_dir
-                    .as_deref()
-                    .filter(|working_dir| canonical.starts_with(working_dir));
-                let path_is_covered =
-                    canonical_is_covered.is_some_and(|working_dir| path.starts_with(working_dir));
-                if !path_is_covered {
-                    insert_resource(
-                        &mut result,
-                        &mut resource_path_bytes,
-                        path.clone(),
-                        field,
-                        declaring,
-                    )?;
-                }
-                if path != canonical && canonical_is_covered.is_none() {
-                    insert_resource(
-                        &mut result,
-                        &mut resource_path_bytes,
-                        canonical,
-                        field,
-                        declaring,
-                    )?;
-                }
+                let argument = node_env_file_argument.ok_or_else(|| {
+                    fail(field, "selected Node env-file argument span unavailable")
+                })?;
+                node_env_files.push(NodeEnvFileSelection {
+                    canonical_source: canonical,
+                    selected_alias: path,
+                    argument_span: argument.raw_span,
+                    option_prefix: argument.option_prefix,
+                });
                 continue;
             }
 
@@ -3657,7 +3725,7 @@ pub fn select(
                     ScriptDependencyRuntime::Node,
                 )?;
                 if let Some(resource_scope) =
-                    bun_run_file_resource_scope(command_parent, home, &source.instance_cwd)
+                    bun_run_file_resource_scope(command_parent, home, instance_cwd)
                 {
                     // Bun scripts can compute local asset paths at runtime, so
                     // preserve their bounded package (or containing) directory.
@@ -3984,5 +4052,6 @@ pub fn select(
         resources: result.into_iter().collect(),
         variables: variables.into_iter().collect(),
         writable_resources,
+        node_env_files,
     })
 }

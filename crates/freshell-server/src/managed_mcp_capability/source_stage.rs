@@ -68,6 +68,17 @@ mod configured_resource_tests {
             freshell_runtime_protocol::ProviderResourceMount,
         )],
     ) -> std::path::PathBuf {
+        copy_selected_units_through_provider_excluding(owned_root, units, &[])
+    }
+
+    fn copy_selected_units_through_provider_excluding(
+        owned_root: &Path,
+        units: &[(
+            std::path::PathBuf,
+            freshell_runtime_protocol::ProviderResourceMount,
+        )],
+        excluded: &[std::path::PathBuf],
+    ) -> std::path::PathBuf {
         let stage = owned_root.join("stage");
         let stage_selections = units
             .iter()
@@ -93,7 +104,7 @@ mod configured_resource_tests {
         copy_environment_for_mounts(
             &stage_selections,
             &stage,
-            &[],
+            excluded,
             Default::default(),
             &mounted_file_roots,
         )
@@ -172,6 +183,25 @@ mod configured_resource_tests {
             std::os::unix::fs::symlink(host_mount, &destination).unwrap();
         }
         provider
+    }
+
+    fn tree_contains_bytes(root: &Path, needle: &[u8]) -> bool {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+                return false;
+            };
+            if metadata.is_dir() {
+                tree_contains_bytes(&entry.path(), needle)
+            } else if metadata.is_file() {
+                std::fs::read(entry.path())
+                    .is_ok_and(|bytes| bytes.windows(needle.len()).any(|window| window == needle))
+            } else {
+                false
+            }
+        })
     }
 
     fn plan_and_stage_direct_mcp_command(
@@ -263,7 +293,21 @@ mod configured_resource_tests {
                     .map(|relative| Path::new(".provider-home").join(relative))
             })
             .expect("the test provider destination must map into the temporary root");
-        let provider = copy_selected_units_through_provider(owned_root, &units);
+        let excluded = plan
+            .iter()
+            .flat_map(|source| {
+                source
+                    .references
+                    .selections
+                    .iter()
+                    .map(|selection| selection.canonical_source.clone())
+                    .chain(source.configured_resource_exclusions.iter().cloned())
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let provider =
+            copy_selected_units_through_provider_excluding(owned_root, &units, &excluded);
         (plan, provider.join(provider_relative))
     }
 
@@ -1233,7 +1277,7 @@ mod configured_resource_tests {
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(
             &command,
-            "#!/usr/bin/env node\nprocess.stdout.write(require('./helper.js'))\n",
+            "#!/usr/bin/env node\nconst helperPath = require.resolve('./helper.js');\nprocess.stdout.write(require(helperPath))\n",
         )
         .unwrap();
         std::fs::write(
@@ -1406,9 +1450,10 @@ process.stdout.write(require('./helper.js'))
         let env_file = home.join(".env");
         let second_env_file = home.join(".env.local");
         let optional_env_file = home.join(".env.optional");
+        let missing_optional_env_file = home.join(".env.missing-optional");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::write(&command, "if (globalThis.managedPreload !== 'loaded' || globalThis.managedPreloadHelper !== 'loaded' || globalThis.managedImport !== 'loaded' || process.env.MANAGED_ENV_FILE !== 'loaded' || process.env.MANAGED_ENV_FILE_LOCAL !== 'loaded') process.exit(1);\nprocess.stdout.write('command options staged\\n');\n").unwrap();
+        std::fs::write(&command, "if (globalThis.managedPreload !== 'loaded' || globalThis.managedPreloadHelper !== 'loaded' || globalThis.managedImport !== 'loaded' || !process.env.MANAGED_ENV_FILE?.startsWith('MCP_ENV_SECRET_') || !process.env.MANAGED_ENV_FILE_LOCAL?.startsWith('MCP_ENV_SECRET_') || !process.env.MANAGED_ENV_FILE_OPTIONAL?.startsWith('MCP_ENV_SECRET_')) process.exit(1);\nprocess.stdout.write('command options staged\\n');\n").unwrap();
         std::fs::write(
             &preload,
             "require('./preload-helper.cjs');\nglobalThis.managedPreload = 'loaded';\n",
@@ -1422,8 +1467,24 @@ process.stdout.write(require('./helper.js'))
         std::fs::write(&imported, "globalThis.managedImport = 'loaded';\n").unwrap();
         std::fs::write(&loader, "export async function resolve(specifier, context, nextResolve) { return nextResolve(specifier, context); }\n").unwrap();
         std::fs::write(&experimental_loader, "export async function resolve(specifier, context, nextResolve) { return nextResolve(specifier, context); }\n").unwrap();
-        std::fs::write(&env_file, "MANAGED_ENV_FILE=loaded\n").unwrap();
-        std::fs::write(&second_env_file, "MANAGED_ENV_FILE_LOCAL=loaded\n").unwrap();
+        let first_secret = b"MCP_ENV_SECRET_ALPHA_4f7c5d91\n";
+        let second_secret = b"MCP_ENV_SECRET_BETA_92b16a03\n";
+        let optional_secret = b"MCP_ENV_SECRET_OPTIONAL_3468ef22\n";
+        std::fs::write(
+            &env_file,
+            [b"MANAGED_ENV_FILE=".as_slice(), first_secret].concat(),
+        )
+        .unwrap();
+        std::fs::write(
+            &second_env_file,
+            [b"MANAGED_ENV_FILE_LOCAL=".as_slice(), second_secret].concat(),
+        )
+        .unwrap();
+        std::fs::write(
+            &optional_env_file,
+            [b"MANAGED_ENV_FILE_OPTIONAL=".as_slice(), optional_secret].concat(),
+        )
+        .unwrap();
 
         let option_arguments = vec![
             "node".to_owned(),
@@ -1437,6 +1498,8 @@ process.stdout.write(require('./helper.js'))
             "--env-file".to_owned(),
             second_env_file.to_string_lossy().into_owned(),
             format!("--env-file-if-exists={}", optional_env_file.display()),
+            "--env-file-if-exists".to_owned(),
+            missing_optional_env_file.to_string_lossy().into_owned(),
             command.to_string_lossy().into_owned(),
         ];
         let (plan, _) = plan_and_stage_mcp_command_for_resource(
@@ -1452,8 +1515,6 @@ process.stdout.write(require('./helper.js'))
             &imported,
             &loader,
             &experimental_loader,
-            &env_file,
-            &second_env_file,
         ] {
             assert!(
                 plan[0]
@@ -1466,51 +1527,142 @@ process.stdout.write(require('./helper.js'))
         assert!(!plan[0]
             .configured_resources
             .contains(&home.canonicalize().unwrap()));
+        for secret_file in [&env_file, &second_env_file, &optional_env_file] {
+            let canonical = secret_file.canonicalize().unwrap();
+            assert!(
+                !plan[0].configured_resources.contains(&canonical),
+                "Node env file {} must use the managed secret path, not ordinary resources",
+                secret_file.display()
+            );
+            assert!(plan[0].configured_resource_exclusions.contains(&canonical));
+        }
         assert!(!plan[0].configured_resources.contains(
             &optional_env_file
                 .canonicalize()
                 .unwrap_or(optional_env_file.clone())
         ));
 
-        let provider = copy_selected_units_through_provider(
-            owned.path(),
-            &resource_units(
-                &home,
-                &home.join(".config/opencode"),
-                &workspace,
-                &plan,
-                None,
-            )
-            .unwrap(),
+        assert_eq!(plan[0].references.selections.len(), 3);
+        let prepared_config: serde_json::Value =
+            serde_json::from_str(plan[0].references.template.as_str()).unwrap();
+        let prepared_arguments = prepared_config["mcp"]["direct"]["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|argument| argument.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            prepared_arguments[7],
+            "--env-file=/home/freshell/provider/.freshell/references/0"
         );
-        let staged = |path: &Path| {
-            provider
-                .join(".provider-home")
-                .join(path.strip_prefix(&home).unwrap())
+        assert_eq!(prepared_arguments[8], "--env-file");
+        assert_eq!(
+            prepared_arguments[9],
+            "/home/freshell/provider/.freshell/references/1"
+        );
+        assert_eq!(
+            prepared_arguments[10],
+            "--env-file-if-exists=/home/freshell/provider/.freshell/references/2"
+        );
+        assert_eq!(prepared_arguments[11], "--env-file-if-exists");
+        assert_eq!(
+            prepared_arguments[12],
+            missing_optional_env_file.display().to_string(),
+            "an absent separated optional file keeps Node's native optional-file behavior"
+        );
+
+        let units = resource_units(
+            &home,
+            &home.join(".config/opencode"),
+            &workspace,
+            &plan,
+            None,
+        )
+        .unwrap();
+        assert!(units.iter().all(|(source, mount)| {
+            ![&env_file, &second_env_file, &optional_env_file]
+                .iter()
+                .any(|secret_file| {
+                    let secret = secret_file.canonicalize().unwrap();
+                    source == &secret
+                        || (mount.kind
+                            == freshell_runtime_protocol::ProviderResourceKind::Directory
+                            && secret.starts_with(source))
+                })
+        }));
+        let provider = copy_selected_units_through_provider_excluding(
+            owned.path(),
+            &units,
+            &plan[0]
+                .configured_resource_exclusions
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        for root in ["stage", "host", "provider"] {
+            assert!(!tree_contains_bytes(
+                &owned.path().join(root),
+                first_secret.strip_suffix(b"\n").unwrap()
+            ));
+            assert!(!tree_contains_bytes(
+                &owned.path().join(root),
+                second_secret.strip_suffix(b"\n").unwrap()
+            ));
+            assert!(!tree_contains_bytes(
+                &owned.path().join(root),
+                optional_secret.strip_suffix(b"\n").unwrap()
+            ));
+        }
+        let secret_root = provider.join(".provider-home/.freshell/references");
+        std::fs::create_dir_all(&secret_root).unwrap();
+        for selection in &plan[0].references.selections {
+            let id = selection.runtime_destination.rsplit('/').next().unwrap();
+            std::fs::copy(&selection.canonical_source, secret_root.join(id)).unwrap();
+        }
+        let provider_argument = |argument: &str| {
+            if let Some((option, value)) = argument.split_once('=') {
+                let path = Path::new(value);
+                if let Some(relative) = value.strip_prefix("/home/freshell/provider/") {
+                    return format!(
+                        "{option}={}",
+                        provider.join(".provider-home").join(relative).display()
+                    );
+                }
+                if let Ok(relative) = path.strip_prefix(&home) {
+                    return format!(
+                        "{option}={}",
+                        provider.join(".provider-home").join(relative).display()
+                    );
+                }
+            }
+            if let Some(relative) = argument.strip_prefix("/home/freshell/provider/") {
+                return provider
+                    .join(".provider-home")
+                    .join(relative)
+                    .to_string_lossy()
+                    .into_owned();
+            }
+            let path = Path::new(argument);
+            if let Ok(relative) = path.strip_prefix(&home) {
+                return provider
+                    .join(".provider-home")
+                    .join(relative)
+                    .to_string_lossy()
+                    .into_owned();
+            }
+            argument.to_owned()
         };
-        let arguments = vec![
-            format!("--require={}", staged(&preload).display()),
-            "--import".to_owned(),
-            staged(&imported).to_string_lossy().into_owned(),
-            format!("--loader={}", staged(&loader).display()),
-            "--experimental-loader".to_owned(),
-            staged(&experimental_loader).to_string_lossy().into_owned(),
-            format!("--env-file={}", staged(&env_file).display()),
-            "--env-file".to_owned(),
-            staged(&second_env_file).to_string_lossy().into_owned(),
-            format!(
-                "--env-file-if-exists={}",
-                staged(&optional_env_file).display()
-            ),
-            staged(&command).to_string_lossy().into_owned(),
-        ];
+        let arguments = prepared_arguments[1..]
+            .iter()
+            .map(|argument| provider_argument(argument))
+            .collect::<Vec<_>>();
         let output = execute_node_command_with_home_hidden(owned.path(), &home, &arguments);
         assert!(output.status.success(), "{:?}", output.stderr);
         assert_eq!(output.stdout, b"command options staged\n");
     }
 
     #[test]
-    fn direct_node_command_options_inside_mcp_cwd_use_the_directory_copy() {
+    fn direct_node_env_file_inside_selected_mcp_cwd_uses_a_secret_mount() {
         let owned = tempfile::tempdir().unwrap();
         let home = owned.path().join("home");
         let workspace = owned.path().join("workspace");
@@ -1522,11 +1674,12 @@ process.stdout.write(require('./helper.js'))
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(
             &command,
-            "if (globalThis.cwdPreload !== 'loaded' || process.env.MANAGED_CWD_ENV !== 'loaded') process.exit(1);\nprocess.stdout.write('cwd options loaded\\n');\n",
+            "if (globalThis.cwdPreload !== 'loaded' || !process.env.MANAGED_CWD_ENV?.startsWith('MCP_ENV_SECRET_')) process.exit(1);\nprocess.stdout.write('cwd options loaded\\n');\n",
         )
         .unwrap();
         std::fs::write(&preload, "globalThis.cwdPreload = 'loaded';\n").unwrap();
-        std::fs::write(&env_file, "MANAGED_CWD_ENV=loaded\n").unwrap();
+        let secret = b"MCP_ENV_SECRET_CWD_20ac671d\n";
+        std::fs::write(&env_file, [b"MANAGED_CWD_ENV=".as_slice(), secret].concat()).unwrap();
         let command_arguments = vec![
             "node".to_owned(),
             "--require=./preload.cjs".to_owned(),
@@ -1553,6 +1706,17 @@ process.stdout.write(require('./helper.js'))
                 covered.display()
             );
         }
+        let canonical_env_file = env_file.canonicalize().unwrap();
+        assert!(plan[0]
+            .configured_resource_exclusions
+            .contains(&canonical_env_file));
+        assert_eq!(plan[0].references.selections.len(), 1);
+        let prepared_config: serde_json::Value =
+            serde_json::from_str(plan[0].references.template.as_str()).unwrap();
+        assert_eq!(
+            prepared_config["mcp"]["direct"]["command"][2],
+            "--env-file=/home/freshell/provider/.freshell/references/0"
+        );
 
         let units = resource_units(
             &home,
@@ -1562,6 +1726,53 @@ process.stdout.write(require('./helper.js'))
             None,
         )
         .unwrap();
+        let unfiltered = tempfile::tempdir().unwrap();
+        let unfiltered_stage = unfiltered.path().join("stage");
+        copy_environment_for_mounts(
+            &[CopySelection {
+                source: canonical_cwd.clone(),
+                destination_relative: "tools".into(),
+            }],
+            &unfiltered_stage,
+            &[],
+            Default::default(),
+            &[],
+        )
+        .unwrap();
+        assert!(tree_contains_bytes(
+            &unfiltered_stage,
+            secret.strip_suffix(b"\n").unwrap()
+        ));
+        let unfiltered_host = unfiltered.path().join("host");
+        copy_environment(
+            &[CopySelection {
+                source: unfiltered_stage.join("tools"),
+                destination_relative: "tools".into(),
+            }],
+            &unfiltered_host,
+            &[],
+            Default::default(),
+        )
+        .unwrap();
+        assert!(tree_contains_bytes(
+            &unfiltered_host,
+            secret.strip_suffix(b"\n").unwrap()
+        ));
+        let unfiltered_provider = unfiltered.path().join("provider");
+        copy_environment(
+            &[CopySelection {
+                source: unfiltered_host.join("tools"),
+                destination_relative: "tools".into(),
+            }],
+            &unfiltered_provider,
+            &[],
+            Default::default(),
+        )
+        .unwrap();
+        assert!(tree_contains_bytes(
+            &unfiltered_provider,
+            secret.strip_suffix(b"\n").unwrap()
+        ));
         let cwd_mount = units
             .iter()
             .find(|(source, _)| source == &canonical_cwd)
@@ -1576,14 +1787,57 @@ process.stdout.write(require('./helper.js'))
                     .map(|relative| Path::new(".provider-home").join(relative))
             })
             .expect("test MCP cwd destination must map into the provider root");
-        let provider = copy_selected_units_through_provider(owned.path(), &units);
+        let provider = copy_selected_units_through_provider_excluding(
+            owned.path(),
+            &units,
+            &plan[0]
+                .configured_resource_exclusions
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
         let provider_cwd = provider.join(provider_relative);
         assert!(provider_cwd.is_dir(), "{}", provider_cwd.display());
+        let staged_cwd = owned
+            .path()
+            .join("stage")
+            .join(&cwd_mount.stage_relative_path);
+        assert!(
+            !staged_cwd.join(".env").exists(),
+            "the stage copy retained the selected env file: exclusions={:?}, units={:?}, stage={}",
+            plan[0].configured_resource_exclusions,
+            units,
+            staged_cwd.display()
+        );
+        let host_cwd = owned
+            .path()
+            .join("host")
+            .join(&cwd_mount.provider_relative_path);
+        assert!(
+            !host_cwd.join(".env").exists(),
+            "the host copy retained the selected env file: {}",
+            host_cwd.display()
+        );
+        assert!(
+            !provider_cwd.join(".env").exists(),
+            "the selected cwd copy must omit its env file"
+        );
+        for root in ["stage", "host", "provider"] {
+            assert!(!tree_contains_bytes(
+                &owned.path().join(root),
+                secret.strip_suffix(b"\n").unwrap()
+            ));
+        }
+        let secret_target = provider.join(".provider-home/.freshell/references/0");
+        std::fs::create_dir_all(secret_target.parent().unwrap()).unwrap();
+        std::fs::copy(&canonical_env_file, &secret_target).unwrap();
 
         let hidden_home = owned.path().join("home-hidden");
         std::fs::rename(&home, &hidden_home).unwrap();
         let output = std::process::Command::new("node")
-            .args(["--require=./preload.cjs", "--env-file=.env", "server.js"])
+            .arg("--require=./preload.cjs")
+            .arg(format!("--env-file={}", secret_target.display()))
+            .arg("server.js")
             .current_dir(&provider_cwd)
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())

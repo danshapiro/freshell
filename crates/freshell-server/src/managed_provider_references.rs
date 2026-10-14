@@ -153,6 +153,7 @@ pub(super) fn resolve_file_references_from_view(
             relocated_files: &std::collections::BTreeMap::new(),
             original_form: false,
             available_view_bytes: (64 * 1024 * 1024usize).saturating_sub(raw.len()),
+            additional_rewrites: &[],
         },
     )
 }
@@ -160,6 +161,44 @@ pub(super) struct ReferenceProjection<'a> {
     pub relocated_files: &'a std::collections::BTreeMap<PathBuf, PathBuf>,
     pub original_form: bool,
     pub available_view_bytes: usize,
+    pub additional_rewrites: &'a [(std::ops::Range<usize>, String)],
+}
+
+fn apply_source_edits(
+    raw: &str,
+    edits: &[(std::ops::Range<usize>, String)],
+) -> Result<String, &'static str> {
+    let mut edits = edits.to_vec();
+    edits.sort_by_key(|(span, _)| span.start);
+    let mut previous_end = 0;
+    let mut output_bytes = raw.len();
+    for (span, replacement) in &edits {
+        if span.start < previous_end
+            || span.start > span.end
+            || span.end > raw.len()
+            || !raw.is_char_boundary(span.start)
+            || !raw.is_char_boundary(span.end)
+        {
+            return Err("selected configuration edits overlap or exceed their source");
+        }
+        output_bytes = output_bytes
+            .checked_sub(span.len())
+            .and_then(|bytes| bytes.checked_add(replacement.len()))
+            .ok_or("source-view size overflow")?;
+        previous_end = span.end;
+    }
+    if output_bytes > 16 * 1024 * 1024 {
+        return Err("source view exceeds 16 MiB");
+    }
+    let mut output = String::with_capacity(output_bytes);
+    let mut cursor = 0;
+    for (span, replacement) in edits {
+        output.push_str(&raw[cursor..span.start]);
+        output.push_str(&replacement);
+        cursor = span.end;
+    }
+    output.push_str(&raw[cursor..]);
+    Ok(output)
 }
 pub(super) fn resolve_file_references_from_view_relocated(
     raw: &str,
@@ -400,8 +439,11 @@ pub(super) fn resolve_file_references_from_view_relocated(
                 "generated configuration name collides with an original child input",
             ));
         }
+        let recipe_source = apply_source_edits(raw, projection.additional_rewrites)
+            .map_err(|cause| fail(0, Vec::new(), cause))?;
         check_new_views(
-            raw.len()
+            recipe_source
+                .len()
                 .checked_add(generated_name.len() + 6)
                 .ok_or_else(|| fail(0, Vec::new(), "source-view size overflow"))?,
         )?;
@@ -409,7 +451,7 @@ pub(super) fn resolve_file_references_from_view_relocated(
             format!("{{env:{generated_name}}}"),
             vec![GeneratedFileRecipe {
                 generated_name,
-                unexpanded_source: raw.into(),
+                unexpanded_source: recipe_source,
                 declaring_config: origin.declaring_config.into(),
                 cwd: origin.cwd.into(),
                 original_home: origin.original_home.into(),
@@ -417,7 +459,7 @@ pub(super) fn resolve_file_references_from_view_relocated(
             }],
         )
     } else {
-        if rewritten.is_empty() {
+        if rewritten.is_empty() && projection.additional_rewrites.is_empty() {
             let source = source_view.unwrap_or_else(|| std::sync::Arc::new(raw.to_owned()));
             return Ok(ResolvedFileReferencePlan {
                 template: source.clone(),
@@ -431,25 +473,11 @@ pub(super) fn resolve_file_references_from_view_relocated(
                 native_alias_kinds,
             });
         }
-        let mut template_bytes = raw.len();
-        for (span, replacement) in &rewritten {
-            template_bytes = template_bytes
-                .checked_sub(span.len())
-                .and_then(|bytes| bytes.checked_add(replacement.len()))
-                .ok_or_else(|| fail(0, Vec::new(), "source-view size overflow"))?;
-        }
-        if template_bytes > 16 * 1024 * 1024 {
-            return Err(fail(0, Vec::new(), "source view exceeds 16 MiB"));
-        }
+        rewritten.extend(projection.additional_rewrites.iter().cloned());
+        let template =
+            apply_source_edits(raw, &rewritten).map_err(|cause| fail(0, Vec::new(), cause))?;
+        let template_bytes = template.len();
         check_new_views(template_bytes)?;
-        let mut template = String::new();
-        let mut cursor = 0;
-        for (span, replacement) in rewritten {
-            template.push_str(&raw[cursor..span.start]);
-            template.push_str(&replacement);
-            cursor = span.end;
-        }
-        template.push_str(&raw[cursor..]);
         (template, Vec::new())
     };
     let unexpanded_direct_source = (!generated || projection.original_form)
