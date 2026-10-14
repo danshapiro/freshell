@@ -345,19 +345,44 @@ describe('selected production owner registration', () => {
       try { expect((owner.runtime as any).phase2BootstrapFiles()).toEqual([]) } finally { vi.unstubAllEnvs() }
     }
   })
-  it('scrubs free FreshOpenCode credentials after explicit web overrides without enabling fixtures', () => {
+  it('preserves only the selected FreshOpenCode auth-file reference while scrubbing other credentials', () => {
     let actual!: RuntimeWebConstructOptions
+    const authFile = '/unit/opencode-auth-reference.json'
+    const environment = { FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: authFile }
     const factory = runner.createExternalManagedWebFactory({
       spec: 'test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts', mode: 'freshopencode',
-    }, {}, options => { actual = options; return {} as any })
-    const env = { OPENAI_API_KEY: 'unit-sentinel', ANTHROPIC_API_KEY: 'unit-sentinel',
-      FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: '/unit/unreadable', FRESHELL_MANAGED_CODEX_ONECLI_AUTH_FILE: '/unit/unreadable',
-      HTTPS_PROXY: 'http://unit.invalid', NODE_EXTRA_CA_CERTS: '/unit/unreadable', FRESHELL_RUNTIME_CONTROL_SOCKET: '/owned/control' }
+    }, environment, options => { actual = options; return {} as any })
+    const env = { ...environment, OPENAI_API_KEY: 'unit-sentinel', OPENCODE_API_KEY: 'unit-sentinel',
+      ANTHROPIC_API_KEY: 'unit-sentinel', GEMINI_API_KEY: 'unit-sentinel',
+      FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: '/unit/unrelated-opencode-env-reference',
+      FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: '/unit/unrelated-opencode-ca-reference',
+      FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION: 'allow',
+      FRESHELL_MANAGED_CLAUDE_ONECLI_AUTH_FILE: '/unit/unrelated-claude-reference',
+      FRESHELL_MANAGED_CODEX_ONECLI_AUTH_FILE: '/unit/unrelated-codex-reference',
+      FRESHELL_MANAGED_AMPLIFIER_ONECLI_AUTH_FILE: '/unit/unrelated-amplifier-reference',
+      HTTP_PROXY: 'http://unit.invalid', HTTPS_PROXY: 'http://unit.invalid', ALL_PROXY: 'http://unit.invalid',
+      http_proxy: 'http://unit.invalid', https_proxy: 'http://unit.invalid', all_proxy: 'http://unit.invalid',
+      NODE_EXTRA_CA_CERTS: '/unit/unrelated-extra-ca', SSL_CERT_FILE: '/unit/unrelated-ca-file',
+      SSL_CERT_DIR: '/unit/unrelated-ca-dir', FRESHELL_RUNTIME_CONTROL_SOCKET: '/owned/control' }
     factory({ repoRoot: fixtureRepoRoot, env, setupHome: async () => {} } as RuntimeWebConstructOptions)
+    expect(actual.env.FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE).toBe(authFile)
     const observed = { ...env, ...actual.env }
     stripRuntimeWebEnvironment(observed, actual)
-    expect(observed).toEqual({ FRESHELL_RUNTIME_CONTROL_SOCKET: '/owned/control' })
+    expect(observed).toEqual({ FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: authFile,
+      FRESHELL_RUNTIME_CONTROL_SOCKET: '/owned/control' })
     expect(actual.providerFreeFixture).not.toBe(true)
+  })
+  it('strips the OpenCode auth-file reference when FreshOpenCode is not the selected mode', () => {
+    let actual!: RuntimeWebConstructOptions
+    const factory = runner.createExternalManagedWebFactory({
+      spec: 'test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts', mode: 'freshclaude',
+    }, { FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: '/unit/unselected-opencode-auth-reference.json' },
+    options => { actual = options; return {} as any })
+    const env = { FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: '/unit/unselected-opencode-auth-reference.json',
+      FRESHELL_RUNTIME_CONTROL_SOCKET: '/owned/control' }
+    factory({ repoRoot: fixtureRepoRoot, env, setupHome: async () => {} } as RuntimeWebConstructOptions)
+    stripRuntimeWebEnvironment(env, actual)
+    expect(env).toEqual({ FRESHELL_RUNTIME_CONTROL_SOCKET: '/owned/control' })
   })
   describe('actual provider consumers', () => {
     beforeAll(() => {

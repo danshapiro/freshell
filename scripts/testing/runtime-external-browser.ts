@@ -2923,9 +2923,16 @@ export function createExternalManagedWebFactory(selection: ExternalBrowserSelect
   } : {}
   const spec = path.basename(selection.spec)
   const selected = qualificationSelections(selection, environment, retainedArtifacts)
+  const opencodeAuthFileKey = 'FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE'
+  const selectedFreshOpenCode = spec === 'runtime-fresh-agent-qualification-rust.spec.ts'
+    && selected.modes.length === 1 && selected.modes[0] === 'freshopencode' && !retainedArtifacts
+  const selectedFreshOpenCodeAuthFile = selectedFreshOpenCode ? environment[opencodeAuthFileKey] : undefined
+  const preserveFreshOpenCodeAuthFile = typeof selectedFreshOpenCodeAuthFile === 'string' && selectedFreshOpenCodeAuthFile.length > 0
+  if (preserveFreshOpenCodeAuthFile) preset[opencodeAuthFileKey] = selectedFreshOpenCodeAuthFile
   const freshBootstrap = new Set<string>(selected.modes.filter(mode => mode !== 'freshopencode').map(mode => mode === 'freshcodex' ? 'CODEX' : 'CLAUDE'))
   const unselectedFreshBootstrap = !retainedArtifacts && spec === 'runtime-fresh-agent-qualification-rust.spec.ts'
-    ? ['CLAUDE', 'CODEX', 'OPENCODE', 'AMPLIFIER'].filter(provider => !freshBootstrap.has(provider)).map(provider => `FRESHELL_MANAGED_${provider}_`) : []
+    ? ['CLAUDE', 'CODEX', 'OPENCODE', 'AMPLIFIER'].filter(provider => !freshBootstrap.has(provider)
+      && !(provider === 'OPENCODE' && preserveFreshOpenCodeAuthFile)).map(provider => `FRESHELL_MANAGED_${provider}_`) : []
   const claudeStartup = !retainedArtifacts && spec === 'runtime-managed-provider-qualification-rust.spec.ts'
     && selected.providers.includes('claude')
   const amplifierProfile = !retainedArtifacts && spec === 'runtime-managed-provider-qualification-rust.spec.ts'
@@ -2941,23 +2948,38 @@ export function createExternalManagedWebFactory(selection: ExternalBrowserSelect
       FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: bootstrap.environmentFile,
       FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: bootstrap.caFile })
   }
-  return options => webFactory({ ...options, env: { ...options.env, ...preset },
-    ...(unselectedFreshBootstrap.length ? { stripEnvPrefixes: [...options.stripEnvPrefixes ?? [], ...unselectedFreshBootstrap, 'OPENCODE_API_KEY'] } : {}),
-    ...(spec === 'runtime-fresh-agent-qualification-rust.spec.ts' && selected.modes.length === 1 && selected.modes[0] === 'freshopencode' && !retainedArtifacts ? { stripEnvPrefixes: [...options.stripEnvPrefixes ?? [],
-      'ANTHROPIC_', 'CLAUDE_', 'OPENAI_', 'OPENCODE_API_KEY', 'GEMINI_', 'GOOGLE_API_KEY', 'LUNAROUTE_', 'ONECLI_',
-      'FRESHELL_MANAGED_CLAUDE_', 'FRESHELL_MANAGED_CODEX_', 'FRESHELL_MANAGED_OPENCODE_', 'FRESHELL_MANAGED_AMPLIFIER_',
-      'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
-    ] } : {}),
-    ...(amplifierProfile || claudeStartup ? { setupHome: async (home: string) => {
-      await options.setupHome?.(home)
-      if (amplifierProfile) stageAmplifierQualificationProfile(amplifierProfile, home)
-      if (claudeStartup) {
-        const directory = path.join(home, '.claude')
-        await fsp.mkdir(directory, { recursive: true, mode: 0o700 })
-        await fsp.writeFile(path.join(directory, '.claude.json'), ownedClaudeStartupPreferences([options.repoRoot]), { mode: 0o600 })
+  return options => {
+    const env = { ...options.env, ...preset }
+    const stripEnvPrefixes = new Set(options.stripEnvPrefixes ?? [])
+    if (unselectedFreshBootstrap.length) {
+      for (const prefix of [...unselectedFreshBootstrap, 'OPENCODE_API_KEY']) stripEnvPrefixes.add(prefix)
+    }
+    if (selectedFreshOpenCode) {
+      if (preserveFreshOpenCodeAuthFile) {
+        for (const key of new Set([...Object.keys(environment), ...Object.keys(env)])) {
+          if (key.startsWith('FRESHELL_MANAGED_OPENCODE_') && key !== opencodeAuthFileKey) stripEnvPrefixes.add(key)
+        }
+      } else {
+        stripEnvPrefixes.add('FRESHELL_MANAGED_OPENCODE_')
       }
-    } } : {}),
-  })
+      for (const prefix of [
+        'ANTHROPIC_', 'CLAUDE_', 'OPENAI_', 'OPENCODE_API_KEY', 'GEMINI_', 'GOOGLE_API_KEY', 'LUNAROUTE_', 'ONECLI_',
+        'FRESHELL_MANAGED_CLAUDE_', 'FRESHELL_MANAGED_CODEX_', 'FRESHELL_MANAGED_AMPLIFIER_',
+        'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
+      ]) stripEnvPrefixes.add(prefix)
+    }
+    return webFactory({ ...options, env, ...(stripEnvPrefixes.size ? { stripEnvPrefixes: [...stripEnvPrefixes] } : {}),
+      ...(amplifierProfile || claudeStartup ? { setupHome: async (home: string) => {
+        await options.setupHome?.(home)
+        if (amplifierProfile) stageAmplifierQualificationProfile(amplifierProfile, home)
+        if (claudeStartup) {
+          const directory = path.join(home, '.claude')
+          await fsp.mkdir(directory, { recursive: true, mode: 0o700 })
+          await fsp.writeFile(path.join(directory, '.claude.json'), ownedClaudeStartupPreferences([options.repoRoot]), { mode: 0o600 })
+        }
+      } } : {}),
+    })
+  }
 }
 
 function selectsInterruptedOrdinaryStop(selection: ExternalBrowserSelection, environment: NodeJS.ProcessEnv): boolean {
