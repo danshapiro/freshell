@@ -3440,11 +3440,14 @@ async fn main() -> ExitCode {
     // `prepare_retention("server-shutdown")` and their records flip to
     // Retained — instead of handing them to the teardown worker.
     //
-    // Supervisor caveat (recorded, no code — reports/V6.md NA-1): the in-repo
-    // systemd unit is NOT installed today (restarts are script-driven). If it
-    // is ever adopted, its KillMode must not be `control-group` — a cgroup
-    // kill would slaughter the retained sidecars this deliberately keeps
-    // alive (`process_group(0)` detaches the pgid, not the cgroup).
+    // Supervisor caveat (SAFE-11, reports/V6.md NA-1): the shipped systemd
+    // unit (installers/systemd/freshell-rust.service) sets
+    // `KillMode=process` for exactly this reason — a cgroup kill
+    // (`control-group`, the default; `mixed` likewise) would slaughter the
+    // retained sidecars this deliberately keeps alive (`process_group(0)`
+    // detaches the pgid, not the cgroup). Keep that setting: hosts whose
+    // installed copy predates it must re-copy the unit and daemon-reload,
+    // or unit restarts still defeat retention.
     freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
         .begin_shutdown_retention();
     registry.kill_all();
