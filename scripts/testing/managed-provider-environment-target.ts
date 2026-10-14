@@ -123,8 +123,12 @@ import dependency from 'managed-direct-fixture-dependency'
 const schema = JSON.parse(fs.readFileSync(new URL('./schema.json', import.meta.url), 'utf8'))
 const [receiptPath, expectedNonce] = process.argv.slice(2)
 if (!receiptPath || !expectedNonce) process.exit(12)
+const envFileOperandRewritten = process.execArgv.some(value =>
+  /^--env-file=\/home\/freshell\/provider\/\.freshell\/references\/\d+$/.test(value))
+const envValueLoaded = process.env.FRESHELL_MANAGED_SHARED_ENV === expectedNonce
 fs.writeFileSync(receiptPath, JSON.stringify({ expectedNonce, helper: process.env.MANAGED_DIRECT_MCP_HELPER,
-  sibling, dependency, schemaNonce: schema.nonce, cwd: process.cwd(), scriptPath: process.argv[1] }))
+  sibling, dependency, schemaNonce: schema.nonce, cwd: process.cwd(), scriptPath: process.argv[1],
+  envFileOperandRewritten, envValueLoaded }))
 let buffered = ''
 process.stdin.setEncoding('utf8')
 process.stdin.on('data', chunk => {
@@ -161,7 +165,11 @@ let appendError
 try { fs.appendFileSync(${outputUrl}, '|' + expectedNonce) }
 catch (error) { appendError = error.code ?? error.message ?? String(error) }
 const output = fs.readFileSync(${outputUrl}, 'utf8')
-fs.writeFileSync(receiptPath, JSON.stringify({ expectedNonce, appendError, output, scriptPath: process.argv[1] }))
+const envFileOperandRewritten = process.execArgv.some(value =>
+  /^--env-file=\/home\/freshell\/provider\/\.freshell\/references\/\d+$/.test(value))
+const envValueLoaded = process.env.FRESHELL_MANAGED_SHARED_ENV === expectedNonce
+fs.writeFileSync(receiptPath, JSON.stringify({ expectedNonce, appendError, output, scriptPath: process.argv[1],
+  envFileOperandRewritten, envValueLoaded }))
 let buffered = ''
 process.stdin.setEncoding('utf8')
 process.stdin.on('data', chunk => {
@@ -352,6 +360,8 @@ async function configure(root: string, nonce: string, candidateSha: string, runI
   await fs.mkdir(mcpNested, { recursive: true, mode: 0o755 })
   await fs.mkdir(directMcp, { recursive: true, mode: 0o755 })
   await fs.mkdir(mcpParentDependency, { recursive: true, mode: 0o755 })
+  const sharedEnvFile = path.join(directMcp, '.env')
+  await fs.writeFile(sharedEnvFile, `FRESHELL_MANAGED_SHARED_ENV=${nonce}\n`, { mode: 0o600 })
   const directMcpDependency = path.join(directMcp, 'node_modules/managed-direct-fixture-dependency')
   await fs.mkdir(directMcpDependency, { recursive: true, mode: 0o755 })
   await fs.mkdir(path.join(xdg, 'opencode'), { recursive: true, mode: 0o755 })
@@ -394,7 +404,7 @@ export default {id:'managed-environment-tui',async tui(api,options){
   await fs.writeFile(path.join(mcpPackage, 'server.mjs'), managedMcpServerSource)
   const directCommand = path.join(directMcp, 'start')
   await fs.writeFile(directCommand,
-    '#!/bin/sh\nSCRIPT_DIR=$(dirname "$0")\n. "$SCRIPT_DIR/helper.sh"\nexec node "$SCRIPT_DIR/server.mjs" "$@"\n',
+    '#!/bin/sh\ncd "$(dirname "$0")"\nSCRIPT_DIR=$(dirname "$0")\n. "$SCRIPT_DIR/helper.sh"\nexec node --env-file=.env "$SCRIPT_DIR/server.mjs" "$@"\n',
     { mode: 0o751 })
   await fs.chmod(directCommand, 0o751)
   await fs.writeFile(path.join(directMcp, 'helper.sh'),
@@ -446,7 +456,7 @@ export default {id:'managed-environment-tui',async tui(api,options){
         },
         direct_home_append_fixture: {
           type: 'local',
-          command: ['node', homeAppend.script, homeAppend.receipt, nonce],
+          command: ['node', `--env-file=${sharedEnvFile}`, homeAppend.script, homeAppend.receipt, nonce],
           enabled: true,
         },
       },
@@ -1362,12 +1372,16 @@ export async function runManagedEnvironmentTarget() {
     assert.equal(preflightDirectMcp.sibling, nonce)
     assert.equal(preflightDirectMcp.dependency, nonce)
     assert.equal(preflightDirectMcp.schemaNonce, nonce)
+    assert.equal(preflightDirectMcp.envFileOperandRewritten, true)
+    assert.equal(preflightDirectMcp.envValueLoaded, true)
     assert(preflightDirectMcp.scriptPath.endsWith('/direct-mcp/server.mjs'))
     const preflightHomeAppend = await poll('OpenCode starts the direct HOME MCP and it appends its sibling output', async () =>
       readJson(path.join(selected.workspace, 'preflight/.managed-fixture/direct-home-mcp-receipt.json')))
     assert.equal(preflightHomeAppend.expectedNonce, nonce)
     assert.equal(preflightHomeAppend.appendError, undefined, 'the staged HOME-level append target must be writable')
     assert.equal(preflightHomeAppend.output, `initial-${nonce}|${nonce}`)
+    assert.equal(preflightHomeAppend.envFileOperandRewritten, true)
+    assert.equal(preflightHomeAppend.envValueLoaded, true)
     assert(preflightHomeAppend.scriptPath.endsWith('/direct-home-preflight.mjs'))
     const preflightView = await poll('genuine managed preflight native identity', () =>
       observeManagedEnvironmentNativeIdentity(rig!, created.terminalId, preflightChild.nativeSessionId))
@@ -1517,12 +1531,16 @@ export async function runManagedEnvironmentTarget() {
           assert.equal(directMcpServer.sibling, nonce)
           assert.equal(directMcpServer.dependency, nonce)
           assert.equal(directMcpServer.schemaNonce, nonce)
+          assert.equal(directMcpServer.envFileOperandRewritten, true)
+          assert.equal(directMcpServer.envValueLoaded, true)
           assert(directMcpServer.scriptPath.endsWith('/direct-mcp/server.mjs'))
           const directHomeAppendMcp = await poll('Cloud OpenCode appends through its direct HOME MCP', async () =>
             readJson(path.join(cwd, '.managed-fixture/direct-home-mcp-receipt.json')))
           assert.equal(directHomeAppendMcp.expectedNonce, nonce)
           assert.equal(directHomeAppendMcp.appendError, undefined, 'the managed HOME sibling mount must permit append')
           assert.equal(directHomeAppendMcp.output, `initial-${nonce}|${nonce}`)
+          assert.equal(directHomeAppendMcp.envFileOperandRewritten, true)
+          assert.equal(directHomeAppendMcp.envValueLoaded, true)
           assert(directHomeAppendMcp.scriptPath.endsWith('/direct-home-healthy.mjs'))
           const stage = await stageProof(rig!, view, nonce)
           const receipt = { ...fixture, terminalId: view.terminalId, soulId: view.soulId, incarnationId: view.incarnationId,

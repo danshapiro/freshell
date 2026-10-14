@@ -314,9 +314,18 @@ pub struct PlannedSourceOccurrence {
     pub configured_writable_resources: std::collections::BTreeSet<PathBuf>,
     /// Selected Node env-file aliases excluded from ordinary resource copies.
     pub configured_resource_exclusions: std::collections::BTreeSet<PathBuf>,
+    /// Shell wrapper Node env-file operands rewritten in their staged copies.
+    pub configured_resource_edits: Vec<ConfiguredResourceEdit>,
     /// Captured with the retained source view so later staging does not
     /// reinterpret a generated entry after ordinary-terminal cleanup.
     pub user_owns_freshell_mcp: bool,
+}
+
+pub struct ConfiguredResourceEdit {
+    pub source: PathBuf,
+    pub span: std::ops::Range<usize>,
+    pub expected: String,
+    pub replacement: String,
 }
 
 #[derive(Default)]
@@ -657,12 +666,30 @@ pub fn plan_loaded_opencode_sources_relocated(
             cause: error.cause,
         })?;
         let mut node_env_file_edits = Vec::with_capacity(selected_resources.node_env_files.len());
+        let mut configured_resource_edits = Vec::new();
         for env_file in &selected_resources.node_env_files {
             let destination = allocate(&env_file.canonical_source).map_err(fail)?;
-            let replacement = format!("{}{destination}", env_file.option_prefix);
-            let replacement = serde_json::to_string(&replacement)
-                .map_err(|_| fail("selected Node env-file path could not be encoded"))?;
-            node_env_file_edits.push((env_file.argument_span.clone(), replacement));
+            match &env_file.rewrite {
+                super::opencode_resources::NodeEnvFileRewrite::ConfigArgument {
+                    argument_span,
+                    option_prefix,
+                } => {
+                    let replacement = format!("{option_prefix}{destination}");
+                    let replacement = serde_json::to_string(&replacement)
+                        .map_err(|_| fail("selected Node env-file path could not be encoded"))?;
+                    node_env_file_edits.push((argument_span.clone(), replacement));
+                }
+                super::opencode_resources::NodeEnvFileRewrite::ShellScriptArgument {
+                    script_source,
+                    argument_span,
+                    expected_operand,
+                } => configured_resource_edits.push(ConfiguredResourceEdit {
+                    source: script_source.clone(),
+                    span: argument_span.clone(),
+                    expected: expected_operand.clone(),
+                    replacement: destination,
+                }),
+            }
         }
         let references = super::resolve_file_references_from_view_relocated(
             &loaded.view,
@@ -773,6 +800,7 @@ pub fn plan_loaded_opencode_sources_relocated(
             configured_resources: selected_resources.resources,
             configured_writable_resources: selected_resources.writable_resources,
             configured_resource_exclusions,
+            configured_resource_edits,
             user_owns_freshell_mcp,
         };
         planned

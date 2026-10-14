@@ -236,8 +236,10 @@ test(healthyTitle, async ({ page }, info) => {
     return directMcpReceipt
   }, { timeout: 120_000 }).toMatchObject({ expectedNonce: fixture.expectedNonce, helper: fixture.expectedNonce, cwd: pane.cwd })
   expect(directMcpReceipt).toMatchObject({ sibling: fixture.expectedNonce,
-    dependency: fixture.expectedNonce, schemaNonce: fixture.expectedNonce })
+    dependency: fixture.expectedNonce, schemaNonce: fixture.expectedNonce,
+    envFileOperandRewritten: true, envValueLoaded: true })
   expect(directMcpReceipt.scriptPath).toMatch(/\/direct-mcp\/server\.mjs$/)
+  expect(receipt.directHomeAppendMcp).toMatchObject({ envFileOperandRewritten: true, envValueLoaded: true })
   expect(receipt.soulId).toBeTruthy()
   expect(receipt.incarnationId).toBeTruthy()
   expect(receipt.nativeSessionId).toBeTruthy()

@@ -1673,6 +1673,7 @@ fn stage_provider_root(
         let mut _filtered_resource_sources = None;
         let mut retained_resource_sources = None;
         let mut mounted_resource_file_roots = Vec::new();
+        let mut configured_resource_edits = Vec::new();
         if let Some(plan) = opencode_input.source_plan {
             // Indexed payloads remain exclusively in the private input volume,
             // even when an ordinary package scope also contains their files.
@@ -1752,6 +1753,7 @@ fn stage_provider_root(
                 )?;
                 _filtered_resource_sources = Some(scratch);
             }
+            configured_resource_edits = source_stage::configured_resource_edits(&units, plan)?;
             selections.extend(source_stage::resource_copy_selections(&units)?);
             let descriptors = units
                 .into_iter()
@@ -2160,6 +2162,7 @@ fn stage_provider_root(
             bytes = report.bytes,
             elapsed_ms = started.elapsed().as_millis() as u64
         );
+        source_stage::apply_configured_resource_edits(&temporary, &configured_resource_edits)?;
         if let Some(resources) = amplifier_resources {
             if let Some(settings) = resources.rewritten_settings {
                 let relative = if let Some(prepared) = &ordinary_resources {

@@ -776,18 +776,52 @@ fn shell_executable_name(token: &str) -> String {
 struct ShellNodeInvocation {
     script_operand: Option<String>,
     file_operands: Vec<(String, bool)>,
+    env_file_operands: Vec<(String, std::ops::Range<usize>, bool)>,
+}
+
+fn shell_argument_span(
+    line: &str,
+    span: std::ops::Range<usize>,
+) -> (String, std::ops::Range<usize>) {
+    let bytes = line.as_bytes();
+    let mut start = span.start;
+    let mut end = span.end;
+    while start < end && matches!(bytes[start], b'"' | b'\'') {
+        start += 1;
+    }
+    while start < end && matches!(bytes[end - 1], b'"' | b'\'') {
+        end -= 1;
+    }
+    while start < end && matches!(bytes[end - 1], b';' | b'&') {
+        end -= 1;
+    }
+    while start < end && matches!(bytes[start], b'"' | b'\'') {
+        start += 1;
+    }
+    while start < end && matches!(bytes[end - 1], b'"' | b'\'') {
+        end -= 1;
+    }
+    (line[start..end].to_owned(), start..end)
 }
 
 fn shell_node_invocation(line: &str) -> Option<ShellNodeInvocation> {
-    let words = line
-        .split_ascii_whitespace()
-        .map(|word| word.trim_matches(['"', '\'']))
+    let mut word_spans = Vec::new();
+    let mut offset = 0;
+    for word in line.split_ascii_whitespace() {
+        let start = line[offset..].find(word)? + offset;
+        let span = start..start + word.len();
+        offset = span.end;
+        word_spans.push(span);
+    }
+    let words = word_spans
+        .iter()
+        .map(|span| line[span.clone()].trim_matches(['"', '\'']))
         .collect::<Vec<_>>();
     let node_index = words
         .iter()
         .position(|word| matches!(shell_executable_name(word).as_str(), "node" | "nodejs"))?;
     let mut index = node_index + 1;
-    const NODE_OPTIONS_WITH_VALUE: [&str; 8] = [
+    const NODE_OPTIONS_WITH_VALUE: [&str; 9] = [
         "-r",
         "--require",
         "--import",
@@ -795,6 +829,7 @@ fn shell_node_invocation(line: &str) -> Option<ShellNodeInvocation> {
         "--experimental-loader",
         "--conditions",
         "--env-file",
+        "--env-file-if-exists",
         "--inspect-port",
     ];
     const NODE_SCRIPT_FILE_OPTIONS: [&str; 5] = [
@@ -805,6 +840,7 @@ fn shell_node_invocation(line: &str) -> Option<ShellNodeInvocation> {
         "--experimental-loader",
     ];
     let mut file_operands = Vec::new();
+    let mut env_file_operands = Vec::new();
     while let Some(argument) = words.get(index) {
         if *argument == "--" {
             index += 1;
@@ -814,18 +850,39 @@ fn shell_node_invocation(line: &str) -> Option<ShellNodeInvocation> {
             .split_once('=')
             .map_or((*argument, None), |(option, value)| (option, Some(value)));
         if NODE_OPTIONS_WITH_VALUE.contains(&option) {
-            let value = inline_value.or_else(|| words.get(index + 1).copied());
-            if let Some(value) = value {
-                let value = value.trim_end_matches([';', '&']);
-                let is_script = NODE_SCRIPT_FILE_OPTIONS.contains(&option);
-                let is_path = (option == "--env-file" && !value.starts_with('-'))
-                    || Path::new(value).is_absolute()
-                    || value.starts_with("./")
-                    || value.starts_with("../")
-                    || value.contains(['$', '*', '?']);
-                if is_path && (is_script || option == "--env-file") {
-                    file_operands.push((value.to_owned(), is_script));
-                }
+            let operand_index = if inline_value.is_some() {
+                index
+            } else {
+                index + 1
+            };
+            let raw_span = word_spans.get(operand_index)?.clone();
+            let operand_span = if inline_value.is_some() {
+                let equals = line[raw_span.clone()].find('=')? + raw_span.start + 1;
+                equals..raw_span.end
+            } else {
+                raw_span
+            };
+            let (raw_value, value_span) = shell_argument_span(line, operand_span);
+            let value = if raw_value.is_empty() {
+                inline_value
+                    .or_else(|| words.get(index + 1).copied())?
+                    .trim_matches(['"', '\''])
+                    .to_owned()
+            } else {
+                raw_value
+            };
+            let is_script = NODE_SCRIPT_FILE_OPTIONS.contains(&option);
+            let is_env_file = matches!(option, "--env-file" | "--env-file-if-exists");
+            let is_path = (is_env_file && !value.starts_with('-'))
+                || Path::new(&value).is_absolute()
+                || value.starts_with("./")
+                || value.starts_with("../")
+                || value.contains(['$', '*', '?']);
+            if is_path && is_script {
+                file_operands.push((value.clone(), is_script));
+            }
+            if is_env_file && is_path {
+                env_file_operands.push((value, value_span, option == "--env-file-if-exists"));
             }
             index += if inline_value.is_some() { 1 } else { 2 };
             continue;
@@ -849,6 +906,7 @@ fn shell_node_invocation(line: &str) -> Option<ShellNodeInvocation> {
     Some(ShellNodeInvocation {
         script_operand,
         file_operands,
+        env_file_operands,
     })
 }
 
@@ -1328,11 +1386,222 @@ fn javascript_tokens(source: &str) -> Result<Vec<JavaScriptToken>, &'static str>
     javascript_tokens_inner(source, 0, false, 0, &mut token_count).map(|(tokens, _)| tokens)
 }
 
-fn node_relative_module_specifiers(source: &str) -> Result<Vec<String>, &'static str> {
-    let tokens = javascript_tokens(source)?;
+fn javascript_deferred_function_tokens(
+    tokens: &[JavaScriptToken],
+    matching_braces: &[Option<usize>],
+) -> std::collections::BTreeSet<usize> {
+    let mut matching_parentheses = vec![None; tokens.len()];
+    let mut opening_parentheses = vec![None; tokens.len()];
+    let mut open_parentheses = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            JavaScriptToken::Punctuation(b'(') => open_parentheses.push(index),
+            JavaScriptToken::Punctuation(b')') => {
+                if let Some(open) = open_parentheses.pop() {
+                    matching_parentheses[open] = Some(index);
+                    opening_parentheses[index] = Some(open);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let immediately_invoked_group = |function_start: usize, body_end: usize| {
+        matches!(
+            tokens.get(body_end + 1),
+            Some(JavaScriptToken::Punctuation(b')'))
+        ) && opening_parentheses
+            .get(body_end + 1)
+            .and_then(|open| *open)
+            .is_some_and(|open| {
+                open < function_start
+                    && matches!(
+                        tokens.get(body_end + 2),
+                        Some(JavaScriptToken::Punctuation(b'('))
+                    )
+            })
+    };
+
+    let mut deferred_ranges = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if matches!(token, JavaScriptToken::Identifier(name) if name == "function") {
+            let mut cursor = index + 1;
+            if matches!(tokens.get(cursor), Some(JavaScriptToken::Punctuation(b'*'))) {
+                cursor += 1;
+            }
+            if matches!(tokens.get(cursor), Some(JavaScriptToken::Identifier(_))) {
+                cursor += 1;
+            }
+            if matches!(tokens.get(cursor), Some(JavaScriptToken::Punctuation(b'('))) {
+                if let Some(parameters_end) = matching_parentheses[cursor] {
+                    let body = parameters_end + 1;
+                    if matches!(tokens.get(body), Some(JavaScriptToken::Punctuation(b'{'))) {
+                        if let Some(body_end) = matching_braces[body] {
+                            if !immediately_invoked_group(index, body_end) {
+                                deferred_ranges.push(body + 1..body_end);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if matches!(
+            (token, tokens.get(index + 1)),
+            (
+                JavaScriptToken::Punctuation(b'='),
+                Some(JavaScriptToken::Punctuation(b'>'))
+            )
+        ) {
+            let body = index + 2;
+            if matches!(tokens.get(body), Some(JavaScriptToken::Punctuation(b'{'))) {
+                if let Some(body_end) = matching_braces[body] {
+                    if !immediately_invoked_group(index, body_end) {
+                        deferred_ranges.push(body + 1..body_end);
+                    }
+                }
+            } else {
+                let (mut parentheses, mut brackets, mut braces) = (0usize, 0usize, 0usize);
+                let mut end = body;
+                while end < tokens.len() {
+                    match tokens.get(end) {
+                        Some(JavaScriptToken::Punctuation(b'(')) => parentheses += 1,
+                        Some(JavaScriptToken::Punctuation(b')')) if parentheses == 0 => break,
+                        Some(JavaScriptToken::Punctuation(b')')) => parentheses -= 1,
+                        Some(JavaScriptToken::Punctuation(b'[')) => brackets += 1,
+                        Some(JavaScriptToken::Punctuation(b']')) if brackets == 0 => break,
+                        Some(JavaScriptToken::Punctuation(b']')) => brackets -= 1,
+                        Some(JavaScriptToken::Punctuation(b'{')) => braces += 1,
+                        Some(JavaScriptToken::Punctuation(b'}')) if braces == 0 => break,
+                        Some(JavaScriptToken::Punctuation(b'}')) => braces -= 1,
+                        Some(JavaScriptToken::Punctuation(b';' | b','))
+                            if parentheses == 0 && brackets == 0 && braces == 0 =>
+                        {
+                            break
+                        }
+                        _ => {}
+                    }
+                    end += 1;
+                }
+                let immediately_invoked =
+                    matches!(tokens.get(end), Some(JavaScriptToken::Punctuation(b')')))
+                        && opening_parentheses
+                            .get(end)
+                            .and_then(|open| *open)
+                            .is_some_and(|open| {
+                                open < index
+                                    && matches!(
+                                        tokens.get(end + 1),
+                                        Some(JavaScriptToken::Punctuation(b'('))
+                                    )
+                            });
+                if !immediately_invoked {
+                    deferred_ranges.push(body..end);
+                }
+            }
+        }
+
+        if matches!(token, JavaScriptToken::Punctuation(b')'))
+            && matches!(
+                tokens.get(index + 1),
+                Some(JavaScriptToken::Punctuation(b'{'))
+            )
+        {
+            let Some(open) = opening_parentheses[index] else {
+                continue;
+            };
+            let is_control_body = matches!(
+                tokens.get(open.wrapping_sub(1)),
+                Some(JavaScriptToken::Identifier(keyword))
+                    if matches!(keyword.as_str(), "if" | "for" | "while" | "switch" | "catch" | "with")
+            );
+            if !is_control_body {
+                if let Some(body_end) = matching_braces[index + 1] {
+                    deferred_ranges.push(index + 2..body_end);
+                }
+            }
+        }
+    }
+    deferred_ranges.into_iter().flatten().collect()
+}
+
+fn javascript_try_catch_bodies(tokens: &[JavaScriptToken]) -> std::collections::BTreeSet<usize> {
+    let mut matching_braces = vec![None; tokens.len()];
+    let mut open_braces = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            JavaScriptToken::Punctuation(b'{') => open_braces.push(index),
+            JavaScriptToken::Punctuation(b'}') => {
+                if let Some(open) = open_braces.pop() {
+                    matching_braces[open] = Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+
     let mut result = std::collections::BTreeSet::new();
     for (index, token) in tokens.iter().enumerate() {
-        let module = match token {
+        if !matches!(token, JavaScriptToken::Identifier(keyword) if keyword == "try")
+            || !matches!(
+                tokens.get(index + 1),
+                Some(JavaScriptToken::Punctuation(b'{'))
+            )
+        {
+            continue;
+        }
+        let Some(body_end) = matching_braces[index + 1] else {
+            continue;
+        };
+        if !matches!(tokens.get(body_end + 1), Some(JavaScriptToken::Identifier(keyword)) if keyword == "catch")
+        {
+            continue;
+        }
+        let mut catch_body = body_end + 2;
+        if matches!(
+            tokens.get(catch_body),
+            Some(JavaScriptToken::Punctuation(b'('))
+        ) {
+            let mut depth = 0usize;
+            while catch_body < tokens.len() {
+                match tokens.get(catch_body) {
+                    Some(JavaScriptToken::Punctuation(b'(')) => depth += 1,
+                    Some(JavaScriptToken::Punctuation(b')')) => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            catch_body += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                catch_body += 1;
+            }
+        }
+        if matches!(
+            tokens.get(catch_body),
+            Some(JavaScriptToken::Punctuation(b'{'))
+        ) && matching_braces[catch_body].is_some()
+        {
+            result.extend(index + 2..body_end);
+        }
+    }
+    let deferred_function_tokens = javascript_deferred_function_tokens(tokens, &matching_braces);
+    result.retain(|index| !deferred_function_tokens.contains(index));
+    result
+}
+
+struct NodeModuleSpecifier {
+    value: String,
+    missing_is_optional: bool,
+}
+
+fn node_relative_module_specifiers(source: &str) -> Result<Vec<NodeModuleSpecifier>, &'static str> {
+    let tokens = javascript_tokens(source)?;
+    let optional_try_tokens = javascript_try_catch_bodies(&tokens);
+    let mut result = std::collections::BTreeMap::<String, bool>::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let (module, require_resolve) = match token {
             JavaScriptToken::Identifier(name) if name == "require" || name == "import" => {
                 let require_resolve = name == "require"
                     && matches!(
@@ -1348,27 +1617,40 @@ fn node_relative_module_specifiers(source: &str) -> Result<Vec<String>, &'static
                         Some(JavaScriptToken::Punctuation(b'('))
                     );
                 if require_resolve {
-                    tokens.get(index + 4)
+                    (tokens.get(index + 4), true)
                 } else {
-                    match tokens.get(index + 1) {
-                        Some(JavaScriptToken::Punctuation(b'(')) => tokens.get(index + 2),
-                        Some(JavaScriptToken::String(_)) if name == "import" => {
-                            tokens.get(index + 1)
-                        }
-                        _ => None,
-                    }
+                    (
+                        match tokens.get(index + 1) {
+                            Some(JavaScriptToken::Punctuation(b'(')) => tokens.get(index + 2),
+                            Some(JavaScriptToken::String(_)) if name == "import" => {
+                                tokens.get(index + 1)
+                            }
+                            _ => None,
+                        },
+                        false,
+                    )
                 }
             }
-            JavaScriptToken::Identifier(name) if name == "from" => tokens.get(index + 1),
-            _ => None,
+            JavaScriptToken::Identifier(name) if name == "from" => (tokens.get(index + 1), false),
+            _ => (None, false),
         };
         if let Some(JavaScriptToken::String(Some(specifier))) = module {
             if specifier.starts_with("./") || specifier.starts_with("../") {
-                result.insert(specifier.clone());
+                let missing_is_optional = require_resolve && optional_try_tokens.contains(&index);
+                result
+                    .entry(specifier.clone())
+                    .and_modify(|prior| *prior &= missing_is_optional)
+                    .or_insert(missing_is_optional);
             }
         }
     }
-    Ok(result.into_iter().collect())
+    Ok(result
+        .into_iter()
+        .map(|(value, missing_is_optional)| NodeModuleSpecifier {
+            value,
+            missing_is_optional,
+        })
+        .collect())
 }
 
 fn node_relative_resource_specifiers(
@@ -2528,6 +2810,18 @@ struct DirectScriptResources<'a> {
     writable_files: &'a mut std::collections::BTreeSet<PathBuf>,
 }
 
+struct ShellScriptSelection<'a> {
+    default_working_directory: &'a Path,
+    covered_directory: Option<&'a Path>,
+}
+
+struct ShellScriptResources<'a> {
+    paths: &'a mut std::collections::BTreeSet<PathBuf>,
+    path_bytes: &'a mut usize,
+    writable_resources: &'a mut std::collections::BTreeSet<PathBuf>,
+    node_env_files: &'a mut Vec<NodeEnvFileSelection>,
+}
+
 fn direct_script_dependency_paths(
     parent: &Path,
     entry_point_import_root: &Path,
@@ -2550,8 +2844,13 @@ fn direct_script_dependency_paths(
                         .or_insert((parse_as_script, writable));
                 };
                 for specifier in node_relative_module_specifiers(source)? {
-                    let files = resolve_node_relative_module(parent, &specifier)?
-                        .ok_or("direct MCP Node relative module is missing")?;
+                    let Some(files) = resolve_node_relative_module(parent, &specifier.value)?
+                    else {
+                        if specifier.missing_is_optional {
+                            continue;
+                        }
+                        return Err("direct MCP Node relative module is missing");
+                    };
                     for file in files {
                         record(file, true, false);
                     }
@@ -2751,9 +3050,8 @@ fn insert_shell_script_dependencies(
     script: &Path,
     scope: &Path,
     declaring: &Path,
-    result: &mut std::collections::BTreeSet<PathBuf>,
-    resource_path_bytes: &mut usize,
-    writable_resources: &mut std::collections::BTreeSet<PathBuf>,
+    selection: ShellScriptSelection<'_>,
+    resources: ShellScriptResources<'_>,
     field: &'static str,
 ) -> Result<(), ResourceError> {
     const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
@@ -2799,21 +3097,31 @@ fn insert_shell_script_dependencies(
         let script_parent = canonical
             .parent()
             .ok_or_else(|| fail("direct MCP shell script has no containing directory"))?;
-        let mut working_directory_is_script_parent = false;
-        for line in source
-            .lines()
-            .filter(|line| !line.trim_start().starts_with('#'))
-        {
+        let mut working_directory = Some(selection.default_working_directory.to_owned());
+        let mut source_offset = 0usize;
+        for full_line in source.split_inclusive('\n') {
+            let line = full_line
+                .strip_suffix('\n')
+                .unwrap_or(full_line)
+                .strip_suffix('\r')
+                .unwrap_or(full_line.strip_suffix('\n').unwrap_or(full_line));
+            if line.trim_start().starts_with('#') {
+                source_offset += full_line.len();
+                continue;
+            }
             let node_line = if let Some(remainder) = shell_changes_to_script_directory(line) {
-                working_directory_is_script_parent = true;
+                working_directory = Some(script_parent.to_owned());
                 remainder
             } else {
                 if line.trim_start().starts_with("cd ") {
-                    working_directory_is_script_parent = false;
+                    working_directory = None;
                 }
                 line
             };
+            let node_line_offset = source_offset + line.len().saturating_sub(node_line.len());
             let mut candidates = std::collections::BTreeMap::new();
+            let mut env_file_candidates =
+                std::collections::BTreeMap::<PathBuf, Vec<(String, std::ops::Range<usize>)>>::new();
             if let Some(operand) = shell_source_operand(line) {
                 if let Some(candidate) =
                     shell_source_path(script_parent, &operand, &directory_variables)
@@ -2835,15 +3143,53 @@ fn insert_shell_script_dependencies(
                     .and_modify(|kind: &mut (bool, bool)| kind.1 |= parse_as_node_script)
                     .or_insert((false, parse_as_node_script));
             }
-            if working_directory_is_script_parent && invokes_node {
+            if invokes_node {
                 if let Some(invocation) = node_invocation {
-                    if let Some(relative) = invocation.script_operand {
-                        candidates
-                            .entry(script_parent.join(relative))
-                            .and_modify(|kind: &mut (bool, bool)| kind.1 = true)
-                            .or_insert((false, true));
+                    let ShellNodeInvocation {
+                        script_operand,
+                        file_operands,
+                        env_file_operands,
+                    } = invocation;
+                    if let Some(relative) = script_operand {
+                        let path = Path::new(&relative);
+                        let candidate = if path.is_absolute() {
+                            Some(path.to_owned())
+                        } else {
+                            working_directory
+                                .as_deref()
+                                .map(|directory| directory.join(path))
+                        };
+                        if let Some(candidate) = candidate {
+                            candidates
+                                .entry(candidate)
+                                .and_modify(|kind: &mut (bool, bool)| kind.1 = true)
+                                .or_insert((false, true));
+                        }
                     }
-                    for (operand, parse_as_node_script) in invocation.file_operands {
+                    for (operand, parse_as_node_script) in file_operands {
+                        if operand.contains(['$', '*', '?']) {
+                            return Err(fail(
+                                "direct MCP Node option has an unresolved dynamic file path",
+                            ));
+                        }
+                        let path = Path::new(&operand);
+                        let candidate = if path.is_absolute() {
+                            Some(path.to_owned())
+                        } else {
+                            working_directory
+                                .as_deref()
+                                .map(|directory| directory.join(path))
+                        };
+                        if let Some(candidate) = candidate {
+                            candidates
+                                .entry(candidate)
+                                .and_modify(|kind: &mut (bool, bool)| {
+                                    kind.1 |= parse_as_node_script
+                                })
+                                .or_insert((false, parse_as_node_script));
+                        }
+                    }
+                    for (operand, argument_span, optional) in env_file_operands {
                         if operand.contains(['$', '*', '?']) {
                             return Err(fail(
                                 "direct MCP Node option has an unresolved dynamic file path",
@@ -2853,12 +3199,27 @@ fn insert_shell_script_dependencies(
                         let candidate = if path.is_absolute() {
                             path.to_owned()
                         } else {
-                            script_parent.join(path)
+                            working_directory
+                                .as_deref()
+                                .ok_or_else(|| {
+                                    fail("direct MCP Node env-file has an unresolved working directory")
+                                })?
+                                .join(path)
                         };
-                        candidates
-                            .entry(candidate)
-                            .and_modify(|kind: &mut (bool, bool)| kind.1 |= parse_as_node_script)
-                            .or_insert((false, parse_as_node_script));
+                        if optional
+                            && std::fs::symlink_metadata(&candidate)
+                                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                        {
+                            continue;
+                        }
+                        env_file_candidates
+                            .entry(candidate.clone())
+                            .or_default()
+                            .push((
+                                operand,
+                                node_line_offset + argument_span.start
+                                    ..node_line_offset + argument_span.end,
+                            ));
                     }
                 }
             }
@@ -2872,37 +3233,69 @@ fn insert_shell_script_dependencies(
                         "direct MCP shell source escapes its selected script scope",
                     ));
                 }
-                insert_resource(
-                    result,
-                    resource_path_bytes,
-                    dependency.clone(),
-                    field,
-                    declaring,
-                )?;
+                if !selection
+                    .covered_directory
+                    .is_some_and(|directory| dependency.starts_with(directory))
+                {
+                    insert_resource(
+                        resources.paths,
+                        resources.path_bytes,
+                        dependency.clone(),
+                        field,
+                        declaring,
+                    )?;
+                }
                 if parse_as_node_script {
-                    insert_installed_package_ancestor_resources(
+                    insert_installed_package_ancestor_resources_covered(
                         &dependency,
                         scope,
                         declaring,
-                        result,
-                        resource_path_bytes,
+                        resources.paths,
+                        resources.path_bytes,
                         field,
+                        selection.covered_directory,
                     )?;
-                    insert_direct_script_dependencies(
+                    insert_direct_script_dependencies_covered(
                         &dependency,
                         scope,
                         declaring,
                         DirectScriptResources {
-                            paths: result,
-                            path_bytes: resource_path_bytes,
-                            writable_files: writable_resources,
+                            paths: &mut *resources.paths,
+                            path_bytes: &mut *resources.path_bytes,
+                            writable_files: &mut *resources.writable_resources,
                         },
                         field,
-                        ScriptDependencyRuntime::Node,
+                        ScriptDependencySelection {
+                            runtime: ScriptDependencyRuntime::Node,
+                            covered_directory: selection.covered_directory,
+                        },
                     )?;
                 }
                 pending.push((dependency, parse_as_script));
             }
+            for (candidate, arguments) in env_file_candidates {
+                let dependency = checked(&candidate, field, declaring)?;
+                if !dependency.is_file() {
+                    return Err(fail("direct MCP Node env file is not a regular file"));
+                }
+                if !dependency.starts_with(scope) {
+                    return Err(fail(
+                        "direct MCP Node env file escapes its selected script scope",
+                    ));
+                }
+                for (expected_operand, argument_span) in arguments {
+                    resources.node_env_files.push(NodeEnvFileSelection {
+                        canonical_source: dependency.clone(),
+                        selected_alias: candidate.clone(),
+                        rewrite: NodeEnvFileRewrite::ShellScriptArgument {
+                            script_source: canonical.clone(),
+                            argument_span,
+                            expected_operand,
+                        },
+                    });
+                }
+            }
+            source_offset += full_line.len();
         }
     }
     Ok(())
@@ -3138,11 +3531,22 @@ pub(super) struct ResourceSelection {
     pub node_env_files: Vec<NodeEnvFileSelection>,
 }
 
+pub(super) enum NodeEnvFileRewrite {
+    ConfigArgument {
+        argument_span: std::ops::Range<usize>,
+        option_prefix: String,
+    },
+    ShellScriptArgument {
+        script_source: PathBuf,
+        argument_span: std::ops::Range<usize>,
+        expected_operand: String,
+    },
+}
+
 pub(super) struct NodeEnvFileSelection {
     pub canonical_source: PathBuf,
     pub selected_alias: PathBuf,
-    pub argument_span: std::ops::Range<usize>,
-    pub option_prefix: String,
+    pub rewrite: NodeEnvFileRewrite,
 }
 fn checked(path: &Path, field: &'static str, _source: &Path) -> Result<PathBuf, ResourceError> {
     let fail = |cause| ResourceError { field, cause };
@@ -3585,8 +3989,10 @@ pub(super) fn select(
                 node_env_files.push(NodeEnvFileSelection {
                     canonical_source: canonical,
                     selected_alias: path,
-                    argument_span: argument.raw_span,
-                    option_prefix: argument.option_prefix,
+                    rewrite: NodeEnvFileRewrite::ConfigArgument {
+                        argument_span: argument.raw_span,
+                        option_prefix: argument.option_prefix,
+                    },
                 });
                 continue;
             }
@@ -3697,6 +4103,30 @@ pub(super) fn select(
                 .as_ref()
                 .is_some_and(|working_dir| canonical.starts_with(working_dir))
             {
+                if is_shell_script(&canonical) {
+                    let command_parent = canonical
+                        .parent()
+                        .ok_or_else(|| fail(field, "command has no containing scope"))?;
+                    let dependency_scope = direct_script_dependency_scope(command_parent, home);
+                    let working_directory =
+                        current_mcp_working_dir.as_deref().unwrap_or(instance_cwd);
+                    insert_shell_script_dependencies(
+                        &canonical,
+                        &dependency_scope,
+                        declaring,
+                        ShellScriptSelection {
+                            default_working_directory: working_directory,
+                            covered_directory: current_mcp_working_dir.as_deref(),
+                        },
+                        ShellScriptResources {
+                            paths: &mut result,
+                            path_bytes: &mut resource_path_bytes,
+                            writable_resources: &mut writable_resources,
+                            node_env_files: &mut node_env_files,
+                        },
+                        field,
+                    )?;
+                }
                 continue;
             }
             let command_parent = canonical
@@ -3822,9 +4252,18 @@ pub(super) fn select(
                         &canonical,
                         &dependency_scope,
                         declaring,
-                        &mut result,
-                        &mut resource_path_bytes,
-                        &mut writable_resources,
+                        ShellScriptSelection {
+                            default_working_directory: current_mcp_working_dir
+                                .as_deref()
+                                .unwrap_or(instance_cwd),
+                            covered_directory: None,
+                        },
+                        ShellScriptResources {
+                            paths: &mut result,
+                            path_bytes: &mut resource_path_bytes,
+                            writable_resources: &mut writable_resources,
+                            node_env_files: &mut node_env_files,
+                        },
                         field,
                     )?;
                 }
@@ -3902,9 +4341,18 @@ pub(super) fn select(
                             &canonical,
                             &dependency_scope,
                             declaring,
-                            &mut result,
-                            &mut resource_path_bytes,
-                            &mut writable_resources,
+                            ShellScriptSelection {
+                                default_working_directory: current_mcp_working_dir
+                                    .as_deref()
+                                    .unwrap_or(instance_cwd),
+                                covered_directory: None,
+                            },
+                            ShellScriptResources {
+                                paths: &mut result,
+                                path_bytes: &mut resource_path_bytes,
+                                writable_resources: &mut writable_resources,
+                                node_env_files: &mut node_env_files,
+                            },
                             field,
                         )?;
                     }
