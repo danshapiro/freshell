@@ -277,7 +277,7 @@ describe('body-free terminal ordinary-turn reduction', () => {
     runInNewContext(buildTerminalOrdinaryTurnBrowserScript(), { window: browserWindow })
     const observer = browserWindow[TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL] as {
       prepareBeforeSend: (provider: string, terminalId: string) => unknown
-      observeAfterSend: (baseline: unknown) => unknown
+      observeAfterSend: (baseline: unknown, expectedInput: string) => unknown
     }
 
     const captured = observer.prepareBeforeSend(target.provider, target.terminalId)
@@ -301,9 +301,9 @@ describe('body-free terminal ordinary-turn reduction', () => {
       { type: 'terminal.input', terminalId: 'other-terminal', data: promptSentinel },
       { type: 'terminal.input', terminalId: target.terminalId, data: promptSentinel },
     )
-    const observed = observer.observeAfterSend(captured)
+    const observed = observer.observeAfterSend(captured, promptSentinel)
     expect(observed).toEqual({
-      inputSeen: true,
+      requestInputSeen: true,
       activitySeen: true,
       outputSeen: true,
       outputFrameCount: 1,
@@ -335,5 +335,44 @@ describe('body-free terminal ordinary-turn reduction', () => {
 
     expect(observer.prepareBeforeSend(target.provider, target.terminalId)).toBeNull()
     expect(received).toHaveLength(1)
+  })
+
+  it('requires the expected request data on the selected terminal', () => {
+    const received: unknown[] = [
+      { type: 'terminal.attach.ready', terminalId: target.terminalId, streamId: target.streamId, headSeq: 0 },
+    ]
+    const sent: unknown[] = []
+    const browserWindow: Record<string, unknown> = {
+      __FRESHELL_TEST_HARNESS__: {
+        getReceivedWsMessages: () => received,
+        clearReceivedWsMessages: () => { received.length = 0 },
+        getSentWsMessages: () => sent,
+        clearSentWsMessages: () => { sent.length = 0 },
+      },
+    }
+    runInNewContext(buildTerminalOrdinaryTurnBrowserScript(), { window: browserWindow })
+    const observer = browserWindow[TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL] as {
+      prepareBeforeSend: (provider: string, terminalId: string) => unknown
+      observeAfterSend: (baseline: unknown, expectedInput: string) => unknown
+    }
+
+    const captured = observer.prepareBeforeSend(target.provider, target.terminalId)
+    expect(captured).not.toBeNull()
+
+    const expectedInput = 'request'
+    sent.push({ type: 'terminal.input', terminalId: target.terminalId, data: '\r' })
+    expect(observer.observeAfterSend(captured, expectedInput)).toMatchObject({ requestInputSeen: false })
+
+    sent.length = 0
+    sent.push({ type: 'terminal.input', terminalId: 'another-terminal', data: expectedInput })
+    expect(observer.observeAfterSend(captured, expectedInput)).toMatchObject({ requestInputSeen: false })
+
+    sent.length = 0
+    sent.push(
+      { type: 'terminal.input', terminalId: target.terminalId, data: 're' },
+      { type: 'terminal.input', terminalId: target.terminalId, data: 'quest' },
+      { type: 'terminal.input', terminalId: target.terminalId, data: '\r' },
+    )
+    expect(observer.observeAfterSend(captured, expectedInput)).toMatchObject({ requestInputSeen: true })
   })
 })

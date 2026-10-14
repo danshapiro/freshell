@@ -23,7 +23,7 @@ export type TerminalOrdinaryTurnSummary = {
 }
 
 export type TerminalOrdinaryTurnBrowserObservation = TerminalOrdinaryTurnSummary & {
-  inputSeen: boolean
+  requestInputSeen: boolean
 }
 
 export type TerminalOrdinaryTurnBrowserObserver = {
@@ -31,7 +31,7 @@ export type TerminalOrdinaryTurnBrowserObserver = {
     provider: TerminalOrdinaryTurnProvider,
     terminalId: string,
   ): TerminalOrdinaryTurnBaseline | null
-  observeAfterSend(baseline: TerminalOrdinaryTurnBaseline): TerminalOrdinaryTurnBrowserObservation | null
+  observeAfterSend(baseline: TerminalOrdinaryTurnBaseline, expectedInput: string): TerminalOrdinaryTurnBrowserObservation | null
 }
 
 export async function waitForTerminalOrdinaryTurnBaseline(
@@ -213,7 +213,7 @@ export function buildTerminalOrdinaryTurnBrowserScript(): string {
         harness.clearSentWsMessages();
         return baseline;
       },
-      observeAfterSend(baseline) {
+      observeAfterSend(baseline, expectedInput) {
         const harness = window.__FRESHELL_TEST_HARNESS__;
         if (!harness
           || typeof harness.getReceivedWsMessages !== 'function'
@@ -222,13 +222,24 @@ export function buildTerminalOrdinaryTurnBrowserScript(): string {
         const sent = harness.getSentWsMessages();
         if (!Array.isArray(received) || !Array.isArray(sent)) return null;
 
-        let inputSeen = false;
+        const inputParts = [];
         for (const value of sent) {
           if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
-          if (value.type === 'terminal.input' && value.terminalId === baseline.terminalId) inputSeen = true;
+          if (value.type === 'terminal.input'
+            && value.terminalId === baseline.terminalId
+            && typeof value.data === 'string') inputParts.push(value.data);
         }
+        const sentInput = inputParts.join('');
+        const carriageReturn = String.fromCharCode(13);
+        const lineFeed = String.fromCharCode(10);
+        const requestInputSeen = expectedInput.length > 0 && (
+          sentInput === expectedInput
+          || sentInput === expectedInput + carriageReturn
+          || sentInput === expectedInput + lineFeed
+          || sentInput === expectedInput + carriageReturn + lineFeed
+        );
         return {
-          inputSeen,
+          requestInputSeen,
           ...reduceTerminalOrdinaryTurnFrames(received, baseline),
         };
       },

@@ -275,24 +275,25 @@ async function executeAndAwaitOrdinaryTurn(
   const terminal = page.locator(`[data-pane-id="${paneId}"] .xterm:visible`).last()
   await terminal.waitFor({ state: 'visible', timeout: 90_000 })
   await terminal.click()
-  await page.keyboard.insertText('Reply in one short sentence. Do not use tools.')
+  const requestText = 'Reply in one short sentence. Do not use tools.'
 
   const baseline = await waitForTerminalOrdinaryTurnBaseline(() => page.evaluate(({ globalName, providerName, id }) => {
     const observer = (window as any)[globalName]
     return observer?.prepareBeforeSend(providerName, id) ?? null
   }, { globalName: TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL, providerName: provider, id: terminalId }) as Promise<TerminalOrdinaryTurnBaseline | null>)
   if (!baseline) throw new OrdinaryTerminalTurnError('attach_ready', null)
+  await page.keyboard.insertText(requestText)
 
   await page.keyboard.press('Enter')
   let latestFacts: TerminalOrdinaryTurnBrowserObservation | null = null
   try {
     return await waitForValue('ordinary terminal provider turn completion', async () => {
-      latestFacts = await page.evaluate(({ globalName, currentBaseline }) => {
+      latestFacts = await page.evaluate(({ globalName, currentBaseline, expectedInput }) => {
         const observer = (window as any)[globalName]
-        return observer?.observeAfterSend(currentBaseline) ?? null
-      }, { globalName: TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL, currentBaseline: baseline }) as TerminalOrdinaryTurnBrowserObservation | null
+        return observer?.observeAfterSend(currentBaseline, expectedInput) ?? null
+      }, { globalName: TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL, currentBaseline: baseline, expectedInput: requestText }) as TerminalOrdinaryTurnBrowserObservation | null
       return latestFacts
-        && latestFacts.inputSeen
+        && latestFacts.requestInputSeen
         && latestFacts.activitySeen
         && latestFacts.outputSeen
         && latestFacts.completionSeen
