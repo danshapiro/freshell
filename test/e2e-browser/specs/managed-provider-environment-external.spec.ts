@@ -4,6 +4,7 @@ import { test, expect } from '../helpers/fixtures.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import type { ProviderPreparationFailure } from '../../../shared/ws-protocol.js'
+import { summarizeProviderPreparationFailure, summarizeRuntimeErrorClass, summarizeRuntimeErrorCode } from '../../../scripts/testing/managed-environment-create.js'
 
 const paired = resolvePairedExternalFixture(process.env, true)
 if (paired?.kind !== 'managed-environment') throw new Error('Managed environment requires its paired owned target')
@@ -17,7 +18,7 @@ const caseScenarios: Record<string, string> = {
 }
 
 async function terminalDiagnostic(page: Page, terminalId?: string) {
-  return page.evaluate(({ terminalId, marker }) => {
+  const diagnostic = await page.evaluate(({ terminalId, marker }) => {
     const harness = window.__FRESHELL_TEST_HARNESS__
     const buffer = terminalId && harness ? harness.getTerminalBuffer(terminalId) : null
     const received = (harness?.getReceivedWsMessages?.() ?? []) as any[]
@@ -42,7 +43,9 @@ async function terminalDiagnostic(page: Page, terminalId?: string) {
     const attachErrors = received.filter(message => message.type === 'error'
       && (message.terminalId === terminalId || typeof message.requestId === 'string' && attachRequests.has(message.requestId)))
       .slice(-16).map(message => ({ type: 'error', code: ['INVALID_REQUEST', 'TERMINAL_NOT_FOUND', 'PTY_SPAWN_FAILED',
-        'SESSION_RESERVED', 'INTERNAL_ERROR', 'AUTH_FAILED'].includes(message.code) ? message.code : 'UNKNOWN' }))
+        'SESSION_RESERVED', 'INTERNAL_ERROR', 'AUTH_FAILED'].includes(message.code) ? message.code : 'UNKNOWN',
+      message: typeof message.message === 'string' ? message.message.slice(0, 4096) : undefined,
+      providerPreparationFailure: message.providerPreparationFailure }))
     const metadata = (messages: any[]) => messages.filter(message => message.terminalId === terminalId && [
       'terminal.attach', 'terminal.replay.credit', 'terminal.attach.ready', 'terminal.output.gap',
       'terminal.stream.changed', 'terminal.modes.sync', 'terminal.turn.complete',
@@ -73,6 +76,16 @@ async function terminalDiagnostic(page: Page, terminalId?: string) {
       // These getters retain bounded history, not a complete transport trace.
       receivedHistoryAtBound: received.length >= 500, writeHistoryAtBound: writes.length >= 1000 }
   }, { terminalId, marker: `MANAGED_ENV_OUTPUT ${fixture.expectedNonce}` }).catch(() => ({ observation: 'UNKNOWN' }))
+  if (!('attachErrors' in diagnostic) || !Array.isArray(diagnostic.attachErrors)) return diagnostic
+  return { ...diagnostic, attachErrors: diagnostic.attachErrors.map((error: any) => {
+    const runtimeErrorClass = summarizeRuntimeErrorClass(error.message ?? '')
+    const runtimeErrorCode = summarizeRuntimeErrorCode(error.message ?? '')
+    const providerPreparationFailure = summarizeProviderPreparationFailure(error.providerPreparationFailure)
+    return { type: error.type, code: error.code,
+      ...(runtimeErrorClass ? { runtimeErrorClass } : {}),
+      ...(runtimeErrorCode ? { runtimeErrorCode } : {}),
+      ...(providerPreparationFailure ? { providerPreparationFailure } : {}) }
+  }) }
 }
 
 async function hasCompletedOutputWrite(page: Page, terminalId: string, marker: string, after = 0) {
@@ -94,20 +107,25 @@ test.afterEach(async ({ page }, info) => {
   if (!scenario) throw new Error('Unknown managed environment case')
   const cwd = `${fixture.remoteWorkspacePath}/${scenario}`
   const request = await readReceipt(page, `${cwd}/.managed-fixture/request.json`)
+  let failureEvidence: Record<string, unknown> | undefined
   if (info.status !== info.expectedStatus) {
     const pane = await activePane(page).catch(() => null)
     const diagnostic = await terminalDiagnostic(page, pane?.content.kind === 'terminal' ? pane.content.terminalId : undefined)
-    console.error(JSON.stringify({ severity: 'error', event: 'managed_environment.browser_attempt_failed',
-      scenario, attempt: info.retry, status: info.status,
+    failureEvidence = {
       stage: info.annotations.filter(value => value.type === 'managed-stage').at(-1)?.description ?? 'UNKNOWN',
       terminalPresent: pane?.content.kind === 'terminal' && Boolean(pane.content.terminalId),
       soulPresent: pane?.content.kind === 'terminal' && Boolean(pane.content.soulId),
       nativeIdentityPresent: pane?.content.kind === 'terminal' && Boolean(pane.content.sessionRef),
-      diagnostic }))
+      diagnostic,
+    }
+    console.error(JSON.stringify({ severity: 'error', event: 'managed_environment.browser_attempt_failed',
+      scenario, attempt: info.retry, status: info.status,
+      ...failureEvidence }))
   }
   const response = await page.request.post(`${paired!.targetUrl}/api/files/write`, { headers, timeout: 30_000,
     data: { path: `${cwd}/.managed-fixture/completion.json`, content: JSON.stringify({ ...fixture, scenario,
       attempt: info.retry, status: info.status, willRetry: info.status !== info.expectedStatus && info.retry < info.project.retries,
+      ...(failureEvidence ? { failureEvidence } : {}),
       ...(request?.attempt === info.retry ? { createRequestId: request.createRequestId } : {}) }) } })
   expect(response.ok()).toBe(true)
 })

@@ -17,6 +17,66 @@ export type ManagedEnvironmentAttempt = ManagedEnvironmentFixture & {
 export type ManagedEnvironmentCompletion = ManagedEnvironmentAttempt & {
   status: string
   willRetry: boolean
+  failureEvidence?: unknown
+}
+
+export type ManagedEnvironmentReadyOutcome<T> =
+  | { kind: 'ready'; value: T }
+  | { kind: 'browser_attempt_failed' }
+
+export function writeManagedEnvironmentBrowserFailureIncident(
+  request: ManagedEnvironmentAttempt,
+  evidence: Record<string, unknown>,
+  writeIncident: (name: string, value: unknown) => void,
+): boolean {
+  try {
+    writeIncident(`managed-environment-browser-${request.scenario}-${request.attempt}`, {
+      ...evidence,
+      severity: 'error', event: 'managed_environment.browser_runtime_capture',
+      scenario: request.scenario, attempt: request.attempt,
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Wait for a healthy OpenCode child without trapping a failed browser attempt
+ * behind the longer child-startup deadline. Playwright writes the matching
+ * completion from afterEach; a retry cannot be authorized until this wait
+ * returns.
+ */
+export async function waitForManagedEnvironmentReadyOrBrowserFailure<T>(
+  request: ManagedEnvironmentAttempt,
+  observeReady: () => Promise<T | undefined>,
+  observeCompletion: () => Promise<ManagedEnvironmentCompletion | undefined>,
+  options: { timeoutMs?: number; pollIntervalMs?: number } = {},
+): Promise<ManagedEnvironmentReadyOutcome<T>> {
+  const timeoutMs = options.timeoutMs ?? 180_000
+  const pollIntervalMs = options.pollIntervalMs ?? 250
+  const deadline = Date.now() + timeoutMs
+  while (true) {
+    const ready = await observeReady()
+    if (ready !== undefined) return { kind: 'ready', value: ready }
+
+    const completion = await observeCompletion()
+    if (completion
+      && completion.candidateSha === request.candidateSha
+      && completion.runId === request.runId
+      && completion.remoteWorkspacePath === request.remoteWorkspacePath
+      && completion.expectedNonce === request.expectedNonce
+      && completion.scenario === request.scenario
+      && completion.attempt === request.attempt
+      && (completion.createRequestId === undefined || completion.createRequestId === request.createRequestId)
+      && completion.status !== 'passed') {
+      return { kind: 'browser_attempt_failed' }
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`Managed environment timed out: actual selected Bun child for attempt ${request.attempt}`)
+    }
+    await new Promise<void>(resolve => setTimeout(resolve, pollIntervalMs))
+  }
 }
 
 export async function serviceManagedEnvironmentCases(

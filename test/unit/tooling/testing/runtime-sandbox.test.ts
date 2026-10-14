@@ -35,7 +35,17 @@ import { RuntimeHarness, dockerSocketPath } from '../../../../scripts/testing/ru
 import { RestrictedDockerBroker, type PreparedInputAuthorization } from '../../../../scripts/testing/runtime-test-broker.js'
 import { ManagedRuntimeBrowserRig } from '../../../e2e-browser/helpers/managed-runtime.js'
 import { prepareProviderParityUserRoots } from '../../../helpers/provider-parity-environment.js'
-import { assertManagedTerminalCreated, observeManagedEnvironmentNativeIdentity, readManagedEnvironmentDaemonId, serviceManagedEnvironmentScenario, serviceManagedEnvironmentCases, type ManagedEnvironmentAttempt, type ManagedEnvironmentCompletion } from '../../../../scripts/testing/managed-environment-create.js'
+import {
+  assertManagedTerminalCreated,
+  observeManagedEnvironmentNativeIdentity,
+  readManagedEnvironmentDaemonId,
+  serviceManagedEnvironmentScenario,
+  serviceManagedEnvironmentCases,
+  waitForManagedEnvironmentReadyOrBrowserFailure,
+  writeManagedEnvironmentBrowserFailureIncident,
+  type ManagedEnvironmentAttempt,
+  type ManagedEnvironmentCompletion,
+} from '../../../../scripts/testing/managed-environment-create.js'
 import type { ErrorMessage } from '../../../../shared/ws-protocol.js'
 
 describe('managed environment browser attempt lifetime', () => {
@@ -67,6 +77,48 @@ describe('managed environment browser attempt lifetime', () => {
       expect.soft(published).toEqual([request(0), request(1)])
       expect(completed).toEqual([0, 1])
     })
+  })
+
+  it('stops waiting for a healthy child when the matching browser attempt has already failed', async () => {
+    const current = request(0)
+    let completionReady = false
+    let childReads = 0
+    const outcome = waitForManagedEnvironmentReadyOrBrowserFailure(
+      current,
+      async () => { childReads += 1; return undefined },
+      async () => completionReady ? completion(0, true) : undefined,
+      { timeoutMs: 500, pollIntervalMs: 1 },
+    )
+    setTimeout(() => { completionReady = true }, 20)
+
+    await expect(outcome).resolves.toMatchObject({ kind: 'browser_attempt_failed' })
+    expect(childReads).toBeGreaterThan(0)
+  })
+
+  it('ignores stale retry completions while waiting for the current child', async () => {
+    let childReads = 0
+    const outcome = await waitForManagedEnvironmentReadyOrBrowserFailure(
+      request(1),
+      async () => { childReads += 1; return childReads === 2 ? 'owned-child' : undefined },
+      async () => completion(0, true),
+      { timeoutMs: 500, pollIntervalMs: 1 },
+    )
+
+    expect(outcome).toEqual({ kind: 'ready', value: 'owned-child' })
+    expect(childReads).toBe(2)
+  })
+
+  it('keeps browser failure evidence best effort so incident-write errors cannot block retries', () => {
+    const requestValue = request(1)
+    const writeIncident = vi.fn(() => { throw new Error('incident storage unavailable') })
+
+    expect(writeManagedEnvironmentBrowserFailureIncident(requestValue, { browser: 'safe diagnostic' }, writeIncident)).toBe(false)
+    expect(writeIncident).toHaveBeenCalledWith('managed-environment-browser-healthy-1', expect.objectContaining({
+      event: 'managed_environment.browser_runtime_capture',
+      scenario: 'healthy',
+      attempt: 1,
+      browser: 'safe diagnostic',
+    }))
   })
 
   it('keeps the owned target alive until the browser reports attempt completion', async () => {

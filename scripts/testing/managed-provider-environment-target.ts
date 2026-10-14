@@ -10,11 +10,13 @@ import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION, type ClientMessage } from '../../shared/ws-protocol.js'
 import { ManagedRuntimeBrowserRig, type ManagedRuntimeView } from '../../test/e2e-browser/helpers/managed-runtime.js'
 import { authorizeProviderParityRequest, captureProviderParityVolumes, cleanupProviderParityVolumes } from '../../test/helpers/provider-parity-broker.js'
-import { managedEnvironmentOpencodeSelection } from '../../test/helpers/provider-parity-environment.js'
+import { managedEnvironmentOpencodeSelection, providerParityFailureDiagnostics } from '../../test/helpers/provider-parity-environment.js'
 import { fakeOnecliGrants } from '../../test/helpers/provider-parity-onecli.js'
 import type { InitialProviderVolumeAuthorization } from './runtime-test-broker.js'
 import { resolvePairedExternalFixture } from './e2e-external-target.js'
-import { assertManagedTerminalCreated, observeManagedEnvironmentNativeIdentity, readManagedEnvironmentDaemonId, serviceManagedEnvironmentCases } from './managed-environment-create.js'
+import { assertManagedTerminalCreated, observeManagedEnvironmentNativeIdentity, readManagedEnvironmentDaemonId,
+  serviceManagedEnvironmentCases, summarizeRustServerLogEvents, waitForManagedEnvironmentReadyOrBrowserFailure,
+  writeManagedEnvironmentBrowserFailureIncident } from './managed-environment-create.js'
 import { waitForCloudExecutionDispatch } from './cloud-execution-dispatch.js'
 import { ManagedEnvironmentBrowserSummaryCapture, type ManagedEnvironmentBrowserSummary } from './managed-environment-browser-summary.js'
 
@@ -1449,47 +1451,85 @@ export async function runManagedEnvironmentTarget() {
           assert.equal(browser!.exitCode, null, 'Cloud browser exited without its attempt completion')
           return undefined
         }, scenario === 'healthy' ? 360_000 : 300_000),
-        onAuthorized: async request => { if (scenario === 'healthy') {
-        const { child, view } = await poll('actual selected Bun child and current request', async () => {
-          const child = await readJson(path.join(cwd, '.managed-fixture/child-receipt.json'))
-          if (!child) return undefined
-          const view = (await rig!.inventory()).find(row => row.terminalId === child.terminalId
-            && row.terminalCreateRequestId === request.createRequestId && row.nativeSessionId === child.nativeSessionId && row.launchState === 'running')
-          return view ? { child, view } : undefined
-        })
-        assert.equal(child.expectedNonce, nonce); assert.equal(child.candidateSha, fixture.candidateSha); assert.equal(child.runId, fixture.runId)
-        assert.equal(child.bun, true); assert.equal(child.opencodeVersion, '1.18.21'); assert.match(child.bunExecutable, /opencode/)
-        assert.equal(child.executableMode, '0711')
-        const mcpServer = await poll('Cloud OpenCode starts the nested Bun package-script MCP', async () =>
-          readJson(path.join(cwd, '.managed-fixture/mcp-receipt.json')))
-        assert.equal(mcpServer.expectedNonce, nonce)
-        assert.equal(mcpServer.dependency, nonce, 'OpenCode MCP must load the staged parent dependency')
-        assert.equal(mcpServer.bun, true, 'OpenCode must run the local MCP package script under Bun')
-        assert.equal(mcpServer.bunVersion, '1.4.3', 'Managed OpenCode MCP must use the pinned Bun runtime')
-        assert.equal(mcpServer.launchCwd, selected.mcpPackage, 'Bun runs a package script from its package root')
-        assert.equal(mcpServer.bunCommandCwd, selected.mcpNested, 'OpenCode must launch Bun from the configured nested MCP cwd')
-        assert.equal(mcpServer.configuredCwd, selected.mcpNested)
-        assert(mcpServer.scriptPath.endsWith('/fixture-mcp/server.mjs'))
-        const directMcpServer = await poll('Cloud OpenCode starts the direct extensionless MCP through its sibling helper', async () =>
-          readJson(path.join(cwd, '.managed-fixture/direct-mcp-receipt.json')))
-        assert.equal(directMcpServer.expectedNonce, nonce)
-        assert.equal(directMcpServer.helper, nonce)
-        assert.equal(directMcpServer.sibling, nonce)
-        assert.equal(directMcpServer.dependency, nonce)
-        assert.equal(directMcpServer.schemaNonce, nonce)
-        assert(directMcpServer.scriptPath.endsWith('/direct-mcp/server.mjs'))
-        const directHomeAppendMcp = await poll('Cloud OpenCode appends through its direct HOME MCP', async () =>
-          readJson(path.join(cwd, '.managed-fixture/direct-home-mcp-receipt.json')))
-        assert.equal(directHomeAppendMcp.expectedNonce, nonce)
-        assert.equal(directHomeAppendMcp.appendError, undefined, 'the managed HOME sibling mount must permit append')
-        assert.equal(directHomeAppendMcp.output, `initial-${nonce}|${nonce}`)
-        assert(directHomeAppendMcp.scriptPath.endsWith('/direct-home-healthy.mjs'))
-        const stage = await stageProof(rig!, view, nonce)
-        const receipt = { ...fixture, terminalId: view.terminalId, soulId: view.soulId, incarnationId: view.incarnationId,
-          nativeSessionId: view.nativeSessionId, stage, child, mcpServer, directMcpServer, directHomeAppendMcp }
-        await writeJson(path.join(cwd, '.managed-fixture/target-receipt.json'), receipt)
-        proof.healthy = receipt
-        } },
+        onAuthorized: async request => {
+          if (scenario !== 'healthy') return
+          const completionPath = path.join(cwd, '.managed-fixture/completion.json')
+          const outcome = await waitForManagedEnvironmentReadyOrBrowserFailure(request, async () => {
+            const child = await readJson(path.join(cwd, '.managed-fixture/child-receipt.json'))
+            if (!child) return undefined
+            const view = (await rig!.inventory()).find(row => row.terminalId === child.terminalId
+              && row.terminalCreateRequestId === request.createRequestId && row.nativeSessionId === child.nativeSessionId
+              && row.launchState === 'running')
+            return view ? { child, view } : undefined
+          }, () => readJson(completionPath))
+          if (outcome.kind === 'browser_attempt_failed') {
+            const completion = await readJson(completionPath)
+            let rows: ManagedRuntimeView[] = []
+            try { rows = (await rig!.inventory()).filter(row => row.terminalCreateRequestId === request.createRequestId) }
+            catch { /* Keep browser failure evidence even when a fresh inventory cannot be read. */ }
+            const view = rows[0]
+            const summarizeOwnedLogs = (containerId: string) => {
+              try { return providerParityFailureDiagnostics(rig!.runtime.containerLogs(containerId).slice(-512 * 1024)) }
+              catch { return 'UNKNOWN' }
+            }
+            const supervisorLogs = summarizeOwnedLogs(rig!.supervisor.containerId)
+            const sessionHostLogs = view?.containerId ? summarizeOwnedLogs(view.containerId) : undefined
+            let serverLogEvents: ReturnType<typeof summarizeRustServerLogEvents> = []
+            try { serverLogEvents = summarizeRustServerLogEvents(Object.values(rig!.web.capturedOutput()).join('\n')) }
+            catch { /* Keep browser and runtime evidence if the scratch server log is unavailable. */ }
+            const captured = writeManagedEnvironmentBrowserFailureIncident(request, {
+              browser: completion?.failureEvidence ?? 'UNKNOWN',
+              managedTerminal: view ? {
+                launchState: view.launchState, desiredState: view.desiredState, recoveryState: view.recoveryState,
+                durabilityState: view.durabilityState, allocationState: view.allocationState,
+                provider: view.provider, terminalMode: view.terminalMode,
+                nativeIdentityPresent: Boolean(view.nativeSessionId), sessionHostPresent: Boolean(view.containerId),
+              } : { matchingTerminalCount: rows.length },
+              ...(sessionHostLogs ? { sessionHostLogs } : {}), supervisorLogs, serverLogEvents,
+            }, (name, value) => rig!.runtime.writeIncident(name, value))
+            if (!captured) {
+              console.error(JSON.stringify({ severity: 'error', event: 'managed_environment.browser_runtime_capture_persist_failed', scenario, attempt: request.attempt }))
+            }
+            return
+          }
+          const { child, view } = outcome.value
+          assert.equal(child.expectedNonce, nonce)
+          assert.equal(child.candidateSha, fixture.candidateSha)
+          assert.equal(child.runId, fixture.runId)
+          assert.equal(child.bun, true)
+          assert.equal(child.opencodeVersion, '1.18.21')
+          assert.match(child.bunExecutable, /opencode/)
+          assert.equal(child.executableMode, '0711')
+          const mcpServer = await poll('Cloud OpenCode starts the nested Bun package-script MCP', async () =>
+            readJson(path.join(cwd, '.managed-fixture/mcp-receipt.json')))
+          assert.equal(mcpServer.expectedNonce, nonce)
+          assert.equal(mcpServer.dependency, nonce, 'OpenCode MCP must load the staged parent dependency')
+          assert.equal(mcpServer.bun, true, 'OpenCode must run the local MCP package script under Bun')
+          assert.equal(mcpServer.bunVersion, '1.4.3', 'Managed OpenCode MCP must use the pinned Bun runtime')
+          assert.equal(mcpServer.launchCwd, selected.mcpPackage, 'Bun runs a package script from its package root')
+          assert.equal(mcpServer.bunCommandCwd, selected.mcpNested, 'OpenCode must launch Bun from the configured nested MCP cwd')
+          assert.equal(mcpServer.configuredCwd, selected.mcpNested)
+          assert(mcpServer.scriptPath.endsWith('/fixture-mcp/server.mjs'))
+          const directMcpServer = await poll('Cloud OpenCode starts the direct extensionless MCP through its sibling helper', async () =>
+            readJson(path.join(cwd, '.managed-fixture/direct-mcp-receipt.json')))
+          assert.equal(directMcpServer.expectedNonce, nonce)
+          assert.equal(directMcpServer.helper, nonce)
+          assert.equal(directMcpServer.sibling, nonce)
+          assert.equal(directMcpServer.dependency, nonce)
+          assert.equal(directMcpServer.schemaNonce, nonce)
+          assert(directMcpServer.scriptPath.endsWith('/direct-mcp/server.mjs'))
+          const directHomeAppendMcp = await poll('Cloud OpenCode appends through its direct HOME MCP', async () =>
+            readJson(path.join(cwd, '.managed-fixture/direct-home-mcp-receipt.json')))
+          assert.equal(directHomeAppendMcp.expectedNonce, nonce)
+          assert.equal(directHomeAppendMcp.appendError, undefined, 'the managed HOME sibling mount must permit append')
+          assert.equal(directHomeAppendMcp.output, `initial-${nonce}|${nonce}`)
+          assert(directHomeAppendMcp.scriptPath.endsWith('/direct-home-healthy.mjs'))
+          const stage = await stageProof(rig!, view, nonce)
+          const receipt = { ...fixture, terminalId: view.terminalId, soulId: view.soulId, incarnationId: view.incarnationId,
+            nativeSessionId: view.nativeSessionId, stage, child, mcpServer, directMcpServer, directHomeAppendMcp }
+          await writeJson(path.join(cwd, '.managed-fixture/target-receipt.json'), receipt)
+          proof.healthy = receipt
+        },
       }
     }, async () => {
       const browserExit = await bounded(browserJoin!, 120_000, 'configured Cloud browser final join')
