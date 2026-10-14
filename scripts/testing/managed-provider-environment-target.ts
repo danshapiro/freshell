@@ -334,6 +334,15 @@ export function managedEnvironmentFixtureLayout(root: string) {
   return { workspace, resources, plugin, mcpPackage, directMcp, mcpNested, mcpParentDependency }
 }
 
+export function managedHomeAppendFixturePaths(xdg: string, cwd: string, scenario: string) {
+  const script = path.join(xdg, 'opencode/mcp-servers', `direct-home-${scenario}.mjs`)
+  return {
+    script,
+    output: path.join(path.dirname(script), `direct-home-${scenario}.txt`),
+    receipt: path.join(cwd, '.managed-fixture/direct-home-mcp-receipt.json'),
+  }
+}
+
 async function configure(root: string, nonce: string, candidateSha: string, runId: string) {
   const home = path.join(root, 'home'), xdg = path.join(home, 'fixture-xdg')
   const { workspace, resources, plugin, mcpPackage, directMcp, mcpNested, mcpParentDependency } = managedEnvironmentFixtureLayout(root)
@@ -415,11 +424,9 @@ export default {id:'managed-environment-tui',async tui(api,options){
     await fs.chmod(path.join(cwd, '.managed-fixture'), 0o777)
     await fs.writeFile(path.join(cwd, 'rules.txt'), nonce, { mode: 0o600 })
     const mcpReceipt = path.join(cwd, '.managed-fixture/mcp-receipt.json')
-    const homeAppendScript = path.join(xdg, 'opencode/mcp-servers', `direct-home-${scenario}.mjs`)
-    const homeAppendOutput = `direct-home-${scenario}.txt`
-    const homeAppendReceipt = path.join(cwd, '.managed-fixture/direct-home-mcp-receipt.json')
-    await fs.writeFile(homeAppendScript, directHomeAppendMcpServerSource(homeAppendOutput))
-    await fs.writeFile(path.join(home, homeAppendOutput), `initial-${nonce}`)
+    const homeAppend = managedHomeAppendFixturePaths(xdg, cwd, scenario)
+    await fs.writeFile(homeAppend.script, directHomeAppendMcpServerSource(path.basename(homeAppend.output)))
+    await fs.writeFile(homeAppend.output, `initial-${nonce}`)
     await writeJson(path.join(cwd, 'opencode.json'), { agent: { fixtureRelative: {
       prompt: `{file:./${scenario === 'missing-reference' ? 'missing-selected.txt' : 'rules.txt'}}` } },
       mcp: {
@@ -437,7 +444,7 @@ export default {id:'managed-environment-tui',async tui(api,options){
         },
         direct_home_append_fixture: {
           type: 'local',
-          command: ['node', homeAppendScript, homeAppendReceipt, nonce],
+          command: ['node', homeAppend.script, homeAppend.receipt, nonce],
           enabled: true,
         },
       },

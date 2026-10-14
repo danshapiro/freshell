@@ -10,6 +10,7 @@ import {
 import {
   checkpointTcpForwarderSource,
   externalTargetRead,
+  managedHomeAppendFixturePaths,
   managedEnvironmentFixtureLayout,
   processIdentity,
   resolveManagedProviderEnvironmentTargetMode,
@@ -111,6 +112,17 @@ describe('managed provider environment target mode', () => {
     const packageRelativeToWorkspace = path.relative(fixture.workspace, fixture.mcpPackage)
     expect(packageRelativeToWorkspace.startsWith(`..${path.sep}`) || path.isAbsolute(packageRelativeToWorkspace)).toBe(true)
     expect(fixture.mcpParentDependency).toBe(path.join(fixture.resources, 'node_modules/managed-fixture-mcp-dependency'))
+  })
+
+  it('seeds the direct HOME append file beside the XDG MCP script it resolves from', () => {
+    const xdg = '/tmp/managed-environment-fixture/home/fixture-xdg'
+    const cwd = '/tmp/managed-environment-fixture/workspace/preflight'
+    const paths = managedHomeAppendFixturePaths(xdg, cwd, 'preflight')
+
+    expect(paths.script).toBe(path.join(xdg, 'opencode/mcp-servers/direct-home-preflight.mjs'))
+    expect(paths.output).toBe(path.join(path.dirname(paths.script), 'direct-home-preflight.txt'))
+    expect(path.dirname(paths.output)).toBe(path.dirname(paths.script))
+    expect(paths.receipt).toBe(path.join(cwd, '.managed-fixture/direct-home-mcp-receipt.json'))
   })
 
   it('forwards one fixed TCP target while preserving streamed client data', async () => {
