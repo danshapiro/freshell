@@ -2134,6 +2134,20 @@ const OrdinaryFreshProviderEventsSchema = z.object({
   createFailureDiagnostics: z.array(OrdinaryFreshProviderStartupDiagnosticSchema).max(8),
   errorCodePresent: z.boolean(), errorMessagePresent: z.boolean(),
 })
+const OrdinaryFreshReadinessSchema = z.object({
+  paneFound: z.boolean(),
+  paneStatus: z.enum(['idle', 'creating', 'starting', 'connected', 'running', 'busy', 'create-failed', 'exited', 'stuck', 'missing', 'other']),
+  sessionStatePresent: z.boolean(),
+  sessionStatus: z.enum(['creating', 'starting', 'connected', 'running', 'idle', 'compacting', 'exited', 'stuck', 'create-failed', 'missing', 'other']),
+  attachTargetsPaneSession: z.boolean(),
+  composerPresent: z.boolean(),
+  composerDisabled: z.boolean().nullable(),
+  composerVisible: z.boolean(),
+  composerFocused: z.boolean(),
+  composerHasInput: z.boolean(),
+  connectionStatus: z.enum(['disconnected', 'connecting', 'connected', 'ready', 'missing', 'other']),
+  networkEffectsSuppressed: z.boolean(),
+})
 const OrdinaryFreshDiagnosticSchema = z.union([
   z.object({ event: z.literal('durable_souls.ordinary_turn_completed'), lane: z.literal('fresh-agent'),
     mode: OrdinaryFreshModeSchema }),
@@ -2142,7 +2156,8 @@ const OrdinaryFreshDiagnosticSchema = z.union([
     createCompleted: z.boolean(), composerFilled: z.boolean(), assistantBaselineCaptured: z.boolean(),
     composerSubmitted: z.boolean(), sendObserved: z.boolean(), turnCompleteObserved: z.boolean(), assistantTextDisplayed: z.boolean(),
     assistantDom: z.object({ available: z.boolean(), rows: OrdinaryFreshCountSchema, textCharacters: OrdinaryFreshCountSchema }),
-    providerEvents: OrdinaryFreshProviderEventsSchema }),
+    providerEvents: OrdinaryFreshProviderEventsSchema,
+    readiness: OrdinaryFreshReadinessSchema.nullable().optional() }),
 ])
 type ManagedOrdinaryDiagnostic = z.infer<typeof OrdinaryTerminalDiagnosticSchema> | z.infer<typeof OrdinaryFreshDiagnosticSchema>
 
@@ -2422,7 +2437,7 @@ export default class ManagedExternalExecutionReporter implements Reporter {
           assistantBaselineCaptured: source.assistantBaselineCaptured, composerSubmitted: source.composerSubmitted,
           sendObserved: source.sendObserved, turnCompleteObserved: source.turnCompleteObserved,
           assistantTextDisplayed: source.assistantTextDisplayed, assistantDom: source.assistantDom,
-          providerEvents: source.providerEvents })
+          providerEvents: source.providerEvents, ...(source.readiness ? { readiness: source.readiness } : {}) })
       } else {
         this.emit({ ...common, mode: source.mode })
       }

@@ -177,6 +177,10 @@ function ordinaryFreshAgentReadinessFacts(input: { paneId: string; attachSession
   const paneRoot = Array.from(document.querySelectorAll<HTMLElement>('[data-pane-id]'))
     .find((element) => element.dataset.paneId === paneId)
   const composer = paneRoot?.querySelector<HTMLTextAreaElement>('[aria-label="Chat message input"]')
+  const composerRect = composer?.getBoundingClientRect()
+  const composerStyle = composer ? window.getComputedStyle(composer) : null
+  const composerVisible = Boolean(composer && composerRect && composerRect.width > 0 && composerRect.height > 0
+    && composerStyle?.display !== 'none' && composerStyle?.visibility !== 'hidden' && composerStyle?.opacity !== '0')
   const enumValue = (value: unknown, allowed: readonly string[]) => (
     typeof value === 'string' && allowed.includes(value) ? value : value == null ? 'missing' : 'other'
   )
@@ -203,6 +207,8 @@ function ordinaryFreshAgentReadinessFacts(input: { paneId: string; attachSession
     attachTargetsPaneSession: matchingAttachCount > 0,
     composerPresent: Boolean(composer),
     composerDisabled: composer ? composer.disabled : null,
+    composerVisible,
+    composerFocused: Boolean(composer && document.activeElement === composer),
     composerHasInput: Boolean(composer?.value.trim()),
     connectionStatus: enumValue(state?.connection?.status, ['disconnected', 'connecting', 'connected', 'ready']),
     networkEffectsSuppressed: harness?.isAllFreshAgentNetworkEffectsSuppressed?.() === true

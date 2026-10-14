@@ -1177,7 +1177,7 @@ describe('body-free ordinary-turn Cloud diagnostics', () => {
     }
   })
 
-  it('forwards fixed FreshAgent progress facts without readiness errors or assistant text', () => {
+  it('forwards only bounded FreshAgent readiness facts without errors or assistant text', () => {
     for (const [key, value] of Object.entries(descriptor)) vi.stubEnv(key, value)
     const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
     try {
@@ -1195,7 +1195,14 @@ describe('body-free ordinary-turn Cloud diagnostics', () => {
           snapshot: 0, changed: 0, turnComplete: 0, result: 0 }, createFailureCodes: [],
           createFailureDiagnostics: [], errorCodePresent: false, errorMessagePresent: false,
           unapproved: 'private-provider-output-sentinel' },
-        readiness: { sessionError: 'private-readiness-sentinel' },
+        readiness: {
+          paneFound: true, paneStatus: 'connected', sessionStatePresent: true,
+          sessionStatus: 'idle', attachTargetsPaneSession: true,
+          composerPresent: true, composerDisabled: false, composerVisible: true,
+          composerFocused: false, composerHasInput: false,
+          connectionStatus: 'ready', networkEffectsSuppressed: false,
+          sessionError: 'private-readiness-sentinel',
+        },
       })
       reporter.onStdOut(event.slice(0, 80), testCase)
       reporter.onStdOut(`${event.slice(80)}\n`, testCase)
@@ -1215,6 +1222,13 @@ describe('body-free ordinary-turn Cloud diagnostics', () => {
         providerEvents: { counts: { created: 1, createFailed: 0, assistant: 0, stream: 0, error: 0,
           snapshot: 0, changed: 0, turnComplete: 0, result: 0 }, createFailureCodes: [],
           createFailureDiagnostics: [], errorCodePresent: false, errorMessagePresent: false },
+        readiness: {
+          paneFound: true, paneStatus: 'connected', sessionStatePresent: true,
+          sessionStatus: 'idle', attachTargetsPaneSession: true,
+          composerPresent: true, composerDisabled: false, composerVisible: true,
+          composerFocused: false, composerHasInput: false,
+          connectionStatus: 'ready', networkEffectsSuppressed: false,
+        },
       })
       for (const sentinel of ['private-assistant-sentinel', 'private-provider-output-sentinel', 'private-readiness-sentinel']) {
         expect(JSON.stringify(forwarded)).not.toContain(sentinel)
