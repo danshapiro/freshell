@@ -345,20 +345,22 @@ describe('selected production owner registration', () => {
       try { expect((owner.runtime as any).phase2BootstrapFiles()).toEqual([]) } finally { vi.unstubAllEnvs() }
     }
   })
-  it('preserves only the selected FreshOpenCode auth-file reference while scrubbing other credentials', () => {
+  it('preserves the FreshOpenCode auth-file reference only for the exact three-mode ordinary-turn selection', () => {
     let actual!: RuntimeWebConstructOptions
     const authFile = '/unit/opencode-auth-reference.json'
-    const environment = { FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: authFile }
+    const environment = { FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE: '1',
+      FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_MODES: 'freshclaude,freshcodex,freshopencode',
+      FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: authFile }
     const factory = runner.createExternalManagedWebFactory({
-      spec: 'test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts', mode: 'freshopencode',
+      spec: 'test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts',
+      grep: 'each selected fresh-agent mode completes one ordinary turn$',
     }, environment, options => { actual = options; return {} as any })
-    const env = { ...environment, OPENAI_API_KEY: 'unit-sentinel', OPENCODE_API_KEY: 'unit-sentinel',
+    const env = { FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: authFile,
+      OPENAI_API_KEY: 'unit-sentinel', OPENCODE_API_KEY: 'unit-sentinel',
       ANTHROPIC_API_KEY: 'unit-sentinel', GEMINI_API_KEY: 'unit-sentinel',
       FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: '/unit/unrelated-opencode-env-reference',
       FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: '/unit/unrelated-opencode-ca-reference',
       FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION: 'allow',
-      FRESHELL_MANAGED_CLAUDE_ONECLI_AUTH_FILE: '/unit/unrelated-claude-reference',
-      FRESHELL_MANAGED_CODEX_ONECLI_AUTH_FILE: '/unit/unrelated-codex-reference',
       FRESHELL_MANAGED_AMPLIFIER_ONECLI_AUTH_FILE: '/unit/unrelated-amplifier-reference',
       HTTP_PROXY: 'http://unit.invalid', HTTPS_PROXY: 'http://unit.invalid', ALL_PROXY: 'http://unit.invalid',
       http_proxy: 'http://unit.invalid', https_proxy: 'http://unit.invalid', all_proxy: 'http://unit.invalid',
@@ -371,6 +373,21 @@ describe('selected production owner registration', () => {
     expect(observed).toEqual({ FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: authFile,
       FRESHELL_RUNTIME_CONTROL_SOCKET: '/owned/control' })
     expect(actual.providerFreeFixture).not.toBe(true)
+  })
+  it.each([
+    { selection: 'unfiltered FreshOpenCode selection', grep: undefined },
+    { selection: 'different FreshAgent case', grep: 'qualifies only explicitly selected modes with production transports$' },
+  ])('strips the FreshOpenCode auth-file reference for a $selection', ({ grep }) => {
+    let actual!: RuntimeWebConstructOptions
+    const authFile = '/unit/unselected-opencode-auth-reference.json'
+    const factory = runner.createExternalManagedWebFactory({
+      spec: 'test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts', mode: 'freshopencode',
+      ...(grep ? { grep } : {}),
+    }, { FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: authFile }, options => { actual = options; return {} as any })
+    const env = { FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: authFile, FRESHELL_RUNTIME_CONTROL_SOCKET: '/owned/control' }
+    factory({ repoRoot: fixtureRepoRoot, env, setupHome: async () => {} } as RuntimeWebConstructOptions)
+    stripRuntimeWebEnvironment(env, actual)
+    expect(env).toEqual({ FRESHELL_RUNTIME_CONTROL_SOCKET: '/owned/control' })
   })
   it('strips the OpenCode auth-file reference when FreshOpenCode is not the selected mode', () => {
     let actual!: RuntimeWebConstructOptions

@@ -2925,8 +2925,10 @@ export function createExternalManagedWebFactory(selection: ExternalBrowserSelect
   const selected = qualificationSelections(selection, environment, retainedArtifacts)
   const opencodeAuthFileKey = 'FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE'
   const selectedFreshOpenCode = spec === 'runtime-fresh-agent-qualification-rust.spec.ts'
-    && selected.modes.length === 1 && selected.modes[0] === 'freshopencode' && !retainedArtifacts
-  const selectedFreshOpenCodeAuthFile = selectedFreshOpenCode ? environment[opencodeAuthFileKey] : undefined
+    && selected.modes.includes('freshopencode') && !retainedArtifacts
+  const selectedFreshOpenCodeOrdinaryTurn = selectedFreshOpenCode
+    && selection.grep === 'each selected fresh-agent mode completes one ordinary turn$'
+  const selectedFreshOpenCodeAuthFile = selectedFreshOpenCodeOrdinaryTurn ? environment[opencodeAuthFileKey] : undefined
   const preserveFreshOpenCodeAuthFile = typeof selectedFreshOpenCodeAuthFile === 'string' && selectedFreshOpenCodeAuthFile.length > 0
   if (preserveFreshOpenCodeAuthFile) preset[opencodeAuthFileKey] = selectedFreshOpenCodeAuthFile
   const freshBootstrap = new Set<string>(selected.modes.filter(mode => mode !== 'freshopencode').map(mode => mode === 'freshcodex' ? 'CODEX' : 'CLAUDE'))
@@ -2964,9 +2966,11 @@ export function createExternalManagedWebFactory(selection: ExternalBrowserSelect
       }
       for (const prefix of [
         'ANTHROPIC_', 'CLAUDE_', 'OPENAI_', 'OPENCODE_API_KEY', 'GEMINI_', 'GOOGLE_API_KEY', 'LUNAROUTE_', 'ONECLI_',
-        'FRESHELL_MANAGED_CLAUDE_', 'FRESHELL_MANAGED_CODEX_', 'FRESHELL_MANAGED_AMPLIFIER_',
         'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
       ]) stripEnvPrefixes.add(prefix)
+      if (!freshBootstrap.has('CLAUDE')) stripEnvPrefixes.add('FRESHELL_MANAGED_CLAUDE_')
+      if (!freshBootstrap.has('CODEX')) stripEnvPrefixes.add('FRESHELL_MANAGED_CODEX_')
+      stripEnvPrefixes.add('FRESHELL_MANAGED_AMPLIFIER_')
     }
     return webFactory({ ...options, env, ...(stripEnvPrefixes.size ? { stripEnvPrefixes: [...stripEnvPrefixes] } : {}),
       ...(amplifierProfile || claudeStartup ? { setupHome: async (home: string) => {
