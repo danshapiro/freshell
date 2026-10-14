@@ -1967,19 +1967,54 @@ fn copy_provider_config_references_with_ownership(
         })
         .collect::<Vec<_>>();
     let config_selection_count = selections.len();
-    let mut resource_selections = Vec::new();
-    for unit in context
+    let resource_mounts = context
         .prepared_inputs
         .iter()
         .flat_map(|inputs| &inputs.resource_mounts)
-    {
+        .collect::<Vec<_>>();
+    let mut recovered_writable_files = std::collections::BTreeMap::<PathBuf, PathBuf>::new();
+    if let Some(previous) = previous_projection.as_ref() {
+        for unit in &resource_mounts {
+            let recovered =
+                match nested_writable_file_recovery_source(context, unit, previous, final_home) {
+                    Ok(recovered) => recovered,
+                    Err(error) => {
+                        emit_nested_writable_file_recovery_failure(provider, unit, error);
+                        return Err(format!(
+                            "provider resource {} ({}) could not be recovered: {}",
+                            unit.provider_relative_path,
+                            unit.stage_relative_path,
+                            error.message()
+                        ));
+                    }
+                };
+            let Some(source) = recovered else {
+                continue;
+            };
+            let identity = PathBuf::from(&unit.provider_relative_path);
+            if recovered_writable_files
+                .get(&identity)
+                .is_some_and(|existing| existing != &source)
+            {
+                let error = NestedWritableFileRecoveryFailure::AmbiguousAliasSources;
+                emit_nested_writable_file_recovery_failure(provider, unit, error);
+                return Err(format!(
+                    "provider resource {} ({}) could not be recovered: {}",
+                    unit.provider_relative_path,
+                    unit.stage_relative_path,
+                    error.message()
+                ));
+            }
+            recovered_writable_files.insert(identity, source);
+        }
+    }
+    let mut resource_selections = Vec::new();
+    for unit in resource_mounts {
         let staged_source = user_provider_root.join(&unit.stage_relative_path);
-        let source = if let Some(previous) = previous_projection.as_ref() {
-            nested_writable_file_recovery_source(context, unit, previous, final_home)?
-                .unwrap_or(staged_source)
-        } else {
-            staged_source
-        };
+        let source = recovered_writable_files
+            .get(Path::new(&unit.provider_relative_path))
+            .cloned()
+            .unwrap_or(staged_source);
         resource_selections.push(CopySelection {
             source,
             destination_relative: unit.provider_relative_path.clone().into(),
@@ -2231,12 +2266,76 @@ fn writable_resource_mount_roots(
         .collect()
 }
 
+#[derive(Clone, Copy)]
+enum NestedWritableFileRecoveryFailure {
+    PriorStateUnavailable,
+    PriorResourceDeleted,
+    PriorResourceUnavailable,
+    PriorResourceEscapedProjection,
+    PriorResourceNotOwned,
+    PriorResourceNotFile,
+    AmbiguousDirectoryOwners,
+    AmbiguousAliasSources,
+}
+
+impl NestedWritableFileRecoveryFailure {
+    fn code(self) -> &'static str {
+        match self {
+            Self::PriorStateUnavailable => "prior_provider_state_unavailable",
+            Self::PriorResourceDeleted => "prior_resource_deleted",
+            Self::PriorResourceUnavailable => "prior_resource_unavailable",
+            Self::PriorResourceEscapedProjection => "target_outside_projection",
+            Self::PriorResourceNotOwned => "target_not_owned",
+            Self::PriorResourceNotFile => "target_not_file",
+            Self::AmbiguousDirectoryOwners => "ambiguous_directory_owners",
+            Self::AmbiguousAliasSources => "ambiguous_alias_sources",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::PriorStateUnavailable => "prior provider state is unavailable",
+            Self::PriorResourceDeleted => "prior nested writable resource was deleted",
+            Self::PriorResourceUnavailable => "prior nested writable resource is unavailable",
+            Self::PriorResourceEscapedProjection => {
+                "prior nested writable resource escaped provider state"
+            }
+            Self::PriorResourceNotOwned => "prior nested writable resource target is not owned",
+            Self::PriorResourceNotFile => "prior nested writable resource is not a regular file",
+            Self::AmbiguousDirectoryOwners => {
+                "prior nested writable resource has ambiguous directory owners"
+            }
+            Self::AmbiguousAliasSources => {
+                "resource aliases resolve to different prior runtime files"
+            }
+        }
+    }
+}
+
+fn emit_nested_writable_file_recovery_failure(
+    provider: &str,
+    mount: &freshell_runtime_protocol::ProviderResourceMount,
+    error: NestedWritableFileRecoveryFailure,
+) {
+    emit_environment_event(serde_json::json!({
+        "severity": "error",
+        "event": "provider.inputs.recovery.failed",
+        "stage": "session_host",
+        "provider": provider,
+        "operation": "recover_nested_writable_file",
+        "reason": error.code(),
+        "resource_stage_path": mount.stage_relative_path,
+        "provider_relative_path": mount.provider_relative_path,
+        "corrective_message": "retain provider inputs and repair the resource selection before retrying"
+    }));
+}
+
 fn nested_writable_file_recovery_source(
     context: &freshell_runtime_protocol::ProviderLaunchContext,
     mount: &freshell_runtime_protocol::ProviderResourceMount,
     previous: &std::collections::BTreeSet<String>,
     previous_home: &Path,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Option<PathBuf>, NestedWritableFileRecoveryFailure> {
     use freshell_runtime_protocol::ProviderResourceKind;
     if mount.kind != ProviderResourceKind::File || !mount.writable {
         return Ok(None);
@@ -2245,14 +2344,12 @@ fn nested_writable_file_recovery_source(
     if mount_relative.as_os_str().is_empty() || previous.contains(&mount.provider_relative_path) {
         return Ok(None);
     }
-    let Some(mount_alias) = Path::new(&mount.effective_destination)
-        .strip_prefix("/home/freshell/provider")
-        .ok()
-    else {
+    let mount_destination = Path::new(&mount.effective_destination);
+    if !mount_destination.is_absolute() {
         return Ok(None);
-    };
+    }
     let canonical_home = std::fs::canonicalize(previous_home)
-        .map_err(|_| "prior provider state is unavailable for writable-file recovery")?;
+        .map_err(|_| NestedWritableFileRecoveryFailure::PriorStateUnavailable)?;
     let mut candidates = Vec::<(usize, PathBuf)>::new();
     for directory in context
         .prepared_inputs
@@ -2260,16 +2357,11 @@ fn nested_writable_file_recovery_source(
         .flat_map(|inputs| &inputs.resource_mounts)
         .filter(|candidate| candidate.kind == ProviderResourceKind::Directory)
     {
-        let Some(directory_alias) = Path::new(&directory.effective_destination)
-            .strip_prefix("/home/freshell/provider")
-            .ok()
-        else {
-            continue;
-        };
-        if directory_alias.as_os_str().is_empty() {
+        let directory_destination = Path::new(&directory.effective_destination);
+        if !directory_destination.is_absolute() {
             continue;
         }
-        let Ok(suffix) = mount_alias.strip_prefix(directory_alias) else {
+        let Ok(suffix) = mount_destination.strip_prefix(directory_destination) else {
             continue;
         };
         if suffix.as_os_str().is_empty() {
@@ -2284,36 +2376,22 @@ fn nested_writable_file_recovery_source(
         let canonical = match std::fs::canonicalize(&prior_path) {
             Ok(path) => path,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(
-                    "prior nested writable resource was deleted; retain inputs and repair".into(),
-                )
+                return Err(NestedWritableFileRecoveryFailure::PriorResourceDeleted)
             }
-            Err(_) => {
-                return Err(
-                    "prior nested writable resource is unavailable; retain inputs and repair"
-                        .into(),
-                )
-            }
+            Err(_) => return Err(NestedWritableFileRecoveryFailure::PriorResourceUnavailable),
         };
-        let canonical_relative = canonical.strip_prefix(&canonical_home).map_err(|_| {
-            "prior nested writable resource escaped provider state; retain inputs and repair"
-        })?;
+        let canonical_relative = canonical
+            .strip_prefix(&canonical_home)
+            .map_err(|_| NestedWritableFileRecoveryFailure::PriorResourceEscapedProjection)?;
         if !previous.contains(&canonical_relative.to_string_lossy().into_owned()) {
-            return Err(
-                "prior nested writable resource target is not owned; retain inputs and repair"
-                    .into(),
-            );
+            return Err(NestedWritableFileRecoveryFailure::PriorResourceNotOwned);
         }
-        let metadata = std::fs::metadata(&canonical).map_err(|_| {
-            "prior nested writable resource is unavailable; retain inputs and repair"
-        })?;
+        let metadata = std::fs::metadata(&canonical)
+            .map_err(|_| NestedWritableFileRecoveryFailure::PriorResourceUnavailable)?;
         if !metadata.is_file() {
-            return Err(
-                "prior nested writable resource is not a regular file; retain inputs and repair"
-                    .into(),
-            );
+            return Err(NestedWritableFileRecoveryFailure::PriorResourceNotFile);
         }
-        candidates.push((directory_alias.components().count(), canonical));
+        candidates.push((directory_destination.components().count(), canonical));
     }
     candidates.sort_by_key(|(depth, path)| (std::cmp::Reverse(*depth), path.clone()));
     let Some((depth, source)) = candidates.first().cloned() else {
@@ -2325,10 +2403,7 @@ fn nested_writable_file_recovery_source(
         .take_while(|(candidate_depth, _)| *candidate_depth == depth)
         .any(|(_, candidate)| candidate != &source)
     {
-        return Err(
-            "prior nested writable resource has ambiguous directory owners; retain inputs and repair"
-                .into(),
-        );
+        return Err(NestedWritableFileRecoveryFailure::AmbiguousDirectoryOwners);
     }
     Ok(Some(source))
 }
@@ -4494,6 +4569,219 @@ mod tests {
         )
     }
 
+    fn opencode_resource_mount(
+        id: &str,
+        logical_destination: &str,
+        effective_destination: &str,
+        kind: freshell_runtime_protocol::ProviderResourceKind,
+        writable: bool,
+    ) -> freshell_runtime_protocol::ProviderResourceMount {
+        let file = kind == freshell_runtime_protocol::ProviderResourceKind::File;
+        freshell_runtime_protocol::ProviderResourceMount {
+            stage_relative_path: if file {
+                format!(".freshell/resource-units/{id}/source")
+            } else {
+                format!(".freshell/resource-units/{id}")
+            },
+            provider_relative_path: if file {
+                format!(".freshell/provider-roots/{id}/source")
+            } else {
+                format!(".freshell/provider-roots/{id}")
+            },
+            logical_destination: logical_destination.into(),
+            effective_destination: effective_destination.into(),
+            kind,
+            writable,
+        }
+    }
+
+    fn opencode_context_with_mounts(
+        resource_mounts: Vec<freshell_runtime_protocol::ProviderResourceMount>,
+    ) -> freshell_runtime_protocol::ProviderLaunchContext {
+        use freshell_runtime_protocol::*;
+        let capability = McpCapabilityReference {
+            grant_id: "grant-managed-provider-recovery-test".into(),
+            endpoint: "http://host.docker.internal:1234".into(),
+            provider_relative_path: ".freshell/mcp-capability.json".into(),
+            host_gateway_address: None,
+        };
+        ProviderLaunchContext {
+            config: vec![],
+            preparation: ProviderPreparation::Opencode {
+                project_config: vec![],
+                tui_config: None,
+                tui_source: None,
+                inline_config: false,
+            },
+            prepared_inputs: Some(PreparedProviderInputs {
+                generation_id: capability.grant_id.clone(),
+                initial_auth_reservation: None,
+                manifest: ProviderInputManifestReference {
+                    relative_path: ".freshell/input-manifest.json".into(),
+                    sha256: "a".repeat(64),
+                    source_count: 0,
+                    alias_count: 0,
+                    recipe_count: 0,
+                },
+                config_binds: vec![],
+                indexed_files: None,
+                resource_mounts,
+            }),
+            mcp_capability: Some(capability),
+        }
+    }
+
+    #[test]
+    fn provider_config_recovery_migrates_nested_writable_file_under_external_directory() {
+        use freshell_runtime_protocol::ProviderResourceKind;
+
+        let owned = tempfile::tempdir().unwrap();
+        let user_root = owned.path().join("provider");
+        let workspace = owned.path().join("workspace");
+        let home = owned.path().join("home");
+        let directory_source = user_root.join(".freshell/resource-units/external-directory");
+        let file_source = user_root.join(".freshell/resource-units/external-state/source");
+        let directory_relative = PathBuf::from(".freshell/provider-roots/external-directory");
+        let file_relative = PathBuf::from(".freshell/provider-roots/external-state/source");
+        std::fs::create_dir_all(&directory_source).unwrap();
+        std::fs::create_dir_all(file_source.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(directory_source.join("state.json"), "external seed").unwrap();
+        std::fs::write(directory_source.join("ordinary.json"), "ordinary seed").unwrap();
+        std::fs::write(&file_source, "stale exact seed").unwrap();
+
+        let directory = opencode_resource_mount(
+            "external-directory",
+            "/opt/provider-mcp",
+            "/opt/provider-mcp",
+            ProviderResourceKind::Directory,
+            false,
+        );
+        let initial = opencode_context_with_mounts(vec![directory.clone()]);
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        copy_provider_config_references(
+            &initial, "opencode", &workspace, &user_root, &home, uid, gid,
+        )
+        .unwrap();
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(home.join(&directory_relative).join("state.json"))
+            .unwrap()
+            .write_all(b" + runtime state")
+            .unwrap();
+        std::fs::write(
+            directory_source.join("state.json"),
+            "external refreshed seed",
+        )
+        .unwrap();
+        std::fs::write(
+            directory_source.join("ordinary.json"),
+            "ordinary refreshed seed",
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.join(file_relative.parent().unwrap())).unwrap();
+        std::fs::write(home.join(&file_relative), "").unwrap();
+
+        let writable = opencode_resource_mount(
+            "external-state",
+            "/opt/provider-mcp/state.json",
+            "/opt/provider-mcp/state.json",
+            ProviderResourceKind::File,
+            true,
+        );
+        let refresh = opencode_context_with_mounts(vec![directory, writable]);
+        refresh_provider_config_references(
+            &refresh, "opencode", &workspace, &user_root, &home, uid, gid,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(home.join(&file_relative)).unwrap(),
+            b"external seed + runtime state",
+            "new exact writable mounts under external directories must inherit prior runtime data"
+        );
+        assert_eq!(
+            std::fs::read(home.join(&directory_relative).join("state.json")).unwrap(),
+            b"external refreshed seed",
+            "the directory projection must still refresh independently"
+        );
+        assert_eq!(
+            std::fs::read(home.join(&directory_relative).join("ordinary.json")).unwrap(),
+            b"ordinary refreshed seed"
+        );
+    }
+
+    #[test]
+    fn provider_config_recovery_uses_one_source_for_resource_aliases() {
+        use freshell_runtime_protocol::ProviderResourceKind;
+
+        let owned = tempfile::tempdir().unwrap();
+        let user_root = owned.path().join("provider");
+        let workspace = owned.path().join("workspace");
+        let home = owned.path().join("home");
+        let directory_source = user_root.join(".freshell/resource-units/aliased-directory");
+        let file_source = user_root.join(".freshell/resource-units/aliased-state/source");
+        let directory_relative = PathBuf::from(".freshell/provider-roots/aliased-directory");
+        let file_relative = PathBuf::from(".freshell/provider-roots/aliased-state/source");
+        std::fs::create_dir_all(&directory_source).unwrap();
+        std::fs::create_dir_all(file_source.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(directory_source.join("state.json"), "alias seed").unwrap();
+        std::fs::write(&file_source, "stale alias seed").unwrap();
+        let directory = opencode_resource_mount(
+            "aliased-directory",
+            "/workspace/mcp",
+            "/home/freshell/provider/mcp",
+            ProviderResourceKind::Directory,
+            false,
+        );
+        let initial = opencode_context_with_mounts(vec![directory.clone()]);
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        copy_provider_config_references(
+            &initial, "opencode", &workspace, &user_root, &home, uid, gid,
+        )
+        .unwrap();
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(home.join(&directory_relative).join("state.json"))
+            .unwrap()
+            .write_all(b" + runtime state")
+            .unwrap();
+        std::fs::create_dir_all(home.join(file_relative.parent().unwrap())).unwrap();
+        std::fs::write(home.join(&file_relative), "").unwrap();
+
+        let primary_alias = opencode_resource_mount(
+            "aliased-state",
+            "/workspace/mcp/state.json",
+            "/home/freshell/provider/mcp/state.json",
+            ProviderResourceKind::File,
+            true,
+        );
+        let original_path_alias = opencode_resource_mount(
+            "aliased-state",
+            "/external/input/state.json",
+            "/external/input/state.json",
+            ProviderResourceKind::File,
+            true,
+        );
+        let refresh =
+            opencode_context_with_mounts(vec![directory, primary_alias, original_path_alias]);
+        refresh_provider_config_references(
+            &refresh, "opencode", &workspace, &user_root, &home, uid, gid,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(home.join(&file_relative)).unwrap(),
+            b"alias seed + runtime state",
+            "aliases of one physical writable root must all use its recovered runtime source"
+        );
+    }
+
     fn executable_fixture() -> tempfile::TempDir {
         match std::env::var_os("FRESHELL_TEST_EXECUTABLE_TMP_DIR") {
             Some(directory) => tempfile::tempdir_in(directory),
@@ -6298,6 +6586,57 @@ mod tests {
             .unwrap()
             .contains("repair"));
         assert!(event["elapsed_ms"].as_u64().is_some());
+
+        let redaction_root = tempfile::tempdir().unwrap();
+        let redaction_root_text = redaction_root.path().to_string_lossy().into_owned();
+        let recovery = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::provider_config_recovery_preserves_written_writable_file_and_refreshes_read_only_file",
+                "--nocapture",
+            ])
+            .env("TMPDIR", redaction_root.path())
+            .env("TMP", redaction_root.path())
+            .env("TEMP", redaction_root.path())
+            .output()
+            .unwrap();
+        assert!(recovery.status.success(), "{recovery:?}");
+        let recovery_stderr = std::str::from_utf8(&recovery.stderr).unwrap();
+        let recovery_events = recovery_stderr
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let recovery_failures = recovery_events
+            .iter()
+            .filter(|event| event["event"] == "provider.inputs.recovery.failed")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recovery_failures.len(),
+            1,
+            "a blocked writable-file recovery must produce one resource-specific diagnostic"
+        );
+        let recovery_failure = recovery_failures[0];
+        assert_eq!(recovery_failure["severity"], "error");
+        assert_eq!(recovery_failure["stage"], "session_host");
+        assert_eq!(recovery_failure["provider"], "opencode");
+        assert_eq!(
+            recovery_failure["operation"],
+            "recover_nested_writable_file"
+        );
+        assert_eq!(recovery_failure["reason"], "prior_resource_deleted");
+        assert_eq!(
+            recovery_failure["resource_stage_path"],
+            ".freshell/resource-units/deleted/source"
+        );
+        assert_eq!(
+            recovery_failure["provider_relative_path"],
+            ".freshell/provider-roots/deleted/source"
+        );
+        assert!(
+            !recovery_stderr.contains("stale host seed")
+                && !recovery_stderr.contains(&redaction_root_text),
+            "recovery diagnostics must not expose fixture contents or temporary host paths"
+        );
 
         #[cfg(unix)]
         {

@@ -110,16 +110,24 @@ mod configured_resource_tests {
         copy_environment(&host_selections, &host, &[], Default::default()).unwrap();
 
         let provider = owned_root.join("provider");
+        let nested_file_mounts = units
+            .iter()
+            .filter(|(_, mount)| {
+                mount.kind == freshell_runtime_protocol::ProviderResourceKind::File
+                    && units.iter().any(|(_, directory)| {
+                        directory.kind == freshell_runtime_protocol::ProviderResourceKind::Directory
+                            && Path::new(&mount.effective_destination)
+                                .strip_prefix(&directory.effective_destination)
+                                .is_ok_and(|suffix| !suffix.as_os_str().is_empty())
+                    })
+            })
+            .collect::<Vec<_>>();
         let provider_selections = units
             .iter()
             .filter(|(_, mount)| {
-                !units.iter().any(|(_, directory)| {
-                    directory.kind == freshell_runtime_protocol::ProviderResourceKind::Directory
-                        && mount.kind == freshell_runtime_protocol::ProviderResourceKind::File
-                        && Path::new(&mount.effective_destination)
-                            .strip_prefix(&directory.effective_destination)
-                            .is_ok_and(|suffix| !suffix.as_os_str().is_empty())
-                })
+                !nested_file_mounts
+                    .iter()
+                    .any(|(_, nested_mount)| *nested_mount == *mount)
             })
             .map(|(_, mount)| CopySelection {
                 source: host.join(&mount.provider_relative_path),
@@ -135,6 +143,34 @@ mod configured_resource_tests {
             })
             .collect::<Vec<_>>();
         copy_environment(&provider_selections, &provider, &[], Default::default()).unwrap();
+
+        // The filesystem helper cannot create Docker volume subpath mounts.
+        // Overlay each exact nested file as a symlink to its independent host
+        // volume inode, after projecting the enclosing directory. The script
+        // then exercises the same path that OpenCode sees at runtime.
+        for (_, mount) in nested_file_mounts {
+            let destination_relative = Path::new(&mount.effective_destination)
+                .strip_prefix(owned_root)
+                .map(Path::to_path_buf)
+                .or_else(|_| {
+                    Path::new(&mount.effective_destination)
+                        .strip_prefix("/home/freshell/provider")
+                        .map(|relative| Path::new(".provider-home").join(relative))
+                })
+                .expect("test provider destinations must map into the temporary root");
+            let destination = provider.join(destination_relative);
+            let host_mount = host.join(&mount.provider_relative_path);
+            std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            match std::fs::symlink_metadata(&destination) {
+                Ok(metadata) => {
+                    assert!(metadata.is_file() || metadata.file_type().is_symlink());
+                    std::fs::remove_file(&destination).unwrap();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("cannot inspect nested provider mount: {error}"),
+            }
+            std::os::unix::fs::symlink(host_mount, &destination).unwrap();
+        }
         provider
     }
 
@@ -1687,8 +1723,18 @@ process.stdout.write(require('./helper.js'))
         assert!(output.status.success(), "{:?}", output.stderr);
         assert_eq!(output.stdout, b"nested state updated\n");
         assert_eq!(
+            std::fs::read(&host_state).unwrap(),
+            b"mount-only runtime state + runtime state",
+            "the executed provider script must write through the exact host-volume file mount"
+        );
+        assert_eq!(
+            std::fs::read(&host_directory_state).unwrap(),
+            b"initial state",
+            "the exact mount write must not mutate the enclosing directory volume"
+        );
+        assert_eq!(
             std::fs::read(provider_script_directory.join("state.json")).unwrap(),
-            b"initial state + runtime state"
+            b"mount-only runtime state + runtime state"
         );
     }
 
