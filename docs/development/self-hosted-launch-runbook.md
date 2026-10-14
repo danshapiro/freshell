@@ -373,11 +373,15 @@ drop-in, plus `freshell-supervisor.service`):
   `freshell-supervisor.service`. Restarting the SUPERVISOR therefore also
   restarts the server in the same transaction — one
   `systemctl --user restart freshell-supervisor.service` redeploys both.
-  BEWARE: any server-unit restart terminates the server's RETAINED Codex
-  sidecars (see the restart-effects list below — the unit has no
-  `KillMode` override, so systemd's control-group kill defeats the
-  server's deliberate SAFE-11 retention); in-flight Codex conversations
-  are lost.
+  The shipped unit sets `KillMode=process` (SAFE-11: the server's graceful
+  shutdown deliberately RETAINS adopted terminal-pane Codex sidecars, and
+  a control-group kill would slaughter them), so unit restarts PRESERVE
+  in-flight Codex conversations — but only if the INSTALLED copy carries
+  that line. Verify `systemctl --user show freshell-rust -p KillMode`
+  reports `process`; an installed copy without it (or explicitly
+  `control-group`) must be re-copied from `installers/systemd/` and
+  `systemctl --user daemon-reload`d, or unit restarts still terminate
+  retained Codex conversations.
   The same `Type=simple` socket race as the strict sequence applies here:
   the server may start before the supervisor rebinds its control socket
   and come up failed; the unit's `Restart=on-failure` retries can then
