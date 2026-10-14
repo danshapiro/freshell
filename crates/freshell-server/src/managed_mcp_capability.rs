@@ -10826,6 +10826,142 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
         }
     }
 
+    #[tokio::test]
+    async fn managed_opencode_controller_publishes_direct_home_sibling_file_mount() {
+        use crate::managed_provider_references::sources::*;
+        use freshell_runtime_protocol::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let cwd = workspace.join("preflight");
+        let config_root = home.join(".config/opencode");
+        let resources = owned.path().join("selected-resources");
+        let direct_home_script = home.join("direct-home-preflight.mjs");
+        let direct_home_wrapper = home.join("direct-home-preflight-start");
+        let direct_home_output = home.join("direct-home-preflight.txt");
+        let direct_home_env = home.join("direct-home-preflight.env");
+        let workspace_config = workspace.join("preflight/opencode.json");
+        std::fs::create_dir_all(&config_root).unwrap();
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::create_dir_all(workspace_config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &direct_home_env,
+            "FRESHELL_MANAGED_SHARED_ENV=fixture-value\n",
+        )
+        .unwrap();
+        std::fs::write(&direct_home_output, "initial").unwrap();
+        std::fs::write(
+            &direct_home_script,
+            "import fs from 'node:fs'\nconst output = new URL('./direct-home-preflight.txt', import.meta.url)\nfs.appendFileSync(output, '|managed')\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &direct_home_wrapper,
+            format!(
+                "#!/bin/sh\nSCRIPT_DIR=$(dirname \"$0\")\nnode --env-file={} \"$SCRIPT_DIR/direct-home-preflight.mjs\" \"$@\"\n",
+                direct_home_env.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&direct_home_wrapper, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let mut mcp = serde_json::Map::new();
+        for name in ["nested_package", "direct_script", "workspace_alias"] {
+            let script = resources.join(format!("{name}.mjs"));
+            std::fs::write(&script, "process.stdin.resume()\n").unwrap();
+            mcp.insert(
+                name.into(),
+                serde_json::json!({
+                    "type":"local",
+                    "command":["node", script.to_string_lossy()],
+                    "enabled":true,
+                }),
+            );
+        }
+        mcp.insert(
+            "direct_home_append_fixture".into(),
+            serde_json::json!({
+                "type":"local",
+                "command":[direct_home_wrapper, "receipt.json", "fixture-value"],
+                "enabled":true,
+            }),
+        );
+        std::fs::write(
+            &workspace_config,
+            serde_json::json!({ "mcp": mcp }).to_string(),
+        )
+        .unwrap();
+
+        let sources = discover_opencode(OpencodeDiscovery {
+            home: &home,
+            cwd: &cwd,
+            worktree: &workspace,
+            config_root: &config_root,
+            env: &|_| None,
+        })
+        .unwrap();
+        let plan = plan_opencode_sources(sources, &cwd, &home, &|_, _, _| None).unwrap();
+        let direct_home_output = direct_home_output.canonicalize().unwrap();
+        assert!(plan.iter().any(|source| source
+            .configured_writable_resources
+            .contains(&direct_home_output)));
+        let secret_references = plan
+            .iter()
+            .flat_map(|source| &source.references.selections)
+            .map(|selection| {
+                let index = selection
+                    .runtime_destination
+                    .strip_prefix("/home/freshell/provider/.freshell/references/")
+                    .unwrap();
+                ProviderSecretReference {
+                    source_path: selection.canonical_source.to_string_lossy().into_owned(),
+                    profile: ProviderSecretProfile::OpencodeConfigurationFile,
+                    provider_relative_path: Some(format!(".freshell/references/{index}")),
+                }
+            })
+            .collect::<Vec<_>>();
+        let directory = owned.path().join("control/mcp-capabilities");
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = CapabilityStore::default();
+        let capability = store
+            .issue(
+                SoulId::new(),
+                &directory,
+                "http://host.docker.internal:4000".into(),
+                Some(("opencode", &home, &[])),
+                OpencodeEphemeralInput {
+                    cwd: Some(&cwd),
+                    workspace: Some(&workspace),
+                    source_plan: Some(&plan),
+                    secret_references: Some(&secret_references),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let stage = staged_provider_root_path(&directory, &capability.grant_id).unwrap();
+        let inputs: PreparedProviderInputs = serde_json::from_slice(
+            &std::fs::read(stage.join(".freshell/prepared-inputs.json")).unwrap(),
+        )
+        .unwrap();
+        let mount = inputs
+            .resource_mounts
+            .iter()
+            .find(|mount| {
+                mount.kind == ProviderResourceKind::File
+                    && mount.writable
+                    && mount.effective_destination
+                        == "/home/freshell/provider/direct-home-preflight.txt"
+            })
+            .expect("prepared input descriptor must publish the exact writable HOME sibling mount");
+        let staged = stage.join(&mount.stage_relative_path);
+        let metadata = std::fs::symlink_metadata(&staged).unwrap();
+        assert!(metadata.is_file() && !metadata.file_type().is_symlink());
+        assert_eq!(std::fs::read(staged).unwrap(), b"initial");
+    }
+
     #[test]
     fn managed_provider_ancestor_root_has_its_own_native_mount_location() {
         use crate::managed_provider_references::sources::*;

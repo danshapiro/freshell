@@ -390,10 +390,14 @@ export function managedEnvironmentFixtureLayout(root: string) {
 
 export function managedHomeAppendFixturePaths(home: string, cwd: string, scenario: string) {
   const script = path.join(home, `direct-home-${scenario}.mjs`)
+  const receipt = path.join(cwd, '.managed-fixture/direct-home-mcp-receipt.json')
   return {
     script,
+    wrapper: path.join(home, `direct-home-${scenario}-start`),
+    envFile: path.join(home, `direct-home-${scenario}.env`),
     output: path.join(path.dirname(script), `direct-home-${scenario}.txt`),
-    receipt: path.join(cwd, '.managed-fixture/direct-home-mcp-receipt.json'),
+    receipt,
+    started: `${receipt}.started`,
   }
 }
 
@@ -495,6 +499,31 @@ export default {id:'managed-environment-tui',async tui(api,options){
     const homeAppend = managedHomeAppendFixturePaths(home, cwd, scenario)
     await fs.writeFile(homeAppend.script, directHomeAppendMcpServerSource(path.basename(homeAppend.output)))
     await fs.writeFile(homeAppend.output, `initial-${nonce}`)
+    await fs.writeFile(homeAppend.envFile, `FRESHELL_MANAGED_SHARED_ENV=${nonce}\n`, { mode: 0o600 })
+    const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
+    await fs.writeFile(homeAppend.wrapper, `#!/bin/sh
+set +e
+SCRIPT_DIR=$(dirname "$0")
+receipt=$1
+expected=$2
+started="${'${receipt}'}.started"
+printf '%s' wrapper-started > "$started"
+diagnostic=$(mktemp)
+node --env-file=${shellQuote(homeAppend.envFile)} "$SCRIPT_DIR/${path.basename(homeAppend.script)}" "$receipt" "$expected" 2>"$diagnostic"
+status=$?
+if [ "$status" -ne 0 ]; then
+  has_enoent=false
+  has_eacces=false
+  has_env_file_error=false
+  grep -q 'ENOENT' "$diagnostic" && has_enoent=true
+  grep -q 'EACCES' "$diagnostic" && has_eacces=true
+  grep -qi 'env file' "$diagnostic" && has_env_file_error=true
+  printf '{"wrapperStarted":true,"nodeExitCode":%s,"stderrHasENOENT":%s,"stderrHasEACCES":%s,"stderrHasEnvFileError":%s}' "$status" "$has_enoent" "$has_eacces" "$has_env_file_error" > "$receipt"
+fi
+rm -f "$diagnostic"
+exit "$status"
+`, { mode: 0o751 })
+    await fs.chmod(homeAppend.wrapper, 0o751)
     await writeJson(path.join(cwd, 'opencode.json'), { model: managedEnvironmentFixtureModel, agent: { fixtureRelative: {
       prompt: `{file:./${scenario === 'missing-reference' ? 'missing-selected.txt' : 'rules.txt'}}` } },
       mcp: {
@@ -518,7 +547,7 @@ export default {id:'managed-environment-tui',async tui(api,options){
         },
         direct_home_append_fixture: {
           type: 'local',
-          command: ['node', `--env-file=${sharedEnvFile}`, homeAppend.script, homeAppend.receipt, nonce],
+          command: [homeAppend.wrapper, homeAppend.receipt, nonce],
           enabled: true,
         },
       },
@@ -1441,9 +1470,23 @@ export async function runManagedEnvironmentTarget() {
     assert.equal(preflightDirectMcp.envFileOperandRewritten, true)
     assert.equal(preflightDirectMcp.envValueLoaded, true)
     assert(preflightDirectMcp.scriptPath.endsWith('/direct-mcp/server.mjs'))
-    const preflightHomeAppend = await poll('OpenCode starts the direct HOME MCP and it appends its sibling output', async () =>
-      readJson(path.join(selected.workspace, 'preflight/.managed-fixture/direct-home-mcp-receipt.json')))
-    assert.equal(preflightHomeAppend.expectedNonce, nonce)
+    const preflightHomeAppendPaths = managedHomeAppendFixturePaths(
+      selected.home, path.join(selected.workspace, 'preflight'), 'preflight')
+    const preflightHomeAppend = await poll('OpenCode starts the direct HOME MCP and it appends its sibling output', async () => {
+      const receipt = await readJson(preflightHomeAppendPaths.receipt)
+      if (receipt) return receipt
+      try {
+        const [started, metadata] = await Promise.all([
+          fs.readFile(preflightHomeAppendPaths.started, 'utf8'), fs.stat(preflightHomeAppendPaths.started),
+        ])
+        if (started === 'wrapper-started' && Date.now() - metadata.mtimeMs > 15_000) {
+          return { wrapperStarted: true, nodeStartupTimedOut: true }
+        }
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+      return undefined
+    })
+    assert.equal(preflightHomeAppend.expectedNonce, nonce,
+      `direct HOME MCP did not complete its receipt: ${JSON.stringify(preflightHomeAppend)}`)
     assert.equal(preflightHomeAppend.appendError, undefined, 'the staged HOME-level append target must be writable')
     assert.equal(preflightHomeAppend.readError, undefined, 'the staged HOME-level append target must be readable')
     assert.equal(preflightHomeAppend.outputExists, true, 'the sibling file must exist inside the provider container')

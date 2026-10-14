@@ -1778,18 +1778,19 @@ mod configured_resource_tests {
         std::fs::create_dir_all(&workspace_cwd).unwrap();
         std::fs::create_dir_all(workspace_config.parent().unwrap()).unwrap();
         std::fs::write(global.join("opencode.json"), r#"{"model":"fixture/model"}"#).unwrap();
-        std::fs::write(package.join("package.json"), r#"{"type":"module","scripts":{"mcp.js":"bun ./server.mjs"}}"#).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"type":"module","scripts":{"mcp.js":"bun ./server.mjs"}}"#,
+        )
+        .unwrap();
         std::fs::write(package.join("server.mjs"), "process.stdin.resume();\n").unwrap();
         std::fs::write(
             direct.join("start"),
             "#!/bin/sh\ncd \"$(dirname \"$0\")\"\nSCRIPT_DIR=$(dirname \"$0\")\n. \"$SCRIPT_DIR/helper.sh\"\nexec node --env-file=.env \"$SCRIPT_DIR/server.mjs\" \"$@\"\n",
         )
         .unwrap();
-        std::fs::set_permissions(
-            direct.join("start"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        std::fs::set_permissions(direct.join("start"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
         std::fs::write(direct.join("helper.sh"), "export FIXTURE_HELPER=loaded\n").unwrap();
         std::fs::write(direct.join("server.mjs"), "process.stdin.resume();\n").unwrap();
         std::fs::write(&shared_env, "FIXTURE_SHARED_ENV=loaded\n").unwrap();
@@ -1894,10 +1895,16 @@ mod configured_resource_tests {
             .into_iter()
             .collect::<Vec<_>>();
         let provider = copy_selected_units_through_provider_excluding_with_plan(
-            owned.path(), &units, &excluded, &plan,
+            owned.path(),
+            &units,
+            &excluded,
+            &plan,
         );
         let provider_output = provider.join(".provider-home/direct-home-preflight.txt");
-        assert!(provider_output.is_file(), "the HOME sibling must survive the complete selected-resource copy");
+        assert!(
+            provider_output.is_file(),
+            "the HOME sibling must survive the complete selected-resource copy"
+        );
         assert_eq!(std::fs::read_to_string(provider_output).unwrap(), "initial");
     }
 
