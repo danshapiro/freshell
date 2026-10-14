@@ -124,6 +124,7 @@ enum Node {
 struct Plan {
     nodes: BTreeMap<PathBuf, Node>,
     mappings: BTreeMap<PathBuf, PathBuf>,
+    independent_file_roots: BTreeSet<PathBuf>,
     pending: VecDeque<(PathBuf, PathBuf, usize)>,
     exclusions: Vec<PathBuf>,
     excluded_subtree: Option<PathBuf>,
@@ -554,7 +555,7 @@ impl Plan {
             }
             return Ok(());
         }
-        if !metadata.file_type().is_symlink() {
+        if !metadata.file_type().is_symlink() && !self.independent_file_roots.contains(&path) {
             if let Some(mapped) = self.mapped(&canonical)? {
                 if mapped != path {
                     return self.claim(path, Node::Link(mapped));
@@ -873,19 +874,6 @@ fn copy_environment_projection(
             ));
         }
     }
-    let mut plan = Plan {
-        nodes: BTreeMap::new(),
-        mappings: BTreeMap::new(),
-        pending: VecDeque::new(),
-        exclusions: excluded_canonical_sources.to_vec(),
-        excluded_subtree,
-        included_subtree_resources: BTreeSet::new(),
-        counted_files: BTreeSet::new(),
-        bytes: 0,
-        metadata_bytes: 0,
-        limits,
-        account_home,
-    };
     let mut selections = selections.iter().collect::<Vec<_>>();
     selections.sort_by_key(|selection| {
         (
@@ -903,6 +891,29 @@ fn copy_environment_projection(
             ));
         }
     }
+    let independent_file_roots = selections
+        .iter()
+        .filter(|selection| mounted_roots.contains(&selection.destination_relative))
+        .filter_map(|selection| {
+            let metadata = fs::symlink_metadata(&selection.source).ok()?;
+            (metadata.is_file() && !metadata.file_type().is_symlink())
+                .then(|| selection.destination_relative.clone())
+        })
+        .collect();
+    let mut plan = Plan {
+        nodes: BTreeMap::new(),
+        mappings: BTreeMap::new(),
+        independent_file_roots,
+        pending: VecDeque::new(),
+        exclusions: excluded_canonical_sources.to_vec(),
+        excluded_subtree,
+        included_subtree_resources: BTreeSet::new(),
+        counted_files: BTreeSet::new(),
+        bytes: 0,
+        metadata_bytes: 0,
+        limits,
+        account_home,
+    };
     for selection in &selections {
         let path = &selection.destination_relative;
         if !valid_relative(path) {
@@ -931,6 +942,12 @@ fn copy_environment_projection(
         }
         plan.select_linked_ancestors(selection, &selections, &canonical)?;
         if metadata.file_type().is_symlink() {
+            plan.enqueue(selection.source.clone(), path.clone(), 0)?;
+        } else if plan.independent_file_roots.contains(path) {
+            // A separately mounted exact file needs its own inode even when
+            // the same source file was already copied through a selected
+            // directory. Canonical-path accounting still charges its bytes
+            // once.
             plan.enqueue(selection.source.clone(), path.clone(), 0)?;
         } else if let Some(mapped) = plan.mapped(&canonical)? {
             if mapped != *path {
@@ -1018,6 +1035,7 @@ fn copy_environment_projection(
         NEXT_PROJECTION.fetch_add(1, Ordering::Relaxed)
     )))?;
     let mut actual_bytes = 0u64;
+    let mut counted_sources = BTreeSet::new();
     for (relative, node) in &plan.nodes {
         let destination = temporary.0.join(relative);
         match node {
@@ -1027,6 +1045,7 @@ fn copy_environment_projection(
                 mode(&destination, 0o700, relative)?;
             }
             Node::File(source, source_mode, expected) => {
+                let count_source_bytes = counted_sources.insert(source.clone());
                 let mut input =
                     File::open(source).map_err(|cause| io_error(relative, "open", cause))?;
                 let mut options = OpenOptions::new();
@@ -1051,16 +1070,20 @@ fn copy_environment_projection(
                     file_bytes = file_bytes
                         .checked_add(read as u64)
                         .ok_or_else(|| error(relative, "read", "file byte accounting overflow"))?;
-                    actual_bytes = actual_bytes
-                        .checked_add(read as u64)
-                        .ok_or_else(|| error(relative, "read", "total byte accounting overflow"))?;
+                    if count_source_bytes {
+                        actual_bytes = actual_bytes.checked_add(read as u64).ok_or_else(|| {
+                            error(relative, "read", "total byte accounting overflow")
+                        })?;
+                    }
                     bound(relative, "file_bytes", file_bytes, limits.max_file_bytes)?;
-                    bound(
-                        relative,
-                        "total_bytes",
-                        actual_bytes,
-                        limits.max_total_bytes,
-                    )?;
+                    if count_source_bytes {
+                        bound(
+                            relative,
+                            "total_bytes",
+                            actual_bytes,
+                            limits.max_total_bytes,
+                        )?;
+                    }
                     output
                         .write_all(&buffer[..read])
                         .map_err(|cause| io_error(relative, "write", cause))?;
@@ -2742,6 +2765,51 @@ mod tests {
             .file_type()
             .is_symlink());
         assert_eq!(fs::read(destination.join("skill/data")).unwrap(), b"nonce");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mounted_nested_file_root_keeps_an_independent_inode_and_single_byte_charge() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir_all(source.join("mcp")).unwrap();
+        fs::write(source.join("mcp/state.json"), "nonce").unwrap();
+        let destination = root.path().join("out");
+        fs::create_dir_all(destination.join("exact")).unwrap();
+        fs::write(destination.join("exact/source"), []).unwrap();
+
+        let report = copy_environment_for_mounts(
+            &[
+                selection(&source.join("mcp"), "directory"),
+                selection(&source.join("mcp/state.json"), "exact/source"),
+            ],
+            &destination,
+            &[],
+            CopyLimits {
+                max_total_bytes: 5,
+                ..CopyLimits::default()
+            },
+            &[PathBuf::from("exact/source")],
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.bytes, 5,
+            "duplicate physical copies share one byte charge"
+        );
+        for path in [
+            destination.join("directory/state.json"),
+            destination.join("exact/source"),
+        ] {
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            assert!(metadata.is_file() && !metadata.file_type().is_symlink());
+        }
+        fs::write(destination.join("exact/source"), "runtime state").unwrap();
+        assert_eq!(
+            fs::read(destination.join("directory/state.json")).unwrap(),
+            b"nonce",
+            "the exact mounted file must not alias its selected directory copy"
+        );
     }
 
     #[cfg(unix)]

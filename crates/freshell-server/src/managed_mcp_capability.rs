@@ -1672,6 +1672,7 @@ fn stage_provider_root(
         );
         let mut _filtered_resource_sources = None;
         let mut retained_resource_sources = None;
+        let mut mounted_resource_file_roots = Vec::new();
         if let Some(plan) = opencode_input.source_plan {
             // Indexed payloads remain exclusively in the private input volume,
             // even when an ordinary package scope also contains their files.
@@ -1752,6 +1753,22 @@ fn stage_provider_root(
                 .into_iter()
                 .map(|(_, mount)| mount)
                 .collect::<Vec<_>>();
+            mounted_resource_file_roots = descriptors
+                .iter()
+                .filter(|mount| mount.kind == freshell_runtime_protocol::ProviderResourceKind::File)
+                .map(|mount| PathBuf::from(&mount.stage_relative_path))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            for root in &mounted_resource_file_roots {
+                let destination = temporary.join(root);
+                private_directory(
+                    destination
+                        .parent()
+                        .ok_or("mounted resource file stage has no parent")?,
+                )?;
+                write_private_bytes(&destination, &[])?;
+            }
             let metadata = freshell_runtime_protocol::bounded_json_bytes(
                 &descriptors,
                 freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
@@ -1978,7 +1995,7 @@ fn stage_provider_root(
             selections = selections.len()
         );
         let copy_result = if provider == "opencode" {
-            freshell_platform::provider_environment::copy_environment_excluding_subtree(
+            freshell_platform::provider_environment::copy_environment_excluding_subtree_for_mounts(
                 &selections,
                 &temporary,
                 &excluded,
@@ -1987,6 +2004,7 @@ fn stage_provider_root(
                     .or(opencode_input.cwd)
                     .unwrap_or(home),
                 CopyLimits::default(),
+                &mounted_resource_file_roots,
             )
         } else {
             copy_environment(&selections, &temporary, &excluded, CopyLimits::default())
@@ -10056,6 +10074,107 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             std::fs::read_to_string(selected.join("opencode.json")).unwrap(),
             raw
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_opencode_controller_stages_nested_writable_file_as_regular_mount_source() {
+        use crate::managed_provider_references::sources::*;
+        use freshell_platform::opencode_recipe::DiscoveryRoot;
+        use freshell_runtime_protocol::*;
+        use std::os::unix::fs::MetadataExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let config_root = home.join(".config/opencode");
+        let project_config = workspace.join(".opencode/opencode.json");
+        let mcp_directory = home.join("mcp");
+        let script = mcp_directory.join("server.mjs");
+        let state = mcp_directory.join("state.json");
+        std::fs::create_dir_all(&config_root).unwrap();
+        std::fs::create_dir_all(project_config.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&mcp_directory).unwrap();
+        std::fs::write(
+            &project_config,
+            serde_json::json!({
+                "mcp": { "direct": { "type": "local", "command": [script] } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            &script,
+            "import fs from 'node:fs';\nimport path from 'node:path';\nimport { fileURLToPath } from 'node:url';\nconst __dirname = path.dirname(fileURLToPath(import.meta.url));\nfs.appendFileSync(path.join(__dirname, 'state.json'), ' + runtime state');\n",
+        )
+        .unwrap();
+        std::fs::write(&state, "initial state").unwrap();
+
+        let sources = discover_opencode(OpencodeDiscovery {
+            home: &home,
+            cwd: &workspace,
+            worktree: &workspace,
+            config_root: &config_root,
+            env: &|_| None,
+        })
+        .unwrap();
+        let plan = plan_opencode_sources(sources, &workspace, &home, &|_, _, _| None).unwrap();
+        let canonical_state = state.canonicalize().unwrap();
+        assert!(plan.iter().any(|source| {
+            source
+                .configured_writable_resources
+                .contains(&canonical_state)
+        }));
+
+        let selected_roots = [DiscoveryRoot {
+            logical_path: mcp_directory,
+            role: DiscoveryRole::Home,
+        }];
+        let directory = owned.path().join("control/mcp-capabilities");
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = CapabilityStore::default();
+        let capability = store
+            .issue(
+                SoulId::new(),
+                &directory,
+                "http://host.docker.internal:4000".into(),
+                Some(("opencode", &home, &[])),
+                OpencodeEphemeralInput {
+                    cwd: Some(&workspace),
+                    workspace: Some(&workspace),
+                    source_plan: Some(&plan),
+                    secret_references: Some(&[]),
+                    resource_roots: Some(&selected_roots),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let stage = staged_provider_root_path(&directory, &capability.grant_id).unwrap();
+        let inputs: PreparedProviderInputs = serde_json::from_slice(
+            &std::fs::read(stage.join(".freshell/prepared-inputs.json")).unwrap(),
+        )
+        .unwrap();
+        let writable_files = inputs
+            .resource_mounts
+            .iter()
+            .filter(|mount| {
+                mount.kind == ProviderResourceKind::File
+                    && mount.writable
+                    && mount.effective_destination.ends_with("/mcp/state.json")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !writable_files.is_empty(),
+            "controller staging must include the exact writable file mount"
+        );
+        for mount in writable_files {
+            let staged_file = stage.join(&mount.stage_relative_path);
+            let metadata = std::fs::symlink_metadata(&staged_file).unwrap();
+            assert!(metadata.is_file() && !metadata.file_type().is_symlink());
+            assert_eq!(metadata.nlink(), 1, "mount sources require an owned inode");
+            assert_eq!(std::fs::read(&staged_file).unwrap(), b"initial state");
+        }
     }
 
     #[tokio::test]

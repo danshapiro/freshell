@@ -11,7 +11,9 @@ use std::{collections::BTreeMap, path::Path};
 mod configured_resource_tests {
     use super::*;
     use crate::managed_provider_references::sources::*;
-    use freshell_platform::provider_environment::{copy_environment, CopySelection};
+    use freshell_platform::provider_environment::{
+        copy_environment, copy_environment_for_mounts, CopySelection,
+    };
 
     fn execute_selected_resource_with_path(
         path: &Path,
@@ -74,7 +76,28 @@ mod configured_resource_tests {
                 destination_relative: mount.stage_relative_path.clone().into(),
             })
             .collect::<Vec<_>>();
-        copy_environment(&stage_selections, &stage, &[], Default::default()).unwrap();
+        let mounted_file_roots = units
+            .iter()
+            .filter(|(_, mount)| {
+                mount.kind == freshell_runtime_protocol::ProviderResourceKind::File
+            })
+            .map(|(_, mount)| Path::new(&mount.stage_relative_path).to_owned())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        for root in &mounted_file_roots {
+            let placeholder = stage.join(root);
+            std::fs::create_dir_all(placeholder.parent().unwrap()).unwrap();
+            std::fs::write(placeholder, []).unwrap();
+        }
+        copy_environment_for_mounts(
+            &stage_selections,
+            &stage,
+            &[],
+            Default::default(),
+            &mounted_file_roots,
+        )
+        .unwrap();
 
         let host = owned_root.join("host");
         let host_selections = units
@@ -89,6 +112,15 @@ mod configured_resource_tests {
         let provider = owned_root.join("provider");
         let provider_selections = units
             .iter()
+            .filter(|(_, mount)| {
+                !units.iter().any(|(_, directory)| {
+                    directory.kind == freshell_runtime_protocol::ProviderResourceKind::Directory
+                        && mount.kind == freshell_runtime_protocol::ProviderResourceKind::File
+                        && Path::new(&mount.effective_destination)
+                            .strip_prefix(&directory.effective_destination)
+                            .is_ok_and(|suffix| !suffix.as_os_str().is_empty())
+                })
+            })
             .map(|(_, mount)| CopySelection {
                 source: host.join(&mount.provider_relative_path),
                 destination_relative: Path::new(&mount.effective_destination)
@@ -1613,6 +1645,35 @@ process.stdout.write(require('./helper.js'))
             .map(|(_, mount)| mount)
             .expect("the selected script directory needs a directory mount");
         let provider = copy_selected_units_through_provider(owned.path(), &units);
+        let staged_state = owned
+            .path()
+            .join("stage")
+            .join(&state_mount.1.stage_relative_path);
+        let staged_state_metadata = std::fs::symlink_metadata(&staged_state).unwrap();
+        assert!(
+            staged_state_metadata.is_file() && !staged_state_metadata.file_type().is_symlink(),
+            "a file mount must have a physical regular inode in the controller stage"
+        );
+        let host_state = owned
+            .path()
+            .join("host")
+            .join(&state_mount.1.provider_relative_path);
+        let host_directory_state = owned
+            .path()
+            .join("host")
+            .join(&directory_mount.provider_relative_path)
+            .join("state.json");
+        let host_state_metadata = std::fs::symlink_metadata(&host_state).unwrap();
+        assert!(
+            host_state_metadata.is_file() && !host_state_metadata.file_type().is_symlink(),
+            "the provider-volume file subpath must be a physical regular inode"
+        );
+        std::fs::write(&host_state, "mount-only runtime state").unwrap();
+        assert_eq!(
+            std::fs::read(&host_directory_state).unwrap(),
+            b"initial state",
+            "writes through the exact mount must not alias the enclosing directory copy"
+        );
         let provider_script_directory = provider.join(".provider-home").join(
             Path::new(&directory_mount.effective_destination)
                 .strip_prefix("/home/freshell/provider")

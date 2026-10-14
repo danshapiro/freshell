@@ -1944,6 +1944,11 @@ fn copy_provider_config_references_with_ownership(
     };
     use freshell_runtime_protocol::ProviderConfigRoot;
     context.validate(provider).map_err(|error| error.message)?;
+    let previous_projection = if provider == "opencode" && provider_home != final_home {
+        Some(read_projection_manifest(final_home)?)
+    } else {
+        None
+    };
     let mut selections = provider_config_references(context)
         .into_iter()
         .map(|reference| {
@@ -1962,16 +1967,25 @@ fn copy_provider_config_references_with_ownership(
         })
         .collect::<Vec<_>>();
     let config_selection_count = selections.len();
-    selections.extend(
-        context
-            .prepared_inputs
-            .iter()
-            .flat_map(|inputs| &inputs.resource_mounts)
-            .map(|unit| CopySelection {
-                source: user_provider_root.join(&unit.stage_relative_path),
-                destination_relative: unit.provider_relative_path.clone().into(),
-            }),
-    );
+    let mut resource_selections = Vec::new();
+    for unit in context
+        .prepared_inputs
+        .iter()
+        .flat_map(|inputs| &inputs.resource_mounts)
+    {
+        let staged_source = user_provider_root.join(&unit.stage_relative_path);
+        let source = if let Some(previous) = previous_projection.as_ref() {
+            nested_writable_file_recovery_source(context, unit, previous, final_home)?
+                .unwrap_or(staged_source)
+        } else {
+            staged_source
+        };
+        resource_selections.push(CopySelection {
+            source,
+            destination_relative: unit.provider_relative_path.clone().into(),
+        });
+    }
+    selections.extend(resource_selections);
     let protected = private_bound_destinations(context);
     let mut excluded = provider_credential_sources(user_provider_root);
     // A prepared config leaf is the selected view of the raw file still held
@@ -2215,6 +2229,108 @@ fn writable_resource_mount_roots(
         })
         .map(|mount| PathBuf::from(&mount.provider_relative_path))
         .collect()
+}
+
+fn nested_writable_file_recovery_source(
+    context: &freshell_runtime_protocol::ProviderLaunchContext,
+    mount: &freshell_runtime_protocol::ProviderResourceMount,
+    previous: &std::collections::BTreeSet<String>,
+    previous_home: &Path,
+) -> Result<Option<PathBuf>, String> {
+    use freshell_runtime_protocol::ProviderResourceKind;
+    if mount.kind != ProviderResourceKind::File || !mount.writable {
+        return Ok(None);
+    }
+    let mount_relative = Path::new(&mount.provider_relative_path);
+    if mount_relative.as_os_str().is_empty() || previous.contains(&mount.provider_relative_path) {
+        return Ok(None);
+    }
+    let Some(mount_alias) = Path::new(&mount.effective_destination)
+        .strip_prefix("/home/freshell/provider")
+        .ok()
+    else {
+        return Ok(None);
+    };
+    let canonical_home = std::fs::canonicalize(previous_home)
+        .map_err(|_| "prior provider state is unavailable for writable-file recovery")?;
+    let mut candidates = Vec::<(usize, PathBuf)>::new();
+    for directory in context
+        .prepared_inputs
+        .iter()
+        .flat_map(|inputs| &inputs.resource_mounts)
+        .filter(|candidate| candidate.kind == ProviderResourceKind::Directory)
+    {
+        let Some(directory_alias) = Path::new(&directory.effective_destination)
+            .strip_prefix("/home/freshell/provider")
+            .ok()
+        else {
+            continue;
+        };
+        if directory_alias.as_os_str().is_empty() {
+            continue;
+        }
+        let Ok(suffix) = mount_alias.strip_prefix(directory_alias) else {
+            continue;
+        };
+        if suffix.as_os_str().is_empty() {
+            continue;
+        }
+        let prior_relative = Path::new(&directory.provider_relative_path).join(suffix);
+        let prior_text = prior_relative.to_string_lossy().into_owned();
+        if !previous.contains(&prior_text) {
+            continue;
+        }
+        let prior_path = previous_home.join(&prior_relative);
+        let canonical = match std::fs::canonicalize(&prior_path) {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(
+                    "prior nested writable resource was deleted; retain inputs and repair".into(),
+                )
+            }
+            Err(_) => {
+                return Err(
+                    "prior nested writable resource is unavailable; retain inputs and repair"
+                        .into(),
+                )
+            }
+        };
+        let canonical_relative = canonical.strip_prefix(&canonical_home).map_err(|_| {
+            "prior nested writable resource escaped provider state; retain inputs and repair"
+        })?;
+        if !previous.contains(&canonical_relative.to_string_lossy().into_owned()) {
+            return Err(
+                "prior nested writable resource target is not owned; retain inputs and repair"
+                    .into(),
+            );
+        }
+        let metadata = std::fs::metadata(&canonical).map_err(|_| {
+            "prior nested writable resource is unavailable; retain inputs and repair"
+        })?;
+        if !metadata.is_file() {
+            return Err(
+                "prior nested writable resource is not a regular file; retain inputs and repair"
+                    .into(),
+            );
+        }
+        candidates.push((directory_alias.components().count(), canonical));
+    }
+    candidates.sort_by_key(|(depth, path)| (std::cmp::Reverse(*depth), path.clone()));
+    let Some((depth, source)) = candidates.first().cloned() else {
+        return Ok(None);
+    };
+    if candidates
+        .iter()
+        .skip(1)
+        .take_while(|(candidate_depth, _)| *candidate_depth == depth)
+        .any(|(_, candidate)| candidate != &source)
+    {
+        return Err(
+            "prior nested writable resource has ambiguous directory owners; retain inputs and repair"
+                .into(),
+        );
+    }
+    Ok(Some(source))
 }
 
 // A resource's native HOME alias is a separate volume-subpath mount. Publish
@@ -4783,22 +4899,34 @@ mod tests {
         let home = owned.path().join("home");
         let directory_source = user_root.join(".freshell/resource-units/directory");
         let directory_relative = PathBuf::from(".freshell/provider-roots/directory");
+        let preserved_source = user_root.join(".freshell/resource-units/preserved/source");
         let writable_source = user_root.join(".freshell/resource-units/writable/source");
         let readonly_source = user_root.join(".freshell/resource-units/readonly/source");
+        let deleted_source = user_root.join(".freshell/resource-units/deleted/source");
+        let preserved_relative = PathBuf::from(".freshell/provider-roots/preserved/source");
         let writable_relative = PathBuf::from(".freshell/provider-roots/writable/source");
         let readonly_relative = PathBuf::from(".freshell/provider-roots/readonly/source");
         std::fs::create_dir_all(&directory_source).unwrap();
+        std::fs::create_dir_all(preserved_source.parent().unwrap()).unwrap();
         std::fs::create_dir_all(writable_source.parent().unwrap()).unwrap();
         std::fs::create_dir_all(readonly_source.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(home.join(&directory_relative)).unwrap();
+        std::fs::create_dir_all(home.join(preserved_relative.parent().unwrap())).unwrap();
         std::fs::create_dir_all(home.join(writable_relative.parent().unwrap())).unwrap();
         std::fs::create_dir_all(home.join(readonly_relative.parent().unwrap())).unwrap();
         std::fs::write(directory_source.join("state.txt"), "directory seed").unwrap();
+        std::fs::write(
+            directory_source.join("removed.txt"),
+            "deleted directory seed",
+        )
+        .unwrap();
+        std::fs::write(&preserved_source, "preserved seed").unwrap();
         std::fs::write(&writable_source, "writable seed").unwrap();
         std::fs::write(&readonly_source, "readonly seed").unwrap();
         // Resource roots exist as physical placeholders before initial
         // publication, just as their Docker volume subpath mounts do.
+        std::fs::write(home.join(&preserved_relative), "").unwrap();
         std::fs::write(home.join(&writable_relative), "").unwrap();
         std::fs::write(home.join(&readonly_relative), "").unwrap();
         let capability = McpCapabilityReference {
@@ -4807,7 +4935,7 @@ mod tests {
             provider_relative_path: ".freshell/mcp-capability.json".into(),
             host_gateway_address: None,
         };
-        let context = ProviderLaunchContext {
+        let mut context = ProviderLaunchContext {
             config: vec![],
             preparation: ProviderPreparation::Opencode {
                 project_config: vec![],
@@ -4837,10 +4965,10 @@ mod tests {
                         writable: false,
                     },
                     ProviderResourceMount {
-                        stage_relative_path: ".freshell/resource-units/writable/source".into(),
-                        provider_relative_path: writable_relative.to_string_lossy().into_owned(),
-                        logical_destination: "/home/freshell/provider/mcp/state.txt".into(),
-                        effective_destination: "/home/freshell/provider/mcp/state.txt".into(),
+                        stage_relative_path: ".freshell/resource-units/preserved/source".into(),
+                        provider_relative_path: preserved_relative.to_string_lossy().into_owned(),
+                        logical_destination: "/home/freshell/provider/mcp/preserved.txt".into(),
+                        effective_destination: "/home/freshell/provider/mcp/preserved.txt".into(),
                         kind: ProviderResourceKind::File,
                         writable: true,
                     },
@@ -4868,7 +4996,13 @@ mod tests {
         use std::io::Write;
         std::fs::OpenOptions::new()
             .append(true)
-            .open(home.join(&writable_relative))
+            .open(home.join(&preserved_relative))
+            .unwrap()
+            .write_all(b" + exact runtime state")
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(home.join(&directory_relative).join("state.txt"))
             .unwrap()
             .write_all(b" + runtime state")
             .unwrap();
@@ -4877,8 +5011,22 @@ mod tests {
             "refreshed directory seed",
         )
         .unwrap();
+        std::fs::write(&preserved_source, "refreshed preserved seed").unwrap();
         std::fs::write(&writable_source, "refreshed writable seed").unwrap();
         std::fs::write(&readonly_source, "refreshed readonly seed").unwrap();
+        context
+            .prepared_inputs
+            .as_mut()
+            .unwrap()
+            .resource_mounts
+            .push(ProviderResourceMount {
+                stage_relative_path: ".freshell/resource-units/writable/source".into(),
+                provider_relative_path: writable_relative.to_string_lossy().into_owned(),
+                logical_destination: "/home/freshell/provider/mcp/state.txt".into(),
+                effective_destination: "/home/freshell/provider/mcp/state.txt".into(),
+                kind: ProviderResourceKind::File,
+                writable: true,
+            });
 
         refresh_provider_config_references(
             &context, "opencode", &workspace, &user_root, &home, uid, gid,
@@ -4892,13 +5040,53 @@ mod tests {
         );
         assert_eq!(
             std::fs::read(home.join(&writable_relative)).unwrap(),
-            b"writable seed + runtime state",
-            "replacement must keep the existing writable mount's runtime data"
+            b"directory seed + runtime state",
+            "adding an exact writable mount must migrate the prior directory-backed runtime data"
+        );
+        assert_eq!(
+            std::fs::read(home.join(&preserved_relative)).unwrap(),
+            b"preserved seed + exact runtime state",
+            "an existing exact writable mount must keep its runtime data across refresh"
         );
         assert_eq!(
             std::fs::read(home.join(&readonly_relative)).unwrap(),
             b"refreshed readonly seed",
             "read-only inputs still refresh from their selected source"
+        );
+
+        // If a new exact writable mount replaces a directory child that the
+        // provider deleted, recovery must not silently restore stale staged
+        // contents from the original host source.
+        std::fs::create_dir_all(deleted_source.parent().unwrap()).unwrap();
+        std::fs::write(&deleted_source, "stale host seed").unwrap();
+        let deleted_relative = PathBuf::from(".freshell/provider-roots/deleted/source");
+        std::fs::create_dir_all(home.join(deleted_relative.parent().unwrap())).unwrap();
+        std::fs::write(home.join(&deleted_relative), "").unwrap();
+        std::fs::remove_file(home.join(&directory_relative).join("removed.txt")).unwrap();
+        context
+            .prepared_inputs
+            .as_mut()
+            .unwrap()
+            .resource_mounts
+            .push(ProviderResourceMount {
+                stage_relative_path: ".freshell/resource-units/deleted/source".into(),
+                provider_relative_path: deleted_relative.to_string_lossy().into_owned(),
+                logical_destination: "/home/freshell/provider/mcp/removed.txt".into(),
+                effective_destination: "/home/freshell/provider/mcp/removed.txt".into(),
+                kind: ProviderResourceKind::File,
+                writable: true,
+            });
+        let recovery = refresh_provider_config_references(
+            &context, "opencode", &workspace, &user_root, &home, uid, gid,
+        );
+        assert!(
+            matches!(recovery, Err(ref error) if error.contains("was deleted")),
+            "deleted prior writable state must block recovery instead of restoring stale source"
+        );
+        assert_eq!(
+            std::fs::read(home.join(&deleted_relative)).unwrap(),
+            b"",
+            "blocked recovery must not restore stale host content into the mount placeholder"
         );
     }
 
