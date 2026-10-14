@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process'
 import fs from 'node:fs/promises'
 import { createConnection, createServer, type AddressInfo } from 'node:net'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import {
   assertManagedTerminalCreated,
@@ -18,6 +19,7 @@ import {
   runManagedProviderEnvironmentTarget,
   stopExact,
   workspaceCwdAliasMcpWrapperSource,
+  writeWorkspaceCwdAliasMcpWrapper,
 } from '../../../../scripts/testing/managed-provider-environment-target.js'
 
 async function listenOnLoopback(server: ReturnType<typeof createServer>): Promise<number> {
@@ -207,6 +209,42 @@ fs.writeFileSync(receiptPath, JSON.stringify({ envValueLoaded: process.env.FRESH
         nodeExitCode: 1,
         stderrHasSyntaxError: true,
       })
+    } finally {
+      await fs.rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps a workspace MCP wrapper searchable under a private process umask', async () => {
+    const directory = await fs.mkdtemp(path.join(process.env.TMPDIR ?? '/tmp', 'frs-managed-wrapper-mode-'))
+    try {
+      const fixtureDirectory = path.join(directory, '.managed-fixture')
+      await fs.mkdir(fixtureDirectory, { recursive: true, mode: 0o777 })
+      await fs.chmod(fixtureDirectory, 0o777)
+      const wrapper = path.join(fixtureDirectory, 'mcp-cwd-alias/start')
+      const moduleUrl = pathToFileURL(path.resolve('scripts/testing/managed-provider-environment-target.ts')).href
+      const script = `import fs from 'node:fs/promises'
+import path from 'node:path'
+import { writeWorkspaceCwdAliasMcpWrapper } from ${JSON.stringify(moduleUrl)}
+const wrapper = ${JSON.stringify(wrapper)}
+process.umask(0o077)
+await writeWorkspaceCwdAliasMcpWrapper(wrapper)
+const directory = await fs.stat(path.dirname(wrapper))
+const executable = await fs.stat(wrapper)
+process.stdout.write(JSON.stringify({ directoryMode: directory.mode & 0o777, executableMode: executable.mode & 0o777 }))`
+      const child = spawn(process.execPath, ['--import', 'tsx/esm', '--input-type=module', '-e', script], {
+        cwd: path.resolve('.'), stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      let stdout = '', stderr = ''
+      child.stdout?.setEncoding('utf8')
+      child.stderr?.setEncoding('utf8')
+      child.stdout?.on('data', chunk => { stdout += chunk })
+      child.stderr?.on('data', chunk => { stderr += chunk })
+      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+        child.once('error', reject)
+        child.once('close', (code, signal) => resolve({ code, signal }))
+      })
+      expect(exit, stderr).toEqual({ code: 0, signal: null })
+      expect(JSON.parse(stdout)).toEqual({ directoryMode: 0o755, executableMode: 0o751 })
     } finally {
       await fs.rm(directory, { recursive: true, force: true })
     }

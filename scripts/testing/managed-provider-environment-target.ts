@@ -222,6 +222,13 @@ exit "$status"
 `
 }
 
+export async function writeWorkspaceCwdAliasMcpWrapper(wrapperPath: string): Promise<void> {
+  await fs.mkdir(path.dirname(wrapperPath), { recursive: true, mode: 0o755 })
+  await fs.chmod(path.dirname(wrapperPath), 0o755)
+  await fs.writeFile(wrapperPath, workspaceCwdAliasMcpWrapperSource(), { mode: 0o751 })
+  await fs.chmod(wrapperPath, 0o751)
+}
+
 export function directHomeAppendMcpServerSource(outputName: string): string {
   const outputUrl = `new URL(${JSON.stringify(`./${outputName}`)}, import.meta.url)`
   return `import fs from 'node:fs'
@@ -522,9 +529,7 @@ export default {id:'managed-environment-tui',async tui(api,options){
     const mcpReceipt = path.join(cwd, '.managed-fixture/mcp-receipt.json')
     const cwdAliasWrapper = path.join(cwd, '.managed-fixture/mcp-cwd-alias/start')
     const cwdAliasReceipt = path.join(cwd, '.managed-fixture/mcp-cwd-alias-receipt.json')
-    await fs.mkdir(path.dirname(cwdAliasWrapper), { recursive: true, mode: 0o755 })
-    await fs.writeFile(cwdAliasWrapper, workspaceCwdAliasMcpWrapperSource(), { mode: 0o751 })
-    await fs.chmod(cwdAliasWrapper, 0o751)
+    await writeWorkspaceCwdAliasMcpWrapper(cwdAliasWrapper)
     const homeAppend = managedHomeAppendFixturePaths(home, cwd, scenario)
     await fs.writeFile(homeAppend.script, directHomeAppendMcpServerSource(path.basename(homeAppend.output)))
     await fs.writeFile(homeAppend.output, `initial-${nonce}`)
