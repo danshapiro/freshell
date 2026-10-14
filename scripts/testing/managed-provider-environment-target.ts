@@ -476,7 +476,8 @@ export default {id:'managed-environment-tui',async tui(api,options){
  const command=new URL('./command',import.meta.url), resource=fs.readFileSync(new URL('./selected-resource',import.meta.url),'utf8');
  const child=Bun.spawn([command.pathname],{stdout:'pipe',stderr:'pipe'});const output=JSON.parse(await new Response(child.stdout).text());if(await child.exited!==0)throw new Error('selected executable failed');
  const configuration=await api.client.config.get({directory:cwd});if(!configuration.data?.agent)throw new Error('resolved provider configuration was not available');const sessionFlag=process.argv.findIndex(value=>value==='--session'||value==='-s');const resumed=sessionFlag>=0?process.argv[sessionFlag+1]:undefined;const result=resumed?await api.client.session.get({directory:cwd,sessionID:resumed}):await api.client.session.create({directory:cwd,title:'Managed fixture'});if(!result.data?.id||(resumed&&result.data.id!==resumed))throw new Error('native session creation or resume failed');api.route.navigate('session',{sessionID:result.data.id});
- const receipt={...options,terminalId:process.env.FRESHELL_TERMINAL_ID,nativeSessionId:result.data.id,bun:typeof Bun==='object',bunVersion:Bun.version,bunExecutable:process.execPath,opencodeVersion:api.app.version,model:configuration.data.model,dependency,resource,absoluteReference:configuration.data.agent.fixtureAbsolute.prompt,relativeReference:configuration.data.agent.fixtureRelative.prompt,executableMode:(fs.statSync(command).mode&511).toString(8).padStart(4,'0'),pid:process.pid,createdAt:new Date().toISOString()};
+ let mcpStatuses={};if(cwd.endsWith('/preflight')){await new Promise(resolve=>setTimeout(resolve,3000));try{const response=await api.client.mcp.status({directory:cwd});mcpStatuses=Object.fromEntries(Object.entries(response.data??{}).map(([name,status])=>[name,{status:status?.status??'unknown',...(status?.status==='failed'?{error:String(status.error).replaceAll(options.expectedNonce,'[fixture-nonce]').slice(0,240)}:{})}]))}catch(error){mcpStatuses={queryError:String(error).replaceAll(options.expectedNonce,'[fixture-nonce]').slice(0,240)}}}
+ const receipt={...options,terminalId:process.env.FRESHELL_TERMINAL_ID,nativeSessionId:result.data.id,bun:typeof Bun==='object',bunVersion:Bun.version,bunExecutable:process.execPath,opencodeVersion:api.app.version,model:configuration.data.model,dependency,resource,absoluteReference:configuration.data.agent.fixtureAbsolute.prompt,relativeReference:configuration.data.agent.fixtureRelative.prompt,executableMode:(fs.statSync(command).mode&511).toString(8).padStart(4,'0'),mcpStatuses,pid:process.pid,createdAt:new Date().toISOString()};
  fs.writeFileSync(path.join(cwd,'.managed-fixture/child-receipt.json'),JSON.stringify(receipt));const marker='MANAGED_ENV_OUTPUT '+output.resource;process.stdout.write('\\n'+marker+'\\n');api.ui.toast.show({message:marker,duration:180000});
 }};`)
   await writeJson(path.join(mcpPackage, 'package.json'), {
@@ -1542,7 +1543,7 @@ export async function runManagedEnvironmentTarget() {
       return undefined
     }, 45_000)
     assert.equal(preflightCwdAliasMcp.expectedNonce, nonce,
-      `workspace external-CWD MCP did not complete its receipt: ${JSON.stringify(preflightCwdAliasMcp)}`)
+      `workspace external-CWD MCP did not complete its receipt: ${JSON.stringify({ receipt: preflightCwdAliasMcp, mcpStatuses: preflightChild.mcpStatuses })}`)
     assert.equal(preflightCwdAliasMcp.helper, nonce)
     assert.equal(preflightCwdAliasMcp.envValueLoaded, true)
     assert.match(preflightCwdAliasMcp.envFileTarget, /^\/home\/freshell\/provider\/\.freshell\/references\/\d+$/)
