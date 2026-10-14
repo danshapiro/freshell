@@ -237,7 +237,7 @@ pub fn select_opencode_resource_roots(
 ) -> Result<Vec<DiscoveryRoot>, &'static str> {
     let disabled = (request.env)("OPENCODE_DISABLE_PROJECT_CONFIG")
         .is_some_and(|value| matches!(value.as_str(), "1" | "true"));
-    let mut roots = config_directories(request, None, disabled)?;
+    let mut roots = config_directories(request, Some(request.worktree), disabled)?;
     for (directory, role) in std::iter::once((request.home.to_path_buf(), DiscoveryRole::Home))
         .chain(
             ancestors(request.cwd, Some(request.worktree))
