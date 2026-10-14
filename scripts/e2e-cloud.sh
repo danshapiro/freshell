@@ -796,28 +796,47 @@ cmd_run() {
   # Capture to a variable so we can print the full output AND extract a
   # per-shard summary, even when some shards fail.
   echo "[e2e-cloud] Fetching logs..."
-  local log_output="" summary_lines="" display_log_unavailable=false summary_footers_complete=false
-  local summary_footer_count
+  local log_output="" summary_lines="" display_log_unavailable=false task_summaries_complete=false
+  local task_summary_query task_summary_logs task_summary_receipts="" task_summary_error=""
+  local -a task_summary_account_args=()
   local summary_attempt
+  if [ -n "${GCP_ACCOUNT:-}" ]; then
+    task_summary_account_args=(--account="$GCP_ACCOUNT")
+  fi
+  # Cloud Run's raw textPayload can begin with cursor-control ANSI sequences,
+  # so the Logging filter intentionally matches the status phrase unanchored;
+  # the parser strips ANSI and confirms that the normalized line is a footer.
+  task_summary_query="resource.type=\"cloud_run_job\" AND labels.\"run.googleapis.com/execution_name\"=\"${execution_id}\" AND (textPayload =~ \"[0-9]+ (failed|passed|skipped|interrupted)\" OR textPayload=\"[e2e-entrypoint] No specs assigned to this shard. Exporting zero-test receipt.\")"
   for summary_attempt in 1 2 3 4 5; do
     if log_output=$(gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" 2>&1); then
       summary_lines=$(printf '%s\n' "$log_output" | node "$ROOT/scripts/testing/e2e-cloud-log-summary.mjs")
       display_log_unavailable=false
-      summary_footer_count=$(printf '%s\n' "$summary_lines" \
-        | grep -Ec '^[[:space:]]+[0-9]+ (failed|passed|skipped|interrupted)\b' || true)
-      summary_footers_complete=false
-      if [ "$summary_footer_count" -ge "$shards" ]; then
-        summary_footers_complete=true
-      fi
-      if $summary_footers_complete || $playwright_dry_run; then
-        break
-      fi
     else
       log_output=""
       display_log_unavailable=true
     fi
+
+    task_summaries_complete=false
+    task_summary_error=""
+    if $playwright_dry_run; then
+      break
+    fi
+    if task_summary_logs=$(gcloud logging read "$task_summary_query" "${task_summary_account_args[@]}" \
+      --project="$GCP_PROJECT" --format=json --limit=1000 2>&1); then
+      if task_summary_receipts=$(printf '%s' "$task_summary_logs" \
+        | node "$ROOT/scripts/e2e-cloud-task-summaries.mjs" "$execution_id" "$shards" 2>&1); then
+        task_summaries_complete=true
+      else
+        task_summary_error="$task_summary_receipts"
+      fi
+    else
+      task_summary_error="$task_summary_logs"
+    fi
+    if $task_summaries_complete; then
+      break
+    fi
     if [ "$summary_attempt" -lt 5 ]; then
-      echo "[e2e-cloud] Waiting for Playwright display-log summary (attempt ${summary_attempt}/5)." >&2
+      echo "[e2e-cloud] Waiting for task-indexed Playwright summary evidence (attempt ${summary_attempt}/5): ${task_summary_error}" >&2
       sleep 3
     fi
   done
@@ -826,8 +845,9 @@ cmd_run() {
     # display, but never decides whether retry evidence exists; that decision
     # comes from the required jsonPayload query below.
     echo "[e2e-cloud] WARNING: could not read display logs after five attempts." >&2
-  elif ! $summary_footers_complete && ! $playwright_dry_run; then
-    echo "[e2e-cloud] WARNING: Playwright summary footers for all ${shards} shard(s) were not present in display logs after five attempts." >&2
+  fi
+  if ! $task_summaries_complete && ! $playwright_dry_run; then
+    echo "[e2e-cloud] WARNING: task-indexed Playwright footer or empty-shard evidence for all ${shards} task(s) was not present in Cloud Logging after five attempts." >&2
   fi
 
   # Print logs from every shard. Retry traces are retained as bounded base64
@@ -886,16 +906,16 @@ cmd_run() {
     fi
   fi
 
-  # Extract and display a per-shard summary from the Playwright output.
-  # Each shard's entrypoint prints "Shard X/Y assignment" and Playwright's
-  # line reporter prints a final "  N passed (duration)" or
-  # "  N failed, M passed (duration)" summary line. Cloud Logging prefixes
-  # each returned line with its timestamp and can preserve terminal cursor
-  # controls from Playwright, so normalize those before the target validates
-  # the footer's pass/fail/skip counts.
+  # Display only the summary rows whose raw textPayload entries were validated
+  # against this execution's Cloud Run task indexes. The formatted logs above
+  # can lag independently, so they are not a reliable source for this section.
   echo ""
   echo "[e2e-cloud] Per-shard summary:"
-  printf '%s\n' "$summary_lines"
+  if $playwright_dry_run; then
+    printf '%s\n' "$summary_lines"
+  elif $task_summaries_complete; then
+    jq -r '.summaries[] | "[Cloud Run task \(.taskIndex)]\n\(.text)"' <<< "$task_summary_receipts"
+  fi
 
   # Check execution status — transient describe errors right after
   # `execute --wait` are a real flake class, so retry briefly; a PERMANENT
