@@ -368,9 +368,13 @@ describe('body-free terminal ordinary-turn reduction', () => {
     expect(observer.observeAfterSend(captured, expectedInput)).toMatchObject({ requestInputSeen: false })
 
     sent.length = 0
+    const splitAt = Math.ceil(expectedInput.length / 2)
     sent.push(
-      { type: 'terminal.input', terminalId: target.terminalId, data: 're' },
-      { type: 'terminal.input', terminalId: target.terminalId, data: 'quest' },
+      { type: 'terminal.input', terminalId: target.terminalId, data: expectedInput.slice(0, splitAt) },
+      { type: 'terminal.input', terminalId: target.terminalId, data: '\x1b[?1;2c' },
+      { type: 'terminal.input', terminalId: target.terminalId, data: '\x1b]10;rgb:0000/0000/0000\x07' },
+      { type: 'terminal.input', terminalId: target.terminalId, data: '\x1bP1+r544e=78\x1b\\' },
+      { type: 'terminal.input', terminalId: target.terminalId, data: expectedInput.slice(splitAt) },
       { type: 'terminal.input', terminalId: target.terminalId, data: '\r' },
     )
     expect(observer.observeAfterSend(captured, expectedInput)).toMatchObject({ requestInputSeen: true })

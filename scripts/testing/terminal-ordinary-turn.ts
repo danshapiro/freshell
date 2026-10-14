@@ -222,12 +222,40 @@ export function buildTerminalOrdinaryTurnBrowserScript(): string {
         const sent = harness.getSentWsMessages();
         if (!Array.isArray(received) || !Array.isArray(sent)) return null;
 
+        const isTerminalResponseFrame = (data) => {
+          const escape = 27;
+          const bell = 7;
+          const stringTerminator = String.fromCharCode(escape, 92);
+          const last = data.length - 1;
+          if (data.length < 3 || data.charCodeAt(0) !== escape) return false;
+          const introducer = data.charCodeAt(1);
+          if (introducer === 91) {
+            const finalByte = data.charCodeAt(last);
+            if (![0x63, 0x6e, 0x52, 0x74, 0x75, 0x79].includes(finalByte)) return false;
+            for (let cursor = 2; cursor < last; cursor += 1) {
+              const code = data.charCodeAt(cursor);
+              if (code < 0x20 || code > 0x3f) return false;
+            }
+            return true;
+          }
+          if (introducer === 93) {
+            return data.indexOf(String.fromCharCode(bell), 2) === last
+              || (last >= 3 && data.indexOf(stringTerminator, 2) === last - 1);
+          }
+          if ([80, 88, 94, 95].includes(introducer)) {
+            return last >= 3 && data.indexOf(stringTerminator, 2) === last - 1;
+          }
+          return false;
+        };
+        // xterm returns device and mode reports through the same input path as keystrokes.
+        // Ignore complete response-only frames before comparing the typed request.
         const inputParts = [];
         for (const value of sent) {
           if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
           if (value.type === 'terminal.input'
             && value.terminalId === baseline.terminalId
-            && typeof value.data === 'string') inputParts.push(value.data);
+            && typeof value.data === 'string'
+            && !isTerminalResponseFrame(value.data)) inputParts.push(value.data);
         }
         const sentInput = inputParts.join('');
         const carriageReturn = String.fromCharCode(13);
