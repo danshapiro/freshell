@@ -30,7 +30,13 @@ case "$*" in
   *"executions logs read"*)
     count_file="$STUB_CAPTURE/logs.count"
     count="$(cat "$count_file" 2>/dev/null || echo 0)"; count=$((count + 1)); echo "$count" > "$count_file"
-    if [ "${STUB_SKIPPED_ONLY:-0}" = 1 ]; then
+    if [ "${STUB_DELAY_PASSED_AFTER_SKIPPED_ONCE:-0}" = 1 ]; then
+      echo "[e2e-entrypoint] Shard 1/1 assignment: focused fixture"
+      echo "  3 skipped (1.0s)"
+      if [ "$count" -gt 1 ]; then
+        echo "  2 passed (5.0s)"
+      fi
+    elif [ "${STUB_SKIPPED_ONLY:-0}" = 1 ]; then
       echo "[e2e-entrypoint] Shard 1/1 assignment: focused fixture"
       echo "  3 skipped (1.0s)"
     elif [ "${STUB_EMPTY_SHARDS:-0}" = 1 ]; then
@@ -70,6 +76,21 @@ case "$*" in
       count="$(cat "$count_file" 2>/dev/null || echo 0)"; count=$((count + 1)); echo "$count" > "$count_file"
       if [ "${STUB_NO_TASK_SUMMARY:-0}" = 1 ]; then
         echo '[]'
+      elif [ "${STUB_DELAY_PASSED_AFTER_SKIPPED_ONCE:-0}" = 1 ]; then
+        if [ "$count" -eq 1 ]; then
+          cat <<'JSON'
+[
+ {"labels":{"run.googleapis.com/execution_name":"exec-json-receipt","run.googleapis.com/task_index":"0"},"textPayload":"  3 skipped (1.0s)"}
+]
+JSON
+        else
+          cat <<'JSON'
+[
+ {"labels":{"run.googleapis.com/execution_name":"exec-json-receipt","run.googleapis.com/task_index":"0"},"textPayload":"  3 skipped (1.0s)"},
+ {"labels":{"run.googleapis.com/execution_name":"exec-json-receipt","run.googleapis.com/task_index":"0"},"textPayload":"  2 passed (5.0s)"}
+]
+JSON
+        fi
       elif [ "${STUB_SKIPPED_ONLY:-0}" = 1 ]; then
         cat <<'JSON'
 [
@@ -138,6 +159,12 @@ JSON
 esac
 GCLOUD
 chmod +x "$WORK/bin/gcloud"
+cat > "$WORK/bin/sleep" <<'SLEEP'
+#!/usr/bin/env bash
+# Poll retries are driven by fixture responses; real waiting adds no coverage.
+exit 0
+SLEEP
+chmod +x "$WORK/bin/sleep"
 
 records_no_retry='[
  {"jsonPayload":{"event":"e2e_playwright_task_complete","execution":"exec-json-receipt","taskIndex":0,"taskCount":2,"recoveredRetryCount":0}},
@@ -257,6 +284,16 @@ fi
 SKIPPED_ONLY_OUT="$(env PATH="$WORK/bin:$PATH" STUB_CAPTURE="$WORK/capture" STUB_SKIPPED_ONLY=1 STUB_LOGGING_JSON="$records_one_task" STUB_SUCCEEDED=1 GCLOUD_IDENT=stub@example.invalid "$SCRIPT" run --cloud --shards=1 2>&1)" && SKIPPED_ONLY_RC=0 || SKIPPED_ONLY_RC=$?
 if [ "$SKIPPED_ONLY_RC" -eq 0 ] || ! grep -q "no passed Playwright tests" <<< "$SKIPPED_ONLY_OUT"; then
   echo "FAIL: skipped-only Playwright evidence was accepted as a passing Cloud run"; echo "$SKIPPED_ONLY_OUT"; exit 1
+fi
+
+rm -f "$WORK/capture/logs.count" "$WORK/capture/task-footers.count"
+DELAYED_PASS_OUT="$(env PATH="$WORK/bin:$PATH" STUB_CAPTURE="$WORK/capture" STUB_DELAY_PASSED_AFTER_SKIPPED_ONCE=1 STUB_LOGGING_JSON="$records_one_task" STUB_SUCCEEDED=1 GCLOUD_IDENT=stub@example.invalid "$SCRIPT" run --cloud --shards=1 2>&1)" && DELAYED_PASS_RC=0 || DELAYED_PASS_RC=$?
+if [ "$DELAYED_PASS_RC" -ne 0 ] \
+  || [ "$(cat "$WORK/capture/task-footers.count" 2>/dev/null || echo 0)" -ne 2 ] \
+  || ! grep -q "3 skipped (1.0s)" <<< "$DELAYED_PASS_OUT" \
+  || ! grep -q "2 passed (5.0s)" <<< "$DELAYED_PASS_OUT" \
+  || ! grep -q "All tasks completed successfully" <<< "$DELAYED_PASS_OUT"; then
+  echo "FAIL: wrapper stopped polling after a skipped footer instead of waiting for the same task's later passed footer"; echo "$DELAYED_PASS_OUT"; exit 1
 fi
 
 NO_TASK_SUMMARY_OUT="$(env PATH="$WORK/bin:$PATH" STUB_CAPTURE="$WORK/capture" STUB_NO_TASK_SUMMARY=1 STUB_LOGGING_JSON="$records_no_retry" STUB_SUCCEEDED=2 GCLOUD_IDENT=stub@example.invalid "$SCRIPT" run --cloud --shards=2 2>&1)" && NO_TASK_SUMMARY_RC=0 || NO_TASK_SUMMARY_RC=$?

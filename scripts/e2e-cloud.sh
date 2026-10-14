@@ -833,7 +833,10 @@ cmd_run() {
       task_summary_error="$task_summary_logs"
     fi
     if $task_summaries_complete; then
-      break
+      if [ "$(jq -r '.hasPassedTest' <<< "$task_summary_receipts")" = "true" ]; then
+        break
+      fi
+      task_summary_error="task-indexed summaries are complete, but no passed Playwright footer has arrived yet"
     fi
     if [ "$summary_attempt" -lt 5 ]; then
       echo "[e2e-cloud] Waiting for task-indexed Playwright summary evidence (attempt ${summary_attempt}/5): ${task_summary_error}" >&2
