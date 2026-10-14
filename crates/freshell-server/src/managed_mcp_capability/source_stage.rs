@@ -1542,6 +1542,8 @@ process.stdout.write(require('./helper.js'))
             home.join("existing-deleted-property-url-output.txt");
         let append_conditional_alias_url_output =
             home.join("existing-conditional-alias-url-output.txt");
+        let append_harmless_conditional_alias_url_output =
+            home.join("existing-harmless-conditional-alias-url-output.txt");
         let append_parenthesized_property_url_output =
             home.join("existing-parenthesized-property-url-output.txt");
         let append_let_variable_url_output = home.join("existing-let-url-variable-output.txt");
@@ -1563,7 +1565,7 @@ process.stdout.write(require('./helper.js'))
             .unwrap();
         std::io::Write::write_all(
             &mut command_file,
-            b"\nconst parenthesizedPropertyUrl = new URL('./existing-parenthesized-property-url-output.txt', import.meta.url);\n(parenthesizedPropertyUrl.href) = new URL('./existing-unrelated-url-output.txt', import.meta.url).href;\nfs.appendFileSync(parenthesizedPropertyUrl, ' appended');\nconst conditionalOutputUrl = new URL('./existing-conditional-alias-url-output.txt', import.meta.url);\nconst fallbackUrl = new URL('./existing-unrelated-url-output.txt', import.meta.url);\nconst selectedUrl = true ? conditionalOutputUrl : fallbackUrl;\nselectedUrl.href = new URL('./existing-unrelated-url-output.txt', import.meta.url).href;\nif (false) fs.appendFileSync(conditionalOutputUrl, ' appended');\n",
+            b"\nconst parenthesizedPropertyUrl = new URL('./existing-parenthesized-property-url-output.txt', import.meta.url);\n(parenthesizedPropertyUrl.href) = new URL('./existing-unrelated-url-output.txt', import.meta.url).href;\nfs.appendFileSync(parenthesizedPropertyUrl, ' appended');\nconst conditionalOutputUrl = new URL('./existing-conditional-alias-url-output.txt', import.meta.url);\nconst fallbackUrl = new URL('./existing-unrelated-url-output.txt', import.meta.url);\nconst selectedUrl = true ? conditionalOutputUrl : fallbackUrl;\nselectedUrl.href = new URL('./existing-unrelated-url-output.txt', import.meta.url).href;\nif (false) fs.appendFileSync(conditionalOutputUrl, ' appended');\nconst harmlessConditionalOutputUrl = new URL('./existing-harmless-conditional-alias-url-output.txt', import.meta.url);\nconst harmlessSelectedUrl = true ? harmlessConditionalOutputUrl : fallbackUrl;\nconsole.error(harmlessSelectedUrl.href);\nif (false) fs.appendFileSync(harmlessConditionalOutputUrl, ' appended');\n",
         )
         .unwrap();
         std::fs::write(&append_output, "existing").unwrap();
@@ -1578,6 +1580,11 @@ process.stdout.write(require('./helper.js'))
         std::fs::write(
             &append_conditional_alias_url_output,
             "conditional alias URL existing",
+        )
+        .unwrap();
+        std::fs::write(
+            &append_harmless_conditional_alias_url_output,
+            "harmless conditional alias URL existing",
         )
         .unwrap();
         std::fs::write(
@@ -1614,6 +1621,7 @@ process.stdout.write(require('./helper.js'))
             &reassigned_url_output,
             &unrelated_url_output,
             &append_conditional_alias_url_output,
+            &append_harmless_conditional_alias_url_output,
         ] {
             assert!(plan[0]
                 .configured_resources
@@ -1643,6 +1651,7 @@ process.stdout.write(require('./helper.js'))
             &append_nested_url_output,
             &append_let_variable_url_output,
             &append_var_variable_url_output,
+            &append_harmless_conditional_alias_url_output,
         ] {
             let canonical = output.canonicalize().unwrap();
             let mounts = units

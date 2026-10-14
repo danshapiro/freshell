@@ -1312,12 +1312,21 @@ fn node_relative_resource_specifiers(
             output_destination_bindings.insert((name.clone(), binding_scope));
         }
     }
+    let conditional_aliases = node_conditional_alias_analysis(
+        &tokens,
+        &scopes,
+        &binding_declarations,
+        &mut binding_resolver,
+    )?;
     let ambiguous_output_bindings = node_ambiguous_output_bindings(
         &tokens,
         &scopes,
         &output_destinations,
         &mut binding_resolver,
+        &conditional_aliases.safe_reference_indices,
     )?;
+    let mut ambiguous_output_bindings = ambiguous_output_bindings;
+    conditional_aliases.propagate_ambiguity(&mut ambiguous_output_bindings);
     let mut result = std::collections::BTreeMap::<String, bool>::new();
     for index in 0..tokens.len() {
         if index >= 2
@@ -1763,11 +1772,120 @@ fn node_simple_url_binding_declaration(
     ))
 }
 
+#[derive(Default)]
+struct JavaScriptConditionalAliasAnalysis {
+    sources_by_alias: std::collections::BTreeMap<
+        JavaScriptBindingKey,
+        std::collections::BTreeSet<JavaScriptBindingKey>,
+    >,
+    safe_reference_indices: std::collections::BTreeSet<usize>,
+}
+
+impl JavaScriptConditionalAliasAnalysis {
+    fn propagate_ambiguity(
+        &self,
+        ambiguous: &mut std::collections::BTreeSet<JavaScriptBindingKey>,
+    ) {
+        let mut pending = ambiguous.iter().cloned().collect::<Vec<_>>();
+        while let Some(alias) = pending.pop() {
+            let Some(sources) = self.sources_by_alias.get(&alias) else {
+                continue;
+            };
+            for source in sources {
+                if ambiguous.insert(source.clone()) {
+                    pending.push(source.clone());
+                }
+            }
+        }
+    }
+}
+
+fn node_conditional_alias_analysis(
+    tokens: &[JavaScriptToken],
+    scopes: &JavaScriptScopes,
+    binding_declarations: &std::collections::BTreeMap<JavaScriptBindingKey, usize>,
+    resolver: &mut JavaScriptBindingResolver<'_>,
+) -> Result<JavaScriptConditionalAliasAnalysis, &'static str> {
+    let mut analysis = JavaScriptConditionalAliasAnalysis::default();
+    for index in 0..tokens.len().saturating_sub(7) {
+        let Some(JavaScriptToken::Identifier(kind)) = tokens.get(index) else {
+            continue;
+        };
+        if !matches!(kind.as_str(), "const" | "let" | "var") {
+            continue;
+        }
+        let Some(JavaScriptToken::Identifier(alias_name)) = tokens.get(index + 1) else {
+            continue;
+        };
+        if !matches!(
+            tokens.get(index + 2),
+            Some(JavaScriptToken::Punctuation(b'='))
+        ) || !matches!(tokens.get(index + 3), Some(JavaScriptToken::Identifier(_)))
+            || !matches!(
+                tokens.get(index + 4),
+                Some(JavaScriptToken::Punctuation(b'?'))
+            )
+            || !matches!(tokens.get(index + 5), Some(JavaScriptToken::Identifier(_)))
+            || !matches!(
+                tokens.get(index + 6),
+                Some(JavaScriptToken::Punctuation(b':'))
+            )
+            || !matches!(tokens.get(index + 7), Some(JavaScriptToken::Identifier(_)))
+            || !matches!(
+                tokens.get(index + 8),
+                None | Some(JavaScriptToken::Punctuation(b';' | b'}'))
+            )
+        {
+            continue;
+        }
+
+        let alias_scope = node_variable_binding_scope(kind, scopes.token_scope_ids[index], scopes);
+        let alias_key = (alias_name.clone(), alias_scope);
+        if binding_declarations.get(&alias_key) != Some(&1) {
+            continue;
+        }
+        let Some(JavaScriptToken::Identifier(source_a_name)) = tokens.get(index + 5) else {
+            continue;
+        };
+        let Some(JavaScriptToken::Identifier(source_b_name)) = tokens.get(index + 7) else {
+            continue;
+        };
+        let Some(source_a_scope) =
+            resolver.resolve(source_a_name, scopes.token_scope_ids[index + 5])?
+        else {
+            continue;
+        };
+        let Some(source_b_scope) =
+            resolver.resolve(source_b_name, scopes.token_scope_ids[index + 7])?
+        else {
+            continue;
+        };
+        let source_a_key = (source_a_name.clone(), source_a_scope);
+        let source_b_key = (source_b_name.clone(), source_b_scope);
+        if binding_declarations.get(&source_a_key) != Some(&1)
+            || binding_declarations.get(&source_b_key) != Some(&1)
+        {
+            continue;
+        }
+
+        analysis
+            .sources_by_alias
+            .entry(alias_key)
+            .or_default()
+            .extend([source_a_key, source_b_key]);
+        analysis
+            .safe_reference_indices
+            .extend([index + 3, index + 5, index + 7]);
+    }
+    Ok(analysis)
+}
+
 fn node_ambiguous_output_bindings(
     tokens: &[JavaScriptToken],
     scopes: &JavaScriptScopes,
     output_destinations: &[bool],
     resolver: &mut JavaScriptBindingResolver<'_>,
+    conditional_alias_references: &std::collections::BTreeSet<usize>,
 ) -> Result<std::collections::BTreeSet<(String, usize)>, &'static str> {
     let mut ambiguous = std::collections::BTreeSet::new();
     for (index, token) in tokens.iter().enumerate() {
@@ -1775,6 +1893,7 @@ fn node_ambiguous_output_bindings(
             continue;
         };
         if output_destinations[index]
+            || conditional_alias_references.contains(&index)
             || scopes.parameter_token_indices.contains(&index)
             || is_javascript_variable_declaration_name(tokens, index)
             || matches!(
