@@ -627,7 +627,7 @@ PY
    # ${VAR:-} defaults keep the trap functional under set -u even in a
    # lost-shell recovery where RUN is unset):
    trap 'rm -f "${RUN:-/nonexistent}/hdr" "${D:-/nonexistent}/hdr"' EXIT
-    printf 'D=%q\nWS=%q\nCHECKOUT=%q\n' "$D" "$WS" "$CHECKOUT" > "$D/run.env"
+    printf 'D=%q\nWS=%q\nCHECKOUT=%q\nPROBE_ROOT=%q\n' "$D" "$WS" "$CHECKOUT" "$PROBE_ROOT" > "$D/run.env"
     # create the probe pane (example); record terminalId from the response:
    curl -s --connect-timeout 5 --max-time 30 -X POST -H @"$D/hdr" -H "Content-Type: application/json" \
      -d '{"mode":"shell","cwd":"'"$WS"'","name":"home-mount probe"}' \
@@ -790,8 +790,16 @@ for r in (afp or []):
       esac
     done <<<"$ALLOWED"
     if [ "$PROBE_PATH_OK" != 1 ]; then
-      FIRST_ALLOWED=$(head -1 <<<"$ALLOWED")
-      FIRST_ALLOWED=${FIRST_ALLOWED/#\~/$HOME}   # expand ~ — quoted mktemp will not
+      # Pick the first USABLE Linux-path root: the server maps
+      # Windows-style roots (WSL deployments, e.g. C:\Users\...) to
+      # Linux paths itself — a literal such entry would break mktemp:
+      FIRST_ALLOWED=""
+      while read -r A; do
+        A=${A/#\~/$HOME}
+        case "$A" in
+          /*) FIRST_ALLOWED="$A"; break ;;
+        esac
+      done <<<"$ALLOWED"
       if [ -n "$FIRST_ALLOWED" ]; then
         # Keep PROBE_ROOT (and the REST probe's WS) where it is — mint a
         # SEPARATE browser root under the allowed root and record it:
@@ -1025,14 +1033,25 @@ PY
         # TIE the records to THIS run's workspace: mixing one run's D (and
         # its self-consistent SOUL_ID/TID) with another run's WS would
         # otherwise stop the old run's soul and delete the new workspace:
-        if [ -n "${WS:-}" ] && [ -f "$D/run.env" ]; then
-          # Source the file to UNESCAPE the %q-encoded values — a raw
-          # text read would compare escaped bytes against the real path
-          # and false-refuse any path with spaces:
-          RECORDED_WS=$(bash -c '. "$1"; printf "%s" "${WS:-}"' _ "$D/run.env")
-          if [ -n "$RECORDED_WS" ] && [ "$RECORDED_WS" != "$WS" ]; then
-            echo "REFUSING: D=$D records workspace $RECORDED_WS, but WS=$WS — mixed runs; resolve manually"
-            exit 1
+        # Source the file to UNESCAPE the %q-encoded values — a raw
+        # text read would compare escaped bytes against the real path
+        # and false-refuse any path with spaces. BOTH recorded paths are
+        # cross-checked, so a mistaken BWS pointing at another empty
+        # workspace is refused:
+        if [ -f "$D/run.env" ]; then
+          if [ -n "${WS:-}" ]; then
+            RECORDED_WS=$(bash -c '. "$1"; printf "%s" "${WS:-}"' _ "$D/run.env")
+            if [ -n "$RECORDED_WS" ] && [ "$RECORDED_WS" != "$WS" ]; then
+              echo "REFUSING: D=$D records workspace $RECORDED_WS, but WS=$WS — mixed runs; resolve manually"
+              exit 1
+            fi
+          fi
+          if [ -n "${BWS:-}" ]; then
+            RECORDED_BWS=$(bash -c '. "$1"; printf "%s" "${BWS:-}"' _ "$D/run.env")
+            if [ -n "$RECORDED_BWS" ] && [ "$RECORDED_BWS" != "$BWS" ]; then
+              echo "REFUSING: D=$D records browser workspace $RECORDED_BWS, but BWS=$BWS — mixed runs; resolve manually"
+              exit 1
+            fi
           fi
         fi
       fi
@@ -1149,7 +1168,8 @@ d=d.get("data",d)
 cc=d.get("codingCli")
 assert isinstance(cc, dict), "malformed settings response: no codingCli"
 cur=(cc.get("providers") or {}).get("opencode",{}).get("cwd")
-print("" if cur is None else cur)' "$D/settings.json" 2>/dev/null) || { sleep 2; continue; }
+print("" if cur is None else cur)' "$D/settings.json" 2>/dev/null) || { rm -f "$D/settings.json"; sleep 2; continue; }
+        rm -f "$D/settings.json"   # may carry secrets
         if [ "$CUR" = "$BWS" ]; then break; fi
         sleep 2
       done
@@ -1182,6 +1202,7 @@ cc=d.get("codingCli")
 assert isinstance(cc, dict), "malformed settings response: no codingCli"
 cur=(cc.get("providers") or {}).get("opencode",{}).get("cwd")
 print("" if cur is None else cur)' "$D/settings.json")
+      rm -f "$D/settings.json"   # may carry secrets — remove immediately
       if [ "$CURNOW" != "$BWS" ]; then
         echo "OpenCode default no longer points at the probe path (now '$CURNOW') — leaving the newer value alone"
       else
@@ -1241,6 +1262,8 @@ print("" if cur is None else cur)' "$D/settings.json")
     # shared between concurrent runs and left behind on failure) and
     # needs a live token header — after a lost shell, mint both:
     if [ -n "${BWS:-}" ]; then
+      # Bounded post-deletion POLL rather than a single read — the
+      # client's save queue can deliver late:
       sleep 3
       SWEEP_DIR=$(mktemp -d)
       umask 077
@@ -1281,19 +1304,23 @@ PY
       # The sweep is the LAST verification gate — it fails closed:
       [ -f "$HDR" ] \
         || { echo "sweep cannot run (no token) — check Settings → Coding CLI → OpenCode manually; the default may point at the deleted probe dir"; rm -rf "$SWEEP_DIR"; exit 1; }
-      SETTINGS_CODE=$(curl -s --connect-timeout 5 --max-time 10 \
-        -o "$SWEEP_DIR/settings.json" -w '%{http_code}' -H @"$HDR" \
-        http://127.0.0.1:3001/api/settings) || SETTINGS_CODE=000
-      grep -q '^2' <<<"$SETTINGS_CODE" \
-        || { echo "sweep settings read FAILED (HTTP $SETTINGS_CODE) — check Settings → Coding CLI → OpenCode manually"; rm -rf "$SWEEP_DIR"; exit 1; }
-      SWEEP_CWD=$(python3 -c 'import json,sys
+      SWEEP_HITS=0
+      for SWEEP_I in $(seq 1 6); do
+        SETTINGS_CODE=$(curl -s --connect-timeout 5 --max-time 10 \
+          -o "$SWEEP_DIR/settings.json" -w '%{http_code}' -H @"$HDR" \
+          http://127.0.0.1:3001/api/settings) || SETTINGS_CODE=000
+        if ! grep -q '^2' <<<"$SETTINGS_CODE"; then sleep 3; continue; fi
+        SWEEP_CWD=$(python3 -c 'import json,sys
 d=json.load(open(sys.argv[1])); d=d.get("data",d)
 cc=d.get("codingCli")
 assert isinstance(cc, dict), "malformed settings response"
 cur=((cc.get("providers") or {}).get("opencode",{}) or {}).get("cwd")
-print("" if cur is None else cur)' "$SWEEP_DIR/settings.json") \
-        || { echo "sweep got a malformed settings response — check Settings → Coding CLI → OpenCode manually"; rm -rf "$SWEEP_DIR"; exit 1; }
-      if [ "$SWEEP_CWD" = "$BWS" ]; then
+print("" if cur is None else cur)' "$SWEEP_DIR/settings.json") || { sleep 3; continue; }
+        if [ "$SWEEP_CWD" = "$BWS" ]; then SWEEP_HITS=1; break; fi
+        sleep 3
+      done
+      rm -f "$SWEEP_DIR/settings.json"
+      if [ "$SWEEP_HITS" = 1 ]; then
         BODY=$(python3 -c 'import json;print(json.dumps({"codingCli":{"providers":{"opencode":{"cwd":None}}}}))')
         PATCH_CODE=$(curl -s --connect-timeout 5 --max-time 30 \
           -o "$SWEEP_DIR/patch.out" -w '%{http_code}' -X PATCH -H @"$HDR" \
@@ -1333,9 +1360,11 @@ print("" if cur is None else cur)' "$SWEEP_DIR/settings.json") \
     ```
 
     If the block aborts before `verified_empty`, the token header is
-    already gone (the `trap` removed it) while the non-secret probe
-    records — the soul ID and the tab response — remain in `$D` for the
-    documented recheck-and-retry; delete `$D`, `$WS`, and `$BWS`
+    already gone (the `trap` removed it) while the probe records — the
+    soul ID and the tab response — remain in `$D` for the documented
+    recheck-and-retry. Settings responses are deleted immediately after
+    each parse (they can carry API keys); anything that still remains is
+    inside a 0700 mktemp directory. Delete `$D`, `$WS`, and `$BWS`
     manually once BOTH probe souls are resolved.
 
    HONEST LIMIT on the settings restore: the settings API has no
