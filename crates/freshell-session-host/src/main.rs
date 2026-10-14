@@ -4781,18 +4781,23 @@ mod tests {
         let user_root = source_root.join("provider");
         let workspace = owned.path().join("workspace");
         let home = owned.path().join("home");
+        let directory_source = user_root.join(".freshell/resource-units/directory");
+        let directory_relative = PathBuf::from(".freshell/provider-roots/directory");
         let writable_source = user_root.join(".freshell/resource-units/writable/source");
         let readonly_source = user_root.join(".freshell/resource-units/readonly/source");
         let writable_relative = PathBuf::from(".freshell/provider-roots/writable/source");
         let readonly_relative = PathBuf::from(".freshell/provider-roots/readonly/source");
+        std::fs::create_dir_all(&directory_source).unwrap();
         std::fs::create_dir_all(writable_source.parent().unwrap()).unwrap();
         std::fs::create_dir_all(readonly_source.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(home.join(&directory_relative)).unwrap();
         std::fs::create_dir_all(home.join(writable_relative.parent().unwrap())).unwrap();
         std::fs::create_dir_all(home.join(readonly_relative.parent().unwrap())).unwrap();
+        std::fs::write(directory_source.join("state.txt"), "directory seed").unwrap();
         std::fs::write(&writable_source, "writable seed").unwrap();
         std::fs::write(&readonly_source, "readonly seed").unwrap();
-        // Exact-file mounts exist as physical placeholders before initial
+        // Resource roots exist as physical placeholders before initial
         // publication, just as their Docker volume subpath mounts do.
         std::fs::write(home.join(&writable_relative), "").unwrap();
         std::fs::write(home.join(&readonly_relative), "").unwrap();
@@ -4824,6 +4829,14 @@ mod tests {
                 indexed_files: None,
                 resource_mounts: vec![
                     ProviderResourceMount {
+                        stage_relative_path: ".freshell/resource-units/directory".into(),
+                        provider_relative_path: directory_relative.to_string_lossy().into_owned(),
+                        logical_destination: "/home/freshell/provider/mcp".into(),
+                        effective_destination: "/home/freshell/provider/mcp".into(),
+                        kind: ProviderResourceKind::Directory,
+                        writable: false,
+                    },
+                    ProviderResourceMount {
                         stage_relative_path: ".freshell/resource-units/writable/source".into(),
                         provider_relative_path: writable_relative.to_string_lossy().into_owned(),
                         logical_destination: "/home/freshell/provider/mcp/state.txt".into(),
@@ -4848,6 +4861,10 @@ mod tests {
             &context, "opencode", &workspace, &user_root, &home, uid, gid,
         )
         .unwrap();
+        assert_eq!(
+            std::fs::read(home.join(&directory_relative).join("state.txt")).unwrap(),
+            b"directory seed"
+        );
         use std::io::Write;
         std::fs::OpenOptions::new()
             .append(true)
@@ -4855,6 +4872,11 @@ mod tests {
             .unwrap()
             .write_all(b" + runtime state")
             .unwrap();
+        std::fs::write(
+            directory_source.join("state.txt"),
+            "refreshed directory seed",
+        )
+        .unwrap();
         std::fs::write(&writable_source, "refreshed writable seed").unwrap();
         std::fs::write(&readonly_source, "refreshed readonly seed").unwrap();
 
@@ -4863,6 +4885,11 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(
+            std::fs::read(home.join(&directory_relative).join("state.txt")).unwrap(),
+            b"refreshed directory seed",
+            "the selected directory's ordinary children must still refresh"
+        );
         assert_eq!(
             std::fs::read(home.join(&writable_relative)).unwrap(),
             b"writable seed + runtime state",

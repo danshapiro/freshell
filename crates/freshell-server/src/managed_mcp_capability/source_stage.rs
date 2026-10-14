@@ -1527,6 +1527,111 @@ process.stdout.write(require('./helper.js'))
     }
 
     #[test]
+    fn nested_direct_script_keeps_writable_sibling_mount_under_selected_directory() {
+        use freshell_platform::opencode_recipe::{DiscoveryRole, DiscoveryRoot};
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let script_directory = home.join("mcp");
+        let command = script_directory.join("server.mjs");
+        let state_file = script_directory.join("state.json");
+        std::fs::create_dir_all(&script_directory).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &command,
+            "import fs from 'node:fs';\nimport path from 'node:path';\nimport { fileURLToPath } from 'node:url';\nconst __dirname = path.dirname(fileURLToPath(import.meta.url));\nfs.appendFileSync(path.join(__dirname, 'state.json'), ' + runtime state');\nprocess.stdout.write('nested state updated\\n');\n",
+        )
+        .unwrap();
+        std::fs::write(&state_file, "initial state").unwrap();
+
+        let (plan, _) =
+            plan_and_stage_direct_mcp_command(owned.path(), &home, &workspace, &command);
+        let canonical_state = state_file.canonicalize().unwrap();
+        assert!(plan[0]
+            .configured_writable_resources
+            .contains(&canonical_state));
+        let previous_units = resource_units(
+            &home,
+            &home.join(".config/opencode"),
+            &workspace,
+            &plan,
+            None,
+        )
+        .unwrap();
+        let previous_state_mount = previous_units
+            .iter()
+            .find(|(source, mount)| {
+                source == &canonical_state
+                    && mount.kind == freshell_runtime_protocol::ProviderResourceKind::File
+                    && mount.effective_destination == "/home/freshell/provider/mcp/state.json"
+            })
+            .map(|(_, mount)| mount.clone())
+            .expect("the initial generation needs a writable state mount");
+        let selected_directory = DiscoveryRoot {
+            logical_path: script_directory.clone(),
+            role: DiscoveryRole::Home,
+        };
+        let mut units = resource_units(
+            &home,
+            &home.join(".config/opencode"),
+            &workspace,
+            &plan,
+            Some(std::slice::from_ref(&selected_directory)),
+        )
+        .unwrap();
+        merge_recovery_resource_mounts(
+            &mut units,
+            &previous_units
+                .iter()
+                .map(|(_, mount)| mount.clone())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let state_mount = units
+            .iter()
+            .find(|(source, mount)| {
+                source == &canonical_state
+                    && mount.kind == freshell_runtime_protocol::ProviderResourceKind::File
+            })
+            .expect("writable state beneath a selected directory needs an exact file mount");
+        assert!(state_mount.1.writable);
+        assert_eq!(
+            state_mount.1.provider_relative_path, previous_state_mount.provider_relative_path,
+            "recovery must reuse the exact writable file's provider subpath"
+        );
+
+        let directory_mount = units
+            .iter()
+            .find(|(source, mount)| {
+                source == &script_directory.canonicalize().unwrap()
+                    && mount.kind == freshell_runtime_protocol::ProviderResourceKind::Directory
+                    && mount
+                        .effective_destination
+                        .starts_with("/home/freshell/provider")
+            })
+            .map(|(_, mount)| mount)
+            .expect("the selected script directory needs a directory mount");
+        let provider = copy_selected_units_through_provider(owned.path(), &units);
+        let provider_script_directory = provider.join(".provider-home").join(
+            Path::new(&directory_mount.effective_destination)
+                .strip_prefix("/home/freshell/provider")
+                .unwrap(),
+        );
+        let output = execute_node_with_home_hidden(
+            owned.path(),
+            &home,
+            &provider_script_directory.join("server.mjs"),
+        );
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"nested state updated\n");
+        assert_eq!(
+            std::fs::read(provider_script_directory.join("state.json")).unwrap(),
+            b"initial state + runtime state"
+        );
+    }
+
+    #[test]
     fn direct_node_script_does_not_stage_absent_sibling_write_targets() {
         let owned = tempfile::tempdir().unwrap();
         let home = owned.path().join("home");
@@ -4427,6 +4532,29 @@ pub(super) fn resource_units(
                     .map_err(|_| "selected OpenCode configured resource is unavailable")?;
                 roots.insert((logical.clone(), role), canonical);
             }
+        }
+    }
+    // A containing directory supplies ordinary child inputs, but its writable
+    // projection cannot preserve an exact file across provider refresh. Keep
+    // every existing static write target as its own file root even when a
+    // selected directory already covers that path.
+    for writable in &writable_resources {
+        if writable.starts_with(workspace) {
+            continue;
+        }
+        let canonical = std::fs::canonicalize(writable)
+            .map_err(|_| "selected OpenCode writable resource is unavailable")?;
+        if canonical != *writable || !canonical.is_file() {
+            return Err("selected OpenCode writable resource changed during preparation".into());
+        }
+        let mut roles = vec![crate::managed_provider_references::sources::DiscoveryRole::Workspace];
+        if writable.starts_with(global) {
+            roles.push(crate::managed_provider_references::sources::DiscoveryRole::Global);
+        } else if writable.starts_with(home) {
+            roles.push(crate::managed_provider_references::sources::DiscoveryRole::Home);
+        }
+        for role in roles {
+            roots.insert((writable.clone(), role), canonical.clone());
         }
     }
     let mut units = Vec::new();

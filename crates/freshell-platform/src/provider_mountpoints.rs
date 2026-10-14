@@ -491,6 +491,39 @@ mod tests {
     }
 
     #[test]
+    fn provider_mountpoints_create_a_file_target_inside_a_selected_directory() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let selected = [
+            Mountpoint {
+                relative_path: ".freshell/provider-roots/directory".into(),
+                directory: true,
+            },
+            Mountpoint {
+                relative_path: ".freshell/provider-roots/state/source".into(),
+                directory: false,
+            },
+            Mountpoint {
+                relative_path: "mcp".into(),
+                directory: true,
+            },
+            Mountpoint {
+                relative_path: "mcp/state.json".into(),
+                directory: false,
+            },
+        ];
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+
+        prepare_for_identity(&home, &selected, uid, gid).unwrap();
+
+        assert!(home.join(".freshell/provider-roots/directory").is_dir());
+        assert!(home.join(".freshell/provider-roots/state/source").is_file());
+        assert!(home.join("mcp").is_dir());
+        assert!(home.join("mcp/state.json").is_file());
+    }
+
+    #[test]
     fn provider_mountpoints_remove_only_retired_empty_resource_placeholders() {
         let owned = tempfile::tempdir().unwrap();
         let home = owned.path().join("home");

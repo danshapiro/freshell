@@ -743,4 +743,49 @@ mod tests {
         assert!(selected.iter().any(|point| point.relative_path == ".freshell/provider-roots/root-0/opencode.json" && !point.directory),
             "exact private leaves must exist in the owned soul subpath before Docker mounts the external root");
     }
+
+    #[test]
+    fn provider_mountpoints_include_nested_writable_file_mounts() {
+        let mounts = docker::TerminalMounts {
+            workspace: "/synthetic/workspace".into(),
+            git_common_dir: None,
+            provider_bootstrap_files: vec![],
+            provider_secret_files: vec![],
+            indexed_secret_sources: BTreeMap::new(),
+            provider_user_root: None,
+            mcp_capability_file: None,
+            input_manifest: None,
+            indexed_files: None,
+            config_binds: vec![],
+            resource_mounts: vec![
+                ProviderResourceMount {
+                    stage_relative_path: ".freshell/resource-units/root-directory".into(),
+                    provider_relative_path: ".freshell/provider-roots/root-directory".into(),
+                    logical_destination: "/home/freshell/provider/mcp".into(),
+                    effective_destination: "/home/freshell/provider/mcp".into(),
+                    kind: ProviderResourceKind::Directory,
+                    writable: false,
+                },
+                ProviderResourceMount {
+                    stage_relative_path: ".freshell/resource-units/root-state/source".into(),
+                    provider_relative_path: ".freshell/provider-roots/root-state/source".into(),
+                    logical_destination: "/home/freshell/provider/mcp/state.json".into(),
+                    effective_destination: "/home/freshell/provider/mcp/state.json".into(),
+                    kind: ProviderResourceKind::File,
+                    writable: true,
+                },
+            ],
+        };
+
+        let selected = selections(&mounts).unwrap();
+        let has = |path: &str, directory| {
+            selected
+                .iter()
+                .any(|point| point.relative_path == path && point.directory == directory)
+        };
+        assert!(has(".freshell/provider-roots/root-directory", true));
+        assert!(has(".freshell/provider-roots/root-state/source", false));
+        assert!(has("mcp", true));
+        assert!(has("mcp/state.json", false));
+    }
 }
