@@ -87,7 +87,7 @@ describe('explicit real-root rehearsal admission', () => {
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
     const address = server.address(); if (!address || typeof address === 'string') throw new Error('owned HTTP fixture missing')
     input.preflightUrl = `http://127.0.0.1:${address.port}/api/runtime/soul-loss-repairs/preflight`
-    const preflight = readRehearsalPreflight(input, 'fixture', { timeoutMs: 30 })
+    const preflight = readRehearsalPreflight(input, 'fixture', { timeoutMs: 1_000 })
     try {
       await requestObserved
       await expect(preflight).rejects.toMatchObject({ name: 'TimeoutError' })

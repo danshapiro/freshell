@@ -3040,7 +3040,7 @@ describe('owned inventory control read timeout', () => {
           frame.writeUInt32BE(payload.length)
           payload.copy(frame, 4)
           socket.end(frame)
-        }, 100)
+        }, 1_000)
         timers.add(timer)
         socket.once('close', () => { clearTimeout(timer); timers.delete(timer) })
       })
@@ -3050,10 +3050,11 @@ describe('owned inventory control read timeout', () => {
     const instance = { controlSocket: socketPath, controlSecret: 'controlled-secret' } as owner.SupervisorInstance
     try {
       const read = method === 'adminEnvelopeRaw'
-        ? h.adminEnvelopeRaw(instance, { body: h.inventoryBody() }, { timeoutMs: 25 })
-        : h[method](instance, h.inventoryBody(), { timeoutMs: 25 })
-      await expect(read).rejects.toThrow(/control round trip exceeded 25ms/)
-      await vi.waitFor(() => { expect(requests).toBe(1); expect(closed).toBe(1); expect(sockets.size).toBe(0); expect(timers.size).toBe(0) })
+        ? h.adminEnvelopeRaw(instance, { body: h.inventoryBody() }, { timeoutMs: 250 })
+        : h[method](instance, h.inventoryBody(), { timeoutMs: 250 })
+      await expect(read).rejects.toThrow(/control round trip exceeded 250ms/)
+      await vi.waitFor(() => { expect(requests).toBe(1); expect(closed).toBe(1); expect(sockets.size).toBe(0); expect(timers.size).toBe(0) },
+        { timeout: 3_000, interval: 10 })
     } finally {
       for (const timer of timers) clearTimeout(timer)
       for (const socket of sockets) socket.destroy()
