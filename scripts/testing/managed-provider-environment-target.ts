@@ -24,6 +24,7 @@ const cloudflaredVersion = '2026.10.0'
 const cloudflaredSha = 'd33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db'
 const scenarios = ['healthy', 'missing-reference', 'startup-before-identity'] as const
 const ordinaryFixtureMode = 'managed-fixture-ordinary'
+const managedEnvironmentFixtureModel = 'opencode/big-pickle'
 const checkpointImage = 'freshell-sandbox:latest'
 const checkpointContainerPort = 3477
 const checkpointForwarderPort = 3478
@@ -162,6 +163,7 @@ const [receiptPath, expectedNonce] = process.argv.slice(2)
 if (!receiptPath || !expectedNonce) process.exit(12)
 fs.writeFileSync(receiptPath, JSON.stringify({ expectedNonce, helper,
   envValueLoaded: process.env.FRESHELL_MANAGED_CWD_ALIAS_ENV === expectedNonce,
+  envFileTarget: fs.realpathSync('.env'),
   envFileOperand: process.execArgv.find(value => value.startsWith('--env-file=')),
   cwd: process.cwd(), scriptPath: process.argv[1] }))
 let buffered = ''
@@ -435,7 +437,7 @@ export default {id:'managed-environment-tui',async tui(api,options){
  const command=new URL('./command',import.meta.url), resource=fs.readFileSync(new URL('./selected-resource',import.meta.url),'utf8');
  const child=Bun.spawn([command.pathname],{stdout:'pipe',stderr:'pipe'});const output=JSON.parse(await new Response(child.stdout).text());if(await child.exited!==0)throw new Error('selected executable failed');
  const configuration=await api.client.config.get({directory:cwd});if(!configuration.data?.agent)throw new Error('resolved provider configuration was not available');const sessionFlag=process.argv.findIndex(value=>value==='--session'||value==='-s');const resumed=sessionFlag>=0?process.argv[sessionFlag+1]:undefined;const result=resumed?await api.client.session.get({directory:cwd,sessionID:resumed}):await api.client.session.create({directory:cwd,title:'Managed fixture'});if(!result.data?.id||(resumed&&result.data.id!==resumed))throw new Error('native session creation or resume failed');api.route.navigate('session',{sessionID:result.data.id});
- const receipt={...options,terminalId:process.env.FRESHELL_TERMINAL_ID,nativeSessionId:result.data.id,bun:typeof Bun==='object',bunVersion:Bun.version,bunExecutable:process.execPath,opencodeVersion:api.app.version,dependency,resource,absoluteReference:configuration.data.agent.fixtureAbsolute.prompt,relativeReference:configuration.data.agent.fixtureRelative.prompt,executableMode:(fs.statSync(command).mode&511).toString(8).padStart(4,'0'),pid:process.pid,createdAt:new Date().toISOString()};
+ const receipt={...options,terminalId:process.env.FRESHELL_TERMINAL_ID,nativeSessionId:result.data.id,bun:typeof Bun==='object',bunVersion:Bun.version,bunExecutable:process.execPath,opencodeVersion:api.app.version,model:configuration.data.model,dependency,resource,absoluteReference:configuration.data.agent.fixtureAbsolute.prompt,relativeReference:configuration.data.agent.fixtureRelative.prompt,executableMode:(fs.statSync(command).mode&511).toString(8).padStart(4,'0'),pid:process.pid,createdAt:new Date().toISOString()};
  fs.writeFileSync(path.join(cwd,'.managed-fixture/child-receipt.json'),JSON.stringify(receipt));const marker='MANAGED_ENV_OUTPUT '+output.resource;process.stdout.write('\\n'+marker+'\\n');api.ui.toast.show({message:marker,duration:180000});
 }};`)
   await writeJson(path.join(mcpPackage, 'package.json'), {
@@ -468,7 +470,8 @@ export default {id:'managed-environment-tui',async tui(api,options){
   const absoluteRule = path.join(resources, 'absolute-rule.txt')
   await fs.writeFile(absoluteRule, nonce, { mode: 0o600 })
   const options = { expectedNonce: nonce, candidateSha, runId }
-  await writeJson(path.join(xdg, 'opencode/opencode.json'), { plugin: [[plugin, options]], agent: { fixtureAbsolute: { prompt: `{file:${absoluteRule}}` } } })
+  await writeJson(path.join(xdg, 'opencode/opencode.json'), { model: managedEnvironmentFixtureModel,
+    plugin: [[plugin, options]], agent: { fixtureAbsolute: { prompt: `{file:${absoluteRule}}` } } })
   await writeJson(path.join(xdg, 'opencode/tui.json'), { plugin: [[plugin, options]] })
   for (const scenario of [...scenarios, 'preflight']) {
     const cwd = path.join(workspace, scenario)
@@ -486,7 +489,7 @@ export default {id:'managed-environment-tui',async tui(api,options){
     const homeAppend = managedHomeAppendFixturePaths(home, cwd, scenario)
     await fs.writeFile(homeAppend.script, directHomeAppendMcpServerSource(path.basename(homeAppend.output)))
     await fs.writeFile(homeAppend.output, `initial-${nonce}`)
-    await writeJson(path.join(cwd, 'opencode.json'), { agent: { fixtureRelative: {
+    await writeJson(path.join(cwd, 'opencode.json'), { model: managedEnvironmentFixtureModel, agent: { fixtureRelative: {
       prompt: `{file:./${scenario === 'missing-reference' ? 'missing-selected.txt' : 'rules.txt'}}` } },
       mcp: {
         managed_fixture: {
@@ -1406,6 +1409,7 @@ export async function runManagedEnvironmentTarget() {
     assert.equal(preflightChild.terminalId, created.terminalId)
     assert.equal(preflightChild.candidateSha, rig.runtime.candidateSha)
     assert.equal(preflightChild.runId, rig.runtime.runId)
+    assert.equal(preflightChild.model, managedEnvironmentFixtureModel)
     assert.equal(preflightChild.expectedNonce, nonce)
     assert.equal(preflightChild.bun, true)
     const preflightMcp = await poll('OpenCode starts the nested Bun package-script MCP', async () =>
@@ -1441,6 +1445,7 @@ export async function runManagedEnvironmentTarget() {
     assert.equal(preflightCwdAliasMcp.expectedNonce, nonce)
     assert.equal(preflightCwdAliasMcp.helper, nonce)
     assert.equal(preflightCwdAliasMcp.envValueLoaded, true)
+    assert.match(preflightCwdAliasMcp.envFileTarget, /^\/home\/freshell\/provider\/\.freshell\/references\/\d+$/)
     assert.equal(preflightCwdAliasMcp.envFileOperand, '--env-file=.env', 'the workspace wrapper must retain its relative operand')
     assert.equal(preflightCwdAliasMcp.cwd, selected.cwdAliasProject)
     assert(preflightCwdAliasMcp.scriptPath.endsWith('/cwd-alias-project/server.mjs'))
@@ -1574,6 +1579,7 @@ export async function runManagedEnvironmentTarget() {
           assert.equal(child.runId, fixture.runId)
           assert.equal(child.bun, true)
           assert.equal(child.opencodeVersion, '1.18.21')
+          assert.equal(child.model, managedEnvironmentFixtureModel)
           assert.match(child.bunExecutable, /opencode/)
           assert.equal(child.executableMode, '0711')
           const mcpServer = await poll('Cloud OpenCode starts the nested Bun package-script MCP', async () =>
@@ -1609,6 +1615,7 @@ export async function runManagedEnvironmentTarget() {
           assert.equal(workspaceCwdAliasMcp.expectedNonce, nonce)
           assert.equal(workspaceCwdAliasMcp.helper, nonce)
           assert.equal(workspaceCwdAliasMcp.envValueLoaded, true)
+          assert.match(workspaceCwdAliasMcp.envFileTarget, /^\/home\/freshell\/provider\/\.freshell\/references\/\d+$/)
           assert.equal(workspaceCwdAliasMcp.envFileOperand, '--env-file=.env', 'the workspace wrapper must retain its relative operand')
           assert.equal(workspaceCwdAliasMcp.cwd, selected.cwdAliasProject)
           assert(workspaceCwdAliasMcp.scriptPath.endsWith('/cwd-alias-project/server.mjs'))

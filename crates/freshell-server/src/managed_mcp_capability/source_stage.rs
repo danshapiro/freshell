@@ -5916,7 +5916,7 @@ process.stdout.write(require('./helper.js'))
                 relative_path: ".env".into(),
                 reference_index: 0,
             }],
-            retired_reference_aliases: Vec::new(),
+            retired_reference_aliases: vec![".previously-retired-env".into()],
         };
         let mut current = vec![(
             "/synthetic/current-opencode-root".into(),
@@ -5958,6 +5958,83 @@ process.stdout.write(require('./helper.js'))
             "a retained resource cannot keep a previous generation's private reference index"
         );
         assert_eq!(retained[0].retired_reference_aliases, vec![".env"]);
+    }
+
+    #[test]
+    fn recovery_keeps_live_reference_aliases_and_expires_old_retirement_instructions() {
+        use freshell_runtime_protocol::{
+            ProviderResourceKind, ProviderResourceMount, ProviderResourceReferenceAlias,
+        };
+
+        let aliases = |index_offset: u16| {
+            (0u16..129)
+                .map(|index| ProviderResourceReferenceAlias {
+                    relative_path: format!(".env-{index}"),
+                    reference_index: index + index_offset,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mount = |aliases, retired_aliases| ProviderResourceMount {
+            stage_relative_path: ".freshell/resource-units/opencode-home".into(),
+            provider_relative_path: ".freshell/provider-roots/opencode-home".into(),
+            logical_destination: "/home/freshell/provider/.config/opencode".into(),
+            effective_destination: "/home/freshell/provider/.config/opencode".into(),
+            kind: ProviderResourceKind::Directory,
+            writable: false,
+            reference_aliases: aliases,
+            retired_reference_aliases: retired_aliases,
+        };
+
+        let previous = mount(aliases(0), vec![".expired-env".into()]);
+        let mut current = vec![(
+            "/synthetic/current-opencode-root".into(),
+            mount(aliases(1), Vec::new()),
+        )];
+
+        merge_recovery_resource_mounts(&mut current, std::slice::from_ref(&previous)).unwrap();
+
+        assert_eq!(current[0].1.reference_aliases, aliases(1));
+        assert!(
+            current[0].1.retired_reference_aliases.is_empty(),
+            "live aliases must not also be scheduled for retirement, and old retirement instructions expire"
+        );
+    }
+
+    #[test]
+    fn recovery_retires_only_previously_live_aliases_that_are_now_absent() {
+        use freshell_runtime_protocol::{
+            ProviderResourceKind, ProviderResourceMount, ProviderResourceReferenceAlias,
+        };
+
+        let mount = |aliases, retired_aliases| ProviderResourceMount {
+            stage_relative_path: ".freshell/resource-units/opencode-home".into(),
+            provider_relative_path: ".freshell/provider-roots/opencode-home".into(),
+            logical_destination: "/home/freshell/provider/.config/opencode".into(),
+            effective_destination: "/home/freshell/provider/.config/opencode".into(),
+            kind: ProviderResourceKind::Directory,
+            writable: false,
+            reference_aliases: aliases,
+            retired_reference_aliases: retired_aliases,
+        };
+        let previous = mount(
+            vec![ProviderResourceReferenceAlias {
+                relative_path: ".removed-env".into(),
+                reference_index: 0,
+            }],
+            vec![".already-removed-env".into()],
+        );
+        let mut current = vec![(
+            "/synthetic/current-opencode-root".into(),
+            mount(Vec::new(), Vec::new()),
+        )];
+
+        merge_recovery_resource_mounts(&mut current, std::slice::from_ref(&previous)).unwrap();
+
+        assert_eq!(
+            current[0].1.retired_reference_aliases,
+            vec![".removed-env"],
+            "only live aliases from the previous generation need cleanup"
+        );
     }
 
     #[test]
@@ -6257,6 +6334,8 @@ pub(super) fn merge_recovery_resource_mounts(
             })
     }
 
+    // Previous-generation retirement entries have already served their cleanup
+    // purpose. Recompute this generation's list from the still-live prior links.
     for (_, mount) in current.iter_mut() {
         if let Some(prior) = previous
             .iter()
@@ -6270,15 +6349,17 @@ pub(super) fn merge_recovery_resource_mounts(
             }
             mount.stage_relative_path = prior.stage_relative_path.clone();
             mount.provider_relative_path = prior.provider_relative_path.clone();
-            mount
-                .retired_reference_aliases
-                .extend(prior.retired_reference_aliases.iter().cloned());
-            mount.retired_reference_aliases.extend(
-                prior
-                    .reference_aliases
-                    .iter()
-                    .map(|alias| alias.relative_path.clone()),
-            );
+            let live_aliases = mount
+                .reference_aliases
+                .iter()
+                .map(|alias| alias.relative_path.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            mount.retired_reference_aliases = prior
+                .reference_aliases
+                .iter()
+                .filter(|alias| !live_aliases.contains(alias.relative_path.as_str()))
+                .map(|alias| alias.relative_path.clone())
+                .collect();
             mount.retired_reference_aliases.sort();
             mount.retired_reference_aliases.dedup();
         }
@@ -6305,12 +6386,11 @@ pub(super) fn merge_recovery_resource_mounts(
         }
         if retained_destinations.insert(prior.effective_destination.clone()) {
             let mut retained_mount = prior.clone();
-            retained_mount.retired_reference_aliases.extend(
-                prior
-                    .reference_aliases
-                    .iter()
-                    .map(|alias| alias.relative_path.clone()),
-            );
+            retained_mount.retired_reference_aliases = prior
+                .reference_aliases
+                .iter()
+                .map(|alias| alias.relative_path.clone())
+                .collect();
             retained_mount.reference_aliases.clear();
             retained_mount.retired_reference_aliases.sort();
             retained_mount.retired_reference_aliases.dedup();
