@@ -115,10 +115,28 @@ export async function readManagedEnvironmentDaemonId(): Promise<string> {
 }
 
 type ManagedCreateOwner = {
-  web: { capturedOutput(): { stdout: string; stderr: string } }
+  web: { capturedOutput(): { stdout: string; stderr: string }; info: { logsDir: string } }
   runtime: { containerLogs(id: string): string; writeIncident(name: string, value: unknown): void;
     broker?: { receiptIds(): Set<string> } }
   supervisor: { containerId: string; runtimeRoot?: string }
+}
+
+const safeLogLevels = new Set(['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR'])
+
+export function summarizeRustServerLogEvents(raw: string): Array<{ level: string; event: string }> {
+  const boundedTail = raw.slice(-512 * 1024)
+  const summary: Array<{ level: string; event: string }> = []
+  for (const line of boundedTail.split('\n').slice(-256)) {
+    if (line.length > 64 * 1024) continue
+    let value: unknown
+    try { value = JSON.parse(line) } catch { continue }
+    if (!value || typeof value !== 'object') continue
+    const record = value as Record<string, unknown>
+    if (typeof record.event !== 'string' || !/^[a-z][a-z0-9_.:-]{0,127}$/.test(record.event)
+      || typeof record.level !== 'string' || !safeLogLevels.has(record.level)) continue
+    summary.push({ level: record.level, event: record.event })
+  }
+  return summary.slice(-32)
 }
 
 const failureReasons = [
@@ -190,6 +208,14 @@ export function assertManagedTerminalCreated(owner: ManagedCreateOwner,
       ?? (filesystemLabel && osError !== undefined ? `${filesystemLabel} filesystem error` : 'UNKNOWN')
     const code = ErrorCode.safeParse(response.code)
     const web = owner.web.capturedOutput()
+    let serverLogEvents: Array<{ level: string; event: string }> = []
+    try {
+      const logPath = path.join(owner.web.info.logsDir, 'rust-server.jsonl')
+      const metadata = fs.statSync(logPath)
+      if (metadata.isFile() && metadata.size <= 4 * 1024 * 1024) {
+        serverLogEvents = summarizeRustServerLogEvents(fs.readFileSync(logPath, 'utf8'))
+      }
+    } catch { /* Missing or oversized logs remain unavailable. */ }
     let supervisor: Record<string, string> | 'UNKNOWN' = 'UNKNOWN'
     let sessionHost: Record<string, unknown> | 'UNKNOWN' = 'UNKNOWN'
     try {
@@ -239,6 +265,7 @@ export function assertManagedTerminalCreated(owner: ManagedCreateOwner,
     } catch { /* An absent owned supervisor leaves its observation unknown. */ }
     owner.runtime.writeIncident('managed-environment-create-failure', {
       severity: 'error', event: 'managed_environment.create_failed', code: code.success ? code.data : 'UNKNOWN', reason, ...(osError === undefined ? {} : { osError }),
+      serverLogEvents,
       server: { source: 'owned-server-typed-reply',
         capturedOutputAvailable: Boolean(web.stdout || web.stderr) }, supervisor, sessionHost,
     })

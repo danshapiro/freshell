@@ -3,6 +3,7 @@ import fs from 'node:fs/promises'
 import { createConnection, createServer, type AddressInfo } from 'node:net'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { summarizeRustServerLogEvents } from '../../../../scripts/testing/managed-environment-create.js'
 import {
   checkpointTcpForwarderSource,
   externalTargetRead,
@@ -22,6 +23,19 @@ async function listenOnLoopback(server: ReturnType<typeof createServer>): Promis
 }
 
 describe('managed provider environment target mode', () => {
+  it('retains only bounded event names and levels from server logs', () => {
+    const logs = [
+      JSON.stringify({ level: 'ERROR', event: 'provider.opencode.resource.failed', msg: 'PRIVATE_CONFIG_SENTINEL', token: 'PRIVATE_TOKEN_SENTINEL' }),
+      JSON.stringify({ level: 'WARN', event: 'invalid event name', msg: 'PRIVATE_MESSAGE_SENTINEL' }),
+      '{invalid json',
+    ].join('\n')
+
+    const summary = summarizeRustServerLogEvents(logs)
+
+    expect(summary).toEqual([{ level: 'ERROR', event: 'provider.opencode.resource.failed' }])
+    expect(JSON.stringify(summary)).not.toContain('PRIVATE_')
+  })
+
   it('waits for the target Retry-After before retrying a rate-limited control read', async () => {
     const responses = [
       new Response('rate limited', { status: 429, headers: { 'retry-after': '2' } }),
