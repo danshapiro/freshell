@@ -1318,6 +1318,7 @@ fn node_relative_resource_specifiers(
         &binding_declarations,
         &mut binding_resolver,
     )?;
+    conditional_aliases.propagate_to_sources(&mut output_destination_bindings);
     let ambiguous_output_bindings = node_ambiguous_output_bindings(
         &tokens,
         &scopes,
@@ -1326,7 +1327,7 @@ fn node_relative_resource_specifiers(
         &conditional_aliases.safe_reference_indices,
     )?;
     let mut ambiguous_output_bindings = ambiguous_output_bindings;
-    conditional_aliases.propagate_ambiguity(&mut ambiguous_output_bindings);
+    conditional_aliases.propagate_to_sources(&mut ambiguous_output_bindings);
     let mut result = std::collections::BTreeMap::<String, bool>::new();
     for index in 0..tokens.len() {
         if index >= 2
@@ -1782,17 +1783,17 @@ struct JavaScriptConditionalAliasAnalysis {
 }
 
 impl JavaScriptConditionalAliasAnalysis {
-    fn propagate_ambiguity(
+    fn propagate_to_sources(
         &self,
-        ambiguous: &mut std::collections::BTreeSet<JavaScriptBindingKey>,
+        bindings: &mut std::collections::BTreeSet<JavaScriptBindingKey>,
     ) {
-        let mut pending = ambiguous.iter().cloned().collect::<Vec<_>>();
+        let mut pending = bindings.iter().cloned().collect::<Vec<_>>();
         while let Some(alias) = pending.pop() {
             let Some(sources) = self.sources_by_alias.get(&alias) else {
                 continue;
             };
             for source in sources {
-                if ambiguous.insert(source.clone()) {
+                if bindings.insert(source.clone()) {
                     pending.push(source.clone());
                 }
             }
@@ -1831,10 +1832,7 @@ fn node_conditional_alias_analysis(
                 Some(JavaScriptToken::Punctuation(b':'))
             )
             || !matches!(tokens.get(index + 7), Some(JavaScriptToken::Identifier(_)))
-            || !matches!(
-                tokens.get(index + 8),
-                None | Some(JavaScriptToken::Punctuation(b';' | b'}'))
-            )
+            || !javascript_conditional_alias_initializer_terminates(tokens, index + 8)
         {
             continue;
         }
@@ -1878,6 +1876,23 @@ fn node_conditional_alias_analysis(
             .extend([index + 3, index + 5, index + 7]);
     }
     Ok(analysis)
+}
+
+fn javascript_conditional_alias_initializer_terminates(
+    tokens: &[JavaScriptToken],
+    next_index: usize,
+) -> bool {
+    // Tokenization drops whitespace, so a following statement's identifier is
+    // the bounded ASI signal for this simple initializer. `in` and
+    // `instanceof` can still continue the expression; member/call/operator
+    // continuations stay fail-closed below.
+    match tokens.get(next_index) {
+        None | Some(JavaScriptToken::Punctuation(b';' | b',' | b'}')) => true,
+        Some(JavaScriptToken::Identifier(keyword)) => {
+            !matches!(keyword.as_str(), "in" | "instanceof")
+        }
+        _ => false,
+    }
 }
 
 fn node_ambiguous_output_bindings(
