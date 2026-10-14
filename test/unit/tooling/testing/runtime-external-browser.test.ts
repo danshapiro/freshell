@@ -2219,7 +2219,7 @@ describe('owned web process lifetime (Node process fixture only)', () => {
       runtime_code: 'HOST_UNREACHABLE', provider: 'codex', provider_start_diagnostic: 'authentication',
       transcript: 'provider-body-must-not-persist' } }
     const unsafe = { level: 'WARN', fields: { message: 'fresh_agent.create.launch_failed',
-      provider_start_diagnostic: 'private credential detail' } }
+      provider_start_diagnostic: 'credential-leak-1' } }
     await fsp.writeFile(entry, `process.stderr.write(${JSON.stringify(JSON.stringify(safe) + '\n' + JSON.stringify(unsafe) + '\n')});\n${await fsp.readFile(entry, 'utf8')}`)
     const diagnostics = vi.fn()
     const server = new runner.ManagedRuntimeWebServer({ binary: process.execPath, repoRoot: process.cwd(),
@@ -2232,7 +2232,7 @@ describe('owned web process lifetime (Node process fixture only)', () => {
       expect(record.facts).toContainEqual({ severity: 'warn', event: 'fresh_agent.create.launch_failed',
         fields: { runtime_code: 'HOST_UNREACHABLE', provider: 'codex', provider_start_diagnostic: 'authentication' } })
       expect(JSON.stringify(record)).not.toContain('provider-body-must-not-persist')
-      expect(JSON.stringify(record)).not.toContain('private credential detail')
+      expect(JSON.stringify(record)).not.toContain('credential-leak-1')
     } finally { await server.stop(); await fsp.rm(directory, { recursive: true }) }
   })
   it('records an authenticated cleanliness refusal before exact owned web cleanup', async () => {
