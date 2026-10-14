@@ -311,6 +311,8 @@ pub struct PlannedSourceOccurrence {
     pub requires_config_bind: bool,
     pub instance_cwd: PathBuf,
     pub configured_resources: Vec<PathBuf>,
+    /// Canonical exact files with statically identified Node write targets.
+    pub configured_writable_resources: std::collections::BTreeSet<PathBuf>,
     /// Captured with the retained source view so later staging does not
     /// reinterpret a generated entry after ordinary-terminal cleanup.
     pub user_owns_freshell_mcp: bool,
@@ -715,9 +717,10 @@ pub fn plan_loaded_opencode_sources_relocated(
             requires_config_bind: loaded.requires_config_bind,
             instance_cwd: cwd.into(),
             configured_resources: Vec::new(),
+            configured_writable_resources: Default::default(),
             user_owns_freshell_mcp,
         };
-        let (resources, names) =
+        let selected_resources =
             super::opencode_resources::select(&planned, home, global.as_deref(), &|name| {
                 lookup(planned.source.lane, &planned.source.logical_path, name)
             })
@@ -730,8 +733,12 @@ pub fn plan_loaded_opencode_sources_relocated(
                 variables: vec![],
                 cause: error.cause,
             })?;
-        planned.configured_resources = resources;
-        planned.references.path_variables.extend(names);
+        planned.configured_resources = selected_resources.resources;
+        planned.configured_writable_resources = selected_resources.writable_resources;
+        planned
+            .references
+            .path_variables
+            .extend(selected_resources.variables);
         planned.references.path_variables.sort();
         planned.references.path_variables.dedup();
         result.push(planned);

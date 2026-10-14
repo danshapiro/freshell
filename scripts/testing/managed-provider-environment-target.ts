@@ -334,8 +334,8 @@ export function managedEnvironmentFixtureLayout(root: string) {
   return { workspace, resources, plugin, mcpPackage, directMcp, mcpNested, mcpParentDependency }
 }
 
-export function managedHomeAppendFixturePaths(xdg: string, cwd: string, scenario: string) {
-  const script = path.join(xdg, 'opencode/mcp-servers', `direct-home-${scenario}.mjs`)
+export function managedHomeAppendFixturePaths(home: string, cwd: string, scenario: string) {
+  const script = path.join(home, `direct-home-${scenario}.mjs`)
   return {
     script,
     output: path.join(path.dirname(script), `direct-home-${scenario}.txt`),
@@ -424,7 +424,7 @@ export default {id:'managed-environment-tui',async tui(api,options){
     await fs.chmod(path.join(cwd, '.managed-fixture'), 0o777)
     await fs.writeFile(path.join(cwd, 'rules.txt'), nonce, { mode: 0o600 })
     const mcpReceipt = path.join(cwd, '.managed-fixture/mcp-receipt.json')
-    const homeAppend = managedHomeAppendFixturePaths(xdg, cwd, scenario)
+    const homeAppend = managedHomeAppendFixturePaths(home, cwd, scenario)
     await fs.writeFile(homeAppend.script, directHomeAppendMcpServerSource(path.basename(homeAppend.output)))
     await fs.writeFile(homeAppend.output, `initial-${nonce}`)
     await writeJson(path.join(cwd, 'opencode.json'), { agent: { fixtureRelative: {
@@ -1300,7 +1300,7 @@ export async function runManagedEnvironmentTarget() {
       FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: '', FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: '' }
     rig = new ManagedRuntimeBrowserRig(repoRoot, 2, { ...environment, FRESHELL_MANAGED_ENVIRONMENT_FIXTURE_ONLY: '1' },
       environment, 'release', { enabledProviders: ['opencode'] }, home,
-      { workspaceRoots: [workspace], providerInputRoots: [managedEnvironmentFixtureLayout(root).resources],
+      { workspaceRoots: [workspace], providerInputRoots: [managedEnvironmentFixtureLayout(root).resources, home],
         bootstrapFiles: [grants.grants.opencode], defaultCwd: workspace })
     const selected = await configure(root, nonce, rig.runtime.candidateSha, rig.runtime.runId)
     await rig.start()

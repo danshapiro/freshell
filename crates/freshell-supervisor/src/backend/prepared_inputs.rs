@@ -29,7 +29,7 @@ pub(super) fn mount_descriptors(
         add(
             &root.effective_destination,
             json!({"Type":"volume","Source":provider_volume,"Target":root.effective_destination,
-            "ReadOnly":root.kind==freshell_runtime_protocol::ProviderResourceKind::File,
+            "ReadOnly":root.kind==freshell_runtime_protocol::ProviderResourceKind::File && !root.writable,
             "VolumeOptions":{"NoCopy":true,"Subpath":root.provider_relative_path}}),
         )?;
     }
@@ -175,6 +175,7 @@ mod tests {
                 logical_destination: "/outside/plugin".into(),
                 effective_destination: "/outside/plugin".into(),
                 kind: ProviderResourceKind::Directory,
+                writable: false,
             }],
             indexed_files: Some(IndexedProviderFiles {
                 volume_name: "freshell-inputs-aaaaaaaaaaaaaaaaaaaaaaaa".into(),
@@ -226,6 +227,35 @@ mod tests {
             .find(|mount| mount["Target"] == "/outside/plugin")
             .unwrap()["ReadOnly"] = json!(true);
         assert!(verify(&actual, &mounts, "owned-provider", &volumes).is_err());
+    }
+
+    #[test]
+    fn provider_prepared_file_mounts_are_readonly_unless_explicitly_writable() {
+        let (mut mounts, _, _) = fixture();
+        for (name, destination, writable) in [
+            ("readonly", "/outside/input.txt", false),
+            ("writable", "/outside/output.txt", true),
+        ] {
+            mounts.resource_mounts.push(ProviderResourceMount {
+                stage_relative_path: format!(".freshell/resource-units/{name}/source"),
+                provider_relative_path: format!(".freshell/provider-roots/{name}/source"),
+                logical_destination: destination.into(),
+                effective_destination: destination.into(),
+                kind: ProviderResourceKind::File,
+                writable,
+            });
+        }
+
+        let descriptors = mount_descriptors(&mounts, "owned-provider").unwrap();
+        let descriptor = |destination: &str| {
+            descriptors
+                .iter()
+                .find(|mount| mount["Target"] == destination)
+                .expect("selected exact file mount")
+        };
+        assert_eq!(descriptor("/outside/input.txt")["ReadOnly"], true);
+        assert_eq!(descriptor("/outside/output.txt")["ReadOnly"], false);
+        assert_eq!(descriptor("/outside/plugin")["ReadOnly"], false);
     }
 
     #[test]

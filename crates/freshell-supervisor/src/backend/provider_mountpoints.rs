@@ -736,6 +736,7 @@ mod tests {
                 logical_destination: "/synthetic/workspace/.opencode".into(),
                 effective_destination: "/synthetic/workspace/.opencode".into(),
                 kind: ProviderResourceKind::Directory,
+                writable: false,
             }],
         };
         let selected = selections(&mounts).unwrap();

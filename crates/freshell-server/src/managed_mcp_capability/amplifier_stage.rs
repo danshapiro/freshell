@@ -142,6 +142,7 @@ pub(super) fn prepare(
         logical_destination: "/home/freshell/provider/.freshell/resources".into(),
         effective_destination: "/home/freshell/provider/.freshell/resources".into(),
         kind: ProviderResourceKind::Directory,
+        writable: false,
     });
     Ok(prepared)
 }

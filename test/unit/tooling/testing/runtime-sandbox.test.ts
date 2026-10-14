@@ -598,7 +598,7 @@ describe('closed managed environment fixture inputs', () => {
       process.env.DOCKER_HOST = `unix://${socket}`
       const rig = new ManagedRuntimeBrowserRig(repository, 2, { HOME: home, XDG_CONFIG_HOME: xdg },
         { HOME: home, XDG_CONFIG_HOME: xdg }, 'test', { enabledProviders: ['opencode'] }, home,
-        { workspaceRoots: [workspace], providerInputRoots: [providerInputs], bootstrapFiles: [grant], defaultCwd: workspace })
+        { workspaceRoots: [workspace], providerInputRoots: [providerInputs, home], bootstrapFiles: [grant], defaultCwd: workspace })
       harness = rig.runtime
       useOwnedHarnessArtifacts(harness, host)
       await harness.prepare()
@@ -613,6 +613,7 @@ describe('closed managed environment fixture inputs', () => {
       expect(dispatched).toContain(`HOME=${home}`)
       expect(dispatched).toContain(`XDG_CONFIG_HOME=${xdg}`)
       expect(dispatched).toContain(`${home}:${home}:ro`)
+      expect(dispatched.filter(argument => argument === `${home}:${home}:ro`)).toHaveLength(1)
       expect(dispatched).not.toContain(`${repository}:${repository}:ro`)
       expect((await fs.stat(home)).mode & 0o777).toBe(0o700)
     } finally {

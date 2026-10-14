@@ -485,7 +485,11 @@ export class RuntimeHarness {
         args.push('-v', `${root}:${root}:ro`)
       }
       for (const root of this.phase2ProviderInputRoots()) {
-        if (root === this.testRoot || root === this.buildDir || this.phase2WorkspaceRoots().includes(root)) continue
+        // The explicitly selected HOME is already mounted above; avoid
+        // publishing a duplicate Docker mount when it is also an approved
+        // provider-input root.
+        if (root === this.providerFixtureHome || root === this.testRoot || root === this.buildDir
+          || this.phase2WorkspaceRoots().includes(root)) continue
         args.push('-v', `${root}:${root}:ro`)
       }
     }

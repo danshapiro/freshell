@@ -1574,6 +1574,39 @@ process.stdout.write(require('./helper.js'))
                 .unwrap_or_else(|_| copy_output.clone())
         ));
 
+        let units = resource_units(
+            &home,
+            &home.join(".config/opencode"),
+            &workspace,
+            &plan,
+            None,
+        )
+        .unwrap();
+        for output in [&append_output, &append_url_output] {
+            let canonical = output.canonicalize().unwrap();
+            let mounts = units
+                .iter()
+                .filter(|(source, mount)| {
+                    source == &canonical
+                        && mount.kind == freshell_runtime_protocol::ProviderResourceKind::File
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                !mounts.is_empty(),
+                "existing static output must be an exact file mount"
+            );
+            assert!(mounts.iter().all(|(_, mount)| mount.writable));
+        }
+        let copy_source_mounts = units
+            .iter()
+            .filter(|(source, mount)| {
+                source == &copy_source.canonicalize().unwrap()
+                    && mount.kind == freshell_runtime_protocol::ProviderResourceKind::File
+            })
+            .collect::<Vec<_>>();
+        assert!(!copy_source_mounts.is_empty());
+        assert!(copy_source_mounts.iter().all(|(_, mount)| !mount.writable));
+
         let output = execute_node_with_home_hidden(owned.path(), &home, &provider_script);
         assert!(output.status.success(), "{:?}", output.stderr);
         let provider_script_directory = std::fs::canonicalize(&provider_script)
@@ -3304,6 +3337,7 @@ process.stdout.write(require('./helper.js'))
             logical_destination: package.to_string_lossy().into_owned(),
             effective_destination: package.to_string_lossy().into_owned(),
             kind: freshell_runtime_protocol::ProviderResourceKind::Directory,
+            writable: false,
         };
         let mut units = vec![(package.clone(), mount)];
 
@@ -3504,6 +3538,7 @@ process.stdout.write(require('./helper.js'))
                 logical_destination: "/tmp/external".into(),
                 effective_destination: "/tmp/external".into(),
                 kind: freshell_runtime_protocol::ProviderResourceKind::Directory,
+                writable: false,
             },
         )];
         let capture = Capture::default();
@@ -4039,6 +4074,7 @@ process.stdout.write(require('./helper.js'))
             logical_destination: "/home/freshell/provider/.config/opencode".into(),
             effective_destination: "/home/freshell/provider/.config/opencode".into(),
             kind: ProviderResourceKind::Directory,
+            writable: false,
         };
         let mut current = vec![(
             "/synthetic/current-opencode-root".into(),
@@ -4048,6 +4084,7 @@ process.stdout.write(require('./helper.js'))
                 logical_destination: previous.logical_destination.clone(),
                 effective_destination: previous.effective_destination.clone(),
                 kind: ProviderResourceKind::Directory,
+                writable: false,
             },
         )];
         let retained =
@@ -4082,6 +4119,7 @@ process.stdout.write(require('./helper.js'))
             logical_destination: destination.into(),
             effective_destination: destination.into(),
             kind: ProviderResourceKind::Directory,
+            writable: false,
         };
 
         for (current_destination, previous_destination) in [
@@ -4130,6 +4168,7 @@ process.stdout.write(require('./helper.js'))
             logical_destination: destination.into(),
             effective_destination: destination.into(),
             kind: ProviderResourceKind::Directory,
+            writable: false,
         };
         let mut aliases = vec![(source, mount("/workspace/current"))];
         let prior = mount("/home/freshell/provider/.config/opencode");
@@ -4175,6 +4214,10 @@ pub(super) fn resource_units(
     use freshell_runtime_protocol::{ProviderResourceKind, ProviderResourceMount};
     use sha2::{Digest, Sha256};
     let mut roots = BTreeMap::new();
+    let writable_resources = plan
+        .iter()
+        .flat_map(|source| source.configured_writable_resources.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>();
     for root in accepted_roots.unwrap_or_default() {
         if root.role == crate::managed_provider_references::sources::DiscoveryRole::Unknown {
             return Err("selected resource discovery role is unrecorded".into());
@@ -4248,6 +4291,8 @@ pub(super) fn resource_units(
         } else {
             ProviderResourceKind::Directory
         };
+        let writable =
+            kind == ProviderResourceKind::File && writable_resources.contains(&canonical);
         let name = if kind == ProviderResourceKind::File {
             format!("{name}/source")
         } else {
@@ -4284,6 +4329,7 @@ pub(super) fn resource_units(
                     .ok_or("resource destination is not UTF-8")?
                     .into(),
                 kind,
+                writable,
             },
         ));
     }

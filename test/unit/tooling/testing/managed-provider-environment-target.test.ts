@@ -114,12 +114,14 @@ describe('managed provider environment target mode', () => {
     expect(fixture.mcpParentDependency).toBe(path.join(fixture.resources, 'node_modules/managed-fixture-mcp-dependency'))
   })
 
-  it('seeds the direct HOME append file beside the XDG MCP script it resolves from', () => {
-    const xdg = '/tmp/managed-environment-fixture/home/fixture-xdg'
+  it('seeds the direct HOME append file at the HOME root outside XDG resource roots', () => {
+    const home = '/tmp/managed-environment-fixture/home'
     const cwd = '/tmp/managed-environment-fixture/workspace/preflight'
-    const paths = managedHomeAppendFixturePaths(xdg, cwd, 'preflight')
+    const paths = managedHomeAppendFixturePaths(home, cwd, 'preflight')
 
-    expect(paths.script).toBe(path.join(xdg, 'opencode/mcp-servers/direct-home-preflight.mjs'))
+    expect(paths.script).toBe(path.join(home, 'direct-home-preflight.mjs'))
+    expect(path.dirname(paths.script)).toBe(home)
+    expect(paths.script.startsWith(path.join(home, 'fixture-xdg') + path.sep)).toBe(false)
     expect(paths.output).toBe(path.join(path.dirname(paths.script), 'direct-home-preflight.txt'))
     expect(path.dirname(paths.output)).toBe(path.dirname(paths.script))
     expect(paths.receipt).toBe(path.join(cwd, '.managed-fixture/direct-home-mcp-receipt.json'))

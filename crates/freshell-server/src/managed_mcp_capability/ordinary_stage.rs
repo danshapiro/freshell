@@ -143,6 +143,7 @@ pub(super) fn prepare_selected<M: serde::Serialize>(
                     .ok_or("Codex resource destination is not UTF-8")?
                     .into(),
                 kind,
+                writable: false,
             });
         }
     }

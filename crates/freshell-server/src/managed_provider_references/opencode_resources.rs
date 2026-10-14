@@ -1299,10 +1299,10 @@ fn node_relative_module_specifiers(source: &str) -> Result<Vec<String>, &'static
 fn node_relative_resource_specifiers(
     parent: &Path,
     source: &str,
-) -> Result<std::collections::BTreeSet<String>, &'static str> {
+) -> Result<std::collections::BTreeMap<String, bool>, &'static str> {
     let tokens = javascript_tokens(source)?;
     let output_destinations = node_output_destination_mask(&tokens)?;
-    let mut result = std::collections::BTreeSet::new();
+    let mut result = std::collections::BTreeMap::<String, bool>::new();
     for index in 0..tokens.len() {
         if index >= 2
             && matches!(tokens.get(index - 2), Some(JavaScriptToken::Identifier(_)))
@@ -1362,7 +1362,10 @@ fn node_relative_resource_specifiers(
                 if safe && !relative.as_os_str().is_empty() {
                     let relative = relative.to_string_lossy().into_owned();
                     if !output_destinations[index - 2] || parent.join(&relative).exists() {
-                        result.insert(relative);
+                        result
+                            .entry(relative)
+                            .and_modify(|writable| *writable |= output_destinations[index - 2])
+                            .or_insert(output_destinations[index - 2]);
                     }
                 }
             }
@@ -1410,7 +1413,10 @@ fn node_relative_resource_specifiers(
             && !specifier.contains(['?', '#', '\\', '$'])
             && (!output_destinations[index] || parent.join(specifier).exists())
         {
-            result.insert(specifier.clone());
+            result
+                .entry(specifier.clone())
+                .and_modify(|writable| *writable |= output_destinations[index])
+                .or_insert(output_destinations[index]);
         }
     }
     Ok(result)
@@ -1837,6 +1843,13 @@ struct ScriptDependencySelection<'a> {
 struct ScriptDependencyPath {
     path: PathBuf,
     parse_as_script: bool,
+    writable: bool,
+}
+
+struct DirectScriptResources<'a> {
+    paths: &'a mut std::collections::BTreeSet<PathBuf>,
+    path_bytes: &'a mut usize,
+    writable_files: &'a mut std::collections::BTreeSet<PathBuf>,
 }
 
 fn direct_script_dependency_paths(
@@ -1847,32 +1860,36 @@ fn direct_script_dependency_paths(
 ) -> Result<Vec<ScriptDependencyPath>, &'static str> {
     match runtime {
         ScriptDependencyRuntime::Node => {
-            let mut result = std::collections::BTreeMap::<PathBuf, bool>::new();
+            let mut result = std::collections::BTreeMap::<PathBuf, (bool, bool)>::new();
             {
-                let mut record = |path: PathBuf, imported_module: bool| {
+                let mut record = |path: PathBuf, imported_module: bool, writable: bool| {
                     let parse_as_script = is_script_dependency_source(&path, runtime)
                         || (imported_module && path.extension().is_none());
                     result
                         .entry(path)
-                        .and_modify(|selected| *selected |= parse_as_script)
-                        .or_insert(parse_as_script);
+                        .and_modify(|selected| {
+                            selected.0 |= parse_as_script;
+                            selected.1 |= writable;
+                        })
+                        .or_insert((parse_as_script, writable));
                 };
                 for specifier in node_relative_module_specifiers(source)? {
                     let files = resolve_node_relative_module(parent, &specifier)?
                         .ok_or("direct MCP Node relative module is missing")?;
                     for file in files {
-                        record(file, true);
+                        record(file, true, false);
                     }
                 }
-                for specifier in node_relative_resource_specifiers(parent, source)? {
-                    record(parent.join(specifier), false);
+                for (specifier, writable) in node_relative_resource_specifiers(parent, source)? {
+                    record(parent.join(specifier), false, writable);
                 }
             }
             Ok(result
                 .into_iter()
-                .map(|(path, parse_as_script)| ScriptDependencyPath {
+                .map(|(path, (parse_as_script, writable))| ScriptDependencyPath {
                     path,
                     parse_as_script,
+                    writable,
                 })
                 .collect())
         }
@@ -1889,6 +1906,7 @@ fn direct_script_dependency_paths(
             .map(|path| ScriptDependencyPath {
                 parse_as_script: is_script_dependency_source(&path, runtime),
                 path,
+                writable: false,
             })
             .collect()),
         ScriptDependencyRuntime::Ruby => ruby_relative_require_specifiers(source)?
@@ -1899,6 +1917,7 @@ fn direct_script_dependency_paths(
                 Ok(ScriptDependencyPath {
                     parse_as_script: is_script_dependency_source(&path, runtime),
                     path,
+                    writable: false,
                 })
             })
             .collect(),
@@ -1923,8 +1942,7 @@ fn insert_direct_script_dependencies(
     script: &Path,
     scope: &Path,
     declaring: &Path,
-    result: &mut std::collections::BTreeSet<PathBuf>,
-    resource_path_bytes: &mut usize,
+    resources: DirectScriptResources<'_>,
     field: &'static str,
     runtime: ScriptDependencyRuntime,
 ) -> Result<(), ResourceError> {
@@ -1932,8 +1950,7 @@ fn insert_direct_script_dependencies(
         script,
         scope,
         declaring,
-        result,
-        resource_path_bytes,
+        resources,
         field,
         ScriptDependencySelection {
             runtime,
@@ -1946,8 +1963,7 @@ fn insert_direct_script_dependencies_covered(
     script: &Path,
     scope: &Path,
     declaring: &Path,
-    result: &mut std::collections::BTreeSet<PathBuf>,
-    resource_path_bytes: &mut usize,
+    resources: DirectScriptResources<'_>,
     field: &'static str,
     selection: ScriptDependencySelection<'_>,
 ) -> Result<(), ResourceError> {
@@ -2007,6 +2023,9 @@ fn insert_direct_script_dependencies_covered(
                     "direct MCP dependency escapes its selected script scope",
                 ));
             }
+            if candidate.writable && dependency_is_file {
+                resources.writable_files.insert(dependency.clone());
+            }
             let alias = freshell_platform::opencode_config::lexical_path(&candidate.path);
             if alias != dependency {
                 if !alias.starts_with(scope) {
@@ -2023,7 +2042,13 @@ fn insert_direct_script_dependencies_covered(
                     .covered_directory
                     .is_some_and(|directory| alias.starts_with(directory))
                 {
-                    insert_resource(result, resource_path_bytes, alias, field, declaring)?;
+                    insert_resource(
+                        &mut *resources.paths,
+                        &mut *resources.path_bytes,
+                        alias,
+                        field,
+                        declaring,
+                    )?;
                 }
             }
             if !selection
@@ -2031,8 +2056,8 @@ fn insert_direct_script_dependencies_covered(
                 .is_some_and(|directory| dependency.starts_with(directory))
             {
                 insert_resource(
-                    result,
-                    resource_path_bytes,
+                    &mut *resources.paths,
+                    &mut *resources.path_bytes,
                     dependency.clone(),
                     field,
                     declaring,
@@ -2052,6 +2077,7 @@ fn insert_shell_script_dependencies(
     declaring: &Path,
     result: &mut std::collections::BTreeSet<PathBuf>,
     resource_path_bytes: &mut usize,
+    writable_resources: &mut std::collections::BTreeSet<PathBuf>,
     field: &'static str,
 ) -> Result<(), ResourceError> {
     const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
@@ -2190,8 +2216,11 @@ fn insert_shell_script_dependencies(
                         &dependency,
                         scope,
                         declaring,
-                        result,
-                        resource_path_bytes,
+                        DirectScriptResources {
+                            paths: result,
+                            path_bytes: resource_path_bytes,
+                            writable_files: writable_resources,
+                        },
                         field,
                         ScriptDependencyRuntime::Node,
                     )?;
@@ -2425,6 +2454,12 @@ pub struct ResourceError {
     pub field: &'static str,
     pub cause: &'static str,
 }
+
+pub struct ResourceSelection {
+    pub resources: Vec<PathBuf>,
+    pub variables: Vec<String>,
+    pub writable_resources: std::collections::BTreeSet<PathBuf>,
+}
 fn checked(path: &Path, field: &'static str, _source: &Path) -> Result<PathBuf, ResourceError> {
     let fail = |cause| ResourceError { field, cause };
     let canonical = std::fs::canonicalize(path)
@@ -2568,11 +2603,12 @@ pub fn select(
     home: &Path,
     global: Option<&Path>,
     lookup: &dyn Fn(&str) -> Option<String>,
-) -> Result<(Vec<PathBuf>, Vec<String>), ResourceError> {
+) -> Result<ResourceSelection, ResourceError> {
     let declaring = &source.source.logical_path;
     let fail = |field: &'static str, cause: &'static str| ResourceError { field, cause };
     let mut result = std::collections::BTreeSet::new();
     let mut resource_path_bytes = 0usize;
+    let mut writable_resources = std::collections::BTreeSet::new();
     let mut variables = std::collections::BTreeSet::new();
     let raw = source.references.unexpanded_source();
     let skip_owned_freshell_mcp =
@@ -2919,8 +2955,11 @@ pub fn select(
                     &canonical,
                     &dependency_scope,
                     declaring,
-                    &mut result,
-                    &mut resource_path_bytes,
+                    DirectScriptResources {
+                        paths: &mut result,
+                        path_bytes: &mut resource_path_bytes,
+                        writable_files: &mut writable_resources,
+                    },
                     field,
                     ScriptDependencySelection {
                         runtime: ScriptDependencyRuntime::Node,
@@ -2940,8 +2979,11 @@ pub fn select(
                     &canonical,
                     &dependency_scope,
                     declaring,
-                    &mut result,
-                    &mut resource_path_bytes,
+                    DirectScriptResources {
+                        paths: &mut result,
+                        path_bytes: &mut resource_path_bytes,
+                        writable_files: &mut writable_resources,
+                    },
                     field,
                     ScriptDependencyRuntime::Node,
                 )?;
@@ -3005,8 +3047,11 @@ pub fn select(
                     &canonical,
                     &dependency_scope,
                     declaring,
-                    &mut result,
-                    &mut resource_path_bytes,
+                    DirectScriptResources {
+                        paths: &mut result,
+                        path_bytes: &mut resource_path_bytes,
+                        writable_files: &mut writable_resources,
+                    },
                     field,
                     ScriptDependencyRuntime::Node,
                 )?;
@@ -3094,8 +3139,11 @@ pub fn select(
                         &canonical,
                         &dependency_scope,
                         declaring,
-                        &mut result,
-                        &mut resource_path_bytes,
+                        DirectScriptResources {
+                            paths: &mut result,
+                            path_bytes: &mut resource_path_bytes,
+                            writable_files: &mut writable_resources,
+                        },
                         field,
                         ScriptDependencyRuntime::Node,
                     )?;
@@ -3107,6 +3155,7 @@ pub fn select(
                         declaring,
                         &mut result,
                         &mut resource_path_bytes,
+                        &mut writable_resources,
                         field,
                     )?;
                 }
@@ -3115,8 +3164,11 @@ pub fn select(
                         &canonical,
                         &dependency_scope,
                         declaring,
-                        &mut result,
-                        &mut resource_path_bytes,
+                        DirectScriptResources {
+                            paths: &mut result,
+                            path_bytes: &mut resource_path_bytes,
+                            writable_files: &mut writable_resources,
+                        },
                         field,
                         ScriptDependencyRuntime::Python,
                     )?;
@@ -3126,8 +3178,11 @@ pub fn select(
                         &canonical,
                         &dependency_scope,
                         declaring,
-                        &mut result,
-                        &mut resource_path_bytes,
+                        DirectScriptResources {
+                            paths: &mut result,
+                            path_bytes: &mut resource_path_bytes,
+                            writable_files: &mut writable_resources,
+                        },
                         field,
                         ScriptDependencyRuntime::Ruby,
                     )?;
@@ -3162,8 +3217,11 @@ pub fn select(
                             &canonical,
                             &dependency_scope,
                             declaring,
-                            &mut result,
-                            &mut resource_path_bytes,
+                            DirectScriptResources {
+                                paths: &mut result,
+                                path_bytes: &mut resource_path_bytes,
+                                writable_files: &mut writable_resources,
+                            },
                             field,
                             ScriptDependencyRuntime::Node,
                         )?;
@@ -3177,6 +3235,7 @@ pub fn select(
                             declaring,
                             &mut result,
                             &mut resource_path_bytes,
+                            &mut writable_resources,
                             field,
                         )?;
                     }
@@ -3185,8 +3244,11 @@ pub fn select(
                             &canonical,
                             &dependency_scope,
                             declaring,
-                            &mut result,
-                            &mut resource_path_bytes,
+                            DirectScriptResources {
+                                paths: &mut result,
+                                path_bytes: &mut resource_path_bytes,
+                                writable_files: &mut writable_resources,
+                            },
                             field,
                             ScriptDependencyRuntime::Python,
                         )?;
@@ -3196,8 +3258,11 @@ pub fn select(
                             &canonical,
                             &dependency_scope,
                             declaring,
-                            &mut result,
-                            &mut resource_path_bytes,
+                            DirectScriptResources {
+                                paths: &mut result,
+                                path_bytes: &mut resource_path_bytes,
+                                writable_files: &mut writable_resources,
+                            },
                             field,
                             ScriptDependencyRuntime::Ruby,
                         )?;
@@ -3217,8 +3282,11 @@ pub fn select(
                         &canonical,
                         &dependency_scope,
                         declaring,
-                        &mut result,
-                        &mut resource_path_bytes,
+                        DirectScriptResources {
+                            paths: &mut result,
+                            path_bytes: &mut resource_path_bytes,
+                            writable_files: &mut writable_resources,
+                        },
                         field,
                         ScriptDependencyRuntime::Node,
                     )?;
@@ -3311,8 +3379,9 @@ pub fn select(
             field,
         )?;
     }
-    Ok((
-        result.into_iter().collect(),
-        variables.into_iter().collect(),
-    ))
+    Ok(ResourceSelection {
+        resources: result.into_iter().collect(),
+        variables: variables.into_iter().collect(),
+        writable_resources,
+    })
 }

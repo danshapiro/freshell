@@ -173,6 +173,14 @@ pub struct ProviderResourceMount {
     pub logical_destination: String,
     pub effective_destination: String,
     pub kind: ProviderResourceKind,
+    /// Exact files are read-only unless a bounded static writer was selected.
+    /// Directories retain their existing writable resource behavior.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub writable: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,7 +322,8 @@ impl PreparedProviderInputs {
         }
         for mount in &self.resource_mounts {
             let file = mount.kind == ProviderResourceKind::File;
-            if !unit_path(&mount.stage_relative_path, ".freshell/resource-units", file)
+            if (mount.writable && !file)
+                || !unit_path(&mount.stage_relative_path, ".freshell/resource-units", file)
                 || !unit_path(
                     &mount.provider_relative_path,
                     ".freshell/provider-roots",
@@ -710,6 +719,35 @@ mod tests {
         assert!(value.validate(Some(&capability())).is_err());
     }
     #[test]
+    fn provider_resource_mount_write_access_is_opt_in_and_file_only() {
+        let mut value = serde_json::to_value(prepared()).unwrap();
+        value["resourceMounts"] = serde_json::json!([{
+            "stageRelativePath": ".freshell/resource-units/unit-0/source",
+            "providerRelativePath": ".freshell/provider-roots/unit-0/source",
+            "logicalDestination": "/fixture/output.txt",
+            "effectiveDestination": "/fixture/output.txt",
+            "kind": "file",
+            "writable": true
+        }]);
+        let writable: PreparedProviderInputs = serde_json::from_value(value.clone())
+            .expect("new descriptors may opt one exact file resource into writes");
+        writable.validate(Some(&capability())).unwrap();
+
+        let legacy = value["resourceMounts"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("writable");
+        assert_eq!(legacy, Some(serde_json::json!(true)));
+        let restored: PreparedProviderInputs = serde_json::from_value(value.clone()).unwrap();
+        let encoded = serde_json::to_value(restored).unwrap();
+        assert!(encoded["resourceMounts"][0].get("writable").is_none());
+
+        value["resourceMounts"][0]["kind"] = serde_json::json!("directory");
+        let writable_directory: PreparedProviderInputs =
+            serde_json::from_value(value).expect("write intent is structurally valid");
+        assert!(writable_directory.validate(Some(&capability())).is_err());
+    }
+    #[test]
     fn provider_prepared_mounts_preserve_home_and_control_parents() {
         for destination in [
             "/home/freshell/provider",
@@ -723,6 +761,7 @@ mod tests {
                 logical_destination: destination.into(),
                 effective_destination: destination.into(),
                 kind: ProviderResourceKind::Directory,
+                writable: false,
             });
             assert!(
                 value.validate(Some(&capability())).is_err(),
