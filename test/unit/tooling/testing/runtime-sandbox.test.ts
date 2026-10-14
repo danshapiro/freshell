@@ -300,7 +300,8 @@ describe('managed environment create failure retention', () => {
       await fs.writeFile(lifecycle, `${JSON.stringify(failureEvent)}\n`)
     }
     const logs = vi.spyOn(rig.runtime, 'containerLogs').mockReturnValue(fileEvidence ? secretMarkers.join(' ') : JSON.stringify(failureEvent))
-    const web = { capturedOutput: vi.fn(() => ({ stdout: JSON.stringify(failureEvent), stderr: secretMarkers.join(' ') })),
+    const web = { info: { logsDir: directory },
+      capturedOutput: vi.fn(() => ({ stdout: JSON.stringify(failureEvent), stderr: secretMarkers.join(' ') })),
       stop: async () => fs.rm(home, { recursive: true }) }
     rig.web = web as unknown as typeof rig.web
     rig.supervisor = { containerId: 'd'.repeat(64), runtimeRoot } as typeof rig.supervisor
@@ -374,7 +375,7 @@ describe('managed environment create failure retention', () => {
       const logs = vi.spyOn(rig.runtime, 'containerLogs').mockImplementation(id => id === hostId ? childLogs : '')
       const receipts = vi.spyOn(rig.runtime.broker, 'receiptIds').mockReturnValue(new Set(kind === 'foreign-preparation' ? [] : [hostId]))
       restoreReceipts = () => receipts.mockRestore()
-      rig.web = { capturedOutput: () => ({ stdout: '', stderr: markers.join(' ') }),
+      rig.web = { info: { logsDir: directory }, capturedOutput: () => ({ stdout: '', stderr: markers.join(' ') }),
         stop: async () => fs.rm(home, { recursive: true }) } as unknown as typeof rig.web
       rig.supervisor = { containerId: 'd'.repeat(64), runtimeRoot } as typeof rig.supervisor
       const owner = rig
