@@ -857,7 +857,10 @@ for r in (afp or []):
           rm -rf "$BWS"
           BWS=$(mktemp -d "$BROWSER_ROOT/bws.XXXXXX")
           chmod 0770 "$BWS"
-          printf 'BWS=%q\n' "$BWS" >> "$D/run.env"
+          # Recompute the canonical match path for the NEW workspace — a
+          # stale BWS_MATCH would search for the deleted old one:
+          BWS_MATCH=$(realpath -e "$BWS")
+          printf 'BWS=%q\nBWS_MATCH=%q\n' "$BWS" "$BWS_MATCH" >> "$D/run.env"
         fi
       fi
     fi
