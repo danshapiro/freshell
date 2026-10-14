@@ -1537,18 +1537,26 @@ process.stdout.write(require('./helper.js'))
         let append_output = home.join("existing-output.txt");
         let append_url_output = home.join("existing-url-output.txt");
         let append_variable_url_output = home.join("existing-url-variable-output.txt");
+        let append_let_variable_url_output = home.join("existing-let-url-variable-output.txt");
+        let append_var_variable_url_output = home.join("existing-var-url-variable-output.txt");
+        let reassigned_url_output = home.join("existing-reassigned-url-output.txt");
+        let unrelated_url_output = home.join("existing-unrelated-url-output.txt");
         let copy_source = home.join("copy-source.txt");
         let copy_output = home.join("copy-output.txt");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(
             &command,
-            "import fs from 'node:fs';\nimport path from 'node:path';\nimport { fileURLToPath } from 'node:url';\nconst __dirname = path.dirname(fileURLToPath(import.meta.url));\nfs.writeFileSync(path.join(__dirname, 'generated-path.json'), 'path output');\nfs.writeFileSync(new URL('./generated-url.json', import.meta.url), 'url output');\nfs.appendFileSync(path.join(__dirname, 'existing-output.txt'), ' appended');\nfs.appendFileSync(new URL('./existing-url-output.txt', import.meta.url), ' appended');\nconst stateUrl = new URL('./existing-url-variable-output.txt', import.meta.url);\nfs.appendFileSync(stateUrl, ' appended');\nfs.copyFileSync(path.join(__dirname, 'copy-source.txt'), path.join(__dirname, 'copy-output.txt'));\nprocess.stdout.write(__dirname + '\\n');\n",
+            "import fs from 'node:fs';\nimport path from 'node:path';\nimport { fileURLToPath } from 'node:url';\nconst __dirname = path.dirname(fileURLToPath(import.meta.url));\nfs.writeFileSync(path.join(__dirname, 'generated-path.json'), 'path output');\nfs.writeFileSync(new URL('./generated-url.json', import.meta.url), 'url output');\nfs.appendFileSync(path.join(__dirname, 'existing-output.txt'), ' appended');\nfs.appendFileSync(new URL('./existing-url-output.txt', import.meta.url), ' appended');\nconst stateUrl = new URL('./existing-url-variable-output.txt', import.meta.url);\nfs.appendFileSync(stateUrl, ' appended');\nlet letUrl = new URL('./existing-let-url-variable-output.txt', import.meta.url);\nfs.appendFileSync(letUrl, ' appended');\nvar varUrl = new URL('./existing-var-url-variable-output.txt', import.meta.url);\nfs.appendFileSync(varUrl, ' appended');\nlet reassignedUrl = new URL('./existing-reassigned-url-output.txt', import.meta.url);\nreassignedUrl = new URL('./existing-reassigned-url-output.txt', import.meta.url);\nfs.appendFileSync(reassignedUrl, ' appended');\nconst url = new URL('./existing-unrelated-url-output.txt', import.meta.url);\nfunction writeParameter(url) { fs.appendFileSync(url, ' appended'); }\nfs.copyFileSync(path.join(__dirname, 'copy-source.txt'), path.join(__dirname, 'copy-output.txt'));\nprocess.stdout.write(__dirname + '\\n');\n",
         )
         .unwrap();
         std::fs::write(&append_output, "existing").unwrap();
         std::fs::write(&append_url_output, "url existing").unwrap();
         std::fs::write(&append_variable_url_output, "url variable existing").unwrap();
+        std::fs::write(&append_let_variable_url_output, "let url variable existing").unwrap();
+        std::fs::write(&append_var_variable_url_output, "var url variable existing").unwrap();
+        std::fs::write(&reassigned_url_output, "reassigned url existing").unwrap();
+        std::fs::write(&unrelated_url_output, "unrelated url existing").unwrap();
         std::fs::write(&copy_source, "copy input").unwrap();
 
         let (plan, provider_script) =
@@ -1564,7 +1572,14 @@ process.stdout.write(require('./helper.js'))
         assert!(plan[0]
             .configured_resources
             .contains(&append_output.canonicalize().unwrap()));
-        for output in [&append_url_output, &append_variable_url_output] {
+        for output in [
+            &append_url_output,
+            &append_variable_url_output,
+            &append_let_variable_url_output,
+            &append_var_variable_url_output,
+            &reassigned_url_output,
+            &unrelated_url_output,
+        ] {
             assert!(plan[0]
                 .configured_resources
                 .contains(&output.canonicalize().unwrap()));
@@ -1590,6 +1605,8 @@ process.stdout.write(require('./helper.js'))
             &append_output,
             &append_url_output,
             &append_variable_url_output,
+            &append_let_variable_url_output,
+            &append_var_variable_url_output,
         ] {
             let canonical = output.canonicalize().unwrap();
             let mounts = units
@@ -1605,6 +1622,28 @@ process.stdout.write(require('./helper.js'))
             );
             assert!(mounts.iter().all(|(_, mount)| mount.writable));
         }
+        let unrelated_url_mounts = units
+            .iter()
+            .filter(|(source, mount)| {
+                source == &unrelated_url_output.canonicalize().unwrap()
+                    && mount.kind == freshell_runtime_protocol::ProviderResourceKind::File
+            })
+            .collect::<Vec<_>>();
+        assert!(!unrelated_url_mounts.is_empty());
+        assert!(unrelated_url_mounts
+            .iter()
+            .all(|(_, mount)| !mount.writable));
+        let reassigned_url_mounts = units
+            .iter()
+            .filter(|(source, mount)| {
+                source == &reassigned_url_output.canonicalize().unwrap()
+                    && mount.kind == freshell_runtime_protocol::ProviderResourceKind::File
+            })
+            .collect::<Vec<_>>();
+        assert!(!reassigned_url_mounts.is_empty());
+        assert!(reassigned_url_mounts
+            .iter()
+            .all(|(_, mount)| !mount.writable));
         let copy_source_mounts = units
             .iter()
             .filter(|(source, mount)| {

@@ -1301,8 +1301,16 @@ fn node_relative_resource_specifiers(
     source: &str,
 ) -> Result<std::collections::BTreeMap<String, bool>, &'static str> {
     let tokens = javascript_tokens(source)?;
+    let scope_ids = javascript_token_scope_ids(&tokens)?;
     let (output_destinations, output_destination_variables) =
-        node_output_destination_mask(&tokens)?;
+        node_output_destination_mask(&tokens, &scope_ids)?;
+    let binding_declarations = node_variable_binding_declaration_counts(&tokens, &scope_ids);
+    let ambiguous_output_variables = node_ambiguous_output_variables(
+        &tokens,
+        &scope_ids,
+        &output_destinations,
+        &output_destination_variables,
+    );
     let mut result = std::collections::BTreeMap::<String, bool>::new();
     for index in 0..tokens.len() {
         if index >= 2
@@ -1412,7 +1420,10 @@ fn node_relative_resource_specifiers(
                 tokens.get(index - 1),
                 Some(JavaScriptToken::Punctuation(b'='))
             )
-            && matches!(tokens.get(index - 2), Some(JavaScriptToken::Identifier(name)) if output_destination_variables.contains(name))
+            && matches!(tokens.get(index - 2), Some(JavaScriptToken::Identifier(name))
+                if output_destination_variables.contains(&(name.clone(), scope_ids[index]))
+                    && binding_declarations.get(&(name.clone(), scope_ids[index])) == Some(&1)
+                    && !ambiguous_output_variables.contains(&(name.clone(), scope_ids[index])))
             && matches!(tokens.get(index - 3), Some(JavaScriptToken::Identifier(keyword)) if matches!(keyword.as_str(), "const" | "let" | "var"));
         let is_output_destination = output_destinations[index] || is_bound_output_destination;
         if new_keyword == "new"
@@ -1431,9 +1442,87 @@ fn node_relative_resource_specifiers(
     Ok(result)
 }
 
+fn javascript_token_scope_ids(tokens: &[JavaScriptToken]) -> Result<Vec<usize>, &'static str> {
+    let mut scope_stack = Vec::new();
+    let mut scope_ids = Vec::with_capacity(tokens.len());
+    for (index, token) in tokens.iter().enumerate() {
+        if matches!(token, JavaScriptToken::Punctuation(b'}')) && scope_stack.pop().is_none() {
+            return Err("direct MCP Node script has an unmatched closing brace");
+        }
+        scope_ids.push(scope_stack.last().copied().unwrap_or(0));
+        if matches!(token, JavaScriptToken::Punctuation(b'{')) {
+            // Reserve zero for the top-level scope and give each brace scope a
+            // unique token-derived identity. This deliberately treats nested
+            // blocks as separate scopes, so uncertain captures remain read-only.
+            scope_stack.push(index + 1);
+        }
+    }
+    if !scope_stack.is_empty() {
+        return Err("direct MCP Node script has an unmatched opening brace");
+    }
+    Ok(scope_ids)
+}
+
+fn node_variable_binding_declaration_counts(
+    tokens: &[JavaScriptToken],
+    scope_ids: &[usize],
+) -> std::collections::BTreeMap<(String, usize), usize> {
+    let mut declarations = std::collections::BTreeMap::new();
+    for index in 0..tokens.len().saturating_sub(1) {
+        if !matches!(tokens.get(index), Some(JavaScriptToken::Identifier(keyword)) if matches!(keyword.as_str(), "const" | "let" | "var"))
+        {
+            continue;
+        }
+        let Some(JavaScriptToken::Identifier(name)) = tokens.get(index + 1) else {
+            continue;
+        };
+        let key = (name.clone(), scope_ids[index]);
+        *declarations.entry(key).or_insert(0) += 1;
+    }
+    declarations
+}
+
+fn node_ambiguous_output_variables(
+    tokens: &[JavaScriptToken],
+    scope_ids: &[usize],
+    output_destinations: &[bool],
+    output_destination_variables: &std::collections::BTreeSet<(String, usize)>,
+) -> std::collections::BTreeSet<(String, usize)> {
+    let mut ambiguous = std::collections::BTreeSet::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let JavaScriptToken::Identifier(name) = token else {
+            continue;
+        };
+        let key = (name.clone(), scope_ids[index]);
+        if !output_destination_variables.contains(&key) || output_destinations[index] {
+            continue;
+        }
+        let is_url_binding_declaration = index >= 1
+            && matches!(tokens.get(index - 1), Some(JavaScriptToken::Identifier(keyword)) if matches!(keyword.as_str(), "const" | "let" | "var"))
+            && matches!(
+                tokens.get(index + 1),
+                Some(JavaScriptToken::Punctuation(b'='))
+            )
+            && matches!(tokens.get(index + 2), Some(JavaScriptToken::Identifier(keyword)) if keyword == "new")
+            && matches!(tokens.get(index + 3), Some(JavaScriptToken::Identifier(constructor)) if constructor == "URL")
+            && matches!(
+                tokens.get(index + 4),
+                Some(JavaScriptToken::Punctuation(b'('))
+            );
+        if !is_url_binding_declaration {
+            // A second use outside a recognized output argument may reassign
+            // or mutate the URL. Keep the selected input read-only when this
+            // bounded scanner cannot prove the binding stays stable.
+            ambiguous.insert(key);
+        }
+    }
+    ambiguous
+}
+
 fn node_output_destination_mask(
     tokens: &[JavaScriptToken],
-) -> Result<(Vec<bool>, std::collections::BTreeSet<String>), &'static str> {
+    scope_ids: &[usize],
+) -> Result<(Vec<bool>, std::collections::BTreeSet<(String, usize)>), &'static str> {
     const OUTPUT_CALLS: [(&str, usize); 15] = [
         ("appendFile", 0),
         ("appendFileSync", 0),
@@ -1513,7 +1602,7 @@ fn node_output_destination_mask(
         if let Some(end) = end.filter(|end| *end > start) {
             if end == start + 1 {
                 if let Some(JavaScriptToken::Identifier(name)) = tokens.get(start) {
-                    direct_variables.insert(name.clone());
+                    direct_variables.insert((name.clone(), scope_ids[start]));
                 }
             }
             ranges.push(start..end);
