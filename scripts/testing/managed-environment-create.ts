@@ -123,18 +123,33 @@ type ManagedCreateOwner = {
 
 const safeLogLevels = new Set(['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR'])
 
-export function summarizeRustServerLogEvents(raw: string): Array<{ level: string; event: string }> {
+export function summarizeRustServerLogEvents(raw: string): Array<{
+  level: string
+  event?: string
+  target?: string
+  fields: string[]
+}> {
   const boundedTail = raw.slice(-512 * 1024)
-  const summary: Array<{ level: string; event: string }> = []
+  const summary: Array<{ level: string; event?: string; target?: string; fields: string[] }> = []
   for (const line of boundedTail.split('\n').slice(-256)) {
     if (line.length > 64 * 1024) continue
     let value: unknown
     try { value = JSON.parse(line) } catch { continue }
     if (!value || typeof value !== 'object') continue
     const record = value as Record<string, unknown>
-    if (typeof record.event !== 'string' || !/^[a-z][a-z0-9_.:-]{0,127}$/.test(record.event)
+    const event = typeof record.event === 'string' && /^[a-z][a-z0-9_.:-]{0,127}$/.test(record.event)
+      ? record.event : undefined
+    const target = typeof record.target === 'string' && /^[a-zA-Z0-9_:.$-]{1,160}$/.test(record.target)
+      ? record.target : undefined
+    if ((typeof record.event === 'string' && event === undefined) || (!event && !target)
       || typeof record.level !== 'string' || !safeLogLevels.has(record.level)) continue
-    summary.push({ level: record.level, event: record.event })
+    const sensitiveFieldName = /token|secret|auth|prompt|content|payload|message|text|config|password|credential|key|path|url|body/i
+    const fields = Object.keys(record)
+      .filter(key => !['ts', 'level', 'target', 'app_version', 'server_pid', 'event', 'msg'].includes(key)
+        && /^[a-zA-Z][a-zA-Z0-9_]{0,63}$/.test(key) && !sensitiveFieldName.test(key))
+      .sort()
+      .slice(0, 24)
+    summary.push({ level: record.level, ...(event ? { event } : {}), ...(target ? { target } : {}), fields })
   }
   return summary.slice(-32)
 }

@@ -25,14 +25,19 @@ async function listenOnLoopback(server: ReturnType<typeof createServer>): Promis
 describe('managed provider environment target mode', () => {
   it('retains only bounded event names and levels from server logs', () => {
     const logs = [
-      JSON.stringify({ level: 'ERROR', event: 'provider.opencode.resource.failed', msg: 'PRIVATE_CONFIG_SENTINEL', token: 'PRIVATE_TOKEN_SENTINEL' }),
-      JSON.stringify({ level: 'WARN', event: 'invalid event name', msg: 'PRIVATE_MESSAGE_SENTINEL' }),
+      JSON.stringify({ level: 'ERROR', event: 'provider.opencode.resource.failed', target: 'freshell_server::managed_runtime',
+        stage: 'prepare', msg: 'PRIVATE_CONFIG_SENTINEL', token: 'PRIVATE_TOKEN_SENTINEL' }),
+      JSON.stringify({ level: 'ERROR', target: 'freshell_server::managed_runtime', stage: 'activate', code: 'PTY', msg: 'PRIVATE_ERROR_SENTINEL' }),
+      JSON.stringify({ level: 'WARN', event: 'invalid event name', target: 'freshell_server::managed_runtime', msg: 'PRIVATE_MESSAGE_SENTINEL' }),
       '{invalid json',
     ].join('\n')
 
     const summary = summarizeRustServerLogEvents(logs)
 
-    expect(summary).toEqual([{ level: 'ERROR', event: 'provider.opencode.resource.failed' }])
+    expect(summary).toEqual([
+      { level: 'ERROR', event: 'provider.opencode.resource.failed', target: 'freshell_server::managed_runtime', fields: ['stage'] },
+      { level: 'ERROR', target: 'freshell_server::managed_runtime', fields: ['code', 'stage'] },
+    ])
     expect(JSON.stringify(summary)).not.toContain('PRIVATE_')
   })
 
