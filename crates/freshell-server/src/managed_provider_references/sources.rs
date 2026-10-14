@@ -316,6 +316,9 @@ pub struct PlannedSourceOccurrence {
     pub configured_resource_exclusions: std::collections::BTreeSet<PathBuf>,
     /// Shell wrapper Node env-file operands rewritten in their staged copies.
     pub configured_resource_edits: Vec<ConfiguredResourceEdit>,
+    /// Shell wrappers in the workspace can keep their relative env-file
+    /// operands when the MCP cwd exposes a private reference through a link.
+    pub configured_resource_reference_aliases: Vec<ConfiguredResourceReferenceAlias>,
     /// Captured with the retained source view so later staging does not
     /// reinterpret a generated entry after ordinary-terminal cleanup.
     pub user_owns_freshell_mcp: bool,
@@ -326,6 +329,13 @@ pub struct ConfiguredResourceEdit {
     pub span: std::ops::Range<usize>,
     pub expected: String,
     pub replacement: String,
+}
+
+pub struct ConfiguredResourceReferenceAlias {
+    pub source: PathBuf,
+    pub working_directory: PathBuf,
+    pub relative_path: PathBuf,
+    pub reference_destination: String,
 }
 
 #[derive(Default)]
@@ -667,6 +677,7 @@ pub fn plan_loaded_opencode_sources_relocated(
         })?;
         let mut node_env_file_edits = Vec::with_capacity(selected_resources.node_env_files.len());
         let mut configured_resource_edits = Vec::new();
+        let mut configured_resource_reference_aliases = Vec::new();
         for env_file in &selected_resources.node_env_files {
             let destination = allocate(&env_file.canonical_source).map_err(fail)?;
             match &env_file.rewrite {
@@ -688,6 +699,15 @@ pub fn plan_loaded_opencode_sources_relocated(
                     span: argument_span.clone(),
                     expected: expected_operand.clone(),
                     replacement: destination,
+                }),
+                super::opencode_resources::NodeEnvFileRewrite::ShellWorkingDirectoryAlias {
+                    working_directory,
+                    relative_path,
+                } => configured_resource_reference_aliases.push(ConfiguredResourceReferenceAlias {
+                    source: env_file.canonical_source.clone(),
+                    working_directory: working_directory.clone(),
+                    relative_path: relative_path.clone(),
+                    reference_destination: destination,
                 }),
             }
         }
@@ -801,6 +821,7 @@ pub fn plan_loaded_opencode_sources_relocated(
             configured_writable_resources: selected_resources.writable_resources,
             configured_resource_exclusions,
             configured_resource_edits,
+            configured_resource_reference_aliases,
             user_owns_freshell_mcp,
         };
         planned

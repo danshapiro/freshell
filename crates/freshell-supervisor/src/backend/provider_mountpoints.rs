@@ -737,6 +737,7 @@ mod tests {
                 effective_destination: "/synthetic/workspace/.opencode".into(),
                 kind: ProviderResourceKind::Directory,
                 writable: false,
+                reference_aliases: vec![],
             }],
         };
         let selected = selections(&mounts).unwrap();
@@ -765,6 +766,7 @@ mod tests {
                     effective_destination: "/home/freshell/provider/mcp".into(),
                     kind: ProviderResourceKind::Directory,
                     writable: false,
+                    reference_aliases: vec![],
                 },
                 ProviderResourceMount {
                     stage_relative_path: ".freshell/resource-units/root-state/source".into(),
@@ -773,6 +775,7 @@ mod tests {
                     effective_destination: "/home/freshell/provider/mcp/state.json".into(),
                     kind: ProviderResourceKind::File,
                     writable: true,
+                    reference_aliases: vec![],
                 },
             ],
         };

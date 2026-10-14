@@ -1756,6 +1756,7 @@ fn stage_provider_root(
                 _filtered_resource_sources = Some(scratch);
             } else {
                 configured_resource_edits = source_stage::configured_resource_edits(&units, plan)?;
+                source_stage::attach_configured_resource_reference_aliases(&mut units, plan)?;
             }
             selections.extend(source_stage::resource_copy_selections(&units)?);
             let descriptors = units

@@ -143,6 +143,7 @@ pub(super) fn prepare(
         effective_destination: "/home/freshell/provider/.freshell/resources".into(),
         kind: ProviderResourceKind::Directory,
         writable: false,
+        reference_aliases: Vec::new(),
     });
     Ok(prepared)
 }

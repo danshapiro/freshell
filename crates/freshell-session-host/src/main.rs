@@ -1930,6 +1930,138 @@ fn workspace_suffix_under_resource(resource_root: &Path, workspace: &Path) -> Op
     (!suffix.as_os_str().is_empty()).then(|| suffix.to_path_buf())
 }
 
+fn install_provider_resource_reference_aliases(
+    context: &freshell_runtime_protocol::ProviderLaunchContext,
+    provider_home: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    use freshell_runtime_protocol::ProviderResourceKind;
+
+    let mut installed = Vec::new();
+    for mount in context
+        .prepared_inputs
+        .iter()
+        .flat_map(|inputs| &inputs.resource_mounts)
+    {
+        if mount.reference_aliases.is_empty() {
+            continue;
+        }
+        if mount.kind != ProviderResourceKind::Directory {
+            return Err("provider reference aliases require a directory resource".into());
+        }
+        let mount_relative = Path::new(&mount.provider_relative_path);
+        if mount_relative.is_absolute()
+            || mount_relative
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err("provider reference alias mount path is unsafe".into());
+        }
+        let mount_root = provider_home.join(mount_relative);
+        if !std::fs::metadata(&mount_root).is_ok_and(|metadata| metadata.is_dir()) {
+            return Err("provider reference alias resource directory is unavailable".into());
+        }
+        let canonical_provider_home = std::fs::canonicalize(provider_home)
+            .map_err(|_| "provider reference alias provider HOME is unavailable")?;
+        let canonical_mount_root = std::fs::canonicalize(&mount_root)
+            .map_err(|_| "provider reference alias resource directory is unavailable")?;
+        if !canonical_mount_root.starts_with(&canonical_provider_home) {
+            return Err("provider reference alias resource directory escapes provider HOME".into());
+        }
+        for alias in &mount.reference_aliases {
+            let relative = Path::new(&alias.relative_path);
+            if relative.as_os_str().is_empty()
+                || relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            {
+                return Err("provider reference alias path is unsafe".into());
+            }
+            let reference_relative =
+                PathBuf::from(format!(".freshell/references/{}", alias.reference_index));
+            let reference = provider_home.join(&reference_relative);
+            if !std::fs::metadata(&reference).is_ok_and(|metadata| metadata.is_file()) {
+                return Err("provider reference alias target is unavailable".into());
+            }
+            let destination = mount_root.join(relative);
+            let parent = destination
+                .parent()
+                .ok_or("provider reference alias has no parent directory")?;
+            if !std::fs::metadata(parent).is_ok_and(|metadata| metadata.is_dir()) {
+                return Err("provider reference alias parent directory is unavailable".into());
+            }
+            let canonical_parent = std::fs::canonicalize(parent)
+                .map_err(|_| "provider reference alias parent directory is unavailable")?;
+            if !canonical_parent.starts_with(&canonical_mount_root) {
+                return Err(
+                    "provider reference alias parent directory escapes its resource".into(),
+                );
+            }
+            let resolved_reference = std::fs::canonicalize(&reference)
+                .map_err(|_| "provider reference alias target is unavailable")?;
+            match std::fs::symlink_metadata(&destination) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    let link = std::fs::read_link(&destination)
+                        .map_err(|_| "provider reference alias could not be inspected")?;
+                    let resolved_link = if link.is_absolute() {
+                        link
+                    } else {
+                        parent.join(link)
+                    };
+                    if std::fs::canonicalize(resolved_link).ok().as_ref()
+                        != Some(&resolved_reference)
+                    {
+                        return Err(
+                            "provider reference alias conflicts with an existing link".into()
+                        );
+                    }
+                    installed.push(PathBuf::from(&mount.provider_relative_path).join(relative));
+                    continue;
+                }
+                Ok(_) => {
+                    return Err(
+                        "provider reference alias would replace an existing resource".into(),
+                    )
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err("provider reference alias path could not be inspected".into()),
+            }
+
+            let from_components = Path::new(&mount.provider_relative_path)
+                .join(relative.parent().unwrap_or_else(|| Path::new("")))
+                .components()
+                .map(|part| match part {
+                    std::path::Component::Normal(value) => Ok(value.to_owned()),
+                    _ => Err("provider reference alias source path is unsafe"),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let to_components = reference_relative
+                .components()
+                .map(|part| match part {
+                    std::path::Component::Normal(value) => Ok(value.to_owned()),
+                    _ => Err("provider reference alias target path is unsafe"),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let common = from_components
+                .iter()
+                .zip(&to_components)
+                .take_while(|(left, right)| left == right)
+                .count();
+            let mut link = PathBuf::new();
+            for _ in common..from_components.len() {
+                link.push("..");
+            }
+            for component in &to_components[common..] {
+                link.push(component);
+            }
+            std::os::unix::fs::symlink(link, &destination)
+                .map_err(|_| "provider reference alias could not be created")?;
+            installed.push(PathBuf::from(&mount.provider_relative_path).join(relative));
+        }
+    }
+    Ok(installed)
+}
+
 fn copy_provider_config_references_with_ownership(
     context: &freshell_runtime_protocol::ProviderLaunchContext,
     provider: &str,
@@ -2222,10 +2354,20 @@ fn copy_provider_config_references_with_ownership(
         )
     }
     .map_err(|error| error.to_string())?;
+    let reference_aliases = if provider_home == final_home {
+        install_provider_resource_reference_aliases(context, provider_home)?
+    } else {
+        Vec::new()
+    };
     let projected = report
         .projected_paths
         .iter()
         .map(|path| path.to_string_lossy().into_owned())
+        .chain(
+            reference_aliases
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned()),
+        )
         .collect::<std::collections::BTreeSet<_>>();
     let mut ownership_paths = report
         .projected_paths
@@ -2778,7 +2920,29 @@ fn refresh_provider_config_in_stage(
     )
     .map_err(|_| "preserved writable resource metadata write failed")?;
     allow_provider_read_stage(stage.path(), unsafe { libc::getegid() })?;
-    apply_staged_provider_config(stage.path(), provider_home)
+    apply_staged_provider_config(stage.path(), provider_home)?;
+    record_provider_resource_reference_aliases(context, provider_home)
+}
+
+fn record_provider_resource_reference_aliases(
+    context: &freshell_runtime_protocol::ProviderLaunchContext,
+    provider_home: &Path,
+) -> Result<(), String> {
+    let aliases = install_provider_resource_reference_aliases(context, provider_home)?;
+    if aliases.is_empty() {
+        return Ok(());
+    }
+    let mut projected = read_projection_manifest(provider_home)?;
+    projected.extend(
+        aliases
+            .into_iter()
+            .map(|path| path.to_string_lossy().into_owned()),
+    );
+    let manifest = write_projection_manifest(provider_home, &projected)?;
+    set_owner(&manifest, unsafe { libc::geteuid() }, unsafe {
+        libc::getegid()
+    })?;
+    Ok(())
 }
 
 fn refresh_provider_config_as_provider(
@@ -4592,6 +4756,7 @@ mod tests {
             effective_destination: effective_destination.into(),
             kind,
             writable,
+            reference_aliases: vec![],
         }
     }
 
@@ -4629,6 +4794,150 @@ mod tests {
             }),
             mcp_capability: Some(capability),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_resource_reference_alias_links_to_private_reference_without_copying_it() {
+        use freshell_runtime_protocol::{
+            IndexedProviderFileAlias, IndexedProviderFiles, ProviderResourceKind,
+            ProviderResourceReferenceAlias,
+        };
+
+        let owned = tempfile::tempdir().unwrap();
+        let provider_home = owned.path().join("provider");
+        let user_provider_root = owned.path().join("prepared");
+        let resource_stage = user_provider_root.join(".freshell/resource-units/mcp-project");
+        let resource_root = provider_home.join(".freshell/provider-roots/mcp-project");
+        let workspace = owned.path().join("workspace");
+        std::fs::create_dir_all(&resource_stage).unwrap();
+        std::fs::create_dir_all(&provider_home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(provider_home.join(".freshell/references")).unwrap();
+        std::fs::write(resource_stage.join("server.mjs"), "console.log('ready')\n").unwrap();
+        std::fs::write(
+            provider_home.join(".freshell/references/0"),
+            "MANAGED_ALIAS_SECRET=private-value\n",
+        )
+        .unwrap();
+        let mut mount = opencode_resource_mount(
+            "mcp-project",
+            "/opt/mcp-project",
+            "/opt/mcp-project",
+            ProviderResourceKind::Directory,
+            false,
+        );
+        mount.reference_aliases = vec![ProviderResourceReferenceAlias {
+            relative_path: ".env".into(),
+            reference_index: 0,
+        }];
+        let mut context = opencode_context_with_mounts(vec![mount]);
+        let inputs = context.prepared_inputs.as_mut().unwrap();
+        inputs.manifest.source_count = 1;
+        inputs.manifest.alias_count = 1;
+        inputs.indexed_files = Some(IndexedProviderFiles {
+            volume_name: "freshell-inputs-aaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            aliases: vec![IndexedProviderFileAlias {
+                source_id: 0,
+                logical_destination: "/fixture/private-reference".into(),
+                effective_destination: "/fixture/private-reference".into(),
+            }],
+            staged_source_paths: None,
+        });
+
+        let stage = tempfile::tempdir_in(&provider_home).unwrap();
+        super::refresh_provider_config_in_stage(
+            &context,
+            "opencode",
+            &workspace,
+            &user_provider_root,
+            &provider_home,
+            stage,
+        )
+        .unwrap();
+        let alias = resource_root.join(".env");
+        assert!(std::fs::symlink_metadata(&alias)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(&alias).unwrap(),
+            "MANAGED_ALIAS_SECRET=private-value\n"
+        );
+        assert_eq!(
+            std::fs::read_link(&alias).unwrap(),
+            PathBuf::from("../../references/0")
+        );
+        assert!(super::read_projection_manifest(&provider_home)
+            .unwrap()
+            .contains(".freshell/provider-roots/mcp-project/.env"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_resource_reference_alias_refuses_to_replace_resource_content() {
+        use freshell_runtime_protocol::{ProviderResourceKind, ProviderResourceReferenceAlias};
+
+        let owned = tempfile::tempdir().unwrap();
+        let provider_home = owned.path().join("provider");
+        let resource_root = provider_home.join(".freshell/provider-roots/mcp-project");
+        std::fs::create_dir_all(&resource_root).unwrap();
+        std::fs::create_dir_all(provider_home.join(".freshell/references")).unwrap();
+        std::fs::write(provider_home.join(".freshell/references/0"), "secret\n").unwrap();
+        std::fs::write(resource_root.join(".env"), "ordinary resource\n").unwrap();
+        let mut mount = opencode_resource_mount(
+            "mcp-project",
+            "/opt/mcp-project",
+            "/opt/mcp-project",
+            ProviderResourceKind::Directory,
+            false,
+        );
+        mount.reference_aliases = vec![ProviderResourceReferenceAlias {
+            relative_path: ".env".into(),
+            reference_index: 0,
+        }];
+        let context = opencode_context_with_mounts(vec![mount]);
+
+        let error = super::install_provider_resource_reference_aliases(&context, &provider_home)
+            .expect_err("an alias cannot overwrite an unrelated resource file");
+        assert!(error.contains("replace an existing resource"));
+        assert_eq!(
+            std::fs::read_to_string(resource_root.join(".env")).unwrap(),
+            "ordinary resource\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_resource_reference_alias_cannot_escape_through_parent_symlink() {
+        use freshell_runtime_protocol::{ProviderResourceKind, ProviderResourceReferenceAlias};
+
+        let owned = tempfile::tempdir().unwrap();
+        let provider_home = owned.path().join("provider");
+        let resource_root = provider_home.join(".freshell/provider-roots/mcp-project");
+        let outside = owned.path().join("outside");
+        std::fs::create_dir_all(&resource_root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(provider_home.join(".freshell/references")).unwrap();
+        std::fs::write(provider_home.join(".freshell/references/0"), "secret\n").unwrap();
+        std::os::unix::fs::symlink(&outside, resource_root.join("nested")).unwrap();
+        let mut mount = opencode_resource_mount(
+            "mcp-project",
+            "/opt/mcp-project",
+            "/opt/mcp-project",
+            ProviderResourceKind::Directory,
+            false,
+        );
+        mount.reference_aliases = vec![ProviderResourceReferenceAlias {
+            relative_path: "nested/.env".into(),
+            reference_index: 0,
+        }];
+        let context = opencode_context_with_mounts(vec![mount]);
+
+        let error = super::install_provider_resource_reference_aliases(&context, &provider_home)
+            .expect_err("an alias parent must remain inside its managed resource directory");
+        assert!(error.contains("parent directory"));
+        assert!(!outside.join(".env").exists());
     }
 
     #[test]
@@ -5131,6 +5440,7 @@ mod tests {
                     effective_destination: native.to_str().unwrap().into(),
                     kind: ProviderResourceKind::Directory,
                     writable: false,
+                    reference_aliases: vec![],
                 }],
             }),
             mcp_capability: Some(capability),
@@ -5251,6 +5561,7 @@ mod tests {
                         effective_destination: "/home/freshell/provider/mcp".into(),
                         kind: ProviderResourceKind::Directory,
                         writable: false,
+                        reference_aliases: vec![],
                     },
                     ProviderResourceMount {
                         stage_relative_path: ".freshell/resource-units/preserved/source".into(),
@@ -5259,6 +5570,7 @@ mod tests {
                         effective_destination: "/home/freshell/provider/mcp/preserved.txt".into(),
                         kind: ProviderResourceKind::File,
                         writable: true,
+                        reference_aliases: vec![],
                     },
                     ProviderResourceMount {
                         stage_relative_path: ".freshell/resource-units/readonly/source".into(),
@@ -5267,6 +5579,7 @@ mod tests {
                         effective_destination: "/home/freshell/provider/mcp/reference.txt".into(),
                         kind: ProviderResourceKind::File,
                         writable: false,
+                        reference_aliases: vec![],
                     },
                 ],
             }),
@@ -5314,6 +5627,7 @@ mod tests {
                 effective_destination: "/home/freshell/provider/mcp/state.txt".into(),
                 kind: ProviderResourceKind::File,
                 writable: true,
+                reference_aliases: vec![],
             });
 
         refresh_provider_config_references(
@@ -5363,6 +5677,7 @@ mod tests {
                 effective_destination: "/home/freshell/provider/mcp/removed.txt".into(),
                 kind: ProviderResourceKind::File,
                 writable: true,
+                reference_aliases: vec![],
             });
         let recovery = refresh_provider_config_references(
             &context, "opencode", &workspace, &user_root, &home, uid, gid,
@@ -5448,6 +5763,7 @@ mod tests {
                         effective_destination: package.to_string_lossy().into_owned(),
                         kind: ProviderResourceKind::Directory,
                         writable: false,
+                        reference_aliases: vec![],
                     },
                     ProviderResourceMount {
                         stage_relative_path: ".freshell/resource-units/root-0".into(),
@@ -5456,6 +5772,7 @@ mod tests {
                         effective_destination: "/home/freshell/provider/.config/opencode".into(),
                         kind: ProviderResourceKind::Directory,
                         writable: false,
+                        reference_aliases: vec![],
                     },
                 ],
             }),
@@ -5559,6 +5876,7 @@ mod tests {
                     effective_destination: "/home/freshell/provider/.config/opencode".into(),
                     kind: ProviderResourceKind::Directory,
                     writable: false,
+                    reference_aliases: vec![],
                 }],
                 indexed_files: None,
             }),
@@ -6720,6 +7038,7 @@ mod tests {
                     effective_destination: external.to_string_lossy().into_owned(),
                     kind: ProviderResourceKind::Directory,
                     writable: false,
+                    reference_aliases: vec![],
                 }],
             }),
             mcp_capability: Some(capability),

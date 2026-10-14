@@ -176,6 +176,7 @@ mod tests {
                 effective_destination: "/outside/plugin".into(),
                 kind: ProviderResourceKind::Directory,
                 writable: false,
+                reference_aliases: vec![],
             }],
             indexed_files: Some(IndexedProviderFiles {
                 volume_name: "freshell-inputs-aaaaaaaaaaaaaaaaaaaaaaaa".into(),
@@ -243,6 +244,7 @@ mod tests {
                 effective_destination: destination.into(),
                 kind: ProviderResourceKind::File,
                 writable,
+                reference_aliases: vec![],
             });
         }
 

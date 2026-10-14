@@ -68,6 +68,124 @@ pub(super) fn configured_resource_edits(
     Ok(edits)
 }
 
+pub(super) fn attach_configured_resource_reference_aliases(
+    units: &mut [(
+        std::path::PathBuf,
+        freshell_runtime_protocol::ProviderResourceMount,
+    )],
+    plan: &[PlannedSourceOccurrence],
+) -> Result<(), String> {
+    use freshell_runtime_protocol::{ProviderResourceKind, ProviderResourceReferenceAlias};
+
+    let mut added = 0usize;
+    for source in plan {
+        for alias in &source.configured_resource_reference_aliases {
+            let reference_destination = source
+                .references
+                .selections
+                .iter()
+                .find(|selection| {
+                    selection.canonical_source == alias.source
+                        && selection.runtime_destination == alias.reference_destination
+                })
+                .map(|selection| selection.runtime_destination.as_str())
+                .ok_or("selected MCP env-file alias has no matching private reference")?;
+            let reference_index = reference_destination
+                .strip_prefix("/home/freshell/provider/.freshell/references/")
+                .and_then(|value| value.parse::<u16>().ok())
+                .ok_or("selected MCP env-file reference has an invalid runtime path")?;
+            let canonical_working_directory = std::fs::canonicalize(&alias.working_directory)
+                .map_err(|_| "selected MCP env-file working directory is unavailable")?;
+            let canonical_source = std::fs::canonicalize(&alias.source)
+                .map_err(|_| "selected MCP env-file reference source is unavailable")?;
+            let mut relative_alias = std::path::PathBuf::new();
+            for component in alias.relative_path.components() {
+                match component {
+                    std::path::Component::Normal(part) => relative_alias.push(part),
+                    _ => return Err("selected MCP env-file alias path is unsafe".into()),
+                }
+            }
+            let destination = canonical_working_directory.join(&relative_alias);
+            let canonical_alias_parent = destination
+                .parent()
+                .and_then(|parent| std::fs::canonicalize(parent).ok())
+                .ok_or("selected MCP env-file alias parent is unavailable")?;
+            let destination_source = match std::fs::symlink_metadata(&destination) {
+                Ok(_) => std::fs::canonicalize(&destination)
+                    .map_err(|_| "selected MCP env-file alias path is unavailable")?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    canonical_source.clone()
+                }
+                Err(_) => {
+                    return Err("selected MCP env-file alias path could not be inspected".into())
+                }
+            };
+            if destination_source != canonical_source {
+                return Err(
+                    "selected MCP env-file alias would replace a different resource".into(),
+                );
+            }
+
+            let mut matching_mounts = units
+                .iter_mut()
+                .filter_map(|(resource_source, mount)| {
+                    if mount.kind != ProviderResourceKind::Directory {
+                        return None;
+                    }
+                    let canonical_root = std::fs::canonicalize(&*resource_source).ok()?;
+                    let cwd_suffix = canonical_working_directory
+                        .strip_prefix(&canonical_root)
+                        .ok()?;
+                    canonical_alias_parent.strip_prefix(&canonical_root).ok()?;
+                    Some((
+                        canonical_root.components().count(),
+                        cwd_suffix.to_path_buf(),
+                        mount,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            matching_mounts.sort_by_key(|(depth, _, _)| *depth);
+            let (_, cwd_suffix, mount) = matching_mounts
+                .pop()
+                .ok_or("selected MCP env-file alias has no containing resource directory")?;
+            let relative_path = cwd_suffix.join(&relative_alias);
+            if relative_path.as_os_str().is_empty()
+                || relative_path
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            {
+                return Err(
+                    "selected MCP env-file alias path escapes its resource directory".into(),
+                );
+            }
+            if mount.reference_aliases.iter().any(|existing| {
+                existing.relative_path == relative_path.to_string_lossy()
+                    && existing.reference_index != reference_index
+            }) {
+                return Err(
+                    "selected MCP env-file aliases conflict within one resource directory".into(),
+                );
+            }
+            if !mount.reference_aliases.iter().any(|existing| {
+                existing.relative_path == relative_path.to_string_lossy()
+                    && existing.reference_index == reference_index
+            }) {
+                added += 1;
+                if added > 256 {
+                    return Err("selected MCP env-file aliases exceed their bound".into());
+                }
+                mount
+                    .reference_aliases
+                    .push(ProviderResourceReferenceAlias {
+                        relative_path: relative_path.to_string_lossy().into_owned(),
+                        reference_index,
+                    });
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn apply_configured_resource_edits(
     staged_root: &Path,
     edits: &[StagedResourceEdit],
@@ -1901,7 +2019,12 @@ mod configured_resource_tests {
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(
             project.join("server.mjs"),
-            "if (process.env.MANAGED_PROJECT_ENV !== 'project-secret') process.exit(11);\nprocess.stdout.write('project cwd env loaded\\n');\n",
+            "import helper from './helper.mjs';\nif (helper !== 'project-secret:helper') process.exit(11);\nprocess.stdout.write('project cwd env loaded\\n');\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("helper.mjs"),
+            "export default `${process.env.MANAGED_PROJECT_ENV}:helper`;\n",
         )
         .unwrap();
         std::fs::write(project.join(".env"), "MANAGED_PROJECT_ENV=project-secret\n").unwrap();
@@ -1971,14 +2094,116 @@ mod configured_resource_tests {
     }
 
     #[test]
-    fn shell_wrapper_edits_map_to_a_resource_filtered_around_the_workspace() {
+    fn shell_wrapper_resolves_env_file_after_cd_to_script_directory_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let project = owned.path().join("project");
+        let script_directory = project.join("bin");
+        let wrapper = script_directory.join("start");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&script_directory).unwrap();
+        std::fs::write(
+            &wrapper,
+            "#!/bin/sh\nSCRIPT_DIR=$(dirname \"$0\")/..\ncd \"$SCRIPT_DIR\"\nexec node --env-file=.env server.mjs\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            project.join("server.mjs"),
+            "if (process.env.MANAGED_PARENT_ENV !== 'project-root') process.exit(11);\nprocess.stdout.write('parent env loaded\\n');\n",
+        )
+        .unwrap();
+        std::fs::write(
+            script_directory.join("server.mjs"),
+            "process.stdout.write('wrong script directory selected\\n');\n",
+        )
+        .unwrap();
+        std::fs::write(project.join(".env"), "MANAGED_PARENT_ENV=project-root\n").unwrap();
+        std::fs::write(
+            script_directory.join(".env"),
+            "MANAGED_PARENT_ENV=script-directory-decoy\n",
+        )
+        .unwrap();
+
+        let (plan, provider_wrapper) = plan_and_stage_mcp_command_for_resource_with_cwd(
+            owned.path(),
+            &home,
+            &workspace,
+            &[wrapper.to_string_lossy().into_owned()],
+            &wrapper,
+            Some(&project),
+        );
+        let selected_env = plan[0]
+            .references
+            .selections
+            .iter()
+            .find(|selection| {
+                selection.canonical_source == project.join(".env").canonicalize().unwrap()
+            })
+            .expect("relative Node env-file must resolve from the parent directory selected by the wrapper");
+        let reference = owned
+            .path()
+            .join("provider/.provider-home/.freshell/references/0");
+        std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
+        std::fs::copy(&selected_env.canonical_source, &reference).unwrap();
+        let wrapper_permissions = std::fs::metadata(&provider_wrapper).unwrap().permissions();
+        let wrapper_source = std::fs::read_to_string(&provider_wrapper).unwrap();
+        std::fs::write(
+            &provider_wrapper,
+            wrapper_source.replace(
+                "/home/freshell/provider/.freshell/references/0",
+                &reference.to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider_wrapper, wrapper_permissions).unwrap();
+        let project_mount = resource_units(
+            &home,
+            &home.join(".config/opencode"),
+            &workspace,
+            &plan,
+            None,
+        )
+        .unwrap()
+        .into_iter()
+        .find(|(source, _)| source == &project.canonicalize().unwrap())
+        .expect("the configured MCP project cwd must be staged");
+        let provider_cwd_relative = Path::new(&project_mount.1.effective_destination)
+            .strip_prefix(owned.path())
+            .map(Path::to_path_buf)
+            .or_else(|_| {
+                Path::new(&project_mount.1.effective_destination)
+                    .strip_prefix("/home/freshell/provider")
+                    .map(|relative| Path::new(".provider-home").join(relative))
+            })
+            .expect("the configured project cwd must map into the provider fixture");
+        let provider_cwd = owned.path().join("provider").join(provider_cwd_relative);
+        let hidden_home = owned.path().join("home-hidden");
+        let hidden_project = owned.path().join("project-hidden");
+        std::fs::rename(&home, &hidden_home).unwrap();
+        std::fs::rename(&project, &hidden_project).unwrap();
+        let output =
+            execute_selected_resource_with_context(&provider_wrapper, None, Some(&provider_cwd))
+                .unwrap();
+        std::fs::rename(&hidden_project, &project).unwrap();
+        std::fs::rename(&hidden_home, &home).unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"parent env loaded\n");
+    }
+
+    #[test]
+    fn shell_wrapper_workspace_env_file_uses_private_cwd_alias_after_filter() {
         use std::os::unix::fs::PermissionsExt;
 
         let owned = tempfile::tempdir().unwrap();
         let home = owned.path().join("home");
         let external = owned.path().join("external");
         let workspace = external.join("workspace");
-        let wrapper = external.join("bin/start");
+        let wrapper = workspace.join("bin/start");
         std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&home).unwrap();
@@ -2038,18 +2263,66 @@ mod configured_resource_tests {
         .unwrap();
         let scratch = owned.path().join("scratch");
         std::fs::create_dir_all(&scratch).unwrap();
+        let excluded = plan
+            .iter()
+            .flat_map(|source| {
+                source
+                    .references
+                    .selections
+                    .iter()
+                    .map(|selection| selection.canonical_source.clone())
+            })
+            .collect::<Vec<_>>();
         let edits = filter_workspace_from_enclosing_resource_units_with_edits(
             &mut units,
             "opencode",
             &workspace,
             &scratch,
-            &[],
+            &excluded,
             &plan,
         )
         .unwrap_or_else(|error| {
             panic!("filtering a containing resource must preserve the original-to-stage edit mapping: {error}")
         });
-        assert_eq!(edits.len(), 1);
+        assert!(
+            edits.is_empty(),
+            "the mounted workspace wrapper stays unchanged"
+        );
+        let resource_mount = units
+            .iter()
+            .find(|(_, mount)| mount.logical_destination == external.to_string_lossy())
+            .expect("the configured MCP cwd must remain a selected resource");
+        assert_eq!(
+            resource_mount.1.reference_aliases,
+            vec![freshell_runtime_protocol::ProviderResourceReferenceAlias {
+                relative_path: ".env".into(),
+                reference_index: 0,
+            }]
+        );
+
+        let staged_root = owned.path().join("filtered-stage");
+        let selections = resource_copy_selections(&units).unwrap();
+        freshell_platform::provider_environment::copy_environment(
+            &selections,
+            &staged_root,
+            &excluded,
+            Default::default(),
+        )
+        .unwrap();
+        let filtered_resource = staged_root.join(&resource_mount.1.stage_relative_path);
+        assert!(!filtered_resource.join("workspace").exists());
+        assert!(!filtered_resource.join(".env").exists());
+        assert!(filtered_resource.join("server.mjs").is_file());
+
+        let private_reference = owned.path().join("private/references/0");
+        std::fs::create_dir_all(private_reference.parent().unwrap()).unwrap();
+        std::fs::copy(external.join(".env"), &private_reference).unwrap();
+        std::os::unix::fs::symlink(&private_reference, filtered_resource.join(".env")).unwrap();
+        let output =
+            execute_selected_resource_with_context(&wrapper, None, Some(&filtered_resource))
+                .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"filtered-resource-secret");
     }
 
     #[test]
@@ -4896,6 +5169,7 @@ process.stdout.write(require('./helper.js'))
             effective_destination: package.to_string_lossy().into_owned(),
             kind: freshell_runtime_protocol::ProviderResourceKind::Directory,
             writable: false,
+            reference_aliases: Vec::new(),
         };
         let mut units = vec![(package.clone(), mount)];
 
@@ -5097,6 +5371,7 @@ process.stdout.write(require('./helper.js'))
                 effective_destination: "/tmp/external".into(),
                 kind: freshell_runtime_protocol::ProviderResourceKind::Directory,
                 writable: false,
+                reference_aliases: Vec::new(),
             },
         )];
         let capture = Capture::default();
@@ -5633,6 +5908,7 @@ process.stdout.write(require('./helper.js'))
             effective_destination: "/home/freshell/provider/.config/opencode".into(),
             kind: ProviderResourceKind::Directory,
             writable: false,
+            reference_aliases: Vec::new(),
         };
         let mut current = vec![(
             "/synthetic/current-opencode-root".into(),
@@ -5643,6 +5919,7 @@ process.stdout.write(require('./helper.js'))
                 effective_destination: previous.effective_destination.clone(),
                 kind: ProviderResourceKind::Directory,
                 writable: false,
+                reference_aliases: Vec::new(),
             },
         )];
         let retained =
@@ -5678,6 +5955,7 @@ process.stdout.write(require('./helper.js'))
             effective_destination: destination.into(),
             kind: ProviderResourceKind::Directory,
             writable: false,
+            reference_aliases: Vec::new(),
         };
 
         for (current_destination, previous_destination) in [
@@ -5727,6 +6005,7 @@ process.stdout.write(require('./helper.js'))
             effective_destination: destination.into(),
             kind: ProviderResourceKind::Directory,
             writable: false,
+            reference_aliases: Vec::new(),
         };
         let mut aliases = vec![(source, mount("/workspace/current"))];
         let prior = mount("/home/freshell/provider/.config/opencode");
@@ -5911,6 +6190,7 @@ pub(super) fn resource_units(
                     .into(),
                 kind,
                 writable,
+                reference_aliases: Vec::new(),
             },
         ));
     }
@@ -6186,6 +6466,7 @@ pub(super) fn filter_workspace_from_enclosing_resource_units_with_edits(
     plan: &[PlannedSourceOccurrence],
 ) -> Result<Vec<StagedResourceEdit>, String> {
     let edits = configured_resource_edits(units, plan)?;
+    attach_configured_resource_reference_aliases(units, plan)?;
     filter_workspace_from_enclosing_resource_units(
         units,
         provider,

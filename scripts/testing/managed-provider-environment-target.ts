@@ -156,6 +156,41 @@ process.stdin.on('data', chunk => {
 })
 `
 
+const workspaceCwdAliasMcpServerSource = String.raw`import fs from 'node:fs'
+import helper from './helper.mjs'
+const [receiptPath, expectedNonce] = process.argv.slice(2)
+if (!receiptPath || !expectedNonce) process.exit(12)
+fs.writeFileSync(receiptPath, JSON.stringify({ expectedNonce, helper,
+  envValueLoaded: process.env.FRESHELL_MANAGED_CWD_ALIAS_ENV === expectedNonce,
+  envFileOperand: process.execArgv.find(value => value.startsWith('--env-file=')),
+  cwd: process.cwd(), scriptPath: process.argv[1] }))
+let buffered = ''
+process.stdin.setEncoding('utf8')
+process.stdin.on('data', chunk => {
+  buffered += chunk
+  while (true) {
+    const boundary = buffered.indexOf('\n')
+    if (boundary < 0) break
+    const line = buffered.slice(0, boundary)
+    buffered = buffered.slice(boundary + 1)
+    let request
+    try { request = JSON.parse(line) } catch { continue }
+    if (!request || !Object.hasOwn(request, 'id')) continue
+    let result
+    if (request.method === 'initialize') result = { protocolVersion: request.params?.protocolVersion ?? '2024-11-05',
+      capabilities: { tools: {} }, serverInfo: { name: 'freshell-workspace-cwd-alias-fixture', version: '1.0.0' } }
+    else if (request.method === 'tools/list') result = { tools: [] }
+    else if (request.method === 'ping') result = {}
+    else {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id,
+        error: { code: -32601, message: 'Method not found' } }) + '\n')
+      continue
+    }
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\n')
+  }
+})
+`
+
 function directHomeAppendMcpServerSource(outputName: string): string {
   const outputUrl = `new URL(${JSON.stringify(`./${outputName}`)}, import.meta.url)`
   return `import fs from 'node:fs'
@@ -339,9 +374,10 @@ export function managedEnvironmentFixtureLayout(root: string) {
   const plugin = path.join(resources, 'fixture-plugin')
   const mcpPackage = path.join(resources, 'fixture-mcp')
   const directMcp = path.join(resources, 'direct-mcp')
+  const cwdAliasProject = path.join(resources, 'cwd-alias-project')
   const mcpNested = path.join(mcpPackage, 'nested')
   const mcpParentDependency = path.join(resources, 'node_modules/managed-fixture-mcp-dependency')
-  return { workspace, resources, plugin, mcpPackage, directMcp, mcpNested, mcpParentDependency }
+  return { workspace, resources, plugin, mcpPackage, directMcp, cwdAliasProject, mcpNested, mcpParentDependency }
 }
 
 export function managedHomeAppendFixturePaths(home: string, cwd: string, scenario: string) {
@@ -355,13 +391,18 @@ export function managedHomeAppendFixturePaths(home: string, cwd: string, scenari
 
 async function configure(root: string, nonce: string, candidateSha: string, runId: string) {
   const home = path.join(root, 'home'), xdg = path.join(home, 'fixture-xdg')
-  const { workspace, resources, plugin, mcpPackage, directMcp, mcpNested, mcpParentDependency } = managedEnvironmentFixtureLayout(root)
+  const { workspace, resources, plugin, mcpPackage, directMcp, cwdAliasProject, mcpNested, mcpParentDependency } = managedEnvironmentFixtureLayout(root)
   await fs.mkdir(path.join(plugin, 'node_modules/managed-fixture-dependency'), { recursive: true, mode: 0o755 })
   await fs.mkdir(mcpNested, { recursive: true, mode: 0o755 })
   await fs.mkdir(directMcp, { recursive: true, mode: 0o755 })
+  await fs.mkdir(cwdAliasProject, { recursive: true, mode: 0o755 })
+  await fs.symlink(workspace, path.join(cwdAliasProject, 'workspace'))
   await fs.mkdir(mcpParentDependency, { recursive: true, mode: 0o755 })
   const sharedEnvFile = path.join(directMcp, '.env')
   await fs.writeFile(sharedEnvFile, `FRESHELL_MANAGED_SHARED_ENV=${nonce}\n`, { mode: 0o600 })
+  await fs.writeFile(path.join(cwdAliasProject, '.env'), `FRESHELL_MANAGED_CWD_ALIAS_ENV=${nonce}\n`, { mode: 0o600 })
+  await fs.writeFile(path.join(cwdAliasProject, 'helper.mjs'), `export default ${JSON.stringify(nonce)};\n`)
+  await fs.writeFile(path.join(cwdAliasProject, 'server.mjs'), workspaceCwdAliasMcpServerSource)
   const directMcpDependency = path.join(directMcp, 'node_modules/managed-direct-fixture-dependency')
   await fs.mkdir(directMcpDependency, { recursive: true, mode: 0o755 })
   await fs.mkdir(path.join(xdg, 'opencode'), { recursive: true, mode: 0o755 })
@@ -436,6 +477,12 @@ export default {id:'managed-environment-tui',async tui(api,options){
     await fs.chmod(path.join(cwd, '.managed-fixture'), 0o777)
     await fs.writeFile(path.join(cwd, 'rules.txt'), nonce, { mode: 0o600 })
     const mcpReceipt = path.join(cwd, '.managed-fixture/mcp-receipt.json')
+    const cwdAliasWrapper = path.join(cwd, '.managed-fixture/mcp-cwd-alias/start')
+    const cwdAliasReceipt = path.join(cwd, '.managed-fixture/mcp-cwd-alias-receipt.json')
+    await fs.mkdir(path.dirname(cwdAliasWrapper), { recursive: true, mode: 0o755 })
+    await fs.writeFile(cwdAliasWrapper,
+      '#!/bin/sh\nexec node --env-file=.env server.mjs "$@"\n', { mode: 0o751 })
+    await fs.chmod(cwdAliasWrapper, 0o751)
     const homeAppend = managedHomeAppendFixturePaths(home, cwd, scenario)
     await fs.writeFile(homeAppend.script, directHomeAppendMcpServerSource(path.basename(homeAppend.output)))
     await fs.writeFile(homeAppend.output, `initial-${nonce}`)
@@ -454,6 +501,12 @@ export default {id:'managed-environment-tui',async tui(api,options){
           command: [directCommand, path.join(cwd, '.managed-fixture/direct-mcp-receipt.json'), nonce],
           enabled: true,
         },
+        workspace_cwd_alias_fixture: {
+          type: 'local',
+          command: [cwdAliasWrapper, cwdAliasReceipt, nonce],
+          cwd: cwdAliasProject,
+          enabled: true,
+        },
         direct_home_append_fixture: {
           type: 'local',
           command: ['node', `--env-file=${sharedEnvFile}`, homeAppend.script, homeAppend.receipt, nonce],
@@ -462,7 +515,7 @@ export default {id:'managed-environment-tui',async tui(api,options){
       },
     })
   }
-  return { home, xdg, workspace, command, mcpPackage, mcpNested }
+  return { home, xdg, workspace, command, mcpPackage, mcpNested, cwdAliasProject }
 }
 
 async function socketCreate(rig: ManagedRuntimeBrowserRig, requestId: string, mode: 'shell' | 'opencode', cwd: string,
@@ -1383,12 +1436,21 @@ export async function runManagedEnvironmentTarget() {
     assert.equal(preflightHomeAppend.envFileOperandRewritten, true)
     assert.equal(preflightHomeAppend.envValueLoaded, true)
     assert(preflightHomeAppend.scriptPath.endsWith('/direct-home-preflight.mjs'))
+    const preflightCwdAliasMcp = await poll('OpenCode starts a workspace wrapper with its external MCP cwd env file', async () =>
+      readJson(path.join(selected.workspace, 'preflight/.managed-fixture/mcp-cwd-alias-receipt.json')))
+    assert.equal(preflightCwdAliasMcp.expectedNonce, nonce)
+    assert.equal(preflightCwdAliasMcp.helper, nonce)
+    assert.equal(preflightCwdAliasMcp.envValueLoaded, true)
+    assert.equal(preflightCwdAliasMcp.envFileOperand, '--env-file=.env', 'the workspace wrapper must retain its relative operand')
+    assert.equal(preflightCwdAliasMcp.cwd, selected.cwdAliasProject)
+    assert(preflightCwdAliasMcp.scriptPath.endsWith('/cwd-alias-project/server.mjs'))
     const preflightView = await poll('genuine managed preflight native identity', () =>
       observeManagedEnvironmentNativeIdentity(rig!, created.terminalId, preflightChild.nativeSessionId))
     assert((await terminalDirectory(rig)).some(row => row.terminalId === created.terminalId))
     assert.deepEqual(await webChildren(rig), [], 'Managed child must belong to the disposable session host, not the host web process')
     proof.preflight = { terminalId: created.terminalId, soulId: preflightView.soulId, incarnationId: preflightView.incarnationId,
       stage: await stageProof(rig, preflightView, nonce), child: preflightChild, mcpServer: preflightMcp,
+      workspaceCwdAliasMcp: preflightCwdAliasMcp,
       directMcpServer: preflightDirectMcp, directHomeAppendMcp: preflightHomeAppend }
     const toolHome = path.join(root, 'tools')
     await fs.mkdir(toolHome, { mode: 0o700 })
@@ -1542,9 +1604,18 @@ export async function runManagedEnvironmentTarget() {
           assert.equal(directHomeAppendMcp.envFileOperandRewritten, true)
           assert.equal(directHomeAppendMcp.envValueLoaded, true)
           assert(directHomeAppendMcp.scriptPath.endsWith('/direct-home-healthy.mjs'))
+          const workspaceCwdAliasMcp = await poll('Cloud OpenCode starts a workspace wrapper with its external MCP cwd env file', async () =>
+            readJson(path.join(cwd, '.managed-fixture/mcp-cwd-alias-receipt.json')))
+          assert.equal(workspaceCwdAliasMcp.expectedNonce, nonce)
+          assert.equal(workspaceCwdAliasMcp.helper, nonce)
+          assert.equal(workspaceCwdAliasMcp.envValueLoaded, true)
+          assert.equal(workspaceCwdAliasMcp.envFileOperand, '--env-file=.env', 'the workspace wrapper must retain its relative operand')
+          assert.equal(workspaceCwdAliasMcp.cwd, selected.cwdAliasProject)
+          assert(workspaceCwdAliasMcp.scriptPath.endsWith('/cwd-alias-project/server.mjs'))
           const stage = await stageProof(rig!, view, nonce)
           const receipt = { ...fixture, terminalId: view.terminalId, soulId: view.soulId, incarnationId: view.incarnationId,
-            nativeSessionId: view.nativeSessionId, stage, child, mcpServer, directMcpServer, directHomeAppendMcp }
+            nativeSessionId: view.nativeSessionId, stage, child, mcpServer, directMcpServer, directHomeAppendMcp,
+            workspaceCwdAliasMcp }
           await writeJson(path.join(cwd, '.managed-fixture/target-receipt.json'), receipt)
           proof.healthy = receipt
         },

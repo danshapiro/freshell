@@ -3,6 +3,7 @@
 use crate::{McpCapabilityReference, RuntimeError, RuntimeErrorCode, SoulId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::path::Path;
 
 /// One immutable preparation result for every launch and replacement route.
 /// Source documents and selected payloads stay in their private filesystem.
@@ -177,6 +178,17 @@ pub struct ProviderResourceMount {
     /// Directories retain their existing writable resource behavior.
     #[serde(default, skip_serializing_if = "is_false")]
     pub writable: bool,
+    /// Safe in-root aliases to private file references, created after the
+    /// resource tree has been copied into the provider HOME.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reference_aliases: Vec<ProviderResourceReferenceAlias>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderResourceReferenceAlias {
+    pub relative_path: String,
+    pub reference_index: u16,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -320,9 +332,16 @@ impl PreparedProviderInputs {
                 ProviderResourceKind::File,
             )?;
         }
+        let mut total_resource_reference_aliases = 0usize;
         for mount in &self.resource_mounts {
             let file = mount.kind == ProviderResourceKind::File;
+            total_resource_reference_aliases = total_resource_reference_aliases
+                .checked_add(mount.reference_aliases.len())
+                .filter(|count| *count <= 256)
+                .ok_or_else(|| invalid("resource reference alias count"))?;
             if (mount.writable && !file)
+                || (!mount.reference_aliases.is_empty() && file)
+                || mount.reference_aliases.len() > 256
                 || !unit_path(&mount.stage_relative_path, ".freshell/resource-units", file)
                 || !unit_path(
                     &mount.provider_relative_path,
@@ -344,6 +363,32 @@ impl PreparedProviderInputs {
                 format!("resource:{}", mount.provider_relative_path),
                 mount.kind,
             )?;
+            let mut aliases = BTreeMap::<String, u16>::new();
+            for alias in &mount.reference_aliases {
+                let relative = Path::new(&alias.relative_path);
+                if alias.relative_path.len() > 64 * 1024
+                    || alias.relative_path.is_empty()
+                    || relative.is_absolute()
+                    || relative
+                        .components()
+                        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+                    || alias.reference_index >= self.manifest.source_count
+                    || aliases
+                        .insert(alias.relative_path.clone(), alias.reference_index)
+                        .is_some()
+                {
+                    return Err(invalid("resource reference alias"));
+                }
+            }
+            for path in aliases.keys() {
+                let path = Path::new(path);
+                if aliases
+                    .keys()
+                    .any(|other| other != path && Path::new(other).starts_with(path))
+                {
+                    return Err(invalid("overlapping resource reference aliases"));
+                }
+            }
         }
         if let Some(files) = &self.indexed_files {
             if !files
@@ -747,6 +792,56 @@ mod tests {
             serde_json::from_value(value).expect("write intent is structurally valid");
         assert!(writable_directory.validate(Some(&capability())).is_err());
     }
+
+    #[test]
+    fn provider_resource_reference_aliases_are_safe_and_reference_bounded() {
+        let mut value = prepared();
+        value.resource_mounts.push(ProviderResourceMount {
+            stage_relative_path: ".freshell/resource-units/project".into(),
+            provider_relative_path: ".freshell/provider-roots/project".into(),
+            logical_destination: "/fixture/project".into(),
+            effective_destination: "/fixture/project".into(),
+            kind: ProviderResourceKind::Directory,
+            writable: false,
+            reference_aliases: vec![ProviderResourceReferenceAlias {
+                relative_path: ".env".into(),
+                reference_index: 1,
+            }],
+        });
+        value.validate(Some(&capability())).unwrap();
+        let wire = serde_json::to_vec(&value).unwrap();
+        let received: PreparedProviderInputs = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(received, value);
+
+        for unsafe_path in ["../outside", "nested/../../outside", "/absolute", ""] {
+            let mut invalid = value.clone();
+            invalid.resource_mounts[0].reference_aliases[0].relative_path = unsafe_path.into();
+            assert!(
+                invalid.validate(Some(&capability())).is_err(),
+                "accepted {unsafe_path:?}"
+            );
+        }
+        let mut invalid_index = value.clone();
+        invalid_index.resource_mounts[0].reference_aliases[0].reference_index = 2;
+        assert!(invalid_index.validate(Some(&capability())).is_err());
+
+        let mut file_mount = value.clone();
+        file_mount.resource_mounts[0].kind = ProviderResourceKind::File;
+        file_mount.resource_mounts[0].stage_relative_path =
+            ".freshell/resource-units/project/source".into();
+        file_mount.resource_mounts[0].provider_relative_path =
+            ".freshell/provider-roots/project/source".into();
+        assert!(file_mount.validate(Some(&capability())).is_err());
+
+        let mut overlapping = value;
+        overlapping.resource_mounts[0]
+            .reference_aliases
+            .push(ProviderResourceReferenceAlias {
+                relative_path: ".env/child".into(),
+                reference_index: 0,
+            });
+        assert!(overlapping.validate(Some(&capability())).is_err());
+    }
     #[test]
     fn provider_prepared_mounts_preserve_home_and_control_parents() {
         for destination in [
@@ -762,6 +857,7 @@ mod tests {
                 effective_destination: destination.into(),
                 kind: ProviderResourceKind::Directory,
                 writable: false,
+                reference_aliases: vec![],
             });
             assert!(
                 value.validate(Some(&capability())).is_err(),

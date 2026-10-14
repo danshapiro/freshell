@@ -144,6 +144,7 @@ pub(super) fn prepare_selected<M: serde::Serialize>(
                     .into(),
                 kind,
                 writable: false,
+                reference_aliases: Vec::new(),
             });
         }
     }

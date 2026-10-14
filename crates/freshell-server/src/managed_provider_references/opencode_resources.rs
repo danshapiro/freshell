@@ -730,7 +730,10 @@ fn direct_script_dependency_scope(command_parent: &Path, home: &Path) -> PathBuf
         .to_owned()
 }
 
-fn shell_directory_variables(source: &str) -> std::collections::BTreeSet<String> {
+fn shell_directory_variables(
+    source: &str,
+    script_parent: &Path,
+) -> std::collections::BTreeMap<String, PathBuf> {
     source
         .lines()
         .filter_map(|line| {
@@ -743,20 +746,49 @@ fn shell_directory_variables(source: &str) -> std::collections::BTreeSet<String>
                 && name
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
-            (valid_name && value.contains("dirname") && value.contains("$0"))
-                .then(|| name.to_owned())
+            if !valid_name {
+                return None;
+            }
+            let value = value.trim().trim_matches(['"', '\'']);
+            let prefix = ["$(dirname \"$0\")", "$(dirname -- \"$0\")"]
+                .into_iter()
+                .find(|prefix| value.starts_with(prefix))?;
+            let suffix = value.strip_prefix(prefix)?;
+            if suffix.contains(['$', '*', '?', ';', '&', '|', '\n', '\r']) {
+                return None;
+            }
+            let relative = suffix.strip_prefix('/').unwrap_or(suffix);
+            let relative_path = Path::new(relative);
+            if relative_path.is_absolute()
+                || relative_path.components().any(|component| {
+                    !matches!(
+                        component,
+                        std::path::Component::Normal(_)
+                            | std::path::Component::CurDir
+                            | std::path::Component::ParentDir
+                    )
+                })
+            {
+                return None;
+            }
+            let directory = script_parent.join(relative_path).canonicalize().ok()?;
+            directory.is_dir().then(|| (name.to_owned(), directory))
         })
         .collect()
 }
 
 fn shell_changes_to_script_directory<'a>(
     line: &'a str,
-    directory_variables: &std::collections::BTreeSet<String>,
-) -> Option<&'a str> {
+    directory_variables: &std::collections::BTreeMap<String, PathBuf>,
+    script_parent: &Path,
+) -> Option<(PathBuf, &'a str)> {
     const CD_TO_SCRIPT_DIRECTORY: &str = "cd \"$(dirname \"$0\")\"";
     let line = line.trim_start();
     if let Some(remainder) = line.strip_prefix(CD_TO_SCRIPT_DIRECTORY) {
-        return shell_command_after_directory_change(remainder);
+        return Some((
+            script_parent.to_owned(),
+            shell_command_after_directory_change(remainder)?,
+        ));
     }
 
     let remainder = line.strip_prefix("cd ")?.trim_start();
@@ -773,10 +805,10 @@ fn shell_changes_to_script_directory<'a>(
         .strip_prefix("${")
         .and_then(|value| value.strip_suffix('}'))
         .or_else(|| operand.strip_prefix('$'))?;
-    if !directory_variables.contains(variable) {
-        return None;
-    }
-    shell_command_after_directory_change(remainder)
+    Some((
+        directory_variables.get(variable)?.clone(),
+        shell_command_after_directory_change(remainder)?,
+    ))
 }
 
 fn shell_command_after_directory_change(remainder: &str) -> Option<&str> {
@@ -972,7 +1004,7 @@ fn shell_source_operand(line: &str) -> Option<String> {
 fn shell_source_path(
     script_parent: &Path,
     operand: &str,
-    directory_variables: &std::collections::BTreeSet<String>,
+    directory_variables: &std::collections::BTreeMap<String, PathBuf>,
 ) -> Result<Option<PathBuf>, &'static str> {
     if operand.starts_with('/') {
         return Ok(None);
@@ -989,18 +1021,26 @@ fn shell_source_path(
         let Some((name, suffix)) = variable.split_once('}') else {
             return Ok(None);
         };
-        if !directory_variables.contains(name) {
+        let base = directory_variables
+            .get(name)
+            .ok_or("direct MCP shell script has an unresolved dynamic source path")?;
+        relative = suffix.strip_prefix('/').unwrap_or(suffix);
+        if relative.is_empty() || relative.contains(['$', '*', '?']) {
             return Err("direct MCP shell script has an unresolved dynamic source path");
         }
-        relative = suffix.strip_prefix('/').unwrap_or(suffix);
+        return Ok(Some(base.join(relative)));
     } else if let Some(variable) = operand.strip_prefix('$') {
         let (name, suffix) = variable
             .split_once('/')
             .ok_or("direct MCP shell script has an unresolved dynamic source path")?;
-        if !directory_variables.contains(name) {
+        let base = directory_variables
+            .get(name)
+            .ok_or("direct MCP shell script has an unresolved dynamic source path")?;
+        relative = suffix;
+        if relative.is_empty() || relative.contains(['$', '*', '?']) {
             return Err("direct MCP shell script has an unresolved dynamic source path");
         }
-        relative = suffix;
+        return Ok(Some(base.join(relative)));
     }
     if relative.is_empty() || relative.contains(['$', '*', '?']) {
         return Err("direct MCP shell script has an unresolved dynamic source path");
@@ -1010,17 +1050,17 @@ fn shell_source_path(
 
 fn shell_directory_relative_paths(
     line: &str,
-    directory_variables: &std::collections::BTreeSet<String>,
+    directory_variables: &std::collections::BTreeMap<String, PathBuf>,
     script_parent: &Path,
-) -> std::collections::BTreeSet<String> {
+) -> std::collections::BTreeSet<PathBuf> {
     let mut result = std::collections::BTreeSet::new();
-    let mut prefixes = std::collections::BTreeSet::new();
-    for variable in directory_variables {
-        prefixes.insert(format!("${variable}/"));
-        prefixes.insert(format!("${{{variable}}}/"));
+    let mut prefixes = std::collections::BTreeMap::new();
+    for (variable, directory) in directory_variables {
+        prefixes.insert(format!("${variable}/"), directory.clone());
+        prefixes.insert(format!("${{{variable}}}/"), directory.clone());
     }
-    prefixes.insert("$(dirname \"$0\")/".to_owned());
-    for prefix in prefixes {
+    prefixes.insert("$(dirname \"$0\")/".to_owned(), script_parent.to_owned());
+    for (prefix, directory) in prefixes {
         let mut search_from = 0;
         while search_from < line.len() {
             let Some(relative_start) = line[search_from..].find(&prefix) else {
@@ -1032,12 +1072,13 @@ fn shell_directory_relative_paths(
                 .find(|character: char| character.is_whitespace() || "\"'`;|&)".contains(character))
                 .unwrap_or(suffix.len());
             let relative = &suffix[..length];
+            let candidate = directory.join(relative);
             if !relative.is_empty()
                 && !relative.contains(['$', '*', '?'])
-                && (!shell_directory_path_is_redirection_target(line, start)
-                    || script_parent.join(relative).exists())
+                && candidate.is_file()
+                && (!shell_directory_path_is_redirection_target(line, start) || candidate.exists())
             {
-                result.insert(relative.to_owned());
+                result.insert(candidate);
             }
             search_from = start + prefix.len() + length;
         }
@@ -3118,15 +3159,15 @@ fn insert_shell_script_dependencies(
         }
         let source = std::fs::read_to_string(&canonical)
             .map_err(|_| fail("direct MCP shell script is not readable UTF-8"))?;
-        let directory_variables = shell_directory_variables(&source);
+        let script_parent = canonical
+            .parent()
+            .ok_or_else(|| fail("direct MCP shell script has no containing directory"))?;
+        let directory_variables = shell_directory_variables(&source, script_parent);
         if directory_variables.len() > 128 {
             return Err(fail(
                 "direct MCP shell dependency closure exceeds its variable bound",
             ));
         }
-        let script_parent = canonical
-            .parent()
-            .ok_or_else(|| fail("direct MCP shell script has no containing directory"))?;
         let mut working_directory = Some(selection.default_working_directory.to_owned());
         let mut source_offset = 0usize;
         for full_line in source.split_inclusive('\n') {
@@ -3139,10 +3180,10 @@ fn insert_shell_script_dependencies(
                 source_offset += full_line.len();
                 continue;
             }
-            let node_line = if let Some(remainder) =
-                shell_changes_to_script_directory(line, &directory_variables)
+            let node_line = if let Some((directory, remainder)) =
+                shell_changes_to_script_directory(line, &directory_variables, script_parent)
             {
-                working_directory = Some(script_parent.to_owned());
+                working_directory = Some(directory);
                 remainder
             } else {
                 if line.trim_start().starts_with("cd ") {
@@ -3152,8 +3193,10 @@ fn insert_shell_script_dependencies(
             };
             let node_line_offset = source_offset + line.len().saturating_sub(node_line.len());
             let mut candidates = std::collections::BTreeMap::new();
-            let mut env_file_candidates =
-                std::collections::BTreeMap::<PathBuf, Vec<(String, std::ops::Range<usize>)>>::new();
+            let mut env_file_candidates = std::collections::BTreeMap::<
+                PathBuf,
+                Vec<(String, std::ops::Range<usize>, Option<PathBuf>)>,
+            >::new();
             if let Some(operand) = shell_source_operand(line) {
                 if let Some(candidate) =
                     shell_source_path(script_parent, &operand, &directory_variables)
@@ -3166,12 +3209,13 @@ fn insert_shell_script_dependencies(
             let node_invocation = invokes_node
                 .then(|| shell_node_invocation(node_line))
                 .flatten();
-            for relative in
+            for candidate in
                 shell_directory_relative_paths(line, &directory_variables, script_parent)
             {
-                let parse_as_node_script = invokes_node && is_node_script_path(&relative);
+                let parse_as_node_script =
+                    invokes_node && is_node_script_path(&candidate.to_string_lossy());
                 candidates
-                    .entry(script_parent.join(relative))
+                    .entry(candidate)
                     .and_modify(|kind: &mut (bool, bool)| kind.1 |= parse_as_node_script)
                     .or_insert((false, parse_as_node_script));
             }
@@ -3251,6 +3295,7 @@ fn insert_shell_script_dependencies(
                                 operand,
                                 node_line_offset + argument_span.start
                                     ..node_line_offset + argument_span.end,
+                                working_directory.clone(),
                             ));
                     }
                 }
@@ -3285,6 +3330,12 @@ fn insert_shell_script_dependencies(
                     )?;
                 }
                 if parse_as_node_script {
+                    let dependency_scope = std::iter::once(scope)
+                        .chain(default_working_directory_scope.as_deref())
+                        .chain(selection.workspace_directory)
+                        .filter(|directory| dependency.starts_with(directory))
+                        .max_by_key(|directory| directory.components().count())
+                        .unwrap_or(scope);
                     insert_installed_package_ancestor_resources_covered(
                         &dependency,
                         scope,
@@ -3296,7 +3347,7 @@ fn insert_shell_script_dependencies(
                     )?;
                     insert_direct_script_dependencies_covered(
                         &dependency,
-                        scope,
+                        dependency_scope,
                         declaring,
                         DirectScriptResources {
                             paths: &mut *resources.paths,
@@ -3334,15 +3385,48 @@ fn insert_shell_script_dependencies(
                 }) {
                     continue;
                 }
-                for (expected_operand, argument_span) in arguments {
+                for (expected_operand, argument_span, working_directory) in arguments {
+                    let alias = selection
+                        .workspace_directory
+                        .filter(|workspace| canonical.starts_with(workspace))
+                        .filter(|workspace| !dependency.starts_with(workspace))
+                        .and_then(|_| {
+                            let directory = working_directory?.canonicalize().ok()?;
+                            if !dependency.starts_with(&directory) {
+                                return None;
+                            }
+                            let operand = Path::new(&expected_operand);
+                            if operand.is_absolute() {
+                                return None;
+                            }
+                            let mut relative_path = PathBuf::new();
+                            for component in operand.components() {
+                                match component {
+                                    std::path::Component::Normal(part) => relative_path.push(part),
+                                    std::path::Component::CurDir => {}
+                                    _ => return None,
+                                }
+                            }
+                            (!relative_path.as_os_str().is_empty())
+                                .then_some((directory, relative_path))
+                        });
+                    let rewrite = alias.map_or_else(
+                        || NodeEnvFileRewrite::ShellScriptArgument {
+                            script_source: canonical.clone(),
+                            argument_span: argument_span.clone(),
+                            expected_operand: expected_operand.clone(),
+                        },
+                        |(working_directory, relative_path)| {
+                            NodeEnvFileRewrite::ShellWorkingDirectoryAlias {
+                                working_directory,
+                                relative_path,
+                            }
+                        },
+                    );
                     resources.node_env_files.push(NodeEnvFileSelection {
                         canonical_source: dependency.clone(),
                         selected_alias: candidate.clone(),
-                        rewrite: NodeEnvFileRewrite::ShellScriptArgument {
-                            script_source: canonical.clone(),
-                            argument_span,
-                            expected_operand,
-                        },
+                        rewrite,
                     });
                 }
             }
@@ -3591,6 +3675,10 @@ pub(super) enum NodeEnvFileRewrite {
         script_source: PathBuf,
         argument_span: std::ops::Range<usize>,
         expected_operand: String,
+    },
+    ShellWorkingDirectoryAlias {
+        working_directory: PathBuf,
+        relative_path: PathBuf,
     },
 }
 
