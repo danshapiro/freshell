@@ -305,10 +305,14 @@ describe('managed runtime broker actor storage', () => {
         stageRoot:`/tmp/owned/scenarios/scenario/control/provider-roots/${generationId}`,
         configurationBinds:[{sourceRelativePath:'.freshell/templates/source-0',effectiveDestination:'/workspace/opencode.json'}],
         resourceMounts:[{providerRelativePath:'.freshell/provider-roots/plugin-0',effectiveDestination:'/workspace/plugin',kind:'directory'},
-          {providerRelativePath:'.freshell/provider-roots/instructions-0/source',effectiveDestination:'/workspace/instructions.md',kind:'file'}],
+          {providerRelativePath:'.freshell/provider-roots/instructions-0/source',effectiveDestination:'/workspace/instructions.md',kind:'file'},
+          {providerRelativePath:'.freshell/provider-roots/output-0/source',effectiveDestination:'/workspace/generated.txt',kind:'file',writable:true}],
         indexedFiles:{volumeName,aliases:[{sourceId:0,effectiveDestination:'/workspace/selected-input'}]},
         indexedSecretSources:[{grantIndex:1,sourceId:0}],
       };
+      const directoryWrite = structuredClone(authorization);
+      directoryWrite.resourceMounts[0].writable = true;
+      expect(() => instance.authorizePreparedInputs(directoryWrite)).toThrow('prepared resource source is invalid');
       instance.authorizePreparedInputs(authorization);
       const body=JSON.parse(createBody([...ordinaryBinds,actorBind]).toString());
       body.HostConfig.Mounts=[
@@ -317,14 +321,18 @@ describe('managed runtime broker actor storage', () => {
         {Type:'volume',Source:volumeName,Target:'/workspace/selected-input',ReadOnly:true,VolumeOptions:{NoCopy:true,Subpath:'files/source-0'}},
         {Type:'volume',Source:volumeName,Target:'/run/freshell-secrets/provider-1',ReadOnly:true,VolumeOptions:{NoCopy:true,Subpath:'files/source-0'}},
         {Type:'volume',Source:providerVolume,Target:'/workspace/instructions.md',ReadOnly:true,VolumeOptions:{NoCopy:true,Subpath:'.freshell/provider-roots/instructions-0/source'}},
+        {Type:'volume',Source:providerVolume,Target:'/workspace/generated.txt',ReadOnly:false,VolumeOptions:{NoCopy:true,Subpath:'.freshell/provider-roots/output-0/source'}},
       ];
       expect((await request('POST','/v1.47/containers/create?name=owned-prepared',body)).status).toBe(201);
       expect(forwarded).toHaveLength(1);
-      for (const mutation of ['source','target','writable','subpath','nocopy','missing','empty','duplicate','owner','image','volume']) {
+      for (const mutation of ['source','target','writable','prepared-writable-file-readonly','directory-readonly','ordinary-file-writable','subpath','nocopy','missing','empty','duplicate','owner','image','volume']) {
         const changed=structuredClone(body);
         if (mutation==='source') changed.HostConfig.Mounts[0].Source='/var/run/docker.sock';
         if (mutation==='target') changed.HostConfig.Mounts[0].Target='/run/freshell';
         if (mutation==='writable') changed.HostConfig.Mounts[2].ReadOnly=false;
+        if (mutation==='prepared-writable-file-readonly') changed.HostConfig.Mounts[5].ReadOnly=true;
+        if (mutation==='directory-readonly') changed.HostConfig.Mounts[1].ReadOnly=true;
+        if (mutation==='ordinary-file-writable') changed.HostConfig.Mounts[4].ReadOnly=false;
         if (mutation==='subpath') changed.HostConfig.Mounts[2].VolumeOptions.Subpath='files/source-1';
         if (mutation==='nocopy') changed.HostConfig.Mounts[1].VolumeOptions.NoCopy=false;
         if (mutation==='missing') changed.HostConfig.Mounts.pop();
@@ -1332,7 +1340,11 @@ describe('fixed indexed publisher broker',()=>{
       const input = { ...publisherAuthorization(), soulId: owner.soulId, generationId, hostBinaryPath, providerVolumeName: owner.providerVolumeName,
         stageRoot: path.join(directory, 'scenarios/scenario/control/provider-roots', generationId),
         configurationBinds: [{ sourceRelativePath: '.freshell/templates/codex-0', effectiveDestination: '/home/freshell/provider/.codex/config.toml' }],
-        resourceMounts: [{ providerRelativePath: '.freshell/provider-roots/root-0', effectiveDestination: '/home/freshell/provider/.codex/skills', kind: 'directory' as const }],
+        resourceMounts: [
+          { providerRelativePath: '.freshell/provider-roots/root-0', effectiveDestination: '/home/freshell/provider/.codex/skills', kind: 'directory' as const },
+          { providerRelativePath: '.freshell/provider-roots/root-1/source', effectiveDestination: '/home/freshell/provider/.codex/README.md', kind: 'file' as const },
+          { providerRelativePath: '.freshell/provider-roots/root-2/source', effectiveDestination: '/home/freshell/provider/.codex/generated.txt', kind: 'file' as const, writable: true },
+        ],
         indexedFiles: { volumeName: `freshell-inputs-${createHash('sha256').update(`${owner.soulId}\0${generationId}`).digest('hex').slice(0, 24)}`, aliases: [] },
         indexedSecretSources: [] }
       const { metadata, capabilities, context } = await publishControllerPreparation(directory, input, '11111111-1111-4111-8111-111111111111', 'codex')
@@ -1392,6 +1404,40 @@ describe('fixed indexed publisher broker',()=>{
         expect(() => instance.authorizePreparedInputs(changed), destination).toThrow()
       }
       expect((await request('POST', '/v1.47/volumes/create', volume)).status, JSON.stringify(instance.eventsSnapshot().slice(-4))).toBe(201)
+      const registered = [...(instance as unknown as { preparedInputs: Map<string, PreparedInputAuthorization> }).preparedInputs.values()]
+        .find(prepared => prepared.generationId === generationId)
+      expect(registered?.resourceMounts).toEqual(input.resourceMounts)
+      const runtimeDir = path.join(directory, 'r/scenario/x/incarnation-one')
+      const runtimeBinds = ordinaryBinds.map(bind => bind.replace('/tmp/owned/freshell-session-host', owner.hostBinaryPath)
+        .replace('/tmp/owned/r/scenario/x/incarnation-one', runtimeDir).replace(providerVolume, owner.providerVolumeName))
+      const runtimeActorKey = createHash('sha256').update(`${owner.installationId}\0${owner.soulId}`).digest('hex')
+      const runtimeActorBind = `${path.join(directory, 'r/scenario/x/souls', runtimeActorKey, 'actor')}:/run/freshell-host-actor:rw`
+      const runtime = JSON.parse(createBody([...runtimeBinds, runtimeActorBind]).toString())
+      runtime.Labels['com.freshell.soul-id'] = owner.soulId
+      runtime.HostConfig.Mounts = [
+        ...registered!.configurationBinds.map(bind => ({ Type: 'bind', Source: path.join(input.stageRoot, bind.sourceRelativePath),
+          Target: bind.effectiveDestination, ReadOnly: true })),
+        ...registered!.resourceMounts.map(mount => ({ Type: 'volume', Source: owner.providerVolumeName,
+          Target: mount.effectiveDestination, ReadOnly: mount.kind === 'file' && mount.writable !== true,
+          VolumeOptions: { NoCopy: true, Subpath: mount.providerRelativePath } })),
+      ]
+      const writableIndex = runtime.HostConfig.Mounts.findIndex((mount: any) => mount.Target === '/home/freshell/provider/.codex/generated.txt')
+      const directoryIndex = runtime.HostConfig.Mounts.findIndex((mount: any) => mount.Target === '/home/freshell/provider/.codex/skills')
+      const ordinaryFileIndex = runtime.HostConfig.Mounts.findIndex((mount: any) => mount.Target === '/home/freshell/provider/.codex/README.md')
+      expect([writableIndex, directoryIndex, ordinaryFileIndex].every((index: number) => index >= 0)).toBe(true)
+      expect((await request('POST', '/v1.47/containers/create?name=registered-writable-resource', runtime)).status,
+        JSON.stringify(instance.eventsSnapshot().slice(-4))).toBe(201)
+      for (const [name, index, readOnly] of [
+        ['writable-file-made-readonly', writableIndex, true],
+        ['directory-made-readonly', directoryIndex, true],
+        ['ordinary-file-made-writable', ordinaryFileIndex, false],
+      ] as const) {
+        const changed = structuredClone(runtime)
+        changed.HostConfig.Mounts[index].ReadOnly = readOnly
+        const before = forwarded.length
+        expect((await request('POST', `/v1.47/containers/create?name=${name}`, changed)).status, name).toBe(403)
+        expect(forwarded).toHaveLength(before)
+      }
       const before = forwarded.length
       for (const mutation of ['owner', 'generation', 'permissions', 'volume']) {
         const changed = structuredClone(volume)

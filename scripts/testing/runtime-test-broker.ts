@@ -71,7 +71,8 @@ function preparedMountsMatch(actual: unknown[], input: PreparedInputAuthorizatio
     Type: 'bind', Source: path.join(input.stageRoot, bind.sourceRelativePath), Target: bind.effectiveDestination, ReadOnly: true,
   }))
   expected.push(...input.resourceMounts.map((mount) => ({
-    Type: 'volume', Source: input.providerVolumeName, Target: mount.effectiveDestination, ReadOnly: mount.kind === 'file',
+    Type: 'volume', Source: input.providerVolumeName, Target: mount.effectiveDestination,
+    ReadOnly: mount.kind === 'file' && mount.writable !== true,
     VolumeOptions: { NoCopy: true, Subpath: mount.providerRelativePath },
   })))
   if (input.indexedFiles) {
@@ -161,7 +162,7 @@ export type PreparedInputAuthorization = {
   stageRoot: string
   generationId: string
   configurationBinds: { sourceRelativePath: string; effectiveDestination: string }[]
-  resourceMounts: { providerRelativePath: string; effectiveDestination: string; kind: 'file' | 'directory' }[]
+  resourceMounts: { providerRelativePath: string; effectiveDestination: string; kind: 'file' | 'directory'; writable?: boolean }[]
   indexedFiles?: { volumeName: string; aliases: { sourceId: number; effectiveDestination: string }[] }
   indexedSecretSources: { grantIndex: number; sourceId: number }[]
 }
@@ -335,7 +336,10 @@ export class RestrictedDockerBroker {
     }
     for (const mount of input.resourceMounts) {
       const relative=mount.kind==='file' && mount.providerRelativePath.endsWith('/source') ? mount.providerRelativePath.slice(0,-'/source'.length) : mount.providerRelativePath;
-      if (!unit(relative, '.freshell/provider-roots/') || (mount.kind==='file' && !mount.providerRelativePath.endsWith('/source')) || !['file', 'directory'].includes(mount.kind)) throw new Error('prepared resource source is invalid')
+      if (!unit(relative, '.freshell/provider-roots/') || (mount.kind==='file' && !mount.providerRelativePath.endsWith('/source'))
+        || !['file', 'directory'].includes(mount.kind)
+        || (mount.writable !== undefined && typeof mount.writable !== 'boolean')
+        || (mount.kind !== 'file' && mount.writable === true)) throw new Error('prepared resource source is invalid')
       claim(mount.effectiveDestination)
     }
     if (input.indexedFiles) {
@@ -1368,7 +1372,8 @@ export class RestrictedDockerBroker {
               configurationBinds: (inputs.configBinds ?? []).map((bind: Record<string, any>) => ({
                 sourceRelativePath: bind.sourceRelativePath, effectiveDestination: bind.effectiveDestination,
               })), resourceMounts: (inputs.resourceMounts ?? []).map((mount: Record<string, any>) => ({
-                providerRelativePath: mount.providerRelativePath, effectiveDestination: mount.effectiveDestination, kind: mount.kind,
+                providerRelativePath: mount.providerRelativePath, effectiveDestination: mount.effectiveDestination,
+                kind: mount.kind, writable: mount.writable,
               })), indexedFiles: inputs.indexedFiles, indexedSecretSources,
             })
           }
