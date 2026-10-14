@@ -196,17 +196,23 @@ process.stdin.on('data', chunk => {
 function directHomeAppendMcpServerSource(outputName: string): string {
   const outputUrl = `new URL(${JSON.stringify(`./${outputName}`)}, import.meta.url)`
   return `import fs from 'node:fs'
+import { fileURLToPath } from 'node:url'
 const [receiptPath, expectedNonce] = process.argv.slice(2)
 if (!receiptPath || !expectedNonce) process.exit(12)
 let appendError
 try { fs.appendFileSync(${outputUrl}, '|' + expectedNonce) }
 catch (error) { appendError = error.code ?? error.message ?? String(error) }
-const output = fs.readFileSync(${outputUrl}, 'utf8')
+let output, readError
+try { output = fs.readFileSync(${outputUrl}, 'utf8') }
+catch (error) { readError = error.code ?? error.message ?? String(error) }
+const outputPath = fileURLToPath(${outputUrl})
+const outputExists = fs.existsSync(outputPath)
+const siblingMountPresent = (() => { try { return fs.readFileSync('/proc/self/mountinfo', 'utf8').split('\n').some(line => line.includes(outputPath)) } catch { return false } })()
 const envFileOperandRewritten = process.execArgv.some(value =>
   /^--env-file=\/home\/freshell\/provider\/\.freshell\/references\/\d+$/.test(value))
 const envValueLoaded = process.env.FRESHELL_MANAGED_SHARED_ENV === expectedNonce
-fs.writeFileSync(receiptPath, JSON.stringify({ expectedNonce, appendError, output, scriptPath: process.argv[1],
-  envFileOperandRewritten, envValueLoaded }))
+fs.writeFileSync(receiptPath, JSON.stringify({ expectedNonce, appendError, readError, output, outputExists,
+  siblingMountPresent, scriptPath: process.argv[1], envFileOperandRewritten, envValueLoaded }))
 let buffered = ''
 process.stdin.setEncoding('utf8')
 process.stdin.on('data', chunk => {
@@ -1439,6 +1445,9 @@ export async function runManagedEnvironmentTarget() {
       readJson(path.join(selected.workspace, 'preflight/.managed-fixture/direct-home-mcp-receipt.json')))
     assert.equal(preflightHomeAppend.expectedNonce, nonce)
     assert.equal(preflightHomeAppend.appendError, undefined, 'the staged HOME-level append target must be writable')
+    assert.equal(preflightHomeAppend.readError, undefined, 'the staged HOME-level append target must be readable')
+    assert.equal(preflightHomeAppend.outputExists, true, 'the sibling file must exist inside the provider container')
+    assert.equal(preflightHomeAppend.siblingMountPresent, true, 'the sibling file must have its own provider-volume mount')
     assert.equal(preflightHomeAppend.output, `initial-${nonce}|${nonce}`)
     assert.equal(preflightHomeAppend.envFileOperandRewritten, true)
     assert.equal(preflightHomeAppend.envValueLoaded, true)

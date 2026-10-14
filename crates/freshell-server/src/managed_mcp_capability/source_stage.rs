@@ -1754,6 +1754,154 @@ mod configured_resource_tests {
     }
 
     #[test]
+    fn direct_home_mcp_sibling_survives_a_multi_entry_resource_plan() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let resources = owned.path().join("selected-resources");
+        let global = home.join(".config/opencode");
+        let package = resources.join("fixture-mcp");
+        let package_cwd = package.join("nested");
+        let direct = resources.join("direct-mcp");
+        let cwd_alias = resources.join("cwd-alias-project");
+        let workspace_cwd = workspace.join("preflight/.managed-fixture/mcp-cwd-alias");
+        let home_script = home.join("direct-home-preflight.mjs");
+        let home_output = home.join("direct-home-preflight.txt");
+        let shared_env = direct.join(".env");
+        let workspace_config = workspace.join("preflight/opencode.json");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(&package_cwd).unwrap();
+        std::fs::create_dir_all(&direct).unwrap();
+        std::fs::create_dir_all(&cwd_alias).unwrap();
+        std::fs::create_dir_all(&workspace_cwd).unwrap();
+        std::fs::create_dir_all(workspace_config.parent().unwrap()).unwrap();
+        std::fs::write(global.join("opencode.json"), r#"{"model":"fixture/model"}"#).unwrap();
+        std::fs::write(package.join("package.json"), r#"{"type":"module","scripts":{"mcp.js":"bun ./server.mjs"}}"#).unwrap();
+        std::fs::write(package.join("server.mjs"), "process.stdin.resume();\n").unwrap();
+        std::fs::write(
+            direct.join("start"),
+            "#!/bin/sh\ncd \"$(dirname \"$0\")\"\nSCRIPT_DIR=$(dirname \"$0\")\n. \"$SCRIPT_DIR/helper.sh\"\nexec node --env-file=.env \"$SCRIPT_DIR/server.mjs\" \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            direct.join("start"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::write(direct.join("helper.sh"), "export FIXTURE_HELPER=loaded\n").unwrap();
+        std::fs::write(direct.join("server.mjs"), "process.stdin.resume();\n").unwrap();
+        std::fs::write(&shared_env, "FIXTURE_SHARED_ENV=loaded\n").unwrap();
+        std::fs::write(cwd_alias.join("server.mjs"), "process.stdin.resume();\n").unwrap();
+        std::fs::write(cwd_alias.join(".env"), "FIXTURE_CWD_ENV=loaded\n").unwrap();
+        std::os::unix::fs::symlink(&workspace, cwd_alias.join("workspace")).unwrap();
+        std::fs::write(
+            workspace_cwd.join("start"),
+            "#!/bin/sh\nexec node --env-file=.env server.mjs \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            workspace_cwd.join("start"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::write(&home_output, "initial").unwrap();
+        std::fs::write(
+            &home_script,
+            "import fs from 'node:fs'\nconst output = new URL('./direct-home-preflight.txt', import.meta.url)\nfs.appendFileSync(output, '|managed')\n",
+        )
+        .unwrap();
+        let command = |values: Vec<String>, cwd: Option<&Path>| {
+            let mut entry = serde_json::json!({ "type": "local", "command": values });
+            if let Some(cwd) = cwd {
+                entry["cwd"] = serde_json::json!(cwd.to_string_lossy());
+            }
+            entry
+        };
+        std::fs::write(
+            &workspace_config,
+            serde_json::json!({
+                "mcp": {
+                    "managed_fixture": command(vec!["bun".into(), "run".into(), "mcp.js".into()], Some(&package_cwd)),
+                    "direct_script_fixture": command(vec![direct.join("start").to_string_lossy().into_owned()], None),
+                    "workspace_cwd_alias_fixture": command(vec![workspace_cwd.join("start").to_string_lossy().into_owned()], Some(&cwd_alias)),
+                    "direct_home_append_fixture": command(vec![
+                        "node".into(),
+                        format!("--env-file={}", shared_env.display()),
+                        home_script.to_string_lossy().into_owned(),
+                    ], None),
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let global_config = global.join("opencode.json");
+        let plan = plan_opencode_sources(
+            vec![
+                SourceOccurrence {
+                    logical_path: global_config.clone(),
+                    canonical_source: global_config,
+                    lane: SourceLane::Main,
+                    role: DiscoveryRole::Global,
+                },
+                SourceOccurrence {
+                    logical_path: workspace_config.clone(),
+                    canonical_source: workspace_config,
+                    lane: SourceLane::Main,
+                    role: DiscoveryRole::Workspace,
+                },
+            ],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .unwrap();
+        let selected_home_output = home_output.canonicalize().unwrap();
+        assert!(
+            plan.iter().any(|source| source
+                .configured_writable_resources
+                .contains(&selected_home_output)),
+            "the full MCP config must mark the direct HOME append target writable"
+        );
+        let units = resource_units(&home, &global, &workspace, &plan, None).unwrap();
+        let home_output_mount = units
+            .iter()
+            .find(|(source, mount)| {
+                source == &selected_home_output
+                    && mount.kind == freshell_runtime_protocol::ProviderResourceKind::File
+                    && mount.writable
+                    && mount.effective_destination
+                        == "/home/freshell/provider/direct-home-preflight.txt"
+            })
+            .expect("the direct HOME sibling needs its own writable provider mount");
+        assert_eq!(
+            home_output_mount.1.effective_destination,
+            "/home/freshell/provider/direct-home-preflight.txt"
+        );
+        let excluded = plan
+            .iter()
+            .flat_map(|source| {
+                source
+                    .references
+                    .selections
+                    .iter()
+                    .map(|selection| selection.canonical_source.clone())
+                    .chain(source.configured_resource_exclusions.iter().cloned())
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let provider = copy_selected_units_through_provider_excluding_with_plan(
+            owned.path(), &units, &excluded, &plan,
+        );
+        let provider_output = provider.join(".provider-home/direct-home-preflight.txt");
+        assert!(provider_output.is_file(), "the HOME sibling must survive the complete selected-resource copy");
+        assert_eq!(std::fs::read_to_string(provider_output).unwrap(), "initial");
+    }
+
+    #[test]
     fn direct_node_script_allows_missing_optional_require_resolve_after_all_resource_copies() {
         use std::os::unix::fs::PermissionsExt;
 
