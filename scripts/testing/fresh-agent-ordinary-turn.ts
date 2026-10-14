@@ -1,3 +1,5 @@
+import type { Page } from '@playwright/test'
+
 export type FreshAgentOrdinaryTurnFrame = {
   type?: unknown
   provider?: unknown
@@ -22,6 +24,16 @@ export function freshAgentAssistantResponseFacts(root: ParentNode): { rows: numb
     rows: turns.length,
     textCharacters: bodies.reduce((total, body) => total + (body.textContent?.trim().length ?? 0), 0),
   }
+}
+
+export async function freshAgentAssistantResponseDomFacts(
+  page: Page,
+  paneId: string,
+): Promise<{ rows: number; textCharacters: number }> {
+  // Pane identity is also present on its shell and header. Select the chat
+  // view itself so Playwright evaluates exactly one transcript root.
+  return page.locator(`[data-pane-id="${paneId}"][data-context="fresh-agent"]`)
+    .evaluate(freshAgentAssistantResponseFacts)
 }
 
 /** Existing assistant text counts only when the observed pane grows after send. */

@@ -20,7 +20,7 @@ import {
   type FreshAgentWireObservations,
 } from '../helpers/fresh-agent-browser-wire-observer.js'
 import {
-  freshAgentAssistantResponseFacts,
+  freshAgentAssistantResponseDomFacts as assistantResponseDomFacts,
   freshAgentAssistantTextAppeared,
   freshAgentTurnCompletionStatus,
 } from '../../../scripts/testing/fresh-agent-ordinary-turn.js'
@@ -214,10 +214,6 @@ function ordinaryFreshAgentReadinessFacts(input: { paneId: string; attachSession
     networkEffectsSuppressed: harness?.isAllFreshAgentNetworkEffectsSuppressed?.() === true
       || harness?.isFreshAgentNetworkEffectsSuppressed?.(paneId) === true,
   }
-}
-
-async function assistantResponseDomFacts(page: Page, paneId: string): Promise<{ rows: number; textCharacters: number }> {
-  return page.locator(`[data-pane-id="${paneId}"]`).evaluate(freshAgentAssistantResponseFacts)
 }
 
 async function paneFor(page: Page, observation: Parameters<typeof observeOwnedFreshBrowserPane>[0]) {
