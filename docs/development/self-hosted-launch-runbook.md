@@ -119,7 +119,11 @@ post-deploy soul sweep:
 
 ```bash
 set -euo pipefail
-RUN=$(mktemp -d)   # private per-run dir for the survival snapshots
+# REUSE $RUN when re-running this block in the same shell (the QUICK
+# sequence re-captures after the build): a fresh mktemp would orphan the
+# first directory, and the exit trap only scrubs the CURRENT run's
+# header — an orphaned header is a leaked full-scope token:
+RUN=${RUN:-$(mktemp -d)}   # private per-run dir for the survival snapshots
 # Pin the Docker CLI to the SAME daemon socket the supervisor's unit
 # actually names (its --docker-socket argument, with systemd specifiers
 # %t = the user runtime dir and %h = the home expanded) — a site-specific
@@ -1147,6 +1151,7 @@ if rows:
     print(s["soulId"], s["intentRevision"], s["launchState"], s.get("containerId") or "-")
 else:
     print("")' "$BWS")
+      NO_BROWSER_SOUL=0
       if [ -z "$BS" ]; then
         # Two cases: step 7 FAILED with a diagnosed stale client (no
         # managed soul was ever created — export BROWSER_CHECK_FAILED=1
@@ -1154,6 +1159,7 @@ else:
         # anomaly — refuse):
         if [ "${BROWSER_CHECK_FAILED:-0}" = "1" ]; then
           echo "no managed browser soul (stale-client step 7) — restoring settings and removing the workspace"
+          NO_BROWSER_SOUL=1
         else
           { echo "browser-check soul disappeared from the registry before cleanup — investigate before deleting $BWS (or export BROWSER_CHECK_FAILED=1 if step 7 failed with a stale client)"; exit 1; }
         fi
@@ -1162,11 +1168,12 @@ else:
       # In recovery (no records tie BWS to this run), confirm the
       # browser soul separately — mixing two runs' empty probe dirs
       # must not stop another run's soul unconfirmed:
-      if [ "${RECOVERY_MINTED:-0}" = "1" ]; then
+      if [ "${RECOVERY_MINTED:-0}" = "1" ] && [ "${NO_BROWSER_SOUL:-0}" != 1 ]; then
         echo "Recovery matched browser soul: $BS_ID state=$BS_STATE workspace=$BWS"
         read -r -p "Stop and delete this BROWSER probe soul too? Type 'yes' to confirm: " BCONFIRM
         [ "$BCONFIRM" = "yes" ] || { echo "browser probe left running — resolve $BWS manually"; exit 1; }
       fi
+      if [ "$NO_BROWSER_SOUL" != 1 ]; then
       # An EXITED incarnation can still be desired-running (eligible for
       # recovery) — only a committed stop intent makes it safe to delete
       # the workspace, so require desiredState=="stopped" too:
@@ -1185,6 +1192,7 @@ else:
 o=json.load(sys.stdin)
 assert o.get("outcome")=="verified_empty", o
 print("stopped browser soul:", o["outcome"])'
+      fi
       fi
     fi
     # Restore OpenCode's default cwd that the directory step overwrote
