@@ -344,6 +344,7 @@ DOCKER_ARGS=(
   -v "${REPO_ROOT}:/workspace"
   -v freshell-sandbox-cargo-registry:/usr/local/cargo/registry
   -v freshell-sandbox-cargo-git:/usr/local/cargo/git
+  -v freshell-sandbox-pnpm-store:/home/sandbox/.local/share/pnpm/store
   -v freshell-sandbox-cargo-target:/workspace/target
   -v freshell-sandbox-node-modules:/workspace/node_modules
   # pnpm workspace members with their own dependencies get their own

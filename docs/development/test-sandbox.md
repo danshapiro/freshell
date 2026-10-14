@@ -113,8 +113,10 @@ lock presence, npm's `package-lock.json` first so legacy branches keep their
   explicit `--store-dir /home/sandbox/.local/share/pnpm/store`. The explicit
   store dir is load-bearing: pnpm's default store-path resolution probes the
   project root's writability, and the bind-mounted repo is not writable by the
-  sandbox user, so the default probe would fail every install. The store lives
-  inside the container at the same per-user location pnpm would pick itself.
+  sandbox user, so the default probe would fail every install. The store uses
+  the sandbox-owned `freshell-sandbox-pnpm-store` volume. This keeps it writable
+  under `--runtime-suite`'s read-only container root and lets its offline
+  dependency install reuse packages prepared by an ordinary sandbox run.
 - Install success is recorded in `node_modules/.sandbox-deps-state` — a
   fingerprint over the manager and its version, the install policy flags, the
   root manifest, the selected manager's lock/config files, and the workspace

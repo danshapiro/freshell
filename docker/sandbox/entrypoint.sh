@@ -71,6 +71,7 @@ chown "${TARGET_UID}:${TARGET_GID}" /home/sandbox/.cache
 VOLUME_DIRS=(
   "/usr/local/cargo/registry"
   "/usr/local/cargo/git"
+  "/home/sandbox/.local/share/pnpm/store"
   "/workspace/target"
   "/workspace/node_modules"
   "/home/sandbox/.cache/ms-playwright"
