@@ -3734,6 +3734,23 @@ fn write_provider_bootstrap_files(
     )
 }
 
+fn create_codex_home_if_absent(home: &Path) -> Result<Option<PathBuf>, String> {
+    // Codex requires an explicitly configured CODEX_HOME to exist before
+    // startup, even without config or credentials. Return only a new root
+    // for ownership handoff; an existing native store keeps its identity.
+    let codex_home = home.join(".codex");
+    match std::fs::symlink_metadata(&codex_home) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(None),
+        Ok(_) => Err("managed CODEX_HOME must be a physical directory".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&codex_home).map_err(|error| error.to_string())?;
+            set_mode(&codex_home, 0o700)?;
+            Ok(Some(codex_home))
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 fn write_provider_bootstrap_files_with_publish(
     provider: &str,
     files: &[ProviderBootstrapFile],
@@ -3817,6 +3834,9 @@ fn write_provider_bootstrap_files_with_publish(
         .map(|path| home.join(path))
         .collect::<Vec<_>>();
     publication.commit().map_err(|error| error.to_string())?;
+    if provider == "codex" {
+        paths.extend(create_codex_home_if_absent(home)?);
+    }
     paths.push(home.to_owned());
     emit_environment_event(
         serde_json::json!({"severity":"info","event":"provider.bootstrap.published","provider":provider,"entries":paths.len()}),
@@ -11545,6 +11565,100 @@ console.log('actual library export/import/full-row reader and Node semantic bind
                 std::fs::read(home.join("provider-sibling")).unwrap(),
                 b"durable"
             );
+        }
+
+        #[test]
+        fn empty_codex_state_supports_provider_startup_for_terminal_and_fresh_launches() {
+            for fresh in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let home = root.path().join("provider");
+                std::fs::create_dir(&home).unwrap();
+                let paths = ProviderConfigPaths {
+                    private_mount: root.path().join("private"),
+                    provider_home: home.clone(),
+                };
+                let uid = unsafe { libc::geteuid() };
+                let gid = unsafe { libc::getegid() };
+                if fresh {
+                    let launch: FreshAgentLaunchSpec = serde_json::from_value(serde_json::json!({
+                        "sessionId":"codex-startup", "provider":"codex",
+                        "sessionType":"freshcodex", "runtimeVariant":"codex-app-server",
+                        "providerStoreId":"codex-store", "cwd":root.path(),
+                        "workspacePath":root.path(), "runAsUid":uid, "runAsGid":gid
+                    }))
+                    .unwrap();
+                    prepare_fresh_provider_state_at(&launch, &paths, &root.path().join("inputs"))
+                        .unwrap();
+                } else {
+                    let mut terminal: TerminalLaunchSpec =
+                        serde_json::from_value(serde_json::json!({
+                            "terminalId":"codex-startup", "streamId":"codex-stream",
+                            "mode":"codex", "program":"codex", "cwd":root.path(),
+                            "runAsUid":uid, "runAsGid":gid, "cols":80, "rows":24,
+                            "projectKey":"codex-startup", "workspacePath":root.path()
+                        }))
+                        .unwrap();
+                    prepare_provider_state_for_fresh_launch_at(
+                        &mut terminal,
+                        &paths,
+                        &root.path().join("inputs"),
+                    )
+                    .unwrap();
+                }
+
+                // An explicit CODEX_HOME must already exist when Codex starts.
+                // Exercise the child boundary and native-store writability,
+                // with no config projection or credential file to create it.
+                let codex_home = home.join(".codex");
+                let started = Command::new("sh")
+                    .args([
+                        "-c",
+                        "cd \"$CODEX_HOME\" && mkdir sessions && printf native-started > sessions/startup",
+                    ])
+                    .env("CODEX_HOME", &codex_home)
+                    .output()
+                    .unwrap();
+                assert!(
+                    started.status.success(),
+                    "{} launch cannot start with an explicit CODEX_HOME: {}",
+                    if fresh { "fresh" } else { "terminal" },
+                    String::from_utf8_lossy(&started.stderr)
+                );
+                assert_eq!(
+                    std::fs::read(codex_home.join("sessions/startup")).unwrap(),
+                    b"native-started"
+                );
+                assert_eq!(
+                    std::fs::metadata(&codex_home).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
+        }
+
+        #[test]
+        fn codex_initialization_preserves_an_existing_native_home_and_history() {
+            use std::os::unix::fs::MetadataExt;
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("provider");
+            let codex_home = home.join(".codex");
+            std::fs::create_dir_all(codex_home.join("sessions")).unwrap();
+            std::fs::set_permissions(&codex_home, std::fs::Permissions::from_mode(0o750)).unwrap();
+            let history = codex_home.join("sessions/existing.jsonl");
+            std::fs::write(&history, b"retained-native-history").unwrap();
+            let before = std::fs::metadata(&codex_home).unwrap();
+            let history_inode = std::fs::metadata(&history).unwrap().ino();
+
+            let created =
+                write_provider_bootstrap_files("codex", &[], &home, &root.path().join("inputs"))
+                    .unwrap();
+            assert!(!created.contains(&codex_home));
+            let after = std::fs::metadata(&codex_home).unwrap();
+            assert_eq!(
+                (after.ino(), after.uid(), after.gid(), after.mode()),
+                (before.ino(), before.uid(), before.gid(), before.mode())
+            );
+            assert_eq!(std::fs::metadata(&history).unwrap().ino(), history_inode);
+            assert_eq!(std::fs::read(history).unwrap(), b"retained-native-history");
         }
         #[test]
         fn all_selected_entries_above_ten_thousand_remain_runnable() {
