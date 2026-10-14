@@ -1977,6 +1977,23 @@ impl TerminalLaunchSpec {
     }
 }
 
+/// Approved SHA-256 digests of the managed Claude `--settings` recipe
+/// (`freshell_platform::cli_launch::claude_settings_json`). The recipe is
+/// pinned by digest (not raw text) so the list stays a fixed-size constant.
+/// Superseded recipe revisions stay listed so durable argv persisted under
+/// them keeps validating. When `freshell-platform` changes the recipe, add
+/// the new digest here — the drift-guard test
+/// (`approved_claude_settings_digests_track_current_recipes`) fails with the
+/// computed digest until you do.
+const APPROVED_CLAUDE_SETTINGS_DIGESTS: [&str; 4] = [
+    // Current recipes (since 0908a4624, Oct 4 2026: bell via hook response).
+    "41b86fd2aed9fa85ad0c3e99695de49fdadc36fcd6dc80d9fb53a2305b95cd71", // Unix
+    "b48c5d93ff2129438e2e10dc9eadc45849ec1b93c683a1ca08aebaa55d46a786", // Windows
+    // Superseded recipes (pre-0908a4624: bell via /dev/tty and CONOUT$).
+    "aa8900bab7bd9bcbb64634d60593a9217c1639b539cea23318122b3428d123c6", // Unix
+    "d2dcb96c036160b2469bcd732fdc8d767dd481f9c0c864ce47d58ed057652c4d", // Windows
+];
+
 /// Durable argv accepts only provider launch selectors. Credential-bearing
 /// switches must be resolved through the child-only OneCLI path instead.
 pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(), RuntimeError> {
@@ -2017,11 +2034,7 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
         let allowed = match (mode, flag) {
             ("claude", "--settings") => {
                 let digest = format!("{:x}", sha2::Sha256::digest(value.as_bytes()));
-                matches!(
-                    digest.as_str(),
-                    "aa8900bab7bd9bcbb64634d60593a9217c1639b539cea23318122b3428d123c6"
-                        | "d2dcb96c036160b2469bcd732fdc8d767dd481f9c0c864ce47d58ed057652c4d"
-                )
+                APPROVED_CLAUDE_SETTINGS_DIGESTS.contains(&digest.as_str())
             }
             ("claude", "--mcp-config") => matches!(
                 value.as_str(),
@@ -3045,6 +3058,34 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The managed Claude `--settings` payload is BUILT by freshell-platform
+    /// (`cli_launch::claude_settings_json`) but APPROVED by digest in this
+    /// crate. The two once drifted (0908a4624 rewrote the bell commands
+    /// without updating the approved digests) and every managed Claude launch
+    /// was rejected for 10 days. This guard pins the crates together: if the
+    /// recipe changes without the digest list, rust-gate fails HERE.
+    #[test]
+    fn approved_claude_settings_digests_track_current_recipes() {
+        let mut drift = Vec::new();
+        for target in [
+            freshell_platform::cli_launch::ProviderTarget::Unix,
+            freshell_platform::cli_launch::ProviderTarget::Windows,
+        ] {
+            let recipe = freshell_platform::cli_launch::claude_settings_json(target);
+            let digest = format!("{:x}", sha2::Sha256::digest(recipe.as_bytes()));
+            let args = vec!["--settings".to_string(), recipe];
+            if validate_managed_terminal_args("claude", &args).is_err() {
+                drift.push(format!("{target:?}: {digest}"));
+            }
+        }
+        assert!(
+            drift.is_empty(),
+            "claude --settings recipe digests not in the approved list: \
+             {drift:#?}; update APPROVED_CLAUDE_SETTINGS_DIGESTS in this \
+             crate to match freshell-platform's current recipe"
+        );
+    }
 
     #[test]
     fn durable_terminal_argument_recipe_preserves_provider_options_and_legacy_modes() {
