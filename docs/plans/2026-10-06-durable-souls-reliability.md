@@ -7,7 +7,7 @@
 ## User Request
 
 ### Requested result
-Complete Stage 4 of the planned durable-souls repair, including ordinary use in the six selected modes, then stop before beginning Stage 5. Reconcile the run record against the actual artifacts before continuing.
+Continue the durable-souls repair from its saved state through Stage 5's final whole-delta review and the usual recap. Proceed to Stage 5 without waiting for the unavailable test grant, and report the unfinished Task 9 ordinary-use checks accurately.
 
 ### Explicit constraints
 - Use the-usual workflow and a dedicated worktree; fix test failures found in this repair and continue.
@@ -18,11 +18,12 @@ Complete Stage 4 of the planned durable-souls repair, including ordinary use in 
 - Do not inspect provider-result files, Cloud launcher output, provider output, terminal snapshots, prompts, or response bodies.
 - For Stage 5 Fresh Eyes, use the runner's `--gpt` option because other models are unavailable; this is the user's explicit exception to the different-model-family preference.
 - Do not make changes to the rubric while its example wording remains under discussion.
-- The user approved `--local` for the six exact Task 9 ordinary-turn selectors because the selected specs are excluded from Cloud; run them separately and stop before Stage 5.
+- The user approved `--local` for the six exact Task 9 ordinary-turn selectors because the selected specs are excluded from Cloud; those checks ran and remain 0/6. Proceed to Stage 5 without the existing test grant, but do not count the failed checks as acceptance.
 
 ### Accepted tradeoffs and residuals
 - Existing provider sessions may not survive a runtime transition; manual porting may be needed later.
 - Amplifier and Kilroy are outside this repair's live checks.
+- The existing isolated test grant is unavailable. Stage 5 may proceed, while Task 9's 0/6 ordinary-use result remains unresolved and must not be described as passing.
 **Goal:** Fix the diagnosed durable-souls defects and verify ordinary one-turn use in the six selected modes without requiring same-session continuity across a transition.
 
 **Architecture:** Correct the existing runtime paths and use focused behavior tests plus isolated managed-browser smoke checks. Preserve existing session data; do not add an audit or certification campaign. If a provider transition leaves an old conversation behind, manual porting is acceptable.
