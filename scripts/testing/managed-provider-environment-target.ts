@@ -1541,7 +1541,8 @@ export async function runManagedEnvironmentTarget() {
       if (Date.now() - aliasWaitStartedAt > 30_000) return { wrapperStarted: false, nodeStartupTimedOut: true }
       return undefined
     }, 45_000)
-    assert.equal(preflightCwdAliasMcp.expectedNonce, nonce)
+    assert.equal(preflightCwdAliasMcp.expectedNonce, nonce,
+      `workspace external-CWD MCP did not complete its receipt: ${JSON.stringify(preflightCwdAliasMcp)}`)
     assert.equal(preflightCwdAliasMcp.helper, nonce)
     assert.equal(preflightCwdAliasMcp.envValueLoaded, true)
     assert.match(preflightCwdAliasMcp.envFileTarget, /^\/home\/freshell\/provider\/\.freshell\/references\/\d+$/)
