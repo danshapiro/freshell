@@ -123,6 +123,13 @@ type ManagedCreateOwner = {
 
 const safeLogLevels = new Set(['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR'])
 
+export function summarizeProviderPreparationFailure(
+  value: ErrorMessage['providerPreparationFailure'],
+): Pick<NonNullable<ErrorMessage['providerPreparationFailure']>, 'code' | 'stage' | 'operation' | 'cause'> | undefined {
+  if (!value) return undefined
+  return { code: value.code, stage: value.stage, operation: value.operation, cause: value.cause }
+}
+
 export function summarizeRustServerLogEvents(raw: string): Array<{
   level: string
   event?: string
@@ -281,6 +288,9 @@ export function assertManagedTerminalCreated(owner: ManagedCreateOwner,
     owner.runtime.writeIncident('managed-environment-create-failure', {
       severity: 'error', event: 'managed_environment.create_failed', code: code.success ? code.data : 'UNKNOWN', reason, ...(osError === undefined ? {} : { osError }),
       serverLogEvents,
+      ...(response.providerPreparationFailure
+        ? { providerPreparationFailure: summarizeProviderPreparationFailure(response.providerPreparationFailure) }
+        : {}),
       server: { source: 'owned-server-typed-reply',
         capturedOutputAvailable: Boolean(web.stdout || web.stderr) }, supervisor, sessionHost,
     })

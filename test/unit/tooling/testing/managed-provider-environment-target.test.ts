@@ -3,7 +3,10 @@ import fs from 'node:fs/promises'
 import { createConnection, createServer, type AddressInfo } from 'node:net'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { summarizeRustServerLogEvents } from '../../../../scripts/testing/managed-environment-create.js'
+import {
+  assertManagedTerminalCreated,
+  summarizeRustServerLogEvents,
+} from '../../../../scripts/testing/managed-environment-create.js'
 import {
   checkpointTcpForwarderSource,
   externalTargetRead,
@@ -23,6 +26,39 @@ async function listenOnLoopback(server: ReturnType<typeof createServer>): Promis
 }
 
 describe('managed provider environment target mode', () => {
+  it('records typed provider preparation causes without persisting paths', () => {
+    const incidents: unknown[] = []
+    const owner = {
+      web: { capturedOutput: () => ({ stdout: '', stderr: '' }), info: { logsDir: '/nonexistent/managed-test' } },
+      runtime: { containerLogs: () => '', writeIncident: (_name: string, value: unknown) => incidents.push(value) },
+      supervisor: { containerId: 'a'.repeat(64) },
+    }
+    const response = {
+      type: 'error' as const,
+      code: 'PTY_SPAWN_FAILED' as const,
+      timestamp: new Date().toISOString(),
+      message: 'managed runtime launch failed',
+      providerPreparationFailure: {
+        code: 'SELECTED_REFERENCE_UNAVAILABLE' as const,
+        stage: 'configuration' as const,
+        operation: 'resolve' as const,
+        cause: 'permission_denied' as const,
+        workspace: '/private/workspace',
+        declaringConfig: '/private/home/opencode.json',
+        selectedPath: '/private/home/mcp-server.mjs',
+      },
+    }
+
+    expect(() => assertManagedTerminalCreated(owner, response)).toThrow()
+    expect(incidents).toHaveLength(1)
+    expect(incidents[0]).toMatchObject({
+      providerPreparationFailure: {
+        code: 'SELECTED_REFERENCE_UNAVAILABLE', stage: 'configuration', operation: 'resolve', cause: 'permission_denied',
+      },
+    })
+    expect(JSON.stringify(incidents[0])).not.toContain('/private/')
+  })
+
   it('retains only bounded event names and levels from server logs', () => {
     const logs = [
       JSON.stringify({ level: 'ERROR', event: 'provider.opencode.resource.failed', target: 'freshell_server::managed_runtime',
