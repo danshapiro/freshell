@@ -130,6 +130,25 @@ export function summarizeProviderPreparationFailure(
   return { code: value.code, stage: value.stage, operation: value.operation, cause: value.cause }
 }
 
+const runtimeErrorCodes = [
+  'InvalidRequest', 'ProviderInputsChanged', 'ProtocolVersionMismatch', 'UnauthorizedRole', 'FrameTooLarge',
+  'RequestIdConflict', 'RegistryBusy', 'RegistryFailure', 'StaleControlEpoch', 'StaleIntentRevision',
+  'LossCertificationBlocked', 'IncidentPersistenceFailed', 'NoticeNotFound', 'MigrationBlocked', 'RepairBlocked',
+  'UnknownSoul', 'UnknownIncarnation', 'OwnershipMismatch', 'BackendUnavailable', 'TerminationUnconfirmed',
+  'HostUnreachable', 'HostAuthenticationFailed', 'StaleExecutionGrant', 'InvalidRuntimeLimits', 'BlockedResource',
+  'CommandAmbiguous', 'OutputCursorExpired', 'UnsupportedWorkload', 'UnsupportedOperation',
+  'OperationImplementationUnavailable', 'FaultInjected', 'RecoveryBlocked', 'RecoveryImplementationUnavailable',
+  'RecoveryWrongIdentity', 'RecoveryRetryBudget', 'RecoveryInProgress', 'RecoveryStopUnconfirmed',
+] as const
+
+export function summarizeRuntimeErrorCode(message: string): typeof runtimeErrorCodes[number] | undefined {
+  const prefix = 'runtime supervisor rejected request: '
+  const index = message.indexOf(prefix)
+  if (index < 0) return undefined
+  const rejection = message.slice(index + prefix.length)
+  return runtimeErrorCodes.find(code => rejection.startsWith(`${code}:`))
+}
+
 export function summarizeRustServerLogEvents(raw: string): Array<{
   level: string
   event?: string
@@ -226,6 +245,7 @@ export function assertManagedTerminalCreated(owner: ManagedCreateOwner,
     const filesystemLabel = filesystemLabels.find(value => response.message.includes(`${value}:`))
     const errno = response.message.match(/\(os error (\d{1,4})\)/)
     const osError = errno ? Number(errno[1]) : undefined
+    const runtimeErrorCode = summarizeRuntimeErrorCode(response.message)
     const reason = failureReasons.find(value => response.message.includes(value)) ?? inputReason
       ?? (filesystemLabel && osError !== undefined ? `${filesystemLabel} filesystem error` : 'UNKNOWN')
     const code = ErrorCode.safeParse(response.code)
@@ -288,6 +308,7 @@ export function assertManagedTerminalCreated(owner: ManagedCreateOwner,
     owner.runtime.writeIncident('managed-environment-create-failure', {
       severity: 'error', event: 'managed_environment.create_failed', code: code.success ? code.data : 'UNKNOWN', reason, ...(osError === undefined ? {} : { osError }),
       serverLogEvents,
+      ...(runtimeErrorCode ? { runtimeErrorCode } : {}),
       ...(response.providerPreparationFailure
         ? { providerPreparationFailure: summarizeProviderPreparationFailure(response.providerPreparationFailure) }
         : {}),

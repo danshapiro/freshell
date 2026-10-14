@@ -37,7 +37,7 @@ describe('managed provider environment target mode', () => {
       type: 'error' as const,
       code: 'PTY_SPAWN_FAILED' as const,
       timestamp: new Date().toISOString(),
-      message: 'managed runtime launch failed',
+      message: 'managed runtime launch failed: runtime supervisor rejected request: BackendUnavailable: /private/runtime/path',
       providerPreparationFailure: {
         code: 'SELECTED_REFERENCE_UNAVAILABLE' as const,
         stage: 'configuration' as const,
@@ -52,6 +52,7 @@ describe('managed provider environment target mode', () => {
     expect(() => assertManagedTerminalCreated(owner, response)).toThrow()
     expect(incidents).toHaveLength(1)
     expect(incidents[0]).toMatchObject({
+      runtimeErrorCode: 'BackendUnavailable',
       providerPreparationFailure: {
         code: 'SELECTED_REFERENCE_UNAVAILABLE', stage: 'configuration', operation: 'resolve', cause: 'permission_denied',
       },
