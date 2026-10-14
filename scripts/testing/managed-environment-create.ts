@@ -189,6 +189,33 @@ export function summarizeRustServerLogEvents(raw: string): Array<{
   return summary.slice(-32)
 }
 
+const maxRustServerLogTailBytes = 512 * 1024
+
+function readRustServerLogEvents(logPath: string): ReturnType<typeof summarizeRustServerLogEvents> {
+  let descriptor: number | undefined
+  try {
+    descriptor = fs.openSync(logPath, 'r')
+    const metadata = fs.fstatSync(descriptor)
+    if (!metadata.isFile()) return []
+    const byteLength = Math.min(metadata.size, maxRustServerLogTailBytes)
+    const buffer = Buffer.allocUnsafe(byteLength)
+    const position = metadata.size - byteLength
+    let bytesRead = 0
+    while (bytesRead < byteLength) {
+      const count = fs.readSync(descriptor, buffer, bytesRead, byteLength - bytesRead, position + bytesRead)
+      if (count === 0) break
+      bytesRead += count
+    }
+    return summarizeRustServerLogEvents(buffer.subarray(0, bytesRead).toString('utf8'))
+  } catch {
+    return []
+  } finally {
+    if (descriptor !== undefined) {
+      try { fs.closeSync(descriptor) } catch { /* A diagnostic descriptor may already be closed. */ }
+    }
+  }
+}
+
 const failureReasons = [
   'OneCLI grant is unavailable',
   'prepared private source unreadable',
@@ -260,14 +287,7 @@ export function assertManagedTerminalCreated(owner: ManagedCreateOwner,
       ?? (filesystemLabel && osError !== undefined ? `${filesystemLabel} filesystem error` : 'UNKNOWN')
     const code = ErrorCode.safeParse(response.code)
     const web = owner.web.capturedOutput()
-    let serverLogEvents: Array<{ level: string; event: string }> = []
-    try {
-      const logPath = path.join(owner.web.info.logsDir, 'rust-server.jsonl')
-      const metadata = fs.statSync(logPath)
-      if (metadata.isFile() && metadata.size <= 4 * 1024 * 1024) {
-        serverLogEvents = summarizeRustServerLogEvents(fs.readFileSync(logPath, 'utf8'))
-      }
-    } catch { /* Missing or oversized logs remain unavailable. */ }
+    const serverLogEvents = readRustServerLogEvents(path.join(owner.web.info.logsDir, 'rust-server.jsonl'))
     let supervisor: Record<string, string> | 'UNKNOWN' = 'UNKNOWN'
     let sessionHost: Record<string, unknown> | 'UNKNOWN' = 'UNKNOWN'
     try {

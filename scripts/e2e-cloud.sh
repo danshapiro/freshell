@@ -796,16 +796,20 @@ cmd_run() {
   # Capture to a variable so we can print the full output AND extract a
   # per-shard summary, even when some shards fail.
   echo "[e2e-cloud] Fetching logs..."
-  local log_output="" summary_lines="" display_log_unavailable=false summary_footer_present=false
+  local log_output="" summary_lines="" display_log_unavailable=false summary_footers_complete=false
+  local summary_footer_count
   local summary_attempt
   for summary_attempt in 1 2 3 4 5; do
     if log_output=$(gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" 2>&1); then
       summary_lines=$(printf '%s\n' "$log_output" | node "$ROOT/scripts/testing/e2e-cloud-log-summary.mjs")
       display_log_unavailable=false
-      if printf '%s\n' "$summary_lines" | grep -Eq '^[[:space:]]+[0-9]+ (failed|passed|skipped|interrupted)\b'; then
-        summary_footer_present=true
+      summary_footer_count=$(printf '%s\n' "$summary_lines" \
+        | grep -Ec '^[[:space:]]+[0-9]+ (failed|passed|skipped|interrupted)\b' || true)
+      summary_footers_complete=false
+      if [ "$summary_footer_count" -ge "$shards" ]; then
+        summary_footers_complete=true
       fi
-      if $summary_footer_present || $playwright_dry_run; then
+      if $summary_footers_complete || $playwright_dry_run; then
         break
       fi
     else
@@ -822,8 +826,8 @@ cmd_run() {
     # display, but never decides whether retry evidence exists; that decision
     # comes from the required jsonPayload query below.
     echo "[e2e-cloud] WARNING: could not read display logs after five attempts." >&2
-  elif ! $summary_footer_present && ! $playwright_dry_run; then
-    echo "[e2e-cloud] WARNING: Playwright summary footer was not present in display logs after five attempts." >&2
+  elif ! $summary_footers_complete && ! $playwright_dry_run; then
+    echo "[e2e-cloud] WARNING: Playwright summary footers for all ${shards} shard(s) were not present in display logs after five attempts." >&2
   fi
 
   # Print logs from every shard. Retry traces are retained as bounded base64

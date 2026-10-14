@@ -80,6 +80,32 @@ describe('managed provider environment target mode', () => {
     expect(JSON.stringify(summary)).not.toContain('PRIVATE_')
   })
 
+  it('keeps the bounded tail of a large active server log in failure evidence', async () => {
+    const directory = await fs.mkdtemp(path.join(process.env.TMPDIR ?? '/tmp', 'frs-managed-server-log-'))
+    const incidents: Array<Record<string, unknown>> = []
+    try {
+      const logPath = path.join(directory, 'rust-server.jsonl')
+      const tail = { level: 'INFO', target: 'freshell_server::managed_runtime', stage: 'activate' }
+      await fs.writeFile(logPath, `${'x'.repeat(5 * 1024 * 1024)}\n${JSON.stringify(tail)}\n`)
+      expect((await fs.stat(logPath)).size).toBeGreaterThan(4 * 1024 * 1024)
+
+      const owner = {
+        web: { capturedOutput: () => ({ stdout: '', stderr: '' }), info: { logsDir: directory } },
+        runtime: { containerLogs: () => '', writeIncident: (_name: string, value: unknown) => incidents.push(value as Record<string, unknown>) },
+        supervisor: { containerId: 'a'.repeat(64) },
+      }
+      const response = { type: 'error' as const, code: 'PTY_SPAWN_FAILED' as const,
+        timestamp: new Date().toISOString(), message: 'managed runtime launch failed' }
+
+      expect(() => assertManagedTerminalCreated(owner, response)).toThrow()
+      expect(incidents[0]?.serverLogEvents).toEqual([
+        { level: 'INFO', target: tail.target, fields: ['stage'] },
+      ])
+    } finally {
+      await fs.rm(directory, { recursive: true, force: true })
+    }
+  })
+
   it('waits for the target Retry-After before retrying a rate-limited control read', async () => {
     const responses = [
       new Response('rate limited', { status: 429, headers: { 'retry-after': '2' } }),

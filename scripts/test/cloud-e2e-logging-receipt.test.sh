@@ -30,7 +30,14 @@ case "$*" in
   *"executions logs read"*)
     count_file="$STUB_CAPTURE/logs.count"
     count="$(cat "$count_file" 2>/dev/null || echo 0)"; count=$((count + 1)); echo "$count" > "$count_file"
-    if [ "${STUB_DELAY_SUMMARY_ONCE:-0}" = 1 ] && [ "$count" -eq 1 ]; then
+    if [ "${STUB_DELAY_SECOND_SHARD_FOOTER_ONCE:-0}" = 1 ]; then
+      echo "[e2e-entrypoint] Shard 1/2 assignment: focused fixture"
+      echo "[e2e-entrypoint] Shard 2/2 assignment: focused fixture"
+      echo "  2 passed (5.0s)"
+      if [ "$count" -gt 1 ]; then
+        echo "  2 passed (7.0s)"
+      fi
+    elif [ "${STUB_DELAY_SUMMARY_ONCE:-0}" = 1 ] && [ "$count" -eq 1 ]; then
       echo "[e2e-entrypoint] Shard 1/2 assignment: focused fixture"
     else
       echo "[e2e-entrypoint] Shard 1/2 assignment: focused fixture"
@@ -119,6 +126,20 @@ if ! grep -Fq 'labels."run.googleapis.com/execution_name"="exec-json-receipt"' "
   || grep -Fq 'labels.execution_name' "$WORK/capture/gcloud.args"; then
   echo "FAIL: wrapper did not issue a structured jsonPayload Cloud Logging query scoped to its execution"
   cat "$WORK/capture/gcloud.args"; exit 1
+fi
+
+# A footer from the first task is not a complete display summary when the
+# requested run has multiple shards. Keep reading until every shard footer is
+# visible, even if one task's footer arrives before the others.
+rm -f "$WORK/capture/logs.count" "$WORK/capture/logging.count" "$WORK/capture/gcloud.args"
+PARTIAL_SHARD_OUT="$(env PATH="$WORK/bin:$PATH" STUB_CAPTURE="$WORK/capture" STUB_DELAY_SECOND_SHARD_FOOTER_ONCE=1 STUB_LOGGING_JSON="$records_no_retry" GCLOUD_IDENT=stub@example.invalid "$SCRIPT" run --cloud --shards=2 2>&1)" || {
+  echo "FAIL: two-shard run with delayed display footer failed"; echo "$PARTIAL_SHARD_OUT"; exit 1
+}
+if [ "$(cat "$WORK/capture/logs.count")" -lt 2 ] \
+  || ! grep -q "2 passed (5.0s)" <<< "$PARTIAL_SHARD_OUT" \
+  || ! grep -q "2 passed (7.0s)" <<< "$PARTIAL_SHARD_OUT"; then
+  echo "FAIL: wrapper stopped reading display logs before every shard footer arrived"
+  echo "$PARTIAL_SHARD_OUT"; cat "$WORK/capture/gcloud.args"; exit 1
 fi
 
 records_empty_shards='[
