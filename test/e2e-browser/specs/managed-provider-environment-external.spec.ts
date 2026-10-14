@@ -1,4 +1,5 @@
 import type { Page } from '@playwright/test'
+import path from 'node:path'
 import { resolvePairedExternalFixture } from '../../../scripts/testing/e2e-external-target.js'
 import { test, expect } from '../helpers/fixtures.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
@@ -234,7 +235,9 @@ test(healthyTitle, async ({ page }, info) => {
   await expect.poll(async () => {
     directMcpReceipt = await readReceipt(page, `${pane.cwd}/.managed-fixture/direct-mcp-receipt.json`)
     return directMcpReceipt
-  }, { timeout: 120_000 }).toMatchObject({ expectedNonce: fixture.expectedNonce, helper: fixture.expectedNonce, cwd: pane.cwd })
+  }, { timeout: 120_000 }).toMatchObject({ expectedNonce: fixture.expectedNonce, helper: fixture.expectedNonce })
+  // The shell wrapper changes into its own MCP directory before launching Node.
+  expect(directMcpReceipt.cwd).toBe(path.dirname(directMcpReceipt.scriptPath))
   expect(directMcpReceipt).toMatchObject({ sibling: fixture.expectedNonce,
     dependency: fixture.expectedNonce, schemaNonce: fixture.expectedNonce,
     envFileOperandRewritten: true, envValueLoaded: true })
