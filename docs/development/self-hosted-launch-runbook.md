@@ -105,8 +105,11 @@ cargo build --release -p freshell-server -p freshell-supervisor \
   -p freshell-session-host --features freshell-server/managed-runtime-v1
 ```
 
-**Preliminary: capture the baseline.** Before restarting anything,
-capture two snapshots into a private per-run directory (fixed `/tmp`
+**Preliminary: capture the baseline.** Capture two snapshots into a
+private per-run directory (in the QUICK sequence, re-run this block
+AFTER the build and immediately before the restart, so souls created
+during the build are baselined; in the STRICT sequence, run it before
+the stop) (fixed `/tmp`
 paths would let a second run overwrite the first run's baseline before
 its comparison): the RUNNING containers (their IDs and exact start
 times) and the DESIRED-RUNNING soul IDs — the supervisor reconciles
@@ -222,9 +225,13 @@ process tree (for example an SSH session to the host) — a host-side
 Freshell terminal pane is itself killed by the restart, which would abort
 the procedure mid-way and leave the service down. Two sequences:
 
-- Quick (compatible changes): build, then restart immediately, accepting
-  the short skew window.
-- Strict (changes that must never skew): FIRST `systemctl --user stop
+- Quick (compatible changes): build, then RE-CAPTURE the baseline block
+  immediately before the restart (souls created during the build are
+  otherwise unbaselined and their loss goes undetected), then restart.
+  The short skew window is accepted.
+- Strict (changes that must never skew): FIRST re-run the baseline
+  capture block above (nothing new can be created after the stop, so
+  a pre-stop baseline is complete), then `systemctl --user stop
   freshell-supervisor.service` (the server stops with it via the
   `Requires=` coupling), THEN run the build command from the Build
   surface above — never before the stop, or the running supervisor
@@ -777,6 +784,11 @@ for r in (afp or []):
     # does NOT permit $HOME/freshell-probe.* even though the entry sits
     # under $HOME; allowed=["/home"] DOES. A grep for "^$HOME" answers
     # the wrong question for both cases:
+    # An empty/unset allowedFilePaths means the server permits ALL
+    # paths — treat that as allowed, not denied:
+    if [ -z "$(printf '%s' "$ALLOWED" | tr -d '[:space:]')" ]; then
+      PROBE_PATH_OK=1
+    else
     PROBE_PATH_OK=0
     while read -r A; do
       [ -n "$A" ] || continue
@@ -789,6 +801,7 @@ for r in (afp or []):
         "$A"|"$A"/*) PROBE_PATH_OK=1; break ;;
       esac
     done <<<"$ALLOWED"
+    fi
     if [ "$PROBE_PATH_OK" != 1 ]; then
       # Pick the first USABLE Linux-path root: the server maps
       # Windows-style roots (WSL deployments, e.g. C:\Users\...) to
@@ -1135,12 +1148,25 @@ if rows:
 else:
     print("")' "$BWS")
       if [ -z "$BS" ]; then
-        # Step 7 VERIFIED a running soul in this workspace; a row that
-        # vanished since is an anomaly, not success — do not delete the
-        # workspace while the soul's intent is unresolved:
-        { echo "browser-check soul disappeared from the registry before cleanup — investigate before deleting $BWS"; exit 1; }
+        # Two cases: step 7 FAILED with a diagnosed stale client (no
+        # managed soul was ever created — export BROWSER_CHECK_FAILED=1
+        # to clean up), or a previously verified soul vanished (an
+        # anomaly — refuse):
+        if [ "${BROWSER_CHECK_FAILED:-0}" = "1" ]; then
+          echo "no managed browser soul (stale-client step 7) — restoring settings and removing the workspace"
+        else
+          { echo "browser-check soul disappeared from the registry before cleanup — investigate before deleting $BWS (or export BROWSER_CHECK_FAILED=1 if step 7 failed with a stale client)"; exit 1; }
+        fi
       fi
       read -r BS_ID BS_REV BS_STATE BS_CID <<< "$BS"
+      # In recovery (no records tie BWS to this run), confirm the
+      # browser soul separately — mixing two runs' empty probe dirs
+      # must not stop another run's soul unconfirmed:
+      if [ "${RECOVERY_MINTED:-0}" = "1" ]; then
+        echo "Recovery matched browser soul: $BS_ID state=$BS_STATE workspace=$BWS"
+        read -r -p "Stop and delete this BROWSER probe soul too? Type 'yes' to confirm: " BCONFIRM
+        [ "$BCONFIRM" = "yes" ] || { echo "browser probe left running — resolve $BWS manually"; exit 1; }
+      fi
       # An EXITED incarnation can still be desired-running (eligible for
       # recovery) — only a committed stop intent makes it safe to delete
       # the workspace, so require desiredState=="stopped" too:
