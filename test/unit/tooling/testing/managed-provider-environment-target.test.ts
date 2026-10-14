@@ -17,6 +17,7 @@ import {
   resolveManagedProviderEnvironmentTargetMode,
   runManagedProviderEnvironmentTarget,
   stopExact,
+  workspaceCwdAliasMcpWrapperSource,
 } from '../../../../scripts/testing/managed-provider-environment-target.js'
 
 async function listenOnLoopback(server: ReturnType<typeof createServer>): Promise<number> {
@@ -152,6 +153,63 @@ describe('managed provider environment target mode', () => {
     expect(paths.output).toBe(path.join(path.dirname(paths.script), 'direct-home-preflight.txt'))
     expect(path.dirname(paths.output)).toBe(path.dirname(paths.script))
     expect(paths.receipt).toBe(path.join(cwd, '.managed-fixture/direct-home-mcp-receipt.json'))
+  })
+
+  it('runs an external-CWD MCP wrapper and reports a Node startup syntax error', async () => {
+    const directory = await fs.mkdtemp(path.join(process.env.TMPDIR ?? '/tmp', 'frs-managed-cwd-alias-mcp-'))
+    try {
+      const workspace = path.join(directory, 'workspace')
+      const resource = path.join(directory, 'selected-resources/cwd-alias-project')
+      const wrapper = path.join(workspace, '.managed-fixture/mcp-cwd-alias/start')
+      const receipt = path.join(workspace, '.managed-fixture/mcp-cwd-alias-receipt.json')
+      await fs.mkdir(path.dirname(wrapper), { recursive: true })
+      await fs.mkdir(resource, { recursive: true })
+      await fs.writeFile(wrapper, workspaceCwdAliasMcpWrapperSource(), { mode: 0o751 })
+      await fs.writeFile(path.join(resource, '.env'), 'FRESHELL_MANAGED_CWD_ALIAS_ENV=expected-nonce\n')
+      await fs.writeFile(path.join(resource, 'server.mjs'), `import fs from 'node:fs'
+const [receiptPath, expectedNonce] = process.argv.slice(2)
+fs.writeFileSync(receiptPath, JSON.stringify({ envValueLoaded: process.env.FRESHELL_MANAGED_CWD_ALIAS_ENV === expectedNonce,
+  envFileTarget: fs.realpathSync('.env'), envFileOperand: process.execArgv.find(value => value.startsWith('--env-file=')),
+  cwd: process.cwd() }))
+`)
+
+      const launch = async (expectedReceipt: string) => {
+        const child = spawn(wrapper, [expectedReceipt, 'expected-nonce'], {
+          cwd: resource,
+          stdio: ['ignore', 'ignore', 'pipe'],
+        })
+        let stderr = ''
+        child.stderr?.setEncoding('utf8')
+        child.stderr?.on('data', chunk => { stderr += chunk })
+        const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+          child.once('error', reject)
+          child.once('close', (code, signal) => resolve({ code, signal }))
+        })
+        return { exit, stderr }
+      }
+
+      const success = await launch(receipt)
+      expect(success).toMatchObject({ exit: { code: 0, signal: null }, stderr: '' })
+      expect(await fs.readFile(`${receipt}.started`, 'utf8')).toBe('wrapper-started')
+      expect(JSON.parse(await fs.readFile(receipt, 'utf8'))).toEqual({
+        envValueLoaded: true,
+        envFileTarget: path.join(resource, '.env'),
+        envFileOperand: '--env-file=.env',
+        cwd: resource,
+      })
+
+      await fs.writeFile(path.join(resource, 'server.mjs'), 'const = invalid\n')
+      const failureReceipt = path.join(workspace, '.managed-fixture/syntax-error-receipt.json')
+      const failure = await launch(failureReceipt)
+      expect(failure.exit).toEqual({ code: 1, signal: null })
+      expect(JSON.parse(await fs.readFile(failureReceipt, 'utf8'))).toMatchObject({
+        wrapperStarted: true,
+        nodeExitCode: 1,
+        stderrHasSyntaxError: true,
+      })
+    } finally {
+      await fs.rm(directory, { recursive: true, force: true })
+    }
   })
 
   it('generates a runnable direct HOME MCP script that appends to its sibling file', async () => {

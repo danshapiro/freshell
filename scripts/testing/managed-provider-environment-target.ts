@@ -193,6 +193,35 @@ process.stdin.on('data', chunk => {
 })
 `
 
+export function workspaceCwdAliasMcpWrapperSource(): string {
+  const receiptVariable = '${receipt}'
+  return `#!/bin/sh
+set +e
+receipt=$1
+started="${receiptVariable}.started"
+printf '%s' wrapper-started > "$started"
+diagnostic=$(mktemp)
+node --env-file=.env server.mjs "$@" 2>"$diagnostic"
+status=$?
+if [ "$status" -ne 0 ]; then
+  has_enoent=false
+  has_eacces=false
+  has_env_file_error=false
+  has_syntax_error=false
+  has_module_error=false
+  grep -q 'ENOENT' "$diagnostic" && has_enoent=true
+  grep -q 'EACCES' "$diagnostic" && has_eacces=true
+  grep -qi 'env file' "$diagnostic" && has_env_file_error=true
+  grep -q 'SyntaxError' "$diagnostic" && has_syntax_error=true
+  if grep -q 'ERR_MODULE_NOT_FOUND' "$diagnostic" || grep -qi 'Cannot find module' "$diagnostic"; then has_module_error=true; fi
+  printf '{"wrapperStarted":true,"nodeExitCode":%s,"stderrHasENOENT":%s,"stderrHasEACCES":%s,"stderrHasEnvFileError":%s,"stderrHasSyntaxError":%s,"stderrHasModuleError":%s}' \
+    "$status" "$has_enoent" "$has_eacces" "$has_env_file_error" "$has_syntax_error" "$has_module_error" > "$receipt"
+fi
+rm -f "$diagnostic"
+exit "$status"
+`
+}
+
 export function directHomeAppendMcpServerSource(outputName: string): string {
   const outputUrl = `new URL(${JSON.stringify(`./${outputName}`)}, import.meta.url)`
   return `import fs from 'node:fs'
@@ -493,8 +522,7 @@ export default {id:'managed-environment-tui',async tui(api,options){
     const cwdAliasWrapper = path.join(cwd, '.managed-fixture/mcp-cwd-alias/start')
     const cwdAliasReceipt = path.join(cwd, '.managed-fixture/mcp-cwd-alias-receipt.json')
     await fs.mkdir(path.dirname(cwdAliasWrapper), { recursive: true, mode: 0o755 })
-    await fs.writeFile(cwdAliasWrapper,
-      '#!/bin/sh\nexec node --env-file=.env server.mjs "$@"\n', { mode: 0o751 })
+    await fs.writeFile(cwdAliasWrapper, workspaceCwdAliasMcpWrapperSource(), { mode: 0o751 })
     await fs.chmod(cwdAliasWrapper, 0o751)
     const homeAppend = managedHomeAppendFixturePaths(home, cwd, scenario)
     await fs.writeFile(homeAppend.script, directHomeAppendMcpServerSource(path.basename(homeAppend.output)))
@@ -1497,8 +1525,22 @@ export async function runManagedEnvironmentTarget() {
     assert.equal(preflightHomeAppend.envFileOperandRewritten, true)
     assert.equal(preflightHomeAppend.envValueLoaded, true)
     assert(preflightHomeAppend.scriptPath.endsWith('/direct-home-preflight.mjs'))
-    const preflightCwdAliasMcp = await poll('OpenCode starts a workspace wrapper with its external MCP cwd env file', async () =>
-      readJson(path.join(selected.workspace, 'preflight/.managed-fixture/mcp-cwd-alias-receipt.json')))
+    const preflightCwdAliasReceipt = path.join(selected.workspace, 'preflight/.managed-fixture/mcp-cwd-alias-receipt.json')
+    const aliasWaitStartedAt = Date.now()
+    const preflightCwdAliasMcp = await poll('OpenCode starts a workspace wrapper with its external MCP cwd env file', async () => {
+      const receipt = await readJson(preflightCwdAliasReceipt)
+      if (receipt) return receipt
+      try {
+        const [started, metadata] = await Promise.all([
+          fs.readFile(`${preflightCwdAliasReceipt}.started`, 'utf8'), fs.stat(`${preflightCwdAliasReceipt}.started`),
+        ])
+        if (started === 'wrapper-started' && Date.now() - metadata.mtimeMs > 15_000) {
+          return { wrapperStarted: true, nodeStartupTimedOut: true }
+        }
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+      if (Date.now() - aliasWaitStartedAt > 30_000) return { wrapperStarted: false, nodeStartupTimedOut: true }
+      return undefined
+    }, 45_000)
     assert.equal(preflightCwdAliasMcp.expectedNonce, nonce)
     assert.equal(preflightCwdAliasMcp.helper, nonce)
     assert.equal(preflightCwdAliasMcp.envValueLoaded, true)
