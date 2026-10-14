@@ -233,10 +233,11 @@ the procedure mid-way and leave the service down. Two sequences:
   immediately before the restart (souls created during the build are
   otherwise unbaselined and their loss goes undetected), then restart.
   The short skew window is accepted.
-- Strict (changes that must never skew): FIRST re-run the baseline
-  capture block above (nothing new can be created after the stop, so
-  a pre-stop baseline is complete), then `systemctl --user stop
-  freshell-supervisor.service` (the server stops with it via the
+- Strict (changes that must never skew): re-run the baseline capture
+  block IMMEDIATELY before the stop command below (a soul created
+  between an earlier capture and the stop would be unbaselined; the
+  next command being the stop makes that window effectively nil), then
+  `systemctl --user stop freshell-supervisor.service` (the server stops with it via the
   `Requires=` coupling), THEN run the build command from the Build
   surface above — never before the stop, or the running supervisor
   picks up the new session host mid-flight (the exact skew this
@@ -828,6 +829,9 @@ for r in (afp or []):
           /*) ;;
           *) echo "not a Linux absolute path — aborting"; exit 1 ;;
         esac
+        # Feed the typed path into the creation loop below (it iterates
+        # over $ALLOWED):
+        ALLOWED="$FIRST_ALLOWED"
       fi
       if [ -n "$FIRST_ALLOWED" ]; then
         # Keep PROBE_ROOT (and the REST probe's WS) where it is — mint a
@@ -855,7 +859,10 @@ for r in (afp or []):
     # from a React effect, and the managed launch is asynchronous — so
     # the soul may not exist the instant you confirm. Poll up to ~120s:
     # Snapshot the soul list BEFORE the pane creation — the check must
-    # match a NEW soul (a delta), not any pre-existing one:
+    # match a NEW soul (a delta), not any pre-existing one. The snapshot
+    # MUST precede the UI step below, or the probe's own soul lands in
+    # the baseline and the delta assertion rejects a correctly managed
+    # pane:
     SOULS_BEFORE=$(curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" \
       http://127.0.0.1:3001/api/runtime/souls \
       | python3 -c 'import json,sys
@@ -929,6 +936,15 @@ print("UI pane is managed:", rows[-1]["soulId"])' "$BWS" "$SOULS_BEFORE"
     If the assertion fails, the client is stale or not negotiating
     `managedRuntimeV1` — rebuild/redeploy the client and hard-refresh
     again. Close the test pane.
+    RESIDUAL RISK (documented, not eliminated): the UI does not expose
+    the tested pane's terminal ID, so the check identifies the pane by
+    workspace + creation-delta, not by exact terminal identity. A
+    concurrent client that creates an OpenCode pane in $BWS inside the
+    seconds between this client's picker save and the immediate default
+    restore could still confound the match. Run this check when no
+    other client is likely to create OpenCode panes (the single-operator
+    self-hosted norm), and treat any surprise match with suspicion —
+    the cleanup confirmations still gate destructive stops.
  8. Probe cleanup (LAST): probe souls are NOT auto-collected — the
     server's idle reaper explicitly skips managed terminals (their
     lifetime is supervisor-owned) and the supervisor has no idle reaper,
