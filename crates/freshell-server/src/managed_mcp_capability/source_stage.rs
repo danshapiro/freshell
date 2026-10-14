@@ -1540,6 +1540,8 @@ process.stdout.write(require('./helper.js'))
         let append_nested_url_output = home.join("existing-nested-url-variable-output.txt");
         let append_deleted_property_url_output =
             home.join("existing-deleted-property-url-output.txt");
+        let append_conditional_alias_url_output =
+            home.join("existing-conditional-alias-url-output.txt");
         let append_parenthesized_property_url_output =
             home.join("existing-parenthesized-property-url-output.txt");
         let append_let_variable_url_output = home.join("existing-let-url-variable-output.txt");
@@ -1561,7 +1563,7 @@ process.stdout.write(require('./helper.js'))
             .unwrap();
         std::io::Write::write_all(
             &mut command_file,
-            b"\nconst parenthesizedPropertyUrl = new URL('./existing-parenthesized-property-url-output.txt', import.meta.url);\n(parenthesizedPropertyUrl.href) = new URL('./existing-unrelated-url-output.txt', import.meta.url).href;\nfs.appendFileSync(parenthesizedPropertyUrl, ' appended');\n",
+            b"\nconst parenthesizedPropertyUrl = new URL('./existing-parenthesized-property-url-output.txt', import.meta.url);\n(parenthesizedPropertyUrl.href) = new URL('./existing-unrelated-url-output.txt', import.meta.url).href;\nfs.appendFileSync(parenthesizedPropertyUrl, ' appended');\nconst conditionalOutputUrl = new URL('./existing-conditional-alias-url-output.txt', import.meta.url);\nconst fallbackUrl = new URL('./existing-unrelated-url-output.txt', import.meta.url);\nconst selectedUrl = true ? conditionalOutputUrl : fallbackUrl;\nselectedUrl.href = new URL('./existing-unrelated-url-output.txt', import.meta.url).href;\nif (false) fs.appendFileSync(conditionalOutputUrl, ' appended');\n",
         )
         .unwrap();
         std::fs::write(&append_output, "existing").unwrap();
@@ -1571,6 +1573,11 @@ process.stdout.write(require('./helper.js'))
         std::fs::write(
             &append_deleted_property_url_output,
             "deleted property URL existing",
+        )
+        .unwrap();
+        std::fs::write(
+            &append_conditional_alias_url_output,
+            "conditional alias URL existing",
         )
         .unwrap();
         std::fs::write(
@@ -1606,6 +1613,7 @@ process.stdout.write(require('./helper.js'))
             &append_var_variable_url_output,
             &reassigned_url_output,
             &unrelated_url_output,
+            &append_conditional_alias_url_output,
         ] {
             assert!(plan[0]
                 .configured_resources
@@ -1663,6 +1671,17 @@ process.stdout.write(require('./helper.js'))
             .collect::<Vec<_>>();
         assert!(!unrelated_url_mounts.is_empty());
         assert!(unrelated_url_mounts
+            .iter()
+            .all(|(_, mount)| !mount.writable));
+        let conditional_alias_url_mounts = units
+            .iter()
+            .filter(|(source, mount)| {
+                source == &append_conditional_alias_url_output.canonicalize().unwrap()
+                    && mount.kind == freshell_runtime_protocol::ProviderResourceKind::File
+            })
+            .collect::<Vec<_>>();
+        assert!(!conditional_alias_url_mounts.is_empty());
+        assert!(conditional_alias_url_mounts
             .iter()
             .all(|(_, mount)| !mount.writable));
         let deleted_property_url_mounts = units

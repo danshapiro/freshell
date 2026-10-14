@@ -1781,10 +1781,7 @@ fn node_ambiguous_output_bindings(
                 tokens.get(index.checked_sub(1).unwrap_or(usize::MAX)),
                 Some(JavaScriptToken::Punctuation(b'.'))
             )
-            || matches!(
-                tokens.get(index + 1),
-                Some(JavaScriptToken::Punctuation(b':'))
-            )
+            || javascript_is_object_property_key(tokens, index)
             || javascript_is_safe_property_read(tokens, index)
         {
             continue;
@@ -1803,6 +1800,16 @@ fn is_javascript_variable_declaration_name(tokens: &[JavaScriptToken], index: us
             Some(JavaScriptToken::Identifier(keyword))
                 if matches!(keyword.as_str(), "const" | "let" | "var")
         )
+}
+
+fn javascript_is_object_property_key(tokens: &[JavaScriptToken], index: usize) -> bool {
+    matches!(
+        tokens.get(index + 1),
+        Some(JavaScriptToken::Punctuation(b':'))
+    ) && matches!(
+        tokens.get(index.checked_sub(1).unwrap_or(usize::MAX)),
+        Some(JavaScriptToken::Punctuation(b'{' | b','))
+    )
 }
 
 fn javascript_is_safe_property_read(tokens: &[JavaScriptToken], index: usize) -> bool {
