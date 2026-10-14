@@ -3,8 +3,11 @@ import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 
 import {
+  buildCloudCompanionRun,
   buildVitestArgs,
   createStandardTestPlan,
+  parseLocalOnlyTestDirs,
+  resolveCloudCompanionScope,
   resolveDesktopWorkerPlan,
   resolvePriorityValue,
   resolveScriptPhaseCommand,
@@ -149,6 +152,121 @@ describe('run-standard-tests', () => {
       { command: 'npm', args: ['run', 'build:tools'] },
       { command: 'cargo', args: ['build', '--release', '-p', 'freshell-server', '--locked'] },
     ])
+  })
+
+  describe('parseLocalOnlyTestDirs', () => {
+    it('extracts test-directory exclusions from dockerignore content in file order', () => {
+      const text = [
+        '# Build artifacts (rebuilt in Docker — never copy from host)',
+        '.worktrees/',
+        'node_modules/',
+        '/test/server/',
+        '/test/unit/server/',
+        '/test/integration/server/',
+        'docs/plans/',
+        '',
+      ].join('\n')
+      expect(parseLocalOnlyTestDirs(text)).toEqual([
+        'test/server',
+        'test/unit/server',
+        'test/integration/server',
+      ])
+    })
+
+    it('ignores comments, re-includes, and glob patterns', () => {
+      expect(parseLocalOnlyTestDirs([
+        '# /test/commented/',
+        '!test/re-included/',
+        '/test/globbed/*/',
+        '/test/star*/',
+        'port/*',
+        '',
+      ].join('\n'))).toEqual([])
+    })
+
+    it('accepts paths without a leading slash and with or without a trailing slash', () => {
+      expect(parseLocalOnlyTestDirs('test/integration/server\ntest/server\n')).toEqual([
+        'test/integration/server',
+        'test/server',
+      ])
+    })
+
+    it('deduplicates repeated entries', () => {
+      expect(parseLocalOnlyTestDirs('/test/integration/server/\n/test/integration/server/\n')).toEqual([
+        'test/integration/server',
+      ])
+    })
+
+    it('ignores non-test paths and nested build-artifact re-includes', () => {
+      expect(parseLocalOnlyTestDirs([
+        '/server/',
+        'dist/',
+        'test/fixtures/distribution/rust-only/dist/*',
+        '',
+      ].join('\n'))).toEqual([])
+    })
+  })
+
+  describe('resolveCloudCompanionScope', () => {
+    const localOnlyDirs = ['test/integration/server']
+
+    it('runs every local-only dir on a broad run with no path selectors', () => {
+      expect(resolveCloudCompanionScope([], localOnlyDirs)).toEqual(['test/integration/server'])
+      expect(resolveCloudCompanionScope(['--reporter=basic'], localOnlyDirs))
+        .toEqual(['test/integration/server'])
+    })
+
+    it('narrows to the local-only paths a mixed selector intersects', () => {
+      expect(resolveCloudCompanionScope(
+        [
+          'test/unit/client/lib/foo.test.ts',
+          'test/integration/server/managed-provider-parity.test.ts',
+        ],
+        localOnlyDirs,
+      )).toEqual(['test/integration/server/managed-provider-parity.test.ts'])
+    })
+
+    it('skips focused runs that do not intersect the local-only dirs', () => {
+      expect(resolveCloudCompanionScope(['test/unit/client/store/foo.test.ts'], localOnlyDirs))
+        .toEqual([])
+    })
+
+    it('matches the directory itself when it is passed as a selector', () => {
+      expect(resolveCloudCompanionScope(['test/integration/server'], localOnlyDirs))
+        .toEqual(['test/integration/server'])
+    })
+
+    it('normalizes Windows separators and ./ prefixes before matching', () => {
+      expect(resolveCloudCompanionScope(
+        ['./test/integration/server\\provider-parity-contract.test.ts'],
+        localOnlyDirs,
+      )).toEqual(['test/integration/server/provider-parity-contract.test.ts'])
+    })
+  })
+
+  describe('buildCloudCompanionRun', () => {
+    it('builds a background vitest phase pinned to the companion scope', () => {
+      expect(buildCloudCompanionRun({
+        mode: 'desktop',
+        clientWorkers: '5',
+        scope: ['test/integration/server'],
+      })).toEqual({
+        name: 'client-local-only',
+        runner: 'vitest',
+        configPath: 'config/vitest/vitest.config.ts',
+        maxWorkers: '5',
+        priority: 'background',
+        pathFilters: ['test/integration/server'],
+      })
+    })
+
+    it('uses normal priority in aggressive mode', () => {
+      expect(buildCloudCompanionRun({
+        mode: 'aggressive',
+        clientWorkers: '5',
+        scope: ['test/integration/server'],
+      }).priority).toBe('normal')
+    })
   })
 
   describe('resolveScriptPhaseCommand', () => {
