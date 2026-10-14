@@ -84,7 +84,7 @@ describe('body-free terminal ordinary-turn reduction', () => {
     })
   })
 
-  it('requires matching activity, then fresh nonempty same-stream output, then advanced completion', () => {
+  it('requires matching activity, fresh nonempty same-stream output, and advanced completion', () => {
     const summary = reduceTerminalOrdinaryTurnFrames([
       activity('claude'),
       output(target.terminalId, target.streamId, 11, 'private answer bytes'),
@@ -200,17 +200,17 @@ describe('body-free terminal ordinary-turn reduction', () => {
   })
 
   it.each([
-    ['wrong terminal activity', [activity('claude', 'other-terminal'), output(), complete()], false, false],
-    ['wrong provider activity', [activity('codex'), output(), complete()], false, false],
-    ['wrong terminal output', [activity('claude'), output('other-terminal'), complete()], true, false],
-    ['wrong stream output', [activity('claude'), output(target.terminalId, 'other-stream'), complete()], true, false],
-    ['wrong terminal completion', [activity('claude'), output(), complete(target.provider, 'other-terminal')], true, true],
-    ['wrong provider completion', [activity('claude'), output(), complete('codex')], true, true],
-  ])('ignores %s', (_label, frames, activitySeen, outputSeen) => {
+    ['wrong terminal activity', [activity('claude', 'other-terminal'), output(), complete()], false, true, true],
+    ['wrong provider activity', [activity('codex'), output(), complete()], false, true, true],
+    ['wrong terminal output', [activity('claude'), output('other-terminal'), complete()], true, false, true],
+    ['wrong stream output', [activity('claude'), output(target.terminalId, 'other-stream'), complete()], true, false, true],
+    ['wrong terminal completion', [activity('claude'), output(), complete(target.provider, 'other-terminal')], true, true, false],
+    ['wrong provider completion', [activity('claude'), output(), complete('codex')], true, true, false],
+  ])('tracks only matching evidence for %s', (_label, frames, activitySeen, outputSeen, completionSeen) => {
     const summary = reduceTerminalOrdinaryTurnFrames(frames, baseline())
     expect(summary.activitySeen).toBe(activitySeen)
     expect(summary.outputSeen).toBe(outputSeen)
-    expect(summary.completionSeen).toBe(false)
+    expect(summary.completionSeen).toBe(completionSeen)
   })
 
   it('does not count empty or baseline-stale output', () => {
@@ -223,17 +223,27 @@ describe('body-free terminal ordinary-turn reduction', () => {
       { type: 'terminal.attach.ready', terminalId: target.terminalId, streamId: target.streamId, headSeq: 10 },
     ]))
 
-    expect(summary).toMatchObject({ activitySeen: true, outputSeen: false, outputFrameCount: 0, completionSeen: false })
+    expect(summary).toMatchObject({ activitySeen: true, outputSeen: false, outputFrameCount: 0, completionSeen: true })
   })
 
-  it('does not accept output that arrived before matching activity', () => {
-    const summary = reduceTerminalOrdinaryTurnFrames([
-      output(),
-      activity('claude'),
-      complete(),
-    ], baseline())
+  it.each([
+    ['activity, output, completion', [activity('claude'), output(), complete()]],
+    ['activity, completion, output', [activity('claude'), complete(), output()]],
+    ['output, activity, completion', [output(), activity('claude'), complete()]],
+    ['output, completion, activity', [output(), complete(), activity('claude')]],
+    ['completion, activity, output', [complete(), activity('claude'), output()]],
+    ['completion, output, activity', [complete(), output(), activity('claude')]],
+  ])('collects matching evidence regardless of arrival order: %s', (_order, frames) => {
+    const summary = reduceTerminalOrdinaryTurnFrames(frames, baseline())
 
-    expect(summary).toMatchObject({ activitySeen: true, outputSeen: false, outputFrameCount: 0, completionSeen: false })
+    expect(summary).toMatchObject({
+      activitySeen: true,
+      outputSeen: true,
+      outputFrameCount: 1,
+      outputSeq: 11,
+      completionSeen: true,
+      completionSeq: 8,
+    })
   })
 
   it('requires completion sequence advancement beyond the captured baseline', () => {
@@ -241,16 +251,6 @@ describe('body-free terminal ordinary-turn reduction', () => {
       activity('claude'),
       output(),
       complete(target.provider, target.terminalId, 8),
-    ], baseline([complete(target.provider, target.terminalId, 8)]))
-
-    expect(summary).toMatchObject({ activitySeen: true, outputSeen: true, completionSeen: false, completionSeq: null })
-  })
-
-  it('requires completion to arrive after fresh output', () => {
-    const summary = reduceTerminalOrdinaryTurnFrames([
-      activity('claude'),
-      complete(target.provider, target.terminalId, 9),
-      output(),
     ], baseline([complete(target.provider, target.terminalId, 8)]))
 
     expect(summary).toMatchObject({ activitySeen: true, outputSeen: true, completionSeen: false, completionSeq: null })

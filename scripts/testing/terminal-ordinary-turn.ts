@@ -150,7 +150,7 @@ export function reduceTerminalOrdinaryTurnFrames(
     }
 
     if (frame.type === 'terminal.output' || frame.type === 'terminal.output.batch') {
-      if (!activitySeen || frame.terminalId !== baseline.terminalId || frame.streamId !== baseline.streamId) continue
+      if (frame.terminalId !== baseline.terminalId || frame.streamId !== baseline.streamId) continue
       const seqEnd = sequence(frame.seqEnd, true)
       if (seqEnd === null || seqEnd <= baseline.outputSeq || typeof frame.data !== 'string' || frame.data.length === 0) continue
       outputFrameCount += 1
@@ -158,8 +158,7 @@ export function reduceTerminalOrdinaryTurnFrames(
       continue
     }
 
-    if (outputFrameCount === 0
-      || frame.type !== 'terminal.turn.complete'
+    if (frame.type !== 'terminal.turn.complete'
       || frame.terminalId !== baseline.terminalId
       || frame.provider !== baseline.provider
       || frame.outcome !== 'completed') continue
