@@ -10,7 +10,7 @@ describe('managed ordinary-turn diagnostics', () => {
       stage: 'creating',
       createCompleted: false,
       composerFilled: false,
-      assistantBaselineKnownEmpty: false,
+      assistantBaselineCaptured: false,
       composerSubmitted: false,
       sendObserved: false,
       turnCompleteObserved: false,

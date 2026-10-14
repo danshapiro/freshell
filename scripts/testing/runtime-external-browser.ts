@@ -2101,7 +2101,7 @@ const PaneCreationProbeSchema = z.object({
   }).strict()).max(8),
 }).strict()
 const OrdinaryTerminalTurnFactsSchema = z.object({
-  inputSeen: z.boolean(), activitySeen: z.boolean(), outputSeen: z.boolean(),
+  requestInputSeen: z.boolean(), activitySeen: z.boolean(), outputSeen: z.boolean(),
   outputFrameCount: z.number().int().nonnegative().max(10000), completionSeen: z.boolean(),
 })
 const OrdinaryTerminalDiagnosticSchema = z.discriminatedUnion('event', [
@@ -2139,7 +2139,7 @@ const OrdinaryFreshDiagnosticSchema = z.union([
     mode: OrdinaryFreshModeSchema }),
   z.object({ event: z.literal('durable_souls.ordinary_turn_failed'), lane: z.literal('fresh-agent'),
     mode: OrdinaryFreshModeSchema, stage: OrdinaryFreshStageSchema,
-    createCompleted: z.boolean(), composerFilled: z.boolean(), assistantBaselineKnownEmpty: z.boolean(),
+    createCompleted: z.boolean(), composerFilled: z.boolean(), assistantBaselineCaptured: z.boolean(),
     composerSubmitted: z.boolean(), sendObserved: z.boolean(), turnCompleteObserved: z.boolean(), assistantTextDisplayed: z.boolean(),
     assistantDom: z.object({ available: z.boolean(), rows: OrdinaryFreshCountSchema, textCharacters: OrdinaryFreshCountSchema }),
     providerEvents: OrdinaryFreshProviderEventsSchema }),
@@ -2419,7 +2419,7 @@ export default class ManagedExternalExecutionReporter implements Reporter {
       } else if (source.event === 'durable_souls.ordinary_turn_failed') {
         this.emit({ ...common, mode: source.mode, stage: source.stage,
           createCompleted: source.createCompleted, composerFilled: source.composerFilled,
-          assistantBaselineKnownEmpty: source.assistantBaselineKnownEmpty, composerSubmitted: source.composerSubmitted,
+          assistantBaselineCaptured: source.assistantBaselineCaptured, composerSubmitted: source.composerSubmitted,
           sendObserved: source.sendObserved, turnCompleteObserved: source.turnCompleteObserved,
           assistantTextDisplayed: source.assistantTextDisplayed, assistantDom: source.assistantDom,
           providerEvents: source.providerEvents })

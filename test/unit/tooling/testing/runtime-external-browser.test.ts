@@ -1150,7 +1150,9 @@ describe('body-free ordinary-turn Cloud diagnostics', () => {
       reporter.onStdOut(`${JSON.stringify({
         severity: 'error', event: 'durable_souls.ordinary_turn_failed', lane: 'terminal', provider: 'codex',
         paneSetupFailureStage: 'managed_runtime_view', ordinaryTurnFailureStage: null,
-        terminalFacts: { available: false }, ordinaryTurnFacts: null,
+        terminalFacts: { available: false }, ordinaryTurnFacts: {
+          requestInputSeen: false, activitySeen: false, outputSeen: false, outputFrameCount: 0, completionSeen: false,
+        },
         prompt: 'private-prompt-sentinel', providerOutput: 'private-provider-output-sentinel',
       })}\n`, testCase)
 
@@ -1163,7 +1165,9 @@ describe('body-free ordinary-turn Cloud diagnostics', () => {
         file: 'test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts',
         sourceEvent: 'durable_souls.ordinary_turn_failed', outcome: 'failed', lane: 'terminal', provider: 'codex',
         paneSetupFailureStage: 'managed_runtime_view', ordinaryTurnFailureStage: null,
-        terminalFacts: { available: false }, ordinaryTurnFacts: null,
+        terminalFacts: { available: false }, ordinaryTurnFacts: {
+          requestInputSeen: false, activitySeen: false, outputSeen: false, outputFrameCount: 0, completionSeen: false,
+        },
       })
       expect(JSON.stringify(forwarded)).not.toContain('private-prompt-sentinel')
       expect(JSON.stringify(forwarded)).not.toContain('private-provider-output-sentinel')
@@ -1184,7 +1188,7 @@ describe('body-free ordinary-turn Cloud diagnostics', () => {
       const event = JSON.stringify({
         severity: 'error', event: 'durable_souls.ordinary_turn_failed', lane: 'fresh-agent', mode: 'freshcodex',
         stage: 'waiting_for_composer', createCompleted: true, composerFilled: false,
-        assistantBaselineKnownEmpty: false, composerSubmitted: false, sendObserved: false,
+        assistantBaselineCaptured: false, composerSubmitted: false, sendObserved: false,
         turnCompleteObserved: false, assistantTextDisplayed: false,
         assistantDom: { available: true, rows: 0, textCharacters: 0, assistantText: 'private-assistant-sentinel' },
         providerEvents: { counts: { created: 1, createFailed: 0, assistant: 0, stream: 0, error: 0,
@@ -1205,7 +1209,7 @@ describe('body-free ordinary-turn Cloud diagnostics', () => {
         file: 'test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts',
         sourceEvent: 'durable_souls.ordinary_turn_failed', outcome: 'failed', lane: 'fresh-agent',
         mode: 'freshcodex', stage: 'waiting_for_composer', createCompleted: true, composerFilled: false,
-        assistantBaselineKnownEmpty: false, composerSubmitted: false, sendObserved: false,
+        assistantBaselineCaptured: false, composerSubmitted: false, sendObserved: false,
         turnCompleteObserved: false, assistantTextDisplayed: false,
         assistantDom: { available: true, rows: 0, textCharacters: 0 },
         providerEvents: { counts: { created: 1, createFailed: 0, assistant: 0, stream: 0, error: 0,
