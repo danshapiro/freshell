@@ -800,6 +800,18 @@ for r in (afp or []):
           /*) FIRST_ALLOWED="$A"; break ;;
         esac
       done <<<"$ALLOWED"
+      if [ -z "$FIRST_ALLOWED" ]; then
+        # Windows-only allowed lists (WSL): the server maps such roots
+        # itself and this script cannot replicate the mapping — ask the
+        # operator for the Linux form of one allowed root (visible in
+        # the picker) and mint under that:
+        read -r -p "Allowed roots are Windows-style; type the LINUX path of one allowed root for the browser probe: " FIRST_ALLOWED
+        FIRST_ALLOWED=${FIRST_ALLOWED/#\~/$HOME}
+        case "$FIRST_ALLOWED" in
+          /*) ;;
+          *) echo "not a Linux absolute path — aborting"; exit 1 ;;
+        esac
+      fi
       if [ -n "$FIRST_ALLOWED" ]; then
         # Keep PROBE_ROOT (and the REST probe's WS) where it is — mint a
         # SEPARATE browser root under the allowed root and record it:
@@ -953,6 +965,7 @@ PY
       # $HOME/freshell-probe.* pattern:
       if [ -f "${D:-/nonexistent}/run.env" ]; then
         RECORDED_ROOT=$(bash -c '. "$1"; printf "%s" "${PROBE_ROOT:-}"' _ "${D:-}/run.env")
+        RECORDED_ROOT=${RECORDED_ROOT:+$(realpath -m "$RECORDED_ROOT")}
         if [ -n "$RECORDED_ROOT" ] && [ "$RECORDED_ROOT" != "$PROBE_ROOT" ]; then
           echo "REFUSING: PROBE_ROOT=$PROBE_ROOT is not the root this run recorded ($RECORDED_ROOT)"
           exit 1
@@ -984,6 +997,9 @@ PY
           esac
         fi
         WANT_ROOT="${WANT_ROOT:-$GUARD_ROOT}"
+        # Canonicalize the recorded root — a symlinked allowed root
+        # records uncanonicalized while $VAL above went through realpath:
+        [ -n "$WANT_ROOT" ] && WANT_ROOT=$(realpath -m "$WANT_ROOT")
         if [ "$PARENT" != "$WANT_ROOT" ]; then
           echo "REFUSING: $V=$VAL is not under this run's recorded root for it ($WANT_ROOT) — resolve manually"
           exit 1
@@ -1010,14 +1026,10 @@ PY
         echo "REFUSING: $V=$VAL is not empty — probe workspaces are empty; resolve manually"
         exit 1
       fi
-      # The records path above already tied each workspace to its OWN
-      # recorded root (PROBE_ROOT for WS, BROWSER_ROOT for BWS) — no
-      # cross-variable sharing rule applies; the recovery path anchors
-      # by basename above. Only remember the first parent for any later
-      # recovery-mode checks:
-      if [ -z "$GUARD_ROOT" ]; then
-        GUARD_ROOT="$PARENT"
-      fi
+      # Each workspace is validated independently: the records path ties
+      # it to its OWN recorded root (PROBE_ROOT for WS, BROWSER_ROOT for
+      # BWS); recovery anchors by basename. No cross-variable sharing —
+      # the two roots are legitimately different:
       printf -v "$V" '%s' "$VAL"
     done
     if [ -n "${D:-}" ]; then
@@ -1304,7 +1316,7 @@ PY
       # The sweep is the LAST verification gate — it fails closed:
       [ -f "$HDR" ] \
         || { echo "sweep cannot run (no token) — check Settings → Coding CLI → OpenCode manually; the default may point at the deleted probe dir"; rm -rf "$SWEEP_DIR"; exit 1; }
-      SWEEP_HITS=0
+      SWEEP_HITS=0; SWEEP_READS_OK=0
       for SWEEP_I in $(seq 1 6); do
         SETTINGS_CODE=$(curl -s --connect-timeout 5 --max-time 10 \
           -o "$SWEEP_DIR/settings.json" -w '%{http_code}' -H @"$HDR" \
@@ -1316,10 +1328,14 @@ cc=d.get("codingCli")
 assert isinstance(cc, dict), "malformed settings response"
 cur=((cc.get("providers") or {}).get("opencode",{}) or {}).get("cwd")
 print("" if cur is None else cur)' "$SWEEP_DIR/settings.json") || { sleep 3; continue; }
+        SWEEP_READS_OK=$((SWEEP_READS_OK + 1))
         if [ "$SWEEP_CWD" = "$BWS" ]; then SWEEP_HITS=1; break; fi
         sleep 3
       done
       rm -f "$SWEEP_DIR/settings.json"
+      # Fail closed: a sweep where EVERY read failed verified nothing:
+      [ "$SWEEP_READS_OK" -ge 1 ] \
+        || { echo "sweep could not read settings at all — check Settings → Coding CLI → OpenCode manually; the default may point at the deleted probe dir"; rm -rf "$SWEEP_DIR"; exit 1; }
       if [ "$SWEEP_HITS" = 1 ]; then
         BODY=$(python3 -c 'import json;print(json.dumps({"codingCli":{"providers":{"opencode":{"cwd":None}}}}))')
         PATCH_CODE=$(curl -s --connect-timeout 5 --max-time 30 \
@@ -1362,9 +1378,10 @@ print("" if cur is None else cur)' "$SWEEP_DIR/settings.json") || { sleep 3; con
     If the block aborts before `verified_empty`, the token header is
     already gone (the `trap` removed it) while the probe records — the
     soul ID and the tab response — remain in `$D` for the documented
-    recheck-and-retry. Settings responses are deleted immediately after
-    each parse (they can carry API keys); anything that still remains is
-    inside a 0700 mktemp directory. Delete `$D`, `$WS`, and `$BWS`
+    recheck-and-retry. Settings responses are deleted right after
+    each single-read parse; the sweep keeps its response only inside its
+    private loop directory and removes it with the directory (responses
+    can carry API keys). Delete `$D`, `$WS`, and `$BWS`
     manually once BOTH probe souls are resolved.
 
    HONEST LIMIT on the settings restore: the settings API has no
