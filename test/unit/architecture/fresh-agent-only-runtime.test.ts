@@ -13,7 +13,12 @@ const retiredNodeBackendPaths = [
   'server',
   'test/server',
   'test/unit/server',
-  'test/integration/server',
+  // NOTE: 'test/integration/server' was retired with the Node backend, then
+  // RE-ADDED (2026-09-28) as the live managed-provider parity suites — it is
+  // a production test root now, NOT retired, and must NOT return to this
+  // list. Its suites need a locally built Rust server binary + Docker, so
+  // they run in local lanes (default vitest config, base gate) and are
+  // deliberately excluded from the Cloud Run image (.dockerignore).
   'test/integration/session-repair.test.ts',
   'tsconfig.server.json',
   'dist/server',
