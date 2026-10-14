@@ -1196,11 +1196,13 @@ print("stopped browser soul:", o["outcome"])'
       fi
     fi
     # Restore OpenCode's default cwd that the directory step overwrote
-    # (only when the browser check ran — $BWS set). The picker's settings
-    # save is an UNAWAITED async request — first WAIT (bounded) for it to
-    # land (the visible default becomes $BWS), or the delayed save could
-    # arrive AFTER this restore and re-point the default at the
-    # about-to-be-deleted workspace:
+    # (only when the browser check ran — $BWS set). Step 7 already
+    # restored it once the picker's async save landed; this is the
+    # belt-and-braces pass — a save that somehow never landed (or landed
+    # after step 7's restore window) still gets corrected here before
+    # the workspace goes away. The wait is bounded; a save arriving after
+    # BOTH this pass and the post-deletion sweep is the documented
+    # residual (Settings shows it):
     if [ -n "${BWS:-}" ]; then
       for i in $(seq 1 15); do
         SETTINGS_CODE=$(curl -s --connect-timeout 5 --max-time 10 \
