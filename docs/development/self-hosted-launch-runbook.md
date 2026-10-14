@@ -739,7 +739,11 @@ print(next(s["soulId"] for s in souls if s.get("terminalId")==sys.argv[1]))' "$T
     fi
     BWS=$(mktemp -d "$PROBE_ROOT/bws.XXXXXX")   # unique per run
     chmod 0770 "$BWS"   # same in-soul-shell access requirement as $WS
-    printf 'BWS=%q\n' "$BWS" >> "$D/run.env"
+    # The server CANONICALIZES the cwd when it stores terminalCwd — a
+    # symlinked parent in an allowed root means the raw $BWS spelling
+    # never matches the soul record. Match on the canonical form:
+    BWS_MATCH=$(realpath -e "$BWS")
+    printf 'BWS=%q\nBWS_MATCH=%q\n' "$BWS" "$BWS_MATCH" >> "$D/run.env"
     # The directory picker PERSISTS the chosen path as OpenCode's default
     # cwd (the confirm handler patches settings) — record the current
     # default (VERIFIED read: an error response must not masquerade as
@@ -765,8 +769,11 @@ print("" if cur is None else cur)' "$D/settings.json" > "$D/old-opencode-cwd.txt
     # correctly deployed client). A plain shell pane will NOT do either:
     # shell panes skip the directory step and always take the default
     # workspace. OpenCode's directory step has a free-text PATH INPUT:
-    # type the absolute $BWS path there and confirm. If the picker
-    # REJECTS the path (the directory is validated against the
+    # type the absolute $BWS path there — but DO NOT CONFIRM YET: the
+    # block below snapshots the soul list FIRST, and its prompt tells
+    # you when to confirm (a pane created before the snapshot lands in
+    # the baseline and the delta assertion would reject a correct
+    # deploy). If the picker REJECTS the path (the directory is validated against the
     # `allowedFilePaths` setting — a deployment whose allowed roots
     # exclude $HOME will 403 the probe root), mint the probe root under
     # an allowed root instead and record it so the cleanup guard
@@ -913,7 +920,7 @@ souls=json.load(sys.stdin)["souls"]
 rows=[s for s in souls if s.get("terminalCwd")==sys.argv[1] and s["soulId"] not in before]
 sids={r["soulId"] for r in rows}
 assert len(sids)<=1, ("workspace ambiguous (mint a fresh BWS and retry)", rows)
-sys.exit(0 if len(sids)==1 and rows[-1].get("launchState")=="running" else 1)' "$BWS" "$SOULS_BEFORE"; then
+sys.exit(0 if len(sids)==1 and rows[-1].get("launchState")=="running" else 1)' "$BWS_MATCH" "$SOULS_BEFORE"; then
         echo "UI pane is managed (after $((SECONDS - POLL_DEADLINE + 120))s)"
         break
       fi
@@ -930,7 +937,7 @@ sids={r["soulId"] for r in rows}
 assert len(sids)<=1, ("workspace ambiguous (mint a fresh BWS and retry)", rows)
 assert rows and rows[-1].get("launchState")=="running", \
   "no NEW running managed soul for the UI pane after ~120s — client stale or not negotiating"
-print("UI pane is managed:", rows[-1]["soulId"])' "$BWS" "$SOULS_BEFORE"
+print("UI pane is managed:", rows[-1]["soulId"])' "$BWS_MATCH" "$SOULS_BEFORE"
     ```
 
     If the assertion fails, the client is stale or not negotiating
@@ -1148,6 +1155,10 @@ PY
               echo "REFUSING: D=$D records browser workspace $RECORDED_BWS, but BWS=$BWS — mixed runs; resolve manually"
               exit 1
             fi
+            RECORDED_BWS_MATCH=$(bash -c '. "$1"; printf "%s" "${BWS_MATCH:-}"' _ "$D/run.env")
+            if [ -n "$RECORDED_BWS_MATCH" ]; then
+              BWS_MATCH="$RECORDED_BWS_MATCH"
+            fi
           fi
         fi
       fi
@@ -1204,6 +1215,9 @@ print("stopped:", o["outcome"])'
     # Look it up by workspace in ANY launchState — a blocked or exited
     # probe soul still must not be orphaned against a deleted workspace:
     if [ -n "${BWS:-}" ]; then
+      # Match the server's canonical spelling (BWS_MATCH from the
+      # records; realpath of $BWS in recovery):
+      BWS_LOOKUP="${BWS_MATCH:-$(realpath -e "$BWS" 2>/dev/null || printf '%s' "$BWS")}"
       BS=$(curl -s --connect-timeout 5 --max-time 10 -H @"$D/hdr" http://127.0.0.1:3001/api/runtime/souls \
         | python3 -c 'import json,sys
 souls=json.load(sys.stdin)["souls"]
@@ -1217,7 +1231,7 @@ if rows:
     s=rows[-1]
     print(s["soulId"], s["intentRevision"], s["launchState"], s.get("containerId") or "-")
 else:
-    print("")' "$BWS")
+    print("")' "$BWS_LOOKUP")
       NO_BROWSER_SOUL=0
       if [ -z "$BS" ]; then
         # Two cases: step 7 FAILED with a diagnosed stale client (no
