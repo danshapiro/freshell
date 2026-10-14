@@ -7,7 +7,7 @@
 ## User Request
 
 ### Requested result
-Fix the durable-souls problems identified in the diagnosis and make ordinary use work in Claude, Codex and OpenCode terminal and fresh-agent modes.
+Complete the planned durable-souls repair, including ordinary use in the six selected modes, and carry the-usual workflow through its final recap. Reconcile the run record against the actual artifacts before continuing.
 
 ### Explicit constraints
 - Use the-usual workflow and a dedicated worktree; fix test failures found in this repair and continue.
