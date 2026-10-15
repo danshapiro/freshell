@@ -39,6 +39,7 @@ use axum::{
     routing::post,
     Json, Router,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha1::{Digest, Sha1};
@@ -97,6 +98,8 @@ const CHECKPOINT_TIMEOUT_COOLDOWN: Duration = Duration::from_secs(60);
 const CHECKPOINT_COOLDOWN_LIMIT: usize = 128;
 const CHECKPOINT_OUTCOME_STORE_VERSION: u8 = 1;
 const CHECKPOINT_OUTCOME_STORE_LIMIT: usize = 8192;
+const CHECKPOINT_OUTCOME_REPLAY_LIMIT: usize = 8192;
+const CHECKPOINT_OUTCOME_REPLAY_PAGE_LIMIT: usize = 200;
 const CHECKPOINT_DISPATCH_FENCE_LIMIT: usize = CHECKPOINT_OUTCOME_STORE_LIMIT;
 const CHECKPOINT_VOLATILE_FENCE_LIMIT: usize = 1024;
 
@@ -168,6 +171,35 @@ struct StoredCheckpointOutcome {
     capture_settled: bool,
     submitted_turn_id: Option<String>,
     created_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckpointOutcomeReplayPosition {
+    created_at_ms: u64,
+    key: String,
+    request_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckpointOutcomeReplayCursor {
+    provider: AgentProvider,
+    session_id: String,
+    session_type: SessionType,
+    window_start: CheckpointOutcomeReplayPosition,
+    snapshot_end: CheckpointOutcomeReplayPosition,
+    after: CheckpointOutcomeReplayPosition,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckpointOutcomeReplayQuery {
+    provider: String,
+    session_id: String,
+    session_type: String,
+    cursor: Option<String>,
+    limit: Option<usize>,
 }
 
 fn capture_settled_by_default() -> bool {
@@ -1312,12 +1344,14 @@ impl CheckpointService {
         Ok(store.outcomes.get(key).cloned())
     }
 
-    async fn replay_for_identity(
+    async fn replay_outcome_page(
         &self,
         provider: AgentProvider,
         session_id: &str,
         session_type: SessionType,
-    ) {
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<FreshAgentCheckpointOutcome>, Option<String>), String> {
         let records = {
             let _guard = self.outcome_gate.lock().await;
             match self.read_outcome_store().await {
@@ -1326,7 +1360,7 @@ impl CheckpointService {
                     tracing::error!(
                         event = "code_checkpoint.outcome_store_read_failed",
                         cause = %error,
-                        "durable checkpoint outcomes could not be replayed"
+                        "durable checkpoint outcomes could not be read for recovery"
                     );
                     let mut cached = self
                         .durable_outcome_cache
@@ -1339,11 +1373,28 @@ impl CheckpointService {
                             .expect("volatile checkpoint outcomes mutex poisoned")
                             .clone(),
                     );
+                    if cached.is_empty() {
+                        return Err(error);
+                    }
                     cached
                 }
             }
         };
-        for record in records.values().filter(|record| {
+        let cursor = cursor
+            .map(|value| {
+                if value.len() > 4096 {
+                    return Err("checkpoint outcome cursor exceeds bound".to_string());
+                }
+                let bytes = URL_SAFE_NO_PAD
+                    .decode(value)
+                    .map_err(|_| "invalid checkpoint outcome cursor".to_string())?;
+                serde_json::from_slice::<CheckpointOutcomeReplayCursor>(&bytes)
+                    .map_err(|_| "invalid checkpoint outcome cursor".to_string())
+            })
+            .transpose()?;
+
+        let mut entries = Vec::new();
+        for (key, record) in records.iter().filter(|(_, record)| {
             record.outcome.provider == provider
                 && record.outcome.session_type == session_type
                 && record
@@ -1352,15 +1403,92 @@ impl CheckpointService {
                     .any(|alias| alias == session_id)
         }) {
             if record.request_ids.is_empty() {
-                self.broadcast_outcome(record.outcome.clone());
+                entries.push((
+                    CheckpointOutcomeReplayPosition {
+                        created_at_ms: record.created_at_ms,
+                        key: key.clone(),
+                        request_id: record.outcome.request_id.clone(),
+                    },
+                    &record.outcome,
+                ));
             } else {
                 for request_id in &record.request_ids {
-                    let mut outcome = record.outcome.clone();
-                    outcome.request_id = request_id.clone();
-                    self.broadcast_outcome(outcome);
+                    entries.push((
+                        CheckpointOutcomeReplayPosition {
+                            created_at_ms: record.created_at_ms,
+                            key: key.clone(),
+                            request_id: request_id.clone(),
+                        },
+                        &record.outcome,
+                    ));
                 }
             }
         }
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let (window_start, snapshot_end) = if let Some(cursor) = &cursor {
+            if cursor.provider != provider
+                || cursor.session_id != session_id
+                || cursor.session_type != session_type
+                || cursor.after < cursor.window_start
+                || cursor.after > cursor.snapshot_end
+            {
+                return Err("invalid checkpoint outcome cursor".to_string());
+            }
+            (cursor.window_start.clone(), cursor.snapshot_end.clone())
+        } else {
+            if entries.len() > CHECKPOINT_OUTCOME_REPLAY_LIMIT {
+                entries.drain(..entries.len() - CHECKPOINT_OUTCOME_REPLAY_LIMIT);
+            }
+            let Some((first, _)) = entries.first() else {
+                return Ok((Vec::new(), None));
+            };
+            let Some((last, _)) = entries.last() else {
+                return Ok((Vec::new(), None));
+            };
+            (first.clone(), last.clone())
+        };
+
+        let entries = entries
+            .into_iter()
+            .filter(|(position, _)| {
+                position >= &window_start
+                    && position <= &snapshot_end
+                    && cursor
+                        .as_ref()
+                        .is_none_or(|cursor| position > &cursor.after)
+            })
+            .collect::<Vec<_>>();
+        let page_limit = limit.clamp(1, CHECKPOINT_OUTCOME_REPLAY_PAGE_LIMIT);
+        let has_more = entries.len() > page_limit;
+        let mut outcomes = Vec::with_capacity(page_limit.min(entries.len()));
+        let mut last_position = None;
+        for (position, stored) in entries.into_iter().take(page_limit) {
+            let mut outcome = stored.clone();
+            outcome.request_id = position.request_id.clone();
+            // Materialized sessions retain the provisional id as an alias in
+            // the store. The pane needs the id it attached with on this page.
+            outcome.session_id = session_id.to_string();
+            last_position = Some(position);
+            outcomes.push(outcome);
+        }
+        let next_cursor = if has_more {
+            let after = last_position.ok_or("checkpoint outcome page lost its cursor")?;
+            let cursor = CheckpointOutcomeReplayCursor {
+                provider,
+                session_id: session_id.to_string(),
+                session_type,
+                window_start,
+                snapshot_end,
+                after,
+            };
+            let encoded = serde_json::to_vec(&cursor)
+                .map_err(|_| "checkpoint outcome cursor encoding failed")?;
+            Some(URL_SAFE_NO_PAD.encode(encoded))
+        } else {
+            None
+        };
+        Ok((outcomes, next_cursor))
     }
 
     fn broadcast_outcome(&self, outcome: FreshAgentCheckpointOutcome) {
@@ -2788,18 +2916,6 @@ impl freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier for Checkpoint
             }
         })
     }
-
-    fn replay_for_session(
-        self: Arc<Self>,
-        provider: AgentProvider,
-        session_id: String,
-        session_type: SessionType,
-    ) -> futures_util::future::BoxFuture<'static, ()> {
-        Box::pin(async move {
-            self.replay_for_identity(provider, &session_id, session_type)
-                .await;
-        })
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3672,6 +3788,10 @@ pub fn router(state: CheckpointsApiState) -> Router {
         .route(
             "/api/fresh-agent/checkpoints",
             post(post_checkpoint).get(get_method(get_checkpoints)),
+        )
+        .route(
+            "/api/fresh-agent/checkpoints/outcomes",
+            get_method(get_checkpoint_outcomes),
         )
         .route(
             "/api/fresh-agent/checkpoints/restore",
@@ -5380,6 +5500,84 @@ async fn post_checkpoint_metadata(
     }
 }
 
+async fn get_checkpoint_outcomes(
+    State(state): State<CheckpointsApiState>,
+    headers: HeaderMap,
+    Query(query): Query<CheckpointOutcomeReplayQuery>,
+) -> Response {
+    if !is_authed(&headers, &state.auth_token) {
+        return unauthorized();
+    }
+    let Some(provider) = parse_agent_provider(&query.provider) else {
+        return bad_request("provider is invalid");
+    };
+    let Some(session_type) = parse_session_type(&query.session_type) else {
+        return bad_request("sessionType is invalid");
+    };
+    if query.session_id.is_empty() || query.session_id.len() > 1024 {
+        return bad_request("sessionId is invalid");
+    }
+
+    match state
+        .service
+        .replay_outcome_page(
+            provider,
+            &query.session_id,
+            session_type,
+            query.cursor.as_deref(),
+            query.limit.unwrap_or(CHECKPOINT_OUTCOME_REPLAY_PAGE_LIMIT),
+        )
+        .await
+    {
+        Ok((outcomes, next_cursor)) => {
+            let outcomes = outcomes
+                .into_iter()
+                .map(|outcome| {
+                    serde_json::to_value(
+                        freshell_protocol::ServerMessage::FreshAgentCheckpointOutcome(outcome),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>();
+            let outcomes = match outcomes {
+                Ok(outcomes) => outcomes,
+                Err(error) => {
+                    tracing::error!(
+                        event = "code_checkpoint.outcome_replay_serialize_failed",
+                        cause = %error,
+                        "checkpoint outcomes could not be serialized for session recovery"
+                    );
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": "checkpoint outcomes could not be loaded" })),
+                    )
+                        .into_response();
+                }
+            };
+            let mut body = json!({ "outcomes": outcomes });
+            if let Some(next_cursor) = next_cursor {
+                body["nextCursor"] = json!(next_cursor);
+            }
+            Json(body).into_response()
+        }
+        Err(error) if error.contains("cursor") => bad_request(&error),
+        Err(error) => {
+            tracing::error!(
+                event = "code_checkpoint.outcome_replay_read_failed",
+                provider = %query.provider,
+                session_id = %query.session_id,
+                session_type = %query.session_type,
+                cause = %error,
+                "checkpoint outcomes could not be loaded for session recovery"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "checkpoint outcomes could not be loaded" })),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// `POST /checkpoints/restore` (`fresh-agent-extras-router.ts:410-428`).
 async fn post_checkpoint_restore(
     State(state): State<CheckpointsApiState>,
@@ -6121,7 +6319,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_durable_outcome_replays_when_store_becomes_unreadable() {
+    async fn cached_durable_outcome_page_survives_when_store_becomes_unreadable() {
         use freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier;
         use std::sync::atomic::AtomicUsize;
 
@@ -6167,17 +6365,25 @@ mod tests {
         tokio::fs::remove_file(&store_path).await.unwrap();
         tokio::fs::create_dir(&store_path).await.unwrap();
 
-        service
-            .replay_for_identity(
+        let (outcomes, next_cursor) = service
+            .replay_outcome_page(
                 AgentProvider::Opencode,
                 "session-cache-replay",
                 SessionType::Freshopencode,
+                None,
+                200,
             )
-            .await;
+            .await
+            .unwrap();
 
-        let outcome: Value = serde_json::from_str(&outcome_rx.recv().await.unwrap()).unwrap();
-        assert_eq!(outcome["requestId"], "request-cache-replay");
-        assert_eq!(outcome["logicalAttemptId"], "attempt-cache-replay");
+        let outcome = outcomes.first().unwrap();
+        assert_eq!(outcome.request_id, "request-cache-replay");
+        assert_eq!(outcome.logical_attempt_id, "attempt-cache-replay");
+        assert!(next_cursor.is_none());
+        assert!(
+            outcome_rx.try_recv().is_ok(),
+            "the live outcome stays on the broadcast bus"
+        );
         assert_eq!(dispatches.load(Ordering::SeqCst), 1);
     }
 
@@ -6758,9 +6964,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_identity_receipt_is_durable_and_replayed_after_service_reload() {
-        use freshell_ws::checkpoint_barrier::FreshAgentCheckpointBarrier;
-
+    async fn codex_identity_receipt_is_durable_and_loaded_after_service_reload() {
         let home = tempfile::tempdir().unwrap();
         let (broadcast_tx, _) = tokio::sync::broadcast::channel(16);
         let service =
@@ -6830,25 +7034,233 @@ mod tests {
             "durable checkpoint identity state never stores the sent prompt"
         );
 
+        let (replay_tx, _) = tokio::sync::broadcast::channel(8);
+        let reloaded = Arc::new(CheckpointService::new(
+            Arc::new(home.path().to_path_buf()),
+            Arc::new(replay_tx),
+        ));
+        let (outcomes, next_cursor) = reloaded
+            .replay_outcome_page(
+                AgentProvider::Codex,
+                "codex-session",
+                SessionType::Freshcodex,
+                None,
+                200,
+            )
+            .await
+            .unwrap();
+        let replayed = outcomes.first().unwrap();
+        assert!(next_cursor.is_none());
+        assert_eq!(replayed.logical_attempt_id, "codex-logical-attempt-1");
+        assert_eq!(
+            replayed.native_turn_id.as_deref(),
+            Some("codex-native-turn-1")
+        );
+        assert_eq!(
+            replayed.display_turn_id.as_deref(),
+            Some("codex-native-turn-1:row-0")
+        );
+    }
+
+    #[tokio::test]
+    async fn replayed_checkpoint_uses_the_requested_materialized_session_alias() {
+        use tower::ServiceExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(16);
+        let service =
+            CheckpointService::new(Arc::new(home.path().to_path_buf()), Arc::new(broadcast_tx));
+        let workspace = ResolvedCheckpointWorkspace {
+            path: PathBuf::from("/work/codex-project"),
+            provenance: "directory-picker".to_string(),
+        };
+        let send = FreshAgentSend {
+            provider: AgentProvider::Codex,
+            session_id: "provisional-codex-session".to_string(),
+            session_type: SessionType::Freshcodex,
+            text: "turn text is not stored".to_string(),
+            cwd: Some("/work/codex-project".to_string()),
+            images: None,
+            request_id: Some("codex-materialized-request".to_string()),
+            settings: None,
+            observed_epoch: None,
+            observed_generation: None,
+            checkpoint_intent: Some(freshell_protocol::FreshAgentCheckpointIntent {
+                logical_attempt_id: "codex-materialized-attempt".to_string(),
+                workspace: None,
+            }),
+        };
+        let key = checkpoint_attempt_key(&send, "codex-materialized-attempt");
+        let mut record = service.new_record(
+            &send,
+            "codex-materialized-attempt",
+            "codex-materialized-request",
+            Some((&workspace, "")),
+            Ok("checkpoint-materialized".to_string()),
+        );
+        record.dispatch_started = true;
+        record.outcome.native_turn_id = Some("codex-native-materialized-turn".to_string());
+        record.outcome.display_turn_id = Some("codex-native-materialized-turn:row-0".to_string());
+        service.persist_outcome(&key, record).await.unwrap();
+
+        service
+            .observe_materialized(&json!({
+                "provider": "codex",
+                "sessionType": "freshcodex",
+                "previousSessionId": "provisional-codex-session",
+                "sessionId": "durable-codex-session"
+            }))
+            .await;
+
         let (replay_tx, mut replay_rx) = tokio::sync::broadcast::channel(8);
         let reloaded = Arc::new(CheckpointService::new(
             Arc::new(home.path().to_path_buf()),
             Arc::new(replay_tx),
         ));
-        reloaded
-            .clone()
-            .replay_for_session(
+        let (outcomes, next_cursor) = reloaded
+            .replay_outcome_page(
                 AgentProvider::Codex,
-                "codex-session".to_string(),
+                "durable-codex-session",
                 SessionType::Freshcodex,
+                None,
+                200,
             )
-            .await;
-        let frame = replay_rx.recv().await.unwrap();
-        let replayed: Value = serde_json::from_str(&frame).unwrap();
-        assert_eq!(replayed["type"], "freshAgent.checkpoint.outcome");
-        assert_eq!(replayed["logicalAttemptId"], "codex-logical-attempt-1");
-        assert_eq!(replayed["nativeTurnId"], "codex-native-turn-1");
-        assert_eq!(replayed["displayTurnId"], "codex-native-turn-1:row-0");
+            .await
+            .unwrap();
+
+        let replayed = outcomes.first().unwrap();
+        assert!(next_cursor.is_none());
+        assert_eq!(replayed.session_id, "durable-codex-session");
+        assert_eq!(
+            replayed.native_turn_id.as_deref(),
+            Some("codex-native-materialized-turn")
+        );
+        assert_eq!(
+            replayed.checkpoint_id.as_deref(),
+            Some("checkpoint-materialized")
+        );
+        assert!(matches!(
+            replay_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        let api_state = CheckpointsApiState {
+            auth_token: Arc::new("tok".to_string()),
+            home: Arc::new(home.path().to_path_buf()),
+            service: Arc::clone(&reloaded),
+        };
+        let app = router(api_state);
+        let unauthorized_request = axum::http::Request::builder()
+            .uri("/api/fresh-agent/checkpoints/outcomes?provider=codex&sessionId=durable-codex-session&sessionType=freshcodex&limit=200")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let unauthorized_response = app.clone().oneshot(unauthorized_request).await.unwrap();
+        assert_eq!(unauthorized_response.status(), StatusCode::UNAUTHORIZED);
+        let request = axum::http::Request::builder()
+            .uri("/api/fresh-agent/checkpoints/outcomes?provider=codex&sessionId=durable-codex-session&sessionType=freshcodex&limit=200")
+            .header("x-auth-token", "tok")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = body_json(response).await;
+        assert_eq!(
+            response["outcomes"][0]["sessionId"],
+            "durable-codex-session"
+        );
+        assert_eq!(
+            response["outcomes"][0]["type"],
+            "freshAgent.checkpoint.outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_outcome_recovery_paginates_large_histories_without_broadcasting() {
+        let home = tempfile::tempdir().unwrap();
+        let (broadcast_tx, mut broadcast_rx) = tokio::sync::broadcast::channel(1024);
+        let service =
+            CheckpointService::new(Arc::new(home.path().to_path_buf()), Arc::new(broadcast_tx));
+        let mut outcomes = BTreeMap::new();
+        for index in 0..1100 {
+            let request_id = format!("replay-request-{index:04}");
+            let record = StoredCheckpointOutcome {
+                version: CHECKPOINT_OUTCOME_STORE_VERSION,
+                outcome: FreshAgentCheckpointOutcome {
+                    logical_attempt_id: format!("replay-attempt-{index:04}"),
+                    request_id: request_id.clone(),
+                    provider: AgentProvider::Codex,
+                    session_id: "replay-session".to_string(),
+                    session_type: SessionType::Freshcodex,
+                    status: FreshAgentCheckpointStatus::Available,
+                    checkpoint_id: Some(format!("replay-checkpoint-{index:04}")),
+                    workspace: None,
+                    code: None,
+                    reason: None,
+                    native_turn_id: Some(format!("native-turn-{index:04}")),
+                    display_turn_id: Some(format!("native-turn-{index:04}:row-0")),
+                },
+                request_ids: vec![request_id],
+                session_aliases: vec!["replay-session".to_string()],
+                dispatch_started: true,
+                capture_settled: true,
+                submitted_turn_id: None,
+                created_at_ms: index,
+            };
+            outcomes.insert(format!("replay-key-{index:04}"), record);
+        }
+        service
+            .write_outcome_store(&CheckpointOutcomeStore {
+                version: CHECKPOINT_OUTCOME_STORE_VERSION,
+                outcomes,
+            })
+            .await
+            .unwrap();
+
+        let mut recovered = Vec::new();
+        let mut cursor = None;
+        loop {
+            let (page, next_cursor) = service
+                .replay_outcome_page(
+                    AgentProvider::Codex,
+                    "replay-session",
+                    SessionType::Freshcodex,
+                    cursor.as_deref(),
+                    200,
+                )
+                .await
+                .unwrap();
+            assert!(page.len() <= 200);
+            recovered.extend(page.into_iter().map(|outcome| outcome.request_id));
+            let Some(next_cursor) = next_cursor else {
+                break;
+            };
+            if recovered.len() == 200 {
+                let mismatched_page = service
+                    .replay_outcome_page(
+                        AgentProvider::Codex,
+                        "another-session",
+                        SessionType::Freshcodex,
+                        Some(&next_cursor),
+                        200,
+                    )
+                    .await;
+                assert!(mismatched_page.is_err());
+            }
+            cursor = Some(next_cursor);
+        }
+        assert_eq!(recovered.len(), 1100);
+        assert_eq!(
+            recovered.first().map(String::as_str),
+            Some("replay-request-0000")
+        );
+        assert_eq!(
+            recovered.last().map(String::as_str),
+            Some("replay-request-1099")
+        );
+        assert!(matches!(
+            broadcast_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

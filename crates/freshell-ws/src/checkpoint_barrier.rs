@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use freshell_protocol::{AgentProvider, FreshAgentSend, SessionType};
+use freshell_protocol::FreshAgentSend;
 use futures::future::BoxFuture;
 
 pub trait FreshAgentCheckpointBarrier: Send + Sync {
@@ -15,16 +15,6 @@ pub trait FreshAgentCheckpointBarrier: Send + Sync {
         self: Arc<Self>,
         send: FreshAgentSend,
         forward: BoxFuture<'static, ()>,
-    ) -> BoxFuture<'static, ()>;
-
-    /// Replays durable per-turn results when a pane reattaches after missing
-    /// the pre-forward outcome broadcast. Implementations filter by provider
-    /// session identity and never infer an outcome from transcript text.
-    fn replay_for_session(
-        self: Arc<Self>,
-        provider: AgentProvider,
-        session_id: String,
-        session_type: SessionType,
     ) -> BoxFuture<'static, ()>;
 }
 

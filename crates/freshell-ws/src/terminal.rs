@@ -1963,62 +1963,26 @@ async fn handle_client_text(
         // same pattern as the other `freshAgent.*` arms. `_` keeps swallowing only
         // `Amplifier` (no fresh-agent runtime, same as the `FreshAgentSend` arm).
         ClientMessage::FreshAgentAttach(attach) => {
-            let checkpoint_replay = state.checkpoint_send.service.clone();
             match attach.provider {
                 freshell_protocol::AgentProvider::Codex => {
                     let fresh_codex = state.fresh_codex.clone();
                     tokio::spawn(
-                        async move {
-                            if let Some(service) = checkpoint_replay {
-                                Arc::clone(&service)
-                                    .replay_for_session(
-                                        attach.provider,
-                                        attach.session_id.clone(),
-                                        attach.session_type,
-                                    )
-                                    .await;
-                            }
-                            fresh_codex.handle_attach(attach).await
-                        }
-                        .instrument(tracing::Span::current()),
+                        async move { fresh_codex.handle_attach(attach).await }
+                            .instrument(tracing::Span::current()),
                     );
                 }
                 freshell_protocol::AgentProvider::Claude => {
                     let fresh_claude = state.fresh_claude.clone();
-                    let checkpoint_replay = state.checkpoint_send.service.clone();
                     tokio::spawn(
-                        async move {
-                            if let Some(service) = checkpoint_replay {
-                                Arc::clone(&service)
-                                    .replay_for_session(
-                                        attach.provider,
-                                        attach.session_id.clone(),
-                                        attach.session_type,
-                                    )
-                                    .await;
-                            }
-                            fresh_claude.handle_attach(attach).await
-                        }
-                        .instrument(tracing::Span::current()),
+                        async move { fresh_claude.handle_attach(attach).await }
+                            .instrument(tracing::Span::current()),
                     );
                 }
                 freshell_protocol::AgentProvider::Opencode => {
                     let fresh_opencode = state.fresh_opencode.clone();
-                    let checkpoint_replay = state.checkpoint_send.service.clone();
                     tokio::spawn(
-                        async move {
-                            if let Some(service) = checkpoint_replay {
-                                Arc::clone(&service)
-                                    .replay_for_session(
-                                        attach.provider,
-                                        attach.session_id.clone(),
-                                        attach.session_type,
-                                    )
-                                    .await;
-                            }
-                            fresh_opencode.handle_attach(attach).await
-                        }
-                        .instrument(tracing::Span::current()),
+                        async move { fresh_opencode.handle_attach(attach).await }
+                            .instrument(tracing::Span::current()),
                     );
                 }
                 _ => {}
@@ -13051,15 +13015,6 @@ mod pane_reconcile_gate_tests {
                 }
                 forward.await;
             })
-        }
-
-        fn replay_for_session(
-            self: Arc<Self>,
-            _provider: freshell_protocol::AgentProvider,
-            _session_id: String,
-            _session_type: freshell_protocol::SessionType,
-        ) -> futures::future::BoxFuture<'static, ()> {
-            Box::pin(async {})
         }
     }
 

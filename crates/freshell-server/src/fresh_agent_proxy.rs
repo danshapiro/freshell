@@ -210,15 +210,6 @@ impl HostedFreshAgentProxy {
                 }
             }
             HostedFreshAgentCommand::Attach(message) => {
-                if let Some(barrier) = self.checkpoint_barrier.get() {
-                    Arc::clone(barrier)
-                        .replay_for_session(
-                            message.provider,
-                            message.session_id.clone(),
-                            message.session_type,
-                        )
-                        .await;
-                }
                 if let Some(soul) = self
                     .resolve_soul(&message.provider, message.session_type, &message.session_id)
                     .await

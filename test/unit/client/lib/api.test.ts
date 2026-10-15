@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   api,
+  getFreshAgentCheckpointOutcomePage,
   getFreshAgentModelCapabilities,
   refreshFreshAgentModelCapabilities,
   getFreshAgentThreadSnapshot,
@@ -219,6 +220,34 @@ describe('visible-first read-model helpers', () => {
         signal,
         headers: expect.any(Headers),
       }),
+    )
+  })
+
+  it('loads a typed checkpoint outcome page for one provider session', async () => {
+    const signal = new AbortController().signal
+    const outcome = {
+      type: 'freshAgent.checkpoint.outcome',
+      logicalAttemptId: 'attempt-reopened',
+      requestId: 'request-reopened',
+      provider: 'codex',
+      sessionId: 'thread/one',
+      sessionType: 'freshcodex',
+      status: 'available',
+      checkpointId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      nativeTurnId: 'native-turn-1',
+      displayTurnId: 'native-turn-1:row-0',
+    }
+    mockFetch.mockResolvedValueOnce(mockJson({ outcomes: [outcome], nextCursor: 'cursor+/' }))
+
+    await expect(getFreshAgentCheckpointOutcomePage({
+      provider: 'codex',
+      sessionId: 'thread/one',
+      sessionType: 'freshcodex',
+      cursor: 'cursor+/',
+    }, { signal })).resolves.toEqual({ outcomes: [outcome], nextCursor: 'cursor+/' })
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/api/fresh-agent/checkpoints/outcomes?provider=codex&sessionId=thread%2Fone&sessionType=freshcodex&limit=200&cursor=cursor%2B%2F',
+      expect.objectContaining({ signal, headers: expect.any(Headers) }),
     )
   })
 

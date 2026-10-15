@@ -13,8 +13,11 @@ use freshell_runtime_protocol::{
 use std::{
     fs::{File, OpenOptions},
     io::{BufReader, Read, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
+
+static INDEX_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 std::thread_local! {
@@ -388,17 +391,19 @@ fn write_index_atomic(
         scanned_through_offset,
         torn_tail,
     )?;
-    let temporary = path.with_extension("tmp");
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&temporary)
-        .map_err(|_| "retained output index unavailable")?;
+    let (temporary, mut file) = create_index_temporary(path)?;
+    let _temporary_cleanup = RemoveIndexTemporary(temporary.clone());
     file.write_all(&bytes)
         .and_then(|_| file.sync_all())
         .map_err(|_| "retained output index write failed")?;
-    std::fs::rename(&temporary, path).map_err(|_| "retained output index commit failed")?;
+    if std::fs::rename(&temporary, path).is_err() {
+        // Windows may reject replacing an index another reader just committed.
+        // A complete, valid index for this spool is already enough to proceed;
+        // never report a read failure merely because the concurrent writer won.
+        if !index_is_valid_for_spool(path, descriptor, spool_bytes) {
+            return Err("retained output index commit failed".into());
+        }
+    }
     File::open(
         path.parent()
             .ok_or("retained output directory unavailable")?,
@@ -408,6 +413,49 @@ fn write_index_atomic(
     Ok(())
 }
 
+fn create_index_temporary(path: &Path) -> Result<(PathBuf, File), String> {
+    let parent = path
+        .parent()
+        .ok_or("retained output directory unavailable")?;
+    let name = path
+        .file_name()
+        .ok_or("retained output index unavailable")?
+        .to_string_lossy();
+    for _ in 0..128 {
+        let sequence = INDEX_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(".{name}.tmp-{}-{sequence}", std::process::id()));
+        match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+        {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err("retained output index unavailable".into()),
+        }
+    }
+    Err("retained output index temporary namespace exhausted".into())
+}
+
+struct RemoveIndexTemporary(PathBuf);
+
+impl Drop for RemoveIndexTemporary {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn index_is_valid_for_spool(
+    path: &Path,
+    descriptor: &TerminalSpoolDescriptor,
+    spool_bytes: u64,
+) -> bool {
+    File::open(path)
+        .ok()
+        .and_then(|file| read_spool_index(BufReader::new(file), descriptor, spool_bytes).ok())
+        .is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +463,41 @@ mod tests {
         terminal_spool::{write_spool_index_header, TerminalSpoolFrame, MAX_OUTPUT_FRAME_BYTES},
         IncarnationId, TerminalLaunchSpec,
     };
+
+    #[test]
+    fn concurrent_cold_index_rebuilds_do_not_collide_on_temporary_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let descriptor = TerminalSpoolDescriptor {
+            schema_version: 1,
+            incarnation_id: IncarnationId::new(),
+            terminal_id: "concurrent-index-terminal".into(),
+            stream_epoch: "launch-prefix-hostboot-concurrent".into(),
+            segment_limit_bytes: 32 * 1024 * 1024,
+        };
+        let path = directory.path().join(SPOOL_CURRENT_INDEX_FILE);
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let workers = (0..16)
+            .map(|_| {
+                let path = path.clone();
+                let descriptor = descriptor.clone();
+                let ready = std::sync::Arc::clone(&ready);
+                std::thread::spawn(move || {
+                    ready.wait();
+                    write_index_atomic(&path, &descriptor, &[], 0, 0, false)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        assert!(index_is_valid_for_spool(&path, &descriptor, 0));
+        assert_eq!(
+            std::fs::read_dir(directory.path()).unwrap().count(),
+            1,
+            "all unique temporary files are removed after the atomic commits"
+        );
+    }
 
     #[test]
     fn legacy_supervisor_fallback_builds_and_reuses_sparse_spool_index() {

@@ -298,6 +298,7 @@ const wsMock = vi.hoisted(() => ({
 const apiMock = vi.hoisted(() => ({
   get: vi.fn(),
   getFreshAgentThreadSnapshot: vi.fn(),
+  getFreshAgentCheckpointOutcomePage: vi.fn(),
   getFreshAgentModelCapabilities: vi.fn(),
   post: vi.fn(),
   requestSessionHandoff: vi.fn(),
@@ -324,6 +325,7 @@ vi.mock('@/lib/api', async () => {
     ...actual,
     api: { ...actual.api, get: apiMock.get, post: apiMock.post },
     getFreshAgentThreadSnapshot: apiMock.getFreshAgentThreadSnapshot,
+    getFreshAgentCheckpointOutcomePage: apiMock.getFreshAgentCheckpointOutcomePage,
     getFreshAgentModelCapabilities: apiMock.getFreshAgentModelCapabilities,
     requestSessionHandoff: apiMock.requestSessionHandoff,
     setSessionMetadata: apiMock.setSessionMetadata,
@@ -554,9 +556,11 @@ beforeEach(() => {
   window.localStorage.removeItem('fresh-agent-prompt-history:freshcodex')
   window.localStorage.removeItem('fresh-agent-prompt-history:freshclaude')
   apiMock.getFreshAgentThreadSnapshot.mockReset()
+  apiMock.getFreshAgentCheckpointOutcomePage.mockReset()
   apiMock.getFreshAgentModelCapabilities.mockReset()
   apiMock.get.mockReset()
   apiMock.get.mockResolvedValue({ checkpoints: [] })
+  apiMock.getFreshAgentCheckpointOutcomePage.mockResolvedValue({ outcomes: [] })
   apiMock.post.mockReset()
   apiMock.requestSessionHandoff.mockReset()
   apiMock.setSessionMetadata.mockReset()
@@ -3629,7 +3633,7 @@ describe('FreshAgentView', () => {
     expect(apiMock.get).not.toHaveBeenCalledWith(expect.stringContaining('/api/fresh-agent/checkpoints?'))
   })
 
-  it('accepts a replayed checkpoint outcome after reload when it carries an exact provider row identity', async () => {
+  it('accepts a late checkpoint outcome event when it carries an exact provider row identity', async () => {
     const checkpointId = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
     const workspace = { path: '/repo/selected', provenance: 'directory-picker' as const }
     const nativeTurnId = 'codex-replayed-turn'
@@ -3706,8 +3710,8 @@ describe('FreshAgentView', () => {
     expect(getFreshAgentPaneContent(store).checkpointOutcomes ?? []).toHaveLength(0)
     expect(screen.queryByRole('status', { name: 'Code rewind available for this message' })).not.toBeInTheDocument()
 
-    // The first broadcast was missed while this pane was detached. The server
-    // replay has no in-memory pending send metadata to rely on after remount.
+    // A later identity-enriched event can arrive after the pane has already
+    // processed the checkpoint result, so it must still bind only the exact row.
     act(() => {
       onMessage?.({
         type: 'freshAgent.checkpoint.outcome',
@@ -3745,9 +3749,8 @@ describe('FreshAgentView', () => {
       }),
     ]))
 
-    // The server may replay many durable outcomes after attach. A local
-    // retention limit must not discard an older exact checkpoint from that
-    // replay before the pane is reloaded again.
+    // Recovery can return many durable outcomes in pages. A local retention
+    // limit must not discard an older exact checkpoint before the pane reloads.
     act(() => {
       for (let index = 0; index < 200; index += 1) {
         onMessage?.({
@@ -3788,6 +3791,86 @@ describe('FreshAgentView', () => {
       .toHaveTextContent('No exact code checkpoint is available for this message.')
     expect(within(remountedUserRows[1]!).getByRole('button', { name: 'Rewind unavailable for this message' }))
       .toBeDisabled()
+  })
+
+  it('restores durable checkpoint outcomes from paged session history after reopening a pane', async () => {
+    const sessionId = 'thread-reopened-checkpoints'
+    const requestId = 'request-reopened-checkpoints'
+    const nativeTurnId = 'native-reopened-turn'
+    const checkpointId = 'dddddddddddddddddddddddddddddddd'
+    const workspace = { path: '/repo/selected', provenance: 'directory-picker' as const }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'reopened session',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [{
+        id: `${nativeTurnId}:row-0`,
+        turnId: `${nativeTurnId}:row-0`,
+        nativeTurnId,
+        source: 'durable',
+        role: 'user',
+        summary: 'A turn from the reopened session',
+        items: [{ id: 'reopened-turn-text', kind: 'text', text: 'A turn from the reopened session' }],
+      }],
+    })
+    apiMock.getFreshAgentCheckpointOutcomePage
+      .mockResolvedValueOnce({ outcomes: [], nextCursor: 'checkpoint-page-2' })
+      .mockResolvedValueOnce({ outcomes: [{
+        type: 'freshAgent.checkpoint.outcome',
+        logicalAttemptId: 'attempt-reopened-checkpoints',
+        requestId,
+        provider: 'codex',
+        sessionId,
+        sessionType: 'freshcodex',
+        status: 'available',
+        checkpointId,
+        workspace,
+        nativeTurnId,
+        displayTurnId: `${nativeTurnId}:row-0`,
+      }] })
+
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'new-pane-after-reopen',
+        sessionId,
+        sessionRef: { provider: 'codex', sessionId },
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    const rewind = await screen.findByRole('button', { name: 'Rewind code to here' })
+    expect(rewind).toBeEnabled()
+    expect(apiMock.getFreshAgentCheckpointOutcomePage).toHaveBeenNthCalledWith(
+      1,
+      { provider: 'codex', sessionId, sessionType: 'freshcodex', cursor: undefined },
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    )
+    expect(apiMock.getFreshAgentCheckpointOutcomePage).toHaveBeenNthCalledWith(
+      2,
+      { provider: 'codex', sessionId, sessionType: 'freshcodex', cursor: 'checkpoint-page-2' },
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    )
+    expect(getFreshAgentPaneContent(store).checkpointOutcomes).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        requestId,
+        conversationRequestId: 'new-pane-after-reopen',
+        conversationSessionKey: JSON.stringify(['codex', 'freshcodex', sessionId]),
+        checkpointId,
+        nativeTurnId,
+        displayTurnId: `${nativeTurnId}:row-0`,
+      }),
+    ]))
   })
 
   it('keeps an unbound modern turn unavailable instead of matching its prompt to another checkpoint', async () => {

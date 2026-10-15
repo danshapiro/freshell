@@ -1,5 +1,8 @@
 import type { CodingCliProviderName } from './coding-cli-types'
-import type { TokenSummary } from '@shared/ws-protocol'
+import {
+  FreshAgentCheckpointOutcomeSchema,
+  type TokenSummary,
+} from '@shared/ws-protocol'
 import type { TitleSource } from '@shared/title-source'
 import {
   FreshAgentSnapshotSchema,
@@ -624,6 +627,43 @@ export async function getFreshAgentModelCapabilities(
     }
     throw error
   }
+}
+
+const FreshAgentCheckpointOutcomePageSchema = z.object({
+  outcomes: z.array(FreshAgentCheckpointOutcomeSchema),
+  nextCursor: z.string().min(1).optional(),
+}).strict()
+
+export type FreshAgentCheckpointOutcomePage = z.infer<typeof FreshAgentCheckpointOutcomePageSchema>
+
+export async function getFreshAgentCheckpointOutcomePage(
+  identity: {
+    provider: string
+    sessionId: string
+    sessionType: string
+    cursor?: string
+  },
+  options: ApiRequestOptions = {},
+): Promise<FreshAgentCheckpointOutcomePage> {
+  const query = new URLSearchParams({
+    provider: identity.provider,
+    sessionId: identity.sessionId,
+    sessionType: identity.sessionType,
+    limit: '200',
+  })
+  if (identity.cursor) query.set('cursor', identity.cursor)
+  const raw = await with429Retry(
+    () => api.get(`/api/fresh-agent/checkpoints/outcomes?${query.toString()}`, options),
+    options,
+  )
+  const parsed = FreshAgentCheckpointOutcomePageSchema.safeParse(raw)
+  if (!parsed.success) {
+    throw new FreshAgentApiContractError(
+      'Fresh-agent checkpoint outcome response did not match the shared contract.',
+      parsed.error.issues,
+    )
+  }
+  return parsed.data
 }
 
 export async function refreshFreshAgentModelCapabilities(

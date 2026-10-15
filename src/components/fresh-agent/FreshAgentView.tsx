@@ -26,7 +26,14 @@ import { sendSuppressedAwareFreshAgentFrame } from '@/lib/fresh-agent-configure'
 import { KILL_ACK_TIMEOUT_MESSAGE, KILL_FAILED_MESSAGE, sendFreshAgentKillAndAwait, sendFreshAgentRecoveryStopAndAwait } from '@/lib/kill-ack'
 import { createLogger } from '@/lib/client-logger'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
-import { ApiError, api, getFreshAgentModelCapabilities, getFreshAgentThreadSnapshot, setSessionMetadata } from '@/lib/api'
+import {
+  ApiError,
+  api,
+  getFreshAgentCheckpointOutcomePage,
+  getFreshAgentModelCapabilities,
+  getFreshAgentThreadSnapshot,
+  setSessionMetadata,
+} from '@/lib/api'
 import { clearPaneCloseError, clearReconcilePendingPane, consumePaneRefreshRequest, mergePaneContent, startNewManagedRuntimeConversation, updatePaneContent } from '@/store/panesSlice'
 import { retryManagedConversation } from '@/lib/managed-runtime-retry'
 import { isManagedRuntimeRecoveryDecision, ManagedRuntimeRecoveryCard } from '@/components/ManagedRuntimeRecoveryCard'
@@ -259,6 +266,12 @@ type CheckpointTurnAvailability = FreshAgentTurnRewindAvailability & {
   /** Exact provider identity, present only after observing the real user row. */
   nativeTurnId?: string
   displayTurnId?: string
+}
+
+type CheckpointAvailabilityPublication = {
+  requestId?: string
+  submittedTurnId?: string
+  availability: CheckpointTurnAvailability
 }
 
 const CHECKPOINT_FAILURE_FALLBACK = 'The project workspace could not be saved before this message was sent.'
@@ -647,6 +660,61 @@ function getQuestionAgentLabel(paneContent: FreshAgentPaneContent, descriptorLab
       return 'Opencode'
     default:
       return descriptorLabel ?? 'Fresh Agent'
+  }
+}
+
+function checkpointOutcomeMessageAvailability(
+  message: Record<string, unknown>,
+): CheckpointTurnAvailability {
+  const safeTurnId = (value: unknown): string | undefined => (
+    typeof value === 'string'
+    && value.length > 0
+    && value.length <= 256
+    && !/[\u0000-\u001f\u007f-\u009f]/.test(value)
+      ? value
+      : undefined
+  )
+  const nativeTurnId = safeTurnId(message.nativeTurnId)
+  const displayTurnId = safeTurnId(message.displayTurnId)
+  const workspace = normalizeFreshAgentCheckpointWorkspace(message.workspace)
+  if (
+    message.status === 'available'
+    && typeof message.checkpointId === 'string'
+    && message.checkpointId.length > 0
+    && message.checkpointId.length <= 256
+    && !/[\u0000-\u001f\u007f-\u009f]/.test(message.checkpointId)
+  ) {
+    return {
+      status: 'available',
+      checkpointId: message.checkpointId,
+      ...(workspace ? { workspace } : {}),
+      ...(nativeTurnId ? { nativeTurnId } : {}),
+      ...(displayTurnId ? { displayTurnId } : {}),
+    }
+  }
+  if (message.status === 'unavailable') {
+    const reason = typeof message.reason === 'string'
+      ? sanitizeCheckpointReason(message.reason)
+      : ''
+    const code = typeof message.code === 'string' && /^[a-z0-9_.:-]{1,96}$/.test(message.code)
+      ? message.code
+      : undefined
+    return {
+      status: 'unavailable',
+      reason: reason || CHECKPOINT_FAILURE_FALLBACK,
+      ...(code ? { code } : {}),
+      ...(workspace ? { workspace } : {}),
+      ...(nativeTurnId ? { nativeTurnId } : {}),
+      ...(displayTurnId ? { displayTurnId } : {}),
+    }
+  }
+  return {
+    status: 'unavailable',
+    reason: 'The server did not return a saved code checkpoint.',
+    code: 'checkpoint_capture_failed',
+    ...(workspace ? { workspace } : {}),
+    ...(nativeTurnId ? { nativeTurnId } : {}),
+    ...(displayTurnId ? { displayTurnId } : {}),
   }
 }
 
@@ -1100,61 +1168,180 @@ export function FreshAgentView({
   const [checkpointAvailabilityByTurn, setCheckpointAvailabilityByTurn] = useState<Map<string, CheckpointTurnAvailability>>(
     () => checkpointAvailabilityMap(paneContent),
   )
-  const publishCheckpointAvailability = useCallback((
+  const publishCheckpointAvailabilities = useCallback((
     scope: string,
-    requestId: string | undefined,
-    submittedTurnId: string | undefined,
-    availability: CheckpointTurnAvailability,
+    publications: CheckpointAvailabilityPublication[],
   ) => {
     setCheckpointAvailabilityByTurn((current) => {
       const next = new Map(current)
-      if (requestId) {
-        next.set(checkpointAvailabilityKey(scope, 'request', requestId), availability)
-      }
-      if (submittedTurnId) {
-        next.set(checkpointTurnAvailabilityKey(scope, submittedTurnId), availability)
-      }
-      if (availability.displayTurnId) {
-        next.set(checkpointTurnAvailabilityKey(scope, availability.displayTurnId), availability)
-      }
-      if (availability.nativeTurnId) {
-        next.set(checkpointTurnAvailabilityKey(scope, availability.nativeTurnId), availability)
+      for (const { requestId, submittedTurnId, availability } of publications) {
+        if (requestId) {
+          next.set(checkpointAvailabilityKey(scope, 'request', requestId), availability)
+        }
+        if (submittedTurnId) {
+          next.set(checkpointTurnAvailabilityKey(scope, submittedTurnId), availability)
+        }
+        if (availability.displayTurnId) {
+          next.set(checkpointTurnAvailabilityKey(scope, availability.displayTurnId), availability)
+        }
+        if (availability.nativeTurnId) {
+          next.set(checkpointTurnAvailabilityKey(scope, availability.nativeTurnId), availability)
+        }
       }
       return next
     })
-    if (!requestId || availability.status === 'pending') return
+    if (!publications.some(({ requestId, availability }) => (
+      requestId && availability.status !== 'pending'
+    ))) return
 
     const state = appStore.getState()
     const paneRoot = state.panes.layouts[tabId]
     const latestPaneContent = paneRoot ? findPaneContent(paneRoot, paneId) : null
     if (latestPaneContent?.kind !== 'fresh-agent' || latestPaneContent.createRequestId !== scope) return
     const conversationSessionKey = freshAgentCheckpointConversationKeyForContent(latestPaneContent)
-    const outcome: FreshAgentCheckpointOutcome = {
-      version: 1,
-      requestId,
-      conversationRequestId: scope,
-      ...(conversationSessionKey ? { conversationSessionKey } : {}),
-      ...(availability.displayTurnId ? { displayTurnId: availability.displayTurnId } : {}),
-      ...(availability.nativeTurnId ? { nativeTurnId: availability.nativeTurnId } : {}),
-      status: availability.status,
-      ...(availability.status === 'available' && availability.checkpointId
-        ? { checkpointId: availability.checkpointId }
-        : {}),
-      ...(availability.workspace ? { workspace: availability.workspace } : {}),
-      ...(availability.status === 'unavailable'
-        ? {
-            ...(availability.code ? { code: availability.code } : {}),
-            reason: availability.reason,
-          }
-        : {}),
+    const outcomesByRequestId = new Map(
+      (latestPaneContent.checkpointOutcomes ?? []).map((outcome) => [outcome.requestId, outcome]),
+    )
+    for (const { requestId, availability } of publications) {
+      if (!requestId || availability.status === 'pending') continue
+      const outcome: FreshAgentCheckpointOutcome = {
+        version: 1,
+        requestId,
+        conversationRequestId: scope,
+        ...(conversationSessionKey ? { conversationSessionKey } : {}),
+        ...(availability.displayTurnId ? { displayTurnId: availability.displayTurnId } : {}),
+        ...(availability.nativeTurnId ? { nativeTurnId: availability.nativeTurnId } : {}),
+        status: availability.status,
+        ...(availability.status === 'available' && availability.checkpointId
+          ? { checkpointId: availability.checkpointId }
+          : {}),
+        ...(availability.workspace ? { workspace: availability.workspace } : {}),
+        ...(availability.status === 'unavailable'
+          ? {
+              ...(availability.code ? { code: availability.code } : {}),
+              reason: availability.reason,
+            }
+          : {}),
+      }
+      outcomesByRequestId.delete(requestId)
+      outcomesByRequestId.set(requestId, outcome)
     }
-    const priorOutcomes = latestPaneContent.checkpointOutcomes ?? []
-    const checkpointOutcomes = [
-      ...priorOutcomes.filter((item) => item.requestId !== requestId),
-      outcome,
-    ].slice(-FRESH_AGENT_CHECKPOINT_OUTCOME_LIMIT)
+    while (outcomesByRequestId.size > FRESH_AGENT_CHECKPOINT_OUTCOME_LIMIT) {
+      const oldestRequestId = outcomesByRequestId.keys().next().value
+      if (oldestRequestId === undefined) break
+      outcomesByRequestId.delete(oldestRequestId)
+    }
+    const checkpointOutcomes = [...outcomesByRequestId.values()]
     dispatch(mergePaneContent({ tabId, paneId, updates: { checkpointOutcomes } }))
   }, [appStore, dispatch, paneId, tabId])
+  const publishCheckpointAvailability = useCallback((
+    scope: string,
+    requestId: string | undefined,
+    submittedTurnId: string | undefined,
+    availability: CheckpointTurnAvailability,
+  ) => {
+    publishCheckpointAvailabilities(scope, [{ requestId, submittedTurnId, availability }])
+  }, [publishCheckpointAvailabilities])
+  const checkpointOutcomeHistoryFull = (paneContent.checkpointOutcomes?.length ?? 0)
+    >= FRESH_AGENT_CHECKPOINT_OUTCOME_LIMIT
+  useEffect(() => {
+    const sessionId = paneContent.sessionId
+      ?? (paneContent.sessionRef?.provider === paneContent.provider
+        ? paneContent.sessionRef.sessionId
+        : undefined)
+      ?? paneContent.resumeSessionId
+    if (
+      connectionStatus !== 'ready'
+      || !sessionId
+      || checkpointOutcomeHistoryFull
+    ) return
+
+    const controller = new AbortController()
+    let cancelled = false
+    const provider = paneContent.provider
+    const sessionType = paneContent.sessionType
+    const scope = paneContent.createRequestId
+    const loadCheckpointOutcomes = async () => {
+      let cursor: string | undefined
+      let total = 0
+      const seenCursors = new Set<string>()
+      do {
+        const page = await getFreshAgentCheckpointOutcomePage(
+          { provider, sessionId, sessionType, cursor },
+          { signal: controller.signal },
+        )
+        if (cancelled) return
+        const pagePublications: CheckpointAvailabilityPublication[] = []
+        const latestState = appStore.getState()
+        const latestLayout = latestState.panes.layouts[tabId]
+        const latestContent = latestLayout ? findPaneContent(latestLayout, paneId) : null
+        const existingOutcomes = new Map(
+          (latestContent?.kind === 'fresh-agent' ? latestContent.checkpointOutcomes ?? [] : [])
+            .map((saved) => [saved.requestId, saved]),
+        )
+        for (const outcome of page.outcomes) {
+          if (
+            outcome.provider !== provider
+            || outcome.sessionType !== sessionType
+            || outcome.sessionId !== sessionId
+          ) continue
+          const fetched = checkpointOutcomeMessageAvailability(outcome as unknown as Record<string, unknown>)
+          const existing = existingOutcomes.get(outcome.requestId)
+          const availability = existing
+            ? (() => {
+                const saved = checkpointOutcomeAvailability(existing)
+                return {
+                  ...fetched,
+                  ...saved,
+                  nativeTurnId: fetched.nativeTurnId ?? saved.nativeTurnId,
+                  displayTurnId: fetched.displayTurnId ?? saved.displayTurnId,
+                  workspace: fetched.workspace ?? saved.workspace,
+                }
+              })()
+            : fetched
+          pagePublications.push({ requestId: outcome.requestId, availability })
+          total += 1
+          if (total >= FRESH_AGENT_CHECKPOINT_OUTCOME_LIMIT) break
+        }
+        publishCheckpointAvailabilities(scope, pagePublications)
+        if (total >= FRESH_AGENT_CHECKPOINT_OUTCOME_LIMIT) return
+        cursor = page.nextCursor
+        if (cursor && seenCursors.has(cursor)) {
+          throw new Error('Checkpoint outcome history returned a repeated page cursor.')
+        }
+        if (cursor) seenCursors.add(cursor)
+      } while (cursor)
+    }
+
+    void loadCheckpointOutcomes().catch((err: unknown) => {
+      if (cancelled || controller.signal.aborted) return
+      log.warn({
+        event: 'fresh_agent.checkpoint_outcomes_fetch_failed',
+        provider,
+        sessionId,
+        sessionType,
+        err,
+      })
+    })
+    return () => {
+      cancelled = true
+      controller.abort()
+    }
+  }, [
+    appStore,
+    checkpointOutcomeHistoryFull,
+    connectionStatus,
+    paneContent.createRequestId,
+    paneContent.provider,
+    paneContent.resumeSessionId,
+    paneContent.sessionId,
+    paneContent.sessionRef?.provider,
+    paneContent.sessionRef?.sessionId,
+    paneContent.sessionType,
+    paneId,
+    publishCheckpointAvailabilities,
+    tabId,
+  ])
   const getCheckpointAvailability = useCallback((turn: FreshAgentTurn): CheckpointTurnAvailability | undefined => {
     if (turn.role !== 'user') return undefined
     const scope = checkpointAvailabilityScope(paneContent)
@@ -2805,20 +2992,10 @@ export function FreshAgentView({
         const requestId = message.requestId
         const pending = pendingSendMetadataRef.current.get(requestId)
         const current = paneContentRef.current
-        const checkpointTurnId = (value: unknown): string | undefined => (
-          typeof value === 'string'
-          && value.length > 0
-          && value.length <= 256
-          && !/[\u0000-\u001f\u007f-\u009f]/.test(value)
-            ? value
-            : undefined
-        )
-        const nativeTurnId = checkpointTurnId(message.nativeTurnId)
-        const displayTurnId = checkpointTurnId(message.displayTurnId)
-        const hasProviderTurnIdentity = Boolean(nativeTurnId || displayTurnId)
+        const fetchedOutcome = checkpointOutcomeMessageAvailability(message)
         if (
           (pending && message.logicalAttemptId !== pending.logicalAttemptId)
-          || (!pending && !hasProviderTurnIdentity)
+          || (!pending && !fetchedOutcome.nativeTurnId && !fetchedOutcome.displayTurnId)
           || !locatorMatchesPane(
             message,
             current,
@@ -2827,57 +3004,15 @@ export function FreshAgentView({
           )
         ) return
 
-        const workspace = normalizeFreshAgentCheckpointWorkspace(message.workspace)
+        const workspace = fetchedOutcome.workspace
           ?? pending?.checkpointWorkspace
           ?? current.checkpointWorkspace
-        let checkpointOutcome: CheckpointTurnAvailability
-        if (
-          message.status === 'available'
-          && typeof message.checkpointId === 'string'
-          && message.checkpointId.length > 0
-          && message.checkpointId.length <= 256
-          && !/[\u0000-\u001f\u007f-\u009f]/.test(message.checkpointId)
-        ) {
-          checkpointOutcome = {
-            status: 'available',
-            checkpointId: message.checkpointId,
-            ...(workspace ? { workspace } : {}),
-            ...(nativeTurnId ? { nativeTurnId } : {}),
-            ...(displayTurnId ? { displayTurnId } : {}),
-          }
-        } else if (message.status === 'unavailable') {
-          const suppliedReason = typeof message.reason === 'string'
-            ? sanitizeCheckpointReason(message.reason)
-            : ''
-          const suppliedCode = typeof message.code === 'string'
-            && /^[a-z0-9_.:-]{1,96}$/.test(message.code)
-            ? message.code
-            : undefined
-          checkpointOutcome = {
-            status: 'unavailable',
-            reason: suppliedReason || CHECKPOINT_FAILURE_FALLBACK,
-            ...(suppliedCode ? { code: suppliedCode } : {}),
-            ...(workspace ? { workspace } : {}),
-            ...(nativeTurnId ? { nativeTurnId } : {}),
-            ...(displayTurnId ? { displayTurnId } : {}),
-          }
-        } else {
-          checkpointOutcome = {
-            status: 'unavailable',
-            reason: 'The server did not return a saved code checkpoint.',
-            code: 'checkpoint_capture_failed',
-            ...(workspace ? { workspace } : {}),
-            ...(nativeTurnId ? { nativeTurnId } : {}),
-            ...(displayTurnId ? { displayTurnId } : {}),
-          }
-        }
+        const checkpointOutcome = { ...fetchedOutcome, ...(workspace ? { workspace } : {}) }
         if (pending) {
           recordPendingSendMetadata(requestId, { checkpointOutcome })
         } else {
-          // Replayed outcomes arrive after remount, when the transient send
-          // map is empty. The provider IDs are stamped only after observing
-          // the exact persisted user row, so they safely bind the durable
-          // result to its transcript row without prompt or ordinal matching.
+          // Late outcome events have no transient send metadata. Provider row
+          // IDs bind them to the exact transcript row without prompt matching.
           publishCheckpointAvailability(
             checkpointAvailabilityScope(current),
             requestId,
