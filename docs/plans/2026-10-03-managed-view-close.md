@@ -8,14 +8,19 @@
 
 ### Requested result
 Stop Freshell from recreating shell and coding CLI tabs after they have been
-closed by fixing the managed-view recovery root cause.
+closed by fixing the managed-view recovery root cause, then rebase the working
+branch onto remote `main`.
 
 ### Explicit constraints
 - Treat “Windows” as terminal tabs, per the user's clarification.
 - Follow the-usual workflow through independent review and configured
   repository verification.
+- Continue routine implementation and verification without pausing for
+  progress or routine-choice questions; provide status updates as work
+  proceeds.
 - Keep the live Freshell server running; do not restart or deploy it.
 - Do not create a PR or merge the branch.
+- Rebase the feature branch onto fetched `origin/main`.
 
 ### Accepted tradeoffs and residuals
 - Closing a tab detaches the managed view while leaving its process running
