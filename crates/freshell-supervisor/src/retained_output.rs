@@ -17,7 +17,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-static INDEX_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 std::thread_local! {
@@ -126,27 +126,82 @@ pub(crate) fn read(
             exit: TerminalExitObservation::Unavailable,
         };
         completed.validate(&descriptor, batch.head_seq)?;
-        let temporary = completion_path.with_extension("tmp");
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&temporary)
-            .map_err(|_| "completion unavailable")?;
-        let bytes = serde_json::to_vec(&completed).map_err(|_| "completion encoding failed")?;
-        file.write_all(&bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|_| "completion write failed")?;
-        std::fs::rename(temporary, &completion_path).map_err(|_| "completion commit failed")?;
-        File::open(&source.runtime_dir)
-            .and_then(|dir| dir.sync_all())
-            .map_err(|_| "completion parent sync failed")?;
+        let completed = commit_completion_if_absent(&completion_path, &descriptor, completed)?;
+        batch.exit_code = match &completed.exit {
+            TerminalExitObservation::Known { code } => Some(*code),
+            TerminalExitObservation::Unavailable => None,
+        };
         batch.completion = Some(completed);
         batch.exited = true;
-        batch.exit_code = None;
     }
     batch.native_session_id = source.native_session_id;
     Ok(batch)
+}
+
+fn commit_completion_if_absent(
+    path: &Path,
+    descriptor: &TerminalSpoolDescriptor,
+    completion: TerminalSpoolCompletion,
+) -> Result<TerminalSpoolCompletion, String> {
+    completion.validate(descriptor, completion.head_seq)?;
+    let bytes = serde_json::to_vec(&completion).map_err(|_| "completion encoding failed")?;
+    let (temporary, mut file) = create_completion_temporary(path)?;
+    let _temporary_cleanup = RemoveTemporaryFile(temporary.clone());
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|_| "completion write failed")?;
+    drop(file);
+
+    match std::fs::hard_link(&temporary, path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing: TerminalSpoolCompletion = metadata(path)?;
+            existing.validate(descriptor, completion.head_seq)?;
+            return Ok(existing);
+        }
+        Err(_) => return Err("completion commit failed".into()),
+    }
+
+    File::open(
+        path.parent()
+            .ok_or("retained output directory unavailable")?,
+    )
+    .and_then(|directory| directory.sync_all())
+    .map_err(|_| "completion parent sync failed")?;
+    Ok(completion)
+}
+
+fn create_completion_temporary(path: &Path) -> Result<(PathBuf, File), String> {
+    create_unique_temporary(
+        path,
+        "completion unavailable",
+        "completion temporary namespace exhausted",
+    )
+}
+
+fn create_unique_temporary(
+    path: &Path,
+    unavailable: &'static str,
+    namespace_exhausted: &'static str,
+) -> Result<(PathBuf, File), String> {
+    let parent = path
+        .parent()
+        .ok_or("retained output directory unavailable")?;
+    let name = path.file_name().ok_or(unavailable)?.to_string_lossy();
+    for _ in 0..128 {
+        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(".{name}.tmp-{}-{sequence}", std::process::id()));
+        match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+        {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err(unavailable.into()),
+        }
+    }
+    Err(namespace_exhausted.into())
 }
 
 fn read_indexed(
@@ -392,7 +447,7 @@ fn write_index_atomic(
         torn_tail,
     )?;
     let (temporary, mut file) = create_index_temporary(path)?;
-    let _temporary_cleanup = RemoveIndexTemporary(temporary.clone());
+    let _temporary_cleanup = RemoveTemporaryFile(temporary.clone());
     file.write_all(&bytes)
         .and_then(|_| file.sync_all())
         .map_err(|_| "retained output index write failed")?;
@@ -414,32 +469,16 @@ fn write_index_atomic(
 }
 
 fn create_index_temporary(path: &Path) -> Result<(PathBuf, File), String> {
-    let parent = path
-        .parent()
-        .ok_or("retained output directory unavailable")?;
-    let name = path
-        .file_name()
-        .ok_or("retained output index unavailable")?
-        .to_string_lossy();
-    for _ in 0..128 {
-        let sequence = INDEX_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary = parent.join(format!(".{name}.tmp-{}-{sequence}", std::process::id()));
-        match OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)
-        {
-            Ok(file) => return Ok((temporary, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(_) => return Err("retained output index unavailable".into()),
-        }
-    }
-    Err("retained output index temporary namespace exhausted".into())
+    create_unique_temporary(
+        path,
+        "retained output index unavailable",
+        "retained output index temporary namespace exhausted",
+    )
 }
 
-struct RemoveIndexTemporary(PathBuf);
+struct RemoveTemporaryFile(PathBuf);
 
-impl Drop for RemoveIndexTemporary {
+impl Drop for RemoveTemporaryFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
@@ -463,6 +502,43 @@ mod tests {
         terminal_spool::{write_spool_index_header, TerminalSpoolFrame, MAX_OUTPUT_FRAME_BYTES},
         IncarnationId, TerminalLaunchSpec,
     };
+
+    #[test]
+    fn completion_commit_preserves_a_concurrent_known_exit_observation() {
+        let directory = tempfile::tempdir().unwrap();
+        let descriptor = TerminalSpoolDescriptor {
+            schema_version: 1,
+            incarnation_id: IncarnationId::new(),
+            terminal_id: "completion-terminal".into(),
+            stream_epoch: "launch-prefix-hostboot-completion".into(),
+            segment_limit_bytes: 32 * 1024 * 1024,
+        };
+        let path = directory.path().join(SPOOL_COMPLETION_FILE);
+        let known = TerminalSpoolCompletion {
+            incarnation_id: descriptor.incarnation_id.clone(),
+            terminal_id: descriptor.terminal_id.clone(),
+            stream_epoch: descriptor.stream_epoch.clone(),
+            retained_from_seq: 1,
+            head_seq: 3,
+            exit: TerminalExitObservation::Known { code: 17 },
+        };
+        std::fs::write(&path, serde_json::to_vec(&known).unwrap()).unwrap();
+        let fallback = TerminalSpoolCompletion {
+            exit: TerminalExitObservation::Unavailable,
+            ..known.clone()
+        };
+
+        let committed = commit_completion_if_absent(&path, &descriptor, fallback).unwrap();
+        let on_disk: TerminalSpoolCompletion = metadata(&path).unwrap();
+
+        assert_eq!(committed, known);
+        assert_eq!(on_disk, known);
+        assert_eq!(
+            std::fs::read_dir(directory.path()).unwrap().count(),
+            1,
+            "the temporary completion file is removed after another writer wins"
+        );
+    }
 
     #[test]
     fn concurrent_cold_index_rebuilds_do_not_collide_on_temporary_files() {

@@ -443,6 +443,76 @@ async fn retained_output_verified_end_survives_cleanup_and_cold_supervisor() {
 }
 
 #[tokio::test]
+async fn concurrent_verified_empty_reads_share_one_completion_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let (_supervisor, context) =
+        retained_output_fixture(root.path(), BackendRuntimeState::Exited).await;
+    let incarnation_id = context.prior_handle.incarnation_id().clone();
+    let runtime_dir = context.prior_handle.runtime_dir().to_path_buf();
+    let terminal = context.prior_handle.terminal().unwrap().clone();
+    let gate = std::sync::Arc::new(std::sync::Barrier::new(32));
+    let readers = (0..32)
+        .map(|_| {
+            let gate = std::sync::Arc::clone(&gate);
+            let source = crate::registry::RetainedOutputSource {
+                incarnation_id: incarnation_id.clone(),
+                runtime_dir: runtime_dir.clone(),
+                terminal: terminal.clone(),
+                native_session_id: None,
+            };
+            tokio::task::spawn_blocking(move || {
+                gate.wait();
+                crate::retained_output::read(
+                    source,
+                    0,
+                    65536,
+                    Some("launch-prefix-hostboot-exact".into()),
+                    true,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for reader in readers {
+        let output = reader.await.unwrap().unwrap();
+        assert!(output.exited);
+        assert_eq!(output.head_seq, 3);
+        assert!(matches!(
+            output.completion.unwrap().exit,
+            freshell_runtime_protocol::TerminalExitObservation::Unavailable
+        ));
+    }
+    let completion: freshell_runtime_protocol::TerminalSpoolCompletion = serde_json::from_slice(
+        &std::fs::read(runtime_dir.join("terminal-spool-completion.json")).unwrap(),
+    )
+    .unwrap();
+    completion
+        .validate(
+            &freshell_runtime_protocol::TerminalSpoolDescriptor {
+                schema_version: 1,
+                incarnation_id,
+                terminal_id: terminal.terminal_id,
+                stream_epoch: "launch-prefix-hostboot-exact".into(),
+                segment_limit_bytes: 33554432,
+            },
+            3,
+        )
+        .unwrap();
+    assert_eq!(
+        std::fs::read_dir(&runtime_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".terminal-spool-completion.json.tmp-"))
+            .count(),
+        0,
+        "concurrent completion temporaries are cleaned up"
+    );
+}
+
+#[tokio::test]
 async fn retained_output_missing_spool_reports_real_failure() {
     let root = tempfile::tempdir().unwrap();
     let (supervisor, context) =

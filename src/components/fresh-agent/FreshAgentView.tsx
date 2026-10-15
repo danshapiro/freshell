@@ -1284,9 +1284,13 @@ export function FreshAgentView({
           const availability = existing
             ? (() => {
                 const saved = checkpointOutcomeAvailability(existing)
+                const savedRestoreFailure = saved.status === 'unavailable'
+                  && saved.code === 'workspace_unavailable'
+                const merged = savedRestoreFailure && fetched.status === 'available'
+                  ? fetched
+                  : { ...fetched, ...saved }
                 return {
-                  ...fetched,
-                  ...saved,
+                  ...merged,
                   nativeTurnId: fetched.nativeTurnId ?? saved.nativeTurnId,
                   displayTurnId: fetched.displayTurnId ?? saved.displayTurnId,
                   workspace: fetched.workspace ?? saved.workspace,
@@ -4205,13 +4209,6 @@ export function FreshAgentView({
     const cwd = agentSessionCwdRef.current ?? current.initialCwd ?? workspace?.path
     if (!cwd) {
       const reason = 'No project working directory is available for this message.'
-      const requestId = (turn as FreshAgentTurn & { requestId?: unknown }).requestId
-      publishCheckpointAvailability(
-        checkpointAvailabilityScope(current),
-        typeof requestId === 'string' ? requestId : undefined,
-        getFreshAgentDisplayTurnKey(turn),
-        { status: 'unavailable', reason, code: 'workspace_unavailable', ...(workspace ? { workspace } : {}) },
-      )
       setNotice(`Rewind unavailable for this message: ${reason}`)
       return
     }
@@ -4232,18 +4229,6 @@ export function FreshAgentView({
           const details = (error as { details?: unknown }).details
           if (details && typeof details === 'object' && (details as { code?: unknown }).code === 'workspace_unavailable') {
             const reason = checkpointFailureReason(error)
-            const requestId = (turn as FreshAgentTurn & { requestId?: unknown }).requestId
-            publishCheckpointAvailability(
-              checkpointAvailabilityScope(current),
-              typeof requestId === 'string' ? requestId : undefined,
-              getFreshAgentDisplayTurnKey(turn),
-              {
-                status: 'unavailable',
-                reason,
-                code: checkpointFailureCode(error) ?? 'checkpoint_restore_failed',
-                ...(workspace ? { workspace } : {}),
-              },
-            )
             setNotice(`Rewind unavailable for this message: ${reason}`)
             return
           }
