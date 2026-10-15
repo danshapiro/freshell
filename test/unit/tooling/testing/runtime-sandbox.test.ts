@@ -129,31 +129,31 @@ describe('managed environment browser attempt lifetime', () => {
         incarnationId: 'replacement-incarnation', containerId: 'a'.repeat(64),
       } } } },
       { event: 'supervisor.lifecycle', data: { raw: { event: 'supervisor.activation_failed', data: {
-        soulId: 'owned-soul', incarnationId: 'replacement-incarnation', stage: 'deliver_execution_grant',
-        errorCode: 'HOST_UNREACHABLE', errorClass: 'runtime_activation_failed', launchState: 'starting',
+        soulId: 'owned-soul', incarnationId: 'replacement-incarnation', stage: 'create_stopped_runtime',
+        errorCode: 'HOST_UNREACHABLE', errorClass: 'runtime_activation_failed', launchState: 'prepared',
         errorMessage: `provider config failed at ${secretPath}`,
       } } } },
       { event: 'supervisor.lifecycle', data: { raw: { event: 'supervisor.recovery.activation_failed', data: {
         soulId: 'owned-soul', priorIncarnationId: 'prior-incarnation',
         replacementIncarnationId: 'replacement-incarnation', errorCode: 'HOST_UNREACHABLE',
-        errorClass: 'provider_activation_failed', blockReason: 'PROVIDER_UNAVAILABLE',
+        errorClass: 'provider_activation_failed', blockReason: 'RETRY_BUDGET',
       } } } },
       { event: 'supervisor.lifecycle', data: { raw: { event: 'supervisor.activation_failed', data: {
         soulId: 'foreign-soul', incarnationId: 'foreign-incarnation', stage: secretPath,
         errorCode: 'HOST_UNREACHABLE', errorClass: 'runtime_activation_failed', launchState: 'starting',
       } } } },
-    ].map(entry => JSON.stringify(entry)).join('\n')
+    ].map(entry => JSON.stringify(entry.data.raw)).join('\n')
 
     const evidence = summarizeManagedEnvironmentRecoveryFailure(lifecycle, 'owned-soul', 'prior-incarnation')
 
     expect(evidence).toEqual({
       recovery: {
         priorIncarnationId: 'prior-incarnation', replacementIncarnationId: 'replacement-incarnation',
-        errorCode: 'HOST_UNREACHABLE', errorClass: 'provider_activation_failed', blockReason: 'PROVIDER_UNAVAILABLE',
+        errorCode: 'HOST_UNREACHABLE', errorClass: 'provider_activation_failed', blockReason: 'RETRY_BUDGET',
       },
       activation: {
-        incarnationId: 'replacement-incarnation', stage: 'deliver_execution_grant',
-        errorCode: 'HOST_UNREACHABLE', errorClass: 'runtime_activation_failed', launchState: 'starting',
+        incarnationId: 'replacement-incarnation', stage: 'create_stopped_runtime',
+        errorCode: 'HOST_UNREACHABLE', errorClass: 'runtime_activation_failed', launchState: 'prepared',
       },
       hostContainerId: 'a'.repeat(64),
     })

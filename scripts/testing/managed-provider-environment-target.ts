@@ -1760,7 +1760,7 @@ export async function runManagedEnvironmentTarget() {
         row.soulId === original.soulId && row.incarnationId !== original.incarnationId && row.launchState === 'running'), 300_000)
     } catch (error) {
       try {
-        const lifecycle = await fs.readFile(path.join(rig.runtime.evidenceDir, 'lifecycle.jsonl'), 'utf8')
+        const lifecycle = await fs.readFile(path.join(path.dirname(rig.supervisor.runtimeRoot), 'evidence', 'lifecycle.jsonl'), 'utf8')
         const { hostContainerId, ...safeFailure } = summarizeManagedEnvironmentRecoveryFailure(
           lifecycle, original.soulId, original.incarnationId)
         const supervisorLogs = providerParityFailureDiagnostics(

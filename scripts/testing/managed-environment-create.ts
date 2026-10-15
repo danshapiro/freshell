@@ -58,7 +58,7 @@ export function summarizeManagedEnvironmentRecoveryFailure(
   for (const line of lifecycle.split('\n')) {
     try {
       const entry = JSON.parse(line)
-      const raw = entry?.event === 'supervisor.lifecycle' ? entry.data?.raw : undefined
+      const raw = entry?.event === 'supervisor.lifecycle' ? entry.data?.raw : entry
       const data = raw?.data
       if (!raw || !data || typeof data !== 'object') continue
 
@@ -72,12 +72,11 @@ export function summarizeManagedEnvironmentRecoveryFailure(
         if (!incarnationId || incarnationId === priorIncarnationId) continue
         activations.set(incarnationId, {
           incarnationId,
-          stage: fixed(data.stage, ['authenticate_started_host', 'deliver_execution_grant', 'commit_execution_grant',
-            'enable_long_lived_runtime', 'commit_running_state', 'commit_provider_inputs', 'record_native_identity']),
+          stage: fixed(data.stage, activationStages),
           errorCode: fixed(data.errorCode, ['HOST_UNREACHABLE', 'HOST_AUTHENTICATION_FAILED', 'INVALID_REQUEST',
             'PROVIDER_INPUTS_CHANGED', 'BACKEND_UNAVAILABLE', 'REGISTRY_FAILURE', 'OWNERSHIP_MISMATCH']),
           errorClass: fixed(data.errorClass, ['runtime_activation_failed', 'provider_activation_failed']),
-          launchState: fixed(data.launchState, ['created', 'starting', 'running', 'failed', 'stopping', 'stopped']),
+          launchState: fixed(data.launchState, ['prepared', 'created', 'starting', 'running', 'failed', 'stopping', 'stopped']),
         })
       } else if (data.soulId === soulId && raw.event === 'supervisor.recovery.activation_failed'
         && data.priorIncarnationId === priorIncarnationId) {
@@ -89,7 +88,11 @@ export function summarizeManagedEnvironmentRecoveryFailure(
           errorCode: fixed(data.errorCode, ['HOST_UNREACHABLE', 'HOST_AUTHENTICATION_FAILED', 'INVALID_REQUEST',
             'PROVIDER_INPUTS_CHANGED', 'BACKEND_UNAVAILABLE', 'REGISTRY_FAILURE', 'OWNERSHIP_MISMATCH']),
           errorClass: fixed(data.errorClass, ['runtime_activation_failed', 'provider_activation_failed']),
-          blockReason: fixed(data.blockReason, ['PROVIDER_UNAVAILABLE', 'RECOVERY_UNAVAILABLE', 'CHECKPOINT_UNAVAILABLE']),
+          blockReason: fixed(data.blockReason, ['CAPABILITY_PENDING', 'CREDENTIALS_EXPIRED', 'RATE_LIMITED',
+            'PROVIDER_UNAVAILABLE', 'STORE_UNREADABLE', 'STORE_MISSING', 'WORKSPACE_UNAVAILABLE',
+            'INCOMPATIBLE_BINARY', 'UNSUPPORTED_PROTOCOL', 'AMBIGUOUS_IDENTITY', 'IMPLEMENTATION_UNAVAILABLE',
+            'INSUFFICIENT_RESOURCES', 'RETRY_BUDGET', 'STOP_INTENT', 'OLD_RUNTIME_NOT_EMPTY',
+            'WRONG_NATIVE_IDENTITY', 'COMMAND_AMBIGUOUS']),
         }
       }
     } catch { /* Ignore malformed lifecycle records and retain only valid evidence. */ }
