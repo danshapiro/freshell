@@ -1,10 +1,21 @@
 import { Terminal } from '@xterm/xterm'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { terminalBufferText } from '../../../../src/lib/terminal-buffer-text.js'
-import { providerStageResponse, sequenceProviderResponse, type ProviderResponseSnapshot } from '../../../e2e-browser/helpers/provider-response-sequencing.js'
+import { providerStageResponse, sampleProviderResponseBrowser, sequenceProviderResponse,
+  type ProviderResponseCompletion, type ProviderResponseSnapshot } from '../../../e2e-browser/helpers/provider-response-sequencing.js'
 
 const terminals: Terminal[] = []
-afterEach(() => terminals.splice(0).forEach(terminal => terminal.dispose()))
+afterEach(() => {
+  terminals.splice(0).forEach(terminal => terminal.dispose())
+  vi.unstubAllGlobals()
+})
+
+function completion(overrides: Partial<ProviderResponseCompletion> = {}): ProviderResponseCompletion {
+  return {
+    terminalId: 'terminal', provider: 'opencode', streamId: 'current', sessionId: 'root',
+    completionSeq: 1, at: 100, outcome: 'failed', ...overrides,
+  }
+}
 
 function rig(cols = 120, initial = false) {
   const terminal = new Terminal({ cols, rows: 12, allowProposedApi: true })
@@ -15,15 +26,18 @@ function rig(cols = 120, initial = false) {
     attachRequestId: 'attach', nativeSessionId: 'root', wsReady: true, replayPending: false,
     writesPending: false, highestObservedSeq: 1, completedSeq: 1, cols, rows: 12, bufferType: 'normal',
   }
-  const read = async () => snapshot && ({ ...snapshot, text: terminalBufferText(terminal.buffer.active) })
+  const surface = () => snapshot && ({ ...snapshot, text: terminalBufferText(terminal.buffer.active) })
+  let browserSample: (() => ReturnType<typeof sampleProviderResponseBrowser>) | undefined
+  const read = async () => browserSample ? browserSample().snapshot : surface()
   const response = providerStageResponse('codename-public-test', 'after_host', 'fresh-tag', initial)
   const actions: string[] = []
+  const reports: string[] = []
   const scheduled: Array<() => Promise<void>> = []
   let duringPrepare: (() => Promise<void>) | undefined
   const run = () => sequenceProviderResponse({
-    paneId: 'pane', terminalId: 'terminal', priorStreamId: 'old', nativeSessionId: 'root', response, read,
+    provider: 'opencode', paneId: 'pane', terminalId: 'terminal', priorStreamId: 'old', nativeSessionId: 'root', response, read,
     prepare: async command => { actions.push('prepare'); await write(`${command}\r\n`); await duringPrepare?.() },
-    submit: async () => { actions.push('submit') }, report: () => {}, timeoutMs: 240_000,
+    submit: async () => { actions.push('submit') }, report: phase => { reports.push(phase) }, timeoutMs: 240_000,
     waitFor: async (_description, probe) => {
       for (let attempt = 0; attempt < 8; attempt++) {
         const result = await probe()
@@ -33,12 +47,136 @@ function rig(cols = 120, initial = false) {
       throw new Error('bounded test timeout')
     },
   })
-  return { write, response, actions, scheduled, run, set: (value: typeof snapshot) => { snapshot = value },
+  return { write, response, actions, reports, scheduled, run, set: (value: typeof snapshot) => { snapshot = value },
     duringPrepare: (callback: () => Promise<void>) => { duringPrepare = callback },
-    update: (value: Partial<NonNullable<typeof snapshot>>) => { if (snapshot) Object.assign(snapshot, value) } }
+    update: (value: Partial<NonNullable<typeof snapshot>>) => { if (snapshot) Object.assign(snapshot, value) },
+    useBrowserMessages: (messages: unknown[]) => {
+      vi.stubGlobal('window', { __FRESHELL_TEST_HARNESS__: {
+        getTerminalSnapshot: surface, getTerminalWriteEvents: () => [], getReceivedWsMessages: () => messages,
+        getWsReadyState: () => 'ready', getRegisteredTerminalIds: () => ['terminal'], getTerminalModes: () => null,
+      } })
+      // Match Playwright's serialization boundary: no module closure survives.
+      const sampler = Function(`return (${sampleProviderResponseBrowser.toString()})`)() as typeof sampleProviderResponseBrowser
+      browserSample = () => sampler({ id: 'terminal', nonce: response.nonce, expected: response.expected })
+      return browserSample
+    },
+  }
 }
 
+describe('provider browser response diagnostics', () => {
+  it.each(['completed', 'failed'] as const)('retains the schema-safe %s outcome without native bodies', outcome => {
+    const test = rig()
+    const { streamId: _stream, ...native } = completion({ outcome })
+    const sample = test.useBrowserMessages([
+      { type: 'terminal.attach.ready', terminalId: 'terminal', streamId: 'current' },
+      { type: 'terminal.turn.complete', ...native, data: 'synthetic-body', body: 'synthetic-body',
+        title: 'synthetic-body', error: { message: 'synthetic-body' } },
+    ])()
+    expect(sample.snapshot?.turnCompletions).toEqual([completion({ outcome })])
+    expect(sample.diagnostics.received.at(-1)).toMatchObject({ provider: 'opencode', outcome, completionSeq: 1 })
+    expect(JSON.stringify(sample.diagnostics)).not.toContain('synthetic-body')
+    expect(JSON.stringify(sample.snapshot?.turnCompletions)).not.toContain('synthetic-body')
+  })
+
+  it('omits malformed outcome, provider, and numeric metadata rather than retaining arbitrary values', () => {
+    const test = rig()
+    const sample = test.useBrowserMessages([
+      { type: 'terminal.turn.complete', terminalId: 'terminal', provider: 'synthetic-body', outcome: 'synthetic-body',
+        completionSeq: 'synthetic-body', at: { message: 'synthetic-body' } },
+    ])()
+    expect(sample.snapshot?.turnCompletions).toEqual([])
+    expect(JSON.stringify(sample.diagnostics)).not.toContain('synthetic-body')
+  })
+
+  it('retains completion stream context in arrival order and leaves missing context unknown', () => {
+    const test = rig()
+    const { streamId: _stream, ...native } = completion()
+    const sample = test.useBrowserMessages([
+      { type: 'terminal.turn.complete', ...native },
+      { type: 'terminal.attach.ready', terminalId: 'terminal', streamId: 'old' },
+      { type: 'terminal.turn.complete', ...native, completionSeq: 2 },
+      { type: 'terminal.stream.changed', terminalId: 'terminal', streamId: 'current' },
+      { type: 'terminal.output.batch', terminalId: 'foreign', streamId: 'foreign', data: 'synthetic-body' },
+      { type: 'terminal.turn.complete', ...native, completionSeq: 3 },
+    ])()
+    expect(sample.snapshot?.turnCompletions?.map(({ streamId }) => streamId)).toEqual([null, 'old', 'current'])
+    expect(JSON.stringify(sample.diagnostics)).not.toContain('synthetic-body')
+  })
+})
+
 describe('provider browser response sequencing with the actual emulator', () => {
+  it('fails on a newly received native failure through the exact serialized browser sampler', async () => {
+    const test = rig()
+    const messages: unknown[] = [{ type: 'terminal.attach.ready', terminalId: 'terminal', streamId: 'current' }]
+    test.useBrowserMessages(messages)
+    test.scheduled.push(async () => {
+      const { streamId: _stream, ...native } = completion()
+      messages.push({ type: 'terminal.turn.complete', ...native })
+    })
+    await expect(test.run()).rejects.toMatchObject({ name: 'ProviderResponseTurnFailedError', outcome: 'failed' })
+  })
+
+  it.each([false, true])('fails immediately on the current submitted turn failure with writesPending=%s', async writesPending => {
+    const test = rig()
+    test.scheduled.push(async () => {
+      test.update({ writesPending, turnCompletions: [completion()] })
+    }, async () => { throw new Error('failure must settle before another poll') })
+    await expect(test.run()).rejects.toMatchObject({
+      name: 'ProviderResponseTurnFailedError', provider: 'opencode', outcome: 'failed', completionSeq: 1,
+    })
+    expect(test.actions).toEqual(['prepare', 'submit'])
+    expect(test.reports).toEqual(['pre_send', 'failed'])
+    expect(test.scheduled).toHaveLength(1)
+  })
+
+  it('rejects a failed current turn even when the expected response is visible', async () => {
+    const test = rig()
+    test.scheduled.push(async () => {
+      await test.write(test.response.expected)
+      test.update({ turnCompletions: [completion()] })
+    })
+    await expect(test.run()).rejects.toMatchObject({ name: 'ProviderResponseTurnFailedError', outcome: 'failed' })
+  })
+
+  it('baselines failed completions from before submit including preparation', async () => {
+    const test = rig()
+    test.update({ turnCompletions: [completion()] })
+    test.duringPrepare(async () => { test.update({ turnCompletions: [completion({ completionSeq: 2 })] }) })
+    test.scheduled.push(async () => {
+      test.update({ turnCompletions: [completion({ completionSeq: 2 }), completion({ completionSeq: 3, outcome: 'completed' })] })
+      await test.write(test.response.expected)
+    })
+    await expect(test.run()).resolves.toBe('current')
+  })
+
+  it.each([
+    { terminalId: 'foreign' }, { provider: 'codex' }, { streamId: 'foreign' }, { streamId: null },
+    { sessionId: 'foreign' }, { completionSeq: 0 },
+  ] satisfies Partial<ProviderResponseCompletion>[])('ignores a foreign or invalid failed completion %j', async overrides => {
+    const test = rig()
+    test.scheduled.push(async () => {
+      test.update({ turnCompletions: [completion(overrides)] })
+    }, () => test.write(test.response.expected))
+    await expect(test.run()).resolves.toBe('current')
+  })
+
+  it('still requires the fresh expected response after successful completion', async () => {
+    const test = rig()
+    test.scheduled.push(async () => { test.update({ turnCompletions: [completion({ outcome: 'completed' })] }) })
+    await expect(test.run()).rejects.toThrow('bounded test timeout')
+    expect(test.actions).toEqual(['prepare', 'submit'])
+    expect(test.reports).toEqual(['pre_send', 'timeout'])
+  })
+
+  it('does not attribute a failed completion to a replaced browser stream', async () => {
+    const test = rig()
+    test.scheduled.push(async () => {
+      test.update({ streamId: 'replacement', attachStreamId: 'replacement', turnCompletions: [completion()] })
+    })
+    await expect(test.run()).rejects.toThrow('bounded test timeout')
+    expect(test.reports).toEqual(['pre_send', 'timeout'])
+  })
+
   it('stays pending when old nonce history replays after dispatch', async () => {
     const test = rig()
     test.scheduled.push(() => test.write('codename-public-test\r\ncodename-public-test'))

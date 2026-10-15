@@ -43,7 +43,7 @@ import {
 } from '../helpers/managed-runtime.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TestHarness } from '../helpers/test-harness.js'
-import { providerStageResponse, sequenceProviderResponse } from '../helpers/provider-response-sequencing.js'
+import { providerStageResponse, sampleProviderResponseBrowser, sequenceProviderResponse } from '../helpers/provider-response-sequencing.js'
 import {
   buildTerminalOrdinaryTurnBrowserScript,
   TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL,
@@ -198,6 +198,7 @@ async function executeAndAwaitNonceOutput(
   page: Page,
   paneId: string,
   terminalId: string,
+  provider: ProviderDefinition['provider'],
   nonce: string,
   stage: 'initial' | 'after_host' | 'after_provider',
   priorStreamId?: string,
@@ -209,37 +210,11 @@ async function executeAndAwaitNonceOutput(
   const terminal = page.locator(`[data-pane-id="${paneId}"] .xterm:visible`).last()
   let diagnostics: unknown = null
   return sequenceProviderResponse({
-    paneId, terminalId, response, priorStreamId, nativeSessionId, timeoutMs,
+    provider, paneId, terminalId, response, priorStreamId, nativeSessionId, timeoutMs,
     requireSettledOutput,
     waitFor: waitForValue,
     read: async () => {
-      const sampled = await page.evaluate(({ id, nonce, expected }) => {
-        const harness = window.__FRESHELL_TEST_HARNESS__
-        const snapshot = harness?.getTerminalSnapshot?.(id) ?? null
-        const writes = (harness?.getTerminalWriteEvents?.() ?? []).filter(event => event.terminalId === id)
-        const messages = (harness?.getReceivedWsMessages?.() ?? []) as Array<Record<string, unknown>>
-        const count = (text: string, value: string) => text.split(value).length - 1
-        return {
-          snapshot: snapshot && { ...snapshot, wsReady: harness?.getWsReadyState() === 'ready' },
-          diagnostics: {
-            registeredTerminalIds: harness?.getRegisteredTerminalIds().slice(0, 16) ?? [],
-            modes: harness?.getTerminalModes(id) ?? null,
-            nonceCount: count(snapshot?.text ?? '', nonce),
-            expectedCount: count(snapshot?.text ?? '', expected),
-            expectedCountIgnoringLineBreaks: count((snapshot?.text ?? '').replaceAll('\n', ''), expected),
-            writeTotals: ['submitted', 'written'].map(phase => {
-              const events = writes.filter(event => event.phase === phase)
-              return { phase, count: events.length, chars: events.reduce((sum, event) => sum + event.chars, 0),
-                latestAt: events.at(-1)?.at ?? null }
-            }),
-            writes: writes.slice(-8).map(({ phase, chars, at, paneId }) => ({ phase, chars, at, paneId })),
-            received: messages.filter(message => message.terminalId === id).slice(-8).map(message => ({
-              type: message.type, streamId: message.streamId, attachRequestId: message.attachRequestId,
-              seq: message.seq, seqStart: message.seqStart, seqEnd: message.seqEnd,
-            })),
-          },
-        }
-      }, { id: terminalId, nonce, expected: response.expected })
+      const sampled = await page.evaluate(sampleProviderResponseBrowser, { id: terminalId, nonce, expected: response.expected })
       diagnostics = sampled.diagnostics
       return sampled.snapshot
     },
@@ -253,7 +228,7 @@ async function executeAndAwaitNonceOutput(
       const surface = snapshot && (({ text: _text, ...metadata }) => metadata)(snapshot)
       // Cloud stdout already survives owner cleanup. Keep one bounded, body-free
       // record at each boundary; neither record certifies native completion.
-      console.log(JSON.stringify({ severity: phase === 'timeout' ? 'error' : 'info',
+      console.log(JSON.stringify({ severity: phase === 'pre_send' ? 'info' : 'error',
         event: 'provider_browser.response_sequence', stage, phase, paneId, terminalId, surface, diagnostics }))
     },
   })
@@ -451,7 +426,7 @@ async function qualifyProvider(
 
   const nonce = `codename-${randomBytes(16).toString('hex')}`
   const initialStreamId = await executeAndAwaitNonceOutput(
-    page, created.paneId, created.terminalId, nonce, 'initial',
+    page, created.paneId, created.terminalId, definition.provider, nonce, 'initial',
   )
   const nativeSessionId = await waitForValue('exact native session id', async () => (
     await paneNativeId(harness, tabId, created.paneId, definition.provider)
@@ -471,7 +446,7 @@ async function qualifyProvider(
   expect((await rig.ownedContainerState(initialEnclosure)).running).toBe(false)
 
   const hostStreamId = await executeAndAwaitNonceOutput(
-    page, created.paneId, created.terminalId, nonce, 'after_host', initialStreamId, nativeSessionId,
+    page, created.paneId, created.terminalId, definition.provider, nonce, 'after_host', initialStreamId, nativeSessionId,
   )
 
   if (!afterHostLoss.containerId) throw new Error('host-loss replacement has no owned container')
@@ -487,7 +462,7 @@ async function qualifyProvider(
   expect((await rig.ownedContainerState(hostLossEnclosure)).running).toBe(false)
 
   await executeAndAwaitNonceOutput(
-    page, created.paneId, created.terminalId, nonce, 'after_provider', hostStreamId, nativeSessionId,
+    page, created.paneId, created.terminalId, definition.provider, nonce, 'after_provider', hostStreamId, nativeSessionId,
   )
 
   const snapshot = await rig.inventorySnapshot()
