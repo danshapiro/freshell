@@ -17,7 +17,7 @@ import fsp from 'node:fs/promises'
 import { defaultReceiptFileName } from './runtime-receipts.js'
 import { captureRuntimeCandidate } from './runtime-gate-integrity.js'
 import { buildProviderQualificationReceipt, type ProviderQualificationReceiptV2, type ProviderQualificationRow } from './provider-qualification-receipt.js'
-import { buildFreshAgentQualificationReceipt, deriveFreshBrowserExecution, matchesFreshBrowserFrame, sameFreshBrowserActivation, validateFreshBrowserAlias, validateFreshApprovalCheckpoint, validateFreshApprovalDispatch, validateFreshApprovalRecovery, nativeCompletedTurnProofs, type FreshBrowserIngressObservation, type FreshAgentQualificationReceiptV1, type FreshAgentQualificationRow } from './fresh-agent-qualification-receipt.js'
+import { buildFreshAgentQualificationReceipt, deriveFreshBrowserExecution, matchesFreshBrowserFrame, matchesFreshBrowserSendAccepted, sameFreshBrowserActivation, validateFreshBrowserAlias, validateFreshApprovalCheckpoint, validateFreshApprovalDispatch, validateFreshApprovalRecovery, nativeCompletedTurnProofs, type FreshBrowserIngressObservation, type FreshAgentQualificationReceiptV1, type FreshAgentQualificationRow } from './fresh-agent-qualification-receipt.js'
 import { claudeNativeInspection, nativeCheckpointTranscriptRetained, observeNativeSoloBashOutcome, openCodeFreeAccessScript } from './runtime-native-feasibility.js'
 import type { QualifiableTerminalProvider } from './provider-qualification-selection.js'
 import { deferredProviders, loadCapabilityManifest } from './provider-certification.js'
@@ -6140,7 +6140,7 @@ export class ManagedRuntimeOwner {
         || !request.requestId) throw new Error('registered actual browser send/ack required')
       await this.assertCurrentHandle(handle)
       const view = await this.currentRuntimeEnclosure(handle)
-      if (!matchesFreshBrowserFrame(view, request) || reply.sessionId !== view.freshAgentSessionId
+      if (!matchesFreshBrowserFrame(view, request) || !matchesFreshBrowserSendAccepted(view, reply)
         || !sameFreshBrowserActivation(view, challenge.beforeView)) throw new Error('browser send activation differs')
       const deadline = Date.now() + 90_000
       let captured: FreshCapturedNativeHistory | undefined

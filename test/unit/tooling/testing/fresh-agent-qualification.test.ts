@@ -31,6 +31,45 @@ const receiptRunId = 'fresh-agent-live-001'
 const tempRoots: string[] = []
 
 describe('observed fresh browser execution', () => {
+  it('reopens the materialized OpenCode native send acknowledgment from retained originals', () => {
+    const built = fixture([row('freshopencode')], 'production', 'low', true)
+    const original = readBrowserExecution(built)
+    original.ui.reply.sessionId = original.ui.view.nativeSessionId
+    original.ui.reply.provider = 'opencode'
+    original.ui.reply.sessionType = 'freshopencode'
+    rewriteBrowserExecution(built, original)
+    expect(() => validateFreshAgentQualificationReceipt({ repoRoot: built.repoRoot, candidateSha, expectedRuntimeImage: runtimeImage, receipt: built.receipt })).not.toThrow()
+    expect(() => buildFreshAgentQualificationReceipt({ repoRoot: built.repoRoot, evidenceDir: built.evidenceDir, candidateSha,
+      receiptRunId, runtimeImage, selectedModes: ['freshopencode'], rows: built.receipt.rows })).not.toThrow()
+  })
+
+  it.each(['foreign-session', 'provider', 'mode', 'request', 'native-observation'])('rejects a materialized OpenCode native acknowledgment with %s from retained originals', fault => {
+    const built = fixture([row('freshopencode')], 'production', 'low', true)
+    const original = readBrowserExecution(built)
+    original.ui.reply.sessionId = original.ui.view.nativeSessionId
+    original.ui.reply.provider = 'opencode'
+    original.ui.reply.sessionType = 'freshopencode'
+    if (fault === 'foreign-session') original.ui.reply.sessionId = 'third-unrelated-native'
+    if (fault === 'provider') original.ui.reply.provider = 'codex'
+    if (fault === 'mode') original.ui.reply.sessionType = 'freshcodex'
+    if (fault === 'request') original.ui.reply.requestId = 'unrelated-request'
+    if (fault === 'native-observation') original.ui.view.nativeIdentityObservation.nativeSessionId = 'third-unrelated-native'
+    rewriteBrowserExecution(built, original)
+    expect(() => validateFreshAgentQualificationReceipt({ repoRoot: built.repoRoot, candidateSha, expectedRuntimeImage: runtimeImage, receipt: built.receipt })).toThrow()
+    expect(() => buildFreshAgentQualificationReceipt({ repoRoot: built.repoRoot, evidenceDir: built.evidenceDir, candidateSha,
+      receiptRunId, runtimeImage, selectedModes: ['freshopencode'], rows: built.receipt.rows })).toThrow()
+  })
+
+  it.each(['freshclaude', 'kilroy', 'freshcodex'] as const)('retains the presentation acknowledgment contract for reopened %s originals', mode => {
+    const built = fixture([row(mode)], 'production', 'low', true)
+    const original = readBrowserExecution(built)
+    original.ui.reply.sessionId = original.ui.view.nativeSessionId
+    rewriteBrowserExecution(built, original)
+    expect(() => validateFreshAgentQualificationReceipt({ repoRoot: built.repoRoot, candidateSha, expectedRuntimeImage: runtimeImage, receipt: built.receipt })).toThrow()
+    expect(() => buildFreshAgentQualificationReceipt({ repoRoot: built.repoRoot, evidenceDir: built.evidenceDir, candidateSha,
+      receiptRunId, runtimeImage, selectedModes: [mode], rows: built.receipt.rows })).toThrow()
+  })
+
   it.each(['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'] as const)('reopens materialized browser identities for %s without changing observed frames', mode => {
     const built = fixture([row(mode)], 'production', 'low', true)
     expect(validateFreshAgentQualificationReceipt({ repoRoot: built.repoRoot, candidateSha, expectedRuntimeImage: runtimeImage, receipt: built.receipt }).rows).toEqual(built.receipt.rows)
@@ -184,8 +223,9 @@ function rewriteBrowserExecution(built: ReturnType<typeof fixture>, original: an
   built.receipt.artifacts.assertions.sha256 = createHash('sha256').update(fs.readFileSync(assertionsPath)).digest('hex')
 }
 
-function browserOwnerFixture() {
-  const built = fixture()
+function browserOwnerFixture(mode: FreshAgentQualificationRow['mode'] = 'freshclaude') {
+  const selected = row(mode)
+  const built = fixture([selected])
   const original = readBrowserExecution(built)
   // Source-only cloud checkouts lack Git metadata; the owned fixture supplies its actual candidate.
   const git = (...args: string[]) => execFileSync('git', [
@@ -209,26 +249,61 @@ function browserOwnerFixture() {
   vi.spyOn(owner.runtime, 'recordLifecycle').mockImplementation(() => undefined)
   const capture = vi.spyOn(internal, 'captureFreshNativeSource').mockResolvedValue({ turns: [{ toolCalls: [] }] })
   vi.spyOn(internal, 'materializeNativeSource').mockResolvedValue(original.ui.after)
-  internal.freshNativeCollections.set('collection', { mode: 'freshclaude', provider: 'claude' })
-  const challenge = { handle, collectionId: 'collection', provider: 'claude', beforeTurns: 0, prompt: original.ui.request.text, beforeView: structuredClone(view) }
+  internal.freshNativeCollections.set('collection', { mode, provider: selected.provider })
+  const challenge = { handle, collectionId: 'collection', provider: selected.provider, beforeTurns: 0, prompt: original.ui.request.text, beforeView: structuredClone(view) }
   internal.freshBrowserChallenges.set('ui-challenge', challenge)
   const request = { ...original.ui.request, sessionId: view.nativeSessionId }
   const reply = { ...original.ui.reply, sessionId: view.freshAgentSessionId }
   const approval = structuredClone(original.approvals[0])
-  approval.soulId = view.soulId
-  approval.beforeView = structuredClone(view)
-  approval.afterView = structuredClone(view)
-  approval.events.unshift({ kind: 'permission_requested', data: approval.beforeCard })
-  internal.freshApprovalChallenges.set('approval-challenge', approval)
-  vi.spyOn(internal, 'freshApprovalEvents').mockResolvedValue(approval.events.at(-1))
-  vi.spyOn(internal, 'freshApprovalEffect').mockResolvedValue(approval.effectCount)
-  vi.spyOn(internal, 'readFreshApprovalEvents').mockResolvedValue({ head: 0, events: [] })
-  approval.cursor = 0
+  if (approval) {
+    approval.soulId = view.soulId
+    approval.beforeView = structuredClone(view)
+    approval.afterView = structuredClone(view)
+    approval.events.unshift({ kind: 'permission_requested', data: approval.beforeCard })
+    internal.freshApprovalChallenges.set('approval-challenge', approval)
+    vi.spyOn(internal, 'freshApprovalEvents').mockResolvedValue(approval.events.at(-1))
+    vi.spyOn(internal, 'freshApprovalEffect').mockResolvedValue(approval.effectCount)
+    vi.spyOn(internal, 'readFreshApprovalEvents').mockResolvedValue({ head: 0, events: [] })
+    approval.cursor = 0
+  }
   const retain = vi.spyOn(internal, 'retainNativeOriginal').mockResolvedValue({ path: 'outcome.json', sha256: 'a'.repeat(64) })
   return { owner, internal, view, handle, challenge, request, reply, approval, capture, retain }
 }
 
 describe('materialized browser owner consumers', () => {
+  it('finishes materialized OpenCode native acknowledgment on its exact current allocation', async () => {
+    const { owner, internal, view, handle, request, reply, challenge, capture } = browserOwnerFixture('freshopencode')
+    reply.sessionId = view.nativeSessionId
+    reply.provider = 'opencode'
+    reply.sessionType = 'freshopencode'
+    await expect(owner.finishFreshBrowserTurn(handle, 'ui-challenge', request, reply)).resolves.toBeUndefined()
+    expect(capture).toHaveBeenCalledExactlyOnceWith(handle, 'opencode')
+    expect(challenge.finished).toBe(true)
+    expect(internal.freshBrowserCollections.get('collection').ui.reply.sessionId).toBe(view.nativeSessionId)
+  })
+
+  it.each(['foreign-session', 'provider', 'mode', 'request', 'native-observation', 'incarnation'])('rejects a materialized OpenCode native acknowledgment with %s before capture', async fault => {
+    const { owner, view, handle, request, reply, capture } = browserOwnerFixture('freshopencode')
+    reply.sessionId = view.nativeSessionId
+    reply.provider = 'opencode'
+    reply.sessionType = 'freshopencode'
+    if (fault === 'foreign-session') reply.sessionId = 'third-unrelated-native'
+    if (fault === 'provider') reply.provider = 'codex'
+    if (fault === 'mode') reply.sessionType = 'freshcodex'
+    if (fault === 'request') reply.requestId = 'unrelated-request'
+    if (fault === 'native-observation') view.nativeIdentityObservation.nativeSessionId = 'third-unrelated-native'
+    if (fault === 'incarnation') view.nativeIdentityObservation.incarnationId = 'old-incarnation'
+    await expect(owner.finishFreshBrowserTurn(handle, 'ui-challenge', request, reply)).rejects.toThrow()
+    expect(capture).not.toHaveBeenCalled()
+  })
+
+  it.each(['freshclaude', 'kilroy', 'freshcodex'] as const)('retains the presentation acknowledgment contract for the actual %s owner', async mode => {
+    const { owner, view, handle, request, reply, capture } = browserOwnerFixture(mode)
+    reply.sessionId = view.nativeSessionId
+    await expect(owner.finishFreshBrowserTurn(handle, 'ui-challenge', request, reply)).rejects.toThrow()
+    expect(capture).not.toHaveBeenCalled()
+  })
+
   it.each(['history-resume', 'ws-attach'] as const)('records the actual %s native attach on its registered allocation', async ingress => {
     const { owner, internal, handle, view } = browserOwnerFixture()
     Object.assign(internal.freshNativeCollections.get('collection'), { soulId: view.soulId, nativeSessionId: view.nativeSessionId })
@@ -248,8 +323,8 @@ describe('materialized browser owner consumers', () => {
     await expect(owner.observeFreshBrowserIngress(handle, 'collection', { ingress: 'history-resume', request })).rejects.toThrow()
     expect(internal.freshBrowserCollections.get('collection').routes).toEqual([])
   })
-  it('finishes the actual native send with its presentation acknowledgment and retains both frames', async () => {
-    const { owner, internal, handle, request, reply, challenge } = browserOwnerFixture()
+  it.each(['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'] as const)('finishes the actual %s native send with its presentation acknowledgment and retains both frames', async mode => {
+    const { owner, internal, handle, request, reply, challenge } = browserOwnerFixture(mode)
     await expect(owner.finishFreshBrowserTurn(handle, 'ui-challenge', request, reply)).resolves.toBeUndefined()
     expect(internal.freshBrowserCollections.get('collection').ui).toMatchObject({ request, reply, view: challenge.beforeView })
     expect(challenge.finished).toBe(true)

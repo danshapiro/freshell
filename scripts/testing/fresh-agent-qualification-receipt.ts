@@ -75,7 +75,8 @@ export type FreshBrowserIngressObservation = {
 
 /** Outgoing browser frames can retain the create ID until materialization.
  * Both addresses must belong to this exact launch-bound native observation.
- * Proxy send acknowledgments use freshAgentSessionId; raw host dispatches use nativeSessionId.
+ * Raw host dispatches use nativeSessionId. Proxy send acknowledgments keep
+ * freshAgentSessionId except OpenCode, whose route can materialize to nativeSessionId.
  */
 export function matchesFreshBrowserFrame(view: any, frame: Record<string, any> | undefined): boolean {
   const contract = MODE_CONTRACT[view?.freshAgentSessionType as QualifiableFreshAgentMode]
@@ -88,6 +89,12 @@ export function matchesFreshBrowserFrame(view: any, frame: Record<string, any> |
     && !!frame && (frame.sessionId === view.nativeSessionId || frame.sessionId === view.freshAgentSessionId)
     && (frame.provider === undefined || frame.provider === contract.provider)
     && (frame.sessionType === undefined || frame.sessionType === view.freshAgentSessionType)
+}
+
+export function matchesFreshBrowserSendAccepted(view: any, frame: Record<string, any> | undefined): boolean {
+  return frame?.type === 'freshAgent.send.accepted' && matchesFreshBrowserFrame(view, frame)
+    && (frame.sessionId === view.freshAgentSessionId
+      || (view.freshAgentSessionType === 'freshopencode' && frame.sessionId === view.nativeSessionId))
 }
 
 export function sameFreshBrowserActivation(view: Record<string, any>, expected: Record<string, any> | undefined): boolean {
@@ -557,7 +564,7 @@ function validateBrowserExecutions(evidenceDir: string, rows: FreshAgentQualific
       || ['soulId', 'nativeSessionId', 'freshAgentSessionId', 'freshAgentSessionType', 'provider'].some(field => view[field] !== original.allocations[1].view[field])
       || !sameFreshBrowserActivation(view, split?.view)
       || ui.reply?.type !== 'freshAgent.send.accepted' || ui.reply.requestId !== ui.request.requestId
-      || !ui.request.requestId || ui.reply.sessionId !== view.freshAgentSessionId || before.history.turns.length !== ui.beforeTurns || after.history.turns.length !== before.history.turns.length + 1
+      || !ui.request.requestId || !matchesFreshBrowserSendAccepted(view, ui.reply) || before.history.turns.length !== ui.beforeTurns || after.history.turns.length !== before.history.turns.length + 1
       || newInputs.length !== 1 || newInputs[0]!.text !== ui.request.text || evidence?.kind !== 'identified_message'
       || (row.provider === 'codex' ? evidence.turnId !== newInputs[0]!.id : evidence.parentMessageId !== newInputs[0]!.id)
       || last.toolCalls.length || stableJson(after.history.turns.slice(0, before.history.turns.length)) !== stableJson(before.history.turns)) throw new Error('actual browser native no-tool completion differs')

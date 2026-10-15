@@ -1088,6 +1088,13 @@ async fn materialization_keeps_following_transcript_invalidations_on_the_native_
             "sessionId":"ses_native"
         }),
         serde_json::json!({
+            "type":"freshAgent.send.accepted",
+            "provider":"opencode",
+            "sessionType":"freshopencode",
+            "sessionId":"ses_native",
+            "requestId":"materialized-send"
+        }),
+        serde_json::json!({
             "type":"freshAgent.event",
             "provider":"opencode",
             "sessionType":"freshopencode",
@@ -1115,12 +1122,15 @@ async fn materialization_keeps_following_transcript_invalidations_on_the_native_
             .await;
     }
 
-    let frames: Vec<serde_json::Value> = (0..3)
+    let frames: Vec<serde_json::Value> = (0..4)
         .map(|_| serde_json::from_str(&receiver.try_recv().unwrap()).unwrap())
         .collect();
     assert_eq!(frames[0]["previousSessionId"], "managed-public");
     assert_eq!(frames[0]["sessionId"], "ses_native");
-    for (frame, event_type) in frames[1..]
+    assert_eq!(frames[1]["type"], "freshAgent.send.accepted");
+    assert_eq!(frames[1]["sessionId"], "ses_native");
+    assert_eq!(frames[1]["requestId"], "materialized-send");
+    for (frame, event_type) in frames[2..]
         .iter()
         .zip(["freshAgent.session.changed", "freshAgent.turn.complete"])
     {
