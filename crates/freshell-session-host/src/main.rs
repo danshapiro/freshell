@@ -3973,7 +3973,7 @@ fn preflight_provider_reference_aliases(
                 Err(_) => return Err("provider reference alias target is unavailable".into()),
             }
         }
-        if !std::fs::symlink_metadata(&reference).is_ok_and(|metadata| metadata.is_file()) {
+        if !std::fs::metadata(&reference).is_ok_and(|metadata| metadata.is_file()) {
             return Err("provider reference alias target is unavailable".into());
         }
         if !provider_reference_alias_parent_available(home, &relative, current)? {
@@ -5308,9 +5308,12 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(provider_home.join(".freshell/references")).unwrap();
         std::fs::write(resource_stage.join("server.mjs"), "console.log('ready')\n").unwrap();
-        std::fs::write(
+        let private_reference = owned.path().join("private-reference-0");
+        std::fs::write(&private_reference, "MANAGED_ALIAS_SECRET=private-value\n").unwrap();
+        // Indexed configuration references point into the read-only secret mount at runtime.
+        std::os::unix::fs::symlink(
+            &private_reference,
             provider_home.join(".freshell/references/0"),
-            "MANAGED_ALIAS_SECRET=private-value\n",
         )
         .unwrap();
         let mut mount = opencode_resource_mount(
@@ -5356,6 +5359,12 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(provider_home.join(".freshell/references/0")).unwrap(),
             "MANAGED_ALIAS_SECRET=private-value\n"
+        );
+        assert!(
+            std::fs::symlink_metadata(provider_home.join(".freshell/references/0"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
         assert_eq!(
             std::fs::read_link(&alias).unwrap(),
