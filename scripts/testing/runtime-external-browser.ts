@@ -16,6 +16,7 @@ import http, { type IncomingMessage, type ServerResponse } from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import type { FreshBrowserIngressObservation } from './fresh-agent-qualification-receipt.js'
+import { nativeRecoveryValidationDiagnostic } from './qualification-observations.js'
 import { FreshBrowserChallengeResultSchema, RuntimeFreshAgentObservationSchema, type FreshBrowserChallengeResult } from './runtime-sandbox.js'
 import type { RuntimeWebConstructOptions, RuntimeWebFactory, RuntimeWebHandle, RuntimeWebInfo } from './runtime-sandbox.js'
 import type { SyntheticStoppedRepairBatchFacts, SyntheticStoppedRepairBatchObservation, SyntheticStoppedRepairFault } from './runtime-sandbox.js'
@@ -1934,15 +1935,18 @@ export function createExternalRuntimeControl(
     try { return await execute(request) } catch (error) {
       const runtime = z.object({ runtimeError: z.object({ code: z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/) }) }).safeParse(error)
       const address = z.object({ runtimeHandleMismatches: RuntimeHandleMismatchFieldsSchema }).safeParse(error)
+      const nativeRecoveryDiagnostic = nativeRecoveryValidationDiagnostic(error)
       owner.runtime.recordLifecycle('external.owner_operation_refused', {
         severity: 'warn', runId: descriptor.runId, candidateSha: descriptor.candidateSha,
         operationId: request.operationId, action: request.action,
         reason: runtime.success ? 'runtime_rejection'
           : address.success ? 'current_address_mismatch'
-            : error instanceof Error && error.message === 'exact actually pending fixture decision required'
-              ? 'pending_decision_mismatch' : 'owner_operation_refused',
+            : nativeRecoveryDiagnostic ? 'native_recovery_validation_failed'
+              : error instanceof Error && error.message === 'exact actually pending fixture decision required'
+                ? 'pending_decision_mismatch' : 'owner_operation_refused',
         ...(runtime.success ? { runtimeCode: runtime.data.runtimeError.code } : {}),
         ...(address.success ? { mismatchedFields: address.data.runtimeHandleMismatches } : {}),
+        ...(nativeRecoveryDiagnostic ? { nativeRecoveryDiagnostic } : {}),
         ...(request.handle ? { soulId: request.handle.soulId, incarnationId: request.handle.incarnationId } : {}),
       })
       throw error

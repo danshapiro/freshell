@@ -27,6 +27,7 @@ vi.mock('../../../e2e-browser/helpers/fixtures.js', () => ({
 import { runSelectedProviderQualification } from '../../../../scripts/testing/runtime-provider-qualification.js'
 import { runSelectedFreshAgentQualification } from '../../../../scripts/testing/runtime-fresh-agent-qualification.js'
 import { projectManagedViewProbe } from '../../../../scripts/testing/managed-view-probe.js'
+import { NativeRecoveryValidationError } from '../../../../scripts/testing/qualification-observations.js'
 
 import { playwright, campaignGate } from '../../../../scripts/testing/runtime-landing-campaign.js'
 import * as runner from '../../../../scripts/testing/runtime-external-browser.js'
@@ -3100,6 +3101,56 @@ describe('closed external owner control', () => {
       runtimeCode: 'HOST_UNREACHABLE', soulId: handle.soulId, incarnationId: handle.incarnationId,
     })
     expect(JSON.stringify(log.mock.calls)).not.toContain('private')
+  })
+  it.each(['after_session_host_crash', 'after_provider_process_crash'] as const)(
+    'retains only the fixed native recall diagnostic through capture and owner refusal (%s)', async stage => {
+      const { owned, context, request } = fixture()
+      const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'owned-soul',
+        incarnationId: 'owned-incarnation', containerId: 'b'.repeat(64), hostBootId: 'owned-boot', nativeSessionId: 'owned-root' }
+      const failure = new NativeRecoveryValidationError(stage)
+      failure.message = 'private-native-response-and-credential-sentinel'
+      Object.assign(failure, { cause: { text: 'private-seed-sentinel' } })
+      const capture = vi.spyOn(owned, 'captureFreshNativeStage').mockImplementation(() =>
+        (owned as any).trackNativeCapture(async () => { throw failure }))
+      const log = vi.spyOn(owned.runtime, 'recordLifecycle').mockImplementation(() => undefined)
+      const control = runner.createExternalRuntimeControl(owned, context)
+      const operation = { ...request, action: 'fresh-native-stage', handle,
+        nativeCollectionId: '11111111-1111-4111-8111-111111111111' }
+      await expect(control(operation)).rejects.toBe(failure)
+      await expect(control(operation)).rejects.toBe(failure)
+      const diagnostic = { code: 'recovery_nonce_not_recalled', stage }
+      expect(log).toHaveBeenCalledWith('external.native_collection_failed', {
+        severity: 'warn', nativeRecoveryDiagnostic: diagnostic,
+      })
+      expect(log).toHaveBeenCalledWith('external.owner_operation_refused', {
+        severity: 'warn', runId: context.runId, candidateSha: context.candidateSha,
+        operationId: request.operationId, action: 'fresh-native-stage', reason: 'native_recovery_validation_failed',
+        nativeRecoveryDiagnostic: diagnostic, soulId: handle.soulId, incarnationId: handle.incarnationId,
+      })
+      expect(capture).toHaveBeenCalledOnce()
+      expect(log).toHaveBeenCalledTimes(2)
+      expect((owned as any).nativeCaptures.size).toBe(0)
+      expect((owned as any).nativeCaptureFailures).toEqual(['native original capture failed'])
+      expect(JSON.stringify(log.mock.calls)).not.toContain('private-')
+    },
+  )
+  it('keeps unclassified native capture failures free of exception text and native diagnostic lookalikes', async () => {
+    const { owned, context, request } = fixture()
+    const handle = { runId: context.runId, candidateSha: context.candidateSha, soulId: 'owned-soul',
+      incarnationId: 'owned-incarnation', containerId: 'b'.repeat(64), hostBootId: 'owned-boot', nativeSessionId: 'owned-root' }
+    const failure = Object.assign(new Error('private-native-response-sentinel'), {
+      diagnostic: { code: 'recovery_nonce_not_recalled', stage: 'after_session_host_crash', text: 'private-seed-sentinel' },
+    })
+    vi.spyOn(owned, 'captureFreshNativeStage').mockImplementation(() =>
+      (owned as any).trackNativeCapture(async () => { throw failure }))
+    const log = vi.spyOn(owned.runtime, 'recordLifecycle').mockImplementation(() => undefined)
+    const control = runner.createExternalRuntimeControl(owned, context)
+    await expect(control({ ...request, action: 'fresh-native-stage', handle,
+      nativeCollectionId: '11111111-1111-4111-8111-111111111111' })).rejects.toBe(failure)
+    expect(log).toHaveBeenCalledWith('external.native_collection_failed', { severity: 'warn' })
+    expect(log).toHaveBeenCalledWith('external.owner_operation_refused', expect.objectContaining({ reason: 'owner_operation_refused' }))
+    for (const [, data] of log.mock.calls) expect(data).not.toHaveProperty('nativeRecoveryDiagnostic')
+    expect(JSON.stringify(log.mock.calls)).not.toContain('private-')
   })
   it('identifies the actual pending-decision predicate without exposing decision or message bodies', async () => {
     const { owned, context, request } = fixture()

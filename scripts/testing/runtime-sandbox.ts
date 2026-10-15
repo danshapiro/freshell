@@ -21,7 +21,7 @@ import { buildFreshAgentQualificationReceipt, deriveFreshBrowserExecution, match
 import { claudeNativeInspection, nativeCheckpointTranscriptRetained, observeNativeSoloBashOutcome, openCodeFreeAccessScript } from './runtime-native-feasibility.js'
 import type { QualifiableTerminalProvider } from './provider-qualification-selection.js'
 import { deferredProviders, loadCapabilityManifest } from './provider-certification.js'
-import { deriveNativeRecoveryOriginals, NATIVE_RECOVERY_ORIGINALS_FILE, type NativeOriginalReference, type NativeRecoveryStage } from './qualification-observations.js'
+import { deriveNativeRecoveryOriginals, nativeRecoveryValidationDiagnostic, NATIVE_RECOVERY_ORIGINALS_FILE, type NativeOriginalReference, type NativeRecoveryStage } from './qualification-observations.js'
 import type { NativeHistory } from './provider-native-history.js'
 
 import { configuredProviderOnecliGrantFiles } from './runtime-amplifier-onecli.js'
@@ -6071,7 +6071,9 @@ export class ManagedRuntimeOwner {
     }, error => {
       this.nativeCaptures.delete(result)
       this.nativeCaptureFailures.push('native original capture failed')
+      const nativeRecoveryDiagnostic = nativeRecoveryValidationDiagnostic(error)
       this.runtime.recordLifecycle('external.native_collection_failed', { severity: 'warn',
+        ...(nativeRecoveryDiagnostic ? { nativeRecoveryDiagnostic } : {}),
         ...(error instanceof NativeHistoryProbeFailure ? { nativeHistoryDiagnostic: error.diagnostic } : {}) })
       throw error
     })

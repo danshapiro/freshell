@@ -9,7 +9,7 @@ import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { buildFreshAgentQualificationReceipt, validateFreshAgentQualificationReceipt, type FreshAgentQualificationRow } from '../../../../scripts/testing/fresh-agent-qualification-receipt.js'
 import { FRESH_AGENT_INGRESS_INVENTORY } from '../../../../scripts/testing/fresh-agent-ingress-inventory.js'
-import { deriveNativeRecoveryOriginals, nativeNamespaceAccessMatches, type NativeRecoveryStage } from '../../../../scripts/testing/qualification-observations.js'
+import { deriveNativeRecoveryOriginals, nativeNamespaceAccessMatches, nativeRecoveryValidationDiagnostic, NativeRecoveryValidationError, type NativeRecoveryStage } from '../../../../scripts/testing/qualification-observations.js'
 import { ManagedRuntimeOwner } from '../../../../scripts/testing/runtime-sandbox.js'
 
 const roots: string[] = []
@@ -30,6 +30,29 @@ describe('selected native free access observation', () => {
     for (const endpoint of ['http://unit.invalid', 'https://private@unit.invalid', 'https://unit.invalid/?token=private', 'https://unit.invalid/#private', 'unknown']) {
       expect(nativeNamespaceAccessMatches({ ...free, freeModelAccess: { ...free.freeModelAccess, endpoint } }, 'freshopencode')).toBe(false)
     }
+  })
+})
+
+describe('native recovery validation diagnostics', () => {
+  it.each(['after_session_host_crash', 'after_provider_process_crash'] as const)('projects only the fixed missing-recall facts at %s', stage => {
+    const expected = { code: 'recovery_nonce_not_recalled', stage }
+    const failure = new NativeRecoveryValidationError(stage)
+    expect(nativeRecoveryValidationDiagnostic(failure)).toEqual(expected)
+    Object.assign(failure, { diagnostic: { ...expected, message: 'synthetic private response', cause: { content: 'synthetic private input' }, stack: 'synthetic private trace' } })
+    expect(nativeRecoveryValidationDiagnostic(failure)).toEqual(expected)
+    expect(nativeRecoveryValidationDiagnostic(Object.assign(new Error('synthetic private error'), {
+      name: 'NativeRecoveryValidationError', diagnostic: expected,
+    }))).toBeUndefined()
+  })
+
+  it.each([
+    null,
+    { code: 'synthetic_private_code', stage: 'after_session_host_crash' },
+    { code: 'recovery_nonce_not_recalled', stage: 'initial' },
+    { code: 'recovery_nonce_not_recalled', stage: 'synthetic_private_stage' },
+  ])('rejects a mutated diagnostic outside the fixed classifications (%#)', diagnostic => {
+    const failure = Object.assign(new NativeRecoveryValidationError('after_session_host_crash'), { diagnostic })
+    expect(nativeRecoveryValidationDiagnostic(failure)).toBeUndefined()
   })
 })
 
@@ -234,6 +257,55 @@ function claudeFixture(generations?: readonly number[], mode = 'freshclaude') {
   write('native-recovery-originals.json', original)
   const derive = (requiredStages?: readonly ('initial' | 'after_session_host_crash' | 'after_provider_process_crash')[]) => deriveNativeRecoveryOriginals({ evidenceDir: input.evidenceDir, candidateSha, runId: receiptRunId, runtimeImage, selected: [mode], requiredStages })
   return { ...built, original, conversation, derive }
+}
+
+function opencodeFixture() {
+  const built = fixture(), { input, write, stages } = built
+  const original = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, 'native-recovery-originals.json'), 'utf8'))
+  const conversation = original.conversations[0]
+  const nativeRows: { id: string; at: number; data: Record<string, unknown>; text: string }[] = []
+  const refreshStage = (index: number) => {
+    const stage = stages[index]!, bytes = fs.readFileSync(path.join(input.evidenceDir, stage.nativeFile.path))
+    stage.nativeFile = { path: stage.nativeFile.path, sha256: digest(bytes) }
+    const store = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.store.path), 'utf8'))
+    Object.assign(store.snapshot, { path: '/owned/opencode.db', bytesBase64: bytes.toString('base64'), sha256: digest(bytes) })
+    stage.store = write(stage.store.path, store)
+  }
+  for (const [index, stage] of stages.entries()) {
+    const request = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.request.path), 'utf8'))
+    const base = 1_780_000_000_000 + index * 10_000
+    nativeRows.push({ id: `user-${index}`, at: base + 2_000, data: { role: 'user' }, text: request.request.params.text },
+      { id: `assistant-${index}`, at: base + 3_000, data: { role: 'assistant', parentID: `user-${index}`, providerID: 'opencode', modelID: 'big-pickle', time: { completed: base + 3_000 } }, text: index ? conversation.nonce : 'stored' })
+    const filename = path.join(input.evidenceDir, `opencode-stage-${index}/opencode.db`)
+    fs.mkdirSync(path.dirname(filename), { recursive: true })
+    const db = new DatabaseSync(filename)
+    try {
+      db.exec('CREATE TABLE session(id TEXT PRIMARY KEY); CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE part(id TEXT PRIMARY KEY,session_id TEXT,message_id TEXT,time_created INTEGER,data TEXT);')
+      db.prepare('INSERT INTO session VALUES (?)').run(conversation.nativeSessionId)
+      for (const row of nativeRows) {
+        db.prepare('INSERT INTO message VALUES (?,?,?,?)').run(row.id, conversation.nativeSessionId, row.at, JSON.stringify(row.data))
+        db.prepare('INSERT INTO part VALUES (?,?,?,?,?)').run(`part-${row.id}`, conversation.nativeSessionId, row.id, row.at, JSON.stringify({ type: 'text', text: row.text }))
+      }
+    } finally { db.close() }
+    stage.nativeFile = { path: path.relative(input.evidenceDir, filename), sha256: digest(fs.readFileSync(filename)) }
+    if (index) Object.assign(stage, { boundaryFile: stages[index - 1]!.nativeFile })
+    refreshStage(index)
+    request.reply = { data: {} }; stage.request = write(stage.request.path, request)
+    const namespace = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, stage.namespace.path), 'utf8'))
+    namespace.httpsStatus = null
+    namespace.freeModelAccess = { source: 'native-config-providers', providerId: 'opencode', modelId: 'big-pickle', endpoint: 'https://unit-free.invalid/v1', ca: 'system-default', peerCertificateSha256: 'a'.repeat(64) }
+    stage.namespace = write(stage.namespace.path, namespace)
+  }
+  original.selected = ['freshopencode']; conversation.mode = 'freshopencode'; conversation.provider = 'opencode'; conversation.stages = stages
+  write('native-recovery-originals.json', original)
+  const derive = () => deriveNativeRecoveryOriginals({ evidenceDir: input.evidenceDir, candidateSha, runId: receiptRunId, runtimeImage, selected: ['freshopencode'] })
+  const replaceResponse = (index: number, response: string) => {
+    const db = new DatabaseSync(path.join(input.evidenceDir, stages[index]!.nativeFile.path))
+    try { db.prepare('UPDATE part SET data=? WHERE message_id=?').run(JSON.stringify({ type: 'text', text: response }), `assistant-${index}`) }
+    finally { db.close() }
+    refreshStage(index); write('native-recovery-originals.json', original)
+  }
+  return { derive, replaceResponse }
 }
 
 function amplifierFixture(observed = false, atomicSaves = false) {
@@ -468,6 +540,27 @@ describe('qualification from private native originals', () => {
       ['initial', false, 'claude-haiku-4-5-20251001', null], ['after_session_host_crash', true, 'claude-haiku-4-5-20251001', null], ['after_provider_process_crash', true, 'claude-haiku-4-5-20251001', null],
     ])
     expect(stages.every(stage => stage.nativeEvidence.kind === 'identified_message' && stage.nativeEvidence.turnId.startsWith('turn-'))).toBe(true)
+  })
+
+  it('accepts synthetic OpenCode nonce recall after both owned crashes', () => {
+    const { derive } = opencodeFixture()
+    expect(derive()[0]!.stages.map(stage => [stage.stage, stage.recalledNonce, stage.noTools])).toEqual([
+      ['initial', false, true], ['after_session_host_crash', true, true], ['after_provider_process_crash', true, true],
+    ])
+  })
+
+  it.each([
+    { index: 1, stage: 'after_session_host_crash' },
+    { index: 2, stage: 'after_provider_process_crash' },
+  ] as const)('reports a fixed diagnostic for missing OpenCode recall at $stage', ({ index, stage }) => {
+    const { derive, replaceResponse } = opencodeFixture()
+    expect(derive()[0]!.stages[index]!.recalledNonce).toBe(true)
+    replaceResponse(index, 'synthetic response without the remembered marker')
+    let failure: unknown
+    try { derive() } catch (error) { failure = error }
+    expect(failure).toBeInstanceOf(NativeRecoveryValidationError)
+    expect(failure).toMatchObject({ diagnostic: { code: 'recovery_nonce_not_recalled', stage } })
+    expect(nativeRecoveryValidationDiagnostic(failure)).toEqual({ code: 'recovery_nonce_not_recalled', stage })
   })
 
   it.each(['missing-nonce', 'tool', 'parent', 'duplicate-provider-id', 'changed-prior-component', 'root', 'missing-model', 'cross-run'] as const)(

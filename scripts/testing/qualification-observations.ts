@@ -11,6 +11,30 @@ import type { NativeAssistantTurn, NativeHistory } from './provider-native-histo
 export const NATIVE_RECOVERY_ORIGINALS_FILE = 'native-recovery-originals.json'
 export type NativeOriginalReference = { path: string; sha256: string }
 export type NativeRecoveryStage = 'initial' | 'after_session_host_crash' | 'after_provider_process_crash'
+export type NativeRecoveryValidationDiagnostic = Readonly<{
+  code: 'recovery_nonce_not_recalled'
+  stage: Exclude<NativeRecoveryStage, 'initial'>
+}>
+
+export class NativeRecoveryValidationError extends Error {
+  readonly diagnostic: NativeRecoveryValidationDiagnostic
+
+  constructor(stage: NativeRecoveryValidationDiagnostic['stage']) {
+    super('native recovery completion does not recall the seed nonce')
+    this.name = 'NativeRecoveryValidationError'
+    this.diagnostic = Object.freeze({ code: 'recovery_nonce_not_recalled', stage })
+  }
+}
+
+/** Only fixed validation facts may cross the body-free owner lifecycle boundary. */
+export function nativeRecoveryValidationDiagnostic(error: unknown): NativeRecoveryValidationDiagnostic | undefined {
+  if (!(error instanceof NativeRecoveryValidationError)) return undefined
+  const diagnostic = error.diagnostic
+  if (diagnostic?.code !== 'recovery_nonce_not_recalled'
+    || (diagnostic.stage !== 'after_session_host_crash' && diagnostic.stage !== 'after_provider_process_crash')) return undefined
+  return { code: 'recovery_nonce_not_recalled', stage: diagnostic.stage }
+}
+
 export type NativeRecoveryStageEvidence = {
   stage: NativeRecoveryStage
   nativeSessionId: string
@@ -295,7 +319,7 @@ export function deriveNativeRecoveryOriginals(input: {
       }
       if (gestures.at(-1)?.reply?.data?.submittedTurnId !== undefined) equal(gestures.at(-1)!.reply.data.submittedTurnId, turn.turnId, 'native submitted/completed turn')
       const recalledNonce = stage.stage !== 'initial' && turn.text.includes(nonce)
-      if (stage.stage !== 'initial' && !recalledNonce) throw new Error('native recovery completion does not recall the seed nonce')
+      if (stage.stage !== 'initial' && !recalledNonce) throw new NativeRecoveryValidationError(stage.stage)
       const profile = observedNativeProfile(turn)
       if (stage.observedReasoningEffort !== undefined && stage.observedReasoningEffort !== profile.effort) throw new Error('declared observed effort is absent from native telemetry')
       stages.push({
