@@ -37,7 +37,7 @@ The user later authorized up to five additional Stage 5 Fresh Eyes review rounds
 ## Global Constraints
 
 1. Work in `/home/dan/code/freshell/.worktrees/durable-souls-reliability` on the recorded feature branch. Preserve existing commits, historical receipts and unrelated work. Do not merge, push, create a PR or deploy without the approvals required by repository instructions.
-2. The remaining live mode checks cover terminal Claude, Codex and OpenCode plus FreshClaude, FreshCodex and FreshOpenCode. Skip Amplifier and Kilroy live checks; leave their existing code and meaningful tests alone.
+2. The remaining live mode checks cover terminal Codex and OpenCode plus FreshCodex and FreshOpenCode. Skip Claude because its login is unavailable, and skip Amplifier and Kilroy live checks; leave their existing code and meaningful tests alone.
 3. Do not require automatic migration of existing conversations or exact provider-native session continuity across a transition. Do not touch real existing session stores. A later manual port is an accepted option if needed.
 4. Keep recovery truthful: a requested or missing identity, unreadable/partial provider storage, or stale observation cannot be treated as proof that a conversation is absent or lost. Retain the existing pristine-seed and ordinary Stop semantics.
 5. Respect the rootless runtime boundary, provider UID/GID, zero capabilities, read-only container root, private writable provider volumes and exact process/resource ownership. Destructive tests use the disposable sandbox or an isolated owned rig.
@@ -52,9 +52,9 @@ The user later authorized up to five additional Stage 5 Fresh Eyes review rounds
 
 Tasks 1–7 below are completed source work; their task sections retain the specific files and historical checks. Historical source reports and receipts remain useful context but do not replace checks on the joined candidate.
 
-The remaining browser verification uses the already-built external managed-runtime runner and the selected ordinary-Stop and six-mode smoke cases in the existing managed-runtime and fresh-agent specs. If a behavior regression is found, change only its owning source and tests. The six-mode smoke reuses the isolated rig, mode selection, and configured credentials. It proves an ordinary launch and one completed response per selected mode; it does not publish a qualification receipt or assert recovery after a crash.
+The remaining browser verification uses the already-built external managed-runtime runner and the selected ordinary-Stop and four-mode smoke cases in the existing managed-runtime and fresh-agent specs. If a behavior regression is found, change only its owning source and tests. The four-mode smoke reuses the isolated rig, mode selection, and configured credentials. It proves an ordinary launch and one completed response per selected mode; it does not publish a qualification receipt or assert recovery after a crash.
 
-The current candidate's provider-free Fresh History browser check and selected interrupted-Stop browser case have passed. The config/legacy retry case was not admitted because its candidate-bound fixture manifest is absent; it is outside the user's accepted transition scope. Remaining work is the six-mode ordinary-use smoke, the final configured full-suite gate and independent review. No production backup, deployment packet, real-session import, transition rehearsal or all-mode campaign is part of this repair.
+The current candidate's provider-free Fresh History browser check and selected interrupted-Stop browser case have passed. The config/legacy retry case was not admitted because its candidate-bound fixture manifest is absent; it is outside the user's accepted transition scope. Remaining work is the four-mode ordinary-use smoke (latest result 1/4), the final configured full-suite gate and independent review. No production backup, deployment packet, real-session import, transition rehearsal or all-mode campaign is part of this repair.
 
 ## Completed source work and current remaining work
 
