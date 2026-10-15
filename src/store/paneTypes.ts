@@ -72,6 +72,8 @@ export type FreshAgentCheckpointOutcome = {
   version: 1
   /** Conversation generation; changes only when the pane is deliberately replaced. */
   conversationRequestId?: string
+  /** Durable provider session identity, allowing a reopened pane to reuse saved outcomes. */
+  conversationSessionKey?: string
   requestId: string
   displayTurnId?: string
   nativeTurnId?: string
@@ -88,6 +90,38 @@ function checkpointOutcomeString(value: unknown, maxLength: number): string | un
   if (typeof value !== 'string' || value.length === 0 || value.length > maxLength) return undefined
   if (/[\u0000-\u001f\u007f-\u009f]/.test(value)) return undefined
   return value
+}
+
+export function freshAgentCheckpointConversationKey(
+  provider: unknown,
+  sessionType: unknown,
+  sessionId: unknown,
+): string | undefined {
+  if (provider !== 'claude' && provider !== 'codex' && provider !== 'opencode') return undefined
+  if (sessionType !== 'freshclaude' && sessionType !== 'freshcodex'
+    && sessionType !== 'kilroy' && sessionType !== 'freshopencode') return undefined
+  const normalizedSessionId = checkpointOutcomeString(sessionId, 256)
+  if (!normalizedSessionId) return undefined
+  return JSON.stringify([provider, sessionType, normalizedSessionId])
+}
+
+export function freshAgentCheckpointConversationKeyForContent(
+  content: {
+    provider?: unknown
+    sessionType?: unknown
+    sessionId?: unknown
+    resumeSessionId?: unknown
+    sessionRef?: unknown
+  },
+): string | undefined {
+  const sessionRef = content.sessionRef && typeof content.sessionRef === 'object' && !Array.isArray(content.sessionRef)
+    ? content.sessionRef as Record<string, unknown>
+    : undefined
+  const provider = content.provider
+  const sessionId = sessionRef && sessionRef.provider === provider
+    ? sessionRef.sessionId
+    : (content.sessionId ?? content.resumeSessionId)
+  return freshAgentCheckpointConversationKey(provider, content.sessionType, sessionId)
 }
 
 function checkpointOutcomeReason(value: unknown): string | undefined {
@@ -119,6 +153,7 @@ export function normalizeFreshAgentCheckpointWorkspace(value: unknown): FreshAge
 export function normalizeFreshAgentCheckpointOutcomes(
   value: unknown,
   conversationRequestId?: string,
+  conversationSessionKey?: string,
 ): FreshAgentCheckpointOutcome[] | undefined {
   if (!Array.isArray(value)) return undefined
   const byRequest = new Map<string, FreshAgentCheckpointOutcome>()
@@ -131,10 +166,14 @@ export function normalizeFreshAgentCheckpointOutcomes(
     const recordConversationRequestId = record.conversationRequestId === undefined
       ? undefined
       : checkpointOutcomeString(record.conversationRequestId, 128)
+    const recordConversationSessionKey = record.conversationSessionKey === undefined
+      ? undefined
+      : checkpointOutcomeString(record.conversationSessionKey, 512)
     if (record.conversationRequestId !== undefined
       && (!recordConversationRequestId || !/^[A-Za-z0-9_.:-]+$/.test(recordConversationRequestId))) continue
     if (conversationRequestId && recordConversationRequestId
-      && recordConversationRequestId !== conversationRequestId) continue
+      && recordConversationRequestId !== conversationRequestId
+      && (!conversationSessionKey || recordConversationSessionKey !== conversationSessionKey)) continue
     if (record.status !== 'available' && record.status !== 'unavailable') continue
 
     const displayTurnId = checkpointOutcomeString(record.displayTurnId, 256)
@@ -156,6 +195,7 @@ export function normalizeFreshAgentCheckpointOutcomes(
       version: 1,
       requestId,
       ...(recordConversationRequestId ? { conversationRequestId: recordConversationRequestId } : {}),
+      ...(recordConversationSessionKey ? { conversationSessionKey: recordConversationSessionKey } : {}),
       ...(displayTurnId ? { displayTurnId } : {}),
       ...(nativeTurnId ? { nativeTurnId } : {}),
       status: record.status,

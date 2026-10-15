@@ -2,6 +2,7 @@ import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import { nanoid } from 'nanoid'
 import {
   normalizeFreshAgentEffortOverride,
+  freshAgentCheckpointConversationKeyForContent,
   normalizeFreshAgentCheckpointOutcomes,
   normalizeFreshAgentModelEffortLevels,
   normalizeFreshAgentModelSelection,
@@ -88,8 +89,9 @@ function normalizeCheckpointWorkspace(value: unknown): FreshAgentCheckpointWorks
 function normalizeCheckpointOutcomes(
   value: unknown,
   conversationRequestId?: string,
+  conversationSessionKey?: string,
 ): FreshAgentCheckpointOutcome[] | undefined {
-  return normalizeFreshAgentCheckpointOutcomes(value, conversationRequestId)
+  return normalizeFreshAgentCheckpointOutcomes(value, conversationRequestId, conversationSessionKey)
 }
 
 function buildPreservedSessionRef(
@@ -204,6 +206,7 @@ function normalizePaneContent(
     const checkpointOutcomes = normalizeCheckpointOutcomes(
       rawFreshAgent.checkpointOutcomes,
       outcomeConversationRequestId,
+      freshAgentCheckpointConversationKeyForContent(rawFreshAgent),
     )
     const closeError = typeof input.closeError === 'string' ? input.closeError : undefined
     const rawModelLabel = rawFreshAgent.modelLabel

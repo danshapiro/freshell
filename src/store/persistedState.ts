@@ -21,6 +21,7 @@ import {
   stripSessionOwnedTabFreezeFlags,
 } from '@/lib/session-name-migration'
 import {
+  freshAgentCheckpointConversationKeyForContent,
   normalizeFreshAgentCheckpointWorkspace,
   normalizeFreshAgentCheckpointOutcomes,
   normalizeFreshAgentPaneModelSelection,
@@ -352,6 +353,7 @@ function normalizeFreshAgentContent(content: Record<string, unknown>): Record<st
   const checkpointOutcomes = normalizeFreshAgentCheckpointOutcomes(
     content.checkpointOutcomes,
     typeof content.createRequestId === 'string' ? content.createRequestId : undefined,
+    freshAgentCheckpointConversationKeyForContent(content),
   )
   const existingRestoreError = readRestoreError(content.restoreError)
   if (existingRestoreError) {

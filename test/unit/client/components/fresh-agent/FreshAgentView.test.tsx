@@ -3419,7 +3419,6 @@ describe('FreshAgentView', () => {
     const store = createStore()
     const checkpointWorkspace = { path: '/repo/project', provenance: 'directory-picker' as const }
     const resolvedCheckpointWorkspace = { path: '/repo/project-root', provenance: 'directory-picker' as const }
-    const listedCheckpointWorkspace = resolvedCheckpointWorkspace
     let onMessage: ((message: Record<string, unknown>) => void) | undefined
     wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
       onMessage = handler
@@ -3477,16 +3476,6 @@ describe('FreshAgentView', () => {
         ],
       })
     apiMock.post.mockResolvedValue({ ok: true })
-    apiMock.get.mockResolvedValue({
-      checkpoints: [{
-        id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-        ts: 1,
-        label: 'Ship it',
-        requestId: 'req-normalized-send',
-        turnId: 'display-user-1',
-        workspace: listedCheckpointWorkspace,
-      }],
-    })
     store.dispatch(initLayout({
       tabId: 'tab-1',
       paneId: 'pane-1',
@@ -3611,6 +3600,7 @@ describe('FreshAgentView', () => {
     expect(persistedOutcomes).toEqual(expect.arrayContaining([expect.objectContaining({
       requestId,
       conversationRequestId: 'req-normalized-send',
+      conversationSessionKey: JSON.stringify(['codex', 'freshcodex', 'thread-materialized-send']),
       displayTurnId: 'codex-turn-17:row-0',
       nativeTurnId: 'codex-turn-17',
       status: 'available',
@@ -3630,17 +3620,13 @@ describe('FreshAgentView', () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true)
     fireEvent.click(screen.getByRole('button', { name: 'Rewind code to here' }))
     await waitFor(() => {
-      expect(apiMock.get).toHaveBeenCalledWith(
-        '/api/fresh-agent/checkpoints?cwd=%2Frepo&workspacePath=%2Frepo%2Fproject-root&workspaceProvenance=directory-picker',
-      )
-    })
-    await waitFor(() => {
       expect(apiMock.post).toHaveBeenCalledWith('/api/fresh-agent/checkpoints/restore', {
         cwd: '/repo',
-        workspace: listedCheckpointWorkspace,
+        workspace: resolvedCheckpointWorkspace,
         id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
       })
     })
+    expect(apiMock.get).not.toHaveBeenCalledWith(expect.stringContaining('/api/fresh-agent/checkpoints?'))
   })
 
   it('accepts a replayed checkpoint outcome after reload when it carries an exact provider row identity', async () => {
@@ -3830,6 +3816,129 @@ describe('FreshAgentView', () => {
     expect(apiMock.post).not.toHaveBeenCalledWith('/api/fresh-agent/checkpoints/restore', expect.anything())
   })
 
+  it('restores saved rewind availability when the same durable session opens with a new pane request', async () => {
+    const sessionId = 'thread-reopened-checkpoints'
+    const checkpointId = 'dddddddddddddddddddddddddddddddd'
+    const sessionKey = JSON.stringify(['codex', 'freshcodex', sessionId])
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'reopened conversation',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [{
+        id: `${sessionId}:row-0`,
+        turnId: `${sessionId}:row-0`,
+        nativeTurnId: sessionId,
+        role: 'user',
+        summary: 'A saved turn in this session',
+        items: [{ id: 'reopened-user-text', kind: 'text', text: 'A saved turn in this session' }],
+      }],
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        sessionId,
+        sessionRef: { provider: 'codex', sessionId },
+        createRequestId: 'new-pane-request',
+        status: 'idle',
+        initialCwd: '/repo',
+        checkpointOutcomes: [{
+          version: 1,
+          conversationRequestId: 'old-pane-request',
+          conversationSessionKey: sessionKey,
+          requestId: 'saved-turn-request',
+          displayTurnId: `${sessionId}:row-0`,
+          nativeTurnId: sessionId,
+          status: 'available',
+          checkpointId,
+          workspace: { path: '/repo', provenance: 'directory-picker' },
+        }],
+      } as never,
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    const userRow = await screen.findByRole('article', { name: 'You transcript turn' })
+    expect(within(userRow).getByRole('status', { name: 'Code rewind available for this message' }))
+      .toHaveTextContent('Code rewind is available for this message.')
+    expect(within(userRow).getByRole('button', { name: 'Rewind code to here' })).toBeEnabled()
+  })
+
+  it('restores a saved checkpoint by ID even when it is outside the newest checkpoint page', async () => {
+    const checkpointId = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
+    const workspace = { path: '/repo/older-checkpoint', provenance: 'directory-picker' as const }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'older checkpoint conversation',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [{
+        id: 'older-checkpoint-row',
+        turnId: 'older-checkpoint-row',
+        nativeTurnId: 'older-checkpoint-native-turn',
+        role: 'user',
+        summary: 'Restore a checkpoint older than the list window',
+        items: [{ id: 'older-checkpoint-user-text', kind: 'text', text: 'Restore a checkpoint older than the list window' }],
+      }],
+    })
+    apiMock.get.mockResolvedValue({ checkpoints: [{
+      id: 'ffffffffffffffffffffffffffffffff',
+      ts: 100,
+      label: 'A newer checkpoint from the capped list',
+      workspace,
+    }] })
+    apiMock.post.mockResolvedValue({ ok: true })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-older-checkpoint',
+        sessionId: 'thread-older-checkpoint',
+        status: 'idle',
+        initialCwd: '/repo',
+        checkpointOutcomes: [{
+          version: 1,
+          conversationRequestId: 'req-older-checkpoint',
+          requestId: 'request-older-checkpoint',
+          displayTurnId: 'older-checkpoint-row',
+          nativeTurnId: 'older-checkpoint-native-turn',
+          status: 'available',
+          checkpointId,
+          workspace,
+        }],
+      } as never,
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const userRow = await screen.findByRole('article', { name: 'You transcript turn' })
+    fireEvent.click(within(userRow).getByRole('button', { name: 'Rewind code to here' }))
+
+    await waitFor(() => {
+      expect(apiMock.post).toHaveBeenCalledWith('/api/fresh-agent/checkpoints/restore', {
+        cwd: '/repo',
+        workspace,
+        id: checkpointId,
+      })
+    })
+    expect(apiMock.get).not.toHaveBeenCalledWith(expect.stringContaining('/api/fresh-agent/checkpoints?'))
+  })
+
   it('uses the selected checkpoint workspace to rewind when a resumed pane has no launch cwd', async () => {
     const checkpointId = 'cccccccccccccccccccccccccccccccc'
     const workspace = { path: '/repo/selected-without-launch-cwd', provenance: 'directory-picker' as const }
@@ -3847,12 +3956,6 @@ describe('FreshAgentView', () => {
         items: [{ id: 'resume-user-text', kind: 'text', text: 'Restore the selected workspace' }],
       }],
     })
-    apiMock.get.mockResolvedValue({ checkpoints: [{
-      id: checkpointId,
-      ts: 1,
-      label: 'Restore the selected workspace',
-      workspace,
-    }] })
     const store = createStore()
     store.dispatch(initLayout({
       tabId: 'tab-1',
@@ -3891,15 +3994,13 @@ describe('FreshAgentView', () => {
     fireEvent.click(within(article as HTMLElement).getByRole('button', { name: 'Rewind code to here' }))
 
     await waitFor(() => {
-      expect(apiMock.get).toHaveBeenCalledWith(
-        '/api/fresh-agent/checkpoints?cwd=%2Frepo%2Fselected-without-launch-cwd&workspacePath=%2Frepo%2Fselected-without-launch-cwd&workspaceProvenance=directory-picker',
-      )
       expect(apiMock.post).toHaveBeenCalledWith('/api/fresh-agent/checkpoints/restore', {
         cwd: '/repo/selected-without-launch-cwd',
         workspace,
         id: checkpointId,
       })
     })
+    expect(apiMock.get).not.toHaveBeenCalledWith(expect.stringContaining('/api/fresh-agent/checkpoints?'))
   })
 
   it('rewinds to the persisted checkpoint ID after reload when duplicate prompts have no metadata links', async () => {
@@ -3928,12 +4029,8 @@ describe('FreshAgentView', () => {
       capabilities: { send: true, interrupt: true, fork: true },
       turns,
     })
-    // Metadata writes failed before reload, so the list has no request/turn
-    // association. The durable outcomes still identify each exact checkpoint.
-    apiMock.get.mockResolvedValue({ checkpoints: [
-      { id: secondCheckpointId, ts: 2, label: 'Repeat this prompt' },
-      { id: firstCheckpointId, ts: 1, label: 'Repeat this prompt' },
-    ] })
+    // The list can be missing metadata links; settled outcomes still identify
+    // the exact checkpoint for each duplicate prompt.
     const persistedContent = JSON.parse(JSON.stringify({
       kind: 'fresh-agent',
       sessionType: 'freshcodex',
@@ -3995,24 +4092,14 @@ describe('FreshAgentView', () => {
     })
   })
 
-  it('preserves an exact available checkpoint after a transient list failure and allows retry', async () => {
-    const checkpointId = '33333333333333333333333333333333'
+  it('keeps legacy label-based rewind retryable after a transient checkpoint list failure', async () => {
     const checkpointWorkspace = { path: '/repo/selected', provenance: 'directory-picker' as const }
-    const persistedOutcome = {
-      version: 1 as const,
-      conversationRequestId: 'req-checkpoint-list-retry',
-      requestId: 'request-checkpoint-list-retry',
-      displayTurnId: 'display-retry-turn',
-      status: 'available' as const,
-      checkpointId,
-      workspace: checkpointWorkspace,
-    }
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
       status: 'idle',
       summary: 'saved turn',
       capabilities: { send: true, interrupt: true, fork: true },
       turns: [{
-        id: 'native-retry-turn',
+        id: 'display-retry-turn',
         turnId: 'display-retry-turn',
         role: 'user',
         summary: 'Retry checkpoint lookup',
@@ -4024,7 +4111,12 @@ describe('FreshAgentView', () => {
         code: 'workspace_unavailable',
         details: 'The selected project workspace is temporarily unavailable.',
       }))
-      .mockResolvedValue({ checkpoints: [{ id: checkpointId, ts: 1, label: 'Retry checkpoint lookup', workspace: checkpointWorkspace }] })
+      .mockResolvedValue({ checkpoints: [{
+        id: '33333333333333333333333333333333',
+        ts: 1,
+        label: 'Retry checkpoint lookup',
+        workspace: checkpointWorkspace,
+      }] })
     const persistedContent = JSON.parse(JSON.stringify({
       kind: 'fresh-agent',
       sessionType: 'freshcodex',
@@ -4034,7 +4126,6 @@ describe('FreshAgentView', () => {
       status: 'idle',
       initialCwd: '/repo',
       checkpointWorkspace,
-      checkpointOutcomes: [persistedOutcome],
     })) as FreshAgentPaneContent
     const store = createStore()
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: persistedContent }))
@@ -4050,9 +4141,6 @@ describe('FreshAgentView', () => {
     fireEvent.click(rewind)
     expect(await screen.findByText('Could not check the saved code checkpoint list. Try again.'))
       .toBeInTheDocument()
-    expect(getFreshAgentPaneContent(store).checkpointOutcomes).toEqual([persistedOutcome])
-    expect(screen.getByRole('status', { name: 'Code rewind available for this message' }))
-      .toHaveTextContent('Code rewind is available for this message.')
     expect(apiMock.post).not.toHaveBeenCalledWith('/api/fresh-agent/checkpoints/restore', expect.anything())
 
     fireEvent.click(rewind)
@@ -4060,10 +4148,10 @@ describe('FreshAgentView', () => {
       expect(apiMock.post).toHaveBeenCalledWith('/api/fresh-agent/checkpoints/restore', {
         cwd: '/repo',
         workspace: checkpointWorkspace,
-        id: checkpointId,
+        id: '33333333333333333333333333333333',
       })
     })
-    expect(getFreshAgentPaneContent(store).checkpointOutcomes).toEqual([persistedOutcome])
+    expect(getFreshAgentPaneContent(store).checkpointOutcomes).toBeUndefined()
   })
 
   it('does not promote a live provider cwd into an explicit checkpoint workspace', async () => {

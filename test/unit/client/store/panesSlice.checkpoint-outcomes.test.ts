@@ -134,4 +134,51 @@ describe('FreshAgent checkpoint outcomes', () => {
       code: 'late_failure',
     })
   })
+
+  it('retains outcomes from an earlier pane create when the durable session is the same', () => {
+    const sessionKey = JSON.stringify(['codex', 'freshcodex', 'thread-reopened-checkpoints'])
+    const state = panesReducer(undefined, initLayout({
+      tabId: 'tab-checkpoints',
+      paneId: 'pane-checkpoints',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        sessionId: 'thread-reopened-checkpoints',
+        sessionRef: { provider: 'codex', sessionId: 'thread-reopened-checkpoints' },
+        createRequestId: 'new-pane-create',
+        status: 'idle',
+        checkpointOutcomes: [
+          {
+            requestId: 'saved-turn',
+            conversationRequestId: 'old-pane-create',
+            conversationSessionKey: sessionKey,
+            displayTurnId: 'thread-reopened-checkpoints:row-0',
+            nativeTurnId: 'thread-reopened-checkpoints',
+            status: 'available',
+            checkpointId: 'saved-checkpoint',
+          },
+          {
+            requestId: 'other-session-turn',
+            conversationRequestId: 'old-pane-create',
+            conversationSessionKey: JSON.stringify(['codex', 'freshcodex', 'different-thread']),
+            displayTurnId: 'different-thread:row-0',
+            status: 'available',
+            checkpointId: 'other-session-checkpoint',
+          },
+        ],
+      } as never,
+    }))
+
+    const leaf = state.layouts['tab-checkpoints'] as Extract<PaneNode, { type: 'leaf' }>
+    expect(leaf.content).toMatchObject({
+      kind: 'fresh-agent',
+      checkpointOutcomes: [{
+        requestId: 'saved-turn',
+        conversationRequestId: 'old-pane-create',
+        conversationSessionKey: sessionKey,
+        checkpointId: 'saved-checkpoint',
+      }],
+    })
+  })
 })

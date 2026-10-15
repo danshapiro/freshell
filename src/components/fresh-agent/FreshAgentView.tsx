@@ -10,6 +10,7 @@ import {
 } from 'react'
 import { nanoid } from 'nanoid'
 import {
+  freshAgentCheckpointConversationKeyForContent,
   normalizeFreshAgentCheckpointWorkspace,
   type FreshAgentCheckpointOutcome,
   type FreshAgentPaneContent,
@@ -310,9 +311,8 @@ function checkpointTurnAvailabilityKey(scope: string, id: string): string {
 }
 
 function checkpointAvailabilityScope(content: FreshAgentPaneContent): string {
-  // A provider may replace its provisional session id when it materializes
-  // the durable conversation. The pane create request is the stable identity
-  // for that conversation generation across the transition.
+  // Request keys fence in-flight sends within this pane. Persisted outcomes
+  // also carry the durable session key so another pane can recover them.
   return content.createRequestId
 }
 
@@ -337,9 +337,14 @@ function checkpointOutcomeAvailability(outcome: FreshAgentCheckpointOutcome): Ch
 
 function checkpointAvailabilityMap(content: FreshAgentPaneContent): Map<string, CheckpointTurnAvailability> {
   const scope = checkpointAvailabilityScope(content)
+  const sessionKey = freshAgentCheckpointConversationKeyForContent(content)
   const availability = new Map<string, CheckpointTurnAvailability>()
   for (const outcome of content.checkpointOutcomes ?? []) {
-    if (outcome.conversationRequestId && outcome.conversationRequestId !== content.createRequestId) continue
+    if (
+      outcome.conversationRequestId
+      && outcome.conversationRequestId !== content.createRequestId
+      && (!sessionKey || outcome.conversationSessionKey !== sessionKey)
+    ) continue
     const value = checkpointOutcomeAvailability(outcome)
     availability.set(checkpointAvailabilityKey(scope, 'request', outcome.requestId), value)
     if (outcome.displayTurnId) {
@@ -1118,10 +1123,16 @@ export function FreshAgentView({
     })
     if (!requestId || availability.status === 'pending') return
 
+    const state = appStore.getState()
+    const paneRoot = state.panes.layouts[tabId]
+    const latestPaneContent = paneRoot ? findPaneContent(paneRoot, paneId) : null
+    if (latestPaneContent?.kind !== 'fresh-agent' || latestPaneContent.createRequestId !== scope) return
+    const conversationSessionKey = freshAgentCheckpointConversationKeyForContent(latestPaneContent)
     const outcome: FreshAgentCheckpointOutcome = {
       version: 1,
       requestId,
       conversationRequestId: scope,
+      ...(conversationSessionKey ? { conversationSessionKey } : {}),
       ...(availability.displayTurnId ? { displayTurnId: availability.displayTurnId } : {}),
       ...(availability.nativeTurnId ? { nativeTurnId: availability.nativeTurnId } : {}),
       status: availability.status,
@@ -1136,10 +1147,6 @@ export function FreshAgentView({
           }
         : {}),
     }
-    const state = appStore.getState()
-    const paneRoot = state.panes.layouts[tabId]
-    const latestPaneContent = paneRoot ? findPaneContent(paneRoot, paneId) : null
-    if (latestPaneContent?.kind !== 'fresh-agent' || latestPaneContent.createRequestId !== scope) return
     const priorOutcomes = latestPaneContent.checkpointOutcomes ?? []
     const checkpointOutcomes = [
       ...priorOutcomes.filter((item) => item.requestId !== requestId),
@@ -2749,6 +2756,21 @@ export function FreshAgentView({
       ) {
         const current = paneContentRef.current
         const sessionRef = message.sessionRef ?? { provider: message.provider, sessionId: message.sessionId }
+        const nextContent = {
+          ...current,
+          sessionId: message.sessionId,
+          sessionRef,
+          resumeSessionId: message.sessionId,
+          restoreError: undefined,
+        }
+        const conversationSessionKey = freshAgentCheckpointConversationKeyForContent(nextContent)
+        const checkpointOutcomes = conversationSessionKey
+          ? current.checkpointOutcomes?.map((outcome) => (
+              !outcome.conversationRequestId || outcome.conversationRequestId === current.createRequestId
+                ? { ...outcome, conversationSessionKey }
+                : outcome
+            ))
+          : current.checkpointOutcomes
         persistDurableFreshAgentFlavor({
           provider: message.provider,
           sessionId: message.sessionId,
@@ -2761,11 +2783,8 @@ export function FreshAgentView({
           tabId,
           paneId,
           content: {
-            ...current,
-            sessionId: message.sessionId,
-            sessionRef,
-            resumeSessionId: message.sessionId,
-            restoreError: undefined,
+            ...nextContent,
+            ...(checkpointOutcomes ? { checkpointOutcomes } : {}),
           },
         }))
       }
@@ -4067,6 +4086,55 @@ export function FreshAgentView({
       setNotice(`Rewind unavailable for this message: ${reason}`)
       return
     }
+
+    const restoreCheckpoint = (
+      checkpointId: string,
+      label: string,
+      restoreWorkspace: typeof workspace,
+    ) => Promise
+      .resolve(api.post('/api/fresh-agent/checkpoints/restore', {
+        cwd,
+        ...(restoreWorkspace ? { workspace: restoreWorkspace } : {}),
+        id: checkpointId,
+      }))
+      .then(() => setNotice(`Code rewound to before: "${label}"`))
+      .catch((error: unknown) => {
+        if (error && typeof error === 'object') {
+          const details = (error as { details?: unknown }).details
+          if (details && typeof details === 'object' && (details as { code?: unknown }).code === 'workspace_unavailable') {
+            const reason = checkpointFailureReason(error)
+            const requestId = (turn as FreshAgentTurn & { requestId?: unknown }).requestId
+            publishCheckpointAvailability(
+              checkpointAvailabilityScope(current),
+              typeof requestId === 'string' ? requestId : undefined,
+              getFreshAgentDisplayTurnKey(turn),
+              {
+                status: 'unavailable',
+                reason,
+                code: checkpointFailureCode(error) ?? 'checkpoint_restore_failed',
+                ...(workspace ? { workspace } : {}),
+              },
+            )
+            setNotice(`Rewind unavailable for this message: ${reason}`)
+            return
+          }
+        }
+        setNotice(error instanceof Error ? `Rewind failed: ${error.message}` : 'Rewind failed')
+      })
+
+    // An exact checkpoint ID came from the settled outcome, which is the
+    // authoritative association to this provider turn. Restore accepts any
+    // still-published ancestor, including commits outside the capped list.
+    if (availability?.checkpointId) {
+      const label = turn.summary.trim() || 'this message'
+      const confirmed = typeof window === 'undefined' || window.confirm(
+        `Rewind code to the state before "${label}"?\n\nTracked files changed since will be overwritten. Files created since are left in place. The conversation is not affected.`,
+      )
+      if (!confirmed) return
+      void restoreCheckpoint(availability.checkpointId, label, workspace)
+      return
+    }
+
     const query = new URLSearchParams({ cwd })
     if (workspace) {
       query.set('workspacePath', workspace.path)
@@ -4082,20 +4150,13 @@ export function FreshAgentView({
           return
         }
         const checkpoints = result.checkpoints
-        // Settled outcomes persist the exact create response across reloads.
-        // This is authoritative when metadata association failed: duplicate
-        // prompt labels cannot safely identify which snapshot belongs to the
-        // selected user turn. Label matching remains only for legacy turns
-        // without a persisted checkpoint ID.
-        const checkpoint = availability?.checkpointId
-          ? checkpoints.find((entry) => entry.id === availability.checkpointId) ?? null
-          : isModernCheckpointTurn(turn)
-            ? null
-            : pickCheckpointForTurn(checkpoints, snapshot?.turns ?? [], turn) as CheckpointCreationEntry | null
+        // Legacy turns do not have a durable outcome or provider identity, so
+        // keep their label-based lookup inside the bounded list window.
+        const checkpoint = isModernCheckpointTurn(turn)
+          ? null
+          : pickCheckpointForTurn(checkpoints, snapshot?.turns ?? [], turn) as CheckpointCreationEntry | null
         if (!checkpoint) {
-          const reason = availability?.checkpointId
-            ? 'The saved code checkpoint for this message is no longer available.'
-            : 'No code checkpoint was saved for this message.'
+          const reason = 'No code checkpoint was saved for this message.'
           const requestId = (turn as FreshAgentTurn & { requestId?: unknown }).requestId
           publishCheckpointAvailability(
             checkpointAvailabilityScope(current),
@@ -4111,36 +4172,7 @@ export function FreshAgentView({
         )
         if (!confirmed) return
         const restoreWorkspace = normalizeFreshAgentCheckpointWorkspace(checkpoint.workspace) ?? workspace
-        return Promise
-          .resolve(api.post('/api/fresh-agent/checkpoints/restore', {
-            cwd,
-            ...(restoreWorkspace ? { workspace: restoreWorkspace } : {}),
-            id: checkpoint.id,
-          }))
-          .then(() => setNotice(`Code rewound to before: "${checkpoint.label}"`))
-          .catch((error: unknown) => {
-            if (error && typeof error === 'object') {
-              const details = (error as { details?: unknown }).details
-              if (details && typeof details === 'object' && (details as { code?: unknown }).code === 'workspace_unavailable') {
-                const reason = checkpointFailureReason(error)
-                const requestId = (turn as FreshAgentTurn & { requestId?: unknown }).requestId
-                publishCheckpointAvailability(
-                  checkpointAvailabilityScope(current),
-                  typeof requestId === 'string' ? requestId : undefined,
-                  getFreshAgentDisplayTurnKey(turn),
-                  {
-                    status: 'unavailable',
-                    reason,
-                    code: checkpointFailureCode(error) ?? 'checkpoint_restore_failed',
-                    ...(workspace ? { workspace } : {}),
-                  },
-                )
-                setNotice(`Rewind unavailable for this message: ${reason}`)
-                return
-              }
-            }
-            setNotice(error instanceof Error ? `Rewind failed: ${error.message}` : 'Rewind failed')
-          })
+        return restoreCheckpoint(checkpoint.id, checkpoint.label, restoreWorkspace)
       })
       .catch(() => {
         // A failed or malformed list read is uncertain. Keep the durable
