@@ -188,8 +188,41 @@ export function buildTerminalOrdinaryTurnBrowserScript(): string {
     const captureTerminalOrdinaryTurnBaseline = ${captureTerminalOrdinaryTurnBaseline.toString()};
     const reduceTerminalOrdinaryTurnFrames = ${reduceTerminalOrdinaryTurnFrames.toString()};
     const globalName = ${JSON.stringify(TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL)};
+    let accumulatedObservation = null;
+    const observationKey = (baseline) => JSON.stringify([
+      baseline.provider,
+      baseline.terminalId,
+      baseline.streamId,
+      baseline.outputSeq,
+      baseline.completionSeq,
+    ]);
+    const latestSequence = (previous, current) => previous === null
+      ? current
+      : current === null ? previous : Math.max(previous, current);
+    const emptyObservation = (key) => ({
+      key,
+      requestInputSeen: false,
+      activitySeen: false,
+      outputSeen: false,
+      outputFrameCount: 0,
+      outputSeq: null,
+      completionSeen: false,
+      completionSeq: null,
+    });
+    const mergeObservation = (key, previous, current) => ({
+      key,
+      requestInputSeen: previous.requestInputSeen || current.requestInputSeen,
+      activitySeen: previous.activitySeen || current.activitySeen,
+      outputSeen: previous.outputSeen || current.outputSeen,
+      // Keep the largest count observed in any rolling-buffer snapshot.
+      outputFrameCount: Math.max(previous.outputFrameCount, current.outputFrameCount),
+      outputSeq: latestSequence(previous.outputSeq, current.outputSeq),
+      completionSeen: previous.completionSeen || current.completionSeen,
+      completionSeq: latestSequence(previous.completionSeq, current.completionSeq),
+    });
     window[globalName] = {
       prepareBeforeSend(provider, terminalId) {
+        accumulatedObservation = null;
         const harness = window.__FRESHELL_TEST_HARNESS__;
         if (!harness
           || typeof harness.getReceivedWsMessages !== 'function'
@@ -209,6 +242,7 @@ export function buildTerminalOrdinaryTurnBrowserScript(): string {
         if (streamId === null) return null;
 
         const baseline = captureTerminalOrdinaryTurnBaseline(frames, { provider, terminalId, streamId });
+        accumulatedObservation = emptyObservation(observationKey(baseline));
         harness.clearReceivedWsMessages();
         harness.clearSentWsMessages();
         return baseline;
@@ -266,9 +300,23 @@ export function buildTerminalOrdinaryTurnBrowserScript(): string {
           || sentInput === expectedInput + lineFeed
           || sentInput === expectedInput + carriageReturn + lineFeed
         );
-        return {
+        const current = {
           requestInputSeen,
           ...reduceTerminalOrdinaryTurnFrames(received, baseline),
+        };
+        const key = observationKey(baseline);
+        const previous = accumulatedObservation && accumulatedObservation.key === key
+          ? accumulatedObservation
+          : emptyObservation(key);
+        accumulatedObservation = mergeObservation(key, previous, current);
+        return {
+          requestInputSeen: accumulatedObservation.requestInputSeen,
+          activitySeen: accumulatedObservation.activitySeen,
+          outputSeen: accumulatedObservation.outputSeen,
+          outputFrameCount: accumulatedObservation.outputFrameCount,
+          outputSeq: accumulatedObservation.outputSeq,
+          completionSeen: accumulatedObservation.completionSeen,
+          completionSeq: accumulatedObservation.completionSeq,
         };
       },
     };

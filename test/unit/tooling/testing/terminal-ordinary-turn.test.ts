@@ -7,6 +7,8 @@ import {
   captureTerminalOrdinaryTurnBaseline,
   reduceTerminalOrdinaryTurnFrames,
   waitForTerminalOrdinaryTurnBaseline,
+  type TerminalOrdinaryTurnBaseline,
+  type TerminalOrdinaryTurnBrowserObservation,
 } from '../../../../scripts/testing/terminal-ordinary-turn.js'
 
 const target = { provider: 'claude', terminalId: 'terminal-1', streamId: 'stream-1' } as const
@@ -313,6 +315,66 @@ describe('body-free terminal ordinary-turn reduction', () => {
     })
     expect(JSON.stringify(observed)).not.toContain(outputSentinel)
     expect(JSON.stringify(observed)).not.toContain(promptSentinel)
+  })
+
+  it('retains body-free turn evidence when the received-message buffer rolls over between polls', () => {
+    const outputSentinel = 'PRIVATE_TERMINAL_RESPONSE_SENTINEL_rolling'
+    const promptSentinel = 'PRIVATE_TERMINAL_PROMPT_SENTINEL_rolling'
+    const received: unknown[] = []
+    const sent: unknown[] = []
+    const recordReceivedWsMessage = (message: unknown) => {
+      received.push(message)
+      if (received.length > 500) received.shift()
+    }
+    recordReceivedWsMessage({
+      type: 'terminal.attach.ready',
+      terminalId: target.terminalId,
+      streamId: target.streamId,
+      headSeq: 10,
+    })
+    const harness = {
+      getReceivedWsMessages: () => [...received],
+      clearReceivedWsMessages: () => { received.length = 0 },
+      getSentWsMessages: () => [...sent],
+      clearSentWsMessages: () => { sent.length = 0 },
+    }
+    const browserWindow: Record<string, unknown> = { __FRESHELL_TEST_HARNESS__: harness }
+    runInNewContext(buildTerminalOrdinaryTurnBrowserScript(), { window: browserWindow })
+    const observer = browserWindow[TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL] as {
+      prepareBeforeSend: (provider: string, terminalId: string) => TerminalOrdinaryTurnBaseline | null
+      observeAfterSend: (baseline: TerminalOrdinaryTurnBaseline, expectedInput: string) => TerminalOrdinaryTurnBrowserObservation | null
+    }
+
+    const captured = observer.prepareBeforeSend(target.provider, target.terminalId)
+    if (!captured) throw new Error('expected a ready terminal baseline')
+    recordReceivedWsMessage(activity(target.provider))
+    recordReceivedWsMessage(output(target.terminalId, target.streamId, 11, outputSentinel))
+    sent.push({ type: 'terminal.input', terminalId: target.terminalId, data: promptSentinel })
+    const firstObservation = observer.observeAfterSend(captured, promptSentinel)
+    expect(firstObservation).toMatchObject({
+      requestInputSeen: true,
+      activitySeen: true,
+      outputSeen: true,
+      completionSeen: false,
+    })
+
+    for (let index = 0; index < 501; index += 1) {
+      recordReceivedWsMessage({ type: 'terminal.keepalive', index })
+    }
+    recordReceivedWsMessage(complete(target.provider, target.terminalId, 9))
+
+    const completedObservation = observer.observeAfterSend(captured, promptSentinel)
+    expect(completedObservation).toMatchObject({
+      requestInputSeen: true,
+      activitySeen: true,
+      outputSeen: true,
+      outputFrameCount: 1,
+      outputSeq: 11,
+      completionSeen: true,
+      completionSeq: 9,
+    })
+    expect(JSON.stringify(completedObservation)).not.toContain(outputSentinel)
+    expect(JSON.stringify(completedObservation)).not.toContain(promptSentinel)
   })
 
   it('does not clear history or invent a baseline without a ready stream for the terminal', () => {
