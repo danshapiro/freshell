@@ -24,6 +24,7 @@ export type TerminalSurfaceSnapshot = {
   replayPending: boolean
   writesPending: boolean
   highestObservedSeq: number
+  /** Current-attach ordered output completion; distinct from checkpoint coverage. */
   completedSeq: number
   cols: number
   rows: number

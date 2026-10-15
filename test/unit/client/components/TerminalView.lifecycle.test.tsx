@@ -6874,6 +6874,67 @@ describe('TerminalView lifecycle updates', () => {
       }, { paneId })?.parserAppliedSeq).toBe(2)
     })
 
+    it.each(['single', 'batch', 'barrier-batch'] as const)('reports completed preprocessed output independently of conservative checkpoint coverage (%s)', async envelope => {
+      const { terminalId, paneId, term } = await renderTerminalHarness({
+        mode: 'opencode', terminalId: `term-startup-completed-${envelope}`,
+        ackInitialAttach: false, clearSends: false, testHarness: true,
+      })
+      term.buffer = { active: { type: 'alternate', length: 0 } }
+      const snapshot = () => window.__FRESHELL_TEST_HARNESS__!.getTerminalSnapshot!(terminalId)!
+      const attach = sentMessages().filter(msg => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId).at(-1)!
+      const streamId = 'startup-completed-stream'
+      const output = (seq: number, data: string) => messageHandler!({
+        terminalId, streamId, attachRequestId: attach.attachRequestId, seqStart: seq, seqEnd: seq, data,
+        ...(envelope === 'single' ? { type: 'terminal.output', source: seq === 1 ? 'replay' : 'live' } : {
+          type: 'terminal.output.batch', source: seq === 1 ? 'replay' : 'live', serializedBytes: data.length + 256,
+          segments: [{ seqStart: seq, seqEnd: seq, endOffset: data.length, rawFrameCount: 1,
+            ...(envelope === 'barrier-batch' ? { barrier: 'control' } : {}) }],
+        }),
+      })
+      act(() => { messageHandler!({ type: 'terminal.attach.ready', terminalId, streamId,
+        headSeq: 1, replayFromSeq: 1, replayToSeq: 1, attachRequestId: attach.attachRequestId }) })
+      term.deferWrites = true
+      act(() => { output(1, '\x1b]52;c;c3ludGhldGlj\x07READY') })
+      expect(snapshot()).toMatchObject({ highestObservedSeq: 1, completedSeq: 0, writesPending: true })
+      act(() => { term.releasePendingWrites() })
+      expect(snapshot()).toMatchObject({ highestObservedSeq: 1, completedSeq: 1, writesPending: false, replayPending: false })
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
+        streamId, serverInstanceId: 'srv-v2-stream',
+      }, { paneId })).toBeNull()
+      act(() => { output(2, 'NEXT') })
+      expect(snapshot()).toMatchObject({ highestObservedSeq: 2, completedSeq: 1, writesPending: true })
+      act(() => { term.releasePendingWrites() })
+      expect(snapshot()).toMatchObject({ highestObservedSeq: 2, completedSeq: 2, writesPending: false })
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
+        streamId, serverInstanceId: 'srv-v2-stream',
+      }, { paneId })).toBeNull()
+    })
+
+    it('reports completed retained-tail replay while preserving its checkpoint baseline', async () => {
+      const { terminalId, paneId, term } = await renderTerminalHarness({
+        mode: 'opencode', terminalId: 'term-retained-tail-completed',
+        ackInitialAttach: false, clearSends: false, testHarness: true,
+      })
+      term.buffer = { active: { type: 'alternate', length: 0 } }
+      const snapshot = () => window.__FRESHELL_TEST_HARNESS__!.getTerminalSnapshot!(terminalId)!
+      const attach = sentMessages().filter(msg => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId).at(-1)!
+      const streamId = 'retained-tail-stream'
+      act(() => { messageHandler!({ type: 'terminal.attach.ready', terminalId, streamId,
+        headSeq: 17, replayFromSeq: 10, replayToSeq: 17, attachRequestId: attach.attachRequestId }) })
+      term.deferWrites = true
+      act(() => { messageHandler!({ type: 'terminal.output.batch', terminalId, streamId,
+        attachRequestId: attach.attachRequestId, source: 'replay', seqStart: 10, seqEnd: 17,
+        data: 'RETAINED', serializedBytes: 256,
+        segments: [{ seqStart: 10, seqEnd: 17, endOffset: 8, rawFrameCount: 8 }],
+      }) })
+      expect(snapshot()).toMatchObject({ highestObservedSeq: 17, completedSeq: 0, writesPending: true })
+      act(() => { term.releasePendingWrites() })
+      expect(snapshot()).toMatchObject({ highestObservedSeq: 17, completedSeq: 17, writesPending: false, replayPending: false })
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
+        streamId, serverInstanceId: 'srv-v2-stream',
+      }, { paneId })).toMatchObject({ parserAppliedSeq: 17, surfaceCoverageSeq: 17 })
+    })
+
     it.each(['single', 'batch'] as const)('counts completed lower sequences in each recovered stream as genuine recovery progress (%s)', async envelope => {
       const { terminalId, term } = await renderTerminalHarness({
         mode: 'claude', terminalId: 'term-managed-progress-domains',

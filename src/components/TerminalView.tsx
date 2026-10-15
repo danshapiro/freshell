@@ -1062,6 +1062,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   const terminalIdRef = useRef<string | undefined>(terminalContent?.terminalId)
   const seqStateRef = useRef<AttachSeqState>(createAttachSeqState())
   const parserAppliedSeqRef = useRef(0)
+  // Ordered output completed for the current attach, independent of whether
+  // preprocessing permits a reconstruction-safe persisted checkpoint.
+  const completedOutputSeqRef = useRef(0)
   // Surface-coverage cursor (responsive-terminal-restore WS1/WS2): the
   // reconstruction-safe contiguous coverage of the stream on THIS surface —
   // advanced by applied frames AND fully-consumed null-screen-effect
@@ -1685,6 +1688,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         lastKnownTerminalIdRef.current = terminalContent.terminalId
       }
       if (terminalContent.terminalId !== prevTerminalId) {
+        completedOutputSeqRef.current = 0
         resetParserAppliedSurface()
         geometryEpochRef.current = 1
         geometryAuthorityRef.current = 'single_client'
@@ -1741,7 +1745,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         replayPending: seq.awaitingFreshSequence || seq.pendingReplay !== null,
         writesPending: writeQueueRef.current?.hasInFlightWrites() === true,
         highestObservedSeq: seq.highestObservedSeq,
-        completedSeq: surfaceCoverageSeqRef.current,
+        completedSeq: completedOutputSeqRef.current,
         cols: t.cols,
         rows: t.rows,
         bufferType: t.buffer.active.type,
@@ -2732,6 +2736,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     surfaceWritesSinceFreshRef.current = 0
     // A brand-new surface has no covered stream position.
     surfaceCoverageSeqRef.current = 0
+    completedOutputSeqRef.current = 0
     unsafeSurfaceCheckpointRef.current = false
     failedConsumptionGenerationRef.current = null
     const writeQueue = createTerminalWriteQueue({
@@ -2953,6 +2958,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         surfaceFreshMarkerRef.current = null
         surfaceWritesSinceFreshRef.current = 0
         surfaceCoverageSeqRef.current = 0
+        completedOutputSeqRef.current = 0
       },
       scrollToBottom: () => {
         if (!allowCurrentTerminalAction()) return
@@ -3745,6 +3751,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         expectedGeometryEpoch,
         expectedGeometryAuthority,
       }
+      completedOutputSeqRef.current = sinceSeq
       if (fullHydrateFallbackReason) {
         recordTerminalPerfAuditEvent('terminal.catchup.full_hydrate_fallback', {
           terminalId: tid,
@@ -4749,6 +4756,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           // Successful ownership of original stream bytes is independent of
           // fidelity, safe coverage, and the replay target (live can exceed it).
           advancePacedReplayConsumption(input.attachRequestId, input.seqEnd)
+          completedOutputSeqRef.current = Math.max(completedOutputSeqRef.current, input.seqEnd)
           const wasExhausted = recoveryAccountingRef.current.exhausted
           const completedStreamId = activeAttach.streamId ?? null
           const progressAccounting = recoveryProgressStreamIdRef.current === completedStreamId
