@@ -1284,9 +1284,8 @@ export function FreshAgentView({
           const availability = existing
             ? (() => {
                 const saved = checkpointOutcomeAvailability(existing)
-                const savedRestoreFailure = saved.status === 'unavailable'
-                  && saved.code === 'workspace_unavailable'
-                const merged = savedRestoreFailure && fetched.status === 'available'
+                const savedFailure = saved.status === 'unavailable'
+                const merged = savedFailure && fetched.status === 'available'
                   ? fetched
                   : { ...fetched, ...saved }
                 return {

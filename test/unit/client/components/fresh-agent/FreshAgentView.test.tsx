@@ -3873,7 +3873,11 @@ describe('FreshAgentView', () => {
     ]))
   })
 
-  it('recovers a stale workspace restore error from the authoritative checkpoint history', async () => {
+  it.each([
+    ['workspace_unavailable', 'The selected project workspace is temporarily unavailable.'],
+    ['checkpoint_outcome_missing', 'The server did not confirm a code checkpoint for this message.'],
+    ['checkpoint_not_found', 'The server could not find the requested code checkpoint.'],
+  ] as const)('recovers a stale %s error from authoritative checkpoint history', async (staleCode, staleReason) => {
     const sessionId = 'thread-recovered-checkpoint-error'
     const requestId = 'request-stale-workspace-error'
     const nativeTurnId = 'native-recovered-checkpoint-error'
@@ -3929,8 +3933,8 @@ describe('FreshAgentView', () => {
           nativeTurnId,
           displayTurnId,
           status: 'unavailable',
-          code: 'workspace_unavailable',
-          reason: 'The selected project workspace is temporarily unavailable.',
+          code: staleCode,
+          reason: staleReason,
           workspace,
         }],
       } as never,
