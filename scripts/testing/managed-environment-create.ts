@@ -41,6 +41,71 @@ export function writeManagedEnvironmentBrowserFailureIncident(
   }
 }
 
+/** Select fixed lifecycle fields for a failed replacement without retaining raw host errors. */
+export function summarizeManagedEnvironmentRecoveryFailure(
+  lifecycle: string,
+  soulId: string,
+  priorIncarnationId: string,
+) {
+  const containerByIncarnation = new Map<string, string>()
+  let recovery: Record<string, string> | undefined
+  const activations = new Map<string, Record<string, string>>()
+  const identity = (value: unknown) => typeof value === 'string'
+    && /^[a-z0-9][a-z0-9-]{0,127}$/i.test(value) ? value : undefined
+  const fixed = (value: unknown, allowed: readonly string[]) =>
+    typeof value === 'string' && allowed.includes(value) ? value : 'UNKNOWN'
+
+  for (const line of lifecycle.split('\n')) {
+    try {
+      const entry = JSON.parse(line)
+      const raw = entry?.event === 'supervisor.lifecycle' ? entry.data?.raw : undefined
+      const data = raw?.data
+      if (!raw || !data || typeof data !== 'object') continue
+
+      if (raw.event === 'supervisor.host_started') {
+        const incarnationId = identity(data.incarnationId)
+        if (incarnationId && typeof data.containerId === 'string' && /^[a-f0-9]{64}$/.test(data.containerId)) {
+          containerByIncarnation.set(incarnationId, data.containerId)
+        }
+      } else if (data.soulId === soulId && raw.event === 'supervisor.activation_failed') {
+        const incarnationId = identity(data.incarnationId)
+        if (!incarnationId || incarnationId === priorIncarnationId) continue
+        activations.set(incarnationId, {
+          incarnationId,
+          stage: fixed(data.stage, ['authenticate_started_host', 'deliver_execution_grant', 'commit_execution_grant',
+            'enable_long_lived_runtime', 'commit_running_state', 'commit_provider_inputs', 'record_native_identity']),
+          errorCode: fixed(data.errorCode, ['HOST_UNREACHABLE', 'HOST_AUTHENTICATION_FAILED', 'INVALID_REQUEST',
+            'PROVIDER_INPUTS_CHANGED', 'BACKEND_UNAVAILABLE', 'REGISTRY_FAILURE', 'OWNERSHIP_MISMATCH']),
+          errorClass: fixed(data.errorClass, ['runtime_activation_failed', 'provider_activation_failed']),
+          launchState: fixed(data.launchState, ['created', 'starting', 'running', 'failed', 'stopping', 'stopped']),
+        })
+      } else if (data.soulId === soulId && raw.event === 'supervisor.recovery.activation_failed'
+        && data.priorIncarnationId === priorIncarnationId) {
+        const replacementIncarnationId = identity(data.replacementIncarnationId)
+        if (!replacementIncarnationId) continue
+        recovery = {
+          priorIncarnationId,
+          replacementIncarnationId,
+          errorCode: fixed(data.errorCode, ['HOST_UNREACHABLE', 'HOST_AUTHENTICATION_FAILED', 'INVALID_REQUEST',
+            'PROVIDER_INPUTS_CHANGED', 'BACKEND_UNAVAILABLE', 'REGISTRY_FAILURE', 'OWNERSHIP_MISMATCH']),
+          errorClass: fixed(data.errorClass, ['runtime_activation_failed', 'provider_activation_failed']),
+          blockReason: fixed(data.blockReason, ['PROVIDER_UNAVAILABLE', 'RECOVERY_UNAVAILABLE', 'CHECKPOINT_UNAVAILABLE']),
+        }
+      }
+    } catch { /* Ignore malformed lifecycle records and retain only valid evidence. */ }
+  }
+
+  const replacementIncarnationId = recovery?.replacementIncarnationId
+    ?? [...activations.keys()].at(-1)
+  const activation = replacementIncarnationId ? activations.get(replacementIncarnationId) : undefined
+  const hostContainerId = replacementIncarnationId ? containerByIncarnation.get(replacementIncarnationId) : undefined
+  return {
+    ...(recovery ? { recovery } : {}),
+    ...(activation ? { activation } : {}),
+    ...(hostContainerId ? { hostContainerId } : {}),
+  }
+}
+
 /**
  * Wait for a healthy OpenCode child without trapping a failed browser attempt
  * behind the longer child-startup deadline. Playwright writes the matching

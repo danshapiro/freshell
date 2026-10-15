@@ -16,7 +16,7 @@ import type { InitialProviderVolumeAuthorization } from './runtime-test-broker.j
 import { resolvePairedExternalFixture } from './e2e-external-target.js'
 import { assertManagedTerminalCreated, observeManagedEnvironmentNativeIdentity, readManagedEnvironmentDaemonId,
   serviceManagedEnvironmentCases, summarizeRustServerLogEvents, waitForManagedEnvironmentReadyOrBrowserFailure,
-  writeManagedEnvironmentBrowserFailureIncident } from './managed-environment-create.js'
+  summarizeManagedEnvironmentRecoveryFailure, writeManagedEnvironmentBrowserFailureIncident } from './managed-environment-create.js'
 import { waitForCloudExecutionDispatch } from './cloud-execution-dispatch.js'
 import { ManagedEnvironmentBrowserSummaryCapture, type ManagedEnvironmentBrowserSummary } from './managed-environment-browser-summary.js'
 
@@ -1754,8 +1754,28 @@ export async function runManagedEnvironmentTarget() {
     assert(original?.containerId)
     await fs.rename(path.join(selected.workspace, 'healthy/.managed-fixture/child-receipt.json'), path.join(root, 'initial-child-receipt.json'))
     rig.runtime.stopOwnedRuntimeExact(original.containerId)
-    const replacement = await poll('current-owner replacement incarnation', async () => (await rig!.inventory()).find(row =>
-      row.soulId === original.soulId && row.incarnationId !== original.incarnationId && row.launchState === 'running'), 300_000)
+    let replacement: ManagedRuntimeView
+    try {
+      replacement = await poll('current-owner replacement incarnation', async () => (await rig!.inventory()).find(row =>
+        row.soulId === original.soulId && row.incarnationId !== original.incarnationId && row.launchState === 'running'), 300_000)
+    } catch (error) {
+      try {
+        const lifecycle = await fs.readFile(path.join(rig.runtime.evidenceDir, 'lifecycle.jsonl'), 'utf8')
+        const { hostContainerId, ...safeFailure } = summarizeManagedEnvironmentRecoveryFailure(
+          lifecycle, original.soulId, original.incarnationId)
+        const supervisorLogs = providerParityFailureDiagnostics(
+          rig.runtime.containerLogs(rig.supervisor.containerId).slice(-512 * 1024))
+        const sessionHostLogs = hostContainerId && rig.runtime.broker?.receiptIds().has(hostContainerId)
+          ? providerParityFailureDiagnostics(rig.runtime.containerLogs(hostContainerId).slice(-512 * 1024))
+          : 'UNKNOWN'
+        rig.runtime.writeIncident('managed-environment-replacement-failure', {
+          severity: 'error', event: 'managed_environment.replacement_failed',
+          soulId: original.soulId, priorIncarnationId: original.incarnationId,
+          failure: safeFailure, supervisorLogs, sessionHostLogs,
+        })
+      } catch { /* Diagnostic capture must not hide the acceptance failure. */ }
+      throw error
+    }
     const replacementChild = await poll('replacement Bun child', async () => readJson(path.join(selected.workspace, 'healthy/.managed-fixture/child-receipt.json')))
     const replacementStage = await stageProof(rig, replacement, nonce)
     assert.equal(replacement.nativeSessionId, original.nativeSessionId)

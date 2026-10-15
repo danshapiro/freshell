@@ -39,6 +39,7 @@ import {
   assertManagedTerminalCreated,
   observeManagedEnvironmentNativeIdentity,
   readManagedEnvironmentDaemonId,
+  summarizeManagedEnvironmentRecoveryFailure,
   serviceManagedEnvironmentScenario,
   serviceManagedEnvironmentCases,
   waitForManagedEnvironmentReadyOrBrowserFailure,
@@ -119,6 +120,44 @@ describe('managed environment browser attempt lifetime', () => {
       attempt: 1,
       browser: 'safe diagnostic',
     }))
+  })
+
+  it('extracts only safe replacement activation evidence and its owned host id', () => {
+    const secretPath = '/provider/.config/opencode/private.json'
+    const lifecycle = [
+      { event: 'supervisor.lifecycle', data: { raw: { event: 'supervisor.host_started', data: {
+        incarnationId: 'replacement-incarnation', containerId: 'a'.repeat(64),
+      } } } },
+      { event: 'supervisor.lifecycle', data: { raw: { event: 'supervisor.activation_failed', data: {
+        soulId: 'owned-soul', incarnationId: 'replacement-incarnation', stage: 'deliver_execution_grant',
+        errorCode: 'HOST_UNREACHABLE', errorClass: 'runtime_activation_failed', launchState: 'starting',
+        errorMessage: `provider config failed at ${secretPath}`,
+      } } } },
+      { event: 'supervisor.lifecycle', data: { raw: { event: 'supervisor.recovery.activation_failed', data: {
+        soulId: 'owned-soul', priorIncarnationId: 'prior-incarnation',
+        replacementIncarnationId: 'replacement-incarnation', errorCode: 'HOST_UNREACHABLE',
+        errorClass: 'provider_activation_failed', blockReason: 'PROVIDER_UNAVAILABLE',
+      } } } },
+      { event: 'supervisor.lifecycle', data: { raw: { event: 'supervisor.activation_failed', data: {
+        soulId: 'foreign-soul', incarnationId: 'foreign-incarnation', stage: secretPath,
+        errorCode: 'HOST_UNREACHABLE', errorClass: 'runtime_activation_failed', launchState: 'starting',
+      } } } },
+    ].map(entry => JSON.stringify(entry)).join('\n')
+
+    const evidence = summarizeManagedEnvironmentRecoveryFailure(lifecycle, 'owned-soul', 'prior-incarnation')
+
+    expect(evidence).toEqual({
+      recovery: {
+        priorIncarnationId: 'prior-incarnation', replacementIncarnationId: 'replacement-incarnation',
+        errorCode: 'HOST_UNREACHABLE', errorClass: 'provider_activation_failed', blockReason: 'PROVIDER_UNAVAILABLE',
+      },
+      activation: {
+        incarnationId: 'replacement-incarnation', stage: 'deliver_execution_grant',
+        errorCode: 'HOST_UNREACHABLE', errorClass: 'runtime_activation_failed', launchState: 'starting',
+      },
+      hostContainerId: 'a'.repeat(64),
+    })
+    expect(JSON.stringify(evidence)).not.toContain(secretPath)
   })
 
   it('keeps the owned target alive until the browser reports attempt completion', async () => {
