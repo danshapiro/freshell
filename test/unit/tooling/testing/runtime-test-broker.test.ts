@@ -80,12 +80,17 @@ it('classifies owned provider publication failures without retaining error bodie
       resource_source_config_scope: 'provider_config',
       limit_kind: 'entries', observed: 100_001, permitted: 100_000 }),
     JSON.stringify({ event: 'session_host.fatal', error: `provider refresh control ${secret}` }),
+    JSON.stringify({ event: 'session_host.fatal', error: `runtime: HostUnreachable: prepare provider config: /private/${secret}.json: Permission denied (os error 13)` }),
     JSON.stringify({ event: 'session_host.fatal', error: secret }),
   ].join('\n')
   const diagnostic = providerParityFailureDiagnostics(logs)
   expect(diagnostic).toMatchObject({
     transactionFailures: [{ stage: 'publish', operation: 'install', errno: 'cross_device' }],
-    workerFailures: [{ operation: 'control', errno: 'unknown' }, { operation: 'unknown', errno: 'unknown' }],
+    workerFailures: [
+      { operation: 'control', errno: 'unknown' },
+      { operation: 'provider_config', errno: 'permission_denied' },
+      { operation: 'unknown', errno: 'unknown' },
+    ],
   })
   expect(diagnostic.transactionEvents).toEqual([
     { event: 'provider.projection.transaction.started', stage: 'stage' },

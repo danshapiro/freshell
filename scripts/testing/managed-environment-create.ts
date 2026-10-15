@@ -4,7 +4,7 @@ import http from 'node:http'
 import path from 'node:path'
 import { ErrorCode, type ErrorMessage } from '../../shared/ws-protocol.js'
 import { dockerSocketPath } from './runtime-sandbox.js'
-import { providerParityFailureDiagnostics } from '../../test/helpers/provider-parity-environment.js'
+import { providerParityFailureDiagnostics, summarizeProviderFailureOperation } from '../../test/helpers/provider-parity-environment.js'
 import type { ManagedRuntimeBrowserRig } from '../../test/e2e-browser/helpers/managed-runtime.js'
 import type { ManagedEnvironmentFixture } from './e2e-external-target.js'
 
@@ -214,23 +214,9 @@ export function summarizeRuntimeErrorCode(message: string): typeof runtimeErrorC
   return summarizeRuntimeRejection(message)?.code
 }
 
-const runtimeErrorOperations = [
-  ['resolve managed provider credentials:', 'credential_resolution'],
-  ['prepare OneCLI provider files:', 'provider_files'],
-  ['prepare hosted OneCLI provider files:', 'provider_files'],
-  ['prepare managed provider:', 'provider_launch'],
-  ['spawn managed terminal:', 'pty_spawn'],
-  ['prepare provider config:', 'provider_config'],
-  ['prepare hosted provider config:', 'provider_config'],
-  ['prepare managed provider state:', 'provider_state'],
-  ['prepare managed Amplifier state:', 'provider_state'],
-  ['prepare hosted fresh-agent provider state failed:', 'provider_state'],
-  ['transfer managed provider state:', 'provider_state_transfer'],
-] as const
-
-export function summarizeRuntimeErrorOperation(message: string): typeof runtimeErrorOperations[number][1] | undefined {
+export function summarizeRuntimeErrorOperation(message: string) {
   const detail = summarizeRuntimeRejection(message)?.detail
-  return detail === undefined ? undefined : runtimeErrorOperations.find(([operation]) => detail.startsWith(operation))?.[1]
+  return detail === undefined ? undefined : summarizeProviderFailureOperation(detail)
 }
 
 export function summarizeRuntimeErrorClass(message: string):

@@ -19,6 +19,25 @@ export function prepareProviderParityUserRoots(home: string, xdgConfigHome: stri
   fs.mkdirSync(path.join(xdgConfigHome, 'opencode'), { recursive: true })
 }
 
+const providerFailureOperations = [
+  ['provider transaction backup ', 'backup'], ['provider transaction install ', 'install'],
+  ['provider transaction create ', 'create'], ['provider transaction remove directory ', 'remove_directory'],
+  ['provider transaction publish manifest:', 'manifest'], ['provider transaction mounted file ', 'mounted_file'],
+  ['provider refresh control ', 'control'], ['provider refresh transaction creation ', 'create_stage'],
+  ['resolve managed provider credentials:', 'credential_resolution'],
+  ['prepare OneCLI provider files:', 'provider_files'], ['prepare hosted OneCLI provider files:', 'provider_files'],
+  ['prepare managed provider:', 'provider_launch'], ['spawn managed terminal:', 'pty_spawn'],
+  ['prepare provider config:', 'provider_config'], ['prepare hosted provider config:', 'provider_config'],
+  ['prepare managed provider state:', 'provider_state'], ['prepare managed Amplifier state:', 'provider_state'],
+  ['prepare hosted fresh-agent provider state failed:', 'provider_state'],
+  ['transfer managed provider state:', 'provider_state_transfer'],
+] as const
+
+export function summarizeProviderFailureOperation(message: string) {
+  return providerFailureOperations.find(([prefix]) =>
+    message.startsWith(prefix) || message.includes(`: ${prefix}`))?.[1]
+}
+
 /** Retain only fixed classifications from the owned host's existing logs. */
 export function providerParityFailureDiagnostics(logs: string) {
   const events = logs.split('\n').flatMap(line => {
@@ -29,19 +48,13 @@ export function providerParityFailureDiagnostics(logs: string) {
   })
   const classify = (cause: unknown) => {
     const message = typeof cause === 'string' ? cause : ''
-    const operations = [
-      ['provider transaction backup ', 'backup'], ['provider transaction install ', 'install'],
-      ['provider transaction create ', 'create'], ['provider transaction remove directory ', 'remove_directory'],
-      ['provider transaction publish manifest:', 'manifest'], ['provider transaction mounted file ', 'mounted_file'],
-      ['provider refresh control ', 'control'], ['provider refresh transaction creation ', 'create_stage'],
-    ] as const
     const errors = [
       ['(os error 18)', 'cross_device'], ['(os error 13)', 'permission_denied'],
       ['(os error 2)', 'missing'], ['(os error 30)', 'read_only'],
       ['(os error 16)', 'busy'], ['(os error 1)', 'operation_not_permitted'],
     ] as const
     return {
-      operation: operations.find(([prefix]) => message.startsWith(prefix))?.[1] ?? 'unknown',
+      operation: summarizeProviderFailureOperation(message) ?? 'unknown',
       errno: errors.find(([marker]) => message.includes(marker))?.[1] ?? 'unknown',
     }
   }
