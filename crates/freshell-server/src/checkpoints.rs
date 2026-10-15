@@ -7592,6 +7592,7 @@ mod tests {
         let (broadcast_tx, _) = tokio::sync::broadcast::channel(8);
         let service =
             CheckpointService::new(Arc::new(home.path().to_path_buf()), Arc::new(broadcast_tx));
+        *service.test_auto_budget_override.lock().unwrap() = Some(Duration::from_secs(60));
         service.establish_cooldown(workspace.path());
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(ReviewR6CaptureLogs(events.clone()));
@@ -7611,14 +7612,16 @@ mod tests {
             FreshAgentCheckpointStatus::Unavailable
         );
         let events = events.lock().unwrap();
-        let failure = events
-            .iter()
-            .find(|event| {
-                event
-                    .get("failure_code")
-                    .is_some_and(|value| value == "capture_timeout_cooldown")
-            })
-            .expect("cooldown unavailable outcome must emit a structured failure event");
+        let failure = events.iter().find(|event| {
+            event
+                .get("failure_code")
+                .is_some_and(|value| value == "capture_timeout_cooldown")
+        });
+        assert!(
+            failure.is_some(),
+            "cooldown unavailable outcome must emit a structured failure event; captured={events:#?}"
+        );
+        let failure = failure.expect("cooldown failure event was checked above");
         assert_eq!(failure["send_request_id"], "review-r6-cooldown");
         assert_eq!(failure["stage"], "capture");
         assert_eq!(failure["operation"], "automatic-pre-turn-snapshot");
