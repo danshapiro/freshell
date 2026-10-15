@@ -2416,6 +2416,18 @@ mod configured_resource_tests {
             None,
         )
         .unwrap();
+        let mut previous_mount = units
+            .iter()
+            .find(|(_, mount)| mount.logical_destination == external.to_string_lossy())
+            .expect("the prior generation must contain the configured MCP cwd")
+            .1
+            .clone();
+        previous_mount.reference_aliases =
+            vec![freshell_runtime_protocol::ProviderResourceReferenceAlias {
+                relative_path: ".env".into(),
+                reference_index: 1,
+            }];
+        merge_recovery_resource_mounts(&mut units, &[previous_mount], &plan).unwrap();
         let scratch = owned.path().join("scratch");
         std::fs::create_dir_all(&scratch).unwrap();
         let excluded = plan
@@ -2453,6 +2465,10 @@ mod configured_resource_tests {
                 relative_path: ".env".into(),
                 reference_index: 0,
             }]
+        );
+        assert!(
+            resource_mount.1.retired_reference_aliases.is_empty(),
+            "a currently configured alias must not also be retired during recovery"
         );
 
         let staged_root = owned.path().join("filtered-stage");
@@ -3241,6 +3257,7 @@ process.stdout.write(require('./helper.js'))
                 .iter()
                 .map(|(_, mount)| mount.clone())
                 .collect::<Vec<_>>(),
+            &[],
         )
         .unwrap();
         let state_mount = units
@@ -6087,7 +6104,8 @@ process.stdout.write(require('./helper.js'))
             },
         )];
         let retained =
-            merge_recovery_resource_mounts(&mut current, std::slice::from_ref(&previous)).unwrap();
+            merge_recovery_resource_mounts(&mut current, std::slice::from_ref(&previous), &[])
+                .unwrap();
         assert_eq!(
             current[0].1.stage_relative_path,
             previous.stage_relative_path
@@ -6104,9 +6122,12 @@ process.stdout.write(require('./helper.js'))
         );
 
         let mut no_current_roots = Vec::new();
-        let retained =
-            merge_recovery_resource_mounts(&mut no_current_roots, std::slice::from_ref(&previous))
-                .unwrap();
+        let retained = merge_recovery_resource_mounts(
+            &mut no_current_roots,
+            std::slice::from_ref(&previous),
+            &[],
+        )
+        .unwrap();
         assert_eq!(retained.len(), 1);
         assert!(
             retained[0].reference_aliases.is_empty(),
@@ -6146,7 +6167,7 @@ process.stdout.write(require('./helper.js'))
             mount(aliases(1), Vec::new()),
         )];
 
-        merge_recovery_resource_mounts(&mut current, std::slice::from_ref(&previous)).unwrap();
+        merge_recovery_resource_mounts(&mut current, std::slice::from_ref(&previous), &[]).unwrap();
 
         assert_eq!(current[0].1.reference_aliases, aliases(1));
         assert!(
@@ -6183,7 +6204,7 @@ process.stdout.write(require('./helper.js'))
             mount(Vec::new(), Vec::new()),
         )];
 
-        merge_recovery_resource_mounts(&mut current, std::slice::from_ref(&previous)).unwrap();
+        merge_recovery_resource_mounts(&mut current, std::slice::from_ref(&previous), &[]).unwrap();
 
         assert_eq!(
             current[0].1.retired_reference_aliases,
@@ -6223,7 +6244,7 @@ process.stdout.write(require('./helper.js'))
                 mount("current", current_destination),
             )];
             let error =
-                merge_recovery_resource_mounts(&mut current, std::slice::from_ref(&previous))
+                merge_recovery_resource_mounts(&mut current, std::slice::from_ref(&previous), &[])
                     .expect_err("nested directory mount roots must preserve the prior generation");
             assert!(error.contains("overlapping") && error.contains("reprepare"));
         }
@@ -6233,9 +6254,12 @@ process.stdout.write(require('./helper.js'))
             "/synthetic/current-resource".into(),
             mount("current", "/home/freshell/provider/.config/opencode-extra"),
         )];
-        let retained =
-            merge_recovery_resource_mounts(&mut prefix_sibling, std::slice::from_ref(&previous))
-                .unwrap();
+        let retained = merge_recovery_resource_mounts(
+            &mut prefix_sibling,
+            std::slice::from_ref(&previous),
+            &[],
+        )
+        .unwrap();
         assert_eq!(retained, vec![previous]);
     }
 
@@ -6260,7 +6284,8 @@ process.stdout.write(require('./helper.js'))
         let mut aliases = vec![(source, mount("/workspace/current"))];
         let prior = mount("/home/freshell/provider/.config/opencode");
         let retained =
-            merge_recovery_resource_mounts(&mut aliases, std::slice::from_ref(&prior)).unwrap();
+            merge_recovery_resource_mounts(&mut aliases, std::slice::from_ref(&prior), &[])
+                .unwrap();
         assert_eq!(retained, vec![prior]);
         let source = current_source_for_resource_mount(&aliases, &retained[0])
             .expect("the selected alias already supplies this physical subpath");
@@ -6457,9 +6482,14 @@ pub(super) fn merge_recovery_resource_mounts(
         freshell_runtime_protocol::ProviderResourceMount,
     )],
     previous: &[freshell_runtime_protocol::ProviderResourceMount],
+    plan: &[PlannedSourceOccurrence],
 ) -> Result<Vec<freshell_runtime_protocol::ProviderResourceMount>, String> {
     use freshell_runtime_protocol::{ProviderResourceKind, ProviderResourceMount};
     const PROVIDER_HOME: &str = "/home/freshell/provider";
+
+    // Retirement must be computed against this generation's configured
+    // aliases, before it is compared with aliases from the previous grant.
+    attach_configured_resource_reference_aliases(current, plan)?;
 
     fn paired_resource_paths(mount: &ProviderResourceMount) -> bool {
         let Some(stage) = mount

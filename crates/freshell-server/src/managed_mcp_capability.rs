@@ -1702,6 +1702,7 @@ fn stage_provider_root(
                 let retained = source_stage::merge_recovery_resource_mounts(
                     &mut units,
                     opencode_input.prior_resource_mounts.unwrap_or_default(),
+                    plan,
                 )?;
                 if retained.is_empty() {
                     None
