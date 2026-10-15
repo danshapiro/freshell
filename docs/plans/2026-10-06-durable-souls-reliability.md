@@ -9,22 +9,26 @@
 ### Requested result
 Continue the durable-souls repair from its saved state through Stage 5's final whole-delta review and the usual recap. Proceed to Stage 5 without waiting for the unavailable test grant, and report the unfinished Task 9 ordinary-use checks accurately.
 
+The user later authorized up to five additional Stage 5 Fresh Eyes review rounds, or until the review passes. They asked to run the four approved non-Claude ordinary-use checks before explaining the prior Codex-login question. Those checks and the explanation are complete; do not change shared credentials without separate approval.
+
 ### Explicit constraints
 - Use the-usual workflow and a dedicated worktree; fix test failures found in this repair and continue.
-- Focus remaining live checks on those six modes; skip Amplifier and Kilroy.
+- Focus the current live checks on terminal Codex and OpenCode plus FreshCodex and FreshOpenCode; skip Claude, Amplifier and Kilroy live checks.
 - Keep verification proportional to the stated threat model: behavior tests and diagnosable logs are enough; do not build a formal certification or audit campaign.
 - Avoid strict provider-session continuity or automatic migration across a transition. If existing sessions need moving, manual porting later is acceptable.
-- Use the easiest existing authorized Codex account path and confirm the existing Claude login works.
+- Use an already authorized Codex path if available; do not change shared credentials without separate approval. Claude live checks are skipped because its login is unavailable.
 - Do not inspect provider-result files, Cloud launcher output, provider output, terminal snapshots, prompts, or response bodies.
 - For Stage 5 Fresh Eyes, use the runner's `--gpt` option because other models are unavailable; this is the user's explicit exception to the different-model-family preference.
 - Do not make changes to the rubric while its example wording remains under discussion.
-- The user approved `--local` for the six exact Task 9 ordinary-turn selectors because the selected specs are excluded from Cloud; those checks ran and remain 0/6. Proceed to Stage 5 without the existing test grant, but do not count the failed checks as acceptance.
+- The user approved `--local` because the selected specs are excluded from Cloud. An earlier six-selector run remains recorded as 0/6; a later run of the four currently selected non-Claude modes is recorded below as 1/4. Neither establishes acceptance.
+- The user narrowed the live checks to terminal Codex and OpenCode plus FreshCodex and FreshOpenCode, leaving Claude untested because its login is unavailable. Do not change the shared Codex login unless separately approved. The latest local rerun passed only FreshOpenCode; Codex terminal failed before launching its provider process, FreshCodex exited without a completed turn, and OpenCode produced output without a completion signal. These failures do not establish an account mismatch.
+- The user authorized up to five additional independent Stage 5 review rounds after the original five-round limit, stopping early if the delta review passes. Continue to use the user's previously approved `--gpt` reviewer exception.
 
 ### Accepted tradeoffs and residuals
 - Existing provider sessions may not survive a runtime transition; manual porting may be needed later.
 - Amplifier and Kilroy are outside this repair's live checks.
-- The existing isolated test grant is unavailable. Stage 5 may proceed, while Task 9's 0/6 ordinary-use result remains unresolved and must not be described as passing.
-**Goal:** Fix the diagnosed durable-souls defects and verify ordinary one-turn use in the six selected modes without requiring same-session continuity across a transition.
+- The existing isolated test grant is unavailable. The four selected live checks were rerun locally: one passed and three failed for reasons recorded in Task 9. Continue without account changes until evidence establishes that a login change is needed.
+**Goal:** Fix the diagnosed durable-souls defects and verify ordinary one-turn use in the four selected non-Claude modes without requiring same-session continuity across a transition.
 
 **Architecture:** Correct the existing runtime paths and use focused behavior tests plus isolated managed-browser smoke checks. Preserve existing session data; do not add an audit or certification campaign. If a provider transition leaves an old conversation behind, manual porting is acceptable.
 
@@ -689,7 +693,7 @@ Run: `git status --short --branch`
 
 No source/test repair was needed for Task 8, so no empty commit was made. The run result and scope decision are recorded above.
 
-### Task 9: Smoke-test ordinary use in the six selected modes
+### Task 9: Smoke-test ordinary use in the four selected non-Claude modes
 
 **Files:**
 - Modify: `test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts` to add a narrowly selected terminal-provider smoke that launches each selected provider and observes one completed response.
@@ -698,29 +702,27 @@ No source/test repair was needed for Task 8, so no empty commit was made. The ru
 
 **Interfaces:**
 - Consumes: the existing explicit provider/mode selectors, isolated managed runtime, actual application pane creation, actual selected provider binary and configured account references.
-- Produces: one ordinary completed response each for Claude, Codex and OpenCode in terminal and fresh-agent modes, with exact resource cleanup. It produces no qualification/certification receipt and makes no claim about same-session restoration after a transition.
+- Produces: one ordinary completed response each for Codex and OpenCode in terminal and fresh-agent modes, with exact resource cleanup. Claude is not part of the current live-check scope because its login is unavailable. These checks produce no qualification/certification receipt and make no claim about same-session restoration after a transition.
 
 - [x] **Step 1: Add the focused behavior checks**
 
 Add one separately selectable browser case to each existing live spec. Each selected mode creates an isolated pane and sends one bounded harmless prompt. For FreshAgent, require a `freshAgent.turn.complete` event for the sent session received after that send and newly displayed nonempty assistant text in that pane; do not require exact model wording or return transcript text to the test runner. For terminal mode, capture the selected terminal's stream and sequence baseline, then reduce post-send WebSocket frames in the browser and require provider-specific activity, nonempty output on that same terminal and stream beyond the baseline, and a `terminal.turn.complete` whose completion sequence advanced beyond the baseline. Return only booleans, counts, and sequence metadata; never read or return terminal snapshot text or output bytes. This proves activity, new output, and a normal turn boundary, but not semantic answer success because the terminal completion event has no success outcome. `freshAgent.send.accepted`, pane allocation, process presence, a requested session ID, or activity without fresh output and completion do not count as completion. Do not crash/restart the host or provider, compare native session IDs across incarnations, test pending approval, or import existing sessions.
 
-- [ ] **Step 2: Run the six focused cases locally**
+- [x] **Step 2: Run the four selected non-Claude cases locally**
 
-These specs are listed in `LOCAL_ONLY_SPECS` and excluded by the Cloud configuration. The user approved `--local` for the six selected mode checks. Run one mode at a time so each has its own result and cleanup receipt.
-
-Run: `FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_MODES=freshopencode pnpm run test:e2e --local --project=chromium test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts --grep 'each selected fresh-agent mode completes one ordinary turn$'`
-
-Run: `FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_MODES=freshclaude pnpm run test:e2e --local --project=chromium test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts --grep 'each selected fresh-agent mode completes one ordinary turn$'`
-
-Run: `FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_MODES=freshcodex pnpm run test:e2e --local --project=chromium test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts --grep 'each selected fresh-agent mode completes one ordinary turn$'`
-
-Run: `FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_PROVIDERS=claude pnpm run test:e2e --local --project=chromium test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts --grep 'each selected terminal provider completes one ordinary turn$'`
+These specs are listed in `LOCAL_ONLY_SPECS` and excluded by the Cloud configuration. The user approved `--local` for the selected mode checks. Run one mode at a time so each has its own result and cleanup receipt.
 
 Run: `FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_PROVIDERS=codex pnpm run test:e2e --local --project=chromium test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts --grep 'each selected terminal provider completes one ordinary turn$'`
 
 Run: `FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_PROVIDERS=opencode pnpm run test:e2e --local --project=chromium test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts --grep 'each selected terminal provider completes one ordinary turn$'`
 
-Expected: all six selected browser cases execute and pass, each records one body-free completion event, and all owned resources close cleanly. No global campaign status or certification is produced.
+Run: `FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_MODES=freshcodex pnpm run test:e2e --local --project=chromium test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts --grep 'each selected fresh-agent mode completes one ordinary turn$'`
+
+Run: `FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_MODES=freshopencode pnpm run test:e2e --local --project=chromium test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts --grep 'each selected fresh-agent mode completes one ordinary turn$'`
+
+Latest rerun: Codex terminal failed at terminal creation with `PTY_SPAWN_FAILED`, before the Codex process started; FreshCodex sent input but its session exited without a completed turn; OpenCode produced output but no completion event; FreshOpenCode passed. No shared login was changed. Task 9 remains unaccepted until the three failures are diagnosed and repaired or explicitly dispositioned.
+
+Expected: all four selected browser cases pass, each records one body-free completion event, and all owned resources close cleanly. A failed case proceeds to Step 3 and is not counted as acceptance. No global campaign status or certification is produced.
 
 - [ ] **Step 3: Diagnose and repair any ordinary-use failure**
 
@@ -752,11 +754,11 @@ Run these exact selected cases on the final candidate after Stage 5 is complete:
 
 Run: `FRESHELL_RUNTIME_SYNTHETIC_RESUME=1 GCLOUD_ROBOT_REQUIRE=1 pnpm exec tsx scripts/testing/runtime-external-browser.ts --spec test/e2e-browser/specs/runtime-terminal-continuity-rust.spec.ts --grep 'synthetic interrupted ordinary Stop preserves history$'`
 
-Run: `FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_PROVIDERS=claude,codex,opencode GCLOUD_ROBOT_REQUIRE=1 pnpm exec tsx scripts/testing/runtime-external-browser.ts --spec test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts --grep 'each selected terminal provider completes one ordinary turn$'`
+Run: `FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_PROVIDERS=codex,opencode GCLOUD_ROBOT_REQUIRE=1 pnpm exec tsx scripts/testing/runtime-external-browser.ts --spec test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts --grep 'each selected terminal provider completes one ordinary turn$'`
 
-Run: `FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_MODES=freshclaude,freshcodex,freshopencode GCLOUD_ROBOT_REQUIRE=1 pnpm exec tsx scripts/testing/runtime-external-browser.ts --spec test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts --grep 'each selected fresh-agent mode completes one ordinary turn$'`
+Run: `FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE=1 FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_MODES=freshcodex,freshopencode GCLOUD_ROBOT_REQUIRE=1 pnpm exec tsx scripts/testing/runtime-external-browser.ts --spec test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts --grep 'each selected fresh-agent mode completes one ordinary turn$'`
 
-Expected: all three selected cases execute and pass on the final candidate; the six selected terminal/FreshAgent modes and the interrupted-Stop case retain their existing Task 8/9 evidence requirements. If Stage 5 fixes change the candidate, run these checks after the final review loop, against the resulting final candidate.
+Expected: the four selected non-Claude cases execute and pass on the final candidate; those four modes and the interrupted-Stop case retain their existing Task 8/9 evidence requirements. If Stage 5 fixes change the candidate, run these checks after the final review loop, against the resulting final candidate.
 
 - [ ] **Step 7: Run the final configured full-suite gate**
 
@@ -771,7 +773,7 @@ Expected: the coordinated full suite passes on the final committed HEAD after th
 | Fix diagnosed durable-souls defects and preserve meaningful regressions | 1–8 | Existing source repair tests, affected browser cases, configured full-suite gate and independent review |
 | Avoid false loss conclusions from missing/unreadable identity or storage | 3, 4, 8 | Existing behavior tests reject unknown or incomplete evidence without treating it as absence |
 | Fix configuration, blocked recovery, retry and interrupted Stop behavior | 2, 5, 6, 8 | Provider-identity config tests, retry tests, and the selected interrupted-Stop browser case; config/legacy transition browser cases are outside the accepted manual-porting scope |
-| Make normal use work across six selected modes | 9 | One completed ordinary response per selected terminal and fresh-agent mode; exact cleanup |
+| Make normal use work across four selected non-Claude modes | 9 | One completed ordinary response per selected terminal and fresh-agent mode; exact cleanup |
 | Skip Amplifier and Kilroy live work | 9 | No Amplifier/Kilroy model, credential or qualification operation; existing code/tests preserved |
 | Allow manual session porting if transition changes a native session | Global 3, 9 | No automatic startup or transition import; selected OpenCode resume remains available on demand, with no same-native-session-across-restart claim |
 | Keep verification proportional to the threat model | all | Behavior tests, clear diagnostics, no certification campaign or audit subsystem |
