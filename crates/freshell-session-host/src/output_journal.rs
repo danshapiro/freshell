@@ -31,6 +31,8 @@ pub struct OutputJournal {
     next_seq: u64,
     previous_index: Vec<TerminalSpoolIndexEntry>,
     current_index: Vec<TerminalSpoolIndexEntry>,
+    previous_torn_tail: bool,
+    current_torn_tail: bool,
     completion: Option<TerminalSpoolCompletion>,
     failure: Option<String>,
     #[cfg(test)]
@@ -86,6 +88,8 @@ impl OutputJournal {
             next_seq: 1,
             previous_index: Vec::new(),
             current_index: Vec::new(),
+            previous_torn_tail: false,
+            current_torn_tail: false,
             completion: None,
             failure: None,
             #[cfg(test)]
@@ -173,9 +177,19 @@ impl OutputJournal {
         }
         let source = self.descriptor();
         let mut segments = Vec::with_capacity(2);
-        for (path, checkpoints, required) in [
-            (self.previous_path(), &self.previous_index, false),
-            (self.current_path(), &self.current_index, true),
+        for (path, checkpoints, torn_tail, required) in [
+            (
+                self.previous_path(),
+                &self.previous_index,
+                self.previous_torn_tail,
+                false,
+            ),
+            (
+                self.current_path(),
+                &self.current_index,
+                self.current_torn_tail,
+                true,
+            ),
         ] {
             let file = match std::fs::File::open(path) {
                 Ok(file) => file,
@@ -193,6 +207,7 @@ impl OutputJournal {
                 reader: BufReader::new(file),
                 file_bytes,
                 checkpoints: checkpoints.clone(),
+                torn_tail,
             });
         }
         let indexed = read_indexed_spool(
@@ -201,7 +216,8 @@ impl OutputJournal {
             after_seq,
             max_bytes,
             self.completion.clone(),
-        )?;
+        )
+        .map_err(|error| error.to_string())?;
         #[cfg(test)]
         self.last_read_bytes_scanned.set(indexed.bytes_scanned);
         Ok(indexed.batch)
@@ -245,7 +261,9 @@ impl OutputJournal {
                 .map_err(|e| e.to_string())?;
             sync_parent(&current)?;
             self.previous_index = std::mem::take(&mut self.current_index);
-            write_index_atomic(&current_index_path, &self.descriptor(), &[], 0)?;
+            self.previous_torn_tail = self.current_torn_tail;
+            self.current_torn_tail = false;
+            write_index_atomic(&current_index_path, &self.descriptor(), &[], 0, 0, false)?;
         }
         let current_len = current.metadata().map(|m| m.len()).unwrap_or(0);
         let checkpoint_needed = self
@@ -281,13 +299,13 @@ impl OutputJournal {
 
     fn seed_sequence_from_spool(&mut self) -> Result<(), String> {
         let source = self.descriptor();
-        let (previous_index, previous_head) = rebuild_spool_index(
+        let (previous_index, previous_head, previous_torn_tail) = rebuild_spool_index(
             &self.previous_path(),
             &self.previous_index_path(),
             false,
             &source,
         )?;
-        let (current_index, current_head) = rebuild_spool_index(
+        let (current_index, current_head, current_torn_tail) = rebuild_spool_index(
             &self.current_path(),
             &self.current_index_path(),
             true,
@@ -295,6 +313,8 @@ impl OutputJournal {
         )?;
         self.previous_index = previous_index;
         self.current_index = current_index;
+        self.previous_torn_tail = previous_torn_tail;
+        self.current_torn_tail = current_torn_tail;
         let head = current_head.max(previous_head);
         self.next_seq = head.checked_add(1).ok_or("output sequence exhausted")?;
         Ok(())
@@ -319,12 +339,12 @@ fn rebuild_spool_index(
     index_path: &Path,
     required: bool,
     source: &TerminalSpoolDescriptor,
-) -> Result<(Vec<TerminalSpoolIndexEntry>, u64), String> {
+) -> Result<(Vec<TerminalSpoolIndexEntry>, u64, bool), String> {
     let file = match std::fs::File::open(spool_path) {
         Ok(file) => file,
         Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {
-            write_index_atomic(index_path, source, &[], 0)?;
-            return Ok((Vec::new(), 0));
+            write_index_atomic(index_path, source, &[], 0, 0, false)?;
+            return Ok((Vec::new(), 0, false));
         }
         Err(_) => return Err("retained output spool unavailable".into()),
     };
@@ -335,9 +355,21 @@ fn rebuild_spool_index(
     if file_bytes > source.segment_limit_bytes {
         return Err("retained spool exceeds segment bound".into());
     }
-    let (checkpoints, head, _) = build_spool_index(BufReader::new(file), source, 0)?;
-    write_index_atomic(index_path, source, &checkpoints, file_bytes)?;
-    Ok((checkpoints, head))
+    let (checkpoints, head, summary) = build_spool_index(BufReader::new(file), source, 0)?;
+    let scanned_through_offset = if checkpoints.is_empty() {
+        summary.last_complete_offset
+    } else {
+        0
+    };
+    write_index_atomic(
+        index_path,
+        source,
+        &checkpoints,
+        file_bytes,
+        scanned_through_offset,
+        summary.torn_tail,
+    )?;
+    Ok((checkpoints, head, summary.torn_tail))
 }
 
 fn write_index_atomic(
@@ -345,8 +377,16 @@ fn write_index_atomic(
     source: &TerminalSpoolDescriptor,
     checkpoints: &[TerminalSpoolIndexEntry],
     spool_bytes: u64,
+    scanned_through_offset: u64,
+    torn_tail: bool,
 ) -> Result<(), String> {
-    let bytes = encode_spool_index(source, checkpoints, spool_bytes)?;
+    let bytes = encode_spool_index(
+        source,
+        checkpoints,
+        spool_bytes,
+        scanned_through_offset,
+        torn_tail,
+    )?;
     let temporary = path.with_extension("tmp");
     let mut file = OpenOptions::new()
         .create(true)

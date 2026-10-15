@@ -81,8 +81,17 @@ pub struct TerminalSpoolFrame {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "record", rename_all = "snake_case")]
 pub enum TerminalSpoolIndexRecord {
-    Header { descriptor: TerminalSpoolDescriptor },
-    Checkpoint { seq: u64, offset: u64 },
+    Header {
+        descriptor: TerminalSpoolDescriptor,
+        #[serde(default)]
+        scanned_through_offset: u64,
+        #[serde(default)]
+        torn_tail: bool,
+    },
+    Checkpoint {
+        seq: u64,
+        offset: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,10 +100,48 @@ pub struct TerminalSpoolIndexEntry {
     pub offset: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalSpoolIndex {
+    pub checkpoints: Vec<TerminalSpoolIndexEntry>,
+    /// With no matching-epoch checkpoints, this is the last complete record
+    /// boundary already scanned, including records from older epochs.
+    pub scanned_through_offset: u64,
+    pub torn_tail: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexedSpoolReadError {
+    /// The sidecar points to the wrong spool records and may be rebuilt.
+    InvalidIndex(String),
+    /// The source or requested page failed; retrying with a full scan is not useful.
+    Other(String),
+}
+
+impl From<String> for IndexedSpoolReadError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+impl From<&str> for IndexedSpoolReadError {
+    fn from(message: &str) -> Self {
+        Self::Other(message.into())
+    }
+}
+
+impl std::fmt::Display for IndexedSpoolReadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidIndex(message) | Self::Other(message) => formatter.write_str(message),
+        }
+    }
+}
+
 pub struct IndexedSpoolSegment<R> {
     pub reader: R,
     pub file_bytes: u64,
     pub checkpoints: Vec<TerminalSpoolIndexEntry>,
+    pub torn_tail: bool,
 }
 
 pub struct IndexedSpoolRead {
@@ -107,13 +154,14 @@ pub struct SpoolScanSummary {
     pub torn_tail: bool,
     pub bytes_scanned: u64,
     pub stopped_early: bool,
+    pub last_complete_offset: u64,
 }
 
 pub fn read_spool_index<R: BufRead>(
     mut reader: R,
     source: &TerminalSpoolDescriptor,
     spool_bytes: u64,
-) -> Result<Vec<TerminalSpoolIndexEntry>, String> {
+) -> Result<TerminalSpoolIndex, String> {
     source.validate()?;
     let mut bytes = Vec::new();
     Read::by_ref(&mut reader)
@@ -131,11 +179,15 @@ pub fn read_spool_index<R: BufRead>(
         .ok_or("retained output index header missing")?;
     let header: TerminalSpoolIndexRecord =
         serde_json::from_slice(header_line).map_err(|_| "invalid retained output index header")?;
-    if header
-        != (TerminalSpoolIndexRecord::Header {
-            descriptor: source.clone(),
-        })
-    {
+    let TerminalSpoolIndexRecord::Header {
+        descriptor,
+        scanned_through_offset,
+        torn_tail,
+    } = header
+    else {
+        return Err("retained output index header missing".into());
+    };
+    if descriptor != *source || scanned_through_offset > spool_bytes {
         return Err("retained output index source mismatch".into());
     }
 
@@ -152,7 +204,11 @@ pub fn read_spool_index<R: BufRead>(
         entries.push(TerminalSpoolIndexEntry { seq, offset });
     }
     validate_spool_index_entries(&entries, spool_bytes)?;
-    Ok(entries)
+    Ok(TerminalSpoolIndex {
+        checkpoints: entries,
+        scanned_through_offset,
+        torn_tail,
+    })
 }
 
 pub fn validate_spool_index_entries(
@@ -206,10 +262,15 @@ pub fn encode_spool_index(
     source: &TerminalSpoolDescriptor,
     checkpoints: &[TerminalSpoolIndexEntry],
     spool_bytes: u64,
+    scanned_through_offset: u64,
+    torn_tail: bool,
 ) -> Result<Vec<u8>, String> {
     validate_spool_index_entries(checkpoints, spool_bytes)?;
+    if scanned_through_offset > spool_bytes {
+        return Err("retained output index scan bound exceeds spool".into());
+    }
     let mut bytes = Vec::new();
-    write_spool_index_header(&mut bytes, source)?;
+    write_spool_index_header(&mut bytes, source, scanned_through_offset, torn_tail)?;
     for checkpoint in checkpoints {
         write_spool_index_checkpoint(&mut bytes, *checkpoint)?;
     }
@@ -222,9 +283,13 @@ pub fn encode_spool_index(
 pub fn write_spool_index_header<W: Write>(
     writer: &mut W,
     source: &TerminalSpoolDescriptor,
+    scanned_through_offset: u64,
+    torn_tail: bool,
 ) -> Result<(), String> {
     let record = TerminalSpoolIndexRecord::Header {
         descriptor: source.clone(),
+        scanned_through_offset,
+        torn_tail,
     };
     serde_json::to_writer(&mut *writer, &record)
         .map_err(|_| "retained output index encoding failed")?;
@@ -277,7 +342,10 @@ pub fn scan_spool_from<R: BufRead>(
     source.validate()?;
     let mut bytes = Vec::new();
     let mut offset = start_offset;
-    let mut summary = SpoolScanSummary::default();
+    let mut summary = SpoolScanSummary {
+        last_complete_offset: start_offset,
+        ..SpoolScanSummary::default()
+    };
     loop {
         bytes.clear();
         let length = Read::by_ref(&mut reader)
@@ -299,6 +367,7 @@ pub fn scan_spool_from<R: BufRead>(
         }
         let row: TerminalSpoolFrame = serde_json::from_slice(&bytes)
             .map_err(|_| "invalid committed retained output frame")?;
+        summary.last_complete_offset = offset;
         let frame = row.frame;
         // A restarted host can leave its prior epoch in the bounded segments.
         if frame.stream_epoch != source.stream_epoch {
@@ -421,14 +490,15 @@ pub fn read_indexed_spool<R: BufRead + Seek>(
     after: u64,
     budget: u64,
     completion: Option<TerminalSpoolCompletion>,
-) -> Result<IndexedSpoolRead, String> {
+) -> Result<IndexedSpoolRead, IndexedSpoolReadError> {
     source.validate()?;
     let mut segment_bounds = Vec::with_capacity(segments.len());
-    let mut torn = false;
+    let mut torn = segments.iter().any(|segment| segment.torn_tail);
     let mut bytes_scanned = 0_u64;
 
     for segment in &mut segments {
-        validate_spool_index_entries(&segment.checkpoints, segment.file_bytes)?;
+        validate_spool_index_entries(&segment.checkpoints, segment.file_bytes)
+            .map_err(IndexedSpoolReadError::InvalidIndex)?;
         let Some(last_checkpoint) = segment.checkpoints.last().copied() else {
             segment_bounds.push(None);
             continue;
@@ -440,6 +510,7 @@ pub fn read_indexed_spool<R: BufRead + Seek>(
             .map_err(|_| "retained output seek failed")?;
         let mut first = true;
         let mut head = None;
+        let mut invalid_index = false;
         let summary = scan_spool_from(
             &mut segment.reader,
             &source,
@@ -448,6 +519,7 @@ pub fn read_indexed_spool<R: BufRead + Seek>(
                 if first {
                     first = false;
                     if frame.seq_start != last_checkpoint.seq {
+                        invalid_index = true;
                         return Err("retained output index does not match its spool".into());
                     }
                 } else if head.is_some_and(|previous| frame.seq_start != previous + 1) {
@@ -456,9 +528,18 @@ pub fn read_indexed_spool<R: BufRead + Seek>(
                 head = Some(frame.seq_end);
                 Ok(false)
             },
-        )?;
+        )
+        .map_err(|error| {
+            if invalid_index {
+                IndexedSpoolReadError::InvalidIndex(error)
+            } else {
+                IndexedSpoolReadError::Other(error)
+            }
+        })?;
         if first {
-            return Err("retained output index checkpoint is missing from its spool".into());
+            return Err(IndexedSpoolReadError::InvalidIndex(
+                "retained output index checkpoint is missing from its spool".into(),
+            ));
         }
         torn |= summary.torn_tail;
         bytes_scanned = bytes_scanned.saturating_add(summary.bytes_scanned);
@@ -469,7 +550,9 @@ pub fn read_indexed_spool<R: BufRead + Seek>(
     for bounds in segment_bounds.iter().flatten() {
         if let Some(head) = previous_head {
             if bounds.0 != head.saturating_add(1) {
-                return Err("retained output segments are not contiguous".into());
+                return Err(IndexedSpoolReadError::InvalidIndex(
+                    "retained output segments are not contiguous".into(),
+                ));
             }
         }
         previous_head = Some(bounds.1);
@@ -509,6 +592,7 @@ pub fn read_indexed_spool<R: BufRead + Seek>(
             .seek(SeekFrom::Start(checkpoint.offset))
             .map_err(|_| "retained output seek failed")?;
         let mut first = true;
+        let mut invalid_index = false;
         let summary = scan_spool_from(
             &mut segment.reader,
             &source,
@@ -517,15 +601,25 @@ pub fn read_indexed_spool<R: BufRead + Seek>(
                 if first {
                     first = false;
                     if frame.seq_start != checkpoint.seq {
+                        invalid_index = true;
                         return Err("retained output index does not match its spool".into());
                     }
                 }
                 page.accept(frame)?;
                 Ok(page.should_stop_scanning())
             },
-        )?;
+        )
+        .map_err(|error| {
+            if invalid_index {
+                IndexedSpoolReadError::InvalidIndex(error)
+            } else {
+                IndexedSpoolReadError::Other(error)
+            }
+        })?;
         if first {
-            return Err("retained output index checkpoint is missing from its spool".into());
+            return Err(IndexedSpoolReadError::InvalidIndex(
+                "retained output index checkpoint is missing from its spool".into(),
+            ));
         }
         torn |= summary.torn_tail;
         bytes_scanned = bytes_scanned.saturating_add(summary.bytes_scanned);
@@ -596,6 +690,7 @@ mod tests {
                 reader: std::io::Cursor::new(bytes),
                 file_bytes,
                 checkpoints,
+                torn_tail: false,
             }],
             126,
             MAX_OUTPUT_FRAME_BYTES as u64,
@@ -612,6 +707,47 @@ mod tests {
             read.bytes_scanned,
             file_bytes
         );
+    }
+
+    #[test]
+    fn empty_sparse_index_preserves_a_torn_tail_marker() {
+        let source = source();
+        let bytes = b"partial committed frame".to_vec();
+        let (checkpoints, _, summary) =
+            build_spool_index(std::io::Cursor::new(bytes.clone()), &source, 0).unwrap();
+        assert!(checkpoints.is_empty());
+        assert!(summary.torn_tail);
+
+        let index_bytes = encode_spool_index(
+            &source,
+            &checkpoints,
+            bytes.len() as u64,
+            summary.last_complete_offset,
+            summary.torn_tail,
+        )
+        .unwrap();
+        let index = read_spool_index(
+            std::io::Cursor::new(index_bytes),
+            &source,
+            bytes.len() as u64,
+        )
+        .unwrap();
+        assert!(index.torn_tail);
+
+        let read = read_indexed_spool(
+            source,
+            vec![IndexedSpoolSegment {
+                reader: std::io::Cursor::new(bytes.clone()),
+                file_bytes: bytes.len() as u64,
+                checkpoints: index.checkpoints,
+                torn_tail: index.torn_tail,
+            }],
+            0,
+            MAX_OUTPUT_FRAME_BYTES as u64,
+            None,
+        )
+        .unwrap();
+        assert!(read.batch.truncated);
     }
 
     #[test]
