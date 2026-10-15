@@ -5,7 +5,6 @@ import type {
   ManagedRuntimeProjectionFields,
   ManagedRuntimeSoul,
   ManagedRuntimeViewIntent,
-  ManagedRuntimeViewVisibility,
 } from '@shared/managed-runtime'
 import { nanoid } from 'nanoid'
 import { closePane, initLayout, restoreLayout, removeLayout, replacePane, setPaneCloseError, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle, markTabClosing, clearTabClosing, markPaneClosing, clearPaneClosing, hasAnyClosePending } from './panesSlice'
@@ -42,7 +41,11 @@ import type { RootState } from './store'
 import { selectTabIdByTerminalId } from './selectors/paneTerminalSelectors'
 import { loadPersistedLayout, markTabsLoadRecovery } from './persistMiddleware'
 import { createLogger } from '@/lib/client-logger'
-import { getManagedRuntimeSoul, updateManagedRuntimeViewVisibility } from '@/lib/api'
+import {
+  getManagedRuntimeInventory,
+  getManagedRuntimeSoul,
+  updateManagedRuntimeViewVisibility,
+} from '@/lib/api'
 import { mergeSessionMetadataByKey, sessionMetadataKey } from '@/lib/session-metadata'
 import {
   clearLocalClosePersistencePending,
@@ -58,7 +61,6 @@ import { layoutClosePersistenceSignature, sameLayoutTopology } from './layout-to
 import { migrateLegacyTerminalDurableState, sanitizeSessionRef } from '@shared/session-contract'
 import { sanitizeTabsAgainstLayouts } from '@/lib/tab-fallback-identity'
 import { TabNameSourceSchema, type TabNameSource } from '@shared/session-names'
-import { getManagedRuntimeInventory, updateManagedRuntimeViewVisibility } from '@/lib/api'
 import { managedRuntimeSnapshotReceived, selectManagedRuntime } from './managedRuntimeSlice'
 import { withManagedVisibilityTransition } from './managedVisibilityCoordinator.js'
 
@@ -919,6 +921,19 @@ function collectManagedViewProjections(
   return [...byViewId.values()]
 }
 
+function ownLocalManagedViewProjection(
+  viewId: string,
+  getState: () => RootState,
+): ManagedViewCloseProjection | undefined {
+  const state = getState()
+  for (const tab of state.tabs.tabs) {
+    const projection = collectManagedViewProjections(state.panes.layouts[tab.id])
+      .find((candidate) => candidate.viewId === viewId)
+    if (projection) return ownManagedViewProjection(projection, tab.id, getState)
+  }
+  return undefined
+}
+
 type ManagedViewRepairFence = {
   viewRevision: number
   soulRevision: number
@@ -1453,11 +1468,13 @@ function paneCloseTargetSetChanged(
   return true
 }
 
-function isManagedRuntimeProjection(content: PaneContent): content is Extract<PaneContent, { kind: 'terminal' }> {
-  return content.kind === 'terminal'
+type ManagedRuntimeLocalProjection = Extract<PaneContent, { kind: 'terminal' | 'fresh-agent' }>
+
+function isManagedRuntimeProjection(content: PaneContent): content is ManagedRuntimeLocalProjection {
+  return content.kind === 'terminal' || content.kind === 'fresh-agent'
 }
 
-function hasManagedRuntimeMarker(content: Extract<PaneContent, { kind: 'terminal' }>): boolean {
+function hasManagedRuntimeMarker(content: ManagedRuntimeLocalProjection): boolean {
   return [content.viewIntentId, content.soulId, content.incarnationId, content.runtimeState]
     .some((value) => typeof value === 'string' && value.length > 0)
 }
@@ -1649,13 +1666,13 @@ export function resolveManagedLocalTabViewIdentity(
   return resolveUnmarkedManagedLocalIdentity(identity, snapshot)
 }
 
-/** Resolve one local terminal without aliasing sibling views of the same soul. */
+/** Resolve one local managed pane without aliasing sibling views of the same soul. */
 export function resolveManagedLocalViewIdentity(
   content: PaneContent,
   snapshot: ManagedRuntimeInventorySnapshot,
   tabViewIntentId?: string,
   paneId?: string,
-  terminalPaneCount = 1,
+  managedPaneCount = 1,
 ): ManagedLocalViewIdentityResolution {
   if (!isManagedRuntimeProjection(content)) return { viewIntentIds: [], ambiguous: false }
   if (content.viewIntentId) return { viewIntentIds: [content.viewIntentId], ambiguous: false }
@@ -1664,7 +1681,7 @@ export function resolveManagedLocalViewIdentity(
     const tabViews = snapshot.viewIntents.filter((view) => view.viewId === tabViewIntentId)
     if (tabViews.length > 1) return { viewIntentIds: [tabViewIntentId], ambiguous: true }
     const tabView = tabViews[0]
-    if (terminalPaneCount === 1 || paneId === tabView?.preferredPaneId) {
+    if (managedPaneCount === 1 || paneId === tabView?.preferredPaneId) {
       if (tabView) {
         const matchedSouls = managedSoulsForLocalIdentity(content, snapshot)
         if (
@@ -1687,8 +1704,8 @@ export function resolveManagedLocalViewIdentity(
   return resolveUnmarkedManagedLocalIdentity(content, snapshot)
 }
 
-function resolveManagedViewForTerminal(
-  content: Extract<PaneContent, { kind: 'terminal' }>,
+function resolveManagedViewForProjection(
+  content: ManagedRuntimeLocalProjection,
   snapshot: ManagedRuntimeInventorySnapshot,
   fallbackViewIntentId?: string,
 ): ManagedViewResolution {
@@ -1699,8 +1716,9 @@ function resolveManagedViewForTerminal(
       : { kind: 'unresolved', viewIntentIds: [content.viewIntentId] }
   }
 
+  const terminalId = content.kind === 'terminal' ? content.terminalId : undefined
   const identityMatchedSouls = snapshot.souls.filter((soul) => (
-    (content.terminalId && soul.terminalId === content.terminalId)
+    (terminalId && soul.terminalId === terminalId)
     || (content.createRequestId && soul.terminalCreateRequestId === content.createRequestId)
   ))
   const matchedSouls = content.soulId
@@ -1734,7 +1752,7 @@ function resolveManagedViewForTerminal(
     && snapshot.pendingProjectionCount === 0
   if (
     hasManagedRuntimeMarker(content)
-    || content.status === 'creating'
+    || (content.kind === 'terminal' && content.status === 'creating')
     || !inventoryComplete
   ) {
     return { kind: 'unresolved', viewIntentIds: [] }
@@ -1757,7 +1775,7 @@ function collectOtherLocalManagedViewIds(
   ) => {
     if (tabId === targetTabId && !targetPaneId) return
     const entries = collectPaneEntries(layout)
-    const terminalPaneCount = entries.filter(({ content }) => isManagedRuntimeProjection(content)).length
+    const managedPaneCount = entries.filter(({ content }) => isManagedRuntimeProjection(content)).length
     for (const entry of entries) {
       if (tabId === targetTabId && entry.paneId === targetPaneId) continue
       const identity = resolveManagedLocalViewIdentity(
@@ -1765,7 +1783,7 @@ function collectOtherLocalManagedViewIds(
         snapshot,
         tabViewIntentId,
         entry.paneId,
-        terminalPaneCount,
+        managedPaneCount,
       )
       if (identity.ambiguous && identity.viewIntentIds.some((id) => targetViewIntentIds.has(id))) {
         throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
@@ -1809,7 +1827,7 @@ function isManagedViewRepresentedLocally(
       continue
     }
     const entries = collectPaneEntries(layout)
-    const terminalPaneCount = entries.filter(({ content }) => isManagedRuntimeProjection(content)).length
+    const managedPaneCount = entries.filter(({ content }) => isManagedRuntimeProjection(content)).length
     for (const { paneId, content } of entries) {
       if (!isManagedRuntimeProjection(content)) continue
       const identity = resolveManagedLocalViewIdentity(
@@ -1817,7 +1835,7 @@ function isManagedViewRepresentedLocally(
         snapshot,
         tab.viewIntentId,
         paneId,
-        terminalPaneCount,
+        managedPaneCount,
       )
       if (identity.viewIntentIds.includes(view.viewId)) return true
     }
@@ -1846,28 +1864,29 @@ function resolveManagedViewIntentsToRemove(
   const targetEntries = layout
     ? collectPaneEntries(layout).filter((entry) => paneId === undefined || entry.paneId === paneId)
     : []
-  const terminalTargets = targetEntries.filter((entry) => isManagedRuntimeProjection(entry.content))
+  const managedTargets = targetEntries.filter((entry) => isManagedRuntimeProjection(entry.content))
   const tabMarkerViewIntentId = tab?.viewIntentId
   const tabViewIntentId = !layout && paneId === undefined ? tab?.viewIntentId : undefined
-  if (terminalTargets.length === 0 && !tabViewIntentId) {
+  if (managedTargets.length === 0 && !tabViewIntentId) {
     return { viewIntentIds: [], paneIds: [], viewIntentIdsByPane: {}, viewIntentIdsByTab: {} }
   }
 
   const runtime = selectManagedRuntime(state)
-  const hasKnownMarker = terminalTargets.some(({ content }) => (
+  const hasKnownMarker = managedTargets.some(({ content }) => (
     isManagedRuntimeProjection(content) && hasManagedRuntimeMarker(content)
   )) || Boolean(tabMarkerViewIntentId)
-  const unresolvedCreation = terminalTargets.some(({ content }) => (
-    isManagedRuntimeProjection(content) && content.status === 'creating'
+  const unresolvedCreation = managedTargets.some(({ content }) => (
+    content.kind === 'terminal' && content.status === 'creating'
   ))
   if (!runtime.available && unresolvedCreation) {
     throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
   }
   if (!runtime.available) {
-    const matchesCachedManagedIdentity = terminalTargets.some(({ content }) => (
+    const matchesCachedManagedIdentity = managedTargets.some(({ content }) => (
       isManagedRuntimeProjection(content)
       && runtime.souls.some((soul) => (
-        (content.terminalId && soul.terminalId === content.terminalId)
+        (content.soulId && soul.soulId === content.soulId)
+        || (content.kind === 'terminal' && content.terminalId && soul.terminalId === content.terminalId)
         || (content.createRequestId && soul.terminalCreateRequestId === content.createRequestId)
       ))
     ))
@@ -1888,7 +1907,7 @@ function resolveManagedViewIntentsToRemove(
       if (matches.length !== 1) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
       targetViewIntentIds.add(tabViewIntentId)
     }
-    const terminalEntries = layout
+    const managedEntries = layout
       ? collectPaneEntries(layout).filter(({ content }) => isManagedRuntimeProjection(content))
       : []
     const tabMarkerMatches = tabMarkerViewIntentId
@@ -1896,18 +1915,18 @@ function resolveManagedViewIntentsToRemove(
       : []
     const tabMarkerView = tabMarkerMatches.length === 1 ? tabMarkerMatches[0] : undefined
     const markedPaneId = tabMarkerView
-      ? terminalEntries.find(({ paneId: candidatePaneId }) => (
+      ? managedEntries.find(({ paneId: candidatePaneId }) => (
         candidatePaneId === tabMarkerView.preferredPaneId
-      ))?.paneId ?? (terminalEntries.length === 1 ? terminalEntries[0]!.paneId : undefined)
+      ))?.paneId ?? (managedEntries.length === 1 ? managedEntries[0]!.paneId : undefined)
       : undefined
-    for (const { paneId: targetPaneId, content } of terminalTargets) {
+    for (const { paneId: targetPaneId, content } of managedTargets) {
       if (!isManagedRuntimeProjection(content)) continue
       const fallbackViewIntentId = tabMarkerViewIntentId
         && targetPaneId === markedPaneId
         && !content.viewIntentId
         ? tabMarkerViewIntentId
         : undefined
-      const resolution = resolveManagedViewForTerminal(content, snapshot, fallbackViewIntentId)
+      const resolution = resolveManagedViewForProjection(content, snapshot, fallbackViewIntentId)
       if (resolution.kind === 'unresolved') {
         paneIds.add(targetPaneId)
         throw Object.assign(new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE), { paneIds: [...paneIds] })
@@ -2391,6 +2410,17 @@ function planManagedReopenProjectionMerge(
   return { targetTabId: tabIds[0]!, redundantTabIds: tabIds.slice(1) }
 }
 
+function confirmsManagedViewVisibility(
+  view: ManagedRuntimeViewIntent,
+  visibility: 'visible' | 'detached',
+  snapshot: ManagedRuntimeInventorySnapshot,
+): boolean {
+  if (view.visibility === visibility) return true
+  if (visibility !== 'detached' || view.visibility !== 'hidden') return false
+  const soul = snapshot.souls.find((candidate) => candidate.soulId === view.soulId)
+  return soul?.desiredState === 'stopped' && soul.recoveryState === 'stopped'
+}
+
 /**
  * Persist a managed view visibility change and synchronize the inventory
  * revision before the caller changes local layout state. A close can otherwise
@@ -2400,13 +2430,14 @@ function planManagedReopenProjectionMerge(
  * rejected by the managed-runtime refresh path.
  *
  * Repeated panes may reference one view intent; mutate each intent only once.
- * If a later view mutation fails, the verification read still records any
- * earlier successful changes. The caller keeps the tab and a retry uses the
- * current per-view revisions.
+ * A later mutation failure repairs an ambiguous committed detach and returns
+ * earlier successful detaches to visible before the caller keeps the tab.
+ * The confirming inventory records the resulting revisions while the local
+ * panes are still present.
  */
 async function persistManagedViewVisibility(
   viewIntentIds: string[],
-  visibility: ManagedRuntimeViewVisibility,
+  visibility: 'visible' | 'detached',
   dispatch: (action: unknown) => void,
   getState: () => RootState,
   options: {
@@ -2431,59 +2462,137 @@ async function persistManagedViewVisibility(
     return matches[0]!
   })
 
-  const needsMutation = targetViews.some((view) => view.visibility !== visibility)
-  if (!needsMutation) return
-
-  let mutationError: unknown
+  const ownedProjections = new Map<string, ManagedViewCloseProjection>()
   for (const view of targetViews) {
-    if (view.visibility === visibility) continue
-    try {
-      await updateManagedRuntimeViewVisibility(
-        view.viewId,
-        visibility,
-        view.revision,
-        view.soulIntentRevision,
-      )
-    } catch (error) {
-      mutationError = error
-      break
-    }
-    if (options.afterVisibilityMutation && !options.afterVisibilityMutation(view.viewId)) break
+    const projection = ownLocalManagedViewProjection(view.viewId, getState)
+    if (projection) ownedProjections.set(view.viewId, projection)
   }
-
-  let confirmedSnapshot: ManagedRuntimeInventorySnapshot
+  const completedDetaches: Array<{
+    projection: ManagedViewCloseProjection
+    view: ManagedRuntimeViewIntent
+  }> = []
+  let outcomeConfirmed = false
   try {
-    confirmedSnapshot = await getManagedRuntimeInventory()
-  } catch (error) {
-    log.warn('could not confirm managed view visibility after update', {
-      viewIntentIds,
-      visibility,
-      error: error instanceof Error ? error.message : String(error),
-    })
-    throw error
-  }
-  applyManagedRuntimeInventory(confirmedSnapshot, dispatch, getState)
+    const needsMutation = targetViews.some((view) => view.visibility !== visibility)
+    if (!needsMutation) {
+      outcomeConfirmed = true
+      return
+    }
 
-  const confirmedViews = new Map<string, ManagedRuntimeViewIntent[]>()
-  for (const view of confirmedSnapshot.viewIntents) {
-    const matches = confirmedViews.get(view.viewId) ?? []
-    matches.push(view)
-    confirmedViews.set(view.viewId, matches)
-  }
-  const unconfirmedIds = viewIntentIds.filter((viewIntentId) => {
-    const matches = confirmedViews.get(viewIntentId) ?? []
-    return matches.length !== 1 || matches[0]!.visibility !== visibility
-  })
-  if (unconfirmedIds.length > 0) {
-    if (mutationError !== undefined) throw mutationError
-    throw new Error(`Managed view visibility was not confirmed for ${unconfirmedIds.join(', ')}`)
-  }
-  if (mutationError !== undefined) {
-    log.warn('managed view update reported an error but inventory confirms the requested visibility', {
-      viewIntentIds,
-      visibility,
-      error: mutationError instanceof Error ? mutationError.message : String(mutationError),
+    let mutationError: unknown
+    for (const view of targetViews) {
+      if (view.visibility === visibility) continue
+      const projection = ownedProjections.get(view.viewId)
+      try {
+        const updatedView = await awaitBoundedManagedRuntimeRequest(
+          'managed view visibility mutation',
+          (signal) => updateManagedViewVisibilityWithSignal(
+            view.viewId,
+            visibility,
+            view.revision,
+            view.soulIntentRevision,
+            signal,
+          ),
+          projection
+            ? managedViewTimeoutHooks(
+              projection,
+              { viewRevision: view.revision, soulRevision: view.soulIntentRevision },
+              visibility === 'detached' ? 'detach' : 'rollback',
+            )
+            : {},
+        )
+        if (visibility === 'detached' && projection && updatedView.visibility === 'detached') {
+          completedDetaches.push({ projection, view: updatedView })
+        }
+      } catch (error) {
+        mutationError = error
+        if (
+          visibility === 'detached'
+          && projection
+          && !isManagedRuntimeRequestTimeout(error)
+        ) {
+          // A rejected response can arrive after the server committed the
+          // detach. Reconcile with authoritative fences before restoring the
+          // local panes, so a still-open pane does not remain remotely hidden.
+          await repairManagedViewAuthoritatively(projection, 'detach', error)
+        }
+        break
+      }
+      if (options.afterVisibilityMutation && !options.afterVisibilityMutation(view.viewId)) break
+    }
+
+    if (mutationError !== undefined && visibility === 'detached') {
+      // A multi-view close is one local transaction. If a later view refuses,
+      // restore earlier successful detaches in reverse order using their
+      // returned revisions, then let the caller retain the source layout.
+      for (const completed of [...completedDetaches].reverse()) {
+        try {
+          await awaitBoundedManagedRuntimeRequest(
+            'managed view rollback mutation',
+            (signal) => updateManagedViewRepairWithSignal(completed.projection, {
+              viewRevision: completed.view.revision,
+              soulRevision: completed.view.soulIntentRevision,
+            }, signal),
+            managedViewTimeoutHooks(completed.projection, {
+              viewRevision: completed.view.revision,
+              soulRevision: completed.view.soulIntentRevision,
+            }, 'rollback'),
+          )
+        } catch (rollbackError) {
+          if (rollbackError instanceof ManagedViewRepairSupersededError || !completed.projection.canRepair()) continue
+          if (!isManagedRuntimeRequestTimeout(rollbackError)) {
+            log.error('managed view detach rollback failed after close refusal', {
+              event: 'managed_view_visibility_rollback_failed',
+              viewId: completed.view.viewId,
+              paneId: completed.projection.paneId,
+              error: managedRuntimeErrorMessage(rollbackError),
+            })
+            await repairManagedViewAuthoritatively(completed.projection, 'rollback', rollbackError)
+          }
+        }
+      }
+    }
+
+    let confirmedSnapshot: ManagedRuntimeInventorySnapshot
+    try {
+      confirmedSnapshot = await getManagedRuntimeInventory()
+    } catch (error) {
+      log.warn('could not confirm managed view visibility after update', {
+        viewIntentIds,
+        visibility,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      throw error
+    }
+    applyManagedRuntimeInventory(confirmedSnapshot, dispatch, getState)
+
+    const confirmedViews = new Map<string, ManagedRuntimeViewIntent[]>()
+    for (const view of confirmedSnapshot.viewIntents) {
+      const matches = confirmedViews.get(view.viewId) ?? []
+      matches.push(view)
+      confirmedViews.set(view.viewId, matches)
+    }
+    const unconfirmedIds = viewIntentIds.filter((viewIntentId) => {
+      const matches = confirmedViews.get(viewIntentId) ?? []
+      return matches.length !== 1 || !confirmsManagedViewVisibility(matches[0]!, visibility, confirmedSnapshot)
     })
+    if (unconfirmedIds.length > 0) {
+      if (mutationError !== undefined) throw mutationError
+      throw new Error(`Managed view visibility was not confirmed for ${unconfirmedIds.join(', ')}`)
+    }
+    if (isManagedRuntimeRequestTimeout(mutationError)) throw mutationError
+    if (mutationError !== undefined) {
+      log.warn('managed view update reported an error but inventory confirms the requested visibility', {
+        viewIntentIds,
+        visibility,
+        error: mutationError instanceof Error ? mutationError.message : String(mutationError),
+      })
+    }
+    outcomeConfirmed = true
+  } finally {
+    if (!outcomeConfirmed) {
+      for (const projection of ownedProjections.values()) projection.allowOlderRepairs()
+    }
   }
 }
 
@@ -2969,7 +3078,11 @@ export const closePaneWithCleanup = createAsyncThunk(
               viewIntentIds: managedViews.viewIntentIds,
               error: error instanceof Error ? error.message : String(error),
             })
-            dispatch(setPaneCloseError({ tabId, paneId, error: MANAGED_VIEW_CLOSE_FAILED_MESSAGE }))
+            surfaceManagedViewDetachFailure(
+              dispatch,
+              tabId,
+              identity.length > 0 ? identity : managedViews.paneIds.map((targetPaneId) => ({ paneId: targetPaneId })),
+            )
             reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
             return
           }
@@ -3218,13 +3331,13 @@ export const closeTab = createAsyncThunk(
               viewIntentIds: managedViews.viewIntentIds,
               error: error instanceof Error ? error.message : String(error),
             })
-            for (const identity of identities) {
-              dispatch(setPaneCloseError({
-                tabId,
-                paneId: identity.paneId,
-                error: MANAGED_VIEW_CLOSE_FAILED_MESSAGE,
-              }))
-            }
+            surfaceManagedViewDetachFailure(
+              dispatch,
+              tabId,
+              identities.length > 0
+                ? identities
+                : managedViews.paneIds.map((paneId) => ({ paneId })),
+            )
             reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identities)
             return
           }
@@ -3560,7 +3673,11 @@ export const replacePaneWithCleanup = createAsyncThunk(
               viewIntentIds: managedViews.viewIntentIds,
               error: error instanceof Error ? error.message : String(error),
             })
-            dispatch(setPaneCloseError({ tabId, paneId, error: MANAGED_VIEW_CLOSE_FAILED_MESSAGE }))
+            surfaceManagedViewDetachFailure(
+              dispatch,
+              tabId,
+              identity.length > 0 ? identity : managedViews.paneIds.map((targetPaneId) => ({ paneId: targetPaneId })),
+            )
             reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
             return
           }

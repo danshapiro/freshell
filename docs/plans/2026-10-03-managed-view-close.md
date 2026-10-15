@@ -35,12 +35,18 @@ the managed process remains available for an explicit reopen.
 pane-close evidence. Before removing a managed representation, resolve its
 exact view intent from current local identity or an authoritative inventory
 match. If identity, capability, or detachment cannot be confirmed, retain the
-local content and report a retryable error. Serialize each browser's managed
-visibility transitions with their associated local layout changes, route the
-recovery panel through the same coordinator, and do not compensate a failed
-close by changing a view back to visible. Protect committed closes from stale
-own-key layout hydration. Reopen only from a complete fresh managed identity,
-reassert the pane as open, and consume only the saved entry that was restored.
+local content and report a retryable error. For an ambiguous failed visibility
+response, read the exact view and soul revisions and repair a committed detach
+back to visible before retaining the local pane. If a later view refuses a
+multi-view close, restore earlier successful detaches in reverse order using
+their returned fences. A hidden view counts as closed only when its matching
+soul is confirmed stopped. Every repair is tied to its local projection so
+newer visibility work supersedes it. Serialize each browser's managed visibility
+transitions with their associated local layout changes, route the recovery
+panel through the same coordinator, and never repair from a stale snapshot.
+Protect committed closes from stale own-key layout hydration. Reopen only from
+a complete fresh managed identity, reassert the pane as open, and consume only
+the saved entry that was restored.
 
 **Tech Stack:** React, Redux Toolkit, TypeScript, Vitest, existing Rust
 managed-runtime and WebSocket contracts.
@@ -221,11 +227,15 @@ Task 3 reopen and the no-local-pane recovery-panel action use the same queue.
 - [x] Step 5: Detach only views with no other local representation. After a
   successful mutation, fetch and apply a confirming inventory and require the
   target to be detached before removing local content. If a multi-view close
-  partly fails, retain the source layout and report the failure; do not write
-  visible compensation. Reassert retained panes as open after an ambiguous or
-  failed close acknowledgement or visibility mutation. A later GET must be
-  applied through the existing managed-runtime revision guard; do not infer
-  equal-revision snapshot coherence.
+  partly fails, retain the source layout and report the failure, restoring
+  earlier successful detaches in reverse order with their returned revision
+  fences. For an ambiguous failed mutation, reconcile the exact target through
+  its authoritative soul read and repair it to visible with current fences.
+  A hidden view counts as confirmed for close only when its matching soul is
+  stopped. Reassert retained panes as open after an ambiguous or failed close
+  acknowledgement or visibility mutation. A later GET must be applied through
+  the existing managed-runtime revision guard; do not infer equal-revision
+  snapshot coherence.
 - [x] Step 6: Run impacted close, panel, pane-gate, recovery, and tab-bar tests,
   then client typecheck. Refactor while green and obtain an independent task
   review.

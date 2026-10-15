@@ -14,6 +14,7 @@ import freshAgentReducer, { applyRuntimeOwner, turnResult } from '@/store/freshA
 import opencodeActivityReducer, { upsertOpencodeActivity } from '@/store/opencodeActivitySlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import { markTabAttention, markPaneAttention } from '@/store/turnCompletionSlice'
+import managedRuntimeReducer, { setManagedRuntimeAvailable } from '@/store/managedRuntimeSlice'
 import type { PanesState } from '@/store/panesSlice'
 import type { PaneNode, PaneContent, EditorPaneContent } from '@/store/paneTypes'
 import type { FreshAgentSessionState, FreshAgentState } from '@/store/freshAgentTypes'
@@ -48,6 +49,7 @@ const {
   mockApiPatch,
   mockManagedVisibility,
   mockManagedSoul,
+  mockManagedInventory,
   saveServerSettingsPatchSpy,
   cancelCreateSpy,
   cancelWsCreateSpy,
@@ -68,6 +70,7 @@ const {
   mockApiPatch: vi.fn(),
   mockManagedVisibility: vi.fn(),
   mockManagedSoul: vi.fn(),
+  mockManagedInventory: vi.fn(),
   saveServerSettingsPatchSpy: vi.fn((patch: unknown) => ({
     type: 'settings/saveServerSettingsPatch',
     payload: patch,
@@ -147,6 +150,7 @@ vi.mock('@/lib/ws-client', () => ({
 vi.mock('@/lib/api', () => ({
   updateManagedRuntimeViewVisibility: mockManagedVisibility,
   getManagedRuntimeSoul: mockManagedSoul,
+  getManagedRuntimeInventory: mockManagedInventory,
   api: {
     get: (path: string, options?: unknown) => options === undefined ? mockApiGet(path) : mockApiGet(path, options),
     post: (path: string, body: unknown) => mockApiPost(path, body),
@@ -390,6 +394,7 @@ function createStore(
       connection: connectionReducer,
       extensions: extensionsReducer,
       terminalMeta: terminalMetaReducer,
+      managedRuntime: managedRuntimeReducer,
       sessions: sessionsReducer,
       freshAgent: freshAgentReducer,
       opencodeActivity: opencodeActivityReducer,
@@ -477,6 +482,7 @@ describe('PaneContainer', () => {
     mockApiPatch.mockReset()
     mockManagedVisibility.mockReset()
     mockManagedSoul.mockReset()
+    mockManagedInventory.mockReset()
     saveServerSettingsPatchSpy.mockClear()
     cancelCreateSpy.mockClear()
     cancelWsCreateSpy.mockClear()
@@ -508,6 +514,33 @@ describe('PaneContainer', () => {
         },
       }
       const store = createStore({ layouts: { 'tab-1': node }, activePane: { 'tab-1': node.id } })
+      store.dispatch(setManagedRuntimeAvailable(true))
+      mockManagedInventory.mockResolvedValue({
+        revision: 10,
+        readiness: {
+          inventoryRevision: 10,
+          initialScanState: 'complete',
+          initialScanStartedAt: 1,
+          initialScanFinishedAt: 2,
+          blockedSubsystems: [],
+          startupRecoveryConcurrencyLimit: 1,
+          startupRecoveryPeak: 0,
+          initialScanDurationMs: 1,
+        },
+        souls: [{
+          soulId: 'managed-close-soul',
+          desiredState: 'stopped',
+          recoveryState: 'stopped',
+        }],
+        viewIntents: [{
+          viewId: 'managed-close-view',
+          soulId: 'managed-close-soul',
+          visibility: 'hidden',
+          revision: 2,
+          soulIntentRevision: 7,
+        }],
+        pendingProjectionCount: 0,
+      })
       let stopped = false
       mockManagedVisibility.mockImplementation(async (viewId, visibility, revision, soulRevision) => {
         expect(stopped).toBe(true)

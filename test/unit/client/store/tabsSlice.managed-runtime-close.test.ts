@@ -31,13 +31,20 @@ import { resetPersistBroadcastForTests } from '../../../../src/store/persistBroa
 import { LAYOUT_WINDOW_ID_STORAGE_KEY } from '../../../../src/store/storage-keys'
 
 const apiMocks = vi.hoisted(() => ({
+  getManagedRuntimeSoul: vi.fn(),
   getManagedRuntimeInventory: vi.fn(),
   updateManagedRuntimeViewVisibility: vi.fn(),
 }))
 
 vi.mock('@/lib/api', async (importOriginal) => {
   const original = await importOriginal<typeof import('@/lib/api')>()
-  return { ...original, ...apiMocks }
+  return {
+    ...original,
+    ...apiMocks,
+    updateManagedRuntimeViewVisibility: (...args: unknown[]) => (
+      apiMocks.updateManagedRuntimeViewVisibility(...args.slice(0, 4))
+    ),
+  }
 })
 
 const wsMock = vi.hoisted(() => ({
@@ -355,6 +362,17 @@ function createCancelledManagedPaneCloseFixture(layoutWindowId: string) {
 describe('closeTab managed runtime visibility', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    apiMocks.getManagedRuntimeSoul.mockReset()
+    apiMocks.getManagedRuntimeSoul.mockImplementation(async (soulId: string) => {
+      const snapshot = await apiMocks.getManagedRuntimeInventory() as ManagedRuntimeInventorySnapshot
+      return {
+        revision: snapshot.revision,
+        readiness: snapshot.readiness,
+        soul: snapshot.souls.find((entry) => entry.soulId === soulId)!,
+        viewIntents: snapshot.viewIntents.filter((entry) => entry.soulId === soulId),
+        actualUsage: null,
+      }
+    })
     wsMock.handlers.clear()
     wsMock.sent = []
     wsMock.holdPaneOpenedResults = false
@@ -670,13 +688,13 @@ describe('closeTab managed runtime visibility', () => {
 
     await store.dispatch(closeTab('managed-tab'))
     expect(store.getState().tabs.tabs).toHaveLength(1)
-    expect(serverSnapshot.viewIntents.map((entry) => entry.visibility)).toEqual(['detached', 'visible'])
+    expect(serverSnapshot.viewIntents.map((entry) => entry.visibility)).toEqual(['visible', 'visible'])
     expect(wsMock.sent.some((message: any) => message.type === 'pane.opened')).toBe(true)
 
     await store.dispatch(closeTab('managed-tab'))
     expect(store.getState().tabs.tabs).toHaveLength(0)
     expect(serverSnapshot.viewIntents.map((entry) => entry.visibility)).toEqual(['detached', 'detached'])
-    expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledTimes(3)
+    expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledTimes(6)
   })
 
   it('refreshes managed handles and reasserts every restored pane before promoting its views', async () => {
@@ -1789,6 +1807,14 @@ describe('closeTab managed runtime visibility', () => {
     let serverSnapshot = inventory(8, [view('view-a', 0)])
     const store = createStore(['view-a'], serverSnapshot)
     let failNextConfirmation = false
+    let failNextPatchResponse = true
+    apiMocks.getManagedRuntimeSoul.mockImplementation(async (soulId: string) => ({
+      revision: serverSnapshot.revision,
+      readiness: serverSnapshot.readiness,
+      soul: serverSnapshot.souls.find((entry) => entry.soulId === soulId)!,
+      viewIntents: serverSnapshot.viewIntents.filter((entry) => entry.soulId === soulId),
+      actualUsage: null,
+    }))
     apiMocks.getManagedRuntimeInventory.mockImplementation(async () => {
       if (failNextConfirmation) {
         failNextConfirmation = false
@@ -1801,9 +1827,10 @@ describe('closeTab managed runtime visibility', () => {
       visibility: ManagedRuntimeViewIntent['visibility'],
     ) => {
       serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
-      if (visibility === 'detached') {
+      if (visibility === 'detached' && failNextPatchResponse) {
+        failNextPatchResponse = false
         failNextConfirmation = true
-        throw new Error('PATCH response lost after commit')
+        throw new SyntaxError('Invalid response JSON')
       }
       return serverSnapshot.viewIntents.find((entry) => entry.viewId === viewId)
     })
@@ -1818,16 +1845,16 @@ describe('closeTab managed runtime visibility', () => {
       terminalId: 'terminal-soul-view-a',
     })
     const paneAfterFailedDetach = collectContent(store.getState().panes.layouts['managed-tab']!, 'managed-pane-0')
-    expect(paneAfterFailedDetach?.closeError).toContain('managed view')
-    expect(serverSnapshot.viewIntents[0]?.visibility).toBe('detached')
-    expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledTimes(1)
+    expect(paneAfterFailedDetach?.closeError).toBe('The pane could not be closed, so it was left open. Try again.')
+    expect(serverSnapshot.viewIntents[0]?.visibility).toBe('visible')
+    expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledTimes(2)
 
     await store.dispatch(replacePaneWithCleanup({ tabId: 'managed-tab', paneId: 'managed-pane-0' }))
 
     expect(collectContent(store.getState().panes.layouts['managed-tab']!, 'managed-pane-0')).toEqual({ kind: 'picker' })
     expect(store.getState().tabs.tabs[0]?.viewIntentId).toBeUndefined()
     expect(serverSnapshot.viewIntents[0]?.visibility).toBe('detached')
-    expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledTimes(1)
+    expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledTimes(3)
   })
 
   it('preserves a fresh shell when closing and reopening a tab after replacing its managed pane', async () => {

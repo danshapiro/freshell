@@ -1,11 +1,20 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 
-const { mockSend, handlers, mockManagedRuntimeViewVisibility, mockGetManagedRuntimeSoul } = vi.hoisted(() => ({
+const {
+  mockSend,
+  handlers,
+  mockManagedRuntimeViewVisibility,
+  mockGetManagedRuntimeSoul,
+  mockGetManagedRuntimeInventory,
+  mockManagedRuntimeViews,
+} = vi.hoisted(() => ({
   mockSend: vi.fn(),
   handlers: new Set<(msg: unknown) => void>(),
   mockManagedRuntimeViewVisibility: vi.fn(),
   mockGetManagedRuntimeSoul: vi.fn(),
+  mockGetManagedRuntimeInventory: vi.fn(),
+  mockManagedRuntimeViews: new Map<string, unknown>(),
 }))
 
 vi.mock('@/lib/ws-client', () => ({
@@ -20,10 +29,24 @@ vi.mock('@/lib/ws-client', () => ({
   }),
 }))
 
-vi.mock('@/lib/api', () => ({
-  updateManagedRuntimeViewVisibility: mockManagedRuntimeViewVisibility,
-  getManagedRuntimeSoul: mockGetManagedRuntimeSoul,
-}))
+vi.mock('@/lib/api', async (importOriginal) => {
+  const original = await importOriginal<typeof import('@/lib/api')>()
+  return {
+    ...original,
+    updateManagedRuntimeViewVisibility: (...args: unknown[]) => {
+      const result = mockManagedRuntimeViewVisibility(...args)
+      return Promise.resolve(result).then((view: unknown) => {
+        if (view && typeof view === 'object' && 'viewId' in view) {
+          const viewId = (view as { viewId?: unknown }).viewId
+          if (typeof viewId === 'string') mockManagedRuntimeViews.set(viewId, view)
+        }
+        return view
+      })
+    },
+    getManagedRuntimeSoul: mockGetManagedRuntimeSoul,
+    getManagedRuntimeInventory: mockGetManagedRuntimeInventory,
+  }
+})
 
 import tabsReducer, {
   addTab,
@@ -34,10 +57,16 @@ import tabsReducer, {
 } from '@/store/tabsSlice'
 import panesReducer, { initLayout, splitPane, setPaneCloseError, addPane, replacePane, updatePaneContent, hydratePanes, clearDeadTerminals, clearTerminalLiveHandles, repairCodexIdentityMismatch, swapPanes, closePane, removeLayout } from '@/store/panesSlice'
 import connectionReducer from '@/store/connectionSlice'
+import managedRuntimeReducer, { setManagedRuntimeAvailable } from '@/store/managedRuntimeSlice'
 import { terminalDetachMiddleware } from '@/store/terminalDetachMiddleware'
 import { KILL_ACK_TIMEOUT_MS } from '@/lib/kill-ack'
 import { collectPaneEntries } from '@/lib/pane-utils'
 import type { PaneContent } from '@/store/paneTypes'
+import type {
+  ManagedRuntimeInventorySnapshot,
+  ManagedRuntimeSoul,
+  ManagedRuntimeViewIntent,
+} from '@shared/managed-runtime'
 
 /**
  * Focused-episode-7 round 2, Finding F2 — the close gate. The pane.close
@@ -146,6 +175,45 @@ function managedViewResult(
   }
 }
 
+function managedInventory(views: ManagedRuntimeViewIntent[]): ManagedRuntimeInventorySnapshot {
+  const soulIds = [...new Set(views.map((view) => view.soulId))]
+  const souls: ManagedRuntimeSoul[] = soulIds.map((soulId) => {
+    const suffix = soulId.replace('soul-view-', '')
+    return {
+      soulId,
+      incarnationId: `incarnation-${soulId}`,
+      launchState: 'running',
+      cleanupState: 'none',
+      intentRevision: 9,
+      executionGeneration: 1,
+      terminalId: `term-${suffix}`,
+      terminalCreateRequestId: `req-${suffix}`,
+      desiredState: 'running',
+      recoveryState: 'live',
+      durabilityState: 'resume_captured',
+      allocationState: 'verified_durable',
+      evidenceRevision: 1,
+      successfulRecoveriesInWindow: 0,
+    }
+  })
+  return {
+    revision: 100,
+    readiness: {
+      inventoryRevision: 100,
+      initialScanState: 'complete',
+      initialScanStartedAt: 1,
+      initialScanFinishedAt: 2,
+      blockedSubsystems: [],
+      startupRecoveryConcurrencyLimit: 1,
+      startupRecoveryPeak: 1,
+      initialScanDurationMs: 1,
+    },
+    souls,
+    viewIntents: views,
+    pendingProjectionCount: 0,
+  }
+}
+
 function managedSoulDetail(
   viewIntentId: string,
   visibility: 'visible' | 'detached',
@@ -167,7 +235,12 @@ function createStore(preloadedState?: {
   connection: ReturnType<typeof connectionReducer>
 }) {
   return configureStore({
-    reducer: { tabs: tabsReducer, panes: panesReducer, connection: connectionReducer },
+    reducer: {
+      tabs: tabsReducer,
+      panes: panesReducer,
+      connection: connectionReducer,
+      managedRuntime: managedRuntimeReducer,
+    },
     middleware: (getDefault) => getDefault().concat(terminalDetachMiddleware as any),
     preloadedState,
   })
@@ -194,6 +267,7 @@ function createTwoPaneStore(opts?: { cridB?: string; terminalIdB?: string; termi
 
 function createManagedTwoPaneStore(legacyViewId?: string) {
   const store = createStore()
+  store.dispatch(setManagedRuntimeAvailable(true))
   store.dispatch(addTab({ id: 'tab-1', mode: 'shell' }))
   store.dispatch(initLayout({
     tabId: 'tab-1',
@@ -208,6 +282,7 @@ function createManagedTwoPaneStore(legacyViewId?: string) {
     newPaneId: 'pane-2',
   }))
   mockSend.mockClear()
+  installManagedViewBackend()
   if (legacyViewId) {
     const state = structuredClone(store.getState())
     const legacy = collectPaneEntries(state.panes.layouts['tab-1']).find(({ content }) => (
@@ -231,6 +306,8 @@ function installManagedViewBackend() {
     ['view-a', managedViewResult('view-a', 'visible', 2, 7)],
     ['view-b', managedViewResult('view-b', 'visible', 3, 8)],
   ])
+  mockManagedRuntimeViews.clear()
+  for (const [viewId, view] of views) mockManagedRuntimeViews.set(viewId, view)
   const mutate = async (viewId: string, visibility: 'visible' | 'detached', revision: number, soulRevision: number) => {
     const current = views.get(viewId)!
     if (revision !== current.revision || soulRevision !== current.soulIntentRevision) {
@@ -240,6 +317,7 @@ function installManagedViewBackend() {
     // including a visible -> visible mutation (view_intents.rs).
     const next = managedViewResult(viewId, visibility, revision + 1, soulRevision)
     views.set(viewId, next)
+    mockManagedRuntimeViews.set(viewId, next)
     return next
   }
   mockManagedRuntimeViewVisibility.mockImplementation(mutate)
@@ -247,6 +325,9 @@ function installManagedViewBackend() {
     const view = views.get(soulId.replace(/^soul-/, ''))!
     return managedSoulDetail(view.viewId, view.visibility, view.revision, view.soulIntentRevision)
   })
+  mockGetManagedRuntimeInventory.mockImplementation(async () => ({
+    ...managedInventory([...mockManagedRuntimeViews.values()] as ManagedRuntimeViewIntent[]),
+  }))
   return { views, mutate }
 }
 
@@ -307,6 +388,7 @@ beforeEach(() => {
   handlers.clear()
   mockManagedRuntimeViewVisibility.mockReset()
   mockGetManagedRuntimeSoul.mockReset()
+  mockGetManagedRuntimeInventory.mockReset()
 })
 
 afterEach(() => {
@@ -534,30 +616,21 @@ describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
   it.each(managedCloseCases.flatMap((closeCase) => [
     { ...closeCase, legacy: false },
     ...(closeCase.name === 'tab' ? [] : [{ ...closeCase, legacy: true }]),
-  ]))('keeps an older repair read inert while a newer $name close is still pending (legacy=$legacy)', async ({ viewId, start, legacy }) => {
+  ]))('keeps an older repair read inert after a newer $name close confirms the committed detach (legacy=$legacy)', async ({ viewId, start, legacy }) => {
     vi.useFakeTimers()
     const store = createManagedTwoPaneStore(legacy ? viewId : undefined)
     const backend = installManagedViewBackend()
     const originalResponse = deferred<ReturnType<typeof managedViewResult>>()
-    const retryResponse = deferred<ReturnType<typeof managedViewResult>>()
     const read = deferred<ReturnType<typeof managedSoulDetail>>()
     let originalResult!: ReturnType<typeof managedViewResult>
     let detachCount = 0
     mockManagedRuntimeViewVisibility.mockImplementation(async (id, visibility, revision, soulRevision) => {
-      if (legacy && id === viewId && visibility === 'detached' && detachCount === 1) {
-        detachCount++
-        // Keep the stale-fence legacy retry pending until its response; its
-        // absent create identity means Redux supplies no pending close flag.
-        await retryResponse.promise
-        return backend.mutate(id, visibility, revision, soulRevision)
-      }
       const result = await backend.mutate(id, visibility, revision, soulRevision)
       if (id === viewId && visibility === 'detached') {
         if (++detachCount === 1) {
           originalResult = result
           return originalResponse.promise
         }
-        return retryResponse.promise
       }
       return result
     })
@@ -573,6 +646,7 @@ describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
     ackAllPaneCloses()
     ackPanesClosedBatches()
     await vi.advanceTimersByTimeAsync(0)
+    await retry
     const callsBeforeRead = mockManagedRuntimeViewVisibility.mock.calls.length
     const current = backend.views.get(viewId)!
     read.resolve(managedSoulDetail(viewId, current.visibility, current.revision, current.soulIntentRevision))
@@ -580,11 +654,7 @@ describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
     await vi.advanceTimersByTimeAsync(0)
     expect(mockManagedRuntimeViewVisibility.mock.calls).toHaveLength(callsBeforeRead)
     expect(backend.views.get(viewId)?.visibility).toBe('detached')
-    retryResponse.resolve(current)
-    await vi.advanceTimersByTimeAsync(0)
-    await retry
-    expect(paneContents(store, 'tab-1').some(({ content }) => (content as { viewIntentId?: string }).viewIntentId === viewId)).toBe(legacy)
-    expect(backend.views.get(viewId)?.visibility).toBe(legacy ? 'visible' : 'detached')
+    expect(paneContents(store, 'tab-1').some(({ content }) => (content as { viewIntentId?: string }).viewIntentId === viewId)).toBe(false)
   })
 
   it.each(managedCloseCases)('retains an older repair when a newer $name close fails before its visibility transaction', async ({ viewId, start }) => {
@@ -660,20 +730,7 @@ describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
   })
 
   it('detaches a managed pane after close evidence and before removing its layout', async () => {
-    const store = createStore()
-    store.dispatch(addTab({ id: 'tab-1', mode: 'shell' }))
-    store.dispatch(initLayout({
-      tabId: 'tab-1',
-      paneId: 'pane-1',
-      content: terminalContent('req-a', 'term-a'),
-    }))
-    store.dispatch(splitPane({
-      tabId: 'tab-1',
-      paneId: 'pane-1',
-      direction: 'vertical',
-      newContent: managedTerminalContent('req-b', 'term-b', 'view-b', 4, 9),
-      newPaneId: 'pane-2',
-    }))
+    const store = createManagedTwoPaneStore()
     mockSend.mockClear()
     mockManagedRuntimeViewVisibility.mockResolvedValue(
       managedViewResult('view-b', 'detached', 5, 10),
@@ -683,26 +740,13 @@ describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
     ackAllPaneCloses()
     await close
 
-    expectManagedVisibilityCall(1, ['view-b', 'detached', 4, 9])
+    expectManagedVisibilityCall(1, ['view-b', 'detached', 3, 8])
     expect(paneContents(store, 'tab-1').map((pane) => pane.paneId)).toEqual(['pane-1'])
   })
 
   it('keeps the tab open, reasserts panes, and rolls back earlier managed detaches when one refuses', async () => {
     mockGetManagedRuntimeSoul.mockResolvedValue(managedSoulDetail('view-b', 'visible', 3, 8))
-    const store = createStore()
-    store.dispatch(addTab({ id: 'tab-1', mode: 'shell' }))
-    store.dispatch(initLayout({
-      tabId: 'tab-1',
-      paneId: 'pane-1',
-      content: managedTerminalContent('req-a', 'term-a', 'view-a', 2, 7),
-    }))
-    store.dispatch(splitPane({
-      tabId: 'tab-1',
-      paneId: 'pane-1',
-      direction: 'vertical',
-      newContent: managedTerminalContent('req-b', 'term-b', 'view-b', 3, 8),
-      newPaneId: 'pane-2',
-    }))
+    const store = createManagedTwoPaneStore()
     mockSend.mockClear()
     mockManagedRuntimeViewVisibility
       .mockImplementation(async (viewId, visibility, revision, soulRevision) => managedViewResult(viewId, visibility, revision + 1, soulRevision))
