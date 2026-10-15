@@ -5111,6 +5111,46 @@ describe('TerminalView lifecycle updates', () => {
     expectTerminalWriteContaining(term, 'Input not sent: Codex is checking whether the session is still active. Try again in a moment.')
   })
 
+  it.each(['opencode', 'codex'] as const)('shows terminal-scoped managed input feedback in ordinary %s mode', async mode => {
+    const terminalId = `term-managed-${mode}`
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal({ terminalId, status: 'running', mode })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+
+    const term = terminalInstances[0]
+    term.write.mockClear()
+    for (const [reason, notice] of [
+      ['managed_recovery_pending', 'Input not sent: this managed session is recovering. Try again when the provider prompt returns.'],
+      ['managed_recovery_blocked', 'Input not sent: managed recovery is blocked. Repair the provider dependency, then retry this pane.'],
+    ] as const) {
+      const writesBeforeForeignFrame = term.write.mock.calls.length
+      act(() => {
+        messageHandler!({ type: 'terminal.input.blocked', terminalId: 'foreign-terminal', reason })
+      })
+      expect(term.write.mock.calls).toHaveLength(writesBeforeForeignFrame)
+
+      act(() => {
+        messageHandler!({ type: 'terminal.input.blocked', terminalId, reason })
+      })
+      expectTerminalWriteContaining(term, notice)
+      expect(term.write.mock.calls).toHaveLength(writesBeforeForeignFrame + 1)
+
+      act(() => {
+        messageHandler!({ type: 'terminal.input.blocked', terminalId, reason })
+      })
+      expect(term.write.mock.calls).toHaveLength(writesBeforeForeignFrame + 1)
+    }
+  })
+
   it('shows feedback when input is blocked because the terminal no longer exists', async () => {
     const { store, tabId, paneId, paneContent } = setupThemeTerminal({
       terminalId: 'term-gone',

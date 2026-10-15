@@ -68,7 +68,7 @@ use freshell_protocol::{
     TerminalDetach, TerminalIdOnly, TerminalInputBlocked, TerminalInputBlockedReason, TerminalKill,
     TerminalResize, FRESH_AGENT_DISABLED_REFUSAL, LEGACY_RESUME_IDENTITY_REFUSAL,
 };
-use freshell_terminal::registry::ManagedTerminalLaunch;
+use freshell_terminal::registry::{ManagedTerminalInputError, ManagedTerminalLaunch};
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
 use crate::WsState;
@@ -80,6 +80,10 @@ mod terminal_create_ordering_tests;
 #[cfg(test)]
 #[path = "terminal_launch_prep_tests.rs"]
 mod terminal_launch_prep_tests;
+
+#[cfg(test)]
+#[path = "terminal_managed_input_tests.rs"]
+mod terminal_managed_input_tests;
 
 #[path = "connection_writer.rs"]
 mod connection_writer;
@@ -3519,7 +3523,7 @@ mod managed_runtime_id_tests {
     };
     use freshell_terminal::registry::{
         ManagedOutputRead, ManagedTerminalController, ManagedTerminalDescriptor,
-        ManagedTerminalFuture, ManagedTerminalLaunch,
+        ManagedTerminalFuture, ManagedTerminalInputError, ManagedTerminalLaunch,
     };
     use std::sync::Arc;
 
@@ -3585,7 +3589,7 @@ mod managed_runtime_id_tests {
             &'a self,
             _: ManagedTerminalDescriptor,
             _: String,
-        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+        ) -> ManagedTerminalFuture<'a, Result<(), ManagedTerminalInputError>> {
             Box::pin(async { panic!("capture must not receive terminal input") })
         }
 
@@ -3763,7 +3767,7 @@ mod managed_runtime_id_tests {
             &'a self,
             _terminal: ManagedTerminalDescriptor,
             _data: String,
-        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+        ) -> ManagedTerminalFuture<'a, Result<(), ManagedTerminalInputError>> {
             Box::pin(async { Ok(()) })
         }
 
@@ -9130,19 +9134,17 @@ fn unknown_terminal_input_blocked(terminal_id: &str) -> ServerMessage {
     })
 }
 
-fn managed_input_blocked_reason(detail: &str) -> Option<TerminalInputBlockedReason> {
-    let normalized = detail.to_ascii_lowercase();
-    if normalized.contains("recovery is in progress")
-        || normalized.contains("input was not dispatched")
-    {
-        Some(TerminalInputBlockedReason::ManagedRecoveryPending)
-    } else if normalized.contains("recovery ended in blocked")
-        || normalized.contains("recovery is blocked")
-        || normalized.contains("blocked_retry_budget")
-    {
-        Some(TerminalInputBlockedReason::ManagedRecoveryBlocked)
-    } else {
-        None
+fn managed_input_blocked_reason(
+    error: &ManagedTerminalInputError,
+) -> Option<TerminalInputBlockedReason> {
+    match error {
+        ManagedTerminalInputError::RecoveryPending => {
+            Some(TerminalInputBlockedReason::ManagedRecoveryPending)
+        }
+        ManagedTerminalInputError::RecoveryBlocked => {
+            Some(TerminalInputBlockedReason::ManagedRecoveryBlocked)
+        }
+        ManagedTerminalInputError::Unavailable(_) => None,
     }
 }
 
@@ -12262,14 +12264,12 @@ mod terminal_dims_range_tests {
 
     #[test]
     fn managed_recovery_input_is_visibly_fenced() {
-        let pending = managed_input_blocked_reason(
-            "managed soul recovery is in progress; input was not dispatched",
-        )
-        .expect("pending recovery reason");
-        let blocked = managed_input_blocked_reason(
-            "managed soul recovery ended in Blocked: BLOCKED_RETRY_BUDGET",
-        )
-        .expect("blocked recovery reason");
+        let pending =
+            managed_input_blocked_reason(&super::ManagedTerminalInputError::RecoveryPending)
+                .expect("pending recovery reason");
+        let blocked =
+            managed_input_blocked_reason(&super::ManagedTerminalInputError::RecoveryBlocked)
+                .expect("blocked recovery reason");
         assert_eq!(pending, TerminalInputBlockedReason::ManagedRecoveryPending);
         assert_eq!(blocked, TerminalInputBlockedReason::ManagedRecoveryBlocked);
 
@@ -12547,7 +12547,7 @@ mod pane_reconcile_gate_tests {
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >;
 
-    async fn loopback_sink_and_client() -> (WsSink, TestClient) {
+    pub(super) async fn loopback_sink_and_client() -> (WsSink, TestClient) {
         let (sink_tx, sink_rx) = tokio::sync::oneshot::channel::<WsSink>();
         let sink_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(sink_tx)));
         let router = axum::Router::new().route(
@@ -12593,7 +12593,7 @@ mod pane_reconcile_gate_tests {
         (sink, client)
     }
 
-    async fn next_text_frame(client: &mut TestClient) -> serde_json::Value {
+    pub(super) async fn next_text_frame(client: &mut TestClient) -> serde_json::Value {
         let msg = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
             .await
             .expect("frame within timeout")
@@ -12869,8 +12869,12 @@ mod managed_output_order_tests {
             &'a self,
             _: ManagedTerminalDescriptor,
             _: String,
-        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
-            Box::pin(async { Err("unused input".into()) })
+        ) -> ManagedTerminalFuture<'a, Result<(), ManagedTerminalInputError>> {
+            Box::pin(async {
+                Err(ManagedTerminalInputError::Unavailable(
+                    "unused input".into(),
+                ))
+            })
         }
 
         fn resize<'a>(

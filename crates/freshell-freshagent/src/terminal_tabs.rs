@@ -4039,7 +4039,7 @@ mod tests {
     use axum::Router;
     use freshell_terminal::registry::{
         ManagedOutputRead, ManagedTerminalController, ManagedTerminalDescriptor,
-        ManagedTerminalFuture,
+        ManagedTerminalFuture, ManagedTerminalInputError,
     };
     use std::sync::Arc;
     use tower::util::ServiceExt;
@@ -7130,7 +7130,7 @@ if (args.includes('app-server')) {{
             &'a self,
             terminal: ManagedTerminalDescriptor,
             data: String,
-        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+        ) -> ManagedTerminalFuture<'a, Result<(), ManagedTerminalInputError>> {
             UnusedManagedController.input(terminal, data)
         }
 
@@ -7257,8 +7257,15 @@ if (args.includes('app-server')) {{
             &'a self,
             _: freshell_terminal::registry::ManagedTerminalDescriptor,
             _: String,
-        ) -> freshell_terminal::registry::ManagedTerminalFuture<'a, Result<(), String>> {
-            Box::pin(async { Err("unexpected managed input".into()) })
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<
+            'a,
+            Result<(), ManagedTerminalInputError>,
+        > {
+            Box::pin(async {
+                Err(ManagedTerminalInputError::Unavailable(
+                    "unexpected managed input".into(),
+                ))
+            })
         }
 
         fn resize<'a>(

@@ -61,7 +61,7 @@ impl ManagedTerminalController for Controller {
         &'a self,
         _: ManagedTerminalDescriptor,
         _: String,
-    ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+    ) -> ManagedTerminalFuture<'a, Result<(), ManagedTerminalInputError>> {
         panic!("output recovery must not replay input")
     }
     fn resize<'a>(

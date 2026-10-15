@@ -11,7 +11,7 @@ use freshell_runtime_protocol::{
 };
 use freshell_terminal::registry::{
     ManagedOutputChunk, ManagedOutputRead, ManagedTerminalController, ManagedTerminalDescriptor,
-    ManagedTerminalFuture, ManagedTerminalLaunch,
+    ManagedTerminalFuture, ManagedTerminalInputError, ManagedTerminalLaunch,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -440,14 +440,12 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
         &'a self,
         terminal: ManagedTerminalDescriptor,
         data: String,
-    ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+    ) -> ManagedTerminalFuture<'a, Result<(), ManagedTerminalInputError>> {
         Box::pin(async move {
             let soul_key = terminal.soul_id;
             let soul = SoulId::parse(&soul_key).map_err(|e| e.to_string())?;
             if self.recovery_in_flight(&soul_key).await {
-                return Err(
-                    "managed soul recovery is in progress; input was not dispatched".into(),
-                );
+                return Err(ManagedTerminalInputError::RecoveryPending);
             }
             if self.blocked_recovery(&soul_key).await?.is_some() {
                 // New user input is an explicit retry/repair signal. Re-arm the
@@ -457,21 +455,25 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     .client
                     .recover(soul.clone(), RecoveryTrigger::ManualRetry)
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(managed_terminal_input_error)?;
                 self.recovery.record_result(&soul_key, &recovered).await;
                 match recovered.outcome {
                     RecoveryOutcome::Reattached
                     | RecoveryOutcome::Replaced
                     | RecoveryOutcome::AlreadyLive => {}
                     _ => {
-                        return Err(recovery_failure_message(&recovered));
+                        return Err(if recovery_pending(&recovered) {
+                            ManagedTerminalInputError::RecoveryPending
+                        } else {
+                            ManagedTerminalInputError::RecoveryBlocked
+                        });
                     }
                 }
             }
             self.client
                 .input(RequestId::new(), soul, data)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(managed_terminal_input_error)?;
             Ok(())
         })
     }
@@ -633,6 +635,16 @@ fn recoverable_host_error(error: &ClientError) -> bool {
                 | RuntimeErrorCode::BackendUnavailable
         )
     )
+}
+
+fn managed_terminal_input_error(error: ClientError) -> ManagedTerminalInputError {
+    match error.runtime_code() {
+        Some(RuntimeErrorCode::RecoveryInProgress) => ManagedTerminalInputError::RecoveryPending,
+        Some(RuntimeErrorCode::RecoveryBlocked | RuntimeErrorCode::RecoveryRetryBudget) => {
+            ManagedTerminalInputError::RecoveryBlocked
+        }
+        _ => ManagedTerminalInputError::Unavailable(error.to_string()),
+    }
 }
 
 fn recovery_pending(result: &RecoveryResult) -> bool {
@@ -2712,3 +2724,7 @@ mod tests {
 #[cfg(all(test, unix))]
 #[path = "managed_output_rpc_tests.rs"]
 mod managed_output_rpc_tests;
+
+#[cfg(all(test, unix))]
+#[path = "managed_input_rpc_tests.rs"]
+mod managed_input_rpc_tests;

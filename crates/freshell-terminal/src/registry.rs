@@ -849,6 +849,33 @@ pub struct ManagedTerminalLaunch {
 
 pub type ManagedTerminalFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Preserve undispatched input refusals across the controller boundary without
+/// depending on provider or recovery message text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedTerminalInputError {
+    RecoveryPending,
+    RecoveryBlocked,
+    Unavailable(String),
+}
+
+impl From<String> for ManagedTerminalInputError {
+    fn from(detail: String) -> Self {
+        Self::Unavailable(detail)
+    }
+}
+
+impl std::fmt::Display for ManagedTerminalInputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RecoveryPending => formatter.write_str("managed terminal recovery is pending"),
+            Self::RecoveryBlocked => formatter.write_str("managed terminal recovery is blocked"),
+            Self::Unavailable(detail) => formatter.write_str(detail),
+        }
+    }
+}
+
+impl std::error::Error for ManagedTerminalInputError {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedOutputChunk {
     pub seq_start: i64,
@@ -890,7 +917,7 @@ pub trait ManagedTerminalController: Send + Sync {
         &'a self,
         terminal: ManagedTerminalDescriptor,
         data: String,
-    ) -> ManagedTerminalFuture<'a, Result<(), String>>;
+    ) -> ManagedTerminalFuture<'a, Result<(), ManagedTerminalInputError>>;
     fn resize<'a>(
         &'a self,
         terminal: ManagedTerminalDescriptor,
@@ -4689,7 +4716,11 @@ impl TerminalRegistry {
         controller.launch(request).await
     }
 
-    pub async fn managed_input(&self, terminal_id: &str, data: String) -> Result<(), String> {
+    pub async fn managed_input(
+        &self,
+        terminal_id: &str,
+        data: String,
+    ) -> Result<(), ManagedTerminalInputError> {
         let terminal = self
             .managed_descriptor(terminal_id)
             .ok_or_else(|| "managed terminal not found".to_string())?;
