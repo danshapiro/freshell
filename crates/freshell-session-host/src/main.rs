@@ -2138,6 +2138,170 @@ fn install_provider_resource_reference_aliases(
     Ok((installed, removed))
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderResourceReferenceAliasPlan {
+    active: Vec<ProviderResourceReferenceAliasInstall>,
+    retired: Vec<ProviderResourceReferenceAliasRetirement>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderResourceReferenceAliasInstall {
+    mount_root: String,
+    relative_path: String,
+    reference_index: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderResourceReferenceAliasRetirement {
+    mount_root: String,
+    relative_path: String,
+}
+
+impl ProviderResourceReferenceAliasInstall {
+    fn provider_path(&self) -> PathBuf {
+        Path::new(&self.mount_root).join(&self.relative_path)
+    }
+}
+
+impl ProviderResourceReferenceAliasRetirement {
+    fn provider_path(&self) -> PathBuf {
+        Path::new(&self.mount_root).join(&self.relative_path)
+    }
+}
+
+fn provider_resource_reference_alias_plan(
+    context: &freshell_runtime_protocol::ProviderLaunchContext,
+) -> Result<ProviderResourceReferenceAliasPlan, String> {
+    use freshell_runtime_protocol::ProviderResourceKind;
+
+    let mut plan = ProviderResourceReferenceAliasPlan::default();
+    let mut paths = std::collections::BTreeSet::new();
+    for mount in context
+        .prepared_inputs
+        .iter()
+        .flat_map(|inputs| &inputs.resource_mounts)
+    {
+        if mount.reference_aliases.is_empty() && mount.retired_reference_aliases.is_empty() {
+            continue;
+        }
+        if mount.kind != ProviderResourceKind::Directory {
+            return Err("provider reference aliases require a directory resource".into());
+        }
+        for alias in &mount.reference_aliases {
+            let path = Path::new(&alias.relative_path);
+            if path.as_os_str().is_empty()
+                || path.is_absolute()
+                || path
+                    .components()
+                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            {
+                return Err("provider reference alias path is unsafe".into());
+            }
+            let provider_path = Path::new(&mount.provider_relative_path).join(path);
+            if !paths.insert(provider_path.to_string_lossy().into_owned()) {
+                return Err("provider reference alias paths overlap".into());
+            }
+            plan.active.push(ProviderResourceReferenceAliasInstall {
+                mount_root: mount.provider_relative_path.clone(),
+                relative_path: alias.relative_path.clone(),
+                reference_index: alias.reference_index,
+            });
+        }
+        for relative in &mount.retired_reference_aliases {
+            let path = Path::new(relative);
+            if path.as_os_str().is_empty()
+                || path.is_absolute()
+                || path
+                    .components()
+                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            {
+                return Err("provider reference alias path is unsafe".into());
+            }
+            let provider_path = Path::new(&mount.provider_relative_path).join(path);
+            if !paths.insert(provider_path.to_string_lossy().into_owned()) {
+                return Err("provider reference alias paths overlap".into());
+            }
+            plan.retired.push(ProviderResourceReferenceAliasRetirement {
+                mount_root: mount.provider_relative_path.clone(),
+                relative_path: relative.clone(),
+            });
+        }
+    }
+    plan.active.sort_by_key(|alias| alias.provider_path());
+    plan.retired.sort_by_key(|alias| alias.provider_path());
+    provider_resource_reference_alias_paths(&plan)?;
+    Ok(plan)
+}
+
+fn provider_resource_reference_alias_paths(
+    plan: &ProviderResourceReferenceAliasPlan,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let resource_roots = Path::new(".freshell/provider-roots");
+    let mut paths = std::collections::BTreeSet::new();
+    let mut parsed = Vec::new();
+    for (mount_root, relative_path) in plan
+        .active
+        .iter()
+        .map(|alias| (alias.mount_root.as_str(), alias.relative_path.as_str()))
+        .chain(
+            plan.retired
+                .iter()
+                .map(|alias| (alias.mount_root.as_str(), alias.relative_path.as_str())),
+        )
+    {
+        let mount_root = Path::new(mount_root);
+        let relative_path = Path::new(relative_path);
+        let safe_relative = |path: &Path| {
+            !path.as_os_str().is_empty()
+                && !path.is_absolute()
+                && path
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+        };
+        if !safe_relative(mount_root)
+            || !mount_root.starts_with(resource_roots)
+            || mount_root.components().count() <= resource_roots.components().count()
+            || !safe_relative(relative_path)
+        {
+            return Err("provider reference alias metadata has an invalid path".into());
+        }
+        let path = mount_root.join(relative_path);
+        let path = path
+            .to_str()
+            .ok_or("provider reference alias path is not UTF-8")?
+            .to_owned();
+        if !paths.insert(path.clone()) {
+            return Err("provider reference alias paths overlap".into());
+        }
+        parsed.push(PathBuf::from(path));
+    }
+    for (index, path) in parsed.iter().enumerate() {
+        if parsed
+            .iter()
+            .skip(index + 1)
+            .any(|other| path != other && (path.starts_with(other) || other.starts_with(path)))
+        {
+            return Err("provider reference alias paths overlap".into());
+        }
+    }
+    Ok(paths)
+}
+
+fn provider_reference_alias_overlaps_selected_paths(
+    plan: &ProviderResourceReferenceAliasPlan,
+    selected: &std::collections::BTreeSet<String>,
+) -> bool {
+    plan.active.iter().any(|alias| {
+        let alias_path = alias.provider_path();
+        selected
+            .iter()
+            .any(|path| Path::new(path).starts_with(&alias_path))
+    })
+}
+
 fn copy_provider_config_references_with_ownership(
     context: &freshell_runtime_protocol::ProviderLaunchContext,
     provider: &str,
@@ -2998,11 +3162,22 @@ fn refresh_provider_config_in_stage(
         preserved,
     )
     .map_err(|_| "preserved writable resource metadata write failed")?;
+    let reference_aliases = provider_resource_reference_alias_plan(context)?;
+    let reference_alias_metadata = freshell_runtime_protocol::bounded_json_bytes(
+        &reference_aliases,
+        MAX_PROJECTION_METADATA_BYTES,
+    )
+    .map_err(|_| "provider reference alias metadata profile exceeded")?;
+    std::fs::write(
+        stage.path().join("resource-reference-aliases.json"),
+        reference_alias_metadata,
+    )
+    .map_err(|_| "provider reference alias metadata write failed")?;
     allow_provider_read_stage(stage.path(), unsafe { libc::getegid() })?;
-    apply_staged_provider_config(stage.path(), provider_home)?;
-    record_provider_resource_reference_aliases(context, provider_home)
+    apply_staged_provider_config(stage.path(), provider_home)
 }
 
+#[cfg(test)]
 fn record_provider_resource_reference_aliases(
     context: &freshell_runtime_protocol::ProviderLaunchContext,
     provider_home: &Path,
@@ -3287,13 +3462,24 @@ fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<()
     let projection = stage.join("projection");
     let previous = read_projection_manifest(provider_home)?;
     let current = read_projection_manifest(&projection)?;
-    let protected: std::collections::BTreeSet<String> =
+    let mut protected: std::collections::BTreeSet<String> =
         match read_projection_metadata(stage, "private-mountpoints.json")? {
             Some(bytes) => {
                 serde_json::from_slice(&bytes).map_err(|_| "private mountpoint metadata invalid")?
             }
             None => Default::default(),
         };
+    let reference_aliases: ProviderResourceReferenceAliasPlan =
+        match read_projection_metadata(stage, "resource-reference-aliases.json")? {
+            Some(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|_| "provider reference alias metadata invalid")?,
+            None => Default::default(),
+        };
+    let reference_alias_paths = provider_resource_reference_alias_paths(&reference_aliases)?;
+    if provider_reference_alias_overlaps_selected_paths(&reference_aliases, &current) {
+        return Err("provider reference alias overlaps a selected resource file".into());
+    }
+    protected.retain(|relative| !reference_alias_paths.contains(relative));
     if protected.iter().any(|relative| {
         Path::new(relative).as_os_str().is_empty()
             || Path::new(relative)
@@ -3380,6 +3566,20 @@ fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<()
     }) {
         return Err("resource mountpoint metadata has an invalid owned root".into());
     }
+    if reference_aliases
+        .active
+        .iter()
+        .map(|alias| Path::new(&alias.mount_root))
+        .chain(
+            reference_aliases
+                .retired
+                .iter()
+                .map(|alias| Path::new(&alias.mount_root)),
+        )
+        .any(|root| !mounted.iter().any(|mounted_root| mounted_root == root))
+    {
+        return Err("provider reference alias is outside its mounted resource".into());
+    }
     let preserve_existing_mounted_files: Vec<PathBuf> =
         match read_projection_metadata(stage, "preserved-writable-resource-files.json")? {
             Some(bytes) => serde_json::from_slice::<Vec<String>>(&bytes)
@@ -3407,6 +3607,7 @@ fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<()
         protected: &protected,
         mounted: &mounted,
         preserve_existing_mounted_files: &preserve_existing_mounted_files,
+        reference_aliases,
     })
 }
 
@@ -3419,6 +3620,7 @@ struct ProviderProjection<'a> {
     protected: &'a std::collections::BTreeSet<String>,
     mounted: &'a [PathBuf],
     preserve_existing_mounted_files: &'a [PathBuf],
+    reference_aliases: ProviderResourceReferenceAliasPlan,
 }
 
 // One provider-owned transaction covers replacement, stale removal and manifest
@@ -3443,10 +3645,38 @@ fn publish_provider_projection_with_manifest(
         protected,
         mounted,
         preserve_existing_mounted_files,
+        reference_aliases,
     } = projection;
     use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt};
+    let reference_alias_paths = provider_resource_reference_alias_paths(&reference_aliases)?;
+    if provider_reference_alias_overlaps_selected_paths(&reference_aliases, current) {
+        return Err("provider reference alias overlaps a selected resource file".into());
+    }
+    preflight_provider_reference_aliases(home, &reference_aliases, current)?;
+    let active_alias_paths = reference_aliases
+        .active
+        .iter()
+        .map(|alias| alias.provider_path().to_string_lossy().into_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    let retired_alias_paths = reference_aliases
+        .retired
+        .iter()
+        .map(|alias| alias.provider_path().to_string_lossy().into_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut transactional_alias_paths = reference_alias_paths;
+    transactional_alias_paths.retain(|relative| {
+        active_alias_paths.contains(relative)
+            || (retired_alias_paths.contains(relative) && !current.contains(relative))
+    });
+    let mut manifest_current = current.clone();
+    manifest_current.extend(active_alias_paths.iter().cloned());
+    for relative in &retired_alias_paths {
+        if !current.contains(relative) {
+            manifest_current.remove(relative);
+        }
+    }
     emit_environment_event(
-        serde_json::json!({"severity":"info","event":"provider.projection.transaction.started","provider":provider,"stage":"stage","previous_entries":previous.len(),"desired_entries":current.len()}),
+        serde_json::json!({"severity":"info","event":"provider.projection.transaction.started","provider":provider,"stage":"stage","previous_entries":previous.len(),"desired_entries":manifest_current.len()}),
     );
     let transaction = tempfile::Builder::new()
         .prefix(".freshell-provider-transaction-")
@@ -3476,7 +3706,7 @@ fn publish_provider_projection_with_manifest(
             );
         }
         // Serialize, write and sync the complete manifest before changing HOME.
-        let manifest = write_projection_manifest(transaction.path(), current)?;
+        let manifest = write_projection_manifest(transaction.path(), &manifest_current)?;
         // Links crossing mounted resource boundaries must still resolve in the
         // final HOME graph, not relative to the independent alias mount.
         for relative in current {
@@ -3519,7 +3749,7 @@ fn publish_provider_projection_with_manifest(
     let mut incoming = BTreeMap::new();
     let prepared: Result<(), String> = (|| {
         for relative in previous.union(current) {
-            if protected.contains(relative) {
+            if protected.contains(relative) || transactional_alias_paths.contains(relative) {
                 continue;
             }
             match fs::symlink_metadata(home.join(relative)) {
@@ -3663,6 +3893,14 @@ fn publish_provider_projection_with_manifest(
                 installed.push(relative.clone());
             }
         }
+        publish_provider_reference_aliases(
+            home,
+            current,
+            &reference_aliases,
+            &backup,
+            &mut moved,
+            &mut installed,
+        )?;
         publish_manifest(&manifest, &home.join(PROVIDER_PROJECTION_MANIFEST))
             .map_err(|error| format!("provider transaction publish manifest: {error}"))?;
         Ok(())
@@ -3713,6 +3951,177 @@ fn publish_provider_projection_with_manifest(
         );
         // Publication has committed. Cleanup failure is observable but cannot
         // retroactively turn the complete environment into a failed refresh.
+    }
+    Ok(())
+}
+
+fn preflight_provider_reference_aliases(
+    home: &Path,
+    plan: &ProviderResourceReferenceAliasPlan,
+    current: &std::collections::BTreeSet<String>,
+) -> Result<(), String> {
+    for alias in &plan.active {
+        let relative = alias.provider_path();
+        let reference = home.join(format!(".freshell/references/{}", alias.reference_index));
+        for parent in [home.join(".freshell"), home.join(".freshell/references")] {
+            match std::fs::symlink_metadata(&parent) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => return Err("provider reference alias target parent is unsafe".into()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err("provider reference alias target is unavailable".into())
+                }
+                Err(_) => return Err("provider reference alias target is unavailable".into()),
+            }
+        }
+        if !std::fs::symlink_metadata(&reference).is_ok_and(|metadata| metadata.is_file()) {
+            return Err("provider reference alias target is unavailable".into());
+        }
+        if !provider_reference_alias_parent_available(home, &relative, current)? {
+            return Err("provider reference alias parent directory is unavailable".into());
+        }
+        let destination = home.join(&relative);
+        match std::fs::symlink_metadata(&destination) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let link = std::fs::read_link(&destination)
+                    .map_err(|_| "provider reference alias could not be inspected")?;
+                let runtime_reference = PathBuf::from(format!(
+                    "/home/freshell/provider/.freshell/references/{}",
+                    alias.reference_index
+                ));
+                if link != runtime_reference
+                    && managed_provider_reference_alias_index(&link, &destination, home).is_none()
+                {
+                    return Err("provider reference alias conflicts with an existing link".into());
+                }
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "provider-created resource blocks provider reference alias {}; retain it and repair the selected path",
+                    relative.display()
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("provider reference alias path could not be inspected".into()),
+        }
+    }
+    for alias in &plan.retired {
+        let relative = alias.provider_path();
+        let _ = provider_reference_alias_parent_available(home, &relative, current)?;
+    }
+    Ok(())
+}
+
+fn provider_reference_alias_parent_available(
+    home: &Path,
+    relative: &Path,
+    current: &std::collections::BTreeSet<String>,
+) -> Result<bool, String> {
+    let parent = relative
+        .parent()
+        .ok_or("provider reference alias has no parent directory")?;
+    let mut prefix = PathBuf::new();
+    for component in parent.components() {
+        prefix.push(component.as_os_str());
+        let absolute = home.join(&prefix);
+        match std::fs::symlink_metadata(&absolute) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err("provider reference alias parent directory is unsafe".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let prefix = prefix
+                    .to_str()
+                    .ok_or("provider reference alias path is not UTF-8")?;
+                return Ok(current.contains(prefix));
+            }
+            Err(_) => return Err("provider reference alias parent directory is unavailable".into()),
+        }
+    }
+    Ok(true)
+}
+
+fn publish_provider_reference_aliases(
+    home: &Path,
+    current: &std::collections::BTreeSet<String>,
+    plan: &ProviderResourceReferenceAliasPlan,
+    backup: &Path,
+    moved: &mut Vec<String>,
+    installed: &mut Vec<String>,
+) -> Result<(), String> {
+    for alias in &plan.active {
+        let relative = alias.provider_path();
+        let relative_string = relative
+            .to_str()
+            .ok_or("provider reference alias path is not UTF-8")?
+            .to_owned();
+        if !provider_reference_alias_parent_available(home, &relative, current)? {
+            return Err("provider reference alias parent directory is unavailable".into());
+        }
+        let destination = home.join(&relative);
+        let target = PathBuf::from(format!(
+            "/home/freshell/provider/.freshell/references/{}",
+            alias.reference_index
+        ));
+        match std::fs::symlink_metadata(&destination) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let link = std::fs::read_link(&destination)
+                    .map_err(|_| "provider reference alias could not be inspected")?;
+                if link == target {
+                    continue;
+                }
+                if managed_provider_reference_alias_index(&link, &destination, home).is_none() {
+                    return Err("provider reference alias conflicts with an existing link".into());
+                }
+                let saved = backup.join(&relative);
+                std::fs::create_dir_all(saved.parent().ok_or("backup parent unavailable")?)
+                    .map_err(|error| error.to_string())?;
+                std::fs::rename(&destination, saved)
+                    .map_err(|error| format!("provider reference alias backup: {error}"))?;
+                moved.push(relative_string.clone());
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "provider-created resource blocks provider reference alias {}; retain it and repair the selected path",
+                    relative.display()
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("provider reference alias path could not be inspected".into()),
+        }
+        std::os::unix::fs::symlink(&target, &destination)
+            .map_err(|error| format!("provider reference alias could not be created: {error}"))?;
+        installed.push(relative_string);
+    }
+    for alias in &plan.retired {
+        let relative = alias.provider_path();
+        let relative_string = relative
+            .to_str()
+            .ok_or("provider reference alias path is not UTF-8")?
+            .to_owned();
+        if current.contains(&relative_string)
+            || !provider_reference_alias_parent_available(home, &relative, current)?
+        {
+            continue;
+        }
+        let destination = home.join(&relative);
+        let link = match std::fs::symlink_metadata(&destination) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                std::fs::read_link(&destination)
+                    .map_err(|_| "retired provider reference alias could not be inspected")?
+            }
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                return Err("retired provider reference alias path could not be inspected".into())
+            }
+        };
+        if managed_provider_reference_alias_index(&link, &destination, home).is_none() {
+            continue;
+        }
+        let saved = backup.join(&relative);
+        std::fs::create_dir_all(saved.parent().ok_or("backup parent unavailable")?)
+            .map_err(|error| error.to_string())?;
+        std::fs::rename(&destination, saved)
+            .map_err(|error| format!("retired provider reference alias backup: {error}"))?;
+        moved.push(relative_string);
     }
     Ok(())
 }
@@ -4959,6 +5368,128 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn failed_reference_alias_refresh_preserves_the_previous_provider_projection() {
+        use freshell_runtime_protocol::{
+            ProviderConfigReference, ProviderConfigRoot, ProviderResourceKind,
+            ProviderResourceReferenceAlias,
+        };
+
+        let owned = tempfile::tempdir().unwrap();
+        let provider_home = owned.path().join("provider");
+        let user_provider_root = owned.path().join("prepared");
+        let workspace = owned.path().join("workspace");
+        let resource_stage = user_provider_root.join(".freshell/resource-units/mcp-project");
+        let resource_root = provider_home.join(".freshell/provider-roots/mcp-project");
+        std::fs::create_dir_all(&resource_stage).unwrap();
+        std::fs::create_dir_all(&resource_root).unwrap();
+        std::fs::create_dir_all(provider_home.join(".opencode")).unwrap();
+        std::fs::create_dir_all(provider_home.join(".freshell/references")).unwrap();
+        std::fs::create_dir_all(user_provider_root.join("references")).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(user_provider_root.join("settings.json"), b"new config").unwrap();
+        std::fs::write(user_provider_root.join("references/0"), b"new secret").unwrap();
+        std::fs::write(resource_stage.join("server.mjs"), b"new resource").unwrap();
+        std::fs::write(
+            provider_home.join(".opencode/settings.json"),
+            b"prior config",
+        )
+        .unwrap();
+        std::fs::write(
+            provider_home.join(".freshell/references/0"),
+            b"prior secret",
+        )
+        .unwrap();
+        std::fs::write(resource_root.join("server.mjs"), b"prior resource").unwrap();
+        // A provider-created file blocks the requested managed alias. The
+        // refresh must fail without publishing its config or resource updates.
+        std::fs::write(resource_root.join(".env"), b"provider-owned file").unwrap();
+        super::write_projection_manifest(
+            &provider_home,
+            &[
+                ".opencode/settings.json".to_owned(),
+                ".freshell/references/0".to_owned(),
+                ".freshell/provider-roots/mcp-project".to_owned(),
+                ".freshell/provider-roots/mcp-project/server.mjs".to_owned(),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+
+        let mut mount = opencode_resource_mount(
+            "mcp-project",
+            "/opt/mcp-project",
+            "/opt/mcp-project",
+            ProviderResourceKind::Directory,
+            false,
+        );
+        mount.reference_aliases = vec![ProviderResourceReferenceAlias {
+            relative_path: ".env".into(),
+            reference_index: 0,
+        }];
+        let mut context = opencode_context_with_mounts(vec![mount]);
+        context.config = vec![
+            ProviderConfigReference {
+                root: ProviderConfigRoot::UserProvider,
+                relative_path: "settings.json".into(),
+                provider_relative_path: ".opencode/settings.json".into(),
+                format: "json".into(),
+            },
+            ProviderConfigReference {
+                root: ProviderConfigRoot::UserProvider,
+                relative_path: "references/0".into(),
+                provider_relative_path: ".freshell/references/0".into(),
+                format: "text".into(),
+            },
+        ];
+        let inputs = context.prepared_inputs.as_mut().unwrap();
+        inputs.manifest.source_count = 1;
+        inputs.manifest.alias_count = 1;
+        inputs.indexed_files = Some(freshell_runtime_protocol::IndexedProviderFiles {
+            volume_name: "freshell-inputs-aaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            aliases: vec![freshell_runtime_protocol::IndexedProviderFileAlias {
+                source_id: 0,
+                logical_destination: "/fixture/private-reference".into(),
+                effective_destination: "/fixture/private-reference".into(),
+            }],
+            staged_source_paths: None,
+        });
+
+        let stage = tempfile::tempdir_in(&provider_home).unwrap();
+        let error = super::refresh_provider_config_in_stage(
+            &context,
+            "opencode",
+            &workspace,
+            &user_provider_root,
+            &provider_home,
+            stage,
+        )
+        .expect_err("a provider-owned alias collision must reject the full refresh");
+
+        assert!(error.contains("provider-created"), "{error}");
+        assert_eq!(
+            std::fs::read(provider_home.join(".opencode/settings.json")).unwrap(),
+            b"prior config"
+        );
+        assert_eq!(
+            std::fs::read(provider_home.join(".freshell/references/0")).unwrap(),
+            b"prior secret"
+        );
+        assert_eq!(
+            std::fs::read(resource_root.join("server.mjs")).unwrap(),
+            b"prior resource"
+        );
+        assert_eq!(
+            std::fs::read(resource_root.join(".env")).unwrap(),
+            b"provider-owned file"
+        );
+        assert!(super::read_projection_manifest(&provider_home)
+            .unwrap()
+            .contains(".freshell/provider-roots/mcp-project/server.mjs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn provider_resource_reference_alias_rebinds_a_reused_reference_index() {
         use freshell_runtime_protocol::{ProviderResourceKind, ProviderResourceReferenceAlias};
 
@@ -5388,6 +5919,7 @@ mod tests {
                 protected: &BTreeSet::new(),
                 mounted: &[],
                 preserve_existing_mounted_files: &[],
+                reference_aliases: Default::default(),
             },
             |source, _destination| {
                 // This callback occupies only the final publication boundary. The
@@ -5423,6 +5955,130 @@ mod tests {
         assert_eq!(
             fs::read(home.join(PROVIDER_PROJECTION_MANIFEST)).unwrap(),
             before
+        );
+        assert!(!fs::read_dir(&home).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".freshell-provider-transaction-")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_reference_aliases_roll_back_with_projection_when_manifest_publish_fails() {
+        use std::{collections::BTreeSet, fs, os::unix::fs::symlink};
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let selected = root.path().join("selected");
+        let resource_relative = Path::new(".freshell/provider-roots/mcp-project");
+        let resource_root = home.join(resource_relative);
+        fs::create_dir_all(&resource_root).unwrap();
+        fs::create_dir_all(home.join(".freshell/references")).unwrap();
+        fs::create_dir(&selected).unwrap();
+        fs::write(home.join(".freshell/references/0"), "new reference").unwrap();
+        fs::write(home.join(".freshell/references/1"), "prior reference").unwrap();
+        fs::write(resource_root.join("server.mjs"), "prior resource").unwrap();
+        symlink(
+            "/home/freshell/provider/.freshell/references/1",
+            resource_root.join(".env"),
+        )
+        .unwrap();
+        symlink(
+            "/home/freshell/provider/.freshell/references/1",
+            resource_root.join(".oldenv"),
+        )
+        .unwrap();
+        fs::write(selected.join("server.mjs"), "new resource").unwrap();
+
+        let alias = resource_relative
+            .join(".env")
+            .to_string_lossy()
+            .into_owned();
+        let retired = resource_relative
+            .join(".oldenv")
+            .to_string_lossy()
+            .into_owned();
+        let previous = BTreeSet::from([
+            ".freshell".into(),
+            ".freshell/provider-roots".into(),
+            resource_relative.to_string_lossy().into_owned(),
+            resource_relative
+                .join("server.mjs")
+                .to_string_lossy()
+                .into_owned(),
+            alias.clone(),
+            retired.clone(),
+        ]);
+        let current = BTreeSet::from([
+            ".freshell".into(),
+            ".freshell/provider-roots".into(),
+            resource_relative.to_string_lossy().into_owned(),
+            resource_relative
+                .join("server.mjs")
+                .to_string_lossy()
+                .into_owned(),
+        ]);
+        write_projection_manifest(&home, &previous).unwrap();
+        let prior_manifest = fs::read(home.join(PROVIDER_PROJECTION_MANIFEST)).unwrap();
+        let selections = [freshell_platform::provider_environment::CopySelection {
+            source: selected,
+            destination_relative: resource_relative.to_path_buf(),
+        }];
+        let reference_aliases = ProviderResourceReferenceAliasPlan {
+            active: vec![ProviderResourceReferenceAliasInstall {
+                mount_root: resource_relative.to_string_lossy().into_owned(),
+                relative_path: ".env".into(),
+                reference_index: 0,
+            }],
+            retired: vec![ProviderResourceReferenceAliasRetirement {
+                mount_root: resource_relative.to_string_lossy().into_owned(),
+                relative_path: ".oldenv".into(),
+            }],
+        };
+
+        let result = publish_provider_projection_with_manifest(
+            ProviderProjection {
+                provider: "opencode",
+                selections: &selections,
+                home: &home,
+                previous: &previous,
+                current: &current,
+                protected: &BTreeSet::new(),
+                mounted: &[],
+                preserve_existing_mounted_files: &[],
+                reference_aliases,
+            },
+            |_source, _destination| {
+                assert_eq!(
+                    fs::read(resource_root.join("server.mjs")).unwrap(),
+                    b"new resource"
+                );
+                assert_eq!(
+                    fs::read_link(resource_root.join(".env")).unwrap(),
+                    Path::new("/home/freshell/provider/.freshell/references/0")
+                );
+                assert!(!resource_root.join(".oldenv").exists());
+                Err(std::io::Error::other("injected manifest publish failure"))
+            },
+        );
+
+        assert!(result.unwrap_err().contains("publish manifest"));
+        assert_eq!(
+            fs::read(resource_root.join("server.mjs")).unwrap(),
+            b"prior resource"
+        );
+        assert_eq!(
+            fs::read_link(resource_root.join(".env")).unwrap(),
+            Path::new("/home/freshell/provider/.freshell/references/1")
+        );
+        assert_eq!(
+            fs::read_link(resource_root.join(".oldenv")).unwrap(),
+            Path::new("/home/freshell/provider/.freshell/references/1")
+        );
+        assert_eq!(
+            fs::read(home.join(PROVIDER_PROJECTION_MANIFEST)).unwrap(),
+            prior_manifest
         );
         assert!(!fs::read_dir(&home).unwrap().any(|entry| entry
             .unwrap()
