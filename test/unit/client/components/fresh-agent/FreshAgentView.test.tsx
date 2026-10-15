@@ -35,7 +35,7 @@ import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
 import { buildReconcileRequest, foldVerdicts, setFreshAgentReconcileActive } from '@/lib/pane-reconcile'
 import type { AppDispatch, RootState } from '@/store/store'
 import { getFreshAgentSnapshotThreadId, getManagedBootstrapHistoryThreadId } from '@/lib/fresh-agent-snapshot-thread'
-import type { FreshAgentPaneContent } from '@/store/paneTypes'
+import { FRESH_AGENT_CHECKPOINT_OUTCOME_LIMIT, type FreshAgentPaneContent } from '@/store/paneTypes'
 import { ApiError } from '@/lib/api'
 import { resetSnapshotSchedulerForTests, SNAPSHOT_DEBOUNCE_MS } from '@/lib/fresh-agent-snapshot-scheduler'
 import { SESSION_HANDOFF_RETRY_BACKOFF_MS } from '@/lib/session-handoff'
@@ -3871,6 +3871,85 @@ describe('FreshAgentView', () => {
         displayTurnId: `${nativeTurnId}:row-0`,
       }),
     ]))
+  })
+
+  it('refreshes checkpoint history when the local outcome list is already at its limit', async () => {
+    const sessionId = 'thread-full-checkpoint-cache'
+    const nativeTurnId = 'native-late-checkpoint-turn'
+    const requestId = 'request-late-checkpoint'
+    const sessionKey = JSON.stringify(['codex', 'freshcodex', sessionId])
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'full local checkpoint cache',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [{
+        id: `${nativeTurnId}:row-0`,
+        turnId: `${nativeTurnId}:row-0`,
+        nativeTurnId,
+        source: 'durable',
+        role: 'user',
+        summary: 'A turn whose checkpoint arrived on another device',
+        items: [{ id: 'late-checkpoint-turn-text', kind: 'text', text: 'A turn whose checkpoint arrived on another device' }],
+      }],
+    })
+    apiMock.getFreshAgentCheckpointOutcomePage.mockResolvedValue({ outcomes: [{
+      type: 'freshAgent.checkpoint.outcome',
+      logicalAttemptId: 'attempt-late-checkpoint',
+      requestId,
+      provider: 'codex',
+      sessionId,
+      sessionType: 'freshcodex',
+      status: 'available',
+      checkpointId: 'ffffffffffffffffffffffffffffffff',
+      nativeTurnId,
+      displayTurnId: `${nativeTurnId}:row-0`,
+    }] })
+
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'new-pane-with-full-cache',
+        sessionId,
+        sessionRef: { provider: 'codex', sessionId },
+        status: 'idle',
+        checkpointOutcomes: Array.from({ length: FRESH_AGENT_CHECKPOINT_OUTCOME_LIMIT }, (_, index) => ({
+          version: 1 as const,
+          conversationRequestId: 'old-pane-scope',
+          conversationSessionKey: sessionKey,
+          requestId: `saved-outcome-${index}`,
+          status: 'unavailable' as const,
+          reason: 'No old checkpoint is available for this turn.',
+        })),
+      } as never,
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    expect(await screen.findByRole('button', { name: 'Rewind code to here' })).toBeEnabled()
+    expect(apiMock.getFreshAgentCheckpointOutcomePage).toHaveBeenCalledWith(
+      { provider: 'codex', sessionId, sessionType: 'freshcodex', cursor: undefined },
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    )
+    const outcomes = getFreshAgentPaneContent(store).checkpointOutcomes ?? []
+    expect(outcomes).toHaveLength(FRESH_AGENT_CHECKPOINT_OUTCOME_LIMIT)
+    expect(outcomes).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        requestId,
+        conversationRequestId: 'new-pane-with-full-cache',
+        conversationSessionKey: sessionKey,
+        nativeTurnId,
+        displayTurnId: `${nativeTurnId}:row-0`,
+      }),
+    ]))
+    expect(outcomes.some((outcome) => outcome.requestId === 'saved-outcome-0')).toBe(false)
   })
 
   it('keeps an unbound modern turn unavailable instead of matching its prompt to another checkpoint', async () => {

@@ -93,16 +93,17 @@ impl HostedPty {
                 .lock()
                 .map(|mut journal| journal.complete(code).is_ok())
                 .unwrap_or(false);
+            // Process exit is independent of whether retained output settled;
+            // supervision must never reattach a process that has already exited.
+            exit_value.store(code, Ordering::SeqCst);
+            exit_flag.store(true, Ordering::SeqCst);
             if !settled {
                 tracing::error!(
                     event = "managed_runtime.output_completion_failed",
                     cause = "spool_settlement",
                     "Output completion could not be committed"
                 );
-                return;
             }
-            exit_value.store(code, Ordering::SeqCst);
-            exit_flag.store(true, Ordering::SeqCst);
             if let (Some(handle), Some(sidecar)) =
                 (runtime_handle.as_ref(), codex_sidecar_on_exit.as_ref())
             {
@@ -548,6 +549,30 @@ mod output_epoch_tests {
             .unwrap()
             .starts_with("launch-prefix-hostboot-"));
         assert_eq!(completion["exit"]["code"], 17);
+    }
+
+    #[tokio::test]
+    async fn retained_output_failure_does_not_hide_provider_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let (hosted, incarnation) = retained_pty(root.path(), "sleep 0.1; exit 23").await;
+        hosted.output.lock().unwrap().record_failure();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !hosted.exited() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("journal completion failure must not leave an exited provider reported live");
+
+        assert_eq!(hosted.exit_code(), 23);
+        let output_error = hosted
+            .read_output(incarnation, 0, 65536, Some(hosted.stream_epoch()))
+            .expect_err("the failed retained-output journal remains unavailable");
+        assert_eq!(
+            output_error.code,
+            freshell_runtime_protocol::RuntimeErrorCode::HostUnreachable
+        );
     }
 
     #[tokio::test]

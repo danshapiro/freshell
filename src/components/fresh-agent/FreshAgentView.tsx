@@ -1242,19 +1242,13 @@ export function FreshAgentView({
   ) => {
     publishCheckpointAvailabilities(scope, [{ requestId, submittedTurnId, availability }])
   }, [publishCheckpointAvailabilities])
-  const checkpointOutcomeHistoryFull = (paneContent.checkpointOutcomes?.length ?? 0)
-    >= FRESH_AGENT_CHECKPOINT_OUTCOME_LIMIT
   useEffect(() => {
     const sessionId = paneContent.sessionId
       ?? (paneContent.sessionRef?.provider === paneContent.provider
         ? paneContent.sessionRef.sessionId
         : undefined)
       ?? paneContent.resumeSessionId
-    if (
-      connectionStatus !== 'ready'
-      || !sessionId
-      || checkpointOutcomeHistoryFull
-    ) return
+    if (connectionStatus !== 'ready' || !sessionId) return
 
     const controller = new AbortController()
     let cancelled = false
@@ -1329,7 +1323,6 @@ export function FreshAgentView({
     }
   }, [
     appStore,
-    checkpointOutcomeHistoryFull,
     connectionStatus,
     paneContent.createRequestId,
     paneContent.provider,
