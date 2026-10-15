@@ -1110,7 +1110,10 @@ export async function runCodeCheckpointTarget() {
       `FRESHELL_LOG_DIR=${checkpointFixtureRoot}/storage/logs`,
       'FRESHELL_CLIENT_DIR=/checkpoint-target/client',
       'CODEX_CMD=/checkpoint-target/fake-codex',
-      'FAKE_CODEX_APP_SERVER_BEHAVIOR={"recordTurns":true,"uniqueThreadIds":true,"persistRolloutUserMessages":true}',
+      // Keep the fake turn active long enough for the backend to record the
+      // turn/start result before the completion notifications arrive. The
+      // shorter default can race that state update on the remote browser path.
+      'FAKE_CODEX_APP_SERVER_BEHAVIOR={"recordTurns":true,"uniqueThreadIds":true,"persistRolloutUserMessages":true,"turnCompleteDelayMs":1000}',
       'FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES=1',
       `FRESHELL_CHECKPOINT_FIXTURE_ROOT=${checkpointFixtureRoot}`,
       `FRESHELL_CHECKPOINT_FIXTURE_UID=${identity.uid}`,
