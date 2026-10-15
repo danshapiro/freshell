@@ -1,6 +1,7 @@
 //! Host-owned native activity transport. The provider HTTP/SSE endpoint stays
 //! on private container loopback; only typed body-free observations are retained.
 use std::collections::{HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -78,9 +79,17 @@ struct NativeJournal {
     bytes: usize,
     head_seq: u64,
     busy_sessions: HashSet<String>,
+    diagnostics_dir: Option<PathBuf>,
 }
 
 impl NativeJournal {
+    fn with_diagnostics(state_dir: PathBuf) -> Self {
+        Self {
+            diagnostics_dir: Some(state_dir),
+            ..Self::default()
+        }
+    }
+
     fn append(&mut self, terminal_id: &str, cycle: u64, stream: u64, event: OpencodeLaneEvent) {
         // Provider error messages, generated titles and arbitrary event bodies
         // cannot enter the metadata journal. Only the abort category matters to
@@ -142,11 +151,16 @@ impl NativeJournal {
             bytes = serde_json::to_vec(&record)
                 .expect("typed native activity serializes")
                 .len();
-            tracing::warn!(
-                terminal_id,
-                event = "managed_opencode.activity_record_refused",
-                reason = "record_too_large"
-            );
+            if let Some(state_dir) = &self.diagnostics_dir {
+                log_diagnostic(
+                    state_dir,
+                    "managed_opencode.activity_record_refused",
+                    serde_json::json!({
+                        "terminalId": terminal_id,
+                        "reason": "record_too_large"
+                    }),
+                );
+            }
         }
         self.bytes += bytes;
         self.events.push_back((record, bytes));
@@ -160,12 +174,17 @@ impl NativeJournal {
             evicted = true;
         }
         if evicted && self.head_seq % MAX_EVENTS as u64 == 1 {
-            tracing::warn!(
-                terminal_id,
-                event = "managed_opencode.activity_retention_advanced",
-                head_seq = self.head_seq,
-                retained_from_seq = self.batch().retained_from_seq
-            );
+            if let Some(state_dir) = &self.diagnostics_dir {
+                log_diagnostic(
+                    state_dir,
+                    "managed_opencode.activity_retention_advanced",
+                    serde_json::json!({
+                        "terminalId": terminal_id,
+                        "headSeq": self.head_seq,
+                        "retainedFromSeq": self.batch().retained_from_seq
+                    }),
+                );
+            }
         }
     }
 
@@ -186,6 +205,20 @@ impl NativeJournal {
     }
 }
 
+pub(crate) fn log_diagnostic(state_dir: &Path, event: &'static str, data: serde_json::Value) {
+    if let Err(error) = crate::append_event(state_dir, event, data) {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "severity": "error",
+                "event": "session_host.diagnostic_write_failed",
+                "diagnosticEvent": event,
+                "error": error
+            })
+        );
+    }
+}
+
 struct AbortTask(tokio::task::JoinHandle<()>);
 impl Drop for AbortTask {
     fn drop(&mut self) {
@@ -202,6 +235,7 @@ pub(crate) struct OpencodeActivityRelay {
 impl OpencodeActivityRelay {
     pub(crate) fn spawn(
         terminal_id: String,
+        state_dir: PathBuf,
         base_url: String,
         exited: Arc<AtomicBool>,
         exit_notify: Arc<Notify>,
@@ -213,6 +247,7 @@ impl OpencodeActivityRelay {
         });
         Self::spawn_with_deps(
             terminal_id,
+            state_dir,
             base_url,
             exited,
             exit_notify,
@@ -223,13 +258,16 @@ impl OpencodeActivityRelay {
 
     fn spawn_with_deps(
         terminal_id: String,
+        state_dir: PathBuf,
         base_url: String,
         exited: Arc<AtomicBool>,
         exit_notify: Arc<Notify>,
         deps: Arc<OpencodeLaneDeps>,
         verify_interval: Duration,
     ) -> Self {
-        let journal = Arc::new(Mutex::new(NativeJournal::default()));
+        let journal = Arc::new(Mutex::new(NativeJournal::with_diagnostics(
+            state_dir.clone(),
+        )));
         let shared = journal.clone();
         let changed = Arc::new(Notify::new());
         let changed_sink = changed.clone();
@@ -267,11 +305,13 @@ impl OpencodeActivityRelay {
         );
         let lane = AbortTask(lane);
         let shared = journal.clone();
+        let diagnostic_terminal_id = terminal_id.clone();
         let task = tokio::spawn(async move {
             let _lane = lane;
-            tracing::info!(
-                terminal_id,
-                event = "managed_opencode.activity_lane_started"
+            log_diagnostic(
+                &state_dir,
+                "managed_opencode.activity_lane_started",
+                serde_json::json!({"terminalId": diagnostic_terminal_id.clone()}),
             );
             while !exited.load(Ordering::SeqCst) {
                 let busy = !shared
@@ -288,9 +328,10 @@ impl OpencodeActivityRelay {
                 }
             }
             ready_tx.send_replace(NativeReadiness::Exited);
-            tracing::info!(
-                terminal_id,
-                event = "managed_opencode.activity_lane_stopped"
+            log_diagnostic(
+                &state_dir,
+                "managed_opencode.activity_lane_stopped",
+                serde_json::json!({"terminalId": diagnostic_terminal_id}),
             );
         });
         Self {
@@ -437,6 +478,50 @@ mod tests {
             journal.batch().events[0].event,
             OpencodeLaneEvent::SnapshotFailed { .. }
         ));
+    }
+
+    #[test]
+    fn refused_and_evicted_activity_records_leave_safe_jsonl_diagnostics() {
+        let owned = tempfile::tempdir().unwrap();
+        let state_dir = owned.path().join("host-state");
+        let mut journal = NativeJournal::with_diagnostics(state_dir.clone());
+        let private_session_id =
+            format!("private-provider-session-{}", "x".repeat(MAX_EVENT_BYTES));
+        journal.append(
+            "terminal-safe",
+            1,
+            1,
+            OpencodeLaneEvent::Status {
+                session_id: private_session_id.clone(),
+                status: OpencodeStatus::Busy,
+            },
+        );
+        for index in 0..MAX_EVENTS {
+            journal.append(
+                "terminal-safe",
+                1,
+                1,
+                OpencodeLaneEvent::SessionIdle {
+                    session_id: format!("session-{index}"),
+                },
+            );
+        }
+
+        let lifecycle = std::fs::read_to_string(state_dir.join("host-lifecycle.jsonl")).unwrap();
+        let events: Vec<serde_json::Value> = lifecycle
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(events.iter().any(|record| {
+            record["event"] == "managed_opencode.activity_record_refused"
+                && record["data"]["reason"] == "record_too_large"
+                && record["data"]["terminalId"] == "terminal-safe"
+        }));
+        assert!(events.iter().any(|record| {
+            record["event"] == "managed_opencode.activity_retention_advanced"
+                && record["data"]["retainedFromSeq"] == 2
+        }));
+        assert!(!lifecycle.contains("private-provider-session-"));
     }
 
     #[test]

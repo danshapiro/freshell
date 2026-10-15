@@ -92,6 +92,7 @@ async fn native_api_with_controls(
 #[tokio::test]
 async fn managed_input_after_native_disconnect_fails_without_claiming_or_writing_bytes() {
     let owned = tempfile::tempdir().unwrap();
+    let state_dir = owned.path().join("state");
     let launch = serde_json::from_value(serde_json::json!({
         "terminalId":"native-disconnect", "streamId":"native-disconnect", "mode":"shell",
         "program":"/usr/bin/cat", "args":[], "cwd":owned.path(), "workspacePath":owned.path(),
@@ -102,7 +103,7 @@ async fn managed_input_after_native_disconnect_fails_without_claiming_or_writing
     .unwrap();
     let incarnation = IncarnationId::new();
     let mut hosted = HostedPty::spawn(
-        &owned.path().join("state"),
+        &state_dir,
         incarnation.clone(),
         &launch,
         BTreeMap::new(),
@@ -115,6 +116,7 @@ async fn managed_input_after_native_disconnect_fails_without_claiming_or_writing
     let (endpoint, server) = native_api_with_controls(None, Some(close_stream.clone())).await;
     let relay = crate::opencode_activity::OpencodeActivityRelay::spawn(
         "native-disconnect".into(),
+        state_dir.clone(),
         endpoint,
         hosted.exited.clone(),
         Arc::new(tokio::sync::Notify::new()),
@@ -145,6 +147,19 @@ async fn managed_input_after_native_disconnect_fails_without_claiming_or_writing
     let output = hosted.read_output(incarnation, 0, 65536, None).unwrap();
     hosted.stop().await;
     server.abort();
+    let lifecycle =
+        std::fs::read_to_string(state_dir.join("host-lifecycle.jsonl")).unwrap_or_default();
+    assert!(
+        lifecycle
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|record| record["event"] == "managed_opencode.activity_input_refused"),
+        "refused OpenCode input must leave a structured host diagnostic"
+    );
+    assert!(
+        !lifecycle.contains("controlled-keybytes"),
+        "diagnostics must not persist the user's input"
+    );
     assert_eq!(
         error.diagnostic_code,
         Some(freshell_runtime_protocol::RuntimeDiagnosticCode::OpencodeActivityDisconnected)
@@ -162,6 +177,7 @@ async fn managed_input_after_native_disconnect_fails_without_claiming_or_writing
 #[tokio::test]
 async fn managed_startup_input_waits_for_native_subscription_and_snapshot_then_writes_once() {
     let owned = tempfile::tempdir().unwrap();
+    let state_dir = owned.path().join("state");
     let launch = serde_json::from_value(serde_json::json!({
         "terminalId":"native-input", "streamId":"native-input", "mode":"shell",
         "program":"/usr/bin/python3", "args":["-c", "import sys\nf=open('received-input', 'ab', buffering=0)\nfor line in sys.stdin.buffer: f.write(line)"],
@@ -170,7 +186,7 @@ async fn managed_startup_input_waits_for_native_subscription_and_snapshot_then_w
         "env":{"HOME":owned.path(),"PATH":"/usr/bin:/bin"}
     })).unwrap();
     let mut hosted = HostedPty::spawn(
-        &owned.path().join("state"),
+        &state_dir,
         IncarnationId::new(),
         &launch,
         BTreeMap::new(),
@@ -186,6 +202,7 @@ async fn managed_startup_input_waits_for_native_subscription_and_snapshot_then_w
             .await;
     hosted.opencode_activity = Some(crate::opencode_activity::OpencodeActivityRelay::spawn(
         "native-input".into(),
+        state_dir,
         endpoint,
         hosted.exited.clone(),
         Arc::new(tokio::sync::Notify::new()),
@@ -250,6 +267,7 @@ async fn managed_startup_input_waits_for_native_subscription_and_snapshot_then_w
 async fn managed_output_relays_native_turn_edges_without_terminal_bytes_or_provider_bodies() {
     use freshell_activity::opencode::{OpencodeLaneEvent, OpencodeStatus};
     let owned = tempfile::tempdir().unwrap();
+    let state_dir = owned.path().join("state");
     let incarnation = IncarnationId::new();
     let launch = serde_json::from_value(serde_json::json!({
         "terminalId":"native-activity", "streamId":"native-activity", "mode":"shell",
@@ -260,7 +278,7 @@ async fn managed_output_relays_native_turn_edges_without_terminal_bytes_or_provi
     }))
     .unwrap();
     let mut hosted = HostedPty::spawn(
-        &owned.path().join("state"),
+        &state_dir,
         incarnation.clone(),
         &launch,
         BTreeMap::new(),
@@ -272,6 +290,7 @@ async fn managed_output_relays_native_turn_edges_without_terminal_bytes_or_provi
     let (endpoint, server) = native_api().await;
     hosted.opencode_activity = Some(crate::opencode_activity::OpencodeActivityRelay::spawn(
         "native-activity".into(),
+        state_dir.clone(),
         endpoint,
         hosted.exited.clone(),
         Arc::new(tokio::sync::Notify::new()),
@@ -301,6 +320,17 @@ async fn managed_output_relays_native_turn_edges_without_terminal_bytes_or_provi
     hosted.stop().await;
     server.abort();
     let output = output.expect("native events must reach the hosted output boundary");
+    let lifecycle =
+        std::fs::read_to_string(state_dir.join("host-lifecycle.jsonl")).unwrap_or_default();
+    assert!(
+        lifecycle
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|record| record["event"] == "managed_opencode.activity_lane_started"),
+        "OpenCode relay startup must leave a structured host diagnostic"
+    );
+    assert!(!lifecycle.contains("synthetic-body-must-not-cross"));
+    assert!(!lifecycle.contains("synthetic-title-must-not-cross"));
     let wire = serde_json::to_vec(&output).unwrap();
     let roundtrip: RuntimeOutputBatch = serde_json::from_slice(&wire).unwrap();
     let native = roundtrip.opencode_activity.unwrap();

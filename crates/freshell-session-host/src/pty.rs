@@ -51,6 +51,7 @@ pub struct HostedPty {
     exited: Arc<AtomicBool>,
     exit_code: Arc<AtomicI64>,
     terminal_id: String,
+    state_dir: PathBuf,
     stream_epoch: String,
     native_session_id: Arc<Mutex<Option<String>>>,
     native_identity_launch: Option<freshell_runtime_protocol::NativeIdentityLaunch>,
@@ -72,7 +73,7 @@ pub(crate) async fn write_hosted_input(
     request_id: &RequestId,
     data: &str,
 ) -> Result<CommandState, RuntimeError> {
-    let (readiness, epoch) = {
+    let (readiness, epoch, state_dir, terminal_id) = {
         let mut terminal = terminal.lock().await;
         let hosted = terminal.as_mut().ok_or_else(|| {
             RuntimeError::new(
@@ -91,13 +92,24 @@ pub(crate) async fn write_hosted_input(
         ) {
             return hosted.write_input(request_id, data);
         }
-        (relay.input_readiness(), hosted.stream_epoch.clone())
+        (
+            relay.input_readiness(),
+            hosted.stream_epoch.clone(),
+            hosted.state_dir.clone(),
+            hosted.terminal_id.clone(),
+        )
     };
     // Waiting holds neither the PTY lock nor a command-journal claim. Output,
     // exit and stop remain available; refused input has never been dispatched.
     if let Err(error) = readiness.wait().await {
-        tracing::warn!(event="managed_opencode.activity_input_refused",
-            stream_epoch=%epoch, diagnostic_code=?error.diagnostic_code);
+        crate::opencode_activity::log_diagnostic(
+            &state_dir,
+            "managed_opencode.activity_input_refused",
+            serde_json::json!({
+                "terminalId": terminal_id,
+                "diagnosticCode": format!("{:?}", error.diagnostic_code)
+            }),
+        );
         return Err(error);
     }
     let mut terminal = terminal.lock().await;
@@ -388,13 +400,20 @@ impl HostedPty {
             match crate::opencode_activity::endpoint(&launch.args) {
                 Some(endpoint) => Some(crate::opencode_activity::OpencodeActivityRelay::spawn(
                     launch.terminal_id.clone(),
+                    state_dir.to_path_buf(),
                     endpoint,
                     exited.clone(),
                     native_exit_notify,
                 )),
                 None => {
-                    tracing::warn!(terminal_id=%launch.terminal_id,
-                        event="managed_opencode.activity_lane_unavailable", reason="missing_loopback_endpoint");
+                    crate::opencode_activity::log_diagnostic(
+                        state_dir,
+                        "managed_opencode.activity_lane_unavailable",
+                        serde_json::json!({
+                            "terminalId": launch.terminal_id,
+                            "reason": "missing_loopback_endpoint"
+                        }),
+                    );
                     None
                 }
             }
@@ -408,6 +427,7 @@ impl HostedPty {
             exited,
             exit_code,
             terminal_id: launch.terminal_id.clone(),
+            state_dir: state_dir.to_path_buf(),
             stream_epoch,
             native_session_id,
             native_identity_launch,
