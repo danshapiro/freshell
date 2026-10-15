@@ -88,24 +88,24 @@ describe('FreshAgent checkpoint outcomes', () => {
     expect(JSON.stringify(leaf.content)).not.toContain('must never be retained')
   })
 
-  it('keeps only the newest 200 settled outcomes and deduplicates by request id', () => {
-    const outcomes = Array.from({ length: 202 }, (_, index) => ({
+  it('retains the latest server replay window and deduplicates by request id', () => {
+    const outcomes = Array.from({ length: 8194 }, (_, index) => ({
       requestId: `send-${index}`,
       displayTurnId: `turn-${index}`,
       status: 'unavailable',
       code: 'capture_failed',
       reason: `failure ${index}`,
     }))
-    outcomes[201] = {
-      requestId: 'send-201',
-      displayTurnId: 'turn-201',
+    outcomes[8193] = {
+      requestId: 'send-8193',
+      displayTurnId: 'turn-8193',
       status: 'available',
       checkpointId: 'checkpoint-latest',
       workspace: { path: '/work/project', provenance: 'resolved-project' },
     } as typeof outcomes[number]
     outcomes.push({
-      requestId: 'send-201',
-      displayTurnId: 'turn-201',
+      requestId: 'send-8193',
+      displayTurnId: 'turn-8193',
       status: 'unavailable',
       code: 'late_failure',
       reason: 'later result for the same request',
@@ -126,10 +126,10 @@ describe('FreshAgent checkpoint outcomes', () => {
     const leaf = state.layouts['tab-checkpoints'] as Extract<PaneNode, { type: 'leaf' }>
     const stored = (leaf.content as { checkpointOutcomes?: Array<Record<string, unknown>> }).checkpointOutcomes!
 
-    expect(stored).toHaveLength(200)
+    expect(stored).toHaveLength(8192)
     expect(stored[0].requestId).toBe('send-2')
     expect(stored.at(-1)).toMatchObject({
-      requestId: 'send-201',
+      requestId: 'send-8193',
       status: 'unavailable',
       code: 'late_failure',
     })

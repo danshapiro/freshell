@@ -11,6 +11,7 @@ import {
 import { nanoid } from 'nanoid'
 import {
   freshAgentCheckpointConversationKeyForContent,
+  FRESH_AGENT_CHECKPOINT_OUTCOME_LIMIT,
   normalizeFreshAgentCheckpointWorkspace,
   type FreshAgentCheckpointOutcome,
   type FreshAgentPaneContent,
@@ -1151,7 +1152,7 @@ export function FreshAgentView({
     const checkpointOutcomes = [
       ...priorOutcomes.filter((item) => item.requestId !== requestId),
       outcome,
-    ].slice(-200)
+    ].slice(-FRESH_AGENT_CHECKPOINT_OUTCOME_LIMIT)
     dispatch(mergePaneContent({ tabId, paneId, updates: { checkpointOutcomes } }))
   }, [appStore, dispatch, paneId, tabId])
   const getCheckpointAvailability = useCallback((turn: FreshAgentTurn): CheckpointTurnAvailability | undefined => {

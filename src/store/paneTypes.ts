@@ -84,7 +84,8 @@ export type FreshAgentCheckpointOutcome = {
   reason?: string
 }
 
-const FRESH_AGENT_CHECKPOINT_OUTCOME_LIMIT = 200
+/** Keep the same maximum history window as the durable server outcome store. */
+export const FRESH_AGENT_CHECKPOINT_OUTCOME_LIMIT = 8192
 
 function checkpointOutcomeString(value: unknown, maxLength: number): string | undefined {
   if (typeof value !== 'string' || value.length === 0 || value.length > maxLength) return undefined
@@ -147,7 +148,7 @@ export function normalizeFreshAgentCheckpointWorkspace(value: unknown): FreshAge
 }
 
 /**
- * Persist only a bounded record of settled checkpoint availability. The
+ * Retain a bounded record of settled checkpoint availability. The
  * whitelist deliberately excludes the submitted prompt and provider payloads.
  */
 export function normalizeFreshAgentCheckpointOutcomes(

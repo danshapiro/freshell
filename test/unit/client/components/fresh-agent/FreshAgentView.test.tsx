@@ -3745,6 +3745,32 @@ describe('FreshAgentView', () => {
       }),
     ]))
 
+    // The server may replay many durable outcomes after attach. A local
+    // retention limit must not discard an older exact checkpoint from that
+    // replay before the pane is reloaded again.
+    act(() => {
+      for (let index = 0; index < 200; index += 1) {
+        onMessage?.({
+          type: 'freshAgent.checkpoint.outcome',
+          requestId: `request-replayed-extra-${index}`,
+          logicalAttemptId: `attempt-replayed-extra-${index}`,
+          sessionId: 'thread-replayed-conversation',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          status: 'available',
+          checkpointId: `checkpoint-extra-${index}`,
+          nativeTurnId: `codex-replayed-extra-${index}`,
+          displayTurnId: `codex-replayed-extra-${index}:row-0`,
+        })
+      }
+    })
+    const retainedOutcomes = getFreshAgentPaneContent(store).checkpointOutcomes ?? []
+    expect(retainedOutcomes).toHaveLength(201)
+    expect(retainedOutcomes[0]).toMatchObject({
+      requestId: 'request-replayed-turn',
+      checkpointId,
+    })
+
     view.unmount()
     render(
       <Provider store={store}>
