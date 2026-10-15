@@ -201,12 +201,36 @@ const runtimeErrorCodes = [
   'RecoveryWrongIdentity', 'RecoveryRetryBudget', 'RecoveryInProgress', 'RecoveryStopUnconfirmed',
 ] as const
 
-export function summarizeRuntimeErrorCode(message: string): typeof runtimeErrorCodes[number] | undefined {
+function summarizeRuntimeRejection(message: string): { code: typeof runtimeErrorCodes[number]; detail: string } | undefined {
   const prefix = 'runtime supervisor rejected request: '
   const index = message.indexOf(prefix)
   if (index < 0) return undefined
   const rejection = message.slice(index + prefix.length)
-  return runtimeErrorCodes.find(code => rejection.startsWith(`${code}:`))
+  const code = runtimeErrorCodes.find(candidate => rejection.startsWith(`${candidate}:`))
+  return code ? { code, detail: rejection.slice(code.length + 2) } : undefined
+}
+
+export function summarizeRuntimeErrorCode(message: string): typeof runtimeErrorCodes[number] | undefined {
+  return summarizeRuntimeRejection(message)?.code
+}
+
+const runtimeErrorOperations = [
+  ['resolve managed provider credentials:', 'credential_resolution'],
+  ['prepare OneCLI provider files:', 'provider_files'],
+  ['prepare hosted OneCLI provider files:', 'provider_files'],
+  ['prepare managed provider:', 'provider_launch'],
+  ['spawn managed terminal:', 'pty_spawn'],
+  ['prepare provider config:', 'provider_config'],
+  ['prepare hosted provider config:', 'provider_config'],
+  ['prepare managed provider state:', 'provider_state'],
+  ['prepare managed Amplifier state:', 'provider_state'],
+  ['prepare hosted fresh-agent provider state failed:', 'provider_state'],
+  ['transfer managed provider state:', 'provider_state_transfer'],
+] as const
+
+export function summarizeRuntimeErrorOperation(message: string): typeof runtimeErrorOperations[number][1] | undefined {
+  const detail = summarizeRuntimeRejection(message)?.detail
+  return detail === undefined ? undefined : runtimeErrorOperations.find(([operation]) => detail.startsWith(operation))?.[1]
 }
 
 export function summarizeRuntimeErrorClass(message: string):
@@ -342,6 +366,7 @@ export function assertManagedTerminalCreated(owner: ManagedCreateOwner,
     const errno = response.message.match(/\(os error (\d{1,4})\)/)
     const osError = errno ? Number(errno[1]) : undefined
     const runtimeErrorCode = summarizeRuntimeErrorCode(response.message)
+    const runtimeErrorOperation = summarizeRuntimeErrorOperation(response.message)
     const runtimeErrorClass = summarizeRuntimeErrorClass(response.message)
     const reason = failureReasons.find(value => response.message.includes(value)) ?? inputReason
       ?? (filesystemLabel && osError !== undefined ? `${filesystemLabel} filesystem error` : 'UNKNOWN')
@@ -399,6 +424,7 @@ export function assertManagedTerminalCreated(owner: ManagedCreateOwner,
       severity: 'error', event: 'managed_environment.create_failed', code: code.success ? code.data : 'UNKNOWN', reason, ...(osError === undefined ? {} : { osError }),
       serverLogEvents,
       ...(runtimeErrorCode ? { runtimeErrorCode } : {}),
+      ...(runtimeErrorOperation ? { runtimeErrorOperation } : {}),
       ...(runtimeErrorClass ? { runtimeErrorClass } : {}),
       ...(response.providerPreparationFailure
         ? { providerPreparationFailure: summarizeProviderPreparationFailure(response.providerPreparationFailure) }

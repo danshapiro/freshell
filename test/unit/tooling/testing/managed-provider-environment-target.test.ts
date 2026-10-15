@@ -66,6 +66,26 @@ describe('managed provider environment target mode', () => {
     expect(JSON.stringify(incidents[0])).not.toContain('/private/')
   })
 
+  it('records only a fixed runtime launch operation for managed host failures', () => {
+    const incidents: unknown[] = []
+    const owner = {
+      web: { capturedOutput: () => ({ stdout: '', stderr: '' }), info: { logsDir: '/nonexistent/managed-test' } },
+      runtime: { containerLogs: () => '', writeIncident: (_name: string, value: unknown) => incidents.push(value) },
+      supervisor: { containerId: 'a'.repeat(64) },
+    }
+    const response = {
+      type: 'error' as const,
+      code: 'PTY_SPAWN_FAILED' as const,
+      timestamp: new Date().toISOString(),
+      message: 'managed runtime launch failed: runtime supervisor rejected request: HostUnreachable: prepare provider config: /private/provider/opencode.json TOKEN_SENTINEL',
+    }
+
+    expect(() => assertManagedTerminalCreated(owner, response)).toThrow()
+    expect(incidents[0]).toMatchObject({ runtimeErrorOperation: 'provider_config' })
+    expect(JSON.stringify(incidents[0])).not.toContain('/private/')
+    expect(JSON.stringify(incidents[0])).not.toContain('TOKEN_SENTINEL')
+  })
+
   it('retains only bounded event names and levels from server logs', () => {
     const logs = [
       JSON.stringify({ level: 'ERROR', event: 'provider.opencode.resource.failed', target: 'freshell_server::managed_runtime',
