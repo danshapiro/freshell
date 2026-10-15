@@ -1,13 +1,14 @@
 import { Terminal } from '@xterm/xterm'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { terminalBufferText } from '../../../../src/lib/terminal-buffer-text.js'
-import { providerStageResponse, sampleProviderResponseBrowser, sequenceProviderResponse,
+import { providerStageResponse, sampleProviderResponseBrowser, sequenceProviderResponse, waitForValue,
   type ProviderResponseCompletion, type ProviderResponseSnapshot } from '../../../e2e-browser/helpers/provider-response-sequencing.js'
 
 const terminals: Terminal[] = []
 afterEach(() => {
   terminals.splice(0).forEach(terminal => terminal.dispose())
   vi.unstubAllGlobals()
+  vi.useRealTimers()
 })
 
 function completion(overrides: Partial<ProviderResponseCompletion> = {}): ProviderResponseCompletion {
@@ -28,27 +29,35 @@ function rig(cols = 120, initial = false) {
   }
   const surface = () => snapshot && ({ ...snapshot, text: terminalBufferText(terminal.buffer.active) })
   let browserSample: (() => ReturnType<typeof sampleProviderResponseBrowser>) | undefined
-  const read = async () => browserSample ? browserSample().snapshot : surface()
+  const readErrors: Error[] = []
+  const read = async () => {
+    const error = readErrors.shift()
+    if (error) throw error
+    return browserSample ? browserSample().snapshot : surface()
+  }
   const response = providerStageResponse('codename-public-test', 'after_host', 'fresh-tag', initial)
   const actions: string[] = []
   const reports: string[] = []
   const scheduled: Array<() => Promise<void>> = []
   let duringPrepare: (() => Promise<void>) | undefined
-  const run = () => sequenceProviderResponse({
+  let duringSubmit: (() => void) | undefined
+  const run = (waitFor: Parameters<typeof sequenceProviderResponse>[0]['waitFor'] = async (_description, probe) => {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const result = await probe()
+      if (result !== null) return result
+      await scheduled.shift()?.()
+    }
+    throw new Error('bounded test timeout')
+  }) => sequenceProviderResponse({
     provider: 'opencode', paneId: 'pane', terminalId: 'terminal', priorStreamId: 'old', nativeSessionId: 'root', response, read,
     prepare: async command => { actions.push('prepare'); await write(`${command}\r\n`); await duringPrepare?.() },
-    submit: async () => { actions.push('submit') }, report: phase => { reports.push(phase) }, timeoutMs: 240_000,
-    waitFor: async (_description, probe) => {
-      for (let attempt = 0; attempt < 8; attempt++) {
-        const result = await probe()
-        if (result !== null) return result
-        await scheduled.shift()?.()
-      }
-      throw new Error('bounded test timeout')
-    },
+    submit: async () => { actions.push('submit'); duringSubmit?.() },
+    report: phase => { reports.push(phase) }, timeoutMs: 240_000, waitFor,
   })
   return { write, response, actions, reports, scheduled, run, set: (value: typeof snapshot) => { snapshot = value },
     duringPrepare: (callback: () => Promise<void>) => { duringPrepare = callback },
+    duringSubmit: (callback: () => void) => { duringSubmit = callback },
+    failNextRead: (error: Error) => { readErrors.push(error) },
     update: (value: Partial<NonNullable<typeof snapshot>>) => { if (snapshot) Object.assign(snapshot, value) },
     useBrowserMessages: (messages: unknown[]) => {
       vi.stubGlobal('window', { __FRESHELL_TEST_HARNESS__: {
@@ -101,6 +110,42 @@ describe('provider browser response diagnostics', () => {
     ])()
     expect(sample.snapshot?.turnCompletions?.map(({ streamId }) => streamId)).toEqual([null, 'old', 'current'])
     expect(JSON.stringify(sample.diagnostics)).not.toContain('synthetic-body')
+  })
+})
+
+describe('provider response sequencing through the production waiter', () => {
+  it.each([false, true])('propagates the typed current-turn failure with transientReadError=%s', async transientReadError => {
+    vi.useFakeTimers()
+    const test = rig()
+    test.duringSubmit(() => {
+      if (transientReadError) test.failNextRead(new Error('synthetic transient probe error'))
+      test.update({ turnCompletions: [completion()] })
+    })
+    let settled: unknown
+    const result = test.run(waitForValue).then(
+      value => { settled = value },
+      error => { settled = error },
+    )
+    await vi.advanceTimersByTimeAsync(1)
+    expect(test.actions).toEqual(['prepare', 'submit'])
+    if (transientReadError) {
+      expect(settled).toBeUndefined()
+      await vi.advanceTimersByTimeAsync(200)
+    }
+    expect(settled).toMatchObject({ name: 'ProviderResponseTurnFailedError', provider: 'opencode', outcome: 'failed' })
+    expect(test.reports).toEqual(['pre_send', 'failed'])
+    await result
+  })
+
+  it('retries unrelated errors with a matching name until the production probe succeeds', async () => {
+    vi.useFakeTimers()
+    const transient = new Error('synthetic transient probe error')
+    transient.name = 'ProviderResponseTurnFailedError'
+    const probe = vi.fn().mockRejectedValueOnce(transient).mockResolvedValueOnce(null).mockResolvedValueOnce('ready')
+    const result = waitForValue('synthetic readiness', probe, 1_000)
+    await vi.advanceTimersByTimeAsync(400)
+    await expect(result).resolves.toBe('ready')
+    expect(probe).toHaveBeenCalledTimes(3)
   })
 })
 

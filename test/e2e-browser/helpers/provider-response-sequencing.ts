@@ -80,6 +80,29 @@ export class ProviderResponseTurnFailedError extends Error {
   }
 }
 
+export async function waitForValue<T>(
+  description: string,
+  probe: () => T | null | undefined | Promise<T | null | undefined>,
+  timeoutMs: number,
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs
+  let lastError: unknown
+  while (Date.now() < deadline) {
+    try {
+      const value = await probe()
+      if (value !== null && value !== undefined) return value
+    } catch (error) {
+      // A native failed turn is final; browser/transport probe failures may
+      // still recover on the next poll.
+      if (error instanceof ProviderResponseTurnFailedError) throw error
+      lastError = error
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200))
+  }
+  const suffix = lastError instanceof Error ? `; last error: ${lastError.message}` : ''
+  throw new Error(`timed out waiting for ${description}${suffix}`)
+}
+
 export function providerStageResponse(nonce: string, stage: string, tag: string, initial = false) {
   const suffix = `${stage}-${tag}`
   return {

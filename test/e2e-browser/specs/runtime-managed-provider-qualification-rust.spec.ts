@@ -43,7 +43,7 @@ import {
 } from '../helpers/managed-runtime.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TestHarness } from '../helpers/test-harness.js'
-import { providerStageResponse, sampleProviderResponseBrowser, sequenceProviderResponse } from '../helpers/provider-response-sequencing.js'
+import { providerStageResponse, sampleProviderResponseBrowser, sequenceProviderResponse, waitForValue } from '../helpers/provider-response-sequencing.js'
 import {
   buildTerminalOrdinaryTurnBrowserScript,
   TERMINAL_ORDINARY_TURN_BROWSER_GLOBAL,
@@ -168,26 +168,6 @@ function leavesByMode(node: any, mode: string): any[] {
   return node.type === 'split'
     ? (node.children ?? []).flatMap((child: any) => leavesByMode(child, mode))
     : []
-}
-
-async function waitForValue<T>(
-  description: string,
-  probe: () => T | null | undefined | Promise<T | null | undefined>,
-  timeoutMs: number,
-): Promise<T> {
-  const deadline = Date.now() + timeoutMs
-  let lastError: unknown
-  while (Date.now() < deadline) {
-    try {
-      const value = await probe()
-      if (value !== null && value !== undefined) return value
-    } catch (error) {
-      lastError = error
-    }
-    await new Promise((resolve) => setTimeout(resolve, 200))
-  }
-  const suffix = lastError instanceof Error ? `; last error: ${lastError.message}` : ''
-  throw new Error(`timed out waiting for ${description}${suffix}`)
 }
 
 function regexEscape(value: string): string {
