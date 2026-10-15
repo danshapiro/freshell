@@ -1,7 +1,9 @@
 use freshell_runtime_protocol::{
     terminal_spool::{
-        scan_spool, RetainedOutputPage, TerminalSpoolFrame as SpoolFrame, SPOOL_COMPLETION_FILE,
-        SPOOL_DESCRIPTOR_FILE,
+        build_spool_index, encode_spool_index, read_indexed_spool, write_spool_index_checkpoint,
+        IndexedSpoolSegment, TerminalSpoolFrame as SpoolFrame, TerminalSpoolIndexEntry,
+        SPOOL_COMPLETION_FILE, SPOOL_CURRENT_INDEX_FILE, SPOOL_DESCRIPTOR_FILE,
+        SPOOL_INDEX_STRIDE_BYTES, SPOOL_PREVIOUS_INDEX_FILE,
     },
     IncarnationId, RuntimeOutputBatch, RuntimeOutputFrame, TerminalExitObservation,
     TerminalSpoolCompletion, TerminalSpoolDescriptor,
@@ -27,8 +29,12 @@ pub struct OutputJournal {
     ring_limit: usize,
     spool_limit: u64,
     next_seq: u64,
+    previous_index: Vec<TerminalSpoolIndexEntry>,
+    current_index: Vec<TerminalSpoolIndexEntry>,
     completion: Option<TerminalSpoolCompletion>,
     failure: Option<String>,
+    #[cfg(test)]
+    last_read_bytes_scanned: std::cell::Cell<u64>,
 }
 
 impl OutputJournal {
@@ -78,8 +84,12 @@ impl OutputJournal {
             spool_limit: spool_limit
                 .clamp((MAX_TRANSPORT_CHUNK_BYTES * 4) as u64, DEFAULT_SPOOL_BYTES),
             next_seq: 1,
+            previous_index: Vec::new(),
+            current_index: Vec::new(),
             completion: None,
             failure: None,
+            #[cfg(test)]
+            last_read_bytes_scanned: std::cell::Cell::new(0),
         };
         atomic_json(
             &journal.state_dir.join(SPOOL_DESCRIPTOR_FILE),
@@ -157,56 +167,49 @@ impl OutputJournal {
         Ok(())
     }
 
-    fn scan(
-        &self,
-        mut accept: impl FnMut(RuntimeOutputFrame) -> Result<(), String>,
-    ) -> Result<bool, String> {
+    pub fn read(&self, after_seq: u64, max_bytes: u64) -> Result<RuntimeOutputBatch, String> {
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
         let source = self.descriptor();
-        let mut torn = false;
-        for (path, required) in [(self.previous_path(), false), (self.current_path(), true)] {
+        let mut segments = Vec::with_capacity(2);
+        for (path, checkpoints, required) in [
+            (self.previous_path(), &self.previous_index, false),
+            (self.current_path(), &self.current_index, true),
+        ] {
             let file = match std::fs::File::open(path) {
                 Ok(file) => file,
                 Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(_) => return Err("retained output spool unavailable".into()),
             };
-            if file
+            let file_bytes = file
                 .metadata()
                 .map_err(|_| "retained spool metadata unavailable")?
-                .len()
-                > source.segment_limit_bytes
-            {
+                .len();
+            if file_bytes > source.segment_limit_bytes {
                 return Err("retained spool exceeds segment bound".into());
             }
-            torn |= scan_spool(BufReader::new(file), &source, &mut accept)?;
+            segments.push(IndexedSpoolSegment {
+                reader: BufReader::new(file),
+                file_bytes,
+                checkpoints: checkpoints.clone(),
+            });
         }
-        Ok(torn)
+        let indexed = read_indexed_spool(
+            source,
+            segments,
+            after_seq,
+            max_bytes,
+            self.completion.clone(),
+        )?;
+        #[cfg(test)]
+        self.last_read_bytes_scanned.set(indexed.bytes_scanned);
+        Ok(indexed.batch)
     }
 
-    pub fn read(&self, after_seq: u64, max_bytes: u64) -> Result<RuntimeOutputBatch, String> {
-        if let Some(error) = &self.failure {
-            return Err(error.clone());
-        }
-        // First scan establishes bounds without retaining the spool in memory.
-        let mut first = None;
-        let mut head = 0;
-        self.scan(|frame| {
-            first.get_or_insert(frame.seq_start);
-            head = frame.seq_end;
-            Ok(())
-        })?;
-        let retained = first.unwrap_or(head.saturating_add(1));
-        let reset = after_seq > head || after_seq.saturating_add(1) < retained;
-        let effective = if reset {
-            retained.saturating_sub(1)
-        } else {
-            after_seq
-        };
-        let mut page = RetainedOutputPage::new(self.descriptor(), effective, max_bytes)?;
-        let torn = self.scan(|frame| page.accept(frame))?;
-        let mut batch = page.finish(torn, self.completion.clone())?;
-        batch.reset_required |= reset;
-        batch.truncated |= reset;
-        Ok(batch)
+    #[cfg(test)]
+    fn last_read_bytes_scanned(&self) -> u64 {
+        self.last_read_bytes_scanned.get()
     }
 
     pub fn head_seq(&self) -> u64 {
@@ -223,7 +226,7 @@ impl OutputJournal {
             .sum()
     }
 
-    fn append_spool(&self, frame: &RuntimeOutputFrame) -> Result<(), String> {
+    fn append_spool(&mut self, frame: &RuntimeOutputFrame) -> Result<(), String> {
         let line = serde_json::to_vec(&SpoolFrame {
             frame: frame.clone(),
         })
@@ -233,10 +236,22 @@ impl OutputJournal {
         let current_len = current.metadata().map(|m| m.len()).unwrap_or(0);
         if current_len > 0 && current_len.saturating_add(line.len() as u64 + 1) > segment_limit {
             let previous = self.previous_path();
+            let previous_index_path = self.previous_index_path();
+            let current_index_path = self.current_index_path();
             let _ = std::fs::remove_file(&previous);
+            let _ = std::fs::remove_file(&previous_index_path);
             std::fs::rename(&current, &previous).map_err(|e| e.to_string())?;
+            std::fs::rename(&current_index_path, &previous_index_path)
+                .map_err(|e| e.to_string())?;
             sync_parent(&current)?;
+            self.previous_index = std::mem::take(&mut self.current_index);
+            write_index_atomic(&current_index_path, &self.descriptor(), &[], 0)?;
         }
+        let current_len = current.metadata().map(|m| m.len()).unwrap_or(0);
+        let checkpoint_needed = self
+            .current_index
+            .last()
+            .is_none_or(|last| current_len.saturating_sub(last.offset) >= SPOOL_INDEX_STRIDE_BYTES);
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -246,15 +261,41 @@ impl OutputJournal {
             .and_then(|_| file.write_all(b"\n"))
             .map_err(|e| e.to_string())?;
         file.sync_data().map_err(|e| e.to_string())?;
+        if checkpoint_needed {
+            let checkpoint = TerminalSpoolIndexEntry {
+                seq: frame.seq_start,
+                offset: current_len,
+            };
+            let mut index = OpenOptions::new()
+                .append(true)
+                .open(self.current_index_path())
+                .map_err(|_| "retained output index unavailable")?;
+            write_spool_index_checkpoint(&mut index, checkpoint)?;
+            index
+                .sync_data()
+                .map_err(|_| "retained output index sync failed")?;
+            self.current_index.push(checkpoint);
+        }
         Ok(())
     }
 
     fn seed_sequence_from_spool(&mut self) -> Result<(), String> {
-        let mut head = 0;
-        self.scan(|frame| {
-            head = frame.seq_end;
-            Ok(())
-        })?;
+        let source = self.descriptor();
+        let (previous_index, previous_head) = rebuild_spool_index(
+            &self.previous_path(),
+            &self.previous_index_path(),
+            false,
+            &source,
+        )?;
+        let (current_index, current_head) = rebuild_spool_index(
+            &self.current_path(),
+            &self.current_index_path(),
+            true,
+            &source,
+        )?;
+        self.previous_index = previous_index;
+        self.current_index = current_index;
+        let head = current_head.max(previous_head);
         self.next_seq = head.checked_add(1).ok_or("output sequence exhausted")?;
         Ok(())
     }
@@ -265,6 +306,59 @@ impl OutputJournal {
     fn previous_path(&self) -> PathBuf {
         self.state_dir.join("terminal-spool-previous.jsonl")
     }
+    fn current_index_path(&self) -> PathBuf {
+        self.state_dir.join(SPOOL_CURRENT_INDEX_FILE)
+    }
+    fn previous_index_path(&self) -> PathBuf {
+        self.state_dir.join(SPOOL_PREVIOUS_INDEX_FILE)
+    }
+}
+
+fn rebuild_spool_index(
+    spool_path: &Path,
+    index_path: &Path,
+    required: bool,
+    source: &TerminalSpoolDescriptor,
+) -> Result<(Vec<TerminalSpoolIndexEntry>, u64), String> {
+    let file = match std::fs::File::open(spool_path) {
+        Ok(file) => file,
+        Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {
+            write_index_atomic(index_path, source, &[], 0)?;
+            return Ok((Vec::new(), 0));
+        }
+        Err(_) => return Err("retained output spool unavailable".into()),
+    };
+    let file_bytes = file
+        .metadata()
+        .map_err(|_| "retained spool metadata unavailable")?
+        .len();
+    if file_bytes > source.segment_limit_bytes {
+        return Err("retained spool exceeds segment bound".into());
+    }
+    let (checkpoints, head, _) = build_spool_index(BufReader::new(file), source, 0)?;
+    write_index_atomic(index_path, source, &checkpoints, file_bytes)?;
+    Ok((checkpoints, head))
+}
+
+fn write_index_atomic(
+    path: &Path,
+    source: &TerminalSpoolDescriptor,
+    checkpoints: &[TerminalSpoolIndexEntry],
+    spool_bytes: u64,
+) -> Result<(), String> {
+    let bytes = encode_spool_index(source, checkpoints, spool_bytes)?;
+    let temporary = path.with_extension("tmp");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|_| "retained output index unavailable")?;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|_| "retained output index sync failed")?;
+    std::fs::rename(&temporary, path).map_err(|_| "retained output index commit failed")?;
+    sync_parent(path)
 }
 
 pub fn atomic_json(path: &Path, value: &impl serde::Serialize) -> Result<(), String> {
@@ -433,6 +527,37 @@ mod tests {
         assert_eq!(batch.frames[0].seq_start, 1);
         assert_eq!(batch.frames[0].data, "restored native conversation");
         assert!(journal.read(1, 64 * 1024).unwrap().frames.is_empty());
+    }
+
+    #[test]
+    fn later_replay_page_does_not_rescan_the_entire_retained_spool() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = OutputJournal::with_limits(
+            dir.path(),
+            IncarnationId::new(),
+            "t".into(),
+            "epoch".into(),
+            64 * 1024,
+            16 * 1024 * 1024,
+        )
+        .unwrap();
+        let payload = "x".repeat(MAX_TRANSPORT_CHUNK_BYTES);
+        let mut last_seq = 0;
+        for _ in 0..96 {
+            last_seq = journal.append(&payload).unwrap()[0].seq_end;
+        }
+        let spool_bytes = journal.spool_bytes();
+
+        let page = journal.read(last_seq - 1, 64 * 1024).unwrap();
+
+        assert_eq!(page.frames.len(), 1);
+        assert_eq!(page.frames[0].seq_start, last_seq);
+        assert!(
+            journal.last_read_bytes_scanned() < spool_bytes / 2,
+            "a near-tail page should scan only its indexed neighborhood, not the full spool twice; scanned {} of {} bytes",
+            journal.last_read_bytes_scanned(),
+            spool_bytes
+        );
     }
 
     #[test]
