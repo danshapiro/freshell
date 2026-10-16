@@ -238,6 +238,122 @@ describe('owned launch cleanup (Docker only)', () => {
     }
   })
 
+  it.each(['next scan', 'retry'] as const)('does not retire a group after a fork/exit between enumeration and stat (%s)', async recovery => {
+    const { owned, childPid } = await launcher(true)
+    await owned.wait()
+    const childStat = fs.readFileSync(`/proc/${childPid}/stat`, 'utf8')
+    const childEnvironment = fs.readFileSync(`/proc/${childPid}/environ`, 'utf8')
+    const executable = fs.readlinkSync(`/proc/${childPid}/exe`)
+    const cwd = fs.readlinkSync(`/proc/${childPid}/cwd`)
+    process.kill(childPid, 'SIGTERM')
+    await absent(childPid)
+
+    // Simulate the exact scan interleaving; all signals below are intercepted.
+    const latePid = childPid + 1_000_000
+    let scans = 0
+    let orphanPresent = true
+    let latePresent = false
+    let revealLate = recovery === 'next scan'
+    const missing = () => Object.assign(new Error('fixture process absent'), { code: 'ENOENT' })
+    const readdir = fs.readdirSync
+    const readdirSpy = vi.spyOn(fs, 'readdirSync').mockImplementation((...args) => {
+      if (args[0] !== '/proc') return Reflect.apply(readdir, fs, args)
+      scans += 1
+      if (scans === 1) return [String(childPid)] as never
+      if (scans === 2) {
+        // The listed orphan forks and exits before its stat is read. The new
+        // child belongs to the group but was not in this directory snapshot.
+        orphanPresent = false
+        latePresent = true
+        return [String(childPid)] as never
+      }
+      return (revealLate && latePresent ? [String(latePid)] : []) as never
+    })
+    const read = fs.readFileSync
+    const readSpy = vi.spyOn(fs, 'readFileSync').mockImplementation((...args) => {
+      if (args[0] === `/proc/${childPid}/stat`) {
+        if (!orphanPresent) throw missing()
+        return childStat
+      }
+      if (args[0] === `/proc/${latePid}/stat`) {
+        if (!latePresent) throw missing()
+        return childStat.replace(/^\d+/, String(latePid))
+      }
+      if (args[0] === `/proc/${childPid}/environ` || args[0] === `/proc/${latePid}/environ`) return childEnvironment
+      return Reflect.apply(read, fs, args)
+    })
+    const readlink = fs.readlinkSync
+    const readlinkSpy = vi.spyOn(fs, 'readlinkSync').mockImplementation((...args) => {
+      if ([`/proc/${childPid}/exe`, `/proc/${latePid}/exe`].includes(String(args[0]))) return executable
+      if ([`/proc/${childPid}/cwd`, `/proc/${latePid}/cwd`].includes(String(args[0]))) return cwd
+      return Reflect.apply(readlink, fs, args)
+    })
+    const signal = vi.spyOn(process, 'kill').mockImplementation((pid, value) => {
+      if (pid === -owned.identity.pid && value === 0) {
+        if (!latePresent) throw Object.assign(new Error('fixture group absent'), { code: 'ESRCH' })
+        return true
+      }
+      if (pid !== latePid || value !== 'SIGTERM') throw new Error('unchecked fixture termination signal')
+      latePresent = false
+      return true
+    })
+    vi.useFakeTimers()
+    try {
+      if (recovery === 'retry') {
+        const result = owned.stop().then(() => undefined, (error: unknown) => error)
+        await vi.runAllTimersAsync()
+        expect(await result).toEqual(new Error('owned process cleanup could not verify absence'))
+        expect(latePresent).toBe(true)
+        revealLate = true
+      }
+      const cleanup = owned.stop()
+      await vi.runAllTimersAsync()
+      await cleanup
+      expect(latePresent).toBe(false)
+      expect(signal).toHaveBeenCalledWith(latePid, 'SIGTERM')
+      expect(signal).toHaveBeenCalledWith(-owned.identity.pid, 0)
+    } finally {
+      vi.useRealTimers()
+      readdirSpy.mockRestore()
+      readSpy.mockRestore()
+      readlinkSpy.mockRestore()
+      signal.mockRestore()
+      await owned.stop()
+    }
+  })
+
+  it.each(['EPERM', 'EIO', undefined])('keeps absence-probe failure retryable (%s)', async code => {
+    const { owned, childPid } = await launcher(true)
+    await owned.wait()
+    // An empty directory snapshot cannot overrule a failed kernel probe.
+    const readdirSpy = vi.spyOn(fs, 'readdirSync').mockReturnValue([])
+    const failure = Object.assign(new Error('fixture group probe failed'), { code })
+    const kill = process.kill.bind(process)
+    const signal = vi.spyOn(process, 'kill').mockImplementation((pid, value) => {
+      if (pid === -owned.identity.pid) {
+        if (value !== 0) throw new Error('unchecked group termination signal')
+        throw failure
+      }
+      return kill(pid, value)
+    })
+    try {
+      await expect(owned.stop()).rejects.toBe(failure)
+      expect(fs.existsSync(`/proc/${childPid}`)).toBe(true)
+      readdirSpy.mockRestore()
+      signal.mockRestore()
+      await owned.stop()
+      await absent(childPid)
+    } finally {
+      readdirSpy.mockRestore()
+      signal.mockRestore()
+      // Also clean the fixture when the regression falsely retired its scope.
+      try { process.kill(childPid, 'SIGKILL') } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+      }
+      await absent(childPid)
+    }
+  })
+
   it('does not reclaim a numeric scope after a completed stop', async () => {
     const { owned, childPid } = await launcher(true)
     await owned.wait()
