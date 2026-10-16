@@ -2885,8 +2885,9 @@ writeFileSync:(file,bytes)=>writes.push({file,observation:JSON.parse(bytes)})};`
                   event: cursor + index + 1 !== head ? { kind: 'fixture' } : fault === 'backlog-permission'
                     ? { kind: 'permission_requested' } : { kind: 'provider', data: { payload: { event: { type: 'freshAgent.permission.dispatch' } } } } })) } }
             }
-            return { data: { head: 2, retainedFrom: fault === 'retention-baseline' ? 2 : 1, resetRequired: fault === 'retention-baseline',
-              events: cursor < 2 ? [{ sequence: 2, event: { kind: 'fixture' } }]
+            return { data: { head: fault === 'retention-baseline' || (fault === 'redispatch' && cursor >= 2) ? 3 : 2,
+              retainedFrom: fault === 'retention-baseline' ? 3 : 1, resetRequired: fault === 'retention-baseline',
+              events: cursor < 2 ? [{ sequence: fault === 'retention-baseline' ? 3 : 2, event: { kind: 'fixture' } }]
                 : fault === 'redispatch' ? [{ sequence: 3, event: { kind: 'provider', data: { payload: { event: { type: 'freshAgent.permission.dispatch', ok: true } } } } }] : [] } }
           }
           if (read) throw new Error('unexpected observation read after parked card')
