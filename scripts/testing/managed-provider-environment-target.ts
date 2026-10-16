@@ -161,8 +161,10 @@ const workspaceCwdAliasMcpServerSource = String.raw`import fs from 'node:fs'
 import helper from './helper.mjs'
 const [receiptPath, expectedNonce] = process.argv.slice(2)
 if (!receiptPath || !expectedNonce) process.exit(12)
+const processStat = fs.readFileSync('/proc/self/stat', 'utf8')
+const processStartTicks = processStat.slice(processStat.lastIndexOf(')') + 2).trim().split(/\s+/)[19]
 fs.writeFileSync(receiptPath, JSON.stringify({ expectedNonce, helper, terminalId: process.env.FRESHELL_TERMINAL_ID,
-  pid: process.pid, createdAt: new Date().toISOString(),
+  pid: process.pid, processStartTicks, createdAt: new Date().toISOString(),
   envValueLoaded: process.env.FRESHELL_MANAGED_CWD_ALIAS_ENV === expectedNonce,
   envFileTarget: fs.realpathSync('.env'),
   envFileOperand: process.execArgv.find(value => value.startsWith('--env-file=')),
@@ -193,6 +195,30 @@ process.stdin.on('data', chunk => {
   }
 })
 `
+
+export function workspaceCwdAliasReplacementProcessProbeSource(): string {
+  return String.raw`const fs = require('node:fs')
+const path = require('node:path')
+const [pidText, receiptPath, expectedNonce, expectedCwd, expectedStartTicks] = process.argv.slice(1)
+const procPath = '/proc/' + Number(pidText)
+const result = { exists: false, isNode: false, envFileOperand: false, fixtureArguments: false, cwdMatches: false,
+  processStartTicksMatches: false }
+try {
+  result.exists = fs.existsSync(procPath + '/stat')
+  const command = fs.readFileSync(procPath + '/cmdline', 'utf8').split(String.fromCharCode(0)).filter(Boolean)
+  const stat = fs.readFileSync(procPath + '/stat', 'utf8')
+  const startTicks = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/)[19]
+  const scriptIndex = command.indexOf('server.mjs')
+  result.isNode = path.basename(fs.readlinkSync(procPath + '/exe').replace(/ \(deleted\)$/, '')) === 'node'
+  result.envFileOperand = command.includes('--env-file=.env')
+  result.fixtureArguments = scriptIndex >= 0 && command[scriptIndex + 1] === receiptPath
+    && command[scriptIndex + 2] === expectedNonce
+  result.cwdMatches = fs.readlinkSync(procPath + '/cwd') === expectedCwd
+  result.processStartTicksMatches = startTicks === expectedStartTicks
+} catch { /* Emit false checks so the host-side assertion reports the failed evidence. */ }
+process.stdout.write(JSON.stringify(result))
+`
+}
 
 export function workspaceCwdAliasMcpWrapperSource(): string {
   const receiptVariable = '${receipt}'
@@ -1798,16 +1824,28 @@ export async function runManagedEnvironmentTarget() {
     assert.equal(replacementCwdAliasMcp.helper, nonce)
     assert.equal(replacementCwdAliasMcp.terminalId, replacement.terminalId)
     assert(Number.isSafeInteger(replacementCwdAliasMcp.pid) && replacementCwdAliasMcp.pid > 1)
+    assert.match(replacementCwdAliasMcp.processStartTicks, /^\d+$/)
     assert.equal(replacementCwdAliasMcp.envValueLoaded, true)
     assert.match(replacementCwdAliasMcp.envFileTarget, /^\/run\/freshell-secrets\/provider-\d+$/)
     assert.equal(replacementCwdAliasMcp.envFileOperand, '--env-file=.env')
     assert.equal(replacementCwdAliasMcp.cwd, selected.cwdAliasProject)
     assert(replacementCwdAliasMcp.scriptPath.endsWith('/cwd-alias-project/server.mjs'))
     assert.equal(await fs.readFile(`${cwdAliasReceiptPath}.started`, 'utf8'), 'wrapper-started')
+    assert(replacement.containerId)
+    const replacementMcpProcessProbe = JSON.parse(rig.runtime.execOwnedContainerExact(replacement.containerId, [
+      'node', '-e', workspaceCwdAliasReplacementProcessProbeSource(),
+      String(replacementCwdAliasMcp.pid), cwdAliasReceiptPath, nonce, selected.cwdAliasProject,
+      replacementCwdAliasMcp.processStartTicks,
+    ]))
+    assert.deepEqual(replacementMcpProcessProbe, {
+      exists: true, isNode: true, envFileOperand: true, fixtureArguments: true, cwdMatches: true,
+      processStartTicksMatches: true,
+    }, 'the .env MCP receipt must belong to a live process in the replacement container')
     proof.nativeReplacement = { priorIncarnationId: original.incarnationId, incarnationId: replacement.incarnationId,
       soulId: replacement.soulId, nativeSessionId: replacement.nativeSessionId, stage: replacementStage,
       child: replacementChild, workspaceCwdAliasMcp: { ...replacementCwdAliasMcp,
-        associatedIncarnationId: replacement.incarnationId } }
+        verifiedInsideContainerId: replacement.containerId, verifiedIncarnationId: replacement.incarnationId,
+        processProbe: replacementMcpProcessProbe } }
     await writeJson(path.join(rig.runtime.evidenceDir, 'managed-environment-acceptance.json'), proof)
     const browserSummary = proof.cloudBrowser as ManagedEnvironmentBrowserSummary
     console.log(JSON.stringify({ severity: 'info', event: 'managed_environment.acceptance_passed', candidateSha: fixture.candidateSha,

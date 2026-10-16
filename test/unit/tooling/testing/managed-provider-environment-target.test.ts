@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import fs from 'node:fs/promises'
 import { createConnection, createServer, type AddressInfo } from 'node:net'
 import path from 'node:path'
@@ -19,6 +19,7 @@ import {
   runManagedProviderEnvironmentTarget,
   stopExact,
   workspaceCwdAliasMcpWrapperSource,
+  workspaceCwdAliasReplacementProcessProbeSource,
   writeWorkspaceCwdAliasMcpWrapper,
 } from '../../../../scripts/testing/managed-provider-environment-target.js'
 
@@ -230,6 +231,61 @@ fs.writeFileSync(receiptPath, JSON.stringify({ envValueLoaded: process.env.FRESH
         stderrHasSyntaxError: true,
       })
     } finally {
+      await fs.rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('binds a generated replacement-process probe to the live MCP process identity', async () => {
+    const directory = await fs.mkdtemp(path.join(process.env.TMPDIR ?? '/tmp', 'frs-managed-cwd-alias-probe-'))
+    const receiptPath = path.join(directory, 'mcp-cwd-alias-receipt.json')
+    const nonce = 'replacement-probe-nonce'
+    let child: ReturnType<typeof spawn> | undefined
+    try {
+      await fs.writeFile(path.join(directory, '.env'), 'PROBE_ENV=ready\n')
+      await fs.writeFile(path.join(directory, 'server.mjs'), `import fs from 'node:fs'
+const [receiptPath] = process.argv.slice(2)
+const stat = fs.readFileSync('/proc/self/stat', 'utf8')
+const processStartTicks = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\\s+/)[19]
+fs.writeFileSync(receiptPath, JSON.stringify({ pid: process.pid, processStartTicks }))
+process.stdout.write(JSON.stringify({ pid: process.pid, processStartTicks }) + '\\n')
+setInterval(() => {}, 1000)
+`)
+      child = spawn(process.execPath, ['--env-file=.env', 'server.mjs', receiptPath, nonce], {
+        cwd: directory, stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      let buffered = ''
+      const receipt = await new Promise<{ pid: number; processStartTicks: string }>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('MCP fixture did not report ready')), 5_000)
+        child!.once('error', error => { clearTimeout(timeout); reject(error) })
+        child!.once('exit', (code, signal) => {
+          clearTimeout(timeout)
+          reject(new Error(`MCP fixture exited before ready (${code ?? signal})`))
+        })
+        child!.stdout!.setEncoding('utf8')
+        child!.stdout!.on('data', chunk => {
+          buffered += chunk
+          const boundary = buffered.indexOf('\n')
+          if (boundary < 0) return
+          clearTimeout(timeout)
+          try { resolve(JSON.parse(buffered.slice(0, boundary))) }
+          catch (error) { reject(error) }
+        })
+      })
+      const runProbe = (startTicks: string) => JSON.parse(execFileSync(process.execPath, [
+        '-e', workspaceCwdAliasReplacementProcessProbeSource(), String(receipt.pid), receiptPath, nonce, directory, startTicks,
+      ], { cwd: directory, encoding: 'utf8' }))
+
+      expect(runProbe(receipt.processStartTicks)).toEqual({
+        exists: true, isNode: true, envFileOperand: true, fixtureArguments: true, cwdMatches: true,
+        processStartTicksMatches: true,
+      })
+      expect(runProbe(`${receipt.processStartTicks}-stale`).processStartTicksMatches).toBe(false)
+    } finally {
+      if (child && child.exitCode === null && child.signalCode === null) {
+        const closed = new Promise<void>(resolve => child!.once('close', () => resolve()))
+        child.kill('SIGTERM')
+        await closed
+      }
       await fs.rm(directory, { recursive: true, force: true })
     }
   })
