@@ -1006,6 +1006,173 @@ fn current_store_verification_replays_completed_v2_response_content() {
 }
 
 #[test]
+fn current_store_verification_replays_committed_revert_of_imported_v2_rows() {
+    let mut fixture = fixture_with_baseline_event();
+    let connection = Connection::open(fixture.root.join("source.sqlite")).unwrap();
+    let prompt =
+        serde_json::json!({"text":"imported prompt after boundary","files":[],"agents":[]});
+    for (seq, kind, data) in [
+        (
+            1,
+            "context.updated",
+            serde_json::json!({"timestamp":20,"messageID":"msg_v2_boundary","text":"boundary"}),
+        ),
+        (
+            2,
+            "prompt.admitted",
+            serde_json::json!({"timestamp":30,"messageID":"msg_v2_after","delivery":"queue","prompt":prompt}),
+        ),
+        (
+            3,
+            "prompted",
+            serde_json::json!({"timestamp":30,"messageID":"msg_v2_after","delivery":"queue","prompt":prompt}),
+        ),
+        (
+            4,
+            "prompt.admitted",
+            serde_json::json!({"timestamp":40,"messageID":"msg_v2_pending","delivery":"steer","prompt":prompt}),
+        ),
+        (
+            5,
+            "revert.staged",
+            serde_json::json!({"timestamp":50,"revert":{"messageID":"msg_v2_boundary"}}),
+        ),
+    ] {
+        let mut data = data;
+        data["sessionID"] = "ses_root".into();
+        append_durable_event(
+            &connection,
+            seq,
+            &format!("evt_imported_{seq}"),
+            &format!("session.next.{kind}.1"),
+            data,
+        );
+    }
+    connection.execute(
+        "INSERT INTO session_message(id,session_id,type,seq,time_created,time_updated,data)
+         VALUES('msg_v2_boundary','ses_root','system',1,20,20,?1),
+               ('msg_v2_after','ses_root','user',3,30,30,?2)",
+        params![serde_json::json!({"text":"boundary","time":{"created":20}}).to_string(),
+            serde_json::json!({"text":"imported prompt after boundary","files":[],"agents":[],"time":{"created":30}}).to_string()],
+    ).unwrap();
+    connection.execute(
+        "INSERT INTO session_input(id,session_id,admitted_seq,promoted_seq,time_created,delivery,prompt)
+         VALUES('msg_v2_after','ses_root',2,3,30,'queue',?1),
+               ('msg_v2_pending','ses_root',4,NULL,40,'steer',?1)",
+        [prompt.to_string()],
+    ).unwrap();
+    connection
+        .execute(
+            "UPDATE session SET revert=?1,time_updated=50 WHERE id='ses_root'",
+            [serde_json::json!({"messageID":"msg_v2_boundary"}).to_string()],
+        )
+        .unwrap();
+    drop(connection);
+    reexport_owned_fixture(&mut fixture);
+    import_bundle(
+        &fixture.descriptor,
+        &fixture.staged_directory,
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .unwrap();
+    verify_current_store(
+        &fixture.descriptor,
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .expect("the imported V2 message/input rows and staged revert are native projections");
+
+    let connection = Connection::open(&fixture.destination_database).unwrap();
+    // Apply all effects of the native committed-revert projector, including
+    // removal of both promoted and pending imported inputs after the boundary.
+    connection.execute_batch(
+        "DELETE FROM session_message WHERE session_id='ses_root' AND seq>1;
+         DELETE FROM session_input WHERE session_id='ses_root' AND (admitted_seq>1 OR promoted_seq>1);
+         UPDATE session SET revert=NULL,time_updated=60 WHERE id='ses_root';",
+    ).unwrap();
+    assert!(
+        verify_current_store(
+            &fixture.descriptor,
+            &fixture.destination_database,
+            &fixture.workspace
+        )
+        .is_err(),
+        "suffix removal needs the committed event"
+    );
+    append_durable_event(
+        &connection,
+        6,
+        "evt_imported_revert",
+        "session.next.revert.committed.1",
+        serde_json::json!({
+            "sessionID":"ses_root","timestamp":60,"messageID":"msg_v2_boundary"
+        }),
+    );
+    let evidence = verify_current_store(&fixture.descriptor, &fixture.destination_database, &fixture.workspace)
+        .expect("a committed native revert authorizes imported projection suffix removal and session update");
+    assert_eq!(
+        evidence.root_tail,
+        VerifiedRootTail::Message {
+            message_id: "msg_v2_boundary".into()
+        }
+    );
+
+    connection
+        .execute("UPDATE session SET time_updated=61 WHERE id='ses_root'", [])
+        .unwrap();
+    assert!(verify_current_store(
+        &fixture.descriptor,
+        &fixture.destination_database,
+        &fixture.workspace
+    )
+    .is_err());
+    connection
+        .execute(
+            "UPDATE session SET time_updated=60,revert=?1 WHERE id='ses_root'",
+            [serde_json::json!({"messageID":"msg_v2_boundary"}).to_string()],
+        )
+        .unwrap();
+    assert!(verify_current_store(
+        &fixture.descriptor,
+        &fixture.destination_database,
+        &fixture.workspace
+    )
+    .is_err());
+    connection
+        .execute("UPDATE session SET revert=NULL WHERE id='ses_root'", [])
+        .unwrap();
+    connection.execute(
+        "INSERT INTO session_input(id,session_id,admitted_seq,promoted_seq,time_created,delivery,prompt)
+         VALUES('msg_v2_pending','ses_root',4,NULL,40,'steer',?1)", [prompt.to_string()]
+    ).unwrap();
+    assert!(
+        verify_current_store(
+            &fixture.descriptor,
+            &fixture.destination_database,
+            &fixture.workspace
+        )
+        .is_err(),
+        "an unremoved imported input cannot match committed revert"
+    );
+    connection
+        .execute("DELETE FROM session_input WHERE id='msg_v2_pending'", [])
+        .unwrap();
+    connection
+        .execute("DELETE FROM session_message WHERE id='msg_v2_boundary'", [])
+        .unwrap();
+    assert!(
+        verify_current_store(
+            &fixture.descriptor,
+            &fixture.destination_database,
+            &fixture.workspace
+        )
+        .is_err(),
+        "revert cannot remove its retained boundary"
+    );
+}
+
+#[test]
 fn current_store_verification_replays_v2_revert_and_derives_boundary_tail() {
     let fixture = fixture_with_baseline_event();
     import_bundle(
