@@ -449,8 +449,12 @@ pub(crate) mod wire_support {
         }
 
         pub(crate) async fn write_all(&mut self, bytes: &[u8]) {
+            self.try_write_all(bytes).await.unwrap();
+        }
+
+        pub(crate) async fn try_write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
             use tokio::io::AsyncWriteExt;
-            self.stream.write_all(bytes).await.unwrap();
+            self.stream.write_all(bytes).await
         }
 
         /// Read until `needle` (inclusive) and return it, retaining any
@@ -585,12 +589,42 @@ pub(crate) mod wire_support {
 
     /// Send verbatim request bytes and read the full framed response.
     pub(crate) async fn raw_exchange(port: u16, request: &[u8]) -> RawResponse {
+        raw_exchange_inner(port, request, false).await
+    }
+
+    /// Send a request whose server may reject the body before the upload
+    /// finishes, then read and validate that response. A peer-close error is
+    /// expected only for this early-rejection probe; all other write errors
+    /// remain failures.
+    pub(crate) async fn raw_exchange_may_close_request_early(
+        port: u16,
+        request: &[u8],
+    ) -> RawResponse {
+        raw_exchange_inner(port, request, true).await
+    }
+
+    async fn raw_exchange_inner(
+        port: u16,
+        request: &[u8],
+        may_close_request_early: bool,
+    ) -> RawResponse {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
                 .await
                 .unwrap();
             let mut wire = Wire::new(stream);
-            wire.write_all(request).await;
+            if let Err(error) = wire.try_write_all(request).await {
+                let peer_closed = matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                );
+                assert!(
+                    may_close_request_early && peer_closed,
+                    "writing raw HTTP request failed: {error}"
+                );
+            }
             let head = wire.read_until(b"\r\n\r\n").await;
             let (status_line, headers) = parse_head(&head);
             let body =
@@ -816,7 +850,7 @@ mod lb_probes {
         )
         .into_bytes();
         req.extend_from_slice(&big);
-        let resp = raw_exchange(port, &req).await;
+        let resp = raw_exchange_may_close_request_early(port, &req).await;
         assert_eq!(
             resp.status_code(),
             413,
