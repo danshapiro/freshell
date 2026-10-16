@@ -2858,9 +2858,9 @@ writeFileSync:(file,bytes)=>writes.push({file,observation:JSON.parse(bytes)})};`
       expect(original.assertions.every((assertion) => assertion.pass)).toBe(true)
     } finally { clock.mockRestore(); fs.rmSync(directory, { recursive: true, force: true }) }
   })
-  it.each(['death', 'published', 'cached', 'redispatch'])('protects the native post-effect observation boundary (%s)', async (fault) => {
+  it.each(['death', 'published', 'cached', 'redispatch', 'backlog-permission', 'backlog-redispatch', 'retention-baseline'])('protects the native post-effect observation boundary (%s)', async (fault) => {
     const publishedOutcome = fault === 'published'
-    const recover = fault === 'cached' || fault === 'redispatch'
+    const recover = !['death', 'published'].includes(fault)
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'native-effect-edge-'))
     const command = `printf 'effect\\n' >> '${path.join(workspace, 'owned-native-effect.jsonl')}'`
     const toolUseID = 'toolu_original1'
@@ -2876,11 +2876,22 @@ writeFileSync:(file,bytes)=>writes.push({file,observation:JSON.parse(bytes)})};`
       adminOk: async (_supervisor: unknown, body: any) => {
         methods.push(body.method)
         if (body.method === 'fresh_agent_read_events') {
-          if (read && recover) return { data: { head: 2, events: fault === 'redispatch' && methods.filter((m) => m === 'fresh_agent_read_events').length > 2
-            ? [{ event: { kind: 'provider', data: { payload: { event: { type: 'freshAgent.permission.dispatch', ok: true } } } } }] : [] } }
+          if (read && recover) {
+            const cursor = body.params.afterSequence
+            if (fault === 'backlog-permission' || (fault === 'backlog-redispatch' && cursor >= 2)) {
+              const head = fault === 'backlog-permission' ? 201 : 202
+              return { data: { head, retainedFrom: 1, resetRequired: false,
+                events: Array.from({ length: Math.min(128, head - cursor) }, (_, index) => ({ sequence: cursor + index + 1,
+                  event: cursor + index + 1 !== head ? { kind: 'fixture' } : fault === 'backlog-permission'
+                    ? { kind: 'permission_requested' } : { kind: 'provider', data: { payload: { event: { type: 'freshAgent.permission.dispatch' } } } } })) } }
+            }
+            return { data: { head: 2, retainedFrom: fault === 'retention-baseline' ? 2 : 1, resetRequired: fault === 'retention-baseline',
+              events: cursor < 2 ? [{ sequence: 2, event: { kind: 'fixture' } }]
+                : fault === 'redispatch' ? [{ sequence: 3, event: { kind: 'provider', data: { payload: { event: { type: 'freshAgent.permission.dispatch', ok: true } } } } }] : [] } }
+          }
           if (read) throw new Error('unexpected observation read after parked card')
           read = true
-          return { data: { head: 1, events: [{ event: { kind: 'permission_requested', data: { decision_id: 'current-card', payload } } }] } }
+          return { data: { head: 1, events: [{ sequence: 1, event: { kind: 'permission_requested', data: { decision_id: 'current-card', payload } } }] } }
         }
         if (body.method === 'fresh_agent_resolve') {
           expect(body.params.decision).toBe('current-card')
@@ -2919,10 +2930,12 @@ writeFileSync:(file,bytes)=>writes.push({file,observation:JSON.parse(bytes)})};`
           transcript: { bytesBase64: nativeBytes.toString('base64'), sha256: createHash('sha256').update(nativeBytes).digest('hex'), completeEof: true } }) })
       if (fault === 'cached') await expect(run).resolves.toBeDefined()
       else await expect(run).rejects.toThrow(publishedOutcome ? 'post-effect native outcome was already published'
-        : fault === 'redispatch' ? 'native decision dispatched again after its effect' : 'controlled exact native death')
+        : fault === 'backlog-permission' ? 'ambiguous effect revived a native permission callback'
+          : fault === 'retention-baseline' ? 'native approval event retention reset'
+            : fault.includes('redispatch') ? 'native decision dispatched again after its effect' : 'controlled exact native death')
       if (recover) {
         expect(methods.filter((m) => m === 'fresh_agent_resolve')).toHaveLength(1)
-        expect(methods.filter((m) => m === 'cached-decision-resolve')).toHaveLength(1)
+        expect(methods.filter((m) => m === 'cached-decision-resolve')).toHaveLength(['backlog-permission', 'retention-baseline'].includes(fault) ? 0 : 1)
         expect(fs.readFileSync(path.join(workspace, 'owned-native-effect.jsonl'), 'utf8')).toBe('effect\n')
       } else expect(methods).toEqual(['fresh_agent_send', 'fresh_agent_read_events', 'fresh_agent_resolve', ...(publishedOutcome ? [] : ['probe_recovery'])])
     } finally { fs.rmSync(workspace, { recursive: true, force: true }) }
