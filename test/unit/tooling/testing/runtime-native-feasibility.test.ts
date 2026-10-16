@@ -77,6 +77,87 @@ function createFixtureCheckout(directory: string): string {
   return commit
 }
 
+describe('native tool failure recovery', () => {
+  it.each(['output-write', 'cleanup-write', 'output-read', 'stop', 'harness'] as const)(
+    'joins owned cleanup and retains the run failure after %s fails', async fault => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-cleanup-failure-'))
+      const fixtureCommit = createFixtureCheckout(directory)
+      const manifest = path.join(directory, 'artifacts.json')
+      fs.writeFileSync(manifest, JSON.stringify({ candidateSha: fixtureCommit, imageDigest, artifacts: {
+        supervisor: { path: '/fixture/supervisor', sha256: 'c'.repeat(64) },
+        host: { path: '/fixture/host', sha256: 'd'.repeat(64) },
+      }, sourceFiles: [] }))
+      const previous = process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE
+      process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE = manifest
+      vi.spyOn(process, 'cwd').mockReturnValue(directory)
+      let scratch: string | undefined
+      vi.spyOn(RuntimeHarness.prototype, 'prepareNativeArtifacts').mockImplementation(async function () {
+        scratch = this.testRoot; fs.mkdirSync(scratch, { recursive: true, mode: 0o700 })
+        return { supervisorPath: '/fixture/supervisor', hostPath: '/fixture/host', serverPath: '/fixture/server',
+          files: ['env_file', 'auth_file', 'ca_file'].map(suffix => ({ name: 'codex/grants/' + suffix, path: manifest, sha256: 'e'.repeat(64) })) }
+      })
+      vi.spyOn(RuntimeHarness.prototype, 'startSupervisor').mockResolvedValue({} as never)
+      vi.spyOn(RustServer.prototype, 'start').mockRejectedValue(new Error('distinctive execution failure'))
+      vi.spyOn(RustServer.prototype, 'processEvidence').mockReturnValue({ pid: 1_000_000_000 } as never)
+      vi.spyOn(RustServer.prototype, 'capturedOutput').mockImplementation(() => {
+        if (fault === 'output-read') throw new Error('distinctive output-read failure')
+        return {} as never
+      })
+      const written = new Map<string, unknown>()
+      vi.spyOn(RuntimeHarness.prototype, 'writeArtifact').mockImplementation((name, value) => {
+        if ((fault === 'output-write' && name.endsWith('-server-output-private.json'))
+          || (fault === 'cleanup-write' && name.endsWith('-server-cleanup.json'))) throw new Error('distinctive ' + fault + ' failure')
+        written.set(name, value); return name
+      })
+      const stop = vi.spyOn(RustServer.prototype, 'stop').mockImplementation(async () => {
+        if (fault === 'stop') throw new Error('distinctive stop failure')
+      })
+      const cleanup = vi.spyOn(RuntimeHarness.prototype, 'cleanup').mockResolvedValue(
+        fault === 'harness' ? { ok: false, errors: ['distinctive harness failure'] } : { ok: true, errors: [] })
+      try {
+        const failure = await runNativeFeasibility(['--provider', 'codex', '--case', 'native-turn']).catch(error => error)
+        expect(stop).toHaveBeenCalledOnce()
+        expect(cleanup).toHaveBeenCalledOnce()
+        expect(written.get('native-case-current-native-turn-failure.json')).toMatchObject({ reason: 'distinctive execution failure' })
+        expect(failure).toBeInstanceOf(AggregateError)
+        expect(failure.errors.map(String).join('\n')).toContain('native experiment cases failed')
+        expect(failure.errors[0].errors[0].message).toBe('distinctive execution failure')
+        expect(failure.errors.map(String).join('\n')).toContain('distinctive ' + fault + ' failure')
+        expect(written.has('native-originals.json')).toBe(false)
+      } finally {
+        vi.restoreAllMocks()
+        if (previous === undefined) delete process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE
+        else process.env.FRESHELL_NATIVE_FEASIBILITY_ARTIFACTS_FILE = previous
+        if (scratch) fs.rmSync(scratch, { recursive: true, force: true })
+        fs.rmSync(directory, { recursive: true, force: true })
+      }
+    })
+
+  it.each([false, true])('reads the next approval page or refuses a retention reset (reset=%s)', async reset => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'native-approval-pages-'))
+    const cursors: number[] = []
+    const batches: unknown[] = []
+    const harness = { writeArtifact: (_name: string, value: unknown) => { batches.push(structuredClone(value)) },
+      adminOk: async (_supervisor: unknown, request: any) => {
+        if (request.method === 'fresh_agent_send') return {}
+        const cursor = request.params.afterSequence; cursors.push(cursor)
+        if (cursors.length > 2) throw new Error('fixture detected repeated or skipped page')
+        return { data: { head: 200, retainedFrom: reset ? 50 : 1, resetRequired: reset,
+          events: Array.from({ length: cursor === 0 ? 128 : 72 }, (_, index) => ({ sequence: cursor + index + (reset ? 50 : 1),
+            event: cursor + index + 1 === 200 ? { kind: 'permission_requested', data: { payload: {
+              nativeCheckpoint: { nativeSessionId: 'owned-root' }, tool: { name: 'fixture-stop-after-found' },
+            } } } : { kind: 'fixture' } })) } }
+      } } as unknown as RuntimeHarness
+    try {
+      await expect(executeManagedNativeApproval({ harness, supervisor: {}, soulId: 'owned-soul', workspace: directory,
+        view: { nativeSessionId: 'owned-root' }, scenario: 'fixture-pages', decision: 'effect-before-observation', inspect: async () => ({}) }))
+        .rejects.toThrow(reset ? 'native approval event retention reset' : 'original current native operation differs before effect')
+      expect(cursors).toEqual(reset ? [0] : [0, 128])
+      expect(batches.length).toBeGreaterThan(0)
+    } finally { fs.rmSync(directory, { recursive: true, force: true }) }
+  })
+})
+
 describe('finite native experiment dispatch (fixtures do not qualify providers)', () => {
   it.each(['valid', 'missing-api', 'wrong-provider', 'wrong-model', 'http-endpoint', 'credential-endpoint', 'grant-leak', 'credential-leak', 'ca-leak', 'proxy-leak', 'untrusted-tls'])('executes free native selected catalog/system-CA TLS access and refuses %s without a model request', async fault => {
     const fixtureTls = path.join(process.cwd(), 'test/e2e-browser/fixtures/tls')

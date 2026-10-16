@@ -1,11 +1,51 @@
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { runInNewContext } from 'node:vm'
 import { describe, expect, it } from 'vitest'
 import {
-  dispatchNativeCases, NATIVE_TRANSFER_CASES, parseNativeTransferArguments,
+  dispatchNativeCases, expectedExportRefusal, NATIVE_TRANSFER_CASES, parseNativeTransferArguments,
   type NativeCaseOriginal, type NativeTransferCase,
 } from '../../../../scripts/testing/opencode-native-transfer-check.js'
 
 const imageDigest = `sha256:${'a'.repeat(64)}`
+
+describe('expected native export refusals', () => {
+  const diagnostic = { event: 'opencode.rehearsal.stage_refused', detail: 'blocked: source schema relationships differ for pinned table message_seq' }
+  // The production container embeds this exact function, without module state.
+  const check: typeof expectedExportRefusal = runInNewContext(`(${expectedExportRefusal.toString()})`)
+  it('accepts a normal case-specific adapter refusal only without a receipt', () => {
+    const result = spawnSync(process.execPath, ['-e', 'process.exitCode=1'], { encoding: 'utf8', timeout: 5_000 })
+    expect(check('changed-type', result, diagnostic, false)).toBe(true)
+    expect(check('changed-type', result, diagnostic, true)).toBe(false)
+  })
+  it.each([
+    { name: 'timeout', result: { status: null, signal: 'SIGTERM', error: Object.assign(new Error('fixture timeout'), { code: 'ETIMEDOUT' }) } },
+    { name: 'signal', result: { status: null, signal: 'SIGSEGV' } },
+    { name: 'spawn error despite exit one', result: { status: 1, error: new Error('spawn failed') } },
+    { name: 'wrong normal exit', result: { status: 7, signal: null } },
+  ])('rejects $name even with the expected diagnostic', ({ result }) => {
+    expect(check('changed-type', result, diagnostic, false)).toBe(false)
+  })
+  it.each([null, {}, { ...diagnostic, detail: 'unrelated disk failure' },
+    { ...diagnostic, detail: 'native file part has no recognized URL' }, { ...diagnostic, event: 'other' }])(
+    'rejects an absent, unrelated or wrong-case cause (%j)', cause => {
+      expect(check('changed-type', { status: 1 }, cause, false)).toBe(false)
+    })
+  it.each([
+    ['changed-type', 'source schema relationships differ for pinned table message_seq'],
+    ['changed-key', 'source schema relationships differ for pinned table message_seq'],
+    ['changed-nullability', 'source schema relationships differ for pinned table message_seq'],
+    ['changed-foreign-key', 'source schema relationships differ for pinned table message_seq'],
+    ['changed-index', 'source schema object inventory differs from pinned OpenCode'],
+    ['changed-trigger', 'source schema object inventory differs from pinned OpenCode'],
+    ['changed-migration', 'source migration journal does not match OpenCode v1.18.21'],
+    ['missing-native-attachment-url', 'native file part has no recognized URL'],
+    ['changed-source-reference', 'workspace file reference is unavailable: ENOENT'],
+    ['missing-snapshot-descendant', 'retained snapshot has an incomplete tree closure'],
+  ])('requires the intended cause for %s', (label, detail) => {
+    expect(check(label, { status: 1 }, { ...diagnostic, detail }, false)).toBe(true)
+    expect(check(label, { status: 1 }, { ...diagnostic, detail: 'unrelated adapter error' }, false)).toBe(false)
+  })
+})
 
 // These finite child fixtures exercise admission, exits, dispatch and cleanup.
 // They are deliberately never passed to runNativeTransferCheck or called
