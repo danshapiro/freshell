@@ -570,7 +570,7 @@ impl HostedFreshAgentProxy {
                     tracing::warn!(event="fresh_agent.create.preparation_failed", reason="onecli_reference_unavailable",
                         request_id=message.request_id.as_str(), provider=provider.as_str(), session_type=session_type.as_str(), soul_id=%soul);
                 })?;
-        let mcp_capability = crate::managed_mcp_capability::issue_mcp_capability(
+        let pending_capability = crate::managed_mcp_capability::issue_mcp_capability(
             &soul,
             provider.native_family(),
             crate::managed_mcp_capability::OpencodeEphemeralInput {
@@ -582,13 +582,14 @@ impl HostedFreshAgentProxy {
         .map_err(|_| {
             tracing::warn!(event="fresh_agent.create.capability_failed", reason="capability_unavailable",
                 request_id=message.request_id.as_str(), provider=provider.as_str(), session_type=session_type.as_str(), soul_id=%soul);
-        })?;
+        })
+        .map(crate::managed_mcp_capability::PendingMcpCapability::new)?;
         let mut provider_launch_context =
             crate::managed_provider_bootstrap::provider_launch_context_for_managed_at(
                 provider.native_family(),
                 &workspace,
                 &cwd,
-                Some(mcp_capability.clone()),
+                Some(pending_capability.reference()),
             )
             .map_err(|_| {
                 tracing::warn!(event="fresh_agent.create.provider_environment_failed", reason="provider_environment_unavailable",
@@ -684,13 +685,11 @@ impl HostedFreshAgentProxy {
             }),
             expected_control_epoch: None,
         };
-        let launched = self
-            .client
-            .launch(request_id, request)
+        let launched = crate::managed_mcp_capability::launch_with_pending_capability(
+                self.client.clone(), request_id, request, Some(pending_capability),
+            )
             .await
             .map_err(|error| {
-                let _ =
-                    crate::managed_mcp_capability::revoke_mcp_capability(&mcp_capability.grant_id);
                 let runtime_code = error.runtime_code().and_then(|code| serde_json::to_value(code).ok())
                     .and_then(|value| value.as_str().map(str::to_owned));
                 let provider_start_diagnostic = error.fresh_agent_provider_start_diagnostic();

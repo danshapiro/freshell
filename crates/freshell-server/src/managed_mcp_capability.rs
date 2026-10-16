@@ -76,6 +76,11 @@ fn store() -> &'static CapabilityStore {
     STORE.get_or_init(CapabilityStore::default)
 }
 
+#[cfg(test)]
+pub(crate) fn grant_count_for_test() -> usize {
+    store().grants.lock().unwrap().len()
+}
+
 fn capability_dir() -> Result<PathBuf, String> {
     SETTINGS
         .get()
@@ -1238,6 +1243,68 @@ pub(crate) fn issue_mcp_capability(
         opencode_input,
         None,
     )
+}
+
+/// Preparation owns an issued grant until the supervisor accepts its launch.
+/// This also covers early returns after provider resources have been staged.
+pub(crate) struct PendingMcpCapability {
+    reference: McpCapabilityReference,
+    armed: bool,
+}
+
+impl PendingMcpCapability {
+    pub(crate) fn new(reference: McpCapabilityReference) -> Self {
+        Self {
+            reference,
+            armed: true,
+        }
+    }
+
+    pub(crate) fn reference(&self) -> McpCapabilityReference {
+        self.reference.clone()
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingMcpCapability {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Err(error) = revoke_mcp_capability(&self.reference.grant_id) {
+                tracing::warn!(event = "managed_mcp.pending_cleanup_failed",
+                    grant_id = self.reference.grant_id.as_str(), error = %error);
+            }
+        }
+    }
+}
+
+pub(crate) async fn launch_with_pending_capability(
+    client: freshell_runtime_client::RuntimeClient,
+    request_id: freshell_runtime_protocol::RequestId,
+    request: freshell_runtime_protocol::LaunchRequest,
+    pending: Option<PendingMcpCapability>,
+) -> Result<freshell_runtime_protocol::LaunchResult, freshell_runtime_client::ClientError> {
+    let Some(mut pending) = pending else {
+        return client.launch(request_id, request).await;
+    };
+    // A disconnected caller cannot cancel a launch already executing in the
+    // supervisor. Keep custody through its reply, even if this waiter is
+    // dropped, so an accepted runtime never loses its staged configuration.
+    tokio::spawn(async move {
+        let result = client.launch(request_id, request).await;
+        if result.is_ok() {
+            pending.disarm();
+        }
+        result
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(freshell_runtime_client::ClientError::Protocol(
+            "managed launch task failed".into(),
+        ))
+    })
 }
 
 /// A web-server restart restores only grants whose exact incarnation remains

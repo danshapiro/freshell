@@ -306,7 +306,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             } else {
                 Default::default()
             };
-            let mcp_capability = matches!(
+            let pending_capability = matches!(
                 request.mode.as_str(),
                 "claude" | "codex" | "opencode" | "amplifier"
             )
@@ -317,13 +317,16 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     opencode_input,
                 )
             })
-            .transpose()?;
+            .transpose()?
+            .map(crate::managed_mcp_capability::PendingMcpCapability::new);
             let mut provider_launch_context =
                 crate::managed_provider_bootstrap::provider_launch_context_for_managed_at(
                     &request.mode,
                     &workspace,
                     &cwd,
-                    mcp_capability.clone(),
+                    pending_capability
+                        .as_ref()
+                        .map(|pending| pending.reference()),
                 )?;
             if let Some(context) = provider_launch_context.as_mut() {
                 if let freshell_runtime_protocol::ProviderPreparation::Opencode {
@@ -344,11 +347,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     }
                 }
             }
-            if mcp_capability.is_some() && provider_launch_context.is_none() {
-                if let Some(capability) = &mcp_capability {
-                    let _ =
-                        crate::managed_mcp_capability::revoke_mcp_capability(&capability.grant_id);
-                }
+            if pending_capability.is_some() && provider_launch_context.is_none() {
                 return Err("managed provider preparation unavailable".into());
             }
             let launch = LaunchRequest {
@@ -407,22 +406,17 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                 }),
                 expected_control_epoch: None,
             };
-            let result = match self.client.launch(request_id, launch).await {
-                Ok(result) => {
-                    if let Some(pending) = pending_opencode_transfer.as_mut() {
-                        pending.disarm();
-                    }
-                    result
-                }
-                Err(error) => {
-                    if let Some(capability) = &mcp_capability {
-                        let _ = crate::managed_mcp_capability::revoke_mcp_capability(
-                            &capability.grant_id,
-                        );
-                    }
-                    return Err(error.to_string());
-                }
-            };
+            let result = crate::managed_mcp_capability::launch_with_pending_capability(
+                self.client.clone(),
+                request_id,
+                launch,
+                pending_capability,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            if let Some(pending) = pending_opencode_transfer.as_mut() {
+                pending.disarm();
+            }
             Ok(ManagedTerminalDescriptor {
                 soul_id: result.view.soul_id.to_string(),
                 incarnation_id: result.view.incarnation_id.to_string(),
