@@ -2695,6 +2695,35 @@ fn update_assistant(
     Ok(())
 }
 
+fn update_assistant_item(
+    messages: &mut BTreeMap<(String, String), ProjectedSessionMessage>,
+    session_id: &str,
+    event_data: &serde_json::Value,
+    item_type: &str,
+    id_field: &str,
+    update: impl FnOnce(
+        &mut serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), OpenCodeImportError>,
+) -> Result<(), OpenCodeImportError> {
+    let id = json_string(event_data, id_field)?;
+    update_assistant(messages, session_id, event_data, |object| {
+        if let Some(item) = object
+            .get_mut("content")
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|content| {
+                content.iter_mut().rev().find(|item| {
+                    item.get("type").and_then(serde_json::Value::as_str) == Some(item_type)
+                        && item.get("id").and_then(serde_json::Value::as_str) == Some(id.as_str())
+                })
+            })
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            update(item)?;
+        }
+        Ok(())
+    })
+}
+
 fn update_tool(
     messages: &mut BTreeMap<(String, String), ProjectedSessionMessage>,
     session_id: &str,
@@ -2901,35 +2930,6 @@ fn collect_current_json_nodes(
         _ => {}
     }
     Ok(())
-}
-
-fn update_assistant_item(
-    messages: &mut BTreeMap<(String, String), ProjectedSessionMessage>,
-    session_id: &str,
-    event_data: &serde_json::Value,
-    item_type: &str,
-    id_field: &str,
-    update: impl FnOnce(
-        &mut serde_json::Map<String, serde_json::Value>,
-    ) -> Result<(), OpenCodeImportError>,
-) -> Result<(), OpenCodeImportError> {
-    let id = json_string(event_data, id_field)?;
-    update_assistant(messages, session_id, event_data, |object| {
-        if let Some(item) = object
-            .get_mut("content")
-            .and_then(serde_json::Value::as_array_mut)
-            .and_then(|content| {
-                content.iter_mut().rev().find(|item| {
-                    item.get("type").and_then(serde_json::Value::as_str) == Some(item_type)
-                        && item.get("id").and_then(serde_json::Value::as_str) == Some(id.as_str())
-                })
-            })
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            update(item)?;
-        }
-        Ok(())
-    })
 }
 
 fn json_column_changes_are_typed(
