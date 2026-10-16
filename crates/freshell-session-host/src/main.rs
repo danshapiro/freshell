@@ -11584,6 +11584,9 @@ console.log('actual library export/import/full-row reader and Node semantic bind
                 let root = tempfile::tempdir().unwrap();
                 let home = root.path().join("provider");
                 std::fs::create_dir(&home).unwrap();
+                // This same-UID fixture represents storage before handoff;
+                // provider-owned 0700 would instead describe a completed retry.
+                std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
                 let paths = ProviderConfigPaths {
                     private_mount: root.path().join("private"),
                     provider_home: home.clone(),
