@@ -3673,13 +3673,15 @@ impl OpenCodeTransferDescriptor {
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(invalid)?;
             let relative = std::path::Path::new(path);
+            let empty_workspace_reference =
+                kind == "workspace_path_reference" && sha256 == sha256_hex(&[]);
             if kind.is_empty()
                 || path.is_empty()
                 || relative.is_absolute()
                 || relative
                     .components()
                     .any(|component| !matches!(component, std::path::Component::Normal(_)))
-                || size == 0
+                || (size == 0 && !empty_workspace_reference)
                 || !is_lower_hex_64(sha256)
                 || !asset_metadata.insert((path.to_string(), size, sha256.to_string()))
             {
