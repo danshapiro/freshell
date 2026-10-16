@@ -180,6 +180,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
     let historyEnclosure: ReturnType<ManagedFixtureRig['runtimeEnclosureHandle']> | undefined
     let cpuSession: Awaited<ReturnType<ReturnType<Page['context']>['newCDPSession']>> | undefined
     let profilingStarted = false
+    let releaseHeldSnapshot: (() => void) | undefined
     const measurementErrors: FreshCodexHistoryMeasurementError[] = []
     const measurement: Record<string, unknown> = { kind: 'owned-page saved-history diagnostic', errors: measurementErrors }
     const measurementFinish: FreshCodexHistoryMeasurementFinish = { errors: measurementErrors }
@@ -287,24 +288,12 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
           incarnationId: view.incarnationId, nativeSessionId: view.nativeSessionId })
       }
       expect(sent.some((frame) => frame.type === 'freshAgent.attach' && frame.sessionId === original.sessionId)).toBe(true)
-      let release!: () => void
-      const held = new Promise<void>((resolve) => { release = resolve })
+      const held = new Promise<void>((resolve) => { releaseHeldSnapshot = resolve })
       let liveResponse: any
-      let diagnosticRouteId = 0
       await page.route('**/api/fresh-agent/threads/**', async (route) => {
-        const routeId = ++diagnosticRouteId
-        const internal = route as any
-        const originalHandled = internal._reportHandled.bind(internal)
-        internal._reportHandled = (done: boolean) => {
-          console.log(JSON.stringify({ event: 'held_history_route_handled', routeId, done, stack: new Error().stack }))
-          return originalHandled(done)
-        }
-        console.log(JSON.stringify({ event: 'held_history_route_entered', routeId }))
         const actual = await route.fetch()
         liveResponse = await actual.json()
-        console.log(JSON.stringify({ event: 'held_history_route_fetched', routeId, status: actual.status() }))
         await held
-        console.log(JSON.stringify({ event: 'held_history_route_released', routeId, handling: Boolean(internal._handlingPromise) }))
         await route.fulfill({ response: actual })
       })
       const baseline = sent.length
@@ -325,7 +314,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       await expect(pane.getByRole('button', { name: 'Start new session' })).toHaveCount(0)
       await expectOriginalConversation()
       expect((await fixtureState()).dispatchCount).toBe(before.dispatchCount)
-      release()
+      releaseHeldSnapshot!()
       await expect(composer).toBeEnabled()
       await expect(composer).toHaveValue('Draft stays in this managed conversation')
       await composer.press('Enter')
@@ -341,7 +330,9 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       const stableProviderState = (await fixtureState())
       // A tracked host can stop answering while its managed projection still says live.
       // Its saved source is the owned provider volume, never a coincident web-local file.
-      await page.unroute('**/api/fresh-agent/threads/**')
+      // A send can start another snapshot while the fixture counters settle.
+      // Drain its real fetch/fulfill before removal continues in-flight routes.
+      await page.unrouteAll({ behavior: 'wait' })
       await rig.prepareCoincidentFreshCodexHistory(rig.exactRuntimeHandle(view))
       // Finish healthy preparation before starting this owned controller's
       // first observation window. Its startup must reattach the original host.
@@ -502,7 +493,12 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
     } finally {
       measurement.finallyEnteredAt = Date.now()
       try {
-        if (heldHost && heldHandle) await rig.releaseRuntimeHost(heldHandle)
+        try {
+          releaseHeldSnapshot?.()
+          await page.unrouteAll({ behavior: 'wait' })
+        } finally {
+          if (heldHost && heldHandle) await rig.releaseRuntimeHost(heldHandle)
+        }
       } finally {
         try {
           // Resume the exact owned host before diagnostic extraction on failure.

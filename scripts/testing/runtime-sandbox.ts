@@ -4765,6 +4765,10 @@ export const ManagedOpenCodeAdoptionStatusSchema: z.ZodType<ManagedOpenCodeAdopt
   }).strict() }).strict() }).strict(),
 ])
 
+function freshCodexFixtureTranscriptPath(nativeId: string): string {
+  return `/home/freshell/provider/.codex/sessions/rollout-fixture-${nativeId}.jsonl`
+}
+
 function freshCodexSavedTranscript(nativeId: string): string {
   return [
     JSON.stringify({ type: 'session_meta', payload: { id: nativeId, cwd: '/workspace', model_provider: 'openai' } }),
@@ -7382,7 +7386,7 @@ export class ManagedRuntimeOwner {
     ].map((row) => JSON.stringify(row)).join('\n') + '\n'
     await this.ownedProviderExec(handle.containerId, ['node', '--input-type=module', '-e',
       'import fs from "node:fs"; import path from "node:path"; fs.mkdirSync(path.dirname(process.argv[1]), {recursive:true}); fs.writeFileSync(process.argv[1],process.argv[2]);',
-      `/home/freshell/provider/.codex/sessions/rollout-fixture-${handle.nativeSessionId}.jsonl`, transcript])
+      freshCodexFixtureTranscriptPath(handle.nativeSessionId), transcript])
     this.interruptedStop = { handle: { ...handle }, volumeName: this.supervisor.volumeName,
       runtimeRoot: this.supervisor.runtimeRoot, scenarioId: this.supervisor.scenarioId, countersInstalled: false }
     this.runtime.recordLifecycle('external.interrupted_stop_history_prepared', { severity: 'info', ...handle })
@@ -7635,7 +7639,7 @@ export class ManagedRuntimeOwner {
 
   async prepareFreshCodexSavedHistory(handle: ExactRuntimeHandle): Promise<{ bytes: number }> {
     await this.assertFreshCodexSavedHistoryFixture(handle)
-    const target = `/home/freshell/provider/.codex/sessions/2026/03/01/rollout-${handle.nativeSessionId}.jsonl`
+    const target = freshCodexFixtureTranscriptPath(handle.nativeSessionId)
     const raw = await this.ownedProviderExec(handle.containerId, ['node', '--input-type=module', '-e',
       `import fs from "node:fs"; import path from "node:path"; const makeTranscript = ${freshCodexSavedTranscript.toString()}; fs.mkdirSync(path.dirname(process.argv[1]), {recursive:true}); fs.writeFileSync(process.argv[1], makeTranscript(process.argv[2])); process.stdout.write(JSON.stringify({bytes: fs.statSync(process.argv[1]).size}));`,
       target, handle.nativeSessionId])
@@ -7647,7 +7651,7 @@ export class ManagedRuntimeOwner {
   async freshCodexSavedHistoryUnchanged(handle: ExactRuntimeHandle): Promise<boolean> {
     await this.assertFreshCodexSavedHistoryFixture(handle)
     const raw = await this.ownedProviderExec(handle.containerId, ['cat',
-      `/home/freshell/provider/.codex/sessions/2026/03/01/rollout-${handle.nativeSessionId}.jsonl`])
+      freshCodexFixtureTranscriptPath(handle.nativeSessionId)])
     return raw === freshCodexSavedTranscript(handle.nativeSessionId)
   }
 

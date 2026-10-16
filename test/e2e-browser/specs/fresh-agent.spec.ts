@@ -941,13 +941,11 @@ test.describe('Fresh Agent', () => {
   test('freshclaude settings use FreshAgent model defaults and create payload', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {
     const creates: Array<Record<string, unknown>> = []
     let routedSocketCount = 0
-    const sentTypes: unknown[] = []
     await page.routeWebSocket('**/ws', (socket) => {
       routedSocketCount += 1
       const upstream = socket.connectToServer()
       socket.onMessage((data) => {
         const message = JSON.parse(String(data)) as Record<string, unknown>
-        sentTypes.push(message.type)
         if (message.type === 'freshAgent.create') {
           creates.push(message)
           return // Observe the actual client payload without launching a provider.
@@ -956,8 +954,10 @@ test.describe('Fresh Agent', () => {
       })
       upstream.onMessage((data) => socket.send(data))
     })
-    // Routing applies to new sockets; reconnect before selecting the Fresh Agent.
-    await harness.forceDisconnect()
+    // Playwright installs its WebSocket constructor through a navigation init
+    // script. Reload the document so the real client uses the routed transport.
+    await page.reload()
+    await harness.waitForHarness()
     await harness.waitForConnection()
     await expect.poll(() => routedSocketCount, { message: 'The settings test must observe the replacement WebSocket' }).toBeGreaterThan(0)
     await terminal.waitForTerminal()
@@ -983,34 +983,22 @@ test.describe('Fresh Agent', () => {
     expect(thinkingOptions).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
     await expect(thinking).toHaveValue('high')
 
-    await expect.poll(async () => ({
-      create: creates[0] ?? null,
-      sentTypes,
-      lifecycle: await page.evaluate(() => {
-        const harness = window.__FRESHELL_TEST_HARNESS__!
-        const state = harness.getState()
-        const leaves: unknown[] = []
-        const visit = (node: any) => {
-          if (node.type !== 'leaf') return node.children.forEach(visit)
-          if (node.content.kind !== 'fresh-agent') return
-          const content = node.content
-          leaves.push({ paneId: node.id, status: content.status, sessionId: content.sessionId,
-            restoreError: content.restoreError, recoverySummary: content.recoverySummary,
-            suppressed: harness.isFreshAgentNetworkEffectsSuppressed(node.id) })
-        }
-        Object.values(state.panes.layouts).forEach(visit)
-        return { leaves, allSuppressed: harness.isAllFreshAgentNetworkEffectsSuppressed(),
-          sentTypes: harness.getSentWsMessages().map((message: any) => message.type) }
-      }),
-    })).toMatchObject({
-      create: {
-        type: 'freshAgent.create',
-        requestId: expect.any(String),
-        sessionType: 'freshclaude',
-        provider: 'claude',
-        model: 'opus[1m]',
-        effort: 'high',
-      },
+    const paneId = await page.locator('[data-context="fresh-agent"]').last().getAttribute('data-pane-id')
+    const pane = await page.evaluate((targetPaneId) => {
+      const state = window.__FRESHELL_TEST_HARNESS__!.getState()
+      const find = (node: any): any => node.type === 'leaf'
+        ? node.id === targetPaneId ? node.content : undefined
+        : node.children.map(find).find(Boolean)
+      return find(state.panes.layouts[state.tabs.activeTabId!])
+    }, paneId)
+    await expect.poll(() => creates[0] ?? null).toMatchObject({
+      type: 'freshAgent.create',
+      requestId: pane.createRequestId,
+      paneId,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'opus[1m]',
+      effort: 'high',
     })
     expect(creates).toHaveLength(1)
   })

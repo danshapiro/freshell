@@ -212,11 +212,11 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
         await phase('completion', () => waitFor('actual fixture completion', async () => {
           const state = await fixtureState(rig, view)
           // The fixture counter advances before its provider-history write.
-          // The event follows that write, then the proxy sends its raw frame
-          // with the pane's presentation ID. Match that wire ID before History.
+          // Materialization follows that write and promotes the proxy route;
+          // the following completion must use the owned native identity.
           expect({ state, createdSessionId, nativeSessionId, completedTurnSessionIds: [...completedTurnSessionIds] })
             .toMatchObject({ state: { dispatchCount: 1, completionCount: 1 },
-              completedTurnSessionIds: expect.arrayContaining([createdSessionId]) })
+              completedTurnSessionIds: expect.arrayContaining([nativeSessionId]) })
           return state
         }))
         const paneObservation = { ...created, sessionType: definition.mode, provider: wireProvider,
