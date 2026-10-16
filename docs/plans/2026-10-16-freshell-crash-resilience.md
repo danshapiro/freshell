@@ -380,7 +380,7 @@ Document that explicit Cargo `--jobs` overrides can defeat a default, and that t
 - Extends: `RecoverableWebContents.removeListener?(event: string, callback: (...args: any[]) => void): void`.
 - Retains: existing trigger semantics and log names, plus `main_window_recovery_scheduled`, cooldown `retryInMs`, and `main_window_recovery_cancelled`.
 
-- [ ] **Step 1: Add failing behavioral tests**
+- [x] **Step 1: Add failing behavioral tests**
 
 Append these inside the existing `describe('registerRendererRecovery', ...)`, reusing its real EventEmitter fixture and fake timers:
 
@@ -509,7 +509,7 @@ it.each([[-3, true], [-102, false]])('ignores aborted or subframe failure %s/%s'
 
 Replace the old permanent-circuit test and its delayed-second-unresponsive variant with the stronger autonomous-window and immediate-responsive cases above. Replace any unbounded `runAllTimersAsync` in permanent-failure cases with explicit clock advancement. Retain the existing in-flight diagnostic `main_window_recovery_skipped` with `reason: recovery-in-flight`; behavior remains one in-flight attempt, now with the failure retained for its successor.
 
-- [ ] **Step 2: Run red**
+- [x] **Step 2: Run red**
 
 ```bash
 pnpm run test:vitest run test/unit/electron/renderer-recovery.test.ts --config config/vitest/vitest.electron.config.ts
@@ -517,7 +517,7 @@ pnpm run test:vitest run test/unit/electron/renderer-recovery.test.ts --config c
 
 Expected: FAIL because the second attempt/window never starts autonomously, a resolving native action can falsely succeed after its failure event, and no disposer exists.
 
-- [ ] **Step 3: Implement the controller scheduling and logical lifecycle**
+- [x] **Step 3: Implement the controller scheduling and logical lifecycle**
 
 Keep the existing request types/constants and add optional listener removal. Implement one pending request, one recovery timer and one in-flight recovery action per logical window. Failure settlement schedules one successor without another external event. At the rolling limit, retain the request and schedule its next eligible time; a timer callback rechecks liveness/capacity without charging backoff twice. Preserve trigger precedence, expected self-induced renderer-gone handling, inert subframe/aborted navigation, and cancellation of only an obsolete unresponsive request when responsiveness returns.
 
@@ -525,7 +525,7 @@ The disposer is idempotent, removes supported listeners, clears recovery/unrespo
 
 Keep coalesced events from creating overlapping attempts or multiple successors. The optional deterministic verifier used by non-native tests is not production acceptance; Task 3 must wire and exercise actual native verification. Keep the established structured events, token redaction and bounded log volume.
 
-- [ ] **Step 4: Run focused green**
+- [x] **Step 4: Run focused green**
 
 ```bash
 pnpm run test:vitest run test/unit/electron/renderer-recovery.test.ts --config config/vitest/vitest.electron.config.ts
@@ -533,11 +533,11 @@ pnpm run test:vitest run test/unit/electron/renderer-recovery.test.ts --config c
 
 Expected: PASS, including seven autonomous attempts across two windows with no overlapping attempts or dangling timer after success/disposal.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Retain the small `merge`, `drain`, `startIfCapacity`, and `dispose` responsibilities. Remove superseded old timer/request helpers and update test names that described terminal circuit behavior. Preserve reload-unavailable logging and the existing destroyed-webContents fallback; logical window destruction still disposes. Do not introduce a second retry manager or a production timing override. Re-run the same focused command after cleanup.
 
-- [ ] **Step 6: Run impacted verification**
+- [x] **Step 6: Run impacted verification**
 
 ```bash
 pnpm run test:vitest run test/unit/electron/renderer-recovery.test.ts test/unit/electron/startup.test.ts test/unit/electron/main.test.ts --config config/vitest/vitest.electron.config.ts
@@ -547,7 +547,7 @@ pnpm exec tsc -p tsconfig.electron.json --noEmit
 
 Expected: existing startup/lifecycle behavior and new retry tests PASS, with typechecking green. Native readiness and actual long-outage acceptance follow in Task 3; do not claim the user-visible fix complete at this controller checkpoint.
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add electron/renderer-recovery.ts test/unit/electron/renderer-recovery.test.ts
