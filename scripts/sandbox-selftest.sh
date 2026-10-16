@@ -75,7 +75,7 @@ cleanup_selftest_decoys() {
 }
 trap cleanup_selftest_decoys EXIT
 
-bash -c 'exec -a freshell-server-sandbox-host-sentinel sleep 300' &
+bash -c 'exec -a freshell-server-sandbox-host-sentinel sleep 3600' &
 HOST_PID_SENTINEL_PID=$!
 
 python3 - "${HOST_PORT_FILE}" <<'PYHOST' &
@@ -265,6 +265,20 @@ if [ "${P3A_STATUS}" -eq 0 ] && [ "${P3B_STATUS}" -eq 0 ] && [ "${P3C_STATUS}" -
 else
   fail "filesystem isolation: ro_mount_exit=${P3A_STATUS} ordinary_exit=${P3B_STATUS} runtime_suite_exit=${P3C_STATUS} ro=[${P3A_OUT}] ordinary=[${P3B_OUT}] runtime_suite=[${P3C_OUT}]"
 fi
+echo
+
+# ---- Cargo budget: effective cgroup controls and completed build scripts ----
+echo "--- Cargo budget: one and two jobs ---"
+for budget in 1 2; do
+  BUDGET_STATUS=0
+  BUDGET_OUT="$("${REPO_ROOT}/scripts/sandbox-test.sh" "CARGO_BUILD_JOBS=${budget} node scripts/testing/sandbox-budget-smoke.mjs ${budget}" 2>&1)" || BUDGET_STATUS=$?
+  echo "${BUDGET_OUT}"
+  if [ "${BUDGET_STATUS}" -eq 0 ]; then
+    pass "effective cgroup controls and completed Cargo work at ${budget} jobs"
+  else
+    fail "Cargo budget proof failed at ${budget} jobs: ${BUDGET_OUT}"
+  fi
+done
 echo
 
 # ---- Proof 4: utility — a real crate test runs green in both environments ----

@@ -47,6 +47,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       curl \
       ca-certificates \
       gosu \
+      xvfb \
+      xauth \
     && rm -rf /var/lib/apt/lists/*
 
 # rustup + stable toolchain (the workspace has no rust-toolchain.toml; the

@@ -16,6 +16,18 @@ pnpm run test:sandbox "cargo test -p freshell-ws"
 The image builds automatically on first use (`scripts/sandbox-build.sh` runs it directly if you
 need to force a rebuild after changing `docker/sandbox/Dockerfile`).
 
+Ordinary and `--runtime-suite` commands receive two CPUs, an 8 GiB RAM limit,
+a 16 GiB total RAM-plus-swap limit, a 512-process limit, and
+`CARGO_BUILD_JOBS=2`. The explicit swap limit preserves Docker's previous
+default allowance. The wrapper reports its budget and final exit status as
+JSONL on stderr; a failed workload keeps its exact exit code unless the final
+mount-point ownership check fails, which returns 1.
+
+The Cargo setting is a default: an explicit `cargo --jobs` or an in-command
+`CARGO_BUILD_JOBS` assignment can override it. These limits bound each sandbox;
+they do not guarantee that unrelated pressure elsewhere cannot affect the
+host's user services.
+
 ## The `--corpus` flag
 
 For realistic-data perf tests, mount real session corpora **read-only**:
@@ -126,6 +138,7 @@ DBus and the Tauri desktop shell's GTK3, WebKit2GTK 4.1 (with libsoup3), and Aya
 AppIndicator tray dependencies. Rebuild an existing image before running full-workspace tests
 after these prerequisites change; an already-present image is not rebuilt automatically.
 Tests use these libraries as the unprivileged sandbox user without installing packages at run time.
+Xvfb and xauth support headless Electron tests as that same user.
 
 ## When you MUST use it vs may skip it
 
@@ -154,3 +167,20 @@ scripts/sandbox-selftest.sh
 It proves PID isolation, port isolation, filesystem isolation (read-only corpus mounts really are
 read-only, host `~/.freshell` isn't visible unmounted), and that a real crate's tests run green
 inside the sandbox. It uses exact host-side PID and HTTP sentinels that the self-test itself creates, so concurrent worktree servers may legitimately change without producing a false isolation failure; host `:3001`/`:3002` and Freshell PIDs are recorded as diagnostics only.
+
+The self-test also runs six tiny offline Cargo crates at one and two jobs,
+checks the effective cgroup limits, verifies every build script's `NUM_JOBS`
+and measured overlap, and requires completion with ample memory headroom.
+Run that compile-only proof directly in ordinary mode (runtime mode keeps
+`/tmp` non-executable):
+
+```bash
+scripts/sandbox-test.sh "node scripts/testing/sandbox-budget-smoke.mjs 2"
+scripts/sandbox-test.sh "CARGO_BUILD_JOBS=1 node scripts/testing/sandbox-budget-smoke.mjs 1"
+```
+
+This smoke allocates only 8 MiB per concurrent build script. It does not try
+to exhaust memory or reproduce an outage. Real cold compiler verification
+uses separate owned source snapshots and empty target volumes, finite
+container limits, pressure monitoring, and exact-resource cleanup; transient
+measurements belong in the run's external evidence, not this repository.

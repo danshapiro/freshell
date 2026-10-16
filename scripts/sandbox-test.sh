@@ -110,12 +110,28 @@ else
   NETWORK_ARGS=(--network "${NETWORK_NAME}")
 fi
 
+# One shared budget for ordinary and runtime-suite execution. Docker's
+# memory-swap value is total RAM + swap, so 16 GiB preserves the previous
+# default swap allowance alongside the existing 8 GiB memory limit.
+CARGO_JOBS=2
+CPUS=2
+MEMORY_BYTES=$((8 * 1024 * 1024 * 1024))
+MEMORY_SWAP_BYTES=$((2 * MEMORY_BYTES))
+PIDS_LIMIT=512
+MODE=ordinary
+if [ "${RUNTIME_SUITE}" -eq 1 ]; then
+  MODE=runtime-suite
+fi
+
 DOCKER_ARGS=(
   # Reap orphaned test children so zombies cannot exhaust the PID limit.
   run --rm --init
   "${NETWORK_ARGS[@]}"
-  --pids-limit 512
-  --memory 8g
+  --cpus "${CPUS}"
+  --pids-limit "${PIDS_LIMIT}"
+  --memory "$((MEMORY_BYTES / 1024 / 1024 / 1024))g"
+  --memory-swap "$((MEMORY_SWAP_BYTES / 1024 / 1024 / 1024))g"
+  -e "CARGO_BUILD_JOBS=${CARGO_JOBS}"
   -v "${REPO_ROOT}:/workspace"
   -v freshell-sandbox-cargo-registry:/usr/local/cargo/registry
   -v freshell-sandbox-cargo-git:/usr/local/cargo/git
@@ -177,6 +193,8 @@ done
 # which on Debian unconditionally overwrites PATH and would clobber the
 # cargo/rustup PATH entry set via the image's Dockerfile ENV.
 DOCKER_STATUS=0
+printf '{"severity":"info","event":"sandbox_resources","mode":"%s","cargoJobs":%s,"cpus":%s,"memoryBytes":%s,"memorySwapBytes":%s,"pidsLimit":%s,"cause":"sandbox_requested","action":"apply_resource_limits","outcome":"launching"}\n' \
+  "${MODE}" "${CARGO_JOBS}" "${CPUS}" "${MEMORY_BYTES}" "${MEMORY_SWAP_BYTES}" "${PIDS_LIMIT}" >&2
 docker "${DOCKER_ARGS[@]}" "${IMAGE_TAG}" bash -c "${CMD}" || DOCKER_STATUS=$?
 
 # Guard-rail: verify the pre-create step above actually did its job, rather
@@ -185,12 +203,22 @@ docker "${DOCKER_ARGS[@]}" "${IMAGE_TAG}" bash -c "${CMD}" || DOCKER_STATUS=$?
 # repo root, fail loudly with a concrete remediation instead of leaving the
 # next `cargo build`/`pnpm install` on the host to fail with a bare EACCES.
 ROOT_DROPPINGS="$(find "${REPO_ROOT}" -maxdepth 1 -user root 2>/dev/null || true)"
+COMPLETION_CAUSE=workload_completed
 if [ -n "${ROOT_DROPPINGS}" ]; then
   echo "[sandbox] ERROR: root-owned entries found directly under ${REPO_ROOT}:" >&2
   echo "${ROOT_DROPPINGS}" >&2
   echo "[sandbox] dockerd (which runs as root) created these as bind-mount points." >&2
   echo "[sandbox] Remediation: sudo chown -R \"\$(id -u):\$(id -g)\" <path>, for each path listed above, then re-run." >&2
-  exit 1
+  DOCKER_STATUS=1
+  COMPLETION_CAUSE=root_owned_entries
 fi
 
+COMPLETION_SEVERITY=info
+COMPLETION_OUTCOME=succeeded
+if [ "${DOCKER_STATUS}" -ne 0 ]; then
+  COMPLETION_SEVERITY=error
+  COMPLETION_OUTCOME=failed
+fi
+printf '{"severity":"%s","event":"sandbox_completed","mode":"%s","exitCode":%s,"cause":"%s","action":"return_exit_status","outcome":"%s"}\n' \
+  "${COMPLETION_SEVERITY}" "${MODE}" "${DOCKER_STATUS}" "${COMPLETION_CAUSE}" "${COMPLETION_OUTCOME}" >&2
 exit "${DOCKER_STATUS}"
