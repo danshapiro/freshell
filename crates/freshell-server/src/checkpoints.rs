@@ -9153,7 +9153,9 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         initialize_checkpoint_workspace(workspace.path()).await;
         let service = checkpoint_test_service(home.path());
-        *service.test_auto_budget_override.lock().unwrap() = Some(Duration::from_millis(40));
+        // Leave headroom for workspace resolution under parallel test load so
+        // the injected capture delay is the phase that times out.
+        *service.test_auto_budget_override.lock().unwrap() = Some(Duration::from_secs(2));
         service
             .test_capture_delays
             .lock()
@@ -9275,7 +9277,9 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         initialize_checkpoint_workspace(workspace.path()).await;
         let service = checkpoint_test_service(home.path());
-        *service.test_auto_budget_override.lock().unwrap() = Some(Duration::from_millis(40));
+        // Leave headroom for workspace resolution under parallel test load so
+        // the injected capture delay is the phase that times out.
+        *service.test_auto_budget_override.lock().unwrap() = Some(Duration::from_secs(2));
         service
             .test_capture_delays
             .lock()
@@ -9490,7 +9494,8 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         initialize_checkpoint_workspace(workspace.path()).await;
         let service = checkpoint_test_service(home.path());
-        *service.test_auto_budget_override.lock().unwrap() = Some(Duration::from_millis(50));
+        // The total budget includes workspace resolution before lock waiting.
+        *service.test_auto_budget_override.lock().unwrap() = Some(Duration::from_secs(2));
         let holder = service
             .lock_workspace(workspace.path(), Duration::from_secs(1))
             .await
@@ -9566,12 +9571,12 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         initialize_checkpoint_workspace(workspace.path()).await;
         let service = checkpoint_test_service(home.path());
-        *service.test_auto_budget_override.lock().unwrap() = Some(Duration::from_millis(50));
+        *service.test_auto_budget_override.lock().unwrap() = Some(Duration::from_secs(2));
         service
             .test_capture_delays
             .lock()
             .unwrap()
-            .push_back(Duration::from_millis(250));
+            .push_back(Duration::from_secs(3));
         let holder_workspace = ResolvedCheckpointWorkspace {
             path: canonical_workspace(workspace.path()).await.unwrap(),
             provenance: "directory-picker".to_string(),
@@ -9590,7 +9595,7 @@ mod tests {
                     &holder_workspace,
                     "healthy holder",
                     "healthy-holder-request",
-                    Duration::from_secs(2),
+                    Duration::from_secs(4),
                     None,
                 )
                 .await;
@@ -9610,7 +9615,7 @@ mod tests {
         assert_eq!(waiter_dispatches, 1);
         assert!(service.active_cooldown(workspace.path()).is_none());
 
-        match tokio::time::timeout(Duration::from_secs(3), holder)
+        match tokio::time::timeout(Duration::from_secs(5), holder)
             .await
             .expect("healthy capture should finish after the independent waiter timed out")
             .expect("healthy holder task should complete")
