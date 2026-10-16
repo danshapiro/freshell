@@ -18,12 +18,14 @@ const caseScenarios: Record<string, string> = {
   'startup-before-identity retains an actionable blocked result without a replacement conversation': 'startup-before-identity',
 }
 
-async function terminalDiagnostic(page: Page, terminalId?: string) {
-  const diagnostic = await page.evaluate(({ terminalId, marker }) => {
+async function terminalDiagnostic(page: Page, terminalId?: string, paneId?: string, createRequestId?: string) {
+  const diagnostic = await page.evaluate(({ terminalId, paneId, createRequestId, marker }) => {
     const harness = window.__FRESHELL_TEST_HARNESS__
     const buffer = terminalId && harness ? harness.getTerminalBuffer(terminalId) : null
     const received = (harness?.getReceivedWsMessages?.() ?? []) as any[]
     const sent = (harness?.getSentWsMessages?.() ?? []) as any[]
+    const paneCreates = sent.filter(message => message.type === 'terminal.create' && message.paneId === paneId)
+    const paneCreateRequestIds = new Set(paneCreates.map(message => message.requestId).filter(value => typeof value === 'string'))
     const writes = (harness?.getTerminalWriteEvents?.() ?? []).filter(event => event.terminalId === terminalId)
     const output = received.filter(message => message.terminalId === terminalId
       && ['terminal.output', 'terminal.output.batch'].includes(message.type))
@@ -39,12 +41,20 @@ async function terminalDiagnostic(page: Page, terminalId?: string) {
       }
       return { chunks: chunks.length, markerPresent, reset, alternateEntered, alternateExited }
     }
-    const attachRequests = new Set(sent.filter(message => message.terminalId === terminalId
+    const attachRequests = new Set(sent.filter(message => terminalId && message.terminalId === terminalId
       && message.type === 'terminal.attach').map(message => message.attachRequestId))
-    const attachErrors = received.filter(message => message.type === 'error'
-      && (message.terminalId === terminalId || typeof message.requestId === 'string' && attachRequests.has(message.requestId)))
+    const attachErrors = received.filter(message => message.type === 'error' && (
+      (Boolean(terminalId) && message.terminalId === terminalId)
+      || typeof message.requestId === 'string' && (
+        message.requestId === createRequestId
+        || paneCreateRequestIds.has(message.requestId)
+        || attachRequests.has(message.requestId)
+      )
+    ))
       .slice(-16).map(message => ({ type: 'error', code: ['INVALID_REQUEST', 'TERMINAL_NOT_FOUND', 'PTY_SPAWN_FAILED',
         'SESSION_RESERVED', 'INTERNAL_ERROR', 'AUTH_FAILED'].includes(message.code) ? message.code : 'UNKNOWN',
+      ...(typeof message.terminalId === 'string' ? { terminalId: message.terminalId } : {}),
+      ...(typeof message.requestId === 'string' ? { requestId: message.requestId } : {}),
       message: typeof message.message === 'string' ? message.message.slice(0, 4096) : undefined,
       providerPreparationFailure: message.providerPreparationFailure }))
     const metadata = (messages: any[]) => messages.filter(message => message.terminalId === terminalId && [
@@ -66,6 +76,31 @@ async function terminalDiagnostic(page: Page, terminalId?: string) {
         'new_pty_session', 'codex_pty_recovery', 'retention_lost', 'server_restart_incompatible_retention'].includes(message.reason)) value.reason = message.reason
       return value
     })
+    const relevantMessages = received.filter(message => [
+      'terminal.created', 'terminal.status', 'terminal.exit', 'terminal.replaced', 'error',
+    ].includes(message.type) && (
+      (Boolean(terminalId) && (message.terminalId === terminalId || message.oldTerminalId === terminalId || message.newTerminalId === terminalId))
+      || typeof message.requestId === 'string' && (
+        message.requestId === createRequestId || paneCreateRequestIds.has(message.requestId)
+      )
+    )).slice(-24).map(message => {
+      const value: Record<string, string | number | boolean> = { type: message.type }
+      for (const key of ['code', 'requestId', 'terminalId', 'oldTerminalId', 'newTerminalId', 'status', 'exitCode', 'mode']) {
+        if (typeof message[key] === 'string' || Number.isSafeInteger(message[key])) value[key] = message[key]
+      }
+      if (message.recoverySummary && typeof message.recoverySummary === 'object') {
+        const summary = message.recoverySummary as Record<string, unknown>
+        for (const key of ['recoveryState', 'desiredState', 'reason']) {
+          if (typeof summary[key] === 'string') value[`recovery${key[0]!.toUpperCase()}${key.slice(1)}`] = summary[key] as string
+        }
+      }
+      return value
+    })
+    const recentPaneCreates = paneCreates.slice(-16).map(message => ({
+      requestId: typeof message.requestId === 'string' ? message.requestId : 'UNKNOWN',
+      mode: typeof message.mode === 'string' ? message.mode : 'UNKNOWN',
+      restore: message.restore === true,
+    }))
     return { harnessPresent: Boolean(harness), bufferType: typeof buffer, bufferNull: buffer === null,
       bufferLength: typeof buffer === 'string' ? buffer.length : null,
       markerPresent: typeof buffer === 'string' ? buffer.includes(marker) : false,
@@ -74,15 +109,18 @@ async function terminalDiagnostic(page: Page, terminalId?: string) {
       submittedWrites: classify(writes.filter(event => event.phase === 'submitted').map(event => event.data)),
       completedWrites: classify(writes.filter(event => event.phase === 'written').map(event => event.data)),
       sentMetadata: metadata(sent), receivedMetadata: metadata(received), attachErrors,
+      paneCreates: recentPaneCreates, relevantMessages,
       // These getters retain bounded history, not a complete transport trace.
       receivedHistoryAtBound: received.length >= 500, writeHistoryAtBound: writes.length >= 1000 }
-  }, { terminalId, marker: `MANAGED_ENV_OUTPUT ${fixture.expectedNonce}` }).catch(() => ({ observation: 'UNKNOWN' }))
+  }, { terminalId, paneId, createRequestId, marker: `MANAGED_ENV_OUTPUT ${fixture.expectedNonce}` }).catch(() => ({ observation: 'UNKNOWN' }))
   if (!('attachErrors' in diagnostic) || !Array.isArray(diagnostic.attachErrors)) return diagnostic
   return { ...diagnostic, attachErrors: diagnostic.attachErrors.map((error: any) => {
     const runtimeErrorClass = summarizeRuntimeErrorClass(error.message ?? '')
     const runtimeErrorCode = summarizeRuntimeErrorCode(error.message ?? '')
     const providerPreparationFailure = summarizeProviderPreparationFailure(error.providerPreparationFailure)
     return { type: error.type, code: error.code,
+      ...(typeof error.terminalId === 'string' ? { terminalId: error.terminalId } : {}),
+      ...(typeof error.requestId === 'string' ? { requestId: error.requestId } : {}),
       ...(runtimeErrorClass ? { runtimeErrorClass } : {}),
       ...(runtimeErrorCode ? { runtimeErrorCode } : {}),
       ...(providerPreparationFailure ? { providerPreparationFailure } : {}) }
@@ -111,12 +149,20 @@ test.afterEach(async ({ page }, info) => {
   let failureEvidence: Record<string, unknown> | undefined
   if (info.status !== info.expectedStatus) {
     const pane = await activePane(page).catch(() => null)
-    const diagnostic = await terminalDiagnostic(page, pane?.content.kind === 'terminal' ? pane.content.terminalId : undefined)
+    const content = pane?.content.kind === 'terminal' ? pane.content : undefined
+    const diagnostic = await terminalDiagnostic(page, content?.terminalId, pane?.paneId, content?.createRequestId)
     failureEvidence = {
       stage: info.annotations.filter(value => value.type === 'managed-stage').at(-1)?.description ?? 'UNKNOWN',
-      terminalPresent: pane?.content.kind === 'terminal' && Boolean(pane.content.terminalId),
-      soulPresent: pane?.content.kind === 'terminal' && Boolean(pane.content.soulId),
-      nativeIdentityPresent: pane?.content.kind === 'terminal' && Boolean(pane.content.sessionRef),
+      paneId: pane?.paneId,
+      terminalId: content?.terminalId,
+      createRequestId: content?.createRequestId,
+      paneStatus: content?.status,
+      runtimeStatus: content?.runtimeStatus,
+      recoveryState: content?.recoverySummary?.recoveryState,
+      recoveryReason: content?.recoverySummary?.reason,
+      terminalPresent: Boolean(content?.terminalId),
+      soulPresent: Boolean(content?.soulId),
+      nativeIdentityPresent: Boolean(content?.sessionRef),
       diagnostic,
     }
     console.error(JSON.stringify({ severity: 'error', event: 'managed_environment.browser_attempt_failed',
@@ -246,10 +292,14 @@ test(healthyTitle, async ({ page }, info) => {
   expect(receipt.soulId).toBeTruthy()
   expect(receipt.incarnationId).toBeTruthy()
   expect(receipt.nativeSessionId).toBeTruthy()
-  const beforeCreates = await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
-    .filter((message: any) => message.type === 'terminal.create').length)
+  const replacementCreateRequestsBeforeReconnect = await page.evaluate(({ paneId, createRequestId }) => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
+    .filter((message: any) => message.type === 'terminal.create' && message.paneId === paneId)
+    .map((message: any) => message.requestId)
+    .filter((requestId: string) => requestId !== createRequestId),
+  { paneId: pane.paneId, createRequestId: pane.createRequestId })
   console.log(JSON.stringify({ severity: 'info', event: 'managed_environment.browser_before_reconnect',
-    scenario: 'healthy', attempt: info.retry, diagnostic: await terminalDiagnostic(page, terminalId) }))
+    scenario: 'healthy', attempt: info.retry,
+    diagnostic: await terminalDiagnostic(page, terminalId, pane.paneId, pane.createRequestId) }))
   const reconnectStartedAt = await page.evaluate(() => performance.now())
   await new TestHarness(page).forceDisconnect()
   await new TestHarness(page).waitForConnection(120_000)
@@ -258,9 +308,14 @@ test(healthyTitle, async ({ page }, info) => {
   info.annotations.push({ type: 'managed-stage', description: 'healthy-post-reconnect-output' })
   await expect.poll(() => hasCompletedOutputWrite(page, terminalId, marker, reconnectStartedAt),
     { timeout: 120_000 }).toBe(true)
-  expect(await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
-    .filter((message: any) => message.type === 'terminal.create').length)).toBe(beforeCreates)
+  expect(await page.evaluate(({ paneId, createRequestId }) => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
+    .filter((message: any) => message.type === 'terminal.create' && message.paneId === paneId)
+    .map((message: any) => message.requestId)
+    .filter((requestId: string) => requestId !== createRequestId),
+  { paneId: pane.paneId, createRequestId: pane.createRequestId }))
+    .toEqual(replacementCreateRequestsBeforeReconnect)
   const rows = await json(page, '/api/terminals')
+  expect(rows.filter((row: any) => row.cwd === pane.cwd)).toHaveLength(1)
   expect(rows.find((row: any) => row.terminalId === terminalId)).toMatchObject({ terminalId,
     soulId: receipt.soulId, incarnationId: receipt.incarnationId, runtimeStatus: 'running' })
 })
@@ -303,25 +358,25 @@ for (const scenario of ['missing-reference', 'startup-before-identity']) {
       await expect(diagnostic.getByRole('button', { name: 'Retry launch' })).toBeVisible()
       await expect(diagnostic.getByRole('button', { name: /^Attach/ })).toHaveCount(0)
       await assertNoHandle()
-      const creates = await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
-        .filter((message: any) => message.type === 'terminal.create').length)
-      expect(await page.evaluate(requestId => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
-        .filter((message: any) => message.type === 'terminal.create' && message.requestId === requestId).length,
-      pane.createRequestId)).toBe(1)
+      const paneCreateRequests = await page.evaluate(paneId => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
+        .filter((message: any) => message.type === 'terminal.create' && message.paneId === paneId)
+        .map((message: any) => message.requestId), pane.paneId)
+      expect(paneCreateRequests).toEqual([pane.createRequestId])
       await new TestHarness(page).forceDisconnect()
       await new TestHarness(page).waitForConnection(120_000)
       await expect.poll(async () => (await activePane(page)).content, { timeout: 30_000 })
         .toMatchObject(retained)
-      expect(await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
-        .filter((message: any) => message.type === 'terminal.create').length)).toBe(creates)
+      expect(await page.evaluate(paneId => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
+        .filter((message: any) => message.type === 'terminal.create' && message.paneId === paneId)
+        .map((message: any) => message.requestId), pane.paneId)).toEqual(paneCreateRequests)
       await assertNoHandle()
       await page.reload()
       await page.waitForFunction(() => Boolean(window.__FRESHELL_TEST_HARNESS__), undefined, { timeout: 60_000 })
       await new TestHarness(page).waitForConnection(120_000)
       expect((await activePane(page)).content).toMatchObject(retained)
-      expect(await page.evaluate(requestId => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
-        .filter((message: any) => message.type === 'terminal.create' && message.requestId === requestId).length,
-      pane.createRequestId)).toBe(0)
+      expect(await page.evaluate(({ paneId, requestId }) => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
+        .filter((message: any) => message.type === 'terminal.create' && message.paneId === paneId && message.requestId === requestId).length,
+      { paneId: pane.paneId, requestId: pane.createRequestId })).toBe(0)
       await expect(diagnostic).toContainText(selectedPath)
       await expect(diagnostic).toContainText(/not found/i)
       await assertNoHandle()
@@ -344,14 +399,16 @@ for (const scenario of ['missing-reference', 'startup-before-identity']) {
       .map((item: any) => item.terminalId)
       .sort()
     expect(terminalIdsBeforeReconnect).toContain(terminalId)
-    const creates = await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
-      .filter((message: any) => message.type === 'terminal.create').length)
+    const paneCreateRequests = await page.evaluate(paneId => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
+      .filter((message: any) => message.type === 'terminal.create' && message.paneId === paneId)
+      .map((message: any) => message.requestId), pane.paneId)
     await new TestHarness(page).forceDisconnect()
     await new TestHarness(page).waitForConnection(120_000)
     await expect.poll(async () => (await activePane(page)).content, { timeout: 30_000 })
       .toMatchObject({ terminalId, status: 'error' })
-    expect(await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
-      .filter((message: any) => message.type === 'terminal.create').length)).toBe(creates)
+    expect(await page.evaluate(paneId => window.__FRESHELL_TEST_HARNESS__!.getSentWsMessages?.()
+      .filter((message: any) => message.type === 'terminal.create' && message.paneId === paneId)
+      .map((message: any) => message.requestId), pane.paneId)).toEqual(paneCreateRequests)
     expect((await json(page, '/api/terminals'))
       .filter((item: any) => item.cwd === pane.cwd)
       .map((item: any) => item.terminalId)
