@@ -161,7 +161,8 @@ const workspaceCwdAliasMcpServerSource = String.raw`import fs from 'node:fs'
 import helper from './helper.mjs'
 const [receiptPath, expectedNonce] = process.argv.slice(2)
 if (!receiptPath || !expectedNonce) process.exit(12)
-fs.writeFileSync(receiptPath, JSON.stringify({ expectedNonce, helper,
+fs.writeFileSync(receiptPath, JSON.stringify({ expectedNonce, helper, terminalId: process.env.FRESHELL_TERMINAL_ID,
+  pid: process.pid, createdAt: new Date().toISOString(),
   envValueLoaded: process.env.FRESHELL_MANAGED_CWD_ALIAS_ENV === expectedNonce,
   envFileTarget: fs.realpathSync('.env'),
   envFileOperand: process.execArgv.find(value => value.startsWith('--env-file=')),
@@ -1753,6 +1754,11 @@ export async function runManagedEnvironmentTarget() {
     const original = (await rig.inventory()).find(row => row.soulId === healthy.soulId)
     assert(original?.containerId)
     await fs.rename(path.join(selected.workspace, 'healthy/.managed-fixture/child-receipt.json'), path.join(root, 'initial-child-receipt.json'))
+    const cwdAliasReceiptPath = path.join(selected.workspace, 'healthy/.managed-fixture/mcp-cwd-alias-receipt.json')
+    const initialCwdAliasReceipt = await readJson(cwdAliasReceiptPath)
+    assert.equal(initialCwdAliasReceipt?.expectedNonce, nonce, 'the original host must start the workspace-CWD MCP alias')
+    await fs.rename(cwdAliasReceiptPath, path.join(root, 'initial-cwd-alias-mcp-receipt.json'))
+    await fs.rm(`${cwdAliasReceiptPath}.started`, { force: true })
     rig.runtime.stopOwnedRuntimeExact(original.containerId)
     let replacement: ManagedRuntimeView
     try {
@@ -1777,6 +1783,8 @@ export async function runManagedEnvironmentTarget() {
       throw error
     }
     const replacementChild = await poll('replacement Bun child', async () => readJson(path.join(selected.workspace, 'healthy/.managed-fixture/child-receipt.json')))
+    const replacementCwdAliasMcp = await poll('replacement OpenCode starts the workspace-CWD MCP alias', async () =>
+      readJson(cwdAliasReceiptPath))
     const replacementStage = await stageProof(rig, replacement, nonce)
     assert.equal(replacement.nativeSessionId, original.nativeSessionId)
     assert.equal(replacementChild.bun, true)
@@ -1786,8 +1794,20 @@ export async function runManagedEnvironmentTarget() {
     assert.equal(replacementChild.runId, rig.runtime.runId)
     assert.equal(replacementChild.expectedNonce, nonce)
     assert.equal(replacementChild.executableMode, '0711')
+    assert.equal(replacementCwdAliasMcp.expectedNonce, nonce)
+    assert.equal(replacementCwdAliasMcp.helper, nonce)
+    assert.equal(replacementCwdAliasMcp.terminalId, replacement.terminalId)
+    assert(Number.isSafeInteger(replacementCwdAliasMcp.pid) && replacementCwdAliasMcp.pid > 1)
+    assert.equal(replacementCwdAliasMcp.envValueLoaded, true)
+    assert.match(replacementCwdAliasMcp.envFileTarget, /^\/run\/freshell-secrets\/provider-\d+$/)
+    assert.equal(replacementCwdAliasMcp.envFileOperand, '--env-file=.env')
+    assert.equal(replacementCwdAliasMcp.cwd, selected.cwdAliasProject)
+    assert(replacementCwdAliasMcp.scriptPath.endsWith('/cwd-alias-project/server.mjs'))
+    assert.equal(await fs.readFile(`${cwdAliasReceiptPath}.started`, 'utf8'), 'wrapper-started')
     proof.nativeReplacement = { priorIncarnationId: original.incarnationId, incarnationId: replacement.incarnationId,
-      soulId: replacement.soulId, nativeSessionId: replacement.nativeSessionId, stage: replacementStage, child: replacementChild }
+      soulId: replacement.soulId, nativeSessionId: replacement.nativeSessionId, stage: replacementStage,
+      child: replacementChild, workspaceCwdAliasMcp: { ...replacementCwdAliasMcp,
+        associatedIncarnationId: replacement.incarnationId } }
     await writeJson(path.join(rig.runtime.evidenceDir, 'managed-environment-acceptance.json'), proof)
     const browserSummary = proof.cloudBrowser as ManagedEnvironmentBrowserSummary
     console.log(JSON.stringify({ severity: 'info', event: 'managed_environment.acceptance_passed', candidateSha: fixture.candidateSha,
