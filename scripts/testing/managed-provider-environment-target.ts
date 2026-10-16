@@ -1871,7 +1871,7 @@ export async function runManagedEnvironmentTarget() {
     for (let attempt = 0; attempt < 12; attempt++) {
       let result: Record<string, unknown>
       try {
-        result = JSON.parse(rig.runtime.execOwnedContainerExact(replacement.containerId, [
+        result = JSON.parse(rig.runtime.execOwnedContainerAsExact(replacement.containerId, '65534:0', [
           'node', '-e', workspaceCwdAliasReplacementProcessProbeSource(),
           String(replacementCwdAliasMcp.pid), cwdAliasReceiptPath, nonce, selected.cwdAliasProject,
           replacementCwdAliasMcp.processStartTicks,
