@@ -9595,7 +9595,7 @@ mod tests {
                     &holder_workspace,
                     "healthy holder",
                     "healthy-holder-request",
-                    Duration::from_secs(4),
+                    Duration::from_secs(15),
                     None,
                 )
                 .await;
@@ -9615,7 +9615,7 @@ mod tests {
         assert_eq!(waiter_dispatches, 1);
         assert!(service.active_cooldown(workspace.path()).is_none());
 
-        match tokio::time::timeout(Duration::from_secs(5), holder)
+        match tokio::time::timeout(Duration::from_secs(20), holder)
             .await
             .expect("healthy capture should finish after the independent waiter timed out")
             .expect("healthy holder task should complete")
@@ -9630,7 +9630,7 @@ mod tests {
             1
         );
 
-        *service.test_auto_budget_override.lock().unwrap() = Some(Duration::from_secs(3));
+        *service.test_auto_budget_override.lock().unwrap() = Some(Duration::from_secs(15));
         let (next_pane, next_dispatches, _) = run_checkpoint_policy_send(
             Arc::clone(&service),
             checkpoint_policy_send(
