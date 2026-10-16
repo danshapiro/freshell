@@ -5529,7 +5529,7 @@ describe('finite retained fresh native collection', () => {
       nativeIdentityObservation: { nativeSessionId: current.nativeSessionId, incarnationId: current.incarnationId, launchNonce: 'actual-launch' } }
     vi.spyOn(rig as any, 'freshBrowserAllocation').mockResolvedValue({ view, writer: { providerStoreId: 'independent-store' } })
     vi.spyOn(rig, 'currentRuntimeEnclosure').mockResolvedValue(view as any)
-    vi.spyOn(rig as any, 'captureFreshNativeSource').mockResolvedValueOnce({ turns: [] }).mockResolvedValueOnce({ turns: [{ toolCalls: [] }] })
+    vi.spyOn(rig as any, 'captureFreshNativeSource').mockResolvedValueOnce({ turns: [] }).mockResolvedValueOnce({ turns: [{ toolCalls: [], text: 'ready' }] })
     const materialize = vi.spyOn(rig as any, 'materializeNativeSource').mockImplementation(async (name: string) => ({ path: name, sha256: 'a'.repeat(64) }))
     const challenge = await rig.registerFreshBrowserTurn(current, id)
     const request = { type: 'freshAgent.send', sessionId: current.nativeSessionId, requestId: 'actual-request', text: challenge.prompt }

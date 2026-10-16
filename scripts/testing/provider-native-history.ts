@@ -58,6 +58,8 @@ export type NativeAssistantTurn = {
   messageId?: string
   parentMessageId?: string | null
   completedAt: string | number
+  /** Finalized OpenCode rows can contain an API error instead of a successful result. */
+  outcome?: 'completed' | 'failed'
   text: string
   toolCalls: NativeToolCall[]
   resolvedProvider: string
@@ -73,6 +75,12 @@ export type NativeHistory = {
   provider: 'claude' | 'codex' | 'opencode' | 'amplifier'
   nativeSessionId: string
   turns: NativeAssistantTurn[]
+}
+
+/** For prompts requesting an answer; tool-only history remains valid native history. */
+export function hasSuccessfulNativeAnswer(turn: NativeAssistantTurn | undefined, provider: string): boolean {
+  return !!turn?.text.trim() && turn.outcome !== 'failed'
+    && (provider !== 'opencode' || turn.outcome === 'completed')
 }
 
 export function requiredString(value: unknown, label: string): string {

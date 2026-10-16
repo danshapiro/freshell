@@ -31,6 +31,28 @@ const receiptRunId = 'fresh-agent-live-001'
 const tempRoots: string[] = []
 
 describe('observed fresh browser execution', () => {
+  it.each(['api-error', 'api-error-with-text', 'empty', 'whitespace'])(
+    'rejects a finalized OpenCode browser answer with %s through the native reader and receipt', fault => {
+      const built = fixture([row('freshopencode')], 'production', 'low', true)
+      const original = readBrowserExecution(built)
+      const filename = path.join(built.evidenceDir, original.ui.after.path)
+      const db = new DatabaseSync(filename)
+      const assistant = db.prepare('SELECT id, data FROM message WHERE json_extract(data, \'$.role\') = \'assistant\'').get() as { id: string; data: string }
+      const data = JSON.parse(assistant.data)
+      if (fault.startsWith('api-error')) data.error = { name: 'APIError', data: { message: 'PRIVATE_PROVIDER_ERROR' } }
+      db.prepare('UPDATE message SET data=? WHERE id=?').run(JSON.stringify(data), assistant.id)
+      db.prepare('UPDATE part SET data=? WHERE message_id=?').run(JSON.stringify({ type: 'text',
+        text: fault === 'api-error-with-text' ? 'partial answer' : fault === 'whitespace' ? '  \n' : '' }), assistant.id)
+      db.close()
+      original.ui.after.sha256 = createHash('sha256').update(fs.readFileSync(filename)).digest('hex')
+      rewriteBrowserExecution(built, original)
+      expect(() => validateFreshAgentQualificationReceipt({ repoRoot: built.repoRoot, candidateSha, expectedRuntimeImage: runtimeImage, receipt: built.receipt }))
+        .toThrow(/browser native no-tool completion/)
+      expect(() => buildFreshAgentQualificationReceipt({ repoRoot: built.repoRoot, evidenceDir: built.evidenceDir, candidateSha,
+        receiptRunId, runtimeImage, selectedModes: ['freshopencode'], rows: built.receipt.rows })).toThrow(/browser native no-tool completion/)
+    },
+  )
+
   it('reopens the materialized OpenCode native send acknowledgment from retained originals', () => {
     const built = fixture([row('freshopencode')], 'production', 'low', true)
     const original = readBrowserExecution(built)
@@ -247,7 +269,7 @@ function browserOwnerFixture(mode: FreshAgentQualificationRow['mode'] = 'freshcl
   owner.runtime.broker = { receipts: () => [{ ...handle }] } as any
   vi.spyOn(owner, 'inventory').mockResolvedValue([view])
   vi.spyOn(owner.runtime, 'recordLifecycle').mockImplementation(() => undefined)
-  const capture = vi.spyOn(internal, 'captureFreshNativeSource').mockResolvedValue({ turns: [{ toolCalls: [] }] })
+  const capture = vi.spyOn(internal, 'captureFreshNativeSource').mockResolvedValue({ turns: [{ toolCalls: [], text: 'ready', outcome: 'completed' }] })
   vi.spyOn(internal, 'materializeNativeSource').mockResolvedValue(original.ui.after)
   internal.freshNativeCollections.set('collection', { mode, provider: selected.provider })
   const challenge = { handle, collectionId: 'collection', provider: selected.provider, beforeTurns: 0, prompt: original.ui.request.text, beforeView: structuredClone(view) }
@@ -271,6 +293,14 @@ function browserOwnerFixture(mode: FreshAgentQualificationRow['mode'] = 'freshcl
 }
 
 describe('materialized browser owner consumers', () => {
+  it.each(['failed', 'empty'] as const)('refuses a finalized %s OpenCode answer during collection', async fault => {
+    const { owner, handle, request, reply, challenge, capture } = browserOwnerFixture('freshopencode')
+    capture.mockResolvedValue({ turns: [{ toolCalls: [], text: fault === 'empty' ? '' : 'partial answer',
+      outcome: fault === 'failed' ? 'failed' : 'completed' }] })
+    await expect(owner.finishFreshBrowserTurn(handle, 'ui-challenge', request, reply)).rejects.toThrow(/browser no-tool native completion/)
+    expect(challenge.finished).not.toBe(true)
+  })
+
   it('finishes materialized OpenCode native acknowledgment on its exact current allocation', async () => {
     const { owner, internal, view, handle, request, reply, challenge, capture } = browserOwnerFixture('freshopencode')
     reply.sessionId = view.nativeSessionId
