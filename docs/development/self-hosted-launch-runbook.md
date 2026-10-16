@@ -73,8 +73,11 @@ drill, current candidate verification, and a consistent verified live backup
 **before any candidate registry opener**. A migration preview does not create
 that backup. Prepare artifacts away from live binary/client/sidecar paths and
 preserve existing registry, control, runtime, provider, session, and configuration
-paths. Actual six-mode qualification, backup drill, and production installation
-remain pending; committing these instructions does not authorize them.
+paths. This repair checks ordinary use in the four Codex/OpenCode modes;
+Claude live behavior remains unverified by explicit agreement. The backup
+drill below applies to a separately requested production upgrade, not to this
+repair's acceptance. Committing these instructions does not authorize
+production installation.
 
 Record the actual owners, effective units/commands and port before requesting
 the separate exact **APPROVED** for installation, necessary backup maintenance,
@@ -107,7 +110,7 @@ must be effective in their actual owners. Do not use qualification overrides
 or fixture modes for production. Managed Amplifier/Kilroy stay disabled.
 
 Check health, startup build identity/features, effective image, intended
-six-mode admission, structured errors, and preserved inventory/history metadata
+four-mode admission, structured errors, and preserved inventory/history metadata
 without starting or prompting historical sessions. On failure preserve new
 state and prefer a compatible fix-forward; an older binary may reject the
 upgraded schema. Restoring old state needs a matching verified backup and a

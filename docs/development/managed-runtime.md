@@ -12,11 +12,13 @@ legacy.
 
 This unmerged, **UNVERIFIED** candidate enables managed shell and terminal
 Claude/Codex/OpenCode routing, plus Freshclaude/Freshcodex/Freshopencode.
-The source flags prepare normal production routing for the final native
-verification; they do not prove recovery or authorize public release or
-installation. Current candidate-bound native receipts, final checks, and
-independent reviews remain required. Managed Amplifier and Kilroy remain
-pending and disabled; ordinary legacy CLI integrations remain available.
+This repair requires ordinary-use checks for terminal Codex and OpenCode plus
+FreshCodex and FreshOpenCode, the configured test suite, affected browser
+checks, and independent reviews. Claude live behavior remains unverified by
+explicit agreement. Native recovery campaigns and the backup/upgrade drill
+are not acceptance gates for this repair. The source flags do not prove
+recovery or authorize installation. Managed Amplifier and Kilroy remain
+disabled; ordinary legacy CLI integrations remain available.
 
 The Rust server needs `managed-runtime-v1`, an authenticated supervisor, and
 `FRESHELL_MANAGED_RUNTIME_V1=1`; fresh routes also need
@@ -33,7 +35,7 @@ are tracked on separate axes in
 
 | Field | Meaning |
 |---|---|
-| `certificationState` | Source policy used for candidate routing: `certified`, `pending_live_provider_certification`, or `not_applicable`. In an unverified candidate, `certified` is implementation under test; current native receipts remain required. |
+| `certificationState` | Source policy used for candidate routing: `certified`, `pending_live_provider_certification`, or `not_applicable`. A source flag is not evidence that a live check passed. |
 | `qualificationReady` | Whether the adapter can run in an explicitly selected qualification build. It does not enable a release route. |
 | `managedEnabled` | Whether managed routing may own this provider at all. |
 | `durableRecoveryEnabled` | Whether a durable-soul recovery promise is made for it. |
@@ -48,7 +50,9 @@ manifest and the compiled table ever disagree. Deterministic adapter support
 for a deferred provider may exist and be unit-tested; it grants no capability
 negotiation, API, or UI durability claim.
 
-Two gates consume that state:
+Two existing runtime gates consume that state. They remain available for the
+broader release claims they test, but are not additional acceptance gates for
+this four-mode repair:
 
 | Gate | Command | Meaning |
 |---|---|---|
@@ -57,7 +61,7 @@ Two gates consume that state:
 
 Source eligibility is never a native evidence result. Receipt gates still
 require original evidence bound to the exact candidate/image and verified
-cleanup. Selected six-mode results do not imply the separate global campaign
+cleanup. Selected four-mode results do not imply the separate global campaign
 or Gate 5 passed. `BLOCKED` is never `PASS`. A landing run that defers anything other than the
 manifest's deferrable set fails, and a deferral in production mode fails. Each
 run writes `deferred-providers.json` next to `summary.json` so what is *not*

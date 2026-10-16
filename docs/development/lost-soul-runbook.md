@@ -13,13 +13,14 @@ recovery enabled, or fresh modes whose corresponding release policy admits
 durable recovery. Managed shell is certified for isolation but is intrinsically
 non-resumable and never produces a durable-soul loss certificate.
 
-The repaired deployment is intended for terminal Claude/Codex/OpenCode and
-Freshclaude/Freshcodex/Freshopencode. All six actual recovery proofs and final
-deployment verification remain pending. Read the actual candidate's release
-policy rather than treating this intended scope as certification. Managed
-Amplifier and Kilroy remain unqualified and disabled; ordinary legacy CLI
-integrations are unaffected. If a release-disabled mode appears in a managed
-incident, capture the incident and investigate before cleanup.
+The candidate enables terminal Claude/Codex/OpenCode and
+Freshclaude/Freshcodex/Freshopencode. This repair checks ordinary use in the
+four Codex/OpenCode modes; Claude live behavior remains unverified by explicit
+agreement. Native recovery campaigns are not acceptance gates for this repair.
+Read the actual candidate's release policy when determining which modes may
+produce incidents. Managed Amplifier and Kilroy remain disabled; ordinary
+legacy CLI integrations are unaffected. If a release-disabled mode appears in
+a managed incident, capture the incident and investigate before cleanup.
 
 ## Meaning of `lost`
 

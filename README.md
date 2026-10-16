@@ -135,12 +135,12 @@ Reopening a session in another mode keeps the same provider session and conversa
 
 **Stop and reopen** is available only when freshell can confirm the old writer and its owned child processes have stopped. The new mode starts only after that confirmation. On platforms where freshell cannot establish that proof, the request is refused before changing the session, and the existing session remains usable. The current atomic handoff implementation supports this operation when the Freshell server runs on Linux; Windows and macOS receive the explicit refusal and can still use clear-only bookkeeping repair.
 
-The managed-runtime repair is being prepared for Claude, Codex, and OpenCode
-in terminal and fresh-agent modes; qualification and installation are still
-pending. Its upgrade procedure preserves existing session stores and requires
-a verified backup before opening them with the new version. It does not
-automatically import existing sessions. Managed Amplifier and Kilroy remain
-unqualified and disabled; ordinary legacy CLI integrations remain available.
+The managed-runtime repair is being checked with Codex and OpenCode in
+terminal and fresh-agent modes. Claude remains enabled but has not been
+verified with a live session in this repair. Installation requires a separate
+approval and a backup of existing session stores. Existing sessions are not
+automatically imported and may need to be moved manually. Managed Amplifier
+and Kilroy remain disabled; ordinary legacy CLI integrations remain available.
 
 ## Stream Deck
 
