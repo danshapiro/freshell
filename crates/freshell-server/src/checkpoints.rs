@@ -233,6 +233,7 @@ impl Drop for CaptureRequestCancellation {
     }
 }
 
+#[derive(Debug)]
 enum ExplicitCaptureError {
     WorkspaceUnavailable(CheckpointWorkspaceUnavailable),
     ResolutionTimeout(String),
@@ -8422,7 +8423,10 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let service = checkpoint_test_service(home.path());
-        *service.test_explicit_budget_override.lock().unwrap() = Some(Duration::from_millis(50));
+        // The explicit budget includes workspace resolution as well as lock
+        // acquisition. Leave headroom for resolution under parallel test load
+        // so this test exercises the held lock, not scheduler delay.
+        *service.test_explicit_budget_override.lock().unwrap() = Some(Duration::from_secs(2));
         service.establish_cooldown(workspace.path());
         let before = service.cooldowns.lock().unwrap()[workspace.path()].expires_at;
         let holder = service
@@ -8443,7 +8447,10 @@ mod tests {
             )
             .await
             .expect_err("explicit lock wait should time out");
-        assert!(matches!(error, ExplicitCaptureError::WorkspaceBusy(_)));
+        assert!(
+            matches!(error, ExplicitCaptureError::WorkspaceBusy(_)),
+            "expected the held workspace lock to time out, got {error:?}"
+        );
         assert_eq!(
             service.cooldowns.lock().unwrap()[workspace.path()].expires_at,
             before
