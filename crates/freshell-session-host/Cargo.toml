@@ -10,6 +10,7 @@ default = []
 fresh-agent-fixtures = []
 opencode-docker-contract-tests = []
 managed-stop-contract-tests = []
+provider-startup-contract-tests = []
 
 [dependencies]
 freshell-opencode = { path = "../freshell-opencode", features = ["real-transport"] }
@@ -43,3 +44,8 @@ freshell-supervisor = { path = "../freshell-supervisor" }
 name = "opencode_docker_contract"
 path = "tests/opencode_docker_contract.rs"
 required-features = ["opencode-docker-contract-tests"]
+
+[[test]]
+name = "provider_startup_retry"
+path = "tests/provider_startup_retry.rs"
+required-features = ["provider-startup-contract-tests"]

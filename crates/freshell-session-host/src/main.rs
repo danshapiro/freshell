@@ -3655,14 +3655,13 @@ fn prepare_fresh_provider_state_at(
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if launch.native_session_id.is_some() && metadata.uid() == launch.run_as_uid {
-            if metadata.gid() != launch.run_as_gid || metadata.permissions().mode() & 0o777 != 0o700
-            {
-                return Err("selected provider HOME ownership handoff is incomplete".into());
-            }
-            // Initial preparation assigns HOME ownership last. An explicitly
-            // selected native session can reuse that completed handoff, but
-            // still needs actual native observation before it earns evidence.
+        if metadata.uid() == launch.run_as_uid
+            && metadata.gid() == launch.run_as_gid
+            && metadata.permissions().mode() & 0o777 == 0o700
+        {
+            // Initial preparation assigns HOME ownership last. Preparation can
+            // then fail before a native session exists; retry only the selected
+            // context publication without replaying bootstrap or native state.
             emit_environment_event(serde_json::json!({
                 "severity": "info", "event": "provider.environment.ownership.reused",
                 "stage": "session_host", "provider": launch.provider.as_str(),
@@ -3676,6 +3675,9 @@ fn prepare_fresh_provider_state_at(
                 launch.run_as_gid,
                 paths,
             );
+        }
+        if launch.native_session_id.is_some() && metadata.uid() == launch.run_as_uid {
+            return Err("selected provider HOME ownership handoff is incomplete".into());
         }
         if metadata.uid() != unsafe { libc::geteuid() }
             || metadata.gid() != unsafe { libc::getegid() }
