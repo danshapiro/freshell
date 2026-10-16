@@ -2685,7 +2685,9 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::{symlink, PermissionsExt};
-    use std::{fs, path::Path, process::Command};
+    #[cfg(unix)]
+    use std::process::Command;
+    use std::{fs, path::Path};
 
     #[cfg(unix)]
     #[test]
@@ -2721,6 +2723,7 @@ mod tests {
         assert_eq!(fs::read(home.join("config.json")).unwrap(), b"new");
     }
 
+    #[cfg(unix)]
     #[test]
     fn publication_failure_after_first_replacement_restores_original_inodes() {
         use std::os::unix::fs::MetadataExt;
