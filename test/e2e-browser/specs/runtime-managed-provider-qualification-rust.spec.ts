@@ -215,8 +215,8 @@ async function executeAndAwaitNonceOutput(
 }
 
 class OrdinaryTerminalTurnError extends Error {
-  constructor(readonly stage: 'attach_ready' | 'turn_completion', readonly facts: TerminalOrdinaryTurnBrowserObservation | null) {
-    super('ordinary terminal turn did not show provider activity, fresh output, and completion')
+  constructor(readonly stage: 'attach_ready' | 'turn_completion', readonly facts: TerminalOrdinaryTurnBrowserObservation | null, cause?: unknown) {
+    super('ordinary terminal turn did not show provider activity, fresh output, and completion', { cause })
     this.name = 'OrdinaryTerminalTurnError'
   }
 }
@@ -255,8 +255,8 @@ async function executeAndAwaitOrdinaryTurn(
         ? latestFacts
         : null
     }, 240_000)
-  } catch {
-    throw new OrdinaryTerminalTurnError('turn_completion', latestFacts)
+  } catch (error) {
+    throw new OrdinaryTerminalTurnError('turn_completion', latestFacts, error)
   }
 }
 
