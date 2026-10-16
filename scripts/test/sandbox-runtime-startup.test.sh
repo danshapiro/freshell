@@ -19,12 +19,14 @@ cleanup() {
 trap cleanup EXIT
 
 docker image inspect "${IMAGE_TAG}" >/dev/null
+bash "${REPO_ROOT}/scripts/test/sandbox-readonly-root.test.sh"
 if ! docker network inspect freshell-sandbox >/dev/null 2>&1; then
   docker network create --driver bridge freshell-sandbox >/dev/null
 fi
 
 mkdir -p "${FIXTURE}/scripts" "${FIXTURE}/src"
 cp "${REPO_ROOT}/scripts/sandbox-test.sh" "${FIXTURE}/scripts/"
+cp "${REPO_ROOT}/scripts/test/assert-sandbox-readonly-root.sh" "${FIXTURE}/scripts/"
 write_node_manifest() {
   printf '{"name":"sandbox-startup-test","version":"1.0.0","private":true,"packageManager":"pnpm@10.34.5","dependencies":{"ms":"%s"}}\n' "$1" >"${FIXTURE}/package.json"
 }
@@ -66,10 +68,7 @@ if grep -qE '^[^[:space:]]+[[:space:]]+00000000[[:space:]]' /proc/net/route; the
   echo 'FAIL: runtime command has a default network route' >&2
   exit 1
 fi
-if touch /runtime-startup-root-write-probe 2>/dev/null; then
-  echo 'FAIL: runtime command has a writable root' >&2
-  exit 1
-fi
+bash scripts/assert-sandbox-readonly-root.sh
 node - "$1" <<'JS'
 const assert = require('node:assert/strict')
 assert.equal(require('ms')('2s'), 2000)
