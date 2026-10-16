@@ -1328,6 +1328,7 @@ export async function runCodeCheckpointTarget() {
     assert.equal(browserSummary.failedCases, 0)
     assert.equal(browserSummary.skippedCases, 0)
     assert.equal(browserSummary.interruptedCases, 0)
+    assert.equal(browserSummary.flakyCases, 0, 'Configured Cloud browser cases passed only after retry')
     proof.cloudBrowser = { actualNativeExit: browserExit, identity: browserIdentity, ...browserSummary }
     await fs.mkdir(evidenceDir, { recursive: true, mode: 0o700 })
     await writeJson(receiptPath, proof)
@@ -1774,6 +1775,7 @@ export async function runManagedEnvironmentTarget() {
       assert.equal(browserSummary.failedCases, 0, 'Configured managed-environment browser cases failed')
       assert.equal(browserSummary.skippedCases, 0, 'Configured managed-environment browser cases were skipped')
       assert.equal(browserSummary.interruptedCases, 0, 'Configured managed-environment browser cases were interrupted')
+      assert.equal(browserSummary.flakyCases, 0, 'Configured managed-environment browser cases passed only after retry')
       proof.cloudBrowser = { actualNativeExit: browserExit, identity: browserIdentity, selectedScenarios: [...scenarios], ...browserSummary }
     })
     const healthy = proof.healthy as any

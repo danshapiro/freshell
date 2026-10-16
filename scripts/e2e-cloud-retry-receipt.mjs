@@ -10,7 +10,9 @@ import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 
 const MAX_TRACE_BYTES = 8 * 1024 * 1024
-const TRACE_CHUNK_BYTES = 120 * 1024
+// Keep each serialized base64 JSONL record below Cloud Logging's 102,400-byte
+// entry limit (48 KiB raw becomes 64 KiB base64 plus a small fixed envelope).
+const TRACE_CHUNK_BYTES = 48 * 1024
 const MAX_ERROR_TEXT_BYTES = 64 * 1024
 const PLAYWRIGHT_OUTCOMES = ['expected', 'skipped', 'unexpected', 'flaky']
 

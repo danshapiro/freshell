@@ -14,7 +14,7 @@ TRACE="$WORK/first-retry-trace.zip"
 UNRELATED_TRACE="$WORK/retry-success-trace.zip"
 REPORT="$WORK/report.json"
 OUT="$WORK/receipt.jsonl"
-printf 'synthetic first retry trace\n' > "$TRACE"
+head -c 196608 /dev/urandom > "$TRACE"
 printf 'unrelated successful retry trace\n' > "$UNRELATED_TRACE"
 
 cat > "$REPORT" <<JSON
@@ -96,6 +96,15 @@ CHUNKS="$(jq -c 'select(.event == "e2e_playwright_retry_trace_chunk")' "$OUT")"
 if [ -z "$CHUNKS" ]; then
   echo "FAIL: successful retry emitted no durable trace chunks"
   cat "$OUT"
+  exit 1
+fi
+
+if ! jq -s -e '
+  [.[] | select(.event == "e2e_playwright_retry_trace_chunk")] as $chunks
+  | ($chunks | length) > 1
+    and all($chunks[]; ((tojson | length) < 100000) and ((.data | length) <= 65536))
+' "$OUT" >/dev/null; then
+  echo "FAIL: retry trace JSONL chunks exceed Cloud Logging's safe entry size"
   exit 1
 fi
 

@@ -11,21 +11,22 @@ export type ManagedEnvironmentBrowserSummary = {
   failedCases: number
   skippedCases: number
   interruptedCases: number
+  flakyCases: number
 }
 
 type Counts = Omit<ManagedEnvironmentBrowserSummary, 'footer' | 'executedCases'>
 
 function parseFooter(line: string): ManagedEnvironmentBrowserSummary | undefined {
   const normalized = line.replace(ansiEscape, '').trim()
-  if (!/\b(?:failed|passed|skipped|interrupted)\b/.test(normalized)) return undefined
+  if (!/\b(?:failed|passed|skipped|interrupted|flaky)\b/.test(normalized)) return undefined
 
   const withoutDuration = normalized.replace(/\s+\([^()]*\)$/, '')
-  const tokens = [...withoutDuration.matchAll(/(\d+)\s+(failed|passed|skipped|interrupted)\b/g)]
+  const tokens = [...withoutDuration.matchAll(/(\d+)\s+(failed|passed|skipped|interrupted|flaky)\b/g)]
   if (tokens.length === 0) return undefined
-  const remainder = withoutDuration.replace(/\d+\s+(?:failed|passed|skipped|interrupted)\b/g, '').replace(/[\s,]/g, '')
+  const remainder = withoutDuration.replace(/\d+\s+(?:failed|passed|skipped|interrupted|flaky)\b/g, '').replace(/[\s,]/g, '')
   if (remainder.length > 0) return undefined
 
-  const counts: Counts = { passedCases: 0, failedCases: 0, skippedCases: 0, interruptedCases: 0 }
+  const counts: Counts = { passedCases: 0, failedCases: 0, skippedCases: 0, interruptedCases: 0, flakyCases: 0 }
   const seen = new Set<string>()
   for (const token of tokens) {
     const count = Number(token[1])
@@ -35,7 +36,7 @@ function parseFooter(line: string): ManagedEnvironmentBrowserSummary | undefined
     counts[`${category}Cases` as keyof Counts] = count
   }
 
-  const executedCases = counts.passedCases + counts.failedCases + counts.skippedCases + counts.interruptedCases
+  const executedCases = counts.passedCases + counts.failedCases + counts.skippedCases + counts.interruptedCases + counts.flakyCases
   if (!Number.isSafeInteger(executedCases) || executedCases < 1) return undefined
   return { footer: normalized, executedCases, ...counts }
 }

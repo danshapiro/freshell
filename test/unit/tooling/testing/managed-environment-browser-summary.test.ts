@@ -16,6 +16,7 @@ describe('managed environment configured-browser summary', () => {
       failedCases: 0,
       skippedCases: 0,
       interruptedCases: 0,
+      flakyCases: 0,
     })
   })
 
@@ -31,6 +32,23 @@ describe('managed environment configured-browser summary', () => {
       failedCases: 1,
       skippedCases: 1,
       interruptedCases: 0,
+      flakyCases: 0,
+    })
+  })
+
+  it('counts flaky cases in the Playwright footer instead of treating them as missing tests', () => {
+    const capture = new ManagedEnvironmentBrowserSummaryCapture()
+    capture.write('[e2e-cloud] Per-shard summary:\n  1 flaky, 2 passed (1.9m)\n')
+    capture.write('[e2e-cloud] Succeeded tasks: 1\n')
+
+    expect(capture.finish()).toEqual({
+      footer: '1 flaky, 2 passed (1.9m)',
+      executedCases: 3,
+      passedCases: 2,
+      failedCases: 0,
+      skippedCases: 0,
+      interruptedCases: 0,
+      flakyCases: 1,
     })
   })
 
