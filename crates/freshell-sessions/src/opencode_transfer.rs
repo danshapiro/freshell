@@ -1824,9 +1824,27 @@ fn export_exact_session_inner<W: Write>(
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        // A repeated reference can become unavailable after an earlier capture.
+        // Emit only the final retained union, including objects shared by trees
+        // that remain available.
+        let retained_snapshot_objects = saved_snapshots
+            .iter()
+            .flat_map(|reference| {
+                reference.objects.iter().map(|object| {
+                    (
+                        &reference.project_id,
+                        &reference.worktree_sha1,
+                        &object.object_id,
+                    )
+                })
+            })
+            .collect::<BTreeSet<_>>();
         let snapshot_objects = asset_resolver
             .snapshot_objects
             .iter()
+            .filter(|((project_id, worktree_sha1, object_id), _)| {
+                retained_snapshot_objects.contains(&(project_id, worktree_sha1, object_id))
+            })
             .map(
                 |((project_id, worktree_sha1, object_id), output)| SerializedSnapshotObject {
                     project_id: project_id.clone(),
@@ -8581,7 +8599,39 @@ mod native_source_inventory_tests {
             assert!(output.status.success());
             assert_eq!(output.stdout, body, "full native installed object body");
         }
+        let payload_objects = objects
+            .iter()
+            .map(|object| (&object.project_id, &object.worktree_sha1, &object.object_id))
+            .collect::<BTreeSet<_>>();
+        let retained_objects = snapshot
+            .manifest()
+            .saved_snapshots
+            .iter()
+            .flat_map(|reference| {
+                reference.objects.iter().map(|object| {
+                    (
+                        &reference.project_id,
+                        &reference.worktree_sha1,
+                        &object.object_id,
+                    )
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            payload_objects.len(),
+            objects.len(),
+            "no duplicate object tuples"
+        );
+        assert_eq!(
+            payload_objects, retained_objects,
+            "the real importer requires exactly the final retained object union"
+        );
         for reference in &snapshot.manifest().saved_snapshots {
+            if reference.availability == SavedSnapshotAvailability::UnavailableInQualifiedLocations
+            {
+                assert!(reference.objects.is_empty());
+                continue;
+            }
             let bucket = destination
                 .parent()
                 .unwrap()
@@ -8926,6 +8976,9 @@ mod native_source_inventory_tests {
     #[test]
     fn complete_export_warm_missing_roots_preserves_unavailable_references() {
         let fixture = reuse_fixture(false);
+        let (baseline, _, _) = reuse_export(&fixture, None);
+        let baseline: serde_json::Value =
+            serde_json::from_reader(baseline.open_payload().unwrap()).unwrap();
         let roots = fixture
             .trees
             .iter()
@@ -8958,6 +9011,56 @@ mod native_source_inventory_tests {
                 .count(),
             6
         );
+        assert_eq!(
+            payload["rows"], baseline["rows"],
+            "native history is preserved"
+        );
+        assert_exported_snapshot_native_readback(&fixture, &exported, "missing-roots");
+    }
+
+    #[test]
+    fn complete_export_warm_missing_root_preserves_shared_retained_objects() {
+        let fixture = reuse_fixture(false);
+        let (baseline, _, _) = reuse_export(&fixture, None);
+        let baseline: serde_json::Value =
+            serde_json::from_reader(baseline.open_payload().unwrap()).unwrap();
+        let root = fixture_object_path(&fixture, &fixture.trees[0]);
+        let exported = export_after_warm_mutation(&fixture, move |count| {
+            if count == 2 {
+                fs::remove_file(&root).unwrap();
+            }
+        })
+        .unwrap();
+        let references = &exported.manifest().saved_snapshots;
+        assert_eq!(references.len(), 2);
+        let unavailable = references
+            .iter()
+            .find(|reference| reference.tree == fixture.trees[0])
+            .unwrap();
+        assert_eq!(
+            unavailable.availability,
+            SavedSnapshotAvailability::UnavailableInQualifiedLocations
+        );
+        assert!(unavailable.objects.is_empty());
+        let retained = references
+            .iter()
+            .find(|reference| reference.tree == fixture.trees[1])
+            .unwrap();
+        assert_eq!(
+            retained.availability,
+            SavedSnapshotAvailability::RetainedClosure
+        );
+        assert!(retained
+            .objects
+            .iter()
+            .any(|object| object.object_id == fixture.blob));
+        let payload: serde_json::Value =
+            serde_json::from_reader(exported.open_payload().unwrap()).unwrap();
+        assert_eq!(
+            payload["rows"], baseline["rows"],
+            "native history is preserved"
+        );
+        assert_exported_snapshot_native_readback(&fixture, &exported, "shared-retained-objects");
     }
 
     #[test]
