@@ -7,27 +7,25 @@
 ## User Request
 
 ### Requested result
-Continue the durable-souls repair from its saved state through Stage 5's final whole-delta review and the usual recap. Proceed to Stage 5 without waiting for the unavailable test grant, and report the unfinished Task 9 ordinary-use checks accurately.
-
-The user later authorized up to five additional Stage 5 Fresh Eyes review rounds, or until the review passes. They asked to run the four approved non-Claude ordinary-use checks before explaining the prior Codex-login question. Those checks and the explanation are complete; do not change shared credentials without separate approval.
+Fix all known durable-souls problems, complete ordinary use in the four selected Codex/OpenCode modes, fix cold sandbox startup, and perform a thorough review of the entire committed change. Diagnose actual failures, repair substantiated defects, verify the result, and report remaining limitations in plain English. Continue the existing the-usual workflow; the latest request authorizes renewed repairs and review after the earlier review attempts ended without complete coverage.
 
 ### Explicit constraints
 - Use the-usual workflow and a dedicated worktree; fix test failures found in this repair and continue.
 - Focus the current live checks on terminal Codex and OpenCode plus FreshCodex and FreshOpenCode; skip Claude, Amplifier and Kilroy live checks.
 - Keep verification proportional to the stated threat model: behavior tests and diagnosable logs are enough; do not build a formal certification or audit campaign.
 - Avoid strict provider-session continuity or automatic migration across a transition. If existing sessions need moving, manual porting later is acceptable.
-- Use an already authorized Codex path if available; do not change shared credentials without separate approval. Claude live checks are skipped because its login is unavailable.
-- Do not inspect provider-result files, Cloud launcher output, provider output, terminal snapshots, prompts, or response bodies.
+- Use the easiest already authorized Codex account path and existing OneCLI references. Do not change shared credentials without separate approval.
+- Use actual error diagnostics to investigate failures. Protect secret values; the earlier blanket restriction on reading diagnostic output was not a user requirement.
 - For Stage 5 Fresh Eyes, use the runner's `--gpt` option because other models are unavailable; this is the user's explicit exception to the different-model-family preference.
 - Do not make changes to the rubric while its example wording remains under discussion.
-- The user approved `--local` because the selected specs are excluded from Cloud. An earlier six-selector run remains recorded as 0/6; a later run of the four currently selected non-Claude modes is recorded below as 1/4. Neither establishes acceptance.
-- The user narrowed the live checks to terminal Codex and OpenCode plus FreshCodex and FreshOpenCode, leaving Claude untested because its login is unavailable. Do not change the shared Codex login unless separately approved. The latest local rerun passed only FreshOpenCode; Codex terminal failed before launching its provider process, FreshCodex exited without a completed turn, and OpenCode produced output without a completion signal. These failures do not establish an account mismatch.
-- The user authorized up to five additional independent Stage 5 review rounds after the original five-round limit, stopping early if the delta review passes. Continue to use the user's previously approved `--gpt` reviewer exception.
+- The user approved local execution for the selected live specs because they are excluded from Cloud; keep the configured backends for other checks.
+- Review the entire change, including recovery behavior and integration between components. Track actual file coverage and review subsequent repairs; do not count a failed reviewer launch as code-review evidence.
 
 ### Accepted tradeoffs and residuals
 - Existing provider sessions may not survive a runtime transition; manual porting may be needed later.
 - Amplifier and Kilroy are outside this repair's live checks.
-- The existing isolated test grant is unavailable. The four selected live checks were rerun locally: one passed and three failed for reasons recorded in Task 9. Continue without account changes until evidence establishes that a login change is needed.
+- Claude live behavior remains unverified; proceeding without it is accepted. Earlier provider access failures are historical observations, not a diagnosis of current account availability.
+
 **Goal:** Fix the diagnosed durable-souls defects and verify ordinary one-turn use in the four selected non-Claude modes without requiring same-session continuity across a transition.
 
 **Architecture:** Correct the existing runtime paths and use focused behavior tests plus isolated managed-browser smoke checks. Preserve existing session data; do not add an audit or certification campaign. If a provider transition leaves an old conversation behind, manual porting is acceptable.
@@ -726,7 +724,7 @@ Expected: all four selected browser cases pass, each records one body-free compl
 
 - [ ] **Step 3: Diagnose and repair any ordinary-use failure**
 
-If a mode fails, use only its structured diagnostics and owned logs to distinguish a product failure from an unavailable provider account or transport. Fix a product defect with a meaningful regression test and rerun the affected mode. Do not refresh, replace or broaden credentials without explicit authorization; never expose secret material or prompt/response bodies.
+If a mode fails, inspect actual errors and owned diagnostic logs to distinguish a product failure from an unavailable provider account or transport. Fix a product defect with a meaningful regression test and rerun the affected mode. Do not refresh, replace or broaden shared credentials without explicit authorization; never expose secret material.
 
 - [ ] **Step 4: Run affected checks and refactor while green**
 
