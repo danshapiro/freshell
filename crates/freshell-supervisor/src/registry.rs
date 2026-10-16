@@ -5278,16 +5278,43 @@ fn validate_recovery_context_fence(
     fence: &RecoveryWriteFence,
 ) -> Result<(), RegistryError> {
     validate_recovery_revision_fence(tx, soul_id, fence)?;
-    let latest: String = tx.query_row(
-        "SELECT incarnation_id FROM incarnations WHERE soul_id=?1 ORDER BY CASE WHEN launch_state IN ('prepared','created','starting','running','stopping') THEN 0 ELSE 1 END,created_at DESC,rowid DESC LIMIT 1",
-        params![soul_id.as_str()], |row| row.get(0),
-    )?;
-    if latest != fence.active_incarnation_id.as_str() {
+    let latest = load_recovery_prior_incarnation(tx, soul_id, false)?;
+    if latest != fence.active_incarnation_id {
         return Err(RegistryError::InvalidState(
             "recovery observation incarnation changed".into(),
         ));
     }
     Ok(())
+}
+
+fn load_recovery_prior_incarnation(
+    conn: &Connection,
+    soul_id: &SoulId,
+    require_committed_ownership: bool,
+) -> Result<IncarnationId, RegistryError> {
+    // A retired, unowned replacement never became the recovery prior. All
+    // other rows still fence observations, including a newer PREPARED or
+    // unowned stopped row; only handle loading requires committed ownership.
+    let incarnation: String = conn
+        .query_row(
+            &format!(
+                "SELECT incarnation_id FROM incarnations WHERE soul_id=?1
+                 AND NOT (launch_state='failed' AND cleanup_state='termination_unconfirmed'
+                          AND prior_incarnation_id IS NOT NULL
+                          AND docker_daemon_id IS NULL AND container_id IS NULL)
+                 AND (NOT ?2 OR (docker_daemon_id IS NOT NULL AND container_id IS NOT NULL
+                          AND image_ref IS NOT NULL AND runtime_dir IS NOT NULL
+                          AND host_binary_path IS NOT NULL AND immutable_config_digest IS NOT NULL))
+                 ORDER BY CASE WHEN launch_state IN ({ACTIVE_STATES}) THEN 0 ELSE 1 END,
+                          created_at DESC,rowid DESC LIMIT 1"
+            ),
+            params![soul_id.as_str(), require_committed_ownership],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| RegistryError::InvalidState(format!("soul {soul_id} has no incarnation")))?;
+    IncarnationId::parse(incarnation)
+        .map_err(|_| RegistryError::Integrity("invalid incarnation id".into()))
 }
 
 pub(crate) fn deterministic_fresh_agent_fixture(
@@ -5813,18 +5840,7 @@ fn load_recovery_context(
         )
         .optional()?
         .ok_or_else(|| RegistryError::UnknownSoul(soul_id.clone()))?;
-    let incarnation_raw: String = conn
-        .query_row(
-            &format!(
-                "SELECT incarnation_id FROM incarnations WHERE soul_id=?1                  AND docker_daemon_id IS NOT NULL AND container_id IS NOT NULL                  AND image_ref IS NOT NULL AND runtime_dir IS NOT NULL                  AND host_binary_path IS NOT NULL AND immutable_config_digest IS NOT NULL                  ORDER BY CASE WHEN launch_state IN ({ACTIVE_STATES}) THEN 0 ELSE 1 END,created_at DESC LIMIT 1"
-            ),
-            params![soul_id.as_str()],
-            |row| row.get(0),
-        )
-        .optional()?
-        .ok_or_else(|| RegistryError::InvalidState(format!("soul {soul_id} has no incarnation")))?;
-    let incarnation_id = IncarnationId::parse(incarnation_raw)
-        .map_err(|_| RegistryError::Integrity("invalid incarnation id".into()))?;
+    let incarnation_id = load_recovery_prior_incarnation(conn, soul_id, true)?;
     let prior_handle = load_owned_handle(conn, installation, &incarnation_id)?;
     let (accepted_command_count, completed_command_count, dispatched_count): (u64, u64, u64) =
         conn.query_row(
@@ -8606,6 +8622,62 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn retired_unowned_replacement_preserves_prior_capture_and_import_observations() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let (soul, _, spec) = retired_capture_fixture(&registry).await;
+        let start = registry
+            .begin_recovery(
+                soul.clone(),
+                RecoveryTrigger::ProviderExit,
+                RecoveryPath::NativeResume,
+            )
+            .await
+            .unwrap();
+        let prior = start.context.prior_handle.incarnation_id().clone();
+        registry
+            .prepare_replacement(start, None, None, None, RecoveryPath::NativeResume)
+            .await
+            .unwrap();
+        registry
+            .retire_unowned_prepared_replacement(soul.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        assert_eq!(context.prior_handle.incarnation_id(), &prior);
+        let saved = registry
+            .store_verified_recovery_resume_spec_fenced(soul.clone(), spec, context.write_fence())
+            .await
+            .unwrap();
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        let revision = registry
+            .record_native_import_observation(
+                soul.clone(),
+                context.write_fence(),
+                NativeImportObservation {
+                    state: NativeImportState::NotApplicable,
+                    source_store_id: None,
+                    root_session_id: None,
+                    source_generation: None,
+                    schema_fingerprint: None,
+                    migration_fingerprint: None,
+                    complete_source_inventory: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(revision, context.native_import_revision + 1);
+        drop(registry);
+        let reopened = Registry::open(dir.path(), None).unwrap();
+        let persisted = reopened.recovery_context(soul).await.unwrap();
+        assert_eq!(persisted.prior_handle.incarnation_id(), &prior);
+        assert_eq!(persisted.resume_spec, Some(saved));
+        assert_eq!(persisted.native_import_revision, revision);
+        assert_eq!(persisted.evidence_revision, context.evidence_revision + 1);
+    }
+
+    #[tokio::test]
     async fn retired_resume_capture_preserves_active_only_api_and_saved_exact_input() {
         let dir = tempfile::tempdir().unwrap();
         let registry = Registry::open(dir.path(), None).unwrap();
@@ -8673,6 +8745,7 @@ pub(crate) mod tests {
             "unverified_cleanup",
             "new_active",
             "new_stopped",
+            "new_owned_failed",
             "orphan_writer",
             "wrong_root",
             "wrong_store",
@@ -8734,13 +8807,32 @@ pub(crate) mod tests {
                 "unverified_cleanup" => {
                     conn.execute("UPDATE incarnations SET cleanup_state='termination_unconfirmed' WHERE incarnation_id=?1", [context.prior_handle.incarnation_id().as_str()]).unwrap();
                 }
-                "new_active" | "new_stopped" => {
+                "new_active" | "new_stopped" | "new_owned_failed" => {
                     let mut preparation =
                         prep(soul.clone(), RequestId::new(), "new-retired-capture-owner");
                     preparation.provider = context.provider.clone();
                     preparation.native_session_id = context.native_session_id.clone();
                     preparation.fixture = context.fixture;
                     let current = registry.prepare_launch(preparation).await.unwrap();
+                    if case == "new_owned_failed" {
+                        registry
+                            .commit_created(
+                                current.incarnation_id.clone(),
+                                BackendCreatedRecord {
+                                    daemon_id: DockerDaemonId::new(),
+                                    container_id: "new-owned-container".into(),
+                                    image_ref: "new-owned-image".into(),
+                                    runtime_dir: dir.path().join("new-runtime"),
+                                    host_binary_path: dir.path().join("host"),
+                                    immutable_config_digest: "new-owned-digest".into(),
+                                    launch_policy: None,
+                                },
+                            )
+                            .await
+                            .unwrap();
+                        conn.execute("UPDATE incarnations SET launch_state='failed',cleanup_state='termination_unconfirmed',prior_incarnation_id=?1 WHERE incarnation_id=?2",
+                            params![context.prior_handle.incarnation_id().as_str(),current.incarnation_id.as_str()]).unwrap();
+                    }
                     if case == "new_stopped" {
                         registry
                             .mark_stop_outcome(current.incarnation_id, StopOutcome::VerifiedEmpty)

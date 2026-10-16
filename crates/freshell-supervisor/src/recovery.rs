@@ -11756,6 +11756,105 @@ pub(crate) mod automatic_retry_tests {
     }
 
     #[tokio::test]
+    async fn retired_unowned_replacement_settles_dependency_failure_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, backend, _) = open(dir.path(), 0);
+        let soul = seed_native(&supervisor, dir.path()).await;
+        let original = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        let (incarnation, runtime, container) =
+            uncommitted_replacement(&supervisor, &backend, &soul).await;
+        drop(supervisor);
+        drop(backend);
+
+        let (supervisor, backend, clock) = open(dir.path(), 1_000);
+        supervisor.reconcile_startup().await.unwrap();
+        assert_eq!(due(dir.path()), Some(3_000));
+        backend.unavailable(true);
+        clock.store(3_000, Ordering::SeqCst);
+        let report = supervisor.reconcile_startup().await.unwrap();
+        assert!(
+            report.results.iter().all(|result| result.error.is_none()),
+            "{report:?}"
+        );
+        let blocked = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        assert_eq!(blocked.recovery_state, RecoveryState::Blocked);
+        assert_eq!(
+            blocked.prior_handle.incarnation_id(),
+            original.prior_handle.incarnation_id()
+        );
+        let settled = supervisor
+            .registry
+            .recovery_retry(soul.clone(), original.intent_revision)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled.attempt_count, 2);
+        assert!(settled.reserved_attempt_id.is_none());
+        assert_eq!(settled.next_due_at_ms, Some(13_000));
+        assert_eq!(settled.last_reason, "backend_unavailable");
+        let journals = attempts(dir.path());
+        assert_eq!(journals.len(), 2);
+        assert_eq!(journals[1].1, "blocked");
+        assert_uncommitted_object_quarantined(
+            &supervisor,
+            &backend,
+            &incarnation,
+            &runtime,
+            &container,
+        );
+        drop(supervisor);
+        drop(backend);
+
+        let (supervisor, backend, clock) = open(dir.path(), 4_000);
+        supervisor.reconcile_startup().await.unwrap();
+        supervisor.observe_once().await.unwrap();
+        assert_eq!(attempts(dir.path()), journals);
+        assert_eq!(
+            supervisor
+                .registry
+                .recovery_retry(soul.clone(), original.intent_revision)
+                .await
+                .unwrap()
+                .unwrap(),
+            settled
+        );
+        assert_eq!(backend.count("creates"), 1);
+        backend.unavailable(false);
+        clock.store(13_000, Ordering::SeqCst);
+        supervisor.observe_once().await.unwrap();
+        let recovered = supervisor
+            .registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap();
+        assert_eq!(recovered.recovery_state, RecoveryState::Live);
+        assert_eq!(recovered.native_session_id, original.native_session_id);
+        assert_eq!(recovered.provider_store_id, original.provider_store_id);
+        assert_eq!(recovered.intent_revision, original.intent_revision);
+        assert_eq!(backend.count("creates"), 2);
+        assert_eq!(attempts(dir.path()).len(), 3);
+        assert_eq!(attempts(dir.path())[2].1, "succeeded");
+        assert_eq!(due(dir.path()), None);
+        assert_root_and_successes(&supervisor, &soul, 1).await;
+        assert_uncommitted_object_quarantined(
+            &supervisor,
+            &backend,
+            &incarnation,
+            &runtime,
+            &container,
+        );
+        close_retry_hosts(&backend).await;
+    }
+
+    #[tokio::test]
     async fn retry_uncommitted_replacements_preserve_three_attempt_exhaustion() {
         let dir = tempfile::tempdir().unwrap();
         let (supervisor, backend, clock) = open(dir.path(), 0);
