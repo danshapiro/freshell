@@ -3149,16 +3149,42 @@ describe('fixed owned fresh Codex saved history', () => {
       expect(rows[0].payload.id).toBe(current.nativeSessionId)
       expect(rows.at(-1).payload.last_agent_message).toBe(`Managed fixture saved answer\n${'x'.repeat(20_000)}`)
       await expect(rig.freshCodexSavedHistoryUnchanged(current)).resolves.toBe(true)
-      const completedAppend = [
+      const completedRecords = [
         { type: 'turn_context', payload: { turn_id: 'new-native-turn' } },
         { type: 'response_item', payload: { type: 'message', id: 'new-native-user', role: 'user',
           content: [{ type: 'input_text', text: 'Continue the saved conversation' }] } },
         { type: 'response_item', payload: { type: 'message', id: 'new-native-answer', role: 'assistant',
           content: [{ type: 'output_text', text: 'The original conversation continues' }] } },
         { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'new-native-turn' } },
-      ].map(row => JSON.stringify(row)).join('\n') + '\n'
+      ]
+      const completedAppend = completedRecords.map(row => JSON.stringify(row)).join('\n') + '\n'
       await fsp.appendFile(file, completedAppend)
       await expect(rig.freshCodexSavedHistoryUnchanged(current)).resolves.toBe(true)
+      for (const [role, index, textType, wrongTextType] of [
+        ['user', 1, 'input_text', 'output_text'],
+        ['assistant', 2, 'output_text', 'input_text'],
+      ] as const) {
+        for (const [defect, content] of [
+          ['missing body', undefined],
+          ['null body', null],
+          ['empty body', []],
+          ['non-array body', 'body text'],
+          ['null text part', [null]],
+          ['wrong text kind', [{ type: wrongTextType, text: 'body text' }]],
+          ['missing text', [{ type: textType }]],
+          ['non-string text', [{ type: textType, text: 42 }]],
+          ['empty text', [{ type: textType, text: '' }]],
+          ['blank text', [{ type: textType, text: ' \n ' }]],
+          ['extra text part', [{ type: textType, text: 'body text' }, { type: textType, text: 'extra' }]],
+        ] as const) {
+          const malformed = structuredClone(completedRecords)
+          Object.assign(malformed[index].payload, { content })
+          await fsp.writeFile(file, raw + malformed.map(row => JSON.stringify(row)).join('\n') + '\n')
+          await expect.soft(rig.freshCodexSavedHistoryUnchanged(current), `${role}: ${defect}`).resolves.toBe(false)
+        }
+      }
+      await fsp.writeFile(file, raw + completedAppend + completedAppend)
+      await expect(rig.freshCodexSavedHistoryUnchanged(current)).resolves.toBe(false)
       await fsp.writeFile(file, raw.replace('Managed prompt 0', 'Rewritten saved prompt') + completedAppend)
       await expect(rig.freshCodexSavedHistoryUnchanged(current)).resolves.toBe(false)
       await fsp.writeFile(file, raw + completedAppend.split('\n').slice(0, 3).join('\n') + '\n')
