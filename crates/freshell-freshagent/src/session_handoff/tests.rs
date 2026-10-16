@@ -868,6 +868,37 @@ async fn await_pid_dead(pid: u32) {
     }
 }
 
+/// Start a tagged test child only after its TERM trap is installed. The
+/// handoff tests use this as a stubborn tagged descendant to force the
+/// bounded teardown into its unconfirmed path; without the readiness marker,
+/// a fast teardown can deliver SIGTERM before the shell installs the trap and
+/// turn the intended failure into a successful reap.
+#[cfg(target_os = "linux")]
+async fn spawn_term_immune_tagged_child(
+    ownership_id: &str,
+) -> (tokio::process::Child, tempfile::TempDir) {
+    let readiness = tempfile::tempdir().expect("readiness directory");
+    let ready_path = readiness.path().join("term-trap-ready");
+    let child = tokio::process::Command::new("bash")
+        .arg("-c")
+        .arg("trap '' TERM; printf ready > \"$FRESHELL_TEST_CHILD_READY\"; while :; do sleep 1; done")
+        .env("FRESHELL_CLAUDE_SIDECAR_ID", ownership_id)
+        .env("FRESHELL_TEST_CHILD_READY", &ready_path)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn the lingering tagged grandchild");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !ready_path.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "tagged child never installed its TERM trap"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    (child, readiness)
+}
+
 /// Await the single `session.runtimeOwner` frame with this transition
 /// (bounded; skips unrelated frames — the tests 3b/4/5 inline loops,
 /// factored for the round-3 abort-window tests).
@@ -1746,13 +1777,7 @@ async fn a_watcher_join_error_fences_the_key_until_the_replacement_probe_confirm
     // rounds (≥500ms), so the Fenced window is deterministically
     // observable — and the probe provably kill-and-confirms the WHOLE
     // condemned tree, not just the sidecar.
-    let mut grandchild = tokio::process::Command::new("bash")
-        .arg("-c")
-        .arg("trap '' TERM; while :; do sleep 1; done")
-        .env("FRESHELL_CLAUDE_SIDECAR_ID", &ownership_id)
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn the lingering tagged grandchild");
+    let (mut grandchild, _readiness) = spawn_term_immune_tagged_child(&ownership_id).await;
     let grandchild_pid = grandchild.id().expect("grandchild pid");
 
     // Arm the injected JoinError: the NEXT watcher's confirmation wrapper
@@ -4856,13 +4881,7 @@ async fn handoff_with_an_unconfirmable_claude_tree_fences_the_key_until_the_esca
             .expect("the sidecar's ownership id")
             .to_string()
     };
-    let mut grandchild = tokio::process::Command::new("bash")
-        .arg("-c")
-        .arg("trap '' TERM; while :; do sleep 1; done")
-        .env("FRESHELL_CLAUDE_SIDECAR_ID", &ownership_id)
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn the lingering tagged grandchild");
+    let (mut grandchild, _readiness) = spawn_term_immune_tagged_child(&ownership_id).await;
     let grandchild_pid = grandchild.id().expect("grandchild pid");
 
     // Handoff claude -> terminal: the prior stop cannot confirm the tree's
@@ -6531,13 +6550,7 @@ async fn handoff_abort_holds_the_fence_until_the_uncommitted_target_continuation
             .expect("the target sidecar's ownership id")
             .to_string()
     };
-    let mut grandchild = tokio::process::Command::new("bash")
-        .arg("-c")
-        .arg("trap '' TERM; while :; do sleep 1; done")
-        .env("FRESHELL_CLAUDE_SIDECAR_ID", &ownership_id)
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn the lingering tagged grandchild");
+    let (mut grandchild, _readiness) = spawn_term_immune_tagged_child(&ownership_id).await;
     let grandchild_pid = grandchild.id().expect("grandchild pid");
 
     // ABORT inside the fresh-target resume await.
@@ -6827,13 +6840,7 @@ async fn an_aborted_from_vacant_unconfirmed_target_fences_with_a_replacement_wat
             .expect("the target sidecar's ownership id")
             .to_string()
     };
-    let mut grandchild = tokio::process::Command::new("bash")
-        .arg("-c")
-        .arg("trap '' TERM; while :; do sleep 1; done")
-        .env("FRESHELL_CLAUDE_SIDECAR_ID", &ownership_id)
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn the lingering tagged grandchild");
+    let (mut grandchild, _readiness) = spawn_term_immune_tagged_child(&ownership_id).await;
     let grandchild_pid = grandchild.id().expect("grandchild pid");
 
     // ABORT inside the fresh-target resume await; the cleanup's lane kill
